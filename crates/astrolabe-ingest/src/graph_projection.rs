@@ -1461,6 +1461,7 @@ mod tests {
             local_name_gen: String::new(),
             weight,
             props,
+            properties_json: None,
             provenance: LedgerRef {
                 seq: 0,
                 hash: [0; 32],

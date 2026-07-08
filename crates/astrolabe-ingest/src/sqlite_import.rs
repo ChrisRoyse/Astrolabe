@@ -17,6 +17,7 @@ use calyx_core::{
 };
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use rusqlite::{Connection, OpenFlags, params};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -34,9 +35,19 @@ const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump w
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
+const PROJECT_ROW_PREFIX: &[u8] = b"astrolabe:cbm-project:v1:";
+const FILE_HASH_ROW_PREFIX: &[u8] = b"astrolabe:file-hash:v1:";
+const PROJECT_SUMMARY_ROW_PREFIX: &[u8] = b"astrolabe:project-summary:v1:";
+const TOKEN_VECTOR_ROW_PREFIX: &[u8] = b"astrolabe:token-vector:v1:";
+const CBM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:cbm-edge:v1:";
 pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v1";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
+const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
+const SCHEMA_FILE_HASH_ROW: &str = "astrolabe-file-hash-v1";
+const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
+const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
+const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
@@ -178,6 +189,7 @@ struct RawNodeRow {
     start_line: i64,
     end_line: i64,
     properties: Value,
+    properties_json: String,
     node_vector: Option<Vec<u8>>,
 }
 
@@ -189,7 +201,50 @@ struct RawEdgeRow {
     target_id: i64,
     edge_type: String,
     properties: Value,
+    properties_json: String,
     local_name_gen: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawProjectRow {
+    name: String,
+    indexed_at: String,
+    root_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawFileHashRow {
+    project: String,
+    rel_path: String,
+    sha256: String,
+    mtime_ns: i64,
+    size: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RawProjectSummaryRow {
+    project: String,
+    summary: String,
+    source_hash: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawTokenVectorRow {
+    id: i64,
+    project: String,
+    token: String,
+    vector: Vec<u8>,
+    idf: i64,
+}
+
+#[derive(Debug, Clone)]
+struct RawMetadataRows {
+    projects: Vec<RawProjectRow>,
+    file_hashes: Vec<RawFileHashRow>,
+    project_summaries: Vec<RawProjectSummaryRow>,
+    token_vectors: Vec<RawTokenVectorRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,11 +255,16 @@ struct ExtractedNode {
     symbol: SymbolRecord,
     node_vector_sha256: Option<[u8; 32]>,
     node_vector_bytes: Option<usize>,
+    properties_json: String,
+    node_vector: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedConstellation {
     node_id: i64,
+    name: String,
+    properties_json: String,
+    node_vector: Option<Vec<u8>>,
     symbol: SymbolRecord,
     identity: SymbolIdentity,
     constellation: Constellation,
@@ -237,6 +297,16 @@ struct NodeMapRow {
     series_id: SeriesId,
     file_path: String,
     commit: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    start_line: Option<i64>,
+    #[serde(default)]
+    end_line: Option<i64>,
+    #[serde(default)]
+    properties_json: Option<String>,
+    #[serde(default)]
+    node_vector: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -249,6 +319,14 @@ struct StructuralNodeRow {
     name: String,
     file_path: String,
     commit: String,
+    #[serde(default)]
+    start_line: Option<i64>,
+    #[serde(default)]
+    end_line: Option<i64>,
+    #[serde(default)]
+    properties_json: Option<String>,
+    #[serde(default)]
+    node_vector: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,8 +343,112 @@ pub(crate) struct EdgeGraphRow {
     pub(crate) local_name_gen: String,
     pub(crate) weight: f32,
     pub(crate) props: Value,
+    #[serde(default)]
+    pub(crate) properties_json: Option<String>,
     pub(crate) provenance: LedgerRef,
     pub(crate) commit: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CbmProjectRow {
+    pub schema: String,
+    pub project: String,
+    pub indexed_at: String,
+    pub root_path: String,
+    pub commit: String,
+    pub sqlite_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CbmFileHashRow {
+    pub schema: String,
+    pub project: String,
+    pub rel_path: String,
+    pub sha256: String,
+    pub mtime_ns: i64,
+    pub size: i64,
+    pub commit: String,
+    pub sqlite_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CbmProjectSummaryRow {
+    pub schema: String,
+    pub project: String,
+    pub summary: String,
+    pub source_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub commit: String,
+    pub sqlite_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CbmTokenVectorRow {
+    pub schema: String,
+    pub id: i64,
+    pub project: String,
+    pub token: String,
+    pub vector: Vec<u8>,
+    pub idf: i64,
+    pub commit: String,
+    pub sqlite_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CbmRawEdgeRow {
+    pub schema: String,
+    pub sqlite_edge_id: i64,
+    pub project: String,
+    pub source_node_id: i64,
+    pub target_node_id: i64,
+    pub edge_type: String,
+    pub properties_json: String,
+    pub local_name_gen: String,
+    pub commit: String,
+    pub sqlite_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmGraphNode {
+    pub source_node_id: i64,
+    pub project: String,
+    pub label: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub properties_json: String,
+    pub node_vector: Option<Vec<u8>>,
+    pub cx_id: Option<CxId>,
+    pub structural: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CbmGraphEdge {
+    pub sqlite_edge_id: i64,
+    pub project: String,
+    pub source_node_id: i64,
+    pub target_node_id: i64,
+    pub src: Option<CxId>,
+    pub dst: Option<CxId>,
+    pub edge_type: String,
+    pub local_name_gen: String,
+    pub weight: f32,
+    pub properties_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CbmGraphSnapshot {
+    pub project: String,
+    pub panel_version: Option<u32>,
+    pub projects: Vec<CbmProjectRow>,
+    pub nodes: Vec<CbmGraphNode>,
+    pub edges: Vec<CbmGraphEdge>,
+    pub file_hashes: Vec<CbmFileHashRow>,
+    pub project_summaries: Vec<CbmProjectSummaryRow>,
+    pub token_vectors: Vec<CbmTokenVectorRow>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -330,6 +512,7 @@ where
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
+    let raw_metadata = read_metadata_rows(&connection, options, sqlite_fingerprint)?;
     let raw_nodes = read_nodes(&connection, &options.project)?;
     let raw_edges = read_edges(&connection, &options.project)?;
     let sqlite_node_vectors = raw_nodes
@@ -343,6 +526,7 @@ where
         options,
         &extracted,
         raw_edges,
+        raw_metadata,
         sqlite_fingerprint,
     )?;
 
@@ -458,9 +642,18 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, project, label, name, qualified_name, file_path, start_line, end_line, properties) =
-            row.map_err(|error| invalid_sqlite(format!("read nodes row: {error}")))?;
-        let properties = serde_json::from_str::<Value>(&properties).map_err(|error| {
+        let (
+            id,
+            project,
+            label,
+            name,
+            qualified_name,
+            file_path,
+            start_line,
+            end_line,
+            properties_json,
+        ) = row.map_err(|error| invalid_sqlite(format!("read nodes row: {error}")))?;
+        let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("node {id} properties JSON is invalid: {error}"))
         })?;
         if !properties.is_object() {
@@ -478,6 +671,7 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
             start_line,
             end_line,
             properties,
+            properties_json,
             node_vector: vectors.get(&id).cloned(),
         });
     }
@@ -538,9 +732,9 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, project, source_id, target_id, edge_type, properties, local_name_gen) =
+        let (id, project, source_id, target_id, edge_type, properties_json, local_name_gen) =
             row.map_err(|error| invalid_sqlite(format!("read edges row: {error}")))?;
-        let properties = serde_json::from_str::<Value>(&properties).map_err(|error| {
+        let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("edge {id} properties JSON is invalid: {error}"))
         })?;
         if !properties.is_object() {
@@ -555,6 +749,7 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
             target_id,
             edge_type,
             properties,
+            properties_json,
             local_name_gen,
         });
     }
@@ -570,6 +765,149 @@ fn table_exists(connection: &Connection, table: &str) -> IngestResult<bool> {
         )
         .map(|value| value != 0)
         .map_err(|error| invalid_sqlite(format!("probe table {table}: {error}")))
+}
+
+fn read_metadata_rows(
+    connection: &Connection,
+    options: &SqliteImportOptions,
+    sqlite_fingerprint: [u8; 32],
+) -> IngestResult<RawMetadataRows> {
+    Ok(RawMetadataRows {
+        projects: read_projects(connection, options, sqlite_fingerprint)?,
+        file_hashes: read_file_hashes(connection, &options.project)?,
+        project_summaries: read_project_summaries(connection, &options.project)?,
+        token_vectors: read_token_vectors(connection, &options.project)?,
+    })
+}
+
+fn read_projects(
+    connection: &Connection,
+    options: &SqliteImportOptions,
+    sqlite_fingerprint: [u8; 32],
+) -> IngestResult<Vec<RawProjectRow>> {
+    if !table_exists(connection, "projects")? {
+        return Ok(vec![RawProjectRow {
+            name: options.project.clone(),
+            indexed_at: hex_lower(&sqlite_fingerprint),
+            root_path: String::new(),
+        }]);
+    }
+    let mut statement = connection
+        .prepare("SELECT name, indexed_at, root_path FROM projects WHERE name = ?1 ORDER BY name")
+        .map_err(|error| invalid_sqlite(format!("prepare projects query: {error}")))?;
+    let rows = statement
+        .query_map(params![options.project], |row| {
+            Ok(RawProjectRow {
+                name: row.get(0)?,
+                indexed_at: row.get(1)?,
+                root_path: row.get(2)?,
+            })
+        })
+        .map_err(|error| invalid_sqlite(format!("query projects: {error}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|error| invalid_sqlite(format!("read projects row: {error}")))?);
+    }
+    if out.is_empty() {
+        out.push(RawProjectRow {
+            name: options.project.clone(),
+            indexed_at: hex_lower(&sqlite_fingerprint),
+            root_path: String::new(),
+        });
+    }
+    Ok(out)
+}
+
+fn read_file_hashes(connection: &Connection, project: &str) -> IngestResult<Vec<RawFileHashRow>> {
+    if !table_exists(connection, "file_hashes")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT project, rel_path, sha256, mtime_ns, size \
+             FROM file_hashes WHERE project = ?1 ORDER BY rel_path",
+        )
+        .map_err(|error| invalid_sqlite(format!("prepare file_hashes query: {error}")))?;
+    let rows = statement
+        .query_map(params![project], |row| {
+            Ok(RawFileHashRow {
+                project: row.get(0)?,
+                rel_path: row.get(1)?,
+                sha256: row.get(2)?,
+                mtime_ns: row.get(3)?,
+                size: row.get(4)?,
+            })
+        })
+        .map_err(|error| invalid_sqlite(format!("query file_hashes: {error}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|error| invalid_sqlite(format!("read file_hashes row: {error}")))?);
+    }
+    Ok(out)
+}
+
+fn read_project_summaries(
+    connection: &Connection,
+    project: &str,
+) -> IngestResult<Vec<RawProjectSummaryRow>> {
+    if !table_exists(connection, "project_summaries")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT project, summary, source_hash, created_at, updated_at \
+             FROM project_summaries WHERE project = ?1 ORDER BY project",
+        )
+        .map_err(|error| invalid_sqlite(format!("prepare project_summaries query: {error}")))?;
+    let rows = statement
+        .query_map(params![project], |row| {
+            Ok(RawProjectSummaryRow {
+                project: row.get(0)?,
+                summary: row.get(1)?,
+                source_hash: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })
+        .map_err(|error| invalid_sqlite(format!("query project_summaries: {error}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(
+            row.map_err(|error| invalid_sqlite(format!("read project_summaries row: {error}")))?,
+        );
+    }
+    Ok(out)
+}
+
+fn read_token_vectors(
+    connection: &Connection,
+    project: &str,
+) -> IngestResult<Vec<RawTokenVectorRow>> {
+    if !table_exists(connection, "token_vectors")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, project, token, vector, idf \
+             FROM token_vectors WHERE project = ?1 ORDER BY id",
+        )
+        .map_err(|error| invalid_sqlite(format!("prepare token_vectors query: {error}")))?;
+    let rows = statement
+        .query_map(params![project], |row| {
+            Ok(RawTokenVectorRow {
+                id: row.get(0)?,
+                project: row.get(1)?,
+                token: row.get(2)?,
+                vector: row.get(3)?,
+                idf: row.get(4)?,
+            })
+        })
+        .map_err(|error| invalid_sqlite(format!("query token_vectors: {error}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|error| invalid_sqlite(format!("read token_vectors row: {error}")))?);
+    }
+    Ok(out)
 }
 
 fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>> {
@@ -622,6 +960,8 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
             symbol,
             node_vector_sha256,
             node_vector_bytes,
+            properties_json: raw.properties_json,
+            node_vector: raw.node_vector,
         });
     }
     Ok(out)
@@ -633,6 +973,7 @@ fn prepare_batch<C, R>(
     options: &SqliteImportOptions,
     nodes: &[ExtractedNode],
     edges: Vec<RawEdgeRow>,
+    metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
 ) -> IngestResult<PreparedBatch>
 where
@@ -649,7 +990,7 @@ where
         prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
     constellations.sort_by_key(|prepared| prepared.node_id);
 
-    let mut graph_rows = Vec::new();
+    let mut graph_rows = metadata_graph_rows(options, metadata, sqlite_fingerprint)?;
     for prepared in &constellations {
         graph_rows.push(node_map_graph_row(options, prepared)?);
     }
@@ -660,6 +1001,7 @@ where
     for node in nodes.iter().filter(|node| node.label.is_structural()) {
         graph_rows.push(structural_graph_row(options, node)?);
     }
+    graph_rows.extend(raw_edge_graph_rows(options, &edges, sqlite_fingerprint)?);
     for (_, value) in &mut graph_rows {
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
@@ -674,6 +1016,105 @@ where
         sqlite_edges,
         edge_skips,
     })
+}
+
+fn metadata_graph_rows(
+    options: &SqliteImportOptions,
+    metadata: RawMetadataRows,
+    sqlite_fingerprint: [u8; 32],
+) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let fingerprint = hex_lower(&sqlite_fingerprint);
+    let mut rows = Vec::new();
+    for project in metadata.projects {
+        let row = CbmProjectRow {
+            schema: SCHEMA_PROJECT_ROW.to_string(),
+            project: project.name,
+            indexed_at: project.indexed_at,
+            root_path: project.root_path,
+            commit: options.commit.clone(),
+            sqlite_fingerprint_sha256: fingerprint.clone(),
+        };
+        rows.push((
+            project_key(PROJECT_ROW_PREFIX, &row.project),
+            serde_json::to_vec(&row)?,
+        ));
+    }
+    for file_hash in metadata.file_hashes {
+        let row = CbmFileHashRow {
+            schema: SCHEMA_FILE_HASH_ROW.to_string(),
+            project: file_hash.project,
+            rel_path: file_hash.rel_path,
+            sha256: file_hash.sha256,
+            mtime_ns: file_hash.mtime_ns,
+            size: file_hash.size,
+            commit: options.commit.clone(),
+            sqlite_fingerprint_sha256: fingerprint.clone(),
+        };
+        rows.push((
+            keyed_graph_key(FILE_HASH_ROW_PREFIX, &row.project, row.rel_path.as_bytes()),
+            serde_json::to_vec(&row)?,
+        ));
+    }
+    for summary in metadata.project_summaries {
+        let row = CbmProjectSummaryRow {
+            schema: SCHEMA_PROJECT_SUMMARY_ROW.to_string(),
+            project: summary.project,
+            summary: summary.summary,
+            source_hash: summary.source_hash,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
+            commit: options.commit.clone(),
+            sqlite_fingerprint_sha256: fingerprint.clone(),
+        };
+        rows.push((
+            project_key(PROJECT_SUMMARY_ROW_PREFIX, &row.project),
+            serde_json::to_vec(&row)?,
+        ));
+    }
+    for token_vector in metadata.token_vectors {
+        let row = CbmTokenVectorRow {
+            schema: SCHEMA_TOKEN_VECTOR_ROW.to_string(),
+            id: token_vector.id,
+            project: token_vector.project,
+            token: token_vector.token,
+            vector: token_vector.vector,
+            idf: token_vector.idf,
+            commit: options.commit.clone(),
+            sqlite_fingerprint_sha256: fingerprint.clone(),
+        };
+        rows.push((
+            graph_key(TOKEN_VECTOR_ROW_PREFIX, &row.project, row.id)?,
+            serde_json::to_vec(&row)?,
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
+}
+
+fn raw_edge_graph_rows(
+    options: &SqliteImportOptions,
+    edges: &[RawEdgeRow],
+    sqlite_fingerprint: [u8; 32],
+) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let fingerprint = hex_lower(&sqlite_fingerprint);
+    let mut rows = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let row = CbmRawEdgeRow {
+            schema: SCHEMA_CBM_EDGE_ROW.to_string(),
+            sqlite_edge_id: edge.id,
+            project: edge.project.clone(),
+            source_node_id: edge.source_id,
+            target_node_id: edge.target_id,
+            edge_type: edge.edge_type.clone(),
+            properties_json: edge.properties_json.clone(),
+            local_name_gen: edge.local_name_gen.clone(),
+            commit: options.commit.clone(),
+            sqlite_fingerprint_sha256: fingerprint.clone(),
+        };
+        rows.push((raw_edge_key(&row)?, serde_json::to_vec(&row)?));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
 }
 
 fn prepare_edge_rows(
@@ -717,6 +1158,7 @@ fn prepare_edge_rows(
             local_name_gen: edge.local_name_gen,
             weight,
             props: edge.properties,
+            properties_json: Some(edge.properties_json),
             provenance: zero_ledger_ref(),
             commit: options.commit.clone(),
         };
@@ -879,6 +1321,9 @@ where
     constellation.validate_schema()?;
     Ok(PreparedConstellation {
         node_id: node.id,
+        name: node.name,
+        properties_json: node.properties_json,
+        node_vector: node.node_vector,
         symbol: node.symbol,
         identity,
         constellation,
@@ -943,6 +1388,11 @@ fn node_map_graph_row(
         series_id: prepared.identity.series_id,
         file_path: prepared.symbol.rel_file_path.clone(),
         commit: options.commit.clone(),
+        name: Some(prepared.name.clone()),
+        start_line: Some(i64::from(prepared.symbol.start_line)),
+        end_line: Some(i64::from(prepared.symbol.end_line)),
+        properties_json: Some(prepared.properties_json.clone()),
+        node_vector: prepared.node_vector.clone(),
     };
     Ok((
         graph_key(NODE_MAP_PREFIX, &prepared.symbol.project, prepared.node_id)?,
@@ -963,6 +1413,10 @@ fn structural_graph_row(
         name: node.name.clone(),
         file_path: node.symbol.rel_file_path.clone(),
         commit: options.commit.clone(),
+        start_line: Some(i64::from(node.symbol.start_line)),
+        end_line: Some(i64::from(node.symbol.end_line)),
+        properties_json: Some(node.properties_json.clone()),
+        node_vector: node.node_vector.clone(),
     };
     Ok((
         graph_key(STRUCTURAL_NODE_PREFIX, &node.symbol.project, node.id)?,
@@ -1060,6 +1514,7 @@ fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> 
         && row.local_name_gen == prepared.row.local_name_gen
         && (row.weight - prepared.row.weight).abs() <= f32::EPSILON
         && row.props == prepared.row.props
+        && row.properties_json == prepared.row.properties_json
         && row.commit == prepared.row.commit
 }
 
@@ -1423,6 +1878,332 @@ where
     Ok(counts)
 }
 
+pub fn read_cbm_graph_snapshot<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> IngestResult<CbmGraphSnapshot>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let mut panel_version = None;
+    let mut nodes = Vec::new();
+
+    for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
+        if row.project != project {
+            continue;
+        }
+        if row.schema != SCHEMA_NODE_MAP {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} has wrong schema {}",
+                row.node_id, row.schema
+            )));
+        }
+        let base = vault
+            .read_cf_at(snapshot, ColumnFamily::Base, &base_key(row.cx_id))?
+            .ok_or_else(|| {
+                IngestError::InvalidInput(format!(
+                    "node map row {} points to missing Base row {}",
+                    row.node_id, row.cx_id
+                ))
+            })?;
+        let decoded = encode::decode_constellation_base(&base)?;
+        panel_version.get_or_insert(decoded.panel_version);
+        let name = row
+            .name
+            .or_else(|| decoded.metadata_value("name").map(ToOwned::to_owned))
+            .unwrap_or_else(|| local_name_from_qn(&row.qualified_name));
+        let file_path = if row.file_path.is_empty() {
+            decoded
+                .metadata_value("file_path")
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            row.file_path
+        };
+        let start_line = row
+            .start_line
+            .or_else(|| scalar_i64(&decoded, "start_line"))
+            .unwrap_or(0);
+        let end_line = row
+            .end_line
+            .or_else(|| scalar_i64(&decoded, "end_line"))
+            .unwrap_or(0);
+        let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
+        ensure_json_object_text(&properties_json, "node properties")?;
+        nodes.push(CbmGraphNode {
+            source_node_id: row.node_id,
+            project: row.project,
+            label: row.label,
+            name,
+            qualified_name: row.qualified_name,
+            file_path,
+            start_line,
+            end_line,
+            properties_json,
+            node_vector: row.node_vector,
+            cx_id: Some(row.cx_id),
+            structural: false,
+        });
+    }
+
+    for row in read_graph_rows::<C, StructuralNodeRow>(vault, snapshot, STRUCTURAL_NODE_PREFIX)? {
+        if row.project != project {
+            continue;
+        }
+        if row.schema != SCHEMA_STRUCTURAL_NODE {
+            return Err(IngestError::InvalidInput(format!(
+                "structural node row {} has wrong schema {}",
+                row.node_id, row.schema
+            )));
+        }
+        let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
+        ensure_json_object_text(&properties_json, "structural node properties")?;
+        nodes.push(CbmGraphNode {
+            source_node_id: row.node_id,
+            project: row.project,
+            label: row.label,
+            name: row.name,
+            qualified_name: row.qualified_name,
+            file_path: row.file_path,
+            start_line: row.start_line.unwrap_or(0),
+            end_line: row.end_line.unwrap_or(0),
+            properties_json,
+            node_vector: row.node_vector,
+            cx_id: None,
+            structural: true,
+        });
+    }
+    nodes.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.source_node_id.cmp(&right.source_node_id))
+    });
+
+    let mut edges = Vec::new();
+    for row in read_graph_rows::<C, CbmRawEdgeRow>(vault, snapshot, CBM_EDGE_ROW_PREFIX)? {
+        if row.project != project {
+            continue;
+        }
+        if row.schema != SCHEMA_CBM_EDGE_ROW {
+            return Err(IngestError::InvalidInput(format!(
+                "raw edge row {} has wrong schema {}",
+                row.sqlite_edge_id, row.schema
+            )));
+        }
+        ensure_json_object_text(&row.properties_json, "edge properties")?;
+        edges.push(CbmGraphEdge {
+            sqlite_edge_id: row.sqlite_edge_id,
+            project: row.project,
+            source_node_id: row.source_node_id,
+            target_node_id: row.target_node_id,
+            src: None,
+            dst: None,
+            edge_type: row.edge_type,
+            local_name_gen: row.local_name_gen,
+            weight: 1.0,
+            properties_json: row.properties_json,
+        });
+    }
+    if edges.is_empty() {
+        for row in read_graph_rows::<C, EdgeGraphRow>(vault, snapshot, EDGE_ROW_PREFIX)? {
+            if row.project != project {
+                continue;
+            }
+            validate_edge_snapshot_row(&row)?;
+            let properties_json = row.properties_json.unwrap_or_else(|| {
+                serde_json::to_string(&row.props).unwrap_or_else(|_| "{}".into())
+            });
+            ensure_json_object_text(&properties_json, "edge properties")?;
+            edges.push(CbmGraphEdge {
+                sqlite_edge_id: row.sqlite_edge_id,
+                project: row.project,
+                source_node_id: row.source_node_id,
+                target_node_id: row.target_node_id,
+                src: Some(row.src),
+                dst: Some(row.dst),
+                edge_type: row.edge_type,
+                local_name_gen: row.local_name_gen,
+                weight: row.weight,
+                properties_json,
+            });
+        }
+    }
+    edges.sort_by(|left, right| {
+        left.sqlite_edge_id
+            .cmp(&right.sqlite_edge_id)
+            .then_with(|| left.source_node_id.cmp(&right.source_node_id))
+            .then_with(|| left.target_node_id.cmp(&right.target_node_id))
+            .then_with(|| left.edge_type.cmp(&right.edge_type))
+            .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+    });
+
+    let mut projects = filter_schema_project(
+        read_graph_rows(vault, snapshot, PROJECT_ROW_PREFIX)?,
+        project,
+        |row: &CbmProjectRow| (&row.schema, SCHEMA_PROJECT_ROW, &row.project),
+    )?;
+    if projects.is_empty() {
+        projects.push(CbmProjectRow {
+            schema: SCHEMA_PROJECT_ROW.to_string(),
+            project: project.to_string(),
+            indexed_at: String::new(),
+            root_path: String::new(),
+            commit: String::new(),
+            sqlite_fingerprint_sha256: String::new(),
+        });
+    }
+    projects.sort_by(|left, right| left.project.cmp(&right.project));
+
+    let mut file_hashes = filter_schema_project(
+        read_graph_rows(vault, snapshot, FILE_HASH_ROW_PREFIX)?,
+        project,
+        |row: &CbmFileHashRow| (&row.schema, SCHEMA_FILE_HASH_ROW, &row.project),
+    )?;
+    file_hashes.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+
+    let mut project_summaries = filter_schema_project(
+        read_graph_rows(vault, snapshot, PROJECT_SUMMARY_ROW_PREFIX)?,
+        project,
+        |row: &CbmProjectSummaryRow| (&row.schema, SCHEMA_PROJECT_SUMMARY_ROW, &row.project),
+    )?;
+    project_summaries.sort_by(|left, right| left.project.cmp(&right.project));
+
+    let mut token_vectors = filter_schema_project(
+        read_graph_rows(vault, snapshot, TOKEN_VECTOR_ROW_PREFIX)?,
+        project,
+        |row: &CbmTokenVectorRow| (&row.schema, SCHEMA_TOKEN_VECTOR_ROW, &row.project),
+    )?;
+    token_vectors.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.token.cmp(&right.token))
+    });
+
+    Ok(CbmGraphSnapshot {
+        project: project.to_string(),
+        panel_version,
+        projects,
+        nodes,
+        edges,
+        file_hashes,
+        project_summaries,
+        token_vectors,
+    })
+}
+
+fn read_graph_rows<C, T>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prefix: &[u8],
+) -> IngestResult<Vec<T>>
+where
+    C: Clock,
+    T: DeserializeOwned,
+{
+    vault
+        .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(prefix))?
+        .into_iter()
+        .map(|(key, value)| {
+            serde_json::from_slice(&value).map_err(|error| {
+                IngestError::InvalidInput(format!(
+                    "decode Graph CF row {}: {error}",
+                    hex_lower(&key)
+                ))
+            })
+        })
+        .collect()
+}
+
+fn filter_schema_project<T>(
+    rows: Vec<T>,
+    project: &str,
+    metadata: impl Fn(&T) -> (&str, &'static str, &str),
+) -> IngestResult<Vec<T>> {
+    let mut out = Vec::new();
+    for row in rows {
+        let (actual_schema, expected_schema, row_project) = metadata(&row);
+        if row_project != project {
+            continue;
+        }
+        if actual_schema != expected_schema {
+            return Err(IngestError::InvalidInput(format!(
+                "Graph CF row for project {project} has wrong schema {actual_schema}"
+            )));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn local_name_from_qn(qualified_name: &str) -> String {
+    qualified_name
+        .rsplit_once('.')
+        .map_or(qualified_name, |(_, name)| name)
+        .to_string()
+}
+
+fn scalar_i64(decoded: &Constellation, key: &str) -> Option<i64> {
+    decoded.scalars.get(key).and_then(|value| {
+        if value.is_finite() && value.fract() == 0.0 {
+            Some(*value as i64)
+        } else {
+            None
+        }
+    })
+}
+
+fn ensure_json_object_text(value: &str, label: &str) -> IngestResult<()> {
+    let parsed = serde_json::from_str::<Value>(value)
+        .map_err(|error| IngestError::InvalidInput(format!("{label} JSON is invalid: {error}")))?;
+    if !parsed.is_object() {
+        return Err(IngestError::InvalidInput(format!(
+            "{label} JSON must be an object"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_edge_snapshot_row(row: &EdgeGraphRow) -> IngestResult<()> {
+    if row.schema != SCHEMA_EDGE_ROW {
+        return Err(IngestError::InvalidInput(format!(
+            "edge row {} has wrong schema {}",
+            row.sqlite_edge_id, row.schema
+        )));
+    }
+    match EdgeKind::from_cbm_type(&row.edge_type) {
+        Some(kind) if kind.code() == row.etype => {}
+        Some(kind) => {
+            return Err(IngestError::InvalidInput(format!(
+                "edge row {} etype {} does not match {}",
+                row.sqlite_edge_id,
+                row.etype,
+                kind.as_str()
+            )));
+        }
+        None => {
+            return Err(IngestError::InvalidInput(format!(
+                "edge row {} has unknown type {}",
+                row.sqlite_edge_id, row.edge_type
+            )));
+        }
+    }
+    if !(row.weight.is_finite() && (0.0..=1.0).contains(&row.weight)) {
+        return Err(IngestError::InvalidInput(format!(
+            "edge row {} weight {} is outside [0, 1]",
+            row.sqlite_edge_id, row.weight
+        )));
+    }
+    if !row.props.is_object() {
+        return Err(IngestError::InvalidInput(format!(
+            "edge row {} props are not an object",
+            row.sqlite_edge_id
+        )));
+    }
+    Ok(())
+}
+
 fn verify_edge_row_deep<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
@@ -1564,6 +2345,31 @@ fn graph_key(prefix: &[u8], project: &str, node_id: i64) -> IngestResult<Vec<u8>
     key.extend_from_slice(prefix);
     key.extend_from_slice(&sha256_digest(project.as_bytes()));
     key.extend_from_slice(&node_id.to_be_bytes());
+    Ok(key)
+}
+
+fn project_key(prefix: &[u8], project: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 32);
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key
+}
+
+fn keyed_graph_key(prefix: &[u8], project: &str, discriminator: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 64);
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key.extend_from_slice(&sha256_digest(discriminator));
+    key
+}
+
+fn raw_edge_key(row: &CbmRawEdgeRow) -> IngestResult<Vec<u8>> {
+    let id = u64::try_from(row.sqlite_edge_id)
+        .map_err(|_| invalid_sqlite(format!("edge id {} cannot be encoded", row.sqlite_edge_id)))?;
+    let mut key = Vec::with_capacity(CBM_EDGE_ROW_PREFIX.len() + 32 + 8);
+    key.extend_from_slice(CBM_EDGE_ROW_PREFIX);
+    key.extend_from_slice(&sha256_digest(row.project.as_bytes()));
+    key.extend_from_slice(&id.to_be_bytes());
     Ok(key)
 }
 
@@ -2089,7 +2895,7 @@ mod tests {
             report.readback.slot_rows_verified,
             default_panel_slots().len()
         );
-        assert_eq!(report.readback.graph_rows_verified, 2);
+        assert_eq!(report.readback.graph_rows_verified, 4);
         assert_eq!(report.readback.edge_rows_verified, 0);
         assert_eq!(report.readback.expected_edge_rows, 0);
         let deep = crate::verify_deep(&vault).expect("deep verify");
@@ -2165,7 +2971,7 @@ mod tests {
         assert_eq!(report.sqlite_edges, 4);
         assert_eq!(report.edge_skips.dangling, 1);
         assert_eq!(report.edge_rows_written, 3);
-        assert_eq!(report.graph_rows_written, 6);
+        assert_eq!(report.graph_rows_written, 11);
         assert_eq!(report.readback.edge_rows_verified, 3);
         assert_eq!(report.readback.expected_edge_rows, 3);
 

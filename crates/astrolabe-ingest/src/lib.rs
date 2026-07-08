@@ -24,8 +24,10 @@ pub use registry::{
 };
 pub use sqlite_import::{
     ASTRO_EDGE_DANGLING, ASTRO_INGEST_READBACK_MISMATCH, ASTRO_INGEST_SQLITE_INVALID,
-    EdgeSkipCounters, SqliteImportDeepVerifyCounts, SqliteImportOptions, SqliteImportReadback,
-    SqliteImportReport, import_sqlite_to_vault,
+    CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
+    CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, EdgeSkipCounters,
+    SqliteImportDeepVerifyCounts, SqliteImportOptions, SqliteImportReadback, SqliteImportReport,
+    import_sqlite_to_vault, read_cbm_graph_snapshot,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

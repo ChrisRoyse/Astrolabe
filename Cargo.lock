@@ -132,6 +132,16 @@ name = "astrolabe-lower"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-ingest",
+ "astrolabe-panel",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "cbm-sys",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
