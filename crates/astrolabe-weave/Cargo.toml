@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+calyx-core.workspace = true
 
 [lib]
 path = "src/lib.rs"

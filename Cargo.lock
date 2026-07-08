@@ -185,6 +185,7 @@ name = "astrolabe-weave"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "calyx-core",
 ]
 
 [[package]]
