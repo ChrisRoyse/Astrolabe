@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use astrolabe_domain::SymbolLabel;
+use astrolabe_domain::{ASTRO_SYMBOL_NON_FINITE, SymbolLabel};
 use calyx_core::{
     AbsentReason, Input, Lens, LensId, Modality, SlotId, SlotShape, SlotVector, SparseEntry,
     content_address,
@@ -15,10 +15,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use lenses::{
-    ApiCall, AstProfile, ComplexityMetrics, DeterministicEncoderLens, EncoderLensInput,
-    GraphPositionInput, IdentifierLexicalInput, PathHierarchyInput, StructuralTrigram,
-    TypeSurfaceInput, cbm_camel_split_text, cbm_camel_split_tokens, encode_slot,
-    fixture_encoder_input, s0_s9_lenses,
+    ApiCall, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
+    ConfigEnvSurfaceInput, DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput,
+    GraphPositionInput, IdentifierLexicalInput, LangLabelInput, PathHierarchyInput,
+    RECORD_VECTOR_SCALAR_KEYS, RecordVectorInput, RoleFlagsInput, RouteObservation,
+    RouteSurfaceInput, StructuralTrigram, TestTopologyInput, TypeSurfaceInput, canonical_route_qn,
+    cbm_camel_split_text, cbm_camel_split_tokens, cbm_route_canon_path, encode_slot,
+    fixture_encoder_input, fixture_scalar_sidecar, s0_s9_lenses, s10_s17_s21_lenses,
 };
 
 /// Crate name reported by Cargo metadata.
@@ -594,6 +597,15 @@ pub fn default_contracts() -> Vec<FrozenLensContract> {
         .collect()
 }
 
+/// Returns slots that participate in constellation identity/dedup.
+pub fn identity_slot_ids() -> BTreeSet<SlotId> {
+    PANEL_V1_SLOTS
+        .iter()
+        .filter(|slot| !slot.excluded_from_dedup)
+        .map(|slot| slot.slot_id())
+        .collect()
+}
+
 /// Label class used by blueprint `05_LENS_PANEL.md` section 3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -681,7 +693,7 @@ where
 }
 
 /// Input passed through the panel driver.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PanelInput {
     /// Domain label for the symbol being measured.
     pub label: SymbolLabel,
@@ -689,6 +701,8 @@ pub struct PanelInput {
     pub available_slots: BTreeSet<SlotId>,
     /// Stable source bytes for deterministic fixture/runtime probes.
     pub source_bytes: Vec<u8>,
+    /// Exact scalar measurements preserved beside the vector panel.
+    pub scalars: BTreeMap<String, f64>,
 }
 
 impl PanelInput {
@@ -698,6 +712,7 @@ impl PanelInput {
             label,
             available_slots: PANEL_V1_SLOTS.iter().map(|slot| slot.slot_id()).collect(),
             source_bytes: label.as_str().as_bytes().to_vec(),
+            scalars: BTreeMap::new(),
         }
     }
 
@@ -710,7 +725,14 @@ impl PanelInput {
             label,
             available_slots: available_slots.into_iter().collect(),
             source_bytes: label.as_str().as_bytes().to_vec(),
+            scalars: BTreeMap::new(),
         }
+    }
+
+    /// Attaches exact scalar measurements to be preserved beside emitted vectors.
+    pub fn with_scalars(mut self, scalars: BTreeMap<String, f64>) -> Self {
+        self.scalars = scalars;
+        self
     }
 }
 
@@ -745,6 +767,8 @@ pub struct PanelReadout {
     pub label: SymbolLabel,
     /// One vector or explicit absence for every v1 slot.
     pub slots: BTreeMap<SlotId, SlotVector>,
+    /// Exact scalar measurements from the source symbol.
+    pub scalars: BTreeMap<String, f64>,
 }
 
 /// Default Astrolabe panel driver.
@@ -784,6 +808,7 @@ impl PanelDriver {
     where
         R: SlotRuntime,
     {
+        validate_scalar_sidecar(&input.scalars)?;
         let applicable = applicable_slot_ids(input.label);
         let mut slots = BTreeMap::new();
         for slot in PANEL_V1_SLOTS {
@@ -808,6 +833,7 @@ impl PanelDriver {
             panel_version: self.version,
             label: input.label,
             slots,
+            scalars: input.scalars.clone(),
         })
     }
 }
@@ -1346,6 +1372,26 @@ fn validate_slot_shape(slot: PanelSlotSpec, vector: &SlotVector) -> PanelResult<
             "Emit the vector shape declared by the frozen slot spec.",
         )),
     }
+}
+
+fn validate_scalar_sidecar(scalars: &BTreeMap<String, f64>) -> PanelResult<()> {
+    for (key, value) in scalars {
+        if key.is_empty() {
+            return Err(PanelError::new(
+                ASTRO_PANEL_VECTOR_INVALID,
+                "scalar sidecar key must not be empty",
+                "Preserve scalar fields under stable non-empty keys.",
+            ));
+        }
+        if !value.is_finite() {
+            return Err(PanelError::new(
+                ASTRO_SYMBOL_NON_FINITE,
+                format!("scalar sidecar {key} is non-finite"),
+                "Drop or repair non-finite scalar values before panel measurement.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn vector_norm(vector: &SlotVector) -> Option<f32> {
