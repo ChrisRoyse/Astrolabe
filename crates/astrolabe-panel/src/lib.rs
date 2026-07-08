@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod lenses;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -11,6 +13,13 @@ use calyx_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use lenses::{
+    ApiCall, AstProfile, ComplexityMetrics, DeterministicEncoderLens, EncoderLensInput,
+    GraphPositionInput, IdentifierLexicalInput, PathHierarchyInput, StructuralTrigram,
+    TypeSurfaceInput, cbm_camel_split_text, cbm_camel_split_tokens, encode_slot,
+    fixture_encoder_input, s0_s9_lenses,
+};
 
 /// Crate name reported by Cargo metadata.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
