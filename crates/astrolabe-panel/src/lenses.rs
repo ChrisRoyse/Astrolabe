@@ -41,7 +41,7 @@ const AST_PROFILE_MAXIMA: [f32; AST_PROFILE_DIM as usize] = [
 const COMPLEXITY_PLE_THRESHOLDS: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 const GRAPH_EDGE_CLASSES: &[&str] = &["call", "dataflow", "type", "service"];
-const SEE_S8_DIMENSION_ISSUE: &str = "https://github.com/ChrisRoyse/Astrolabe/issues/66";
+const S8_DIMENSION_CONTRACT: &str = "docs/astrolabe-blueprint.md S8 graph_position Dense(16)";
 
 /// Frozen S21 record-vector scalar order.
 pub const RECORD_VECTOR_SCALAR_KEYS: [&str; RECORD_VEC_DIM as usize] = [
@@ -1150,7 +1150,7 @@ fn encode_graph_position(input: &GraphPositionInput) -> PanelResult<SlotVector> 
             return Err(PanelError::new(
                 ASTRO_PANEL_VECTOR_INVALID,
                 format!(
-                    "graph_position {} degree {} is negative; see {SEE_S8_DIMENSION_ISSUE}",
+                    "graph_position {} degree {} is negative; see {S8_DIMENSION_CONTRACT}",
                     graph_degree_name(idx),
                     value
                 ),
@@ -1170,7 +1170,7 @@ fn encode_graph_position(input: &GraphPositionInput) -> PanelResult<SlotVector> 
             return Err(PanelError::new(
                 ASTRO_PANEL_VECTOR_INVALID,
                 format!(
-                    "graph_position centrality scalar {value} is negative; see {SEE_S8_DIMENSION_ISSUE}"
+                    "graph_position centrality scalar {value} is negative; see {S8_DIMENSION_CONTRACT}"
                 ),
                 "Emit non-negative woven graph centrality/entropy features.",
             ));
@@ -1208,7 +1208,7 @@ fn encode_graph_position(input: &GraphPositionInput) -> PanelResult<SlotVector> 
     // S8 Dense(16) dimension order:
     // 0-7: log1p in/out degree for call, dataflow, type, service;
     // 8-11: sampled betweenness, PageRank, clustering coefficient, neighbor-label entropy;
-    // 12-15: derived totals pending the explicit contract clarification in issue #66.
+    // 12-15: log1p total_in, log1p total_out, log1p total_degree, direction balance.
     dense(SlotId::new(8), data)
 }
 

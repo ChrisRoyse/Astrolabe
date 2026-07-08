@@ -763,7 +763,7 @@ Schema id: `astro.panel.v1`. All lenses frozen with content-addressed contracts;
 | 5 | `type_surface` | Sparse(65536) | hashed set: param types âˆª return types âˆª USES_TYPE âˆª INSTANTIATES targets | type refs | Finite | â€” |
 | 6 | `decorators` | Sparse(4096) | hashed set of decorators/annotations + decorator_tags | defs | Finite | â€” |
 | 7 | `identifier_lexical` | Sparse(131072) | camelCase/snake-split tokens of name+QN (+ optional body identifiers), tf-weighted | tokens | Finite | â€” (BM25-indexed) |
-| 8 | `graph_position` | Dense(16) | log1p in/out degree per class {call, dataflow, type, service}, sampled betweenness, PageRank, clustering coeff, neighbor-label entropy | woven graph | Finite | backfilled post-weave |
+| 8 | `graph_position` | Dense(16) | structural signature; frozen dimension order below | woven graph | Finite | backfilled post-weave |
 | 9 | `path_hierarchy` | Sparse(16384) | hashed dir segments (each ancestor prefix) + depth | file_path | Finite | â€” |
 | 10 | `churn_profile` | Dense(8) | log1p change_count, log age_days, log days_since, co-change degree, cadence median, cadence MAD, revert count, fix-touch count | git pass | Finite | backfilled |
 | 11 | `recency` | Dense(1) | exp decay, half-life 30d (frozen) | last_modified | Finite | **retrieval_only, excluded_from_dedup** |
@@ -780,6 +780,27 @@ Schema id: `astro.panel.v1`. All lenses frozen with content-addressed contracts;
 | 22 | `token_multi` | Multi(128) | per-token nomic vectors, random-projected 768â†’128, MaxSim late interaction | tokens | Finite | optional feature `multi-vector` |
 
 **Optional plug-in lenses** (off by default; registered via Calyx registry runtimes when the user enables them): `tei_semantic` (TeiHttpLens â†’ real transformer, e.g. full nomic-embed-code or Qwen3), `splade_sparse` (FastembedSparseLens), `colbert_multi` (FastembedBgem3Lens), `reranker` (FastembedRerankerLens; retrieval-only, request-scoped, never persisted). These slot in with zero engine changes â€” the "plug-in lens is THE key" property.
+
+S8 `graph_position` Dense(16) dimension order is frozen as:
+
+| Dim | Quantity |
+|---|---|
+| 0 | `log1p(call_in)` |
+| 1 | `log1p(call_out)` |
+| 2 | `log1p(dataflow_in)` |
+| 3 | `log1p(dataflow_out)` |
+| 4 | `log1p(type_in)` |
+| 5 | `log1p(type_out)` |
+| 6 | `log1p(service_in)` |
+| 7 | `log1p(service_out)` |
+| 8 | `sampled_betweenness` |
+| 9 | `pagerank` |
+| 10 | `clustering_coeff` |
+| 11 | `neighbor_label_entropy` |
+| 12 | `log1p(total_in_degree)` |
+| 13 | `log1p(total_out_degree)` |
+| 14 | `log1p(total_degree)` |
+| 15 | `direction_balance = (total_out_degree - total_in_degree) / max(total_degree, 1)` |
 
 ## 3. Per-label applicability matrix
 
@@ -1942,4 +1963,3 @@ Core (P0â€“P6, the "insanely useful" milestone): **26â€“39 ew**. Full 
 
 
 ---
-
