@@ -1,0 +1,120 @@
+//! `calyx-mcp` stdio entrypoint.
+//!
+//! Reads newline-delimited JSON-RPC requests from stdin, dispatches each through
+//! [`McpServer`], and writes newline-delimited JSON-RPC responses to stdout.
+//! Protocol output is stdout-only; every diagnostic goes to stderr so a stray
+//! log line can never corrupt the response stream. Notifications (requests with
+//! no `id`) receive no reply, per JSON-RPC 2.0.
+
+use std::io::{self, BufRead, Write};
+use std::process::ExitCode;
+
+use calyx_core::AuthN;
+use calyx_mcp::jsonrpc::{JsonRpcId, decode_jsonrpc_request};
+use calyx_mcp::server::McpServer;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--build-info") {
+        return print_build_info(&args);
+    }
+    let mut server = McpServer::new();
+    if let Err(error) = calyx_mcp::tools::register_all(&mut server) {
+        eprintln!("calyx-mcp: {}: {}", error.code, error.message);
+        return ExitCode::FAILURE;
+    }
+    eprintln!("calyx-mcp: registered {} tools", server.tool_count());
+    let authn = AuthN::InProcess {
+        host_app_id: "calyx-mcp-stdio".to_string(),
+    };
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("calyx-mcp: stdin read error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let request = match decode_jsonrpc_request(trimmed.as_bytes()) {
+            Ok(request) => request,
+            Err(error) => {
+                // Malformed line: log to stderr and keep serving the next line.
+                eprintln!("calyx-mcp: {}: {}", error.code, error.message);
+                continue;
+            }
+        };
+
+        // Notifications (no id) get no response.
+        let is_notification = request.id.is_none() || matches!(request.id, Some(JsonRpcId::Null));
+        let response = server.dispatch_with_authn(request, Some(&authn));
+        if is_notification {
+            continue;
+        }
+
+        match serde_json::to_string(&response) {
+            Ok(line) => {
+                if let Err(error) = writeln!(out, "{line}") {
+                    eprintln!("calyx-mcp: stdout write error: {error}");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(error) = out.flush() {
+                    eprintln!("calyx-mcp: stdout flush error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            Err(error) => {
+                eprintln!("calyx-mcp: response serialize error: {error}");
+            }
+        }
+    }
+
+    // EOF on stdin → clean shutdown.
+    ExitCode::SUCCESS
+}
+
+/// `--build-info` (#1108): print the embedded identity JSON to stdout and
+/// exit so deploy tooling can verify the deployed binary. This path never
+/// enters the JSON-RPC loop, so the protocol stream stays uncorrupted.
+fn print_build_info(args: &[String]) -> ExitCode {
+    if args != ["--build-info"] {
+        eprintln!("calyx-mcp: --build-info takes no other arguments");
+        return ExitCode::from(2);
+    }
+    // calyx-mcp has no compile-time capability surface (#1130): no cargo
+    // features, no GPU dependencies. The empty map is still explicit so a
+    // future capability cannot be forgotten silently.
+    let mut report = match serde_json::to_value(calyx_buildinfo::build_info!(capabilities: &[])) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("calyx-mcp: CALYX_BUILD_INFO_INVALID: serialize build info: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    report["binary"] = serde_json::Value::from("calyx-mcp");
+    report["executable"] = serde_json::Value::from(
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("unavailable: {error}")),
+    );
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("calyx-mcp: response serialize error: {error}");
+            ExitCode::from(2)
+        }
+    }
+}

@@ -1,0 +1,66 @@
+[package]
+name = "calyx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "calyx"
+path = "src/main.rs"
+
+[features]
+default = []
+# `cuda` means the WHOLE GPU surface (#1130) — forge kernels, candle/fastembed
+# embedders, and the sextant cuVS index paths. Never split a sub-surface out
+# of this list again: #941 did (cuda-sextant) and produced binaries that
+# passed the #1116 deploy feature gate yet had the partitioned GPU path
+# compiled out. Platform limits belong in the owning crate (calyx-sextant
+# target-gates cuVS to Linux), and what actually got compiled is proven via
+# build-info `capabilities`, not feature names.
+cuda = ["calyx-forge/cuda", "calyx-registry/cuda", "calyx-sextant/cuda"]
+
+[build-dependencies]
+calyx-buildinfo = { path = "../calyx-buildinfo" }
+
+[dependencies]
+calyx-assay = { path = "../calyx-assay" }
+calyx-anneal = { path = "../calyx-anneal" }
+calyx-aster = { path = "../calyx-aster" }
+calyx-buildinfo = { path = "../calyx-buildinfo" }
+calyx-core = { path = "../calyx-core" }
+calyx-forge = { path = "../calyx-forge" }
+calyx-fsv = { path = "../calyx-fsv" }
+calyx-ledger = { path = "../calyx-ledger" }
+calyx-lodestar = { path = "../calyx-lodestar" }
+calyx-loom = { path = "../calyx-loom" }
+calyx-oracle = { path = "../calyx-oracle" }
+calyx-paths = { path = "../calyx-paths" }
+calyx-search = { path = "../calyx-search" }
+calyx-registry = { path = "../calyx-registry" }
+calyx-sextant = { path = "../calyx-sextant" }
+calyx-ward = { path = "../calyx-ward" }
+calyxd = { path = "../calyxd" }
+bincode.workspace = true
+blake3.workspace = true
+ciborium.workspace = true
+crc32fast.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ulid.workspace = true
+ureq.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+] }
+
+[dev-dependencies]
+calyx-testkit = { path = "../calyx-testkit" }
+proptest.workspace = true

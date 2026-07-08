@@ -1,0 +1,78 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+secrets/
+credentials.json
+service-account*.json
+*.key
+*.pem
+*.pfx
+*.p12
+*.token
+
+# Rust / Cargo
+target/
+**/target/
+*.rs.bk
+*.pdb
+
+# C / C++ / CMake build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.exe
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+.npm-cache-local/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local data, caches, logs, and scratch space
+data/
+db/
+storage/
+logs/
+tmp/
+.tmp/
+.cache/
+*.log
+*.tmp
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

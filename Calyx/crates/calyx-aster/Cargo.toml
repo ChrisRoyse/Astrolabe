@@ -1,0 +1,43 @@
+[package]
+name = "calyx-aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+calyx-core = { path = "../calyx-core" }
+calyx-forge = { path = "../calyx-forge" }
+calyx-ledger = { path = "../calyx-ledger" }
+calyx-paths = { path = "../calyx-paths" }
+crc32fast.workspace = true
+hkdf.workspace = true
+memmap2.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+calyx-fsv = { path = "../calyx-fsv" }
+calyx-ledger = { path = "../calyx-ledger" }
+calyx-mincut = { path = "../calyx-mincut" }
+criterion.workspace = true
+proptest.workspace = true
+ulid.workspace = true
+
+[[bench]]
+name = "bench_arena_reset"
+harness = false
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true

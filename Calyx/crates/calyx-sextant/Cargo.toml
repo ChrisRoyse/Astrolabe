@@ -1,0 +1,52 @@
+[package]
+name = "calyx-sextant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# `cuda` is the whole GPU surface for this crate (#1130). The cuVS deps are
+# target-gated to Linux because RAPIDS ships no native Windows/macOS libcuvs
+# (#1016): on non-Linux targets `--features cuda` still builds, the cuVS index
+# paths are compiled out (`cfg(sextant_cuvs)`, emitted by build.rs), and the
+# runtime stubs fail closed naming the platform limitation. The resolved truth
+# is exported as `CUVS_COMPILED` for build-info capability readback — deploy
+# gates must assert that, never the feature name.
+cuda = ["dep:cudarc", "dep:cuvs-sys"]
+
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+calyx-anneal = { path = "../calyx-anneal" }
+calyx-aster = { path = "../calyx-aster" }
+calyx-core = { path = "../calyx-core" }
+calyx-paths = { path = "../calyx-paths" }
+calyx-ward = { path = "../calyx-ward" }
+memmap2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+zeroize = "1"
+zstd.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc = { workspace = true, optional = true, features = ["std", "driver", "dynamic-linking", "cuda-13030"] }
+cuvs-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+calyx-fsv = { path = "../calyx-fsv" }
+calyx-loom = { path = "../calyx-loom" }
+calyx-oracle = { path = "../calyx-oracle" }
+criterion.workspace = true
+proptest.workspace = true
+sha2.workspace = true
+
+[[bench]]
+name = "bench_diskann_1e6"
+harness = false

@@ -1,0 +1,85 @@
+output_root: "${CALYX_HOME}/lenses"
+models:
+  - name: semantic-bge-small-en-v1-5
+    hf_id: Xenova/bge-small-en-v1.5
+    modality: text
+    formats: [onnx-int8]
+    pooling: mean
+    norm: l2
+
+  - name: semantic-all-minilm-l6-v2-candle
+    hf_id: sentence-transformers/all-MiniLM-L6-v2
+    modality: text
+    formats: [candle-fp16]
+    pooling: mean
+    norm: l2
+    dtype: f16
+
+  - name: semantic-potion-base-8m
+    hf_id: minishlab/potion-base-8M
+    modality: text
+    formats: [model2vec]
+    pooling: mean
+    norm: l2
+    dtype: int8
+
+  - name: domain-scincl-onnx-fp32
+    hf_id: malteos/scincl
+    modality: text
+    formats: [onnx-fp32]
+    pooling: mean
+    norm: l2
+    license: mit
+    max_batch: 64
+
+  - name: audio-wav2vec2-base-960h
+    hf_id: Xenova/wav2vec2-base-960h
+    modality: audio
+    formats: [onnx-int8]
+    pooling: mean
+    norm: finite
+
+  - name: image-siglip2-b16-adapter
+    hf_id: google/siglip2-base-patch16-224
+    modality: image
+    formats: [adapter]
+    pooling: mean
+    norm: l2
+    dim: 16
+    license: apache-2.0
+
+  - name: audio-clap-htsat-adapter
+    hf_id: laion/clap-htsat-unfused
+    modality: audio
+    formats: [adapter]
+    pooling: mean
+    norm: l2
+    dim: 16
+    license: apache-2.0
+
+  - name: protein-esm2-t6-8m-adapter
+    hf_id: facebook/esm2_t6_8M_UR50D
+    modality: protein
+    formats: [adapter]
+    pooling: mean
+    norm: l2
+    dim: 16
+    license: mit
+
+  - name: dna-dnabert2-117m-adapter
+    hf_id: zhihan1996/DNABERT-2-117M
+    modality: dna
+    formats: [adapter]
+    pooling: mean
+    norm: l2
+    dim: 16
+    license: apache-2.0
+
+  - name: molecule-chemberta-zinc-adapter
+    hf_id: seyonec/ChemBERTa-zinc-base-v1
+    modality: molecule
+    formats: [adapter]
+    pooling: mean
+    norm: l2
+    dim: 16
+    license: mit
