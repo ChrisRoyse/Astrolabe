@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod registry;
+
+pub use registry::{
+    ASTRO_SERIES_REGISTRY_PREFIX, DeepVerifyReport, GitRenameStatus, IngestError, IngestResult,
+    QN_KEY_MAX_BYTES, QnIndexRow, RecurrenceRow, RenameHint, RenameRecord, ReverseIndexRow,
+    SeriesIngestReport, SeriesSplitRecord, SeriesVersionInput, SeriesVersionRef,
+    StoredSeriesRegistryRow, bounded_qn_key, ingest_series_batch, ingest_series_batch_parallel,
+    parse_git_rename_status, qn_index_key, read_registry_snapshot, recurrence_key,
+    reverse_index_key, series_row_key, split_record_key, verify_deep, verify_deep_vault_path,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {

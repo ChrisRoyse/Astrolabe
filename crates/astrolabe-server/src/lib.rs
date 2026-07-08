@@ -72,6 +72,7 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
 
     match args[0].as_str() {
         "cli" => run_cli(&args[1..]),
+        "verify" => run_verify(&args[1..]),
         "--version" | "-V" => {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -94,7 +95,9 @@ fn initialize_tracing() {
 }
 
 fn print_usage() {
-    eprintln!("Usage: astrolabe [cli <tool> '<json>']");
+    eprintln!(
+        "Usage: astrolabe [cli <tool> '<json>' | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]"
+    );
 }
 
 fn run_server() -> Result<i32, DynError> {
@@ -222,6 +225,39 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     print_mcp_tool_result(&result)
+}
+
+fn run_verify(args: &[String]) -> Result<i32, DynError> {
+    let mut args = args.to_vec();
+    let raw_json = strip_flag(&mut args, "--json");
+    let deep = strip_flag(&mut args, "--deep");
+    let vault = strip_flag_value(&mut args, "--vault")
+        .or_else(|| strip_flag_value(&mut args, "--vault-dir"))
+        .ok_or("verify requires --vault <dir>")?;
+    let vault_id = strip_flag_value(&mut args, "--vault-id").ok_or("verify requires --vault-id")?;
+    let vault_salt =
+        strip_flag_value(&mut args, "--vault-salt").ok_or("verify requires --vault-salt")?;
+    if !deep {
+        return Err("verify currently requires --deep".into());
+    }
+    if !args.is_empty() {
+        return Err(format!("unknown verify arguments: {}", args.join(" ")).into());
+    }
+
+    let report = astrolabe_ingest::verify_deep_vault_path(vault, &vault_id, &vault_salt)?;
+    if raw_json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={}",
+            report.series_rows,
+            report.reverse_rows,
+            report.qn_index_rows,
+            report.recurrence_rows,
+            report.split_rows
+        );
+    }
+    Ok(0)
 }
 
 fn strip_flag(args: &mut Vec<String>, flag: &str) -> bool {
@@ -401,5 +437,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn verify_requires_deep_flag() {
+        let err = run_verify(&[
+            "--vault".to_string(),
+            "target/nope".to_string(),
+            "--vault-id".to_string(),
+            "00000000000000000000000000".to_string(),
+            "--vault-salt".to_string(),
+            "salt".to_string(),
+        ])
+        .expect_err("missing deep is refused");
+
+        assert!(err.to_string().contains("--deep"));
     }
 }
