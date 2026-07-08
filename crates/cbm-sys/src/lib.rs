@@ -1,10 +1,15 @@
-#![forbid(unsafe_code)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const CBM_VENDOR_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../vendor/codebase-memory-mcp"
 );
+
+include!("bindings.rs");
 
 pub fn vendor_root() -> &'static str {
     CBM_VENDOR_ROOT

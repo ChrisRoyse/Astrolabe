@@ -158,6 +158,12 @@ jobs:
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
 
+      - name: Install Rust C deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev clang
+
       - name: Install MinGW linker (Windows GNU)
         if: matrix.os == 'windows-latest'
         uses: msys2/setup-msys2@v2
@@ -168,6 +174,12 @@ jobs:
             mingw-w64-x86_64-gcc
             make
             git
+
+      - name: Install LLVM objcopy (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
       - name: Install Python for Calyx formatter metadata parsing
         uses: actions/setup-python@v5
