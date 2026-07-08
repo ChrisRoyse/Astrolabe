@@ -36,4 +36,5 @@ CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
+"$PYTHON_BIN" scripts/check-lowered-parity.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"

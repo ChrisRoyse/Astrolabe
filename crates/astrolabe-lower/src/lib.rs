@@ -394,67 +394,14 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 fn create_cbm_schema(connection: &Connection) -> LowerResult<()> {
     connection.execute_batch(
-        "CREATE TABLE projects (\
-           name TEXT PRIMARY KEY,\
-           indexed_at TEXT NOT NULL,\
-           root_path TEXT NOT NULL\
-         );\
-         CREATE TABLE file_hashes (\
-           project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\
-           rel_path TEXT NOT NULL,\
-           sha256 TEXT NOT NULL,\
-           mtime_ns INTEGER NOT NULL DEFAULT 0,\
-           size INTEGER NOT NULL DEFAULT 0,\
-           PRIMARY KEY (project, rel_path)\
-         );\
-         CREATE TABLE nodes (\
-           id INTEGER PRIMARY KEY AUTOINCREMENT,\
-           project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\
-           label TEXT NOT NULL,\
-           name TEXT NOT NULL,\
-           qualified_name TEXT NOT NULL,\
-           file_path TEXT DEFAULT '',\
-           start_line INTEGER DEFAULT 0,\
-           end_line INTEGER DEFAULT 0,\
-           properties TEXT DEFAULT '{}',\
-           UNIQUE(project, qualified_name)\
-         );\
-         CREATE TABLE edges (\
-           id INTEGER PRIMARY KEY AUTOINCREMENT,\
-           project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\
-           source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\
-           target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\
-           type TEXT NOT NULL,\
-           properties TEXT DEFAULT '{}',\
-           url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\
-           local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'\
-             THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\
-           UNIQUE(source_id, target_id, type, local_name_gen)\
-         );\
-         CREATE TABLE project_summaries (\
-           project TEXT PRIMARY KEY,\
-           summary TEXT NOT NULL,\
-           source_hash TEXT NOT NULL,\
-           created_at TEXT NOT NULL,\
-           updated_at TEXT NOT NULL\
-         );\
-         CREATE TABLE node_vectors (\
-           node_id INTEGER PRIMARY KEY,\
-           project TEXT NOT NULL,\
-           vector BLOB NOT NULL\
-         );\
-         CREATE TABLE token_vectors (\
-           id INTEGER PRIMARY KEY,\
-           project TEXT NOT NULL,\
-           token TEXT NOT NULL,\
-           vector BLOB NOT NULL,\
-           idf INTEGER NOT NULL\
-         );\
-         CREATE VIRTUAL TABLE nodes_fts USING fts5(\
-           name, qualified_name, label, file_path,\
-           content='',\
-           tokenize='unicode61 remove_diacritics 2'\
-         );\
+        "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t);\
+         CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\trel_path TEXT NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tmtime_ns INTEGER NOT NULL DEFAULT 0,\n\t\tsize INTEGER NOT NULL DEFAULT 0,\n\t\tPRIMARY KEY (project, rel_path)\n\t);\
+         CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t);\
+         CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT '{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t);\
+         CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\tcreated_at TEXT NOT NULL,\n\t\t\tupdated_at TEXT NOT NULL\n\t\t);\
+         CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\tvector BLOB NOT NULL\n\t);\
+         CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\ttoken TEXT NOT NULL,\n\t\tvector BLOB NOT NULL,\n\t\tidf INTEGER NOT NULL\n\t);\
+         CREATE VIRTUAL TABLE nodes_fts USING fts5(  name, qualified_name, label, file_path,  content='',  tokenize='unicode61 remove_diacritics 2');\
          CREATE TABLE astro_meta (\
            schema TEXT NOT NULL,\
            vault_fingerprint TEXT NOT NULL,\
