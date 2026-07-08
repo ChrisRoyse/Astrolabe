@@ -139,6 +139,11 @@ name = "astrolabe-panel"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "calyx-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
