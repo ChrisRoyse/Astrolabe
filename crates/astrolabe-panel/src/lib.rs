@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod embeddings;
 mod lenses;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +15,10 @@ use calyx_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use embeddings::{
+    NOMIC_EMBED_DIM, NOMIC_TOKEN_COUNT, NOMIC_VECTOR_BLOB_SHA256, StaticEmbeddingInput,
+    StaticEmbeddingLens, StaticEmbeddingTable, fixture_static_embedding_input, s18_s20_lenses,
+};
 pub use lenses::{
     ApiCall, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
     ConfigEnvSurfaceInput, DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput,
@@ -183,12 +188,16 @@ impl FrozenLensContract {
     /// Creates the default frozen contract for a v1 panel slot.
     pub fn for_slot(slot: &PanelSlotSpec) -> Self {
         let shape = shape_fingerprint(slot.shape);
-        let weights_sha = sha256_digest(&[
-            PANEL_SCHEMA_ID.as_bytes(),
-            slot.key.as_bytes(),
-            shape.as_bytes(),
-            b"default-encoder-v1",
-        ]);
+        let weights_sha = if matches!(slot.slot, 18 | 19 | 20 | 22) {
+            NOMIC_VECTOR_BLOB_SHA256
+        } else {
+            sha256_digest(&[
+                PANEL_SCHEMA_ID.as_bytes(),
+                slot.key.as_bytes(),
+                shape.as_bytes(),
+                b"default-encoder-v1",
+            ])
+        };
         let corpus_hash = sha256_digest(&[b"corpus-independent"]);
         Self::new(
             slot.key,
