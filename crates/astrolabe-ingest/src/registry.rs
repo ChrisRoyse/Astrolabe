@@ -11,6 +11,8 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, Clock, CxId, Seq, VaultId};
 use serde::{Deserialize, Serialize};
 
+use crate::sqlite_import::verify_sqlite_import_deep;
+
 /// Namespace prefix for every Astrolabe series registry key stored in Aster.
 pub const ASTRO_SERIES_REGISTRY_PREFIX: &[u8] = b"astrolabe:series-registry:v1:";
 /// Maximum QN key bytes before the CBM-style FNV tail fallback is applied.
@@ -36,10 +38,21 @@ pub type IngestResult<T> = std::result::Result<T, IngestError>;
 pub enum IngestError {
     /// A domain identity operation failed.
     Domain(astrolabe_domain::DomainError),
+    /// A panel measurement operation failed.
+    Panel(astrolabe_panel::PanelError),
     /// A Calyx/Aster operation failed.
     Calyx(CalyxError),
     /// A registry row failed deterministic JSON serialization or decoding.
     Json(serde_json::Error),
+    /// Input was refused fail-closed with a stable `ASTRO_*` code.
+    Refused {
+        /// Stable refusal code.
+        code: &'static str,
+        /// Human-readable refusal message.
+        message: String,
+        /// Operator-facing remediation.
+        remediation: &'static str,
+    },
     /// Caller supplied an invalid registry input.
     InvalidInput(String),
     /// Deep verification found persisted CF bytes that violate registry invariants.
@@ -50,8 +63,14 @@ impl fmt::Display for IngestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Domain(err) => write!(f, "{err}"),
+            Self::Panel(err) => write!(f, "{err}"),
             Self::Calyx(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "{err}"),
+            Self::Refused {
+                code,
+                message,
+                remediation,
+            } => write!(f, "{code}: {message} Remediation: {remediation}"),
             Self::InvalidInput(message) => f.write_str(message),
             Self::VerifyFailed(errors) => {
                 write!(
@@ -66,9 +85,50 @@ impl fmt::Display for IngestError {
 
 impl Error for IngestError {}
 
+impl IngestError {
+    /// Builds an ingest refusal with a stable machine-readable code.
+    pub fn refused(
+        code: &'static str,
+        message: impl Into<String>,
+        remediation: &'static str,
+    ) -> Self {
+        Self::Refused {
+            code,
+            message: message.into(),
+            remediation,
+        }
+    }
+
+    /// Returns the stable refusal code when this error has one.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Domain(err) => Some(err.code()),
+            Self::Panel(err) => Some(err.code()),
+            Self::Refused { code, .. } => Some(code),
+            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) | Self::VerifyFailed(_) => None,
+        }
+    }
+
+    /// Returns the operator-facing remediation when this error has one.
+    pub fn remediation(&self) -> Option<&str> {
+        match self {
+            Self::Domain(err) => Some(err.remediation()),
+            Self::Panel(err) => Some(err.remediation()),
+            Self::Refused { remediation, .. } => Some(remediation),
+            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) | Self::VerifyFailed(_) => None,
+        }
+    }
+}
+
 impl From<astrolabe_domain::DomainError> for IngestError {
     fn from(value: astrolabe_domain::DomainError) -> Self {
         Self::Domain(value)
+    }
+}
+
+impl From<astrolabe_panel::PanelError> for IngestError {
+    fn from(value: astrolabe_panel::PanelError) -> Self {
+        Self::Panel(value)
     }
 }
 
@@ -316,6 +376,12 @@ pub struct DeepVerifyReport {
     pub recurrence_rows: usize,
     /// Number of split records verified.
     pub split_rows: usize,
+    /// Number of SQLite-import node mapping rows verified against Base CF rows.
+    pub sqlite_node_map_rows: usize,
+    /// Number of SQLite-import structural metadata-only rows decoded.
+    pub sqlite_structural_rows: usize,
+    /// Number of SQLite-import Base CF constellation rows decoded via node maps.
+    pub sqlite_constellation_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -574,6 +640,8 @@ where
         }
     }
 
+    let sqlite = verify_sqlite_import_deep(vault, &mut errors)?;
+
     if !errors.is_empty() {
         return Err(IngestError::VerifyFailed(errors));
     }
@@ -584,6 +652,9 @@ where
         qn_index_rows: qn_rows,
         recurrence_rows: recurrence.len(),
         split_rows: splits,
+        sqlite_node_map_rows: sqlite.node_map_rows,
+        sqlite_structural_rows: sqlite.structural_rows,
+        sqlite_constellation_rows: sqlite.constellation_rows,
     })
 }
 
@@ -1039,6 +1110,9 @@ mod tests {
                 qn_index_rows: 1,
                 recurrence_rows: 1,
                 split_rows: 0,
+                sqlite_node_map_rows: 0,
+                sqlite_structural_rows: 0,
+                sqlite_constellation_rows: 0,
             }
         );
     }
@@ -1068,6 +1142,9 @@ mod tests {
                 qn_index_rows: 1,
                 recurrence_rows: 1,
                 split_rows: 0,
+                sqlite_node_map_rows: 0,
+                sqlite_structural_rows: 0,
+                sqlite_constellation_rows: 0,
             }
         );
         fs::remove_dir_all(&dir).expect("remove durable vault dir");

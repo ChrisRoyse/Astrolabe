@@ -249,12 +249,15 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
         println!("{}", serde_json::to_string(&report)?);
     } else {
         println!(
-            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={}",
+            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={}",
             report.series_rows,
             report.reverse_rows,
             report.qn_index_rows,
             report.recurrence_rows,
-            report.split_rows
+            report.split_rows,
+            report.sqlite_node_map_rows,
+            report.sqlite_structural_rows,
+            report.sqlite_constellation_rows
         );
     }
     Ok(0)

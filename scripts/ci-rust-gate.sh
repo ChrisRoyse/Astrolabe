@@ -208,6 +208,7 @@ cd "$ROOT"
 run_logged "astrolabe-fmt-$LABEL" cargo fmt --check --all
 run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets --target "$TARGET_TRIPLE" -- -D warnings
 run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace --target "$TARGET_TRIPLE"
+run_logged "astrolabe-ingest-lscale-bench-$LABEL" bash scripts/bench-ingest-lscale.sh --ci-smoke
 run_logged "libcbm-symbols-$LABEL" bash scripts/check-libcbm-symbols.sh
 run_logged "single-mimalloc-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-single-mimalloc.sh
 run_logged "mcp-parity-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-mcp-parity.sh
