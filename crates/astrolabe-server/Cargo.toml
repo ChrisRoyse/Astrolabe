@@ -15,6 +15,7 @@ calyx-aster.workspace = true
 calyx-core.workspace = true
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 

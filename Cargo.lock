@@ -175,6 +175,7 @@ dependencies = [
  "calyx-core",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tracing",
  "tracing-subscriber",
 ]

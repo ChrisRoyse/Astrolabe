@@ -9,6 +9,7 @@ use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AbsentReason, SlotVector, VaultId};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::DynError;
 
@@ -52,6 +53,12 @@ struct ShadowImportOutcome {
     sqlite_nodes: usize,
     sqlite_edges: usize,
     constellation_inputs: usize,
+    structural_only: usize,
+    new_cx_ids: usize,
+    reused_cx_ids: usize,
+    graph_rows_written: usize,
+    edge_rows_written: usize,
+    cx_id_set_sha256: String,
     ledger_seq: u64,
     ledger_rows_after: usize,
     verify_chain_status: String,
@@ -299,6 +306,12 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
         sqlite_nodes: report.sqlite_nodes,
         sqlite_edges: report.sqlite_edges,
         constellation_inputs: report.constellation_inputs,
+        structural_only: report.structural_only,
+        new_cx_ids: report.new_cx_ids,
+        reused_cx_ids: report.reused_cx_ids,
+        graph_rows_written: report.graph_rows_written,
+        edge_rows_written: report.edge_rows_written,
+        cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
         ledger_seq: report.ledger_seq,
         ledger_rows_after: report.ledger_rows_after,
         verify_chain_status: verify.status,
@@ -311,6 +324,14 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "sqlite_nodes": outcome.sqlite_nodes,
         "sqlite_edges": outcome.sqlite_edges,
         "constellation_inputs": outcome.constellation_inputs,
+        "structural_only": outcome.structural_only,
+        "idempotency": {
+            "new_cx_ids": outcome.new_cx_ids,
+            "reused_cx_ids": outcome.reused_cx_ids,
+            "graph_rows_written": outcome.graph_rows_written,
+            "edge_rows_written": outcome.edge_rows_written,
+            "cx_id_set_sha256": outcome.cx_id_set_sha256,
+        },
         "sqlite_path": outcome.sqlite_path,
         "vault_dir": outcome.vault_dir,
         "vault_id": outcome.vault_id,
@@ -333,6 +354,16 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     let fingerprint = read_config_value(&cache_dir, &metadata_key(project, "vault_fingerprint"))?;
     let ledger_seq = read_config_value(&cache_dir, &metadata_key(project, "ledger_seq"))?
         .and_then(|value| value.parse::<u64>().ok());
+    let new_cx_ids = read_config_value(&cache_dir, &metadata_key(project, "new_cx_ids"))?
+        .and_then(|value| value.parse::<usize>().ok());
+    let reused_cx_ids = read_config_value(&cache_dir, &metadata_key(project, "reused_cx_ids"))?
+        .and_then(|value| value.parse::<usize>().ok());
+    let graph_rows_written =
+        read_config_value(&cache_dir, &metadata_key(project, "graph_rows_written"))?
+            .and_then(|value| value.parse::<usize>().ok());
+    let edge_rows_written =
+        read_config_value(&cache_dir, &metadata_key(project, "edge_rows_written"))?
+            .and_then(|value| value.parse::<usize>().ok());
     let panel_version = read_config_value(&cache_dir, &metadata_key(project, "panel_version"))?
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_PANEL_VERSION);
@@ -350,6 +381,13 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
         "vault_fingerprint": fingerprint,
         "vault_ledger_head": ledger_seq,
         "panel_version": panel_version,
+        "idempotency": {
+            "new_cx_ids": new_cx_ids,
+            "reused_cx_ids": reused_cx_ids,
+            "graph_rows_written": graph_rows_written,
+            "edge_rows_written": edge_rows_written,
+            "cx_id_set_sha256": read_config_value(&cache_dir, &metadata_key(project, "cx_id_set_sha256"))?,
+        },
         "stores": stores_summary(&sqlite_path, &configured_vault_dir),
         "vault": {
             "dir": configured_vault_dir,
@@ -518,6 +556,12 @@ fn persist_shadow_outcome(project: &str, outcome: &ShadowImportOutcome) -> Resul
         ("ledger_seq", outcome.ledger_seq.to_string()),
         ("ledger_rows", outcome.ledger_rows_after.to_string()),
         ("panel_version", DEFAULT_PANEL_VERSION.to_string()),
+        ("structural_only", outcome.structural_only.to_string()),
+        ("new_cx_ids", outcome.new_cx_ids.to_string()),
+        ("reused_cx_ids", outcome.reused_cx_ids.to_string()),
+        ("graph_rows_written", outcome.graph_rows_written.to_string()),
+        ("edge_rows_written", outcome.edge_rows_written.to_string()),
+        ("cx_id_set_sha256", outcome.cx_id_set_sha256.clone()),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -575,6 +619,17 @@ fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
 
 fn vault_salt(project: &str) -> String {
     format!("astrolabe-shadow-v1:{project}")
+}
+
+fn cx_id_set_sha256(ids: &[calyx_core::CxId]) -> String {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe-shadow-cx-id-set-v1");
+    for id in sorted {
+        hasher.update(id.as_bytes());
+    }
+    hex_lower(&hasher.finalize())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

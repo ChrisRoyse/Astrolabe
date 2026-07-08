@@ -37,4 +37,5 @@ bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
 "$PYTHON_BIN" scripts/check-lowered-parity.py
+"$PYTHON_BIN" scripts/check-shadow-parity.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"
