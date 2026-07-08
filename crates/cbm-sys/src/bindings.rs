@@ -3015,3 +3015,49 @@ unsafe extern "C" {
         sql: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn cbm_mimalloc_malloc(size: usize) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_malloc_aligned(
+        size: usize,
+        alignment: usize,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_zalloc_aligned(
+        size: usize,
+        alignment: usize,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_realloc_aligned(
+        p: *mut ::std::os::raw::c_void,
+        newsize: usize,
+        alignment: usize,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_free(p: *mut ::std::os::raw::c_void);
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_usable_size(p: *const ::std::os::raw::c_void) -> usize;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_collect(force: bool);
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_version() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mimalloc_process_info(
+        elapsed_msecs: *mut usize,
+        user_msecs: *mut usize,
+        system_msecs: *mut usize,
+        current_rss: *mut usize,
+        peak_rss: *mut usize,
+        current_commit: *mut usize,
+        peak_commit: *mut usize,
+        page_faults: *mut usize,
+    );
+}

@@ -661,6 +661,9 @@ cbm: $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Static library for Astrolabe FFI ─────────────────────────────
 
+ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+ASTRO_ALLOC_SHIM_SRC = $(ASTROLABE_PATCH_DIR)/astro_alloc_shim.c
+ASTRO_ALLOC_SHIM_OBJ = $(LIBCBM_DIR)/astro_alloc_shim.o
 LIBCBM_DIR = $(BUILD_DIR)/libcbm
 LIBCBM_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
               $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(CBM_DIR)/lsp_all.c $(PREPROCESSOR_SRC) \
@@ -672,12 +675,19 @@ endif
 LIBCBM_C_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(filter %.c,$(LIBCBM_SRCS)))
 LIBCBM_CXX_OBJS = $(patsubst %.cpp,$(LIBCBM_DIR)/%.o,$(filter %.cpp,$(LIBCBM_SRCS)))
 LIBCBM_ASM_OBJS = $(patsubst %.S,$(LIBCBM_DIR)/%.o,$(UNIXCODER_BLOB_SRC))
-LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS)
+LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ)
 LIBCBM_CFLAGS = $(CFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_CXXFLAGS = $(CXXFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+ifeq ($(LIBCBM_ASAN),1)
+LIBCBM_CFLAGS = $(CFLAGS_COMMON) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_CXXFLAGS = $(CXXFLAGS_COMMON) -g -O1 $(CXXFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
+endif
 LIBCBM_A = $(BUILD_DIR)/libcbm.a
 LIBCBM_RELOC = $(BUILD_DIR)/libcbm.o
 LIBCBM_EXPORTS = $(BUILD_DIR)/libcbm.exports
@@ -701,6 +711,10 @@ $(LIBCBM_DIR)/$(CBM_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_D
 $(LIBCBM_DIR)/$(MIMALLOC_SRC:.c=.o): $(MIMALLOC_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_MIMALLOC_CFLAGS) -c -o $@ $<
+
+$(ASTRO_ALLOC_SHIM_OBJ): $(ASTRO_ALLOC_SHIM_SRC) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -Ivendored/mimalloc/include -Ivendored/mimalloc/src -c -o $@ $<
 
 $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)

@@ -207,6 +207,7 @@ impl ExtractedFile {
         rel_path: &str,
         timeout_micros: i64,
     ) -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
         let source_len = c_int::try_from(source.len()).map_err(|_| {
             envelope(
                 "ASTRO_CBM_SOURCE_TOO_LARGE",
@@ -645,6 +646,7 @@ pub struct CbmToolRunner {
 
 impl CbmToolRunner {
     pub fn new(store_path: &str) -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
         let store_path = CString::new(store_path)?;
         // SAFETY: store_path is a live C string for the duration of the call.
         let ptr = unsafe { cbm_sys::cbm_mcp_server_new(store_path.as_ptr()) };

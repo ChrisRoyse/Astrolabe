@@ -11,15 +11,24 @@ fn main() {
         .expect("cbm-sys crate must live under crates/");
     let cbm_root = repo_root.join("vendor/codebase-memory-mcp");
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
+    let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
+    let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("cbm-build");
 
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
+    println!("cargo:rerun-if-changed={}", alloc_shim.display());
+    println!("cargo:rerun-if-changed={}", mimalloc_header.display());
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("VENDORED.md").display()
+    );
+    println!("cargo:rustc-check-cfg=cfg(cbm_sys_asan)");
+    println!(
+        "cargo:rustc-env=CBM_MIMALLOC_VERSION={}",
+        read_mimalloc_version(&mimalloc_header)
     );
     for var in [
         "MAKE",
@@ -36,6 +45,9 @@ fn main() {
         "ASTROLABE_UPDATE_BINDINGS",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+    if env::var_os("CBM_SYS_ASAN").is_some() {
+        println!("cargo:rustc-cfg=cbm_sys_asan");
     }
 
     if build_dir.exists() {
@@ -86,6 +98,9 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
             "CXXFLAGS_EXTRA={}",
             extra_flags("CXXFLAGS_EXTRA", asan_enabled)
         ));
+    }
+    if asan_enabled {
+        command.arg("LIBCBM_ASAN=1");
     }
     if let Ok(archflags) = env::var("ARCHFLAGS") {
         command.arg(format!("ARCHFLAGS={archflags}"));
@@ -198,4 +213,25 @@ fn extra_flags(var: &str, asan_enabled: bool) -> String {
         flags.push_str("-fsanitize=address -fno-omit-frame-pointer");
     }
     flags
+}
+
+fn read_mimalloc_version(header: &Path) -> String {
+    let text = fs::read_to_string(header).unwrap_or_else(|err| {
+        panic!(
+            "failed to read vendored mimalloc header at {}: {err}",
+            header.display()
+        )
+    });
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#define MI_MALLOC_VERSION") {
+            if let Some(version) = rest.split_whitespace().next() {
+                return version.to_string();
+            }
+        }
+    }
+    panic!(
+        "MI_MALLOC_VERSION not found in vendored mimalloc header {}",
+        header.display()
+    );
 }

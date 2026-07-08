@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="${1:-}"
+ALLOWED='^(cbm_|_*asan_|_*ubsan_|_*sanitizer_|_*lsan_|$)'
 
 if [[ -z "$LIB" ]]; then
   py=""
@@ -37,7 +38,7 @@ if command -v readelf >/dev/null 2>&1; then
     readelf -Ws "$LIB" 2>/dev/null |
       awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" { print $8 }' |
       sed 's/^_//' |
-      grep -Ev '^(cbm_|$)' || true
+      grep -Ev "$ALLOWED" || true
   )"
 else
   tool=""
@@ -55,7 +56,7 @@ else
     "$tool" -g --defined-only "$LIB" |
       awk '{print $NF}' |
       sed 's/^_//' |
-      grep -Ev '^(cbm_|$)' || true
+      grep -Ev "$ALLOWED" || true
   )"
 fi
 
