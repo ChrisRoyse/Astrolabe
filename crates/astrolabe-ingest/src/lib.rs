@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 
+mod ledger_verify;
 mod registry;
 mod sqlite_import;
 
+pub use ledger_verify::{VerifyChainReport, verify_chain, verify_chain_vault_path};
 pub use registry::{
-    ASTRO_SERIES_REGISTRY_PREFIX, DeepVerifyReport, GitRenameStatus, IngestError, IngestResult,
-    QN_KEY_MAX_BYTES, QnIndexRow, RecurrenceRow, RenameHint, RenameRecord, ReverseIndexRow,
-    SeriesIngestReport, SeriesSplitRecord, SeriesVersionInput, SeriesVersionRef,
-    StoredSeriesRegistryRow, bounded_qn_key, ingest_series_batch, ingest_series_batch_parallel,
-    parse_git_rename_status, qn_index_key, read_registry_snapshot, recurrence_key,
-    reverse_index_key, series_row_key, split_record_key, verify_deep, verify_deep_vault_path,
+    ASTRO_SERIES_REGISTRY_PREFIX, ASTRO_VERIFY_DEEP_FAILED, DeepVerifyReport, GitRenameStatus,
+    IngestError, IngestResult, QN_KEY_MAX_BYTES, QnIndexRow, RecurrenceRow, RenameHint,
+    RenameRecord, ReverseIndexRow, SeriesIngestReport, SeriesSplitRecord, SeriesVersionInput,
+    SeriesVersionRef, StoredSeriesRegistryRow, bounded_qn_key, ingest_series_batch,
+    ingest_series_batch_parallel, parse_git_rename_status, qn_index_key, read_registry_snapshot,
+    recurrence_key, reverse_index_key, series_row_key, split_record_key, verify_deep,
+    verify_deep_vault_path,
 };
 pub use sqlite_import::{
     ASTRO_EDGE_DANGLING, ASTRO_INGEST_READBACK_MISMATCH, ASTRO_INGEST_SQLITE_INVALID,

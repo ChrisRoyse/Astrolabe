@@ -96,7 +96,7 @@ fn initialize_tracing() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> '<json>' | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]"
+        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -213,6 +213,10 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     };
     let tool_name = args.remove(0);
     let args_json = resolve_cli_args(&args)?;
+    if tool_name == "verify_chain" {
+        return run_verify_chain_cli(&args_json, raw_json, response_out.as_deref());
+    }
+
     let runner = CbmToolRunner::new_default()?;
     let result = runner.handle_tool_raw(&tool_name, &args_json)?;
     if let Some(path) = response_out.as_ref() {
@@ -225,6 +229,62 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     print_mcp_tool_result(&result)
+}
+
+fn run_verify_chain_cli(
+    args_json: &str,
+    raw_json: bool,
+    response_out: Option<&str>,
+) -> Result<i32, DynError> {
+    let value = serde_json::from_str::<serde_json::Value>(args_json)?;
+    let vault = value
+        .get("vault")
+        .or_else(|| value.get("vault_dir"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("verify_chain requires JSON arg {\"vault\":\"<dir>\"}")?;
+
+    let report = astrolabe_ingest::verify_chain_vault_path(vault)?;
+    let json = serde_json::to_string(&report)?;
+    if let Some(path) = response_out {
+        fs::write(path, &json)?;
+    }
+    if raw_json {
+        println!("{json}");
+    } else {
+        print_verify_chain_report(&report);
+    }
+    Ok(verify_chain_exit_code(&report))
+}
+
+fn print_verify_chain_report(report: &astrolabe_ingest::VerifyChainReport) {
+    match report.status.as_str() {
+        "intact" => println!(
+            "ledger chain intact: rows={} checked={}..{} count={}",
+            report.ledger_rows, report.checked_range_start, report.checked_range_end, report.count
+        ),
+        "broken" => println!(
+            "ledger chain broken: at_seq={} quarantine_seq={} checked={}..{} expected_hash={} found_hash={}",
+            report.at_seq.unwrap_or_default(),
+            report.quarantine_seq.unwrap_or_default(),
+            report.checked_range_start,
+            report.checked_range_end,
+            report.expected_hash.as_deref().unwrap_or(""),
+            report.found_hash.as_deref().unwrap_or("")
+        ),
+        "corrupt" => println!(
+            "ledger chain corrupt: at_seq={} quarantine_seq={} checked={}..{} reason={}",
+            report.at_seq.unwrap_or_default(),
+            report.quarantine_seq.unwrap_or_default(),
+            report.checked_range_start,
+            report.checked_range_end,
+            report.reason.as_deref().unwrap_or("")
+        ),
+        other => println!("ledger chain {other}: rows={}", report.ledger_rows),
+    }
+}
+
+fn verify_chain_exit_code(report: &astrolabe_ingest::VerifyChainReport) -> i32 {
+    if report.is_intact() { 0 } else { 1 }
 }
 
 fn run_verify(args: &[String]) -> Result<i32, DynError> {
@@ -249,7 +309,7 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
         println!("{}", serde_json::to_string(&report)?);
     } else {
         println!(
-            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={}",
+            "series registry verified: series_rows={} reverse_rows={} qn_index_rows={} recurrence_rows={} split_rows={} sqlite_node_map_rows={} sqlite_structural_rows={} sqlite_constellation_rows={} ledger_chain_status={} ledger_rows={} ledger_payload_rows={} base_ledger_pairs={}",
             report.series_rows,
             report.reverse_rows,
             report.qn_index_rows,
@@ -257,7 +317,11 @@ fn run_verify(args: &[String]) -> Result<i32, DynError> {
             report.split_rows,
             report.sqlite_node_map_rows,
             report.sqlite_structural_rows,
-            report.sqlite_constellation_rows
+            report.sqlite_constellation_rows,
+            report.ledger_chain_status,
+            report.ledger_rows,
+            report.ledger_payload_rows,
+            report.base_ledger_pairs
         );
     }
     Ok(0)
@@ -455,5 +519,55 @@ mod tests {
         .expect_err("missing deep is refused");
 
         assert!(err.to_string().contains("--deep"));
+    }
+
+    #[test]
+    fn verify_deep_success_exit_code_is_zero() {
+        let dir = temp_dir("verify-deep-empty");
+        fs::create_dir_all(&dir).expect("create verify dir");
+
+        let code = run_verify(&[
+            "--deep".to_string(),
+            "--vault".to_string(),
+            dir.display().to_string(),
+            "--vault-id".to_string(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            "--vault-salt".to_string(),
+            "salt".to_string(),
+        ])
+        .expect("empty durable dir verifies as zero rows");
+
+        assert_eq!(code, 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_chain_exit_codes_are_documented() {
+        let mut report = astrolabe_ingest::VerifyChainReport {
+            status: "intact".to_string(),
+            ledger_rows: 1,
+            checked_range_start: 0,
+            checked_range_end: 1,
+            count: 1,
+            at_seq: None,
+            expected_hash: None,
+            found_hash: None,
+            reason: None,
+            quarantine_seq: None,
+            remediation: None,
+        };
+        assert_eq!(verify_chain_exit_code(&report), 0);
+
+        report.status = "broken".to_string();
+        report.at_seq = Some(0);
+        report.quarantine_seq = Some(0);
+        assert_eq!(verify_chain_exit_code(&report), 1);
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("astrolabe-server-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        dir
     }
 }

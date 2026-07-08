@@ -9,13 +9,13 @@ use astrolabe_domain::{
     SymbolIdentity, SymbolLabel, SymbolRecord,
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
-use calyx_aster::cf::{ColumnFamily, base_key, ledger_range, prefix_range, slot_key};
+use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
     SlotVector,
 };
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -323,13 +323,8 @@ where
             edge_skips,
         },
     )?;
-    let ledger_ref = vault.append_ledger_entry(
-        EntryKind::Ingest,
-        SubjectId::Query(sqlite_fingerprint.to_vec()),
-        payload,
-        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
-    )?;
-    let graph_rows_written = write_import_rows(vault, &prepared, &ledger_ref)?;
+    let (ledger_ref, graph_rows_written) =
+        write_import_rows(vault, &prepared, sqlite_fingerprint, payload)?;
     let readback = verify_import_readback(vault, &prepared)?;
     let ledger_rows_after = ledger_row_count(vault)?;
 
@@ -861,8 +856,9 @@ where
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
-    ledger_ref: &LedgerRef,
-) -> IngestResult<usize>
+    sqlite_fingerprint: [u8; 32],
+    payload: Vec<u8>,
+) -> IngestResult<(LedgerRef, usize)>
 where
     C: Clock,
 {
@@ -879,8 +875,7 @@ where
         {
             continue;
         }
-        let mut constellation = prepared_cx.constellation.clone();
-        constellation.provenance = ledger_ref.clone();
+        let constellation = prepared_cx.constellation.clone();
         rows.push((
             ColumnFamily::Base,
             base_key(constellation.cx_id),
@@ -903,10 +898,40 @@ where
         }
     }
 
-    if !rows.is_empty() {
-        vault.write_cf_batch(rows)?;
+    if rows.is_empty() {
+        let ledger_ref = vault.append_ledger_entry(
+            EntryKind::Ingest,
+            SubjectId::Query(sqlite_fingerprint.to_vec()),
+            payload,
+            ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+        )?;
+        return Ok((ledger_ref, graph_rows_written));
     }
-    Ok(graph_rows_written)
+
+    let ledger_seq = ledger_row_count(vault)? as u64;
+    vault.write_cf_batch_with_ledger_entry(
+        rows,
+        EntryKind::Ingest,
+        SubjectId::Query(sqlite_fingerprint.to_vec()),
+        payload,
+        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+    )?;
+    let ledger_ref = read_ledger_ref(vault, ledger_seq)?;
+    Ok((ledger_ref, graph_rows_written))
+}
+
+fn read_ledger_ref<C>(vault: &AsterVault<C>, seq: u64) -> IngestResult<LedgerRef>
+where
+    C: Clock,
+{
+    let bytes = vault
+        .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(seq))?
+        .ok_or_else(|| readback_mismatch(format!("Ledger CF row {seq} missing after import")))?;
+    let entry = decode(&bytes)?;
+    Ok(LedgerRef {
+        seq: entry.seq,
+        hash: entry.entry_hash,
+    })
 }
 
 fn verify_import_readback<C>(
@@ -1558,6 +1583,8 @@ mod tests {
         assert_eq!(report.structural_only, 1);
         assert_eq!(report.new_cx_ids, 1);
         assert_eq!(report.edge_skips.dangling, 1);
+        assert_eq!(report.seq, 1);
+        assert_eq!(report.ledger_seq, 0);
         assert_eq!(report.readback.base_rows_verified, 1);
         assert_eq!(
             report.readback.slot_rows_verified,
@@ -1568,6 +1595,10 @@ mod tests {
         assert_eq!(deep.sqlite_node_map_rows, 1);
         assert_eq!(deep.sqlite_structural_rows, 1);
         assert_eq!(deep.sqlite_constellation_rows, 1);
+        assert_eq!(deep.ledger_chain_status, "intact");
+        assert_eq!(deep.ledger_rows, 1);
+        assert_eq!(deep.ledger_payload_rows, 1);
+        assert_eq!(deep.base_ledger_pairs, 1);
 
         let cx_id = report.cx_ids[0];
         let base = vault
@@ -1604,6 +1635,8 @@ mod tests {
             .expect("ledger row");
         let entry = decode(&ledger).expect("decode ledger");
         assert_eq!(entry.kind, EntryKind::Ingest);
+        assert_eq!(decoded.provenance.seq, report.ledger_seq);
+        assert_eq!(decoded.provenance.hash, entry.entry_hash);
         let payload: Value = serde_json::from_slice(&entry.payload).expect("payload json");
         assert_eq!(
             payload.get("edge_dangling_skipped").and_then(Value::as_u64),

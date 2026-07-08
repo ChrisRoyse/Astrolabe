@@ -6,6 +6,10 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+crash-fsv = []
+
 [dependencies]
 aes-gcm.workspace = true
 bincode.workspace = true

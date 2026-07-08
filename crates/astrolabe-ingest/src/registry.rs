@@ -9,12 +9,16 @@ use astrolabe_domain::{SeriesId, SymbolRecord};
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, Clock, CxId, Seq, VaultId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
+use crate::ledger_verify::{verify_chain, verify_ledger_pairing};
 use crate::sqlite_import::verify_sqlite_import_deep;
 
 /// Namespace prefix for every Astrolabe series registry key stored in Aster.
 pub const ASTRO_SERIES_REGISTRY_PREFIX: &[u8] = b"astrolabe:series-registry:v1:";
+/// Stable failure code for `astrolabe verify --deep` invariant violations.
+pub const ASTRO_VERIFY_DEEP_FAILED: &str = "ASTRO_VERIFY_DEEP_FAILED";
 /// Maximum QN key bytes before the CBM-style FNV tail fallback is applied.
 pub const QN_KEY_MAX_BYTES: usize = 255;
 
@@ -29,6 +33,8 @@ const SCHEMA_REVERSE: &str = "astrolabe-series-reverse-v1";
 const SCHEMA_QN: &str = "astrolabe-series-qn-index-v1";
 const SCHEMA_RECURRENCE: &str = "astrolabe-series-recurrence-v1";
 const SCHEMA_SPLIT: &str = "astrolabe-series-split-v1";
+const SCHEMA_REGISTRY_LEDGER: &str = "astrolabe-series-registry-ledger-v1";
+const ASTROLABE_REGISTRY_ACTOR: &str = "astrolabe-registry";
 
 /// Result type for Astrolabe ingest and registry operations.
 pub type IngestResult<T> = std::result::Result<T, IngestError>;
@@ -75,7 +81,7 @@ impl fmt::Display for IngestError {
             Self::VerifyFailed(errors) => {
                 write!(
                     f,
-                    "series registry verify --deep failed: {}",
+                    "{ASTRO_VERIFY_DEEP_FAILED}: series registry verify --deep failed: {}",
                     errors.join("; ")
                 )
             }
@@ -105,7 +111,8 @@ impl IngestError {
             Self::Domain(err) => Some(err.code()),
             Self::Panel(err) => Some(err.code()),
             Self::Refused { code, .. } => Some(code),
-            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) | Self::VerifyFailed(_) => None,
+            Self::VerifyFailed(_) => Some(ASTRO_VERIFY_DEEP_FAILED),
+            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) => None,
         }
     }
 
@@ -115,7 +122,10 @@ impl IngestError {
             Self::Domain(err) => Some(err.remediation()),
             Self::Panel(err) => Some(err.remediation()),
             Self::Refused { remediation, .. } => Some(remediation),
-            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) | Self::VerifyFailed(_) => None,
+            Self::VerifyFailed(_) => Some(
+                "Quarantine the vault, inspect the named invariant violations, and rebuild from source bytes before serving reads.",
+            ),
+            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) => None,
         }
     }
 }
@@ -263,6 +273,18 @@ pub struct SeriesSplitRecord {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct SeriesRegistryLedgerPayload {
+    schema: String,
+    project_digest: String,
+    commit_digest: String,
+    series_id: SeriesId,
+    cx_id: CxId,
+    version_count: u64,
+    changed_rows: u64,
+    split_written: bool,
+}
+
 /// Git rename status parsed from CBM-compatible status lines.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct GitRenameStatus {
@@ -382,6 +404,14 @@ pub struct DeepVerifyReport {
     pub sqlite_structural_rows: usize,
     /// Number of SQLite-import Base CF constellation rows decoded via node maps.
     pub sqlite_constellation_rows: usize,
+    /// Ledger hash-chain status (`intact`, `broken`, or `corrupt`).
+    pub ledger_chain_status: String,
+    /// Number of Ledger CF rows visible during deep verification.
+    pub ledger_rows: u64,
+    /// Number of Ledger payload rows decoded and redaction-checked.
+    pub ledger_payload_rows: usize,
+    /// Number of Base CF rows paired to a real Ledger entry hash.
+    pub base_ledger_pairs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -640,6 +670,14 @@ where
         }
     }
 
+    let ledger_chain = verify_chain(vault)?;
+    if !ledger_chain.is_intact() {
+        errors.push(format!(
+            "ledger chain {} at seq {:?}; quarantine_seq={:?}",
+            ledger_chain.status, ledger_chain.at_seq, ledger_chain.quarantine_seq
+        ));
+    }
+    let ledger_pairing = verify_ledger_pairing(vault, &mut errors)?;
     let sqlite = verify_sqlite_import_deep(vault, &mut errors)?;
 
     if !errors.is_empty() {
@@ -655,6 +693,10 @@ where
         sqlite_node_map_rows: sqlite.node_map_rows,
         sqlite_structural_rows: sqlite.structural_rows,
         sqlite_constellation_rows: sqlite.constellation_rows,
+        ledger_chain_status: ledger_chain.status,
+        ledger_rows: ledger_chain.ledger_rows,
+        ledger_payload_rows: ledger_pairing.ledger_payload_rows,
+        base_ledger_pairs: ledger_pairing.base_ledger_pairs,
     })
 }
 
@@ -669,7 +711,13 @@ pub fn verify_deep_vault_path(
     let options = VaultOptions {
         read_only: true,
         restore_ledger_hook: false,
-        selected_cfs: Some(vec![ColumnFamily::Kv, ColumnFamily::Recurrence]),
+        selected_cfs: Some(vec![
+            ColumnFamily::Kv,
+            ColumnFamily::Recurrence,
+            ColumnFamily::Graph,
+            ColumnFamily::Base,
+            ColumnFamily::Ledger,
+        ]),
         ..VaultOptions::default()
     };
     let vault = AsterVault::open(vault_dir, vault_id, vault_salt.as_bytes().to_vec(), options)?;
@@ -844,6 +892,7 @@ where
             serde_json::to_vec(&recurrence)?,
         ),
     ];
+    let split_written = split_record.is_some();
     if let Some(split) = split_record {
         rows.push((
             ColumnFamily::Kv,
@@ -861,9 +910,37 @@ where
     }
     let changed_len = changed.len();
     if !changed.is_empty() {
-        vault.write_cf_batch(changed)?;
+        vault.write_cf_batch_with_ledger_entry(
+            changed,
+            EntryKind::Ingest,
+            SubjectId::Cx(prepared.cx_id),
+            series_registry_ledger_payload(&prepared, series_id, &row, changed_len, split_written)?,
+            ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string()),
+        )?;
     }
     Ok(changed_len)
+}
+
+fn series_registry_ledger_payload(
+    prepared: &PreparedVersionInput,
+    series_id: SeriesId,
+    row: &StoredSeriesRegistryRow,
+    changed_rows: usize,
+    split_written: bool,
+) -> IngestResult<Vec<u8>> {
+    let payload = SeriesRegistryLedgerPayload {
+        schema: SCHEMA_REGISTRY_LEDGER.to_string(),
+        project_digest: hex_lower(
+            blake3::hash(prepared.input.symbol.project.as_bytes()).as_bytes(),
+        ),
+        commit_digest: hex_lower(blake3::hash(prepared.input.commit.as_bytes()).as_bytes()),
+        series_id,
+        cx_id: prepared.cx_id,
+        version_count: row.version_count,
+        changed_rows: changed_rows as u64,
+        split_written,
+    };
+    Ok(serde_json::to_vec(&payload)?)
 }
 
 fn rename_candidates<C>(
@@ -1113,6 +1190,10 @@ mod tests {
                 sqlite_node_map_rows: 0,
                 sqlite_structural_rows: 0,
                 sqlite_constellation_rows: 0,
+                ledger_chain_status: "intact".to_string(),
+                ledger_rows: 1,
+                ledger_payload_rows: 1,
+                base_ledger_pairs: 0,
             }
         );
     }
@@ -1145,6 +1226,10 @@ mod tests {
                 sqlite_node_map_rows: 0,
                 sqlite_structural_rows: 0,
                 sqlite_constellation_rows: 0,
+                ledger_chain_status: "intact".to_string(),
+                ledger_rows: 1,
+                ledger_payload_rows: 1,
+                base_ledger_pairs: 0,
             }
         );
         fs::remove_dir_all(&dir).expect("remove durable vault dir");
@@ -1376,10 +1461,9 @@ mod tests {
             .write_cf(ColumnFamily::Kv, reverse_index_key(cx_id), b"{}".to_vec())
             .expect("corrupt reverse");
 
-        assert!(matches!(
-            verify_deep(&vault),
-            Err(IngestError::VerifyFailed(_))
-        ));
+        let err = verify_deep(&vault).expect_err("reverse corruption should fail verify");
+        assert_eq!(err.code(), Some(ASTRO_VERIFY_DEEP_FAILED));
+        assert!(err.to_string().contains(ASTRO_VERIFY_DEEP_FAILED), "{err}");
     }
 
     #[test]
@@ -1404,6 +1488,7 @@ mod tests {
             .expect("corrupt qn");
 
         let err = verify_deep(&vault).expect_err("qn corruption should fail verify");
+        assert_eq!(err.code(), Some(ASTRO_VERIFY_DEEP_FAILED));
         let IngestError::VerifyFailed(errors) = err else {
             panic!("unexpected verify error: {err}");
         };

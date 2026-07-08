@@ -33,6 +33,7 @@ bash scripts/check-unsafe-boundary.sh
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 "$CARGO_BIN" build --workspace
 "$CARGO_BIN" test --workspace
+bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"

@@ -20,3 +20,7 @@ sha2 = "0.10"
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+calyx-aster = { workspace = true, features = ["crash-fsv"] }
+crc32fast = "1"

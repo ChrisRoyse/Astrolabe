@@ -112,6 +112,7 @@ dependencies = [
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "crc32fast",
  "rusqlite",
  "serde",
  "serde_json",

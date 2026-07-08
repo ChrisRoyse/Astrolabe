@@ -126,6 +126,8 @@ where
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
         let durable_seq = durable.append_batch(rows)?;
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crash_fsv_after_wal_append(durable_seq)?;
         if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
@@ -168,5 +170,18 @@ where
         )?;
         self.rows.advance_to_at_least(seq);
         Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "crash-fsv"))]
+fn crash_fsv_after_wal_append(seq: Seq) -> Result<()> {
+    let Some(marker) = std::env::var_os("CALYX_ASTER_CRASH_FSV_AFTER_WAL_APPEND_MARKER") else {
+        return Ok(());
+    };
+    std::fs::write(&marker, format!("{seq}\n")).map_err(|error| {
+        CalyxError::disk_pressure(format!("write crash FSV marker {:?}: {error}", marker))
+    })?;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 }
