@@ -447,6 +447,16 @@ Threads inside the server process:
 | HTTP UI (optional) | CBM `ui` | localhost-only graph UI; reads vault via lowered artifact + new provenance endpoints |
 | Parent-death watchdog | CBM | `getppid` poll; orphan cleanup |
 
+Multiple MCP server processes may exist for one repo because users routinely run
+several agents at once. At the pinned Calyx revision, Aster durable vaults allow
+concurrent open; write commits are serialized by the per-vault OS file lock
+`locks/durable.commit.lock`, and recurrence writes use
+`locks/recurrence.write.lock`. Shadow-stage Astrolabe therefore permits every
+process to keep serving legacy tools from SQLite while vault imports serialize
+through Aster's durable commit lock. Future vault-backed background lanes
+(watcher, assay, anneal, kernel rebuilds) must add explicit single-owner
+election before they become active in more than one process.
+
 ## 3. Storage architecture (D3)
 
 **Aster vault = source of truth. SQLite `.db` = lowered, regenerable artifact.**
@@ -1659,6 +1669,7 @@ Unmodified CBM behavior. The dial exists so one binary serves all stages.
 - CBM pipeline runs exactly as today â†’ SQLite `.db` (still the serving store for all 14 tools).
 - **Post-index import** (zero-FFI, D2): `astrolabe-ingest` reads the freshly-dumped SQLite â†’ builds constellations, edges, series, recurrence into the vault; ledger records the import with the SQLite content fingerprint.
 - New tools (`anchor_outcome`, `measure_bits`, `get_kernel`, `get_context_pack`, â€¦) serve **from the vault**; legacy tools serve from SQLite. Two stores, one writer each, clearly labeled.
+- Multi-agent/process behavior: all processes may serve legacy SQLite reads; shadow imports share one Aster vault and serialize durable commits through `locks/durable.commit.lock`. No watcher/anneal/background lane is active in followers until single-owner election lands.
 - **Parity harness** runs continuously (20 Â§3): node/edge counts, search-overlap metrics, spot symbol equality. Divergence â‡’ shadow flagged, never silent.
 - Rollback = ignore the vault. Cost: disk (vault alongside SQLite), one extra import pass (~minutes at L).
 
@@ -1877,6 +1888,7 @@ Every identified risk, honestly stated, with mitigation and owner-phase. Severit
 | R25 | Ledger growth unbounded on busy monorepos | ðŸŸ¡ | checkpoints + Merkle export; ledger is hashes-only (tiny rows); measured: ~1KB/mutation â‡’ GBs/year at extreme scale â€” acceptable; archival tiering available |
 | R26 | Lowered-SQLite staleness confuses legacy consumers | ðŸŸ¡ | vault fingerprint + `stale_by` surfaced; debounced regen; `fresh` force option |
 | R27 | Erasure/PII: proprietary code in vaults, secrets in history | ðŸŸ  | CBM secret filters upstream + Calyx redaction + erasure tombstones (13 Â§5); vaults are local-only by default (no egress) |
+| R31 | Multiple agent MCP processes contend for one Aster vault | ðŸŸ  | Aster durable commits are OS-file-lock serialized; shadow legacy reads stay on SQLite; vault-backed background lanes require single-owner election before activation; cross-process harness verifies no corruption/deadlock |
 
 ## Product & ecosystem
 
