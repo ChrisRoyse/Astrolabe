@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = [
+    "vendor/calyx",
+    "vendor/codebase-memory-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/ChrisRoyse/Astrolabe"
+publish = false
+
+[workspace.dependencies]
+astrolabe-domain = { path = "crates/astrolabe-domain" }
+cbm-sys = { path = "crates/cbm-sys" }
+calyx-core = { path = "vendor/calyx/crates/calyx-core" }

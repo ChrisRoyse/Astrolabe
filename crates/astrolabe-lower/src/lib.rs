@@ -1,0 +1,20 @@
+#![forbid(unsafe_code)]
+
+pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+pub fn parent_system() -> astrolabe_domain::ParentSystem {
+    astrolabe_domain::ParentSystem::CodebaseMemoryMcp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_cbm_parent() {
+        assert_eq!(
+            parent_system(),
+            astrolabe_domain::ParentSystem::CodebaseMemoryMcp
+        );
+    }
+}
