@@ -5,8 +5,8 @@ use std::thread;
 
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
-    ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, SeriesId,
-    SymbolIdentity, SymbolLabel, SymbolRecord,
+    ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, EdgeKind,
+    SeriesId, SymbolIdentity, SymbolLabel, SymbolRecord,
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
@@ -34,8 +34,10 @@ const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump w
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
+const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v1";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
+const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
@@ -101,12 +103,16 @@ pub struct SqliteImportReadback {
     pub slot_rows_verified: usize,
     /// Graph CF rows decoded or byte-compared after mapping/structural writes.
     pub graph_rows_verified: usize,
+    /// Typed edge Graph CF rows decoded and field-compared.
+    pub edge_rows_verified: usize,
     /// Expected Base CF rows for the imported non-structural symbols.
     pub expected_base_rows: usize,
     /// Expected slot sidecar rows for the imported non-structural symbols.
     pub expected_slot_rows: usize,
     /// Expected graph mapping plus structural metadata rows.
     pub expected_graph_rows: usize,
+    /// Expected typed edge rows.
+    pub expected_edge_rows: usize,
 }
 
 /// Summary of a CBM SQLite-to-Aster import batch.
@@ -118,6 +124,8 @@ pub struct SqliteImportReport {
     pub sqlite_nodes: usize,
     /// Number of `node_vectors` rows read for the selected project.
     pub sqlite_node_vectors: usize,
+    /// Number of `edges` rows read for the selected project.
+    pub sqlite_edges: usize,
     /// Non-structural symbols measured into constellations.
     pub constellation_inputs: usize,
     /// Structural-only nodes written as graph metadata rows, with no panel measurement.
@@ -128,6 +136,8 @@ pub struct SqliteImportReport {
     pub reused_cx_ids: usize,
     /// Graph CF rows whose bytes changed in this run.
     pub graph_rows_written: usize,
+    /// Typed edge Graph CF rows whose bytes changed in this run.
+    pub edge_rows_written: usize,
     /// Latest vault sequence after the run ledger append.
     pub seq: Seq,
     /// Ledger sequence of the real `EntryKind::Ingest` run record.
@@ -153,6 +163,8 @@ pub struct SqliteImportDeepVerifyCounts {
     pub structural_rows: usize,
     /// Base CF constellation rows decoded through node-map references.
     pub constellation_rows: usize,
+    /// Typed edge rows decoded and provenance-checked.
+    pub edge_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +179,17 @@ struct RawNodeRow {
     end_line: i64,
     properties: Value,
     node_vector: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct RawEdgeRow {
+    id: i64,
+    project: String,
+    source_id: i64,
+    target_id: i64,
+    edge_type: String,
+    properties: Value,
+    local_name_gen: String,
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +214,16 @@ struct PreparedConstellation {
 struct PreparedBatch {
     constellations: Vec<PreparedConstellation>,
     graph_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    edge_rows: Vec<PreparedEdgeRow>,
     structural_only: usize,
+    sqlite_edges: usize,
+    edge_skips: EdgeSkipCounters,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedEdgeRow {
+    key: Vec<u8>,
+    row: EdgeGraphRow,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,6 +251,24 @@ struct StructuralNodeRow {
     commit: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct EdgeGraphRow {
+    schema: String,
+    project: String,
+    sqlite_edge_id: i64,
+    source_node_id: i64,
+    target_node_id: i64,
+    src: CxId,
+    dst: CxId,
+    edge_type: String,
+    etype: u16,
+    local_name_gen: String,
+    weight: f32,
+    props: Value,
+    provenance: LedgerRef,
+    commit: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct IngestLedgerPayload {
     schema: String,
@@ -227,15 +277,19 @@ struct IngestLedgerPayload {
     commit_hash_sha256: String,
     sqlite_nodes: u64,
     sqlite_node_vectors: u64,
+    sqlite_edges: u64,
     constellation_inputs: u64,
     structural_only: u64,
     new_cx_ids: u64,
     reused_cx_ids: u64,
     graph_rows_written: u64,
+    edge_inputs: u64,
+    edge_rows_written: u64,
     edge_dangling_skipped: u64,
     expected_base_rows: u64,
     expected_slot_rows: u64,
     expected_graph_rows: u64,
+    expected_edge_rows: u64,
     first_cx_id: Option<String>,
     last_cx_id: Option<String>,
 }
@@ -246,7 +300,7 @@ struct IngestLedgerStats {
     new_cx_ids: usize,
     reused_cx_ids: usize,
     graph_rows_written: usize,
-    edge_skips: EdgeSkipCounters,
+    edge_rows_written: usize,
 }
 
 /// Imports a Codebase Memory MCP SQLite dump into an Aster vault.
@@ -276,14 +330,21 @@ where
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
-    let edge_skips = read_edge_skips(&connection, &options.project)?;
     let raw_nodes = read_nodes(&connection, &options.project)?;
+    let raw_edges = read_edges(&connection, &options.project)?;
     let sqlite_node_vectors = raw_nodes
         .iter()
         .filter(|node| node.node_vector.is_some())
         .count();
     let extracted = extract_nodes(raw_nodes)?;
-    let prepared = prepare_batch(vault, runtime, options, &extracted, sqlite_fingerprint)?;
+    let prepared = prepare_batch(
+        vault,
+        runtime,
+        options,
+        &extracted,
+        raw_edges,
+        sqlite_fingerprint,
+    )?;
 
     let before_snapshot = vault.latest_seq();
     let mut new_cx_ids = 0;
@@ -309,8 +370,8 @@ where
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
     verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
-    let planned_graph_rows_written =
-        count_changed_graph_rows(vault, before_snapshot, &prepared.graph_rows)?;
+    let (planned_graph_rows_written, planned_edge_rows_written) =
+        count_changed_graph_rows(vault, before_snapshot, &prepared)?;
     let payload = ingest_ledger_payload(
         sqlite_fingerprint,
         options,
@@ -320,10 +381,10 @@ where
             new_cx_ids,
             reused_cx_ids,
             graph_rows_written: planned_graph_rows_written,
-            edge_skips,
+            edge_rows_written: planned_edge_rows_written,
         },
     )?;
-    let (ledger_ref, graph_rows_written) =
+    let (ledger_ref, graph_rows_written, edge_rows_written) =
         write_import_rows(vault, &prepared, sqlite_fingerprint, payload)?;
     let readback = verify_import_readback(vault, &prepared)?;
     let ledger_rows_after = ledger_row_count(vault)?;
@@ -332,16 +393,18 @@ where
         sqlite_fingerprint_sha256: sqlite_fingerprint,
         sqlite_nodes: extracted.len(),
         sqlite_node_vectors,
+        sqlite_edges: prepared.sqlite_edges,
         constellation_inputs: prepared.constellations.len(),
         structural_only: prepared.structural_only,
         new_cx_ids,
         reused_cx_ids,
         graph_rows_written,
+        edge_rows_written,
         seq: vault.latest_seq(),
         ledger_seq: ledger_ref.seq,
         ledger_rows_before,
         ledger_rows_after,
-        edge_skips,
+        edge_skips: prepared.edge_skips,
         readback,
         cx_ids,
     })
@@ -445,26 +508,57 @@ fn read_node_vectors(
     Ok(out)
 }
 
-fn read_edge_skips(connection: &Connection, project: &str) -> IngestResult<EdgeSkipCounters> {
+fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
     if !table_exists(connection, "edges")? {
-        return Ok(EdgeSkipCounters::default());
+        return Ok(Vec::new());
     }
-    let dangling = connection
-        .query_row(
-            "SELECT COUNT(*) FROM edges e \
-             LEFT JOIN nodes s ON s.id = e.source_id \
-             LEFT JOIN nodes t ON t.id = e.target_id \
-             WHERE e.project = ?1 AND (s.id IS NULL OR t.id IS NULL)",
-            params![project],
-            |row| row.get::<_, i64>(0),
+    let mut statement = connection
+        .prepare(
+            "SELECT id, project, source_id, target_id, type, COALESCE(properties, '{}'), \
+             CASE WHEN type = 'IMPORTS' AND json_valid(COALESCE(properties, '{}')) \
+             THEN COALESCE(CAST(json_extract(properties, '$.local_name') AS TEXT), '') \
+             ELSE '' END AS local_name_gen \
+             FROM edges WHERE project = ?1 \
+             ORDER BY source_id, target_id, type, local_name_gen, id",
         )
-        .map_err(|error| invalid_sqlite(format!("count dangling edges: {error}")))?;
-    if dangling < 0 {
-        return Err(invalid_sqlite("dangling edge count was negative"));
+        .map_err(|error| invalid_sqlite(format!("prepare edges query: {error}")))?;
+    let rows = statement
+        .query_map(params![project], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| invalid_sqlite(format!("query edges: {error}")))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, project, source_id, target_id, edge_type, properties, local_name_gen) =
+            row.map_err(|error| invalid_sqlite(format!("read edges row: {error}")))?;
+        let properties = serde_json::from_str::<Value>(&properties).map_err(|error| {
+            invalid_sqlite(format!("edge {id} properties JSON is invalid: {error}"))
+        })?;
+        if !properties.is_object() {
+            return Err(invalid_sqlite(format!(
+                "edge {id} properties JSON must be an object"
+            )));
+        }
+        out.push(RawEdgeRow {
+            id,
+            project,
+            source_id,
+            target_id,
+            edge_type,
+            properties,
+            local_name_gen,
+        });
     }
-    Ok(EdgeSkipCounters {
-        dangling: dangling as usize,
-    })
+    Ok(out)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> IngestResult<bool> {
@@ -538,6 +632,7 @@ fn prepare_batch<C, R>(
     runtime: &R,
     options: &SqliteImportOptions,
     nodes: &[ExtractedNode],
+    edges: Vec<RawEdgeRow>,
     sqlite_fingerprint: [u8; 32],
 ) -> IngestResult<PreparedBatch>
 where
@@ -568,12 +663,123 @@ where
     for (_, value) in &mut graph_rows {
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
+    let sqlite_edges = edges.len();
+    let (edge_rows, edge_skips) = prepare_edge_rows(options, &constellations, edges)?;
 
     Ok(PreparedBatch {
         constellations,
         graph_rows,
+        edge_rows,
         structural_only,
+        sqlite_edges,
+        edge_skips,
     })
+}
+
+fn prepare_edge_rows(
+    options: &SqliteImportOptions,
+    constellations: &[PreparedConstellation],
+    edges: Vec<RawEdgeRow>,
+) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
+    let cx_by_node = constellations
+        .iter()
+        .map(|prepared| (prepared.node_id, prepared.identity.cx_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut prepared = Vec::new();
+    let mut skips = EdgeSkipCounters::default();
+
+    for edge in edges {
+        let Some(src) = cx_by_node.get(&edge.source_id).copied() else {
+            skips.dangling += 1;
+            continue;
+        };
+        let Some(dst) = cx_by_node.get(&edge.target_id).copied() else {
+            skips.dangling += 1;
+            continue;
+        };
+        let kind = EdgeKind::from_cbm_type(&edge.edge_type).ok_or_else(|| {
+            invalid_sqlite(format!(
+                "edge {} has unknown Codebase Memory MCP type {:?}",
+                edge.id, edge.edge_type
+            ))
+        })?;
+        let weight = edge_weight(kind, &edge.properties, edge.id)?;
+        let row = EdgeGraphRow {
+            schema: SCHEMA_EDGE_ROW.to_string(),
+            project: edge.project,
+            sqlite_edge_id: edge.id,
+            source_node_id: edge.source_id,
+            target_node_id: edge.target_id,
+            src,
+            dst,
+            edge_type: edge.edge_type,
+            etype: kind.code(),
+            local_name_gen: edge.local_name_gen,
+            weight,
+            props: edge.properties,
+            provenance: zero_ledger_ref(),
+            commit: options.commit.clone(),
+        };
+        let key = edge_graph_key(row.src, row.dst, kind, &row.local_name_gen)?;
+        prepared.push(PreparedEdgeRow { key, row });
+    }
+    prepared.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok((prepared, skips))
+}
+
+fn edge_weight(kind: EdgeKind, properties: &Value, edge_id: i64) -> IngestResult<f32> {
+    let prior = kind.weight_prior();
+    if let Some(property) = prior.dynamic_weight_property
+        && let Some(weight) = numeric_property(properties, property, edge_id)?
+    {
+        return validate_edge_weight(weight, edge_id, property);
+    }
+    if matches!(kind, EdgeKind::Calls | EdgeKind::ResolvedCalls)
+        && let Some(strategy) = string_property(properties, &["strategy"])
+        && let Some(weight) = strategy_confidence(strategy)
+    {
+        return validate_edge_weight(weight, edge_id, "strategy");
+    }
+    validate_edge_weight(prior.fallback, edge_id, "prior")
+}
+
+fn numeric_property(properties: &Value, property: &str, edge_id: i64) -> IngestResult<Option<f32>> {
+    let Some(value) = properties.get(property) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Number(number) => Ok(number.as_f64().map(|value| value as f32)),
+        Value::String(raw) => raw.parse::<f32>().map(Some).map_err(|error| {
+            invalid_sqlite(format!(
+                "edge {edge_id} property {property} could not parse {raw:?}: {error}"
+            ))
+        }),
+        _ => Err(invalid_sqlite(format!(
+            "edge {edge_id} property {property} must be numeric"
+        ))),
+    }
+}
+
+fn strategy_confidence(strategy: &str) -> Option<f32> {
+    match strategy {
+        "import_map" => Some(0.95),
+        "same_module" => Some(0.90),
+        "unique" | "unique_name" => Some(0.75),
+        "suffix" | "suffix_match" => Some(0.55),
+        "service_pattern" => Some(0.50),
+        "lsp" | "lsp_resolve" | "lsp_resolved" => Some(0.60),
+        _ => None,
+    }
+}
+
+fn validate_edge_weight(weight: f32, edge_id: i64, source: &str) -> IngestResult<f32> {
+    if weight.is_finite() && (0.0..=1.0).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(invalid_sqlite(format!(
+            "edge {edge_id} {source} weight {weight} is outside [0, 1]"
+        )))
+    }
 }
 
 fn prepare_constellations_parallel<C, R>(
@@ -803,18 +1009,75 @@ where
 fn count_changed_graph_rows<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
-    rows: &[(Vec<u8>, Vec<u8>)],
-) -> IngestResult<usize>
+    prepared: &PreparedBatch,
+) -> IngestResult<(usize, usize)>
 where
     C: Clock,
 {
     let mut changed = 0;
-    for (key, value) in rows {
+    for (key, value) in &prepared.graph_rows {
         if vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? != Some(value.clone()) {
             changed += 1;
         }
     }
-    Ok(changed)
+    let mut edge_changed = 0;
+    for edge in &prepared.edge_rows {
+        if !edge_row_matches_existing(vault, snapshot, edge)? {
+            edge_changed += 1;
+        }
+    }
+    Ok((changed + edge_changed, edge_changed))
+}
+
+fn edge_row_matches_existing<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prepared: &PreparedEdgeRow,
+) -> IngestResult<bool>
+where
+    C: Clock,
+{
+    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Graph, &prepared.key)? else {
+        return Ok(false);
+    };
+    let Ok(row) = serde_json::from_slice::<EdgeGraphRow>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(edge_row_matches_prepared(&row, prepared)
+        && ledger_ref_matches(vault, snapshot, &row.provenance)?)
+}
+
+fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> bool {
+    row.schema == SCHEMA_EDGE_ROW
+        && row.project == prepared.row.project
+        && row.sqlite_edge_id == prepared.row.sqlite_edge_id
+        && row.source_node_id == prepared.row.source_node_id
+        && row.target_node_id == prepared.row.target_node_id
+        && row.src == prepared.row.src
+        && row.dst == prepared.row.dst
+        && row.edge_type == prepared.row.edge_type
+        && row.etype == prepared.row.etype
+        && row.local_name_gen == prepared.row.local_name_gen
+        && (row.weight - prepared.row.weight).abs() <= f32::EPSILON
+        && row.props == prepared.row.props
+        && row.commit == prepared.row.commit
+}
+
+fn ledger_ref_matches<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    reference: &LedgerRef,
+) -> IngestResult<bool>
+where
+    C: Clock,
+{
+    let Some(bytes) =
+        vault.read_cf_at(snapshot, ColumnFamily::Ledger, &ledger_key(reference.seq))?
+    else {
+        return Ok(false);
+    };
+    let entry = decode(&bytes)?;
+    Ok(entry.entry_hash == reference.hash)
 }
 
 fn verify_existing_constellation<C>(
@@ -858,7 +1121,7 @@ fn write_import_rows<C>(
     prepared: &PreparedBatch,
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
-) -> IngestResult<(LedgerRef, usize)>
+) -> IngestResult<(LedgerRef, usize, usize)>
 where
     C: Clock,
 {
@@ -897,6 +1160,18 @@ where
             graph_rows_written += 1;
         }
     }
+    let mut edge_rows_written = 0;
+    for prepared_edge in &prepared.edge_rows {
+        if !edge_row_matches_existing(vault, snapshot, prepared_edge)? {
+            rows.push((
+                ColumnFamily::Graph,
+                prepared_edge.key.clone(),
+                serde_json::to_vec(&prepared_edge.row)?,
+            ));
+            graph_rows_written += 1;
+            edge_rows_written += 1;
+        }
+    }
 
     if rows.is_empty() {
         let ledger_ref = vault.append_ledger_entry(
@@ -905,7 +1180,7 @@ where
             payload,
             ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
         )?;
-        return Ok((ledger_ref, graph_rows_written));
+        return Ok((ledger_ref, graph_rows_written, edge_rows_written));
     }
 
     let ledger_seq = ledger_row_count(vault)? as u64;
@@ -917,7 +1192,7 @@ where
         ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
     )?;
     let ledger_ref = read_ledger_ref(vault, ledger_seq)?;
-    Ok((ledger_ref, graph_rows_written))
+    Ok((ledger_ref, graph_rows_written, edge_rows_written))
 }
 
 fn read_ledger_ref<C>(vault: &AsterVault<C>, seq: u64) -> IngestResult<LedgerRef>
@@ -985,6 +1260,26 @@ where
         }
         graph_rows_verified += 1;
     }
+    let mut edge_rows_verified = 0;
+    for prepared_edge in &prepared.edge_rows {
+        let actual = vault
+            .read_cf_at(snapshot, ColumnFamily::Graph, &prepared_edge.key)?
+            .ok_or_else(|| readback_mismatch("edge Graph CF row missing after import"))?;
+        let decoded = serde_json::from_slice::<EdgeGraphRow>(&actual)
+            .map_err(|error| readback_mismatch(format!("decode edge Graph CF row: {error}")))?;
+        if !edge_row_matches_prepared(&decoded, prepared_edge) {
+            return Err(readback_mismatch(
+                "edge Graph CF row fields changed after import",
+            ));
+        }
+        if !ledger_ref_matches(vault, snapshot, &decoded.provenance)? {
+            return Err(readback_mismatch(
+                "edge Graph CF row provenance does not match Ledger CF",
+            ));
+        }
+        edge_rows_verified += 1;
+    }
+    graph_rows_verified += edge_rows_verified;
 
     let expected_base_rows = prepared.constellations.len();
     let expected_slot_rows = prepared
@@ -992,10 +1287,12 @@ where
         .iter()
         .map(|prepared| prepared.constellation.slots.len())
         .sum();
-    let expected_graph_rows = prepared.graph_rows.len();
+    let expected_edge_rows = prepared.edge_rows.len();
+    let expected_graph_rows = prepared.graph_rows.len() + expected_edge_rows;
     if base_rows_verified != expected_base_rows
         || slot_rows_verified != expected_slot_rows
         || graph_rows_verified != expected_graph_rows
+        || edge_rows_verified != expected_edge_rows
     {
         return Err(readback_mismatch(
             "readback verified counts did not match committed counts",
@@ -1006,9 +1303,11 @@ where
         base_rows_verified,
         slot_rows_verified,
         graph_rows_verified,
+        edge_rows_verified,
         expected_base_rows,
         expected_slot_rows,
         expected_graph_rows,
+        expected_edge_rows,
     })
 }
 
@@ -1107,7 +1406,71 @@ where
         }
     }
 
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(EDGE_ROW_PREFIX),
+    )? {
+        match serde_json::from_slice::<EdgeGraphRow>(&value) {
+            Ok(row) => {
+                counts.edge_rows += 1;
+                verify_edge_row_deep(vault, snapshot, &key, &row, errors)?;
+            }
+            Err(err) => errors.push(format!("decode edge row {}: {err}", hex_lower(&key))),
+        }
+    }
+
     Ok(counts)
+}
+
+fn verify_edge_row_deep<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    key: &[u8],
+    row: &EdgeGraphRow,
+    errors: &mut Vec<String>,
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    if row.schema != SCHEMA_EDGE_ROW {
+        errors.push(format!("edge row {} has wrong schema", hex_lower(key)));
+    }
+    match EdgeKind::from_cbm_type(&row.edge_type) {
+        Some(kind) if kind.code() == row.etype => {}
+        Some(kind) => errors.push(format!(
+            "edge row {} etype {} does not match {}",
+            hex_lower(key),
+            row.etype,
+            kind.as_str()
+        )),
+        None => errors.push(format!(
+            "edge row {} has unknown type {}",
+            hex_lower(key),
+            row.edge_type
+        )),
+    }
+    if !(row.weight.is_finite() && (0.0..=1.0).contains(&row.weight)) {
+        errors.push(format!(
+            "edge row {} weight {} is outside [0, 1]",
+            hex_lower(key),
+            row.weight
+        ));
+    }
+    if !row.props.is_object() {
+        errors.push(format!(
+            "edge row {} props are not an object",
+            hex_lower(key)
+        ));
+    }
+    if !ledger_ref_matches(vault, snapshot, &row.provenance)? {
+        errors.push(format!(
+            "edge row {} points to missing or mismatched ledger seq {}",
+            hex_lower(key),
+            row.provenance.seq
+        ));
+    }
+    Ok(())
 }
 
 fn verify_node_map_matches_base(
@@ -1158,19 +1521,23 @@ fn ingest_ledger_payload(
         commit_hash_sha256: hex_lower(&sha256_digest(options.commit.as_bytes())),
         sqlite_nodes: (prepared.constellations.len() + prepared.structural_only) as u64,
         sqlite_node_vectors: stats.sqlite_node_vectors as u64,
+        sqlite_edges: prepared.sqlite_edges as u64,
         constellation_inputs: prepared.constellations.len() as u64,
         structural_only: prepared.structural_only as u64,
         new_cx_ids: stats.new_cx_ids as u64,
         reused_cx_ids: stats.reused_cx_ids as u64,
         graph_rows_written: stats.graph_rows_written as u64,
-        edge_dangling_skipped: stats.edge_skips.dangling as u64,
+        edge_inputs: prepared.edge_rows.len() as u64,
+        edge_rows_written: stats.edge_rows_written as u64,
+        edge_dangling_skipped: prepared.edge_skips.dangling as u64,
         expected_base_rows: prepared.constellations.len() as u64,
         expected_slot_rows: prepared
             .constellations
             .iter()
             .map(|prepared| prepared.constellation.slots.len() as u64)
             .sum(),
-        expected_graph_rows: prepared.graph_rows.len() as u64,
+        expected_graph_rows: (prepared.graph_rows.len() + prepared.edge_rows.len()) as u64,
+        expected_edge_rows: prepared.edge_rows.len() as u64,
         first_cx_id: first,
         last_cx_id: last,
     };
@@ -1198,6 +1565,33 @@ fn graph_key(prefix: &[u8], project: &str, node_id: i64) -> IngestResult<Vec<u8>
     key.extend_from_slice(&sha256_digest(project.as_bytes()));
     key.extend_from_slice(&node_id.to_be_bytes());
     Ok(key)
+}
+
+fn edge_graph_key(
+    src: CxId,
+    dst: CxId,
+    kind: EdgeKind,
+    local_name_gen: &str,
+) -> IngestResult<Vec<u8>> {
+    let local_len = u32::try_from(local_name_gen.len()).map_err(|_| {
+        invalid_sqlite("edge local_name_gen is too long to encode into Graph CF key")
+    })?;
+    let mut key =
+        Vec::with_capacity(EDGE_ROW_PREFIX.len() + 16 + 16 + 2 + 4 + local_name_gen.len());
+    key.extend_from_slice(EDGE_ROW_PREFIX);
+    key.extend_from_slice(src.as_bytes());
+    key.extend_from_slice(dst.as_bytes());
+    key.extend_from_slice(&kind.code().to_be_bytes());
+    key.extend_from_slice(&local_len.to_be_bytes());
+    key.extend_from_slice(local_name_gen.as_bytes());
+    Ok(key)
+}
+
+fn zero_ledger_ref() -> LedgerRef {
+    LedgerRef {
+        seq: 0,
+        hash: [0; 32],
+    }
 }
 
 fn scalar_properties(properties: &Value) -> IngestResult<BTreeMap<String, f64>> {
@@ -1494,7 +1888,11 @@ mod tests {
                     source_id INTEGER NOT NULL,
                     target_id INTEGER NOT NULL,
                     type TEXT NOT NULL,
-                    properties TEXT DEFAULT '{}'
+                    properties TEXT DEFAULT '{}',
+                    url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+                    local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                        THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+                    UNIQUE(source_id, target_id, type, local_name_gen)
                 );
                 CREATE TABLE node_vectors (
                     node_id INTEGER PRIMARY KEY,
@@ -1524,6 +1922,23 @@ mod tests {
                 params![label, name, qn, file, start, end, properties],
             )
             .expect("insert node");
+        connection.last_insert_rowid()
+    }
+
+    fn insert_edge(
+        connection: &Connection,
+        source_id: i64,
+        target_id: i64,
+        edge_type: &str,
+        properties: &str,
+    ) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO edges(project, source_id, target_id, type, properties)
+                 VALUES ('demo', ?1, ?2, ?3, ?4)",
+                params![source_id, target_id, edge_type, properties],
+            )
+            .expect("insert edge");
         connection.last_insert_rowid()
     }
 
@@ -1559,13 +1974,95 @@ mod tests {
                 params![function, vec![1_u8, 2, 3, 4]],
             )
             .expect("insert vector");
-        connection
-            .execute(
-                "INSERT INTO edges(project, source_id, target_id, type, properties)
-                 VALUES ('demo', ?1, 9999, 'CALLS', '{}')",
-                params![function],
-            )
-            .expect("insert dangling edge");
+        insert_edge(&connection, function, 9999, "CALLS", "{}");
+    }
+
+    fn edge_fixture(path: &Path) {
+        let connection = create_db(path);
+        let caller = insert_node(
+            &connection,
+            "Function",
+            "handler",
+            "demo.http.handler",
+            "src/http.rs",
+            5,
+            20,
+            r#"{"language":"rust","source_snippet":"fn handler() { helper(); }","signature":"fn handler()"}"#,
+        );
+        let callee = insert_node(
+            &connection,
+            "Function",
+            "helper",
+            "demo.http.helper",
+            "src/http.rs",
+            30,
+            35,
+            r#"{"language":"rust","source_snippet":"fn helper() {}","signature":"fn helper()"}"#,
+        );
+        let module = insert_node(
+            &connection,
+            "Module",
+            "net",
+            "demo.net",
+            "src/net.rs",
+            1,
+            1,
+            r#"{"language":"rust","source_snippet":"mod net;","signature":"mod net"}"#,
+        );
+        insert_edge(
+            &connection,
+            caller,
+            callee,
+            "CALLS",
+            r#"{"confidence":0.85,"strategy":"import_map","line":11,"candidates":1}"#,
+        );
+        insert_edge(
+            &connection,
+            caller,
+            module,
+            "IMPORTS",
+            r#"{"local_name":"alpha","line":2}"#,
+        );
+        insert_edge(
+            &connection,
+            caller,
+            module,
+            "IMPORTS",
+            r#"{"local_name":"beta","line":3}"#,
+        );
+        insert_edge(&connection, caller, 9999, "CALLS", "{}");
+    }
+
+    fn full_vocabulary_fixture(path: &Path) {
+        let connection = create_db(path);
+        let source = insert_node(
+            &connection,
+            "Function",
+            "source",
+            "demo.vocab.source",
+            "src/vocab.rs",
+            1,
+            5,
+            r#"{"language":"rust","source_snippet":"fn source() {}","signature":"fn source()"}"#,
+        );
+        let target = insert_node(
+            &connection,
+            "Function",
+            "target",
+            "demo.vocab.target",
+            "src/vocab.rs",
+            10,
+            15,
+            r#"{"language":"rust","source_snippet":"fn target() {}","signature":"fn target()"}"#,
+        );
+        for kind in EdgeKind::ALL {
+            let properties = if kind == EdgeKind::Imports {
+                r#"{"local_name":"vocab"}"#
+            } else {
+                "{}"
+            };
+            insert_edge(&connection, source, target, kind.as_str(), properties);
+        }
     }
 
     #[test]
@@ -1579,9 +2076,11 @@ mod tests {
 
         assert_eq!(report.sqlite_nodes, 2);
         assert_eq!(report.sqlite_node_vectors, 1);
+        assert_eq!(report.sqlite_edges, 1);
         assert_eq!(report.constellation_inputs, 1);
         assert_eq!(report.structural_only, 1);
         assert_eq!(report.new_cx_ids, 1);
+        assert_eq!(report.edge_rows_written, 0);
         assert_eq!(report.edge_skips.dangling, 1);
         assert_eq!(report.seq, 1);
         assert_eq!(report.ledger_seq, 0);
@@ -1591,10 +2090,13 @@ mod tests {
             default_panel_slots().len()
         );
         assert_eq!(report.readback.graph_rows_verified, 2);
+        assert_eq!(report.readback.edge_rows_verified, 0);
+        assert_eq!(report.readback.expected_edge_rows, 0);
         let deep = crate::verify_deep(&vault).expect("deep verify");
         assert_eq!(deep.sqlite_node_map_rows, 1);
         assert_eq!(deep.sqlite_structural_rows, 1);
         assert_eq!(deep.sqlite_constellation_rows, 1);
+        assert_eq!(deep.sqlite_edge_rows, 0);
         assert_eq!(deep.ledger_chain_status, "intact");
         assert_eq!(deep.ledger_rows, 1);
         assert_eq!(deep.ledger_payload_rows, 1);
@@ -1642,6 +2144,186 @@ mod tests {
             payload.get("edge_dangling_skipped").and_then(Value::as_u64),
             Some(1)
         );
+        assert_eq!(payload.get("sqlite_edges").and_then(Value::as_u64), Some(1));
+        assert_eq!(payload.get("edge_inputs").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            payload.get("edge_rows_written").and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn fsv_imports_typed_edges_with_multiedge_parity_and_idempotency() {
+        let path = temp_db("edges");
+        edge_fixture(&path);
+        let vault = vault();
+
+        let report = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import sqlite edges");
+
+        assert_eq!(report.sqlite_nodes, 3);
+        assert_eq!(report.sqlite_edges, 4);
+        assert_eq!(report.edge_skips.dangling, 1);
+        assert_eq!(report.edge_rows_written, 3);
+        assert_eq!(report.graph_rows_written, 6);
+        assert_eq!(report.readback.edge_rows_verified, 3);
+        assert_eq!(report.readback.expected_edge_rows, 3);
+
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(report.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let entry = decode(&ledger).expect("decode ledger");
+
+        let mut edges = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(EDGE_ROW_PREFIX),
+            )
+            .expect("scan edge rows")
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice::<EdgeGraphRow>(&value).expect("edge row"))
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            (left.src, left.dst, left.etype, left.local_name_gen.as_str()).cmp(&(
+                right.src,
+                right.dst,
+                right.etype,
+                right.local_name_gen.as_str(),
+            ))
+        });
+
+        assert_eq!(edges.len(), 3);
+        let typed_multiset = edges
+            .iter()
+            .map(|edge| (edge.src, edge.dst, edge.etype, edge.local_name_gen.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            typed_multiset,
+            vec![
+                (
+                    report.cx_ids[0],
+                    report.cx_ids[1],
+                    EdgeKind::Calls.code(),
+                    String::new()
+                ),
+                (
+                    report.cx_ids[0],
+                    report.cx_ids[2],
+                    EdgeKind::Imports.code(),
+                    "alpha".to_string()
+                ),
+                (
+                    report.cx_ids[0],
+                    report.cx_ids[2],
+                    EdgeKind::Imports.code(),
+                    "beta".to_string()
+                ),
+            ]
+        );
+
+        let call = edges
+            .iter()
+            .find(|edge| edge.edge_type == "CALLS")
+            .expect("CALLS edge");
+        assert_eq!(call.schema, SCHEMA_EDGE_ROW);
+        assert_eq!(call.source_node_id, 1);
+        assert_eq!(call.target_node_id, 2);
+        assert_eq!(call.etype, EdgeKind::Calls.code());
+        assert!((call.weight - 0.85).abs() <= f32::EPSILON);
+        assert_eq!(
+            call.props.get("strategy").and_then(Value::as_str),
+            Some("import_map")
+        );
+        assert_eq!(call.props.get("line").and_then(Value::as_i64), Some(11));
+        assert_eq!(call.provenance.seq, entry.seq);
+        assert_eq!(call.provenance.hash, entry.entry_hash);
+
+        for import in edges.iter().filter(|edge| edge.edge_type == "IMPORTS") {
+            assert_eq!(import.weight, 1.0);
+            assert_eq!(import.provenance.seq, entry.seq);
+            assert_eq!(import.provenance.hash, entry.entry_hash);
+        }
+
+        let deep = crate::verify_deep(&vault).expect("deep verify edges");
+        assert_eq!(deep.sqlite_edge_rows, 3);
+
+        let before_graph = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(b"astrolabe:"),
+            )
+            .expect("scan graph before reimport");
+        let before_ledger = ledger_row_count(&vault).expect("ledger count before reimport");
+        let replay = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("reimport sqlite edges");
+        assert_eq!(replay.edge_rows_written, 0);
+        assert_eq!(replay.graph_rows_written, 0);
+        assert_eq!(replay.edge_skips.dangling, 1);
+        assert_eq!(
+            vault
+                .scan_cf_range_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Graph,
+                    &prefix_range(b"astrolabe:"),
+                )
+                .expect("scan graph after reimport"),
+            before_graph
+        );
+        assert_eq!(
+            ledger_row_count(&vault).expect("ledger count after reimport"),
+            before_ledger + 1
+        );
+    }
+
+    #[test]
+    fn full_edge_vocabulary_imports_with_golden_priors() {
+        let path = temp_db("edge-vocabulary");
+        full_vocabulary_fixture(&path);
+        let vault = vault();
+
+        let report = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import full edge vocabulary");
+
+        assert_eq!(report.sqlite_edges, EdgeKind::ALL.len());
+        assert_eq!(report.edge_skips.dangling, 0);
+        assert_eq!(report.edge_rows_written, EdgeKind::ALL.len());
+        assert_eq!(report.readback.edge_rows_verified, EdgeKind::ALL.len());
+
+        let edges = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(EDGE_ROW_PREFIX),
+            )
+            .expect("scan edge rows")
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice::<EdgeGraphRow>(&value).expect("edge row"))
+            .collect::<Vec<_>>();
+        assert_eq!(edges.len(), EdgeKind::ALL.len());
+
+        for kind in EdgeKind::ALL {
+            let row = edges
+                .iter()
+                .find(|edge| edge.etype == kind.code())
+                .unwrap_or_else(|| panic!("missing edge kind {kind}"));
+            assert_eq!(row.edge_type, kind.as_str());
+            assert_eq!(row.src, report.cx_ids[0]);
+            assert_eq!(row.dst, report.cx_ids[1]);
+            assert!(
+                (row.weight - kind.weight_prior().fallback).abs() <= f32::EPSILON,
+                "weight prior mismatch for {kind}"
+            );
+        }
+
+        let deep = crate::verify_deep(&vault).expect("deep verify full vocabulary");
+        assert_eq!(deep.sqlite_edge_rows, EdgeKind::ALL.len());
     }
 
     #[test]

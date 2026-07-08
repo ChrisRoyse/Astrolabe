@@ -423,6 +423,50 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    /// All stable edge kinds in `etype` order.
+    pub const ALL: [Self; 40] = [
+        Self::Calls,
+        Self::ResolvedCalls,
+        Self::Imports,
+        Self::Defines,
+        Self::DefinesMethod,
+        Self::Contains,
+        Self::HasBranch,
+        Self::Inherits,
+        Self::Implements,
+        Self::Override,
+        Self::Decorates,
+        Self::Instantiates,
+        Self::UsesType,
+        Self::Usage,
+        Self::Reads,
+        Self::Writes,
+        Self::Throws,
+        Self::Tests,
+        Self::TestsFile,
+        Self::HttpCalls,
+        Self::AsyncCalls,
+        Self::GrpcCalls,
+        Self::GraphqlCalls,
+        Self::TrpcCalls,
+        Self::Handles,
+        Self::DataFlows,
+        Self::InfraMaps,
+        Self::Configures,
+        Self::DependsOn,
+        Self::Emits,
+        Self::ListensOn,
+        Self::FileChangesWith,
+        Self::SimilarTo,
+        Self::SemanticallyRelated,
+        Self::CrossHttpCalls,
+        Self::CrossAsyncCalls,
+        Self::CrossChannel,
+        Self::CrossGrpcCalls,
+        Self::CrossGraphqlCalls,
+        Self::CrossTrpcCalls,
+    ];
+
     /// Returns the stable `u16` edge vocabulary code.
     pub const fn code(self) -> u16 {
         self as u16
@@ -473,11 +517,118 @@ impl EdgeKind {
             Self::CrossTrpcCalls => "CROSS_TRPC_CALLS",
         }
     }
+
+    /// Parses a Codebase Memory MCP edge type string into Astrolabe's stable
+    /// vocabulary. CBM's `CONTAINS_*` family is stored as the `CONTAINS` class.
+    pub fn from_cbm_type(value: &str) -> Option<Self> {
+        match value {
+            "CALLS" => Some(Self::Calls),
+            "RESOLVED_CALLS" => Some(Self::ResolvedCalls),
+            "IMPORTS" => Some(Self::Imports),
+            "DEFINES" => Some(Self::Defines),
+            "DEFINES_METHOD" => Some(Self::DefinesMethod),
+            "CONTAINS" | "CONTAINS_FILE" | "CONTAINS_FOLDER" => Some(Self::Contains),
+            "HAS_BRANCH" => Some(Self::HasBranch),
+            "INHERITS" => Some(Self::Inherits),
+            "IMPLEMENTS" => Some(Self::Implements),
+            "OVERRIDE" => Some(Self::Override),
+            "DECORATES" => Some(Self::Decorates),
+            "INSTANTIATES" => Some(Self::Instantiates),
+            "USES_TYPE" => Some(Self::UsesType),
+            "USAGE" => Some(Self::Usage),
+            "READS" => Some(Self::Reads),
+            "WRITES" => Some(Self::Writes),
+            "THROWS" => Some(Self::Throws),
+            "TESTS" => Some(Self::Tests),
+            "TESTS_FILE" => Some(Self::TestsFile),
+            "HTTP_CALLS" => Some(Self::HttpCalls),
+            "ASYNC_CALLS" => Some(Self::AsyncCalls),
+            "GRPC_CALLS" => Some(Self::GrpcCalls),
+            "GRAPHQL_CALLS" => Some(Self::GraphqlCalls),
+            "TRPC_CALLS" => Some(Self::TrpcCalls),
+            "HANDLES" => Some(Self::Handles),
+            "DATA_FLOWS" => Some(Self::DataFlows),
+            "INFRA_MAPS" => Some(Self::InfraMaps),
+            "CONFIGURES" => Some(Self::Configures),
+            "DEPENDS_ON" => Some(Self::DependsOn),
+            "EMITS" => Some(Self::Emits),
+            "LISTENS_ON" => Some(Self::ListensOn),
+            "FILE_CHANGES_WITH" => Some(Self::FileChangesWith),
+            "SIMILAR_TO" => Some(Self::SimilarTo),
+            "SEMANTICALLY_RELATED" => Some(Self::SemanticallyRelated),
+            "CROSS_HTTP_CALLS" => Some(Self::CrossHttpCalls),
+            "CROSS_ASYNC_CALLS" => Some(Self::CrossAsyncCalls),
+            "CROSS_CHANNEL" => Some(Self::CrossChannel),
+            "CROSS_GRPC_CALLS" => Some(Self::CrossGrpcCalls),
+            "CROSS_GRAPHQL_CALLS" => Some(Self::CrossGraphqlCalls),
+            "CROSS_TRPC_CALLS" => Some(Self::CrossTrpcCalls),
+            _ => None,
+        }
+    }
+
+    /// Data-driven v1 prior used only when the source edge does not carry the
+    /// measured property named in `dynamic_weight_property`.
+    pub const fn weight_prior(self) -> EdgeWeightPrior {
+        match self {
+            Self::Calls | Self::ResolvedCalls => EdgeWeightPrior::new(0.4, Some("confidence")),
+            Self::Imports
+            | Self::Defines
+            | Self::DefinesMethod
+            | Self::Contains
+            | Self::HasBranch => EdgeWeightPrior::new(1.0, None),
+            Self::Inherits
+            | Self::Implements
+            | Self::Override
+            | Self::Decorates
+            | Self::Instantiates
+            | Self::UsesType => EdgeWeightPrior::new(0.9, None),
+            Self::Usage | Self::Reads | Self::Writes | Self::Throws => {
+                EdgeWeightPrior::new(0.7, None)
+            }
+            Self::Tests | Self::TestsFile => EdgeWeightPrior::new(0.9, None),
+            Self::HttpCalls
+            | Self::AsyncCalls
+            | Self::GrpcCalls
+            | Self::GraphqlCalls
+            | Self::TrpcCalls
+            | Self::CrossHttpCalls
+            | Self::CrossAsyncCalls
+            | Self::CrossGrpcCalls
+            | Self::CrossGraphqlCalls
+            | Self::CrossTrpcCalls => EdgeWeightPrior::new(0.5, Some("confidence")),
+            Self::Handles | Self::DependsOn => EdgeWeightPrior::new(0.9, Some("confidence")),
+            Self::DataFlows => EdgeWeightPrior::new(0.7, Some("confidence")),
+            Self::InfraMaps | Self::Configures => EdgeWeightPrior::new(0.8, Some("confidence")),
+            Self::Emits | Self::ListensOn | Self::CrossChannel => EdgeWeightPrior::new(0.7, None),
+            Self::FileChangesWith => EdgeWeightPrior::new(0.5, Some("coupling_score")),
+            Self::SimilarTo => EdgeWeightPrior::new(0.95, Some("jaccard")),
+            Self::SemanticallyRelated => EdgeWeightPrior::new(0.8, Some("score")),
+        }
+    }
 }
 
 impl fmt::Display for EdgeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// V1 edge-weight prior registry entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeWeightPrior {
+    /// Fallback weight in the closed interval `[0, 1]`.
+    pub fallback: f32,
+    /// Source property that supersedes `fallback` when present and valid.
+    pub dynamic_weight_property: Option<&'static str>,
+}
+
+impl EdgeWeightPrior {
+    /// Builds a static prior-table entry.
+    pub const fn new(fallback: f32, dynamic_weight_property: Option<&'static str>) -> Self {
+        Self {
+            fallback,
+            dynamic_weight_property,
+        }
     }
 }
 
@@ -915,6 +1066,32 @@ mod tests {
         assert_eq!(EdgeKind::Calls.as_str(), "CALLS");
         assert_eq!(EdgeKind::Calls.code(), 1);
         assert_eq!(EdgeKind::CrossTrpcCalls.code(), 40);
+    }
+
+    #[test]
+    fn edge_vocabulary_parses_cbm_aliases_and_has_complete_priors() {
+        assert_eq!(
+            EdgeKind::from_cbm_type("CONTAINS_FILE"),
+            Some(EdgeKind::Contains)
+        );
+        assert_eq!(
+            EdgeKind::from_cbm_type("CONTAINS_FOLDER"),
+            Some(EdgeKind::Contains)
+        );
+        assert_eq!(
+            EdgeKind::from_cbm_type("SEMANTICALLY_RELATED"),
+            Some(EdgeKind::SemanticallyRelated)
+        );
+
+        for (index, kind) in EdgeKind::ALL.iter().copied().enumerate() {
+            assert_eq!(kind.code(), (index + 1) as u16);
+            assert_eq!(EdgeKind::from_cbm_type(kind.as_str()), Some(kind));
+            let prior = kind.weight_prior();
+            assert!(
+                prior.fallback.is_finite() && (0.0..=1.0).contains(&prior.fallback),
+                "bad prior for {kind}"
+            );
+        }
     }
 
     #[test]

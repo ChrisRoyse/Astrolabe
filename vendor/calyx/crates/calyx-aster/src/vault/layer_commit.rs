@@ -1,6 +1,6 @@
 use super::{AsterVault, durable, encode, ledger_hook};
 use crate::cf::ColumnFamily;
-use calyx_core::{CalyxError, Clock, Result, Seq};
+use calyx_core::{CalyxError, Clock, LedgerRef, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 
 impl<C> AsterVault<C>
@@ -31,7 +31,7 @@ where
                     &hook, &mut rows, kind, subject, payload, actor,
                 )?;
                 let ledger_ref = staged_ledger_ref(&staged)?;
-                attach_ledger_ref_to_base_rows(&mut data_rows, &ledger_ref)?;
+                attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
                 rows.extend(data_rows);
                 let seq = self.commit_rows_locked(&rows)?;
                 ledger_hook::commit_staged(&mut hook, &staged)?;
@@ -46,7 +46,7 @@ where
             let staged =
                 ledger_hook::stage_entry_payload(hook, &mut rows, kind, subject, payload, actor)?;
             let ledger_ref = staged_ledger_ref(&staged)?;
-            attach_ledger_ref_to_base_rows(&mut data_rows, &ledger_ref)?;
+            attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
             rows.extend(data_rows);
             let seq = self.commit_rows_locked(&rows)?;
             ledger_hook::commit_staged(hook, &staged)?;
@@ -96,14 +96,38 @@ fn staged_ledger_ref(staged: &[calyx_ledger::StagedLedgerRow]) -> Result<calyx_c
         .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))
 }
 
-fn attach_ledger_ref_to_base_rows(
-    rows: &mut [encode::WriteRow],
-    ledger_ref: &calyx_core::LedgerRef,
-) -> Result<()> {
+fn attach_ledger_ref_to_rows(rows: &mut [encode::WriteRow], ledger_ref: &LedgerRef) -> Result<()> {
     for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Base) {
         let mut constellation = encode::decode_constellation_base(&row.value)?;
         constellation.provenance = ledger_ref.clone();
         row.value = encode::encode_constellation_base(&constellation)?;
     }
+    for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Graph) {
+        attach_ledger_ref_to_graph_json_row(row, ledger_ref)?;
+    }
+    Ok(())
+}
+
+fn attach_ledger_ref_to_graph_json_row(
+    row: &mut encode::WriteRow,
+    ledger_ref: &LedgerRef,
+) -> Result<()> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&row.value) else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if !object.contains_key("provenance") {
+        return Ok(());
+    }
+    object.insert(
+        "provenance".to_string(),
+        serde_json::to_value(ledger_ref).map_err(|error| {
+            CalyxError::aster_corrupt_shard(format!("encode graph provenance: {error}"))
+        })?,
+    );
+    row.value = serde_json::to_vec(&value)
+        .map_err(|error| CalyxError::aster_corrupt_shard(format!("encode graph row: {error}")))?;
     Ok(())
 }

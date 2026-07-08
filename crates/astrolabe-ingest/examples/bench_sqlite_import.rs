@@ -71,14 +71,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             "workers": workers,
             "sqlite_nodes": report.sqlite_nodes,
             "sqlite_node_vectors": report.sqlite_node_vectors,
+            "sqlite_edges": report.sqlite_edges,
             "constellation_inputs": report.constellation_inputs,
             "structural_only": report.structural_only,
             "new_cx_ids": report.new_cx_ids,
             "reused_cx_ids": report.reused_cx_ids,
+            "graph_rows_written": report.graph_rows_written,
+            "edge_rows_written": report.edge_rows_written,
             "edge_dangling_skipped": report.edge_skips.dangling,
             "readback_base_rows_verified": report.readback.base_rows_verified,
             "readback_slot_rows_verified": report.readback.slot_rows_verified,
             "readback_graph_rows_verified": report.readback.graph_rows_verified,
+            "readback_edge_rows_verified": report.readback.edge_rows_verified,
         }))?
     );
 

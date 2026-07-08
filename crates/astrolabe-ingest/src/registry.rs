@@ -404,6 +404,8 @@ pub struct DeepVerifyReport {
     pub sqlite_structural_rows: usize,
     /// Number of SQLite-import Base CF constellation rows decoded via node maps.
     pub sqlite_constellation_rows: usize,
+    /// Number of SQLite-import typed edge rows decoded and provenance-checked.
+    pub sqlite_edge_rows: usize,
     /// Ledger hash-chain status (`intact`, `broken`, or `corrupt`).
     pub ledger_chain_status: String,
     /// Number of Ledger CF rows visible during deep verification.
@@ -693,6 +695,7 @@ where
         sqlite_node_map_rows: sqlite.node_map_rows,
         sqlite_structural_rows: sqlite.structural_rows,
         sqlite_constellation_rows: sqlite.constellation_rows,
+        sqlite_edge_rows: sqlite.edge_rows,
         ledger_chain_status: ledger_chain.status,
         ledger_rows: ledger_chain.ledger_rows,
         ledger_payload_rows: ledger_pairing.ledger_payload_rows,
@@ -1190,6 +1193,7 @@ mod tests {
                 sqlite_node_map_rows: 0,
                 sqlite_structural_rows: 0,
                 sqlite_constellation_rows: 0,
+                sqlite_edge_rows: 0,
                 ledger_chain_status: "intact".to_string(),
                 ledger_rows: 1,
                 ledger_payload_rows: 1,
@@ -1226,6 +1230,7 @@ mod tests {
                 sqlite_node_map_rows: 0,
                 sqlite_structural_rows: 0,
                 sqlite_constellation_rows: 0,
+                sqlite_edge_rows: 0,
                 ledger_chain_status: "intact".to_string(),
                 ledger_rows: 1,
                 ledger_payload_rows: 1,
