@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, NulError};
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
+use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::thread::{self, ThreadId};
@@ -17,6 +18,26 @@ pub fn parent_roots() -> (&'static str, &'static str) {
         astrolabe_domain::calyx_vendor_root(),
         cbm_sys::vendor_root(),
     )
+}
+
+pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let ptr = unsafe { cbm_sys::cbm_resolve_cache_dir() };
+    if ptr.is_null() {
+        return Err(envelope(
+            "ASTRO_CBM_CACHE_DIR",
+            "CBM could not resolve its cache directory",
+            "Set CBM_CACHE_DIR or HOME/LOCALAPPDATA to a writable directory.",
+        ));
+    }
+    Ok(PathBuf::from(unsafe { CStr::from_ptr(ptr) }.to_str()?))
+}
+
+pub fn cbm_project_name_from_path(path: &str) -> Result<String, BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let path = CString::new(path)?;
+    let ptr = unsafe { cbm_sys::cbm_project_name_from_path(path.as_ptr()) };
+    unsafe { take_c_string(ptr) }
 }
 
 pub fn route_cbm_logs_to_tracing() {

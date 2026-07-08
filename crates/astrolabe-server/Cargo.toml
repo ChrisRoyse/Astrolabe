@@ -10,6 +10,10 @@ publish.workspace = true
 astrolabe-bridge = { path = "../astrolabe-bridge" }
 astrolabe-domain.workspace = true
 astrolabe-ingest.workspace = true
+astrolabe-panel.workspace = true
+calyx-aster.workspace = true
+calyx-core.workspace = true
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"

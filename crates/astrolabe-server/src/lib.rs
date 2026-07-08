@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use astrolabe_bridge::CbmToolRunner;
 
+mod migration;
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -136,7 +138,7 @@ where
             let mut body = vec![0_u8; content_len];
             reader.read_exact(&mut body)?;
             let request = String::from_utf8(body)?;
-            if let Some(response) = runner.handle_jsonrpc_raw(&request)? {
+            if let Some(response) = migration::handle_jsonrpc_raw(runner, &request)? {
                 write!(
                     writer,
                     "Content-Length: {}\r\n\r\n{}",
@@ -148,7 +150,7 @@ where
             continue;
         }
 
-        if let Some(response) = runner.handle_jsonrpc_raw(&line)? {
+        if let Some(response) = migration::handle_jsonrpc_raw(runner, &line)? {
             writeln!(writer, "{response}")?;
             writer.flush()?;
         }
@@ -218,7 +220,11 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     let runner = CbmToolRunner::new_default()?;
-    let result = runner.handle_tool_raw(&tool_name, &args_json)?;
+    let result = if index_worker {
+        runner.handle_tool_raw(&tool_name, &args_json)?
+    } else {
+        migration::handle_tool_raw(&runner, &tool_name, &args_json)?
+    };
     if let Some(path) = response_out.as_ref() {
         fs::write(path, &result)?;
     }
