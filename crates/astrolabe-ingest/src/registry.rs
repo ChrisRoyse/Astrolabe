@@ -667,7 +667,7 @@ where
                 old_qualified_name: rename.old_qualified_name.clone(),
                 old_rel_file_path: rename.old_rel_file_path.clone(),
             });
-        } else {
+        } else if candidates.len() > 1 {
             split_record = Some(build_split_record(&prepared, rename, candidates));
         }
     }
@@ -1209,6 +1209,31 @@ mod tests {
         let mut expected = vec![candidate_a, candidate_b];
         expected.sort();
         assert_eq!(split.candidate_series_ids, expected);
+    }
+
+    #[test]
+    fn rename_without_prior_candidate_does_not_write_ambiguous_split() {
+        let vault = vault();
+        let renamed = SeriesVersionInput::new(
+            symbol("demo.math.renamed", "src/renamed.rs", "fn add() { 2 }", 10),
+            7,
+            "c2",
+        )
+        .with_rename(RenameHint::from_paths("demo.math.add", "src/math.rs"));
+        let series_id = renamed.symbol.series_id().expect("new series");
+
+        ingest_series_batch(&vault, &[renamed]).expect("rename ingest");
+
+        assert_eq!(series_row(&vault, series_id).version_count, 1);
+        let snapshot = read_registry_snapshot(&vault).expect("snapshot");
+        assert_eq!(
+            snapshot
+                .kv_rows
+                .iter()
+                .filter(|(key, _)| registry_kind(key) == Some(SPLIT_ROW_TAG))
+                .count(),
+            0
+        );
     }
 
     #[test]
