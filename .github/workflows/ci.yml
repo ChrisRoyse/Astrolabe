@@ -33,6 +33,9 @@ jobs:
       - name: Verify crate scaffold has no stub panics
         run: bash scripts/check-no-todo.sh
 
+      - name: Verify unsafe boundary
+        run: bash scripts/check-unsafe-boundary.sh
+
       - name: Verify Calyx path dependencies
         run: python3 scripts/check-calyx-path-deps.py
 
@@ -44,6 +47,7 @@ jobs:
             echo "- Vendor tree pins matched VENDORED.md."
             echo "- Calyx dependencies resolved as local path deps."
             echo "- No todo!()/unimplemented!() in crates/."
+            echo "- Unsafe Rust remained confined to astrolabe-bridge and cbm-sys."
           } >> "$GITHUB_STEP_SUMMARY"
 
   cbm-lint:

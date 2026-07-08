@@ -1,4 +1,14 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use std::convert::TryFrom;
+use std::error::Error;
+use std::ffi::{CStr, CString, NulError};
+use std::fmt;
+use std::marker::PhantomData;
+use std::os::raw::{c_char, c_int};
+use std::ptr::{self, NonNull};
+use std::rc::Rc;
+use std::thread::{self, ThreadId};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -7,6 +17,781 @@ pub fn parent_roots() -> (&'static str, &'static str) {
         astrolabe_domain::calyx_vendor_root(),
         cbm_sys::vendor_root(),
     )
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ErrorEnvelope {
+    pub code: String,
+    pub message: String,
+    pub remediation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+impl ErrorEnvelope {
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            remediation: remediation.into(),
+            stderr: None,
+        }
+    }
+
+    pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.stderr = Some(stderr.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeError {
+    envelope: ErrorEnvelope,
+}
+
+impl BridgeError {
+    pub fn new(envelope: ErrorEnvelope) -> Self {
+        Self { envelope }
+    }
+
+    pub fn envelope(&self) -> &ErrorEnvelope {
+        &self.envelope
+    }
+
+    pub fn into_envelope(self) -> ErrorEnvelope {
+        self.envelope
+    }
+}
+
+impl fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.envelope.code, self.envelope.message)
+    }
+}
+
+impl Error for BridgeError {}
+
+impl From<NulError> for BridgeError {
+    fn from(err: NulError) -> Self {
+        envelope(
+            "ASTRO_CBM_NUL_BYTE",
+            format!(
+                "string argument contains an interior NUL byte at {}",
+                err.nul_position()
+            ),
+            "Validate UTF-8 text before passing it through the C boundary.",
+        )
+    }
+}
+
+impl From<std::str::Utf8Error> for BridgeError {
+    fn from(err: std::str::Utf8Error) -> Self {
+        envelope(
+            "ASTRO_CBM_INVALID_UTF8",
+            format!("CBM returned non-UTF-8 text: {err}"),
+            "Keep boundary payloads UTF-8; Windows wide-path conversion remains inside libcbm.",
+        )
+    }
+}
+
+impl From<std::string::FromUtf8Error> for BridgeError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        envelope(
+            "ASTRO_CBM_INVALID_UTF8",
+            format!("CBM returned non-UTF-8 text: {}", err.utf8_error()),
+            "Keep boundary payloads UTF-8; Windows wide-path conversion remains inside libcbm.",
+        )
+    }
+}
+
+fn envelope(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    remediation: impl Into<String>,
+) -> BridgeError {
+    BridgeError::new(ErrorEnvelope::new(code, message, remediation))
+}
+
+fn internal(message: impl Into<String>) -> BridgeError {
+    envelope(
+        "ASTRO_CBM_INTERNAL",
+        message,
+        "Capture the failing input and inspect the libcbm stderr/log output.",
+    )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Language(cbm_sys::CBMLanguage);
+
+impl Language {
+    pub const C: Self = Self(cbm_sys::CBMLanguage_CBM_LANG_C);
+
+    pub fn from_raw(raw: cbm_sys::CBMLanguage) -> Self {
+        Self(raw)
+    }
+
+    pub fn as_raw(self) -> cbm_sys::CBMLanguage {
+        self.0
+    }
+}
+
+pub fn map_cbm_status(status: i32) -> Result<(), BridgeError> {
+    match status {
+        0 => Ok(()),
+        -1 => Err(envelope(
+            "ASTRO_CBM_STATUS_ERR",
+            "CBM returned CBM_STORE_ERR",
+            "Inspect the store path, input arguments, and CBM diagnostic output.",
+        )),
+        -2 => Err(envelope(
+            "ASTRO_CBM_NOT_FOUND",
+            "CBM returned CBM_STORE_NOT_FOUND",
+            "Verify that the requested project, node, edge, or artifact exists.",
+        )),
+        other => Err(BridgeError::new(
+            ErrorEnvelope::new(
+                "ASTRO_CBM_INTERNAL",
+                format!("CBM returned unknown status code {other}"),
+                "Treat this as an FFI contract drift until the code is documented and mapped.",
+            )
+            .with_stderr(format!("unknown CBM status code: {other}")),
+        )),
+    }
+}
+
+pub const CALLBACK_OK: i32 = 0;
+pub const CALLBACK_ERROR: i32 = -1;
+pub const CALLBACK_PANIC: i32 = -2;
+
+pub fn catch_unwind_to_envelope<F, T>(f: F) -> Result<T, BridgeError>
+where
+    F: FnOnce() -> T + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(f).map_err(|_| {
+        envelope(
+            "ASTRO_FFI_CALLBACK_PANIC",
+            "Rust callback panicked before returning to C",
+            "Keep panic boundaries inside Rust; convert callback failures into status codes.",
+        )
+    })
+}
+
+pub fn guard_ffi_callback<F>(f: F) -> i32
+where
+    F: FnOnce() -> Result<(), BridgeError> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(Ok(())) => CALLBACK_OK,
+        Ok(Err(_)) => CALLBACK_ERROR,
+        Err(_) => CALLBACK_PANIC,
+    }
+}
+
+pub struct ExtractedFile {
+    ptr: NonNull<cbm_sys::CBMFileResult>,
+    _source: Vec<u8>,
+    _project: CString,
+    _rel_path: CString,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl ExtractedFile {
+    pub fn extract(
+        source: &str,
+        language: Language,
+        project: &str,
+        rel_path: &str,
+        timeout_micros: i64,
+    ) -> Result<Self, BridgeError> {
+        let source_len = c_int::try_from(source.len()).map_err(|_| {
+            envelope(
+                "ASTRO_CBM_SOURCE_TOO_LARGE",
+                "source length does not fit the CBM C API",
+                "Split or reject files larger than i32::MAX bytes before extraction.",
+            )
+        })?;
+        let source = source.as_bytes().to_vec();
+        let project = CString::new(project)?;
+        let rel_path = CString::new(rel_path)?;
+
+        // SAFETY: cbm_init is idempotent in libcbm. The C strings outlive the call,
+        // and source is passed with an explicit byte length.
+        unsafe {
+            map_cbm_status(cbm_sys::cbm_init())?;
+            let ptr = cbm_sys::cbm_extract_file(
+                source.as_ptr().cast::<c_char>(),
+                source_len,
+                language.as_raw(),
+                project.as_ptr(),
+                rel_path.as_ptr(),
+                timeout_micros,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            let extracted = Self {
+                ptr: NonNull::new(ptr).ok_or_else(|| {
+                    envelope(
+                        "ASTRO_CBM_NULL_RESULT",
+                        "cbm_extract_file returned NULL",
+                        "Check libcbm diagnostics and reject the file as an extraction failure.",
+                    )
+                })?,
+                _source: source,
+                _project: project,
+                _rel_path: rel_path,
+                _not_send_or_sync: PhantomData,
+            };
+            if extracted.raw().has_error {
+                let message = extracted
+                    .optional_string(extracted.raw().error_msg)?
+                    .unwrap_or_else(|| {
+                        "CBM extraction failed without an error message".to_string()
+                    });
+                Err(envelope(
+                    "ASTRO_CBM_EXTRACT_ERROR",
+                    message,
+                    "Surface the file as skipped and continue indexing the remaining batch.",
+                ))
+            } else {
+                Ok(extracted)
+            }
+        }
+    }
+
+    pub fn definitions(&self) -> Result<Vec<Definition>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(self.raw().defs.items, self.raw().defs.count, "defs")?
+                .iter()
+                .map(|item| self.definition(item))
+                .collect()
+        }
+    }
+
+    pub fn calls(&self) -> Result<Vec<Call>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(self.raw().calls.items, self.raw().calls.count, "calls")?
+                .iter()
+                .map(|item| self.call(item))
+                .collect()
+        }
+    }
+
+    pub fn imports(&self) -> Result<Vec<Import>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(
+                self.raw().imports.items,
+                self.raw().imports.count,
+                "imports",
+            )?
+            .iter()
+            .map(|item| {
+                Ok(Import {
+                    local_name: self.required_string(item.local_name, "import.local_name")?,
+                    module_path: self.required_string(item.module_path, "import.module_path")?,
+                })
+            })
+            .collect()
+        }
+    }
+
+    pub fn usages(&self) -> Result<Vec<Usage>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(self.raw().usages.items, self.raw().usages.count, "usages")?
+                .iter()
+                .map(|item| {
+                    Ok(Usage {
+                        ref_name: self.required_string(item.ref_name, "usage.ref_name")?,
+                        enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    pub fn read_writes(&self) -> Result<Vec<ReadWrite>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(self.raw().rw.items, self.raw().rw.count, "rw")?
+                .iter()
+                .map(|item| {
+                    Ok(ReadWrite {
+                        var_name: self.required_string(item.var_name, "rw.var_name")?,
+                        enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+                        is_write: item.is_write,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    pub fn throws(&self) -> Result<Vec<Throw>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(self.raw().throws.items, self.raw().throws.count, "throws")?
+                .iter()
+                .map(|item| {
+                    Ok(Throw {
+                        exception_name: self
+                            .required_string(item.exception_name, "throw.exception_name")?,
+                        enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    pub fn type_refs(&self) -> Result<Vec<TypeRef>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(
+                self.raw().type_refs.items,
+                self.raw().type_refs.count,
+                "type_refs",
+            )?
+            .iter()
+            .map(|item| {
+                Ok(TypeRef {
+                    type_name: self.required_string(item.type_name, "type_ref.type_name")?,
+                    enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+                })
+            })
+            .collect()
+        }
+    }
+
+    pub fn channels(&self) -> Result<Vec<Channel>, BridgeError> {
+        // SAFETY: self owns a live CBMFileResult until Drop; array pointers are CBM-owned.
+        unsafe {
+            array_slice(
+                self.raw().channels.items,
+                self.raw().channels.count,
+                "channels",
+            )?
+            .iter()
+            .map(|item| {
+                Ok(Channel {
+                    channel_name: self
+                        .required_string(item.channel_name, "channel.channel_name")?,
+                    transport: self.optional_string(item.transport)?,
+                    enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+                    direction: item.direction,
+                })
+            })
+            .collect()
+        }
+    }
+
+    pub fn routes(&self) -> Result<Vec<Route>, BridgeError> {
+        Ok(self
+            .definitions()?
+            .into_iter()
+            .filter_map(|def| {
+                let path = def.route_path?;
+                Some(Route {
+                    owner_qualified_name: def.qualified_name,
+                    path,
+                    method: def.route_method,
+                })
+            })
+            .collect())
+    }
+
+    pub fn module_qn(&self) -> Result<Option<String>, BridgeError> {
+        self.optional_string(self.raw().module_qn)
+    }
+
+    pub fn is_test_file(&self) -> bool {
+        self.raw().is_test_file
+    }
+
+    fn raw(&self) -> &cbm_sys::CBMFileResult {
+        // SAFETY: ptr is non-null and owned by self until Drop.
+        unsafe { self.ptr.as_ref() }
+    }
+
+    fn definition(&self, item: &cbm_sys::CBMDefinition) -> Result<Definition, BridgeError> {
+        Ok(Definition {
+            name: self.required_string(item.name, "definition.name")?,
+            qualified_name: self
+                .required_string(item.qualified_name, "definition.qualified_name")?,
+            label: self.required_string(item.label, "definition.label")?,
+            file_path: self.optional_string(item.file_path)?,
+            start_line: item.start_line,
+            end_line: item.end_line,
+            signature: self.optional_string(item.signature)?,
+            return_type: self.optional_string(item.return_type)?,
+            receiver: self.optional_string(item.receiver)?,
+            docstring: self.optional_string(item.docstring)?,
+            parent_class: self.optional_string(item.parent_class)?,
+            route_path: self.optional_string(item.route_path)?,
+            route_method: self.optional_string(item.route_method)?,
+            complexity: item.complexity,
+            cognitive: item.cognitive,
+            loop_count: item.loop_count,
+            loop_depth: item.loop_depth,
+            is_recursive: item.is_recursive,
+            param_count: item.param_count,
+            max_access_depth: item.max_access_depth,
+            linear_scan_in_loop: item.linear_scan_in_loop,
+            alloc_in_loop: item.alloc_in_loop,
+            recursion_in_loop: item.recursion_in_loop,
+            unguarded_recursion: item.unguarded_recursion,
+            lines: item.lines,
+            fingerprint: self.fingerprint(item.fingerprint, item.fingerprint_k)?,
+            is_exported: item.is_exported,
+            is_abstract: item.is_abstract,
+            is_test: item.is_test,
+            is_entry_point: item.is_entry_point,
+            structural_profile: self.optional_string(item.structural_profile)?,
+            body_tokens: self.optional_string(item.body_tokens)?,
+        })
+    }
+
+    fn call(&self, item: &cbm_sys::CBMCall) -> Result<Call, BridgeError> {
+        let arg_count = usize::try_from(item.arg_count)
+            .map_err(|_| internal(format!("negative call argument count {}", item.arg_count)))?;
+        if arg_count > item.args.len() {
+            return Err(internal(format!(
+                "call argument count {} exceeds fixed CBM_MAX_CALL_ARGS",
+                item.arg_count
+            )));
+        }
+
+        let mut args = Vec::with_capacity(arg_count);
+        for arg in item.args.iter().take(arg_count) {
+            args.push(CallArg {
+                expr: self.optional_string(arg.expr)?,
+                value: self.optional_string(arg.value)?,
+                keyword: self.optional_string(arg.keyword)?,
+                index: arg.index,
+            });
+        }
+
+        Ok(Call {
+            callee_name: self.required_string(item.callee_name, "call.callee_name")?,
+            enclosing_func_qn: self.optional_string(item.enclosing_func_qn)?,
+            first_string_arg: self.optional_string(item.first_string_arg)?,
+            second_arg_name: self.optional_string(item.second_arg_name)?,
+            args,
+            loop_depth: item.loop_depth,
+            branch_depth: item.branch_depth,
+            start_line: item.start_line,
+            is_method: item.is_method,
+        })
+    }
+
+    fn fingerprint(&self, ptr: *mut u32, count: c_int) -> Result<Vec<u32>, BridgeError> {
+        if count < 0 {
+            return Err(internal(format!("negative fingerprint count {count}")));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if ptr.is_null() {
+            return Err(internal(
+                "fingerprint count was positive but pointer was NULL",
+            ));
+        }
+        // SAFETY: CBM owns `count` u32 values for the result lifetime.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
+        Ok(slice.to_vec())
+    }
+
+    fn required_string(&self, ptr: *const c_char, field: &str) -> Result<String, BridgeError> {
+        self.optional_string(ptr)?.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_NULL_FIELD",
+                format!("CBM returned NULL for required field {field}"),
+                "Treat this as FFI contract drift and keep the raw result for debugging.",
+            )
+        })
+    }
+
+    fn optional_string(&self, ptr: *const c_char) -> Result<Option<String>, BridgeError> {
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: CBM returns NUL-terminated strings owned by the result arena.
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str()?.to_owned();
+        Ok(Some(s))
+    }
+}
+
+impl Drop for ExtractedFile {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the CBMFileResult pointer.
+        unsafe {
+            cbm_sys::cbm_free_result(self.ptr.as_ptr());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Definition {
+    pub name: String,
+    pub qualified_name: String,
+    pub label: String,
+    pub file_path: Option<String>,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: Option<String>,
+    pub return_type: Option<String>,
+    pub receiver: Option<String>,
+    pub docstring: Option<String>,
+    pub parent_class: Option<String>,
+    pub route_path: Option<String>,
+    pub route_method: Option<String>,
+    pub complexity: c_int,
+    pub cognitive: c_int,
+    pub loop_count: c_int,
+    pub loop_depth: c_int,
+    pub is_recursive: bool,
+    pub param_count: c_int,
+    pub max_access_depth: c_int,
+    pub linear_scan_in_loop: c_int,
+    pub alloc_in_loop: c_int,
+    pub recursion_in_loop: bool,
+    pub unguarded_recursion: bool,
+    pub lines: c_int,
+    pub fingerprint: Vec<u32>,
+    pub is_exported: bool,
+    pub is_abstract: bool,
+    pub is_test: bool,
+    pub is_entry_point: bool,
+    pub structural_profile: Option<String>,
+    pub body_tokens: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CallArg {
+    pub expr: Option<String>,
+    pub value: Option<String>,
+    pub keyword: Option<String>,
+    pub index: c_int,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Call {
+    pub callee_name: String,
+    pub enclosing_func_qn: Option<String>,
+    pub first_string_arg: Option<String>,
+    pub second_arg_name: Option<String>,
+    pub args: Vec<CallArg>,
+    pub loop_depth: c_int,
+    pub branch_depth: c_int,
+    pub start_line: c_int,
+    pub is_method: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Import {
+    pub local_name: String,
+    pub module_path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Usage {
+    pub ref_name: String,
+    pub enclosing_func_qn: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReadWrite {
+    pub var_name: String,
+    pub enclosing_func_qn: Option<String>,
+    pub is_write: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Throw {
+    pub exception_name: String,
+    pub enclosing_func_qn: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TypeRef {
+    pub type_name: String,
+    pub enclosing_func_qn: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Channel {
+    pub channel_name: String,
+    pub transport: Option<String>,
+    pub enclosing_func_qn: Option<String>,
+    pub direction: cbm_sys::CBMChannelDirection,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Route {
+    pub owner_qualified_name: String,
+    pub path: String,
+    pub method: Option<String>,
+}
+
+pub struct CbmToolRunner {
+    ptr: NonNull<cbm_sys::cbm_mcp_server_t>,
+    owner: ThreadId,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CbmToolRunner {
+    pub fn new(store_path: &str) -> Result<Self, BridgeError> {
+        let store_path = CString::new(store_path)?;
+        // SAFETY: store_path is a live C string for the duration of the call.
+        let ptr = unsafe { cbm_sys::cbm_mcp_server_new(store_path.as_ptr()) };
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_SERVER_INIT",
+                    "cbm_mcp_server_new returned NULL",
+                    "Check store path permissions and CBM startup diagnostics.",
+                )
+            })?,
+            owner: thread::current().id(),
+            _not_send_or_sync: PhantomData,
+        })
+    }
+
+    pub fn handle_tool(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Result<ToolResponse, BridgeError> {
+        self.ensure_owner_thread()?;
+        let tool_name = CString::new(tool_name)?;
+        let args_json = CString::new(args_json)?;
+        // SAFETY: server pointer is owned by self and thread-affine; C strings
+        // outlive the call; the returned heap string is freed by CStringAllocation.
+        let raw = unsafe {
+            let ptr = cbm_sys::cbm_mcp_handle_tool(
+                self.ptr.as_ptr(),
+                tool_name.as_ptr(),
+                args_json.as_ptr(),
+            );
+            take_c_string(ptr)?
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            BridgeError::new(
+                ErrorEnvelope::new(
+                    "ASTRO_CBM_INTERNAL",
+                    format!("CBM returned invalid JSON: {err}"),
+                    "Capture the raw tool response and inspect CBM output formatting.",
+                )
+                .with_stderr(raw.clone()),
+            )
+        })?;
+        if value
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(tool_error(&value, &raw));
+        }
+        Ok(ToolResponse {
+            raw_json: raw,
+            value,
+        })
+    }
+
+    fn ensure_owner_thread(&self) -> Result<(), BridgeError> {
+        if thread::current().id() == self.owner {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_CBM_THREAD_AFFINITY",
+                "CbmToolRunner used from a different thread than the creating thread",
+                "Create one CbmToolRunner per thread; do not share cbm_mcp_server_t across threads.",
+            ))
+        }
+    }
+}
+
+impl Drop for CbmToolRunner {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the cbm_mcp_server_t pointer.
+        unsafe {
+            cbm_sys::cbm_mcp_server_free(self.ptr.as_ptr());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolResponse {
+    pub raw_json: String,
+    pub value: serde_json::Value,
+}
+
+fn tool_error(value: &serde_json::Value, raw: &str) -> BridgeError {
+    let message = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("CBM tool returned isError=true");
+    BridgeError::new(
+        ErrorEnvelope::new(
+            "ASTRO_CBM_TOOL_ERROR",
+            message,
+            "Inspect the tool arguments and retry with a valid indexed project/context.",
+        )
+        .with_stderr(raw.to_string()),
+    )
+}
+
+struct CStringAllocation(NonNull<c_char>);
+
+impl Drop for CStringAllocation {
+    fn drop(&mut self) {
+        // SAFETY: CBM documents these heap strings as caller-free with C free().
+        unsafe {
+            libc::free(self.0.as_ptr().cast());
+        }
+    }
+}
+
+unsafe fn take_c_string(ptr: *mut c_char) -> Result<String, BridgeError> {
+    let allocation = CStringAllocation(NonNull::new(ptr).ok_or_else(|| {
+        envelope(
+            "ASTRO_CBM_NULL_RESULT",
+            "CBM returned NULL for a heap string result",
+            "Inspect CBM diagnostics; this is an FFI contract failure.",
+        )
+    })?);
+    // SAFETY: allocation points at a NUL-terminated C string until Drop.
+    let bytes = unsafe { CStr::from_ptr(allocation.0.as_ptr()) }
+        .to_bytes()
+        .to_vec();
+    Ok(String::from_utf8(bytes)?)
+}
+
+unsafe fn array_slice<'a, T>(
+    items: *mut T,
+    count: c_int,
+    label: &str,
+) -> Result<&'a [T], BridgeError> {
+    if count < 0 {
+        return Err(internal(format!("negative {label} count {count}")));
+    }
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if items.is_null() {
+        return Err(internal(format!(
+            "{label} count was positive but pointer was NULL"
+        )));
+    }
+    // SAFETY: caller ties the returned slice to a live CBMFileResult owner.
+    Ok(unsafe { std::slice::from_raw_parts(items, count as usize) })
 }
 
 #[cfg(test)]
@@ -18,5 +803,113 @@ mod tests {
         let (calyx, cbm) = parent_roots();
         assert!(calyx.ends_with("vendor/calyx"));
         assert!(cbm.ends_with("vendor/codebase-memory-mcp"));
+    }
+
+    #[test]
+    fn extracts_fixture_with_owned_accessors() {
+        let file = ExtractedFile::extract(
+            include_str!("../../cbm-sys/fixtures/simple.c"),
+            Language::C,
+            "astrolabe_fixture",
+            "src/simple.c",
+            0,
+        )
+        .unwrap();
+
+        let defs = file.definitions().unwrap();
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[0].name, "src/simple.c");
+        assert_eq!(defs[0].qualified_name, "astrolabe_fixture.src.simple");
+        assert_eq!(defs[0].label, "Module");
+        assert_eq!(defs[0].start_line, 1);
+        assert_eq!(defs[0].end_line, 8);
+        assert_eq!(defs[1].name, "helper");
+        assert_eq!(
+            defs[1].qualified_name,
+            "astrolabe_fixture.src.simple.helper"
+        );
+        assert_eq!(defs[1].start_line, 1);
+        assert_eq!(defs[1].end_line, 3);
+        assert_eq!(defs[2].name, "add");
+        assert_eq!(defs[2].qualified_name, "astrolabe_fixture.src.simple.add");
+        assert_eq!(defs[2].start_line, 5);
+        assert_eq!(defs[2].end_line, 7);
+
+        let calls = file.calls().unwrap();
+        assert!(calls.iter().any(|call| call.callee_name == "helper"));
+        assert!(file.imports().unwrap().is_empty());
+        let _ = file.usages().unwrap();
+        let _ = file.read_writes().unwrap();
+        let _ = file.throws().unwrap();
+        let _ = file.type_refs().unwrap();
+        let _ = file.channels().unwrap();
+        assert!(file.routes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_use_drop_extracted_file_repeatedly() {
+        for _ in 0..1000 {
+            let file = ExtractedFile::extract(
+                include_str!("../../cbm-sys/fixtures/simple.c"),
+                Language::C,
+                "astrolabe_fixture",
+                "src/simple.c",
+                0,
+            )
+            .unwrap();
+            assert_eq!(file.definitions().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn maps_documented_status_codes() {
+        assert!(map_cbm_status(cbm_sys::CBM_STORE_OK as i32).is_ok());
+        assert_eq!(
+            map_cbm_status(cbm_sys::CBM_STORE_ERR)
+                .unwrap_err()
+                .envelope()
+                .code,
+            "ASTRO_CBM_STATUS_ERR"
+        );
+        assert_eq!(
+            map_cbm_status(cbm_sys::CBM_STORE_NOT_FOUND)
+                .unwrap_err()
+                .envelope()
+                .code,
+            "ASTRO_CBM_NOT_FOUND"
+        );
+        let unknown = map_cbm_status(-444).unwrap_err();
+        assert_eq!(unknown.envelope().code, "ASTRO_CBM_INTERNAL");
+        assert!(unknown.envelope().stderr.is_some());
+    }
+
+    #[test]
+    fn panic_callback_is_mapped_without_unwinding() {
+        let err = catch_unwind_to_envelope(|| panic!("boom")).unwrap_err();
+        assert_eq!(err.envelope().code, "ASTRO_FFI_CALLBACK_PANIC");
+        assert_eq!(
+            guard_ffi_callback(|| Err(envelope("ASTRO_TEST", "no", "fix"))),
+            CALLBACK_ERROR
+        );
+        assert_eq!(guard_ffi_callback(|| panic!("boom")), CALLBACK_PANIC);
+        assert_eq!(guard_ffi_callback(|| Ok(())), CALLBACK_OK);
+    }
+
+    #[test]
+    fn tool_runner_maps_is_error_envelope() {
+        let runner = CbmToolRunner::new(":memory:").unwrap();
+        let err = runner.handle_tool("not_a_tool", "{}").unwrap_err();
+        assert_eq!(err.envelope().code, "ASTRO_CBM_TOOL_ERROR");
+        assert!(err.envelope().message.contains("unknown tool"));
+        assert!(err.envelope().stderr.is_some());
+    }
+
+    #[test]
+    fn tool_runner_create_use_drop_repeatedly() {
+        for _ in 0..1000 {
+            let runner = CbmToolRunner::new(":memory:").unwrap();
+            let err = runner.handle_tool("not_a_tool", "{}").unwrap_err();
+            assert_eq!(err.envelope().code, "ASTRO_CBM_TOOL_ERROR");
+        }
     }
 }

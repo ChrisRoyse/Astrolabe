@@ -156,6 +156,54 @@ run_cbm_sys_asan() {
   fi
 }
 
+run_astrolabe_bridge_asan() {
+  local name="astrolabe-bridge-asan-$LABEL"
+  local log="$LOG_DIR/${name//[^A-Za-z0-9_.-]/_}.log"
+
+  echo "=== $name ==="
+  set +e
+  {
+    env CC=clang CXX=clang++ CBM_SYS_ASAN=1 \
+      cargo test -p astrolabe-bridge --lib --target "$TARGET_TRIPLE" --no-run ||
+      exit $?
+
+    local test_dir="$ROOT/target/$TARGET_TRIPLE/debug/deps"
+    local test_bin
+    test_bin="$(
+      find "$test_dir" -maxdepth 1 -type f -name 'astrolabe_bridge-*' -perm -u+x -printf '%T@ %p\n' |
+        sort -n |
+        tail -n 1 |
+        cut -d' ' -f2-
+    )"
+    if [[ -z "$test_bin" ]]; then
+      echo "ERROR: astrolabe-bridge ASan test binary not found in $test_dir" >&2
+      exit 1
+    fi
+
+    local asan_lib
+    asan_lib="$(clang -print-file-name=libasan.so)"
+    if [[ -z "$asan_lib" || ! -f "$asan_lib" ]]; then
+      echo "ERROR: clang did not resolve libasan.so" >&2
+      exit 1
+    fi
+
+    env \
+      LD_PRELOAD="$asan_lib" \
+      ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=1:halt_on_error=1:abort_on_error=1 \
+      LSAN_OPTIONS=exitcode=23 \
+      "$test_bin" \
+      create_use_drop_extracted_file_repeatedly \
+      tool_runner_create_use_drop_repeatedly \
+      --nocapture
+  } 2>&1 | tee "$log"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "ERROR: $name failed; log: $log" >&2
+    exit "$rc"
+  fi
+}
+
 cd "$ROOT"
 run_logged "astrolabe-fmt-$LABEL" cargo fmt --check --all
 run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets --target "$TARGET_TRIPLE" -- -D warnings
@@ -163,6 +211,7 @@ run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace --t
 run_logged "libcbm-symbols-$LABEL" bash scripts/check-libcbm-symbols.sh
 if [[ "$TARGET_TRIPLE" == *linux-gnu ]]; then
   run_cbm_sys_asan
+  run_astrolabe_bridge_asan
 fi
 run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc --target "$TARGET_TRIPLE"
 
