@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod graph_projection;
 mod ledger_verify;
 mod registry;
 mod sqlite_import;
 
+pub use graph_projection::{
+    ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
+    GraphProjectionCsr, GraphProjectionCsrEdge, GraphProjectionKind,
+    GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
+    ensure_graph_projection_csr, graph_projection_csr_rows, materialize_graph_projection,
+    materialize_graph_projections, read_graph_projection_csr,
+};
 pub use ledger_verify::{VerifyChainReport, verify_chain, verify_chain_vault_path};
 pub use registry::{
     ASTRO_SERIES_REGISTRY_PREFIX, ASTRO_VERIFY_DEEP_FAILED, DeepVerifyReport, GitRenameStatus,

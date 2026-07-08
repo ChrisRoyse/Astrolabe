@@ -34,10 +34,10 @@ const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump w
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
-const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
+pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v1";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
-const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
+pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
@@ -252,21 +252,21 @@ struct StructuralNodeRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct EdgeGraphRow {
-    schema: String,
-    project: String,
-    sqlite_edge_id: i64,
-    source_node_id: i64,
-    target_node_id: i64,
-    src: CxId,
-    dst: CxId,
-    edge_type: String,
-    etype: u16,
-    local_name_gen: String,
-    weight: f32,
-    props: Value,
-    provenance: LedgerRef,
-    commit: String,
+pub(crate) struct EdgeGraphRow {
+    pub(crate) schema: String,
+    pub(crate) project: String,
+    pub(crate) sqlite_edge_id: i64,
+    pub(crate) source_node_id: i64,
+    pub(crate) target_node_id: i64,
+    pub(crate) src: CxId,
+    pub(crate) dst: CxId,
+    pub(crate) edge_type: String,
+    pub(crate) etype: u16,
+    pub(crate) local_name_gen: String,
+    pub(crate) weight: f32,
+    pub(crate) props: Value,
+    pub(crate) provenance: LedgerRef,
+    pub(crate) commit: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1567,7 +1567,7 @@ fn graph_key(prefix: &[u8], project: &str, node_id: i64) -> IngestResult<Vec<u8>
     Ok(key)
 }
 
-fn edge_graph_key(
+pub(crate) fn edge_graph_key(
     src: CxId,
     dst: CxId,
     kind: EdgeKind,

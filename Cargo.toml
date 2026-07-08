@@ -21,3 +21,4 @@ cbm-sys = { path = "crates/cbm-sys" }
 calyx-aster = { path = "vendor/calyx/crates/calyx-aster" }
 calyx-core = { path = "vendor/calyx/crates/calyx-core" }
 calyx-ledger = { path = "vendor/calyx/crates/calyx-ledger" }
+calyx-paths = { path = "vendor/calyx/crates/calyx-paths" }
