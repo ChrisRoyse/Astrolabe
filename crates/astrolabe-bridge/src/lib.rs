@@ -19,6 +19,103 @@ pub fn parent_roots() -> (&'static str, &'static str) {
     )
 }
 
+pub fn route_cbm_logs_to_tracing() {
+    cbm_sys::initialize_allocator_bindings_first();
+    // SAFETY: the callback is a static extern function and remains valid for
+    // the process lifetime. CBM stores only the function pointer.
+    unsafe {
+        cbm_sys::cbm_log_init_from_env();
+        cbm_sys::cbm_log_set_sink_ex(
+            Some(cbm_log_tracing_sink),
+            cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
+        );
+    }
+}
+
+pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let binary_path = binary_path.map(CString::new).transpose()?;
+
+    // SAFETY: all called CBM startup functions are process-global initializers
+    // intended for main() startup. The optional binary path C string is live for
+    // the duration of the call; CBM copies it internally.
+    unsafe {
+        cbm_sys::cbm_log_init_from_env();
+        cbm_sys::cbm_index_supervisor_mark_host();
+        cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
+
+        let info = cbm_sys::cbm_system_info();
+        let ram_fraction = cbm_sys::cbm_mem_ram_fraction_for_total(info.total_ram);
+        cbm_sys::cbm_mem_init(ram_fraction);
+
+        if let Some(binary_path) = binary_path.as_ref() {
+            cbm_sys::cbm_http_server_set_binary_path(binary_path.as_ptr());
+        }
+    }
+
+    Ok(())
+}
+
+pub struct CbmIndexWorkerRole {
+    _response_out: Option<CString>,
+}
+
+impl CbmIndexWorkerRole {
+    pub fn activate(response_out: Option<&str>) -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
+        let response_out = response_out.map(CString::new).transpose()?;
+        // SAFETY: CBM copies response_out into process-global worker state.
+        unsafe {
+            cbm_sys::cbm_index_set_worker_role(
+                true,
+                response_out
+                    .as_ref()
+                    .map_or(ptr::null(), |path| path.as_ptr()),
+            );
+        }
+        Ok(Self {
+            _response_out: response_out,
+        })
+    }
+}
+
+impl Drop for CbmIndexWorkerRole {
+    fn drop(&mut self) {
+        // SAFETY: resetting the process-global worker role has no preconditions.
+        unsafe {
+            cbm_sys::cbm_index_set_worker_role(false, ptr::null());
+        }
+    }
+}
+
+unsafe extern "C" fn cbm_log_tracing_sink(line: *const c_char) {
+    if line.is_null() {
+        return;
+    }
+    // SAFETY: CBM calls the sink with a NUL-terminated line valid for the call.
+    let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
+    if line.starts_with("level=error") {
+        tracing::error!(target: "cbm", "{line}");
+    } else if line.starts_with("level=warn") {
+        tracing::warn!(target: "cbm", "{line}");
+    } else if line.starts_with("level=debug") {
+        tracing::debug!(target: "cbm", "{line}");
+    } else {
+        tracing::info!(target: "cbm", "{line}");
+    }
+}
+
+#[cfg(unix)]
+pub fn parent_process_id() -> Option<u32> {
+    // SAFETY: getppid has no preconditions and does not write through pointers.
+    Some(unsafe { libc::getppid() as u32 })
+}
+
+#[cfg(not(unix))]
+pub fn parent_process_id() -> Option<u32> {
+    None
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ErrorEnvelope {
     pub code: String,
@@ -645,11 +742,20 @@ pub struct CbmToolRunner {
 }
 
 impl CbmToolRunner {
+    pub fn new_default() -> Result<Self, BridgeError> {
+        Self::from_store_path_ptr(ptr::null())
+    }
+
     pub fn new(store_path: &str) -> Result<Self, BridgeError> {
-        cbm_sys::initialize_allocator_bindings_first();
         let store_path = CString::new(store_path)?;
-        // SAFETY: store_path is a live C string for the duration of the call.
-        let ptr = unsafe { cbm_sys::cbm_mcp_server_new(store_path.as_ptr()) };
+        Self::from_store_path_ptr(store_path.as_ptr())
+    }
+
+    fn from_store_path_ptr(store_path: *const c_char) -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
+        // SAFETY: store_path is either NULL (CBM default store path) or a live
+        // C string for the duration of the call.
+        let ptr = unsafe { cbm_sys::cbm_mcp_server_new(store_path) };
         Ok(Self {
             ptr: NonNull::new(ptr).ok_or_else(|| {
                 envelope(
@@ -663,24 +769,39 @@ impl CbmToolRunner {
         })
     }
 
-    pub fn handle_tool(
-        &self,
-        tool_name: &str,
-        args_json: &str,
-    ) -> Result<ToolResponse, BridgeError> {
+    pub fn handle_jsonrpc_raw(&self, request_json: &str) -> Result<Option<String>, BridgeError> {
+        self.ensure_owner_thread()?;
+        let request_json = CString::new(request_json)?;
+        // SAFETY: server pointer is owned by self and thread-affine; request_json
+        // is live for the call. NULL response means notification/no response.
+        unsafe {
+            let ptr = cbm_sys::cbm_mcp_server_handle(self.ptr.as_ptr(), request_json.as_ptr());
+            take_optional_c_string(ptr)
+        }
+    }
+
+    pub fn handle_tool_raw(&self, tool_name: &str, args_json: &str) -> Result<String, BridgeError> {
         self.ensure_owner_thread()?;
         let tool_name = CString::new(tool_name)?;
         let args_json = CString::new(args_json)?;
         // SAFETY: server pointer is owned by self and thread-affine; C strings
         // outlive the call; the returned heap string is freed by CStringAllocation.
-        let raw = unsafe {
+        unsafe {
             let ptr = cbm_sys::cbm_mcp_handle_tool(
                 self.ptr.as_ptr(),
                 tool_name.as_ptr(),
                 args_json.as_ptr(),
             );
-            take_c_string(ptr)?
-        };
+            take_c_string(ptr)
+        }
+    }
+
+    pub fn handle_tool(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Result<ToolResponse, BridgeError> {
+        let raw = self.handle_tool_raw(tool_name, args_json)?;
         let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
             BridgeError::new(
                 ErrorEnvelope::new(
@@ -774,6 +895,14 @@ unsafe fn take_c_string(ptr: *mut c_char) -> Result<String, BridgeError> {
         .to_bytes()
         .to_vec();
     Ok(String::from_utf8(bytes)?)
+}
+
+unsafe fn take_optional_c_string(ptr: *mut c_char) -> Result<Option<String>, BridgeError> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: caller received this pointer from a CBM heap-string API.
+    unsafe { take_c_string(ptr) }.map(Some)
 }
 
 unsafe fn array_slice<'a, T>(

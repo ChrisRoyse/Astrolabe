@@ -224,10 +224,10 @@ fn read_mimalloc_version(header: &Path) -> String {
     });
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("#define MI_MALLOC_VERSION") {
-            if let Some(version) = rest.split_whitespace().next() {
-                return version.to_string();
-            }
+        if let Some(rest) = line.strip_prefix("#define MI_MALLOC_VERSION")
+            && let Some(version) = rest.split_whitespace().next()
+        {
+            return version.to_string();
         }
     }
     panic!(

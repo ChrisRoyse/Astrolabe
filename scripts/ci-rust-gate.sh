@@ -210,6 +210,10 @@ run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets --ta
 run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace --target "$TARGET_TRIPLE"
 run_logged "libcbm-symbols-$LABEL" bash scripts/check-libcbm-symbols.sh
 run_logged "single-mimalloc-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-single-mimalloc.sh
+run_logged "mcp-parity-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-mcp-parity.sh
+if [[ "$TARGET_TRIPLE" != *windows* ]]; then
+  run_logged "astrolabe-watchdog-$LABEL" bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/$TARGET_TRIPLE/debug/astrolabe"
+fi
 if [[ "$TARGET_TRIPLE" == *linux-gnu ]]; then
   run_cbm_sys_asan
   run_astrolabe_bridge_asan

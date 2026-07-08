@@ -38,7 +38,7 @@ fn extracts_c_fixture_against_golden() {
         let defs = (*result).defs;
         let actual = std::slice::from_raw_parts(defs.items, defs.count as usize)
             .iter()
-            .map(|def| definition_to_expected(def))
+            .map(definition_to_expected)
             .collect::<Vec<_>>();
 
         cbm_free_result(result);

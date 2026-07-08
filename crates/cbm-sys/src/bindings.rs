@@ -1311,6 +1311,162 @@ unsafe extern "C" {
         count: ::std::os::raw::c_int,
     );
 }
+pub const CBMLogLevel_CBM_LOG_DEBUG: CBMLogLevel = 0;
+pub const CBMLogLevel_CBM_LOG_INFO: CBMLogLevel = 1;
+pub const CBMLogLevel_CBM_LOG_WARN: CBMLogLevel = 2;
+pub const CBMLogLevel_CBM_LOG_ERROR: CBMLogLevel = 3;
+pub const CBMLogLevel_CBM_LOG_NONE: CBMLogLevel = 4;
+pub type CBMLogLevel = ::std::os::raw::c_uint;
+pub const CBMLogFormat_CBM_LOG_FORMAT_TEXT: CBMLogFormat = 0;
+pub const CBMLogFormat_CBM_LOG_FORMAT_JSON: CBMLogFormat = 1;
+pub type CBMLogFormat = ::std::os::raw::c_uint;
+pub const CBMLogSinkMode_CBM_LOG_SINK_REPLACE: CBMLogSinkMode = 0;
+pub const CBMLogSinkMode_CBM_LOG_SINK_TEE: CBMLogSinkMode = 1;
+pub type CBMLogSinkMode = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn cbm_log_init_from_env();
+}
+unsafe extern "C" {
+    pub fn cbm_log_set_level(level: CBMLogLevel);
+}
+unsafe extern "C" {
+    pub fn cbm_log_get_level() -> CBMLogLevel;
+}
+unsafe extern "C" {
+    pub fn cbm_log_set_format(format: CBMLogFormat);
+}
+unsafe extern "C" {
+    pub fn cbm_log_get_format() -> CBMLogFormat;
+}
+unsafe extern "C" {
+    pub fn cbm_log(level: CBMLogLevel, msg: *const ::std::os::raw::c_char, ...);
+}
+unsafe extern "C" {
+    pub fn cbm_log_int(
+        level: CBMLogLevel,
+        msg: *const ::std::os::raw::c_char,
+        key: *const ::std::os::raw::c_char,
+        value: i64,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_log_mcp_request(
+        method: *const ::std::os::raw::c_char,
+        tool_name: *const ::std::os::raw::c_char,
+        is_error: bool,
+        duration_us: i64,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_log_http_request(
+        component: *const ::std::os::raw::c_char,
+        method: *const ::std::os::raw::c_char,
+        path: *const ::std::os::raw::c_char,
+        status: ::std::os::raw::c_int,
+        duration_ms: i64,
+        request_bytes: usize,
+        response_bytes: usize,
+    );
+}
+pub type cbm_log_sink_fn =
+    ::std::option::Option<unsafe extern "C" fn(line: *const ::std::os::raw::c_char)>;
+unsafe extern "C" {
+    pub fn cbm_log_set_sink(fn_: cbm_log_sink_fn);
+}
+unsafe extern "C" {
+    pub fn cbm_log_set_sink_ex(fn_: cbm_log_sink_fn, mode: CBMLogSinkMode);
+}
+unsafe extern "C" {
+    pub fn cbm_mem_ram_fraction_for_total(total_ram_bytes: usize) -> f64;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_init(ram_fraction: f64);
+}
+unsafe extern "C" {
+    pub fn cbm_mem_rss() -> usize;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_peak_rss() -> usize;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_budget() -> usize;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_set_budget_for_tests(bytes: usize);
+}
+unsafe extern "C" {
+    pub fn cbm_mem_over_budget() -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_worker_budget(num_workers: ::std::os::raw::c_int) -> usize;
+}
+unsafe extern "C" {
+    pub fn cbm_mem_collect();
+}
+unsafe extern "C" {
+    pub fn cbm_mmap_read(
+        path: *const ::std::os::raw::c_char,
+        out_size: *mut usize,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn cbm_munmap(addr: *mut ::std::os::raw::c_void, size: usize);
+}
+unsafe extern "C" {
+    pub fn cbm_now_ns() -> u64;
+}
+unsafe extern "C" {
+    pub fn cbm_now_ms() -> u64;
+}
+unsafe extern "C" {
+    pub fn cbm_nprocs() -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct cbm_system_info_t {
+    pub total_cores: ::std::os::raw::c_int,
+    pub perf_cores: ::std::os::raw::c_int,
+    pub total_ram: usize,
+}
+unsafe extern "C" {
+    pub fn cbm_system_info() -> cbm_system_info_t;
+}
+unsafe extern "C" {
+    pub fn cbm_default_worker_count(initial: bool) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_safe_getenv(
+        name: *const ::std::os::raw::c_char,
+        buf: *mut ::std::os::raw::c_char,
+        buf_sz: usize,
+        fallback: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_get_home_dir() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_app_config_dir() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_app_local_dir() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_resolve_cache_dir() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_file_exists(path: *const ::std::os::raw::c_char) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_is_dir(path: *const ::std::os::raw::c_char) -> bool;
+}
+unsafe extern "C" {
+    pub fn cbm_file_size(path: *const ::std::os::raw::c_char) -> i64;
+}
+unsafe extern "C" {
+    pub fn cbm_normalize_path_sep(path: *mut ::std::os::raw::c_char)
+    -> *mut ::std::os::raw::c_char;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_git_context_t {
@@ -3014,6 +3170,18 @@ unsafe extern "C" {
         s: *mut cbm_store_t,
         sql: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_cli_set_version(ver: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_index_set_worker_role(is_worker: bool, response_out: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_index_supervisor_mark_host();
+}
+unsafe extern "C" {
+    pub fn cbm_http_server_set_binary_path(path: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {
     pub fn cbm_mimalloc_malloc(size: usize) -> *mut ::std::os::raw::c_void;

@@ -14,10 +14,18 @@
 
 #include "cbm.h"
 #include "discover/discover.h"
+#include "foundation/log.h"
+#include "foundation/mem.h"
+#include "foundation/platform.h"
 #include "git/git_context.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
+
+CBM_API void cbm_cli_set_version(const char *ver);
+CBM_API void cbm_index_set_worker_role(bool is_worker, const char *response_out);
+CBM_API void cbm_index_supervisor_mark_host(void);
+CBM_API void cbm_http_server_set_binary_path(const char *path);
 
 CBM_API void *cbm_mimalloc_malloc(size_t size);
 CBM_API void *cbm_mimalloc_malloc_aligned(size_t size, size_t alignment);
