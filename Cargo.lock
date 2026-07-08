@@ -170,6 +170,7 @@ dependencies = [
  "astrolabe-bridge",
  "astrolabe-domain",
  "astrolabe-ingest",
+ "astrolabe-lower",
  "astrolabe-panel",
  "calyx-aster",
  "calyx-core",

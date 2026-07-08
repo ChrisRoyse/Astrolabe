@@ -1,12 +1,16 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use astrolabe_bridge::CbmToolRunner;
 use astrolabe_ingest::{SqliteImportOptions, import_sqlite_to_vault, verify_chain};
+use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AbsentReason, SlotVector, VaultId};
+use calyx_core::{AbsentReason, Clock, SlotVector, VaultId};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +20,11 @@ use crate::DynError;
 const CONFIG_KEY_PREFIX: &str = "astrolabe.calyx.";
 const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
+const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
+const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
+const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
+const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -50,6 +59,13 @@ struct ShadowImportOutcome {
     vault_salt: String,
     sqlite_path: PathBuf,
     sqlite_fingerprint_sha256: String,
+    lowered_sqlite_path: PathBuf,
+    lowered_artifact_sha256: String,
+    lowered_vault_fingerprint_sha256: String,
+    lowered_manifest_seq: u64,
+    lowered_nodes: usize,
+    lowered_edges: usize,
+    lowered_skipped_edges: usize,
     sqlite_nodes: usize,
     sqlite_edges: usize,
     constellation_inputs: usize,
@@ -60,7 +76,7 @@ struct ShadowImportOutcome {
     edge_rows_written: usize,
     cx_id_set_sha256: String,
     ledger_seq: u64,
-    ledger_rows_after: usize,
+    ledger_rows_after: u64,
     verify_chain_status: String,
 }
 
@@ -247,11 +263,15 @@ fn ensure_shadow_import_current(project: &str) -> Result<(), DynError> {
     let configured_vault_dir = read_config_value(&cache_dir, &metadata_key(project, "vault_dir"))?
         .map(PathBuf::from)
         .unwrap_or_else(|| vault_dir(&cache_dir, project));
+    let configured_lowered_path =
+        read_config_value(&cache_dir, &metadata_key(project, "lowered_sqlite_path"))?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| lowered_sqlite_path(&cache_dir, project));
     let verify_intact = configured_vault_dir.exists()
         && astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)
             .map(|report| report.is_intact())
             .unwrap_or(false);
-    if fingerprint.is_some() && verify_intact {
+    if fingerprint.is_some() && verify_intact && configured_lowered_path.exists() {
         return Ok(());
     }
 
@@ -288,10 +308,12 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
     )
     .with_available_slots(std::iter::empty());
     let report = import_sqlite_to_vault(&sqlite_path, &vault, &ShadowSlotRuntime, &options)?;
+    let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
+    let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
     let verify = verify_chain(&vault)?;
     if !verify.is_intact() {
         return Err(format!(
-            "shadow vault ledger verification failed after import: {}",
+            "shadow vault ledger verification failed after import/lower: {}",
             verify.status
         )
         .into());
@@ -303,6 +325,13 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
         vault_salt,
         sqlite_path,
         sqlite_fingerprint_sha256: hex_lower(&report.sqlite_fingerprint_sha256),
+        lowered_sqlite_path,
+        lowered_artifact_sha256: lower_report.artifact_sha256,
+        lowered_vault_fingerprint_sha256: lower_report.vault_fingerprint_sha256,
+        lowered_manifest_seq: lower_report.manifest_seq,
+        lowered_nodes: lower_report.node_count,
+        lowered_edges: lower_report.edge_count,
+        lowered_skipped_edges: lower_report.skipped_edges,
         sqlite_nodes: report.sqlite_nodes,
         sqlite_edges: report.sqlite_edges,
         constellation_inputs: report.constellation_inputs,
@@ -312,10 +341,91 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
         graph_rows_written: report.graph_rows_written,
         edge_rows_written: report.edge_rows_written,
         cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
-        ledger_seq: report.ledger_seq,
-        ledger_rows_after: report.ledger_rows_after,
+        ledger_seq: lower_report.manifest_seq,
+        ledger_rows_after: verify.ledger_rows,
         verify_chain_status: verify.status,
     })
+}
+
+fn lower_shadow_sqlite<C>(
+    cache_dir: &Path,
+    project: &str,
+    vault: &AsterVault<C>,
+) -> Result<astrolabe_lower::LoweredSqliteReport, DynError>
+where
+    C: Clock,
+{
+    with_lowered_sqlite_lock(cache_dir, project, || {
+        lower_cbm_sqlite(
+            vault,
+            lowered_sqlite_path(cache_dir, project),
+            &LowerSqliteOptions::new(project),
+        )
+        .map_err(Into::into)
+    })
+}
+
+fn with_lowered_sqlite_lock<T>(
+    cache_dir: &Path,
+    project: &str,
+    work: impl FnOnce() -> Result<T, DynError>,
+) -> Result<T, DynError> {
+    let lock_path = lowered_sqlite_lock_path(cache_dir, project);
+    let started = Instant::now();
+    let mut work = Some(work);
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(lock) => {
+                drop(lock);
+                let result = work.take().expect("lowered sqlite lock work runs once")();
+                let cleanup = fs::remove_file(&lock_path);
+                if let Err(error) = cleanup
+                    && result.is_ok()
+                {
+                    return Err(error.into());
+                }
+                return result;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if remove_stale_lowered_sqlite_lock(&lock_path)? {
+                    continue;
+                }
+                if started.elapsed() >= LOWERED_SQLITE_LOCK_TIMEOUT {
+                    return Err(format!(
+                        "timed out waiting for lowered SQLite lock: {}",
+                        lock_path.display()
+                    )
+                    .into());
+                }
+                thread::sleep(LOWERED_SQLITE_LOCK_POLL);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn remove_stale_lowered_sqlite_lock(lock_path: &Path) -> Result<bool, DynError> {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return Ok(false);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+    let Ok(age) = modified.elapsed() else {
+        return Ok(false);
+    };
+    if age < LOWERED_SQLITE_LOCK_STALE_AFTER {
+        return Ok(false);
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
@@ -333,6 +443,15 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
             "cx_id_set_sha256": outcome.cx_id_set_sha256,
         },
         "sqlite_path": outcome.sqlite_path,
+        "lowered_sqlite": lowered_summary(
+            &outcome.lowered_sqlite_path,
+            Some(&outcome.lowered_artifact_sha256),
+            Some(&outcome.lowered_vault_fingerprint_sha256),
+            Some(outcome.lowered_manifest_seq),
+            Some(outcome.lowered_nodes),
+            Some(outcome.lowered_edges),
+            Some(outcome.lowered_skipped_edges),
+        ),
         "vault_dir": outcome.vault_dir,
         "vault_id": outcome.vault_id,
         "vault_salt": outcome.vault_salt,
@@ -341,7 +460,11 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "verify_chain": outcome.verify_chain_status,
         "panel_version": DEFAULT_PANEL_VERSION,
         "panel_runtime": "lens_unavailable",
-        "stores": stores_summary(&outcome.sqlite_path, &outcome.vault_dir),
+        "stores": stores_summary(
+            &outcome.sqlite_path,
+            &outcome.vault_dir,
+            Some(&outcome.lowered_sqlite_path),
+        ),
     })
 }
 
@@ -351,6 +474,10 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     let configured_vault_dir = read_config_value(&cache_dir, &metadata_key(project, "vault_dir"))?
         .map(PathBuf::from)
         .unwrap_or_else(|| vault_dir(&cache_dir, project));
+    let lowered_path =
+        read_config_value(&cache_dir, &metadata_key(project, "lowered_sqlite_path"))?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| lowered_sqlite_path(&cache_dir, project));
     let fingerprint = read_config_value(&cache_dir, &metadata_key(project, "vault_fingerprint"))?;
     let ledger_seq = read_config_value(&cache_dir, &metadata_key(project, "ledger_seq"))?
         .and_then(|value| value.parse::<u64>().ok());
@@ -388,7 +515,20 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
             "edge_rows_written": edge_rows_written,
             "cx_id_set_sha256": read_config_value(&cache_dir, &metadata_key(project, "cx_id_set_sha256"))?,
         },
-        "stores": stores_summary(&sqlite_path, &configured_vault_dir),
+        "lowered_sqlite": lowered_summary(
+            &lowered_path,
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_vault_fingerprint_sha256"))?.as_ref(),
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_manifest_seq"))?
+                .and_then(|value| value.parse::<u64>().ok()),
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_nodes"))?
+                .and_then(|value| value.parse::<usize>().ok()),
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_edges"))?
+                .and_then(|value| value.parse::<usize>().ok()),
+            read_config_value(&cache_dir, &metadata_key(project, "lowered_skipped_edges"))?
+                .and_then(|value| value.parse::<usize>().ok()),
+        ),
+        "stores": stores_summary(&sqlite_path, &configured_vault_dir, Some(&lowered_path)),
         "vault": {
             "dir": configured_vault_dir,
             "id": read_config_value(&cache_dir, &metadata_key(project, "vault_id"))?
@@ -401,19 +541,62 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     }))
 }
 
-fn stores_summary(sqlite_path: &Path, vault_dir: &Path) -> Value {
+fn lowered_summary(
+    path: &Path,
+    artifact_sha256: Option<&String>,
+    vault_fingerprint_sha256: Option<&String>,
+    manifest_seq: Option<u64>,
+    nodes: Option<usize>,
+    edges: Option<usize>,
+    skipped_edges: Option<usize>,
+) -> Value {
     json!({
-        "sqlite": {
+        "writer": "astrolabe",
+        "path": path,
+        "exists": path.exists(),
+        "artifact_sha256": artifact_sha256,
+        "vault_fingerprint_sha256": vault_fingerprint_sha256,
+        "manifest_seq": manifest_seq,
+        "nodes": nodes,
+        "edges": edges,
+        "skipped_edges": skipped_edges,
+        "serves_legacy_tools": false,
+    })
+}
+
+fn stores_summary(
+    sqlite_path: &Path,
+    vault_dir: &Path,
+    lowered_sqlite_path: Option<&Path>,
+) -> Value {
+    let mut stores = Map::new();
+    stores.insert(
+        "sqlite".to_string(),
+        json!({
             "writer": "codebase-memory-mcp",
             "path": sqlite_path,
             "serves_legacy_tools": true,
-        },
-        "vault": {
+        }),
+    );
+    stores.insert(
+        "vault".to_string(),
+        json!({
             "writer": "astrolabe",
             "path": vault_dir,
             "serves_legacy_tools": false,
-        },
-    })
+        }),
+    );
+    if let Some(path) = lowered_sqlite_path {
+        stores.insert(
+            "lowered_sqlite".to_string(),
+            json!({
+                "writer": "astrolabe",
+                "path": path,
+                "serves_legacy_tools": false,
+            }),
+        );
+    }
+    Value::Object(stores)
 }
 
 fn augment_tool_result(result: &str, additions: Value) -> Result<String, DynError> {
@@ -550,6 +733,28 @@ fn persist_shadow_outcome(project: &str, outcome: &ShadowImportOutcome) -> Resul
         ("vault_salt", outcome.vault_salt.clone()),
         ("sqlite_path", outcome.sqlite_path.display().to_string()),
         (
+            "lowered_sqlite_path",
+            outcome.lowered_sqlite_path.display().to_string(),
+        ),
+        (
+            "lowered_artifact_sha256",
+            outcome.lowered_artifact_sha256.clone(),
+        ),
+        (
+            "lowered_vault_fingerprint_sha256",
+            outcome.lowered_vault_fingerprint_sha256.clone(),
+        ),
+        (
+            "lowered_manifest_seq",
+            outcome.lowered_manifest_seq.to_string(),
+        ),
+        ("lowered_nodes", outcome.lowered_nodes.to_string()),
+        ("lowered_edges", outcome.lowered_edges.to_string()),
+        (
+            "lowered_skipped_edges",
+            outcome.lowered_skipped_edges.to_string(),
+        ),
+        (
             "vault_fingerprint",
             outcome.sqlite_fingerprint_sha256.clone(),
         ),
@@ -611,6 +816,14 @@ fn metadata_key(project: &str, key: &str) -> String {
 
 fn sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}.db"))
+}
+
+fn lowered_sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
+    cache_dir.join(format!("{project}{LOWERED_SQLITE_SUFFIX}"))
+}
+
+fn lowered_sqlite_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
+    cache_dir.join(format!("{project}{LOWERED_SQLITE_LOCK_SUFFIX}"))
 }
 
 fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
@@ -699,6 +912,19 @@ mod tests {
         let text_value: Value = serde_json::from_str(text).unwrap();
         assert_eq!(text_value["calyx"], "shadow");
         assert_eq!(text_value["vault_fingerprint"], "abc123");
+    }
+
+    #[test]
+    fn stores_summary_labels_lowered_sqlite_as_astrolabe_sidecar() {
+        let stores = stores_summary(
+            Path::new("/cache/demo.db"),
+            Path::new("/cache/demo.astrolabe-vault"),
+            Some(Path::new("/cache/demo.astrolabe-lowered.db")),
+        );
+        assert_eq!(stores["sqlite"]["writer"], "codebase-memory-mcp");
+        assert_eq!(stores["sqlite"]["serves_legacy_tools"], true);
+        assert_eq!(stores["lowered_sqlite"]["writer"], "astrolabe");
+        assert_eq!(stores["lowered_sqlite"]["serves_legacy_tools"], false);
     }
 
     #[test]

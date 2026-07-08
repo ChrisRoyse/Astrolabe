@@ -16,6 +16,7 @@ publish = false
 [workspace.dependencies]
 astrolabe-domain = { path = "crates/astrolabe-domain" }
 astrolabe-ingest = { path = "crates/astrolabe-ingest" }
+astrolabe-lower = { path = "crates/astrolabe-lower" }
 astrolabe-panel = { path = "crates/astrolabe-panel" }
 cbm-sys = { path = "crates/cbm-sys" }
 calyx-aster = { path = "vendor/calyx/crates/calyx-aster" }

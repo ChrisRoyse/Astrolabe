@@ -230,16 +230,20 @@ def main():
             raise SystemExit(f"deep verify failed after concurrent load: {deep}")
         if deep["sqlite_constellation_rows"] < 1 or deep["ledger_payload_rows"] < 1:
             raise SystemExit(f"deep verify did not observe imported vault rows: {deep}")
+        lowered = stable["structuredContent"].get("lowered_sqlite", {})
+        if lowered.get("exists") is not True:
+            raise SystemExit(f"lowered SQLite sidecar missing after concurrent load: {lowered}")
 
         summary = {
             "schema": "astrolabe-cross-process-vault-v1",
             "status": "verified",
             "project": PROJECT,
             "processes": 2,
-            "semantics": "concurrent shadow recovery/import processes complete; Aster durable commits serialize through locks/durable.commit.lock",
+            "semantics": "concurrent shadow recovery/import processes complete; Aster durable commits serialize through locks/durable.commit.lock and lowered SQLite sidecars through .astrolabe-lowered.lock",
             "first_status": first_payload["structuredContent"].get("vault", {}).get("verify_chain"),
             "second_status": second_payload["structuredContent"].get("vault", {}).get("verify_chain"),
             "stable_status": stable["structuredContent"].get("vault", {}).get("verify_chain"),
+            "lowered_sqlite": lowered,
             "deep_verify": deep,
             "legacy_search_total": search.get("total"),
             "upstream": str(upstream),

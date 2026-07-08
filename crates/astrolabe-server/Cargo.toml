@@ -10,6 +10,7 @@ publish.workspace = true
 astrolabe-bridge = { path = "../astrolabe-bridge" }
 astrolabe-domain.workspace = true
 astrolabe-ingest.workspace = true
+astrolabe-lower.workspace = true
 astrolabe-panel.workspace = true
 calyx-aster.workspace = true
 calyx-core.workspace = true

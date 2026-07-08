@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -241,6 +242,83 @@ def compare_fts(native_db, shadow_db, divergences):
         divergences.append({"kind": "fts", "field": "f23"})
 
 
+def sha256_file(path):
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def astro_meta(path):
+    rows = sqlite_rows(
+        path,
+        "SELECT schema, vault_fingerprint, ledger_head_hash, panel_version, lowered_at "
+        "FROM astro_meta",
+    )
+    if len(rows) != 1:
+        raise SystemExit(f"expected exactly one astro_meta row in {path}, got {len(rows)}")
+    row = rows[0]
+    return {
+        "schema": row[0],
+        "vault_fingerprint": row[1],
+        "ledger_head_hash": row[2],
+        "panel_version": row[3],
+        "lowered_at": row[4],
+    }
+
+
+def compare_lowered_artifact(native_db, lowered_db, divergences):
+    native_schema = schema_rows(native_db)
+    lowered_schema = [
+        row for row in schema_rows(lowered_db) if row[1] != "astro_meta"
+    ]
+    if native_schema != lowered_schema:
+        divergences.append({"kind": "lowered_schema", "field": "sqlite_master"})
+
+    local = []
+    compare_nodes(native_db, lowered_db, local)
+    compare_edges(native_db, lowered_db, local)
+    compare_fts(native_db, lowered_db, local)
+    for divergence in local:
+        prefixed = dict(divergence)
+        prefixed["kind"] = f"lowered_{divergence['kind']}"
+        divergences.append(prefixed)
+
+
+def validate_lowered_summary(name, summary, expected_nodes, expected_edges, divergences):
+    if not isinstance(summary, dict):
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.missing"})
+        return None
+    path = Path(summary.get("path", ""))
+    if not path.exists():
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.path_exists"})
+        return path
+    if summary.get("exists") is not True:
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.exists"})
+    if summary.get("nodes") != expected_nodes:
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.nodes"})
+    if summary.get("edges") != expected_edges:
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.edges"})
+    artifact = summary.get("artifact_sha256")
+    if artifact != sha256_file(path):
+        divergences.append(
+            {"kind": "lowered_sqlite", "field": f"{name}.artifact_sha256"}
+        )
+    meta = astro_meta(path)
+    if meta["schema"] != "astrolabe-astro-meta-v1":
+        divergences.append({"kind": "lowered_sqlite", "field": f"{name}.astro_meta.schema"})
+    if summary.get("vault_fingerprint_sha256") != meta["vault_fingerprint"]:
+        divergences.append(
+            {"kind": "lowered_sqlite", "field": f"{name}.astro_meta.vault_fingerprint"}
+        )
+    if not meta["ledger_head_hash"]:
+        divergences.append(
+            {"kind": "lowered_sqlite", "field": f"{name}.astro_meta.ledger_head_hash"}
+        )
+    return path
+
+
 def compare_search(upstream, astrolabe, native_cache, shadow_cache, divergences):
     args = {"project": PROJECT, "label": "Function", "name_pattern": "f23", "limit": 10}
     native = structured(upstream, native_cache, "search_graph", args)
@@ -370,6 +448,12 @@ def main():
             "index_repository",
             {"repo_path": str(repo), "mode": "fast", "name": PROJECT, "calyx": "shadow"},
         )
+        status_content = structured(
+            astrolabe,
+            shadow_cache,
+            "index_status",
+            {"project": PROJECT},
+        )
 
         native_db = native_cache / f"{PROJECT}.db"
         shadow_db = shadow_cache / f"{PROJECT}.db"
@@ -385,11 +469,30 @@ def main():
         compare_fts(native_db, shadow_db, divergences)
         overlap = compare_search(upstream, astrolabe, native_cache, shadow_cache, divergences)
 
-        unwhitelisted = [div for div in divergences if not is_whitelisted(div, whitelist)]
         first_grounding = first["grounding_summary"]
         second_grounding = second["grounding_summary"]
         first_idem = first_grounding["idempotency"]
         second_idem = second_grounding["idempotency"]
+        first_lowered = first_grounding.get("lowered_sqlite")
+        second_lowered = second_grounding.get("lowered_sqlite")
+        status_lowered = status_content.get("lowered_sqlite")
+        if not isinstance(first_lowered, dict):
+            divergences.append({"kind": "lowered_sqlite", "field": "first.missing"})
+        second_lowered_path = validate_lowered_summary(
+            "second", second_lowered, node_count, edge_count, divergences
+        )
+        validate_lowered_summary(
+            "status", status_lowered, node_count, edge_count, divergences
+        )
+        if second_lowered and status_lowered:
+            if second_lowered.get("artifact_sha256") != status_lowered.get("artifact_sha256"):
+                divergences.append(
+                    {"kind": "lowered_sqlite", "field": "status_artifact_sha256"}
+                )
+        if second_lowered_path is not None:
+            compare_lowered_artifact(native_db, second_lowered_path, divergences)
+
+        unwhitelisted = [div for div in divergences if not is_whitelisted(div, whitelist)]
         if first_idem["new_cx_ids"] <= 0:
             unwhitelisted.append({"kind": "idempotency", "field": "first.new_cx_ids"})
         if second_idem["new_cx_ids"] != 0:
@@ -422,6 +525,11 @@ def main():
             "unwhitelisted": unwhitelisted,
             "injected_fault_qn": injected_qn,
             "idempotency": {"first": first_idem, "second": second_idem},
+            "lowered_sqlite": {
+                "first": first_lowered,
+                "second": second_lowered,
+                "status": status_lowered,
+            },
             "deep_verify": deep,
             "upstream": str(upstream),
             "astrolabe": str(astrolabe),
