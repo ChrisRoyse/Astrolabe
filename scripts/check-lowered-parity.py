@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -64,6 +69,40 @@ def build_upstream():
         built = build_dir / "codebase-memory-mcp"
     if not built.exists():
         raise SystemExit(f"upstream build did not produce {built}")
+    return built
+
+
+def default_ui_binary():
+    exe = ".exe" if os.name == "nt" else ""
+    candidates = [
+        ROOT / "target" / "cbm-ui-smoke" / f"codebase-memory-mcp{exe}",
+        ROOT / "target" / "cbm-ui-smoke" / "codebase-memory-mcp",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def build_ui_binary():
+    exe = ".exe" if os.name == "nt" else ""
+    run(
+        [
+            "make",
+            "-C",
+            ROOT / "vendor" / "codebase-memory-mcp",
+            "-f",
+            "Makefile.cbm",
+            "BUILD_DIR=../../target/cbm-ui-smoke",
+            "cbm-with-ui",
+        ],
+        timeout=900,
+    )
+    built = ROOT / "target" / "cbm-ui-smoke" / f"codebase-memory-mcp{exe}"
+    if not built.exists():
+        built = ROOT / "target" / "cbm-ui-smoke" / "codebase-memory-mcp"
+    if not built.exists():
+        raise SystemExit(f"UI build did not produce {built}")
     return built
 
 
@@ -128,15 +167,117 @@ def assert_equal(label, left, right):
         raise SystemExit(1)
 
 
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def http_get_text(url, timeout=2):
+    req = urllib.request.Request(url, headers={"Host": "127.0.0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(f"{url} returned HTTP {response.status}")
+        return response.read().decode("utf-8", errors="replace")
+
+
+def http_get_json(url, timeout=2):
+    return json.loads(http_get_text(url, timeout=timeout))
+
+
+def wait_for_http(proc, url, parser):
+    deadline = time.monotonic() + 20
+    last_error = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise SystemExit(f"UI server exited early with code {proc.returncode}")
+        try:
+            return parser(url)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise SystemExit(f"UI server did not serve {url}: {last_error}")
+
+
+def run_ui_smoke(binary, cache):
+    port = free_port()
+    env = base_env(cache)
+    proc = subprocess.Popen(
+        [str(binary), "--ui=true", f"--port={port}"],
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        root_url = f"http://127.0.0.1:{port}/"
+        index_html = wait_for_http(proc, root_url, http_get_text)
+        if "<html" not in index_html.lower() or "assets/" not in index_html:
+            raise SystemExit("UI root did not return embedded frontend HTML")
+
+        project = urllib.parse.quote(PROJECT)
+        layout_url = f"http://127.0.0.1:{port}/api/layout?project={project}&max_nodes=50"
+        layout = wait_for_http(proc, layout_url, http_get_json)
+        nodes = layout.get("nodes")
+        edges = layout.get("edges")
+        if not isinstance(nodes, list) or len(nodes) < 20:
+            raise SystemExit(f"UI layout returned too few nodes: {layout}")
+        if not isinstance(edges, list) or not edges:
+            raise SystemExit(f"UI layout returned no edges: {layout}")
+
+        names = {node.get("name") for node in nodes if isinstance(node, dict)}
+        if "f23" not in names or "main" not in names:
+            raise SystemExit(f"UI layout missed expected functions: {sorted(names)}")
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise SystemExit(f"UI layout node is not an object: {node}")
+            for axis in ["x", "y", "z"]:
+                value = node.get(axis)
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise SystemExit(f"UI layout node has invalid {axis}: {node}")
+
+        return {
+            "binary": str(binary),
+            "port": port,
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "total_nodes": layout.get("total_nodes"),
+            "status": "verified",
+        }
+    finally:
+        if proc.poll() is None:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream", type=Path)
+    parser.add_argument("--ui-smoke", action="store_true")
+    parser.add_argument("--ui-binary", type=Path)
+    parser.add_argument("--build-ui", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     args = parser.parse_args()
 
     upstream = args.upstream or default_upstream() or build_upstream()
     if not upstream.exists():
         raise SystemExit(f"missing upstream binary: {upstream}")
+    ui_binary = None
+    if args.ui_smoke:
+        ui_binary = args.ui_binary or default_ui_binary()
+        if args.build_ui or ui_binary is None:
+            ui_binary = build_ui_binary()
+        if not ui_binary.exists():
+            raise SystemExit(f"missing UI binary: {ui_binary}")
 
     tmp = Path(tempfile.mkdtemp(prefix="astrolabe-lowered-parity-"))
     try:
@@ -239,18 +380,19 @@ def main():
         if architecture.get("total_nodes", 0) != len(native_nodes):
             raise SystemExit(f"get_architecture total_nodes mismatch: {architecture}")
 
+        ui = run_ui_smoke(ui_binary, lowered_cache) if ui_binary else None
+        summary = {
+            "schema": "astrolabe-lowered-parity-v1",
+            "status": "verified",
+            "project": PROJECT,
+            "nodes": len(native_nodes),
+            "edges": len(sqlite_rows(native_db, edge_sql)),
+            "upstream": str(upstream),
+        }
+        if ui is not None:
+            summary["ui"] = ui
         print(
-            json.dumps(
-                {
-                    "schema": "astrolabe-lowered-parity-v1",
-                    "status": "verified",
-                    "project": PROJECT,
-                    "nodes": len(native_nodes),
-                    "edges": len(sqlite_rows(native_db, edge_sql)),
-                    "upstream": str(upstream),
-                },
-                sort_keys=True,
-            )
+            json.dumps(summary, sort_keys=True)
         )
     finally:
         if args.keep_temp:
