@@ -304,6 +304,7 @@ mod tests {
     use calyx_aster::vault::{AsterVault, VaultOptions};
     use calyx_core::{FixedClock, VaultId};
     use calyx_ledger::{ActorId, EntryKind, SubjectId};
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
@@ -312,6 +313,8 @@ mod tests {
     use super::*;
 
     const CRASH_FSV_KEY: &[u8] = b"astrolabe:crash-fsv:v1";
+    const CONCURRENT_PARENT_WRITES: usize = 16;
+    const CONCURRENT_CHILD_WRITES: usize = 16;
 
     #[test]
     fn verify_chain_reports_intact_and_exact_broken_seq() {
@@ -550,6 +553,89 @@ mod tests {
     }
 
     #[test]
+    fn durable_vault_concurrent_open_serializes_cross_process_writes() {
+        let root = test_dir("concurrent-open");
+        let vault_dir = root.join("vault");
+        let ready = root.join("child.ready");
+        let go = root.join("child.go");
+        fs::create_dir_all(&root).expect("create concurrent-open FSV root");
+
+        let parent_vault = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-concurrent-open",
+            VaultOptions::default(),
+        )
+        .expect("open parent durable vault");
+        append_marker_entry(&parent_vault, "parent-baseline");
+        parent_vault.flush().expect("flush baseline");
+
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("ledger_verify::tests::concurrent_open_child_process")
+            .arg("--nocapture")
+            .env("ASTROLABE_CONCURRENT_OPEN_CHILD", "1")
+            .env("ASTROLABE_CONCURRENT_OPEN_VAULT", &vault_dir)
+            .env("ASTROLABE_CONCURRENT_OPEN_READY", &ready)
+            .env("ASTROLABE_CONCURRENT_OPEN_GO", &go)
+            .spawn()
+            .expect("spawn concurrent-open child");
+
+        wait_for_marker_or_child_exit(&ready, &mut child);
+        fs::write(&go, b"go").expect("release concurrent-open child");
+
+        for index in 0..CONCURRENT_PARENT_WRITES {
+            append_marker_entry(&parent_vault, &format!("parent-{index:02}"));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let output = child
+            .wait_with_output()
+            .expect("wait for concurrent-open child");
+        assert!(
+            output.status.success(),
+            "concurrent-open child failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        append_marker_entry(&parent_vault, "parent-after-child");
+        parent_vault
+            .flush()
+            .expect("flush cross-process ledger rows");
+        drop(parent_vault);
+
+        let expected_count = 2 + CONCURRENT_PARENT_WRITES + CONCURRENT_CHILD_WRITES;
+        let chain = verify_chain_vault_path(&vault_dir).expect("verify physical concurrent chain");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows, expected_count as u64);
+        assert_eq!(chain.count, expected_count as u64);
+
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-concurrent-open",
+            VaultOptions::default(),
+        )
+        .expect("reopen concurrent vault");
+        let markers = ledger_markers(&reopened);
+        assert_eq!(markers.len(), expected_count);
+        assert!(markers.contains("parent-baseline"));
+        assert!(markers.contains("parent-after-child"));
+        for index in 0..CONCURRENT_PARENT_WRITES {
+            assert!(markers.contains(&format!("parent-{index:02}")));
+        }
+        for index in 0..CONCURRENT_CHILD_WRITES {
+            assert!(markers.contains(&format!("child-{index:02}")));
+        }
+
+        drop(reopened);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     #[ignore = "child process helper for kill_after_wal_append_reopens_with_both_data_and_ledger"]
     fn crash_after_wal_append_child() {
         if std::env::var_os("ASTROLABE_CRASH_FSV_CHILD").is_none() {
@@ -580,6 +666,39 @@ mod tests {
         panic!("crash FSV failpoint did not pause");
     }
 
+    #[test]
+    #[ignore = "child process helper for durable_vault_concurrent_open_serializes_cross_process_writes"]
+    fn concurrent_open_child_process() {
+        if std::env::var_os("ASTROLABE_CONCURRENT_OPEN_CHILD").is_none() {
+            return;
+        }
+        let vault_dir = PathBuf::from(
+            std::env::var_os("ASTROLABE_CONCURRENT_OPEN_VAULT")
+                .expect("ASTROLABE_CONCURRENT_OPEN_VAULT"),
+        );
+        let ready = PathBuf::from(
+            std::env::var_os("ASTROLABE_CONCURRENT_OPEN_READY")
+                .expect("ASTROLABE_CONCURRENT_OPEN_READY"),
+        );
+        let go = PathBuf::from(
+            std::env::var_os("ASTROLABE_CONCURRENT_OPEN_GO").expect("ASTROLABE_CONCURRENT_OPEN_GO"),
+        );
+        let child_vault = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-concurrent-open",
+            VaultOptions::default(),
+        )
+        .expect("open child durable vault");
+        fs::write(&ready, b"ready").expect("write child ready marker");
+        wait_for_file(&go, "concurrent-open go marker");
+        for index in 0..CONCURRENT_CHILD_WRITES {
+            append_marker_entry(&child_vault, &format!("child-{index:02}"));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        child_vault.flush().expect("flush child durable vault");
+    }
+
     fn vault() -> AsterVault<FixedClock> {
         AsterVault::with_clock(vault_id(), b"ledger-verify-test", FixedClock::new(42))
     }
@@ -596,6 +715,50 @@ mod tests {
                 ActorId::Service("astrolabe-test".to_string()),
             )
             .expect("append ledger entry");
+    }
+
+    fn append_marker_entry<C>(vault: &AsterVault<C>, marker: &str)
+    where
+        C: Clock,
+    {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "astrolabe-concurrent-open-v1",
+            "marker": marker,
+        }))
+        .expect("encode concurrent-open marker payload");
+        vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Query(marker.as_bytes().to_vec()),
+                payload,
+                ActorId::Service("astrolabe-concurrent-open-test".to_string()),
+            )
+            .expect("append concurrent-open marker entry");
+    }
+
+    fn ledger_markers<C>(vault: &AsterVault<C>) -> BTreeSet<String>
+    where
+        C: Clock,
+    {
+        vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan Ledger CF")
+            .into_iter()
+            .filter_map(|(_, bytes)| {
+                let entry = decode(&bytes).expect("decode Ledger CF row");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&entry.payload).expect("decode ledger payload JSON");
+                (value.get("schema").and_then(serde_json::Value::as_str)
+                    == Some("astrolabe-concurrent-open-v1"))
+                .then(|| {
+                    value
+                        .get("marker")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("marker string")
+                        .to_string()
+                })
+            })
+            .collect()
     }
 
     fn vault_id() -> VaultId {
@@ -685,5 +848,16 @@ mod tests {
             "timed out waiting for crash FSV marker {}",
             marker.display()
         );
+    }
+
+    fn wait_for_file(path: &Path, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {label}: {}", path.display());
     }
 }
