@@ -41,10 +41,13 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
-    anomaly_report_artifact_bytes, detect_anomalies,
+    anomaly_report_artifact_bytes, detect_anomalies, recover_reactive_state,
 };
+use calyx_aster::cf::ColumnFamily;
+use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AbsentReason, Clock, SlotVector, VaultId};
+use calyx_core::{AbsentReason, Clock, SlotVector, VaultId, VaultStore};
+use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -66,6 +69,8 @@ const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
 const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
 const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
+const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
+const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -233,6 +238,7 @@ pub fn handle_tool_raw(
         "get_architecture" => handle_get_architecture(runner, args_json),
         "detect_anomalies" => handle_detect_anomalies(args_json),
         "get_provenance" => handle_get_provenance(args_json),
+        "optimizer_status" => handle_optimizer_status(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -274,6 +280,7 @@ pub fn handle_jsonrpc_raw(
         && tool_name != "get_architecture"
         && tool_name != "detect_anomalies"
         && tool_name != "get_provenance"
+        && tool_name != "optimizer_status"
     {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
@@ -329,10 +336,11 @@ fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> 
     Ok(serde_json::to_string(&response)?)
 }
 
-fn astrolabe_tool_definitions() -> [Value; 2] {
+fn astrolabe_tool_definitions() -> [Value; 3] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
+        optimizer_status_tool_definition(),
     ]
 }
 
@@ -416,6 +424,43 @@ fn detect_anomalies_tool_definition() -> Value {
     })
 }
 
+fn optimizer_status_tool_definition() -> Value {
+    json!({
+        "name": "optimizer_status",
+        "title": "Optimizer Status",
+        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project. This surface currently reports status only; propose and trigger acknowledgement modes fail closed until the anneal pipeline is wired.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["status"],
+                    "description": "Only status is currently enabled."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
 fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
     match tool_name {
         "index_repository" => {
@@ -441,6 +486,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
         }
         "detect_anomalies" => Ok(true),
         "get_provenance" => Ok(true),
+        "optimizer_status" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -656,6 +702,34 @@ fn handle_get_provenance(args_json: &str) -> Result<String, DynError> {
         }
     };
     tool_json_result(provenance_response_json(&project, &response))
+}
+
+fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("optimizer_status arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("optimizer_status requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "optimizer_status requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let mode = string_arg(args_obj, "mode").unwrap_or("status");
+    if mode != "status" {
+        return tool_error_result(format!(
+            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {mode:?} is not available; remediation: use mode=\"status\" until anneal proposals and trigger acknowledgement are wired"
+        ));
+    }
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
+    tool_json_result(optimizer_status_json_at(
+        &cache_dir,
+        &project,
+        anneal_env.as_deref(),
+    )?)
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -3952,6 +4026,477 @@ fn prom_label_value(value: &str) -> String {
         .collect()
 }
 
+fn optimizer_status_json_at(
+    cache_dir: &Path,
+    project: &str,
+    astrolabe_anneal_env: Option<&str>,
+) -> Result<Value, DynError> {
+    let (vault_dir, vault_id, _vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    let ledger_head = read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?
+        .and_then(|value| value.parse::<u64>().ok());
+    let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
+        .and_then(|value| value.parse::<u64>().ok());
+    let verify_status = if vault_dir.exists() {
+        match astrolabe_ingest::verify_chain_vault_path(&vault_dir) {
+            Ok(report) => report.status,
+            Err(error) => format!("error:{error}"),
+        }
+    } else {
+        "missing".to_string()
+    };
+    let background_lane = background_lane_status_at(cache_dir, project)?;
+    let kill_switch = optimizer_kill_switch_json(astrolabe_anneal_env);
+    let global_freeze = kill_switch["global_freeze"].as_bool().unwrap_or(false);
+    let frozen_knobs = optimizer_freeze_status_json(cache_dir, project, global_freeze)?;
+    let recent_changes = optimizer_recent_changes_json(cache_dir, project);
+    let reactive_triggers = optimizer_reactive_triggers_json(cache_dir, project);
+    let status = if global_freeze { "frozen" } else { "inactive" };
+
+    Ok(json!({
+        "schema": OPTIMIZER_STATUS_SCHEMA,
+        "project": project,
+        "status": status,
+        "freshness": "fresh",
+        "trust": "provisional",
+        "reason": "anneal optimizer workers are not enabled in the current shadow stage",
+        "remediation": "use this surface as an operations readback; keep optimizer_status issue open until proposal, janitor, guard-profile, and trigger-ack paths are wired and FSV-tested",
+        "source_state": {
+            "vault_dir": vault_dir,
+            "vault_id": vault_id,
+            "vault_salt_source": metadata_key(project, "vault_salt"),
+            "chain_verify": verify_status,
+            "ledger_head": ledger_head,
+            "ledger_rows": ledger_rows,
+            "metadata_refs": [
+                metadata_key(project, "vault_dir"),
+                metadata_key(project, "vault_id"),
+                metadata_key(project, "vault_salt"),
+                metadata_key(project, "ledger_seq"),
+                metadata_key(project, "ledger_rows"),
+                metadata_key(project, "optimizer_freezes_json")
+            ],
+        },
+        "kill_switch": kill_switch,
+        "frozen_knobs": frozen_knobs,
+        "tripwires": optimizer_tripwires_json(),
+        "budget": optimizer_budget_json(&background_lane),
+        "recent_changes": recent_changes,
+        "pending_proposals": optimizer_pending_proposals_json(),
+        "guard_health": optimizer_guard_health_json(cache_dir, project)?,
+        "drift_alarms": optimizer_drift_alarms_json(),
+        "reactive_triggers": reactive_triggers,
+        "capabilities": {
+            "status": "enabled",
+            "propose": "not_enabled_in_shadow_stage",
+            "trigger_ack": "not_enabled_in_shadow_stage",
+            "janitor": "not_enabled_in_shadow_stage",
+        },
+    }))
+}
+
+fn shadow_vault_config_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<(PathBuf, String, String), DynError> {
+    let vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
+    let vault_id = read_config_value(cache_dir, &metadata_key(project, "vault_id"))?
+        .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
+    let vault_salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
+        .unwrap_or_else(|| vault_salt(project));
+    Ok((vault_dir, vault_id, vault_salt))
+}
+
+fn optimizer_kill_switch_json(astrolabe_anneal_env: Option<&str>) -> Value {
+    let global_freeze = astrolabe_anneal_env.is_some_and(|value| value.trim() == "0");
+    json!({
+        "env_var": "ASTRO_ANNEAL",
+        "source": "process_env",
+        "value": astrolabe_anneal_env,
+        "global_freeze": global_freeze,
+        "tuning_allowed_by_env": !global_freeze,
+        "freshness": "fresh",
+        "trust": "verified",
+        "remediation": if global_freeze {
+            Value::String("unset ASTRO_ANNEAL or set it to a non-zero value before allowing optimizer mutations".to_string())
+        } else {
+            Value::Null
+        },
+    })
+}
+
+fn optimizer_freeze_status_json(
+    cache_dir: &Path,
+    project: &str,
+    global_freeze: bool,
+) -> Result<Value, DynError> {
+    let key = metadata_key(project, "optimizer_freezes_json");
+    let raw = read_config_value(cache_dir, &key)?;
+    let mut knobs = Vec::<Value>::new();
+    let mut status = "read";
+    let mut trust = "verified";
+    let mut reason = Value::Null;
+
+    if let Some(raw) = raw {
+        match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Array(values)) => {
+                knobs = values;
+            }
+            Ok(other) => {
+                status = "invalid";
+                trust = "provisional";
+                reason = Value::String(format!(
+                    "optimizer_freezes_json must be an array, found {}",
+                    json_type_name(&other)
+                ));
+            }
+            Err(error) => {
+                status = "invalid";
+                trust = "provisional";
+                reason = Value::String(format!("stored optimizer_freezes_json invalid: {error}"));
+            }
+        }
+    }
+
+    let frozen_count = knobs.len();
+    Ok(json!({
+        "schema": "astrolabe.optimizer_freezes.v1",
+        "status": status,
+        "source": format!("config:{key}"),
+        "freshness": "fresh",
+        "trust": trust,
+        "global_freeze": global_freeze,
+        "knobs": knobs,
+        "frozen_count": frozen_count,
+        "reason": reason,
+        "remediation": if status == "invalid" {
+            Value::String("repair optimizer_freezes_json before allowing optimizer mutations".to_string())
+        } else if global_freeze {
+            Value::String("global ASTRO_ANNEAL=0 freeze blocks optimizer mutations even when no per-knob freeze is recorded".to_string())
+        } else {
+            Value::Null
+        },
+    }))
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn optimizer_tripwires_json() -> Value {
+    let states = [
+        "recall_at_k",
+        "guard_far",
+        "guard_frr",
+        "search_p99",
+        "ingest_p95",
+    ]
+    .into_iter()
+    .map(|name| {
+        json!({
+            "name": name,
+            "state": "not_armed",
+            "measured_value": Value::Null,
+            "threshold": Value::Null,
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "source": "anneal_engine:not_enabled_in_shadow_stage",
+            "remediation": "wire the anneal shadow-test gate and persist measured tripwire state before treating this tripwire as armed",
+        })
+    })
+    .collect::<Vec<_>>();
+
+    json!({
+        "status": "inactive",
+        "state_count": states.len(),
+        "states": states,
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+    })
+}
+
+fn optimizer_budget_json(background_lane: &Value) -> Value {
+    let anneal_active = background_lane
+        .get("lanes")
+        .and_then(|lanes| lanes.get("anneal"))
+        .and_then(|anneal| anneal.get("active"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json!({
+        "status": if anneal_active { "active" } else { "inactive" },
+        "source": "background_lane_lock",
+        "freshness": background_lane.get("freshness").and_then(Value::as_str).unwrap_or("fresh"),
+        "trust": background_lane.get("trust").and_then(Value::as_str).unwrap_or("provisional"),
+        "background_lane": background_lane,
+        "janitor": {
+            "status": "inactive",
+            "active": false,
+            "max_bytes_per_tick": Value::Null,
+            "bytes_cleaned_last_tick": Value::Null,
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "reason": "artifact janitor is not enabled in the current shadow stage",
+            "remediation": "wire a cooperative janitor tick with an instrumented byte budget before reporting a numeric cleanup limit",
+        },
+    })
+}
+
+fn optimizer_pending_proposals_json() -> Value {
+    json!({
+        "status": "unavailable",
+        "proposal_count": Value::Null,
+        "proposals": [],
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": "anneal proposal store is not enabled in the current shadow stage",
+        "remediation": "wire the P8.3 deficit-to-candidate proposal pipeline before serving optimizer proposals",
+    })
+}
+
+fn optimizer_guard_health_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let security_screen = read_security_screen_metadata(cache_dir, project)?;
+    Ok(json!({
+        "status": "unavailable",
+        "slot_count": Value::Null,
+        "slots": [],
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "source": "guard_profiles:not_persisted",
+        "security_screen_status": security_screen.get("status").cloned().unwrap_or(Value::Null),
+        "reason": "per-slot FAR/FRR/drift calibration profiles are not persisted in the current shadow metadata",
+        "remediation": "wire guard_calibrate profile storage and readback before reporting guard health as measured",
+    }))
+}
+
+fn optimizer_drift_alarms_json() -> Value {
+    json!({
+        "status": "unavailable",
+        "alarm_count": Value::Null,
+        "alarms": [],
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": "drift alarm rows are not yet stored as optimizer-visible state",
+        "remediation": "wire live xterm/assay/reactive drift rows before serving drift alarms from optimizer_status",
+    })
+}
+
+fn optimizer_recent_changes_json(cache_dir: &Path, project: &str) -> Value {
+    match optimizer_recent_changes_json_result(cache_dir, project) {
+        Ok(value) => value,
+        Err(error) => optimizer_unavailable_json(
+            "recent_changes",
+            &format!("ledger tail read failed: {error}"),
+            "repair or reindex the shadow vault, then retry optimizer_status",
+        ),
+    }
+}
+
+fn optimizer_recent_changes_json_result(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(optimizer_unavailable_json(
+            "recent_changes",
+            &format!("shadow vault dir missing: {}", vault_dir.display()),
+            "rerun index_repository with calyx=\"shadow\" before reading optimizer recent changes",
+        ));
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Ledger],
+    )?;
+    let snapshot = vault.snapshot();
+    let mut entries = Vec::new();
+    for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
+        let key_seq = parse_aster_ledger_seq(&key)?;
+        let entry = decode_ledger(&bytes)?;
+        if entry.seq != key_seq {
+            return Ok(optimizer_unavailable_json(
+                "recent_changes",
+                &format!(
+                    "ledger key seq {key_seq} does not match encoded seq {}",
+                    entry.seq
+                ),
+                "repair the Ledger CF before trusting optimizer recent changes",
+            ));
+        }
+        if !entry.verify() {
+            return Ok(optimizer_unavailable_json(
+                "recent_changes",
+                &format!("ledger entry {} failed hash verification", entry.seq),
+                "repair the Ledger CF before trusting optimizer recent changes",
+            ));
+        }
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.seq);
+    let total_rows = entries.len();
+    let mut tail = entries
+        .iter()
+        .rev()
+        .take(OPTIMIZER_RECENT_CHANGE_LIMIT)
+        .map(ledger_entry_status_json)
+        .collect::<Vec<_>>();
+    tail.reverse();
+    Ok(json!({
+        "status": "read",
+        "source": "AsterVault:ColumnFamily::Ledger",
+        "vault_dir": vault_dir,
+        "snapshot": snapshot,
+        "limit": OPTIMIZER_RECENT_CHANGE_LIMIT,
+        "ledger_rows_read": total_rows,
+        "entry_count": tail.len(),
+        "entries": tail,
+        "freshness": "fresh",
+        "trust": "verified",
+    }))
+}
+
+fn open_shadow_vault_read_only(
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    selected_cfs: Vec<ColumnFamily>,
+) -> Result<AsterVault, DynError> {
+    let vault_id = VaultId::from_str(vault_id)?;
+    let options = VaultOptions {
+        read_only: true,
+        restore_ledger_hook: false,
+        selected_cfs: Some(selected_cfs),
+        ..VaultOptions::default()
+    };
+    Ok(AsterVault::open(
+        vault_dir,
+        vault_id,
+        vault_salt.as_bytes().to_vec(),
+        options,
+    )?)
+}
+
+fn ledger_entry_status_json(entry: &calyx_ledger::LedgerEntry) -> Value {
+    json!({
+        "seq": entry.seq,
+        "kind": entry.kind.as_str(),
+        "subject": ledger_subject_json(&entry.subject),
+        "actor": ledger_actor_json(&entry.actor),
+        "ts": entry.ts,
+        "entry_hash": hex_lower(&entry.entry_hash),
+        "prev_hash": hex_lower(&entry.prev_hash),
+        "payload_sha256": hex_lower(&Sha256::digest(&entry.payload)),
+        "payload_bytes": entry.payload.len(),
+        "verified_hash": entry.verify(),
+    })
+}
+
+fn ledger_subject_json(subject: &SubjectId) -> Value {
+    match subject {
+        SubjectId::Cx(id) => json!({"kind": "cx", "id": id.to_string()}),
+        SubjectId::Lens(id) => json!({"kind": "lens", "id": id.to_string()}),
+        SubjectId::Kernel(bytes) => json!({"kind": "kernel", "id_hex": hex_lower(bytes)}),
+        SubjectId::Guard(bytes) => json!({"kind": "guard", "id_hex": hex_lower(bytes)}),
+        SubjectId::Query(bytes) => json!({"kind": "query", "id_hex": hex_lower(bytes)}),
+    }
+}
+
+fn ledger_actor_json(actor: &ActorId) -> Value {
+    match actor {
+        ActorId::Agent(value) => json!({"kind": "agent", "id": value}),
+        ActorId::Service(value) => json!({"kind": "service", "id": value}),
+        ActorId::System => json!({"kind": "system"}),
+    }
+}
+
+fn optimizer_reactive_triggers_json(cache_dir: &Path, project: &str) -> Value {
+    match optimizer_reactive_triggers_json_result(cache_dir, project) {
+        Ok(value) => value,
+        Err(error) => optimizer_unavailable_json(
+            "reactive_triggers",
+            &format!("reactive trigger recovery failed: {error}"),
+            "repair or rebuild reactive Ledger/CF rows before trusting optimizer reactive trigger status",
+        ),
+    }
+}
+
+fn optimizer_reactive_triggers_json_result(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(optimizer_unavailable_json(
+            "reactive_triggers",
+            &format!("shadow vault dir missing: {}", vault_dir.display()),
+            "rerun index_repository with calyx=\"shadow\" before reading reactive triggers",
+        ));
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Ledger, ColumnFamily::Reactive],
+    )?;
+    let state = recover_reactive_state(&vault)?;
+    let subscriptions = state
+        .subscriptions
+        .iter()
+        .map(|subscription| {
+            json!({
+                "subscription_id": subscription.subscription_id.to_string(),
+                "trigger_id": subscription.trigger_id.to_string(),
+                "condition": serde_json::to_value(&subscription.condition).unwrap_or(Value::Null),
+                "owner": subscription.owner.clone(),
+                "max_drain_buf": subscription.max_drain_buf,
+                "created_ledger_seq": subscription.created_ledger_seq,
+                "pending_count": subscription.pending_events.len(),
+                "overflowed": subscription.overflowed,
+                "pending_events": subscription.pending_events.iter()
+                    .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "status": "read",
+        "source": "AsterVault:ColumnFamily::Ledger+Reactive",
+        "vault_dir": vault_dir,
+        "subscription_count": state.subscriptions.len(),
+        "fired_event_count": state.fired_events.len(),
+        "unacknowledged_count": state.pending_event_count(),
+        "subscriptions": subscriptions,
+        "ack": {
+            "status": "not_enabled_in_shadow_stage",
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "remediation": "wire a durable acknowledgement ledger action before draining reactive triggers through optimizer_status",
+        },
+        "freshness": "fresh",
+        "trust": "verified",
+    }))
+}
+
+fn optimizer_unavailable_json(section: &str, reason: &str, remediation: &str) -> Value {
+    json!({
+        "status": "unavailable",
+        "section": section,
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": remediation,
+    })
+}
+
 fn vault_import_summary(source: &str, fallback_reason: Option<&str>) -> Value {
     let fallback_reason = fallback_reason.and_then(|reason| {
         let trimmed = reason.trim();
@@ -5470,6 +6015,71 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_status_reads_ledger_tail_and_labels_inactive_surfaces() {
+        let dir = temp_dir("optimizer-status-readback");
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"optimizer-status-readback".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        for seq in 0..18_u64 {
+            vault
+                .append_ledger_entry(
+                    calyx_ledger::EntryKind::Anneal,
+                    SubjectId::Query(format!("optimizer-change-{seq}").into_bytes()),
+                    format!(r#"{{"seq":{seq}}}"#).into_bytes(),
+                    ActorId::Service("astrolabe-test".to_string()),
+                )
+                .unwrap();
+        }
+        drop(vault);
+
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.vault_dir = vault_dir;
+        outcome.vault_salt = "optimizer-status-readback".to_string();
+        outcome.ledger_seq = 17;
+        outcome.ledger_rows_after = 18;
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let status = optimizer_status_json_at(&dir, "demo", Some("0")).unwrap();
+        assert_eq!(status["schema"], OPTIMIZER_STATUS_SCHEMA);
+        assert_eq!(status["status"], "frozen");
+        assert_eq!(status["kill_switch"]["global_freeze"], true);
+        assert_eq!(status["source_state"]["ledger_head"], 17);
+        assert_eq!(status["source_state"]["ledger_rows"], 18);
+        assert_eq!(status["recent_changes"]["status"], "read");
+        assert_eq!(status["recent_changes"]["ledger_rows_read"], 18);
+        assert_eq!(status["recent_changes"]["entry_count"], 16);
+        let entries = status["recent_changes"]["entries"].as_array().unwrap();
+        assert_eq!(entries.first().unwrap()["seq"], 2);
+        assert_eq!(entries.last().unwrap()["seq"], 17);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["kind"] == "anneal" && entry["verified_hash"] == true)
+        );
+        assert_eq!(status["budget"]["janitor"]["status"], "inactive");
+        assert_eq!(status["pending_proposals"]["status"], "unavailable");
+        assert_eq!(status["guard_health"]["status"], "unavailable");
+        assert_eq!(status["drift_alarms"]["status"], "unavailable");
+        assert_eq!(status["reactive_triggers"]["status"], "read");
+        assert_eq!(status["reactive_triggers"]["unacknowledged_count"], 0);
+        assert_eq!(status["tripwires"]["state_count"], 5);
+        assert!(
+            status["tripwires"]["states"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|state| state["state"] == "not_armed")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn background_lane_labels_owner_and_follower() {
         let owner = background_lane_owner_summary(Path::new("/cache/demo.lock"));
         assert_eq!(owner["schema"], "astrolabe-background-lane-v1");
@@ -5526,7 +6136,7 @@ mod tests {
             let first_tools = first_value["result"]["tools"].as_array().unwrap();
             assert!(!first_tools.iter().any(|tool| matches!(
                 tool["name"].as_str(),
-                Some("get_provenance" | "detect_anomalies")
+                Some("get_provenance" | "detect_anomalies" | "optimizer_status")
             )));
             let request = json!({
                 "jsonrpc": "2.0",
@@ -5570,6 +6180,16 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("ood_commit"))
+        );
+
+        let optimizer_status = tool_definition(tools, "optimizer_status");
+        assert_eq!(
+            optimizer_status["inputSchema"]["required"],
+            json!(["project"])
+        );
+        assert_eq!(
+            optimizer_status["inputSchema"]["properties"]["mode"]["enum"],
+            json!(["status"])
         );
     }
 
