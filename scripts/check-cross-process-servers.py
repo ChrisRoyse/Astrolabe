@@ -275,6 +275,56 @@ def assert_busy_label(content):
         raise SystemExit(f"busy response lacks lock path/remediation: {shadow}")
 
 
+def assert_background_lane_pair(contents, label):
+    lanes = []
+    for content in contents:
+        lane = content.get("background_lane")
+        if not isinstance(lane, dict):
+            raise SystemExit(f"{label} missing background_lane: {content}")
+        if lane.get("schema") != "astrolabe-background-lane-v1":
+            raise SystemExit(f"{label} background_lane schema drift: {lane}")
+        for lane_name in ["watcher", "anneal"]:
+            worker = lane.get("lanes", {}).get(lane_name)
+            if not isinstance(worker, dict):
+                raise SystemExit(f"{label} missing {lane_name} worker lane: {lane}")
+            if worker.get("active") is not False:
+                raise SystemExit(f"{label} shadow-stage {lane_name} worker must be inactive: {lane}")
+            if worker.get("activation") != "not_enabled_in_shadow_stage":
+                raise SystemExit(f"{label} {lane_name} activation label drift: {lane}")
+        lanes.append(lane)
+
+    owners = [lane for lane in lanes if lane.get("status") == "owner"]
+    followers = [lane for lane in lanes if lane.get("status") == "follower"]
+    if len(owners) != 1 or len(followers) != 1:
+        raise SystemExit(f"{label} expected exactly one background owner and one follower: {lanes}")
+
+    owner = owners[0]
+    if owner.get("owner") != "this-process":
+        raise SystemExit(f"{label} owner label drift: {owner}")
+    if owner.get("freshness") != "fresh" or owner.get("trust") != "verified":
+        raise SystemExit(f"{label} owner lacks verified/fresh labels: {owner}")
+    if owner.get("remediation") is not None:
+        raise SystemExit(f"{label} owner should not have remediation: {owner}")
+    if owner.get("lanes", {}).get("watcher", {}).get("eligible_owner") is not True:
+        raise SystemExit(f"{label} owner watcher lane is not marked eligible: {owner}")
+    if owner.get("lanes", {}).get("anneal", {}).get("eligible_owner") is not True:
+        raise SystemExit(f"{label} owner anneal lane is not marked eligible: {owner}")
+
+    follower = followers[0]
+    if follower.get("owner") != "another-process":
+        raise SystemExit(f"{label} follower label drift: {follower}")
+    if follower.get("freshness") != "stale_ok" or follower.get("trust") != "provisional":
+        raise SystemExit(f"{label} follower lacks provisional/stale_ok labels: {follower}")
+    if not follower.get("lock_path") or not follower.get("remediation"):
+        raise SystemExit(f"{label} follower lacks lock path/remediation: {follower}")
+    if follower.get("lanes", {}).get("watcher", {}).get("eligible_owner") is not False:
+        raise SystemExit(f"{label} follower watcher lane is not marked ineligible: {follower}")
+    if follower.get("lanes", {}).get("anneal", {}).get("eligible_owner") is not False:
+        raise SystemExit(f"{label} follower anneal lane is not marked ineligible: {follower}")
+
+    return {"owner": owner, "follower": follower}
+
+
 def deep_verify(astrolabe, cache):
     vault_dir = cache / f"{PROJECT}.astrolabe-vault"
     proc = run(
@@ -351,11 +401,21 @@ def main():
         for content in busy_responses:
             assert_busy_label(content)
 
-        stable = structured(first.call("index_status", {"project": PROJECT}))
-        if stable.get("vault", {}).get("verify_chain") != "intact":
-            raise SystemExit(f"stable server status did not verify intact vault: {stable}")
-        if stable.get("shadow_import", {}).get("status") != "current":
-            raise SystemExit(f"stable server status did not report current shadow import: {stable}")
+        initial_background_lanes = assert_background_lane_pair(
+            [first_content, second_content], "initial two-server status"
+        )
+
+        stable_first = structured(first.call("index_status", {"project": PROJECT}))
+        stable_second = structured(second.call("index_status", {"project": PROJECT}))
+        stable_background_lanes = assert_background_lane_pair(
+            [stable_first, stable_second], "stable two-server status"
+        )
+        if stable_first.get("vault", {}).get("verify_chain") != "intact":
+            raise SystemExit(f"stable server status did not verify intact vault: {stable_first}")
+        if stable_first.get("shadow_import", {}).get("status") != "current":
+            raise SystemExit(
+                f"stable server status did not report current shadow import: {stable_first}"
+            )
 
         search = structured(
             second.call(
@@ -387,8 +447,10 @@ def main():
             "busy_responses": len(busy_responses),
             "first_shadow_import": first_content.get("shadow_import"),
             "second_shadow_import": second_content.get("shadow_import"),
-            "stable_shadow_import": stable.get("shadow_import"),
-            "stable_verify_chain": stable.get("vault", {}).get("verify_chain"),
+            "initial_background_lanes": initial_background_lanes,
+            "stable_background_lanes": stable_background_lanes,
+            "stable_shadow_import": stable_first.get("shadow_import"),
+            "stable_verify_chain": stable_first.get("vault", {}).get("verify_chain"),
             "deep_verify": deep,
             "legacy_search_total": search.get("total"),
             "upstream": str(upstream),

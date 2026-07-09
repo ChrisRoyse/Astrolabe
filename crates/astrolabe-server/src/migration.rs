@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,7 @@ const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
 const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
+const BACKGROUND_LANE_LOCK_SUFFIX: &str = ".astrolabe-background-lane.lock";
 const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
@@ -96,6 +99,12 @@ enum ShadowRefreshStatus {
 struct ShadowImportLock {
     _file: fs::File,
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct BackgroundLaneOwner {
+    _file: fs::File,
+    _path: PathBuf,
 }
 
 impl Drop for ShadowImportLock {
@@ -407,6 +416,117 @@ fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{SHADOW_IMPORT_LOCK_SUFFIX}"))
 }
 
+fn background_lane_owners() -> &'static Mutex<BTreeMap<String, BackgroundLaneOwner>> {
+    static OWNERS: OnceLock<Mutex<BTreeMap<String, BackgroundLaneOwner>>> = OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn background_lane_status_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    fs::create_dir_all(cache_dir)?;
+    let lock_path = background_lane_lock_path(cache_dir, project);
+    let lock_key = lock_path.to_string_lossy().into_owned();
+    let mut owners = background_lane_owners()
+        .lock()
+        .map_err(|_| "background lane owner registry poisoned")?;
+    if owners.contains_key(&lock_key) {
+        return Ok(background_lane_owner_summary(&lock_path));
+    }
+
+    let mut lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {
+            lock.set_len(0)?;
+            writeln!(lock, "schema=astrolabe-background-lane-v1")?;
+            writeln!(lock, "project={project}")?;
+            writeln!(lock, "pid={}", std::process::id())?;
+            lock.sync_all()?;
+            owners.insert(
+                lock_key,
+                BackgroundLaneOwner {
+                    _file: lock,
+                    _path: lock_path.clone(),
+                },
+            );
+            Ok(background_lane_owner_summary(&lock_path))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(background_lane_follower_summary(&lock_path)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn background_lane_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
+    cache_dir.join(format!("{project}{BACKGROUND_LANE_LOCK_SUFFIX}"))
+}
+
+fn background_lane_owner_summary(lock_path: &Path) -> Value {
+    background_lane_summary(
+        "owner",
+        "this-process",
+        "fresh",
+        "verified",
+        lock_path,
+        true,
+    )
+}
+
+fn background_lane_follower_summary(lock_path: &Path) -> Value {
+    background_lane_summary(
+        "follower",
+        "another-process",
+        "stale_ok",
+        "provisional",
+        lock_path,
+        false,
+    )
+}
+
+fn background_lane_summary(
+    status: &str,
+    owner: &str,
+    freshness: &str,
+    trust: &str,
+    lock_path: &Path,
+    eligible_owner: bool,
+) -> Value {
+    json!({
+        "schema": "astrolabe-background-lane-v1",
+        "status": status,
+        "owner": owner,
+        "pid": if eligible_owner {
+            Value::from(u64::from(std::process::id()))
+        } else {
+            Value::Null
+        },
+        "lock_path": lock_path,
+        "freshness": freshness,
+        "trust": trust,
+        "single_owner": eligible_owner,
+        "remediation": if eligible_owner {
+            Value::Null
+        } else {
+            Value::String("use the elected owner process for vault-backed background work, or stop that process and retry".to_string())
+        },
+        "lanes": {
+            "watcher": background_lane_worker_summary(eligible_owner),
+            "anneal": background_lane_worker_summary(eligible_owner),
+        },
+    })
+}
+
+fn background_lane_worker_summary(eligible_owner: bool) -> Value {
+    json!({
+        "eligible_owner": eligible_owner,
+        "active": false,
+        "activation": "not_enabled_in_shadow_stage",
+        "trust": "verified",
+    })
+}
+
 fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     fs::create_dir_all(&cache_dir)?;
@@ -610,6 +730,7 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     } else {
         "missing".to_string()
     };
+    let background_lane = background_lane_status_at(&cache_dir, project)?;
 
     Ok(json!({
         "calyx": "shadow",
@@ -617,6 +738,7 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
         "vault_ledger_head": ledger_seq,
         "panel_version": panel_version,
         "shadow_import": shadow_import_current_summary(&verify_status, lowered_path.exists()),
+        "background_lane": background_lane,
         "idempotency": {
             "new_cx_ids": new_cx_ids,
             "reused_cx_ids": reused_cx_ids,
@@ -1147,6 +1269,34 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("retry index_status")
+        );
+    }
+
+    #[test]
+    fn background_lane_labels_owner_and_follower() {
+        let owner = background_lane_owner_summary(Path::new("/cache/demo.lock"));
+        assert_eq!(owner["schema"], "astrolabe-background-lane-v1");
+        assert_eq!(owner["status"], "owner");
+        assert_eq!(owner["owner"], "this-process");
+        assert_eq!(owner["freshness"], "fresh");
+        assert_eq!(owner["trust"], "verified");
+        assert_eq!(owner["lanes"]["watcher"]["eligible_owner"], true);
+        assert_eq!(owner["lanes"]["watcher"]["active"], false);
+        assert_eq!(owner["lanes"]["anneal"]["active"], false);
+        assert!(owner["remediation"].is_null());
+
+        let follower = background_lane_follower_summary(Path::new("/cache/demo.lock"));
+        assert_eq!(follower["status"], "follower");
+        assert_eq!(follower["owner"], "another-process");
+        assert_eq!(follower["freshness"], "stale_ok");
+        assert_eq!(follower["trust"], "provisional");
+        assert_eq!(follower["lanes"]["watcher"]["eligible_owner"], false);
+        assert_eq!(follower["lanes"]["watcher"]["active"], false);
+        assert!(
+            follower["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("elected owner")
         );
     }
 
