@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 astrolabe-bridge = { path = "../astrolabe-bridge" }
 astrolabe-domain.workspace = true
+astrolabe-guard = { path = "../astrolabe-guard" }
 astrolabe-ingest.workspace = true
 astrolabe-lower.workspace = true
 astrolabe-panel.workspace = true

@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "astrolabe-bridge",
  "astrolabe-domain",
+ "astrolabe-guard",
  "astrolabe-ingest",
  "astrolabe-lower",
  "astrolabe-panel",
