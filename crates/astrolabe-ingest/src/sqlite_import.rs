@@ -3151,8 +3151,10 @@ mod tests {
     };
     use astrolabe_panel::FixtureSlotRuntime;
     use calyx_aster::cf::{ledger_key, prefix_range};
+    use calyx_aster::erase::{EraseRegistry, EraseScope};
+    use calyx_aster::vault::{QuotaConfig, VaultContext, VaultOptions};
     use calyx_core::{CxId, FixedClock, VaultId};
-    use calyx_ledger::decode;
+    use calyx_ledger::{ErasureScope as LedgerErasureScope, decode, tombstone_from_entry};
 
     const TEST_VAULT_ID: &str = "00000000000000000000000000";
 
@@ -3173,6 +3175,27 @@ mod tests {
             "astrolabe-ingest-{name}-{}-{nanos}.db",
             std::process::id()
         ))
+    }
+
+    fn durable_vault(name: &str) -> (std::path::PathBuf, AsterVault<FixedClock>) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-ingest-{name}-{}-{nanos}.vault",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let vault = AsterVault::new_durable_with_clock(
+            &dir,
+            TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+            b"astrolabe-ingest-test".to_vec(),
+            VaultOptions::default(),
+            FixedClock::new(1_785_400_000),
+        )
+        .expect("open durable test vault");
+        (dir, vault)
     }
 
     fn create_db(path: &Path) -> Connection {
@@ -3945,6 +3968,100 @@ mod tests {
             ledger_row_count(&vault).expect("ledger count after"),
             before_ledger + 1
         );
+    }
+
+    #[test]
+    fn erasing_imported_cx_appends_tombstone_without_rewriting_ledger_history() {
+        let path = temp_db("erase-cx");
+        basic_fixture(&path);
+        let (vault_dir, vault) = durable_vault("erase-cx");
+        let report = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import sqlite");
+        let cx_id = report.cx_ids[0];
+
+        let before_ledger = cf_rows(&vault, ColumnFamily::Ledger);
+        assert_eq!(before_ledger.len(), 1);
+        let before_snapshot = vault.latest_seq();
+        assert!(
+            vault
+                .read_cf_at(before_snapshot, ColumnFamily::Base, &base_key(cx_id))
+                .expect("read base before erase")
+                .is_some()
+        );
+        let visible_slots_before = default_panel_slots()
+            .iter()
+            .filter(|slot| {
+                vault
+                    .read_cf_at(
+                        before_snapshot,
+                        ColumnFamily::slot(slot.slot_id()),
+                        &slot_key(cx_id),
+                    )
+                    .expect("read slot before erase")
+                    .is_some()
+            })
+            .count();
+        assert_eq!(visible_slots_before, default_panel_slots().len());
+
+        let mut context = VaultContext::new(
+            vault.vault_id(),
+            b"astrolabe-ingest-erasure-fsv",
+            QuotaConfig::default(),
+            "astrolabe-ingest-test",
+        )
+        .expect("create erasure context");
+        let erase = vault
+            .erase(EraseScope::Cx(cx_id), &mut context, &EraseRegistry::new())
+            .expect("erase imported cx");
+        vault.flush().expect("flush erase");
+
+        assert_eq!(erase.records_deleted, 1);
+        assert!(context.is_key_shredded_for_erasure());
+        let after_snapshot = vault.latest_seq();
+        assert!(
+            vault
+                .read_cf_at(after_snapshot, ColumnFamily::Base, &base_key(cx_id))
+                .expect("read base after erase")
+                .is_none()
+        );
+        for slot in default_panel_slots() {
+            assert!(
+                vault
+                    .read_cf_at(
+                        after_snapshot,
+                        ColumnFamily::slot(slot.slot_id()),
+                        &slot_key(cx_id),
+                    )
+                    .expect("read slot after erase")
+                    .is_none(),
+                "slot {} remained visible after erase",
+                slot.slot_id()
+            );
+        }
+
+        let after_ledger = cf_rows(&vault, ColumnFamily::Ledger);
+        assert_eq!(after_ledger.len(), before_ledger.len() + 1);
+        assert_eq!(
+            &after_ledger[..before_ledger.len()],
+            before_ledger.as_slice()
+        );
+        let (tombstone_key, tombstone_bytes) = after_ledger.last().expect("erase ledger row");
+        assert_eq!(tombstone_key, &ledger_key(before_ledger.len() as u64));
+        let entry = decode(tombstone_bytes).expect("decode erase ledger row");
+        assert_eq!(entry.kind, EntryKind::Erase);
+        let tombstone = tombstone_from_entry(&entry)
+            .expect("decode erasure tombstone")
+            .expect("erase entry carries tombstone");
+        assert_eq!(tombstone.seq, entry.seq);
+        assert_eq!(tombstone.scope, LedgerErasureScope::Cx(cx_id));
+        assert_eq!(tombstone.records_deleted, erase.records_deleted);
+
+        let chain = crate::verify_chain(&vault).expect("verify chain after erase");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows as usize, after_ledger.len());
+
+        fs::remove_file(path).ok();
+        fs::remove_dir_all(vault_dir).ok();
     }
 
     #[test]
