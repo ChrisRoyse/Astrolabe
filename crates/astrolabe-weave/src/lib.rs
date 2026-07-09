@@ -7,6 +7,16 @@ use std::fmt;
 
 use astrolabe_domain::EdgeKind;
 use calyx_core::{SlotId, SlotVector, SparseEntry};
+pub use calyx_loom::reactive::{
+    DEFAULT_MAX_AUDIT_ENTRIES as CALYX_REACTIVE_AUDIT_CAP,
+    DEFAULT_MAX_QUEUE_DEPTH as CALYX_REACTIVE_QUEUE_CAP,
+    DEFAULT_MAX_TRIGGERS as CALYX_REACTIVE_REGISTRY_CAP,
+};
+pub use calyx_loom::{
+    AuditEntry as ReactiveAuditEntry, NoveltyVerdict, ReactiveEngine, ReactiveRowKind,
+    ReactiveSignals, TriggerCondition, TriggerFired, TriggerId, decode_audit_entry,
+    decode_trigger_fired, reactive_row_key,
+};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -26,6 +36,9 @@ pub const DEFAULT_SIM_PROFILE_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIMILARITY_PER_NODE_CAP: usize = 10;
 pub const DEFAULT_SIMILARITY_WORKERS: usize = 1;
 pub const DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT: usize = 50_000;
+pub const ASTROLABE_REACTIVE_REGISTRY_CAP: usize = CALYX_REACTIVE_REGISTRY_CAP;
+pub const ASTROLABE_REACTIVE_QUEUE_CAP: usize = CALYX_REACTIVE_QUEUE_CAP;
+pub const ASTROLABE_REACTIVE_AUDIT_CAP: usize = CALYX_REACTIVE_AUDIT_CAP;
 pub const PANEL_SLOT_COUNT_FOR_ABUNDANCE: usize = 22;
 pub const PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE: usize =
     PANEL_SLOT_COUNT_FOR_ABUNDANCE * (PANEL_SLOT_COUNT_FOR_ABUNDANCE - 1) / 2;
@@ -37,6 +50,27 @@ pub const SLOT_TEST_COVERAGE: SlotId = SlotId::new(14);
 pub const SLOT_ROUTE_MATCH: SlotId = SlotId::new(17);
 pub const SLOT_DOC_SEMANTIC: SlotId = SlotId::new(19);
 pub const SLOT_NAME_SEMANTIC: SlotId = SlotId::new(20);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReactiveCaps {
+    pub max_triggers: usize,
+    pub max_queue_depth: usize,
+    pub max_audit_entries: usize,
+}
+
+impl Default for ReactiveCaps {
+    fn default() -> Self {
+        Self {
+            max_triggers: ASTROLABE_REACTIVE_REGISTRY_CAP,
+            max_queue_depth: ASTROLABE_REACTIVE_QUEUE_CAP,
+            max_audit_entries: ASTROLABE_REACTIVE_AUDIT_CAP,
+        }
+    }
+}
+
+pub fn default_reactive_caps() -> ReactiveCaps {
+    ReactiveCaps::default()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimilarityFamily {
@@ -892,7 +926,22 @@ fn format_score(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use calyx_core::SparseEntry;
+    use std::cell::Cell;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use calyx_aster::cf::ColumnFamily;
+    use calyx_aster::vault::{AsterVault, VaultOptions};
+    use calyx_core::{
+        CxId, FixedClock, LedgerRef, Result as CalyxResult, SparseEntry, SystemClock, VaultId,
+        VaultStore,
+    };
+    use calyx_loom::CALYX_REACTIVE_QUEUE_FULL;
+
+    static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
+    const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
 
     #[test]
     fn identifies_calyx_parent() {
@@ -928,6 +977,213 @@ mod tests {
             thresholds.threshold(SimilarityFamily::Profile),
             DEFAULT_SIM_PROFILE_MIN_SCORE
         );
+    }
+
+    #[test]
+    fn reactive_caps_match_calyx_a26_defaults() {
+        assert_eq!(
+            default_reactive_caps(),
+            ReactiveCaps {
+                max_triggers: 1024,
+                max_queue_depth: 4096,
+                max_audit_entries: 65536,
+            }
+        );
+        assert_eq!(
+            default_reactive_caps(),
+            ReactiveCaps {
+                max_triggers: CALYX_REACTIVE_REGISTRY_CAP,
+                max_queue_depth: CALYX_REACTIVE_QUEUE_CAP,
+                max_audit_entries: CALYX_REACTIVE_AUDIT_CAP,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_event_recurs_persists_audit_and_fired_rows_once_after_reopen() {
+        let (dir, vault) = reactive_vault("event-recurs");
+        let series = cx(9);
+        let trigger_cx = cx(7);
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_000)));
+        let trigger = engine
+            .register(
+                TriggerCondition::EventRecurs {
+                    series,
+                    min_occurrences: 3,
+                },
+                Some("astrolabe-weave".to_string()),
+            )
+            .expect("register recurring trigger");
+        let signals = ScriptedReactiveSignals::grounded();
+
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, lref(1), &signals)
+                .expect("first eval"),
+            0
+        );
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, lref(2), &signals)
+                .expect("second eval"),
+            0
+        );
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, lref(3), &signals)
+                .expect("third eval"),
+            1
+        );
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, lref(4), &signals)
+                .expect("fourth eval"),
+            0
+        );
+
+        let audit = audit_entries(&vault, trigger);
+        assert_eq!(
+            audit.iter().map(|entry| entry.matched).collect::<Vec<_>>(),
+            vec![false, false, true, false]
+        );
+        let fired = fired_events(&vault);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].trigger_id, trigger);
+        assert_eq!(fired[0].ledger_ref.seq, 3);
+        assert_eq!(engine.queue().len(), 1);
+
+        vault.flush().expect("flush durable reactive rows");
+        drop(vault);
+        let reopened = open_reactive_vault(&dir);
+        assert_eq!(
+            audit_entries(&reopened, trigger)
+                .iter()
+                .map(|entry| entry.matched)
+                .collect::<Vec<_>>(),
+            vec![false, false, true, false]
+        );
+        let reopened_fired = fired_events(&reopened);
+        assert_eq!(reopened_fired.len(), 1);
+        assert_eq!(reopened_fired[0].ledger_ref.seq, 3);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_new_region_and_drift_detected_persist_source_rows() {
+        let (dir, vault) = reactive_vault("new-region-drift");
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_500)));
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .expect("register new-region trigger");
+        engine
+            .register(
+                TriggerCondition::DriftDetected {
+                    slot: SlotId::new(8),
+                    drift_threshold: 0.25,
+                },
+                None,
+            )
+            .expect("register drift trigger");
+        let signals =
+            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.5);
+
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, cx(5), lref(11), &signals)
+                .expect("new-region + drift eval"),
+            2
+        );
+
+        let audits = all_audit_entries(&vault);
+        let fired = fired_events(&vault);
+        assert_eq!(audits.len(), 2);
+        assert!(audits.iter().all(|entry| entry.matched));
+        assert_eq!(fired.len(), 2);
+        assert!(
+            fired.iter().any(|event| matches!(
+                event.condition_snapshot,
+                TriggerCondition::NewRegion { .. }
+            ))
+        );
+        assert!(fired.iter().any(|event| matches!(
+            event.condition_snapshot,
+            TriggerCondition::DriftDetected {
+                slot,
+                drift_threshold
+            } if slot == SlotId::new(8) && (drift_threshold - 0.25).abs() <= f32::EPSILON
+        )));
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_queue_overflow_persists_warning_row_and_bounds_queue() {
+        let (dir, vault) = reactive_vault("queue-overflow");
+        let series = cx(3);
+        let mut engine = ReactiveEngine::with_caps(Arc::new(FixedClock::new(55)), 8, 2, 64);
+        for _ in 0..3 {
+            engine
+                .register(
+                    TriggerCondition::EventRecurs {
+                        series,
+                        min_occurrences: 1,
+                    },
+                    None,
+                )
+                .expect("register overflow trigger");
+        }
+        let signals = ScriptedReactiveSignals::grounded();
+
+        let err = engine
+            .evaluate_post_ingest_durable(&vault, series, lref(9), &signals)
+            .expect_err("third fired event overflows two-item queue");
+
+        assert_eq!(err.code, CALYX_REACTIVE_QUEUE_FULL);
+        assert_eq!(engine.queue().len(), 2);
+        assert_eq!(
+            engine
+                .queue()
+                .iter()
+                .map(|event| event.ledger_ref.seq)
+                .collect::<Vec<_>>(),
+            vec![9, 9]
+        );
+        assert_eq!(fired_events(&vault).len(), 3);
+        let warnings = all_audit_entries(&vault)
+            .into_iter()
+            .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_audit_count_matches_evaluation_count_for_no_match_batch() {
+        let (dir, vault) = reactive_vault("audit-count");
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(99)));
+        for _ in 0..7 {
+            engine
+                .register(TriggerCondition::NewRegion { tau_override: None }, None)
+                .expect("register no-match trigger");
+        }
+        let signals = ScriptedReactiveSignals::grounded();
+
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, cx(2), lref(14), &signals)
+                .expect("no-match eval"),
+            0
+        );
+
+        let audits = all_audit_entries(&vault);
+        assert_eq!(audits.len(), 7);
+        assert!(audits.iter().all(|entry| !entry.matched));
+        assert!(audits.iter().all(|entry| entry.code.is_none()));
+        assert!(fired_events(&vault).is_empty());
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1338,5 +1594,120 @@ mod tests {
                 && skip.family == SimilarityFamily::Semantic
                 && skip.reason == reason
         })
+    }
+
+    struct ScriptedReactiveSignals {
+        occurrence: Cell<u64>,
+        novelty: NoveltyVerdict,
+        drift: f32,
+    }
+
+    impl ScriptedReactiveSignals {
+        fn grounded() -> Self {
+            Self::with_novelty_and_drift(NoveltyVerdict::Grounded, 0.0)
+        }
+
+        fn with_novelty_and_drift(novelty: NoveltyVerdict, drift: f32) -> Self {
+            Self {
+                occurrence: Cell::new(0),
+                novelty,
+                drift,
+            }
+        }
+    }
+
+    impl ReactiveSignals for ScriptedReactiveSignals {
+        fn novelty(&self, _cx_id: CxId, _tau_override: Option<f32>) -> CalyxResult<NoveltyVerdict> {
+            Ok(self.novelty)
+        }
+
+        fn occurrence_count(&self, _series: CxId) -> CalyxResult<u64> {
+            let next = self.occurrence.get() + 1;
+            self.occurrence.set(next);
+            Ok(next)
+        }
+
+        fn slot_drift(&self, _slot: SlotId) -> CalyxResult<f32> {
+            Ok(self.drift)
+        }
+    }
+
+    fn reactive_vault(name: &str) -> (PathBuf, AsterVault<SystemClock>) {
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-weave-reactive-{name}-{}-{}",
+            std::process::id(),
+            NEXT_REACTIVE_DIR.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        clean_dir(&dir);
+        let vault = open_reactive_vault(&dir);
+        (dir, vault)
+    }
+
+    fn open_reactive_vault(dir: &Path) -> AsterVault<SystemClock> {
+        AsterVault::new_durable(
+            dir,
+            reactive_vault_id(),
+            REACTIVE_TEST_SALT.to_vec(),
+            VaultOptions::default(),
+        )
+        .expect("open durable reactive vault")
+    }
+
+    fn clean_dir(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).expect("create test vault dir");
+    }
+
+    fn all_audit_entries(vault: &AsterVault<SystemClock>) -> Vec<ReactiveAuditEntry> {
+        reactive_rows(vault)
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let parts = reactive_row_key(&key).expect("reactive row key");
+                (parts.kind == ReactiveRowKind::Audit)
+                    .then(|| decode_audit_entry(&value).expect("reactive audit row"))
+            })
+            .collect()
+    }
+
+    fn audit_entries(
+        vault: &AsterVault<SystemClock>,
+        trigger: TriggerId,
+    ) -> Vec<ReactiveAuditEntry> {
+        all_audit_entries(vault)
+            .into_iter()
+            .filter(|entry| entry.trigger_id == trigger)
+            .collect()
+    }
+
+    fn fired_events(vault: &AsterVault<SystemClock>) -> Vec<TriggerFired> {
+        reactive_rows(vault)
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let parts = reactive_row_key(&key).expect("reactive row key");
+                (parts.kind == ReactiveRowKind::Fired)
+                    .then(|| decode_trigger_fired(&value).expect("reactive fired row"))
+            })
+            .collect()
+    }
+
+    fn reactive_rows(vault: &AsterVault<SystemClock>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Reactive)
+            .expect("scan reactive CF")
+    }
+
+    fn cx(byte: u8) -> CxId {
+        CxId::from_bytes([byte; 16])
+    }
+
+    fn lref(seq: u64) -> LedgerRef {
+        LedgerRef {
+            seq,
+            hash: [seq as u8; 32],
+        }
+    }
+
+    fn reactive_vault_id() -> VaultId {
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
     }
 }

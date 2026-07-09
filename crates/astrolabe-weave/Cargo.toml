@@ -9,6 +9,10 @@ publish.workspace = true
 [dependencies]
 astrolabe-domain.workspace = true
 calyx-core.workspace = true
+calyx-loom.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+calyx-aster.workspace = true
