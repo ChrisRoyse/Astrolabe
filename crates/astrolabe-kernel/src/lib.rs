@@ -8,10 +8,13 @@ pub const SEARCH_SCALE_SCHEMA: &str = "astrolabe.search_scale_plan.v1";
 pub const SEARCH_SCALE_KNOB_REGISTRY_VERSION: &str = "astro.kernel.search_scale_knobs.v1";
 pub const SKILL_TREE_SCHEMA: &str = "astrolabe.skill_tree.v1";
 pub const SKILL_DISCOVERY_KNOB_REGISTRY_VERSION: &str = "astro.kernel.skill_discovery_knobs.v1";
+pub const BRIDGE_SCHEMA: &str = "astrolabe.bridge.v1";
+pub const BRIDGE_CACHE_KEY_SCHEMA: &str = "astrolabe.bridge_cache_key.v1";
 pub const FUNNEL_ACTIVATION_RECORDS_KNOB: &str = "search.funnel.activation_records";
 pub const SKILL_MIN_CLUSTER_SIZE_KNOB: &str = "skills.min_cluster_size";
 pub const SKILL_MIN_SHARED_TOKEN_PERMILLE_KNOB: &str = "skills.min_shared_token_permille";
 pub const ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED: &str = "ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED";
+pub const ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT: &str = "ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT";
 pub const ASTRO_SKILL_DISCOVERY_KNOB_RANGE: &str = "ASTRO_SKILL_DISCOVERY_KNOB_RANGE";
 pub const ASTRO_SKILL_SEARCH_CAP_RANGE: &str = "ASTRO_SKILL_SEARCH_CAP_RANGE";
 pub const DEFAULT_FUNNEL_ACTIVATION_RECORDS: u64 = 10_000_000;
@@ -235,6 +238,469 @@ fn validate_ram_budget(config: &SearchScaleConfig) -> astrolabe_domain::Result<(
         ),
         "enable diskann/spann indexes, opt out high-cost slots, or increase the configured CBM master memory budget before loading the index",
     ))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeKernelSymbol {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub kernel_weight: u64,
+    pub provenance_ref: String,
+}
+
+impl BridgeKernelSymbol {
+    pub fn new(
+        symbol_id: impl Into<String>,
+        qualified_name: impl Into<String>,
+        kernel_weight: u64,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            symbol_id: symbol_id.into(),
+            qualified_name: qualified_name.into(),
+            kernel_weight,
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeScopeKernel {
+    pub scope_id: String,
+    pub vault_id: String,
+    pub dirty_region_hash: String,
+    pub grounded: bool,
+    pub symbols: Vec<BridgeKernelSymbol>,
+}
+
+impl BridgeScopeKernel {
+    pub fn new(
+        scope_id: impl Into<String>,
+        vault_id: impl Into<String>,
+        dirty_region_hash: impl Into<String>,
+        grounded: bool,
+        symbols: Vec<BridgeKernelSymbol>,
+    ) -> Self {
+        Self {
+            scope_id: scope_id.into(),
+            vault_id: vault_id.into(),
+            dirty_region_hash: dirty_region_hash.into(),
+            grounded,
+            symbols,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeReport {
+    pub schema: &'static str,
+    pub scope_a: String,
+    pub scope_b: String,
+    pub cache_key: String,
+    pub bridges: Vec<BridgeResult>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeResult {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub combined_kernel_weight: u64,
+    pub scope_a_kernel_weight: u64,
+    pub scope_b_kernel_weight: u64,
+    pub provenance: BridgeProvenancePair,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeProvenancePair {
+    pub scope_a: String,
+    pub scope_b: String,
+}
+
+pub fn bridge_symbols(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) -> BridgeReport {
+    let left_symbols = canonical_symbol_map(scope_a);
+    let right_symbols = canonical_symbol_map(scope_b);
+    let trust = bridge_trust(scope_a, scope_b);
+    let mut bridges = left_symbols
+        .iter()
+        .filter_map(|(symbol_id, left)| {
+            let right = right_symbols.get(symbol_id)?;
+            Some(BridgeResult {
+                symbol_id: symbol_id.clone(),
+                qualified_name: left.qualified_name.clone(),
+                combined_kernel_weight: left.kernel_weight.saturating_add(right.kernel_weight),
+                scope_a_kernel_weight: left.kernel_weight,
+                scope_b_kernel_weight: right.kernel_weight,
+                provenance: BridgeProvenancePair {
+                    scope_a: left.provenance_ref.clone(),
+                    scope_b: right.provenance_ref.clone(),
+                },
+                freshness: "fresh",
+                trust,
+            })
+        })
+        .collect::<Vec<_>>();
+    bridges.sort_by(|left, right| {
+        right
+            .combined_kernel_weight
+            .cmp(&left.combined_kernel_weight)
+            .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+    });
+
+    BridgeReport {
+        schema: BRIDGE_SCHEMA,
+        scope_a: scope_a.scope_id.clone(),
+        scope_b: scope_b.scope_id.clone(),
+        cache_key: bridge_cache_key(scope_a, scope_b),
+        bridges,
+        freshness: "fresh",
+        trust,
+    }
+}
+
+pub fn bridge_cache_key(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) -> String {
+    let mut scope_hashes = [bridge_scope_hash(scope_a), bridge_scope_hash(scope_b)];
+    scope_hashes.sort();
+    hex_lower(&astrolabe_domain::calyx::content_address([
+        BRIDGE_CACHE_KEY_SCHEMA.as_bytes(),
+        scope_hashes[0].as_bytes(),
+        scope_hashes[1].as_bytes(),
+    ]))
+}
+
+pub fn bridge_report_artifact_bytes(report: &BridgeReport) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("schema=");
+    out.push_str(report.schema);
+    out.push('\n');
+    out.push_str("scope_a=");
+    out.push_str(&report.scope_a);
+    out.push('\n');
+    out.push_str("scope_b=");
+    out.push_str(&report.scope_b);
+    out.push('\n');
+    out.push_str("cache_key=");
+    out.push_str(&report.cache_key);
+    out.push('\n');
+    out.push_str("trust=");
+    out.push_str(report.trust);
+    out.push('\n');
+    for bridge in &report.bridges {
+        out.push_str("bridge\t");
+        out.push_str(&bridge.symbol_id);
+        out.push('\t');
+        out.push_str(&bridge.qualified_name);
+        out.push('\t');
+        out.push_str(&bridge.combined_kernel_weight.to_string());
+        out.push('\t');
+        out.push_str(&bridge.scope_a_kernel_weight.to_string());
+        out.push('\t');
+        out.push_str(&bridge.scope_b_kernel_weight.to_string());
+        out.push('\t');
+        out.push_str(&bridge.provenance.scope_a);
+        out.push('\t');
+        out.push_str(&bridge.provenance.scope_b);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CrossVaultEdge {
+    pub from_vault_id: String,
+    pub from_symbol_id: String,
+    pub to_vault_id: String,
+    pub to_symbol_id: String,
+    pub edge_kind: String,
+    pub provenance_ref: String,
+}
+
+impl CrossVaultEdge {
+    pub fn new(
+        from_vault_id: impl Into<String>,
+        from_symbol_id: impl Into<String>,
+        to_vault_id: impl Into<String>,
+        to_symbol_id: impl Into<String>,
+        edge_kind: impl Into<String>,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            from_vault_id: from_vault_id.into(),
+            from_symbol_id: from_symbol_id.into(),
+            to_vault_id: to_vault_id.into(),
+            to_symbol_id: to_symbol_id.into(),
+            edge_kind: edge_kind.into(),
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CrossVaultBridgeChain {
+    pub from_scope: String,
+    pub to_scope: String,
+    pub from_symbol_id: String,
+    pub to_symbol_id: String,
+    pub hops: Vec<CrossVaultBridgeHop>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CrossVaultBridgeHop {
+    pub from_vault_id: String,
+    pub from_symbol_id: String,
+    pub to_vault_id: String,
+    pub to_symbol_id: String,
+    pub edge_kind: String,
+    pub provenance_ref: String,
+}
+
+pub fn resolve_cross_vault_bridge_chains(
+    scope_a: &BridgeScopeKernel,
+    scope_b: &BridgeScopeKernel,
+    edges: &[CrossVaultEdge],
+) -> astrolabe_domain::Result<Vec<CrossVaultBridgeChain>> {
+    let scope_a_members = symbol_id_set(scope_a);
+    let scope_b_members = symbol_id_set(scope_b);
+    let trust = bridge_trust(scope_a, scope_b);
+    let mut chains = Vec::new();
+
+    for edge in edges
+        .iter()
+        .filter(|edge| edge.edge_kind.starts_with("CROSS_"))
+    {
+        let forward_source = edge.from_vault_id == scope_a.vault_id
+            && scope_a_members.contains(&edge.from_symbol_id);
+        let reverse_source = edge.from_vault_id == scope_b.vault_id
+            && scope_b_members.contains(&edge.from_symbol_id);
+        if !forward_source && !reverse_source {
+            continue;
+        }
+
+        if forward_source {
+            if edge.to_vault_id != scope_b.vault_id {
+                return Err(missing_counterpart_vault_error(edge, scope_b));
+            }
+            if scope_b_members.contains(&edge.to_symbol_id) {
+                chains.push(cross_vault_chain(scope_a, scope_b, edge, trust));
+            }
+        } else {
+            if edge.to_vault_id != scope_a.vault_id {
+                return Err(missing_counterpart_vault_error(edge, scope_a));
+            }
+            if scope_a_members.contains(&edge.to_symbol_id) {
+                chains.push(cross_vault_chain(scope_b, scope_a, edge, trust));
+            }
+        }
+    }
+
+    chains.sort_by(|left, right| {
+        left.from_symbol_id
+            .cmp(&right.from_symbol_id)
+            .then_with(|| left.to_symbol_id.cmp(&right.to_symbol_id))
+            .then_with(|| {
+                left.hops[0]
+                    .provenance_ref
+                    .cmp(&right.hops[0].provenance_ref)
+            })
+    });
+    Ok(chains)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeclaredBridgeBoundary {
+    pub scope_a: String,
+    pub scope_b: String,
+    pub allowed: bool,
+    pub provenance_ref: String,
+}
+
+impl DeclaredBridgeBoundary {
+    pub fn new(
+        scope_a: impl Into<String>,
+        scope_b: impl Into<String>,
+        allowed: bool,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope_a: scope_a.into(),
+            scope_b: scope_b.into(),
+            allowed,
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeBoundaryDiff {
+    pub schema: &'static str,
+    pub scope_a: String,
+    pub scope_b: String,
+    pub violations: Vec<BridgeBoundaryViolation>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BridgeBoundaryViolation {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub declared_provenance_ref: String,
+    pub measured_scope_a_provenance_ref: String,
+    pub measured_scope_b_provenance_ref: String,
+}
+
+pub fn diff_declared_bridge_boundaries(
+    report: &BridgeReport,
+    declared: &[DeclaredBridgeBoundary],
+) -> BridgeBoundaryDiff {
+    let forbidden = declared.iter().find(|boundary| {
+        !boundary.allowed
+            && same_scope_pair(
+                &report.scope_a,
+                &report.scope_b,
+                &boundary.scope_a,
+                &boundary.scope_b,
+            )
+    });
+    let violations = forbidden
+        .map(|boundary| {
+            report
+                .bridges
+                .iter()
+                .map(|bridge| BridgeBoundaryViolation {
+                    symbol_id: bridge.symbol_id.clone(),
+                    qualified_name: bridge.qualified_name.clone(),
+                    declared_provenance_ref: boundary.provenance_ref.clone(),
+                    measured_scope_a_provenance_ref: bridge.provenance.scope_a.clone(),
+                    measured_scope_b_provenance_ref: bridge.provenance.scope_b.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    BridgeBoundaryDiff {
+        schema: BRIDGE_SCHEMA,
+        scope_a: report.scope_a.clone(),
+        scope_b: report.scope_b.clone(),
+        violations,
+        freshness: report.freshness,
+        trust: report.trust,
+    }
+}
+
+fn canonical_symbol_map(scope: &BridgeScopeKernel) -> BTreeMap<String, BridgeKernelSymbol> {
+    let mut symbols = scope.symbols.clone();
+    symbols.sort_by(|left, right| {
+        left.symbol_id
+            .cmp(&right.symbol_id)
+            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            .then_with(|| left.provenance_ref.cmp(&right.provenance_ref))
+    });
+    let mut map = BTreeMap::new();
+    for symbol in symbols {
+        map.entry(symbol.symbol_id.clone()).or_insert(symbol);
+    }
+    map
+}
+
+fn symbol_id_set(scope: &BridgeScopeKernel) -> BTreeSet<String> {
+    scope
+        .symbols
+        .iter()
+        .map(|symbol| symbol.symbol_id.clone())
+        .collect()
+}
+
+fn bridge_trust(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) -> &'static str {
+    if scope_a.grounded && scope_b.grounded {
+        "verified"
+    } else {
+        "provisional"
+    }
+}
+
+fn bridge_scope_hash(scope: &BridgeScopeKernel) -> String {
+    let symbols = canonical_symbol_map(scope);
+    let mut canonical = String::new();
+    canonical.push_str(&scope.scope_id);
+    canonical.push('\t');
+    canonical.push_str(&scope.vault_id);
+    canonical.push('\t');
+    canonical.push_str(&scope.dirty_region_hash);
+    canonical.push('\t');
+    canonical.push_str(if scope.grounded {
+        "grounded"
+    } else {
+        "ungrounded"
+    });
+    canonical.push('\n');
+    for symbol in symbols.values() {
+        canonical.push_str(&symbol.symbol_id);
+        canonical.push('\t');
+        canonical.push_str(&symbol.qualified_name);
+        canonical.push('\t');
+        canonical.push_str(&symbol.kernel_weight.to_string());
+        canonical.push('\t');
+        canonical.push_str(&symbol.provenance_ref);
+        canonical.push('\n');
+    }
+    hex_lower(&astrolabe_domain::calyx::content_address([
+        b"astrolabe-bridge-scope-v1".as_slice(),
+        canonical.as_bytes(),
+    ]))
+}
+
+fn cross_vault_chain(
+    from_scope: &BridgeScopeKernel,
+    to_scope: &BridgeScopeKernel,
+    edge: &CrossVaultEdge,
+    trust: &'static str,
+) -> CrossVaultBridgeChain {
+    CrossVaultBridgeChain {
+        from_scope: from_scope.scope_id.clone(),
+        to_scope: to_scope.scope_id.clone(),
+        from_symbol_id: edge.from_symbol_id.clone(),
+        to_symbol_id: edge.to_symbol_id.clone(),
+        hops: vec![CrossVaultBridgeHop {
+            from_vault_id: edge.from_vault_id.clone(),
+            from_symbol_id: edge.from_symbol_id.clone(),
+            to_vault_id: edge.to_vault_id.clone(),
+            to_symbol_id: edge.to_symbol_id.clone(),
+            edge_kind: edge.edge_kind.clone(),
+            provenance_ref: edge.provenance_ref.clone(),
+        }],
+        freshness: "fresh",
+        trust,
+    }
+}
+
+fn missing_counterpart_vault_error(
+    edge: &CrossVaultEdge,
+    expected: &BridgeScopeKernel,
+) -> astrolabe_domain::DomainError {
+    astrolabe_domain::DomainError::new(
+        ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT,
+        format!(
+            "{} edge {}:{} -> {}:{} does not target counterpart vault {} for scope {}",
+            edge.edge_kind,
+            edge.from_vault_id,
+            edge.from_symbol_id,
+            edge.to_vault_id,
+            edge.to_symbol_id,
+            expected.vault_id,
+            expected.scope_id
+        ),
+        "load the counterpart vault named by the CROSS_* edge or exclude the unresolved cross-vault route from bridge resolution",
+    )
+}
+
+fn same_scope_pair(left_a: &str, left_b: &str, right_a: &str, right_b: &str) -> bool {
+    (left_a == right_a && left_b == right_b) || (left_a == right_b && left_b == right_a)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -597,6 +1063,201 @@ mod tests {
     }
 
     #[test]
+    fn planted_bridge_golden_returns_exact_connectors_ranked() {
+        let (frontend, backend) = bridge_fixture_scopes();
+        let report = bridge_symbols(&frontend, &backend);
+
+        assert_eq!(report.schema, BRIDGE_SCHEMA);
+        assert_eq!(report.scope_a, "frontend");
+        assert_eq!(report.scope_b, "backend");
+        assert_eq!(report.trust, "verified");
+        assert_eq!(
+            report
+                .bridges
+                .iter()
+                .map(|bridge| bridge.symbol_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared.audit", "shared.session"]
+        );
+        assert_eq!(report.bridges[0].combined_kernel_weight, 190);
+        assert_eq!(report.bridges[1].combined_kernel_weight, 90);
+        assert_eq!(report.bridges[0].provenance.scope_a, "ledger:frontend:2");
+        assert_eq!(report.bridges[0].provenance.scope_b, "ledger:backend:5");
+    }
+
+    #[test]
+    fn ungrounded_scope_marks_bridge_results_provisional() {
+        let (frontend, mut backend) = bridge_fixture_scopes();
+        backend.grounded = false;
+        let report = bridge_symbols(&frontend, &backend);
+
+        assert_eq!(report.trust, "provisional");
+        assert!(
+            report
+                .bridges
+                .iter()
+                .all(|bridge| bridge.trust == "provisional")
+        );
+    }
+
+    #[test]
+    fn cross_repo_bridge_chain_resolves_with_hop_provenance() {
+        let frontend = BridgeScopeKernel::new(
+            "repo:frontend",
+            "frontend-vault",
+            "front-dirty",
+            true,
+            vec![BridgeKernelSymbol::new(
+                "route.checkout",
+                "frontend.routes.checkout",
+                77,
+                "ledger:front:3",
+            )],
+        );
+        let checkout = BridgeScopeKernel::new(
+            "repo:checkout",
+            "checkout-vault",
+            "checkout-dirty",
+            true,
+            vec![BridgeKernelSymbol::new(
+                "handler.checkout",
+                "checkout.handlers.checkout",
+                81,
+                "ledger:checkout:8",
+            )],
+        );
+        let edges = vec![CrossVaultEdge::new(
+            "frontend-vault",
+            "route.checkout",
+            "checkout-vault",
+            "handler.checkout",
+            "CROSS_HTTP_CALLS",
+            "ledger:cross:13",
+        )];
+
+        let chains = resolve_cross_vault_bridge_chains(&frontend, &checkout, &edges)
+            .expect("cross-vault bridge chains");
+
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].from_scope, "repo:frontend");
+        assert_eq!(chains[0].to_scope, "repo:checkout");
+        assert_eq!(chains[0].from_symbol_id, "route.checkout");
+        assert_eq!(chains[0].to_symbol_id, "handler.checkout");
+        assert_eq!(chains[0].hops[0].edge_kind, "CROSS_HTTP_CALLS");
+        assert_eq!(chains[0].hops[0].provenance_ref, "ledger:cross:13");
+        assert_eq!(chains[0].trust, "verified");
+    }
+
+    #[test]
+    fn cross_repo_missing_counterpart_vault_fails_closed() {
+        let frontend = BridgeScopeKernel::new(
+            "repo:frontend",
+            "frontend-vault",
+            "front-dirty",
+            true,
+            vec![BridgeKernelSymbol::new(
+                "route.checkout",
+                "frontend.routes.checkout",
+                77,
+                "ledger:front:3",
+            )],
+        );
+        let checkout = BridgeScopeKernel::new(
+            "repo:checkout",
+            "checkout-vault",
+            "checkout-dirty",
+            true,
+            vec![BridgeKernelSymbol::new(
+                "handler.checkout",
+                "checkout.handlers.checkout",
+                81,
+                "ledger:checkout:8",
+            )],
+        );
+        let edges = vec![CrossVaultEdge::new(
+            "frontend-vault",
+            "route.checkout",
+            "missing-vault",
+            "handler.checkout",
+            "CROSS_HTTP_CALLS",
+            "ledger:cross:13",
+        )];
+
+        let err = resolve_cross_vault_bridge_chains(&frontend, &checkout, &edges)
+            .expect_err("missing counterpart vault refused");
+
+        assert_eq!(err.code(), ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT);
+        assert!(err.message().contains("missing-vault"));
+        assert!(err.remediation().contains("counterpart vault"));
+    }
+
+    #[test]
+    fn boundary_diff_flags_forbidden_declared_bridge() {
+        let (frontend, backend) = bridge_fixture_scopes();
+        let report = bridge_symbols(&frontend, &backend);
+        let diff = diff_declared_bridge_boundaries(
+            &report,
+            &[DeclaredBridgeBoundary::new(
+                "frontend",
+                "backend",
+                false,
+                "architecture:layering:1",
+            )],
+        );
+
+        assert_eq!(diff.schema, BRIDGE_SCHEMA);
+        assert_eq!(diff.violations.len(), 2);
+        assert_eq!(diff.violations[0].symbol_id, "shared.audit");
+        assert_eq!(
+            diff.violations[0].declared_provenance_ref,
+            "architecture:layering:1"
+        );
+        assert_eq!(
+            diff.violations[0].measured_scope_a_provenance_ref,
+            "ledger:frontend:2"
+        );
+        assert_eq!(
+            diff.violations[0].measured_scope_b_provenance_ref,
+            "ledger:backend:5"
+        );
+    }
+
+    #[test]
+    fn bridge_cache_key_is_symmetric_and_invalidates_on_dirty_region() {
+        let (frontend, mut backend) = bridge_fixture_scopes();
+        assert_eq!(
+            bridge_cache_key(&frontend, &backend),
+            bridge_cache_key(&backend, &frontend)
+        );
+
+        let original = bridge_cache_key(&frontend, &backend);
+        backend.dirty_region_hash = "backend-dirty-v2".to_string();
+        assert_ne!(original, bridge_cache_key(&frontend, &backend));
+    }
+
+    #[test]
+    fn bridge_report_artifact_bytes_read_back_from_disk() {
+        let (frontend, backend) = bridge_fixture_scopes();
+        let report = bridge_symbols(&frontend, &backend);
+        let bytes = bridge_report_artifact_bytes(&report);
+        let path = std::env::temp_dir().join(format!(
+            "astrolabe-bridge-report-{}-{}.txt",
+            std::process::id(),
+            report.cache_key
+        ));
+        std::fs::write(&path, &bytes).expect("write bridge artifact");
+        let readback = std::fs::read(&path).expect("read bridge artifact");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(readback, bytes);
+        assert!(
+            String::from_utf8(readback)
+                .expect("utf8 bridge artifact")
+                .contains("bridge\tshared.audit")
+        );
+    }
+
+    #[test]
     fn skill_discovery_knobs_are_registry_declared() {
         let min_size = SKILL_DISCOVERY_KNOBS
             .iter()
@@ -720,6 +1381,62 @@ mod tests {
         assert_eq!(err.code(), ASTRO_SKILL_DISCOVERY_KNOB_RANGE);
         assert!(err.message().contains(SKILL_MIN_CLUSTER_SIZE_KNOB));
         assert!(err.remediation().contains("registered bounds"));
+    }
+
+    fn bridge_fixture_scopes() -> (BridgeScopeKernel, BridgeScopeKernel) {
+        let frontend = BridgeScopeKernel::new(
+            "frontend",
+            "app-vault",
+            "frontend-dirty-v1",
+            true,
+            vec![
+                BridgeKernelSymbol::new(
+                    "frontend.form",
+                    "demo.frontend.form",
+                    70,
+                    "ledger:frontend:1",
+                ),
+                BridgeKernelSymbol::new(
+                    "shared.audit",
+                    "demo.shared.audit",
+                    90,
+                    "ledger:frontend:2",
+                ),
+                BridgeKernelSymbol::new(
+                    "shared.session",
+                    "demo.shared.session",
+                    70,
+                    "ledger:frontend:3",
+                ),
+            ],
+        );
+        let backend = BridgeScopeKernel::new(
+            "backend",
+            "app-vault",
+            "backend-dirty-v1",
+            true,
+            vec![
+                BridgeKernelSymbol::new(
+                    "backend.handler",
+                    "demo.backend.handler",
+                    95,
+                    "ledger:backend:4",
+                ),
+                BridgeKernelSymbol::new(
+                    "shared.audit",
+                    "demo.shared.audit",
+                    100,
+                    "ledger:backend:5",
+                ),
+                BridgeKernelSymbol::new(
+                    "shared.session",
+                    "demo.shared.session",
+                    20,
+                    "ledger:backend:6",
+                ),
+            ],
+        );
+        (frontend, backend)
     }
 
     fn skill_fixture() -> Vec<SkillSymbolInput> {

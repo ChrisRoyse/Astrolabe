@@ -1515,7 +1515,9 @@ Design constraints: (a) 100% behavioral compatibility for the 14 existing CBM to
 **`measure_bits`** â€” modes: `signals` (ranking per axis), `sufficiency` (+deficits), `redundancy` (n_eff, gate decisions), `synergy`, `causality` (DRIVES/TE), `calibration` (edge-strategy precision). Params: `project`, `mode`, `axis?`, `scope?`, `refresh?`. Returns the corresponding assay card (08 Â§8) with CIs and trust tags.
 
 ### Kernel & context
-**`get_kernel`** â€” modes: `read|build|gaps`. Params: `project`, `scope?` (dir/domain/subgraph/time-window expr), `budget?`. Returns members (QN + kernel score + grounded flag), recall metrics, gap report.
+**`get_kernel`** â€” modes: `read|build|gaps|bridges`. Params: `project`, `scope?` (dir/domain/subgraph/time-window expr), `budget?`; for `bridges`, `scope_a` and `scope_b` are required. Returns members (QN + kernel score + grounded flag), recall metrics, gap report, or bridge members ranked by combined kernel weight.
+
+Bridge substrate status: `astrolabe.bridge.v1` lives in `astrolabe-kernel` as the P8.7 contract. It returns symbols present in both scope kernels, carries per-scope ledger provenance, labels ungrounded scopes `trust: provisional`, and uses `astrolabe.bridge_cache_key.v1` derived from both scope dirty-region hashes so either side invalidates the cache. Direct `CROSS_*` route/channel edges resolve as cross-vault bridge chains with per-hop provenance; unresolved counterpart vaults fail closed with `ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT` instead of returning a silent empty result. Declared-vs-measured boundary diffs are produced from bridge reports and are consumed by `get_architecture`, not exposed as a new top-level tool.
 
 **`get_context_pack`** â€” the flagship (09 Â§3). Params: `project`, `task`, `token_budget`, `scope?`, `focus?`, `preset?` (`onboarding|subsystem|change|debug`). Returns the ordered pack + manifest (`pack_id`, hashes, coverage, gated flag, trust).
 
