@@ -6,8 +6,10 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "foundation/compat_thread.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
+#include <stdatomic.h>
 #include <string.h>
 
 static int make_temp_gbuf_db(char *path, size_t pathsz, const char *name) {
@@ -77,6 +79,112 @@ static int test_row_edge_sink(const cbm_gbuf_row_edge_t *edge, void *ctx) {
                  edge->local_name_gen ? edge->local_name_gen : "");
     }
     return 0;
+}
+
+typedef struct {
+    atomic_int node_count;
+    atomic_int edge_count;
+    atomic_int bad_rows;
+    atomic_int in_flight;
+    atomic_int max_in_flight;
+    atomic_int first_node_entered;
+    atomic_int release_first_node;
+} row_sink_backpressure_state_t;
+
+static void init_row_sink_backpressure_state(row_sink_backpressure_state_t *state) {
+    atomic_init(&state->node_count, 0);
+    atomic_init(&state->edge_count, 0);
+    atomic_init(&state->bad_rows, 0);
+    atomic_init(&state->in_flight, 0);
+    atomic_init(&state->max_in_flight, 0);
+    atomic_init(&state->first_node_entered, 0);
+    atomic_init(&state->release_first_node, 0);
+}
+
+static void row_sink_note_enter(row_sink_backpressure_state_t *state) {
+    int current = atomic_fetch_add(&state->in_flight, 1) + 1;
+    int observed = atomic_load(&state->max_in_flight);
+    while (current > observed &&
+           !atomic_compare_exchange_weak(&state->max_in_flight, &observed, current)) {
+    }
+}
+
+static void row_sink_note_exit(row_sink_backpressure_state_t *state) {
+    atomic_fetch_sub(&state->in_flight, 1);
+}
+
+static int blocking_row_node_sink(const cbm_gbuf_row_node_t *node, void *ctx) {
+    row_sink_backpressure_state_t *state = (row_sink_backpressure_state_t *)ctx;
+    if (!state) {
+        return -1;
+    }
+    row_sink_note_enter(state);
+    if (!node || !node->qualified_name) {
+        atomic_fetch_add(&state->bad_rows, 1);
+    }
+    int seen = atomic_fetch_add(&state->node_count, 1) + 1;
+    if (seen == 1) {
+        atomic_store(&state->first_node_entered, 1);
+        while (!atomic_load(&state->release_first_node)) {
+            cbm_usleep(0);
+        }
+    }
+    row_sink_note_exit(state);
+    return 0;
+}
+
+static int blocking_row_edge_sink(const cbm_gbuf_row_edge_t *edge, void *ctx) {
+    row_sink_backpressure_state_t *state = (row_sink_backpressure_state_t *)ctx;
+    if (!state) {
+        return -1;
+    }
+    row_sink_note_enter(state);
+    if (!edge || !edge->type) {
+        atomic_fetch_add(&state->bad_rows, 1);
+    }
+    atomic_fetch_add(&state->edge_count, 1);
+    row_sink_note_exit(state);
+    return 0;
+}
+
+typedef struct {
+    cbm_gbuf_t *gb;
+    const char *path;
+    int rc;
+    atomic_int done;
+} row_sink_dump_thread_t;
+
+static void init_row_sink_dump_thread(row_sink_dump_thread_t *thread, cbm_gbuf_t *gb,
+                                      const char *path) {
+    thread->gb = gb;
+    thread->path = path;
+    thread->rc = -1;
+    atomic_init(&thread->done, 0);
+}
+
+static void *row_sink_dump_thread_main(void *arg) {
+    row_sink_dump_thread_t *thread = (row_sink_dump_thread_t *)arg;
+    thread->rc = cbm_gbuf_dump_to_sqlite(thread->gb, thread->path);
+    atomic_store(&thread->done, 1);
+    return NULL;
+}
+
+/* Deadlock fuse for a broken row-sink implementation. This is not a production
+ * threshold; the assertion below is on state while the first callback is held. */
+enum { ROW_SINK_BACKPRESSURE_WAIT_SPINS = 1000000 };
+
+static int wait_for_first_row_sink_callback(row_sink_backpressure_state_t *state,
+                                            row_sink_dump_thread_t *dump) {
+    for (int i = 0; i < ROW_SINK_BACKPRESSURE_WAIT_SPINS; i++) {
+        if (atomic_load(&state->first_node_entered)) {
+            return 0;
+        }
+        if (atomic_load(&dump->done)) {
+            return 1;
+        }
+        cbm_usleep(0);
+    }
+    return -1;
 }
 
 /* ── Node operations ───────────────────────────────────────────── */
@@ -488,6 +596,60 @@ TEST(gbuf_row_sink_null_default_writes_sqlite) {
     cbm_gbuf_set_row_sink(gb, NULL, NULL, NULL);
 
     ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(store, "proj"), 2);
+    cbm_store_close(store);
+
+    unlink(path);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_row_sink_backpressure_blocks_at_current_callback) {
+    char path[256];
+    ASSERT_EQ(make_temp_gbuf_db(path, sizeof(path), "row_sink_backpressure"), 0);
+    cbm_gbuf_t *gb = make_row_sink_fixture();
+    ASSERT_NOT_NULL(gb);
+
+    row_sink_backpressure_state_t state;
+    init_row_sink_backpressure_state(&state);
+    cbm_gbuf_set_row_sink(gb, blocking_row_node_sink, blocking_row_edge_sink, &state);
+
+    row_sink_dump_thread_t dump;
+    init_row_sink_dump_thread(&dump, gb, path);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, row_sink_dump_thread_main, &dump), 0);
+
+    int wait_rc = wait_for_first_row_sink_callback(&state, &dump);
+    if (wait_rc != 0) {
+        atomic_store(&state.release_first_node, 1);
+        cbm_thread_join(&thread);
+        unlink(path);
+        cbm_gbuf_free(gb);
+        FAIL("row sink did not reach the first node callback before dump finished");
+    }
+
+    int pre_release_nodes = atomic_load(&state.node_count);
+    int pre_release_edges = atomic_load(&state.edge_count);
+    int pre_release_done = atomic_load(&dump.done);
+    int pre_release_max_in_flight = atomic_load(&state.max_in_flight);
+
+    atomic_store(&state.release_first_node, 1);
+    ASSERT_EQ(cbm_thread_join(&thread), 0);
+
+    ASSERT_EQ(dump.rc, 0);
+    ASSERT_EQ(pre_release_nodes, 1);
+    ASSERT_EQ(pre_release_edges, 0);
+    ASSERT_EQ(pre_release_done, 0);
+    ASSERT_EQ(pre_release_max_in_flight, 1);
+    ASSERT_EQ(atomic_load(&state.bad_rows), 0);
+    ASSERT_EQ(atomic_load(&state.node_count), 2);
+    ASSERT_EQ(atomic_load(&state.edge_count), 2);
+    ASSERT_EQ(atomic_load(&state.in_flight), 0);
+    ASSERT_EQ(atomic_load(&state.max_in_flight), 1);
+
     cbm_store_t *store = cbm_store_open_path(path);
     ASSERT_NOT_NULL(store);
     ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 2);
@@ -1165,6 +1327,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_row_sink_receives_final_dump_rows);
     RUN_TEST(gbuf_row_sink_failure_aborts_before_sqlite_open);
     RUN_TEST(gbuf_row_sink_null_default_writes_sqlite);
+    RUN_TEST(gbuf_row_sink_backpressure_blocks_at_current_callback);
     RUN_TEST(gbuf_flush_to_store);
     RUN_TEST(gbuf_many_nodes);
 

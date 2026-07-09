@@ -428,15 +428,36 @@ pub struct CbmIndexRepositoryRows {
     pub rows: CbmPipelineRows,
 }
 
-#[derive(Default)]
 struct PipelineRowSinkState {
+    owner: ThreadId,
     nodes: Vec<CbmPipelineNodeRow>,
     edges: Vec<CbmPipelineEdgeRow>,
     error: Option<BridgeError>,
 }
 
 impl PipelineRowSinkState {
+    fn new() -> Self {
+        Self {
+            owner: thread::current().id(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn ensure_callback_thread(&self) -> Result<(), BridgeError> {
+        if thread::current().id() == self.owner {
+            return Ok(());
+        }
+        Err(envelope(
+            "ASTRO_CBM_ROW_SINK_THREAD",
+            "CBM row-sink callback arrived on a different thread than the owning pipeline runner",
+            "Keep row-sink callbacks on the thread that installed the sink, or use an explicitly synchronized sink state.",
+        ))
+    }
+
     fn push_node(&mut self, row: &cbm_sys::cbm_gbuf_row_node_t) -> Result<(), BridgeError> {
+        self.ensure_callback_thread()?;
         self.nodes.push(CbmPipelineNodeRow {
             id: row.id,
             project: required_borrowed_c_string(row.project, "row_sink.node.project")?,
@@ -458,6 +479,7 @@ impl PipelineRowSinkState {
     }
 
     fn push_edge(&mut self, row: &cbm_sys::cbm_gbuf_row_edge_t) -> Result<(), BridgeError> {
+        self.ensure_callback_thread()?;
         self.edges.push(CbmPipelineEdgeRow {
             id: row.id,
             project: required_borrowed_c_string(row.project, "row_sink.edge.project")?,
@@ -542,7 +564,7 @@ impl CbmPipeline {
 
     pub fn collect_rows(&mut self) -> Result<CbmPipelineRows, BridgeError> {
         self.ensure_owner_thread()?;
-        let mut sink = PipelineRowSinkState::default();
+        let mut sink = PipelineRowSinkState::new();
         // SAFETY: self owns the pipeline pointer. `sink` remains live until
         // cbm_pipeline_run returns, and the sink is cleared immediately after.
         let rc = unsafe {
@@ -1440,7 +1462,7 @@ impl CbmToolRunner {
         self.ensure_owner_thread()?;
         let tool_name = CString::new("index_repository")?;
         let args_json = CString::new(args_json)?;
-        let mut sink = PipelineRowSinkState::default();
+        let mut sink = PipelineRowSinkState::new();
 
         // SAFETY: server pointer is owned by self and thread-affine. `sink`
         // lives until cbm_mcp_handle_tool returns and is cleared immediately.
@@ -1936,6 +1958,33 @@ mod tests {
             unsafe { guard_row_sink_edge_callback(std::ptr::null(), |_| Ok(())) },
             CALLBACK_ERROR
         );
+    }
+
+    #[test]
+    fn row_sink_state_rejects_callback_thread_drift() {
+        let mut state = PipelineRowSinkState::new();
+        let ctx = (&mut state as *mut PipelineRowSinkState) as usize;
+        let rc = std::thread::spawn(move || {
+            let node = cbm_sys::cbm_gbuf_row_node_t {
+                id: 1,
+                project: c"demo".as_ptr(),
+                label: c"Function".as_ptr(),
+                name: c"handler".as_ptr(),
+                qualified_name: c"demo.handler".as_ptr(),
+                file_path: c"src/main.rs".as_ptr(),
+                start_line: 1,
+                end_line: 3,
+                properties_json: c"{}".as_ptr(),
+            };
+            unsafe { pipeline_node_sink(&node, ctx as *mut c_void) }
+        })
+        .join()
+        .expect("thread drift probe returns");
+
+        assert_eq!(rc, CALLBACK_ERROR);
+        assert!(state.nodes.is_empty());
+        let error = state.error.take().expect("thread drift is recorded");
+        assert_eq!(error.envelope().code, "ASTRO_CBM_ROW_SINK_THREAD");
     }
 
     #[test]
