@@ -21,11 +21,15 @@ use astrolabe_ingest::{
 };
 use astrolabe_kernel::{
     BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,
-    DEFAULT_FUNNEL_ACTIVATION_RECORDS, SEARCH_SCALE_KNOB_REGISTRY_VERSION, SEARCH_SCALE_SCHEMA,
-    SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, SearchIndexBackend,
-    SearchScaleConfig, SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput, SkillTree,
-    bridge_report_artifact_bytes, bridge_symbols, build_skill_tree, plan_search_scale,
-    skill_tree_artifact_bytes,
+    DEFAULT_FUNNEL_ACTIVATION_RECORDS, LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+    LABEL_PROPAGATION_SCHEMA, LabelGraphEdge, LabelPropagationConfig, LabelPropagationReport,
+    LabelSeed, LabelTombstone, SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION,
+    SEARCH_SCALE_SCHEMA, SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA,
+    ScopeRecallMeasurement, ScopeSummary, ScopeSummaryInput, ScopeSummaryMember,
+    SearchIndexBackend, SearchScaleConfig, SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput,
+    SkillTree, bridge_report_artifact_bytes, bridge_symbols, build_skill_tree,
+    label_propagation_artifact_bytes, plan_search_scale, propagate_labels,
+    scope_summary_artifact_bytes, skill_tree_artifact_bytes, summarize_scope_kernel,
 };
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
@@ -48,6 +52,8 @@ const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
+const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
+const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -107,6 +113,7 @@ struct ShadowImportOutcome {
     search_scale: Value,
     skill_tree: Value,
     bridges: Value,
+    kernel_context: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +123,7 @@ struct RowSinkSnapshot {
     security_screen: Value,
     skill_tree: Value,
     bridges: Value,
+    kernel_context: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +140,7 @@ struct ShadowVaultImport {
     security_screen: Value,
     skill_tree: Value,
     bridges: Value,
+    kernel_context: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +441,7 @@ fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<St
             "astrolabe": {
                 "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
                 "bridges": read_bridges_metadata(&cache_dir, &project)?,
+                "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
             },
         }),
     )
@@ -741,6 +751,7 @@ fn import_shadow_vault(
         search_scale,
         skill_tree: shadow_import.skill_tree,
         bridges: shadow_import.bridges,
+        kernel_context: shadow_import.kernel_context,
     })
 }
 
@@ -760,6 +771,7 @@ where
             let security_screen = snapshot.security_screen.clone();
             let skill_tree = snapshot.skill_tree.clone();
             let bridges = snapshot.bridges.clone();
+            let kernel_context = snapshot.kernel_context.clone();
             match import_cbm_graph_snapshot_to_vault_direct(
                 &snapshot.snapshot,
                 snapshot.source_fingerprint_sha256,
@@ -774,6 +786,7 @@ where
                     security_screen,
                     skill_tree,
                     bridges,
+                    kernel_context,
                 }),
                 Err(error) => {
                     let reason = format!("row-sink direct import failed: {error}");
@@ -785,6 +798,7 @@ where
                         security_screen,
                         skill_tree,
                         bridges,
+                        kernel_context,
                     })
                 }
             }
@@ -795,6 +809,7 @@ where
                 security_screen_unavailable(security_screen_subject(&options.project), &reason);
             let skill_tree = skill_tree_unavailable_json(&reason);
             let bridges = bridges_unavailable_json(&reason);
+            let kernel_context = kernel_context_unavailable_json(&reason);
             Ok(ShadowVaultImport {
                 report,
                 source: "sqlite_fallback".to_string(),
@@ -802,6 +817,7 @@ where
                 security_screen,
                 skill_tree,
                 bridges,
+                kernel_context,
             })
         }
         None => {
@@ -817,6 +833,7 @@ where
                 ),
                 skill_tree: skill_tree_unavailable_json(reason),
                 bridges: bridges_unavailable_json(reason),
+                kernel_context: kernel_context_unavailable_json(reason),
             })
         }
     }
@@ -832,12 +849,14 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
     let security_screen = security_screen_from_row_sink_rows(&rows);
     let skill_tree = skill_tree_from_row_sink_rows(&rows);
     let bridges = bridges_from_row_sink_rows(&rows);
+    let kernel_context = kernel_context_from_row_sink_rows(&rows);
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
         snapshot: pipeline_rows_to_graph_snapshot(rows),
         source_fingerprint_sha256,
         security_screen,
         skill_tree,
         bridges,
+        kernel_context,
     }))
 }
 
@@ -1660,6 +1679,468 @@ fn read_bridges_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynEr
     }
 }
 
+fn kernel_context_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let label_propagation = label_propagation_from_row_sink_rows(rows);
+    let scope_summaries = scope_summaries_from_row_sink_rows(rows);
+    kernel_context_json(label_propagation, scope_summaries)
+}
+
+fn label_propagation_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let (seeds, tombstones, skipped_properties) = label_seed_inputs_from_rows(rows);
+    let edges = label_graph_edges_from_rows(rows);
+    match propagate_labels(
+        &seeds,
+        &edges,
+        &tombstones,
+        &LabelPropagationConfig::default(),
+    ) {
+        Ok(report) => label_propagation_json(
+            &report,
+            seeds.len(),
+            edges.len(),
+            tombstones.len(),
+            skipped_properties,
+        ),
+        Err(error) => {
+            label_propagation_unavailable_json(&format!("label propagation failed: {error}"))
+        }
+    }
+}
+
+fn label_seed_inputs_from_rows(
+    rows: &CbmPipelineRows,
+) -> (Vec<LabelSeed>, Vec<LabelTombstone>, usize) {
+    let mut seeds = Vec::new();
+    let mut tombstones = Vec::new();
+    let mut skipped_properties = 0;
+
+    for node in &rows.nodes {
+        if node.qualified_name.trim().is_empty() || node.label.eq_ignore_ascii_case("project") {
+            continue;
+        }
+        let properties = match serde_json::from_str::<Value>(&node.properties_json) {
+            Ok(properties) => properties,
+            Err(_) => {
+                skipped_properties += 1;
+                continue;
+            }
+        };
+        if let Some(values) = properties
+            .get("label_seeds")
+            .or_else(|| properties.get("grounded_labels"))
+            .and_then(Value::as_array)
+        {
+            for value in values {
+                let Some(label) = value
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let confidence = value
+                    .get("confidence_millipoints")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1_000);
+                if confidence == 0 {
+                    skipped_properties += 1;
+                    continue;
+                }
+                let provenance = value
+                    .get("provenance_ref")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("row_sink:{}:{}#label_seed", node.project, node.id));
+                seeds.push(LabelSeed::new(
+                    node.qualified_name.clone(),
+                    label.to_string(),
+                    confidence,
+                    provenance,
+                ));
+            }
+        }
+        if let Some(values) = properties.get("label_tombstones").and_then(Value::as_array) {
+            for value in values {
+                let symbol_id = value
+                    .get("symbol_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&node.qualified_name);
+                let provenance = value
+                    .get("provenance_ref")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        format!("row_sink:{}:{}#label_tombstone", node.project, node.id)
+                    });
+                tombstones.push(LabelTombstone::new(symbol_id.to_string(), provenance));
+            }
+        }
+    }
+
+    (seeds, tombstones, skipped_properties)
+}
+
+fn label_graph_edges_from_rows(rows: &CbmPipelineRows) -> Vec<LabelGraphEdge> {
+    let node_names = rows
+        .nodes
+        .iter()
+        .filter(|node| !node.qualified_name.trim().is_empty())
+        .map(|node| (node.id, node.qualified_name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    rows.edges
+        .iter()
+        .filter_map(|edge| {
+            let left = node_names.get(&edge.source_id)?;
+            let right = node_names.get(&edge.target_id)?;
+            Some(LabelGraphEdge::new(
+                left.clone(),
+                right.clone(),
+                label_edge_provenance(edge),
+            ))
+        })
+        .collect()
+}
+
+fn label_edge_provenance(edge: &astrolabe_bridge::CbmPipelineEdgeRow) -> String {
+    serde_json::from_str::<Value>(&edge.properties_json)
+        .ok()
+        .and_then(|properties| {
+            properties
+                .get("provenance_ref")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| format!("row_sink:edge:{}:{}", edge.id, edge.edge_type))
+}
+
+fn label_propagation_json(
+    report: &LabelPropagationReport,
+    seed_count: usize,
+    edge_count: usize,
+    tombstone_count: usize,
+    skipped_properties: usize,
+) -> Value {
+    let artifact_bytes = label_propagation_artifact_bytes(report);
+    let status = if skipped_properties > 0 {
+        "partial"
+    } else if report.empty_reason.is_some() {
+        "empty"
+    } else {
+        "built"
+    };
+    json!({
+        "schema": report.schema,
+        "status": status,
+        "knob_registry_version": report.knob_registry_version,
+        "decay_milliper_step": report.decay_milliper_step,
+        "seed_count": seed_count,
+        "edge_count": edge_count,
+        "tombstone_count": tombstone_count,
+        "skipped_count": skipped_properties,
+        "label_count": report.labels.len(),
+        "empty_reason": report.empty_reason,
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "labels": report.labels.iter().map(propagated_label_json).collect::<Vec<_>>(),
+        "freshness": report.freshness,
+        "trust": if skipped_properties == 0 { report.trust } else { "provisional" },
+    })
+}
+
+fn propagated_label_json(label: &astrolabe_kernel::PropagatedLabel) -> Value {
+    json!({
+        "symbol_id": label.symbol_id,
+        "label": label.label,
+        "confidence_millipoints": label.confidence_millipoints,
+        "seed_symbol_id": label.seed_symbol_id,
+        "seed_confidence_millipoints": label.seed_confidence_millipoints,
+        "distance": label.distance,
+        "provenance": {
+            "seed_provenance_ref": label.provenance.seed_provenance_ref,
+            "graph_provenance_refs": label.provenance.graph_provenance_refs,
+            "math": label.provenance.math,
+        },
+        "freshness": label.freshness,
+        "trust": label.trust.as_str(),
+    })
+}
+
+fn label_propagation_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": LABEL_PROPAGATION_SCHEMA,
+        "status": "unavailable",
+        "knob_registry_version": LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with label seed metadata and graph edges available before using propagated-label filters",
+    })
+}
+
+fn scope_summaries_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let (inputs, skipped_properties) = scope_summary_inputs_from_rows(rows);
+    if inputs.is_empty() {
+        return scope_summaries_unavailable_json(
+            "scope summary metadata missing; row-sink nodes must declare kernel_scopes/summary_scopes/scopes",
+        );
+    }
+    let summaries = inputs
+        .iter()
+        .map(summarize_scope_kernel)
+        .collect::<Vec<_>>();
+    scope_summaries_json(&summaries, skipped_properties)
+}
+
+fn scope_summary_inputs_from_rows(rows: &CbmPipelineRows) -> (Vec<ScopeSummaryInput>, usize) {
+    let fingerprint = hex_lower(&row_sink_fingerprint(rows));
+    let mut by_scope = BTreeMap::<String, Vec<ScopeSummaryMember>>::new();
+    let mut grounded_by_scope = BTreeMap::<String, bool>::new();
+    let mut recall_by_scope = BTreeMap::<String, ScopeRecallMeasurement>::new();
+    let mut skipped_properties = 0;
+
+    for node in &rows.nodes {
+        if node.qualified_name.trim().is_empty() || node.label.eq_ignore_ascii_case("project") {
+            continue;
+        }
+        let properties = match serde_json::from_str::<Value>(&node.properties_json) {
+            Ok(properties) => properties,
+            Err(_) => {
+                skipped_properties += 1;
+                continue;
+            }
+        };
+        let scopes = scope_summary_scopes_for_node(&properties);
+        if scopes.is_empty() {
+            continue;
+        }
+        let grounded = properties
+            .get("kernel_grounded")
+            .or_else(|| properties.get("grounded"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        for scope in scopes {
+            let member = ScopeSummaryMember::new(
+                node.qualified_name.clone(),
+                node.qualified_name.clone(),
+                bridge_node_kernel_weight(&properties, &scope),
+                grounded,
+                scope_node_provenance(node, &properties, &scope),
+            );
+            by_scope.entry(scope.clone()).or_default().push(member);
+            grounded_by_scope
+                .entry(scope.clone())
+                .and_modify(|scope_grounded| *scope_grounded = *scope_grounded && grounded)
+                .or_insert(grounded);
+            if let Some(recall) = scope_recall_for_node(&properties, &scope) {
+                recall_by_scope.entry(scope).or_insert(recall);
+            }
+        }
+    }
+
+    let inputs = by_scope
+        .into_iter()
+        .map(|(scope_id, members)| {
+            ScopeSummaryInput::new(
+                scope_id.clone(),
+                format!("row-sink:{fingerprint}:{scope_id}"),
+                grounded_by_scope.get(&scope_id).copied().unwrap_or(false),
+                members,
+                recall_by_scope.get(&scope_id).copied(),
+            )
+        })
+        .collect();
+    (inputs, skipped_properties)
+}
+
+fn scope_summary_scopes_for_node(properties: &Value) -> Vec<String> {
+    let mut scopes = BTreeSet::new();
+    for field in ["kernel_scopes", "summary_scopes", "scope_ids", "scopes"] {
+        if let Some(values) = properties.get(field).and_then(Value::as_array) {
+            for value in values {
+                if let Some(scope) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                {
+                    scopes.insert(scope.to_string());
+                }
+            }
+        }
+    }
+    if let Some(scope) = properties
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
+        scopes.insert(scope.to_string());
+    }
+    scopes.into_iter().collect()
+}
+
+fn scope_node_provenance(
+    node: &astrolabe_bridge::CbmPipelineNodeRow,
+    properties: &Value,
+    scope: &str,
+) -> String {
+    properties
+        .get("kernel_scope_provenance")
+        .or_else(|| properties.get("scope_provenance"))
+        .and_then(Value::as_object)
+        .and_then(|provenance| provenance.get(scope))
+        .and_then(Value::as_str)
+        .or_else(|| properties.get("provenance_ref").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "row_sink:{}:{}#scope_summary:{scope}",
+                node.project, node.id
+            )
+        })
+}
+
+fn scope_recall_for_node(properties: &Value, scope: &str) -> Option<ScopeRecallMeasurement> {
+    let recall = properties.get("scope_recall")?;
+    let direct = recall
+        .get("recalled")
+        .and_then(Value::as_u64)
+        .zip(recall.get("total").and_then(Value::as_u64));
+    let scoped = recall
+        .get(scope)
+        .and_then(Value::as_object)
+        .and_then(|value| {
+            value
+                .get("recalled")
+                .and_then(Value::as_u64)
+                .zip(value.get("total").and_then(Value::as_u64))
+        });
+    direct.or(scoped).and_then(|(recalled, total)| {
+        (total > 0).then_some(ScopeRecallMeasurement { recalled, total })
+    })
+}
+
+fn scope_summaries_json(summaries: &[ScopeSummary], skipped_properties: usize) -> Value {
+    let mut artifact_bytes = Vec::new();
+    for summary in summaries {
+        artifact_bytes.extend(scope_summary_artifact_bytes(summary));
+    }
+    let all_verified =
+        skipped_properties == 0 && summaries.iter().all(|summary| summary.trust == "verified");
+    json!({
+        "schema": SCOPE_SUMMARY_COLLECTION_SCHEMA,
+        "summary_schema": SCOPE_SUMMARY_SCHEMA,
+        "status": if skipped_properties == 0 { "built" } else { "partial" },
+        "summary_count": summaries.len(),
+        "skipped_count": skipped_properties,
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "summaries": summaries.iter().map(scope_summary_json).collect::<Vec<_>>(),
+        "freshness": "fresh",
+        "trust": if all_verified { "verified" } else { "provisional" },
+    })
+}
+
+fn scope_summary_json(summary: &ScopeSummary) -> Value {
+    json!({
+        "schema": summary.schema,
+        "scope_id": summary.scope_id,
+        "dirty_region_hash": summary.dirty_region_hash,
+        "summary_hash": summary.summary_hash,
+        "recall": summary.recall.map(|recall| json!({
+            "recalled": recall.recalled,
+            "total": recall.total,
+        })),
+        "recall_millipoints": summary.recall_millipoints,
+        "grounded_member_count": summary.grounded_member_count,
+        "total_member_count": summary.total_member_count,
+        "grounded_fraction_millipoints": summary.grounded_fraction_millipoints,
+        "members": summary.members.iter().map(|member| {
+            json!({
+                "symbol_id": member.symbol_id,
+                "qualified_name": member.qualified_name,
+                "kernel_weight": member.kernel_weight,
+                "grounded": member.grounded,
+                "provenance_ref": member.provenance_ref,
+            })
+        }).collect::<Vec<_>>(),
+        "freshness": summary.freshness,
+        "trust": summary.trust,
+    })
+}
+
+fn scope_summaries_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": SCOPE_SUMMARY_COLLECTION_SCHEMA,
+        "summary_schema": SCOPE_SUMMARY_SCHEMA,
+        "status": "unavailable",
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with explicit scope metadata before using kernel summary architecture aspects",
+    })
+}
+
+fn kernel_context_json(label_propagation: Value, scope_summaries: Value) -> Value {
+    let label_status = label_propagation
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    let scope_status = scope_summaries
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    let status = if label_status == "unavailable" && scope_status == "unavailable" {
+        "unavailable"
+    } else if matches!(label_status, "built" | "empty") && scope_status == "built" {
+        "built"
+    } else {
+        "partial"
+    };
+    let trust =
+        if label_propagation["trust"] == "verified" && scope_summaries["trust"] == "verified" {
+            "verified"
+        } else {
+            "provisional"
+        };
+    json!({
+        "schema": KERNEL_CONTEXT_SCHEMA,
+        "status": status,
+        "label_propagation": label_propagation,
+        "scope_summaries": scope_summaries,
+        "freshness": if status == "unavailable" { "not_evaluated" } else { "fresh" },
+        "trust": trust,
+    })
+}
+
+fn kernel_context_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": KERNEL_CONTEXT_SCHEMA,
+        "status": "unavailable",
+        "label_propagation": label_propagation_unavailable_json(reason),
+        "scope_summaries": scope_summaries_unavailable_json(reason),
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with row-sink label and scope metadata before using kernel context surfaces",
+    })
+}
+
+fn read_kernel_context_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "kernel_context_json"))?
+    else {
+        return Ok(kernel_context_unavailable_json(
+            "kernel context metadata missing; rerun index_repository with calyx shadow",
+        ));
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(kernel_context_unavailable_json(&format!(
+            "stored kernel_context_json invalid: {error}"
+        ))),
+    }
+}
+
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -1866,6 +2347,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "search_scale": outcome.search_scale.clone(),
         "skill_tree": outcome.skill_tree.clone(),
         "bridges": outcome.bridges.clone(),
+        "kernel_context": outcome.kernel_context.clone(),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -1938,6 +2420,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "search_scale": read_search_scale_metadata(cache_dir, project)?,
         "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
         "bridges": read_bridges_metadata(cache_dir, project)?,
+        "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -2180,6 +2663,7 @@ fn persist_shadow_outcome_at(
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
     let skill_tree_json = serde_json::to_string(&outcome.skill_tree)?;
     let bridge_reports_json = serde_json::to_string(&outcome.bridges)?;
+    let kernel_context_json = serde_json::to_string(&outcome.kernel_context)?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -2232,6 +2716,7 @@ fn persist_shadow_outcome_at(
         ("search_scale_json", search_scale_json),
         ("skill_tree_json", skill_tree_json),
         ("bridge_reports_json", bridge_reports_json),
+        ("kernel_context_json", kernel_context_json),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -2772,6 +3257,106 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_kernel_context_propagates_labels_and_summarizes_scopes() {
+        let context = kernel_context_from_row_sink_rows(&sample_kernel_context_rows());
+
+        assert_eq!(context["schema"], KERNEL_CONTEXT_SCHEMA);
+        assert_eq!(context["status"], "built");
+        assert_eq!(context["freshness"], "fresh");
+        assert_eq!(context["trust"], "provisional");
+
+        let propagation = &context["label_propagation"];
+        assert_eq!(propagation["schema"], LABEL_PROPAGATION_SCHEMA);
+        assert_eq!(propagation["status"], "built");
+        assert_eq!(propagation["seed_count"], 1);
+        assert_eq!(propagation["edge_count"], 2);
+        assert_eq!(propagation["label_count"], 2);
+        assert_eq!(propagation["trust"], "provisional");
+        let labels = propagation["labels"].as_array().expect("labels");
+        assert_eq!(labels[0]["symbol_id"], "auth.token");
+        assert_eq!(labels[0]["label"], "security-sensitive");
+        assert_eq!(labels[0]["confidence_millipoints"], 500);
+        assert_eq!(labels[0]["distance"], 1);
+        assert_eq!(
+            labels[0]["provenance"]["seed_provenance_ref"],
+            "seed:security-review:1"
+        );
+        assert_eq!(labels[1]["symbol_id"], "billing.charge");
+        assert_eq!(labels[1]["confidence_millipoints"], 250);
+        assert_eq!(labels[1]["distance"], 2);
+        assert_eq!(labels[1]["trust"], "provisional");
+
+        let summaries = &context["scope_summaries"];
+        assert_eq!(summaries["schema"], SCOPE_SUMMARY_COLLECTION_SCHEMA);
+        assert_eq!(summaries["summary_schema"], SCOPE_SUMMARY_SCHEMA);
+        assert_eq!(summaries["status"], "built");
+        assert_eq!(summaries["summary_count"], 1);
+        assert_eq!(summaries["trust"], "provisional");
+        let summary = &summaries["summaries"][0];
+        assert_eq!(summary["scope_id"], "payments");
+        assert_eq!(summary["recall"]["recalled"], 2);
+        assert_eq!(summary["recall"]["total"], 3);
+        assert_eq!(summary["recall_millipoints"], 666);
+        assert_eq!(summary["grounded_member_count"], 2);
+        assert_eq!(summary["total_member_count"], 3);
+        assert_eq!(summary["grounded_fraction_millipoints"], 666);
+        let members = summary["members"].as_array().expect("summary members");
+        assert_eq!(members[0]["symbol_id"], "auth.login");
+        assert_eq!(members[1]["symbol_id"], "auth.token");
+        assert_eq!(members[2]["symbol_id"], "billing.charge");
+    }
+
+    #[test]
+    fn kernel_context_persists_reads_back_and_augments_architecture_payload() {
+        let dir = temp_dir("kernel-context-readback");
+        let kernel_context = kernel_context_from_row_sink_rows(&sample_kernel_context_rows());
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.kernel_context = kernel_context.clone();
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "kernel_context_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        let rehydrated = read_kernel_context_metadata(&dir, "demo").unwrap();
+        let summary = grounding_summary(&outcome);
+
+        assert_eq!(raw_value, kernel_context);
+        assert_eq!(rehydrated, kernel_context);
+        assert_eq!(summary["kernel_context"], kernel_context);
+
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"project\":\"demo\",\"total_nodes\":5}"}],
+            "structuredContent": {"project": "demo", "total_nodes": 5},
+            "isError": false,
+        });
+        let augmented = augment_tool_result(
+            &serde_json::to_string(&result).unwrap(),
+            json!({
+                "astrolabe": {
+                    "kernel_context": kernel_context.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(
+            value["structuredContent"]["astrolabe"]["kernel_context"],
+            kernel_context
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let text_value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value["astrolabe"]["kernel_context"], kernel_context);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn vault_import_summary_labels_fallback_trust() {
         let fallback = vault_import_summary(
             "sqlite_fallback",
@@ -2822,12 +3407,14 @@ mod tests {
         let security_screen = security_screen_from_row_sink_rows(&rows);
         let skill_tree = skill_tree_from_row_sink_rows(&rows);
         let bridges = bridges_from_row_sink_rows(&rows);
+        let kernel_context = kernel_context_from_row_sink_rows(&rows);
         let candidate = RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
             snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
             source_fingerprint_sha256: row_sink_fingerprint(&rows),
             security_screen: security_screen.clone(),
             skill_tree: skill_tree.clone(),
             bridges: bridges.clone(),
+            kernel_context: kernel_context.clone(),
         }));
 
         let imported = import_shadow_vault_report(
@@ -2845,6 +3432,7 @@ mod tests {
         assert_eq!(imported.security_screen, security_screen);
         assert_eq!(imported.skill_tree, skill_tree);
         assert_eq!(imported.bridges, bridges);
+        assert_eq!(imported.kernel_context, kernel_context);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -3219,6 +3807,80 @@ mod tests {
         }
     }
 
+    fn sample_kernel_context_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 1,
+                    project: "demo".to_string(),
+                    label: "Project".to_string(),
+                    name: "demo".to_string(),
+                    qualified_name: "demo".to_string(),
+                    file_path: String::new(),
+                    start_line: 0,
+                    end_line: 0,
+                    properties_json: "{}".to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "login".to_string(),
+                    qualified_name: "auth.login".to_string(),
+                    file_path: "auth/login.rs".to_string(),
+                    start_line: 10,
+                    end_line: 20,
+                    properties_json: r#"{"label_seeds":[{"label":"security-sensitive","confidence_millipoints":1000,"provenance_ref":"seed:security-review:1"}],"kernel_scopes":["payments"],"kernel_weight":100,"kernel_grounded":true,"scope_recall":{"payments":{"recalled":2,"total":3}},"kernel_scope_provenance":{"payments":"ledger:payments:1"}}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 3,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "token".to_string(),
+                    qualified_name: "auth.token".to_string(),
+                    file_path: "auth/token.rs".to_string(),
+                    start_line: 30,
+                    end_line: 40,
+                    properties_json: r#"{"kernel_scopes":["payments"],"kernel_weight":80,"kernel_grounded":true,"kernel_scope_provenance":{"payments":"ledger:payments:2"}}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 4,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "charge".to_string(),
+                    qualified_name: "billing.charge".to_string(),
+                    file_path: "billing/charge.rs".to_string(),
+                    start_line: 50,
+                    end_line: 60,
+                    properties_json: r#"{"kernel_scopes":["payments"],"kernel_weight":40,"kernel_grounded":false,"kernel_scope_provenance":{"payments":"ledger:payments:3"}}"#.to_string(),
+                },
+            ],
+            edges: vec![
+                astrolabe_bridge::CbmPipelineEdgeRow {
+                    id: 10,
+                    project: "demo".to_string(),
+                    source_id: 2,
+                    target_id: 3,
+                    edge_type: "CALLS".to_string(),
+                    properties_json: r#"{"provenance_ref":"edge:auth-login-token"}"#.to_string(),
+                    url_path_gen: String::new(),
+                    local_name_gen: String::new(),
+                },
+                astrolabe_bridge::CbmPipelineEdgeRow {
+                    id: 11,
+                    project: "demo".to_string(),
+                    source_id: 3,
+                    target_id: 4,
+                    edge_type: "CALLS".to_string(),
+                    properties_json: r#"{"provenance_ref":"edge:token-billing"}"#.to_string(),
+                    url_path_gen: String::new(),
+                    local_name_gen: String::new(),
+                },
+            ],
+        }
+    }
+
     fn seed_minimal_cbm_sqlite(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -3275,6 +3937,7 @@ mod tests {
             search_scale: sample_search_scale(),
             skill_tree: sample_skill_tree(),
             bridges: sample_bridges(),
+            kernel_context: sample_kernel_context(),
         }
     }
 
@@ -3298,6 +3961,10 @@ mod tests {
 
     fn sample_bridges() -> Value {
         bridges_from_row_sink_rows(&sample_bridge_rows())
+    }
+
+    fn sample_kernel_context() -> Value {
+        kernel_context_from_row_sink_rows(&sample_kernel_context_rows())
     }
 
     fn temp_dir(name: &str) -> PathBuf {
