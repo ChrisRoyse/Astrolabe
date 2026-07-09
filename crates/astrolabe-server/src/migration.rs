@@ -87,6 +87,7 @@ const OPTIMIZER_TRIGGER_ACK_SCHEMA: &str = "astrolabe.optimizer_trigger_ack.v1";
 const OPTIMIZER_JANITOR_SCHEMA: &str = "astrolabe.optimizer_janitor.v1";
 const OPTIMIZER_GUARD_HEALTH_SCHEMA: &str = "astrolabe.optimizer_guard_health.v1";
 const OPTIMIZER_TRIPWIRES_SCHEMA: &str = "astrolabe.optimizer_tripwires.v1";
+const OPTIMIZER_PROPOSALS_SCHEMA: &str = "astrolabe.optimizer_proposals.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
@@ -5176,7 +5177,8 @@ fn optimizer_status_json_at(
                 metadata_key(project, "vault_salt"),
                 metadata_key(project, "ledger_seq"),
                 metadata_key(project, "ledger_rows"),
-                metadata_key(project, "optimizer_freezes_json")
+                metadata_key(project, "optimizer_freezes_json"),
+                metadata_key(project, "optimizer_proposals_json")
             ],
         },
         "kill_switch": kill_switch,
@@ -5184,7 +5186,7 @@ fn optimizer_status_json_at(
         "tripwires": optimizer_tripwires_json(cache_dir, project)?,
         "budget": optimizer_budget_json(&background_lane, janitor),
         "recent_changes": recent_changes,
-        "pending_proposals": optimizer_pending_proposals_json(),
+        "pending_proposals": optimizer_pending_proposals_json(cache_dir, project)?,
         "guard_health": optimizer_guard_health_json(cache_dir, project)?,
         "drift_alarms": optimizer_drift_alarms_json(),
         "reactive_triggers": reactive_triggers,
@@ -5828,15 +5830,163 @@ fn optimizer_janitor_relative_key(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn optimizer_pending_proposals_json() -> Value {
-    json!({
+fn optimizer_pending_proposals_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let key = metadata_key(project, "optimizer_proposals_json");
+    if let Some(raw) = read_config_value(cache_dir, &key)? {
+        return Ok(match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => optimizer_proposals_config_json(value, &key),
+            Err(error) => optimizer_proposals_invalid_json(
+                &key,
+                format!("stored optimizer_proposals_json invalid: {error}"),
+            ),
+        });
+    }
+    Ok(json!({
         "status": "unavailable",
         "proposal_count": Value::Null,
         "proposals": [],
         "freshness": "not_evaluated",
         "trust": "provisional",
+        "source": format!("config:{key}:missing"),
         "reason": "anneal proposal store is not enabled in the current shadow stage",
         "remediation": "wire the P8.3 deficit-to-candidate proposal pipeline before serving optimizer proposals",
+    }))
+}
+
+fn optimizer_proposals_config_json(value: Value, key: &str) -> Value {
+    let Some(object) = value.as_object() else {
+        return optimizer_proposals_invalid_json(key, "optimizer_proposals_json must be an object");
+    };
+    if object.get("schema").and_then(Value::as_str) != Some(OPTIMIZER_PROPOSALS_SCHEMA) {
+        return optimizer_proposals_invalid_json(
+            key,
+            format!("optimizer_proposals_json schema must be {OPTIMIZER_PROPOSALS_SCHEMA}"),
+        );
+    }
+    if object.get("status").and_then(Value::as_str).is_none()
+        || object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return optimizer_proposals_invalid_json(
+            key,
+            "optimizer_proposals_json requires status, freshness, and trust labels",
+        );
+    }
+    let Some(proposals) = object.get("proposals").and_then(Value::as_array) else {
+        return optimizer_proposals_invalid_json(
+            key,
+            "optimizer_proposals_json proposals must be an array",
+        );
+    };
+    for (index, proposal) in proposals.iter().enumerate() {
+        if let Some(reason) = optimizer_proposal_invalid(proposal) {
+            return optimizer_proposals_invalid_json(
+                key,
+                format!("optimizer_proposals_json proposals[{index}] {reason}"),
+            );
+        }
+    }
+
+    let mut out = object.clone();
+    out.insert("proposal_count".to_string(), json!(proposals.len()));
+    out.insert("source".to_string(), json!(format!("config:{key}")));
+    out.insert(
+        "remediation".to_string(),
+        object.get("remediation").cloned().unwrap_or(Value::Null),
+    );
+    Value::Object(out)
+}
+
+fn optimizer_proposal_invalid(proposal: &Value) -> Option<&'static str> {
+    let Some(object) = proposal.as_object() else {
+        return Some("must be an object");
+    };
+    if object.get("proposal_id").and_then(Value::as_str).is_none()
+        || object.get("state").and_then(Value::as_str).is_none()
+    {
+        return Some("requires string proposal_id and state");
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Some("requires freshness and trust labels");
+    }
+    if !json_string_array_nonempty(object.get("provenance")) {
+        return Some("requires non-empty string provenance");
+    }
+    let Some(deficit) = object.get("deficit") else {
+        return Some("requires measured deficit object");
+    };
+    if optimizer_proposal_deficit_invalid(deficit).is_some() {
+        return Some("requires measured deficit labels, numeric bits, and provenance");
+    }
+    let Some(candidate) = object.get("candidate") else {
+        return Some("requires candidate object");
+    };
+    if optimizer_proposal_candidate_invalid(candidate).is_some() {
+        return Some("requires candidate kind, labels, and provenance");
+    }
+    None
+}
+
+fn optimizer_proposal_deficit_invalid(deficit: &Value) -> Option<&'static str> {
+    let Some(object) = deficit.as_object() else {
+        return Some("must be an object");
+    };
+    if object.get("axis").and_then(Value::as_str).is_none() {
+        return Some("requires string axis");
+    }
+    for field in ["measured_bits", "required_bits"] {
+        if object.get(field).and_then(Value::as_f64).is_none() {
+            return Some("requires numeric measured_bits and required_bits");
+        }
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Some("requires freshness and trust labels");
+    }
+    if !json_string_array_nonempty(object.get("provenance")) {
+        return Some("requires non-empty string provenance");
+    }
+    None
+}
+
+fn optimizer_proposal_candidate_invalid(candidate: &Value) -> Option<&'static str> {
+    let Some(object) = candidate.as_object() else {
+        return Some("must be an object");
+    };
+    if object.get("kind").and_then(Value::as_str).is_none() {
+        return Some("requires string kind");
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Some("requires freshness and trust labels");
+    }
+    if !json_string_array_nonempty(object.get("provenance")) {
+        return Some("requires non-empty string provenance");
+    }
+    None
+}
+
+fn json_string_array_nonempty(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty() && values.iter().all(Value::is_string))
+}
+
+fn optimizer_proposals_invalid_json(key: &str, reason: impl Into<String>) -> Value {
+    json!({
+        "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+        "status": "invalid",
+        "proposal_count": Value::Null,
+        "proposals": [],
+        "freshness": "fresh",
+        "trust": "provisional",
+        "source": format!("config:{key}"),
+        "reason": reason.into(),
+        "remediation": "repair optimizer_proposals_json before treating optimizer proposals as pending",
     })
 }
 
@@ -8711,6 +8861,130 @@ mod tests {
         assert_eq!(
             surfaced["states"][1]["remediation"],
             "rollback candidate change before promotion"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_reads_persisted_optimizer_proposals_from_config() {
+        let dir = temp_dir("optimizer-proposals-readback");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let key = metadata_key("demo", "optimizer_proposals_json");
+        let proposals = json!({
+            "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+            "status": "read",
+            "freshness": "fresh",
+            "trust": "verified",
+            "proposals": [{
+                "proposal_id": "proposal:test:1",
+                "state": "pending",
+                "deficit": {
+                    "axis": "defect_prediction",
+                    "measured_bits": 0.61,
+                    "required_bits": 1.0,
+                    "freshness": "fresh",
+                    "trust": "verified",
+                    "provenance": ["measure_bits:test:12"],
+                },
+                "candidate": {
+                    "kind": "hashed_set_lens",
+                    "slot": "lock_atomic_usage",
+                    "freshness": "fresh",
+                    "trust": "provisional",
+                    "provenance": ["propose_lens:test:12"],
+                },
+                "differentiation_gate": {
+                    "status": "pending",
+                    "freshness": "not_evaluated",
+                    "trust": "provisional",
+                    "remediation": "run P8.3 differentiation gate before admitting this proposal",
+                },
+                "freshness": "fresh",
+                "trust": "provisional",
+                "provenance": ["optimizer_proposals:test:12"],
+            }],
+        });
+        write_config_value(&dir, &key, &proposals.to_string()).unwrap();
+        let raw = read_config_value(&dir, &key).unwrap().unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(raw_value, proposals);
+
+        let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        let surfaced = &status["pending_proposals"];
+        assert_eq!(surfaced["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(surfaced["status"], "read");
+        assert_eq!(surfaced["proposal_count"], 1);
+        assert_eq!(surfaced["source"], format!("config:{key}"));
+        assert_eq!(surfaced["freshness"], "fresh");
+        assert_eq!(surfaced["trust"], "verified");
+        assert_eq!(surfaced["proposals"][0]["proposal_id"], "proposal:test:1");
+        assert_eq!(
+            surfaced["proposals"][0]["deficit"]["axis"],
+            "defect_prediction"
+        );
+        assert_eq!(surfaced["proposals"][0]["deficit"]["measured_bits"], 0.61);
+        assert_eq!(
+            surfaced["proposals"][0]["candidate"]["kind"],
+            "hashed_set_lens"
+        );
+        assert_eq!(
+            surfaced["proposals"][0]["differentiation_gate"]["status"],
+            "pending"
+        );
+        assert_eq!(
+            status["capabilities"]["propose"],
+            "not_enabled_in_shadow_stage"
+        );
+        assert!(
+            status["source_state"]["metadata_refs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(key))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_labels_invalid_optimizer_proposals_from_config() {
+        let dir = temp_dir("optimizer-proposals-invalid");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let key = metadata_key("demo", "optimizer_proposals_json");
+        let proposals = json!({
+            "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+            "status": "read",
+            "freshness": "fresh",
+            "trust": "verified",
+            "proposals": [{
+                "proposal_id": "proposal:test:bad",
+                "state": "pending",
+                "freshness": "fresh",
+                "trust": "provisional",
+                "provenance": ["optimizer_proposals:test:bad"],
+            }],
+        });
+        write_config_value(&dir, &key, &proposals.to_string()).unwrap();
+
+        let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        let surfaced = &status["pending_proposals"];
+        assert_eq!(surfaced["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(surfaced["status"], "invalid");
+        assert_eq!(surfaced["proposal_count"], Value::Null);
+        assert_eq!(surfaced["source"], format!("config:{key}"));
+        assert!(
+            surfaced["reason"]
+                .as_str()
+                .unwrap()
+                .contains("requires measured deficit object")
+        );
+        assert_eq!(
+            surfaced["remediation"],
+            "repair optimizer_proposals_json before treating optimizer proposals as pending"
         );
         fs::remove_dir_all(&dir).ok();
     }
