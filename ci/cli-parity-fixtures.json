@@ -17,6 +17,7 @@
     "ingest_traces": {},
     "detect_anomalies": {},
     "get_provenance": {},
-    "optimizer_status": {}
+    "optimizer_status": {},
+    "get_readiness": {}
   }
 }

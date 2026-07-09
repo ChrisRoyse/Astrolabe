@@ -71,6 +71,7 @@ const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
 const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
+const GET_READINESS_SCHEMA: &str = "astrolabe.get_readiness.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -239,6 +240,7 @@ pub fn handle_tool_raw(
         "detect_anomalies" => handle_detect_anomalies(args_json),
         "get_provenance" => handle_get_provenance(args_json),
         "optimizer_status" => handle_optimizer_status(args_json),
+        "get_readiness" => handle_get_readiness(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -281,6 +283,7 @@ pub fn handle_jsonrpc_raw(
         && tool_name != "detect_anomalies"
         && tool_name != "get_provenance"
         && tool_name != "optimizer_status"
+        && tool_name != "get_readiness"
     {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
@@ -336,11 +339,12 @@ fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> 
     Ok(serde_json::to_string(&response)?)
 }
 
-fn astrolabe_tool_definitions() -> [Value; 3] {
+fn astrolabe_tool_definitions() -> [Value; 4] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
         optimizer_status_tool_definition(),
+        get_readiness_tool_definition(),
     ]
 }
 
@@ -461,6 +465,46 @@ fn optimizer_status_tool_definition() -> Value {
     })
 }
 
+fn get_readiness_tool_definition() -> Value {
+    json!({
+        "name": "get_readiness",
+        "title": "Get Readiness",
+        "description": "Return Astrolabe's six-tier readiness predicate for a shadow-indexed project/scope. Tiers fail closed unless their measured source state is present.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to evaluate. If omitted, project-level readiness is reported."
+                },
+                "axis": {
+                    "type": "string",
+                    "description": "Optional readiness axis label; currently used only for labeled remediation."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
 fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
     match tool_name {
         "index_repository" => {
@@ -487,6 +531,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
         "detect_anomalies" => Ok(true),
         "get_provenance" => Ok(true),
         "optimizer_status" => Ok(true),
+        "get_readiness" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -732,6 +777,25 @@ fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
         &project,
         anneal_env.as_deref(),
     )?)
+}
+
+fn handle_get_readiness(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("get_readiness arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("get_readiness requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "get_readiness requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let scope = string_arg(args_obj, "scope");
+    let axis = string_arg(args_obj, "axis");
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -4721,6 +4785,211 @@ fn optimizer_unavailable_json(section: &str, reason: &str, remediation: &str) ->
     })
 }
 
+fn readiness_status_json_at(
+    cache_dir: &Path,
+    project: &str,
+    scope: Option<&str>,
+    axis: Option<&str>,
+) -> Result<Value, DynError> {
+    let effective_scope = scope.unwrap_or(project);
+    let effective_axis = axis.unwrap_or("general");
+    let kernel_context = read_kernel_context_metadata(cache_dir, project)?;
+    let tiers = vec![
+        readiness_unavailable_tier(
+            "oracle_clean",
+            "oracle-clean >= 0.7",
+            "oracle_evidence:not_persisted",
+            "mine and persist oracle outcome anchors plus flakiness/self-consistency ceilings for this scope",
+        ),
+        readiness_unavailable_tier(
+            "panel_sufficient",
+            "panel bits sufficient for axis entropy",
+            "assay_sufficiency:not_persisted",
+            "run measure_bits sufficiency for the requested axis and persist the panel/axis deficit card",
+        ),
+        readiness_kernel_recall_tier(&kernel_context, effective_scope),
+        readiness_unavailable_tier(
+            "calibrated",
+            "guard tau calibrated within ceiling",
+            "guard_profiles:not_persisted",
+            "run guard_calibrate and persist per-slot tau/FAR/FRR profile metadata for this scope",
+        ),
+        readiness_unavailable_tier(
+            "goodhart_defended",
+            "Goodhart gaming check g(tau) >= 0.9",
+            "anneal_goodhart:not_persisted",
+            "run and persist the anneal Goodhart/dominance defense before enabling autonomy",
+        ),
+        readiness_unavailable_tier(
+            "mistakes_closed",
+            "no recurring closed-mistake regressions",
+            "mistake_closure:not_persisted",
+            "run mistake-closure replay and persist wrong-only-once regression state for this scope",
+        ),
+    ];
+    let ready = tiers.iter().all(readiness_tier_passed);
+    let first_failing = tiers
+        .iter()
+        .find(|tier| !readiness_tier_passed(tier))
+        .cloned();
+    let measured_tier_count = tiers
+        .iter()
+        .filter(|tier| tier.get("measured").and_then(Value::as_bool) == Some(true))
+        .count();
+    let trust = if ready && tiers.iter().all(readiness_tier_verified) {
+        "verified"
+    } else {
+        "provisional"
+    };
+    let mut response = json!({
+        "schema": GET_READINESS_SCHEMA,
+        "project": project,
+        "scope": effective_scope,
+        "axis": effective_axis,
+        "status": if ready { "ready" } else { "not_ready" },
+        "ready": ready,
+        "freshness": "fresh",
+        "trust": trust,
+        "measured_tier_count": measured_tier_count,
+        "tier_count": tiers.len(),
+        "tiers": tiers,
+        "first_failing_tier": first_failing.as_ref().map(|tier| {
+            json!({
+                "tier": tier.get("tier").cloned().unwrap_or(Value::Null),
+                "cheapest_fix": tier.get("cheapest_fix").cloned().unwrap_or(Value::Null),
+                "source": tier.get("source").cloned().unwrap_or(Value::Null),
+            })
+        }),
+        "source_state": {
+            "kernel_context": {
+                "schema": kernel_context.get("schema").cloned().unwrap_or(Value::Null),
+                "status": kernel_context.get("status").cloned().unwrap_or(Value::Null),
+                "freshness": kernel_context.get("freshness").cloned().unwrap_or(Value::Null),
+                "trust": kernel_context.get("trust").cloned().unwrap_or(Value::Null),
+                "metadata_ref": metadata_key(project, "kernel_context_json"),
+            },
+        },
+    });
+    refresh_readiness_artifact_hash(&mut response);
+    Ok(response)
+}
+
+fn readiness_unavailable_tier(
+    tier: &str,
+    required: &str,
+    source: &str,
+    cheapest_fix: &str,
+) -> Value {
+    json!({
+        "tier": tier,
+        "pass": false,
+        "measured": false,
+        "value": Value::Null,
+        "required": required,
+        "provenance_refs": [],
+        "source": source,
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "cheapest_fix": cheapest_fix,
+    })
+}
+
+fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) -> Value {
+    let summaries = kernel_context
+        .get("scope_summaries")
+        .and_then(|scope_summaries| scope_summaries.get("summaries"))
+        .and_then(Value::as_array);
+    let Some(summary) = summaries.and_then(|summaries| {
+        summaries
+            .iter()
+            .find(|summary| summary.get("scope_id").and_then(Value::as_str) == Some(scope))
+    }) else {
+        return readiness_unavailable_tier(
+            "kernel_exists",
+            "kernel recall >= 0.95, tested",
+            "kernel_context.scope_summaries:scope_missing",
+            "index with explicit kernel scope metadata and recall readback for the requested scope",
+        );
+    };
+    let recall_millipoints = summary
+        .get("recall_millipoints")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            summary
+                .get("recall")
+                .and_then(Value::as_object)
+                .and_then(|recall| {
+                    recall
+                        .get("recalled")
+                        .and_then(Value::as_u64)
+                        .zip(recall.get("total").and_then(Value::as_u64))
+                })
+                .and_then(|(recalled, total)| {
+                    (total > 0).then_some(recalled.saturating_mul(1000) / total)
+                })
+        });
+    let Some(recall_millipoints) = recall_millipoints else {
+        return readiness_unavailable_tier(
+            "kernel_exists",
+            "kernel recall >= 0.95, tested",
+            "kernel_context.scope_summaries:recall_missing",
+            "persist tested kernel recall for this scope before using readiness as an autonomy gate",
+        );
+    };
+    let provenance_refs = summary
+        .get("members")
+        .and_then(Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(|member| member.get("provenance_ref").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let pass = recall_millipoints >= 950;
+    json!({
+        "tier": "kernel_exists",
+        "pass": pass,
+        "measured": true,
+        "value": {
+            "scope_id": scope,
+            "recall": summary.get("recall").cloned().unwrap_or(Value::Null),
+            "recall_millipoints": recall_millipoints,
+        },
+        "required": "kernel recall >= 0.95, tested",
+        "required_millipoints": 950,
+        "provenance_refs": provenance_refs,
+        "source": "kernel_context.scope_summaries",
+        "freshness": summary.get("freshness").and_then(Value::as_str).unwrap_or("fresh"),
+        "trust": summary.get("trust").and_then(Value::as_str).unwrap_or("provisional"),
+        "cheapest_fix": if pass {
+            Value::Null
+        } else {
+            Value::String("increase or repair the scoped kernel until persisted recall_millipoints is at least 950".to_string())
+        },
+    })
+}
+
+fn readiness_tier_passed(tier: &Value) -> bool {
+    tier.get("pass").and_then(Value::as_bool) == Some(true)
+}
+
+fn readiness_tier_verified(tier: &Value) -> bool {
+    tier.get("trust").and_then(Value::as_str) == Some("verified")
+}
+
+fn refresh_readiness_artifact_hash(readiness: &mut Value) {
+    let mut artifact_source = readiness.clone();
+    if let Some(object) = artifact_source.as_object_mut() {
+        object.remove("artifact_sha256");
+    }
+    let artifact_bytes = serde_json::to_vec(&artifact_source).unwrap_or_default();
+    readiness["artifact_sha256"] = json!(hex_lower(&Sha256::digest(&artifact_bytes)));
+}
+
 fn vault_import_summary(source: &str, fallback_reason: Option<&str>) -> Value {
     let fallback_reason = fallback_reason.and_then(|reason| {
         let trimmed = reason.trim();
@@ -5346,6 +5615,54 @@ mod tests {
         assert_eq!(filtered["skipped_count"], 1);
         assert_eq!(filtered["findings"][0]["kind"], "prompt_injection");
         assert_eq!(filtered["skipped"][0]["kind"], "prompt_injection");
+    }
+
+    #[test]
+    fn get_readiness_reads_kernel_recall_and_fails_closed_unmeasured_tiers() {
+        let dir = temp_dir("readiness-kernel-recall");
+        let kernel_context = kernel_context_from_row_sink_rows(&sample_kernel_context_rows());
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.kernel_context = kernel_context;
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let readiness =
+            readiness_status_json_at(&dir, "demo", Some("payments"), Some("defects")).unwrap();
+        assert_eq!(readiness["schema"], GET_READINESS_SCHEMA);
+        assert_eq!(readiness["status"], "not_ready");
+        assert_eq!(readiness["ready"], false);
+        assert_eq!(readiness["measured_tier_count"], 1);
+        assert_eq!(
+            readiness["first_failing_tier"]["tier"],
+            json!("oracle_clean")
+        );
+
+        let tiers = readiness["tiers"].as_array().unwrap();
+        let kernel = tiers
+            .iter()
+            .find(|tier| tier["tier"] == "kernel_exists")
+            .expect("kernel readiness tier");
+        assert_eq!(kernel["measured"], true);
+        assert_eq!(kernel["pass"], false);
+        assert_eq!(kernel["value"]["scope_id"], "payments");
+        assert_eq!(kernel["value"]["recall_millipoints"], 666);
+        assert_eq!(kernel["required_millipoints"], 950);
+        assert!(
+            kernel["provenance_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "ledger:payments:1")
+        );
+
+        let oracle = tiers
+            .iter()
+            .find(|tier| tier["tier"] == "oracle_clean")
+            .expect("oracle tier");
+        assert_eq!(oracle["measured"], false);
+        assert_eq!(oracle["freshness"], "not_evaluated");
+        assert_eq!(readiness["artifact_sha256"].as_str().unwrap().len(), 64);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -6409,7 +6726,7 @@ mod tests {
             let first_tools = first_value["result"]["tools"].as_array().unwrap();
             assert!(!first_tools.iter().any(|tool| matches!(
                 tool["name"].as_str(),
-                Some("get_provenance" | "detect_anomalies" | "optimizer_status")
+                Some("get_provenance" | "detect_anomalies" | "optimizer_status" | "get_readiness")
             )));
             let request = json!({
                 "jsonrpc": "2.0",
@@ -6469,6 +6786,15 @@ mod tests {
         assert_eq!(
             optimizer_status["inputSchema"]["properties"]["mode"]["enum"],
             json!(["status"])
+        );
+
+        let get_readiness = tool_definition(tools, "get_readiness");
+        assert_eq!(get_readiness["inputSchema"]["required"], json!(["project"]));
+        assert!(
+            get_readiness["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("scope")
         );
     }
 
