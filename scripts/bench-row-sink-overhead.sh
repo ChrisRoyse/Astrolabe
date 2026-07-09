@@ -6,11 +6,14 @@ OUT="${ASTROLABE_ROW_SINK_BENCH_OUT:-$ROOT/target/astrolabe-row-sink-overhead-be
 MODE="${ASTROLABE_ROW_SINK_BENCH_MODE:-full}"
 REPEATS="${ASTROLABE_ROW_SINK_BENCH_REPEATS:-3}"
 FILES="${ASTROLABE_ROW_SINK_BENCH_FILES:-12}"
-GATE_RATIO="${ASTROLABE_ROW_SINK_BENCH_GATE_RATIO:-1.30}"
+CORPUS_CLASS="${ASTROLABE_ROW_SINK_BENCH_CORPUS_CLASS:-small}"
 
 mkdir -p "$(dirname "$OUT")"
 
-args=(--mode "$MODE" --repeats "$REPEATS" --files "$FILES" --gate-ratio "$GATE_RATIO")
+args=(--mode "$MODE" --repeats "$REPEATS" --files "$FILES" --corpus-class "$CORPUS_CLASS")
+if [[ -n "${ASTROLABE_ROW_SINK_BENCH_GATE_RATIO:-}" ]]; then
+  args+=(--gate-ratio "$ASTROLABE_ROW_SINK_BENCH_GATE_RATIO")
+fi
 if [[ -n "${ASTROLABE_ROW_SINK_BENCH_REPO:-}" ]]; then
   args+=(--repo "$ASTROLABE_ROW_SINK_BENCH_REPO")
 fi
@@ -39,6 +42,20 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
 print(f'{data["row_sink_overhead_ratio"]:.3f}')
 PY
 )"
+  gate="$(python3 - <<'PY' "$OUT"
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(f'{data["gate"]["row_sink_overhead_max_ratio"]:.3f}')
+PY
+)"
+  corpus_class="$(python3 - <<'PY' "$OUT"
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["corpus_class"])
+PY
+)"
   {
     echo "### Astrolabe row-sink overhead benchmark"
     echo
@@ -46,8 +63,9 @@ PY
     echo "|---|---:|"
     echo "| Status | $status |"
     echo "| Mode | $MODE |"
+    echo "| Corpus class | $corpus_class |"
     echo "| Repeats | $REPEATS |"
-    echo "| Gate ratio | $GATE_RATIO |"
+    echo "| Gate ratio | $gate |"
     echo "| Measured ratio | $ratio |"
     echo "| Artifact | $OUT |"
   } >> "$GITHUB_STEP_SUMMARY"

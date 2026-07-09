@@ -7,8 +7,33 @@ use astrolabe_bridge::{CbmIndexMode, CbmPipeline};
 use serde_json::json;
 
 const ISSUE_59_SMALL_MEDIUM_MAX_RATIO: f64 = 1.30;
+const ISSUE_59_LARGE_MAX_RATIO: f64 = 1.50;
 const DEFAULT_REPEATS: usize = 3;
 const DEFAULT_GENERATED_FILES: usize = 12;
+
+#[derive(Clone, Copy)]
+enum CorpusClass {
+    Small,
+    Medium,
+    Large,
+}
+
+impl CorpusClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    const fn default_gate_ratio(self) -> f64 {
+        match self {
+            Self::Small | Self::Medium => ISSUE_59_SMALL_MEDIUM_MAX_RATIO,
+            Self::Large => ISSUE_59_LARGE_MAX_RATIO,
+        }
+    }
+}
 
 struct Config {
     repo: Option<PathBuf>,
@@ -16,6 +41,7 @@ struct Config {
     mode_name: String,
     repeats: usize,
     generated_files: usize,
+    corpus_class: CorpusClass,
     gate_ratio: f64,
     project: String,
 }
@@ -89,10 +115,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "source": if config.repo.is_some() { "provided_repo" } else { "generated_c_fixture" },
         "generated_files": if config.repo.is_some() { 0 } else { config.generated_files },
         "repeats": config.repeats,
+        "corpus_class": config.corpus_class.as_str(),
         "gate": {
             "row_sink_overhead_max_ratio": config.gate_ratio,
             "source": "GitHub issue #59 DoD: <=1.3x S/M, <=1.5x L",
-            "applied_corpus_class": "small_or_medium",
+            "applied_corpus_class": config.corpus_class.as_str(),
         },
         "baseline_median_us": baseline_median_us,
         "row_sink_median_us": row_sink_median_us,
@@ -127,7 +154,8 @@ impl Config {
         let mut mode_name = "full".to_string();
         let mut repeats = DEFAULT_REPEATS;
         let mut generated_files = DEFAULT_GENERATED_FILES;
-        let mut gate_ratio = ISSUE_59_SMALL_MEDIUM_MAX_RATIO;
+        let mut corpus_class = CorpusClass::Small;
+        let mut gate_ratio = None;
         let mut project = format!("row-sink-bench-{}-{}", std::process::id(), now_nanos());
 
         let mut index = 0;
@@ -151,12 +179,18 @@ impl Config {
                     generated_files =
                         parse_positive_usize(&required_arg(&args, index, "--files")?)?;
                 }
+                "--corpus-class" => {
+                    index += 1;
+                    corpus_class =
+                        parse_corpus_class(&required_arg(&args, index, "--corpus-class")?)?;
+                }
                 "--gate-ratio" => {
                     index += 1;
-                    gate_ratio = required_arg(&args, index, "--gate-ratio")?.parse::<f64>()?;
-                    if !gate_ratio.is_finite() || gate_ratio <= 0.0 {
+                    let ratio = required_arg(&args, index, "--gate-ratio")?.parse::<f64>()?;
+                    if !ratio.is_finite() || ratio <= 0.0 {
                         return Err("--gate-ratio must be a positive finite number".into());
                     }
+                    gate_ratio = Some(ratio);
                 }
                 "--project" => {
                     index += 1;
@@ -177,7 +211,8 @@ impl Config {
             mode_name,
             repeats,
             generated_files,
-            gate_ratio,
+            corpus_class,
+            gate_ratio: gate_ratio.unwrap_or_else(|| corpus_class.default_gate_ratio()),
             project,
         })
     }
@@ -286,10 +321,21 @@ fn parse_mode(value: &str) -> Result<CbmIndexMode, Box<dyn Error>> {
     }
 }
 
+fn parse_corpus_class(value: &str) -> Result<CorpusClass, Box<dyn Error>> {
+    match value {
+        "small" | "s" => Ok(CorpusClass::Small),
+        "medium" | "m" => Ok(CorpusClass::Medium),
+        "large" | "l" => Ok(CorpusClass::Large),
+        _ => Err(
+            format!("unsupported corpus class {value}; expected small, medium, or large").into(),
+        ),
+    }
+}
+
 fn print_usage() {
     eprintln!(
         "usage: cargo run -p astrolabe-bridge --release --example bench_row_sink_overhead -- \\\n\
          [--repo PATH] [--mode full|moderate|fast] [--repeats N] [--files N] \\\n\
-         [--gate-ratio R] [--project NAME]"
+         [--corpus-class small|medium|large] [--gate-ratio R] [--project NAME]"
     );
 }
