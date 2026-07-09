@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ChrisRoyse/Astrolabe",
+  "title": "Astrolabe",
+  "description": "Calyx x codebase-memory-mcp code intelligence server with legacy CBM compatibility, provenance, shadow vaulting, and Astrolabe diagnostic surfaces.",
+  "repository": {
+    "url": "https://github.com/ChrisRoyse/Astrolabe",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "_meta": {
+    "astrolabe.schema": "astrolabe.server_manifest.v1",
+    "astrolabe.compatibility.command": "codebase-memory-mcp",
+    "astrolabe.primary.command": "astrolabe",
+    "astrolabe.packagePublication": {
+      "status": "not_published",
+      "remediation": "publish package-channel artifacts before treating server.json as installable from the public MCP registry"
+    },
+    "astrolabe.runtimeBinaries": [
+      {
+        "name": "astrolabe",
+        "transport": "stdio"
+      },
+      {
+        "name": "codebase-memory-mcp",
+        "transport": "stdio",
+        "compatibility": "legacy-command-shim"
+      }
+    ]
+  }
+}
