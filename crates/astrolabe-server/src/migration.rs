@@ -20,10 +20,12 @@ use astrolabe_ingest::{
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, verify_chain,
 };
 use astrolabe_kernel::{
+    BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,
     DEFAULT_FUNNEL_ACTIVATION_RECORDS, SEARCH_SCALE_KNOB_REGISTRY_VERSION, SEARCH_SCALE_SCHEMA,
     SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, SearchIndexBackend,
     SearchScaleConfig, SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput, SkillTree,
-    build_skill_tree, plan_search_scale, skill_tree_artifact_bytes,
+    bridge_report_artifact_bytes, bridge_symbols, build_skill_tree, plan_search_scale,
+    skill_tree_artifact_bytes,
 };
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
@@ -45,6 +47,7 @@ const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
+const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -103,6 +106,7 @@ struct ShadowImportOutcome {
     security_screen: Value,
     search_scale: Value,
     skill_tree: Value,
+    bridges: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,7 @@ struct RowSinkSnapshot {
     source_fingerprint_sha256: [u8; 32],
     security_screen: Value,
     skill_tree: Value,
+    bridges: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +131,7 @@ struct ShadowVaultImport {
     fallback_reason: Option<String>,
     security_screen: Value,
     skill_tree: Value,
+    bridges: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +431,7 @@ fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<St
         json!({
             "astrolabe": {
                 "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
+                "bridges": read_bridges_metadata(&cache_dir, &project)?,
             },
         }),
     )
@@ -733,6 +740,7 @@ fn import_shadow_vault(
         security_screen: shadow_import.security_screen,
         search_scale,
         skill_tree: shadow_import.skill_tree,
+        bridges: shadow_import.bridges,
     })
 }
 
@@ -751,6 +759,7 @@ where
         Some(RowSinkImportCandidate::Available(snapshot)) => {
             let security_screen = snapshot.security_screen.clone();
             let skill_tree = snapshot.skill_tree.clone();
+            let bridges = snapshot.bridges.clone();
             match import_cbm_graph_snapshot_to_vault_direct(
                 &snapshot.snapshot,
                 snapshot.source_fingerprint_sha256,
@@ -764,6 +773,7 @@ where
                     fallback_reason: None,
                     security_screen,
                     skill_tree,
+                    bridges,
                 }),
                 Err(error) => {
                     let reason = format!("row-sink direct import failed: {error}");
@@ -774,6 +784,7 @@ where
                         fallback_reason: Some(reason),
                         security_screen,
                         skill_tree,
+                        bridges,
                     })
                 }
             }
@@ -783,12 +794,14 @@ where
             let security_screen =
                 security_screen_unavailable(security_screen_subject(&options.project), &reason);
             let skill_tree = skill_tree_unavailable_json(&reason);
+            let bridges = bridges_unavailable_json(&reason);
             Ok(ShadowVaultImport {
                 report,
                 source: "sqlite_fallback".to_string(),
                 fallback_reason: Some(reason),
                 security_screen,
                 skill_tree,
+                bridges,
             })
         }
         None => {
@@ -803,6 +816,7 @@ where
                     reason,
                 ),
                 skill_tree: skill_tree_unavailable_json(reason),
+                bridges: bridges_unavailable_json(reason),
             })
         }
     }
@@ -817,11 +831,13 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
     let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
     let security_screen = security_screen_from_row_sink_rows(&rows);
     let skill_tree = skill_tree_from_row_sink_rows(&rows);
+    let bridges = bridges_from_row_sink_rows(&rows);
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
         snapshot: pipeline_rows_to_graph_snapshot(rows),
         source_fingerprint_sha256,
         security_screen,
         skill_tree,
+        bridges,
     }))
 }
 
@@ -1415,6 +1431,235 @@ fn read_skill_tree_metadata(cache_dir: &Path, project: &str) -> Result<Value, Dy
     }
 }
 
+fn bridges_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let (scopes, skipped_properties) = bridge_scope_kernels_from_rows(rows);
+    if scopes.len() < 2 {
+        return bridges_unavailable_json(
+            "bridge scope metadata missing; row-sink nodes must declare bridge_scopes/scopes for at least two scopes",
+        );
+    }
+    if scopes.len() > 16 {
+        return bridges_unavailable_json(
+            "bridge scope metadata declared more than 16 scopes; use an explicit bridge scope query before materializing pairwise reports",
+        );
+    }
+
+    let scope_ids = scopes.keys().cloned().collect::<Vec<_>>();
+    let mut reports = Vec::new();
+    for left_index in 0..scope_ids.len() {
+        for right_index in (left_index + 1)..scope_ids.len() {
+            let left = scopes
+                .get(&scope_ids[left_index])
+                .expect("scope id from map");
+            let right = scopes
+                .get(&scope_ids[right_index])
+                .expect("scope id from map");
+            reports.push(bridge_symbols(left, right));
+        }
+    }
+
+    bridges_json(&reports, skipped_properties)
+}
+
+fn bridge_scope_kernels_from_rows(
+    rows: &CbmPipelineRows,
+) -> (BTreeMap<String, BridgeScopeKernel>, usize) {
+    let fingerprint = hex_lower(&row_sink_fingerprint(rows));
+    let mut by_scope = BTreeMap::<String, Vec<BridgeKernelSymbol>>::new();
+    let mut grounded_by_scope = BTreeMap::<String, bool>::new();
+    let mut skipped_properties = 0;
+
+    for node in &rows.nodes {
+        if node.qualified_name.trim().is_empty() || node.label.eq_ignore_ascii_case("project") {
+            continue;
+        }
+        let properties = match serde_json::from_str::<Value>(&node.properties_json) {
+            Ok(properties) => properties,
+            Err(_) => {
+                skipped_properties += 1;
+                continue;
+            }
+        };
+        let scopes = bridge_scopes_for_node(&properties);
+        if scopes.is_empty() {
+            continue;
+        }
+        let node_grounded = properties
+            .get("kernel_grounded")
+            .or_else(|| properties.get("grounded"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        for scope in scopes {
+            let weight = bridge_node_kernel_weight(&properties, &scope);
+            let provenance = bridge_node_provenance(node, &properties, &scope);
+            by_scope
+                .entry(scope.clone())
+                .or_default()
+                .push(BridgeKernelSymbol::new(
+                    node.qualified_name.clone(),
+                    node.qualified_name.clone(),
+                    weight,
+                    provenance,
+                ));
+            grounded_by_scope
+                .entry(scope)
+                .and_modify(|grounded| *grounded = *grounded && node_grounded)
+                .or_insert(node_grounded);
+        }
+    }
+
+    let scopes = by_scope
+        .into_iter()
+        .map(|(scope_id, symbols)| {
+            let grounded = grounded_by_scope.get(&scope_id).copied().unwrap_or(false);
+            (
+                scope_id.clone(),
+                BridgeScopeKernel::new(
+                    scope_id.clone(),
+                    SHADOW_VAULT_ID,
+                    format!("row-sink:{fingerprint}:{scope_id}"),
+                    grounded,
+                    symbols,
+                ),
+            )
+        })
+        .collect();
+    (scopes, skipped_properties)
+}
+
+fn bridge_scopes_for_node(properties: &Value) -> Vec<String> {
+    let mut scopes = BTreeSet::new();
+    for field in ["bridge_scopes", "astrolabe_scopes", "scope_ids", "scopes"] {
+        if let Some(values) = properties.get(field).and_then(Value::as_array) {
+            for value in values {
+                if let Some(scope) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                {
+                    scopes.insert(scope.to_string());
+                }
+            }
+        }
+    }
+    if let Some(scope) = properties
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
+        scopes.insert(scope.to_string());
+    }
+    scopes.into_iter().collect()
+}
+
+fn bridge_node_kernel_weight(properties: &Value, scope: &str) -> u64 {
+    properties
+        .get("kernel_weights")
+        .and_then(Value::as_object)
+        .and_then(|weights| weights.get(scope))
+        .and_then(Value::as_u64)
+        .or_else(|| properties.get("kernel_weight").and_then(Value::as_u64))
+        .filter(|weight| *weight > 0)
+        .unwrap_or(1)
+}
+
+fn bridge_node_provenance(
+    node: &astrolabe_bridge::CbmPipelineNodeRow,
+    properties: &Value,
+    scope: &str,
+) -> String {
+    properties
+        .get("bridge_scope_provenance")
+        .and_then(Value::as_object)
+        .and_then(|provenance| provenance.get(scope))
+        .and_then(Value::as_str)
+        .or_else(|| properties.get("provenance_ref").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("row_sink:{}:{}#scope:{scope}", node.project, node.id))
+}
+
+fn bridges_json(reports: &[BridgeReport], skipped_properties: usize) -> Value {
+    let mut artifact_bytes = Vec::new();
+    for report in reports {
+        artifact_bytes.extend(bridge_report_artifact_bytes(report));
+    }
+    let bridge_count = reports
+        .iter()
+        .map(|report| report.bridges.len())
+        .sum::<usize>();
+    let all_verified =
+        skipped_properties == 0 && reports.iter().all(|report| report.trust == "verified");
+    json!({
+        "schema": BRIDGE_COLLECTION_SCHEMA,
+        "report_schema": BRIDGE_SCHEMA,
+        "status": if skipped_properties == 0 { "built" } else { "partial" },
+        "scope_source": "row_sink_explicit_bridge_scopes",
+        "scope_pair_count": reports.len(),
+        "bridge_count": bridge_count,
+        "skipped_count": skipped_properties,
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "reports": reports.iter().map(bridge_report_json).collect::<Vec<_>>(),
+        "freshness": "fresh",
+        "trust": if all_verified { "verified" } else { "provisional" },
+    })
+}
+
+fn bridge_report_json(report: &BridgeReport) -> Value {
+    json!({
+        "schema": report.schema,
+        "scope_a": report.scope_a,
+        "scope_b": report.scope_b,
+        "cache_key": report.cache_key,
+        "bridge_count": report.bridges.len(),
+        "bridges": report.bridges.iter().map(|bridge| {
+            json!({
+                "symbol_id": bridge.symbol_id,
+                "qualified_name": bridge.qualified_name,
+                "combined_kernel_weight": bridge.combined_kernel_weight,
+                "scope_a_kernel_weight": bridge.scope_a_kernel_weight,
+                "scope_b_kernel_weight": bridge.scope_b_kernel_weight,
+                "provenance": {
+                    "scope_a": bridge.provenance.scope_a,
+                    "scope_b": bridge.provenance.scope_b,
+                },
+                "freshness": bridge.freshness,
+                "trust": bridge.trust,
+            })
+        }).collect::<Vec<_>>(),
+        "freshness": report.freshness,
+        "trust": report.trust,
+    })
+}
+
+fn bridges_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": BRIDGE_COLLECTION_SCHEMA,
+        "report_schema": BRIDGE_SCHEMA,
+        "status": "unavailable",
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with row-sink bridge scope metadata or request a narrowed bridge scope pair before using architecture bridge aspects",
+    })
+}
+
+fn read_bridges_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "bridge_reports_json"))?
+    else {
+        return Ok(bridges_unavailable_json(
+            "bridge report metadata missing; rerun index_repository with calyx shadow",
+        ));
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(bridges_unavailable_json(&format!(
+            "stored bridge_reports_json invalid: {error}"
+        ))),
+    }
+}
+
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -1620,6 +1865,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "security_screen": outcome.security_screen.clone(),
         "search_scale": outcome.search_scale.clone(),
         "skill_tree": outcome.skill_tree.clone(),
+        "bridges": outcome.bridges.clone(),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -1691,6 +1937,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "security_screen": read_security_screen_metadata(cache_dir, project)?,
         "search_scale": read_search_scale_metadata(cache_dir, project)?,
         "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
+        "bridges": read_bridges_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -1932,6 +2179,7 @@ fn persist_shadow_outcome_at(
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
     let skill_tree_json = serde_json::to_string(&outcome.skill_tree)?;
+    let bridge_reports_json = serde_json::to_string(&outcome.bridges)?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -1983,6 +2231,7 @@ fn persist_shadow_outcome_at(
         ("security_screen_json", security_screen_json),
         ("search_scale_json", search_scale_json),
         ("skill_tree_json", skill_tree_json),
+        ("bridge_reports_json", bridge_reports_json),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -2440,6 +2689,89 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_bridges_recover_planted_connectors_from_scope_metadata() {
+        let bridges = bridges_from_row_sink_rows(&sample_bridge_rows());
+
+        assert_eq!(bridges["schema"], BRIDGE_COLLECTION_SCHEMA);
+        assert_eq!(bridges["report_schema"], BRIDGE_SCHEMA);
+        assert_eq!(bridges["status"], "built");
+        assert_eq!(bridges["scope_source"], "row_sink_explicit_bridge_scopes");
+        assert_eq!(bridges["scope_pair_count"], 1);
+        assert_eq!(bridges["bridge_count"], 2);
+        assert_eq!(bridges["skipped_count"], 0);
+        assert_eq!(bridges["freshness"], "fresh");
+        assert_eq!(bridges["trust"], "verified");
+        assert_eq!(
+            bridges["artifact_sha256"]
+                .as_str()
+                .expect("artifact sha")
+                .len(),
+            64
+        );
+
+        let report = &bridges["reports"][0];
+        assert_eq!(report["schema"], BRIDGE_SCHEMA);
+        assert_eq!(report["scope_a"], "backend");
+        assert_eq!(report["scope_b"], "frontend");
+        assert_eq!(report["bridge_count"], 2);
+        let bridge_rows = report["bridges"].as_array().expect("bridge rows");
+        assert_eq!(bridge_rows[0]["symbol_id"], "shared.audit");
+        assert_eq!(bridge_rows[0]["combined_kernel_weight"], 190);
+        assert_eq!(bridge_rows[0]["scope_a_kernel_weight"], 100);
+        assert_eq!(bridge_rows[0]["scope_b_kernel_weight"], 90);
+        assert_eq!(bridge_rows[0]["provenance"]["scope_a"], "ledger:backend:2");
+        assert_eq!(bridge_rows[0]["provenance"]["scope_b"], "ledger:frontend:1");
+        assert_eq!(bridge_rows[1]["symbol_id"], "shared.session");
+    }
+
+    #[test]
+    fn bridge_summary_persists_reads_back_and_augments_architecture_payload() {
+        let dir = temp_dir("bridges-readback");
+        let bridges = bridges_from_row_sink_rows(&sample_bridge_rows());
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.bridges = bridges.clone();
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "bridge_reports_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        let rehydrated = read_bridges_metadata(&dir, "demo").unwrap();
+        let summary = grounding_summary(&outcome);
+
+        assert_eq!(raw_value, bridges);
+        assert_eq!(rehydrated, bridges);
+        assert_eq!(summary["bridges"], bridges);
+
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"project\":\"demo\",\"total_nodes\":5}"}],
+            "structuredContent": {"project": "demo", "total_nodes": 5},
+            "isError": false,
+        });
+        let augmented = augment_tool_result(
+            &serde_json::to_string(&result).unwrap(),
+            json!({
+                "astrolabe": {
+                    "bridges": bridges.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(value["structuredContent"]["astrolabe"]["bridges"], bridges);
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let text_value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value["astrolabe"]["bridges"], bridges);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn vault_import_summary_labels_fallback_trust() {
         let fallback = vault_import_summary(
             "sqlite_fallback",
@@ -2489,11 +2821,13 @@ mod tests {
         let rows = sample_pipeline_rows();
         let security_screen = security_screen_from_row_sink_rows(&rows);
         let skill_tree = skill_tree_from_row_sink_rows(&rows);
+        let bridges = bridges_from_row_sink_rows(&rows);
         let candidate = RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
             snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
             source_fingerprint_sha256: row_sink_fingerprint(&rows),
             security_screen: security_screen.clone(),
             skill_tree: skill_tree.clone(),
+            bridges: bridges.clone(),
         }));
 
         let imported = import_shadow_vault_report(
@@ -2510,6 +2844,7 @@ mod tests {
         assert_eq!(imported.report.sqlite_nodes, 2);
         assert_eq!(imported.security_screen, security_screen);
         assert_eq!(imported.skill_tree, skill_tree);
+        assert_eq!(imported.bridges, bridges);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2820,6 +3155,70 @@ mod tests {
         }
     }
 
+    fn sample_bridge_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 1,
+                    project: "demo".to_string(),
+                    label: "Project".to_string(),
+                    name: "demo".to_string(),
+                    qualified_name: "demo".to_string(),
+                    file_path: String::new(),
+                    start_line: 0,
+                    end_line: 0,
+                    properties_json: "{}".to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "audit".to_string(),
+                    qualified_name: "shared.audit".to_string(),
+                    file_path: "shared/audit.rs".to_string(),
+                    start_line: 10,
+                    end_line: 20,
+                    properties_json: r#"{"bridge_scopes":["frontend","backend"],"kernel_weights":{"frontend":90,"backend":100},"bridge_scope_provenance":{"frontend":"ledger:frontend:1","backend":"ledger:backend:2"}}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 3,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "session".to_string(),
+                    qualified_name: "shared.session".to_string(),
+                    file_path: "shared/session.rs".to_string(),
+                    start_line: 30,
+                    end_line: 40,
+                    properties_json: r#"{"bridge_scopes":["frontend","backend"],"kernel_weights":{"frontend":70,"backend":20},"bridge_scope_provenance":{"frontend":"ledger:frontend:3","backend":"ledger:backend:4"}}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 4,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "form".to_string(),
+                    qualified_name: "frontend.form".to_string(),
+                    file_path: "frontend/form.rs".to_string(),
+                    start_line: 50,
+                    end_line: 60,
+                    properties_json: r#"{"bridge_scopes":["frontend"],"kernel_weight":70,"provenance_ref":"ledger:frontend:5"}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 5,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "handler".to_string(),
+                    qualified_name: "backend.handler".to_string(),
+                    file_path: "backend/handler.rs".to_string(),
+                    start_line: 70,
+                    end_line: 80,
+                    properties_json: r#"{"bridge_scopes":["backend"],"kernel_weight":95,"provenance_ref":"ledger:backend:6"}"#.to_string(),
+                },
+            ],
+            edges: Vec::new(),
+        }
+    }
+
     fn seed_minimal_cbm_sqlite(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -2875,6 +3274,7 @@ mod tests {
             security_screen,
             search_scale: sample_search_scale(),
             skill_tree: sample_skill_tree(),
+            bridges: sample_bridges(),
         }
     }
 
@@ -2894,6 +3294,10 @@ mod tests {
 
     fn sample_skill_tree() -> Value {
         skill_tree_from_row_sink_rows(&sample_skill_rows())
+    }
+
+    fn sample_bridges() -> Value {
+        bridges_from_row_sink_rows(&sample_bridge_rows())
     }
 
     fn temp_dir(name: &str) -> PathBuf {
