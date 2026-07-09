@@ -142,6 +142,7 @@ name = "astrolabe-kernel"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "proptest",
 ]
 
 [[package]]

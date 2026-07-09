@@ -9,5 +9,8 @@ publish.workspace = true
 [dependencies]
 astrolabe-domain.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lib]
 path = "src/lib.rs"

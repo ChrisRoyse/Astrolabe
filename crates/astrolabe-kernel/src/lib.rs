@@ -10,11 +10,18 @@ pub const SKILL_TREE_SCHEMA: &str = "astrolabe.skill_tree.v1";
 pub const SKILL_DISCOVERY_KNOB_REGISTRY_VERSION: &str = "astro.kernel.skill_discovery_knobs.v1";
 pub const BRIDGE_SCHEMA: &str = "astrolabe.bridge.v1";
 pub const BRIDGE_CACHE_KEY_SCHEMA: &str = "astrolabe.bridge_cache_key.v1";
+pub const LABEL_PROPAGATION_SCHEMA: &str = "astrolabe.label_propagation.v1";
+pub const LABEL_PROPAGATION_KNOB_REGISTRY_VERSION: &str = "astro.kernel.label_propagation_knobs.v1";
+pub const SCOPE_SUMMARY_SCHEMA: &str = "astrolabe.scope_summary.v1";
 pub const FUNNEL_ACTIVATION_RECORDS_KNOB: &str = "search.funnel.activation_records";
 pub const SKILL_MIN_CLUSTER_SIZE_KNOB: &str = "skills.min_cluster_size";
 pub const SKILL_MIN_SHARED_TOKEN_PERMILLE_KNOB: &str = "skills.min_shared_token_permille";
+pub const LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB: &str =
+    "labels.propagation.decay_milliper_step";
 pub const ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED: &str = "ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED";
 pub const ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT: &str = "ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT";
+pub const ASTRO_LABEL_PROPAGATION_KNOB_RANGE: &str = "ASTRO_LABEL_PROPAGATION_KNOB_RANGE";
+pub const ASTRO_PROPAGATED_LABEL_TRUST_WRITE: &str = "ASTRO_PROPAGATED_LABEL_TRUST_WRITE";
 pub const ASTRO_SKILL_DISCOVERY_KNOB_RANGE: &str = "ASTRO_SKILL_DISCOVERY_KNOB_RANGE";
 pub const ASTRO_SKILL_SEARCH_CAP_RANGE: &str = "ASTRO_SKILL_SEARCH_CAP_RANGE";
 pub const DEFAULT_FUNNEL_ACTIVATION_RECORDS: u64 = 10_000_000;
@@ -26,6 +33,9 @@ pub const MAX_SKILL_MIN_CLUSTER_SIZE: u64 = 10_000;
 pub const DEFAULT_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 500;
 pub const MIN_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 1;
 pub const MAX_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 1_000;
+pub const DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 500;
+pub const MIN_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 1;
+pub const MAX_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 999;
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
@@ -76,6 +86,17 @@ pub const SKILL_DISCOVERY_KNOBS: &[U64KnobDeclaration] = &[
         rationale: "seed deterministic skill discovery from exemplar token overlap before HDBSCAN/vector clustering is wired",
     },
 ];
+
+pub const LABEL_PROPAGATION_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+    name: LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB,
+    default: DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP,
+    min: MIN_LABEL_PROPAGATION_DECAY_MILLIPER_STEP,
+    max: MAX_LABEL_PROPAGATION_DECAY_MILLIPER_STEP,
+    unit: "milliper_step",
+    source: "docs/astrolabe-blueprint.md#tier-5--the-kernel-distillation--context",
+    rationale: "seed deterministic provisional label propagation before live Lodestar harmonic propagation is wired to persisted graphs",
+}];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SearchIndexBackend {
@@ -704,6 +725,572 @@ fn same_scope_pair(left_a: &str, left_b: &str, right_a: &str, right_b: &str) -> 
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelPropagationConfig {
+    pub decay_milliper_step: u64,
+}
+
+impl Default for LabelPropagationConfig {
+    fn default() -> Self {
+        Self {
+            decay_milliper_step: DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LabelTrust {
+    Trusted,
+    Provisional,
+}
+
+impl LabelTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Provisional => "provisional",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelSeed {
+    pub symbol_id: String,
+    pub label: String,
+    pub confidence_millipoints: u64,
+    pub provenance_ref: String,
+}
+
+impl LabelSeed {
+    pub fn new(
+        symbol_id: impl Into<String>,
+        label: impl Into<String>,
+        confidence_millipoints: u64,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            symbol_id: symbol_id.into(),
+            label: label.into(),
+            confidence_millipoints,
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelGraphEdge {
+    pub left_symbol_id: String,
+    pub right_symbol_id: String,
+    pub provenance_ref: String,
+}
+
+impl LabelGraphEdge {
+    pub fn new(
+        left_symbol_id: impl Into<String>,
+        right_symbol_id: impl Into<String>,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            left_symbol_id: left_symbol_id.into(),
+            right_symbol_id: right_symbol_id.into(),
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelTombstone {
+    pub symbol_id: String,
+    pub provenance_ref: String,
+}
+
+impl LabelTombstone {
+    pub fn new(symbol_id: impl Into<String>, provenance_ref: impl Into<String>) -> Self {
+        Self {
+            symbol_id: symbol_id.into(),
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelPropagationReport {
+    pub schema: &'static str,
+    pub knob_registry_version: &'static str,
+    pub decay_milliper_step: u64,
+    pub labels: Vec<PropagatedLabel>,
+    pub empty_reason: Option<&'static str>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PropagatedLabel {
+    pub symbol_id: String,
+    pub label: String,
+    pub confidence_millipoints: u64,
+    pub seed_symbol_id: String,
+    pub seed_confidence_millipoints: u64,
+    pub distance: u64,
+    pub provenance: LabelPropagationProvenance,
+    pub freshness: &'static str,
+    pub trust: LabelTrust,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LabelPropagationProvenance {
+    pub seed_provenance_ref: String,
+    pub graph_provenance_refs: Vec<String>,
+    pub math: String,
+}
+
+pub fn propagate_labels(
+    seeds: &[LabelSeed],
+    edges: &[LabelGraphEdge],
+    tombstones: &[LabelTombstone],
+    config: &LabelPropagationConfig,
+) -> astrolabe_domain::Result<LabelPropagationReport> {
+    validate_label_propagation_knob(config.decay_milliper_step)?;
+
+    let tombstoned = tombstones
+        .iter()
+        .map(|tombstone| tombstone.symbol_id.clone())
+        .collect::<BTreeSet<_>>();
+    let active_seeds = seeds
+        .iter()
+        .filter(|seed| !tombstoned.contains(&seed.symbol_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if active_seeds.is_empty() {
+        return Ok(LabelPropagationReport {
+            schema: LABEL_PROPAGATION_SCHEMA,
+            knob_registry_version: LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+            decay_milliper_step: config.decay_milliper_step,
+            labels: Vec::new(),
+            empty_reason: Some("zero_seed_scope"),
+            freshness: "fresh",
+            trust: "verified",
+        });
+    }
+
+    let adjacency = label_adjacency(edges, &tombstoned);
+    let seed_keys = active_seeds
+        .iter()
+        .map(|seed| (seed.symbol_id.clone(), seed.label.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut best = BTreeMap::<(String, String), PropagatedLabel>::new();
+
+    for seed in active_seeds {
+        let mut queue = vec![LabelPropagationFrontier {
+            symbol_id: seed.symbol_id.clone(),
+            confidence_millipoints: seed.confidence_millipoints,
+            distance: 0,
+            path_provenance_refs: Vec::new(),
+        }];
+        let mut best_seen_for_seed = BTreeMap::<String, u64>::new();
+        best_seen_for_seed.insert(seed.symbol_id.clone(), seed.confidence_millipoints);
+
+        while let Some(frontier) = queue.pop() {
+            let Some(neighbors) = adjacency.get(&frontier.symbol_id) else {
+                continue;
+            };
+            for (neighbor, edge_provenance_ref) in neighbors {
+                if tombstoned.contains(neighbor) {
+                    continue;
+                }
+                let next_confidence = frontier
+                    .confidence_millipoints
+                    .saturating_mul(config.decay_milliper_step)
+                    / 1_000;
+                if next_confidence == 0 {
+                    continue;
+                }
+                if best_seen_for_seed.get(neighbor).copied().unwrap_or(0) >= next_confidence {
+                    continue;
+                }
+                best_seen_for_seed.insert(neighbor.clone(), next_confidence);
+                let mut path_provenance_refs = frontier.path_provenance_refs.clone();
+                path_provenance_refs.push(edge_provenance_ref.clone());
+                let distance = frontier.distance + 1;
+                queue.push(LabelPropagationFrontier {
+                    symbol_id: neighbor.clone(),
+                    confidence_millipoints: next_confidence,
+                    distance,
+                    path_provenance_refs: path_provenance_refs.clone(),
+                });
+
+                if seed_keys.contains(&(neighbor.clone(), seed.label.clone())) {
+                    continue;
+                }
+                let candidate = PropagatedLabel {
+                    symbol_id: neighbor.clone(),
+                    label: seed.label.clone(),
+                    confidence_millipoints: next_confidence,
+                    seed_symbol_id: seed.symbol_id.clone(),
+                    seed_confidence_millipoints: seed.confidence_millipoints,
+                    distance,
+                    provenance: LabelPropagationProvenance {
+                        seed_provenance_ref: seed.provenance_ref.clone(),
+                        graph_provenance_refs: path_provenance_refs,
+                        math: format!(
+                            "floor(seed_confidence_millipoints * {}^distance / 1000^distance)",
+                            LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB
+                        ),
+                    },
+                    freshness: "fresh",
+                    trust: LabelTrust::Provisional,
+                };
+                let key = (candidate.symbol_id.clone(), candidate.label.clone());
+                let replace = best
+                    .get(&key)
+                    .map(|current| propagated_label_rank(&candidate, current).is_lt())
+                    .unwrap_or(true);
+                if replace {
+                    best.insert(key, candidate);
+                }
+            }
+        }
+    }
+
+    let mut labels = best.into_values().collect::<Vec<_>>();
+    labels.sort_by(|left, right| {
+        left.symbol_id
+            .cmp(&right.symbol_id)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    Ok(LabelPropagationReport {
+        schema: LABEL_PROPAGATION_SCHEMA,
+        knob_registry_version: LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+        decay_milliper_step: config.decay_milliper_step,
+        empty_reason: if labels.is_empty() {
+            Some("no_reachable_unseeded_symbols")
+        } else {
+            None
+        },
+        labels,
+        freshness: "fresh",
+        trust: "provisional",
+    })
+}
+
+pub fn validate_propagated_label_write(
+    label: &PropagatedLabel,
+    requested_trust: LabelTrust,
+) -> astrolabe_domain::Result<()> {
+    if requested_trust == LabelTrust::Trusted {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_PROPAGATED_LABEL_TRUST_WRITE,
+            format!(
+                "propagated label {} on {} cannot be written as trusted",
+                label.label, label.symbol_id
+            ),
+            "write propagated labels as provisional, or create a grounded label seed with trusted provenance",
+        ));
+    }
+    Ok(())
+}
+
+pub fn filter_symbols_by_propagated_label(
+    report: &LabelPropagationReport,
+    label: &str,
+    candidates: &[String],
+) -> Vec<String> {
+    let labeled_symbols = report
+        .labels
+        .iter()
+        .filter(|propagated| propagated.label == label)
+        .map(|propagated| propagated.symbol_id.as_str())
+        .collect::<BTreeSet<_>>();
+    candidates
+        .iter()
+        .filter(|candidate| labeled_symbols.contains(candidate.as_str()))
+        .cloned()
+        .collect()
+}
+
+pub fn label_propagation_artifact_bytes(report: &LabelPropagationReport) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("schema=");
+    out.push_str(report.schema);
+    out.push('\n');
+    out.push_str("knobs=");
+    out.push_str(report.knob_registry_version);
+    out.push('\n');
+    out.push_str("decay=");
+    out.push_str(&report.decay_milliper_step.to_string());
+    out.push('\n');
+    if let Some(reason) = report.empty_reason {
+        out.push_str("empty_reason=");
+        out.push_str(reason);
+        out.push('\n');
+    }
+    for label in &report.labels {
+        out.push_str("label\t");
+        out.push_str(&label.symbol_id);
+        out.push('\t');
+        out.push_str(&label.label);
+        out.push('\t');
+        out.push_str(&label.confidence_millipoints.to_string());
+        out.push('\t');
+        out.push_str(&label.seed_symbol_id);
+        out.push('\t');
+        out.push_str(&label.distance.to_string());
+        out.push('\t');
+        out.push_str(label.trust.as_str());
+        out.push('\t');
+        out.push_str(&label.provenance.seed_provenance_ref);
+        out.push('\t');
+        out.push_str(&label.provenance.graph_provenance_refs.join(","));
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScopeSummaryInput {
+    pub scope_id: String,
+    pub dirty_region_hash: String,
+    pub grounded: bool,
+    pub kernel_members: Vec<ScopeSummaryMember>,
+    pub recall: Option<ScopeRecallMeasurement>,
+}
+
+impl ScopeSummaryInput {
+    pub fn new(
+        scope_id: impl Into<String>,
+        dirty_region_hash: impl Into<String>,
+        grounded: bool,
+        kernel_members: Vec<ScopeSummaryMember>,
+        recall: Option<ScopeRecallMeasurement>,
+    ) -> Self {
+        Self {
+            scope_id: scope_id.into(),
+            dirty_region_hash: dirty_region_hash.into(),
+            grounded,
+            kernel_members,
+            recall,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScopeSummaryMember {
+    pub symbol_id: String,
+    pub qualified_name: String,
+    pub kernel_weight: u64,
+    pub grounded: bool,
+    pub provenance_ref: String,
+}
+
+impl ScopeSummaryMember {
+    pub fn new(
+        symbol_id: impl Into<String>,
+        qualified_name: impl Into<String>,
+        kernel_weight: u64,
+        grounded: bool,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            symbol_id: symbol_id.into(),
+            qualified_name: qualified_name.into(),
+            kernel_weight,
+            grounded,
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ScopeRecallMeasurement {
+    pub recalled: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScopeSummary {
+    pub schema: &'static str,
+    pub scope_id: String,
+    pub dirty_region_hash: String,
+    pub members: Vec<ScopeSummaryMember>,
+    pub recall: Option<ScopeRecallMeasurement>,
+    pub recall_millipoints: Option<u64>,
+    pub grounded_member_count: usize,
+    pub total_member_count: usize,
+    pub grounded_fraction_millipoints: u64,
+    pub summary_hash: String,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+pub fn summarize_scope_kernel(input: &ScopeSummaryInput) -> ScopeSummary {
+    let mut members = input.kernel_members.clone();
+    members.sort_by(|left, right| {
+        right
+            .kernel_weight
+            .cmp(&left.kernel_weight)
+            .then_with(|| left.symbol_id.cmp(&right.symbol_id))
+    });
+    let grounded_member_count = members.iter().filter(|member| member.grounded).count();
+    let total_member_count = members.len();
+    let grounded_fraction_millipoints = (grounded_member_count as u64)
+        .saturating_mul(1_000)
+        .checked_div(total_member_count as u64)
+        .unwrap_or(0);
+    let recall_millipoints = input.recall.and_then(|recall| {
+        recall
+            .recalled
+            .saturating_mul(1_000)
+            .checked_div(recall.total)
+    });
+    let summary_hash = scope_summary_hash(&input.scope_id, &input.dirty_region_hash, &members);
+
+    ScopeSummary {
+        schema: SCOPE_SUMMARY_SCHEMA,
+        scope_id: input.scope_id.clone(),
+        dirty_region_hash: input.dirty_region_hash.clone(),
+        members,
+        recall: input.recall,
+        recall_millipoints,
+        grounded_member_count,
+        total_member_count,
+        grounded_fraction_millipoints,
+        summary_hash,
+        freshness: "fresh",
+        trust: if input.grounded {
+            "verified"
+        } else {
+            "provisional"
+        },
+    }
+}
+
+pub fn scope_summary_artifact_bytes(summary: &ScopeSummary) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("schema=");
+    out.push_str(summary.schema);
+    out.push('\n');
+    out.push_str("scope=");
+    out.push_str(&summary.scope_id);
+    out.push('\n');
+    out.push_str("summary_hash=");
+    out.push_str(&summary.summary_hash);
+    out.push('\n');
+    out.push_str("grounded_fraction=");
+    out.push_str(&summary.grounded_fraction_millipoints.to_string());
+    out.push('\n');
+    if let Some(recall) = summary.recall_millipoints {
+        out.push_str("recall=");
+        out.push_str(&recall.to_string());
+        out.push('\n');
+    }
+    for member in &summary.members {
+        out.push_str("member\t");
+        out.push_str(&member.symbol_id);
+        out.push('\t');
+        out.push_str(&member.qualified_name);
+        out.push('\t');
+        out.push_str(&member.kernel_weight.to_string());
+        out.push('\t');
+        out.push_str(if member.grounded {
+            "grounded"
+        } else {
+            "ungrounded"
+        });
+        out.push('\t');
+        out.push_str(&member.provenance_ref);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LabelPropagationFrontier {
+    symbol_id: String,
+    confidence_millipoints: u64,
+    distance: u64,
+    path_provenance_refs: Vec<String>,
+}
+
+fn validate_label_propagation_knob(value: u64) -> astrolabe_domain::Result<()> {
+    let knob = LABEL_PROPAGATION_KNOBS
+        .iter()
+        .find(|knob| knob.name == LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
+        .expect("label propagation decay knob is declared");
+    if value < knob.min || value > knob.max {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_LABEL_PROPAGATION_KNOB_RANGE,
+            format!(
+                "{}={} is outside declared bounds {}..={}",
+                knob.name, value, knob.min, knob.max
+            ),
+            "set label propagation decay through the registered knob bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn label_adjacency(
+    edges: &[LabelGraphEdge],
+    tombstoned: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let mut adjacency = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    for edge in edges {
+        if tombstoned.contains(&edge.left_symbol_id) || tombstoned.contains(&edge.right_symbol_id) {
+            continue;
+        }
+        adjacency
+            .entry(edge.left_symbol_id.clone())
+            .or_default()
+            .insert((edge.right_symbol_id.clone(), edge.provenance_ref.clone()));
+        adjacency
+            .entry(edge.right_symbol_id.clone())
+            .or_default()
+            .insert((edge.left_symbol_id.clone(), edge.provenance_ref.clone()));
+    }
+    adjacency
+}
+
+fn propagated_label_rank(left: &PropagatedLabel, right: &PropagatedLabel) -> std::cmp::Ordering {
+    right
+        .confidence_millipoints
+        .cmp(&left.confidence_millipoints)
+        .then_with(|| left.distance.cmp(&right.distance))
+        .then_with(|| left.seed_symbol_id.cmp(&right.seed_symbol_id))
+}
+
+fn scope_summary_hash(
+    scope_id: &str,
+    dirty_region_hash: &str,
+    members: &[ScopeSummaryMember],
+) -> String {
+    let mut canonical = String::new();
+    canonical.push_str(scope_id);
+    canonical.push('\t');
+    canonical.push_str(dirty_region_hash);
+    canonical.push('\n');
+    for member in members {
+        canonical.push_str(&member.symbol_id);
+        canonical.push('\t');
+        canonical.push_str(&member.qualified_name);
+        canonical.push('\t');
+        canonical.push_str(&member.kernel_weight.to_string());
+        canonical.push('\t');
+        canonical.push_str(if member.grounded {
+            "grounded"
+        } else {
+            "ungrounded"
+        });
+        canonical.push('\t');
+        canonical.push_str(&member.provenance_ref);
+        canonical.push('\n');
+    }
+    hex_lower(&astrolabe_domain::calyx::content_address([
+        b"astrolabe-scope-summary-v1".as_slice(),
+        canonical.as_bytes(),
+    ]))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SkillSymbolInput {
     pub symbol_id: String,
     pub qualified_name: String,
@@ -977,6 +1564,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn identifies_calyx_parent() {
@@ -1258,6 +1846,282 @@ mod tests {
     }
 
     #[test]
+    fn label_propagation_decay_knob_is_registry_declared() {
+        let knob = LABEL_PROPAGATION_KNOBS
+            .iter()
+            .find(|knob| knob.name == LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
+            .expect("label propagation decay knob");
+        assert_eq!(
+            knob.registry_version,
+            LABEL_PROPAGATION_KNOB_REGISTRY_VERSION
+        );
+        assert_eq!(knob.default, DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP);
+        assert_eq!(knob.default, 500);
+        assert!(knob.min < knob.default);
+        assert!(knob.default < knob.max);
+    }
+
+    #[test]
+    fn propagation_golden_pins_decayed_confidences() {
+        let report = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                1_000,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("propagate labels");
+
+        assert_eq!(report.schema, LABEL_PROPAGATION_SCHEMA);
+        assert_eq!(report.trust, "provisional");
+        assert_eq!(report.empty_reason, None);
+        assert_eq!(
+            report
+                .labels
+                .iter()
+                .map(|label| (
+                    label.symbol_id.as_str(),
+                    label.label.as_str(),
+                    label.confidence_millipoints,
+                    label.distance,
+                    label.trust.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("auth.token", "security-sensitive", 500, 1, "provisional"),
+                (
+                    "billing.charge",
+                    "security-sensitive",
+                    250,
+                    2,
+                    "provisional"
+                ),
+                (
+                    "shared.session",
+                    "security-sensitive",
+                    500,
+                    1,
+                    "provisional"
+                ),
+            ]
+        );
+        let billing = report
+            .labels
+            .iter()
+            .find(|label| label.symbol_id == "billing.charge")
+            .expect("billing propagated label");
+        assert_eq!(
+            billing.provenance.graph_provenance_refs,
+            vec!["edge:auth-token", "edge:token-billing"]
+        );
+        assert!(
+            billing
+                .provenance
+                .math
+                .contains(LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
+        );
+        assert!(
+            report
+                .labels
+                .iter()
+                .all(|label| label.confidence_millipoints < label.seed_confidence_millipoints)
+        );
+    }
+
+    #[test]
+    fn zero_seed_scope_returns_explicit_empty_result() {
+        let report = propagate_labels(
+            &[],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("zero seed propagation");
+
+        assert!(report.labels.is_empty());
+        assert_eq!(report.empty_reason, Some("zero_seed_scope"));
+        assert_eq!(report.trust, "verified");
+    }
+
+    proptest! {
+        #[test]
+        fn propagated_labels_cannot_be_written_as_trusted(confidence in 1_u64..1_000_u64) {
+            let label = PropagatedLabel {
+                symbol_id: "auth.token".to_string(),
+                label: "security-sensitive".to_string(),
+                confidence_millipoints: confidence,
+                seed_symbol_id: "auth.login".to_string(),
+                seed_confidence_millipoints: confidence + 1,
+                distance: 1,
+                provenance: LabelPropagationProvenance {
+                    seed_provenance_ref: "seed:security-review:1".to_string(),
+                    graph_provenance_refs: vec!["edge:auth-token".to_string()],
+                    math: "fixture".to_string(),
+                },
+                freshness: "fresh",
+                trust: LabelTrust::Provisional,
+            };
+
+            let err = validate_propagated_label_write(&label, LabelTrust::Trusted)
+                .expect_err("trusted propagated write refused");
+            prop_assert_eq!(err.code(), ASTRO_PROPAGATED_LABEL_TRUST_WRITE);
+            prop_assert!(validate_propagated_label_write(&label, LabelTrust::Provisional).is_ok());
+        }
+    }
+
+    #[test]
+    fn erasing_seed_recomputes_propagation_without_it() {
+        let seeds = vec![LabelSeed::new(
+            "auth.login",
+            "security-sensitive",
+            1_000,
+            "seed:security-review:1",
+        )];
+        let before = propagate_labels(
+            &seeds,
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("propagate before tombstone");
+        let after = propagate_labels(
+            &seeds,
+            &label_graph_fixture(),
+            &[LabelTombstone::new("auth.login", "erasure:auth-login")],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("propagate after tombstone");
+
+        assert!(!before.labels.is_empty());
+        assert!(after.labels.is_empty());
+        assert_eq!(after.empty_reason, Some("zero_seed_scope"));
+    }
+
+    #[test]
+    fn propagated_label_filter_is_exact_and_preserves_candidate_order() {
+        let report = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                1_000,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("propagate labels");
+        let candidates = vec![
+            "billing.charge".to_string(),
+            "health.ping".to_string(),
+            "auth.token".to_string(),
+        ];
+
+        assert_eq!(
+            filter_symbols_by_propagated_label(&report, "security-sensitive", &candidates),
+            vec!["billing.charge", "auth.token"]
+        );
+        assert!(filter_symbols_by_propagated_label(&report, "deprecated", &candidates).is_empty());
+    }
+
+    #[test]
+    fn label_propagation_knob_range_is_fail_closed() {
+        let config = LabelPropagationConfig {
+            decay_milliper_step: MAX_LABEL_PROPAGATION_DECAY_MILLIPER_STEP + 1,
+        };
+        let err = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                1_000,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &config,
+        )
+        .expect_err("out-of-range decay refused");
+
+        assert_eq!(err.code(), ASTRO_LABEL_PROPAGATION_KNOB_RANGE);
+        assert!(
+            err.message()
+                .contains(LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
+        );
+        assert!(err.remediation().contains("registered knob bounds"));
+    }
+
+    #[test]
+    fn scope_summary_contract_reports_kernel_members_recall_and_grounded_fraction() {
+        let input = scope_summary_fixture(true);
+        let summary = summarize_scope_kernel(&input);
+
+        assert_eq!(summary.schema, SCOPE_SUMMARY_SCHEMA);
+        assert_eq!(summary.scope_id, "scope:payments");
+        assert_eq!(summary.trust, "verified");
+        assert_eq!(
+            summary
+                .members
+                .iter()
+                .map(|member| member.symbol_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["billing.charge", "shared.session", "billing.refund"]
+        );
+        assert_eq!(summary.recall_millipoints, Some(800));
+        assert_eq!(summary.grounded_member_count, 2);
+        assert_eq!(summary.total_member_count, 3);
+        assert_eq!(summary.grounded_fraction_millipoints, 666);
+    }
+
+    #[test]
+    fn ungrounded_scope_summary_is_provisional_and_deterministic() {
+        let input = scope_summary_fixture(false);
+        let mut reversed = scope_summary_fixture(false);
+        reversed.kernel_members.reverse();
+        let first = summarize_scope_kernel(&input);
+        let second = summarize_scope_kernel(&reversed);
+
+        assert_eq!(first.trust, "provisional");
+        assert_eq!(first, second);
+        assert_eq!(first.summary_hash, second.summary_hash);
+    }
+
+    #[test]
+    fn label_and_summary_artifacts_are_read_back_from_disk() {
+        let label_report = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                1_000,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect("propagate labels");
+        let summary = summarize_scope_kernel(&scope_summary_fixture(true));
+        let mut bytes = label_propagation_artifact_bytes(&label_report);
+        bytes.extend(scope_summary_artifact_bytes(&summary));
+        let path = std::env::temp_dir().join(format!(
+            "astrolabe-label-summary-{}-{}.txt",
+            std::process::id(),
+            summary.summary_hash
+        ));
+        std::fs::write(&path, &bytes).expect("write label summary artifact");
+        let readback = std::fs::read(&path).expect("read label summary artifact");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(readback, bytes);
+        let text = String::from_utf8(readback).expect("utf8 label summary artifact");
+        assert!(text.contains("label\tauth.token\tsecurity-sensitive"));
+        assert!(text.contains("member\tbilling.charge"));
+    }
+
+    #[test]
     fn skill_discovery_knobs_are_registry_declared() {
         let min_size = SKILL_DISCOVERY_KNOBS
             .iter()
@@ -1437,6 +2301,49 @@ mod tests {
             ],
         );
         (frontend, backend)
+    }
+
+    fn label_graph_fixture() -> Vec<LabelGraphEdge> {
+        vec![
+            LabelGraphEdge::new("auth.login", "auth.token", "edge:auth-token"),
+            LabelGraphEdge::new("auth.token", "billing.charge", "edge:token-billing"),
+            LabelGraphEdge::new("auth.login", "shared.session", "edge:auth-session"),
+        ]
+    }
+
+    fn scope_summary_fixture(grounded: bool) -> ScopeSummaryInput {
+        ScopeSummaryInput::new(
+            "scope:payments",
+            "payments-dirty-v1",
+            grounded,
+            vec![
+                ScopeSummaryMember::new(
+                    "shared.session",
+                    "demo.shared.session",
+                    80,
+                    true,
+                    "ledger:payments:2",
+                ),
+                ScopeSummaryMember::new(
+                    "billing.refund",
+                    "demo.billing.refund",
+                    40,
+                    false,
+                    "ledger:payments:3",
+                ),
+                ScopeSummaryMember::new(
+                    "billing.charge",
+                    "demo.billing.charge",
+                    100,
+                    true,
+                    "ledger:payments:1",
+                ),
+            ],
+            Some(ScopeRecallMeasurement {
+                recalled: 4,
+                total: 5,
+            }),
+        )
     }
 
     fn skill_fixture() -> Vec<SkillSymbolInput> {
