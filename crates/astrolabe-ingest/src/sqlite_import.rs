@@ -11,6 +11,7 @@ use astrolabe_domain::{
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
+use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
@@ -20,7 +21,7 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{IngestError, IngestResult};
@@ -177,6 +178,16 @@ pub struct SqliteImportDeepVerifyCounts {
     pub constellation_rows: usize,
     /// Typed edge rows decoded and provenance-checked.
     pub edge_rows: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CxGraphErasureReport {
+    pub project: String,
+    pub cx_id: CxId,
+    pub node_map_rows_tombstoned: usize,
+    pub edge_rows_tombstoned: usize,
+    pub raw_edge_rows_tombstoned: usize,
+    pub seq: Seq,
 }
 
 #[derive(Debug, Clone)]
@@ -2596,6 +2607,115 @@ where
     })
 }
 
+pub fn erase_imported_cx_graph_rows<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    cx_id: CxId,
+) -> IngestResult<CxGraphErasureReport>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let mut rows = Vec::new();
+    let tombstone = tombstone_value();
+    let mut seen_keys = BTreeSet::new();
+    let mut source_node_ids = BTreeSet::new();
+    let mut node_map_rows_tombstoned = 0;
+    let mut edge_rows_tombstoned = 0;
+    let mut raw_edge_rows_tombstoned = 0;
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(NODE_MAP_PREFIX),
+    )? {
+        let row = decode_graph_row::<NodeMapRow>(&key, &value)?;
+        if row.project == project && row.cx_id == cx_id && seen_keys.insert(key.clone()) {
+            source_node_ids.insert(row.node_id);
+            rows.push((ColumnFamily::Graph, key, tombstone.clone()));
+            node_map_rows_tombstoned += 1;
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(EDGE_ROW_PREFIX),
+    )? {
+        let row = decode_graph_row::<EdgeGraphRow>(&key, &value)?;
+        let touches_cx = row.project == project
+            && (row.src == cx_id
+                || row.dst == cx_id
+                || source_node_ids.contains(&row.source_node_id)
+                || source_node_ids.contains(&row.target_node_id));
+        if touches_cx && seen_keys.insert(key.clone()) {
+            rows.push((ColumnFamily::Graph, key, tombstone.clone()));
+            edge_rows_tombstoned += 1;
+        }
+    }
+
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(CBM_EDGE_ROW_PREFIX),
+    )? {
+        let row = decode_graph_row::<CbmRawEdgeRow>(&key, &value)?;
+        let touches_cx = row.project == project
+            && (source_node_ids.contains(&row.source_node_id)
+                || source_node_ids.contains(&row.target_node_id));
+        if touches_cx && seen_keys.insert(key.clone()) {
+            rows.push((ColumnFamily::Graph, key, tombstone.clone()));
+            raw_edge_rows_tombstoned += 1;
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(CxGraphErasureReport {
+            project: project.to_string(),
+            cx_id,
+            node_map_rows_tombstoned,
+            edge_rows_tombstoned,
+            raw_edge_rows_tombstoned,
+            seq: vault.latest_seq(),
+        });
+    }
+
+    let payload = serde_json::to_vec(&json!({
+        "schema": "astrolabe-cx-graph-erasure-v1",
+        "project_sha256": hex_lower(&sha256_digest(project.as_bytes())),
+        "cx_id": cx_id.to_string(),
+        "node_map_rows_tombstoned": node_map_rows_tombstoned,
+        "edge_rows_tombstoned": edge_rows_tombstoned,
+        "raw_edge_rows_tombstoned": raw_edge_rows_tombstoned,
+    }))?;
+    vault.write_cf_batch_with_ledger_entry(
+        rows,
+        EntryKind::Admin,
+        SubjectId::Cx(cx_id),
+        payload,
+        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+    )?;
+    vault.purge_tombstoned_cfs(&[ColumnFamily::Graph])?;
+
+    Ok(CxGraphErasureReport {
+        project: project.to_string(),
+        cx_id,
+        node_map_rows_tombstoned,
+        edge_rows_tombstoned,
+        raw_edge_rows_tombstoned,
+        seq: vault.latest_seq(),
+    })
+}
+
+fn decode_graph_row<T>(key: &[u8], value: &[u8]) -> IngestResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_slice(value).map_err(|error| {
+        IngestError::InvalidInput(format!("decode Graph CF row {}: {error}", hex_lower(key)))
+    })
+}
+
 fn read_graph_rows<C, T>(
     vault: &AsterVault<C>,
     snapshot: Seq,
@@ -2608,14 +2728,7 @@ where
     vault
         .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(prefix))?
         .into_iter()
-        .map(|(key, value)| {
-            serde_json::from_slice(&value).map_err(|error| {
-                IngestError::InvalidInput(format!(
-                    "decode Graph CF row {}: {error}",
-                    hex_lower(&key)
-                ))
-            })
-        })
+        .map(|(key, value)| decode_graph_row(&key, &value))
         .collect()
 }
 

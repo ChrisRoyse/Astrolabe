@@ -823,9 +823,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astrolabe_ingest::{SqliteImportOptions, import_sqlite_to_vault};
+    use astrolabe_ingest::{
+        SqliteImportOptions, erase_imported_cx_graph_rows, import_sqlite_to_vault, verify_chain,
+    };
     use astrolabe_panel::FixtureSlotRuntime;
-    use calyx_aster::vault::AsterVault;
+    use calyx_aster::erase::{EraseRegistry, EraseScope};
+    use calyx_aster::vault::{AsterVault, QuotaConfig, VaultContext, VaultOptions};
     use calyx_core::{SystemClock, VaultId};
     use rusqlite::Connection;
     use serde_json::Value;
@@ -900,6 +903,100 @@ mod tests {
         cleanup(&source);
         cleanup(&lowered_a);
         cleanup(&lowered_b);
+    }
+
+    #[test]
+    fn erasure_regenerates_lowered_sqlite_without_erased_bytes() {
+        let source = temp_path("erasure-source.db");
+        let before_lowered = temp_path("erasure-before.db");
+        let after_lowered = temp_path("erasure-after.db");
+        let (vault_dir, source_vault) = durable_vault("erasure-regeneration");
+        const SENTINEL: &str = "erasemeph61token";
+        fixture_sqlite_with_erased_sentinel(&source, SENTINEL);
+
+        let import_report = import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-erasure", 1),
+        )
+        .expect("import source sqlite");
+        source_vault.flush().expect("flush imported durable vault");
+        assert_eq!(import_report.cx_ids.len(), 3);
+        assert!(
+            !path_tree_byte_hits(&vault_dir, SENTINEL.as_bytes()).is_empty(),
+            "sentinel must be present in durable vault before erasure"
+        );
+
+        let options = LowerSqliteOptions::new("demo");
+        let before_report =
+            lower_cbm_sqlite(&source_vault, &before_lowered, &options).expect("lower before erase");
+        assert_eq!(before_report.node_count, 3);
+        assert_eq!(before_report.edge_count, 3);
+        assert!(
+            bytes_contain(
+                &fs::read(&before_lowered).expect("read before lowered"),
+                SENTINEL.as_bytes()
+            ),
+            "sentinel must be materialized in the pre-erasure lowered artifact"
+        );
+        assert_eq!(sqlite_sentinel_hits(&before_lowered, SENTINEL), (1, 1));
+
+        let erased_cx = import_report.cx_ids[1];
+        let mut context = VaultContext::new(
+            source_vault.vault_id(),
+            b"astrolabe-lower-erasure-fsv",
+            QuotaConfig::default(),
+            "astrolabe-lower-test",
+        )
+        .expect("create erasure context");
+        let erase = source_vault
+            .erase(
+                EraseScope::Cx(erased_cx),
+                &mut context,
+                &EraseRegistry::new(),
+            )
+            .expect("erase imported cx");
+        assert_eq!(erase.records_deleted, 1);
+        assert!(context.is_key_shredded_for_erasure());
+
+        let graph_erase =
+            erase_imported_cx_graph_rows(&source_vault, "demo", erased_cx).expect("erase graph");
+        assert_eq!(graph_erase.node_map_rows_tombstoned, 1);
+        assert_eq!(graph_erase.edge_rows_tombstoned, 2);
+        assert_eq!(graph_erase.raw_edge_rows_tombstoned, 2);
+
+        let after_report =
+            lower_cbm_sqlite(&source_vault, &after_lowered, &options).expect("lower after erase");
+        assert_eq!(after_report.node_count, 2);
+        assert_eq!(after_report.edge_count, 1);
+        assert_eq!(after_report.skipped_edges, 0);
+        assert_ne!(after_report.artifact_sha256, before_report.artifact_sha256);
+
+        let after_bytes = fs::read(&after_lowered).expect("read after lowered");
+        assert!(
+            !bytes_contain(&after_bytes, SENTINEL.as_bytes()),
+            "regenerated lowered artifact retained erased sentinel bytes"
+        );
+        assert_eq!(sqlite_sentinel_hits(&after_lowered, SENTINEL), (0, 0));
+
+        source_vault
+            .flush()
+            .expect("flush post-erasure durable vault");
+        let durable_hits = path_tree_byte_hits(&vault_dir, SENTINEL.as_bytes());
+        assert!(
+            durable_hits
+                .iter()
+                .all(|path| path_is_under_child(&vault_dir, path, "wal")),
+            "non-WAL durable vault files retained erased sentinel bytes: {durable_hits:?}"
+        );
+        let chain = verify_chain(&source_vault).expect("verify chain after graph erasure");
+        assert_eq!(chain.status, "intact");
+
+        cleanup(&source);
+        cleanup(&before_lowered);
+        cleanup(&after_lowered);
+        cleanup_dir(&vault_dir);
     }
 
     #[test]
@@ -1447,6 +1544,108 @@ mod tests {
             .expect("summary");
     }
 
+    fn fixture_sqlite_with_erased_sentinel(path: &Path, sentinel: &str) {
+        cleanup(path);
+        let connection = Connection::open(path).expect("open erasure fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                   name TEXT PRIMARY KEY,
+                   indexed_at TEXT NOT NULL,
+                   root_path TEXT NOT NULL
+                 );
+                 CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project TEXT NOT NULL,
+                   label TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   qualified_name TEXT NOT NULL,
+                   file_path TEXT DEFAULT '',
+                   start_line INTEGER DEFAULT 0,
+                   end_line INTEGER DEFAULT 0,
+                   properties TEXT DEFAULT '{}',
+                   UNIQUE(project, qualified_name)
+                 );
+                 CREATE TABLE edges (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project TEXT NOT NULL,
+                   source_id INTEGER NOT NULL,
+                   target_id INTEGER NOT NULL,
+                   type TEXT NOT NULL,
+                   properties TEXT DEFAULT '{}',
+                   url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+                   local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                     THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+                   UNIQUE(source_id, target_id, type, local_name_gen)
+                 );",
+            )
+            .expect("create erasure fixture schema");
+        connection
+            .execute(
+                "INSERT INTO projects(name, indexed_at, root_path)
+                 VALUES ('demo', '2026-03-14T00:00:00Z', '/repo')",
+                [],
+            )
+            .expect("project");
+        insert_node(
+            &connection,
+            &FixtureNode {
+                label: "File",
+                name: "__file__",
+                qualified_name: "demo.src.main.__file__",
+                file_path: "src/main.rs",
+                start_line: 1,
+                end_line: 40,
+                properties: r#"{"language":"rust","source_snippet":"mod main"}"#,
+            },
+        );
+        insert_node(
+            &connection,
+            &FixtureNode {
+                label: "Function",
+                name: sentinel,
+                qualified_name: "demo.src.main.erasemeph61token",
+                file_path: "src/main.rs",
+                start_line: 4,
+                end_line: 12,
+                properties: r#"{"language":"rust","source_snippet":"fn erasemeph61token(){ kept_beta(); }","signature":"fn erasemeph61token()"}"#,
+            },
+        );
+        insert_node(
+            &connection,
+            &FixtureNode {
+                label: "Function",
+                name: "kept_beta",
+                qualified_name: "demo.src.main.kept_beta",
+                file_path: "src/main.rs",
+                start_line: 20,
+                end_line: 24,
+                properties: r#"{"language":"rust","source_snippet":"fn kept_beta() {}","signature":"fn kept_beta()"}"#,
+            },
+        );
+        connection
+            .execute(
+                "INSERT INTO edges(project, source_id, target_id, type, properties)
+                 VALUES ('demo', 1, 2, 'DEFINES', '{}')",
+                [],
+            )
+            .expect("defines erased");
+        connection
+            .execute(
+                "INSERT INTO edges(project, source_id, target_id, type, properties)
+                 VALUES ('demo', 2, 3, 'CALLS', '{\"callee\":\"kept_beta\"}')",
+                [],
+            )
+            .expect("calls erased");
+        connection
+            .execute(
+                "INSERT INTO edges(project, source_id, target_id, type, properties)
+                 VALUES ('demo', 1, 3, 'DEFINES', '{}')",
+                [],
+            )
+            .expect("defines kept");
+    }
+
     struct FixtureNode<'a> {
         label: &'a str,
         name: &'a str,
@@ -1483,6 +1682,78 @@ mod tests {
             b"astrolabe-lower-test".to_vec(),
             SystemClock,
         )
+    }
+
+    fn durable_vault(name: &str) -> (PathBuf, AsterVault<SystemClock>) {
+        let dir = temp_dir_path(&format!("{name}.vault"));
+        let vault = AsterVault::new_durable(
+            &dir,
+            "00000000000000000000000000"
+                .parse::<VaultId>()
+                .expect("vault id"),
+            b"astrolabe-lower-test".to_vec(),
+            VaultOptions::default(),
+        )
+        .expect("open durable lower test vault");
+        (dir, vault)
+    }
+
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    fn path_tree_byte_hits(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
+        if needle.is_empty() || !root.exists() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let metadata = fs::metadata(&path).expect("metadata during byte sweep");
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path).expect("read directory during byte sweep") {
+                    stack.push(entry.expect("directory entry").path());
+                }
+            } else if metadata.is_file() {
+                let bytes = fs::read(&path).expect("read file during byte sweep");
+                if bytes_contain(&bytes, needle) {
+                    hits.push(path);
+                }
+            }
+        }
+        hits.sort();
+        hits
+    }
+
+    fn path_is_under_child(root: &Path, path: &Path, child: &str) -> bool {
+        path.strip_prefix(root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| component.as_os_str() == child)
+    }
+
+    fn sqlite_sentinel_hits(path: &Path, sentinel: &str) -> (i64, i64) {
+        let connection = Connection::open(path).expect("open lowered sentinel db");
+        let like = format!("%{sentinel}%");
+        let table_hits = connection
+            .query_row(
+                "SELECT count(*) FROM nodes
+                 WHERE name LIKE ?1 OR qualified_name LIKE ?1 OR properties LIKE ?1",
+                [like],
+                |row| row.get(0),
+            )
+            .expect("sentinel table query");
+        let fts_hits = connection
+            .query_row(
+                "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?1",
+                [sentinel],
+                |row| row.get(0),
+            )
+            .expect("sentinel fts query");
+        (table_hits, fts_hits)
     }
 
     fn temp_path(name: &str) -> PathBuf {
