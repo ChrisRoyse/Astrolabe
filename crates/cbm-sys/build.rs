@@ -23,6 +23,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", mimalloc_header.display());
     println!(
         "cargo:rerun-if-changed={}",
+        cbm_root.join("src/mcp/mcp.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        cbm_root.join("src/mcp/mcp.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         repo_root.join("VENDORED.md").display()
     );
     println!("cargo:rustc-check-cfg=cfg(cbm_sys_asan)");

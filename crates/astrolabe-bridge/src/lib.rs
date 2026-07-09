@@ -422,6 +422,12 @@ pub struct CbmPipelineRows {
     pub edges: Vec<CbmPipelineEdgeRow>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmIndexRepositoryRows {
+    pub raw_json: String,
+    pub rows: CbmPipelineRows,
+}
+
 #[derive(Default)]
 struct PipelineRowSinkState {
     nodes: Vec<CbmPipelineNodeRow>,
@@ -1427,6 +1433,50 @@ impl CbmToolRunner {
         }
     }
 
+    pub fn handle_index_repository_with_rows(
+        &self,
+        args_json: &str,
+    ) -> Result<CbmIndexRepositoryRows, BridgeError> {
+        self.ensure_owner_thread()?;
+        let tool_name = CString::new("index_repository")?;
+        let args_json = CString::new(args_json)?;
+        let mut sink = PipelineRowSinkState::default();
+
+        // SAFETY: server pointer is owned by self and thread-affine. `sink`
+        // lives until cbm_mcp_handle_tool returns and is cleared immediately.
+        let raw_result = unsafe {
+            cbm_sys::cbm_mcp_server_set_row_sink(
+                self.ptr.as_ptr(),
+                Some(pipeline_node_sink),
+                Some(pipeline_edge_sink),
+                (&mut sink as *mut PipelineRowSinkState).cast::<c_void>(),
+            );
+            let ptr = cbm_sys::cbm_mcp_handle_tool(
+                self.ptr.as_ptr(),
+                tool_name.as_ptr(),
+                args_json.as_ptr(),
+            );
+            cbm_sys::cbm_mcp_server_set_row_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            take_c_string(ptr)
+        };
+        let raw_json = raw_result?;
+        if let Some(error) = sink.error {
+            return Err(error);
+        }
+        let project = project_from_tool_result(&raw_json)
+            .or_else(|| sink.nodes.first().map(|node| node.project.clone()))
+            .or_else(|| sink.edges.first().map(|edge| edge.project.clone()))
+            .unwrap_or_default();
+        Ok(CbmIndexRepositoryRows {
+            raw_json,
+            rows: CbmPipelineRows {
+                project,
+                nodes: sink.nodes,
+                edges: sink.edges,
+            },
+        })
+    }
+
     pub fn handle_tool(
         &self,
         tool_name: &str,
@@ -1500,6 +1550,28 @@ fn tool_error(value: &serde_json::Value, raw: &str) -> BridgeError {
         )
         .with_stderr(raw.to_string()),
     )
+}
+
+fn project_from_tool_result(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if let Some(project) = value
+        .get("structuredContent")
+        .and_then(|content| content.get("project"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(project.to_string());
+    }
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)?;
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("project")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 struct CStringAllocation(NonNull<c_char>);
@@ -1576,6 +1648,18 @@ mod tests {
             "astrolabe-bridge-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn cleanup_cbm_project_db(project: &str) {
+        let Ok(cache_dir) = cbm_cache_dir() else {
+            return;
+        };
+        let path = cache_dir.join(format!("{project}.db"));
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut raw = path.as_os_str().to_os_string();
+            raw.push(suffix);
+            std::fs::remove_file(std::path::PathBuf::from(raw)).ok();
+        }
     }
 
     #[test]
@@ -1678,6 +1762,69 @@ mod tests {
 
         drop(connection);
         drop(pipeline);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tool_runner_index_repository_collects_rows_from_single_mcp_run() {
+        let dir = temp_dir("tool-runner-row-sink");
+        let repo = dir.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).expect("create fixture repo");
+        std::fs::write(
+            src.join("main.c"),
+            "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
+        )
+        .expect("write C fixture");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let project = format!("row-sink-tool-{}-{nanos}", std::process::id());
+        let args = serde_json::json!({
+            "repo_path": repo.to_str().expect("utf8 repo path"),
+            "mode": "full",
+            "name": project,
+        })
+        .to_string();
+
+        let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+        let run = runner
+            .handle_index_repository_with_rows(&args)
+            .expect("single MCP index_repository run with row sink");
+        let value: serde_json::Value =
+            serde_json::from_str(&run.raw_json).expect("valid MCP tool result JSON");
+        assert_eq!(
+            value.get("isError").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            project_from_tool_result(&run.raw_json).as_deref(),
+            Some(project.as_str())
+        );
+        assert_eq!(run.rows.project, project);
+        assert!(
+            run.rows
+                .nodes
+                .iter()
+                .any(|node| node.qualified_name.ends_with(".main")),
+            "expected main function in MCP row sink: {:?}",
+            run.rows
+        );
+        assert!(
+            run.rows
+                .nodes
+                .iter()
+                .all(|node| node.project == run.rows.project)
+        );
+        assert!(
+            run.rows
+                .edges
+                .iter()
+                .all(|edge| edge.project == run.rows.project)
+        );
+
+        cleanup_cbm_project_db(&run.rows.project);
         std::fs::remove_dir_all(dir).ok();
     }
 

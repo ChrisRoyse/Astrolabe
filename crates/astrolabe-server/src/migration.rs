@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use astrolabe_bridge::{CbmIndexMode, CbmPipeline, CbmPipelineRows, CbmToolRunner};
+use astrolabe_bridge::{CbmPipelineRows, CbmToolRunner};
 use astrolabe_ingest::{
     CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, SqliteImportOptions,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, verify_chain,
@@ -256,7 +256,15 @@ fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<St
     }
 
     let sanitized_args = strip_calyx_arg(args_obj)?;
-    let result = runner.handle_tool_raw("index_repository", &sanitized_args)?;
+    let (result, row_sink) = match runner.handle_index_repository_with_rows(&sanitized_args) {
+        Ok(run) => (run.raw_json, row_sink_import_candidate_from_rows(run.rows)),
+        Err(error) => (
+            runner.handle_tool_raw("index_repository", &sanitized_args)?,
+            RowSinkImportCandidate::Unavailable(format!(
+                "single-run row-sink index_repository failed: {error}"
+            )),
+        ),
+    };
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
@@ -273,7 +281,6 @@ fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<St
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
         return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
     };
-    let row_sink = collect_row_sink_import_candidate(args_obj, &project, &cache_dir);
     let outcome = match import_shadow_vault(&project, Some(row_sink)) {
         Ok(outcome) => outcome,
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
@@ -684,61 +691,17 @@ where
     }
 }
 
-fn collect_row_sink_import_candidate(
-    args: &Map<String, Value>,
-    project: &str,
-    cache_dir: &Path,
-) -> RowSinkImportCandidate {
-    match collect_row_sink_snapshot(args, project, cache_dir) {
-        Ok(snapshot) => RowSinkImportCandidate::Available(snapshot),
-        Err(error) => {
-            RowSinkImportCandidate::Unavailable(format!("row-sink collection unavailable: {error}"))
-        }
+fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCandidate {
+    if rows.project.trim().is_empty() {
+        return RowSinkImportCandidate::Unavailable(
+            "single-run row sink produced no project name".to_string(),
+        );
     }
-}
-
-fn collect_row_sink_snapshot(
-    args: &Map<String, Value>,
-    project: &str,
-    cache_dir: &Path,
-) -> Result<RowSinkSnapshot, DynError> {
-    let repo_path = string_arg(args, "repo_path")
-        .ok_or("row-sink direct path requires index_repository repo_path")?;
-    let mode = index_mode_from_args(args)
-        .ok_or("row-sink direct path is unavailable for cross-repo-intelligence mode")?;
-    let db_path = temp_row_sink_db_path(cache_dir, project);
-    cleanup_row_sink_db_path(&db_path);
-
-    let result = (|| {
-        let db_path_str = path_to_utf8(&db_path, "row-sink temporary DB path")?;
-        let mut pipeline = CbmPipeline::new(repo_path, db_path_str, mode)?;
-        pipeline.set_project_name(project)?;
-        let rows = pipeline.collect_rows()?;
-        if rows.project != project {
-            return Err(format!(
-                "row-sink project {:?} does not match shadow project {:?}",
-                rows.project, project
-            )
-            .into());
-        }
-        let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
-        Ok(RowSinkSnapshot {
-            snapshot: pipeline_rows_to_graph_snapshot(rows),
-            source_fingerprint_sha256,
-        })
-    })();
-
-    cleanup_row_sink_db_path(&db_path);
-    result
-}
-
-fn index_mode_from_args(args: &Map<String, Value>) -> Option<CbmIndexMode> {
-    match string_arg(args, "mode") {
-        Some("cross-repo-intelligence") => None,
-        Some("fast") => Some(CbmIndexMode::Fast),
-        Some("moderate") => Some(CbmIndexMode::Moderate),
-        _ => Some(CbmIndexMode::Full),
-    }
+    let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
+    RowSinkImportCandidate::Available(RowSinkSnapshot {
+        snapshot: pipeline_rows_to_graph_snapshot(rows),
+        source_fingerprint_sha256,
+    })
 }
 
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
@@ -844,32 +807,6 @@ fn hash_i64(hasher: &mut Sha256, value: i64) {
 
 fn hash_u64(hasher: &mut Sha256, value: u64) {
     hasher.update(value.to_le_bytes());
-}
-
-fn temp_row_sink_db_path(cache_dir: &Path, project: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let project_hash = hex_lower(&Sha256::digest(project.as_bytes()));
-    cache_dir.join(format!(
-        "{project}{LOWERED_SQLITE_SUFFIX}.row-sink-{}-{}-{nanos}.db",
-        std::process::id(),
-        &project_hash[..16],
-    ))
-}
-
-fn cleanup_row_sink_db_path(path: &Path) {
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut raw = path.as_os_str().to_os_string();
-        raw.push(suffix);
-        fs::remove_file(PathBuf::from(raw)).ok();
-    }
-}
-
-fn path_to_utf8<'a>(path: &'a Path, label: &str) -> Result<&'a str, DynError> {
-    path.to_str()
-        .ok_or_else(|| format!("{label} is not valid UTF-8: {}", path.display()).into())
 }
 
 fn lower_shadow_sqlite<C>(
@@ -1520,18 +1457,15 @@ mod tests {
     }
 
     #[test]
-    fn cross_repo_mode_keeps_row_sink_unavailable_before_ffi() {
-        let args = serde_json::json!({
-            "repo_path": "/tmp/demo",
-            "mode": "cross-repo-intelligence",
-        });
-        let candidate =
-            collect_row_sink_import_candidate(args.as_object().unwrap(), "demo", Path::new("/tmp"));
+    fn row_sink_candidate_labels_empty_project_unavailable() {
+        let mut rows = sample_pipeline_rows();
+        rows.project.clear();
+        let candidate = row_sink_import_candidate_from_rows(rows);
         match candidate {
             RowSinkImportCandidate::Unavailable(reason) => {
-                assert!(reason.contains("cross-repo-intelligence"));
+                assert!(reason.contains("project name"));
             }
-            RowSinkImportCandidate::Available(_) => panic!("cross-repo mode must not use row sink"),
+            RowSinkImportCandidate::Available(_) => panic!("empty project must not import direct"),
         }
     }
 

@@ -1517,6 +1517,61 @@ unsafe extern "C" {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct cbm_gbuf_row_node_t {
+    pub id: i64,
+    pub project: *const ::std::os::raw::c_char,
+    pub label: *const ::std::os::raw::c_char,
+    pub name: *const ::std::os::raw::c_char,
+    pub qualified_name: *const ::std::os::raw::c_char,
+    pub file_path: *const ::std::os::raw::c_char,
+    pub start_line: ::std::os::raw::c_int,
+    pub end_line: ::std::os::raw::c_int,
+    pub properties_json: *const ::std::os::raw::c_char,
+}
+impl Default for cbm_gbuf_row_node_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct cbm_gbuf_row_edge_t {
+    pub id: i64,
+    pub project: *const ::std::os::raw::c_char,
+    pub source_id: i64,
+    pub target_id: i64,
+    pub type_: *const ::std::os::raw::c_char,
+    pub properties_json: *const ::std::os::raw::c_char,
+    pub url_path_gen: *const ::std::os::raw::c_char,
+    pub local_name_gen: *const ::std::os::raw::c_char,
+}
+impl Default for cbm_gbuf_row_edge_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type cbm_gbuf_row_node_sink_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        node: *const cbm_gbuf_row_node_t,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int,
+>;
+pub type cbm_gbuf_row_edge_sink_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        edge: *const cbm_gbuf_row_edge_t,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int,
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct cbm_store {
     _unused: [u8; 0],
 }
@@ -1663,6 +1718,14 @@ unsafe extern "C" {
     pub fn cbm_mcp_server_set_config(srv: *mut cbm_mcp_server_t, cfg: *mut cbm_config);
 }
 unsafe extern "C" {
+    pub fn cbm_mcp_server_set_row_sink(
+        srv: *mut cbm_mcp_server_t,
+        node_cb: cbm_gbuf_row_node_sink_fn,
+        edge_cb: cbm_gbuf_row_edge_sink_fn,
+        ctx: *mut ::std::os::raw::c_void,
+    );
+}
+unsafe extern "C" {
     pub fn cbm_mcp_server_handle(
         srv: *mut cbm_mcp_server_t,
         line: *const ::std::os::raw::c_char,
@@ -1710,61 +1773,6 @@ unsafe extern "C" {
         out_size: ::std::os::raw::c_int,
     ) -> bool;
 }
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_gbuf_row_node_t {
-    pub id: i64,
-    pub project: *const ::std::os::raw::c_char,
-    pub label: *const ::std::os::raw::c_char,
-    pub name: *const ::std::os::raw::c_char,
-    pub qualified_name: *const ::std::os::raw::c_char,
-    pub file_path: *const ::std::os::raw::c_char,
-    pub start_line: ::std::os::raw::c_int,
-    pub end_line: ::std::os::raw::c_int,
-    pub properties_json: *const ::std::os::raw::c_char,
-}
-impl Default for cbm_gbuf_row_node_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct cbm_gbuf_row_edge_t {
-    pub id: i64,
-    pub project: *const ::std::os::raw::c_char,
-    pub source_id: i64,
-    pub target_id: i64,
-    pub type_: *const ::std::os::raw::c_char,
-    pub properties_json: *const ::std::os::raw::c_char,
-    pub url_path_gen: *const ::std::os::raw::c_char,
-    pub local_name_gen: *const ::std::os::raw::c_char,
-}
-impl Default for cbm_gbuf_row_edge_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-pub type cbm_gbuf_row_node_sink_fn = ::std::option::Option<
-    unsafe extern "C" fn(
-        node: *const cbm_gbuf_row_node_t,
-        ctx: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
->;
-pub type cbm_gbuf_row_edge_sink_fn = ::std::option::Option<
-    unsafe extern "C" fn(
-        edge: *const cbm_gbuf_row_edge_t,
-        ctx: *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int,
->;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct cbm_gbuf {

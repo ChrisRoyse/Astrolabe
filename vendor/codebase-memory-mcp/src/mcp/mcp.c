@@ -858,6 +858,12 @@ struct cbm_mcp_server {
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
+
+    /* Optional row-sink callbacks for embedders that consume index_repository
+     * rows directly while preserving the normal MCP result and SQLite output. */
+    cbm_gbuf_row_node_sink_fn row_node_sink;
+    cbm_gbuf_row_edge_sink_fn row_edge_sink;
+    void *row_sink_ctx;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -903,6 +909,19 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
+void cbm_mcp_server_set_row_sink(cbm_mcp_server_t *srv, cbm_gbuf_row_node_sink_fn node_cb,
+                                 cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx) {
+    if (!srv) {
+        return;
+    }
+    srv->row_node_sink = node_cb;
+    srv->row_edge_sink = edge_cb;
+    srv->row_sink_ctx = ctx;
+    if (srv->active_pipeline) {
+        cbm_pipeline_set_sink(srv->active_pipeline, node_cb, edge_cb, ctx);
+    }
+}
+
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -918,6 +937,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
+    srv->row_sink_ctx = NULL;
     free(srv);
 }
 
@@ -3906,6 +3926,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
+    cbm_pipeline_set_sink(p, srv->row_node_sink, srv->row_edge_sink, srv->row_sink_ctx);
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
         cbm_pipeline_free(p);
         free(name_override);
