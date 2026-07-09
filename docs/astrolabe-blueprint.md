@@ -71,7 +71,7 @@ codebase-memory-mcp                          Calyx
 7. **The oracle predicts consequences.** "If I change X, what breaks?" answered from grounded changeâ†’outcome history via hop-attenuated consequence trees; root-cause abduction runs the same walk backwards; the honesty gate refuses questions the panel can't support.
 8. **Every answer carries provenance.** Hash-chained ledger, answer traces, bit-for-bit reproduction, tamper-evident graph â€” the first MCP whose claims an agent (or auditor) can verify.
 9. **Architecture: Rust host, C engine.** A new Rust binary embeds Calyx crates natively and links CBM's extraction pipeline as a static C library (`libcbm`). Migration follows Calyx's own proven Leapable pattern: shadow â†’ flip â†’ native, with SQLite retained as a *lowered artifact* for the Cypher engine and UI.
-10. **Both codebases are ~production-grade and open.** CBM: MIT, ~201K LOC C, 5,900+ tests. Calyx: BSL 1.1 (âš  license review required for distribution â€” see 21_RISKS), ~540K LOC Rust, ~3,500+ tests. The integration is additive: no rewrite of either engine's core.
+10. **Both codebases are ~production-grade.** CBM: MIT, ~201K LOC C, 5,900+ tests. Calyx: BSL 1.1 standalone, with an Astrolabe-specific owner grant recorded in the root LICENSE/NOTICE for the combined binary, ~540K LOC Rust, ~3,500+ tests. The integration is additive: no rewrite of either engine's core.
 
 ## Decision log (headline decisions made in these documents)
 
@@ -1808,7 +1808,7 @@ Stages: (1) C gate â€” upstream CBM lint/tests (clang-tidy -Werror, cppchec
 
 Same channel network as CBM (npm/PyPI/Homebrew/Scoop/Winget/Chocolatey/AUR/`go install` shims download the platform binary). Binary named `astrolabe` with `codebase-memory-mcp` compat shim. Size estimate: CBM ~(grammars-dominated) + Rust engine â‡’ target < 150MB static (strip + LTO both halves; grammar set is the floor). UI variant unchanged (embed script + Node build). `server.json` MCP registry manifest updated.
 
-**âš  Licensing gate (release blocker):** CBM is MIT; **Calyx is BSL 1.1** (converts to Apache-2.0 four years post-release). Redistributing a combined binary embeds BSL-licensed code â€” the Additional Use Grant terms govern what's permitted (BSL's standard restriction targets offering the software as a competing DBaaS; an embedded developer tool is typically within grant, but this **requires explicit legal review and/or a license grant from the Calyx author before any public release**. Internal/self-hosted use is unrestricted.) Tracked as risk R1 (21).
+**Licensing gate:** CBM is MIT; Calyx remains BSL 1.1 as a standalone project, and the Astrolabe combined binary carries a self-issued owner grant recorded in the root LICENSE/NOTICE files. `scripts/check-license-notices.py` verifies the release-critical notice manifest for Calyx, CBM, tree-sitter, SQLite, mimalloc, compression/json libraries, and nomic assets. Full package-channel notice generation remains a release packaging task. Tracked as R1 documentation/gate work (21).
 
 
 ---
@@ -1880,7 +1880,7 @@ Every identified risk, honestly stated, with mitigation and owner-phase. Severit
 
 | # | Risk | Sev | Mitigation |
 |---|---|---|---|
-| R1 | **Calyx is BSL 1.1**; redistributing a combined public binary may exceed the Additional Use Grant | ðŸ”´ | Legal review before any public release; seek explicit grant/dual-license from the Calyx author; until resolved, ship as source-build/internal-use; BSL auto-converts to Apache-2.0 4 years post-release (long-term safe) |
+| R1 | License/notice completeness for combined distribution | ðŸŸ¡ | External grant blocker resolved by Calyx ownership; root LICENSE/NOTICE records the Astrolabe-specific Calyx grant; `scripts/check-license-notices.py` gates release-critical vendored notices; full package-channel notice aggregation still required before public release |
 | R2 | Upstream drift: both parents are pre-1.0, actively developed; pinned SHAs rot | ðŸŸ  | subtree pins + small patch set (19 Â§3) designed for upstreaming; quarterly rebase budget; interface-invariant tests catch breakage at the pin bump |
 | R3 | Scope explosion (this plan is large) | ðŸŸ  | phase gates (22) each independently shippable & valuable; Tier 1â€“5 alone justify the project; Tiers 6â€“12 are optional extensions |
 

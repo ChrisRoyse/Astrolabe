@@ -1,0 +1,32 @@
+Astrolabe Combined Distribution License Grant
+
+Copyright (c) 2026 Chris Royse.
+
+Astrolabe is an integration of the Astrolabe glue code in this repository,
+the vendored Calyx source tree, and the vendored codebase-memory-mcp source
+tree.
+
+Astrolabe integration code written in this repository may be used, copied,
+modified, merged, published, distributed, sublicensed, and/or sold as part of
+Astrolabe, subject to preserving this notice and the third-party notices named
+in NOTICE.
+
+Calyx owner grant: Chris Royse owns the vendored Calyx work and grants the
+Astrolabe project permission to use, copy, modify, link, embed, and distribute
+Calyx as part of the combined Astrolabe source and binary distributions. This
+self-issued grant is specific to Astrolabe distributions from this repository
+and does not rewrite the standalone Calyx license stored at
+vendor/calyx/LICENSE.
+
+codebase-memory-mcp remains under its MIT license at
+vendor/codebase-memory-mcp/LICENSE. Other vendored third-party components
+remain under their own licenses and notices. See NOTICE and the referenced
+license files for distribution obligations.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

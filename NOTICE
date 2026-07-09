@@ -1,0 +1,79 @@
+Astrolabe Notices
+
+This file records the release-critical notices for the combined Astrolabe
+distribution. Source license files remain authoritative.
+
+Astrolabe integration code
+- Copyright (c) 2026 Chris Royse.
+- License/grant: see LICENSE in this repository.
+
+Calyx
+- Path: vendor/calyx
+- Source license: vendor/calyx/LICENSE
+- License: Business Source License 1.1 for standalone Calyx, with an
+  Astrolabe-specific owner-granted combined-distribution grant recorded in the
+  root LICENSE file.
+
+codebase-memory-mcp
+- Path: vendor/codebase-memory-mcp
+- Source license: vendor/codebase-memory-mcp/LICENSE
+- License: MIT License.
+- Copyright notice in source license: Copyright (c) 2025 DeusData.
+
+tree-sitter common/runtime
+- Paths:
+  - vendor/codebase-memory-mcp/internal/cbm/vendored/common/LICENSE
+  - vendor/codebase-memory-mcp/internal/cbm/vendored/common/tree_sitter/LICENSE
+- License: MIT License.
+
+tree-sitter grammars
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/grammars
+- License: each grammar carries its own LICENSE file in its grammar directory.
+  Distribution packaging must preserve those files.
+
+SQLite
+- Path: vendor/codebase-memory-mcp/vendored/sqlite3
+- Source license: vendor/codebase-memory-mcp/vendored/sqlite3/LICENSE.md
+- License/notice: public domain blessing as published by SQLite.
+
+mimalloc
+- Path: vendor/codebase-memory-mcp/vendored/mimalloc
+- Source license: vendor/codebase-memory-mcp/vendored/mimalloc/LICENSE
+- License: MIT License.
+
+zstd
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/zstd
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/zstd/LICENSE
+- License: BSD License.
+
+lz4
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4/LICENSE
+- License: BSD-style license.
+
+xxHash
+- Path: vendor/codebase-memory-mcp/vendored/xxhash
+- Source license: vendor/codebase-memory-mcp/vendored/xxhash/LICENSE
+- License: BSD 2-Clause License.
+
+yyjson
+- Path: vendor/codebase-memory-mcp/vendored/yyjson
+- Source license: vendor/codebase-memory-mcp/vendored/yyjson/LICENSE
+- License: MIT License.
+
+TRE
+- Path: vendor/codebase-memory-mcp/vendored/tre
+- Source license: vendor/codebase-memory-mcp/vendored/tre/LICENSE
+- License: BSD-style license.
+
+nomic embedding assets
+- Path: vendor/codebase-memory-mcp/vendored/nomic
+- Source license: vendor/codebase-memory-mcp/vendored/nomic/LICENSE
+- Source notice: vendor/codebase-memory-mcp/vendored/nomic/NOTICE
+- License: Apache License 2.0.
+
+Node graph UI dependencies
+- Path: vendor/codebase-memory-mcp/graph-ui/node_modules
+- Notice status: package-manager generated dependency notices remain a release
+  packaging task. This root NOTICE does not replace per-package notices under
+  node_modules.
