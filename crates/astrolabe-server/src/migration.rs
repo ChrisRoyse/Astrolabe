@@ -49,12 +49,13 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
-    anomaly_report_artifact_bytes, detect_anomalies, recover_reactive_state,
+    SubscriptionId, acknowledge_reactive_subscription, anomaly_report_artifact_bytes,
+    detect_anomalies, recover_reactive_state,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AbsentReason, Clock, SlotVector, VaultId, VaultStore};
+use calyx_core::{AbsentReason, Clock, LedgerRef, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
@@ -82,10 +83,12 @@ const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v1";
 const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str = "astrolabe.periodic_verify_chain_tick.v1";
 const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
+const OPTIMIZER_TRIGGER_ACK_SCHEMA: &str = "astrolabe.optimizer_trigger_ack.v1";
 const OPTIMIZER_JANITOR_SCHEMA: &str = "astrolabe.optimizer_janitor.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
+const OPTIMIZER_TRIGGER_ACK_ACTOR: &str = "astrolabe-server-optimizer-status";
 const GET_READINESS_SCHEMA: &str = "astrolabe.get_readiness.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -463,7 +466,7 @@ fn optimizer_status_tool_definition() -> Value {
     json!({
         "name": "optimizer_status",
         "title": "Optimizer Status",
-        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project. This surface currently reports status only; propose and trigger acknowledgement modes fail closed until the anneal pipeline is wired.",
+        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, or durably acknowledge pending reactive trigger events for a subscription.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -473,8 +476,12 @@ fn optimizer_status_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["status"],
-                    "description": "Only status is currently enabled."
+                    "enum": ["status", "ack_triggers"],
+                    "description": "Use status for readback or ack_triggers to append a durable acknowledgement for one subscription."
+                },
+                "subscription_id": {
+                    "type": "string",
+                    "description": "Required when mode is ack_triggers; use a subscription_id returned by optimizer_status.reactive_triggers.subscriptions."
                 }
             },
             "required": ["project"],
@@ -866,18 +873,41 @@ fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
         );
     }
     let mode = string_arg(args_obj, "mode").unwrap_or("status");
-    if mode != "status" {
-        return tool_error_result(format!(
-            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {mode:?} is not available; remediation: use mode=\"status\" until anneal proposals and trigger acknowledgement are wired"
-        ));
-    }
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
-    tool_json_result(optimizer_status_json_at(
-        &cache_dir,
-        &project,
-        anneal_env.as_deref(),
-    )?)
+    match mode {
+        "status" => {
+            let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
+            tool_json_result(optimizer_status_json_at(
+                &cache_dir,
+                &project,
+                anneal_env.as_deref(),
+            )?)
+        }
+        "ack_triggers" => {
+            let Some(raw_subscription_id) = string_arg(args_obj, "subscription_id") else {
+                return tool_error_result(
+                    "ASTRO_OPTIMIZER_ACK_SUBSCRIPTION_REQUIRED: optimizer_status mode=\"ack_triggers\" requires subscription_id; remediation: read optimizer_status.reactive_triggers.subscriptions and retry with one returned subscription_id",
+                );
+            };
+            let subscription_id = match SubscriptionId::from_str(raw_subscription_id) {
+                Ok(subscription_id) => subscription_id,
+                Err(error) => {
+                    return tool_error_result(format!(
+                        "ASTRO_OPTIMIZER_ACK_SUBSCRIPTION_INVALID: invalid subscription_id {raw_subscription_id:?}: {error}; remediation: use a subscription_id returned by optimizer_status.reactive_triggers.subscriptions"
+                    ));
+                }
+            };
+            let value = optimizer_ack_triggers_json_at(&cache_dir, &project, subscription_id)?;
+            if value.get("status").and_then(Value::as_str) == Some("refused") {
+                tool_json_error_result(value)
+            } else {
+                tool_json_result(value)
+            }
+        }
+        other => tool_error_result(format!(
+            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\" or mode=\"ack_triggers\" until anneal proposals are wired"
+        )),
+    }
 }
 
 fn handle_get_readiness(args_json: &str) -> Result<String, DynError> {
@@ -5130,7 +5160,7 @@ fn optimizer_status_json_at(
         "freshness": "fresh",
         "trust": "provisional",
         "reason": "anneal optimizer workers are not enabled in the current shadow stage",
-        "remediation": "use this surface as an operations readback; keep optimizer_status issue open until proposal, janitor, guard-profile, and trigger-ack paths are wired and FSV-tested",
+        "remediation": "use this surface as an operations readback; keep optimizer_status issue open until proposal, guard-profile, and live tripwire paths are wired and FSV-tested",
         "source_state": {
             "vault_dir": vault_dir,
             "vault_id": vault_id,
@@ -5159,8 +5189,96 @@ fn optimizer_status_json_at(
         "capabilities": {
             "status": "enabled",
             "propose": "not_enabled_in_shadow_stage",
-            "trigger_ack": "not_enabled_in_shadow_stage",
+            "trigger_ack": "enabled_durable_ledger_action",
             "janitor": "enabled_budgeted_tick",
+        },
+    }))
+}
+
+fn optimizer_ack_triggers_json_at(
+    cache_dir: &Path,
+    project: &str,
+    subscription_id: SubscriptionId,
+) -> Result<Value, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(json!({
+            "schema": OPTIMIZER_TRIGGER_ACK_SCHEMA,
+            "status": "refused",
+            "project": project,
+            "subscription_id": subscription_id.to_string(),
+            "code": "ASTRO_OPTIMIZER_ACK_VAULT_MISSING",
+            "message": format!("shadow vault dir missing: {}", vault_dir.display()),
+            "remediation": "rerun index_repository with calyx=\"shadow\" before acknowledging reactive triggers",
+            "freshness": "fresh",
+            "trust": "verified",
+        }));
+    }
+
+    let vault = open_shadow_vault_writable(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Ledger, ColumnFamily::Reactive],
+    )?;
+    let report = match acknowledge_reactive_subscription(
+        &vault,
+        subscription_id,
+        OPTIMIZER_TRIGGER_ACK_ACTOR.to_string(),
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return Ok(json!({
+                "schema": OPTIMIZER_TRIGGER_ACK_SCHEMA,
+                "status": "refused",
+                "project": project,
+                "subscription_id": subscription_id.to_string(),
+                "code": error.code,
+                "message": error.message,
+                "remediation": error.remediation,
+                "freshness": "fresh",
+                "trust": "verified",
+            }));
+        }
+    };
+    drop(vault);
+
+    let readback = optimizer_reactive_triggers_json_result(cache_dir, project)?;
+    let status = if report.acked_count == 0 {
+        "noop"
+    } else if report.pending_after == 0 {
+        "acked"
+    } else {
+        "partial"
+    };
+    let trust = if report.pending_after == 0 {
+        "verified"
+    } else {
+        "provisional"
+    };
+    let ledger_ref = report
+        .ledger_ref
+        .as_ref()
+        .map(ledger_ref_json)
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "schema": OPTIMIZER_TRIGGER_ACK_SCHEMA,
+        "status": status,
+        "project": project,
+        "subscription_id": report.subscription_id.to_string(),
+        "pending_before": report.pending_before,
+        "acked_count": report.acked_count,
+        "pending_after": report.pending_after,
+        "ledger_ref": ledger_ref,
+        "acknowledged_events": serde_json::to_value(&report.acknowledged_events)?,
+        "readback": readback,
+        "source": "AsterVault:ColumnFamily::Ledger",
+        "freshness": "fresh",
+        "trust": trust,
+        "remediation": if report.pending_after == 0 {
+            Value::Null
+        } else {
+            Value::String("inspect reactive trigger readback; pending events remained after acknowledgement".to_string())
         },
     }))
 }
@@ -5732,11 +5850,30 @@ fn open_shadow_vault_read_only(
     vault_salt: &str,
     selected_cfs: Vec<ColumnFamily>,
 ) -> Result<AsterVault, DynError> {
+    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, true)
+}
+
+fn open_shadow_vault_writable(
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    selected_cfs: Vec<ColumnFamily>,
+) -> Result<AsterVault, DynError> {
+    open_shadow_vault_with_access(vault_dir, vault_id, vault_salt, selected_cfs, false)
+}
+
+fn open_shadow_vault_with_access(
+    vault_dir: &Path,
+    vault_id: &str,
+    vault_salt: &str,
+    selected_cfs: Vec<ColumnFamily>,
+    read_only: bool,
+) -> Result<AsterVault, DynError> {
     let vault_id = VaultId::from_str(vault_id)?;
     let options = VaultOptions {
-        read_only: true,
-        restore_ledger_hook: false,
-        selected_cfs: Some(selected_cfs),
+        read_only,
+        restore_ledger_hook: !read_only,
+        selected_cfs: read_only.then_some(selected_cfs),
         ..VaultOptions::default()
     };
     Ok(AsterVault::open(
@@ -5759,6 +5896,13 @@ fn ledger_entry_status_json(entry: &calyx_ledger::LedgerEntry) -> Value {
         "payload_sha256": hex_lower(&Sha256::digest(&entry.payload)),
         "payload_bytes": entry.payload.len(),
         "verified_hash": entry.verify(),
+    })
+}
+
+fn ledger_ref_json(ledger_ref: &LedgerRef) -> Value {
+    json!({
+        "seq": ledger_ref.seq,
+        "entry_hash": hex_lower(&ledger_ref.hash),
     })
 }
 
@@ -5829,19 +5973,25 @@ fn optimizer_reactive_triggers_json_result(
             })
         })
         .collect::<Vec<_>>();
+    let unacknowledged_count = state.pending_event_count();
     Ok(json!({
         "status": "read",
         "source": "AsterVault:ColumnFamily::Ledger+Reactive",
         "vault_dir": vault_dir,
         "subscription_count": state.subscriptions.len(),
         "fired_event_count": state.fired_events.len(),
-        "unacknowledged_count": state.pending_event_count(),
+        "unacknowledged_count": unacknowledged_count,
         "subscriptions": subscriptions,
         "ack": {
-            "status": "not_enabled_in_shadow_stage",
-            "freshness": "not_evaluated",
-            "trust": "provisional",
-            "remediation": "wire a durable acknowledgement ledger action before draining reactive triggers through optimizer_status",
+            "status": "enabled_durable_ledger_action",
+            "mode": "ack_triggers",
+            "freshness": "fresh",
+            "trust": "verified",
+            "remediation": if unacknowledged_count == 0 {
+                Value::Null
+            } else {
+                Value::String("call optimizer_status with mode=\"ack_triggers\" and a subscription_id from this readback".to_string())
+            },
         },
         "freshness": "fresh",
         "trust": "verified",
@@ -8105,6 +8255,14 @@ mod tests {
         assert_eq!(status["drift_alarms"]["status"], "unavailable");
         assert_eq!(status["reactive_triggers"]["status"], "read");
         assert_eq!(status["reactive_triggers"]["unacknowledged_count"], 0);
+        assert_eq!(
+            status["reactive_triggers"]["ack"]["status"],
+            "enabled_durable_ledger_action"
+        );
+        assert_eq!(
+            status["capabilities"]["trigger_ack"],
+            "enabled_durable_ledger_action"
+        );
         assert_eq!(status["capabilities"]["janitor"], "enabled_budgeted_tick");
         assert_eq!(status["tripwires"]["state_count"], 5);
         assert!(
@@ -8113,6 +8271,114 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|state| state["state"] == "not_armed")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_ack_mode_persists_durable_trigger_ack_and_readback() {
+        use astrolabe_weave::{NoveltyVerdict, ReactiveEngine, ReactiveSignals, TriggerCondition};
+        use std::sync::Arc;
+
+        struct AckSignals;
+        impl ReactiveSignals for AckSignals {
+            fn novelty(
+                &self,
+                _cx_id: calyx_core::CxId,
+                _tau_override: Option<f32>,
+            ) -> calyx_core::Result<NoveltyVerdict> {
+                Ok(NoveltyVerdict::Grounded)
+            }
+
+            fn occurrence_count(&self, _series: calyx_core::CxId) -> calyx_core::Result<u64> {
+                Ok(1)
+            }
+
+            fn slot_drift(&self, _slot: calyx_core::SlotId) -> calyx_core::Result<f32> {
+                Ok(0.0)
+            }
+        }
+
+        let dir = temp_dir("optimizer-ack-readback");
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"optimizer-ack-readback".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let series = calyx_core::CxId::from_input(b"optimizer-ack-series", 1, b"ack");
+        let trigger_cx = calyx_core::CxId::from_input(b"optimizer-ack-trigger", 1, b"ack");
+        let mut engine = ReactiveEngine::new(Arc::new(calyx_core::FixedClock::new(1_786_321_250)));
+        let subscription_id = engine
+            .subscribe_durable(
+                &vault,
+                TriggerCondition::EventRecurs {
+                    series,
+                    min_occurrences: 1,
+                },
+                Some("astrolabe-server-ack-test".to_string()),
+            )
+            .unwrap();
+        let ingest_ref = vault
+            .append_ledger_entry(
+                calyx_ledger::EntryKind::Ingest,
+                SubjectId::Cx(trigger_cx),
+                b"optimizer ack trigger ingest".to_vec(),
+                ActorId::Service("astrolabe-server-test".to_string()),
+            )
+            .unwrap();
+        {
+            let signals = AckSignals;
+            assert_eq!(
+                engine
+                    .evaluate_post_ingest_durable(&vault, trigger_cx, ingest_ref, &signals)
+                    .unwrap(),
+                1
+            );
+        }
+        let verify = verify_chain(&vault).unwrap();
+        drop(engine);
+        drop(vault);
+
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.vault_dir = vault_dir;
+        outcome.vault_salt = "optimizer-ack-readback".to_string();
+        outcome.ledger_seq = verify.checked_range_end.saturating_sub(1);
+        outcome.ledger_rows_after = verify.ledger_rows;
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let status_before = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        assert_eq!(
+            status_before["reactive_triggers"]["unacknowledged_count"],
+            1
+        );
+        assert_eq!(
+            status_before["reactive_triggers"]["subscriptions"][0]["subscription_id"],
+            subscription_id.to_string()
+        );
+        assert_eq!(
+            status_before["reactive_triggers"]["ack"]["status"],
+            "enabled_durable_ledger_action"
+        );
+
+        let ack = optimizer_ack_triggers_json_at(&dir, "demo", subscription_id).unwrap();
+        assert_eq!(ack["schema"], OPTIMIZER_TRIGGER_ACK_SCHEMA);
+        assert_eq!(ack["status"], "acked");
+        assert_eq!(ack["pending_before"], 1);
+        assert_eq!(ack["acked_count"], 1);
+        assert_eq!(ack["pending_after"], 0);
+        assert!(ack["ledger_ref"]["seq"].as_u64().unwrap() >= verify.ledger_rows);
+        assert_eq!(ack["readback"]["unacknowledged_count"], 0);
+        assert_eq!(ack["trust"], "verified");
+
+        let status_after = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        assert_eq!(status_after["reactive_triggers"]["unacknowledged_count"], 0);
+        assert_eq!(
+            status_after["reactive_triggers"]["subscriptions"][0]["pending_count"],
+            0
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -8279,7 +8545,7 @@ mod tests {
         );
         assert_eq!(
             optimizer_status["inputSchema"]["properties"]["mode"]["enum"],
-            json!(["status"])
+            json!(["status", "ack_triggers"])
         );
 
         let get_readiness = tool_definition(tools, "get_readiness");

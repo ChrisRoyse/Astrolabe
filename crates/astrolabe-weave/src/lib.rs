@@ -8,19 +8,21 @@ use std::fmt;
 use astrolabe_domain::EdgeKind;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Clock, SlotId, SlotVector, SparseEntry, VaultStore};
+use calyx_core::{CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultStore};
 use calyx_ledger::decode as decode_ledger;
+use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
 pub use calyx_loom::reactive::{
     DEFAULT_MAX_AUDIT_ENTRIES as CALYX_REACTIVE_AUDIT_CAP,
     DEFAULT_MAX_QUEUE_DEPTH as CALYX_REACTIVE_QUEUE_CAP,
     DEFAULT_MAX_TRIGGERS as CALYX_REACTIVE_REGISTRY_CAP,
 };
 pub use calyx_loom::{
-    AuditEntry as ReactiveAuditEntry, CALYX_REACTIVE_ROW_CORRUPT, NoveltyVerdict, ReactiveEngine,
-    ReactiveRowKind, ReactiveSignals, SubscriptionId, TriggerCondition, TriggerFired, TriggerId,
-    decode_audit_entry, decode_trigger_fired, reactive_row_key,
+    AuditEntry as ReactiveAuditEntry, CALYX_REACTIVE_ROW_CORRUPT,
+    CALYX_REACTIVE_SUBSCRIPTION_NOT_FOUND, NoveltyVerdict, ReactiveEngine, ReactiveRowKind,
+    ReactiveSignalSet, ReactiveSignals, SeriesStore, SubscriptionId, TriggerCondition,
+    TriggerFired, TriggerId, decode_audit_entry, decode_trigger_fired, reactive_row_key,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -48,6 +50,7 @@ pub const PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE: usize =
     PANEL_SLOT_COUNT_FOR_ABUNDANCE * (PANEL_SLOT_COUNT_FOR_ABUNDANCE - 1) / 2;
 pub const DETECT_ANOMALIES_SCHEMA: &str = "astrolabe.detect_anomalies.v1";
 pub const ASTRO_ANOMALY_INVALID_KIND: &str = "ASTRO_ANOMALY_INVALID_KIND";
+pub const ASTROLABE_REACTIVE_ACK_TAG: &str = "astrolabe_reactive_ack_v1";
 
 pub const SLOT_COMPLEXITY: SlotId = SlotId::new(2);
 pub const SLOT_GRAPH_POSITION: SlotId = SlotId::new(8);
@@ -105,6 +108,35 @@ pub struct RecoveredReactiveSubscription {
     pub overflowed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReactiveAckReport {
+    pub subscription_id: SubscriptionId,
+    pub pending_before: usize,
+    pub acked_count: usize,
+    pub pending_after: usize,
+    pub ledger_ref: Option<LedgerRef>,
+    pub acknowledged_events: Vec<TriggerFired>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct ReactiveAckEventRef {
+    trigger_id: TriggerId,
+    cx_id: CxId,
+    ledger_seq: u64,
+    ledger_hash: String,
+}
+
+impl ReactiveAckEventRef {
+    fn from_event(event: &TriggerFired) -> Self {
+        Self {
+            trigger_id: event.trigger_id,
+            cx_id: event.cx_id,
+            ledger_seq: event.ledger_ref.seq,
+            ledger_hash: hex_lower(&event.ledger_ref.hash),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ReactiveSubscriptionLedgerPayload {
     tag: String,
@@ -116,6 +148,14 @@ struct ReactiveSubscriptionLedgerPayload {
     max_drain_buf: usize,
 }
 
+#[derive(Deserialize)]
+struct ReactiveAckLedgerPayload {
+    tag: String,
+    action: String,
+    subscription_id: SubscriptionId,
+    acknowledged: Vec<ReactiveAckEventRef>,
+}
+
 pub fn recover_reactive_state<C>(
     vault: &AsterVault<C>,
 ) -> calyx_core::Result<RecoveredReactiveState>
@@ -124,6 +164,7 @@ where
 {
     let snapshot = vault.snapshot();
     let mut subscriptions = BTreeMap::<SubscriptionId, RecoveredReactiveSubscription>::new();
+    let mut acknowledged = BTreeMap::<SubscriptionId, BTreeSet<ReactiveAckEventRef>>::new();
 
     for (_key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
         let entry = decode_ledger(&bytes)
@@ -131,44 +172,66 @@ where
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.payload) else {
             continue;
         };
-        if value.get("tag").and_then(serde_json::Value::as_str) != Some("reactive_subscription_v1")
-        {
-            continue;
-        }
-        let payload: ReactiveSubscriptionLedgerPayload =
-            serde_json::from_value(value).map_err(|error| {
-                reactive_recovery_error(format!(
-                    "decode reactive subscription ledger payload: {error}"
-                ))
-            })?;
-        if payload.tag != "reactive_subscription_v1" {
-            continue;
-        }
+        match value.get("tag").and_then(serde_json::Value::as_str) {
+            Some("reactive_subscription_v1") => {
+                let payload: ReactiveSubscriptionLedgerPayload = serde_json::from_value(value)
+                    .map_err(|error| {
+                        reactive_recovery_error(format!(
+                            "decode reactive subscription ledger payload: {error}"
+                        ))
+                    })?;
+                if payload.tag != "reactive_subscription_v1" {
+                    continue;
+                }
 
-        match payload.action.as_str() {
-            "SUBSCRIPTION_CREATED" => {
-                subscriptions.insert(
-                    payload.subscription_id,
-                    RecoveredReactiveSubscription {
-                        subscription_id: payload.subscription_id,
-                        trigger_id: payload.trigger_id,
-                        condition: payload.condition,
-                        owner: payload.owner,
-                        max_drain_buf: payload.max_drain_buf.max(1),
-                        created_ledger_seq: entry.seq,
-                        pending_events: Vec::new(),
-                        overflowed: false,
-                    },
-                );
+                match payload.action.as_str() {
+                    "SUBSCRIPTION_CREATED" => {
+                        subscriptions.insert(
+                            payload.subscription_id,
+                            RecoveredReactiveSubscription {
+                                subscription_id: payload.subscription_id,
+                                trigger_id: payload.trigger_id,
+                                condition: payload.condition,
+                                owner: payload.owner,
+                                max_drain_buf: payload.max_drain_buf.max(1),
+                                created_ledger_seq: entry.seq,
+                                pending_events: Vec::new(),
+                                overflowed: false,
+                            },
+                        );
+                    }
+                    "SUBSCRIPTION_REMOVED" => {
+                        subscriptions.remove(&payload.subscription_id);
+                    }
+                    other => {
+                        return Err(reactive_recovery_error(format!(
+                            "unknown reactive subscription action {other}"
+                        )));
+                    }
+                }
             }
-            "SUBSCRIPTION_REMOVED" => {
-                subscriptions.remove(&payload.subscription_id);
+            Some(ASTROLABE_REACTIVE_ACK_TAG) => {
+                let payload: ReactiveAckLedgerPayload =
+                    serde_json::from_value(value).map_err(|error| {
+                        reactive_recovery_error(format!(
+                            "decode reactive ack ledger payload: {error}"
+                        ))
+                    })?;
+                if payload.tag != ASTROLABE_REACTIVE_ACK_TAG {
+                    continue;
+                }
+                if payload.action != "SUBSCRIPTION_EVENTS_ACKED" {
+                    return Err(reactive_recovery_error(format!(
+                        "unknown reactive ack action {}",
+                        payload.action
+                    )));
+                }
+                acknowledged
+                    .entry(payload.subscription_id)
+                    .or_default()
+                    .extend(payload.acknowledged);
             }
-            other => {
-                return Err(reactive_recovery_error(format!(
-                    "unknown reactive subscription action {other}"
-                )));
-            }
+            _ => {}
         }
     }
 
@@ -189,6 +252,12 @@ where
             if event.ledger_ref.seq < subscription.created_ledger_seq {
                 continue;
             }
+            if acknowledged
+                .get(&subscription.subscription_id)
+                .is_some_and(|acked| acked.contains(&ReactiveAckEventRef::from_event(event)))
+            {
+                continue;
+            }
             if subscription.pending_events.len() >= subscription.max_drain_buf {
                 subscription.pending_events.remove(0);
                 subscription.overflowed = true;
@@ -200,6 +269,54 @@ where
     Ok(RecoveredReactiveState {
         subscriptions: subscriptions.into_values().collect(),
         fired_events,
+    })
+}
+
+pub fn acknowledge_reactive_subscription<C>(
+    vault: &AsterVault<C>,
+    subscription_id: SubscriptionId,
+    actor: impl Into<String>,
+) -> calyx_core::Result<ReactiveAckReport>
+where
+    C: Clock,
+{
+    let before = recover_reactive_state(vault)?;
+    let subscription = before
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.subscription_id == subscription_id)
+        .ok_or_else(|| reactive_subscription_not_found(subscription_id))?;
+    let acknowledged_events = subscription.pending_events.clone();
+    let pending_before = acknowledged_events.len();
+    let ledger_ref = if acknowledged_events.is_empty() {
+        None
+    } else {
+        Some(append_reactive_ack_ledger(
+            vault,
+            subscription_id,
+            &acknowledged_events,
+            actor.into(),
+        )?)
+    };
+    if ledger_ref.is_some() {
+        vault.flush()?;
+    }
+    let after = recover_reactive_state(vault)?;
+    let pending_after = after
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.subscription_id == subscription_id)
+        .ok_or_else(|| reactive_subscription_not_found(subscription_id))?
+        .pending_events
+        .len();
+
+    Ok(ReactiveAckReport {
+        subscription_id,
+        pending_before,
+        acked_count: acknowledged_events.len(),
+        pending_after,
+        ledger_ref,
+        acknowledged_events,
     })
 }
 
@@ -220,12 +337,58 @@ where
     Ok(fired)
 }
 
+fn append_reactive_ack_ledger<C>(
+    vault: &AsterVault<C>,
+    subscription_id: SubscriptionId,
+    events: &[TriggerFired],
+    actor: String,
+) -> calyx_core::Result<LedgerRef>
+where
+    C: Clock,
+{
+    let acknowledged = events
+        .iter()
+        .map(ReactiveAckEventRef::from_event)
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "tag": ASTROLABE_REACTIVE_ACK_TAG,
+        "action": "SUBSCRIPTION_EVENTS_ACKED",
+        "subscription_id": subscription_id.to_string(),
+        "acknowledged_count": acknowledged.len(),
+        "acknowledged": acknowledged,
+    }))
+    .map_err(|error| reactive_recovery_error(format!("encode reactive ack payload: {error}")))?;
+    RedactionPolicy::check_payload(&payload)?;
+    vault.append_ledger_entry(
+        EntryKind::Guard,
+        SubjectId::Guard(format!("reactive_ack:{subscription_id}").into_bytes()),
+        payload,
+        ActorId::Service(actor),
+    )
+}
+
 fn reactive_recovery_error(message: impl Into<String>) -> CalyxError {
     CalyxError {
         code: CALYX_REACTIVE_ROW_CORRUPT,
         message: message.into(),
         remediation: "repair or rebuild reactive Ledger/CF rows before recovering subscriptions",
     }
+}
+
+fn reactive_subscription_not_found(subscription_id: SubscriptionId) -> CalyxError {
+    CalyxError {
+        code: CALYX_REACTIVE_SUBSCRIPTION_NOT_FOUND,
+        message: format!("reactive subscription {subscription_id} is not registered"),
+        remediation: "use a subscription id from recovered reactive state",
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1765,6 +1928,82 @@ mod tests {
     }
 
     #[test]
+    fn durable_ack_persists_and_recovery_drains_pending_subscription_after_reopen() {
+        let (dir, vault) = reactive_vault("ack-recovery");
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_750)));
+        let subscription = engine
+            .subscribe_durable(
+                &vault,
+                TriggerCondition::NewRegion { tau_override: None },
+                Some("astrolabe-weave-ack".to_string()),
+            )
+            .expect("durable subscription");
+        let trigger = engine
+            .subscriptions()
+            .get(subscription)
+            .expect("subscription handle")
+            .trigger_id;
+        let trigger_cx = cx(45);
+        let ingest_ref = vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Cx(trigger_cx),
+                b"reactive ack ingest".to_vec(),
+                ActorId::Service("astrolabe-weave-test".to_string()),
+            )
+            .expect("append real ingest ledger entry");
+        let signals =
+            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
+
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, ingest_ref.clone(), &signals)
+                .expect("evaluate durable subscription"),
+            1
+        );
+        let before = recover_reactive_state(&vault).expect("recover before ack");
+        assert_eq!(before.pending_event_count(), 1);
+
+        let ack = acknowledge_reactive_subscription(
+            &vault,
+            subscription,
+            "astrolabe-weave-test".to_string(),
+        )
+        .expect("ack durable subscription");
+        assert_eq!(ack.subscription_id, subscription);
+        assert_eq!(ack.pending_before, 1);
+        assert_eq!(ack.acked_count, 1);
+        assert_eq!(ack.pending_after, 0);
+        assert_eq!(ack.acknowledged_events.len(), 1);
+        assert_eq!(ack.acknowledged_events[0].trigger_id, trigger);
+        assert_eq!(ack.acknowledged_events[0].ledger_ref.seq, ingest_ref.seq);
+        assert!(ack.ledger_ref.is_some());
+
+        let ack_payloads = reactive_ack_payloads(&vault);
+        assert_eq!(ack_payloads.len(), 1);
+        assert_eq!(ack_payloads[0]["tag"], ASTROLABE_REACTIVE_ACK_TAG);
+        assert_eq!(ack_payloads[0]["action"], "SUBSCRIPTION_EVENTS_ACKED");
+        assert_eq!(ack_payloads[0]["subscription_id"], subscription.to_string());
+        assert_eq!(ack_payloads[0]["acknowledged_count"], 1);
+
+        let after = recover_reactive_state(&vault).expect("recover after ack");
+        assert_eq!(after.fired_events.len(), 1);
+        assert_eq!(after.pending_event_count(), 0);
+        vault.flush().expect("flush durable ack state");
+        drop(engine);
+        drop(vault);
+
+        let reopened = open_reactive_vault(&dir);
+        let reopened_state =
+            recover_reactive_state(&reopened).expect("recover durable ack state after reopen");
+        assert_eq!(reopened_state.fired_events.len(), 1);
+        assert_eq!(reopened_state.pending_event_count(), 0);
+        assert_eq!(reactive_ack_payloads(&reopened).len(), 1);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn durable_new_region_and_drift_detected_persist_source_rows() {
         let (dir, vault) = reactive_vault("new-region-drift");
         let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_500)));
@@ -2548,6 +2787,21 @@ mod tests {
         vault
             .scan_cf_at(vault.snapshot(), ColumnFamily::Reactive)
             .expect("scan reactive CF")
+    }
+
+    fn reactive_ack_payloads(vault: &AsterVault<SystemClock>) -> Vec<serde_json::Value> {
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Ledger)
+            .expect("scan ledger CF")
+            .into_iter()
+            .filter_map(|(_key, value)| {
+                let entry = calyx_ledger::decode(&value).expect("decode ledger row");
+                let payload: serde_json::Value = serde_json::from_slice(&entry.payload).ok()?;
+                (payload.get("tag").and_then(serde_json::Value::as_str)
+                    == Some(ASTROLABE_REACTIVE_ACK_TAG))
+                .then_some(payload)
+            })
+            .collect()
     }
 
     #[cfg(target_os = "linux")]

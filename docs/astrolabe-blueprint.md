@@ -1486,7 +1486,7 @@ Wrong predictions (impact said safe â†’ test failed; abduction ranked wrong
 ## 6. Ops surface
 
 `optimizer_status`: tripwire states, budget usage, recent changes (last 16 ledger entries), pending proposals, guard health, drift alarms. Janitor bounds artifact buildup (100 MiB/tick). Kill switch: `ASTRO_ANNEAL=0` freezes all tuning (serving unaffected); per-knob freeze supported. Everything reversible via `rollback(change_id)` until explicitly committed.
-Janitor implementation status: `optimizer_status` runs a cooperative tick over the Astrolabe-owned `<project>.astrolabe-optimizer-artifacts` cache root, reports the 100 MiB/tick policy as `max_bytes_per_tick`, deletes only regular files without following symlinks, and reports before/after bytes, skip counts, `freshness`, `trust`, and remediation. Coverage reads remaining file bytes after the tick. Remaining #58 work is measured guard health, proposal mode, durable trigger acknowledgements, and live tripwire state.
+Implementation status: `optimizer_status` runs a cooperative janitor tick over the Astrolabe-owned `<project>.astrolabe-optimizer-artifacts` cache root, reports the 100 MiB/tick policy as `max_bytes_per_tick`, deletes only regular files without following symlinks, and reports before/after bytes, skip counts, `freshness`, `trust`, and remediation. `mode="ack_triggers"` appends an Astrolabe-owned ack ledger entry naming exact fired events for one subscription, then reopens trigger readback to prove pending count changes without deleting Reactive CF fired rows. Coverage reads remaining janitor file bytes and durable ack ledger payloads after reopen. Remaining #58 work is measured guard health, proposal mode, and live tripwire state.
 
 
 ---
