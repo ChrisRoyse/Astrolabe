@@ -27,3 +27,9 @@ calyx-core = { path = "vendor/calyx/crates/calyx-core" }
 calyx-ledger = { path = "vendor/calyx/crates/calyx-ledger" }
 calyx-loom = { path = "vendor/calyx/crates/calyx-loom" }
 calyx-paths = { path = "vendor/calyx/crates/calyx-paths" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

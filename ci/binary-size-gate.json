@@ -1,0 +1,17 @@
+{
+  "schema": "astrolabe.binary_size_gate.v1",
+  "max_bytes": 157286400,
+  "max_mib": 150,
+  "profile": "release",
+  "binaries": [
+    {
+      "name": "astrolabe",
+      "path": "target/release/astrolabe"
+    },
+    {
+      "name": "codebase-memory-mcp",
+      "path": "target/release/codebase-memory-mcp"
+    }
+  ],
+  "remediation": "Build the release profile with LTO and symbol stripping; if a binary still exceeds the gate, publish a component size breakdown before changing this threshold."
+}
