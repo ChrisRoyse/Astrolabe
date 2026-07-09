@@ -86,6 +86,7 @@ const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
 const OPTIMIZER_TRIGGER_ACK_SCHEMA: &str = "astrolabe.optimizer_trigger_ack.v1";
 const OPTIMIZER_JANITOR_SCHEMA: &str = "astrolabe.optimizer_janitor.v1";
 const OPTIMIZER_GUARD_HEALTH_SCHEMA: &str = "astrolabe.optimizer_guard_health.v1";
+const OPTIMIZER_TRIPWIRES_SCHEMA: &str = "astrolabe.optimizer_tripwires.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
@@ -5180,7 +5181,7 @@ fn optimizer_status_json_at(
         },
         "kill_switch": kill_switch,
         "frozen_knobs": frozen_knobs,
-        "tripwires": optimizer_tripwires_json(),
+        "tripwires": optimizer_tripwires_json(cache_dir, project)?,
         "budget": optimizer_budget_json(&background_lane, janitor),
         "recent_changes": recent_changes,
         "pending_proposals": optimizer_pending_proposals_json(),
@@ -5381,7 +5382,17 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn optimizer_tripwires_json() -> Value {
+fn optimizer_tripwires_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let key = metadata_key(project, "optimizer_tripwires_json");
+    if let Some(raw) = read_config_value(cache_dir, &key)? {
+        return Ok(match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => optimizer_tripwires_config_json(value, &key),
+            Err(error) => optimizer_tripwires_invalid_json(
+                &key,
+                format!("stored optimizer_tripwires_json invalid: {error}"),
+            ),
+        });
+    }
     let states = [
         "recall_at_k",
         "guard_far",
@@ -5404,12 +5415,99 @@ fn optimizer_tripwires_json() -> Value {
     })
     .collect::<Vec<_>>();
 
-    json!({
+    Ok(json!({
         "status": "inactive",
         "state_count": states.len(),
         "states": states,
         "freshness": "not_evaluated",
         "trust": "provisional",
+        "source": format!("config:{key}:missing"),
+    }))
+}
+
+fn optimizer_tripwires_config_json(value: Value, key: &str) -> Value {
+    let Some(object) = value.as_object() else {
+        return optimizer_tripwires_invalid_json(key, "optimizer_tripwires_json must be an object");
+    };
+    if object.get("schema").and_then(Value::as_str) != Some(OPTIMIZER_TRIPWIRES_SCHEMA) {
+        return optimizer_tripwires_invalid_json(
+            key,
+            format!("optimizer_tripwires_json schema must be {OPTIMIZER_TRIPWIRES_SCHEMA}"),
+        );
+    }
+    let Some(states) = object.get("states").and_then(Value::as_array) else {
+        return optimizer_tripwires_invalid_json(
+            key,
+            "optimizer_tripwires_json states must be an array",
+        );
+    };
+    if object.get("status").and_then(Value::as_str).is_none()
+        || object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return optimizer_tripwires_invalid_json(
+            key,
+            "optimizer_tripwires_json requires status, freshness, and trust labels",
+        );
+    }
+    for (index, state) in states.iter().enumerate() {
+        if let Some(reason) = optimizer_tripwire_state_invalid(state) {
+            return optimizer_tripwires_invalid_json(
+                key,
+                format!("optimizer_tripwires_json states[{index}] {reason}"),
+            );
+        }
+    }
+
+    let mut out = object.clone();
+    out.insert("state_count".to_string(), json!(states.len()));
+    out.insert("source".to_string(), json!(format!("config:{key}")));
+    out.insert(
+        "remediation".to_string(),
+        object.get("remediation").cloned().unwrap_or(Value::Null),
+    );
+    Value::Object(out)
+}
+
+fn optimizer_tripwire_state_invalid(state: &Value) -> Option<&'static str> {
+    let Some(object) = state.as_object() else {
+        return Some("must be an object");
+    };
+    if object.get("name").and_then(Value::as_str).is_none()
+        || object.get("state").and_then(Value::as_str).is_none()
+    {
+        return Some("requires string name and state");
+    }
+    for field in ["measured_value", "threshold"] {
+        if object.get(field).and_then(Value::as_f64).is_none() {
+            return Some("requires numeric measured_value and threshold");
+        }
+    }
+    if object
+        .get("last_evaluated_ledger_seq")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Some("requires last_evaluated_ledger_seq");
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Some("requires freshness and trust labels");
+    }
+    None
+}
+
+fn optimizer_tripwires_invalid_json(key: &str, reason: impl Into<String>) -> Value {
+    json!({
+        "status": "invalid",
+        "state_count": Value::Null,
+        "states": [],
+        "freshness": "fresh",
+        "trust": "provisional",
+        "source": format!("config:{key}"),
+        "reason": reason.into(),
+        "remediation": "repair optimizer_tripwires_json before treating tripwire state as measured",
     })
 }
 
@@ -8551,6 +8649,69 @@ mod tests {
         assert_eq!(guard["slots"][0]["drift"], 0.012);
         assert_eq!(guard["slots"][0]["last_calibrated_ledger_seq"], 7);
         assert_eq!(guard["slots"][0]["provenance"][0], "guard_calibrate:test:7");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_reads_measured_tripwires_from_config() {
+        let dir = temp_dir("optimizer-tripwires-readback");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let key = metadata_key("demo", "optimizer_tripwires_json");
+        let tripwires = json!({
+            "schema": OPTIMIZER_TRIPWIRES_SCHEMA,
+            "status": "measured",
+            "freshness": "fresh",
+            "trust": "verified",
+            "states": [
+                {
+                    "name": "recall_at_k",
+                    "state": "quiet",
+                    "measured_value": 0.972,
+                    "threshold": 0.950,
+                    "last_evaluated_ledger_seq": 11,
+                    "freshness": "fresh",
+                    "trust": "verified",
+                    "provenance": ["anneal_shadow:test:11"],
+                },
+                {
+                    "name": "guard_far",
+                    "state": "tripped",
+                    "measured_value": 0.014,
+                    "threshold": 0.010,
+                    "last_evaluated_ledger_seq": 11,
+                    "freshness": "fresh",
+                    "trust": "verified",
+                    "provenance": ["guard_profile:test:11"],
+                    "remediation": "rollback candidate change before promotion",
+                },
+            ],
+        });
+        write_config_value(&dir, &key, &tripwires.to_string()).unwrap();
+        let raw = read_config_value(&dir, &key).unwrap().unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(raw_value, tripwires);
+
+        let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        let surfaced = &status["tripwires"];
+        assert_eq!(surfaced["schema"], OPTIMIZER_TRIPWIRES_SCHEMA);
+        assert_eq!(surfaced["status"], "measured");
+        assert_eq!(surfaced["state_count"], 2);
+        assert_eq!(surfaced["source"], format!("config:{key}"));
+        assert_eq!(surfaced["freshness"], "fresh");
+        assert_eq!(surfaced["trust"], "verified");
+        assert_eq!(surfaced["states"][0]["name"], "recall_at_k");
+        assert_eq!(surfaced["states"][0]["measured_value"], 0.972);
+        assert_eq!(surfaced["states"][0]["threshold"], 0.950);
+        assert_eq!(surfaced["states"][0]["last_evaluated_ledger_seq"], 11);
+        assert_eq!(surfaced["states"][1]["name"], "guard_far");
+        assert_eq!(surfaced["states"][1]["state"], "tripped");
+        assert_eq!(
+            surfaced["states"][1]["remediation"],
+            "rollback candidate change before promotion"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
