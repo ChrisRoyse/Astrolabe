@@ -568,6 +568,24 @@ impl CbmPipeline {
         })
     }
 
+    pub fn set_project_name(&mut self, name: &str) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        let name = CString::new(name)?;
+        // SAFETY: self owns the pipeline pointer. CBM copies and normalizes the
+        // provided project name during the call.
+        let accepted =
+            unsafe { cbm_sys::cbm_pipeline_set_project_name(self.ptr.as_ptr(), name.as_ptr()) };
+        if accepted {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_CBM_PIPELINE_PROJECT_NAME",
+                "CBM rejected the requested pipeline project name",
+                "Use a non-empty project name valid for CBM cache path construction.",
+            ))
+        }
+    }
+
     pub fn project_name(&self) -> Result<String, BridgeError> {
         self.ensure_owner_thread()?;
         // SAFETY: self owns the pipeline pointer; CBM returns a borrowed
@@ -1620,9 +1638,12 @@ mod tests {
             CbmIndexMode::Full,
         )
         .expect("create CBM pipeline");
+        pipeline
+            .set_project_name("row-sink-demo")
+            .expect("override CBM project name");
         let rows = pipeline.collect_rows().expect("collect row-sink rows");
 
-        assert!(!rows.project.is_empty());
+        assert_eq!(rows.project, "row-sink-demo");
         assert!(
             rows.nodes
                 .iter()

@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use astrolabe_bridge::CbmToolRunner;
-use astrolabe_ingest::{SqliteImportOptions, import_sqlite_to_vault, verify_chain};
+use astrolabe_bridge::{CbmIndexMode, CbmPipeline, CbmPipelineRows, CbmToolRunner};
+use astrolabe_ingest::{
+    CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, SqliteImportOptions,
+    import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, verify_chain,
+};
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -83,6 +86,27 @@ struct ShadowImportOutcome {
     ledger_seq: u64,
     ledger_rows_after: u64,
     verify_chain_status: String,
+    vault_import_source: String,
+    vault_import_fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RowSinkSnapshot {
+    snapshot: CbmGraphSnapshot,
+    source_fingerprint_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+enum RowSinkImportCandidate {
+    Available(RowSinkSnapshot),
+    Unavailable(String),
+}
+
+#[derive(Debug)]
+struct ShadowVaultImport {
+    report: astrolabe_ingest::SqliteImportReport,
+    source: String,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -249,7 +273,8 @@ fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<St
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
         return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
     };
-    let outcome = match import_shadow_vault(&project) {
+    let row_sink = collect_row_sink_import_candidate(args_obj, &project, &cache_dir);
+    let outcome = match import_shadow_vault(&project, Some(row_sink)) {
         Ok(outcome) => outcome,
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
     };
@@ -328,7 +353,7 @@ fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, Dy
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, project)? else {
         return Ok(ShadowRefreshStatus::Busy);
     };
-    let outcome = import_shadow_vault(project)?;
+    let outcome = import_shadow_vault(project, None)?;
     persist_shadow_outcome(project, &outcome)?;
     Ok(ShadowRefreshStatus::Refreshed)
 }
@@ -527,7 +552,10 @@ fn background_lane_worker_summary(eligible_owner: bool) -> Value {
     })
 }
 
-fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
+fn import_shadow_vault(
+    project: &str,
+    row_sink: Option<RowSinkImportCandidate>,
+) -> Result<ShadowImportOutcome, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     fs::create_dir_all(&cache_dir)?;
     let sqlite_path = sqlite_path(&cache_dir, project);
@@ -555,7 +583,9 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
         DEFAULT_PANEL_VERSION,
     )
     .with_available_slots(std::iter::empty());
-    let report = import_sqlite_to_vault(&sqlite_path, &vault, &ShadowSlotRuntime, &options)?;
+    let shadow_import =
+        import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
+    let report = shadow_import.report;
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
     let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
     let verify = verify_chain(&vault)?;
@@ -592,7 +622,254 @@ fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
         ledger_seq: lower_report.manifest_seq,
         ledger_rows_after: verify.ledger_rows,
         verify_chain_status: verify.status,
+        vault_import_source: shadow_import.source,
+        vault_import_fallback_reason: shadow_import.fallback_reason,
     })
+}
+
+fn import_shadow_vault_report<C, R>(
+    sqlite_path: &Path,
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    row_sink: Option<RowSinkImportCandidate>,
+) -> Result<ShadowVaultImport, DynError>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    match row_sink {
+        Some(RowSinkImportCandidate::Available(snapshot)) => {
+            match import_cbm_graph_snapshot_to_vault_direct(
+                &snapshot.snapshot,
+                snapshot.source_fingerprint_sha256,
+                vault,
+                runtime,
+                options,
+            ) {
+                Ok(report) => Ok(ShadowVaultImport {
+                    report,
+                    source: "row_sink_direct".to_string(),
+                    fallback_reason: None,
+                }),
+                Err(error) => {
+                    let reason = format!("row-sink direct import failed: {error}");
+                    let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
+                    Ok(ShadowVaultImport {
+                        report,
+                        source: "sqlite_fallback".to_string(),
+                        fallback_reason: Some(reason),
+                    })
+                }
+            }
+        }
+        Some(RowSinkImportCandidate::Unavailable(reason)) => {
+            let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
+            Ok(ShadowVaultImport {
+                report,
+                source: "sqlite_fallback".to_string(),
+                fallback_reason: Some(reason),
+            })
+        }
+        None => {
+            let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
+            Ok(ShadowVaultImport {
+                report,
+                source: "sqlite_fallback".to_string(),
+                fallback_reason: Some(
+                    "row-sink snapshot not available for recovery import".to_string(),
+                ),
+            })
+        }
+    }
+}
+
+fn collect_row_sink_import_candidate(
+    args: &Map<String, Value>,
+    project: &str,
+    cache_dir: &Path,
+) -> RowSinkImportCandidate {
+    match collect_row_sink_snapshot(args, project, cache_dir) {
+        Ok(snapshot) => RowSinkImportCandidate::Available(snapshot),
+        Err(error) => {
+            RowSinkImportCandidate::Unavailable(format!("row-sink collection unavailable: {error}"))
+        }
+    }
+}
+
+fn collect_row_sink_snapshot(
+    args: &Map<String, Value>,
+    project: &str,
+    cache_dir: &Path,
+) -> Result<RowSinkSnapshot, DynError> {
+    let repo_path = string_arg(args, "repo_path")
+        .ok_or("row-sink direct path requires index_repository repo_path")?;
+    let mode = index_mode_from_args(args)
+        .ok_or("row-sink direct path is unavailable for cross-repo-intelligence mode")?;
+    let db_path = temp_row_sink_db_path(cache_dir, project);
+    cleanup_row_sink_db_path(&db_path);
+
+    let result = (|| {
+        let db_path_str = path_to_utf8(&db_path, "row-sink temporary DB path")?;
+        let mut pipeline = CbmPipeline::new(repo_path, db_path_str, mode)?;
+        pipeline.set_project_name(project)?;
+        let rows = pipeline.collect_rows()?;
+        if rows.project != project {
+            return Err(format!(
+                "row-sink project {:?} does not match shadow project {:?}",
+                rows.project, project
+            )
+            .into());
+        }
+        let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
+        Ok(RowSinkSnapshot {
+            snapshot: pipeline_rows_to_graph_snapshot(rows),
+            source_fingerprint_sha256,
+        })
+    })();
+
+    cleanup_row_sink_db_path(&db_path);
+    result
+}
+
+fn index_mode_from_args(args: &Map<String, Value>) -> Option<CbmIndexMode> {
+    match string_arg(args, "mode") {
+        Some("cross-repo-intelligence") => None,
+        Some("fast") => Some(CbmIndexMode::Fast),
+        Some("moderate") => Some(CbmIndexMode::Moderate),
+        _ => Some(CbmIndexMode::Full),
+    }
+}
+
+fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
+    let project = rows.project.clone();
+    let nodes = rows
+        .nodes
+        .into_iter()
+        .map(|node| CbmGraphNode {
+            source_node_id: node.id,
+            project: node.project,
+            label: node.label,
+            name: node.name,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            properties_json: node.properties_json,
+            node_vector: None,
+            cx_id: None,
+            structural: false,
+        })
+        .collect();
+    let edges = rows
+        .edges
+        .into_iter()
+        .map(|edge| CbmGraphEdge {
+            sqlite_edge_id: edge.id,
+            project: edge.project,
+            source_node_id: edge.source_id,
+            target_node_id: edge.target_id,
+            src: None,
+            dst: None,
+            edge_type: edge.edge_type,
+            local_name_gen: edge.local_name_gen,
+            weight: 1.0,
+            properties_json: edge.properties_json,
+        })
+        .collect();
+    CbmGraphSnapshot {
+        project,
+        panel_version: Some(DEFAULT_PANEL_VERSION),
+        projects: Vec::new(),
+        nodes,
+        edges,
+        file_hashes: Vec::new(),
+        project_summaries: Vec::new(),
+        token_vectors: Vec::new(),
+    }
+}
+
+fn row_sink_fingerprint(rows: &CbmPipelineRows) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe-cbm-row-sink-v1\0");
+    hash_str(&mut hasher, &rows.project);
+
+    let mut nodes = rows.nodes.iter().collect::<Vec<_>>();
+    nodes.sort_by_key(|node| node.id);
+    hash_u64(&mut hasher, nodes.len() as u64);
+    for node in nodes {
+        hash_i64(&mut hasher, node.id);
+        hash_str(&mut hasher, &node.project);
+        hash_str(&mut hasher, &node.label);
+        hash_str(&mut hasher, &node.name);
+        hash_str(&mut hasher, &node.qualified_name);
+        hash_str(&mut hasher, &node.file_path);
+        hash_i64(&mut hasher, node.start_line);
+        hash_i64(&mut hasher, node.end_line);
+        hash_str(&mut hasher, &node.properties_json);
+    }
+
+    let mut edges = rows.edges.iter().collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.source_id.cmp(&right.source_id))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.edge_type.cmp(&right.edge_type))
+            .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+    });
+    hash_u64(&mut hasher, edges.len() as u64);
+    for edge in edges {
+        hash_i64(&mut hasher, edge.id);
+        hash_str(&mut hasher, &edge.project);
+        hash_i64(&mut hasher, edge.source_id);
+        hash_i64(&mut hasher, edge.target_id);
+        hash_str(&mut hasher, &edge.edge_type);
+        hash_str(&mut hasher, &edge.properties_json);
+        hash_str(&mut hasher, &edge.url_path_gen);
+        hash_str(&mut hasher, &edge.local_name_gen);
+    }
+
+    hasher.finalize().into()
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hash_u64(hasher, value.len() as u64);
+    hasher.update(value.as_bytes());
+}
+
+fn hash_i64(hasher: &mut Sha256, value: i64) {
+    hasher.update(value.to_le_bytes());
+}
+
+fn hash_u64(hasher: &mut Sha256, value: u64) {
+    hasher.update(value.to_le_bytes());
+}
+
+fn temp_row_sink_db_path(cache_dir: &Path, project: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let project_hash = hex_lower(&Sha256::digest(project.as_bytes()));
+    cache_dir.join(format!(
+        "{project}{LOWERED_SQLITE_SUFFIX}.row-sink-{}-{}-{nanos}.db",
+        std::process::id(),
+        &project_hash[..16],
+    ))
+}
+
+fn cleanup_row_sink_db_path(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(suffix);
+        fs::remove_file(PathBuf::from(raw)).ok();
+    }
+}
+
+fn path_to_utf8<'a>(path: &'a Path, label: &str) -> Result<&'a str, DynError> {
+    path.to_str()
+        .ok_or_else(|| format!("{label} is not valid UTF-8: {}", path.display()).into())
 }
 
 fn lower_shadow_sqlite<C>(
@@ -688,6 +965,10 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "verify_chain": outcome.verify_chain_status,
         "panel_version": DEFAULT_PANEL_VERSION,
         "panel_runtime": "lens_unavailable",
+        "vault_import": vault_import_summary(
+            &outcome.vault_import_source,
+            outcome.vault_import_fallback_reason.as_deref(),
+        ),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -746,6 +1027,13 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
             "edge_rows_written": edge_rows_written,
             "cx_id_set_sha256": read_config_value(&cache_dir, &metadata_key(project, "cx_id_set_sha256"))?,
         },
+        "vault_import": vault_import_summary(
+            read_config_value(&cache_dir, &metadata_key(project, "vault_import_source"))?
+                .as_deref()
+                .unwrap_or("unknown"),
+            read_config_value(&cache_dir, &metadata_key(project, "vault_import_fallback_reason"))?
+                .as_deref(),
+        ),
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(&cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -770,6 +1058,23 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
             "verify_chain": verify_status,
         },
     }))
+}
+
+fn vault_import_summary(source: &str, fallback_reason: Option<&str>) -> Value {
+    let fallback_reason = fallback_reason.and_then(|reason| {
+        let trimmed = reason.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let fallback = fallback_reason.is_some() || source == "sqlite_fallback" || source == "unknown";
+    json!({
+        "source": source,
+        "trust": if fallback { "provisional" } else { "verified" },
+        "fallback_reason": fallback_reason,
+    })
 }
 
 fn lowered_summary(
@@ -998,6 +1303,14 @@ fn persist_shadow_outcome(project: &str, outcome: &ShadowImportOutcome) -> Resul
         ("graph_rows_written", outcome.graph_rows_written.to_string()),
         ("edge_rows_written", outcome.edge_rows_written.to_string()),
         ("cx_id_set_sha256", outcome.cx_id_set_sha256.clone()),
+        ("vault_import_source", outcome.vault_import_source.clone()),
+        (
+            "vault_import_fallback_reason",
+            outcome
+                .vault_import_fallback_reason
+                .clone()
+                .unwrap_or_default(),
+        ),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -1159,6 +1472,140 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_snapshot_maps_bridge_rows_without_inventing_metadata() {
+        let rows = sample_pipeline_rows();
+        let snapshot = pipeline_rows_to_graph_snapshot(rows);
+        assert_eq!(snapshot.project, "demo");
+        assert_eq!(snapshot.panel_version, Some(DEFAULT_PANEL_VERSION));
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.file_hashes.is_empty());
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.nodes[0].source_node_id, 2);
+        assert_eq!(snapshot.nodes[0].qualified_name, "demo.helper");
+        assert!(snapshot.nodes[0].node_vector.is_none());
+        assert_eq!(snapshot.edges.len(), 1);
+        assert_eq!(snapshot.edges[0].sqlite_edge_id, 7);
+        assert_eq!(snapshot.edges[0].local_name_gen, "helper");
+    }
+
+    #[test]
+    fn row_sink_fingerprint_is_stable_for_row_order() {
+        let rows = sample_pipeline_rows();
+        let expected = row_sink_fingerprint(&rows);
+        let mut reordered = rows.clone();
+        reordered.nodes.reverse();
+        reordered.edges.reverse();
+        assert_eq!(row_sink_fingerprint(&reordered), expected);
+    }
+
+    #[test]
+    fn vault_import_summary_labels_fallback_trust() {
+        let fallback = vault_import_summary(
+            "sqlite_fallback",
+            Some("row-sink collection unavailable: no repo_path"),
+        );
+        assert_eq!(fallback["source"], "sqlite_fallback");
+        assert_eq!(fallback["trust"], "provisional");
+        assert!(
+            fallback["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("row-sink collection unavailable")
+        );
+
+        let direct = vault_import_summary("row_sink_direct", None);
+        assert_eq!(direct["source"], "row_sink_direct");
+        assert_eq!(direct["trust"], "verified");
+        assert!(direct["fallback_reason"].is_null());
+    }
+
+    #[test]
+    fn cross_repo_mode_keeps_row_sink_unavailable_before_ffi() {
+        let args = serde_json::json!({
+            "repo_path": "/tmp/demo",
+            "mode": "cross-repo-intelligence",
+        });
+        let candidate =
+            collect_row_sink_import_candidate(args.as_object().unwrap(), "demo", Path::new("/tmp"));
+        match candidate {
+            RowSinkImportCandidate::Unavailable(reason) => {
+                assert!(reason.contains("cross-repo-intelligence"));
+            }
+            RowSinkImportCandidate::Available(_) => panic!("cross-repo mode must not use row sink"),
+        }
+    }
+
+    #[test]
+    fn shadow_import_report_uses_available_row_sink_snapshot() {
+        let dir = temp_dir("row-sink-direct-report");
+        let vault_dir = dir.join("vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"direct-test".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+        let rows = sample_pipeline_rows();
+        let candidate = RowSinkImportCandidate::Available(RowSinkSnapshot {
+            snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
+            source_fingerprint_sha256: row_sink_fingerprint(&rows),
+        });
+
+        let imported = import_shadow_vault_report(
+            &dir.join("must-not-exist.db"),
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(candidate),
+        )
+        .unwrap();
+
+        assert_eq!(imported.source, "row_sink_direct");
+        assert!(imported.fallback_reason.is_none());
+        assert_eq!(imported.report.sqlite_nodes, 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_import_report_falls_back_to_sqlite_with_reason() {
+        let dir = temp_dir("row-sink-fallback-report");
+        fs::create_dir_all(&dir).unwrap();
+        let sqlite = dir.join("source.db");
+        seed_minimal_cbm_sqlite(&sqlite);
+        let vault = AsterVault::new_durable(
+            dir.join("vault"),
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"fallback-test".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+
+        let imported = import_shadow_vault_report(
+            &sqlite,
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(RowSinkImportCandidate::Unavailable(
+                "forced unavailable".to_string(),
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(imported.source, "sqlite_fallback");
+        assert_eq!(
+            imported.fallback_reason.as_deref(),
+            Some("forced unavailable")
+        );
+        assert_eq!(imported.report.sqlite_nodes, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn shadow_import_lock_reports_busy_until_owner_drops() {
         let dir = temp_dir("shadow-import-lock");
         fs::create_dir_all(&dir).unwrap();
@@ -1312,6 +1759,70 @@ mod tests {
                 .unwrap()
                 .contains("invalid calyx dial")
         );
+    }
+
+    fn sample_pipeline_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "helper".to_string(),
+                    qualified_name: "demo.helper".to_string(),
+                    file_path: "src/main.c".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties_json: "{}".to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 1,
+                    project: "demo".to_string(),
+                    label: "Project".to_string(),
+                    name: "demo".to_string(),
+                    qualified_name: "demo".to_string(),
+                    file_path: String::new(),
+                    start_line: 0,
+                    end_line: 0,
+                    properties_json: "{}".to_string(),
+                },
+            ],
+            edges: vec![astrolabe_bridge::CbmPipelineEdgeRow {
+                id: 7,
+                project: "demo".to_string(),
+                source_id: 2,
+                target_id: 1,
+                edge_type: "IMPORTS".to_string(),
+                properties_json: r#"{"local_name":"helper"}"#.to_string(),
+                url_path_gen: String::new(),
+                local_name_gen: "helper".to_string(),
+            }],
+        }
+    }
+
+    fn seed_minimal_cbm_sqlite(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               label TEXT NOT NULL,
+               name TEXT NOT NULL,
+               qualified_name TEXT NOT NULL,
+               file_path TEXT DEFAULT '',
+               start_line INTEGER DEFAULT 0,
+               end_line INTEGER DEFAULT 0,
+               properties TEXT DEFAULT '{}'
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
+             VALUES (1, 'demo', 'Function', 'main', 'demo.main', 'src/main.c', 1, 1, '{}')",
+            [],
+        )
+        .unwrap();
     }
 
     fn temp_dir(name: &str) -> PathBuf {
