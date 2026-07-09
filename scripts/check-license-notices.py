@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -12,10 +13,39 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "ci" / "license-notices.json"
+DEFAULT_ARTIFACT_DIR = ROOT / "target" / "astrolabe-release-predicate"
+LICENSE_GATE_ARTIFACT = "license-gate.json"
 VENDOR_NOTICE_NAMES = {"LICENSE", "LICENSE.md", "NOTICE", "NOTICE.md", "COPYING", "COPYING.md"}
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--write-release-artifact",
+        action="store_true",
+        help="Write the license_gate release-predicate artifact on success.",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        default=str(DEFAULT_ARTIFACT_DIR),
+        help="Directory for release-predicate artifacts.",
+    )
+    args = parser.parse_args()
+
+    summary = verify_license_notices()
+    if args.write_release_artifact:
+        write_release_artifact(summary, Path(args.artifact_dir))
+    print(
+        "license notices verified: "
+        f"{summary['component_count']} components, "
+        f"{summary['coverage_group_count']} coverage groups, "
+        f"{summary['vendor_notice_file_count']} vendor notice files, "
+        f"schema={summary['manifest_schema']}"
+    )
+    return 0
+
+
+def verify_license_notices() -> dict[str, Any]:
     manifest = load_manifest()
     notice = read_required_file("NOTICE")
     for required in manifest["required_files"]:
@@ -35,13 +65,33 @@ def main() -> int:
             "and a matching entry in NOTICE",
             {"first_uncovered": uncovered[0], "uncovered_count": len(uncovered)},
         )
-    print(
-        "license notices verified: "
-        f"{len(manifest['components'])} components, "
-        f"{len(manifest.get('coverage_groups', []))} coverage groups, "
-        f"{len(discovered)} vendor notice files, schema={manifest['schema']}"
-    )
-    return 0
+    return {
+        "manifest_schema": manifest["schema"],
+        "component_count": len(manifest["components"]),
+        "coverage_group_count": len(manifest.get("coverage_groups", [])),
+        "vendor_notice_file_count": len(discovered),
+        "covered_vendor_notice_file_count": len(covered),
+        "component_names": [component["name"] for component in manifest["components"]],
+        "coverage_group_names": [
+            group["name"] for group in manifest.get("coverage_groups", [])
+        ],
+    }
+
+
+def write_release_artifact(summary: dict[str, Any], artifact_dir: Path) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "schema": "astrolabe.license_gate.v1",
+        "status": "pass",
+        "source": "scripts/check-license-notices.py",
+        "manifest": normalize_path(str(MANIFEST.relative_to(ROOT))),
+        "notice": "NOTICE",
+        "vendor_discovery": "git ls-files vendor",
+        **summary,
+    }
+    path = artifact_dir / LICENSE_GATE_ARTIFACT
+    path.write_text(json.dumps(artifact, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    print(f"license gate release artifact wrote: {path}")
 
 
 def load_manifest() -> dict[str, Any]:
