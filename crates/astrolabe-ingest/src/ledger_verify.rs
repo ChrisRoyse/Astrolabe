@@ -356,19 +356,56 @@ mod tests {
     }
 
     #[test]
-    fn redaction_refuses_secret_payload() {
-        let vault = vault();
-        let err = vault
+    fn redaction_refuses_secret_payload_before_append_or_batch_commit() {
+        let append_vault = vault();
+        let err = append_vault
             .append_ledger_entry(
                 EntryKind::Ingest,
                 SubjectId::Query(b"secret-test".to_vec()),
-                br#"{"api_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
-                    .to_vec(),
+                secret_payload(),
                 ActorId::Service("astrolabe-test".to_string()),
             )
             .expect_err("secret payload must be refused");
 
         assert_eq!(err.code, "CALYX_LEDGER_SECRET_IN_PAYLOAD");
+        assert_eq!(
+            verify_chain(&append_vault)
+                .expect("verify empty chain")
+                .ledger_rows,
+            0
+        );
+
+        let batch_vault = vault();
+        let data_key = b"secret-batch-row".to_vec();
+        let err = batch_vault
+            .write_cf_batch_with_ledger_entry(
+                [(ColumnFamily::Kv, data_key.clone(), b"value".to_vec())],
+                EntryKind::Ingest,
+                SubjectId::Query(b"secret-batch-test".to_vec()),
+                secret_payload(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect_err("secret batch payload must be refused");
+
+        assert_eq!(err.code, "CALYX_LEDGER_GROUP_COMMIT_FAILED");
+        assert!(
+            err.message.contains("CALYX_LEDGER_SECRET_IN_PAYLOAD")
+                || err.message.contains("secret-like")
+                || err.message.contains("token-like secret"),
+            "{err}"
+        );
+        assert!(
+            batch_vault
+                .read_cf_at(batch_vault.latest_seq(), ColumnFamily::Kv, &data_key)
+                .expect("read refused data row")
+                .is_none()
+        );
+        assert_eq!(
+            verify_chain(&batch_vault)
+                .expect("verify empty batch chain")
+                .ledger_rows,
+            0
+        );
     }
 
     #[test]
@@ -715,6 +752,11 @@ mod tests {
                 ActorId::Service("astrolabe-test".to_string()),
             )
             .expect("append ledger entry");
+    }
+
+    fn secret_payload() -> Vec<u8> {
+        br#"{"api_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+            .to_vec()
     }
 
     fn append_marker_entry<C>(vault: &AsterVault<C>, marker: &str)

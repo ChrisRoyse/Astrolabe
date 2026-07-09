@@ -1432,6 +1432,8 @@ Team artifact status: `astrolabe.team_artifact.v1` lives in `astrolabe-lower`. E
 - Redaction policy on every payload writer (secret-shaped keys/tokens rejected â€” CALYX_LEDGER_SECRET_IN_PAYLOAD; CBM's secret filters remain upstream at extraction).
 - Lawful/user erasure (proprietary snippet, leaked credential in history): erase scope (cx/series/vault) via append-only erasure tombstones; derived artifacts (indexes, lowered SQLite, packs) regenerate without the erased content; the tombstone itself is the audit record.
 
+Redaction audit status: `ci/redaction-writers.json` plus `scripts/check-redaction-writers.py` enumerate all Astrolabe production ledger writer call sites and require a payload contract plus coverage note for each new writer. `astrolabe-ingest` now proves both direct append and batch-with-ledger writes reject secret-shaped payloads before ledger/data rows land. Remaining #61 work is the end-to-end erasure byte sweep, derived artifact regeneration after tombstones, egress-denying harness, subprocess shell-arg static audit, and loopback UI binding verification.
+
 ## 6. MVCC time-travel audit (9.7)
 
 `as_of(t)` reads pin a snapshot: "what did the graph believe when the agent made that change?" â€” pairs with the ledger to reconstruct any historical decision context; retention horizon configurable (default: keep all â€” code vaults are small relative to media).

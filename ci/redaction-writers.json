@@ -1,0 +1,47 @@
+{
+  "schema_version": "astrolabe.redaction_writers.v1",
+  "writers": [
+    {
+      "file": "crates/astrolabe-ingest/src/graph_projection.rs",
+      "function": "materialize_graph_projection_from_source",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "projection kind, source fingerprint prefix, and row counts only; no raw symbols or source text",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/registry.rs",
+      "function": "apply_one",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "project and commit are digested; payload carries series_id, cx_id, version count, and changed-row counts only",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/sqlite_import.rs",
+      "function": "write_import_rows",
+      "method": "append_ledger_entry",
+      "payload_contract": "SQLite, project, and commit identifiers are SHA-256 digests; payload carries counts and first/last CxIds only",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the append API rejects secret-shaped payload bytes before ledger rows land"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/sqlite_import.rs",
+      "function": "write_import_rows",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "SQLite, project, and commit identifiers are SHA-256 digests; payload carries counts and first/last CxIds only",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
+    },
+    {
+      "file": "crates/astrolabe-lower/src/lib.rs",
+      "function": "write_lower_manifest",
+      "method": "append_ledger_entry",
+      "payload_contract": "lowered artifact payload carries project digest prefix, vault fingerprint prefix, artifact digest prefix, and row counts only",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the append API rejects secret-shaped payload bytes before ledger rows land"
+    },
+    {
+      "file": "crates/astrolabe-lower/src/lib.rs",
+      "function": "write_lower_manifest",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "lowered artifact payload carries project digest prefix, vault fingerprint prefix, artifact digest prefix, and row counts only",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
+    }
+  ]
+}
