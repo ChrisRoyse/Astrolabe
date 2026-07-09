@@ -323,7 +323,7 @@ Every unit of real work â€” a test run, a review, a revert, an agent task �
 | 7.7 | Test-selection oracle: given a diff, the minimal test set with grounded failure-probability ranking (impact tree âˆ© TESTS edges) | [FUSE] | P7 |
 | 7.8 | Readiness predicate: per scope, the falsifiable conjunction â€” oracle-clean â‰¥0.7, panel sufficient, kernel recall â‰¥0.95, calibrated, Goodhart-defended, mistakes closed â€” "is ASTROLABE ready to be trusted on this subsystem?" | [CX] super_intelligence predicate | P8 |
 | 7.9 | What-if on architecture: consequence trees over INFRA_MAPS/DATA_FLOWS ("if this service's route changes, which consumers break, with what confidence") including cross-repo | P8 |
-| 7.10 | Reviewer routing: abduction + ownership lens â†’ who has grounded history with the implicated region | [FUSE] | P8 |
+| 7.10 | Reviewer routing: abduction + ownership lens â†’ who has grounded history with the implicated region | [FUSE] | P10 |
 
 ## Tier 8 â€” Search & navigation (unified, fused, guarded)
 
@@ -1954,7 +1954,8 @@ Streaming FFI sink (single-parse path), primary-by-default dial, full soak/hazar
 **Gate:** release predicate (20 Â§4) fully green; overhead ratios met at L; two-binary fallback retired from default path.
 
 ## P10 â€” Frontier (ongoing)
-Cross-repo org vault + hierarchical kernels + cross-repo TE; autonomy-dial policy hooks; refactoring advisor; self-healing docs; historical counterfactual evals; UI intelligence overlays (kernel glow, trust colors, gap map); team vault exchange with signatures; optional real-model lens packs (TEI/ONNX).
+Cross-repo org vault + hierarchical kernels + cross-repo TE; autonomy-dial policy hooks; reviewer routing/ownership lens; refactoring advisor; self-healing docs; historical counterfactual evals; UI intelligence overlays (kernel glow, trust colors, gap map); team vault exchange with signatures; optional real-model lens packs (TEI/ONNX).
+Capability 7.10 lives here, not P8: reviewer routing depends on the P7 oracle surfaces and a privacy/erasure-ready ownership substrate; until those exist, emitting author rankings would be a provisional standalone claim rather than a grounded oracle field.
 Capability 11.6 lives here, not P9: the overlay truth claims require kernel, trust/provenance, grounding-gap, agreement, and cross-repo products to exist first; P9 only hardens and releases the established substrate.
 **Gate:** per-feature; each rides the established substrate.
 
