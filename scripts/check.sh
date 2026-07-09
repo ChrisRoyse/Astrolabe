@@ -41,6 +41,7 @@ bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
 "$PYTHON_BIN" scripts/check-cli-parity.py --astrolabe "$ROOT/target/debug/astrolabe"
+"$PYTHON_BIN" scripts/check-compat-shim.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-lowered-parity.py
 "$PYTHON_BIN" scripts/check-shadow-parity.py
 "$PYTHON_BIN" scripts/check-cross-process-vault.py

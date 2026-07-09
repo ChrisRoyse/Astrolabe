@@ -1,0 +1,71 @@
+{
+  "schema": "astrolabe.compat_shim_fixtures.v1",
+  "legacy_command": "codebase-memory-mcp",
+  "targets": [
+    {
+      "agent": "Claude Code",
+      "config_path": ".claude/.mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Codex CLI",
+      "config_path": ".codex/config.toml",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Gemini CLI",
+      "config_path": ".gemini/settings.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Zed",
+      "config_path": "settings.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "OpenCode",
+      "config_path": ".opencode/config.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Antigravity",
+      "config_path": ".gemini/config/mcp_config.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Aider",
+      "config_path": ".aider/mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "KiloCode",
+      "config_path": "kilocode_mcp_settings.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "VS Code",
+      "config_path": "Code/User/mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Cursor",
+      "config_path": ".cursor/mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "OpenClaw",
+      "config_path": "openclaw_mcp_settings.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Kiro",
+      "config_path": ".kiro/settings/mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    },
+    {
+      "agent": "Junie",
+      "config_path": ".junie/mcp.json",
+      "config": {"command": "codebase-memory-mcp", "args": []}
+    }
+  ]
+}
