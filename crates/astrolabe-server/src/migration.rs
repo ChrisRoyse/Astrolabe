@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -21,7 +21,9 @@ use astrolabe_ingest::{
 };
 use astrolabe_kernel::{
     DEFAULT_FUNNEL_ACTIVATION_RECORDS, SEARCH_SCALE_KNOB_REGISTRY_VERSION, SEARCH_SCALE_SCHEMA,
-    SearchIndexBackend, SearchScaleConfig, SearchScalePlan, plan_search_scale,
+    SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, SearchIndexBackend,
+    SearchScaleConfig, SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput, SkillTree,
+    build_skill_tree, plan_search_scale, skill_tree_artifact_bytes,
 };
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
@@ -100,6 +102,7 @@ struct ShadowImportOutcome {
     vault_import_fallback_reason: Option<String>,
     security_screen: Value,
     search_scale: Value,
+    skill_tree: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,7 @@ struct RowSinkSnapshot {
     snapshot: CbmGraphSnapshot,
     source_fingerprint_sha256: [u8; 32],
     security_screen: Value,
+    skill_tree: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +125,7 @@ struct ShadowVaultImport {
     source: String,
     fallback_reason: Option<String>,
     security_screen: Value,
+    skill_tree: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +197,7 @@ pub fn handle_tool_raw(
     match tool_name {
         "index_repository" => handle_index_repository(runner, args_json),
         "index_status" => handle_index_status(runner, args_json),
+        "get_architecture" => handle_get_architecture(runner, args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -226,7 +232,10 @@ pub fn handle_jsonrpc_raw(
     let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
-    if tool_name != "index_repository" && tool_name != "index_status" {
+    if tool_name != "index_repository"
+        && tool_name != "index_status"
+        && tool_name != "get_architecture"
+    {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
 
@@ -258,6 +267,12 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
         "index_status" => {
+            let Some(project) = status_project_from_args(args)? else {
+                return Ok(false);
+            };
+            Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        "get_architecture" => {
             let Some(project) = status_project_from_args(args)? else {
                 return Ok(false);
             };
@@ -385,6 +400,34 @@ fn handle_index_status(runner: &CbmToolRunner, args_json: &str) -> Result<String
         );
     }
     augment_tool_result(&result, summary)
+}
+
+fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+    let result = runner.handle_tool_raw("get_architecture", args_json)?;
+    if tool_result_is_error(&result)? {
+        return Ok(result);
+    }
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(result);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(result);
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return Ok(result);
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return Ok(result);
+    }
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    augment_tool_result(
+        &result,
+        json!({
+            "astrolabe": {
+                "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
+            },
+        }),
+    )
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -689,6 +732,7 @@ fn import_shadow_vault(
         vault_import_fallback_reason: shadow_import.fallback_reason,
         security_screen: shadow_import.security_screen,
         search_scale,
+        skill_tree: shadow_import.skill_tree,
     })
 }
 
@@ -706,6 +750,7 @@ where
     match row_sink {
         Some(RowSinkImportCandidate::Available(snapshot)) => {
             let security_screen = snapshot.security_screen.clone();
+            let skill_tree = snapshot.skill_tree.clone();
             match import_cbm_graph_snapshot_to_vault_direct(
                 &snapshot.snapshot,
                 snapshot.source_fingerprint_sha256,
@@ -718,6 +763,7 @@ where
                     source: "row_sink_direct".to_string(),
                     fallback_reason: None,
                     security_screen,
+                    skill_tree,
                 }),
                 Err(error) => {
                     let reason = format!("row-sink direct import failed: {error}");
@@ -727,6 +773,7 @@ where
                         source: "sqlite_fallback".to_string(),
                         fallback_reason: Some(reason),
                         security_screen,
+                        skill_tree,
                     })
                 }
             }
@@ -735,11 +782,13 @@ where
             let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
             let security_screen =
                 security_screen_unavailable(security_screen_subject(&options.project), &reason);
+            let skill_tree = skill_tree_unavailable_json(&reason);
             Ok(ShadowVaultImport {
                 report,
                 source: "sqlite_fallback".to_string(),
                 fallback_reason: Some(reason),
                 security_screen,
+                skill_tree,
             })
         }
         None => {
@@ -753,6 +802,7 @@ where
                     security_screen_subject(&options.project),
                     reason,
                 ),
+                skill_tree: skill_tree_unavailable_json(reason),
             })
         }
     }
@@ -766,10 +816,12 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
     }
     let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
     let security_screen = security_screen_from_row_sink_rows(&rows);
+    let skill_tree = skill_tree_from_row_sink_rows(&rows);
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
         snapshot: pipeline_rows_to_graph_snapshot(rows),
         source_fingerprint_sha256,
         security_screen,
+        skill_tree,
     }))
 }
 
@@ -1248,6 +1300,121 @@ fn search_scale_unavailable_json(reason: &str) -> Value {
     })
 }
 
+fn skill_tree_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let inputs = skill_inputs_from_row_sink_rows(rows);
+    match build_skill_tree(&inputs, &SkillDiscoveryConfig::default()) {
+        Ok(tree) => skill_tree_json(&tree),
+        Err(error) => skill_tree_unavailable_json(&format!("skill discovery failed: {error}")),
+    }
+}
+
+fn skill_inputs_from_row_sink_rows(rows: &CbmPipelineRows) -> Vec<SkillSymbolInput> {
+    rows.nodes
+        .iter()
+        .filter(|node| !node.qualified_name.trim().is_empty())
+        .filter(|node| !node.label.eq_ignore_ascii_case("project"))
+        .filter_map(|node| {
+            let tokens = skill_tokens_for_node(node);
+            if tokens.is_empty() {
+                return None;
+            }
+            Some(SkillSymbolInput::new(
+                node.qualified_name.clone(),
+                node.qualified_name.clone(),
+                node.file_path.clone(),
+                tokens,
+            ))
+        })
+        .collect()
+}
+
+fn skill_tokens_for_node(node: &astrolabe_bridge::CbmPipelineNodeRow) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    push_skill_tokens(&mut tokens, &node.name);
+    push_skill_tokens(&mut tokens, &node.file_path);
+    if let Ok(properties) = serde_json::from_str::<Value>(&node.properties_json) {
+        for field in ["docstring", "signature", "route_path"] {
+            if let Some(value) = properties.get(field).and_then(Value::as_str) {
+                push_skill_tokens(&mut tokens, value);
+            }
+        }
+        for field in ["param_names", "decorators"] {
+            if let Some(values) = properties.get(field).and_then(Value::as_array) {
+                for value in values {
+                    if let Some(value) = value.as_str() {
+                        push_skill_tokens(&mut tokens, value);
+                    }
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn push_skill_tokens(tokens: &mut BTreeSet<String>, text: &str) {
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+    {
+        if token.len() >= 2 {
+            tokens.insert(token);
+        }
+    }
+}
+
+fn skill_tree_json(tree: &SkillTree) -> Value {
+    let artifact_bytes = skill_tree_artifact_bytes(tree);
+    json!({
+        "schema": tree.schema,
+        "status": "built",
+        "knob_registry_version": tree.knob_registry_version,
+        "skill_count": tree.skills.len(),
+        "noise_count": tree.noise_symbols.len(),
+        "membership_hash": tree.membership_hash,
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "skills": tree.skills.iter().map(skill_node_json).collect::<Vec<_>>(),
+        "noise_symbols": tree.noise_symbols,
+        "freshness": tree.freshness,
+        "trust": tree.trust,
+    })
+}
+
+fn skill_node_json(skill: &astrolabe_kernel::SkillNode) -> Value {
+    json!({
+        "skill_id": skill.skill_id,
+        "name": skill.name,
+        "members": skill.members,
+        "exemplar_tokens": skill.exemplar_tokens,
+        "membership_hash": skill.membership_hash,
+    })
+}
+
+fn skill_tree_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": SKILL_TREE_SCHEMA,
+        "status": "unavailable",
+        "knob_registry_version": SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with row-sink metadata available before using skill-scoped search or architecture skill aspects",
+    })
+}
+
+fn read_skill_tree_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "skill_tree_json"))? else {
+        return Ok(skill_tree_unavailable_json(
+            "skill tree metadata missing; rerun index_repository with calyx shadow",
+        ));
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(skill_tree_unavailable_json(&format!(
+            "stored skill_tree_json invalid: {error}"
+        ))),
+    }
+}
+
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -1452,6 +1619,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         ),
         "security_screen": outcome.security_screen.clone(),
         "search_scale": outcome.search_scale.clone(),
+        "skill_tree": outcome.skill_tree.clone(),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -1522,6 +1690,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         ),
         "security_screen": read_security_screen_metadata(cache_dir, project)?,
         "search_scale": read_search_scale_metadata(cache_dir, project)?,
+        "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -1762,6 +1931,7 @@ fn persist_shadow_outcome_at(
     let conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
+    let skill_tree_json = serde_json::to_string(&outcome.skill_tree)?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -1812,6 +1982,7 @@ fn persist_shadow_outcome_at(
         ),
         ("security_screen_json", security_screen_json),
         ("search_scale_json", search_scale_json),
+        ("skill_tree_json", skill_tree_json),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -2181,6 +2352,94 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_skill_tree_recovers_planted_clusters_from_metadata() {
+        let skill_tree = skill_tree_from_row_sink_rows(&sample_skill_rows());
+
+        assert_eq!(skill_tree["schema"], SKILL_TREE_SCHEMA);
+        assert_eq!(skill_tree["status"], "built");
+        assert_eq!(
+            skill_tree["knob_registry_version"],
+            SKILL_DISCOVERY_KNOB_REGISTRY_VERSION
+        );
+        assert_eq!(skill_tree["freshness"], "fresh");
+        assert_eq!(skill_tree["trust"], "verified");
+        assert_eq!(skill_tree["skill_count"], 2);
+        assert_eq!(skill_tree["noise_count"], 1);
+        assert_eq!(skill_tree["noise_symbols"], json!(["health.ping"]));
+        assert_eq!(
+            skill_tree["artifact_sha256"]
+                .as_str()
+                .expect("artifact sha")
+                .len(),
+            64
+        );
+
+        let skills = skill_tree["skills"].as_array().expect("skills array");
+        assert!(skills.iter().any(|skill| {
+            skill["members"] == json!(["auth.login", "auth.logout"])
+                && skill["membership_hash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 32)
+        }));
+        assert!(skills.iter().any(|skill| {
+            skill["members"] == json!(["billing.charge", "billing.refund"])
+                && skill["membership_hash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 32)
+        }));
+    }
+
+    #[test]
+    fn skill_tree_summary_persists_reads_back_and_augments_architecture_payload() {
+        let dir = temp_dir("skill-tree-readback");
+        let skill_tree = skill_tree_from_row_sink_rows(&sample_skill_rows());
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.skill_tree = skill_tree.clone();
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "skill_tree_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        let rehydrated = read_skill_tree_metadata(&dir, "demo").unwrap();
+        let summary = grounding_summary(&outcome);
+
+        assert_eq!(raw_value, skill_tree);
+        assert_eq!(rehydrated, skill_tree);
+        assert_eq!(summary["skill_tree"], skill_tree);
+
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"project\":\"demo\",\"total_nodes\":5}"}],
+            "structuredContent": {"project": "demo", "total_nodes": 5},
+            "isError": false,
+        });
+        let augmented = augment_tool_result(
+            &serde_json::to_string(&result).unwrap(),
+            json!({
+                "astrolabe": {
+                    "skill_tree": skill_tree.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(
+            value["structuredContent"]["astrolabe"]["skill_tree"],
+            skill_tree
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let text_value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value["astrolabe"]["skill_tree"], skill_tree);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn vault_import_summary_labels_fallback_trust() {
         let fallback = vault_import_summary(
             "sqlite_fallback",
@@ -2229,10 +2488,12 @@ mod tests {
             .with_available_slots(std::iter::empty());
         let rows = sample_pipeline_rows();
         let security_screen = security_screen_from_row_sink_rows(&rows);
+        let skill_tree = skill_tree_from_row_sink_rows(&rows);
         let candidate = RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
             snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
             source_fingerprint_sha256: row_sink_fingerprint(&rows),
             security_screen: security_screen.clone(),
+            skill_tree: skill_tree.clone(),
         }));
 
         let imported = import_shadow_vault_report(
@@ -2248,6 +2509,7 @@ mod tests {
         assert!(imported.fallback_reason.is_none());
         assert_eq!(imported.report.sqlite_nodes, 2);
         assert_eq!(imported.security_screen, security_screen);
+        assert_eq!(imported.skill_tree, skill_tree);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2483,6 +2745,81 @@ mod tests {
         }
     }
 
+    fn sample_skill_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 1,
+                    project: "demo".to_string(),
+                    label: "Project".to_string(),
+                    name: "demo".to_string(),
+                    qualified_name: "demo".to_string(),
+                    file_path: String::new(),
+                    start_line: 0,
+                    end_line: 0,
+                    properties_json: "{}".to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "login".to_string(),
+                    qualified_name: "auth.login".to_string(),
+                    file_path: "auth".to_string(),
+                    start_line: 10,
+                    end_line: 14,
+                    properties_json: r#"{"docstring":"auth user session"}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 3,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "logout".to_string(),
+                    qualified_name: "auth.logout".to_string(),
+                    file_path: "auth".to_string(),
+                    start_line: 20,
+                    end_line: 24,
+                    properties_json: r#"{"docstring":"auth user session"}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 4,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "charge".to_string(),
+                    qualified_name: "billing.charge".to_string(),
+                    file_path: "billing".to_string(),
+                    start_line: 30,
+                    end_line: 34,
+                    properties_json: r#"{"docstring":"billing payment account"}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 5,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "refund".to_string(),
+                    qualified_name: "billing.refund".to_string(),
+                    file_path: "billing".to_string(),
+                    start_line: 40,
+                    end_line: 44,
+                    properties_json: r#"{"docstring":"billing payment account"}"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 6,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "ping".to_string(),
+                    qualified_name: "health.ping".to_string(),
+                    file_path: "health".to_string(),
+                    start_line: 50,
+                    end_line: 52,
+                    properties_json: r#"{"docstring":"liveness probe"}"#.to_string(),
+                },
+            ],
+            edges: Vec::new(),
+        }
+    }
+
     fn seed_minimal_cbm_sqlite(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -2537,6 +2874,7 @@ mod tests {
             vault_import_fallback_reason: None,
             security_screen,
             search_scale: sample_search_scale(),
+            skill_tree: sample_skill_tree(),
         }
     }
 
@@ -2552,6 +2890,10 @@ mod tests {
             3,
         )
         .unwrap()
+    }
+
+    fn sample_skill_tree() -> Value {
+        skill_tree_from_row_sink_rows(&sample_skill_rows())
     }
 
     fn temp_dir(name: &str) -> PathBuf {
