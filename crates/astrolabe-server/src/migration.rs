@@ -1,5 +1,6 @@
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::thread;
@@ -21,9 +22,11 @@ const CONFIG_KEY_PREFIX: &str = "astrolabe.calyx.";
 const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
+const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
 const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
+const SHADOW_IMPORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -82,6 +85,24 @@ struct ShadowImportOutcome {
 
 #[derive(Debug)]
 struct ShadowSlotRuntime;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ShadowRefreshStatus {
+    Current,
+    Refreshed,
+    Busy,
+}
+
+#[derive(Debug)]
+struct ShadowImportLock {
+    path: PathBuf,
+}
+
+impl Drop for ShadowImportLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 impl SlotRuntime for ShadowSlotRuntime {
     fn measure_slot(&self, _slot: &PanelSlotSpec, _input: &PanelInput) -> PanelResult<SlotVector> {
@@ -214,6 +235,10 @@ fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<St
         return Ok(result);
     }
 
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+        return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
+    };
     let outcome = match import_shadow_vault(&project) {
         Ok(outcome) => outcome,
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
@@ -247,16 +272,31 @@ fn handle_index_status(runner: &CbmToolRunner, args_json: &str) -> Result<String
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
-    if let Err(error) = ensure_shadow_import_current(&project) {
-        return tool_error_result(format!("shadow import recovery failed: {error}"));
+    let refresh_status = match ensure_shadow_import_current(&project) {
+        Ok(status) => status,
+        Err(error) => {
+            return tool_error_result(format!("shadow import recovery failed: {error}"));
+        }
+    };
+    let mut summary = shadow_status_summary(&project)?;
+    if refresh_status == ShadowRefreshStatus::Busy
+        && let Some(summary_obj) = summary.as_object_mut()
+    {
+        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+        merge_object(
+            summary_obj,
+            shadow_import_busy_summary_at(&cache_dir, &project)
+                .as_object()
+                .expect("busy summary object"),
+        );
     }
-    augment_tool_result(&result, shadow_status_summary(&project)?)
+    augment_tool_result(&result, summary)
 }
 
-fn ensure_shadow_import_current(project: &str) -> Result<(), DynError> {
+fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     if !sqlite_path(&cache_dir, project).exists() {
-        return Ok(());
+        return Ok(ShadowRefreshStatus::Current);
     }
 
     let fingerprint = read_config_value(&cache_dir, &metadata_key(project, "vault_fingerprint"))?;
@@ -272,11 +312,103 @@ fn ensure_shadow_import_current(project: &str) -> Result<(), DynError> {
             .map(|report| report.is_intact())
             .unwrap_or(false);
     if fingerprint.is_some() && verify_intact && configured_lowered_path.exists() {
-        return Ok(());
+        return Ok(ShadowRefreshStatus::Current);
     }
 
+    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, project)? else {
+        return Ok(ShadowRefreshStatus::Busy);
+    };
     let outcome = import_shadow_vault(project)?;
-    persist_shadow_outcome(project, &outcome)
+    persist_shadow_outcome(project, &outcome)?;
+    Ok(ShadowRefreshStatus::Refreshed)
+}
+
+fn try_shadow_import_lock(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<ShadowImportLock>, DynError> {
+    fs::create_dir_all(cache_dir)?;
+    let lock_path = shadow_import_lock_path(cache_dir, project);
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock) => {
+                writeln!(lock, "pid={}", std::process::id())?;
+                lock.sync_all()?;
+                return Ok(Some(ShadowImportLock { path: lock_path }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if remove_stale_shadow_import_lock(&lock_path)? {
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn shadow_import_busy_summary_at(cache_dir: &Path, project: &str) -> Value {
+    json!({
+        "calyx": "shadow",
+        "shadow_import": {
+            "status": "busy",
+            "freshness": "stale_ok",
+            "trust": "provisional",
+            "owner": "another-process",
+            "lock_path": shadow_import_lock_path(cache_dir, project),
+            "remediation": "retry after the active Astrolabe shadow import completes; legacy SQLite results remain served by codebase-memory-mcp",
+        }
+    })
+}
+
+fn shadow_import_current_summary(verify_status: &str, lowered_exists: bool) -> Value {
+    let current = verify_status == "intact" && lowered_exists;
+    json!({
+        "status": if current { "current" } else { "unverified" },
+        "freshness": if current { "fresh" } else { "stale_or_missing" },
+        "trust": if current { "verified" } else { "provisional" },
+        "remediation": if current {
+            Value::Null
+        } else {
+            Value::String("run index_repository with calyx shadow or retry index_status after shadow import completes".to_string())
+        },
+    })
+}
+
+fn remove_stale_shadow_import_lock(lock_path: &Path) -> Result<bool, DynError> {
+    remove_stale_sidecar_lock(lock_path, SHADOW_IMPORT_LOCK_STALE_AFTER)
+}
+
+fn remove_stale_lowered_sqlite_lock(lock_path: &Path) -> Result<bool, DynError> {
+    remove_stale_sidecar_lock(lock_path, LOWERED_SQLITE_LOCK_STALE_AFTER)
+}
+
+fn remove_stale_sidecar_lock(lock_path: &Path, stale_after: Duration) -> Result<bool, DynError> {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return Ok(false);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+    let Ok(age) = modified.elapsed() else {
+        return Ok(false);
+    };
+    if age < stale_after {
+        return Ok(false);
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
+    cache_dir.join(format!("{project}{SHADOW_IMPORT_LOCK_SUFFIX}"))
 }
 
 fn import_shadow_vault(project: &str) -> Result<ShadowImportOutcome, DynError> {
@@ -408,26 +540,6 @@ fn with_lowered_sqlite_lock<T>(
     }
 }
 
-fn remove_stale_lowered_sqlite_lock(lock_path: &Path) -> Result<bool, DynError> {
-    let Ok(metadata) = fs::metadata(lock_path) else {
-        return Ok(false);
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(false);
-    };
-    let Ok(age) = modified.elapsed() else {
-        return Ok(false);
-    };
-    if age < LOWERED_SQLITE_LOCK_STALE_AFTER {
-        return Ok(false);
-    }
-    match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
     json!({
         "status": "imported",
@@ -508,6 +620,7 @@ fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
         "vault_fingerprint": fingerprint,
         "vault_ledger_head": ledger_seq,
         "panel_version": panel_version,
+        "shadow_import": shadow_import_current_summary(&verify_status, lowered_path.exists()),
         "idempotency": {
             "new_cx_ids": new_cx_ids,
             "reused_cx_ids": reused_cx_ids,
@@ -925,6 +1038,58 @@ mod tests {
         assert_eq!(stores["sqlite"]["serves_legacy_tools"], true);
         assert_eq!(stores["lowered_sqlite"]["writer"], "astrolabe");
         assert_eq!(stores["lowered_sqlite"]["serves_legacy_tools"], false);
+    }
+
+    #[test]
+    fn shadow_import_lock_reports_busy_until_owner_drops() {
+        let dir = temp_dir("shadow-import-lock");
+        fs::create_dir_all(&dir).unwrap();
+        let first = try_shadow_import_lock(&dir, "demo")
+            .unwrap()
+            .expect("first process owns shadow import");
+        let lock_path = shadow_import_lock_path(&dir, "demo");
+        assert!(lock_path.exists());
+        assert!(fs::read_to_string(&lock_path).unwrap().contains("pid="));
+        assert!(
+            try_shadow_import_lock(&dir, "demo").unwrap().is_none(),
+            "second process must see an honest busy state"
+        );
+
+        let busy = shadow_import_busy_summary_at(&dir, "demo");
+        assert_eq!(busy["shadow_import"]["status"], "busy");
+        assert_eq!(busy["shadow_import"]["freshness"], "stale_ok");
+        assert_eq!(busy["shadow_import"]["trust"], "provisional");
+        assert_eq!(
+            busy["shadow_import"]["lock_path"],
+            lock_path.display().to_string()
+        );
+
+        drop(first);
+        assert!(!lock_path.exists());
+        let second = try_shadow_import_lock(&dir, "demo")
+            .unwrap()
+            .expect("lock releases on owner drop");
+        drop(second);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_import_status_labels_unverified_state() {
+        let current = shadow_import_current_summary("intact", true);
+        assert_eq!(current["status"], "current");
+        assert_eq!(current["trust"], "verified");
+        assert!(current["remediation"].is_null());
+
+        let unverified = shadow_import_current_summary("missing", false);
+        assert_eq!(unverified["status"], "unverified");
+        assert_eq!(unverified["freshness"], "stale_or_missing");
+        assert_eq!(unverified["trust"], "provisional");
+        assert!(
+            unverified["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("retry index_status")
+        );
     }
 
     #[test]
