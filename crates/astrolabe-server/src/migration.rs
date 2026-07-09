@@ -1696,6 +1696,11 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
             "single-run row sink produced no project name".to_string(),
         );
     }
+    if rows.nodes.is_empty() && rows.edges.is_empty() {
+        return RowSinkImportCandidate::Unavailable(
+            "single-run row sink produced zero nodes and zero edges".to_string(),
+        );
+    }
     let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
     let security_screen = security_screen_from_row_sink_rows(&rows);
     let skill_tree = skill_tree_from_row_sink_rows(&rows);
@@ -7105,6 +7110,24 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_candidate_labels_empty_snapshot_unavailable() {
+        let rows = CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        let candidate = row_sink_import_candidate_from_rows(rows);
+        match candidate {
+            RowSinkImportCandidate::Unavailable(reason) => {
+                assert!(reason.contains("zero nodes and zero edges"));
+            }
+            RowSinkImportCandidate::Available(_) => {
+                panic!("empty row-sink snapshot must not import direct")
+            }
+        }
+    }
+
+    #[test]
     fn shadow_import_report_uses_available_row_sink_snapshot() {
         let dir = temp_dir("row-sink-direct-report");
         let vault_dir = dir.join("vault");
@@ -7189,6 +7212,46 @@ mod tests {
             Some("forced unavailable")
         );
         assert_eq!(imported.report.sqlite_nodes, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_import_report_falls_back_to_sqlite_for_empty_row_sink_snapshot() {
+        let dir = temp_dir("row-sink-empty-fallback-report");
+        fs::create_dir_all(&dir).unwrap();
+        let sqlite = dir.join("source.db");
+        seed_minimal_cbm_sqlite(&sqlite);
+        let vault = AsterVault::new_durable(
+            dir.join("vault"),
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"empty-row-sink-fallback-test".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+        let rows = CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+
+        let imported = import_shadow_vault_report(
+            &sqlite,
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(row_sink_import_candidate_from_rows(rows)),
+        )
+        .unwrap();
+
+        assert_eq!(imported.source, "sqlite_fallback");
+        assert_eq!(
+            imported.fallback_reason.as_deref(),
+            Some("single-run row sink produced zero nodes and zero edges")
+        );
+        assert_eq!(imported.report.sqlite_nodes, 1);
+        assert_eq!(imported.report.new_cx_ids, 1);
         fs::remove_dir_all(&dir).ok();
     }
 
