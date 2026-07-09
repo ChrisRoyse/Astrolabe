@@ -243,6 +243,19 @@ fn internal(message: impl Into<String>) -> BridgeError {
     )
 }
 
+fn required_borrowed_c_string(ptr: *const c_char, field: &str) -> Result<String, BridgeError> {
+    if ptr.is_null() {
+        return Err(envelope(
+            "ASTRO_CBM_NULL_FIELD",
+            format!("CBM returned NULL for required field {field}"),
+            "Treat this as FFI contract drift and keep the raw result for debugging.",
+        ));
+    }
+    // SAFETY: callers pass borrowed CBM strings that are NUL-terminated and
+    // valid for the duration of the enclosing FFI callback or owner call.
+    Ok(unsafe { CStr::from_ptr(ptr) }.to_str()?.to_owned())
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Language(cbm_sys::CBMLanguage);
 
@@ -358,6 +371,271 @@ where
         })?;
         f(edge)
     })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CbmIndexMode {
+    Full,
+    Moderate,
+    Fast,
+}
+
+impl CbmIndexMode {
+    fn as_raw(self) -> cbm_sys::cbm_index_mode_t {
+        match self {
+            Self::Full => cbm_sys::cbm_index_mode_t_CBM_MODE_FULL,
+            Self::Moderate => cbm_sys::cbm_index_mode_t_CBM_MODE_MODERATE,
+            Self::Fast => cbm_sys::cbm_index_mode_t_CBM_MODE_FAST,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmPipelineNodeRow {
+    pub id: i64,
+    pub project: String,
+    pub label: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub properties_json: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmPipelineEdgeRow {
+    pub id: i64,
+    pub project: String,
+    pub source_id: i64,
+    pub target_id: i64,
+    pub edge_type: String,
+    pub properties_json: String,
+    pub url_path_gen: String,
+    pub local_name_gen: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CbmPipelineRows {
+    pub project: String,
+    pub nodes: Vec<CbmPipelineNodeRow>,
+    pub edges: Vec<CbmPipelineEdgeRow>,
+}
+
+#[derive(Default)]
+struct PipelineRowSinkState {
+    nodes: Vec<CbmPipelineNodeRow>,
+    edges: Vec<CbmPipelineEdgeRow>,
+    error: Option<BridgeError>,
+}
+
+impl PipelineRowSinkState {
+    fn push_node(&mut self, row: &cbm_sys::cbm_gbuf_row_node_t) -> Result<(), BridgeError> {
+        self.nodes.push(CbmPipelineNodeRow {
+            id: row.id,
+            project: required_borrowed_c_string(row.project, "row_sink.node.project")?,
+            label: required_borrowed_c_string(row.label, "row_sink.node.label")?,
+            name: required_borrowed_c_string(row.name, "row_sink.node.name")?,
+            qualified_name: required_borrowed_c_string(
+                row.qualified_name,
+                "row_sink.node.qualified_name",
+            )?,
+            file_path: required_borrowed_c_string(row.file_path, "row_sink.node.file_path")?,
+            start_line: i64::from(row.start_line),
+            end_line: i64::from(row.end_line),
+            properties_json: required_borrowed_c_string(
+                row.properties_json,
+                "row_sink.node.properties_json",
+            )?,
+        });
+        Ok(())
+    }
+
+    fn push_edge(&mut self, row: &cbm_sys::cbm_gbuf_row_edge_t) -> Result<(), BridgeError> {
+        self.edges.push(CbmPipelineEdgeRow {
+            id: row.id,
+            project: required_borrowed_c_string(row.project, "row_sink.edge.project")?,
+            source_id: row.source_id,
+            target_id: row.target_id,
+            edge_type: required_borrowed_c_string(row.type_, "row_sink.edge.type")?,
+            properties_json: required_borrowed_c_string(
+                row.properties_json,
+                "row_sink.edge.properties_json",
+            )?,
+            url_path_gen: required_borrowed_c_string(
+                row.url_path_gen,
+                "row_sink.edge.url_path_gen",
+            )?,
+            local_name_gen: required_borrowed_c_string(
+                row.local_name_gen,
+                "row_sink.edge.local_name_gen",
+            )?,
+        });
+        Ok(())
+    }
+
+    fn finish_callback(&mut self, result: std::thread::Result<Result<(), BridgeError>>) -> c_int {
+        match result {
+            Ok(Ok(())) => CALLBACK_OK,
+            Ok(Err(error)) => {
+                self.remember_error(error);
+                CALLBACK_ERROR
+            }
+            Err(_) => {
+                self.remember_error(envelope(
+                    "ASTRO_FFI_CALLBACK_PANIC",
+                    "Rust row-sink callback panicked before returning to C",
+                    "Keep panic boundaries inside Rust; convert callback failures into status codes.",
+                ));
+                CALLBACK_PANIC
+            }
+        }
+    }
+
+    fn remember_error(&mut self, error: BridgeError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+}
+
+pub struct CbmPipeline {
+    ptr: NonNull<cbm_sys::cbm_pipeline_t>,
+    owner: ThreadId,
+    _repo_path: CString,
+    _db_path: CString,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CbmPipeline {
+    pub fn new(repo_path: &str, db_path: &str, mode: CbmIndexMode) -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
+        let repo_path = CString::new(repo_path)?;
+        let db_path = CString::new(db_path)?;
+        // SAFETY: cbm_init is idempotent in libcbm. The repo/db strings outlive
+        // pipeline creation and CBM copies the paths into the pipeline object.
+        unsafe {
+            map_cbm_status(cbm_sys::cbm_init())?;
+            let ptr =
+                cbm_sys::cbm_pipeline_new(repo_path.as_ptr(), db_path.as_ptr(), mode.as_raw());
+            Ok(Self {
+                ptr: NonNull::new(ptr).ok_or_else(|| {
+                    envelope(
+                        "ASTRO_CBM_PIPELINE_INIT",
+                        "cbm_pipeline_new returned NULL",
+                        "Check repository path validity and CBM startup diagnostics.",
+                    )
+                })?,
+                owner: thread::current().id(),
+                _repo_path: repo_path,
+                _db_path: db_path,
+                _not_send_or_sync: PhantomData,
+            })
+        }
+    }
+
+    pub fn collect_rows(&mut self) -> Result<CbmPipelineRows, BridgeError> {
+        self.ensure_owner_thread()?;
+        let mut sink = PipelineRowSinkState::default();
+        // SAFETY: self owns the pipeline pointer. `sink` remains live until
+        // cbm_pipeline_run returns, and the sink is cleared immediately after.
+        let rc = unsafe {
+            cbm_sys::cbm_pipeline_set_sink(
+                self.ptr.as_ptr(),
+                Some(pipeline_node_sink),
+                Some(pipeline_edge_sink),
+                (&mut sink as *mut PipelineRowSinkState).cast::<c_void>(),
+            );
+            let rc = cbm_sys::cbm_pipeline_run(self.ptr.as_ptr());
+            cbm_sys::cbm_pipeline_set_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            rc
+        };
+
+        if rc != 0 {
+            if let Some(error) = sink.error {
+                return Err(error);
+            }
+            map_cbm_status(rc)?;
+        }
+        if let Some(error) = sink.error {
+            return Err(error);
+        }
+        let project = self.project_name()?;
+        Ok(CbmPipelineRows {
+            project,
+            nodes: sink.nodes,
+            edges: sink.edges,
+        })
+    }
+
+    pub fn project_name(&self) -> Result<String, BridgeError> {
+        self.ensure_owner_thread()?;
+        // SAFETY: self owns the pipeline pointer; CBM returns a borrowed
+        // NUL-terminated string valid until cbm_pipeline_free.
+        let ptr = unsafe { cbm_sys::cbm_pipeline_project_name(self.ptr.as_ptr()) };
+        required_borrowed_c_string(ptr, "pipeline.project_name")
+    }
+
+    fn ensure_owner_thread(&self) -> Result<(), BridgeError> {
+        if thread::current().id() == self.owner {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_CBM_THREAD_AFFINITY",
+                "CbmPipeline used from a different thread than the creating thread",
+                "Create one CbmPipeline per thread; do not share cbm_pipeline_t across threads.",
+            ))
+        }
+    }
+}
+
+impl Drop for CbmPipeline {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the cbm_pipeline_t pointer.
+        unsafe {
+            cbm_sys::cbm_pipeline_free(self.ptr.as_ptr());
+        }
+    }
+}
+
+unsafe extern "C" fn pipeline_node_sink(
+    node: *const cbm_sys::cbm_gbuf_row_node_t,
+    ctx: *mut c_void,
+) -> c_int {
+    let Some(state) = (unsafe { (ctx as *mut PipelineRowSinkState).as_mut() }) else {
+        return CALLBACK_ERROR;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let node = unsafe { node.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_NODE",
+                "CBM row-sink node callback received NULL",
+                "Treat this as FFI contract drift; callbacks require a borrowed row pointer.",
+            )
+        })?;
+        state.push_node(node)
+    }));
+    state.finish_callback(result)
+}
+
+unsafe extern "C" fn pipeline_edge_sink(
+    edge: *const cbm_sys::cbm_gbuf_row_edge_t,
+    ctx: *mut c_void,
+) -> c_int {
+    let Some(state) = (unsafe { (ctx as *mut PipelineRowSinkState).as_mut() }) else {
+        return CALLBACK_ERROR;
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let edge = unsafe { edge.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_EDGE",
+                "CBM row-sink edge callback received NULL",
+                "Treat this as FFI contract drift; callbacks require a borrowed row pointer.",
+            )
+        })?;
+        state.push_edge(edge)
+    }));
+    state.finish_callback(result)
 }
 
 pub struct ExtractedFile {
@@ -1271,6 +1549,17 @@ mod tests {
         assert!(cbm.ends_with("vendor/codebase-memory-mcp"));
     }
 
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "astrolabe-bridge-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn extracts_fixture_with_owned_accessors() {
         let file = ExtractedFile::extract(
@@ -1310,6 +1599,65 @@ mod tests {
         let _ = file.type_refs().unwrap();
         let _ = file.channels().unwrap();
         assert!(file.routes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pipeline_row_collector_matches_persisted_sqlite_counts() {
+        let dir = temp_dir("pipeline-row-collector");
+        let repo = dir.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).expect("create fixture repo");
+        std::fs::write(
+            src.join("main.c"),
+            "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
+        )
+        .expect("write C fixture");
+        let db = dir.join("graph.db");
+
+        let mut pipeline = CbmPipeline::new(
+            repo.to_str().expect("utf8 repo path"),
+            db.to_str().expect("utf8 db path"),
+            CbmIndexMode::Full,
+        )
+        .expect("create CBM pipeline");
+        let rows = pipeline.collect_rows().expect("collect row-sink rows");
+
+        assert!(!rows.project.is_empty());
+        assert!(
+            rows.nodes
+                .iter()
+                .any(|node| node.qualified_name.ends_with(".main")),
+            "expected main function in row sink: {rows:?}"
+        );
+        assert!(rows.nodes.iter().all(|node| node.project == rows.project));
+        assert!(rows.edges.iter().all(|edge| edge.project == rows.project));
+        assert!(
+            rows.edges
+                .iter()
+                .all(|edge| edge.source_id > 0 && edge.target_id > 0)
+        );
+
+        let connection = rusqlite::Connection::open(&db).expect("open CBM sqlite");
+        let node_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE project = ?1",
+                [rows.project.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count sqlite nodes");
+        let edge_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE project = ?1",
+                [rows.project.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count sqlite edges");
+        assert_eq!(usize::try_from(node_count).unwrap(), rows.nodes.len());
+        assert_eq!(usize::try_from(edge_count).unwrap(), rows.edges.len());
+
+        drop(connection);
+        drop(pipeline);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

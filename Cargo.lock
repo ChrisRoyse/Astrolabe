@@ -96,6 +96,7 @@ dependencies = [
  "calyx-core",
  "cbm-sys",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "tracing",
