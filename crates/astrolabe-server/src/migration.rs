@@ -94,6 +94,7 @@ const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
 const OPTIMIZER_TRIGGER_ACK_ACTOR: &str = "astrolabe-server-optimizer-status";
 const GET_READINESS_SCHEMA: &str = "astrolabe.get_readiness.v1";
+const IMPUTE_FIELDS_SCHEMA: &str = "astrolabe.impute_fields.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -276,6 +277,7 @@ pub fn handle_tool_raw(
         "get_provenance" => handle_get_provenance(args_json),
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
+        "impute_fields" => handle_impute_fields(args_json),
         "team_artifact" => handle_team_artifact(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
@@ -376,12 +378,13 @@ fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> 
     Ok(serde_json::to_string(&response)?)
 }
 
-fn astrolabe_tool_definitions() -> [Value; 5] {
+fn astrolabe_tool_definitions() -> [Value; 6] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
         optimizer_status_tool_definition(),
         get_readiness_tool_definition(),
+        impute_fields_tool_definition(),
         team_artifact_tool_definition(),
     ]
 }
@@ -547,6 +550,51 @@ fn get_readiness_tool_definition() -> Value {
     })
 }
 
+fn impute_fields_tool_definition() -> Value {
+    json!({
+        "name": "impute_fields",
+        "title": "Impute Fields",
+        "description": "Return persisted Astrolabe imputation proposals for a target field. Proposals are always inferred/provisional and are never written as trusted data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Stable target id whose missing field should be proposed."
+                },
+                "field": {
+                    "type": "string",
+                    "enum": ["doc", "types", "callees", "tests"],
+                    "description": "Missing field to impute."
+                },
+                "write_as_trusted": {
+                    "type": "boolean",
+                    "description": "If true, the tool refuses; imputed values cannot be merged as trusted data."
+                }
+            },
+            "required": ["project", "target", "field"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
 fn team_artifact_tool_definition() -> Value {
     json!({
         "name": "team_artifact",
@@ -643,6 +691,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
         "get_provenance" => Ok(true),
         "optimizer_status" => Ok(true),
         "get_readiness" => Ok(true),
+        "impute_fields" => Ok(true),
         "team_artifact" => Ok(true),
         _ => Ok(false),
     }
@@ -940,6 +989,43 @@ fn handle_get_readiness(args_json: &str) -> Result<String, DynError> {
     let axis = string_arg(args_obj, "axis");
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
+}
+
+fn handle_impute_fields(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("impute_fields arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("impute_fields requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "impute_fields requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let Some(target) = string_arg(args_obj, "target") else {
+        return tool_error_result("impute_fields requires target");
+    };
+    let Some(field) = string_arg(args_obj, "field") else {
+        return tool_error_result("impute_fields requires field");
+    };
+    if !matches!(field, "doc" | "types" | "callees" | "tests") {
+        return tool_error_result(
+            "impute_fields field must be one of doc, types, callees, or tests",
+        );
+    }
+    let write_as_trusted = args_obj
+        .get("write_as_trusted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let value = impute_fields_json_at(&cache_dir, &project, target, field, write_as_trusted)?;
+    if value.get("status").and_then(Value::as_str) == Some("refused") {
+        tool_json_error_result(value)
+    } else {
+        tool_json_result(value)
+    }
 }
 
 fn handle_team_artifact(args_json: &str) -> Result<String, DynError> {
@@ -6818,6 +6904,202 @@ fn optimizer_unavailable_json(section: &str, reason: &str, remediation: &str) ->
     })
 }
 
+fn impute_fields_json_at(
+    cache_dir: &Path,
+    project: &str,
+    target: &str,
+    field: &str,
+    write_as_trusted: bool,
+) -> Result<Value, DynError> {
+    if write_as_trusted {
+        return Ok(json!({
+            "schema": IMPUTE_FIELDS_SCHEMA,
+            "project": project,
+            "target": target,
+            "field": field,
+            "status": "refused",
+            "code": "ASTRO_IMPUTE_TRUSTED_WRITE_REFUSED",
+            "message": "imputed values are inferred/provisional and cannot be written as trusted data",
+            "remediation": "serve the proposal with inferred/provisional tags, then require a separate trusted source before merging",
+            "proposal_count": Value::Null,
+            "proposals": [],
+            "source": "request:write_as_trusted",
+            "freshness": "fresh",
+            "trust": "verified",
+        }));
+    }
+
+    let key = metadata_key(project, "impute_fields_json");
+    let Some(raw) = read_config_value(cache_dir, &key)? else {
+        return Ok(json!({
+            "schema": IMPUTE_FIELDS_SCHEMA,
+            "project": project,
+            "target": target,
+            "field": field,
+            "status": "unavailable",
+            "proposal_count": Value::Null,
+            "proposals": [],
+            "source": format!("config:{key}:missing"),
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "reason": "imputation proposal store is not persisted for this project",
+            "remediation": "run the oracle imputation pipeline and persist inferred/provisional proposals before calling impute_fields",
+        }));
+    };
+    let value = match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(impute_fields_invalid_json(
+                project,
+                target,
+                field,
+                &key,
+                format!("stored impute_fields_json invalid: {error}"),
+            ));
+        }
+    };
+    let value = match impute_fields_config_value(value, &key) {
+        Ok(value) => value,
+        Err(reason) => {
+            return Ok(impute_fields_invalid_json(
+                project, target, field, &key, reason,
+            ));
+        }
+    };
+    let proposals = value
+        .get("proposals")
+        .and_then(Value::as_array)
+        .expect("validated imputation proposals array")
+        .iter()
+        .filter(|proposal| {
+            proposal.get("target").and_then(Value::as_str) == Some(target)
+                && proposal.get("field").and_then(Value::as_str) == Some(field)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let proposal_count = proposals.len();
+    Ok(json!({
+        "schema": IMPUTE_FIELDS_SCHEMA,
+        "project": project,
+        "target": target,
+        "field": field,
+        "status": "read",
+        "proposal_count": proposal_count,
+        "proposals": proposals,
+        "source": format!("config:{key}"),
+        "freshness": value.get("freshness").cloned().unwrap_or_else(|| json!("fresh")),
+        "trust": value.get("trust").cloned().unwrap_or_else(|| json!("provisional")),
+        "remediation": if proposal_count == 0 {
+            Value::String("no inferred/provisional proposal matched the requested target and field".to_string())
+        } else {
+            Value::Null
+        },
+    }))
+}
+
+fn impute_fields_config_value(value: Value, key: &str) -> Result<Value, String> {
+    let Some(object) = value.as_object() else {
+        return Err("impute_fields_json must be an object".to_string());
+    };
+    if object.get("schema").and_then(Value::as_str) != Some(IMPUTE_FIELDS_SCHEMA) {
+        return Err(format!(
+            "impute_fields_json schema must be {IMPUTE_FIELDS_SCHEMA}"
+        ));
+    }
+    if object.get("status").and_then(Value::as_str).is_none()
+        || object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Err("impute_fields_json requires status, freshness, and trust labels".to_string());
+    }
+    let Some(proposals) = object.get("proposals").and_then(Value::as_array) else {
+        return Err("impute_fields_json proposals must be an array".to_string());
+    };
+    for (index, proposal) in proposals.iter().enumerate() {
+        if let Some(reason) = impute_field_proposal_invalid(proposal) {
+            return Err(format!("impute_fields_json proposals[{index}] {reason}"));
+        }
+    }
+    let mut out = object.clone();
+    out.insert("source".to_string(), json!(format!("config:{key}")));
+    Ok(Value::Object(out))
+}
+
+fn impute_field_proposal_invalid(proposal: &Value) -> Option<&'static str> {
+    let Some(object) = proposal.as_object() else {
+        return Some("must be an object");
+    };
+    if object.get("target").and_then(Value::as_str).is_none() {
+        return Some("requires string target");
+    }
+    let Some(field) = object.get("field").and_then(Value::as_str) else {
+        return Some("requires string field");
+    };
+    if !matches!(field, "doc" | "types" | "callees" | "tests") {
+        return Some("field must be doc, types, callees, or tests");
+    }
+    if object.get("value").is_none() {
+        return Some("requires value");
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str) != Some("provisional")
+    {
+        return Some("requires freshness and trust=provisional");
+    }
+    let tags = object.get("tags");
+    if !json_string_array_contains(tags, "inferred")
+        || !json_string_array_contains(tags, "provisional")
+    {
+        return Some("requires inferred and provisional tags");
+    }
+    if !json_string_array_nonempty(object.get("provenance")) {
+        return Some("requires non-empty string provenance");
+    }
+    if field == "doc" && !imputed_doc_guard_check_passed(object.get("guard_check")) {
+        return Some("doc proposals require guard_check.status=passed with labels and provenance");
+    }
+    None
+}
+
+fn imputed_doc_guard_check_passed(guard_check: Option<&Value>) -> bool {
+    let Some(object) = guard_check.and_then(Value::as_object) else {
+        return false;
+    };
+    object.get("status").and_then(Value::as_str) == Some("passed")
+        && object.get("freshness").and_then(Value::as_str).is_some()
+        && object.get("trust").and_then(Value::as_str).is_some()
+        && json_string_array_nonempty(object.get("provenance"))
+}
+
+fn json_string_array_contains(value: Option<&Value>, needle: &str) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
+}
+
+fn impute_fields_invalid_json(
+    project: &str,
+    target: &str,
+    field: &str,
+    key: &str,
+    reason: impl Into<String>,
+) -> Value {
+    json!({
+        "schema": IMPUTE_FIELDS_SCHEMA,
+        "project": project,
+        "target": target,
+        "field": field,
+        "status": "invalid",
+        "proposal_count": Value::Null,
+        "proposals": [],
+        "source": format!("config:{key}"),
+        "freshness": "fresh",
+        "trust": "provisional",
+        "reason": reason.into(),
+        "remediation": "repair impute_fields_json before serving imputation proposals",
+    })
+}
+
 fn readiness_status_json_at(
     cache_dir: &Path,
     project: &str,
@@ -7713,6 +7995,119 @@ mod tests {
         assert_eq!(oracle["measured"], false);
         assert_eq!(oracle["freshness"], "not_evaluated");
         assert_eq!(readiness["artifact_sha256"].as_str().unwrap().len(), 64);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn impute_fields_reads_guard_checked_doc_proposals_from_config() {
+        let dir = temp_dir("impute-fields-doc-readback");
+        let key = metadata_key("demo", "impute_fields_json");
+        let imputation = json!({
+            "schema": IMPUTE_FIELDS_SCHEMA,
+            "status": "available",
+            "freshness": "fresh",
+            "trust": "verified",
+            "proposals": [
+                {
+                    "target": "symbol:demo:parse_config",
+                    "field": "doc",
+                    "value": "Parses a configuration document into validated settings.",
+                    "tags": ["inferred", "provisional"],
+                    "freshness": "fresh",
+                    "trust": "provisional",
+                    "provenance": ["oracle_impute:test:doc", "trusted_region:test:parse"],
+                    "guard_check": {
+                        "status": "passed",
+                        "freshness": "fresh",
+                        "trust": "verified",
+                        "provenance": ["guard_check:test:doc"],
+                    },
+                },
+                {
+                    "target": "symbol:demo:parse_config",
+                    "field": "types",
+                    "value": ["ConfigResult"],
+                    "tags": ["inferred", "provisional"],
+                    "freshness": "fresh",
+                    "trust": "provisional",
+                    "provenance": ["oracle_impute:test:types"],
+                },
+            ],
+        });
+        write_config_value(&dir, &key, &imputation.to_string()).unwrap();
+        let raw = read_config_value(&dir, &key).unwrap().unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(raw_value, imputation);
+
+        let result =
+            impute_fields_json_at(&dir, "demo", "symbol:demo:parse_config", "doc", false).unwrap();
+        assert_eq!(result["schema"], IMPUTE_FIELDS_SCHEMA);
+        assert_eq!(result["status"], "read");
+        assert_eq!(result["proposal_count"], 1);
+        assert_eq!(result["source"], format!("config:{key}"));
+        assert_eq!(
+            result["proposals"][0]["value"],
+            "Parses a configuration document into validated settings."
+        );
+        assert_eq!(result["proposals"][0]["tags"][0], "inferred");
+        assert_eq!(result["proposals"][0]["tags"][1], "provisional");
+        assert_eq!(result["proposals"][0]["trust"], "provisional");
+        assert_eq!(result["proposals"][0]["guard_check"]["status"], "passed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn impute_fields_refuses_trusted_write() {
+        let dir = temp_dir("impute-fields-trusted-refusal");
+        let result =
+            impute_fields_json_at(&dir, "demo", "symbol:demo:parse_config", "doc", true).unwrap();
+        assert_eq!(result["schema"], IMPUTE_FIELDS_SCHEMA);
+        assert_eq!(result["status"], "refused");
+        assert_eq!(result["code"], "ASTRO_IMPUTE_TRUSTED_WRITE_REFUSED");
+        assert_eq!(result["source"], "request:write_as_trusted");
+        assert!(result["proposals"].as_array().unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn impute_fields_rejects_doc_proposal_without_passed_guard_check() {
+        let dir = temp_dir("impute-fields-doc-guard-invalid");
+        let key = metadata_key("demo", "impute_fields_json");
+        let imputation = json!({
+            "schema": IMPUTE_FIELDS_SCHEMA,
+            "status": "available",
+            "freshness": "fresh",
+            "trust": "verified",
+            "proposals": [{
+                "target": "symbol:demo:parse_config",
+                "field": "doc",
+                "value": "Parses a configuration document into validated settings.",
+                "tags": ["inferred", "provisional"],
+                "freshness": "fresh",
+                "trust": "provisional",
+                "provenance": ["oracle_impute:test:doc"],
+                "guard_check": {
+                    "status": "failed",
+                    "freshness": "fresh",
+                    "trust": "verified",
+                    "provenance": ["guard_check:test:doc"],
+                },
+            }],
+        });
+        write_config_value(&dir, &key, &imputation.to_string()).unwrap();
+
+        let result =
+            impute_fields_json_at(&dir, "demo", "symbol:demo:parse_config", "doc", false).unwrap();
+        assert_eq!(result["schema"], IMPUTE_FIELDS_SCHEMA);
+        assert_eq!(result["status"], "invalid");
+        assert_eq!(result["source"], format!("config:{key}"));
+        assert!(
+            result["reason"]
+                .as_str()
+                .unwrap()
+                .contains("guard_check.status=passed")
+        );
+        assert!(result["proposals"].as_array().unwrap().is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -9711,6 +10106,7 @@ mod tests {
                         | "detect_anomalies"
                         | "optimizer_status"
                         | "get_readiness"
+                        | "impute_fields"
                         | "team_artifact"
                 )
             )));
@@ -9781,6 +10177,22 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("scope")
+        );
+
+        let impute_fields = tool_definition(tools, "impute_fields");
+        assert_eq!(
+            impute_fields["inputSchema"]["required"],
+            json!(["project", "target", "field"])
+        );
+        assert_eq!(
+            impute_fields["inputSchema"]["properties"]["field"]["enum"],
+            json!(["doc", "types", "callees", "tests"])
+        );
+        assert!(
+            impute_fields["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("write_as_trusted")
         );
 
         let team_artifact = tool_definition(tools, "team_artifact");

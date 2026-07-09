@@ -1548,7 +1548,7 @@ Anomaly aggregation status: `astrolabe.detect_anomalies.v1` lives in `astrolabe-
 ### Oracle
 **`predict_impact`** â€” params: `project`, `symbols|diff`, `depth?`. Returns consequence tree, test-selection set, confidence + ceilings, or refusal (11 Â§2).
 **`abduce_cause`** â€” params: `project`, `failure` (test QN/incident ref/symbol). Returns ranked causes + disconfirming tests (11 Â§3).
-**`impute_fields`** â€” params: `project`, `target`, `field` (`doc|types|callees|tests`). Returns proposals tagged inferred/provisional (11 Â§4).
+**`impute_fields`** â€” params: `project`, `target`, `field` (`doc|types|callees|tests`). Returns proposals tagged inferred/provisional (11 Â§4). Implementation status: the MCP surface reads persisted `astrolabe.impute_fields.v1` proposal metadata from `_config.db`, refuses trusted writes, requires `inferred` + `provisional` tags on every proposal, and serves doc proposals only when persisted `guard_check.status="passed"` with labels/provenance.
 **`forecast`** â€” params: `project`, `series` (test/file/symbol), `kind?`. Returns next-occurrence interval, hazard, periodicity, regime changes (11 Â§5).
 
 ### Trust & ops
