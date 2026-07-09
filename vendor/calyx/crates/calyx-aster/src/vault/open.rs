@@ -13,6 +13,7 @@ where
         clock: C,
     ) -> Result<Self> {
         DurableVault::validate_options(&options)?;
+        let clock = std::sync::Arc::new(clock);
         let vault_root = vault_dir.as_ref().to_path_buf();
         let recovery = DurableVault::recover_batches(vault_dir.as_ref(), &options)?;
         let ledger_hook = if options.restore_ledger_hook {
@@ -21,6 +22,7 @@ where
                 &recovery,
                 options.ledger_checkpoint.clone(),
                 options.tiering_policy.as_ref(),
+                std::sync::Arc::clone(&clock),
             )?)
         } else {
             None

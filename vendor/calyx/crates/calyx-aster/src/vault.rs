@@ -45,7 +45,7 @@ use crate::wal::TornTail;
 use calyx_core::{Anchor, SlotId, VaultStore};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use context::VaultContext;
@@ -69,12 +69,12 @@ const DEFAULT_LEASE_MS: u64 = 5_000;
 pub struct AsterVault<C = SystemClock> {
     vault_id: VaultId,
     vault_salt: Vec<u8>,
-    clock: C,
+    clock: Arc<C>,
     rows: VersionedCfStore,
     durable: Option<DurableVault>,
     dedup_policy: DedupPolicy,
     retention_horizon: Mutex<RetentionHorizon>,
-    ledger_hook: Option<AsterLedgerHook>,
+    ledger_hook: Option<AsterLedgerHook<C>>,
     read_only: bool,
     recurrence_write_lock: Mutex<()>,
     recovery_report: VaultRecoveryReport,
@@ -136,7 +136,7 @@ where
         Self {
             vault_id,
             vault_salt: vault_salt.into(),
-            clock,
+            clock: Arc::new(clock),
             rows: VersionedCfStore::default(),
             durable: None,
             dedup_policy: DedupPolicy::default(),
@@ -442,7 +442,7 @@ where
 
     #[cfg(test)]
     pub(crate) fn clock_ref(&self) -> &C {
-        &self.clock
+        self.clock.as_ref()
     }
 
     /// Collects the aggregate resource status for this vault (PRD 18 §4).

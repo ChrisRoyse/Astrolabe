@@ -4,8 +4,7 @@ use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
 use crate::ledger_view::{AsterLedgerCfStore, read_ledger_seqs_unlocked_with_tiering};
 use calyx_core::{
-    CalyxError, Constellation, LedgerRef, METADATA_CHUNK_ID, METADATA_DATABASE_NAME, Result,
-    SystemClock,
+    CalyxError, Clock, Constellation, LedgerRef, METADATA_CHUNK_ID, METADATA_DATABASE_NAME, Result,
 };
 use calyx_ledger::{
     ActorId, CheckpointConfig, CheckpointPayload, DefaultLedgerHook, EntryKind, LedgerAppender,
@@ -15,25 +14,27 @@ use calyx_ledger::{
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(super) type AsterLedgerHook = Mutex<DefaultLedgerHook<MemoryLedgerStore, SystemClock>>;
-pub(super) type AsterLedgerHookGuard<'a> =
-    MutexGuard<'a, DefaultLedgerHook<MemoryLedgerStore, SystemClock>>;
+pub(super) type AsterLedgerHook<C> = Mutex<DefaultLedgerHook<MemoryLedgerStore, Arc<C>>>;
+pub(super) type AsterLedgerHookGuard<'a, C> =
+    MutexGuard<'a, DefaultLedgerHook<MemoryLedgerStore, Arc<C>>>;
 
-pub(super) fn recover_hook(
+pub(super) fn recover_hook<C: Clock>(
     recovery: &RecoveredBatches,
     checkpoint: Option<CheckpointConfig>,
-) -> Result<AsterLedgerHook> {
-    recover_hook_from_store(recovered_ledger_store(recovery)?, checkpoint)
+    clock: Arc<C>,
+) -> Result<AsterLedgerHook<C>> {
+    recover_hook_from_store(recovered_ledger_store(recovery)?, checkpoint, clock)
 }
 
-pub(super) fn recover_hook_from_vault_dir(
+pub(super) fn recover_hook_from_vault_dir<C: Clock>(
     vault_dir: &Path,
     recovery: &RecoveredBatches,
     checkpoint: Option<CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
-) -> Result<AsterLedgerHook> {
+    clock: Arc<C>,
+) -> Result<AsterLedgerHook<C>> {
     let store = match physical_ledger_store(
         vault_dir,
         LedgerViewLock::Acquire,
@@ -43,14 +44,15 @@ pub(super) fn recover_hook_from_vault_dir(
         Some(store) => store,
         None => recovered_ledger_store(recovery)?,
     };
-    recover_hook_from_store(store, checkpoint)
+    recover_hook_from_store(store, checkpoint, clock)
 }
 
-fn recover_hook_from_store(
+fn recover_hook_from_store<C: Clock>(
     store: MemoryLedgerStore,
     checkpoint: Option<CheckpointConfig>,
-) -> Result<AsterLedgerHook> {
-    let appender = LedgerAppender::open(store, SystemClock)?;
+    clock: Arc<C>,
+) -> Result<AsterLedgerHook<C>> {
+    let appender = LedgerAppender::open(store, clock)?;
     let hook = match checkpoint {
         Some(config) => DefaultLedgerHook::with_checkpoint_config(appender, config)?,
         None => DefaultLedgerHook::new(appender),
@@ -222,17 +224,20 @@ fn durable_commit_lock_path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("locks").join("durable.commit.lock")
 }
 
-pub(super) fn lock_hook(hook: &AsterLedgerHook) -> Result<AsterLedgerHookGuard<'_>> {
+pub(super) fn lock_hook<C: Clock>(
+    hook: &AsterLedgerHook<C>,
+) -> Result<AsterLedgerHookGuard<'_, C>> {
     hook.lock()
         .map_err(|_| CalyxError::ledger_group_commit_failed("ledger hook lock poisoned"))
 }
 
-pub(super) fn refresh_hook(
-    hook: &AsterLedgerHook,
+pub(super) fn refresh_hook<C: Clock>(
+    hook: &AsterLedgerHook<C>,
     vault_dir: &Path,
     recovery: &RecoveredBatches,
     checkpoint: Option<CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
+    clock: Arc<C>,
 ) -> Result<()> {
     let store = match physical_ledger_store(
         vault_dir,
@@ -243,7 +248,7 @@ pub(super) fn refresh_hook(
         Some(store) => store,
         None => recovered_ledger_store(recovery)?,
     };
-    let replacement = recover_hook_from_store(store, checkpoint)?
+    let replacement = recover_hook_from_store(store, checkpoint, clock)?
         .into_inner()
         .map_err(|_| CalyxError::ledger_group_commit_failed("new ledger hook lock poisoned"))?;
     let mut guard = lock_hook(hook)?;
@@ -251,8 +256,8 @@ pub(super) fn refresh_hook(
     Ok(())
 }
 
-pub(super) fn stage_ingest(
-    hook: &DefaultLedgerHook<MemoryLedgerStore, SystemClock>,
+pub(super) fn stage_ingest<C: Clock>(
+    hook: &DefaultLedgerHook<MemoryLedgerStore, Arc<C>>,
     rows: &mut Vec<WriteRow>,
     constellation: &Constellation,
 ) -> Result<Vec<StagedLedgerRow>> {
@@ -264,8 +269,8 @@ pub(super) fn stage_ingest(
     )
 }
 
-pub(super) fn stage_ingest_payload(
-    hook: &DefaultLedgerHook<MemoryLedgerStore, SystemClock>,
+pub(super) fn stage_ingest_payload<C: Clock>(
+    hook: &DefaultLedgerHook<MemoryLedgerStore, Arc<C>>,
     rows: &mut Vec<WriteRow>,
     subject: calyx_core::CxId,
     payload: Vec<u8>,
@@ -280,8 +285,8 @@ pub(super) fn stage_ingest_payload(
     )
 }
 
-pub(super) fn stage_entry_payload(
-    hook: &DefaultLedgerHook<MemoryLedgerStore, SystemClock>,
+pub(super) fn stage_entry_payload<C: Clock>(
+    hook: &DefaultLedgerHook<MemoryLedgerStore, Arc<C>>,
     rows: &mut Vec<WriteRow>,
     kind: EntryKind,
     subject: SubjectId,
@@ -299,8 +304,8 @@ pub(super) fn stage_entry_payload(
     Ok(staged)
 }
 
-pub(super) fn commit_staged(
-    hook: &mut DefaultLedgerHook<MemoryLedgerStore, SystemClock>,
+pub(super) fn commit_staged<C: Clock>(
+    hook: &mut DefaultLedgerHook<MemoryLedgerStore, Arc<C>>,
     staged: &[StagedLedgerRow],
 ) -> Result<LedgerRef> {
     let data_ref = staged

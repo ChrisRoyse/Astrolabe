@@ -3155,7 +3155,6 @@ mod tests {
     use calyx_ledger::decode;
 
     const TEST_VAULT_ID: &str = "00000000000000000000000000";
-    type NormalizedLedgerRow = (u64, [u8; 32], EntryKind, SubjectId, Vec<u8>, ActorId);
 
     fn vault() -> AsterVault<FixedClock> {
         AsterVault::with_clock(
@@ -3494,96 +3493,31 @@ mod tests {
     where
         C: Clock,
     {
-        vault
+        let mut rows = vault
             .scan_cf_at(vault.latest_seq(), family)
-            .expect("scan CF rows")
+            .expect("scan CF rows");
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
     }
 
-    fn normalize_graph_row(mut value: Vec<u8>) -> Vec<u8> {
-        let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {
-            return value;
-        };
-        let Some(object) = json.as_object_mut() else {
-            return value;
-        };
-        if !object.contains_key("provenance") {
-            return value;
-        }
-        object.insert(
-            "provenance".to_string(),
-            serde_json::to_value(zero_ledger_ref()).expect("ledger ref JSON"),
-        );
-        value = serde_json::to_vec(&json).expect("normalized graph row JSON");
-        value
-    }
-
-    fn normalized_base_rows<C>(vault: &AsterVault<C>) -> Vec<(Vec<u8>, Vec<u8>)>
+    fn assert_import_cfs_match_raw<C>(left: &AsterVault<C>, right: &AsterVault<C>)
     where
         C: Clock,
     {
-        cf_rows(vault, ColumnFamily::Base)
-            .into_iter()
-            .map(|(key, value)| {
-                let mut row = encode::decode_constellation_base(&value).expect("decode Base row");
-                row.provenance = zero_ledger_ref();
-                (
-                    key,
-                    encode::encode_constellation_base(&row).expect("encode Base row"),
-                )
-            })
-            .collect()
-    }
-
-    fn normalized_graph_rows<C>(vault: &AsterVault<C>) -> Vec<(Vec<u8>, Vec<u8>)>
-    where
-        C: Clock,
-    {
-        cf_rows(vault, ColumnFamily::Graph)
-            .into_iter()
-            .map(|(key, value)| (key, normalize_graph_row(value)))
-            .collect()
-    }
-
-    fn normalized_ledger_rows<C>(vault: &AsterVault<C>) -> Vec<NormalizedLedgerRow>
-    where
-        C: Clock,
-    {
-        cf_rows(vault, ColumnFamily::Ledger)
-            .into_iter()
-            .map(|(_, value)| {
-                let entry = decode(&value).expect("decode Ledger row");
-                (
-                    entry.seq,
-                    entry.prev_hash,
-                    entry.kind,
-                    entry.subject,
-                    entry.payload,
-                    entry.actor,
-                )
-            })
-            .collect()
-    }
-
-    fn assert_import_cfs_match_with_ledger_ref_normalized<C>(
-        left: &AsterVault<C>,
-        right: &AsterVault<C>,
-    ) where
-        C: Clock,
-    {
         assert_eq!(
-            normalized_base_rows(left),
-            normalized_base_rows(right),
-            "Base CF rows differ after ledger-ref normalization"
+            cf_rows(left, ColumnFamily::Base),
+            cf_rows(right, ColumnFamily::Base),
+            "Base CF rows differ"
         );
         assert_eq!(
-            normalized_graph_rows(left),
-            normalized_graph_rows(right),
-            "Graph CF rows differ after ledger-ref normalization"
+            cf_rows(left, ColumnFamily::Graph),
+            cf_rows(right, ColumnFamily::Graph),
+            "Graph CF rows differ"
         );
         assert_eq!(
-            normalized_ledger_rows(left),
-            normalized_ledger_rows(right),
-            "Ledger CF semantic rows differ after timestamp/hash normalization"
+            cf_rows(left, ColumnFamily::Ledger),
+            cf_rows(right, ColumnFamily::Ledger),
+            "Ledger CF rows differ"
         );
         for slot in default_panel_slots() {
             assert_eq!(
@@ -3877,7 +3811,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_row_sink_snapshot_import_matches_sqlite_import_after_ledger_ref_normalization() {
+    fn direct_row_sink_snapshot_import_matches_sqlite_import_raw_cfs() {
         let path = temp_db("row-sink-direct-edges");
         edge_fixture(&path);
         let sqlite_vault = vault();
@@ -3896,7 +3830,7 @@ mod tests {
         .expect("direct row-sink import");
 
         assert_eq!(direct, sqlite);
-        assert_import_cfs_match_with_ledger_ref_normalized(&direct_vault, &sqlite_vault);
+        assert_import_cfs_match_raw(&direct_vault, &sqlite_vault);
 
         fs::remove_file(path).ok();
     }

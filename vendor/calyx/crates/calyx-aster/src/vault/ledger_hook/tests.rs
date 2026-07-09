@@ -37,6 +37,7 @@ fn recovered_hook_continues_existing_ledger_sequence() {
             router_latest_readback: false,
         },
         None,
+        std::sync::Arc::new(calyx_core::FixedClock::new(44)),
     )
     .expect("recover empty hook");
     let guard = hook.get_mut().unwrap();
@@ -104,10 +105,21 @@ fn physical_ledger_rows_recover_hook_when_manifest_view_has_gap() {
         router_latest_readback: false,
     };
 
-    let manifest_only_error = recover_hook(&gapped_recovery, None).unwrap_err();
+    let manifest_only_error = recover_hook(
+        &gapped_recovery,
+        None,
+        std::sync::Arc::new(calyx_core::FixedClock::new(866)),
+    )
+    .unwrap_err();
     assert_eq!(manifest_only_error.code, "CALYX_LEDGER_CHAIN_BROKEN");
-    let mut recovered =
-        recover_hook_from_vault_dir(&dir, &gapped_recovery, None, None).expect("physical recovery");
+    let mut recovered = recover_hook_from_vault_dir(
+        &dir,
+        &gapped_recovery,
+        None,
+        None,
+        std::sync::Arc::new(calyx_core::FixedClock::new(866)),
+    )
+    .expect("physical recovery");
     let guard = recovered.get_mut().expect("hook guard");
 
     assert_eq!(guard.appender().next_seq(), 4);
@@ -155,9 +167,14 @@ fn anchored_checkpoint_recovery_hydrates_bounded_tail_window() {
         router_latest_readback: false,
     };
 
-    let mut recovered =
-        recover_hook_from_vault_dir(&dir, &recovery, Some(CheckpointConfig::new(3)), None)
-            .expect("bounded physical recovery");
+    let mut recovered = recover_hook_from_vault_dir(
+        &dir,
+        &recovery,
+        Some(CheckpointConfig::new(3)),
+        None,
+        std::sync::Arc::new(calyx_core::FixedClock::new(867)),
+    )
+    .expect("bounded physical recovery");
     let guard = recovered.get_mut().expect("hook guard");
     let hydrated_rows = guard.appender().store().scan().unwrap().len();
 

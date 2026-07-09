@@ -1,10 +1,42 @@
-use super::{AsterVault, VaultOptions};
-use crate::cf::{ColumnFamily, ledger_key};
+use super::{AsterVault, VaultOptions, encode};
+use crate::cf::{ColumnFamily, base_key, ledger_key};
 use calyx_core::{CxFlags, InputRef, LedgerRef, Modality, SlotId, SlotVector, VaultId, VaultStore};
-use calyx_ledger::{ActorId, decode as decode_ledger};
+use calyx_ledger::{ActorId, EntryKind, SubjectId, decode as decode_ledger};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const ISSUE78_FIXED_TS: u64 = 1_785_400_078;
+
+#[test]
+fn fixed_clock_group_commit_raw_cfs_are_byte_identical() {
+    let left = fixed_parity_vault();
+    let right = fixed_parity_vault();
+
+    commit_parity_group(&left);
+    commit_parity_group(&right);
+
+    let left_ledger = raw_cf_rows(&left, ColumnFamily::Ledger);
+    assert_eq!(
+        left_ledger,
+        raw_cf_rows(&right, ColumnFamily::Ledger),
+        "Ledger CF bytes must match for identical fixed-clock group commits"
+    );
+    assert_eq!(
+        raw_cf_rows(&left, ColumnFamily::Base),
+        raw_cf_rows(&right, ColumnFamily::Base),
+        "Base CF provenance bytes must match without normalization"
+    );
+    assert_eq!(
+        raw_cf_rows(&left, ColumnFamily::Graph),
+        raw_cf_rows(&right, ColumnFamily::Graph),
+        "Graph CF provenance bytes must match without normalization"
+    );
+
+    assert_eq!(left_ledger.len(), 1);
+    let entry = decode_ledger(&left_ledger[0].1).expect("decode ledger entry");
+    assert_eq!(entry.ts, ISSUE78_FIXED_TS);
+}
 
 #[test]
 #[ignore = "manual FSV for PH35 ledger actor and monotonic timestamp rows"]
@@ -77,7 +109,58 @@ fn ph35_actor_monotonic_ts_manual_fsv() {
     assert!(ts.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
-fn sample_constellation(vault: &AsterVault, seed: u8) -> calyx_core::Constellation {
+fn fixed_parity_vault() -> AsterVault<calyx_core::FixedClock> {
+    AsterVault::with_clock(
+        vault_id(),
+        b"issue78-fixed-clock-parity".to_vec(),
+        calyx_core::FixedClock::new(ISSUE78_FIXED_TS),
+    )
+}
+
+fn commit_parity_group<C: calyx_core::Clock>(vault: &AsterVault<C>) {
+    let constellation = sample_constellation(vault, 78);
+    let graph_row = serde_json::to_vec(&serde_json::json!({
+        "kind": "issue78.edge",
+        "src": constellation.cx_id.to_string(),
+        "dst": constellation.cx_id.to_string(),
+        "provenance": LedgerRef { seq: 9_999, hash: [9; 32] },
+    }))
+    .expect("encode graph parity row");
+
+    vault
+        .write_cf_batch_with_ledger_entry(
+            [
+                (
+                    ColumnFamily::Base,
+                    base_key(constellation.cx_id),
+                    encode::encode_constellation_base(&constellation)
+                        .expect("encode base parity row"),
+                ),
+                (ColumnFamily::Graph, b"issue78/edge/0".to_vec(), graph_row),
+            ],
+            EntryKind::Ingest,
+            SubjectId::Cx(constellation.cx_id),
+            br#"{"event":"issue78.fixed_clock_group_commit"}"#.to_vec(),
+            ActorId::Service("issue78-fixed-clock-fsv".to_string()),
+        )
+        .expect("commit parity group");
+}
+
+fn raw_cf_rows<C: calyx_core::Clock>(
+    vault: &AsterVault<C>,
+    family: ColumnFamily,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = vault
+        .scan_cf_at(vault.snapshot(), family)
+        .expect("scan raw CF rows");
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn sample_constellation<C: calyx_core::Clock>(
+    vault: &AsterVault<C>,
+    seed: u8,
+) -> calyx_core::Constellation {
     let input = format!("ph35-actor-ts-{seed}");
     let cx_id = vault.cx_id_for_input(input.as_bytes(), 7);
     let mut input_hash = [0_u8; 32];

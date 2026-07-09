@@ -53,6 +53,7 @@ where
                 &recovered,
                 durable.ledger_checkpoint(),
                 durable.tiering_policy(),
+                std::sync::Arc::clone(&self.clock),
             )?;
         }
         self.replace_retention_horizon(recovered.retention_horizon.clone())?;

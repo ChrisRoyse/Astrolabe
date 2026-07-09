@@ -54,7 +54,7 @@ where
         })
     }
 
-    fn transient_ledger_hook(&self) -> Result<ledger_hook::AsterLedgerHook> {
+    fn transient_ledger_hook(&self) -> Result<ledger_hook::AsterLedgerHook<C>> {
         let ledger_rows = self
             .scan_cf_at(self.latest_seq(), ColumnFamily::Ledger)?
             .into_iter()
@@ -85,6 +85,7 @@ where
                 router_latest_readback: false,
             },
             None,
+            std::sync::Arc::clone(&self.clock),
         )
     }
 }

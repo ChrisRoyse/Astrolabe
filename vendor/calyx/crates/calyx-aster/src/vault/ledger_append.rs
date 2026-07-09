@@ -1,7 +1,7 @@
 use super::{AsterVault, encode, ledger_hook};
 use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
-use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
+use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, VaultStore};
 use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow, SubjectId,
 };
@@ -110,7 +110,7 @@ where
         actor: ActorId,
     ) -> Result<LedgerRef> {
         let store = AsterRawLedgerStore { vault: self };
-        let mut appender = LedgerAppender::open(store, SystemClock)?;
+        let mut appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
         appender.append(kind, subject, payload, actor)
     }
 
@@ -122,7 +122,7 @@ where
         entry: LedgerEntryInput,
     ) -> Result<LedgerRef> {
         let store = AsterRawLedgerStore { vault: self };
-        let appender = LedgerAppender::open(store, SystemClock)?;
+        let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
         let prepared = appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?;
         let ledger_ref = prepared.ledger_ref();
         constellation.provenance = ledger_ref.clone();
@@ -143,7 +143,7 @@ where
     pub(crate) fn next_ledger_seq_locked(&self) -> Result<u64> {
         let Some(hook) = &self.ledger_hook else {
             let store = AsterRawLedgerStore { vault: self };
-            return Ok(LedgerAppender::open(store, SystemClock)?.next_seq());
+            return Ok(LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?.next_seq());
         };
         let guard = ledger_hook::lock_hook(hook)?;
         Ok(guard.appender().next_seq())
@@ -187,7 +187,7 @@ where
         actor: ActorId,
     ) -> Result<LedgerRef> {
         let store = AsterRawLedgerStore { vault: self };
-        let appender = LedgerAppender::open(store, SystemClock)?;
+        let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
         let prepared = appender.prepare(kind, subject, payload, actor)?;
         let ledger_ref = prepared.ledger_ref();
         rows.push(encode::WriteRow {

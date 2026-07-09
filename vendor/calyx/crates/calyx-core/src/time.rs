@@ -1,5 +1,6 @@
 //! Clock injection and monotonic stamp types.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Monotonic store sequence number.
@@ -12,6 +13,15 @@ pub type Ts = u64;
 pub trait Clock: Send + Sync {
     /// Returns the current server timestamp.
     fn now(&self) -> Ts;
+}
+
+impl<T> Clock for Arc<T>
+where
+    T: Clock + ?Sized,
+{
+    fn now(&self) -> Ts {
+        self.as_ref().now()
+    }
 }
 
 /// Real wall-clock implementation for outer runtime boundaries.

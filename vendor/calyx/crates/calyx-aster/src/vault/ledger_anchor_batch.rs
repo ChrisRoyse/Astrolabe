@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use super::{AsterVault, encode, ledger_hook};
 use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
-use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
+use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, VaultStore};
 use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow, SubjectId,
     decode as decode_ledger,
@@ -73,7 +73,7 @@ where
 
             let Some(hook) = &self.ledger_hook else {
                 let store = AnchorBatchRawLedgerStore { vault: self };
-                let appender = LedgerAppender::open(store, SystemClock)?;
+                let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
                 let prepared =
                     appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?;
                 let ledger_ref = prepared.ledger_ref();

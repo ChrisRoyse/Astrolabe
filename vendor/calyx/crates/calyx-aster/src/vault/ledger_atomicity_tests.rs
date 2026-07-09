@@ -164,6 +164,7 @@ fn ph35_group_commit_atomicity_manual_fsv() {
 
 fn router_failure_vault(dir: &Path) -> AsterVault<FixedClock> {
     let router = CfRouter::open(dir, 1).unwrap();
+    let clock = std::sync::Arc::new(FixedClock::new(123));
     let ledger_hook = ledger_hook::recover_hook(
         &durable::RecoveredBatches {
             batches: Vec::new(),
@@ -177,12 +178,13 @@ fn router_failure_vault(dir: &Path) -> AsterVault<FixedClock> {
             router_latest_readback: false,
         },
         None,
+        std::sync::Arc::clone(&clock),
     )
     .unwrap();
     AsterVault {
         vault_id: vault_id(),
         vault_salt: b"salt".to_vec(),
-        clock: FixedClock::new(123),
+        clock,
         rows: VersionedCfStore::new_with_router(0, router),
         durable: None,
         dedup_policy: DedupPolicy::default(),

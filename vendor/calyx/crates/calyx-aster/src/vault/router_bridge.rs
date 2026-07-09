@@ -19,7 +19,7 @@ where
         Self {
             vault_id,
             vault_salt: vault_salt.into(),
-            clock,
+            clock: std::sync::Arc::new(clock),
             rows: VersionedCfStore::new_with_router(0, router),
             durable: None,
             dedup_policy: DedupPolicy::default(),
