@@ -73,7 +73,6 @@ const CBM_TEAM_ARTIFACT_DIR: &str = ".codebase-memory";
 const ASTRO_TEAM_ARTIFACT_ERROR: &str = "ASTRO_TEAM_ARTIFACT_ERROR";
 const ASTRO_TEAM_ARTIFACT_NOT_READY: &str = "ASTRO_TEAM_ARTIFACT_NOT_READY";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
 const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
@@ -221,12 +220,25 @@ struct ShadowImportLock {
 }
 
 #[derive(Debug)]
+struct LoweredSqliteLock {
+    _file: fs::File,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
 struct BackgroundLaneOwner {
     _file: fs::File,
     _path: PathBuf,
 }
 
 impl Drop for ShadowImportLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for LoweredSqliteLock {
     fn drop(&mut self) {
         let _ = self._file.unlock();
         let _ = fs::remove_file(&self.path);
@@ -1362,30 +1374,6 @@ fn shadow_import_current_summary(verify_status: &str, lowered_exists: bool) -> V
             Value::String("run index_repository with calyx shadow or retry index_status after shadow import completes".to_string())
         },
     })
-}
-
-fn remove_stale_lowered_sqlite_lock(lock_path: &Path) -> Result<bool, DynError> {
-    remove_stale_sidecar_lock(lock_path, LOWERED_SQLITE_LOCK_STALE_AFTER)
-}
-
-fn remove_stale_sidecar_lock(lock_path: &Path, stale_after: Duration) -> Result<bool, DynError> {
-    let Ok(metadata) = fs::metadata(lock_path) else {
-        return Ok(false);
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(false);
-    };
-    let Ok(age) = modified.elapsed() else {
-        return Ok(false);
-    };
-    if age < stale_after {
-        return Ok(false);
-    }
-    match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
@@ -4432,41 +4420,46 @@ fn with_lowered_sqlite_lock<T>(
     project: &str,
     work: impl FnOnce() -> Result<T, DynError>,
 ) -> Result<T, DynError> {
-    let lock_path = lowered_sqlite_lock_path(cache_dir, project);
     let started = Instant::now();
-    let mut work = Some(work);
     loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(lock) => {
-                drop(lock);
-                let result = work.take().expect("lowered sqlite lock work runs once")();
-                let cleanup = fs::remove_file(&lock_path);
-                if let Err(error) = cleanup
-                    && result.is_ok()
-                {
-                    return Err(error.into());
-                }
-                return result;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if remove_stale_lowered_sqlite_lock(&lock_path)? {
-                    continue;
-                }
-                if started.elapsed() >= LOWERED_SQLITE_LOCK_TIMEOUT {
-                    return Err(format!(
-                        "timed out waiting for lowered SQLite lock: {}",
-                        lock_path.display()
-                    )
-                    .into());
-                }
-                thread::sleep(LOWERED_SQLITE_LOCK_POLL);
-            }
-            Err(error) => return Err(error.into()),
+        if let Some(_lock) = try_lowered_sqlite_lock(cache_dir, project)? {
+            return work();
         }
+        if started.elapsed() >= LOWERED_SQLITE_LOCK_TIMEOUT {
+            return Err(format!(
+                "timed out waiting for lowered SQLite lock: {}",
+                lowered_sqlite_lock_path(cache_dir, project).display()
+            )
+            .into());
+        }
+        thread::sleep(LOWERED_SQLITE_LOCK_POLL);
+    }
+}
+
+fn try_lowered_sqlite_lock(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<LoweredSqliteLock>, DynError> {
+    fs::create_dir_all(cache_dir)?;
+    let lock_path = lowered_sqlite_lock_path(cache_dir, project);
+    let mut lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {
+            lock.set_len(0)?;
+            writeln!(lock, "pid={}", std::process::id())?;
+            lock.sync_all()?;
+            Ok(Some(LoweredSqliteLock {
+                _file: lock,
+                path: lock_path,
+            }))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -7351,6 +7344,92 @@ mod tests {
     }
 
     #[test]
+    fn lowered_sqlite_lock_reports_busy_until_owner_drops() {
+        let dir = temp_dir("lowered-sqlite-lock");
+        fs::create_dir_all(&dir).unwrap();
+        let first = try_lowered_sqlite_lock(&dir, "demo")
+            .unwrap()
+            .expect("first process owns lowered SQLite regeneration");
+        let lock_path = lowered_sqlite_lock_path(&dir, "demo");
+        assert!(lock_path.exists());
+        assert!(fs::read_to_string(&lock_path).unwrap().contains("pid="));
+        assert!(
+            try_lowered_sqlite_lock(&dir, "demo").unwrap().is_none(),
+            "second owner must observe the live lowered SQLite lock as busy"
+        );
+
+        drop(first);
+        assert!(!lock_path.exists());
+        let second = try_lowered_sqlite_lock(&dir, "demo")
+            .unwrap()
+            .expect("lowered SQLite lock releases on owner drop");
+        drop(second);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lowered_sqlite_lock_releases_after_owner_process_kill() {
+        let dir = temp_dir("lowered-sqlite-kill");
+        fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("owner.ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("migration::tests::lowered_sqlite_lock_child_process")
+            .arg("--nocapture")
+            .env("ASTROLABE_LOWERED_LOCK_CHILD", "1")
+            .env("ASTROLABE_LOWERED_LOCK_CACHE", &dir)
+            .env("ASTROLABE_LOWERED_LOCK_PROJECT", "demo")
+            .env("ASTROLABE_LOWERED_LOCK_READY", &ready)
+            .spawn()
+            .expect("spawn lowered SQLite lock child");
+
+        wait_for_file_or_child_exit(&ready, &mut child);
+        assert!(
+            try_lowered_sqlite_lock(&dir, "demo").unwrap().is_none(),
+            "parent must observe the live child owner as busy"
+        );
+
+        child.kill().expect("kill lowered SQLite lock child");
+        let status = child.wait().expect("wait for lowered SQLite lock child");
+        assert!(
+            !status.success(),
+            "child should be killed while holding lowered SQLite lock"
+        );
+
+        let recovered = wait_for_lowered_sqlite_lock(&dir, "demo");
+        drop(recovered);
+        assert!(
+            !lowered_sqlite_lock_path(&dir, "demo").exists(),
+            "new owner drop removes the crash-left lowered SQLite lock marker"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "child process helper for lowered_sqlite_lock_releases_after_owner_process_kill"]
+    fn lowered_sqlite_lock_child_process() {
+        if std::env::var_os("ASTROLABE_LOWERED_LOCK_CHILD").is_none() {
+            return;
+        }
+        let cache_dir = PathBuf::from(
+            std::env::var_os("ASTROLABE_LOWERED_LOCK_CACHE").expect("ASTROLABE_LOWERED_LOCK_CACHE"),
+        );
+        let project = std::env::var("ASTROLABE_LOWERED_LOCK_PROJECT")
+            .expect("ASTROLABE_LOWERED_LOCK_PROJECT");
+        let ready = PathBuf::from(
+            std::env::var_os("ASTROLABE_LOWERED_LOCK_READY").expect("ASTROLABE_LOWERED_LOCK_READY"),
+        );
+        let _lock = try_lowered_sqlite_lock(&cache_dir, &project)
+            .unwrap()
+            .expect("child owns lowered SQLite lock");
+        fs::write(&ready, b"ready").expect("write child ready marker");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
     fn shadow_import_status_labels_unverified_state() {
         let current = shadow_import_current_summary("intact", true);
         assert_eq!(current["status"], "current");
@@ -8497,6 +8576,20 @@ mod tests {
         panic!(
             "timed out waiting to reacquire shadow import lock {}",
             shadow_import_lock_path(cache_dir, project).display()
+        );
+    }
+
+    fn wait_for_lowered_sqlite_lock(cache_dir: &Path, project: &str) -> LoweredSqliteLock {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(lock) = try_lowered_sqlite_lock(cache_dir, project).unwrap() {
+                return lock;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "timed out waiting to reacquire lowered SQLite lock {}",
+            lowered_sqlite_lock_path(cache_dir, project).display()
         );
     }
 }

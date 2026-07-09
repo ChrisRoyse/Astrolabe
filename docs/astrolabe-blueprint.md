@@ -453,11 +453,13 @@ concurrent open; write commits are serialized by the per-vault OS file lock
 `locks/durable.commit.lock`, and recurrence writes use
 `locks/recurrence.write.lock`. Shadow-stage Astrolabe therefore permits every
 process to keep serving legacy tools from SQLite while vault imports serialize
-through Aster's durable commit lock. Shadow-stage vault-backed background lane
-activation is gated by a per-project `.astrolabe-background-lane.lock`: exactly
-one process is elected owner, followers report `stale_ok`/`provisional` with
-remediation, and watcher/anneal workers remain explicitly inactive until those
-lanes are enabled.
+through Aster's durable commit lock. Lowered SQLite sidecar regeneration is
+also serialized by a per-project OS file lock at `.astrolabe-lowered.lock`; an
+owner death releases the OS lock and the next owner rewrites/removes the marker.
+Shadow-stage vault-backed background lane activation is gated by a per-project
+`.astrolabe-background-lane.lock`: exactly one process is elected owner,
+followers report `stale_ok`/`provisional` with remediation, and watcher/anneal
+workers remain explicitly inactive until those lanes are enabled.
 
 ## 3. Storage architecture (D3)
 
@@ -1707,7 +1709,7 @@ Unmodified CBM behavior. The dial exists so one binary serves all stages.
 - CBM pipeline runs exactly as today â†’ SQLite `.db` (still the serving store for all 14 tools).
 - **Post-index import** (zero-FFI, D2): `astrolabe-ingest` reads the freshly-dumped SQLite â†’ builds constellations, edges, series, recurrence into the vault; ledger records the import with the SQLite content fingerprint.
 - New tools (`anchor_outcome`, `measure_bits`, `get_kernel`, `get_context_pack`, â€¦) serve **from the vault**; legacy tools serve from SQLite. Two stores, one writer each, clearly labeled.
-- Multi-agent/process behavior: all processes may serve legacy SQLite reads; shadow imports share one Aster vault and serialize durable commits through `locks/durable.commit.lock`; lowered SQLite sidecar regeneration serializes through a per-project `.astrolabe-lowered.lock`; background-lane ownership is elected through `.astrolabe-background-lane.lock`, with followers labeled `stale_ok`/`provisional` and watcher/anneal workers explicitly inactive in shadow stage.
+- Multi-agent/process behavior: all processes may serve legacy SQLite reads; shadow imports share one Aster vault and serialize durable commits through `locks/durable.commit.lock`; lowered SQLite sidecar regeneration serializes through a per-project OS file lock at `.astrolabe-lowered.lock` and owner death releases it; background-lane ownership is elected through `.astrolabe-background-lane.lock`, with followers labeled `stale_ok`/`provisional` and watcher/anneal workers explicitly inactive in shadow stage.
 - **Parity harness** runs continuously (20 Â§3): node/edge counts, search-overlap metrics, spot symbol equality. Divergence â‡’ shadow flagged, never silent.
 - Rollback = ignore the vault. Cost: disk (vault alongside SQLite), one extra import pass (~minutes at L).
 
@@ -1930,7 +1932,7 @@ Every identified risk, honestly stated, with mitigation and owner-phase. Severit
 | R25 | Ledger growth unbounded on busy monorepos | ðŸŸ¡ | checkpoints + Merkle export; ledger is hashes-only (tiny rows); measured: ~1KB/mutation â‡’ GBs/year at extreme scale â€” acceptable; archival tiering available |
 | R26 | Lowered-SQLite staleness confuses legacy consumers | ðŸŸ¡ | vault fingerprint + `stale_by` surfaced; debounced regen; `fresh` force option |
 | R27 | Erasure/PII: proprietary code in vaults, secrets in history | ðŸŸ  | CBM secret filters upstream + Calyx redaction + erasure tombstones (13 Â§5); vaults are local-only by default (no egress) |
-| R31 | Multiple agent MCP processes contend for one Aster vault | ðŸŸ  | Aster durable commits are OS-file-lock serialized; lowered SQLite sidecar writes use a per-project sidecar lock; shadow legacy reads stay on SQLite; background-lane ownership uses a per-project OS file lock with labeled followers and inactive shadow-stage watcher/anneal workers; cross-process harness verifies no corruption/deadlock and exactly one owner |
+| R31 | Multiple agent MCP processes contend for one Aster vault | ðŸŸ  | Aster durable commits are OS-file-lock serialized; lowered SQLite sidecar writes use a per-project OS file lock with owner-death release; shadow legacy reads stay on SQLite; background-lane ownership uses a per-project OS file lock with labeled followers and inactive shadow-stage watcher/anneal workers; cross-process harness verifies no corruption/deadlock and exactly one owner |
 
 ## Product & ecosystem
 
