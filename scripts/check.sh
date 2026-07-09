@@ -47,6 +47,7 @@ bash scripts/check-mcp-parity.sh
 "$PYTHON_BIN" scripts/check-installer-roundtrip.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-hook-contracts.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-server-manifest.py
+"$PYTHON_BIN" scripts/check-egress-deny.py --astrolabe "$ROOT/target/debug/astrolabe"
 if [[ "${ASTROLABE_CHECK_UI_SMOKE:-0}" == "1" ]]; then
   "$PYTHON_BIN" scripts/check-lowered-parity.py --ui-smoke
 else
