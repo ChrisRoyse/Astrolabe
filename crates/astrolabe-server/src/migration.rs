@@ -33,6 +33,12 @@ use astrolabe_kernel::{
 };
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
+use astrolabe_provenance::{
+    AnswerHop, AnswerTrace, ChainStatus, ChainVerification, Freshness, GET_PROVENANCE_SCHEMA,
+    LedgerPointer, PackManifest, ProvenancePayload, ProvenanceQuery, ProvenanceResponse,
+    ProvenanceStore, ReproduceRecord, SymbolLineage, get_provenance,
+    provenance_response_artifact_bytes,
+};
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
     anomaly_report_artifact_bytes, detect_anomalies,
@@ -58,6 +64,7 @@ const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
 const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
+const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -119,6 +126,7 @@ struct ShadowImportOutcome {
     bridges: Value,
     kernel_context: Value,
     anomalies: Value,
+    provenance: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +138,7 @@ struct RowSinkSnapshot {
     bridges: Value,
     kernel_context: Value,
     anomalies: Value,
+    provenance: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +157,7 @@ struct ShadowVaultImport {
     bridges: Value,
     kernel_context: Value,
     anomalies: Value,
+    provenance: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +231,7 @@ pub fn handle_tool_raw(
         "index_status" => handle_index_status(runner, args_json),
         "get_architecture" => handle_get_architecture(runner, args_json),
         "detect_anomalies" => handle_detect_anomalies(args_json),
+        "get_provenance" => handle_get_provenance(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -259,6 +270,7 @@ pub fn handle_jsonrpc_raw(
         && tool_name != "index_status"
         && tool_name != "get_architecture"
         && tool_name != "detect_anomalies"
+        && tool_name != "get_provenance"
     {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
@@ -303,6 +315,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
         "detect_anomalies" => Ok(true),
+        "get_provenance" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -453,6 +466,7 @@ fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<St
                 "bridges": read_bridges_metadata(&cache_dir, &project)?,
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
                 "anomalies": read_anomaly_report_metadata(&cache_dir, &project)?,
+                "provenance": read_provenance_metadata(&cache_dir, &project)?,
             },
         }),
     )
@@ -479,6 +493,44 @@ fn handle_detect_anomalies(args_json: &str) -> Result<String, DynError> {
         Err(error) => return tool_error_result(error.to_string()),
     };
     tool_json_result(filtered)
+}
+
+fn handle_get_provenance(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("get_provenance arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("get_provenance requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "get_provenance requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let Some(mode) = string_arg(args_obj, "mode") else {
+        return tool_error_result(
+            "get_provenance requires mode: lineage, answer_trace, verify_chain, or reproduce",
+        );
+    };
+    let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let store = match provenance_store_for_project(&cache_dir, &project) {
+        Ok(store) => store,
+        Err(error) => return tool_error_result(error.to_string()),
+    };
+    let response = match get_provenance(&store, &ProvenanceQuery::new(mode, subject_id)) {
+        Ok(response) => response,
+        Err(error) => {
+            return tool_error_result(format!(
+                "{}: {}; remediation: {}",
+                error.code(),
+                error.message(),
+                error.remediation()
+            ));
+        }
+    };
+    tool_json_result(provenance_response_json(&project, &response))
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -753,6 +805,12 @@ fn import_shadow_vault(
     }
     let total_records = (report.sqlite_nodes as u64).saturating_add(report.sqlite_edges as u64);
     let search_scale = search_scale_summary(search_scale_settings, total_records)?;
+    let provenance = provenance_surface_with_chain(
+        shadow_import.provenance,
+        &lower_report.vault_fingerprint_sha256,
+        lower_report.manifest_seq,
+        &verify,
+    );
 
     Ok(ShadowImportOutcome {
         vault_dir,
@@ -787,6 +845,7 @@ fn import_shadow_vault(
         bridges: shadow_import.bridges,
         kernel_context: shadow_import.kernel_context,
         anomalies: shadow_import.anomalies,
+        provenance,
     })
 }
 
@@ -808,6 +867,7 @@ where
             let bridges = snapshot.bridges.clone();
             let kernel_context = snapshot.kernel_context.clone();
             let anomalies = snapshot.anomalies.clone();
+            let provenance = snapshot.provenance.clone();
             match import_cbm_graph_snapshot_to_vault_direct(
                 &snapshot.snapshot,
                 snapshot.source_fingerprint_sha256,
@@ -824,6 +884,7 @@ where
                     bridges,
                     kernel_context,
                     anomalies,
+                    provenance,
                 }),
                 Err(error) => {
                     let reason = format!("row-sink direct import failed: {error}");
@@ -837,6 +898,7 @@ where
                         bridges,
                         kernel_context,
                         anomalies,
+                        provenance,
                     })
                 }
             }
@@ -849,6 +911,7 @@ where
             let bridges = bridges_unavailable_json(&reason);
             let kernel_context = kernel_context_unavailable_json(&reason);
             let anomalies = anomaly_report_unavailable_json(&reason);
+            let provenance = provenance_unavailable_json(&reason);
             Ok(ShadowVaultImport {
                 report,
                 source: "sqlite_fallback".to_string(),
@@ -858,6 +921,7 @@ where
                 bridges,
                 kernel_context,
                 anomalies,
+                provenance,
             })
         }
         None => {
@@ -875,6 +939,7 @@ where
                 bridges: bridges_unavailable_json(reason),
                 kernel_context: kernel_context_unavailable_json(reason),
                 anomalies: anomaly_report_unavailable_json(reason),
+                provenance: provenance_unavailable_json(reason),
             })
         }
     }
@@ -892,6 +957,7 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
     let bridges = bridges_from_row_sink_rows(&rows);
     let kernel_context = kernel_context_from_row_sink_rows(&rows);
     let anomalies = anomalies_from_row_sink_rows(&rows);
+    let provenance = provenance_from_row_sink_rows(&rows);
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
         snapshot: pipeline_rows_to_graph_snapshot(rows),
         source_fingerprint_sha256,
@@ -900,6 +966,7 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
         bridges,
         kernel_context,
         anomalies,
+        provenance,
     }))
 }
 
@@ -2395,6 +2462,876 @@ fn filter_anomaly_report_json(
     Ok(report)
 }
 
+fn provenance_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let fingerprint = hex_lower(&row_sink_fingerprint(rows));
+    let ledger_head = LedgerPointer::new(0, format!("row-sink:{fingerprint}"));
+    let mut store = ProvenanceStore {
+        vault_fingerprint: format!("row-sink:{fingerprint}"),
+        ledger_head: ledger_head.clone(),
+        chain: ChainVerification {
+            status: ChainStatus::Intact,
+            checked_from: 0,
+            checked_to: 0,
+            provenance: ledger_head,
+        },
+        symbols: BTreeMap::new(),
+        answers: BTreeMap::new(),
+        reproductions: BTreeMap::new(),
+        manifests: BTreeMap::new(),
+    };
+    let mut skipped_properties = 0usize;
+
+    for node in &rows.nodes {
+        let properties = match serde_json::from_str::<Value>(&node.properties_json) {
+            Ok(properties) => properties,
+            Err(_) => {
+                skipped_properties += 1;
+                continue;
+            }
+        };
+        if let Some(lineage) = symbol_lineage_from_node(node, &properties, &mut skipped_properties)
+        {
+            store.symbols.insert(lineage.symbol_id.clone(), lineage);
+        }
+        if let Some(trace) = answer_trace_from_properties(&properties, &mut skipped_properties) {
+            store.answers.insert(trace.answer_id.clone(), trace);
+        }
+        if let Some(record) = reproduce_record_from_properties(&properties, &mut skipped_properties)
+        {
+            store.reproductions.insert(record.answer_id.clone(), record);
+        }
+        if let Some(manifest) = pack_manifest_from_properties(
+            &properties,
+            &store.vault_fingerprint,
+            &mut skipped_properties,
+        ) {
+            store.manifests.insert(manifest.pack_id.clone(), manifest);
+        }
+    }
+
+    if store.symbols.is_empty()
+        && store.answers.is_empty()
+        && store.reproductions.is_empty()
+        && store.manifests.is_empty()
+    {
+        return provenance_unavailable_json(
+            "provenance metadata missing; row-sink nodes must declare provenance_lineage, provenance_answer, provenance_reproduce, or provenance_manifest blocks",
+        );
+    }
+
+    provenance_surface_json(&store, skipped_properties)
+}
+
+fn symbol_lineage_from_node(
+    node: &astrolabe_bridge::CbmPipelineNodeRow,
+    properties: &Value,
+    skipped_properties: &mut usize,
+) -> Option<SymbolLineage> {
+    if node.qualified_name.trim().is_empty() || node.label.eq_ignore_ascii_case("project") {
+        return None;
+    }
+    let events = properties
+        .get("provenance_lineage")
+        .or_else(|| properties.get("lineage_events"))
+        .and_then(Value::as_array)?;
+    let symbol_id = properties
+        .get("provenance_symbol_id")
+        .or_else(|| properties.get("symbol_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&node.qualified_name);
+    let versions = events
+        .iter()
+        .filter_map(|event| lineage_event_from_value(event, skipped_properties))
+        .collect::<Vec<_>>();
+    if versions.is_empty() {
+        *skipped_properties += 1;
+        return None;
+    }
+    Some(SymbolLineage {
+        symbol_id: symbol_id.to_string(),
+        versions,
+    })
+}
+
+fn lineage_event_from_value(
+    value: &Value,
+    skipped_properties: &mut usize,
+) -> Option<astrolabe_provenance::LineageEvent> {
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let ledger = value
+        .get("ledger")
+        .and_then(ledger_pointer_from_value)
+        .or_else(|| ledger_pointer_from_value(value));
+    let summary = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(kind), Some(ledger), Some(summary)) = (kind, ledger, summary) else {
+        *skipped_properties += 1;
+        return None;
+    };
+    Some(astrolabe_provenance::LineageEvent {
+        kind: kind.to_string(),
+        ledger,
+        summary: summary.to_string(),
+    })
+}
+
+fn answer_trace_from_properties(
+    properties: &Value,
+    skipped_properties: &mut usize,
+) -> Option<AnswerTrace> {
+    let value = properties
+        .get("provenance_answer")
+        .or_else(|| properties.get("answer_trace"))?;
+    let Some(answer_id) = value
+        .get("answer_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        *skipped_properties += 1;
+        return None;
+    };
+    let kernel_entry = optional_ledger_pointer_field(value, "kernel_entry", skipped_properties);
+    let fusion_weights_ref =
+        optional_ledger_pointer_field(value, "fusion_weights_ref", skipped_properties);
+    let guard_verdict_ref =
+        optional_ledger_pointer_field(value, "guard_verdict_ref", skipped_properties);
+    let hops = value
+        .get("hops")
+        .and_then(Value::as_array)
+        .map(|hops| {
+            hops.iter()
+                .filter_map(|hop| answer_hop_from_value(hop, skipped_properties))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let max_seq = [
+        kernel_entry.as_ref(),
+        fusion_weights_ref.as_ref(),
+        guard_verdict_ref.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pointer| pointer.seq)
+    .chain(hops.iter().map(|hop| hop.ledger.seq))
+    .max()
+    .unwrap_or(0);
+    let freshness = value
+        .get("freshness")
+        .and_then(freshness_from_value)
+        .unwrap_or_else(|| Freshness::fresh(max_seq));
+    Some(AnswerTrace {
+        answer_id: answer_id.to_string(),
+        kernel_entry,
+        hops,
+        fusion_weights_ref,
+        guard_verdict_ref,
+        freshness,
+    })
+}
+
+fn answer_hop_from_value(value: &Value, skipped_properties: &mut usize) -> Option<AnswerHop> {
+    let from_symbol = value
+        .get("from_symbol")
+        .or_else(|| value.get("from"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let to_symbol = value
+        .get("to_symbol")
+        .or_else(|| value.get("to"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let ledger = value.get("ledger").and_then(ledger_pointer_from_value);
+    let (Some(from_symbol), Some(to_symbol), Some(ledger)) = (from_symbol, to_symbol, ledger)
+    else {
+        *skipped_properties += 1;
+        return None;
+    };
+    Some(AnswerHop {
+        from_symbol: from_symbol.to_string(),
+        to_symbol: to_symbol.to_string(),
+        ledger,
+    })
+}
+
+fn reproduce_record_from_properties(
+    properties: &Value,
+    skipped_properties: &mut usize,
+) -> Option<ReproduceRecord> {
+    let value = properties
+        .get("provenance_reproduce")
+        .or_else(|| properties.get("reproduce_record"))?;
+    let answer_id = value
+        .get("answer_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let recorded_digest = value
+        .get("recorded_digest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_digest = value
+        .get("current_digest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let drift_microunits = value.get("drift_microunits").and_then(Value::as_u64);
+    let drift_bound_microunits = value.get("drift_bound_microunits").and_then(Value::as_u64);
+    let ledger = value.get("ledger").and_then(ledger_pointer_from_value);
+    let (
+        Some(answer_id),
+        Some(recorded_digest),
+        Some(current_digest),
+        Some(drift_microunits),
+        Some(drift_bound_microunits),
+        Some(ledger),
+    ) = (
+        answer_id,
+        recorded_digest,
+        current_digest,
+        drift_microunits,
+        drift_bound_microunits,
+        ledger,
+    )
+    else {
+        *skipped_properties += 1;
+        return None;
+    };
+    Some(ReproduceRecord {
+        answer_id: answer_id.to_string(),
+        recorded_digest: recorded_digest.to_string(),
+        current_digest: current_digest.to_string(),
+        drift_microunits,
+        drift_bound_microunits,
+        ledger,
+    })
+}
+
+fn pack_manifest_from_properties(
+    properties: &Value,
+    default_vault_fingerprint: &str,
+    skipped_properties: &mut usize,
+) -> Option<PackManifest> {
+    let value = properties
+        .get("provenance_manifest")
+        .or_else(|| properties.get("pack_manifest"))?;
+    let pack_id = value
+        .get("pack_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let ledger_ref = value.get("ledger_ref").and_then(ledger_pointer_from_value);
+    let member_hash = value
+        .get("member_hash")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(pack_id), Some(ledger_ref), Some(member_hash)) = (pack_id, ledger_ref, member_hash)
+    else {
+        *skipped_properties += 1;
+        return None;
+    };
+    let vault_fingerprint = value
+        .get("vault_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_vault_fingerprint);
+    Some(PackManifest {
+        pack_id: pack_id.to_string(),
+        ledger_ref,
+        vault_fingerprint: vault_fingerprint.to_string(),
+        member_hash: member_hash.to_string(),
+    })
+}
+
+fn optional_ledger_pointer_field(
+    value: &Value,
+    field: &str,
+    skipped_properties: &mut usize,
+) -> Option<LedgerPointer> {
+    let raw = value.get(field)?;
+    let pointer = ledger_pointer_from_value(raw);
+    if pointer.is_none() {
+        *skipped_properties += 1;
+    }
+    pointer
+}
+
+fn ledger_pointer_from_value(value: &Value) -> Option<LedgerPointer> {
+    let seq = value
+        .get("seq")
+        .or_else(|| value.get("ledger_seq"))
+        .and_then(Value::as_u64)?;
+    let chain_hash = value
+        .get("chain_hash")
+        .or_else(|| value.get("ledger_hash"))
+        .or_else(|| value.get("hash"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(LedgerPointer::new(seq, chain_hash))
+}
+
+fn freshness_from_value(value: &Value) -> Option<Freshness> {
+    let seq = value.get("seq").and_then(Value::as_u64)?;
+    let stale_by = value
+        .get("stale_by")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some(Freshness { seq, stale_by })
+}
+
+fn provenance_surface_with_chain(
+    mut surface: Value,
+    vault_fingerprint: &str,
+    ledger_seq: u64,
+    verify: &astrolabe_ingest::VerifyChainReport,
+) -> Value {
+    if surface.get("status").and_then(Value::as_str) == Some("unavailable") {
+        return surface;
+    }
+    let ledger_head = LedgerPointer::new(ledger_seq, vault_fingerprint);
+    let chain = chain_verification_from_report(verify, ledger_head.clone());
+    if let Some(store) = surface.get_mut("store").and_then(Value::as_object_mut) {
+        store.insert(
+            "vault_fingerprint".to_string(),
+            Value::String(vault_fingerprint.to_string()),
+        );
+        store.insert("ledger_head".to_string(), ledger_pointer_json(&ledger_head));
+        store.insert("chain".to_string(), chain_verification_json(&chain));
+        refresh_manifest_vault_fingerprints(store, vault_fingerprint);
+    }
+    surface["vault_fingerprint"] = Value::String(vault_fingerprint.to_string());
+    surface["ledger_head"] = ledger_pointer_json(&ledger_head);
+    surface["chain"] = chain_verification_json(&chain);
+    if let Some(store) = surface.get("store") {
+        surface["artifact_sha256"] = Value::String(hex_lower(&Sha256::digest(
+            provenance_store_artifact_bytes(store),
+        )));
+    }
+    surface
+}
+
+fn refresh_manifest_vault_fingerprints(store: &mut Map<String, Value>, vault_fingerprint: &str) {
+    let Some(manifests) = store.get_mut("manifests").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for manifest in manifests.values_mut() {
+        let should_replace = manifest
+            .get("vault_fingerprint")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.is_empty() || value.starts_with("row-sink:"));
+        if should_replace && let Some(manifest_obj) = manifest.as_object_mut() {
+            manifest_obj.insert(
+                "vault_fingerprint".to_string(),
+                Value::String(vault_fingerprint.to_string()),
+            );
+        }
+    }
+}
+
+fn chain_verification_from_report(
+    verify: &astrolabe_ingest::VerifyChainReport,
+    provenance: LedgerPointer,
+) -> ChainVerification {
+    let status = match verify.status.as_str() {
+        "intact" => ChainStatus::Intact,
+        "broken" => ChainStatus::Broken {
+            seq: verify.at_seq.unwrap_or(verify.checked_range_end),
+        },
+        "corrupt" => ChainStatus::Corrupt {
+            seq: verify.at_seq.unwrap_or(verify.checked_range_end),
+            reason: verify
+                .reason
+                .clone()
+                .unwrap_or_else(|| "ledger verifier reported corruption".to_string()),
+        },
+        other => ChainStatus::Corrupt {
+            seq: verify.at_seq.unwrap_or(verify.checked_range_end),
+            reason: format!("unknown ledger verifier status {other}"),
+        },
+    };
+    ChainVerification {
+        status,
+        checked_from: verify.checked_range_start,
+        checked_to: verify.checked_range_end.saturating_sub(1),
+        provenance,
+    }
+}
+
+fn provenance_surface_json(store: &ProvenanceStore, skipped_properties: usize) -> Value {
+    let store_json = provenance_store_json(store);
+    let artifact_bytes = provenance_store_artifact_bytes(&store_json);
+    let total_records = store.symbols.len()
+        + store.answers.len()
+        + store.reproductions.len()
+        + store.manifests.len();
+    json!({
+        "schema": PROVENANCE_SURFACE_SCHEMA,
+        "tool_schema": GET_PROVENANCE_SCHEMA,
+        "status": if skipped_properties == 0 { "built" } else { "partial" },
+        "record_count": total_records,
+        "symbol_count": store.symbols.len(),
+        "answer_count": store.answers.len(),
+        "reproduce_count": store.reproductions.len(),
+        "manifest_count": store.manifests.len(),
+        "metadata_skipped_count": skipped_properties,
+        "vault_fingerprint": store.vault_fingerprint,
+        "ledger_head": ledger_pointer_json(&store.ledger_head),
+        "chain": chain_verification_json(&store.chain),
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "store": store_json,
+        "freshness": "fresh",
+        "trust": if skipped_properties == 0 { "verified" } else { "provisional" },
+    })
+}
+
+fn provenance_store_artifact_bytes(store_json: &Value) -> Vec<u8> {
+    serde_json::to_vec(store_json).unwrap_or_default()
+}
+
+fn provenance_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": PROVENANCE_SURFACE_SCHEMA,
+        "tool_schema": GET_PROVENANCE_SCHEMA,
+        "status": "unavailable",
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with explicit provenance metadata before using get_provenance",
+    })
+}
+
+fn read_provenance_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "provenance_json"))? else {
+        return Ok(provenance_unavailable_json(
+            "provenance metadata missing; rerun index_repository with calyx shadow",
+        ));
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(provenance_unavailable_json(&format!(
+            "stored provenance_json invalid: {error}"
+        ))),
+    }
+}
+
+fn provenance_store_for_project(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<ProvenanceStore, DynError> {
+    let surface = read_provenance_metadata(cache_dir, project)?;
+    if surface.get("status").and_then(Value::as_str) == Some("unavailable") {
+        let reason = surface
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("provenance metadata unavailable");
+        let remediation = surface
+            .get("remediation")
+            .and_then(Value::as_str)
+            .unwrap_or("rerun index_repository with explicit provenance metadata");
+        return Err(format!("{reason}; remediation: {remediation}").into());
+    }
+    let mut store = provenance_store_from_json(
+        surface
+            .get("store")
+            .ok_or("stored provenance_json missing store")?,
+    )?;
+    let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
+    if !configured_vault_dir.exists() {
+        return Err(format!(
+            "get_provenance cannot verify shadow vault bytes; vault dir missing: {}",
+            configured_vault_dir.display()
+        )
+        .into());
+    }
+    let verify = astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)?;
+    let chain_hash = read_config_value(
+        cache_dir,
+        &metadata_key(project, "lowered_vault_fingerprint_sha256"),
+    )?
+    .unwrap_or_else(|| store.ledger_head.chain_hash.clone());
+    let ledger_seq = read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(store.ledger_head.seq);
+    let ledger_head = LedgerPointer::new(ledger_seq, chain_hash.clone());
+    store.vault_fingerprint = chain_hash;
+    store.ledger_head = ledger_head.clone();
+    store.chain = chain_verification_from_report(&verify, ledger_head);
+    Ok(store)
+}
+
+fn provenance_store_json(store: &ProvenanceStore) -> Value {
+    json!({
+        "vault_fingerprint": store.vault_fingerprint,
+        "ledger_head": ledger_pointer_json(&store.ledger_head),
+        "chain": chain_verification_json(&store.chain),
+        "symbols": value_map(store.symbols.iter().map(|(key, lineage)| {
+            (key.clone(), symbol_lineage_json(lineage))
+        })),
+        "answers": value_map(store.answers.iter().map(|(key, trace)| {
+            (key.clone(), answer_trace_json(trace))
+        })),
+        "reproductions": value_map(store.reproductions.iter().map(|(key, record)| {
+            (key.clone(), reproduce_record_json(record))
+        })),
+        "manifests": value_map(store.manifests.iter().map(|(key, manifest)| {
+            (key.clone(), pack_manifest_json(manifest))
+        })),
+    })
+}
+
+fn provenance_store_from_json(value: &Value) -> Result<ProvenanceStore, DynError> {
+    let object = required_object(value, "provenance store")?;
+    let symbols = object
+        .get("symbols")
+        .and_then(Value::as_object)
+        .ok_or("provenance store missing symbols")?
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), symbol_lineage_from_json(value)?)))
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    let answers = object
+        .get("answers")
+        .and_then(Value::as_object)
+        .ok_or("provenance store missing answers")?
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), answer_trace_from_json(value)?)))
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    let reproductions = object
+        .get("reproductions")
+        .and_then(Value::as_object)
+        .ok_or("provenance store missing reproductions")?
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), reproduce_record_from_json(value)?)))
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    let manifests = object
+        .get("manifests")
+        .and_then(Value::as_object)
+        .ok_or("provenance store missing manifests")?
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), pack_manifest_from_json(value)?)))
+        .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+    Ok(ProvenanceStore {
+        vault_fingerprint: required_string_field(value, "vault_fingerprint")?,
+        ledger_head: ledger_pointer_from_json(required_value_field(value, "ledger_head")?)?,
+        chain: chain_verification_from_json(required_value_field(value, "chain")?)?,
+        symbols,
+        answers,
+        reproductions,
+        manifests,
+    })
+}
+
+fn provenance_response_json(project: &str, response: &ProvenanceResponse) -> Value {
+    let artifact_bytes = provenance_response_artifact_bytes(response);
+    json!({
+        "schema": response.schema,
+        "project": project,
+        "status": "built",
+        "mode": response.mode.as_str(),
+        "trust": response.trust,
+        "freshness": freshness_json(&response.freshness),
+        "provenance": ledger_pointer_json(&response.provenance),
+        "warning_count": response.warnings.len(),
+        "warnings": response.warnings.iter().map(|warning| {
+            json!({
+                "code": warning.code,
+                "message": warning.message,
+            })
+        }).collect::<Vec<_>>(),
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "payload": provenance_payload_json(&response.payload),
+    })
+}
+
+fn provenance_payload_json(payload: &ProvenancePayload) -> Value {
+    match payload {
+        ProvenancePayload::Lineage(lineage) => {
+            json!({
+                "kind": "lineage",
+                "lineage": symbol_lineage_json(lineage),
+            })
+        }
+        ProvenancePayload::AnswerTrace(trace) => {
+            json!({
+                "kind": "answer_trace",
+                "answer_trace": answer_trace_json(trace),
+            })
+        }
+        ProvenancePayload::VerifyChain(chain) => {
+            json!({
+                "kind": "verify_chain",
+                "verify_chain": chain_verification_json(chain),
+            })
+        }
+        ProvenancePayload::Reproduce(report) => {
+            json!({
+                "kind": "reproduce",
+                "reproduce": {
+                    "answer_id": report.answer_id,
+                    "bit_exact": report.bit_exact,
+                    "drift_microunits": report.drift_microunits,
+                    "drift_bound_microunits": report.drift_bound_microunits,
+                    "recorded_digest": report.recorded_digest,
+                    "current_digest": report.current_digest,
+                },
+            })
+        }
+    }
+}
+
+fn symbol_lineage_json(lineage: &SymbolLineage) -> Value {
+    json!({
+        "symbol_id": lineage.symbol_id,
+        "versions": lineage.versions.iter().map(|event| {
+            json!({
+                "kind": event.kind,
+                "ledger": ledger_pointer_json(&event.ledger),
+                "summary": event.summary,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn symbol_lineage_from_json(value: &Value) -> Result<SymbolLineage, DynError> {
+    Ok(SymbolLineage {
+        symbol_id: required_string_field(value, "symbol_id")?,
+        versions: required_value_field(value, "versions")?
+            .as_array()
+            .ok_or("symbol lineage versions must be an array")?
+            .iter()
+            .map(lineage_event_from_json)
+            .collect::<Result<Vec<_>, DynError>>()?,
+    })
+}
+
+fn lineage_event_from_json(value: &Value) -> Result<astrolabe_provenance::LineageEvent, DynError> {
+    Ok(astrolabe_provenance::LineageEvent {
+        kind: required_string_field(value, "kind")?,
+        ledger: ledger_pointer_from_json(required_value_field(value, "ledger")?)?,
+        summary: required_string_field(value, "summary")?,
+    })
+}
+
+fn answer_trace_json(trace: &AnswerTrace) -> Value {
+    json!({
+        "answer_id": trace.answer_id,
+        "kernel_entry": trace.kernel_entry.as_ref().map(ledger_pointer_json),
+        "hops": trace.hops.iter().map(answer_hop_json).collect::<Vec<_>>(),
+        "fusion_weights_ref": trace.fusion_weights_ref.as_ref().map(ledger_pointer_json),
+        "guard_verdict_ref": trace.guard_verdict_ref.as_ref().map(ledger_pointer_json),
+        "freshness": freshness_json(&trace.freshness),
+    })
+}
+
+fn answer_trace_from_json(value: &Value) -> Result<AnswerTrace, DynError> {
+    Ok(AnswerTrace {
+        answer_id: required_string_field(value, "answer_id")?,
+        kernel_entry: optional_ledger_pointer_from_json(value.get("kernel_entry"))?,
+        hops: required_value_field(value, "hops")?
+            .as_array()
+            .ok_or("answer trace hops must be an array")?
+            .iter()
+            .map(answer_hop_from_json)
+            .collect::<Result<Vec<_>, DynError>>()?,
+        fusion_weights_ref: optional_ledger_pointer_from_json(value.get("fusion_weights_ref"))?,
+        guard_verdict_ref: optional_ledger_pointer_from_json(value.get("guard_verdict_ref"))?,
+        freshness: freshness_from_json(required_value_field(value, "freshness")?)?,
+    })
+}
+
+fn answer_hop_json(hop: &AnswerHop) -> Value {
+    json!({
+        "from_symbol": hop.from_symbol,
+        "to_symbol": hop.to_symbol,
+        "ledger": ledger_pointer_json(&hop.ledger),
+    })
+}
+
+fn answer_hop_from_json(value: &Value) -> Result<AnswerHop, DynError> {
+    Ok(AnswerHop {
+        from_symbol: required_string_field(value, "from_symbol")?,
+        to_symbol: required_string_field(value, "to_symbol")?,
+        ledger: ledger_pointer_from_json(required_value_field(value, "ledger")?)?,
+    })
+}
+
+fn reproduce_record_json(record: &ReproduceRecord) -> Value {
+    json!({
+        "answer_id": record.answer_id,
+        "recorded_digest": record.recorded_digest,
+        "current_digest": record.current_digest,
+        "drift_microunits": record.drift_microunits,
+        "drift_bound_microunits": record.drift_bound_microunits,
+        "ledger": ledger_pointer_json(&record.ledger),
+    })
+}
+
+fn reproduce_record_from_json(value: &Value) -> Result<ReproduceRecord, DynError> {
+    Ok(ReproduceRecord {
+        answer_id: required_string_field(value, "answer_id")?,
+        recorded_digest: required_string_field(value, "recorded_digest")?,
+        current_digest: required_string_field(value, "current_digest")?,
+        drift_microunits: required_u64_field(value, "drift_microunits")?,
+        drift_bound_microunits: required_u64_field(value, "drift_bound_microunits")?,
+        ledger: ledger_pointer_from_json(required_value_field(value, "ledger")?)?,
+    })
+}
+
+fn pack_manifest_json(manifest: &PackManifest) -> Value {
+    json!({
+        "pack_id": manifest.pack_id,
+        "ledger_ref": ledger_pointer_json(&manifest.ledger_ref),
+        "vault_fingerprint": manifest.vault_fingerprint,
+        "member_hash": manifest.member_hash,
+    })
+}
+
+fn pack_manifest_from_json(value: &Value) -> Result<PackManifest, DynError> {
+    Ok(PackManifest {
+        pack_id: required_string_field(value, "pack_id")?,
+        ledger_ref: ledger_pointer_from_json(required_value_field(value, "ledger_ref")?)?,
+        vault_fingerprint: required_string_field(value, "vault_fingerprint")?,
+        member_hash: required_string_field(value, "member_hash")?,
+    })
+}
+
+fn ledger_pointer_json(pointer: &LedgerPointer) -> Value {
+    json!({
+        "seq": pointer.seq,
+        "chain_hash": pointer.chain_hash,
+    })
+}
+
+fn ledger_pointer_from_json(value: &Value) -> Result<LedgerPointer, DynError> {
+    Ok(LedgerPointer::new(
+        required_u64_field(value, "seq")?,
+        required_string_field(value, "chain_hash")?,
+    ))
+}
+
+fn optional_ledger_pointer_from_json(
+    value: Option<&Value>,
+) -> Result<Option<LedgerPointer>, DynError> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => ledger_pointer_from_json(value).map(Some),
+    }
+}
+
+fn freshness_json(freshness: &Freshness) -> Value {
+    json!({
+        "seq": freshness.seq,
+        "stale_by": freshness.stale_by,
+    })
+}
+
+fn freshness_from_json(value: &Value) -> Result<Freshness, DynError> {
+    let stale_by = value
+        .get("stale_by")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(Freshness {
+        seq: required_u64_field(value, "seq")?,
+        stale_by,
+    })
+}
+
+fn chain_verification_json(chain: &ChainVerification) -> Value {
+    let mut status = json!({
+        "status": chain.status.as_str(),
+    });
+    if let Some(status_obj) = status.as_object_mut() {
+        match &chain.status {
+            ChainStatus::Intact => {}
+            ChainStatus::Broken { seq } => {
+                status_obj.insert("seq".to_string(), json!(seq));
+            }
+            ChainStatus::Corrupt { seq, reason } => {
+                status_obj.insert("seq".to_string(), json!(seq));
+                status_obj.insert("reason".to_string(), json!(reason));
+            }
+        }
+    }
+    json!({
+        "status": status,
+        "checked_from": chain.checked_from,
+        "checked_to": chain.checked_to,
+        "provenance": ledger_pointer_json(&chain.provenance),
+    })
+}
+
+fn chain_verification_from_json(value: &Value) -> Result<ChainVerification, DynError> {
+    let status_value = required_value_field(value, "status")?;
+    let status = match required_string_field(status_value, "status")?.as_str() {
+        "intact" => ChainStatus::Intact,
+        "broken" => ChainStatus::Broken {
+            seq: required_u64_field(status_value, "seq")?,
+        },
+        "corrupt" => ChainStatus::Corrupt {
+            seq: required_u64_field(status_value, "seq")?,
+            reason: required_string_field(status_value, "reason")?,
+        },
+        other => return Err(format!("unknown provenance chain status {other}").into()),
+    };
+    Ok(ChainVerification {
+        status,
+        checked_from: required_u64_field(value, "checked_from")?,
+        checked_to: required_u64_field(value, "checked_to")?,
+        provenance: ledger_pointer_from_json(required_value_field(value, "provenance")?)?,
+    })
+}
+
+fn value_map(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
+    Value::Object(entries.into_iter().collect())
+}
+
+fn required_value_field<'a>(value: &'a Value, field: &str) -> Result<&'a Value, DynError> {
+    required_object(value, "object")?
+        .get(field)
+        .ok_or_else(|| format!("missing field {field}").into())
+}
+
+fn required_string_field(value: &Value, field: &str) -> Result<String, DynError> {
+    required_value_field(value, field)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("field {field} must be a string").into())
+}
+
+fn required_u64_field(value: &Value, field: &str) -> Result<u64, DynError> {
+    required_value_field(value, field)?
+        .as_u64()
+        .ok_or_else(|| format!("field {field} must be an unsigned integer").into())
+}
+
+fn required_object<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<&'a Map<String, Value>, DynError> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{context} must be a JSON object").into())
+}
+
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -2603,6 +3540,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "bridges": outcome.bridges.clone(),
         "kernel_context": outcome.kernel_context.clone(),
         "anomalies": outcome.anomalies.clone(),
+        "provenance": outcome.provenance.clone(),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -2677,6 +3615,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "bridges": read_bridges_metadata(cache_dir, project)?,
         "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
         "anomalies": read_anomaly_report_metadata(cache_dir, project)?,
+        "provenance": read_provenance_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -2930,6 +3869,7 @@ fn persist_shadow_outcome_at(
     let bridge_reports_json = serde_json::to_string(&outcome.bridges)?;
     let kernel_context_json = serde_json::to_string(&outcome.kernel_context)?;
     let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
+    let provenance_json = serde_json::to_string(&outcome.provenance)?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -2984,6 +3924,7 @@ fn persist_shadow_outcome_at(
         ("bridge_reports_json", bridge_reports_json),
         ("kernel_context_json", kernel_context_json),
         ("anomaly_report_json", anomaly_report_json),
+        ("provenance_json", provenance_json),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -3718,6 +4659,178 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
+        let provenance = provenance_from_row_sink_rows(&sample_provenance_rows());
+
+        assert_eq!(provenance["schema"], PROVENANCE_SURFACE_SCHEMA);
+        assert_eq!(provenance["tool_schema"], GET_PROVENANCE_SCHEMA);
+        assert_eq!(provenance["status"], "built");
+        assert_eq!(provenance["symbol_count"], 1);
+        assert_eq!(provenance["answer_count"], 2);
+        assert_eq!(provenance["reproduce_count"], 2);
+        assert_eq!(provenance["manifest_count"], 1);
+        assert_eq!(provenance["metadata_skipped_count"], 0);
+        assert_eq!(provenance["trust"], "verified");
+
+        let store = provenance_store_from_json(&provenance["store"]).unwrap();
+        for (mode, subject) in [
+            ("lineage", Some("auth.login")),
+            ("answer_trace", Some("answer:auth")),
+            ("verify_chain", None),
+            ("reproduce", Some("answer:auth")),
+        ] {
+            let response = get_provenance(&store, &ProvenanceQuery::new(mode, subject))
+                .expect("provenance mode response");
+            assert_eq!(response.schema, GET_PROVENANCE_SCHEMA);
+            assert!(matches!(response.trust, "verified" | "provisional"));
+            assert!(!response.provenance.chain_hash.is_empty());
+        }
+
+        let incomplete = get_provenance(
+            &store,
+            &ProvenanceQuery::new("answer_trace", Some("answer:incomplete")),
+        )
+        .expect("incomplete answer trace still returns labeled warnings");
+        assert_eq!(incomplete.trust, "provisional");
+        assert!(
+            incomplete
+                .warnings
+                .iter()
+                .all(|warning| warning.code == "unprovenanced")
+        );
+
+        let drift = get_provenance(
+            &store,
+            &ProvenanceQuery::new("reproduce", Some("answer:drifted")),
+        )
+        .expect_err("drift over bound must fail closed");
+        assert_eq!(drift.code(), astrolabe_provenance::REPRODUCE_DRIFT_EXCEEDED);
+
+        let missing = get_provenance(
+            &store,
+            &ProvenanceQuery::new("lineage", Some("auth.missing")),
+        )
+        .expect_err("unknown subject must fail closed");
+        assert_eq!(
+            missing.code(),
+            astrolabe_provenance::ASTRO_PROVENANCE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn provenance_summary_persists_reads_back_and_augments_architecture_payload() {
+        let dir = temp_dir("provenance-readback");
+        let provenance = sample_provenance();
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.provenance = provenance.clone();
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "provenance_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        let rehydrated = read_provenance_metadata(&dir, "demo").unwrap();
+        let summary = grounding_summary(&outcome);
+
+        assert_eq!(raw_value, provenance);
+        assert_eq!(rehydrated, provenance);
+        assert_eq!(summary["provenance"], provenance);
+
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"project\":\"demo\",\"total_nodes\":5}"}],
+            "structuredContent": {"project": "demo", "total_nodes": 5},
+            "isError": false,
+        });
+        let augmented = augment_tool_result(
+            &serde_json::to_string(&result).unwrap(),
+            json!({
+                "astrolabe": {
+                    "provenance": provenance.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(
+            value["structuredContent"]["astrolabe"]["provenance"],
+            provenance
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let text_value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value["astrolabe"]["provenance"], provenance);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
+        let dir = temp_dir("provenance-verify-chain");
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"provenance-verify-chain".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+        let rows = sample_provenance_rows();
+        let candidate = row_sink_import_candidate_from_rows(rows);
+        let imported = import_shadow_vault_report(
+            &dir.join("must-not-exist.db"),
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(candidate),
+        )
+        .unwrap();
+        let verify = verify_chain(&vault).unwrap();
+        let provenance =
+            provenance_surface_with_chain(imported.provenance, &"44".repeat(32), 1, &verify);
+        drop(vault);
+
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.vault_dir = vault_dir;
+        outcome.provenance = provenance;
+        outcome.ledger_seq = 1;
+        outcome.lowered_vault_fingerprint_sha256 = "44".repeat(32);
+        outcome.verify_chain_status = verify.status.clone();
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let store = provenance_store_for_project(&dir, "demo").unwrap();
+        let response = get_provenance(&store, &ProvenanceQuery::new("verify_chain", None))
+            .expect("verify chain provenance");
+        let ProvenancePayload::VerifyChain(chain) = response.payload else {
+            panic!("expected verify_chain payload");
+        };
+        assert_eq!(chain.status.as_str(), "intact");
+        assert_eq!(chain.checked_from, verify.checked_range_start);
+        assert_eq!(chain.checked_to, verify.checked_range_end.saturating_sub(1));
+        assert_eq!(chain.provenance.chain_hash, "44".repeat(32));
+
+        let lineage = get_provenance(&store, &ProvenanceQuery::new("lineage", Some("auth.login")))
+            .expect("lineage from persisted store");
+        let payload = provenance_response_json("demo", &lineage);
+        assert_eq!(payload["schema"], GET_PROVENANCE_SCHEMA);
+        assert_eq!(payload["mode"], "lineage");
+        assert_eq!(
+            payload["artifact_sha256"]
+                .as_str()
+                .expect("artifact sha")
+                .len(),
+            64
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn vault_import_summary_labels_fallback_trust() {
         let fallback = vault_import_summary(
             "sqlite_fallback",
@@ -3770,6 +4883,7 @@ mod tests {
         let bridges = bridges_from_row_sink_rows(&rows);
         let kernel_context = kernel_context_from_row_sink_rows(&rows);
         let anomalies = anomalies_from_row_sink_rows(&rows);
+        let provenance = provenance_from_row_sink_rows(&rows);
         let candidate = RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
             snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
             source_fingerprint_sha256: row_sink_fingerprint(&rows),
@@ -3778,6 +4892,7 @@ mod tests {
             bridges: bridges.clone(),
             kernel_context: kernel_context.clone(),
             anomalies: anomalies.clone(),
+            provenance: provenance.clone(),
         }));
 
         let imported = import_shadow_vault_report(
@@ -3797,6 +4912,7 @@ mod tests {
         assert_eq!(imported.bridges, bridges);
         assert_eq!(imported.kernel_context, kernel_context);
         assert_eq!(imported.anomalies, anomalies);
+        assert_eq!(imported.provenance, provenance);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -4273,6 +5389,77 @@ mod tests {
         }
     }
 
+    fn sample_provenance_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 1,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "login".to_string(),
+                    qualified_name: "auth.login".to_string(),
+                    file_path: "auth/login.rs".to_string(),
+                    start_line: 10,
+                    end_line: 20,
+                    properties_json: r#"{
+                        "provenance_lineage": [
+                            {"kind":"version","ledger":{"seq":7,"chain_hash":"hash-7"},"summary":"initial import"},
+                            {"kind":"anchor","ledger":{"seq":9,"chain_hash":"hash-9"},"summary":"guarded auth anchor"}
+                        ],
+                        "provenance_answer": {
+                            "answer_id":"answer:auth",
+                            "kernel_entry":{"seq":20,"chain_hash":"hash-20"},
+                            "hops":[{"from_symbol":"auth.login","to_symbol":"auth.token","ledger":{"seq":21,"chain_hash":"hash-21"}}],
+                            "fusion_weights_ref":{"seq":22,"chain_hash":"hash-22"},
+                            "guard_verdict_ref":{"seq":23,"chain_hash":"hash-23"},
+                            "freshness":{"seq":23}
+                        },
+                        "provenance_reproduce": {
+                            "answer_id":"answer:auth",
+                            "recorded_digest":"digest-auth",
+                            "current_digest":"digest-auth",
+                            "drift_microunits":0,
+                            "drift_bound_microunits":1000,
+                            "ledger":{"seq":24,"chain_hash":"hash-24"}
+                        },
+                        "provenance_manifest": {
+                            "pack_id":"pack:auth",
+                            "ledger_ref":{"seq":24,"chain_hash":"hash-24"},
+                            "member_hash":"members-auth"
+                        }
+                    }"#.to_string(),
+                },
+                astrolabe_bridge::CbmPipelineNodeRow {
+                    id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "incomplete".to_string(),
+                    qualified_name: "auth.incomplete".to_string(),
+                    file_path: "auth/incomplete.rs".to_string(),
+                    start_line: 30,
+                    end_line: 40,
+                    properties_json: r#"{
+                        "provenance_answer": {
+                            "answer_id":"answer:incomplete",
+                            "kernel_entry":{"seq":30,"chain_hash":"hash-30"},
+                            "freshness":{"seq":30}
+                        },
+                        "provenance_reproduce": {
+                            "answer_id":"answer:drifted",
+                            "recorded_digest":"digest-old",
+                            "current_digest":"digest-new",
+                            "drift_microunits":2000,
+                            "drift_bound_microunits":1000,
+                            "ledger":{"seq":31,"chain_hash":"hash-31"}
+                        }
+                    }"#.to_string(),
+                },
+            ],
+            edges: Vec::new(),
+        }
+    }
+
     fn seed_minimal_cbm_sqlite(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -4331,6 +5518,7 @@ mod tests {
             bridges: sample_bridges(),
             kernel_context: sample_kernel_context(),
             anomalies: sample_anomalies(),
+            provenance: sample_provenance(),
         }
     }
 
@@ -4362,6 +5550,25 @@ mod tests {
 
     fn sample_anomalies() -> Value {
         anomalies_from_row_sink_rows(&sample_anomaly_rows())
+    }
+
+    fn sample_provenance() -> Value {
+        let rows = sample_provenance_rows();
+        let surface = provenance_from_row_sink_rows(&rows);
+        let verify = astrolabe_ingest::VerifyChainReport {
+            status: "intact".to_string(),
+            ledger_rows: 1,
+            checked_range_start: 0,
+            checked_range_end: 2,
+            count: 2,
+            at_seq: None,
+            expected_hash: None,
+            found_hash: None,
+            reason: None,
+            quarantine_seq: None,
+            remediation: None,
+        };
+        provenance_surface_with_chain(surface, &"22".repeat(32), 1, &verify)
     }
 
     fn temp_dir(name: &str) -> PathBuf {

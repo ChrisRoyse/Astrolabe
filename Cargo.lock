@@ -201,6 +201,7 @@ dependencies = [
  "astrolabe-kernel",
  "astrolabe-lower",
  "astrolabe-panel",
+ "astrolabe-provenance",
  "astrolabe-weave",
  "calyx-aster",
  "calyx-core",

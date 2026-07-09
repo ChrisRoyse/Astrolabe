@@ -19,6 +19,7 @@ astrolabe-ingest = { path = "crates/astrolabe-ingest" }
 astrolabe-kernel = { path = "crates/astrolabe-kernel" }
 astrolabe-lower = { path = "crates/astrolabe-lower" }
 astrolabe-panel = { path = "crates/astrolabe-panel" }
+astrolabe-provenance = { path = "crates/astrolabe-provenance" }
 astrolabe-weave = { path = "crates/astrolabe-weave" }
 cbm-sys = { path = "crates/cbm-sys" }
 calyx-aster = { path = "vendor/calyx/crates/calyx-aster" }
