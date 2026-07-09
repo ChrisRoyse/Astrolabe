@@ -31,7 +31,15 @@ use astrolabe_kernel::{
     label_propagation_artifact_bytes, plan_search_scale, propagate_labels,
     scope_summary_artifact_bytes, skill_tree_artifact_bytes, summarize_scope_kernel,
 };
-use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
+use astrolabe_lower::{
+    ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
+    ASTRO_TEAM_ARTIFACT_MERKLE_ROOT, ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
+    ASTRO_TEAM_ARTIFACT_SIGNATURE, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
+    ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, LowerSqliteOptions, TEAM_ARTIFACT_SCHEMA,
+    TeamArtifactExportOptions, TeamArtifactExportReport, TeamArtifactImportOptions,
+    TeamArtifactImportReport, VAULT_EXPORT_ZST_NAME, export_team_artifact, import_team_artifact,
+    lower_cbm_sqlite,
+};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use astrolabe_provenance::{
     AnswerHop, AnswerTrace, ChainStatus, ChainVerification, Freshness, GET_PROVENANCE_SCHEMA,
@@ -61,6 +69,9 @@ const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
 const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
 const BACKGROUND_LANE_LOCK_SUFFIX: &str = ".astrolabe-background-lane.lock";
 const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
+const CBM_TEAM_ARTIFACT_DIR: &str = ".codebase-memory";
+const ASTRO_TEAM_ARTIFACT_ERROR: &str = "ASTRO_TEAM_ARTIFACT_ERROR";
+const ASTRO_TEAM_ARTIFACT_NOT_READY: &str = "ASTRO_TEAM_ARTIFACT_NOT_READY";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
@@ -241,6 +252,7 @@ pub fn handle_tool_raw(
         "get_provenance" => handle_get_provenance(args_json),
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
+        "team_artifact" => handle_team_artifact(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -284,6 +296,7 @@ pub fn handle_jsonrpc_raw(
         && tool_name != "get_provenance"
         && tool_name != "optimizer_status"
         && tool_name != "get_readiness"
+        && tool_name != "team_artifact"
     {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
@@ -339,12 +352,13 @@ fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> 
     Ok(serde_json::to_string(&response)?)
 }
 
-fn astrolabe_tool_definitions() -> [Value; 4] {
+fn astrolabe_tool_definitions() -> [Value; 5] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
         optimizer_status_tool_definition(),
         get_readiness_tool_definition(),
+        team_artifact_tool_definition(),
     ]
 }
 
@@ -505,6 +519,75 @@ fn get_readiness_tool_definition() -> Value {
     })
 }
 
+fn team_artifact_tool_definition() -> Value {
+    json!({
+        "name": "team_artifact",
+        "title": "Team Artifact",
+        "description": "Export or import the chain-verified Astrolabe team artifact. Use repo_path to target <repo>/.codebase-memory, or pass artifact_dir explicitly.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["export", "import"],
+                    "description": "export writes graph.db.zst, vault.export.zst, and artifact.json; import verifies before adopting graph bytes."
+                },
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name. Required for export; import uses it to default adopted_graph_path to the local CBM cache DB."
+                },
+                "repo_path": {
+                    "type": "string",
+                    "description": "Repository path whose .codebase-memory directory contains or receives the team artifact."
+                },
+                "artifact_dir": {
+                    "type": "string",
+                    "description": "Explicit artifact directory. Overrides repo_path/.codebase-memory."
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Alias for artifact_dir in export mode."
+                },
+                "input_dir": {
+                    "type": "string",
+                    "description": "Alias for artifact_dir in import mode."
+                },
+                "adopted_graph_path": {
+                    "type": "string",
+                    "description": "Import destination for verified graph bytes. Defaults to the local CBM cache DB for project."
+                },
+                "cache_db_path": {
+                    "type": "string",
+                    "description": "Alias for adopted_graph_path when importing into a CBM cache DB."
+                },
+                "signing_key_hex": {
+                    "type": "string",
+                    "description": "Optional 32-byte hex Ed25519 signing seed for export."
+                },
+                "expected_signer_pubkey_hex": {
+                    "type": "string",
+                    "description": "Optional 32-byte hex signer public key required during import."
+                }
+            },
+            "required": ["mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
 fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
     match tool_name {
         "index_repository" => {
@@ -532,6 +615,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
         "get_provenance" => Ok(true),
         "optimizer_status" => Ok(true),
         "get_readiness" => Ok(true),
+        "team_artifact" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -796,6 +880,400 @@ fn handle_get_readiness(args_json: &str) -> Result<String, DynError> {
     let axis = string_arg(args_obj, "axis");
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
+}
+
+fn handle_team_artifact(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("team_artifact arguments must be a JSON object");
+    };
+    let Some(mode) = string_arg(args_obj, "mode") else {
+        return tool_error_result("team_artifact requires mode: export or import");
+    };
+    match mode {
+        "export" => handle_team_artifact_export(args_obj),
+        "import" => handle_team_artifact_import(args_obj),
+        other => tool_error_result(format!(
+            "ASTRO_TEAM_ARTIFACT_MODE_UNSUPPORTED: team_artifact mode {other:?} is not available; remediation: use mode=\"export\" or mode=\"import\""
+        )),
+    }
+}
+
+fn handle_team_artifact_export(args: &Map<String, Value>) -> Result<String, DynError> {
+    let Some(project) = team_project_from_args(args)? else {
+        return tool_error_result("team_artifact export requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "team_artifact export requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let refresh_status = match ensure_shadow_import_current(&project) {
+        Ok(ShadowRefreshStatus::Busy) => {
+            return tool_error_result(
+                "ASTRO_TEAM_ARTIFACT_BUSY: shadow import is owned by another process; remediation: retry export after index_status reports shadow_import.status=current",
+            );
+        }
+        Ok(status) => status,
+        Err(error) => {
+            return tool_error_result(format!(
+                "ASTRO_TEAM_ARTIFACT_NOT_READY: shadow import recovery failed: {error}; remediation: rerun index_repository with calyx=\"shadow\" before exporting"
+            ));
+        }
+    };
+    let artifact_dir = match team_artifact_dir_from_args(args, "export") {
+        Ok(path) => path,
+        Err(message) => return tool_error_result(message),
+    };
+    let signing_key =
+        match optional_hex32_arg(args, "signing_key_hex", ASTRO_TEAM_ARTIFACT_SIGNATURE) {
+            Ok(value) => value,
+            Err(message) => return tool_error_result(message),
+        };
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    match team_artifact_export_json_at(
+        &cache_dir,
+        &project,
+        &artifact_dir,
+        signing_key,
+        refresh_status,
+    ) {
+        Ok(value) => tool_json_result(value),
+        Err(error) => team_artifact_error_result("export", &project, &artifact_dir, None, error),
+    }
+}
+
+fn handle_team_artifact_import(args: &Map<String, Value>) -> Result<String, DynError> {
+    let project = team_project_from_args(args)?;
+    let artifact_dir = match team_artifact_dir_from_args(args, "import") {
+        Ok(path) => path,
+        Err(message) => return tool_error_result(message),
+    };
+    let adopted_graph_path = match team_adopted_graph_path_from_args(args, project.as_deref()) {
+        Ok(path) => path,
+        Err(message) => return tool_error_result(message),
+    };
+    let expected_signer = match optional_hex32_arg(
+        args,
+        "expected_signer_pubkey_hex",
+        ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
+    ) {
+        Ok(value) => value,
+        Err(message) => return tool_error_result(message),
+    };
+    team_artifact_import_result(
+        &artifact_dir,
+        &adopted_graph_path,
+        expected_signer,
+        project.as_deref(),
+    )
+}
+
+fn team_artifact_export_json_at(
+    cache_dir: &Path,
+    project: &str,
+    artifact_dir: &Path,
+    signing_key: Option<[u8; 32]>,
+    refresh_status: ShadowRefreshStatus,
+) -> Result<Value, DynError> {
+    let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
+    let lowered_path = read_config_value(cache_dir, &metadata_key(project, "lowered_sqlite_path"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| lowered_sqlite_path(cache_dir, project));
+    if !lowered_path.exists() {
+        return Err(format!(
+            "{ASTRO_TEAM_ARTIFACT_NOT_READY}: lowered SQLite sidecar is missing at {}; remediation: rerun index_status or index_repository with calyx=\"shadow\"",
+            lowered_path.display()
+        )
+        .into());
+    }
+    let verify = astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)?;
+    if !verify.is_intact() {
+        return Err(format!(
+            "{ASTRO_TEAM_ARTIFACT_LEDGER_TAIL}: shadow vault verify_chain status is {}; remediation: repair or reindex before exporting",
+            verify.status
+        )
+        .into());
+    }
+    let vault_id = read_config_value(cache_dir, &metadata_key(project, "vault_id"))?
+        .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
+    let vault_salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
+        .unwrap_or_else(|| vault_salt(project));
+    let vault = AsterVault::new_durable(
+        &configured_vault_dir,
+        VaultId::from_str(&vault_id)?,
+        vault_salt.as_bytes().to_vec(),
+        VaultOptions::default(),
+    )?;
+    let options = match signing_key {
+        Some(key) => TeamArtifactExportOptions::with_signing_key(key),
+        None => TeamArtifactExportOptions::unsigned(),
+    };
+    let report = export_team_artifact(&vault, &lowered_path, artifact_dir, &options)?;
+    team_artifact_export_report_json(
+        project,
+        artifact_dir,
+        &configured_vault_dir,
+        &lowered_path,
+        &verify,
+        refresh_status,
+        &report,
+    )
+}
+
+fn team_artifact_import_result(
+    artifact_dir: &Path,
+    adopted_graph_path: &Path,
+    expected_signer: Option<[u8; 32]>,
+    project: Option<&str>,
+) -> Result<String, DynError> {
+    let options = match expected_signer {
+        Some(pubkey) => TeamArtifactImportOptions::with_expected_signer(pubkey),
+        None => TeamArtifactImportOptions::new(),
+    };
+    match import_team_artifact(artifact_dir, adopted_graph_path, &options) {
+        Ok(report) => tool_json_result(team_artifact_import_report_json(
+            project,
+            artifact_dir,
+            &report,
+        )?),
+        Err(error) => team_artifact_error_result(
+            "import",
+            project.unwrap_or("unknown"),
+            artifact_dir,
+            Some(adopted_graph_path),
+            error,
+        ),
+    }
+}
+
+fn team_artifact_export_report_json(
+    project: &str,
+    artifact_dir: &Path,
+    vault_dir: &Path,
+    lowered_sqlite_path: &Path,
+    verify: &astrolabe_ingest::VerifyChainReport,
+    refresh_status: ShadowRefreshStatus,
+    report: &TeamArtifactExportReport,
+) -> Result<Value, DynError> {
+    let mut value = json!({
+        "schema": TEAM_ARTIFACT_SCHEMA,
+        "mode": "export",
+        "status": "exported",
+        "project": project,
+        "freshness": "fresh",
+        "trust": "verified",
+        "artifact_dir": artifact_dir,
+        "manifest_path": report.manifest_path,
+        "graph_db_zst_path": report.graph_db_zst_path,
+        "vault_export_zst_path": report.vault_export_zst_path,
+        "manifest": serde_json::to_value(&report.manifest)?,
+        "signature_status": if report.manifest.signature.is_some() { "signed" } else { "unsigned" },
+        "source_state": {
+            "shadow_refresh": shadow_refresh_status_str(refresh_status),
+            "vault_dir": vault_dir,
+            "lowered_sqlite_path": lowered_sqlite_path,
+            "verify_chain": verify.status,
+            "ledger_rows": verify.ledger_rows,
+            "checked_range_start": verify.checked_range_start,
+            "checked_range_end": verify.checked_range_end,
+        },
+        "files": {
+            "graph_db_zst": {
+                "name": GRAPH_DB_ZST_NAME,
+                "path": report.graph_db_zst_path,
+                "sha256": report.manifest.graph_db_zst_sha256,
+            },
+            "vault_export_zst": {
+                "name": VAULT_EXPORT_ZST_NAME,
+                "path": report.vault_export_zst_path,
+                "sha256": report.manifest.vault_export_zst_sha256,
+            },
+            "manifest": {
+                "path": report.manifest_path,
+            },
+        },
+    });
+    refresh_value_artifact_hash(&mut value);
+    Ok(value)
+}
+
+fn team_artifact_import_report_json(
+    project: Option<&str>,
+    artifact_dir: &Path,
+    report: &TeamArtifactImportReport,
+) -> Result<Value, DynError> {
+    let mut value = json!({
+        "schema": TEAM_ARTIFACT_SCHEMA,
+        "mode": "import",
+        "status": "imported",
+        "project": project,
+        "freshness": "fresh",
+        "trust": if report.mode == "chain_verified_vault_export" { "verified" } else { "provisional" },
+        "artifact_dir": artifact_dir,
+        "import": {
+            "mode": report.mode,
+            "adopted_graph_path": report.adopted_graph_path,
+            "graph_db_sha256": report.graph_db_sha256,
+            "ledger_rows": report.ledger_rows,
+            "merkle_root": report.merkle_root,
+            "signature_status": report.signature_status,
+            "fallback": report.fallback,
+        },
+        "serving": {
+            "legacy_sqlite_adopted": true,
+            "vault_restored": false,
+            "trust": if report.mode == "chain_verified_vault_export" { "verified" } else { "provisional" },
+            "remediation": if report.mode == "chain_verified_vault_export" {
+                Value::String("legacy tools can serve the adopted graph; rerun index_repository with calyx=\"shadow\" on this machine before trusting local vault-backed surfaces".to_string())
+            } else {
+                Value::String("legacy graph.db.zst was adopted without vault proof; run a local reindex before treating Astrolabe vault-backed surfaces as verified".to_string())
+            },
+        },
+    });
+    refresh_value_artifact_hash(&mut value);
+    Ok(value)
+}
+
+fn team_artifact_error_result<E>(
+    mode: &str,
+    project: &str,
+    artifact_dir: &Path,
+    adopted_graph_path: Option<&Path>,
+    error: E,
+) -> Result<String, DynError>
+where
+    E: std::fmt::Display,
+{
+    let message = error.to_string();
+    let code = team_artifact_error_code(&message);
+    let mut value = json!({
+        "schema": TEAM_ARTIFACT_SCHEMA,
+        "mode": mode,
+        "status": "refused",
+        "project": project,
+        "artifact_dir": artifact_dir,
+        "code": code,
+        "message": message,
+        "remediation": "run index_repository with this repo_path to rebuild the local CBM graph; run it with calyx=\"shadow\" before trusting vault-backed surfaces",
+        "freshness": "fresh",
+        "trust": "verified",
+        "fallback": {
+            "local_reindex": "not_run",
+            "remediation": "run index_repository with this repo_path to rebuild the local CBM graph; run it with calyx=\"shadow\" before trusting vault-backed surfaces",
+        },
+    });
+    if let Some(path) = adopted_graph_path
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("adopted_graph_path".to_string(), json!(path));
+    }
+    refresh_value_artifact_hash(&mut value);
+    tool_json_error_result(value)
+}
+
+fn team_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
+    if let Some(project) = status_project_from_args(args)? {
+        return Ok(Some(project));
+    }
+    Ok(string_arg(args, "repo_path")
+        .map(astrolabe_bridge::cbm_project_name_from_path)
+        .transpose()?)
+}
+
+fn team_artifact_dir_from_args(args: &Map<String, Value>, mode: &str) -> Result<PathBuf, String> {
+    if let Some(path) = string_arg(args, "artifact_dir")
+        .or_else(|| string_arg(args, "output_dir"))
+        .or_else(|| string_arg(args, "input_dir"))
+    {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(repo_path) = string_arg(args, "repo_path") {
+        return Ok(PathBuf::from(repo_path).join(CBM_TEAM_ARTIFACT_DIR));
+    }
+    Err(format!(
+        "team_artifact {mode} requires artifact_dir or repo_path"
+    ))
+}
+
+fn team_adopted_graph_path_from_args(
+    args: &Map<String, Value>,
+    project: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(path) =
+        string_arg(args, "adopted_graph_path").or_else(|| string_arg(args, "cache_db_path"))
+    {
+        return Ok(PathBuf::from(path));
+    }
+    let Some(project) = project else {
+        return Err(
+            "team_artifact import requires adopted_graph_path, or project/repo_path to derive the local CBM cache DB".to_string(),
+        );
+    };
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()
+        .map_err(|error| format!("resolve CBM cache dir: {error}"))?;
+    Ok(sqlite_path(&cache_dir, project))
+}
+
+fn optional_hex32_arg(
+    args: &Map<String, Value>,
+    key: &str,
+    code: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(raw) = string_arg(args, key) else {
+        return Ok(None);
+    };
+    decode_hex_32_arg(raw, key, code).map(Some)
+}
+
+fn decode_hex_32_arg(raw: &str, key: &str, code: &str) -> Result<[u8; 32], String> {
+    if raw.len() != 64 {
+        return Err(format!("{code}: {key} must be exactly 64 hex characters"));
+    }
+    let mut out = [0_u8; 32];
+    for (index, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble_arg(chunk[0], key, code)?;
+        let low = hex_nibble_arg(chunk[1], key, code)?;
+        out[index] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble_arg(byte: u8, key: &str, code: &str) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("{code}: {key} contains non-hex bytes")),
+    }
+}
+
+fn team_artifact_error_code(message: &str) -> &str {
+    for code in [
+        ASTRO_TEAM_ARTIFACT_NOT_READY,
+        ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
+        ASTRO_TEAM_ARTIFACT_GRAPH_BYTES,
+        ASTRO_TEAM_ARTIFACT_VAULT_BYTES,
+        ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
+        ASTRO_TEAM_ARTIFACT_MERKLE_ROOT,
+        ASTRO_TEAM_ARTIFACT_SIGNATURE,
+        ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
+    ] {
+        if message.starts_with(code) {
+            return code;
+        }
+    }
+    ASTRO_TEAM_ARTIFACT_ERROR
+}
+
+fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
+    match status {
+        ShadowRefreshStatus::Current => "current",
+        ShadowRefreshStatus::Refreshed => "refreshed",
+        ShadowRefreshStatus::Busy => "busy",
+    }
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -5166,6 +5644,24 @@ fn tool_json_result(value: Value) -> Result<String, DynError> {
     }))?)
 }
 
+fn tool_json_error_result(value: Value) -> Result<String, DynError> {
+    let text = serde_json::to_string(&value)?;
+    Ok(serde_json::to_string(&json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value,
+        "isError": true,
+    }))?)
+}
+
+fn refresh_value_artifact_hash(value: &mut Value) {
+    let mut artifact_source = value.clone();
+    if let Some(object) = artifact_source.as_object_mut() {
+        object.remove("artifact_sha256");
+    }
+    let artifact_bytes = serde_json::to_vec(&artifact_source).unwrap_or_default();
+    value["artifact_sha256"] = json!(hex_lower(&Sha256::digest(&artifact_bytes)));
+}
+
 fn jsonrpc_result_response(id: Value, result_raw: &str) -> Result<String, DynError> {
     let result: Value = serde_json::from_str(result_raw)?;
     Ok(serde_json::to_string(&json!({
@@ -6605,6 +7101,91 @@ mod tests {
     }
 
     #[test]
+    fn team_artifact_export_import_roundtrip_from_shadow_state() {
+        let dir = temp_dir("team-artifact-roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let lowered = seed_team_shadow_state(&dir);
+        let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
+
+        let exported = team_artifact_export_json_at(
+            &dir,
+            "demo",
+            &artifact_dir,
+            Some([5; 32]),
+            ShadowRefreshStatus::Current,
+        )
+        .expect("export team artifact");
+
+        assert_eq!(exported["schema"], TEAM_ARTIFACT_SCHEMA);
+        assert_eq!(exported["mode"], "export");
+        assert_eq!(exported["status"], "exported");
+        assert_eq!(exported["signature_status"], "signed");
+        assert_eq!(exported["source_state"]["verify_chain"], "intact");
+        assert_eq!(exported["files"]["graph_db_zst"]["name"], GRAPH_DB_ZST_NAME);
+        assert_eq!(
+            exported["files"]["vault_export_zst"]["name"],
+            VAULT_EXPORT_ZST_NAME
+        );
+        assert!(artifact_dir.join(GRAPH_DB_ZST_NAME).exists());
+        assert!(artifact_dir.join(VAULT_EXPORT_ZST_NAME).exists());
+        assert!(artifact_dir.join("artifact.json").exists());
+        assert_eq!(exported["artifact_sha256"].as_str().unwrap().len(), 64);
+
+        let adopted = dir.join("adopted.db");
+        let imported_raw = team_artifact_import_result(&artifact_dir, &adopted, None, Some("demo"))
+            .expect("import team artifact");
+        let imported: Value = serde_json::from_str(&imported_raw).unwrap();
+        assert_eq!(imported["isError"], false);
+        let structured = &imported["structuredContent"];
+        assert_eq!(structured["schema"], TEAM_ARTIFACT_SCHEMA);
+        assert_eq!(structured["mode"], "import");
+        assert_eq!(structured["status"], "imported");
+        assert_eq!(structured["trust"], "verified");
+        assert_eq!(structured["import"]["mode"], "chain_verified_vault_export");
+        assert_eq!(structured["import"]["signature_status"], "verified");
+        assert_eq!(structured["serving"]["legacy_sqlite_adopted"], true);
+        assert_eq!(structured["serving"]["vault_restored"], false);
+        assert_eq!(structured["artifact_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(fs::read(&adopted).unwrap(), fs::read(&lowered).unwrap());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn team_artifact_import_refuses_tampered_vault_without_adopting() {
+        let dir = temp_dir("team-artifact-tamper");
+        fs::create_dir_all(&dir).unwrap();
+        seed_team_shadow_state(&dir);
+        let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
+        team_artifact_export_json_at(
+            &dir,
+            "demo",
+            &artifact_dir,
+            None,
+            ShadowRefreshStatus::Current,
+        )
+        .expect("export team artifact");
+
+        let vault_export_path = artifact_dir.join(VAULT_EXPORT_ZST_NAME);
+        let mut bytes = fs::read(&vault_export_path).unwrap();
+        bytes[0] ^= 0x01;
+        fs::write(&vault_export_path, bytes).unwrap();
+
+        let adopted = dir.join("tampered-adopted.db");
+        let raw = team_artifact_import_result(&artifact_dir, &adopted, None, Some("demo"))
+            .expect("tampered import returns structured refusal");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["isError"], true);
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["status"], "refused");
+        assert_eq!(structured["code"], ASTRO_TEAM_ARTIFACT_VAULT_BYTES);
+        assert_eq!(structured["fallback"]["local_reindex"], "not_run");
+        assert!(!adopted.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn optimizer_status_reads_ledger_tail_and_labels_inactive_surfaces() {
         let dir = temp_dir("optimizer-status-readback");
         let vault_dir = dir.join("demo.astrolabe-vault");
@@ -6726,7 +7307,13 @@ mod tests {
             let first_tools = first_value["result"]["tools"].as_array().unwrap();
             assert!(!first_tools.iter().any(|tool| matches!(
                 tool["name"].as_str(),
-                Some("get_provenance" | "detect_anomalies" | "optimizer_status" | "get_readiness")
+                Some(
+                    "get_provenance"
+                        | "detect_anomalies"
+                        | "optimizer_status"
+                        | "get_readiness"
+                        | "team_artifact"
+                )
             )));
             let request = json!({
                 "jsonrpc": "2.0",
@@ -6795,6 +7382,19 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("scope")
+        );
+
+        let team_artifact = tool_definition(tools, "team_artifact");
+        assert_eq!(team_artifact["inputSchema"]["required"], json!(["mode"]));
+        assert_eq!(
+            team_artifact["inputSchema"]["properties"]["mode"]["enum"],
+            json!(["export", "import"])
+        );
+        assert!(
+            team_artifact["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("expected_signer_pubkey_hex")
         );
     }
 
@@ -7266,6 +7866,66 @@ mod tests {
             remediation: None,
         };
         provenance_surface_with_chain(surface, &"22".repeat(32), 1, &verify)
+    }
+
+    fn seed_team_shadow_state(root: &Path) -> PathBuf {
+        let vault_dir = root.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            vault_salt("demo").as_bytes().to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let options = SqliteImportOptions::new("demo", "commit-team", DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+        let rows = sample_pipeline_rows();
+        let imported = import_shadow_vault_report(
+            &root.join("unused-source.db"),
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(row_sink_import_candidate_from_rows(rows.clone())),
+        )
+        .unwrap();
+        let lower_report = lower_shadow_sqlite(root, "demo", &vault).unwrap();
+        let verify = verify_chain(&vault).unwrap();
+        drop(vault);
+
+        let mut outcome = sample_shadow_outcome(root, imported.security_screen.clone());
+        outcome.vault_dir = vault_dir;
+        outcome.vault_salt = vault_salt("demo");
+        outcome.sqlite_fingerprint_sha256 = hex_lower(&imported.report.sqlite_fingerprint_sha256);
+        outcome.lowered_sqlite_path = lower_report.output_path.clone();
+        outcome.lowered_artifact_sha256 = lower_report.artifact_sha256.clone();
+        outcome.lowered_vault_fingerprint_sha256 = lower_report.vault_fingerprint_sha256.clone();
+        outcome.lowered_manifest_seq = lower_report.manifest_seq;
+        outcome.lowered_nodes = lower_report.node_count;
+        outcome.lowered_edges = lower_report.edge_count;
+        outcome.lowered_skipped_edges = lower_report.skipped_edges;
+        outcome.sqlite_nodes = imported.report.sqlite_nodes;
+        outcome.sqlite_edges = imported.report.sqlite_edges;
+        outcome.constellation_inputs = imported.report.constellation_inputs;
+        outcome.structural_only = imported.report.structural_only;
+        outcome.new_cx_ids = imported.report.new_cx_ids;
+        outcome.reused_cx_ids = imported.report.reused_cx_ids;
+        outcome.graph_rows_written = imported.report.graph_rows_written;
+        outcome.edge_rows_written = imported.report.edge_rows_written;
+        outcome.cx_id_set_sha256 = cx_id_set_sha256(&imported.report.cx_ids);
+        outcome.ledger_seq = lower_report.manifest_seq;
+        outcome.ledger_rows_after = verify.ledger_rows;
+        outcome.verify_chain_status = verify.status;
+        outcome.vault_import_source = imported.source;
+        outcome.vault_import_fallback_reason = imported.fallback_reason;
+        outcome.security_screen = imported.security_screen;
+        outcome.skill_tree = imported.skill_tree;
+        outcome.bridges = imported.bridges;
+        outcome.kernel_context = imported.kernel_context;
+        outcome.anomalies = imported.anomalies;
+        outcome.provenance = imported.provenance;
+        persist_shadow_outcome_at(root, "demo", &outcome).unwrap();
+        persist_dial_at(root, "demo", MigrationDial::Shadow).unwrap();
+        lower_report.output_path
     }
 
     fn temp_dir(name: &str) -> PathBuf {

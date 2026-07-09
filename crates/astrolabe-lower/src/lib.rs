@@ -22,10 +22,10 @@ pub use team_artifact::{
     ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
     ASTRO_TEAM_ARTIFACT_MERKLE_ROOT, ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
     ASTRO_TEAM_ARTIFACT_SIGNATURE, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
-    ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, TeamArtifactExportOptions,
-    TeamArtifactExportReport, TeamArtifactImportOptions, TeamArtifactImportReport,
-    TeamArtifactManifest, TeamArtifactSignature, TeamLedgerHead, VAULT_EXPORT_ZST_NAME,
-    export_team_artifact, import_team_artifact,
+    ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, TEAM_ARTIFACT_SCHEMA,
+    TeamArtifactExportOptions, TeamArtifactExportReport, TeamArtifactImportOptions,
+    TeamArtifactImportReport, TeamArtifactManifest, TeamArtifactSignature, TeamLedgerHead,
+    VAULT_EXPORT_ZST_NAME, export_team_artifact, import_team_artifact,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

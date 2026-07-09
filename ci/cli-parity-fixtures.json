@@ -18,6 +18,7 @@
     "detect_anomalies": {},
     "get_provenance": {},
     "optimizer_status": {},
-    "get_readiness": {}
+    "get_readiness": {},
+    "team_artifact": {}
   }
 }
