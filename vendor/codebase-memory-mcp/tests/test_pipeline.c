@@ -99,6 +99,44 @@ static void teardown_test_repo(void) {
     g_tmpdir[0] = '\0';
 }
 
+typedef struct {
+    const char *project;
+    int node_count;
+    int edge_count;
+    int bad_rows;
+    int fail_on_edge;
+} pipeline_row_sink_state_t;
+
+static int pipeline_row_node_sink(const cbm_gbuf_row_node_t *node, void *ctx) {
+    pipeline_row_sink_state_t *state = (pipeline_row_sink_state_t *)ctx;
+    if (!node || !state) {
+        return -1;
+    }
+    state->node_count++;
+    if (node->id <= 0 || !node->project || strcmp(node->project, state->project) != 0 ||
+        !node->label || !node->name || !node->qualified_name || !node->properties_json) {
+        state->bad_rows++;
+    }
+    return 0;
+}
+
+static int pipeline_row_edge_sink(const cbm_gbuf_row_edge_t *edge, void *ctx) {
+    pipeline_row_sink_state_t *state = (pipeline_row_sink_state_t *)ctx;
+    if (!edge || !state) {
+        return -1;
+    }
+    if (state->fail_on_edge) {
+        return -1;
+    }
+    state->edge_count++;
+    if (edge->id <= 0 || edge->source_id <= 0 || edge->target_id <= 0 || !edge->project ||
+        strcmp(edge->project, state->project) != 0 || !edge->type || !edge->properties_json ||
+        !edge->url_path_gen || !edge->local_name_gen) {
+        state->bad_rows++;
+    }
+    return 0;
+}
+
 /* ── Lifecycle tests ─────────────────────────────────────────────── */
 
 TEST(pipeline_create_free) {
@@ -270,6 +308,58 @@ TEST(pipeline_structure_nodes) {
     ASSERT_GTE(edge_count, 5); /* CONTAINS_FOLDER + CONTAINS_FILE edges */
 
     cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_row_sink_receives_dump_rows) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/row_sink.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    pipeline_row_sink_state_t state = {.project = cbm_pipeline_project_name(p)};
+    cbm_pipeline_set_sink(p, pipeline_row_node_sink, pipeline_row_edge_sink, &state);
+
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(state.bad_rows, 0);
+    ASSERT_GT(state.node_count, 0);
+    ASSERT_GT(state.edge_count, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, state.project), state.node_count);
+    ASSERT_EQ(cbm_store_count_edges(s, state.project), state.edge_count);
+    cbm_store_close(s);
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_row_sink_failure_aborts_run_before_sqlite_open) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/row_sink_fail.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    pipeline_row_sink_state_t state = {.project = cbm_pipeline_project_name(p), .fail_on_edge = 1};
+    cbm_pipeline_set_sink(p, pipeline_row_node_sink, pipeline_row_edge_sink, &state);
+
+    ASSERT_EQ(cbm_pipeline_run(p), -1);
+    ASSERT_GT(state.node_count, 0);
+    ASSERT_EQ(state.edge_count, 0);
+    ASSERT_NEQ(access(db_path, F_OK), 0);
+
     cbm_pipeline_free(p);
     teardown_test_repo();
     PASS();
@@ -6715,6 +6805,8 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_row_sink_receives_dump_rows);
+    RUN_TEST(pipeline_row_sink_failure_aborts_run_before_sqlite_open);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_structure_edges);
