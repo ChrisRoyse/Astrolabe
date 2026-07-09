@@ -314,13 +314,25 @@ fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> 
     let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
         return Ok(response_json.to_string());
     };
-    if !tools
-        .iter()
-        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("get_provenance"))
-    {
-        tools.push(get_provenance_tool_definition());
+    for definition in astrolabe_tool_definitions() {
+        let Some(name) = definition.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        {
+            tools.push(definition);
+        }
     }
     Ok(serde_json::to_string(&response)?)
+}
+
+fn astrolabe_tool_definitions() -> [Value; 2] {
+    [
+        get_provenance_tool_definition(),
+        detect_anomalies_tool_definition(),
+    ]
 }
 
 fn get_provenance_tool_definition() -> Value {
@@ -349,6 +361,42 @@ fn get_provenance_tool_definition() -> Value {
                 }
             },
             "required": ["project", "mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+fn detect_anomalies_tool_definition() -> Value {
+    json!({
+        "name": "detect_anomalies",
+        "title": "Detect Anomalies",
+        "description": "Return calibrated Astrolabe anomaly findings for a shadow-indexed project, optionally filtered by kind.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["doc_drift", "name_truth", "drift", "ood_commit"]
+                }
+            },
+            "required": ["project"],
             "additionalProperties": false
         },
         "outputSchema": {
@@ -5185,7 +5233,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_discovers_get_provenance_on_final_page() {
+    fn tools_list_discovers_astrolabe_tools_on_final_page() {
         let runner = CbmToolRunner::new(":memory:").unwrap();
         let first = handle_jsonrpc_raw(
             &runner,
@@ -5197,11 +5245,10 @@ mod tests {
 
         let final_value = if let Some(cursor) = first_value["result"]["nextCursor"].as_str() {
             let first_tools = first_value["result"]["tools"].as_array().unwrap();
-            assert!(
-                !first_tools
-                    .iter()
-                    .any(|tool| tool["name"] == "get_provenance")
-            );
+            assert!(!first_tools.iter().any(|tool| matches!(
+                tool["name"].as_str(),
+                Some("get_provenance" | "detect_anomalies")
+            )));
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": 71,
@@ -5218,10 +5265,7 @@ mod tests {
 
         assert!(final_value["result"]["nextCursor"].is_null());
         let tools = final_value["result"]["tools"].as_array().unwrap();
-        let get_provenance = tools
-            .iter()
-            .find(|tool| tool["name"] == "get_provenance")
-            .expect("get_provenance tool definition");
+        let get_provenance = tool_definition(tools, "get_provenance");
         assert_eq!(
             get_provenance["inputSchema"]["required"],
             json!(["project", "mode"])
@@ -5236,6 +5280,25 @@ mod tests {
             get_provenance["outputSchema"]["required"],
             json!(["content", "isError"])
         );
+
+        let detect_anomalies = tool_definition(tools, "detect_anomalies");
+        assert_eq!(
+            detect_anomalies["inputSchema"]["required"],
+            json!(["project"])
+        );
+        assert!(
+            detect_anomalies["inputSchema"]["properties"]["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("ood_commit"))
+        );
+    }
+
+    fn tool_definition<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tool definition"))
     }
 
     fn sample_pipeline_rows() -> CbmPipelineRows {
