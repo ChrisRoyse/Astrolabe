@@ -1544,6 +1544,9 @@ Anomaly aggregation status: `astrolabe.detect_anomalies.v1` lives in `astrolabe-
 
 ### Trust & ops
 **`get_provenance`** â€” modes: `lineage` (symbol history), `answer_trace(answer_id)`, `verify_chain(range?)`, `reproduce(answer_id)`. One tool, four verifications (13).
+
+Provenance surface status: `astrolabe.get_provenance.v1` and `astrolabe.inter_agent_trust.v1` live in `astrolabe-provenance` as the P6.9 contract. The contract pins the four modes, `{trust,freshness,provenance,warnings}` envelope, unknown-mode and missing-subject refusals, explicit `unprovenanced` answer-trace warnings, `REPRODUCE_DRIFT_EXCEEDED`, and one-call pack manifest verification across `(pack_id, ledger_ref, vault_fingerprint, member_hash)`. Live MCP/CLI wiring still has to scan persisted ledger/series rows, wrap the existing `verify_chain`, and run the inter-agent round-trip through separate server processes.
+
 **`get_readiness`** â€” params: `project`, `scope?`, `axis?`. Returns the six-tier predicate with measured values + cheapest fix (11 Â§6).
 **`optimizer_status`** â€” anneal state: tripwires, recent changes, proposals, guard health, budget (14 Â§6). (Also: `propose_lens` folded here as mode `propose` â€” runs the deficitâ†’candidate pipeline on demand.)
 
