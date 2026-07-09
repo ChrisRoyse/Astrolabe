@@ -1229,6 +1229,12 @@ Input: a diff (or candidate file/symbol text) + target location.
 
 Response contract includes: per-slot table, overall, provisional flag, nearest exemplar (for the agent to imitate), and remediation text.
 
+Prompt-injection prose screening uses `astro.guard.prompt_injection_patterns.v1`
+and emits provisional `detect_anomalies.kind=prompt_injection` findings plus
+context-pack grounding notes. Dependency OOD screening stays explicitly skipped
+with `guard_calibration_unavailable` accounting until guard profiles and
+purpose slots exist.
+
 ## 4. Integration points
 
 - **Tool:** `guard_check` (agent calls before finalizing an edit); `guard_calibrate` (operator/auto).
@@ -1503,7 +1509,7 @@ Design constraints: (a) 100% behavioral compatibility for the 14 existing CBM to
 ### Navigation & anomaly
 **`find_similar`** â€” modes: `structural|semantic|api|profile|co_change|agree|disagree|define`. Params: `project`, `symbol` (QN/cx), `k?`. Clone-taxonomy classification included for `agree/disagree`.
 
-**`detect_anomalies`** â€” blind-spot sweep + drift alarms + doc-drift/name-truth mismatches + OOD commits. Params: `project`, `scope?`, `kind?`. Returns ranked findings with severities and per-lens evidence.
+**`detect_anomalies`** â€” blind-spot sweep + drift alarms + doc-drift/name-truth mismatches + OOD commits + `prompt_injection` prose findings. Params: `project`, `scope?`, `kind?`. Returns ranked findings with severities and per-lens evidence.
 
 ### Guard
 **`guard_check`** â€” validate a diff/candidate (10 Â§3). Params: `project`, `diff|content+path`, `high_stakes?`. Returns per-slot verdict table, overall, nearest exemplar, remediation.
