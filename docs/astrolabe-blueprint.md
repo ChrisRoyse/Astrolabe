@@ -1858,6 +1858,8 @@ For each subsystem, scripted *read-the-actual-bytes* checks (not green-checkmark
 ### L6 â€” Soak & hazards
 Adapted hazard probes: watcher+incremental churn soak (10K synthetic commits â€” RSS bounded, no oscillation via anneal hysteresis, ledger intact); crash-injection during ingest (WAL/torn-tail recovery â‡’ vault opens Intact, supervisor quarantines the culprit); disk-pressure fail-closed; reactive-queue overflow accounting.
 
+Hazard suite status: `ci/hazard-suite.json` plus `scripts/check-hazard-suite.py` name the current short L6 gate and write `target/astrolabe-release-predicate/verify-chain-soak.json` for the release predicate. The suite currently covers same-commit rollback under backpressure, disk tamper fail-closed behavior, WAL crash recovery with `verify_chain`, exact reactive queue overflow warning rows, and the Linux 4096-event queue soak/RSS bound. Remaining #60 work is the 10K watcher+incremental churn soak, full ingest-stage crash matrix, disk-full artifact recovery, scheduled CI publishing, and trend artifacts.
+
 ### L7 â€” Agent-level evals (the product truth)
 Scripted MCP sessions (rapid-init + tool-sequence scripts, extending CBM's `test_mcp_rapid_init.py`): SWE-bench-lite-style tasks driven with (a) legacy CBM tools vs (b) ASTROLABE packs+oracle â€” measure tokens consumed, task success, wrong-file rate. Published per release; this is success-criterion #1 (01 Â§6) made executable.
 

@@ -1,0 +1,52 @@
+{
+  "schema_version": "astrolabe.hazard_suite.v1",
+  "release_predicate_key": "verify_chain_soak",
+  "release_artifact": "verify-chain-soak.json",
+  "cadence": {
+    "short": "nightly",
+    "full": "weekly"
+  },
+  "tests": [
+    {
+      "id": "same_commit_atomic_reject",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "same_commit_rejected_batch_reopens_with_neither_data_nor_ledger",
+      "kind": "disk_pressure_atomicity",
+      "evidence": ["CALYX_BACKPRESSURE", "ledger_rows"]
+    },
+    {
+      "id": "disk_tamper_fails_closed",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "disk_tamper_reports_broken_seq_and_default_open_fails_closed",
+      "kind": "tamper_fail_closed",
+      "evidence": ["verify_chain_vault_path", "CALYX_LEDGER_CHAIN_BROKEN"]
+    },
+    {
+      "id": "crash_after_wal_recovery",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "kill_after_wal_append_reopens_with_both_data_and_ledger",
+      "kind": "crash_recovery",
+      "evidence": ["ASTROLABE_CRASH_FSV_CHILD", "verify_chain"]
+    },
+    {
+      "id": "queue_overflow_exact_warning",
+      "crate": "astrolabe-weave",
+      "file": "crates/astrolabe-weave/src/lib.rs",
+      "test": "durable_queue_overflow_persists_warning_row_and_bounds_queue",
+      "kind": "reactive_queue_overflow",
+      "evidence": ["CALYX_REACTIVE_QUEUE_FULL", "warnings.len()"]
+    },
+    {
+      "id": "queue_soak_4096_accounting",
+      "crate": "astrolabe-weave",
+      "file": "crates/astrolabe-weave/src/lib.rs",
+      "test": "durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss",
+      "kind": "reactive_queue_soak",
+      "target_os": "linux",
+      "evidence": ["CALYX_REACTIVE_QUEUE_CAP", "MAX_REACTIVE_SOAK_RSS_DELTA_BYTES"]
+    }
+  ]
+}
