@@ -46,6 +46,8 @@ pub const ASTROLABE_REACTIVE_AUDIT_CAP: usize = CALYX_REACTIVE_AUDIT_CAP;
 pub const PANEL_SLOT_COUNT_FOR_ABUNDANCE: usize = 22;
 pub const PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE: usize =
     PANEL_SLOT_COUNT_FOR_ABUNDANCE * (PANEL_SLOT_COUNT_FOR_ABUNDANCE - 1) / 2;
+pub const DETECT_ANOMALIES_SCHEMA: &str = "astrolabe.detect_anomalies.v1";
+pub const ASTRO_ANOMALY_INVALID_KIND: &str = "ASTRO_ANOMALY_INVALID_KIND";
 
 pub const SLOT_COMPLEXITY: SlotId = SlotId::new(2);
 pub const SLOT_GRAPH_POSITION: SlotId = SlotId::new(8);
@@ -669,6 +671,333 @@ pub struct CrossTermAbundance {
     pub lazy_pair_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AnomalyKind {
+    DocDrift,
+    NameTruth,
+    Drift,
+    OodCommit,
+}
+
+impl AnomalyKind {
+    pub const ALL: [Self; 4] = [
+        Self::DocDrift,
+        Self::NameTruth,
+        Self::Drift,
+        Self::OodCommit,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DocDrift => "doc_drift",
+            Self::NameTruth => "name_truth",
+            Self::Drift => "drift",
+            Self::OodCommit => "ood_commit",
+        }
+    }
+}
+
+impl std::str::FromStr for AnomalyKind {
+    type Err = astrolabe_domain::DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "doc_drift" => Ok(Self::DocDrift),
+            "name_truth" => Ok(Self::NameTruth),
+            "drift" => Ok(Self::Drift),
+            "ood_commit" => Ok(Self::OodCommit),
+            _ => Err(astrolabe_domain::DomainError::new(
+                ASTRO_ANOMALY_INVALID_KIND,
+                format!("unknown detect_anomalies kind {value}"),
+                "use one of doc_drift, name_truth, drift, or ood_commit",
+            )),
+        }
+    }
+}
+
+impl fmt::Display for AnomalyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalySeverity {
+    High,
+    Medium,
+}
+
+impl AnomalySeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::High => 2,
+            Self::Medium => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnomalyCalibration {
+    pub kind: AnomalyKind,
+    pub medium_min_score_millipoints: u64,
+    pub high_min_score_millipoints: u64,
+    pub provenance_ref: String,
+}
+
+impl AnomalyCalibration {
+    pub fn new(
+        kind: AnomalyKind,
+        medium_min_score_millipoints: u64,
+        high_min_score_millipoints: u64,
+        provenance_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            medium_min_score_millipoints,
+            high_min_score_millipoints,
+            provenance_ref: provenance_ref.into(),
+        }
+    }
+
+    fn severity_for(&self, score_millipoints: u64) -> Option<AnomalySeverity> {
+        if score_millipoints >= self.high_min_score_millipoints {
+            Some(AnomalySeverity::High)
+        } else if score_millipoints >= self.medium_min_score_millipoints {
+            Some(AnomalySeverity::Medium)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnomalySubstrateRow {
+    pub kind: AnomalyKind,
+    pub subject_id: String,
+    pub score_millipoints: u64,
+    pub message: String,
+    pub substrate_provenance_refs: Vec<String>,
+    pub lens_evidence: Vec<String>,
+}
+
+impl AnomalySubstrateRow {
+    pub fn new(
+        kind: AnomalyKind,
+        subject_id: impl Into<String>,
+        score_millipoints: u64,
+        message: impl Into<String>,
+        substrate_provenance_refs: impl IntoIterator<Item = impl Into<String>>,
+        lens_evidence: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            kind,
+            subject_id: subject_id.into(),
+            score_millipoints,
+            message: message.into(),
+            substrate_provenance_refs: substrate_provenance_refs
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            lens_evidence: lens_evidence.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnomalyReport {
+    pub schema: &'static str,
+    pub kind_filter: Option<AnomalyKind>,
+    pub findings: Vec<AnomalyFinding>,
+    pub skipped: Vec<SkippedAnomalySubstrate>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnomalyFinding {
+    pub kind: AnomalyKind,
+    pub subject_id: String,
+    pub severity: AnomalySeverity,
+    pub score_millipoints: u64,
+    pub message: String,
+    pub substrate_provenance_refs: Vec<String>,
+    pub calibration_provenance_ref: String,
+    pub lens_evidence: Vec<String>,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedAnomalySubstrate {
+    pub kind: AnomalyKind,
+    pub subject_id: String,
+    pub reason: &'static str,
+    pub freshness: &'static str,
+    pub trust: &'static str,
+}
+
+pub fn anomaly_substrate_row_from_eager_cross_term(
+    row: &EagerCrossTermRow,
+    substrate_provenance_ref: impl Into<String>,
+) -> Option<AnomalySubstrateRow> {
+    let kind = match row.kind {
+        EagerAgreementKind::DocDrift => AnomalyKind::DocDrift,
+        EagerAgreementKind::NameTruth => AnomalyKind::NameTruth,
+        _ => return None,
+    };
+    let CrossTermValue::Scalar(value) = &row.value else {
+        return None;
+    };
+    let agreement_millipoints = agreement_to_millipoints(*value);
+    Some(AnomalySubstrateRow::new(
+        kind,
+        row.qualified_name.clone(),
+        1_000_u64.saturating_sub(agreement_millipoints),
+        format!(
+            "{} agreement={} millipoints",
+            row.kind.wire_name(),
+            agreement_millipoints
+        ),
+        [substrate_provenance_ref.into()],
+        [format!(
+            "{}:{}x{}",
+            row.kind.wire_name(),
+            row.left_slot.get(),
+            row.right_slot.get()
+        )],
+    ))
+}
+
+pub fn detect_anomalies(
+    rows: &[AnomalySubstrateRow],
+    calibrations: &[AnomalyCalibration],
+    kind_filter: Option<&str>,
+    vault_grounded: bool,
+) -> astrolabe_domain::Result<AnomalyReport> {
+    let parsed_filter = kind_filter.map(str::parse::<AnomalyKind>).transpose()?;
+    let calibration_by_kind = calibrations
+        .iter()
+        .map(|calibration| (calibration.kind, calibration))
+        .collect::<BTreeMap<_, _>>();
+    let trust = if vault_grounded {
+        "verified"
+    } else {
+        "provisional"
+    };
+    let mut findings = Vec::new();
+    let mut skipped = Vec::new();
+
+    for row in rows {
+        if parsed_filter.is_some_and(|filter| row.kind != filter) {
+            continue;
+        }
+        let Some(calibration) = calibration_by_kind.get(&row.kind) else {
+            skipped.push(SkippedAnomalySubstrate {
+                kind: row.kind,
+                subject_id: row.subject_id.clone(),
+                reason: "missing_calibration",
+                freshness: "not_evaluated",
+                trust: "provisional",
+            });
+            continue;
+        };
+        let Some(severity) = calibration.severity_for(row.score_millipoints) else {
+            continue;
+        };
+        findings.push(AnomalyFinding {
+            kind: row.kind,
+            subject_id: row.subject_id.clone(),
+            severity,
+            score_millipoints: row.score_millipoints,
+            message: row.message.clone(),
+            substrate_provenance_refs: row.substrate_provenance_refs.clone(),
+            calibration_provenance_ref: calibration.provenance_ref.clone(),
+            lens_evidence: row.lens_evidence.clone(),
+            freshness: "fresh",
+            trust,
+        });
+    }
+
+    findings.sort_by(anomaly_finding_order);
+    skipped.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.subject_id.cmp(&right.subject_id))
+    });
+
+    Ok(AnomalyReport {
+        schema: DETECT_ANOMALIES_SCHEMA,
+        kind_filter: parsed_filter,
+        findings,
+        skipped,
+        freshness: "fresh",
+        trust,
+    })
+}
+
+pub fn anomaly_report_artifact_bytes(report: &AnomalyReport) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("schema=");
+    out.push_str(report.schema);
+    out.push('\n');
+    if let Some(kind_filter) = report.kind_filter {
+        out.push_str("kind_filter=");
+        out.push_str(kind_filter.as_str());
+        out.push('\n');
+    }
+    out.push_str("trust=");
+    out.push_str(report.trust);
+    out.push('\n');
+    for finding in &report.findings {
+        out.push_str("finding\t");
+        out.push_str(finding.kind.as_str());
+        out.push('\t');
+        out.push_str(&finding.subject_id);
+        out.push('\t');
+        out.push_str(finding.severity.as_str());
+        out.push('\t');
+        out.push_str(&finding.score_millipoints.to_string());
+        out.push('\t');
+        out.push_str(&finding.substrate_provenance_refs.join(","));
+        out.push('\t');
+        out.push_str(&finding.calibration_provenance_ref);
+        out.push('\t');
+        out.push_str(&finding.lens_evidence.join(","));
+        out.push('\n');
+    }
+    for skipped in &report.skipped {
+        out.push_str("skipped\t");
+        out.push_str(skipped.kind.as_str());
+        out.push('\t');
+        out.push_str(&skipped.subject_id);
+        out.push('\t');
+        out.push_str(skipped.reason);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+fn agreement_to_millipoints(value: f32) -> u64 {
+    (value.clamp(0.0, 1.0) * 1_000.0).round() as u64
+}
+
+fn anomaly_finding_order(left: &AnomalyFinding, right: &AnomalyFinding) -> Ordering {
+    right
+        .severity
+        .rank()
+        .cmp(&left.severity.rank())
+        .then_with(|| right.score_millipoints.cmp(&left.score_millipoints))
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.subject_id.cmp(&right.subject_id))
+}
+
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
     let mut rows = Vec::with_capacity(nodes.len() * EagerAgreementKind::ALL.len());
     for node in nodes {
@@ -1154,6 +1483,139 @@ mod tests {
                 max_audit_entries: CALYX_REACTIVE_AUDIT_CAP,
             }
         );
+    }
+
+    #[test]
+    fn detect_anomalies_aggregates_remaining_kinds_with_calibrated_severity() {
+        let report = detect_anomalies(&anomaly_fixture_rows(), &anomaly_calibrations(), None, true)
+            .expect("detect anomalies");
+
+        assert_eq!(report.schema, DETECT_ANOMALIES_SCHEMA);
+        assert_eq!(report.kind_filter, None);
+        assert_eq!(report.trust, "verified");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .map(|finding| (
+                    finding.kind.as_str(),
+                    finding.subject_id.as_str(),
+                    finding.severity.as_str(),
+                    finding.score_millipoints
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ood_commit", "commit:alien-1", "high", 950),
+                ("doc_drift", "demo.docs.lie", "high", 900),
+                ("drift", "slot:S18:week-2026-27", "high", 850),
+                ("name_truth", "demo.name.misleads", "medium", 600),
+            ]
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| !finding.subject_id.contains("clean"))
+        );
+        let doc = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == AnomalyKind::DocDrift)
+            .expect("doc drift finding");
+        assert_eq!(doc.substrate_provenance_refs, vec!["xterm:doc-bad"]);
+        assert_eq!(doc.calibration_provenance_ref, "calibration:doc-drift:v1");
+        assert!(doc.lens_evidence[0].contains("DOC_DRIFT"));
+    }
+
+    #[test]
+    fn detect_anomalies_kind_filter_and_invalid_kind_refusal() {
+        let report = detect_anomalies(
+            &anomaly_fixture_rows(),
+            &anomaly_calibrations(),
+            Some("doc_drift"),
+            true,
+        )
+        .expect("doc drift filter");
+
+        assert_eq!(report.kind_filter, Some(AnomalyKind::DocDrift));
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].kind, AnomalyKind::DocDrift);
+
+        let err = detect_anomalies(
+            &anomaly_fixture_rows(),
+            &anomaly_calibrations(),
+            Some("supply_chain"),
+            true,
+        )
+        .expect_err("invalid kind refused");
+        assert_eq!(err.code(), ASTRO_ANOMALY_INVALID_KIND);
+        assert!(err.message().contains("supply_chain"));
+    }
+
+    #[test]
+    fn detect_anomalies_cold_start_marks_all_findings_provisional() {
+        let report = detect_anomalies(
+            &anomaly_fixture_rows(),
+            &anomaly_calibrations(),
+            None,
+            false,
+        )
+        .expect("cold start anomalies");
+
+        assert_eq!(report.trust, "provisional");
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.trust == "provisional")
+        );
+    }
+
+    #[test]
+    fn detect_anomalies_reports_missing_calibration_without_silent_fallback() {
+        let rows = vec![AnomalySubstrateRow::new(
+            AnomalyKind::Drift,
+            "slot:S18:week-2026-27",
+            850,
+            "MMD drift alarm",
+            ["assay:mmd:slot18:week27"],
+            ["MMD:S18"],
+        )];
+
+        let report = detect_anomalies(&rows, &[], None, true).expect("missing calibration report");
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].kind, AnomalyKind::Drift);
+        assert_eq!(report.skipped[0].reason, "missing_calibration");
+    }
+
+    #[test]
+    fn detect_anomalies_aggregation_is_deterministic_and_artifact_reads_back() {
+        let rows = anomaly_fixture_rows();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let first =
+            detect_anomalies(&rows, &anomaly_calibrations(), None, true).expect("first report");
+        let second = detect_anomalies(&reversed, &anomaly_calibrations(), None, true)
+            .expect("second report");
+        assert_eq!(first, second);
+
+        let bytes = anomaly_report_artifact_bytes(&first);
+        let path = std::env::temp_dir().join(format!(
+            "astrolabe-anomalies-{}-{}.txt",
+            std::process::id(),
+            first.findings.len()
+        ));
+        std::fs::write(&path, &bytes).expect("write anomaly artifact");
+        let readback = std::fs::read(&path).expect("read anomaly artifact");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(readback, bytes);
+        let text = String::from_utf8(readback).expect("utf8 anomaly artifact");
+        assert!(text.contains("finding\tdoc_drift\tdemo.docs.lie\thigh\t900\txterm:doc-bad"));
+        assert!(text.contains("calibration:doc-drift:v1"));
+        assert!(text.contains("finding\tood_commit\tcommit:alien-1\thigh\t950"));
     }
 
     #[test]
@@ -1861,6 +2323,110 @@ mod tests {
         {
             CrossTermValue::Scalar(value) => value,
             CrossTermValue::Absent { ref reason } => panic!("expected scalar, got {reason:?}"),
+        }
+    }
+
+    fn anomaly_fixture_rows() -> Vec<AnomalySubstrateRow> {
+        let mut rows = Vec::new();
+        for (row, provenance) in [
+            (
+                eager_cross_term_row(
+                    "demo.docs.lie",
+                    EagerAgreementKind::DocDrift,
+                    SLOT_DOC_SEMANTIC,
+                    SIM_SEMANTIC_SLOT,
+                    0.10,
+                ),
+                "xterm:doc-bad",
+            ),
+            (
+                eager_cross_term_row(
+                    "demo.docs.clean",
+                    EagerAgreementKind::DocDrift,
+                    SLOT_DOC_SEMANTIC,
+                    SIM_SEMANTIC_SLOT,
+                    0.95,
+                ),
+                "xterm:doc-clean",
+            ),
+            (
+                eager_cross_term_row(
+                    "demo.name.misleads",
+                    EagerAgreementKind::NameTruth,
+                    SLOT_NAME_SEMANTIC,
+                    SIM_API_SLOT,
+                    0.40,
+                ),
+                "xterm:name-bad",
+            ),
+            (
+                eager_cross_term_row(
+                    "demo.name.clean",
+                    EagerAgreementKind::NameTruth,
+                    SLOT_NAME_SEMANTIC,
+                    SIM_API_SLOT,
+                    0.96,
+                ),
+                "xterm:name-clean",
+            ),
+        ] {
+            rows.push(
+                anomaly_substrate_row_from_eager_cross_term(&row, provenance)
+                    .expect("xterm row converts to anomaly substrate"),
+            );
+        }
+        rows.push(AnomalySubstrateRow::new(
+            AnomalyKind::Drift,
+            "slot:S18:week-2026-27",
+            850,
+            "MMD drift alarm for semantic slot",
+            ["assay:mmd:slot18:week27"],
+            ["MMD:S18", "guard_reject_rate:S18"],
+        ));
+        rows.push(AnomalySubstrateRow::new(
+            AnomalyKind::OodCommit,
+            "commit:alien-1",
+            950,
+            "NewRegion trigger for committed alien code",
+            ["reactive:new-region:alien-1", "commit:alien-1"],
+            ["NewRegion", "S18"],
+        ));
+        rows
+    }
+
+    fn anomaly_calibrations() -> Vec<AnomalyCalibration> {
+        vec![
+            AnomalyCalibration::new(AnomalyKind::DocDrift, 500, 800, "calibration:doc-drift:v1"),
+            AnomalyCalibration::new(
+                AnomalyKind::NameTruth,
+                500,
+                800,
+                "calibration:name-truth:v1",
+            ),
+            AnomalyCalibration::new(AnomalyKind::Drift, 500, 800, "calibration:drift:v1"),
+            AnomalyCalibration::new(
+                AnomalyKind::OodCommit,
+                500,
+                800,
+                "calibration:ood-commit:v1",
+            ),
+        ]
+    }
+
+    fn eager_cross_term_row(
+        qualified_name: &str,
+        kind: EagerAgreementKind,
+        left_slot: SlotId,
+        right_slot: SlotId,
+        value: f32,
+    ) -> EagerCrossTermRow {
+        EagerCrossTermRow {
+            qualified_name: qualified_name.to_string(),
+            kind,
+            left_slot,
+            right_slot,
+            value: CrossTermValue::Scalar(value),
+            persisted: true,
         }
     }
 

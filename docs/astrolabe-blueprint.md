@@ -1530,6 +1530,8 @@ Label/summarization substrate status: `astrolabe.label_propagation.v1` and `astr
 
 **`detect_anomalies`** â€” blind-spot sweep + drift alarms + doc-drift/name-truth mismatches + OOD commits + `prompt_injection` prose findings. Params: `project`, `scope?`, `kind?`. Returns ranked findings with severities and per-lens evidence.
 
+Anomaly aggregation status: `astrolabe.detect_anomalies.v1` lives in `astrolabe-weave` as the P7.9 contract for the remaining kinds: `doc_drift`, `name_truth`, `drift`, and `ood_commit`. Severity thresholds are supplied as per-kind calibration rows with provenance, not fixed globally. Aggregation is deterministic across kinds, clean rows below calibrated severity are not emitted, missing calibration is reported as a skipped substrate rather than silently guessed, invalid `kind` filters fail closed with `ASTRO_ANOMALY_INVALID_KIND`, and cold-start vaults still run with `trust: provisional`. Live server wiring still has to read real xterm/assay/reactive CF rows and merge this contract with `blind_spot`/`prompt_injection` producers.
+
 ### Guard
 **`guard_check`** â€” validate a diff/candidate (10 Â§3). Params: `project`, `diff|content+path`, `high_stakes?`. Returns per-slot verdict table, overall, nearest exemplar, remediation.
 **`guard_calibrate`** â€” build/refresh calibration (operator). Params: `project`, `domain?`, `sources?`. Returns per-slot Ï„/FAR/FRR + corpus provenance.
