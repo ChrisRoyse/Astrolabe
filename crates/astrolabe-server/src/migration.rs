@@ -82,7 +82,10 @@ const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v1";
 const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str = "astrolabe.periodic_verify_chain_tick.v1";
 const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
+const OPTIMIZER_JANITOR_SCHEMA: &str = "astrolabe.optimizer_janitor.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
+const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
+const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
 const GET_READINESS_SCHEMA: &str = "astrolabe.get_readiness.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -5113,6 +5116,11 @@ fn optimizer_status_json_at(
     let frozen_knobs = optimizer_freeze_status_json(cache_dir, project, global_freeze)?;
     let recent_changes = optimizer_recent_changes_json(cache_dir, project);
     let reactive_triggers = optimizer_reactive_triggers_json(cache_dir, project);
+    let janitor = optimizer_janitor_status_json_at(
+        cache_dir,
+        project,
+        OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK,
+    );
     let status = if global_freeze { "frozen" } else { "inactive" };
 
     Ok(json!({
@@ -5142,7 +5150,7 @@ fn optimizer_status_json_at(
         "kill_switch": kill_switch,
         "frozen_knobs": frozen_knobs,
         "tripwires": optimizer_tripwires_json(),
-        "budget": optimizer_budget_json(&background_lane),
+        "budget": optimizer_budget_json(&background_lane, janitor),
         "recent_changes": recent_changes,
         "pending_proposals": optimizer_pending_proposals_json(),
         "guard_health": optimizer_guard_health_json(cache_dir, project)?,
@@ -5152,7 +5160,7 @@ fn optimizer_status_json_at(
             "status": "enabled",
             "propose": "not_enabled_in_shadow_stage",
             "trigger_ack": "not_enabled_in_shadow_stage",
-            "janitor": "not_enabled_in_shadow_stage",
+            "janitor": "enabled_budgeted_tick",
         },
     }))
 }
@@ -5286,7 +5294,7 @@ fn optimizer_tripwires_json() -> Value {
     })
 }
 
-fn optimizer_budget_json(background_lane: &Value) -> Value {
+fn optimizer_budget_json(background_lane: &Value, janitor: Value) -> Value {
     let anneal_active = background_lane
         .get("lanes")
         .and_then(|lanes| lanes.get("anneal"))
@@ -5299,17 +5307,308 @@ fn optimizer_budget_json(background_lane: &Value) -> Value {
         "freshness": background_lane.get("freshness").and_then(Value::as_str).unwrap_or("fresh"),
         "trust": background_lane.get("trust").and_then(Value::as_str).unwrap_or("provisional"),
         "background_lane": background_lane,
-        "janitor": {
-            "status": "inactive",
-            "active": false,
-            "max_bytes_per_tick": Value::Null,
-            "bytes_cleaned_last_tick": Value::Null,
-            "freshness": "not_evaluated",
-            "trust": "provisional",
-            "reason": "artifact janitor is not enabled in the current shadow stage",
-            "remediation": "wire a cooperative janitor tick with an instrumented byte budget before reporting a numeric cleanup limit",
-        },
+        "janitor": janitor,
     })
+}
+
+#[derive(Debug, Clone)]
+struct OptimizerJanitorFile {
+    path: PathBuf,
+    relative_key: String,
+    len: u64,
+}
+
+#[derive(Debug, Default)]
+struct OptimizerJanitorScan {
+    files: Vec<OptimizerJanitorFile>,
+    symlink_entries: usize,
+    special_entries: usize,
+}
+
+impl OptimizerJanitorScan {
+    fn bytes_pending(&self) -> Result<u64, DynError> {
+        let mut total = 0_u64;
+        for file in &self.files {
+            total = total
+                .checked_add(file.len)
+                .ok_or_else(|| "optimizer janitor pending byte count overflow".to_string())?;
+        }
+        Ok(total)
+    }
+}
+
+fn optimizer_janitor_status_json_at(
+    cache_dir: &Path,
+    project: &str,
+    max_bytes_per_tick: u64,
+) -> Value {
+    match optimizer_janitor_tick_json_at(cache_dir, project, max_bytes_per_tick) {
+        Ok(value) => value,
+        Err(error) => {
+            let root = optimizer_janitor_root(cache_dir, project);
+            json!({
+                "schema": OPTIMIZER_JANITOR_SCHEMA,
+                "status": "error",
+                "active": false,
+                "code": "ASTRO_OPTIMIZER_JANITOR_ERROR",
+                "message": error.to_string(),
+                "root": root,
+                "max_bytes_per_tick": max_bytes_per_tick,
+                "max_bytes_per_tick_source": "policy:P8.6-janitor-bound",
+                "source": optimizer_janitor_source(&optimizer_janitor_root(cache_dir, project)),
+                "freshness": "fresh",
+                "trust": "provisional",
+                "remediation": "inspect the janitor root permissions and retry optimizer_status before trusting artifact cleanup state",
+            })
+        }
+    }
+}
+
+fn optimizer_janitor_tick_json_at(
+    cache_dir: &Path,
+    project: &str,
+    max_bytes_per_tick: u64,
+) -> Result<Value, DynError> {
+    let root = optimizer_janitor_root(cache_dir, project);
+    if max_bytes_per_tick == 0 {
+        return Ok(json!({
+            "schema": OPTIMIZER_JANITOR_SCHEMA,
+            "status": "disabled",
+            "active": false,
+            "root": root,
+            "root_exists": root.exists(),
+            "max_bytes_per_tick": max_bytes_per_tick,
+            "max_bytes_per_tick_source": "policy:P8.6-janitor-bound",
+            "bytes_pending_before": Value::Null,
+            "bytes_cleaned_last_tick": 0,
+            "bytes_pending_after": Value::Null,
+            "files_pending_before": Value::Null,
+            "files_deleted_last_tick": 0,
+            "files_pending_after": Value::Null,
+            "skipped": Value::Null,
+            "source": optimizer_janitor_source(&root),
+            "freshness": "fresh",
+            "trust": "verified",
+            "reason": "janitor byte budget is zero",
+            "remediation": "set a positive policy byte budget before relying on optimizer artifact cleanup",
+        }));
+    }
+
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({
+                "schema": OPTIMIZER_JANITOR_SCHEMA,
+                "status": "empty",
+                "active": true,
+                "root": root,
+                "root_exists": false,
+                "max_bytes_per_tick": max_bytes_per_tick,
+                "max_bytes_per_tick_source": "policy:P8.6-janitor-bound",
+                "bytes_pending_before": 0,
+                "bytes_cleaned_last_tick": 0,
+                "bytes_pending_after": 0,
+                "files_pending_before": 0,
+                "files_deleted_last_tick": 0,
+                "files_pending_after": 0,
+                "skipped": {
+                    "symlink_entries_before": 0,
+                    "special_entries_before": 0,
+                    "oversize_files_last_tick": 0,
+                    "budget_deferred_files_last_tick": 0,
+                    "delete_error_files_last_tick": 0,
+                    "symlink_entries_after": 0,
+                    "special_entries_after": 0,
+                },
+                "source": optimizer_janitor_source(&root),
+                "freshness": "fresh",
+                "trust": "verified",
+                "reason": Value::Null,
+                "remediation": Value::Null,
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !metadata.is_dir() {
+        return Ok(json!({
+            "schema": OPTIMIZER_JANITOR_SCHEMA,
+            "status": "invalid_root",
+            "active": false,
+            "code": "ASTRO_OPTIMIZER_JANITOR_INVALID_ROOT",
+            "root": root,
+            "root_exists": true,
+            "max_bytes_per_tick": max_bytes_per_tick,
+            "max_bytes_per_tick_source": "policy:P8.6-janitor-bound",
+            "bytes_pending_before": Value::Null,
+            "bytes_cleaned_last_tick": 0,
+            "bytes_pending_after": Value::Null,
+            "files_pending_before": Value::Null,
+            "files_deleted_last_tick": 0,
+            "files_pending_after": Value::Null,
+            "skipped": Value::Null,
+            "source": optimizer_janitor_source(&root),
+            "freshness": "fresh",
+            "trust": "provisional",
+            "reason": "optimizer janitor root is not a directory owned by this cache namespace",
+            "remediation": "move or remove the invalid optimizer janitor root before retrying optimizer_status",
+        }));
+    }
+
+    let scan_before = optimizer_janitor_scan(&root)?;
+    let bytes_pending_before = scan_before.bytes_pending()?;
+    let files_pending_before = scan_before.files.len();
+    let mut bytes_cleaned = 0_u64;
+    let mut files_deleted = 0_usize;
+    let mut skipped_oversize = 0_usize;
+    let mut skipped_budget = 0_usize;
+    let mut delete_errors = Vec::<Value>::new();
+
+    for file in &scan_before.files {
+        if file.len > max_bytes_per_tick {
+            skipped_oversize += 1;
+            continue;
+        }
+        if bytes_cleaned > max_bytes_per_tick.saturating_sub(file.len) {
+            skipped_budget += 1;
+            continue;
+        }
+        match fs::remove_file(&file.path) {
+            Ok(()) => {
+                bytes_cleaned += file.len;
+                files_deleted += 1;
+            }
+            Err(error) => {
+                delete_errors.push(json!({
+                    "path": file.path,
+                    "relative_path": file.relative_key,
+                    "message": error.to_string(),
+                }));
+            }
+        }
+    }
+
+    let scan_after = optimizer_janitor_scan(&root)?;
+    let bytes_pending_after = scan_after.bytes_pending()?;
+    let files_pending_after = scan_after.files.len();
+    let delete_error_count = delete_errors.len();
+    let status = if delete_error_count > 0 {
+        "partial"
+    } else if files_pending_before == 0 {
+        "empty"
+    } else {
+        "tick_complete"
+    };
+    let trust = if delete_error_count == 0 {
+        "verified"
+    } else {
+        "provisional"
+    };
+    let remediation = if delete_error_count > 0 {
+        Value::String(
+            "inspect delete errors and permissions before trusting optimizer artifact cleanup state"
+                .to_string(),
+        )
+    } else if skipped_oversize > 0 {
+        Value::String(
+            "split oversized optimizer artifacts or raise the policy after review; oversized files are not deleted by this tick"
+                .to_string(),
+        )
+    } else if skipped_budget > 0 {
+        Value::String("run another optimizer_status tick or background janitor tick to continue bounded cleanup".to_string())
+    } else {
+        Value::Null
+    };
+
+    Ok(json!({
+        "schema": OPTIMIZER_JANITOR_SCHEMA,
+        "status": status,
+        "active": true,
+        "root": root,
+        "root_exists": true,
+        "max_bytes_per_tick": max_bytes_per_tick,
+        "max_bytes_per_tick_source": "policy:P8.6-janitor-bound",
+        "bytes_pending_before": bytes_pending_before,
+        "bytes_cleaned_last_tick": bytes_cleaned,
+        "bytes_pending_after": bytes_pending_after,
+        "files_pending_before": files_pending_before,
+        "files_deleted_last_tick": files_deleted,
+        "files_pending_after": files_pending_after,
+        "skipped": {
+            "symlink_entries_before": scan_before.symlink_entries,
+            "special_entries_before": scan_before.special_entries,
+            "oversize_files_last_tick": skipped_oversize,
+            "budget_deferred_files_last_tick": skipped_budget,
+            "delete_error_files_last_tick": delete_error_count,
+            "symlink_entries_after": scan_after.symlink_entries,
+            "special_entries_after": scan_after.special_entries,
+        },
+        "errors": delete_errors,
+        "source": optimizer_janitor_source(&root),
+        "freshness": "fresh",
+        "trust": trust,
+        "reason": Value::Null,
+        "remediation": remediation,
+    }))
+}
+
+fn optimizer_janitor_root(cache_dir: &Path, project: &str) -> PathBuf {
+    cache_dir.join(format!("{project}{OPTIMIZER_JANITOR_DIR_SUFFIX}"))
+}
+
+fn optimizer_janitor_source(root: &Path) -> String {
+    format!(
+        "filesystem:astrolabe-owned-optimizer-artifacts:{}",
+        root.display()
+    )
+}
+
+fn optimizer_janitor_scan(root: &Path) -> Result<OptimizerJanitorScan, DynError> {
+    let mut scan = OptimizerJanitorScan::default();
+    optimizer_janitor_collect(root, root, &mut scan)?;
+    scan.files
+        .sort_by(|left, right| left.relative_key.cmp(&right.relative_key));
+    Ok(scan)
+}
+
+fn optimizer_janitor_collect(
+    root: &Path,
+    dir: &Path,
+    scan: &mut OptimizerJanitorScan,
+) -> Result<(), DynError> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            scan.symlink_entries += 1;
+        } else if metadata.is_file() {
+            scan.files.push(OptimizerJanitorFile {
+                relative_key: optimizer_janitor_relative_key(root, &path),
+                path,
+                len: metadata.len(),
+            });
+        } else if metadata.is_dir() {
+            optimizer_janitor_collect(root, &path, scan)?;
+        } else {
+            scan.special_entries += 1;
+        }
+    }
+    Ok(())
+}
+
+fn optimizer_janitor_relative_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn optimizer_pending_proposals_json() -> Value {
@@ -7793,12 +8092,20 @@ mod tests {
                 .iter()
                 .all(|entry| entry["kind"] == "anneal" && entry["verified_hash"] == true)
         );
-        assert_eq!(status["budget"]["janitor"]["status"], "inactive");
+        assert_eq!(status["budget"]["janitor"]["status"], "empty");
+        assert_eq!(status["budget"]["janitor"]["active"], true);
+        assert_eq!(
+            status["budget"]["janitor"]["max_bytes_per_tick"],
+            OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK
+        );
+        assert_eq!(status["budget"]["janitor"]["bytes_cleaned_last_tick"], 0);
+        assert_eq!(status["budget"]["janitor"]["trust"], "verified");
         assert_eq!(status["pending_proposals"]["status"], "unavailable");
         assert_eq!(status["guard_health"]["status"], "unavailable");
         assert_eq!(status["drift_alarms"]["status"], "unavailable");
         assert_eq!(status["reactive_triggers"]["status"], "read");
         assert_eq!(status["reactive_triggers"]["unacknowledged_count"], 0);
+        assert_eq!(status["capabilities"]["janitor"], "enabled_budgeted_tick");
         assert_eq!(status["tripwires"]["state_count"], 5);
         assert!(
             status["tripwires"]["states"]
@@ -7806,6 +8113,46 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|state| state["state"] == "not_armed")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_janitor_tick_respects_byte_budget_and_reports_filesystem_state() {
+        let dir = temp_dir("optimizer-janitor-budget");
+        let root = optimizer_janitor_root(&dir, "demo");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("a.bin"), vec![b'a'; 40]).unwrap();
+        fs::write(root.join("b.bin"), vec![b'b'; 35]).unwrap();
+        fs::write(root.join("nested").join("c.bin"), vec![b'c'; 50]).unwrap();
+        assert_eq!(file_tree_byte_len(&root), 125);
+
+        let status = optimizer_janitor_tick_json_at(&dir, "demo", 80).unwrap();
+
+        assert_eq!(status["schema"], OPTIMIZER_JANITOR_SCHEMA);
+        assert_eq!(status["status"], "tick_complete");
+        assert_eq!(status["active"], true);
+        assert_eq!(status["max_bytes_per_tick"], 80);
+        assert_eq!(
+            status["max_bytes_per_tick_source"],
+            "policy:P8.6-janitor-bound"
+        );
+        assert_eq!(status["bytes_pending_before"], 125);
+        assert_eq!(status["bytes_cleaned_last_tick"], 75);
+        assert!(status["bytes_cleaned_last_tick"].as_u64().unwrap() <= 80);
+        assert_eq!(status["files_pending_before"], 3);
+        assert_eq!(status["files_deleted_last_tick"], 2);
+        assert_eq!(status["files_pending_after"], 1);
+        assert_eq!(status["bytes_pending_after"], 50);
+        assert_eq!(status["skipped"]["budget_deferred_files_last_tick"], 1);
+        assert_eq!(status["trust"], "verified");
+        assert!(!root.join("a.bin").exists());
+        assert!(!root.join("b.bin").exists());
+        assert!(root.join("nested").join("c.bin").exists());
+        assert_eq!(file_tree_byte_len(&root), 50);
+        assert_eq!(
+            status["bytes_pending_after"].as_u64().unwrap(),
+            file_tree_byte_len(&root)
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -8548,6 +8895,23 @@ mod tests {
         ));
         fs::remove_dir_all(&dir).ok();
         dir
+    }
+
+    fn file_tree_byte_len(root: &Path) -> u64 {
+        if !root.exists() {
+            return 0;
+        }
+        let mut total = 0_u64;
+        for entry in fs::read_dir(root).expect("read file tree") {
+            let path = entry.expect("file tree entry").path();
+            let metadata = fs::symlink_metadata(&path).expect("file tree metadata");
+            if metadata.is_file() {
+                total += u64::try_from(fs::read(&path).expect("read file").len()).unwrap();
+            } else if metadata.is_dir() {
+                total += file_tree_byte_len(&path);
+            }
+        }
+        total
     }
 
     fn wait_for_file_or_child_exit(path: &Path, child: &mut std::process::Child) {
