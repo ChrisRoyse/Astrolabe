@@ -6,17 +6,21 @@ use std::error::Error;
 use std::fmt;
 
 use astrolabe_domain::EdgeKind;
-use calyx_core::{SlotId, SlotVector, SparseEntry};
+use calyx_aster::cf::ColumnFamily;
+use calyx_aster::vault::AsterVault;
+use calyx_core::{CalyxError, Clock, SlotId, SlotVector, SparseEntry, VaultStore};
+use calyx_ledger::decode as decode_ledger;
 pub use calyx_loom::reactive::{
     DEFAULT_MAX_AUDIT_ENTRIES as CALYX_REACTIVE_AUDIT_CAP,
     DEFAULT_MAX_QUEUE_DEPTH as CALYX_REACTIVE_QUEUE_CAP,
     DEFAULT_MAX_TRIGGERS as CALYX_REACTIVE_REGISTRY_CAP,
 };
 pub use calyx_loom::{
-    AuditEntry as ReactiveAuditEntry, NoveltyVerdict, ReactiveEngine, ReactiveRowKind,
-    ReactiveSignals, TriggerCondition, TriggerFired, TriggerId, decode_audit_entry,
-    decode_trigger_fired, reactive_row_key,
+    AuditEntry as ReactiveAuditEntry, CALYX_REACTIVE_ROW_CORRUPT, NoveltyVerdict, ReactiveEngine,
+    ReactiveRowKind, ReactiveSignals, SubscriptionId, TriggerCondition, TriggerFired, TriggerId,
+    decode_audit_entry, decode_trigger_fired, reactive_row_key,
 };
+use serde::Deserialize;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -70,6 +74,156 @@ impl Default for ReactiveCaps {
 
 pub fn default_reactive_caps() -> ReactiveCaps {
     ReactiveCaps::default()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredReactiveState {
+    pub subscriptions: Vec<RecoveredReactiveSubscription>,
+    pub fired_events: Vec<TriggerFired>,
+}
+
+impl RecoveredReactiveState {
+    pub fn pending_event_count(&self) -> usize {
+        self.subscriptions
+            .iter()
+            .map(|subscription| subscription.pending_events.len())
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredReactiveSubscription {
+    pub subscription_id: SubscriptionId,
+    pub trigger_id: TriggerId,
+    pub condition: TriggerCondition,
+    pub owner: Option<String>,
+    pub max_drain_buf: usize,
+    pub created_ledger_seq: u64,
+    pub pending_events: Vec<TriggerFired>,
+    pub overflowed: bool,
+}
+
+#[derive(Deserialize)]
+struct ReactiveSubscriptionLedgerPayload {
+    tag: String,
+    action: String,
+    subscription_id: SubscriptionId,
+    trigger_id: TriggerId,
+    condition: TriggerCondition,
+    owner: Option<String>,
+    max_drain_buf: usize,
+}
+
+pub fn recover_reactive_state<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<RecoveredReactiveState>
+where
+    C: Clock,
+{
+    let snapshot = vault.snapshot();
+    let mut subscriptions = BTreeMap::<SubscriptionId, RecoveredReactiveSubscription>::new();
+
+    for (_key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
+        let entry = decode_ledger(&bytes)
+            .map_err(|error| reactive_recovery_error(format!("decode Ledger CF row: {error}")))?;
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.payload) else {
+            continue;
+        };
+        if value.get("tag").and_then(serde_json::Value::as_str) != Some("reactive_subscription_v1")
+        {
+            continue;
+        }
+        let payload: ReactiveSubscriptionLedgerPayload =
+            serde_json::from_value(value).map_err(|error| {
+                reactive_recovery_error(format!(
+                    "decode reactive subscription ledger payload: {error}"
+                ))
+            })?;
+        if payload.tag != "reactive_subscription_v1" {
+            continue;
+        }
+
+        match payload.action.as_str() {
+            "SUBSCRIPTION_CREATED" => {
+                subscriptions.insert(
+                    payload.subscription_id,
+                    RecoveredReactiveSubscription {
+                        subscription_id: payload.subscription_id,
+                        trigger_id: payload.trigger_id,
+                        condition: payload.condition,
+                        owner: payload.owner,
+                        max_drain_buf: payload.max_drain_buf.max(1),
+                        created_ledger_seq: entry.seq,
+                        pending_events: Vec::new(),
+                        overflowed: false,
+                    },
+                );
+            }
+            "SUBSCRIPTION_REMOVED" => {
+                subscriptions.remove(&payload.subscription_id);
+            }
+            other => {
+                return Err(reactive_recovery_error(format!(
+                    "unknown reactive subscription action {other}"
+                )));
+            }
+        }
+    }
+
+    let mut fired_events = durable_fired_events(vault, snapshot)?;
+    fired_events.sort_by(|left, right| {
+        left.ledger_ref
+            .seq
+            .cmp(&right.ledger_ref.seq)
+            .then_with(|| left.trigger_id.cmp(&right.trigger_id))
+            .then_with(|| left.cx_id.cmp(&right.cx_id))
+    });
+
+    for event in &fired_events {
+        for subscription in subscriptions.values_mut() {
+            if subscription.trigger_id != event.trigger_id {
+                continue;
+            }
+            if event.ledger_ref.seq < subscription.created_ledger_seq {
+                continue;
+            }
+            if subscription.pending_events.len() >= subscription.max_drain_buf {
+                subscription.pending_events.remove(0);
+                subscription.overflowed = true;
+            }
+            subscription.pending_events.push(event.clone());
+        }
+    }
+
+    Ok(RecoveredReactiveState {
+        subscriptions: subscriptions.into_values().collect(),
+        fired_events,
+    })
+}
+
+fn durable_fired_events<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+) -> calyx_core::Result<Vec<TriggerFired>>
+where
+    C: Clock,
+{
+    let mut fired = Vec::new();
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Reactive)? {
+        let parts = reactive_row_key(&key)?;
+        if parts.kind == ReactiveRowKind::Fired {
+            fired.push(decode_trigger_fired(&value)?);
+        }
+    }
+    Ok(fired)
+}
+
+fn reactive_recovery_error(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: CALYX_REACTIVE_ROW_CORRUPT,
+        message: message.into(),
+        remediation: "repair or rebuild reactive Ledger/CF rows before recovering subscriptions",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -938,6 +1092,7 @@ mod tests {
         CxId, FixedClock, LedgerRef, Result as CalyxResult, SparseEntry, SystemClock, VaultId,
         VaultStore,
     };
+    use calyx_ledger::{ActorId, EntryKind, SubjectId};
     use calyx_loom::CALYX_REACTIVE_QUEUE_FULL;
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
@@ -1067,6 +1222,74 @@ mod tests {
         let reopened_fired = fired_events(&reopened);
         assert_eq!(reopened_fired.len(), 1);
         assert_eq!(reopened_fired[0].ledger_ref.seq, 3);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_restart_recovery_reads_pending_subscription_and_fired_state() {
+        let (dir, vault) = reactive_vault("restart-recovery");
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_250)));
+        let subscription = engine
+            .subscribe_durable(
+                &vault,
+                TriggerCondition::NewRegion { tau_override: None },
+                Some("astrolabe-weave-restart".to_string()),
+            )
+            .expect("durable subscription");
+        let trigger = engine
+            .subscriptions()
+            .get(subscription)
+            .expect("subscription handle")
+            .trigger_id;
+        let trigger_cx = cx(44);
+        let ingest_ref = vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Cx(trigger_cx),
+                b"reactive restart recovery ingest".to_vec(),
+                ActorId::Service("astrolabe-weave-test".to_string()),
+            )
+            .expect("append real ingest ledger entry");
+        let signals =
+            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
+
+        assert_eq!(
+            engine
+                .evaluate_post_ingest_durable(&vault, trigger_cx, ingest_ref.clone(), &signals)
+                .expect("evaluate durable subscription"),
+            1
+        );
+        assert_eq!(engine.queue().len(), 1);
+        assert_eq!(
+            engine
+                .subscriptions()
+                .get(subscription)
+                .expect("subscription handle")
+                .pending_len(),
+            1
+        );
+
+        vault.flush().expect("flush durable reactive restart state");
+        drop(engine);
+        drop(vault);
+        let reopened = open_reactive_vault(&dir);
+        let recovered = recover_reactive_state(&reopened).expect("recover durable reactive state");
+
+        assert_eq!(recovered.fired_events.len(), 1);
+        assert_eq!(recovered.fired_events[0].trigger_id, trigger);
+        assert_eq!(recovered.fired_events[0].ledger_ref.seq, ingest_ref.seq);
+        assert_eq!(recovered.subscriptions.len(), 1);
+        let recovered_subscription = &recovered.subscriptions[0];
+        assert_eq!(recovered_subscription.subscription_id, subscription);
+        assert_eq!(recovered_subscription.trigger_id, trigger);
+        assert_eq!(recovered_subscription.pending_events.len(), 1);
+        assert!(!recovered_subscription.overflowed);
+        assert_eq!(
+            recovered_subscription.pending_events[0].ledger_ref.seq,
+            ingest_ref.seq
+        );
+        assert_eq!(recovered.pending_event_count(), 1);
         drop(reopened);
         let _ = fs::remove_dir_all(dir);
     }

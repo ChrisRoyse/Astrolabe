@@ -205,7 +205,10 @@ dependencies = [
  "astrolabe-domain",
  "calyx-aster",
  "calyx-core",
+ "calyx-ledger",
  "calyx-loom",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

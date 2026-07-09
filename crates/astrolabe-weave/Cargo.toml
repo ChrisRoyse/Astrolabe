@@ -8,11 +8,14 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+calyx-aster.workspace = true
 calyx-core.workspace = true
+calyx-ledger.workspace = true
 calyx-loom.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lib]
 path = "src/lib.rs"
 
 [dev-dependencies]
-calyx-aster.workspace = true
