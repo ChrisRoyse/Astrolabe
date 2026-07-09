@@ -2119,14 +2119,28 @@ mod tests {
                 .code,
             "ASTRO_CBM_INVALID_PROJECT_NAME"
         );
-        assert_eq!(
-            watcher
-                .watch("safe-name", "/tmp/astrolabe;watcher")
-                .unwrap_err()
-                .envelope()
-                .code,
-            "ASTRO_CBM_UNSAFE_SHELL_ARG"
-        );
+        let injection_paths = [
+            "/tmp/astrolabe;watcher",
+            "/tmp/astrolabe|watcher",
+            "/tmp/astrolabe&watcher",
+            "/tmp/$(whoami)",
+            "/tmp/`id`",
+            "/tmp/astrolabe\nwatcher",
+            "/tmp/astrolabe\"watcher",
+            "/tmp/astrolabe>out",
+            "' ; rm -rf / ; echo '",
+        ];
+        for path in injection_paths {
+            assert_eq!(
+                watcher
+                    .watch("safe-name", path)
+                    .unwrap_err()
+                    .envelope()
+                    .code,
+                "ASTRO_CBM_UNSAFE_SHELL_ARG",
+                "path should be rejected: {path:?}"
+            );
+        }
         assert_eq!(watcher.watch_count().unwrap(), 0);
     }
 
