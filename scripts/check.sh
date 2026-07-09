@@ -30,6 +30,7 @@ bash scripts/verify-pins.sh
 bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/test-release-predicate.py
+"$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
 "$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
 "$PYTHON_BIN" scripts/check-redaction-writers.py
 "$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact

@@ -7,6 +7,8 @@ MODE="${ASTROLABE_ROW_SINK_BENCH_MODE:-full}"
 REPEATS="${ASTROLABE_ROW_SINK_BENCH_REPEATS:-3}"
 FILES="${ASTROLABE_ROW_SINK_BENCH_FILES:-12}"
 CORPUS_CLASS="${ASTROLABE_ROW_SINK_BENCH_CORPUS_CLASS:-small}"
+WRITE_RELEASE_ARTIFACT="${ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT:-0}"
+ARTIFACT_DIR="${ASTROLABE_ROW_SINK_BENCH_ARTIFACT_DIR:-$ROOT/target/astrolabe-release-predicate}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -23,11 +25,29 @@ fi
 
 cd "$ROOT"
 tmp="$OUT.tmp"
+set +e
 cargo run -p astrolabe-bridge --release --example bench_row_sink_overhead -- "${args[@]}" > "$tmp"
-mv "$tmp" "$OUT"
-cat "$OUT"
+bench_rc=$?
+set -e
 
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+if [[ -s "$tmp" ]]; then
+  mv "$tmp" "$OUT"
+else
+  rm -f "$tmp"
+fi
+
+if [[ "$WRITE_RELEASE_ARTIFACT" == "1" || "$WRITE_RELEASE_ARTIFACT" == "true" ]]; then
+  python3 scripts/write-bench-ratios-artifact.py \
+    --source "$OUT" \
+    --artifact-dir "$ARTIFACT_DIR" \
+    --return-code "$bench_rc"
+fi
+
+if [[ -f "$OUT" ]]; then
+  cat "$OUT"
+fi
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -f "$OUT" ]]; then
   status="$(python3 - <<'PY' "$OUT"
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
@@ -68,5 +88,10 @@ PY
     echo "| Gate ratio | $gate |"
     echo "| Measured ratio | $ratio |"
     echo "| Artifact | $OUT |"
+    if [[ "$WRITE_RELEASE_ARTIFACT" == "1" || "$WRITE_RELEASE_ARTIFACT" == "true" ]]; then
+      echo "| Release predicate artifact | $ARTIFACT_DIR/bench-ratios.json |"
+    fi
   } >> "$GITHUB_STEP_SUMMARY"
 fi
+
+exit "$bench_rc"
