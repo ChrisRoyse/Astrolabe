@@ -46,7 +46,7 @@ bash scripts/check-mcp-parity.sh
 "$PYTHON_BIN" scripts/check-hook-contracts.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-server-manifest.py
 "$PYTHON_BIN" scripts/check-lowered-parity.py
-"$PYTHON_BIN" scripts/check-shadow-parity.py
+"$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact
 "$PYTHON_BIN" scripts/check-cross-process-vault.py
 "$PYTHON_BIN" scripts/check-cross-process-servers.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"

@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT = "astrolabe_shadow_parity"
 WHITELIST = ROOT / "ci" / "shadow-parity-whitelist.json"
 SHADOW_VAULT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+DEFAULT_ARTIFACT_DIR = ROOT / "target" / "astrolabe-release-predicate"
+PARITY_DASHBOARD_ARTIFACT = "parity-dashboard.json"
 
 
 def run(argv, *, env=None, cwd=ROOT, timeout=240):
@@ -383,6 +385,34 @@ def write_dashboard(path, dashboard):
     path.write_text(json.dumps(dashboard, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def write_release_artifact(artifact_dir, dashboard):
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    unwhitelisted_count = len(dashboard["unwhitelisted"])
+    passed = dashboard["status"] == "verified" and unwhitelisted_count == 0
+    artifact = {
+        "schema": "astrolabe.parity_dashboard.v1",
+        "status": "pass" if passed else "fail",
+        "source": "scripts/check-shadow-parity.py",
+        "dashboard_schema": dashboard["schema"],
+        "dashboard_status": dashboard["status"],
+        "reason": None
+        if passed
+        else f"shadow parity has {unwhitelisted_count} unwhitelisted divergence(s)",
+        "project": dashboard["project"],
+        "nodes": dashboard["nodes"],
+        "edges": dashboard["edges"],
+        "search_overlap_at_10": dashboard["search_overlap_at_10"],
+        "divergence_count": len(dashboard["divergences"]),
+        "unwhitelisted_count": len(dashboard["unwhitelisted"]),
+        "second_run_new_cx_ids": dashboard["idempotency"]["second"]["new_cx_ids"],
+        "second_run_graph_rows_written": dashboard["idempotency"]["second"]["graph_rows_written"],
+        "second_run_edge_rows_written": dashboard["idempotency"]["second"]["edge_rows_written"],
+        "deep_verify": dashboard["deep_verify"],
+    }
+    path = artifact_dir / PARITY_DASHBOARD_ARTIFACT
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def write_summary(path, dashboard):
     if path is None:
         return
@@ -408,6 +438,8 @@ def main():
     parser.add_argument("--whitelist", type=Path, default=WHITELIST)
     parser.add_argument("--dashboard-out", type=Path)
     parser.add_argument("--summary-out", type=Path)
+    parser.add_argument("--write-release-artifact", action="store_true")
+    parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--inject-fault", action="store_true")
     parser.add_argument("--expect-failure", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
@@ -543,8 +575,12 @@ def main():
             print(json.dumps(dashboard, sort_keys=True))
             return
         if unwhitelisted:
+            if args.write_release_artifact:
+                write_release_artifact(args.artifact_dir, dashboard)
             print(json.dumps(dashboard, indent=2, sort_keys=True), file=sys.stderr)
             raise SystemExit(1)
+        if args.write_release_artifact:
+            write_release_artifact(args.artifact_dir, dashboard)
         print(json.dumps(dashboard, sort_keys=True))
     finally:
         if args.keep_temp:
