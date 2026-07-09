@@ -33,6 +33,10 @@ use astrolabe_kernel::{
 };
 use astrolabe_lower::{LowerSqliteOptions, lower_cbm_sqlite};
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
+use astrolabe_weave::{
+    AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
+    anomaly_report_artifact_bytes, detect_anomalies,
+};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AbsentReason, Clock, SlotVector, VaultId};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -114,6 +118,7 @@ struct ShadowImportOutcome {
     skill_tree: Value,
     bridges: Value,
     kernel_context: Value,
+    anomalies: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +129,7 @@ struct RowSinkSnapshot {
     skill_tree: Value,
     bridges: Value,
     kernel_context: Value,
+    anomalies: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +147,7 @@ struct ShadowVaultImport {
     skill_tree: Value,
     bridges: Value,
     kernel_context: Value,
+    anomalies: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +220,7 @@ pub fn handle_tool_raw(
         "index_repository" => handle_index_repository(runner, args_json),
         "index_status" => handle_index_status(runner, args_json),
         "get_architecture" => handle_get_architecture(runner, args_json),
+        "detect_anomalies" => handle_detect_anomalies(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -250,6 +258,7 @@ pub fn handle_jsonrpc_raw(
     if tool_name != "index_repository"
         && tool_name != "index_status"
         && tool_name != "get_architecture"
+        && tool_name != "detect_anomalies"
     {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
@@ -293,6 +302,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
+        "detect_anomalies" => Ok(true),
         _ => Ok(false),
     }
 }
@@ -442,9 +452,33 @@ fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<St
                 "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
                 "bridges": read_bridges_metadata(&cache_dir, &project)?,
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
+                "anomalies": read_anomaly_report_metadata(&cache_dir, &project)?,
             },
         }),
     )
+}
+
+fn handle_detect_anomalies(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("detect_anomalies arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("detect_anomalies requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "detect_anomalies requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let kind_filter = string_arg(args_obj, "kind");
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let report = read_anomaly_report_metadata(&cache_dir, &project)?;
+    let filtered = match filter_anomaly_report_json(report, kind_filter) {
+        Ok(filtered) => filtered,
+        Err(error) => return tool_error_result(error.to_string()),
+    };
+    tool_json_result(filtered)
 }
 
 fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
@@ -752,6 +786,7 @@ fn import_shadow_vault(
         skill_tree: shadow_import.skill_tree,
         bridges: shadow_import.bridges,
         kernel_context: shadow_import.kernel_context,
+        anomalies: shadow_import.anomalies,
     })
 }
 
@@ -772,6 +807,7 @@ where
             let skill_tree = snapshot.skill_tree.clone();
             let bridges = snapshot.bridges.clone();
             let kernel_context = snapshot.kernel_context.clone();
+            let anomalies = snapshot.anomalies.clone();
             match import_cbm_graph_snapshot_to_vault_direct(
                 &snapshot.snapshot,
                 snapshot.source_fingerprint_sha256,
@@ -787,6 +823,7 @@ where
                     skill_tree,
                     bridges,
                     kernel_context,
+                    anomalies,
                 }),
                 Err(error) => {
                     let reason = format!("row-sink direct import failed: {error}");
@@ -799,6 +836,7 @@ where
                         skill_tree,
                         bridges,
                         kernel_context,
+                        anomalies,
                     })
                 }
             }
@@ -810,6 +848,7 @@ where
             let skill_tree = skill_tree_unavailable_json(&reason);
             let bridges = bridges_unavailable_json(&reason);
             let kernel_context = kernel_context_unavailable_json(&reason);
+            let anomalies = anomaly_report_unavailable_json(&reason);
             Ok(ShadowVaultImport {
                 report,
                 source: "sqlite_fallback".to_string(),
@@ -818,6 +857,7 @@ where
                 skill_tree,
                 bridges,
                 kernel_context,
+                anomalies,
             })
         }
         None => {
@@ -834,6 +874,7 @@ where
                 skill_tree: skill_tree_unavailable_json(reason),
                 bridges: bridges_unavailable_json(reason),
                 kernel_context: kernel_context_unavailable_json(reason),
+                anomalies: anomaly_report_unavailable_json(reason),
             })
         }
     }
@@ -850,6 +891,7 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
     let skill_tree = skill_tree_from_row_sink_rows(&rows);
     let bridges = bridges_from_row_sink_rows(&rows);
     let kernel_context = kernel_context_from_row_sink_rows(&rows);
+    let anomalies = anomalies_from_row_sink_rows(&rows);
     RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
         snapshot: pipeline_rows_to_graph_snapshot(rows),
         source_fingerprint_sha256,
@@ -857,6 +899,7 @@ fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCa
         skill_tree,
         bridges,
         kernel_context,
+        anomalies,
     }))
 }
 
@@ -2141,6 +2184,217 @@ fn read_kernel_context_metadata(cache_dir: &Path, project: &str) -> Result<Value
     }
 }
 
+fn anomalies_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    let (substrates, calibrations, skipped_properties) = anomaly_inputs_from_rows(rows);
+    match detect_anomalies(&substrates, &calibrations, None, true) {
+        Ok(report) => anomaly_report_json(&report, skipped_properties),
+        Err(error) => anomaly_report_unavailable_json(&format!("detect_anomalies failed: {error}")),
+    }
+}
+
+fn anomaly_inputs_from_rows(
+    rows: &CbmPipelineRows,
+) -> (Vec<AnomalySubstrateRow>, Vec<AnomalyCalibration>, usize) {
+    let mut substrates = Vec::new();
+    let mut calibrations = Vec::new();
+    let mut skipped_properties = 0;
+
+    for node in &rows.nodes {
+        let properties = match serde_json::from_str::<Value>(&node.properties_json) {
+            Ok(properties) => properties,
+            Err(_) => {
+                skipped_properties += 1;
+                continue;
+            }
+        };
+        if let Some(values) = properties
+            .get("anomaly_substrates")
+            .and_then(Value::as_array)
+        {
+            for value in values {
+                let Some(kind) = value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(|kind| kind.parse::<AnomalyKind>().ok())
+                else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let Some(score) = value.get("score_millipoints").and_then(Value::as_u64) else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let subject_id = value
+                    .get("subject_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&node.qualified_name);
+                let message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("row-sink anomaly substrate");
+                let provenance = string_array_field(value, "substrate_provenance_refs");
+                let evidence = string_array_field(value, "lens_evidence");
+                substrates.push(AnomalySubstrateRow::new(
+                    kind,
+                    subject_id.to_string(),
+                    score,
+                    message.to_string(),
+                    if provenance.is_empty() {
+                        vec![format!("row_sink:{}:{}#anomaly", node.project, node.id)]
+                    } else {
+                        provenance
+                    },
+                    evidence,
+                ));
+            }
+        }
+        if let Some(values) = properties
+            .get("anomaly_calibrations")
+            .and_then(Value::as_array)
+        {
+            for value in values {
+                let Some(kind) = value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(|kind| kind.parse::<AnomalyKind>().ok())
+                else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let Some(medium) = value
+                    .get("medium_min_score_millipoints")
+                    .and_then(Value::as_u64)
+                else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let Some(high) = value
+                    .get("high_min_score_millipoints")
+                    .and_then(Value::as_u64)
+                else {
+                    skipped_properties += 1;
+                    continue;
+                };
+                let provenance = value
+                    .get("provenance_ref")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        format!("row_sink:{}:{}#anomaly_calibration", node.project, node.id)
+                    });
+                calibrations.push(AnomalyCalibration::new(kind, medium, high, provenance));
+            }
+        }
+    }
+
+    (substrates, calibrations, skipped_properties)
+}
+
+fn string_array_field(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn anomaly_report_json(report: &AnomalyReport, skipped_properties: usize) -> Value {
+    let artifact_bytes = anomaly_report_artifact_bytes(report);
+    let status = if skipped_properties > 0 || !report.skipped.is_empty() {
+        "partial"
+    } else if report.findings.is_empty() {
+        "empty"
+    } else {
+        "built"
+    };
+    json!({
+        "schema": report.schema,
+        "status": status,
+        "kind_filter": report.kind_filter.map(|kind| kind.as_str()),
+        "finding_count": report.findings.len(),
+        "skipped_count": report.skipped.len(),
+        "metadata_skipped_count": skipped_properties,
+        "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
+        "findings": report.findings.iter().map(anomaly_finding_json).collect::<Vec<_>>(),
+        "skipped": report.skipped.iter().map(|skipped| json!({
+            "kind": skipped.kind.as_str(),
+            "subject_id": skipped.subject_id,
+            "reason": skipped.reason,
+            "freshness": skipped.freshness,
+            "trust": skipped.trust,
+        })).collect::<Vec<_>>(),
+        "freshness": report.freshness,
+        "trust": if skipped_properties == 0 { report.trust } else { "provisional" },
+    })
+}
+
+fn anomaly_finding_json(finding: &astrolabe_weave::AnomalyFinding) -> Value {
+    json!({
+        "kind": finding.kind.as_str(),
+        "subject_id": finding.subject_id,
+        "severity": finding.severity.as_str(),
+        "score_millipoints": finding.score_millipoints,
+        "message": finding.message,
+        "substrate_provenance_refs": finding.substrate_provenance_refs,
+        "calibration_provenance_ref": finding.calibration_provenance_ref,
+        "lens_evidence": finding.lens_evidence,
+        "freshness": finding.freshness,
+        "trust": finding.trust,
+    })
+}
+
+fn anomaly_report_unavailable_json(reason: &str) -> Value {
+    json!({
+        "schema": DETECT_ANOMALIES_SCHEMA,
+        "status": "unavailable",
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+        "reason": reason,
+        "remediation": "rerun index_repository with anomaly substrate metadata or wait for live xterm/assay/reactive rows before using detect_anomalies",
+    })
+}
+
+fn read_anomaly_report_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "anomaly_report_json"))?
+    else {
+        return Ok(anomaly_report_unavailable_json(
+            "anomaly report metadata missing; rerun index_repository with calyx shadow",
+        ));
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(anomaly_report_unavailable_json(&format!(
+            "stored anomaly_report_json invalid: {error}"
+        ))),
+    }
+}
+
+fn filter_anomaly_report_json(
+    mut report: Value,
+    kind_filter: Option<&str>,
+) -> Result<Value, DynError> {
+    let Some(kind_filter) = kind_filter else {
+        return Ok(report);
+    };
+    let kind = kind_filter.parse::<AnomalyKind>()?;
+    if let Some(findings) = report.get_mut("findings").and_then(Value::as_array_mut) {
+        findings.retain(|finding| finding["kind"] == kind.as_str());
+        report["finding_count"] = json!(findings.len());
+    }
+    if let Some(skipped) = report.get_mut("skipped").and_then(Value::as_array_mut) {
+        skipped.retain(|skipped| skipped["kind"] == kind.as_str());
+        report["skipped_count"] = json!(skipped.len());
+    }
+    report["kind_filter"] = json!(kind.as_str());
+    Ok(report)
+}
+
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -2348,6 +2602,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "skill_tree": outcome.skill_tree.clone(),
         "bridges": outcome.bridges.clone(),
         "kernel_context": outcome.kernel_context.clone(),
+        "anomalies": outcome.anomalies.clone(),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
@@ -2421,6 +2676,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
         "bridges": read_bridges_metadata(cache_dir, project)?,
         "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
+        "anomalies": read_anomaly_report_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),
@@ -2614,6 +2870,15 @@ fn tool_error_result(message: impl Into<String>) -> Result<String, DynError> {
     }))?)
 }
 
+fn tool_json_result(value: Value) -> Result<String, DynError> {
+    let text = serde_json::to_string(&value)?;
+    Ok(serde_json::to_string(&json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": value,
+        "isError": false,
+    }))?)
+}
+
 fn jsonrpc_result_response(id: Value, result_raw: &str) -> Result<String, DynError> {
     let result: Value = serde_json::from_str(result_raw)?;
     Ok(serde_json::to_string(&json!({
@@ -2664,6 +2929,7 @@ fn persist_shadow_outcome_at(
     let skill_tree_json = serde_json::to_string(&outcome.skill_tree)?;
     let bridge_reports_json = serde_json::to_string(&outcome.bridges)?;
     let kernel_context_json = serde_json::to_string(&outcome.kernel_context)?;
+    let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -2717,6 +2983,7 @@ fn persist_shadow_outcome_at(
         ("skill_tree_json", skill_tree_json),
         ("bridge_reports_json", bridge_reports_json),
         ("kernel_context_json", kernel_context_json),
+        ("anomaly_report_json", anomaly_report_json),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -3357,6 +3624,100 @@ mod tests {
     }
 
     #[test]
+    fn row_sink_anomalies_aggregate_and_filter_by_kind() {
+        let anomalies = anomalies_from_row_sink_rows(&sample_anomaly_rows());
+
+        assert_eq!(anomalies["schema"], DETECT_ANOMALIES_SCHEMA);
+        assert_eq!(anomalies["status"], "built");
+        assert_eq!(anomalies["finding_count"], 2);
+        assert_eq!(anomalies["skipped_count"], 0);
+        assert_eq!(anomalies["metadata_skipped_count"], 0);
+        assert_eq!(anomalies["trust"], "verified");
+        assert_eq!(
+            anomalies["artifact_sha256"]
+                .as_str()
+                .expect("artifact sha")
+                .len(),
+            64
+        );
+        let findings = anomalies["findings"].as_array().expect("findings");
+        assert_eq!(findings[0]["kind"], "doc_drift");
+        assert_eq!(findings[0]["subject_id"], "demo.docs.lie");
+        assert_eq!(findings[0]["severity"], "high");
+        assert_eq!(findings[0]["score_millipoints"], 900);
+        assert_eq!(
+            findings[0]["substrate_provenance_refs"],
+            json!(["xterm:doc-bad"])
+        );
+        assert_eq!(
+            findings[0]["calibration_provenance_ref"],
+            "calibration:doc-drift:v1"
+        );
+        assert_eq!(findings[1]["kind"], "name_truth");
+        assert_eq!(findings[1]["severity"], "medium");
+
+        let filtered = filter_anomaly_report_json(anomalies.clone(), Some("doc_drift")).unwrap();
+        assert_eq!(filtered["kind_filter"], "doc_drift");
+        assert_eq!(filtered["finding_count"], 1);
+        assert_eq!(filtered["findings"][0]["kind"], "doc_drift");
+        let err = filter_anomaly_report_json(anomalies, Some("bogus")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(astrolabe_weave::ASTRO_ANOMALY_INVALID_KIND)
+        );
+    }
+
+    #[test]
+    fn anomaly_report_persists_reads_back_and_augments_architecture_payload() {
+        let dir = temp_dir("anomaly-report-readback");
+        let anomalies = anomalies_from_row_sink_rows(&sample_anomaly_rows());
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.anomalies = anomalies.clone();
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "anomaly_report_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let raw_value: Value = serde_json::from_str(&raw).unwrap();
+        let rehydrated = read_anomaly_report_metadata(&dir, "demo").unwrap();
+        let summary = grounding_summary(&outcome);
+
+        assert_eq!(raw_value, anomalies);
+        assert_eq!(rehydrated, anomalies);
+        assert_eq!(summary["anomalies"], anomalies);
+
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"project\":\"demo\",\"total_nodes\":5}"}],
+            "structuredContent": {"project": "demo", "total_nodes": 5},
+            "isError": false,
+        });
+        let augmented = augment_tool_result(
+            &serde_json::to_string(&result).unwrap(),
+            json!({
+                "astrolabe": {
+                    "anomalies": anomalies.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(
+            value["structuredContent"]["astrolabe"]["anomalies"],
+            anomalies
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let text_value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value["astrolabe"]["anomalies"], anomalies);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn vault_import_summary_labels_fallback_trust() {
         let fallback = vault_import_summary(
             "sqlite_fallback",
@@ -3408,6 +3769,7 @@ mod tests {
         let skill_tree = skill_tree_from_row_sink_rows(&rows);
         let bridges = bridges_from_row_sink_rows(&rows);
         let kernel_context = kernel_context_from_row_sink_rows(&rows);
+        let anomalies = anomalies_from_row_sink_rows(&rows);
         let candidate = RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
             snapshot: pipeline_rows_to_graph_snapshot(rows.clone()),
             source_fingerprint_sha256: row_sink_fingerprint(&rows),
@@ -3415,6 +3777,7 @@ mod tests {
             skill_tree: skill_tree.clone(),
             bridges: bridges.clone(),
             kernel_context: kernel_context.clone(),
+            anomalies: anomalies.clone(),
         }));
 
         let imported = import_shadow_vault_report(
@@ -3433,6 +3796,7 @@ mod tests {
         assert_eq!(imported.skill_tree, skill_tree);
         assert_eq!(imported.bridges, bridges);
         assert_eq!(imported.kernel_context, kernel_context);
+        assert_eq!(imported.anomalies, anomalies);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -3881,6 +4245,34 @@ mod tests {
         }
     }
 
+    fn sample_anomaly_rows() -> CbmPipelineRows {
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes: vec![astrolabe_bridge::CbmPipelineNodeRow {
+                id: 1,
+                project: "demo".to_string(),
+                label: "Project".to_string(),
+                name: "demo".to_string(),
+                qualified_name: "demo".to_string(),
+                file_path: String::new(),
+                start_line: 0,
+                end_line: 0,
+                properties_json: r#"{
+                    "anomaly_calibrations": [
+                        {"kind":"doc_drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:doc-drift:v1"},
+                        {"kind":"name_truth","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:name-truth:v1"}
+                    ],
+                    "anomaly_substrates": [
+                        {"kind":"doc_drift","subject_id":"demo.docs.lie","score_millipoints":900,"message":"doc/code agreement low","substrate_provenance_refs":["xterm:doc-bad"],"lens_evidence":["doc_drift:S19xS18"]},
+                        {"kind":"name_truth","subject_id":"demo.name.misleads","score_millipoints":600,"message":"name/API agreement low","substrate_provenance_refs":["xterm:name-bad"],"lens_evidence":["name_truth:S20xS4"]},
+                        {"kind":"doc_drift","subject_id":"demo.docs.clean","score_millipoints":100,"message":"clean row below calibration","substrate_provenance_refs":["xterm:doc-clean"],"lens_evidence":["doc_drift:S19xS18"]}
+                    ]
+                }"#.to_string(),
+            }],
+            edges: Vec::new(),
+        }
+    }
+
     fn seed_minimal_cbm_sqlite(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
@@ -3938,6 +4330,7 @@ mod tests {
             skill_tree: sample_skill_tree(),
             bridges: sample_bridges(),
             kernel_context: sample_kernel_context(),
+            anomalies: sample_anomalies(),
         }
     }
 
@@ -3965,6 +4358,10 @@ mod tests {
 
     fn sample_kernel_context() -> Value {
         kernel_context_from_row_sink_rows(&sample_kernel_context_rows())
+    }
+
+    fn sample_anomalies() -> Value {
+        anomalies_from_row_sink_rows(&sample_anomaly_rows())
     }
 
     fn temp_dir(name: &str) -> PathBuf {

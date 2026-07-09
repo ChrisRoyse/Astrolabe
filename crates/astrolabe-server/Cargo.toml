@@ -14,6 +14,7 @@ astrolabe-ingest.workspace = true
 astrolabe-kernel.workspace = true
 astrolabe-lower.workspace = true
 astrolabe-panel.workspace = true
+astrolabe-weave.workspace = true
 calyx-aster.workspace = true
 calyx-core.workspace = true
 rusqlite = { version = "0.40.1", features = ["bundled"] }
