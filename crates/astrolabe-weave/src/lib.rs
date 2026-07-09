@@ -677,14 +677,16 @@ pub enum AnomalyKind {
     NameTruth,
     Drift,
     OodCommit,
+    PromptInjection,
 }
 
 impl AnomalyKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::DocDrift,
         Self::NameTruth,
         Self::Drift,
         Self::OodCommit,
+        Self::PromptInjection,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -693,6 +695,7 @@ impl AnomalyKind {
             Self::NameTruth => "name_truth",
             Self::Drift => "drift",
             Self::OodCommit => "ood_commit",
+            Self::PromptInjection => "prompt_injection",
         }
     }
 }
@@ -706,10 +709,11 @@ impl std::str::FromStr for AnomalyKind {
             "name_truth" => Ok(Self::NameTruth),
             "drift" => Ok(Self::Drift),
             "ood_commit" => Ok(Self::OodCommit),
+            "prompt_injection" => Ok(Self::PromptInjection),
             _ => Err(astrolabe_domain::DomainError::new(
                 ASTRO_ANOMALY_INVALID_KIND,
                 format!("unknown detect_anomalies kind {value}"),
-                "use one of doc_drift, name_truth, drift, or ood_commit",
+                "use one of doc_drift, name_truth, drift, ood_commit, or prompt_injection",
             )),
         }
     }
@@ -1540,6 +1544,10 @@ mod tests {
         assert_eq!(report.kind_filter, Some(AnomalyKind::DocDrift));
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].kind, AnomalyKind::DocDrift);
+        assert_eq!(
+            "prompt_injection".parse::<AnomalyKind>().unwrap(),
+            AnomalyKind::PromptInjection
+        );
 
         let err = detect_anomalies(
             &anomaly_fixture_rows(),
