@@ -88,6 +88,7 @@ const OPTIMIZER_JANITOR_SCHEMA: &str = "astrolabe.optimizer_janitor.v1";
 const OPTIMIZER_GUARD_HEALTH_SCHEMA: &str = "astrolabe.optimizer_guard_health.v1";
 const OPTIMIZER_TRIPWIRES_SCHEMA: &str = "astrolabe.optimizer_tripwires.v1";
 const OPTIMIZER_PROPOSALS_SCHEMA: &str = "astrolabe.optimizer_proposals.v1";
+const OPTIMIZER_DEFICITS_SCHEMA: &str = "astrolabe.optimizer_deficits.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 const OPTIMIZER_JANITOR_DIR_SUFFIX: &str = ".astrolabe-optimizer-artifacts";
 const OPTIMIZER_JANITOR_POLICY_MAX_BYTES_PER_TICK: u64 = 100 * 1024 * 1024;
@@ -469,7 +470,7 @@ fn optimizer_status_tool_definition() -> Value {
     json!({
         "name": "optimizer_status",
         "title": "Optimizer Status",
-        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, or durably acknowledge pending reactive trigger events for a subscription.",
+        "description": "Return labeled Astrolabe optimizer readiness for a shadow-indexed project, durably acknowledge pending reactive trigger events for a subscription, or generate pending proposals from measured deficits.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -479,8 +480,8 @@ fn optimizer_status_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["status", "ack_triggers"],
-                    "description": "Use status for readback or ack_triggers to append a durable acknowledgement for one subscription."
+                    "enum": ["status", "ack_triggers", "propose"],
+                    "description": "Use status for readback, ack_triggers to append a durable acknowledgement for one subscription, or propose to turn measured deficits into a persisted proposal queue."
                 },
                 "subscription_id": {
                     "type": "string",
@@ -907,8 +908,17 @@ fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
                 tool_json_result(value)
             }
         }
+        "propose" => {
+            let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
+            let value = optimizer_propose_json_at(&cache_dir, &project, anneal_env.as_deref())?;
+            if value.get("status").and_then(Value::as_str) == Some("refused") {
+                tool_json_error_result(value)
+            } else {
+                tool_json_result(value)
+            }
+        }
         other => tool_error_result(format!(
-            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\" or mode=\"ack_triggers\" until anneal proposals are wired"
+            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\", mode=\"ack_triggers\", or mode=\"propose\""
         )),
     }
 }
@@ -5178,6 +5188,7 @@ fn optimizer_status_json_at(
                 metadata_key(project, "ledger_seq"),
                 metadata_key(project, "ledger_rows"),
                 metadata_key(project, "optimizer_freezes_json"),
+                metadata_key(project, "optimizer_deficits_json"),
                 metadata_key(project, "optimizer_proposals_json")
             ],
         },
@@ -5192,11 +5203,437 @@ fn optimizer_status_json_at(
         "reactive_triggers": reactive_triggers,
         "capabilities": {
             "status": "enabled",
-            "propose": "not_enabled_in_shadow_stage",
+            "propose": "enabled_from_measured_deficits_to_persisted_queue",
             "trigger_ack": "enabled_durable_ledger_action",
             "janitor": "enabled_budgeted_tick",
         },
     }))
+}
+
+fn optimizer_propose_json_at(
+    cache_dir: &Path,
+    project: &str,
+    astrolabe_anneal_env: Option<&str>,
+) -> Result<Value, DynError> {
+    let kill_switch = optimizer_kill_switch_json(astrolabe_anneal_env);
+    if kill_switch["global_freeze"].as_bool().unwrap_or(false) {
+        return Ok(optimizer_propose_refused_json(
+            project,
+            "ASTRO_OPTIMIZER_PROPOSE_FROZEN",
+            "ASTRO_ANNEAL=0 freezes optimizer proposal generation",
+            "unset ASTRO_ANNEAL or set it to a non-zero value before retrying mode=\"propose\"",
+            "process_env:ASTRO_ANNEAL",
+            "verified",
+        ));
+    }
+
+    let frozen_knobs = optimizer_freeze_status_json(cache_dir, project, false)?;
+    if let Some(reason) = optimizer_freezes_block_propose(&frozen_knobs) {
+        return Ok(optimizer_propose_refused_json(
+            project,
+            "ASTRO_OPTIMIZER_PROPOSE_KNOB_FROZEN",
+            reason,
+            "remove or narrow the proposal-generation freeze before retrying mode=\"propose\"",
+            format!("config:{}", metadata_key(project, "optimizer_freezes_json")),
+            "verified",
+        ));
+    }
+
+    let deficits_key = metadata_key(project, "optimizer_deficits_json");
+    let proposals_key = metadata_key(project, "optimizer_proposals_json");
+    let Some(raw_deficits) = read_config_value(cache_dir, &deficits_key)? else {
+        return Ok(optimizer_propose_refused_json(
+            project,
+            "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_MISSING",
+            "optimizer_deficits_json is not persisted for this project",
+            "run measure_bits sufficiency and persist measured optimizer deficits before retrying mode=\"propose\"",
+            format!("config:{deficits_key}:missing"),
+            "verified",
+        ));
+    };
+    let deficits_value = match serde_json::from_str::<Value>(&raw_deficits) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(optimizer_propose_refused_json(
+                project,
+                "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_INVALID",
+                format!("stored optimizer_deficits_json invalid: {error}"),
+                "repair optimizer_deficits_json before retrying mode=\"propose\"",
+                format!("config:{deficits_key}"),
+                "provisional",
+            ));
+        }
+    };
+    let deficits_value = match optimizer_deficits_config_value(deficits_value, &deficits_key) {
+        Ok(value) => value,
+        Err(reason) => {
+            return Ok(optimizer_propose_refused_json(
+                project,
+                "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_INVALID",
+                reason,
+                "repair optimizer_deficits_json before retrying mode=\"propose\"",
+                format!("config:{deficits_key}"),
+                "provisional",
+            ));
+        }
+    };
+    let deficits = deficits_value
+        .get("deficits")
+        .and_then(Value::as_array)
+        .expect("validated optimizer deficits array");
+    let (proposals, skipped) =
+        optimizer_generate_proposals_from_deficits(project, &deficits_key, deficits);
+    let proposal_count = proposals.len();
+    let skipped_count = skipped.len();
+    let status = if proposal_count == 0 {
+        "empty"
+    } else {
+        "generated"
+    };
+    let remediation = if proposal_count == 0 {
+        Value::String(
+            "all measured deficits were skipped; inspect generation.skipped before relying on pending proposals"
+                .to_string(),
+        )
+    } else {
+        Value::Null
+    };
+    let queue = json!({
+        "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+        "project": project,
+        "status": status,
+        "proposal_count": proposal_count,
+        "proposals": proposals,
+        "source": format!("config:{proposals_key}"),
+        "deficit_source": format!("config:{deficits_key}"),
+        "freshness": "fresh",
+        "trust": "verified",
+        "generation": {
+            "mode": "propose",
+            "source_schema": OPTIMIZER_DEFICITS_SCHEMA,
+            "source": format!("config:{deficits_key}"),
+            "generated_count": proposal_count,
+            "skipped_count": skipped_count,
+            "skipped": skipped,
+            "freshness": "fresh",
+            "trust": "verified",
+        },
+        "remediation": remediation,
+    });
+
+    write_config_value(cache_dir, &proposals_key, &queue.to_string())?;
+    let raw_readback = read_config_value(cache_dir, &proposals_key)?
+        .ok_or_else(|| "optimizer proposal queue write was not readable".to_string())?;
+    let readback_value: Value = serde_json::from_str(&raw_readback)?;
+    if readback_value != queue {
+        return Ok(optimizer_propose_refused_json(
+            project,
+            "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH",
+            "optimizer proposal queue write did not match config readback",
+            "inspect the config store before retrying mode=\"propose\"",
+            format!("config:{proposals_key}"),
+            "provisional",
+        ));
+    }
+
+    Ok(queue)
+}
+
+fn optimizer_deficits_config_value(value: Value, key: &str) -> Result<Value, String> {
+    let Some(object) = value.as_object() else {
+        return Err("optimizer_deficits_json must be an object".to_string());
+    };
+    if object.get("schema").and_then(Value::as_str) != Some(OPTIMIZER_DEFICITS_SCHEMA) {
+        return Err(format!(
+            "optimizer_deficits_json schema must be {OPTIMIZER_DEFICITS_SCHEMA}"
+        ));
+    }
+    if object.get("status").and_then(Value::as_str) != Some("measured") {
+        return Err("optimizer_deficits_json status must be measured".to_string());
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Err("optimizer_deficits_json requires freshness and trust labels".to_string());
+    }
+    let Some(deficits) = object.get("deficits").and_then(Value::as_array) else {
+        return Err("optimizer_deficits_json deficits must be an array".to_string());
+    };
+    for (index, deficit) in deficits.iter().enumerate() {
+        if let Some(reason) = optimizer_deficit_invalid(deficit) {
+            return Err(format!(
+                "optimizer_deficits_json deficits[{index}] {reason}"
+            ));
+        }
+    }
+
+    let mut out = object.clone();
+    out.insert("source".to_string(), json!(format!("config:{key}")));
+    Ok(Value::Object(out))
+}
+
+fn optimizer_deficit_invalid(deficit: &Value) -> Option<&'static str> {
+    let Some(object) = deficit.as_object() else {
+        return Some("must be an object");
+    };
+    for field in [
+        "deficit_id",
+        "axis",
+        "suggested_action",
+        "template_family",
+        "slot",
+    ] {
+        if object.get(field).and_then(Value::as_str).is_none() {
+            return Some(
+                "requires string deficit_id, axis, suggested_action, template_family, and slot",
+            );
+        }
+    }
+    for field in ["measured_bits", "required_bits"] {
+        if object.get(field).and_then(Value::as_f64).is_none() {
+            return Some("requires numeric measured_bits and required_bits");
+        }
+    }
+    if object.get("freshness").and_then(Value::as_str).is_none()
+        || object.get("trust").and_then(Value::as_str).is_none()
+    {
+        return Some("requires freshness and trust labels");
+    }
+    if !json_string_array_nonempty(object.get("provenance")) {
+        return Some("requires non-empty string provenance");
+    }
+    None
+}
+
+fn optimizer_generate_proposals_from_deficits(
+    project: &str,
+    deficits_key: &str,
+    deficits: &[Value],
+) -> (Vec<Value>, Vec<Value>) {
+    let mut proposals = Vec::new();
+    let mut skipped = Vec::new();
+    for deficit in deficits {
+        let object = deficit
+            .as_object()
+            .expect("validated optimizer deficit object");
+        let deficit_id = object
+            .get("deficit_id")
+            .and_then(Value::as_str)
+            .expect("validated deficit_id");
+        let suggested_action = object
+            .get("suggested_action")
+            .and_then(Value::as_str)
+            .expect("validated suggested_action");
+        let measured_bits = object
+            .get("measured_bits")
+            .and_then(Value::as_f64)
+            .expect("validated measured_bits");
+        let required_bits = object
+            .get("required_bits")
+            .and_then(Value::as_f64)
+            .expect("validated required_bits");
+        if measured_bits >= required_bits {
+            skipped.push(optimizer_deficit_skipped_json(
+                deficit_id,
+                "not_deficient",
+                "measured_bits is not below required_bits",
+            ));
+            continue;
+        }
+        if !matches!(suggested_action, "ProposeLens" | "propose_lens") {
+            skipped.push(optimizer_deficit_skipped_json(
+                deficit_id,
+                "unsupported_action",
+                "suggested_action is not ProposeLens",
+            ));
+            continue;
+        }
+        let template_family = object
+            .get("template_family")
+            .and_then(Value::as_str)
+            .expect("validated template_family");
+        let Some(candidate_kind) = optimizer_template_candidate_kind(template_family) else {
+            skipped.push(optimizer_deficit_skipped_json(
+                deficit_id,
+                "unsupported_template_family",
+                "template_family has no Astrolabe proposal template",
+            ));
+            continue;
+        };
+        proposals.push(optimizer_deficit_proposal_json(
+            project,
+            deficits_key,
+            deficit,
+            candidate_kind,
+        ));
+    }
+    (proposals, skipped)
+}
+
+fn optimizer_template_candidate_kind(template_family: &str) -> Option<&'static str> {
+    match template_family {
+        "derived_metric" => Some("derived_metric_lens"),
+        "hashed_set" => Some("hashed_set_lens"),
+        "interaction" => Some("interaction_lens"),
+        "frequency" => Some("frequency_lens"),
+        "pca" => Some("pca_lens"),
+        _ => None,
+    }
+}
+
+fn optimizer_deficit_proposal_json(
+    project: &str,
+    deficits_key: &str,
+    deficit: &Value,
+    candidate_kind: &str,
+) -> Value {
+    let object = deficit
+        .as_object()
+        .expect("validated optimizer deficit object");
+    let deficit_id = object
+        .get("deficit_id")
+        .and_then(Value::as_str)
+        .expect("validated deficit_id");
+    let axis = object
+        .get("axis")
+        .and_then(Value::as_str)
+        .expect("validated axis");
+    let template_family = object
+        .get("template_family")
+        .and_then(Value::as_str)
+        .expect("validated template_family");
+    let slot = object
+        .get("slot")
+        .and_then(Value::as_str)
+        .expect("validated slot");
+    let provenance = json!([
+        format!("config:{deficits_key}"),
+        format!("deficit:{deficit_id}")
+    ]);
+    json!({
+        "proposal_id": optimizer_proposal_id(project, deficit_id, axis, template_family, slot),
+        "state": "pending_differentiation_gate",
+        "deficit": {
+            "deficit_id": deficit_id,
+            "axis": axis,
+            "scope": object.get("scope").cloned().unwrap_or(Value::Null),
+            "measured_bits": object.get("measured_bits").cloned().unwrap_or(Value::Null),
+            "required_bits": object.get("required_bits").cloned().unwrap_or(Value::Null),
+            "freshness": object.get("freshness").cloned().unwrap_or(Value::Null),
+            "trust": object.get("trust").cloned().unwrap_or(Value::Null),
+            "provenance": object.get("provenance").cloned().unwrap_or(Value::Null),
+        },
+        "candidate": {
+            "kind": candidate_kind,
+            "template_family": template_family,
+            "slot": slot,
+            "field": object.get("field").cloned().unwrap_or(Value::Null),
+            "freshness": "fresh",
+            "trust": "provisional",
+            "provenance": provenance.clone(),
+        },
+        "differentiation_gate": {
+            "status": "pending",
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "remediation": "run P8.3 differentiation gate before admitting this proposal",
+        },
+        "freshness": "fresh",
+        "trust": "provisional",
+        "provenance": provenance,
+    })
+}
+
+fn optimizer_proposal_id(
+    project: &str,
+    deficit_id: &str,
+    axis: &str,
+    template_family: &str,
+    slot: &str,
+) -> String {
+    let digest = Sha256::digest(format!(
+        "{project}\0{deficit_id}\0{axis}\0{template_family}\0{slot}"
+    ));
+    let hex = hex_lower(&digest);
+    format!("proposal:{}", &hex[..16])
+}
+
+fn optimizer_deficit_skipped_json(deficit_id: &str, code: &str, reason: &str) -> Value {
+    json!({
+        "deficit_id": deficit_id,
+        "code": code,
+        "reason": reason,
+        "freshness": "fresh",
+        "trust": "verified",
+    })
+}
+
+fn optimizer_freezes_block_propose(frozen_knobs: &Value) -> Option<String> {
+    if frozen_knobs.get("status").and_then(Value::as_str) == Some("invalid") {
+        return Some(
+            "optimizer_freezes_json is invalid, so optimizer proposal generation is refused"
+                .to_string(),
+        );
+    }
+    let knobs = frozen_knobs.get("knobs").and_then(Value::as_array)?;
+    for knob in knobs {
+        if let Some(label) = optimizer_freeze_knob_blocks_propose(knob) {
+            return Some(format!(
+                "optimizer proposal generation is frozen by knob {label:?}"
+            ));
+        }
+    }
+    None
+}
+
+fn optimizer_freeze_knob_blocks_propose(knob: &Value) -> Option<&str> {
+    if let Some(label) = knob.as_str() {
+        return optimizer_freeze_label_blocks_propose(label).then_some(label);
+    }
+    let object = knob.as_object()?;
+    if object
+        .get("frozen")
+        .and_then(Value::as_bool)
+        .is_some_and(|frozen| !frozen)
+    {
+        return None;
+    }
+    let label = object
+        .get("knob")
+        .or_else(|| object.get("name"))
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)?;
+    optimizer_freeze_label_blocks_propose(label).then_some(label)
+}
+
+fn optimizer_freeze_label_blocks_propose(label: &str) -> bool {
+    matches!(
+        label,
+        "all" | "anneal" | "propose" | "proposal_generation" | "optimizer_proposals"
+    )
+}
+
+fn optimizer_propose_refused_json(
+    project: &str,
+    code: &str,
+    message: impl Into<String>,
+    remediation: impl Into<String>,
+    source: impl Into<String>,
+    trust: &str,
+) -> Value {
+    json!({
+        "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+        "project": project,
+        "status": "refused",
+        "code": code,
+        "message": message.into(),
+        "remediation": remediation.into(),
+        "proposal_count": Value::Null,
+        "proposals": [],
+        "source": source.into(),
+        "freshness": "fresh",
+        "trust": trust,
+    })
 }
 
 fn optimizer_ack_triggers_json_at(
@@ -8632,6 +9069,10 @@ mod tests {
             "enabled_durable_ledger_action"
         );
         assert_eq!(
+            status["capabilities"]["propose"],
+            "enabled_from_measured_deficits_to_persisted_queue"
+        );
+        assert_eq!(
             status["capabilities"]["trigger_ack"],
             "enabled_durable_ledger_action"
         );
@@ -8936,7 +9377,7 @@ mod tests {
         );
         assert_eq!(
             status["capabilities"]["propose"],
-            "not_enabled_in_shadow_stage"
+            "enabled_from_measured_deficits_to_persisted_queue"
         );
         assert!(
             status["source_state"]["metadata_refs"]
@@ -8944,6 +9385,185 @@ mod tests {
                 .unwrap()
                 .contains(&json!(key))
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_propose_mode_generates_persisted_queue_from_measured_deficits() {
+        let dir = temp_dir("optimizer-propose-generate");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+        let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+        let deficits = json!({
+            "schema": OPTIMIZER_DEFICITS_SCHEMA,
+            "status": "measured",
+            "freshness": "fresh",
+            "trust": "verified",
+            "deficits": [{
+                "deficit_id": "deficit:test:1",
+                "axis": "defect_prediction",
+                "scope": "payments",
+                "measured_bits": 0.61,
+                "required_bits": 1.0,
+                "suggested_action": "ProposeLens",
+                "template_family": "hashed_set",
+                "slot": "lock_atomic_usage",
+                "field": "lock_calls",
+                "freshness": "fresh",
+                "trust": "verified",
+                "provenance": ["measure_bits:test:12"],
+            }],
+        });
+        write_config_value(&dir, &deficits_key, &deficits.to_string()).unwrap();
+        let raw_deficits = read_config_value(&dir, &deficits_key).unwrap().unwrap();
+        let raw_deficits_value: Value = serde_json::from_str(&raw_deficits).unwrap();
+        assert_eq!(raw_deficits_value, deficits);
+
+        let generated = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+        assert_eq!(generated["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(generated["status"], "generated");
+        assert_eq!(generated["proposal_count"], 1);
+        assert_eq!(generated["source"], format!("config:{proposals_key}"));
+        assert_eq!(
+            generated["deficit_source"],
+            format!("config:{deficits_key}")
+        );
+        assert_eq!(generated["generation"]["mode"], "propose");
+        assert_eq!(generated["generation"]["generated_count"], 1);
+        assert_eq!(generated["generation"]["skipped_count"], 0);
+        assert_eq!(
+            generated["proposals"][0]["state"],
+            "pending_differentiation_gate"
+        );
+        assert_eq!(
+            generated["proposals"][0]["deficit"]["deficit_id"],
+            "deficit:test:1"
+        );
+        assert_eq!(generated["proposals"][0]["deficit"]["measured_bits"], 0.61);
+        assert_eq!(
+            generated["proposals"][0]["candidate"]["kind"],
+            "hashed_set_lens"
+        );
+        assert_eq!(
+            generated["proposals"][0]["candidate"]["provenance"][0],
+            format!("config:{deficits_key}")
+        );
+
+        let raw_queue = read_config_value(&dir, &proposals_key).unwrap().unwrap();
+        let raw_queue_value: Value = serde_json::from_str(&raw_queue).unwrap();
+        assert_eq!(raw_queue_value, generated);
+
+        let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        let surfaced = &status["pending_proposals"];
+        assert_eq!(surfaced["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(surfaced["status"], "generated");
+        assert_eq!(surfaced["proposal_count"], 1);
+        assert_eq!(surfaced["source"], format!("config:{proposals_key}"));
+        assert_eq!(
+            surfaced["proposals"][0]["proposal_id"],
+            generated["proposals"][0]["proposal_id"]
+        );
+        assert_eq!(
+            surfaced["generation"]["source"],
+            format!("config:{deficits_key}")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_propose_mode_refuses_global_freeze_without_writing_queue() {
+        let dir = temp_dir("optimizer-propose-freeze");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+        let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+        let deficits = json!({
+            "schema": OPTIMIZER_DEFICITS_SCHEMA,
+            "status": "measured",
+            "freshness": "fresh",
+            "trust": "verified",
+            "deficits": [{
+                "deficit_id": "deficit:test:frozen",
+                "axis": "defect_prediction",
+                "measured_bits": 0.2,
+                "required_bits": 1.0,
+                "suggested_action": "ProposeLens",
+                "template_family": "hashed_set",
+                "slot": "lock_atomic_usage",
+                "freshness": "fresh",
+                "trust": "verified",
+                "provenance": ["measure_bits:test:frozen"],
+            }],
+        });
+        write_config_value(&dir, &deficits_key, &deficits.to_string()).unwrap();
+
+        let refused = optimizer_propose_json_at(&dir, "demo", Some("0")).unwrap();
+        assert_eq!(refused["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(refused["status"], "refused");
+        assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_FROZEN");
+        assert_eq!(refused["source"], "process_env:ASTRO_ANNEAL");
+        assert!(read_config_value(&dir, &proposals_key).unwrap().is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_propose_mode_refuses_per_knob_freeze_without_writing_queue() {
+        let dir = temp_dir("optimizer-propose-knob-freeze");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+        let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+        let freezes_key = metadata_key("demo", "optimizer_freezes_json");
+        let freezes = json!([{
+            "knob": "proposal_generation",
+            "frozen": true,
+            "freshness": "fresh",
+            "trust": "verified",
+            "provenance": ["operator:test:freeze"],
+        }]);
+        let deficits = json!({
+            "schema": OPTIMIZER_DEFICITS_SCHEMA,
+            "status": "measured",
+            "freshness": "fresh",
+            "trust": "verified",
+            "deficits": [{
+                "deficit_id": "deficit:test:knob-frozen",
+                "axis": "defect_prediction",
+                "measured_bits": 0.2,
+                "required_bits": 1.0,
+                "suggested_action": "ProposeLens",
+                "template_family": "hashed_set",
+                "slot": "lock_atomic_usage",
+                "freshness": "fresh",
+                "trust": "verified",
+                "provenance": ["measure_bits:test:knob-frozen"],
+            }],
+        });
+        write_config_value(&dir, &freezes_key, &freezes.to_string()).unwrap();
+        write_config_value(&dir, &deficits_key, &deficits.to_string()).unwrap();
+        let raw_freezes = read_config_value(&dir, &freezes_key).unwrap().unwrap();
+        let raw_freezes_value: Value = serde_json::from_str(&raw_freezes).unwrap();
+        assert_eq!(raw_freezes_value, freezes);
+
+        let refused = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+        assert_eq!(refused["schema"], OPTIMIZER_PROPOSALS_SCHEMA);
+        assert_eq!(refused["status"], "refused");
+        assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_KNOB_FROZEN");
+        assert_eq!(refused["source"], format!("config:{freezes_key}"));
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("proposal_generation")
+        );
+        assert!(read_config_value(&dir, &proposals_key).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -9151,7 +9771,7 @@ mod tests {
         );
         assert_eq!(
             optimizer_status["inputSchema"]["properties"]["mode"]["enum"],
-            json!(["status", "ack_triggers"])
+            json!(["status", "ack_triggers", "propose"])
         );
 
         let get_readiness = tool_definition(tools, "get_readiness");
