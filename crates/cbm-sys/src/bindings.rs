@@ -3299,6 +3299,30 @@ unsafe extern "C" {
     pub fn cbm_cli_set_version(ver: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {
+    pub fn cbm_cmd_install(
+        argc: ::std::os::raw::c_int,
+        argv: *mut *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_cmd_uninstall(
+        argc: ::std::os::raw::c_int,
+        argv: *mut *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_cmd_update(
+        argc: ::std::os::raw::c_int,
+        argv: *mut *mut ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_build_install_plan_json(
+        home: *const ::std::os::raw::c_char,
+        binary_path: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     pub fn cbm_index_set_worker_role(is_worker: bool, response_out: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {

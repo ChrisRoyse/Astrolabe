@@ -1,0 +1,24 @@
+{
+  "schema": "astrolabe.installer_roundtrip_agents.v1",
+  "agents": [
+    {"id": "claude-code", "detect": {"dir": ".claude"}},
+    {"id": "codex", "detect": {"dir": ".codex"}},
+    {"id": "gemini", "detect": {"dir": ".gemini"}},
+    {"id": "zed", "detect": {"dir": ".config/zed"}},
+    {"id": "opencode", "detect": {"fake_cli": "opencode"}},
+    {"id": "antigravity", "detect": {"dir": ".gemini/antigravity-cli"}},
+    {"id": "aider", "detect": {"fake_cli": "aider"}},
+    {"id": "kilocode", "detect": {"dir": ".config/Code/User/globalStorage/kilocode.kilo-code"}},
+    {"id": "vscode", "detect": {"dir": ".config/Code/User"}},
+    {"id": "cursor", "detect": {"dir": ".cursor"}},
+    {"id": "openclaw", "detect": {"dir": ".openclaw"}},
+    {"id": "kiro", "detect": {"dir": ".kiro"}},
+    {"id": "junie", "detect": {"dir": ".junie"}}
+  ],
+  "shadowed_system_commands": [
+    {
+      "name": "pgrep",
+      "reason": "prevent temp-HOME installer tests from signaling unrelated user codebase-memory-mcp processes"
+    }
+  ]
+}

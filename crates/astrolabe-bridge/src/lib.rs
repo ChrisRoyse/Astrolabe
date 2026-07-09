@@ -74,6 +74,53 @@ pub fn initialize_cbm_host_process_silent(binary_path: Option<&str>) -> Result<(
     initialize_cbm_host_process_with_log_mode(binary_path, true)
 }
 
+pub fn run_cbm_installer_command(command: &str, args: &[String]) -> Result<i32, BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let argc = c_int::try_from(args.len()).map_err(|_| {
+        envelope(
+            "ASTRO_CBM_INSTALLER_ARGC",
+            format!("installer command {command} received too many arguments"),
+            "Reduce command-line argument count before invoking the CBM installer surface.",
+        )
+    })?;
+    let c_args = args
+        .iter()
+        .map(|arg| CString::new(arg.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argv = c_args
+        .iter()
+        .map(|arg| arg.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+
+    let rc = unsafe {
+        match command {
+            "install" => cbm_sys::cbm_cmd_install(argc, argv.as_mut_ptr()),
+            "uninstall" => cbm_sys::cbm_cmd_uninstall(argc, argv.as_mut_ptr()),
+            "update" => cbm_sys::cbm_cmd_update(argc, argv.as_mut_ptr()),
+            other => {
+                return Err(envelope(
+                    "ASTRO_CBM_INSTALLER_COMMAND",
+                    format!("unsupported CBM installer command {other:?}"),
+                    "Use install, uninstall, or update.",
+                ));
+            }
+        }
+    };
+    Ok(rc)
+}
+
+pub fn cbm_install_plan_json(home: &str, binary_path: &str) -> Result<String, BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let home = CString::new(home)?;
+    let binary_path = CString::new(binary_path)?;
+    unsafe {
+        take_c_string(cbm_sys::cbm_build_install_plan_json(
+            home.as_ptr(),
+            binary_path.as_ptr(),
+        ))
+    }
+}
+
 fn initialize_cbm_host_process_with_log_mode(
     binary_path: Option<&str>,
     silent: bool,
@@ -1933,6 +1980,25 @@ mod tests {
         let unknown = map_cbm_status(-444).unwrap_err();
         assert_eq!(unknown.envelope().code, "ASTRO_CBM_INTERNAL");
         assert!(unknown.envelope().stderr.is_some());
+    }
+
+    #[test]
+    fn installer_plan_wrapper_is_record_only_json() {
+        let dir = temp_dir("installer-plan");
+        std::fs::create_dir_all(&dir).expect("create installer plan home");
+        let plan =
+            cbm_install_plan_json(dir.to_str().unwrap(), "/tmp/codebase-memory-mcp").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        assert_eq!(value["type"], "agent.install.plan.v1");
+        assert_eq!(value["writes_started"], false);
+        assert_eq!(value["network_after_install"], false);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn installer_wrapper_rejects_unknown_command() {
+        let error = run_cbm_installer_command("config", &[]).unwrap_err();
+        assert_eq!(error.envelope().code, "ASTRO_CBM_INSTALLER_COMMAND");
     }
 
     #[test]

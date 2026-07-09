@@ -24,6 +24,10 @@
 #include "watcher/watcher.h"
 
 CBM_API void cbm_cli_set_version(const char *ver);
+CBM_API int cbm_cmd_install(int argc, char **argv);
+CBM_API int cbm_cmd_uninstall(int argc, char **argv);
+CBM_API int cbm_cmd_update(int argc, char **argv);
+CBM_API char *cbm_build_install_plan_json(const char *home, const char *binary_path);
 CBM_API void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 CBM_API void cbm_index_supervisor_mark_host(void);
 CBM_API void cbm_http_server_set_binary_path(const char *path);

@@ -4,6 +4,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{
     Arc,
@@ -100,6 +101,7 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
     match args[0].as_str() {
         "cli" => run_cli(&args[1..]),
         "hook-augment" => run_hook_augment(),
+        "install" | "uninstall" | "update" => run_installer_command(args[0].as_str(), &args[1..]),
         "verify" => run_verify(&args[1..]),
         "--version" | "-V" => {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
@@ -124,7 +126,7 @@ fn initialize_tracing() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | hook-augment | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -284,6 +286,197 @@ fn run_hook_augment() -> Result<i32, DynError> {
         println!("{output}");
     }
     Ok(0)
+}
+
+fn run_installer_command(command: &str, args: &[String]) -> Result<i32, DynError> {
+    let code = astrolabe_bridge::run_cbm_installer_command(command, args)?;
+    if command == "uninstall" && code == 0 {
+        cleanup_installer_leftovers()?;
+    }
+    Ok(code)
+}
+
+fn cleanup_installer_leftovers() -> Result<(), DynError> {
+    let Some(home) = installer_home_dir() else {
+        return Ok(());
+    };
+    for rel in [
+        ".claude/hooks/cbm-code-discovery-gate",
+        ".claude/hooks/cbm-session-reminder",
+        ".claude/hooks/cbm-subagent-reminder",
+    ] {
+        remove_file_if_exists(home.join(rel))?;
+    }
+    cleanup_path_blocks(&home)?;
+    for path in known_installer_config_files(&home) {
+        cleanup_known_installer_file(&path)?;
+    }
+    Ok(())
+}
+
+fn installer_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn installer_config_dir(home: &Path) -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+fn known_installer_config_files(home: &Path) -> Vec<PathBuf> {
+    let config = installer_config_dir(home);
+    vec![
+        home.join(".claude/settings.json"),
+        home.join(".claude/.mcp.json"),
+        home.join(".claude.json"),
+        home.join(".codex/config.toml"),
+        home.join(".codex/AGENTS.md"),
+        home.join(".gemini/settings.json"),
+        home.join(".gemini/GEMINI.md"),
+        home.join(".gemini/config/mcp_config.json"),
+        home.join(".gemini/antigravity-cli/settings.json"),
+        home.join(".gemini/antigravity-cli/AGENTS.md"),
+        config.join("opencode/opencode.json"),
+        config.join("opencode/AGENTS.md"),
+        config.join("zed/settings.json"),
+        config.join("Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"),
+        config.join("Code/User/mcp.json"),
+        home.join(".kilocode/rules/codebase-memory-mcp.md"),
+        home.join(".cursor/mcp.json"),
+        home.join(".openclaw/openclaw.json"),
+        home.join(".kiro/settings/mcp.json"),
+        home.join(".junie/mcp/mcp.json"),
+        home.join("CONVENTIONS.md"),
+    ]
+}
+
+fn cleanup_path_blocks(home: &Path) -> Result<(), DynError> {
+    for path in [
+        home.join(".profile"),
+        home.join(".bashrc"),
+        home.join(".bash_profile"),
+        home.join(".zshrc"),
+        home.join(".config/fish/config.fish"),
+    ] {
+        if path.exists() {
+            cleanup_path_block_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_path_block_file(path: &Path) -> Result<(), DynError> {
+    let text = fs::read_to_string(path)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut changed = false;
+    while i < lines.len() {
+        if lines[i].trim() == "# Added by codebase-memory-mcp install"
+            && lines
+                .get(i + 1)
+                .is_some_and(|line| line.contains(".local/bin"))
+        {
+            changed = true;
+            i += 2;
+        } else {
+            out.push(lines[i]);
+            i += 1;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    if out.iter().all(|line| line.trim().is_empty()) {
+        remove_file_if_exists(path)?;
+    } else {
+        fs::write(path, format!("{}\n", out.join("\n")))?;
+    }
+    Ok(())
+}
+
+fn cleanup_known_installer_file(path: &Path) -> Result<(), DynError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = fs::read_to_string(path)?;
+    let cleaned = if path.file_name().and_then(|name| name.to_str()) == Some("config.toml") {
+        strip_codex_session_remainder(&text)
+    } else {
+        text.clone()
+    };
+    if cleaned != text {
+        if cleaned.trim().is_empty() {
+            remove_file_if_exists(path)?;
+        } else {
+            fs::write(path, cleaned)?;
+        }
+        return Ok(());
+    }
+    if text.trim().is_empty() || is_empty_json_config(&text) {
+        remove_file_if_exists(path)?;
+    }
+    Ok(())
+}
+
+fn strip_codex_session_remainder(text: &str) -> String {
+    let begin = "# >>> codebase-memory-mcp SessionStart >>>";
+    let end = "# <<< codebase-memory-mcp SessionStart <<<";
+    let mut out = text.to_string();
+    while let Some(end_start) = out.find(end) {
+        let end_after = (end_start + end.len()).min(out.len());
+        let remove_start = out[..end_start]
+            .rfind(begin)
+            .or_else(|| out[..end_start].rfind("[[hooks.SessionStart]]"))
+            .unwrap_or(end_start);
+        let remove_start = out[..remove_start]
+            .rfind('\n')
+            .map_or(remove_start, |idx| idx + 1);
+        let remove_end = if out[end_after..].starts_with('\n') {
+            end_after + 1
+        } else {
+            end_after
+        };
+        out.replace_range(remove_start..remove_end, "");
+    }
+    out
+}
+
+fn is_empty_json_config(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    json_value_is_empty(&value)
+}
+
+fn json_value_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.is_empty()
+                || object.iter().all(|(key, value)| {
+                    matches!(
+                        key.as_str(),
+                        "mcpServers" | "hooks" | "mcp" | "servers" | "context_servers"
+                    ) && json_value_is_empty(value)
+                })
+        }
+        serde_json::Value::Array(array) => array.is_empty(),
+        serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn remove_file_if_exists(path: impl AsRef<Path>) -> Result<(), DynError> {
+    match fs::remove_file(path.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn hook_augment_output() -> Result<Option<String>, DynError> {
@@ -877,6 +1070,37 @@ mod tests {
             hook_context_from_search_graph(error, "nothing").unwrap(),
             HookSearch::ToolError
         ));
+    }
+
+    #[test]
+    fn installer_cleanup_strips_path_block_and_removes_empty_file() {
+        let dir = temp_dir("installer-path-cleanup");
+        fs::create_dir_all(&dir).expect("create cleanup dir");
+        let profile = dir.join(".profile");
+        fs::write(
+            &profile,
+            "\n# Added by codebase-memory-mcp install\nexport PATH=\"/tmp/.local/bin:$PATH\"\n",
+        )
+        .unwrap();
+        cleanup_path_block_file(&profile).unwrap();
+        assert!(!profile.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn installer_cleanup_removes_codex_session_remainder() {
+        let text = "[[hooks.SessionStart]]\nmatcher = \"startup|resume|clear|compact\"\n\n[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = 'echo \"Code discovery: prefer codebase-memory-mcp\"'\n# <<< codebase-memory-mcp SessionStart <<<\n\n[other]\nvalue = true\n";
+        let cleaned = strip_codex_session_remainder(text);
+        assert!(!cleaned.contains("codebase-memory-mcp"));
+        assert!(cleaned.contains("[other]"));
+    }
+
+    #[test]
+    fn installer_cleanup_recognizes_empty_generated_json() {
+        assert!(is_empty_json_config(r#"{"mcpServers":{},"hooks":{}}"#));
+        assert!(is_empty_json_config(r#"{"mcp":{"servers":[]}}"#));
+        assert!(is_empty_json_config(r#"{"context_servers":{}}"#));
+        assert!(!is_empty_json_config(r#"{"mcpServers":{"demo":{}}}"#));
     }
 
     #[test]
