@@ -596,6 +596,17 @@ impl CbmPipeline {
         })
     }
 
+    pub fn run_to_sqlite(&mut self) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        // SAFETY: self owns the pipeline pointer. Clearing the sink first makes
+        // this the baseline no-row-sink path for benchmark and compatibility use.
+        let rc = unsafe {
+            cbm_sys::cbm_pipeline_set_sink(self.ptr.as_ptr(), None, None, ptr::null_mut());
+            cbm_sys::cbm_pipeline_run(self.ptr.as_ptr())
+        };
+        map_cbm_status(rc)
+    }
+
     pub fn set_project_name(&mut self, name: &str) -> Result<(), BridgeError> {
         self.ensure_owner_thread()?;
         let name = CString::new(name)?;
