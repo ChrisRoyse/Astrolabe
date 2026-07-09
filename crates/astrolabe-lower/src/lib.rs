@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod team_artifact;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -15,6 +17,16 @@ use rusqlite::{Connection, OpenFlags, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+pub use team_artifact::{
+    ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
+    ASTRO_TEAM_ARTIFACT_MERKLE_ROOT, ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
+    ASTRO_TEAM_ARTIFACT_SIGNATURE, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
+    ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, TeamArtifactExportOptions,
+    TeamArtifactExportReport, TeamArtifactImportOptions, TeamArtifactImportReport,
+    TeamArtifactManifest, TeamArtifactSignature, TeamLedgerHead, VAULT_EXPORT_ZST_NAME,
+    export_team_artifact, import_team_artifact,
+};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const ASTRO_LOWER_ACTOR: &str = "astrolabe-lower";
@@ -816,6 +828,8 @@ mod tests {
     use calyx_aster::vault::AsterVault;
     use calyx_core::{SystemClock, VaultId};
     use rusqlite::Connection;
+    use serde_json::Value;
+    use std::io::Cursor;
 
     #[test]
     fn identifies_cbm_parent() {
@@ -886,6 +900,196 @@ mod tests {
         cleanup(&source);
         cleanup(&lowered_a);
         cleanup(&lowered_b);
+    }
+
+    #[test]
+    fn signed_team_artifact_import_verifies_and_adopts_identical_graph() {
+        let fixture = team_fixture(
+            "team-signed",
+            &TeamArtifactExportOptions::with_signing_key([7; 32]),
+        );
+        let adopted = temp_path("team-signed-adopted.db");
+        cleanup(&adopted);
+
+        let signer = hex_to_32(
+            &fixture
+                .export
+                .manifest
+                .signature
+                .as_ref()
+                .expect("signed manifest")
+                .signer_pubkey_hex,
+        );
+        let report = import_team_artifact(
+            &fixture.artifact_dir,
+            &adopted,
+            &TeamArtifactImportOptions::with_expected_signer(signer),
+        )
+        .expect("import signed team artifact");
+
+        assert_eq!(report.mode, "chain_verified_vault_export");
+        assert_eq!(report.signature_status, "verified");
+        assert_eq!(
+            report.merkle_root,
+            fixture.export.manifest.merkle_root.clone()
+        );
+        assert_eq!(
+            fs::read(&adopted).expect("read adopted graph"),
+            fs::read(&fixture.lowered).expect("read source lowered graph")
+        );
+        verify_lowered_sqlite(&adopted, &fixture.lower_report);
+
+        let wrong = import_team_artifact(
+            &fixture.artifact_dir,
+            temp_path("team-signed-wrong-key.db"),
+            &TeamArtifactImportOptions::with_expected_signer([9; 32]),
+        )
+        .expect_err("wrong signer is refused");
+        assert_err_code(&wrong, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER);
+
+        cleanup_team_fixture(&fixture);
+        cleanup(&adopted);
+    }
+
+    #[test]
+    fn unsigned_team_artifact_import_is_labeled() {
+        let fixture = team_fixture("team-unsigned", &TeamArtifactExportOptions::unsigned());
+        let adopted = temp_path("team-unsigned-adopted.db");
+        cleanup(&adopted);
+
+        let report = import_team_artifact(
+            &fixture.artifact_dir,
+            &adopted,
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect("import unsigned team artifact");
+
+        assert!(fixture.export.manifest.unsigned_artifact);
+        assert!(fixture.export.manifest.signature.is_none());
+        assert_eq!(report.signature_status, "unsigned");
+        assert_eq!(
+            fs::read(&adopted).expect("read adopted graph"),
+            fs::read(&fixture.lowered).expect("read lowered graph")
+        );
+
+        cleanup_team_fixture(&fixture);
+        cleanup(&adopted);
+    }
+
+    #[test]
+    fn team_artifact_tamper_matrix_names_refused_component() {
+        let vault_bytes = team_fixture("team-tamper-vault", &TeamArtifactExportOptions::unsigned());
+        flip_first_byte(&vault_bytes.artifact_dir.join(VAULT_EXPORT_ZST_NAME));
+        let err = import_team_artifact(
+            &vault_bytes.artifact_dir,
+            temp_path("team-tamper-vault-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("vault bytes tamper refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_VAULT_BYTES);
+        cleanup_team_fixture(&vault_bytes);
+
+        let ledger_tail =
+            team_fixture("team-tamper-ledger", &TeamArtifactExportOptions::unsigned());
+        rewrite_vault_export_json(&ledger_tail.artifact_dir, |value| {
+            value["ledger_rows"]
+                .as_array_mut()
+                .expect("ledger rows")
+                .pop();
+        });
+        let err = import_team_artifact(
+            &ledger_tail.artifact_dir,
+            temp_path("team-tamper-ledger-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("ledger tail tamper refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL);
+        cleanup_team_fixture(&ledger_tail);
+
+        let merkle = team_fixture("team-tamper-merkle", &TeamArtifactExportOptions::unsigned());
+        rewrite_manifest_json(&merkle.artifact_dir, |value| {
+            value["merkle_root"] = Value::String("00".repeat(32));
+        });
+        let err = import_team_artifact(
+            &merkle.artifact_dir,
+            temp_path("team-tamper-merkle-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("merkle root tamper refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_MERKLE_ROOT);
+        cleanup_team_fixture(&merkle);
+
+        let signature = team_fixture(
+            "team-tamper-signature",
+            &TeamArtifactExportOptions::with_signing_key([11; 32]),
+        );
+        rewrite_manifest_json(&signature.artifact_dir, |value| {
+            let signature_hex = value["signature"]["signature_hex"]
+                .as_str()
+                .expect("signature hex");
+            let (first, rest) = signature_hex.split_at(1);
+            let replacement = if first == "0" {
+                format!("1{rest}")
+            } else {
+                format!("0{rest}")
+            };
+            value["signature"]["signature_hex"] = Value::String(replacement);
+        });
+        let err = import_team_artifact(
+            &signature.artifact_dir,
+            temp_path("team-tamper-signature-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("signature tamper refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_SIGNATURE);
+        cleanup_team_fixture(&signature);
+    }
+
+    #[test]
+    fn legacy_plain_graph_db_zst_imports_without_vault_export() {
+        let source = temp_path("team-legacy-source.db");
+        let lowered = temp_path("team-legacy-lowered.db");
+        let artifact_dir = temp_dir_path("team-legacy-artifact");
+        let adopted = temp_path("team-legacy-adopted.db");
+        fixture_sqlite(&source);
+        let source_vault = vault();
+        import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import source sqlite");
+        let lower_report =
+            lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+                .expect("lower sqlite");
+
+        fs::create_dir_all(&artifact_dir).expect("create legacy artifact dir");
+        let graph_bytes = fs::read(&lowered).expect("read lowered graph");
+        let graph_zst =
+            zstd::stream::encode_all(Cursor::new(&graph_bytes), 3).expect("encode legacy graph");
+        fs::write(artifact_dir.join(GRAPH_DB_ZST_NAME), graph_zst).expect("write graph.db.zst");
+
+        let report =
+            import_team_artifact(&artifact_dir, &adopted, &TeamArtifactImportOptions::new())
+                .expect("legacy import");
+
+        assert_eq!(report.mode, "legacy_plain_graph_db_zst");
+        assert_eq!(report.signature_status, "legacy_unverified");
+        assert_eq!(
+            report.fallback,
+            Some("local_reindex_if_graph_rejected".to_string())
+        );
+        assert_eq!(
+            fs::read(&adopted).expect("read adopted"),
+            fs::read(&lowered).expect("read lowered")
+        );
+        verify_lowered_sqlite(&adopted, &lower_report);
+
+        cleanup(&source);
+        cleanup(&lowered);
+        cleanup(&adopted);
+        cleanup_dir(&artifact_dir);
     }
 
     fn verify_lowered_sqlite(path: &Path, report: &LoweredSqliteReport) {
@@ -975,6 +1179,113 @@ mod tests {
         assert_eq!(meta.2, report.source_ledger_head_hash);
         assert_eq!(meta.3, 1);
         assert_eq!(meta.4, DEFAULT_LOWERED_AT);
+    }
+
+    struct TeamFixture {
+        source: PathBuf,
+        lowered: PathBuf,
+        artifact_dir: PathBuf,
+        lower_report: LoweredSqliteReport,
+        export: TeamArtifactExportReport,
+    }
+
+    fn team_fixture(name: &str, options: &TeamArtifactExportOptions) -> TeamFixture {
+        let source = temp_path(&format!("{name}-source.db"));
+        let lowered = temp_path(&format!("{name}-lowered.db"));
+        let artifact_dir = temp_dir_path(&format!("{name}-artifact"));
+        fixture_sqlite(&source);
+
+        let source_vault = vault();
+        import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import source sqlite");
+        let lower_report =
+            lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+                .expect("lower sqlite");
+        let export = export_team_artifact(&source_vault, &lowered, &artifact_dir, options)
+            .expect("export team artifact");
+        TeamFixture {
+            source,
+            lowered,
+            artifact_dir,
+            lower_report,
+            export,
+        }
+    }
+
+    fn cleanup_team_fixture(fixture: &TeamFixture) {
+        cleanup(&fixture.source);
+        cleanup(&fixture.lowered);
+        cleanup_dir(&fixture.artifact_dir);
+    }
+
+    fn flip_first_byte(path: &Path) {
+        let mut bytes = fs::read(path).expect("read file to tamper");
+        bytes[0] ^= 0x01;
+        fs::write(path, bytes).expect("write tampered file");
+    }
+
+    fn rewrite_vault_export_json<F>(artifact_dir: &Path, mutate: F)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let path = artifact_dir.join(VAULT_EXPORT_ZST_NAME);
+        let bytes = fs::read(&path).expect("read vault export");
+        let decoded = zstd::stream::decode_all(Cursor::new(&bytes)).expect("decode vault export");
+        let mut value: Value = serde_json::from_slice(&decoded).expect("decode export JSON");
+        mutate(&mut value);
+        let next_json = serde_json::to_vec(&value).expect("encode mutated export JSON");
+        let next_zst =
+            zstd::stream::encode_all(Cursor::new(&next_json), 3).expect("encode vault export");
+        fs::write(&path, &next_zst).expect("write vault export");
+        rewrite_manifest_json(artifact_dir, |manifest| {
+            manifest["vault_export_zst_sha256"] =
+                Value::String(hex_lower(&sha256_digest(&next_zst)));
+        });
+    }
+
+    fn rewrite_manifest_json<F>(artifact_dir: &Path, mutate: F)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let path = artifact_dir.join("artifact.json");
+        let bytes = fs::read(&path).expect("read manifest");
+        let mut value: Value = serde_json::from_slice(&bytes).expect("decode manifest");
+        mutate(&mut value);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("encode manifest"),
+        )
+        .expect("write manifest");
+    }
+
+    fn assert_err_code(error: &LowerError, code: &str) {
+        let text = error.to_string();
+        assert!(
+            text.contains(code),
+            "expected error code {code} in {text:?}"
+        );
+    }
+
+    fn hex_to_32(input: &str) -> [u8; 32] {
+        let mut out = [0_u8; 32];
+        for (index, chunk) in input.as_bytes().chunks_exact(2).enumerate() {
+            out[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
+        }
+        out
+    }
+
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("non-hex byte"),
+        }
     }
 
     fn query_pairs(connection: &Connection, sql: &str) -> Vec<(i64, String)> {
@@ -1188,10 +1499,21 @@ mod tests {
         path
     }
 
+    fn temp_dir_path(name: &str) -> PathBuf {
+        let path = temp_path(name);
+        cleanup_dir(&path);
+        path
+    }
+
     fn cleanup(path: &Path) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(sidecar_path(path, "-wal"));
         let _ = fs::remove_file(sidecar_path(path, "-shm"));
         let _ = fs::remove_file(sidecar_path(path, "-journal"));
+    }
+
+    fn cleanup_dir(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_file(path);
     }
 }

@@ -1425,6 +1425,8 @@ Every tool response carries: `trust: trusted|provisional` (anchor roll-up), `fre
 
 `.codebase-memory/graph.db.zst` (lowered SQLite) continues for zero-friction sharing; adds sibling `vault.export.zst` + `artifact.json{schema_version, ledger_head, merkle_root, signature?}`. Import verifies: chain intact â†’ root matches â†’ optional signature â†’ then adopt; any failure â‡’ refuse + local reindex (CBM's existing fallback). Result: pull a teammate's pre-built index *with tamper evidence*.
 
+Team artifact status: `astrolabe.team_artifact.v1` lives in `astrolabe-lower`. Export retains `graph.db.zst`, writes `vault.export.zst`, records compressed/uncompressed graph hashes, ledger head, Merkle root, and optional Calyx Ed25519 root signature in `artifact.json`. Import delays adoption until graph bytes, vault export bytes, chain continuity, ledger head, Merkle root, and optional expected signer all verify; each refusal carries a stable `ASTRO_TEAM_ARTIFACT_*` component code. Plain legacy `graph.db.zst` imports are still accepted and labeled `legacy_unverified`. Remaining #62 work is live server wiring, local reindex fallback invocation, and the unified diagnostics/health surface with periodic `verify_chain`.
+
 ## 5. Erasure & redaction
 
 - Redaction policy on every payload writer (secret-shaped keys/tokens rejected â€” CALYX_LEDGER_SECRET_IN_PAYLOAD; CBM's secret filters remain upstream at extraction).
