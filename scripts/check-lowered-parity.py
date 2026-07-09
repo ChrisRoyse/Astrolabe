@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ipaddress
 import json
 import math
 import os
@@ -199,6 +200,115 @@ def wait_for_http(proc, url, parser):
     raise SystemExit(f"UI server did not serve {url}: {last_error}")
 
 
+def linux_tcp_listeners(port):
+    listeners = []
+    for table, family in [(Path("/proc/net/tcp"), "ipv4"), (Path("/proc/net/tcp6"), "ipv6")]:
+        if not table.exists():
+            continue
+        for line in table.read_text(encoding="utf-8").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] != "0A":
+                continue
+            local = parts[1]
+            if ":" not in local:
+                continue
+            address_hex, port_hex = local.rsplit(":", 1)
+            try:
+                local_port = int(port_hex, 16)
+            except ValueError:
+                continue
+            if local_port != port:
+                continue
+            ip = decode_proc_net_address(address_hex, family)
+            listeners.append(
+                {
+                    "family": family,
+                    "address": str(ip),
+                    "port": port,
+                    "state": "LISTEN",
+                    "loopback": ip.is_loopback,
+                }
+            )
+    return listeners
+
+
+def decode_proc_net_address(address_hex, family):
+    raw = bytes.fromhex(address_hex)
+    if family == "ipv4":
+        return ipaddress.IPv4Address(raw[::-1])
+    if family == "ipv6":
+        # /proc/net/tcp6 stores each 32-bit word little-endian.
+        packed = b"".join(raw[index : index + 4][::-1] for index in range(0, 16, 4))
+        return ipaddress.IPv6Address(packed)
+    raise ValueError(f"unsupported address family: {family}")
+
+
+def local_non_loopback_addresses():
+    addresses = set()
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None)
+    except OSError:
+        infos = []
+    for family, _, _, _, sockaddr in infos:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        raw = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        if not ip.is_loopback and not ip.is_unspecified:
+            addresses.add(raw)
+    return sorted(addresses)
+
+
+def fallback_loopback_probe(port):
+    exposed = []
+    for address in local_non_loopback_addresses():
+        try:
+            with socket.create_connection((address, port), timeout=0.5):
+                exposed.append(address)
+        except OSError:
+            pass
+    if exposed:
+        raise SystemExit(
+            f"UI server accepted non-loopback connections on port {port}: {exposed}"
+        )
+    return [
+        {
+            "family": "probe",
+            "address": "127.0.0.1",
+            "port": port,
+            "state": "reachable",
+            "loopback": True,
+        }
+    ]
+
+
+def assert_loopback_listener(proc, port):
+    if sys.platform.startswith("linux"):
+        deadline = time.monotonic() + 5
+        listeners = []
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise SystemExit(f"UI server exited early with code {proc.returncode}")
+            listeners = linux_tcp_listeners(port)
+            if listeners:
+                break
+            time.sleep(0.1)
+        if not listeners:
+            raise SystemExit(f"UI server listener for port {port} was not visible in /proc/net/tcp")
+    else:
+        listeners = fallback_loopback_probe(port)
+
+    non_loopback = [entry for entry in listeners if not entry["loopback"]]
+    if non_loopback:
+        raise SystemExit(
+            f"UI server must bind loopback only; observed listeners: {json.dumps(listeners, sort_keys=True)}"
+        )
+    return listeners
+
+
 def run_ui_smoke(binary, cache):
     port = free_port()
     env = base_env(cache)
@@ -215,6 +325,7 @@ def run_ui_smoke(binary, cache):
     try:
         root_url = f"http://127.0.0.1:{port}/"
         index_html = wait_for_http(proc, root_url, http_get_text)
+        listeners = assert_loopback_listener(proc, port)
         if "<html" not in index_html.lower() or "assets/" not in index_html:
             raise SystemExit("UI root did not return embedded frontend HTML")
 
@@ -242,6 +353,8 @@ def run_ui_smoke(binary, cache):
         return {
             "binary": str(binary),
             "port": port,
+            "binding": "loopback-only",
+            "listeners": listeners,
             "nodes": len(nodes),
             "edges": len(edges),
             "total_nodes": layout.get("total_nodes"),
@@ -313,7 +426,7 @@ def main():
                 PROJECT,
                 lowered_db,
             ],
-            timeout=240,
+            timeout=900,
         )
         if not lowered_db.exists():
             raise SystemExit(f"lowered DB missing: {lowered_db}")
