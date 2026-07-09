@@ -1372,6 +1372,13 @@ All indexes carry `built_at_seq`/`base_seq` freshness (StaleOk default, Fresh on
 
 Default in-RAM HNSW at repo scale (â‰¤1M symbols fine); DiskANN/SPANN builds offered for monorepos; kernel-first funnel activates > 10M records (org-vault). Quantized (3.5-bit) vectors in indexes with measured-recall gate; raw rescoring for top-k.
 
+Scale posture is planned through `astro.kernel.search_scale_knobs.v1`, not an
+inline threshold: `search.funnel.activation_records` defaults to 10M records,
+activation is surfaced in explain output, DiskANN/SPANN are explicit config
+opt-ins, and estimated per-slot index RSS must fit the CBM master budget before
+an index load proceeds. Over-budget plans fail closed with
+`ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED` and remediation.
+
 
 ---
 
