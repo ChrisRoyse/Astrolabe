@@ -27,7 +27,8 @@ pub use sqlite_import::{
     CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
     CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, EdgeSkipCounters,
     SqliteImportDeepVerifyCounts, SqliteImportOptions, SqliteImportReadback, SqliteImportReport,
-    import_cbm_graph_snapshot_to_vault, import_sqlite_to_vault, read_cbm_graph_snapshot,
+    import_cbm_graph_snapshot_to_vault, import_cbm_graph_snapshot_to_vault_direct,
+    import_sqlite_to_vault, read_cbm_graph_snapshot,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

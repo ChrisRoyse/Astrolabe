@@ -249,6 +249,15 @@ struct RawMetadataRows {
 }
 
 #[derive(Debug, Clone)]
+struct RawCbmImportInput {
+    metadata: RawMetadataRows,
+    nodes: Vec<RawNodeRow>,
+    edges: Vec<RawEdgeRow>,
+    sqlite_fingerprint: [u8; 32],
+    ledger_rows_before: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ExtractedNode {
     id: i64,
     label: SymbolLabel,
@@ -516,19 +525,45 @@ where
     let raw_metadata = read_metadata_rows(&connection, options, sqlite_fingerprint)?;
     let raw_nodes = read_nodes(&connection, &options.project)?;
     let raw_edges = read_edges(&connection, &options.project)?;
-    let sqlite_node_vectors = raw_nodes
+    import_raw_cbm_rows_to_vault(
+        vault,
+        runtime,
+        options,
+        RawCbmImportInput {
+            metadata: raw_metadata,
+            nodes: raw_nodes,
+            edges: raw_edges,
+            sqlite_fingerprint,
+            ledger_rows_before,
+        },
+    )
+}
+
+fn import_raw_cbm_rows_to_vault<C, R>(
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    input: RawCbmImportInput,
+) -> IngestResult<SqliteImportReport>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    let sqlite_node_vectors = input
+        .nodes
         .iter()
         .filter(|node| node.node_vector.is_some())
         .count();
-    let extracted = extract_nodes(raw_nodes)?;
+    let sqlite_nodes = input.nodes.len();
+    let extracted = extract_nodes(input.nodes)?;
     let prepared = prepare_batch(
         vault,
         runtime,
         options,
         &extracted,
-        raw_edges,
-        raw_metadata,
-        sqlite_fingerprint,
+        input.edges,
+        input.metadata,
+        input.sqlite_fingerprint,
     )?;
 
     let before_snapshot = vault.latest_seq();
@@ -558,7 +593,7 @@ where
     let (planned_graph_rows_written, planned_edge_rows_written) =
         count_changed_graph_rows(vault, before_snapshot, &prepared)?;
     let payload = ingest_ledger_payload(
-        sqlite_fingerprint,
+        input.sqlite_fingerprint,
         options,
         &prepared,
         IngestLedgerStats {
@@ -570,13 +605,13 @@ where
         },
     )?;
     let (ledger_ref, graph_rows_written, edge_rows_written) =
-        write_import_rows(vault, &prepared, sqlite_fingerprint, payload)?;
+        write_import_rows(vault, &prepared, input.sqlite_fingerprint, payload)?;
     let readback = verify_import_readback(vault, &prepared)?;
     let ledger_rows_after = ledger_row_count(vault)?;
 
     Ok(SqliteImportReport {
-        sqlite_fingerprint_sha256: sqlite_fingerprint,
-        sqlite_nodes: extracted.len(),
+        sqlite_fingerprint_sha256: input.sqlite_fingerprint,
+        sqlite_nodes,
         sqlite_node_vectors,
         sqlite_edges: prepared.sqlite_edges,
         constellation_inputs: prepared.constellations.len(),
@@ -587,7 +622,7 @@ where
         edge_rows_written,
         seq: vault.latest_seq(),
         ledger_seq: ledger_ref.seq,
-        ledger_rows_before,
+        ledger_rows_before: input.ledger_rows_before,
         ledger_rows_after,
         edge_skips: prepared.edge_skips,
         readback,
@@ -624,6 +659,49 @@ where
     })();
     cleanup_sqlite_path(&path);
     result
+}
+
+/// Imports a CBM row-sink snapshot directly into an Aster vault.
+///
+/// `source_fingerprint_sha256` is the provenance fingerprint that should be
+/// written into the existing SQLite-import metadata schema. Parity tests pass
+/// the fingerprint of the canonical SQLite artifact so the direct sink path can
+/// be byte-compared against the import path without synthesizing a temporary
+/// database.
+pub fn import_cbm_graph_snapshot_to_vault_direct<C, R>(
+    snapshot: &CbmGraphSnapshot,
+    source_fingerprint_sha256: [u8; 32],
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+) -> IngestResult<SqliteImportReport>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    validate_options(options)?;
+    if snapshot.project != options.project {
+        return Err(invalid_sqlite(format!(
+            "row-sink snapshot project {:?} does not match import project {:?}",
+            snapshot.project, options.project
+        )));
+    }
+    let raw_metadata = snapshot_metadata_rows(snapshot, options, source_fingerprint_sha256)?;
+    let raw_nodes = snapshot_node_rows(snapshot, &options.project)?;
+    let raw_edges = snapshot_edge_rows(snapshot, &options.project)?;
+    let ledger_rows_before = ledger_row_count(vault)?;
+    import_raw_cbm_rows_to_vault(
+        vault,
+        runtime,
+        options,
+        RawCbmImportInput {
+            metadata: raw_metadata,
+            nodes: raw_nodes,
+            edges: raw_edges,
+            sqlite_fingerprint: source_fingerprint_sha256,
+            ledger_rows_before,
+        },
+    )
 }
 
 fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
@@ -821,6 +899,202 @@ fn cleanup_sqlite_path(path: &Path) {
     let _ = fs::remove_file(path.with_extension("db-wal"));
     let _ = fs::remove_file(path.with_extension("db-shm"));
     let _ = fs::remove_file(path.with_extension("db-journal"));
+}
+
+fn snapshot_metadata_rows(
+    snapshot: &CbmGraphSnapshot,
+    options: &SqliteImportOptions,
+    source_fingerprint_sha256: [u8; 32],
+) -> IngestResult<RawMetadataRows> {
+    let mut projects = Vec::new();
+    for project in &snapshot.projects {
+        validate_snapshot_schema(
+            &project.schema,
+            SCHEMA_PROJECT_ROW,
+            "row-sink project metadata",
+        )?;
+        if project.project == options.project {
+            projects.push(RawProjectRow {
+                name: project.project.clone(),
+                indexed_at: project.indexed_at.clone(),
+                root_path: project.root_path.clone(),
+            });
+        }
+    }
+    if projects.is_empty() {
+        projects.push(RawProjectRow {
+            name: options.project.clone(),
+            indexed_at: hex_lower(&source_fingerprint_sha256),
+            root_path: String::new(),
+        });
+    }
+
+    let mut file_hashes = Vec::new();
+    for file_hash in &snapshot.file_hashes {
+        validate_snapshot_schema(
+            &file_hash.schema,
+            SCHEMA_FILE_HASH_ROW,
+            "row-sink file hash metadata",
+        )?;
+        if file_hash.project == options.project {
+            file_hashes.push(RawFileHashRow {
+                project: file_hash.project.clone(),
+                rel_path: file_hash.rel_path.clone(),
+                sha256: file_hash.sha256.clone(),
+                mtime_ns: file_hash.mtime_ns,
+                size: file_hash.size,
+            });
+        }
+    }
+    file_hashes.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+
+    let mut project_summaries = Vec::new();
+    for summary in &snapshot.project_summaries {
+        validate_snapshot_schema(
+            &summary.schema,
+            SCHEMA_PROJECT_SUMMARY_ROW,
+            "row-sink project summary metadata",
+        )?;
+        if summary.project == options.project {
+            project_summaries.push(RawProjectSummaryRow {
+                project: summary.project.clone(),
+                summary: summary.summary.clone(),
+                source_hash: summary.source_hash.clone(),
+                created_at: summary.created_at.clone(),
+                updated_at: summary.updated_at.clone(),
+            });
+        }
+    }
+    project_summaries.sort_by(|left, right| left.project.cmp(&right.project));
+
+    let mut token_vectors = Vec::new();
+    for token_vector in &snapshot.token_vectors {
+        validate_snapshot_schema(
+            &token_vector.schema,
+            SCHEMA_TOKEN_VECTOR_ROW,
+            "row-sink token vector metadata",
+        )?;
+        if token_vector.project == options.project {
+            token_vectors.push(RawTokenVectorRow {
+                id: token_vector.id,
+                project: token_vector.project.clone(),
+                token: token_vector.token.clone(),
+                vector: token_vector.vector.clone(),
+                idf: token_vector.idf,
+            });
+        }
+    }
+    token_vectors.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.token.cmp(&right.token))
+    });
+
+    Ok(RawMetadataRows {
+        projects,
+        file_hashes,
+        project_summaries,
+        token_vectors,
+    })
+}
+
+fn snapshot_node_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResult<Vec<RawNodeRow>> {
+    let mut rows = Vec::new();
+    for node in snapshot.nodes.iter().filter(|node| node.project == project) {
+        let properties = serde_json::from_str::<Value>(&node.properties_json).map_err(|error| {
+            invalid_sqlite(format!(
+                "row-sink node {} properties JSON is invalid: {error}",
+                node.source_node_id
+            ))
+        })?;
+        if !properties.is_object() {
+            return Err(invalid_sqlite(format!(
+                "row-sink node {} properties JSON must be an object",
+                node.source_node_id
+            )));
+        }
+        rows.push(RawNodeRow {
+            id: node.source_node_id,
+            project: node.project.clone(),
+            label: node.label.clone(),
+            name: node.name.clone(),
+            qualified_name: node.qualified_name.clone(),
+            file_path: node.file_path.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+            properties,
+            properties_json: node.properties_json.clone(),
+            node_vector: node.node_vector.clone(),
+        });
+    }
+    rows.sort_by_key(|row| row.id);
+    Ok(rows)
+}
+
+fn snapshot_edge_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
+    let mut rows = Vec::new();
+    for edge in snapshot.edges.iter().filter(|edge| edge.project == project) {
+        let properties = serde_json::from_str::<Value>(&edge.properties_json).map_err(|error| {
+            invalid_sqlite(format!(
+                "row-sink edge {} properties JSON is invalid: {error}",
+                edge.sqlite_edge_id
+            ))
+        })?;
+        if !properties.is_object() {
+            return Err(invalid_sqlite(format!(
+                "row-sink edge {} properties JSON must be an object",
+                edge.sqlite_edge_id
+            )));
+        }
+        let expected_local_name = row_sink_local_name_gen(&edge.edge_type, &properties);
+        if edge.local_name_gen != expected_local_name {
+            return Err(invalid_sqlite(format!(
+                "row-sink edge {} local_name_gen {:?} does not match properties-derived {:?}",
+                edge.sqlite_edge_id, edge.local_name_gen, expected_local_name
+            )));
+        }
+        rows.push(RawEdgeRow {
+            id: edge.sqlite_edge_id,
+            project: edge.project.clone(),
+            source_id: edge.source_node_id,
+            target_id: edge.target_node_id,
+            edge_type: edge.edge_type.clone(),
+            properties,
+            properties_json: edge.properties_json.clone(),
+            local_name_gen: edge.local_name_gen.clone(),
+        });
+    }
+    rows.sort_by(|left, right| {
+        left.source_id
+            .cmp(&right.source_id)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.edge_type.cmp(&right.edge_type))
+            .then_with(|| left.local_name_gen.cmp(&right.local_name_gen))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(rows)
+}
+
+fn validate_snapshot_schema(actual: &str, expected: &str, label: &str) -> IngestResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid_sqlite(format!(
+            "{label} has schema {actual:?}, expected {expected:?}"
+        )))
+    }
+}
+
+fn row_sink_local_name_gen(edge_type: &str, properties: &Value) -> String {
+    if edge_type == "IMPORTS" {
+        properties
+            .get("local_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn validate_options(options: &SqliteImportOptions) -> IngestResult<()> {
@@ -2881,6 +3155,7 @@ mod tests {
     use calyx_ledger::decode;
 
     const TEST_VAULT_ID: &str = "00000000000000000000000000";
+    type NormalizedLedgerRow = (u64, [u8; 32], EntryKind, SubjectId, Vec<u8>, ActorId);
 
     fn vault() -> AsterVault<FixedClock> {
         AsterVault::with_clock(
@@ -3211,6 +3486,115 @@ mod tests {
         edges
     }
 
+    fn sqlite_fingerprint(path: &Path) -> [u8; 32] {
+        sha256_digest(&fs::read(path).expect("read sqlite fixture"))
+    }
+
+    fn cf_rows<C>(vault: &AsterVault<C>, family: ColumnFamily) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        C: Clock,
+    {
+        vault
+            .scan_cf_at(vault.latest_seq(), family)
+            .expect("scan CF rows")
+    }
+
+    fn normalize_graph_row(mut value: Vec<u8>) -> Vec<u8> {
+        let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {
+            return value;
+        };
+        let Some(object) = json.as_object_mut() else {
+            return value;
+        };
+        if !object.contains_key("provenance") {
+            return value;
+        }
+        object.insert(
+            "provenance".to_string(),
+            serde_json::to_value(zero_ledger_ref()).expect("ledger ref JSON"),
+        );
+        value = serde_json::to_vec(&json).expect("normalized graph row JSON");
+        value
+    }
+
+    fn normalized_base_rows<C>(vault: &AsterVault<C>) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        C: Clock,
+    {
+        cf_rows(vault, ColumnFamily::Base)
+            .into_iter()
+            .map(|(key, value)| {
+                let mut row = encode::decode_constellation_base(&value).expect("decode Base row");
+                row.provenance = zero_ledger_ref();
+                (
+                    key,
+                    encode::encode_constellation_base(&row).expect("encode Base row"),
+                )
+            })
+            .collect()
+    }
+
+    fn normalized_graph_rows<C>(vault: &AsterVault<C>) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        C: Clock,
+    {
+        cf_rows(vault, ColumnFamily::Graph)
+            .into_iter()
+            .map(|(key, value)| (key, normalize_graph_row(value)))
+            .collect()
+    }
+
+    fn normalized_ledger_rows<C>(vault: &AsterVault<C>) -> Vec<NormalizedLedgerRow>
+    where
+        C: Clock,
+    {
+        cf_rows(vault, ColumnFamily::Ledger)
+            .into_iter()
+            .map(|(_, value)| {
+                let entry = decode(&value).expect("decode Ledger row");
+                (
+                    entry.seq,
+                    entry.prev_hash,
+                    entry.kind,
+                    entry.subject,
+                    entry.payload,
+                    entry.actor,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_import_cfs_match_with_ledger_ref_normalized<C>(
+        left: &AsterVault<C>,
+        right: &AsterVault<C>,
+    ) where
+        C: Clock,
+    {
+        assert_eq!(
+            normalized_base_rows(left),
+            normalized_base_rows(right),
+            "Base CF rows differ after ledger-ref normalization"
+        );
+        assert_eq!(
+            normalized_graph_rows(left),
+            normalized_graph_rows(right),
+            "Graph CF rows differ after ledger-ref normalization"
+        );
+        assert_eq!(
+            normalized_ledger_rows(left),
+            normalized_ledger_rows(right),
+            "Ledger CF semantic rows differ after timestamp/hash normalization"
+        );
+        for slot in default_panel_slots() {
+            assert_eq!(
+                cf_rows(left, ColumnFamily::slot(slot.slot_id())),
+                cf_rows(right, ColumnFamily::slot(slot.slot_id())),
+                "slot {} CF rows differ",
+                slot.slot_id()
+            );
+        }
+    }
+
     fn full_vocabulary_fixture(path: &Path) {
         let connection = create_db(path);
         let source = insert_node(
@@ -3490,6 +3874,51 @@ mod tests {
         assert_eq!(deep.sqlite_edge_rows, 3);
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn direct_row_sink_snapshot_import_matches_sqlite_import_after_ledger_ref_normalization() {
+        let path = temp_db("row-sink-direct-edges");
+        edge_fixture(&path);
+        let sqlite_vault = vault();
+        let direct_vault = vault();
+        let fingerprint = sqlite_fingerprint(&path);
+
+        let sqlite = import_sqlite_to_vault(&path, &sqlite_vault, &FixtureSlotRuntime, &options(1))
+            .expect("sqlite import");
+        let direct = import_cbm_graph_snapshot_to_vault_direct(
+            &edge_snapshot(),
+            fingerprint,
+            &direct_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("direct row-sink import");
+
+        assert_eq!(direct, sqlite);
+        assert_import_cfs_match_with_ledger_ref_normalized(&direct_vault, &sqlite_vault);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn direct_row_sink_snapshot_refuses_local_name_drift() {
+        let mut snapshot = edge_snapshot();
+        snapshot.edges[1].local_name_gen = "wrong".to_string();
+        let err = import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            [0; 32],
+            &vault(),
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("local_name_gen mismatch should fail");
+
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(
+            err.to_string().contains("local_name_gen"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
