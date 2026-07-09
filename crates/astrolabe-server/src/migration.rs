@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use astrolabe_bridge::{CbmPipelineRows, CbmToolRunner};
 use astrolabe_guard::{
@@ -80,6 +80,8 @@ const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
 const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
 const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
+const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v1";
+const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str = "astrolabe.periodic_verify_chain_tick.v1";
 const OPTIMIZER_STATUS_SCHEMA: &str = "astrolabe.optimizer_status.v1";
 const OPTIMIZER_RECENT_CHANGE_LIMIT: usize = 16;
 const GET_READINESS_SCHEMA: &str = "astrolabe.get_readiness.v1";
@@ -4513,6 +4515,7 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
             Some(outcome.ledger_seq),
             Some(outcome.ledger_rows_after),
             None,
+            None,
         ),
         "stores": stores_summary(
             &outcome.sqlite_path,
@@ -4572,6 +4575,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         .and_then(|value| value.parse::<u64>().ok());
     let lowered_exists = lowered_path.exists();
     let background_lane = background_lane_status_at(cache_dir, project)?;
+    let periodic_verify = periodic_verify_status_at(cache_dir, project)?;
     let health = health_surface_json(
         project,
         &verify_status,
@@ -4579,6 +4583,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         ledger_seq,
         ledger_rows,
         Some(&background_lane),
+        Some(&periodic_verify),
     );
 
     Ok(json!({
@@ -4588,6 +4593,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "panel_version": panel_version,
         "shadow_import": shadow_import_current_summary(&verify_status, lowered_exists),
         "background_lane": background_lane,
+        "periodic_verify": periodic_verify,
         "health": health,
         "idempotency": {
             "new_cx_ids": new_cx_ids,
@@ -4636,6 +4642,260 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
     }))
 }
 
+#[derive(Debug, Clone)]
+struct PeriodicVerifyProject {
+    project: String,
+    vault_dir: PathBuf,
+}
+
+pub(crate) fn periodic_verify_chain_tick() -> Result<Value, DynError> {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    periodic_verify_chain_tick_at(&cache_dir)
+}
+
+fn periodic_verify_chain_tick_at(cache_dir: &Path) -> Result<Value, DynError> {
+    let checked_at_unix_ms = unix_epoch_millis();
+    let projects = discover_periodic_verify_projects_at(cache_dir)?;
+    let mut results = Vec::with_capacity(projects.len());
+    for project in projects {
+        results.push(periodic_verify_project_at(
+            cache_dir,
+            &project.project,
+            &project.vault_dir,
+            checked_at_unix_ms,
+        )?);
+    }
+    Ok(json!({
+        "schema": PERIODIC_VERIFY_CHAIN_TICK_SCHEMA,
+        "checked_at_unix_ms": checked_at_unix_ms,
+        "checked_projects": results.len(),
+        "results": results,
+        "freshness": "fresh",
+        "trust": "verified",
+    }))
+}
+
+fn discover_periodic_verify_projects_at(
+    cache_dir: &Path,
+) -> Result<Vec<PeriodicVerifyProject>, DynError> {
+    let conn = open_config(cache_dir)?;
+    let pattern = format!("{CONFIG_KEY_PREFIX}%.vault_dir");
+    let mut statement =
+        conn.prepare("SELECT key, value FROM config WHERE key LIKE ? ORDER BY key")?;
+    let rows = statement.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut projects = Vec::new();
+    for row in rows {
+        let (key, vault_dir) = row?;
+        let Some(project) = project_from_metadata_key(&key, "vault_dir") else {
+            continue;
+        };
+        if project.trim().is_empty() {
+            continue;
+        }
+        projects.push(PeriodicVerifyProject {
+            project,
+            vault_dir: PathBuf::from(vault_dir),
+        });
+    }
+    Ok(projects)
+}
+
+fn project_from_metadata_key(key: &str, field: &str) -> Option<String> {
+    let suffix = format!(".{field}");
+    key.strip_prefix(CONFIG_KEY_PREFIX)?
+        .strip_suffix(&suffix)
+        .map(ToOwned::to_owned)
+}
+
+fn periodic_verify_project_at(
+    cache_dir: &Path,
+    project: &str,
+    vault_dir: &Path,
+    checked_at_unix_ms: u64,
+) -> Result<Value, DynError> {
+    let mut ledger_rows = None;
+    let mut checked_range_start = None;
+    let mut checked_range_end = None;
+    let mut error_text = None;
+    let status = if !vault_dir.exists() {
+        "missing".to_string()
+    } else {
+        match astrolabe_ingest::verify_chain_vault_path(vault_dir) {
+            Ok(report) => {
+                ledger_rows = Some(report.ledger_rows);
+                checked_range_start = Some(report.checked_range_start);
+                checked_range_end = Some(report.checked_range_end);
+                report.status
+            }
+            Err(error) => {
+                error_text = Some(error.to_string());
+                "error".to_string()
+            }
+        }
+    };
+    persist_periodic_verify_status_at(
+        cache_dir,
+        project,
+        &status,
+        vault_dir,
+        checked_at_unix_ms,
+        ledger_rows,
+        checked_range_start,
+        checked_range_end,
+        error_text.as_deref(),
+    )?;
+    Ok(json!({
+        "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+        "project": project,
+        "status": status.clone(),
+        "vault_dir": vault_dir,
+        "checked_at_unix_ms": checked_at_unix_ms,
+        "ledger_rows": ledger_rows,
+        "checked_range_start": checked_range_start,
+        "checked_range_end": checked_range_end,
+        "error": error_text,
+        "freshness": "fresh",
+        "trust": if status == "intact" { "verified" } else { "provisional" },
+        "remediation": periodic_verify_remediation(&status),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_periodic_verify_status_at(
+    cache_dir: &Path,
+    project: &str,
+    status: &str,
+    vault_dir: &Path,
+    checked_at_unix_ms: u64,
+    ledger_rows: Option<u64>,
+    checked_range_start: Option<u64>,
+    checked_range_end: Option<u64>,
+    error_text: Option<&str>,
+) -> Result<(), DynError> {
+    let conn = open_config(cache_dir)?;
+    for (key, value) in [
+        ("periodic_verify_status", status.to_string()),
+        (
+            "periodic_verify_checked_unix_ms",
+            checked_at_unix_ms.to_string(),
+        ),
+        ("periodic_verify_vault_dir", vault_dir.display().to_string()),
+        (
+            "periodic_verify_ledger_rows",
+            ledger_rows
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "periodic_verify_checked_range_start",
+            checked_range_start
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "periodic_verify_checked_range_end",
+            checked_range_end
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "periodic_verify_error",
+            error_text.unwrap_or_default().to_string(),
+        ),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![metadata_key(project, key), value],
+        )?;
+    }
+    Ok(())
+}
+
+fn periodic_verify_status_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let Some(status) =
+        read_config_value(cache_dir, &metadata_key(project, "periodic_verify_status"))?
+    else {
+        return Ok(periodic_verify_unobserved_json(project));
+    };
+    let checked_at_unix_ms =
+        read_config_u64(cache_dir, project, "periodic_verify_checked_unix_ms")?;
+    let ledger_rows = read_config_u64(cache_dir, project, "periodic_verify_ledger_rows")?;
+    let checked_range_start =
+        read_config_u64(cache_dir, project, "periodic_verify_checked_range_start")?;
+    let checked_range_end =
+        read_config_u64(cache_dir, project, "periodic_verify_checked_range_end")?;
+    let vault_dir = read_config_value(
+        cache_dir,
+        &metadata_key(project, "periodic_verify_vault_dir"),
+    )?
+    .filter(|value| !value.trim().is_empty());
+    let error = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_error"))?
+        .filter(|value| !value.trim().is_empty());
+    Ok(json!({
+        "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+        "project": project,
+        "status": status.clone(),
+        "vault_dir": vault_dir,
+        "checked_at_unix_ms": checked_at_unix_ms,
+        "ledger_rows": ledger_rows,
+        "checked_range_start": checked_range_start,
+        "checked_range_end": checked_range_end,
+        "error": error,
+        "freshness": "last_observed",
+        "trust": if status == "intact" { "verified" } else { "provisional" },
+        "remediation": periodic_verify_remediation(&status),
+    }))
+}
+
+fn periodic_verify_unobserved_json(project: &str) -> Value {
+    json!({
+        "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+        "project": project,
+        "status": "unobserved",
+        "vault_dir": Value::Null,
+        "checked_at_unix_ms": Value::Null,
+        "ledger_rows": Value::Null,
+        "checked_range_start": Value::Null,
+        "checked_range_end": Value::Null,
+        "error": Value::Null,
+        "freshness": "unknown",
+        "trust": "provisional",
+        "remediation": "wait for the server periodic verify_chain loop or call index_status for immediate verify_chain readback",
+    })
+}
+
+fn periodic_verify_remediation(status: &str) -> Value {
+    match status {
+        "intact" => Value::Null,
+        "missing" => Value::String(
+            "rerun index_repository with calyx=\"shadow\" so the server has a vault to verify"
+                .to_string(),
+        ),
+        "error" => Value::String(
+            "inspect the stored periodic_verify_error, then run astrolabe verify --deep before trusting vault-backed surfaces"
+                .to_string(),
+        ),
+        _ => Value::String(
+            "run astrolabe verify --deep and reindex before trusting vault-backed surfaces"
+                .to_string(),
+        ),
+    }
+}
+
+fn read_config_u64(cache_dir: &Path, project: &str, key: &str) -> Result<Option<u64>, DynError> {
+    Ok(read_config_value(cache_dir, &metadata_key(project, key))?
+        .and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn unix_epoch_millis() -> u64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn health_surface_json(
     project: &str,
     verify_status: &str,
@@ -4643,8 +4903,12 @@ fn health_surface_json(
     ledger_head: Option<u64>,
     ledger_rows: Option<u64>,
     background_lane: Option<&Value>,
+    periodic_verify: Option<&Value>,
 ) -> Value {
     let chain_intact = verify_status == "intact";
+    let periodic_verify = periodic_verify
+        .cloned()
+        .unwrap_or_else(|| periodic_verify_unobserved_json(project));
     let mut blocking_checks = Vec::new();
     if !chain_intact {
         blocking_checks.push("verify_chain");
@@ -4664,6 +4928,7 @@ fn health_surface_json(
         ready,
         ledger_head,
         ledger_rows,
+        &periodic_verify,
     );
     let trajectory_ndjson = health_trajectory_ndjson(
         project,
@@ -4672,6 +4937,7 @@ fn health_surface_json(
         ready,
         trust,
         background_lane,
+        &periodic_verify,
     );
 
     json!({
@@ -4699,6 +4965,7 @@ fn health_surface_json(
             "exists": lowered_exists,
             "gauge": if lowered_exists { 1 } else { 0 },
         },
+        "periodic_verify": periodic_verify,
         "metrics_format": "prometheus_text_v0",
         "metrics_text": metrics_text,
         "trajectory_format": "ndjson",
@@ -4713,6 +4980,7 @@ fn health_metrics_text(
     ready: bool,
     ledger_head: Option<u64>,
     ledger_rows: Option<u64>,
+    periodic_verify: &Value,
 ) -> String {
     let project = prom_label_value(project);
     let mut lines = vec![
@@ -4731,7 +4999,25 @@ fn health_metrics_text(
             "astrolabe_readiness{{project=\"{project}\"}} {}",
             if ready { 1 } else { 0 }
         ),
+        "# TYPE astrolabe_periodic_verify_last_intact gauge".to_string(),
+        format!(
+            "astrolabe_periodic_verify_last_intact{{project=\"{project}\"}} {}",
+            if periodic_verify_status_is_intact(periodic_verify) {
+                1
+            } else {
+                0
+            }
+        ),
     ];
+    if let Some(checked_at) = periodic_verify
+        .get("checked_at_unix_ms")
+        .and_then(Value::as_u64)
+    {
+        lines.push("# TYPE astrolabe_periodic_verify_checked_unix_ms gauge".to_string());
+        lines.push(format!(
+            "astrolabe_periodic_verify_checked_unix_ms{{project=\"{project}\"}} {checked_at}"
+        ));
+    }
     if let Some(ledger_head) = ledger_head {
         lines.push("# TYPE astrolabe_ledger_head gauge".to_string());
         lines.push(format!(
@@ -4747,6 +5033,10 @@ fn health_metrics_text(
     lines.join("\n")
 }
 
+fn periodic_verify_status_is_intact(periodic_verify: &Value) -> bool {
+    periodic_verify.get("status").and_then(Value::as_str) == Some("intact")
+}
+
 fn health_trajectory_ndjson(
     project: &str,
     verify_status: &str,
@@ -4754,6 +5044,7 @@ fn health_trajectory_ndjson(
     ready: bool,
     trust: &str,
     background_lane: Option<&Value>,
+    periodic_verify: &Value,
 ) -> String {
     let mut events = vec![json!({
         "schema": HEALTH_SURFACE_SCHEMA,
@@ -4773,6 +5064,14 @@ fn health_trajectory_ndjson(
             "trust": background_lane.get("trust").and_then(Value::as_str),
         }));
     }
+    events.push(json!({
+        "schema": HEALTH_SURFACE_SCHEMA,
+        "event": "periodic_verify_chain",
+        "project": project,
+        "status": periodic_verify.get("status").and_then(Value::as_str),
+        "checked_at_unix_ms": periodic_verify.get("checked_at_unix_ms").and_then(Value::as_u64),
+        "trust": periodic_verify.get("trust").and_then(Value::as_str),
+    }));
     events
         .into_iter()
         .map(|event| serde_json::to_string(&event).expect("health event serializes"))
@@ -7013,17 +7312,37 @@ mod tests {
             "status": "owner",
             "trust": "verified",
         });
-        let health = health_surface_json("demo", "intact", true, Some(7), Some(3), Some(&lane));
+        let periodic = json!({
+            "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+            "project": "demo",
+            "status": "intact",
+            "checked_at_unix_ms": 1234,
+            "trust": "verified",
+        });
+        let health = health_surface_json(
+            "demo",
+            "intact",
+            true,
+            Some(7),
+            Some(3),
+            Some(&lane),
+            Some(&periodic),
+        );
 
         assert_eq!(health["schema"], HEALTH_SURFACE_SCHEMA);
         assert_eq!(health["status"], "ready");
         assert_eq!(health["readiness"]["ready"], true);
         assert_eq!(health["chain_verify"]["gauge"], 1);
         assert_eq!(health["lowered_sqlite"]["gauge"], 1);
+        assert_eq!(health["periodic_verify"]["status"], "intact");
         let metrics = health["metrics_text"].as_str().expect("metrics text");
         assert!(metrics.contains("astrolabe_verify_chain_intact{project=\"demo\"} 1"));
         assert!(metrics.contains("astrolabe_lowered_sqlite_exists{project=\"demo\"} 1"));
         assert!(metrics.contains("astrolabe_readiness{project=\"demo\"} 1"));
+        assert!(metrics.contains("astrolabe_periodic_verify_last_intact{project=\"demo\"} 1"));
+        assert!(
+            metrics.contains("astrolabe_periodic_verify_checked_unix_ms{project=\"demo\"} 1234")
+        );
         assert!(metrics.contains("astrolabe_ledger_head{project=\"demo\"} 7"));
         assert!(metrics.contains("astrolabe_ledger_rows{project=\"demo\"} 3"));
 
@@ -7033,19 +7352,22 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("parse health event"))
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0]["event"], "shadow_health");
         assert_eq!(events[0]["verify_chain"], "intact");
         assert_eq!(events[1]["event"], "background_lane");
         assert_eq!(events[1]["status"], "owner");
+        assert_eq!(events[2]["event"], "periodic_verify_chain");
+        assert_eq!(events[2]["status"], "intact");
 
-        let degraded = health_surface_json("demo", "broken", false, None, None, None);
+        let degraded = health_surface_json("demo", "broken", false, None, None, None, None);
         assert_eq!(degraded["status"], "degraded");
         assert_eq!(degraded["readiness"]["ready"], false);
         assert_eq!(
             degraded["readiness"]["blocking_checks"],
             json!(["verify_chain", "lowered_sqlite", "ledger_head"])
         );
+        assert_eq!(degraded["periodic_verify"]["status"], "unobserved");
         assert!(
             degraded["metrics_text"]
                 .as_str()
@@ -7084,6 +7406,7 @@ mod tests {
         assert_eq!(summary["health"]["chain_verify"]["ledger_head"], 0);
         assert_eq!(summary["health"]["chain_verify"]["ledger_rows"], 0);
         assert_eq!(summary["health"]["lowered_sqlite"]["exists"], true);
+        assert_eq!(summary["health"]["periodic_verify"]["status"], "unobserved");
         assert!(
             summary["health"]["metrics_text"]
                 .as_str()
@@ -7097,6 +7420,67 @@ mod tests {
         {
             serde_json::from_str::<Value>(line).expect("health ndjson line parses");
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn periodic_verify_tick_persists_and_surfaces_chain_status() {
+        let dir = temp_dir("periodic-verify");
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"periodic-verify".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        drop(vault);
+        let lowered_path = dir.join("demo.astrolabe-lowered.db");
+        fs::write(&lowered_path, b"lowered sidecar exists").unwrap();
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.vault_dir = vault_dir.clone();
+        outcome.lowered_sqlite_path = lowered_path;
+        outcome.ledger_seq = 0;
+        outcome.ledger_rows_after = 0;
+        outcome.verify_chain_status = "intact".to_string();
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let tick = periodic_verify_chain_tick_at(&dir).unwrap();
+        assert_eq!(tick["schema"], PERIODIC_VERIFY_CHAIN_TICK_SCHEMA);
+        assert_eq!(tick["checked_projects"], 1);
+        assert_eq!(tick["results"][0]["project"], "demo");
+        assert_eq!(tick["results"][0]["status"], "intact");
+        assert_eq!(
+            tick["results"][0]["vault_dir"],
+            vault_dir.display().to_string()
+        );
+
+        let observed = periodic_verify_status_at(&dir, "demo").unwrap();
+        assert_eq!(observed["schema"], PERIODIC_VERIFY_CHAIN_SCHEMA);
+        assert_eq!(observed["status"], "intact");
+        assert_eq!(observed["ledger_rows"], 0);
+        assert_eq!(observed["trust"], "verified");
+        assert!(observed["remediation"].is_null());
+
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["periodic_verify"]["status"], "intact");
+        assert_eq!(summary["health"]["periodic_verify"]["status"], "intact");
+        assert!(
+            summary["health"]["metrics_text"]
+                .as_str()
+                .unwrap()
+                .contains("astrolabe_periodic_verify_last_intact{project=\"demo\"} 1")
+        );
+        let events = summary["health"]["trajectory_ndjson"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("health event parses"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["event"] == "periodic_verify_chain" && event["status"] == "intact"
+        }));
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -46,6 +46,9 @@ const HOOK_MIN_TOKEN_BYTES: usize = 4;
 const HOOK_MAX_TOKEN_BYTES: usize = 96;
 const HOOK_RESULT_LIMIT: u64 = 5;
 const HOOK_MAX_WALKUP: usize = 8;
+const VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS: u64 = 60_000;
+const VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS: u64 = 1_000;
+const VERIFY_CHAIN_LOOP_SLEEP_SLICE_MS: u64 = 100;
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::CodebaseMemoryMcp
@@ -132,6 +135,7 @@ fn print_usage() {
 
 fn run_server() -> Result<i32, DynError> {
     let _watchdog = ParentWatchdog::start();
+    let _verify_chain_loop = VerifyChainLoop::start();
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
     let stdin = io::stdin();
@@ -870,6 +874,11 @@ struct ParentWatchdog {
     handle: Option<JoinHandle<()>>,
 }
 
+struct VerifyChainLoop {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
 struct HookDeadline {
     done: Arc<AtomicBool>,
 }
@@ -892,6 +901,99 @@ impl Drop for HookDeadline {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Relaxed);
     }
+}
+
+impl VerifyChainLoop {
+    fn start() -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        if verify_chain_loop_disabled() {
+            tracing::info!("verify_chain_loop.disabled source=ASTROLABE_VERIFY_CHAIN_LOOP");
+            return Self {
+                shutdown,
+                handle: None,
+            };
+        }
+
+        let interval = verify_chain_loop_interval();
+        let thread_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            loop {
+                if thread_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                match migration::periodic_verify_chain_tick() {
+                    Ok(report) => {
+                        let checked = report
+                            .get("checked_projects")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        tracing::debug!("verify_chain_loop.tick checked_projects={checked}");
+                    }
+                    Err(error) => {
+                        tracing::warn!("verify_chain_loop.tick_failed error={error}");
+                    }
+                }
+                if sleep_until_verify_loop_shutdown(&thread_shutdown, interval) {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for VerifyChainLoop {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn verify_chain_loop_disabled() -> bool {
+    verify_chain_loop_disabled_from_raw(env::var("ASTROLABE_VERIFY_CHAIN_LOOP").ok().as_deref())
+}
+
+fn verify_chain_loop_disabled_from_raw(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
+fn verify_chain_loop_interval() -> Duration {
+    verify_chain_loop_interval_from_raw(
+        env::var("ASTROLABE_VERIFY_CHAIN_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn verify_chain_loop_interval_from_raw(raw: Option<&str>) -> Duration {
+    let millis = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS)
+        .max(VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS);
+    Duration::from_millis(millis)
+}
+
+fn sleep_until_verify_loop_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
+    let slice = Duration::from_millis(VERIFY_CHAIN_LOOP_SLEEP_SLICE_MS);
+    let mut slept = Duration::ZERO;
+    while slept < duration {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = duration.saturating_sub(slept).min(slice);
+        thread::sleep(step);
+        slept = slept.saturating_add(step);
+    }
+    shutdown.load(Ordering::Relaxed)
 }
 
 impl ParentWatchdog {
@@ -1159,6 +1261,28 @@ mod tests {
         report.at_seq = Some(0);
         report.quarantine_seq = Some(0);
         assert_eq!(verify_chain_exit_code(&report), 1);
+    }
+
+    #[test]
+    fn verify_chain_loop_env_controls_are_explicit() {
+        assert!(verify_chain_loop_disabled_from_raw(Some("0")));
+        assert!(verify_chain_loop_disabled_from_raw(Some("false")));
+        assert!(verify_chain_loop_disabled_from_raw(Some("OFF")));
+        assert!(!verify_chain_loop_disabled_from_raw(None));
+        assert!(!verify_chain_loop_disabled_from_raw(Some("1")));
+
+        assert_eq!(
+            verify_chain_loop_interval_from_raw(None),
+            Duration::from_millis(VERIFY_CHAIN_LOOP_DEFAULT_INTERVAL_MS)
+        );
+        assert_eq!(
+            verify_chain_loop_interval_from_raw(Some("25")),
+            Duration::from_millis(VERIFY_CHAIN_LOOP_MIN_INTERVAL_MS)
+        );
+        assert_eq!(
+            verify_chain_loop_interval_from_raw(Some("2500")),
+            Duration::from_millis(2500)
+        );
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
