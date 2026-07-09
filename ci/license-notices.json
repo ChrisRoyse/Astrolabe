@@ -1,5 +1,5 @@
 {
-  "schema": "astrolabe.license_notices.v1",
+  "schema": "astrolabe.license_notices.v2",
   "required_files": [
     "LICENSE",
     "NOTICE"
@@ -16,9 +16,9 @@
       "notice_terms": ["codebase-memory-mcp", "MIT License", "DeusData"]
     },
     {
-      "name": "tree-sitter common",
+      "name": "tree-sitter common/runtime",
       "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/common/LICENSE",
-      "notice_terms": ["tree-sitter common", "MIT License"]
+      "notice_terms": ["tree-sitter common/runtime", "MIT License"]
     },
     {
       "name": "tree-sitter runtime",
@@ -26,9 +26,9 @@
       "notice_terms": ["tree-sitter common/runtime", "MIT License"]
     },
     {
-      "name": "tree-sitter grammars",
-      "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/grammars/rust/LICENSE",
-      "notice_terms": ["tree-sitter grammars", "each grammar carries its own LICENSE"]
+      "name": "tree-sitter runtime library",
+      "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/ts_runtime/LICENSE",
+      "notice_terms": ["tree-sitter runtime library", "MIT License"]
     },
     {
       "name": "SQLite",
@@ -51,6 +51,21 @@
       "notice_terms": ["lz4", "BSD-style license"]
     },
     {
+      "name": "wyhash",
+      "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/wyhash/LICENSE",
+      "notice_terms": ["wyhash", "Unlicense"]
+    },
+    {
+      "name": "simplecpp",
+      "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/simplecpp/LICENSE",
+      "notice_terms": ["simplecpp", "BSD Zero Clause License"]
+    },
+    {
+      "name": "verstable",
+      "license_file": "vendor/codebase-memory-mcp/internal/cbm/vendored/verstable/LICENSE",
+      "notice_terms": ["verstable", "MIT License"]
+    },
+    {
       "name": "xxHash",
       "license_file": "vendor/codebase-memory-mcp/vendored/xxhash/LICENSE",
       "notice_terms": ["xxHash", "BSD 2-Clause License"]
@@ -68,7 +83,16 @@
     {
       "name": "nomic embedding assets",
       "license_file": "vendor/codebase-memory-mcp/vendored/nomic/LICENSE",
-      "notice_terms": ["nomic embedding assets", "Apache License 2.0"]
+      "source_notice_files": ["vendor/codebase-memory-mcp/vendored/nomic/NOTICE"],
+      "notice_terms": ["nomic embedding assets", "Apache License 2.0", "Source notice"]
+    }
+  ],
+  "coverage_groups": [
+    {
+      "name": "tree-sitter grammar licenses",
+      "path_prefix": "vendor/codebase-memory-mcp/internal/cbm/vendored/grammars/",
+      "file_names": ["LICENSE"],
+      "notice_terms": ["tree-sitter grammars", "each grammar carries its own LICENSE"]
     }
   ]
 }

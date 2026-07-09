@@ -26,6 +26,11 @@ tree-sitter common/runtime
   - vendor/codebase-memory-mcp/internal/cbm/vendored/common/tree_sitter/LICENSE
 - License: MIT License.
 
+tree-sitter runtime library
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/ts_runtime
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/ts_runtime/LICENSE
+- License: MIT License.
+
 tree-sitter grammars
 - Path: vendor/codebase-memory-mcp/internal/cbm/vendored/grammars
 - License: each grammar carries its own LICENSE file in its grammar directory.
@@ -50,6 +55,21 @@ lz4
 - Path: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4
 - Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4/LICENSE
 - License: BSD-style license.
+
+wyhash
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/wyhash
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/wyhash/LICENSE
+- License: Unlicense / public domain dedication.
+
+simplecpp
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/simplecpp
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/simplecpp/LICENSE
+- License: BSD Zero Clause License.
+
+verstable
+- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/verstable
+- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/verstable/LICENSE
+- License: MIT License.
 
 xxHash
 - Path: vendor/codebase-memory-mcp/vendored/xxhash
