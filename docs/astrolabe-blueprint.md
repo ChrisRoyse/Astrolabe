@@ -377,7 +377,7 @@ Every unit of real work â€” a test run, a review, a revert, an agent task �
 | 11.3 | Crash-isolated indexing preserved: the supervised worker-subprocess model (crash/hang containment, quarantine of culprit files, RSS return) wraps the combined pipeline | [CBM] index_supervisor | P1 |
 | 11.4 | 13-agent installer network preserved: Claude Code, Codex, Gemini, Cursor, Zed, VS Code, etc. â€” config, skills, hooks, instructions â€” updated for the new tool surface | [CBM] cli installer | P6 |
 | 11.5 | Hooks upgraded: PreToolUse Grep/Glob augmenter returns kernel-ranked hits + hazard notes; optional PostToolUse Edit/Write advisory guard check; SessionStart injects readiness + kernel summary + ADR | [CBM] hook_augment; [FUSE] | P7 |
-| 11.6 | 3D graph UI upgraded: kernel membership as size/glow, trust/provenance colors, grounding-gap overlay, agreement-graph view, satellite galaxies for cross-repo (existing) | [CBM] graph-ui | P9 |
+| 11.6 | 3D graph UI upgraded: kernel membership as size/glow, trust/provenance colors, grounding-gap overlay, agreement-graph view, satellite galaxies for cross-repo (existing) | [CBM] graph-ui | P10 |
 | 11.7 | ADR grounded: the Architecture Decision Record becomes anchored â€” decisions link to the kernel members they govern; drift between ADR text and measured architecture flagged | [CBM] manage_adr; [FUSE] | P8 |
 | 11.8 | Full CLI parity: every MCP tool invokable as `astrolabe cli <tool> '<json>'`; progress sink; `--json` | [CBM] cli runner | P6 |
 | 11.9 | Memory discipline preserved: RAM-first with budgets (mimalloc RSS tracking, retention caps, backpressure naps) + Calyx bounded allocators/caches â€” one allocator, one budget | [CBM] mem.c; [CX] alloc/cache; unified | P1 |
@@ -1955,6 +1955,7 @@ Streaming FFI sink (single-parse path), primary-by-default dial, full soak/hazar
 
 ## P10 â€” Frontier (ongoing)
 Cross-repo org vault + hierarchical kernels + cross-repo TE; autonomy-dial policy hooks; refactoring advisor; self-healing docs; historical counterfactual evals; UI intelligence overlays (kernel glow, trust colors, gap map); team vault exchange with signatures; optional real-model lens packs (TEI/ONNX).
+Capability 11.6 lives here, not P9: the overlay truth claims require kernel, trust/provenance, grounding-gap, agreement, and cross-repo products to exist first; P9 only hardens and releases the established substrate.
 **Gate:** per-feature; each rides the established substrate.
 
 ## Cumulative estimate
