@@ -7536,36 +7536,70 @@ mod tests {
     }
 
     #[test]
-    fn team_artifact_import_refuses_tampered_vault_without_adopting() {
-        let dir = temp_dir("team-artifact-tamper");
-        fs::create_dir_all(&dir).unwrap();
-        seed_team_shadow_state(&dir);
-        let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
-        team_artifact_export_json_at(
-            &dir,
-            "demo",
+    fn team_artifact_import_tamper_matrix_refuses_without_adopting() {
+        let (dir, artifact_dir) =
+            exported_team_artifact_fixture("team-artifact-tamper-vault", None);
+        flip_first_byte(&artifact_dir.join(VAULT_EXPORT_ZST_NAME));
+        assert_team_artifact_refusal(
             &artifact_dir,
-            None,
-            ShadowRefreshStatus::Current,
-        )
-        .expect("export team artifact");
+            &dir.join("tampered-vault-adopted.db"),
+            ASTRO_TEAM_ARTIFACT_VAULT_BYTES,
+        );
+        fs::remove_dir_all(&dir).ok();
 
-        let vault_export_path = artifact_dir.join(VAULT_EXPORT_ZST_NAME);
-        let mut bytes = fs::read(&vault_export_path).unwrap();
-        bytes[0] ^= 0x01;
-        fs::write(&vault_export_path, bytes).unwrap();
+        let (dir, artifact_dir) =
+            exported_team_artifact_fixture("team-artifact-tamper-graph", None);
+        flip_first_byte(&artifact_dir.join(GRAPH_DB_ZST_NAME));
+        assert_team_artifact_refusal(
+            &artifact_dir,
+            &dir.join("tampered-graph-adopted.db"),
+            ASTRO_TEAM_ARTIFACT_GRAPH_BYTES,
+        );
+        fs::remove_dir_all(&dir).ok();
 
-        let adopted = dir.join("tampered-adopted.db");
-        let raw = team_artifact_import_result(&artifact_dir, &adopted, None, Some("demo"))
-            .expect("tampered import returns structured refusal");
-        let value: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["isError"], true);
-        let structured = &value["structuredContent"];
-        assert_eq!(structured["status"], "refused");
-        assert_eq!(structured["code"], ASTRO_TEAM_ARTIFACT_VAULT_BYTES);
-        assert_eq!(structured["fallback"]["local_reindex"], "not_run");
-        assert!(!adopted.exists());
+        let (dir, artifact_dir) =
+            exported_team_artifact_fixture("team-artifact-tamper-ledger", None);
+        rewrite_team_artifact_manifest(&artifact_dir, |value| {
+            value["ledger_head"]["hash"] = Value::String("00".repeat(32));
+        });
+        assert_team_artifact_refusal(
+            &artifact_dir,
+            &dir.join("tampered-ledger-adopted.db"),
+            ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
+        );
+        fs::remove_dir_all(&dir).ok();
 
+        let (dir, artifact_dir) =
+            exported_team_artifact_fixture("team-artifact-tamper-merkle", None);
+        rewrite_team_artifact_manifest(&artifact_dir, |value| {
+            value["merkle_root"] = Value::String("00".repeat(32));
+        });
+        assert_team_artifact_refusal(
+            &artifact_dir,
+            &dir.join("tampered-merkle-adopted.db"),
+            ASTRO_TEAM_ARTIFACT_MERKLE_ROOT,
+        );
+        fs::remove_dir_all(&dir).ok();
+
+        let (dir, artifact_dir) =
+            exported_team_artifact_fixture("team-artifact-tamper-signature", Some([11; 32]));
+        rewrite_team_artifact_manifest(&artifact_dir, |value| {
+            let signature_hex = value["signature"]["signature_hex"]
+                .as_str()
+                .expect("signature hex");
+            let (first, rest) = signature_hex.split_at(1);
+            let replacement = if first == "0" {
+                format!("1{rest}")
+            } else {
+                format!("0{rest}")
+            };
+            value["signature"]["signature_hex"] = Value::String(replacement);
+        });
+        assert_team_artifact_refusal(
+            &artifact_dir,
+            &dir.join("tampered-signature-adopted.db"),
+            ASTRO_TEAM_ARTIFACT_SIGNATURE,
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -8250,6 +8284,58 @@ mod tests {
             remediation: None,
         };
         provenance_surface_with_chain(surface, &"22".repeat(32), 1, &verify)
+    }
+
+    fn exported_team_artifact_fixture(
+        name: &str,
+        signing_key: Option<[u8; 32]>,
+    ) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        seed_team_shadow_state(&dir);
+        let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
+        team_artifact_export_json_at(
+            &dir,
+            "demo",
+            &artifact_dir,
+            signing_key,
+            ShadowRefreshStatus::Current,
+        )
+        .expect("export team artifact");
+        (dir, artifact_dir)
+    }
+
+    fn assert_team_artifact_refusal(artifact_dir: &Path, adopted: &Path, expected_code: &str) {
+        let raw = team_artifact_import_result(artifact_dir, adopted, None, Some("demo"))
+            .expect("tampered import returns structured refusal");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["isError"], true);
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["status"], "refused");
+        assert_eq!(structured["code"], expected_code);
+        assert_eq!(structured["fallback"]["local_reindex"], "not_run");
+        assert!(!adopted.exists());
+    }
+
+    fn flip_first_byte(path: &Path) {
+        let mut bytes = fs::read(path).expect("read bytes");
+        bytes[0] ^= 0x01;
+        fs::write(path, bytes).expect("write tampered bytes");
+    }
+
+    fn rewrite_team_artifact_manifest<F>(artifact_dir: &Path, mutate: F)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let path = artifact_dir.join("artifact.json");
+        let bytes = fs::read(&path).expect("read artifact manifest");
+        let mut value: Value = serde_json::from_slice(&bytes).expect("decode artifact manifest");
+        mutate(&mut value);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&value).expect("encode artifact manifest"),
+        )
+        .expect("write artifact manifest");
     }
 
     fn seed_team_shadow_state(root: &Path) -> PathBuf {
