@@ -199,10 +199,11 @@ where
 fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let mut args = args.to_vec();
     let raw_json = strip_flag(&mut args, "--json");
+    let progress = strip_flag(&mut args, "--progress");
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
     if args.is_empty() {
-        return Err("Usage: astrolabe cli [--json] <tool_name> [json_args]".into());
+        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [json_args]".into());
     }
 
     let _worker_watchdog = index_worker.then(ParentWatchdog::start);
@@ -215,8 +216,15 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     };
     let tool_name = args.remove(0);
     let args_json = resolve_cli_args(&args)?;
+    if progress {
+        eprintln!("astrolabe cli progress: start tool={tool_name}");
+    }
     if tool_name == "verify_chain" {
-        return run_verify_chain_cli(&args_json, raw_json, response_out.as_deref());
+        let code = run_verify_chain_cli(&args_json, raw_json, response_out.as_deref())?;
+        if progress {
+            eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
+        }
+        return Ok(code);
     }
 
     let runner = CbmToolRunner::new_default()?;
@@ -231,10 +239,17 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
 
     if raw_json {
         println!("{result}");
+        if progress {
+            eprintln!("astrolabe cli progress: done tool={tool_name} exit=0");
+        }
         return Ok(0);
     }
 
-    print_mcp_tool_result(&result)
+    let code = print_mcp_tool_result(&result)?;
+    if progress {
+        eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
+    }
+    Ok(code)
 }
 
 fn run_verify_chain_cli(
