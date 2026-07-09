@@ -1857,6 +1857,8 @@ Adapted hazard probes: watcher+incremental churn soak (10K synthetic commits â�
 ### L7 â€” Agent-level evals (the product truth)
 Scripted MCP sessions (rapid-init + tool-sequence scripts, extending CBM's `test_mcp_rapid_init.py`): SWE-bench-lite-style tasks driven with (a) legacy CBM tools vs (b) ASTROLABE packs+oracle â€” measure tokens consumed, task success, wrong-file rate. Published per release; this is success-criterion #1 (01 Â§6) made executable.
 
+Release predicate status: `scripts/release-predicate.sh` / `scripts/release-predicate.py` now evaluates `astrolabe.release_predicate.v1` from JSON artifacts in a fixed conjunct order: L7 agent evals, inherited gates, L1-L4, L5 baselines, bench ratios, verify_chain soak, parity dashboard, license gate, and nightly reproduce sample. It exits nonzero naming the first failing conjunct, reports missing artifacts instead of guessing, prints active L5 waivers verbatim with published numbers, and names `REPRODUCE_DRIFT_EXCEEDED` answer ids from reproduce-sample artifacts. `scripts/test-release-predicate.py` forces every conjunct red and is part of `scripts/check.sh`; the remaining work is producing those artifacts from live CI/eval jobs rather than fixtures.
+
 ## 3. Test infrastructure
 
 Pinned-corpus repos vendored as fixtures (small) + cloned-by-script (large, checksum-pinned); the parity dashboard aggregates L2/L3/L5 across the beta cohort; nightly = full assay sweep + reproduce-sample + soak-short; weekly = L-scale bench + backtests. Red-by-design repro convention adopted for fusion bugs (a failing repro is a permanent regression guard, exit-status board not gate).

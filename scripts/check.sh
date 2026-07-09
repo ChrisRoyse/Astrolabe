@@ -29,6 +29,7 @@ fi
 bash scripts/verify-pins.sh
 bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
+"$PYTHON_BIN" scripts/test-release-predicate.py
 "$CARGO_BIN" metadata --format-version 1 >/dev/null
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 "$CARGO_BIN" build --workspace
