@@ -34,6 +34,18 @@ pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
     Ok(PathBuf::from(unsafe { CStr::from_ptr(ptr) }.to_str()?))
 }
 
+pub fn cbm_memory_budget_bytes() -> usize {
+    cbm_sys::initialize_allocator_bindings_first();
+    // SAFETY: these CBM functions are process-global budget initializers/readers
+    // with no borrowed inputs. cbm_mem_init is idempotent.
+    unsafe {
+        let info = cbm_sys::cbm_system_info();
+        let ram_fraction = cbm_sys::cbm_mem_ram_fraction_for_total(info.total_ram);
+        cbm_sys::cbm_mem_init(ram_fraction);
+        cbm_sys::cbm_mem_budget()
+    }
+}
+
 pub fn cbm_project_name_from_path(path: &str) -> Result<String, BridgeError> {
     cbm_sys::initialize_allocator_bindings_first();
     let path = CString::new(path)?;
@@ -1670,6 +1682,11 @@ mod tests {
         let (calyx, cbm) = parent_roots();
         assert!(calyx.ends_with("vendor/calyx"));
         assert!(cbm.ends_with("vendor/codebase-memory-mcp"));
+    }
+
+    #[test]
+    fn cbm_memory_budget_initializes_to_nonzero_bytes() {
+        assert!(cbm_memory_budget_bytes() > 0);
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
