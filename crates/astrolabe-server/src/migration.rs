@@ -26,7 +26,6 @@ const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
 const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
-const SHADOW_IMPORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -95,11 +94,13 @@ enum ShadowRefreshStatus {
 
 #[derive(Debug)]
 struct ShadowImportLock {
+    _file: fs::File,
     path: PathBuf,
 }
 
 impl Drop for ShadowImportLock {
     fn drop(&mut self) {
+        let _ = self._file.unlock();
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -329,25 +330,24 @@ fn try_shadow_import_lock(
 ) -> Result<Option<ShadowImportLock>, DynError> {
     fs::create_dir_all(cache_dir)?;
     let lock_path = shadow_import_lock_path(cache_dir, project);
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut lock) => {
-                writeln!(lock, "pid={}", std::process::id())?;
-                lock.sync_all()?;
-                return Ok(Some(ShadowImportLock { path: lock_path }));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if remove_stale_shadow_import_lock(&lock_path)? {
-                    continue;
-                }
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
+    let mut lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {
+            lock.set_len(0)?;
+            writeln!(lock, "pid={}", std::process::id())?;
+            lock.sync_all()?;
+            Ok(Some(ShadowImportLock {
+                _file: lock,
+                path: lock_path,
+            }))
         }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -377,10 +377,6 @@ fn shadow_import_current_summary(verify_status: &str, lowered_exists: bool) -> V
             Value::String("run index_repository with calyx shadow or retry index_status after shadow import completes".to_string())
         },
     })
-}
-
-fn remove_stale_shadow_import_lock(lock_path: &Path) -> Result<bool, DynError> {
-    remove_stale_sidecar_lock(lock_path, SHADOW_IMPORT_LOCK_STALE_AFTER)
 }
 
 fn remove_stale_lowered_sqlite_lock(lock_path: &Path) -> Result<bool, DynError> {
@@ -1074,6 +1070,68 @@ mod tests {
     }
 
     #[test]
+    fn shadow_import_lock_releases_after_owner_process_kill() {
+        let dir = temp_dir("shadow-import-kill");
+        fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("owner.ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("migration::tests::shadow_import_lock_child_process")
+            .arg("--nocapture")
+            .env("ASTROLABE_SHADOW_LOCK_CHILD", "1")
+            .env("ASTROLABE_SHADOW_LOCK_CACHE", &dir)
+            .env("ASTROLABE_SHADOW_LOCK_PROJECT", "demo")
+            .env("ASTROLABE_SHADOW_LOCK_READY", &ready)
+            .spawn()
+            .expect("spawn shadow import lock child");
+
+        wait_for_file_or_child_exit(&ready, &mut child);
+        assert!(
+            try_shadow_import_lock(&dir, "demo").unwrap().is_none(),
+            "parent must observe the live child owner as busy"
+        );
+
+        child.kill().expect("kill shadow import lock child");
+        let status = child.wait().expect("wait for shadow import lock child");
+        assert!(
+            !status.success(),
+            "child should be killed while holding lock"
+        );
+
+        let recovered = wait_for_shadow_import_lock(&dir, "demo");
+        drop(recovered);
+        assert!(
+            !shadow_import_lock_path(&dir, "demo").exists(),
+            "new owner drop removes the crash-left lock marker"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "child process helper for shadow_import_lock_releases_after_owner_process_kill"]
+    fn shadow_import_lock_child_process() {
+        if std::env::var_os("ASTROLABE_SHADOW_LOCK_CHILD").is_none() {
+            return;
+        }
+        let cache_dir = PathBuf::from(
+            std::env::var_os("ASTROLABE_SHADOW_LOCK_CACHE").expect("ASTROLABE_SHADOW_LOCK_CACHE"),
+        );
+        let project =
+            std::env::var("ASTROLABE_SHADOW_LOCK_PROJECT").expect("ASTROLABE_SHADOW_LOCK_PROJECT");
+        let ready = PathBuf::from(
+            std::env::var_os("ASTROLABE_SHADOW_LOCK_READY").expect("ASTROLABE_SHADOW_LOCK_READY"),
+        );
+        let _lock = try_shadow_import_lock(&cache_dir, &project)
+            .unwrap()
+            .expect("child owns shadow import lock");
+        fs::write(&ready, b"ready").expect("write child ready marker");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
     fn shadow_import_status_labels_unverified_state() {
         let current = shadow_import_current_summary("intact", true);
         assert_eq!(current["status"], "current");
@@ -1114,5 +1172,34 @@ mod tests {
         ));
         fs::remove_dir_all(&dir).ok();
         dir
+    }
+
+    fn wait_for_file_or_child_exit(path: &Path, child: &mut std::process::Child) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            if let Some(status) = child.try_wait().expect("poll child") {
+                panic!("child exited before ready marker: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        child.kill().ok();
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    fn wait_for_shadow_import_lock(cache_dir: &Path, project: &str) -> ShadowImportLock {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(lock) = try_shadow_import_lock(cache_dir, project).unwrap() {
+                return lock;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "timed out waiting to reacquire shadow import lock {}",
+            shadow_import_lock_path(cache_dir, project).display()
+        );
     }
 }
