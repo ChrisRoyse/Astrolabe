@@ -65,6 +65,7 @@ const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
 const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
 const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
+const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MigrationDial {
@@ -3665,12 +3666,29 @@ fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "kernel_context": outcome.kernel_context.clone(),
         "anomalies": outcome.anomalies.clone(),
         "provenance": outcome.provenance.clone(),
+        "health": health_surface_json(
+            outcome_project_label(outcome),
+            &outcome.verify_chain_status,
+            outcome.lowered_sqlite_path.exists(),
+            Some(outcome.ledger_seq),
+            Some(outcome.ledger_rows_after),
+            None,
+        ),
         "stores": stores_summary(
             &outcome.sqlite_path,
             &outcome.vault_dir,
             Some(&outcome.lowered_sqlite_path),
         ),
     })
+}
+
+fn outcome_project_label(outcome: &ShadowImportOutcome) -> &str {
+    outcome
+        .sqlite_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("unknown")
 }
 
 fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
@@ -3710,15 +3728,27 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
     } else {
         "missing".to_string()
     };
+    let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
+        .and_then(|value| value.parse::<u64>().ok());
+    let lowered_exists = lowered_path.exists();
     let background_lane = background_lane_status_at(cache_dir, project)?;
+    let health = health_surface_json(
+        project,
+        &verify_status,
+        lowered_exists,
+        ledger_seq,
+        ledger_rows,
+        Some(&background_lane),
+    );
 
     Ok(json!({
         "calyx": "shadow",
         "vault_fingerprint": fingerprint,
         "vault_ledger_head": ledger_seq,
         "panel_version": panel_version,
-        "shadow_import": shadow_import_current_summary(&verify_status, lowered_path.exists()),
+        "shadow_import": shadow_import_current_summary(&verify_status, lowered_exists),
         "background_lane": background_lane,
+        "health": health,
         "idempotency": {
             "new_cx_ids": new_cx_ids,
             "reused_cx_ids": reused_cx_ids,
@@ -3764,6 +3794,162 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
             "verify_chain": verify_status,
         },
     }))
+}
+
+fn health_surface_json(
+    project: &str,
+    verify_status: &str,
+    lowered_exists: bool,
+    ledger_head: Option<u64>,
+    ledger_rows: Option<u64>,
+    background_lane: Option<&Value>,
+) -> Value {
+    let chain_intact = verify_status == "intact";
+    let mut blocking_checks = Vec::new();
+    if !chain_intact {
+        blocking_checks.push("verify_chain");
+    }
+    if !lowered_exists {
+        blocking_checks.push("lowered_sqlite");
+    }
+    if ledger_head.is_none() {
+        blocking_checks.push("ledger_head");
+    }
+    let ready = blocking_checks.is_empty();
+    let trust = if ready { "verified" } else { "provisional" };
+    let metrics_text = health_metrics_text(
+        project,
+        chain_intact,
+        lowered_exists,
+        ready,
+        ledger_head,
+        ledger_rows,
+    );
+    let trajectory_ndjson = health_trajectory_ndjson(
+        project,
+        verify_status,
+        lowered_exists,
+        ready,
+        trust,
+        background_lane,
+    );
+
+    json!({
+        "schema": HEALTH_SURFACE_SCHEMA,
+        "status": if ready { "ready" } else { "degraded" },
+        "freshness": "fresh",
+        "trust": trust,
+        "readiness": {
+            "ready": ready,
+            "blocking_checks": blocking_checks,
+            "remediation": if ready {
+                Value::Null
+            } else {
+                Value::String("rerun index_status after shadow import completes; if verify_chain is not intact, run astrolabe verify --deep and reindex before trusting vault-backed surfaces".to_string())
+            },
+        },
+        "chain_verify": {
+            "status": verify_status,
+            "intact": chain_intact,
+            "gauge": if chain_intact { 1 } else { 0 },
+            "ledger_head": ledger_head,
+            "ledger_rows": ledger_rows,
+        },
+        "lowered_sqlite": {
+            "exists": lowered_exists,
+            "gauge": if lowered_exists { 1 } else { 0 },
+        },
+        "metrics_format": "prometheus_text_v0",
+        "metrics_text": metrics_text,
+        "trajectory_format": "ndjson",
+        "trajectory_ndjson": trajectory_ndjson,
+    })
+}
+
+fn health_metrics_text(
+    project: &str,
+    chain_intact: bool,
+    lowered_exists: bool,
+    ready: bool,
+    ledger_head: Option<u64>,
+    ledger_rows: Option<u64>,
+) -> String {
+    let project = prom_label_value(project);
+    let mut lines = vec![
+        "# TYPE astrolabe_verify_chain_intact gauge".to_string(),
+        format!(
+            "astrolabe_verify_chain_intact{{project=\"{project}\"}} {}",
+            if chain_intact { 1 } else { 0 }
+        ),
+        "# TYPE astrolabe_lowered_sqlite_exists gauge".to_string(),
+        format!(
+            "astrolabe_lowered_sqlite_exists{{project=\"{project}\"}} {}",
+            if lowered_exists { 1 } else { 0 }
+        ),
+        "# TYPE astrolabe_readiness gauge".to_string(),
+        format!(
+            "astrolabe_readiness{{project=\"{project}\"}} {}",
+            if ready { 1 } else { 0 }
+        ),
+    ];
+    if let Some(ledger_head) = ledger_head {
+        lines.push("# TYPE astrolabe_ledger_head gauge".to_string());
+        lines.push(format!(
+            "astrolabe_ledger_head{{project=\"{project}\"}} {ledger_head}"
+        ));
+    }
+    if let Some(ledger_rows) = ledger_rows {
+        lines.push("# TYPE astrolabe_ledger_rows gauge".to_string());
+        lines.push(format!(
+            "astrolabe_ledger_rows{{project=\"{project}\"}} {ledger_rows}"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn health_trajectory_ndjson(
+    project: &str,
+    verify_status: &str,
+    lowered_exists: bool,
+    ready: bool,
+    trust: &str,
+    background_lane: Option<&Value>,
+) -> String {
+    let mut events = vec![json!({
+        "schema": HEALTH_SURFACE_SCHEMA,
+        "event": "shadow_health",
+        "project": project,
+        "verify_chain": verify_status,
+        "lowered_sqlite_exists": lowered_exists,
+        "ready": ready,
+        "trust": trust,
+    })];
+    if let Some(background_lane) = background_lane {
+        events.push(json!({
+            "schema": HEALTH_SURFACE_SCHEMA,
+            "event": "background_lane",
+            "project": project,
+            "status": background_lane.get("status").and_then(Value::as_str),
+            "trust": background_lane.get("trust").and_then(Value::as_str),
+        }));
+    }
+    events
+        .into_iter()
+        .map(|event| serde_json::to_string(&event).expect("health event serializes"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prom_label_value(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' | '\r' => "_".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
 }
 
 fn vault_import_summary(source: &str, fallback_reason: Option<&str>) -> Value {
@@ -5188,6 +5374,99 @@ mod tests {
                 .unwrap()
                 .contains("retry index_status")
         );
+    }
+
+    #[test]
+    fn health_surface_metrics_and_ndjson_match_source_state() {
+        let lane = json!({
+            "status": "owner",
+            "trust": "verified",
+        });
+        let health = health_surface_json("demo", "intact", true, Some(7), Some(3), Some(&lane));
+
+        assert_eq!(health["schema"], HEALTH_SURFACE_SCHEMA);
+        assert_eq!(health["status"], "ready");
+        assert_eq!(health["readiness"]["ready"], true);
+        assert_eq!(health["chain_verify"]["gauge"], 1);
+        assert_eq!(health["lowered_sqlite"]["gauge"], 1);
+        let metrics = health["metrics_text"].as_str().expect("metrics text");
+        assert!(metrics.contains("astrolabe_verify_chain_intact{project=\"demo\"} 1"));
+        assert!(metrics.contains("astrolabe_lowered_sqlite_exists{project=\"demo\"} 1"));
+        assert!(metrics.contains("astrolabe_readiness{project=\"demo\"} 1"));
+        assert!(metrics.contains("astrolabe_ledger_head{project=\"demo\"} 7"));
+        assert!(metrics.contains("astrolabe_ledger_rows{project=\"demo\"} 3"));
+
+        let events = health["trajectory_ndjson"]
+            .as_str()
+            .expect("ndjson")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("parse health event"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "shadow_health");
+        assert_eq!(events[0]["verify_chain"], "intact");
+        assert_eq!(events[1]["event"], "background_lane");
+        assert_eq!(events[1]["status"], "owner");
+
+        let degraded = health_surface_json("demo", "broken", false, None, None, None);
+        assert_eq!(degraded["status"], "degraded");
+        assert_eq!(degraded["readiness"]["ready"], false);
+        assert_eq!(
+            degraded["readiness"]["blocking_checks"],
+            json!(["verify_chain", "lowered_sqlite", "ledger_head"])
+        );
+        assert!(
+            degraded["metrics_text"]
+                .as_str()
+                .unwrap()
+                .contains("astrolabe_readiness{project=\"demo\"} 0")
+        );
+    }
+
+    #[test]
+    fn shadow_status_health_reads_physical_vault_and_lowered_sidecar() {
+        let dir = temp_dir("health-status-readback");
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"health-status-readback".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        drop(vault);
+        let lowered_path = dir.join("demo.astrolabe-lowered.db");
+        fs::write(&lowered_path, b"lowered sidecar exists").unwrap();
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(&dir, security);
+        outcome.vault_dir = vault_dir;
+        outcome.lowered_sqlite_path = lowered_path;
+        outcome.ledger_seq = 0;
+        outcome.ledger_rows_after = 0;
+        outcome.verify_chain_status = "intact".to_string();
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["health"]["schema"], HEALTH_SURFACE_SCHEMA);
+        assert_eq!(summary["health"]["status"], "ready");
+        assert_eq!(summary["health"]["chain_verify"]["status"], "intact");
+        assert_eq!(summary["health"]["chain_verify"]["ledger_head"], 0);
+        assert_eq!(summary["health"]["chain_verify"]["ledger_rows"], 0);
+        assert_eq!(summary["health"]["lowered_sqlite"]["exists"], true);
+        assert!(
+            summary["health"]["metrics_text"]
+                .as_str()
+                .unwrap()
+                .contains("astrolabe_verify_chain_intact{project=\"demo\"} 1")
+        );
+        for line in summary["health"]["trajectory_ndjson"]
+            .as_str()
+            .unwrap()
+            .lines()
+        {
+            serde_json::from_str::<Value>(line).expect("health ndjson line parses");
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
