@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
@@ -592,6 +593,234 @@ where
         readback,
         cx_ids,
     })
+}
+
+/// Imports an in-memory CBM row stream through the canonical SQLite importer.
+///
+/// This is the Rust-side contract for `cbm_pipeline_set_sink` callbacks: a sink
+/// must provide the same rows CBM would have persisted to SQLite. The direct
+/// pipeline-to-vault writer can replace the temporary materialization step while
+/// retaining this parity harness.
+pub fn import_cbm_graph_snapshot_to_vault<C, R>(
+    snapshot: &CbmGraphSnapshot,
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+) -> IngestResult<SqliteImportReport>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    if snapshot.project != options.project {
+        return Err(invalid_sqlite(format!(
+            "row-sink snapshot project {:?} does not match import project {:?}",
+            snapshot.project, options.project
+        )));
+    }
+    let path = temp_row_sink_sqlite_path(&snapshot.project);
+    let result = (|| {
+        write_cbm_graph_snapshot_sqlite(snapshot, &path)?;
+        import_sqlite_to_vault(&path, vault, runtime, options)
+    })();
+    cleanup_sqlite_path(&path);
+    result
+}
+
+fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
+    cleanup_sqlite_path(path);
+    let connection = Connection::open(path)
+        .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
+    connection
+        .execute_batch(
+            "CREATE TABLE projects (
+               name TEXT PRIMARY KEY,
+               indexed_at TEXT NOT NULL,
+               root_path TEXT NOT NULL
+             );
+             CREATE TABLE file_hashes (
+               project TEXT NOT NULL,
+               rel_path TEXT NOT NULL,
+               sha256 TEXT NOT NULL,
+               mtime_ns INTEGER NOT NULL DEFAULT 0,
+               size INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(project, rel_path)
+             );
+             CREATE TABLE nodes (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               label TEXT NOT NULL,
+               name TEXT NOT NULL,
+               qualified_name TEXT NOT NULL,
+               file_path TEXT DEFAULT '',
+               start_line INTEGER DEFAULT 0,
+               end_line INTEGER DEFAULT 0,
+               properties TEXT DEFAULT '{}',
+               UNIQUE(project, qualified_name)
+             );
+             CREATE TABLE edges (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               source_id INTEGER NOT NULL,
+               target_id INTEGER NOT NULL,
+               type TEXT NOT NULL,
+               properties TEXT DEFAULT '{}',
+               url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+               local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                 THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+               UNIQUE(source_id, target_id, type, local_name_gen)
+             );
+             CREATE TABLE project_summaries (
+               project TEXT PRIMARY KEY,
+               summary TEXT NOT NULL,
+               source_hash TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE node_vectors (
+               node_id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               vector BLOB NOT NULL
+             );
+             CREATE TABLE token_vectors (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               token TEXT NOT NULL,
+               vector BLOB NOT NULL,
+               idf INTEGER NOT NULL
+             );",
+        )
+        .map_err(|error| invalid_sqlite(format!("create row-sink schema: {error}")))?;
+
+    let projects = if snapshot.projects.is_empty() {
+        vec![CbmProjectRow {
+            schema: SCHEMA_PROJECT_ROW.to_string(),
+            project: snapshot.project.clone(),
+            indexed_at: String::new(),
+            root_path: String::new(),
+            commit: String::new(),
+            sqlite_fingerprint_sha256: String::new(),
+        }]
+    } else {
+        snapshot.projects.clone()
+    };
+    for project in projects {
+        connection
+            .execute(
+                "INSERT INTO projects(name, indexed_at, root_path) VALUES (?1, ?2, ?3)",
+                params![project.project, project.indexed_at, project.root_path],
+            )
+            .map_err(|error| invalid_sqlite(format!("insert row-sink project: {error}")))?;
+    }
+    for file_hash in &snapshot.file_hashes {
+        connection
+            .execute(
+                "INSERT INTO file_hashes(project, rel_path, sha256, mtime_ns, size)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    file_hash.project,
+                    file_hash.rel_path,
+                    file_hash.sha256,
+                    file_hash.mtime_ns,
+                    file_hash.size,
+                ],
+            )
+            .map_err(|error| invalid_sqlite(format!("insert row-sink file hash: {error}")))?;
+    }
+    for node in &snapshot.nodes {
+        ensure_json_object_text(&node.properties_json, "row-sink node properties")?;
+        connection.execute(
+            "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                node.source_node_id,
+                node.project,
+                node.label,
+                node.name,
+                node.qualified_name,
+                node.file_path,
+                node.start_line,
+                node.end_line,
+                node.properties_json,
+            ],
+        )
+        .map_err(|error| invalid_sqlite(format!("insert row-sink node: {error}")))?;
+        if let Some(vector) = &node.node_vector {
+            connection
+                .execute(
+                    "INSERT INTO node_vectors(node_id, project, vector) VALUES (?1, ?2, ?3)",
+                    params![node.source_node_id, node.project, vector],
+                )
+                .map_err(|error| invalid_sqlite(format!("insert row-sink node vector: {error}")))?;
+        }
+    }
+    for edge in &snapshot.edges {
+        ensure_json_object_text(&edge.properties_json, "row-sink edge properties")?;
+        connection
+            .execute(
+                "INSERT INTO edges(id, project, source_id, target_id, type, properties)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    edge.sqlite_edge_id,
+                    edge.project,
+                    edge.source_node_id,
+                    edge.target_node_id,
+                    edge.edge_type,
+                    edge.properties_json,
+                ],
+            )
+            .map_err(|error| invalid_sqlite(format!("insert row-sink edge: {error}")))?;
+    }
+    for summary in &snapshot.project_summaries {
+        connection.execute(
+            "INSERT INTO project_summaries(project, summary, source_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                summary.project,
+                summary.summary,
+                summary.source_hash,
+                summary.created_at,
+                summary.updated_at,
+            ],
+        )
+        .map_err(|error| invalid_sqlite(format!("insert row-sink project summary: {error}")))?;
+    }
+    for token_vector in &snapshot.token_vectors {
+        connection
+            .execute(
+                "INSERT INTO token_vectors(id, project, token, vector, idf)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    token_vector.id,
+                    token_vector.project,
+                    token_vector.token,
+                    token_vector.vector,
+                    token_vector.idf,
+                ],
+            )
+            .map_err(|error| invalid_sqlite(format!("insert row-sink token vector: {error}")))?;
+    }
+    drop(connection);
+    Ok(())
+}
+
+fn temp_row_sink_sqlite_path(project: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let project_hash = hex_lower(&sha256_digest(project.as_bytes()));
+    std::env::temp_dir().join(format!(
+        "astrolabe-cbm-row-sink-{}-{}-{nanos}.db",
+        std::process::id(),
+        &project_hash[..16],
+    ))
+}
+
+fn cleanup_sqlite_path(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("db-wal"));
+    let _ = fs::remove_file(path.with_extension("db-shm"));
+    let _ = fs::remove_file(path.with_extension("db-journal"));
 }
 
 fn validate_options(options: &SqliteImportOptions) -> IngestResult<()> {
@@ -2648,7 +2877,7 @@ mod tests {
     };
     use astrolabe_panel::FixtureSlotRuntime;
     use calyx_aster::cf::{ledger_key, prefix_range};
-    use calyx_core::{FixedClock, VaultId};
+    use calyx_core::{CxId, FixedClock, VaultId};
     use calyx_ledger::decode;
 
     const TEST_VAULT_ID: &str = "00000000000000000000000000";
@@ -2837,6 +3066,149 @@ mod tests {
             r#"{"local_name":"beta","line":3}"#,
         );
         insert_edge(&connection, caller, 9999, "CALLS", "{}");
+    }
+
+    fn edge_snapshot() -> CbmGraphSnapshot {
+        CbmGraphSnapshot {
+            project: "demo".to_string(),
+            panel_version: Some(7),
+            projects: Vec::new(),
+            nodes: vec![
+                CbmGraphNode {
+                    source_node_id: 1,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "handler".to_string(),
+                    qualified_name: "demo.http.handler".to_string(),
+                    file_path: "src/http.rs".to_string(),
+                    start_line: 5,
+                    end_line: 20,
+                    properties_json: r#"{"language":"rust","source_snippet":"fn handler() { helper(); }","signature":"fn handler()"}"#.to_string(),
+                    node_vector: None,
+                    cx_id: None,
+                    structural: false,
+                },
+                CbmGraphNode {
+                    source_node_id: 2,
+                    project: "demo".to_string(),
+                    label: "Function".to_string(),
+                    name: "helper".to_string(),
+                    qualified_name: "demo.http.helper".to_string(),
+                    file_path: "src/http.rs".to_string(),
+                    start_line: 30,
+                    end_line: 35,
+                    properties_json: r#"{"language":"rust","source_snippet":"fn helper() {}","signature":"fn helper()"}"#.to_string(),
+                    node_vector: None,
+                    cx_id: None,
+                    structural: false,
+                },
+                CbmGraphNode {
+                    source_node_id: 3,
+                    project: "demo".to_string(),
+                    label: "Module".to_string(),
+                    name: "net".to_string(),
+                    qualified_name: "demo.net".to_string(),
+                    file_path: "src/net.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    properties_json:
+                        r#"{"language":"rust","source_snippet":"mod net;","signature":"mod net"}"#
+                            .to_string(),
+                    node_vector: None,
+                    cx_id: None,
+                    structural: false,
+                },
+            ],
+            edges: vec![
+                CbmGraphEdge {
+                    sqlite_edge_id: 1,
+                    project: "demo".to_string(),
+                    source_node_id: 1,
+                    target_node_id: 2,
+                    src: None,
+                    dst: None,
+                    edge_type: "CALLS".to_string(),
+                    local_name_gen: String::new(),
+                    weight: 1.0,
+                    properties_json:
+                        r#"{"confidence":0.85,"strategy":"import_map","line":11,"candidates":1}"#
+                            .to_string(),
+                },
+                CbmGraphEdge {
+                    sqlite_edge_id: 2,
+                    project: "demo".to_string(),
+                    source_node_id: 1,
+                    target_node_id: 3,
+                    src: None,
+                    dst: None,
+                    edge_type: "IMPORTS".to_string(),
+                    local_name_gen: "alpha".to_string(),
+                    weight: 1.0,
+                    properties_json: r#"{"local_name":"alpha","line":2}"#.to_string(),
+                },
+                CbmGraphEdge {
+                    sqlite_edge_id: 3,
+                    project: "demo".to_string(),
+                    source_node_id: 1,
+                    target_node_id: 3,
+                    src: None,
+                    dst: None,
+                    edge_type: "IMPORTS".to_string(),
+                    local_name_gen: "beta".to_string(),
+                    weight: 1.0,
+                    properties_json: r#"{"local_name":"beta","line":3}"#.to_string(),
+                },
+                CbmGraphEdge {
+                    sqlite_edge_id: 4,
+                    project: "demo".to_string(),
+                    source_node_id: 1,
+                    target_node_id: 9999,
+                    src: None,
+                    dst: None,
+                    edge_type: "CALLS".to_string(),
+                    local_name_gen: String::new(),
+                    weight: 1.0,
+                    properties_json: "{}".to_string(),
+                },
+            ],
+            file_hashes: Vec::new(),
+            project_summaries: Vec::new(),
+            token_vectors: Vec::new(),
+        }
+    }
+
+    fn edge_multiset<C>(vault: &AsterVault<C>) -> Vec<(CxId, CxId, u16, String, Value)>
+    where
+        C: Clock,
+    {
+        let mut edges = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(EDGE_ROW_PREFIX),
+            )
+            .expect("scan edge rows")
+            .into_iter()
+            .map(|(_, value)| {
+                let edge = serde_json::from_slice::<EdgeGraphRow>(&value).expect("edge row");
+                (
+                    edge.src,
+                    edge.dst,
+                    edge.etype,
+                    edge.local_name_gen,
+                    edge.props,
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            (left.0, left.1, left.2, left.3.as_str()).cmp(&(
+                right.0,
+                right.1,
+                right.2,
+                right.3.as_str(),
+            ))
+        });
+        edges
     }
 
     fn full_vocabulary_fixture(path: &Path) {
@@ -3086,6 +3458,38 @@ mod tests {
             ledger_row_count(&vault).expect("ledger count after reimport"),
             before_ledger + 1
         );
+    }
+
+    #[test]
+    fn row_sink_snapshot_import_matches_sqlite_import_for_typed_edges() {
+        let path = temp_db("row-sink-edges");
+        edge_fixture(&path);
+        let sqlite_vault = vault();
+        let row_sink_vault = vault();
+
+        let sqlite = import_sqlite_to_vault(&path, &sqlite_vault, &FixtureSlotRuntime, &options(1))
+            .expect("sqlite import");
+        let row_sink = import_cbm_graph_snapshot_to_vault(
+            &edge_snapshot(),
+            &row_sink_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("row-sink import");
+
+        assert_eq!(row_sink.cx_ids, sqlite.cx_ids);
+        assert_eq!(row_sink.edge_skips, sqlite.edge_skips);
+        assert_eq!(row_sink.sqlite_nodes, sqlite.sqlite_nodes);
+        assert_eq!(row_sink.sqlite_edges, sqlite.sqlite_edges);
+        assert_eq!(row_sink.readback.expected_edge_rows, 3);
+        assert_eq!(row_sink.readback, sqlite.readback);
+        assert_eq!(edge_multiset(&row_sink_vault), edge_multiset(&sqlite_vault));
+
+        let deep = crate::verify_deep(&row_sink_vault).expect("deep verify row-sink");
+        assert_eq!(deep.ledger_chain_status, "intact");
+        assert_eq!(deep.sqlite_edge_rows, 3);
+
+        fs::remove_file(path).ok();
     }
 
     #[test]

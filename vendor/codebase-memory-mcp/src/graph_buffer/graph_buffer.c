@@ -115,6 +115,11 @@ struct cbm_gbuf {
     CBMDumpTokenVec *dump_token_vecs;
     int dump_token_vec_count;
     int dump_token_vec_cap;
+
+    /* Optional dump-row sink. NULL callbacks preserve normal dump behavior. */
+    cbm_gbuf_row_node_sink_fn row_node_sink;
+    cbm_gbuf_row_edge_sink_fn row_edge_sink;
+    void *row_sink_ctx;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1027,6 +1032,16 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
     }
 }
 
+void cbm_gbuf_set_row_sink(cbm_gbuf_t *gb, cbm_gbuf_row_node_sink_fn node_cb,
+                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx) {
+    if (!gb) {
+        return;
+    }
+    gb->row_node_sink = node_cb;
+    gb->row_edge_sink = edge_cb;
+    gb->row_sink_ctx = ctx;
+}
+
 /* ── Edge operations ─────────────────────────────────────────────── */
 
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
@@ -1578,6 +1593,59 @@ static void free_dump_resources(char **url_paths, char **local_names, int edge_c
     free(temp_to_final);
 }
 
+static bool gbuf_has_row_sink(const cbm_gbuf_t *gb) {
+    return gb && (gb->row_node_sink || gb->row_edge_sink);
+}
+
+static int emit_row_sink_nodes(cbm_gbuf_t *gb, const CBMDumpNode *nodes, int node_count) {
+    if (!gb || !gb->row_node_sink) {
+        return 0;
+    }
+    for (int i = 0; i < node_count; i++) {
+        const CBMDumpNode *n = &nodes[i];
+        cbm_gbuf_row_node_t row = {
+            .id = n->id,
+            .project = n->project,
+            .label = n->label,
+            .name = n->name,
+            .qualified_name = n->qualified_name,
+            .file_path = n->file_path ? n->file_path : "",
+            .start_line = n->start_line,
+            .end_line = n->end_line,
+            .properties_json = n->properties ? n->properties : "{}",
+        };
+        if (gb->row_node_sink(&row, gb->row_sink_ctx) != 0) {
+            cbm_log_error("gbuf.row_sink.err", "kind", "node");
+            return GB_ERR;
+        }
+    }
+    return 0;
+}
+
+static int emit_row_sink_edges(cbm_gbuf_t *gb, const CBMDumpEdge *edges, int edge_count) {
+    if (!gb || !gb->row_edge_sink) {
+        return 0;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        const CBMDumpEdge *e = &edges[i];
+        cbm_gbuf_row_edge_t row = {
+            .id = e->id,
+            .project = e->project,
+            .source_id = e->source_id,
+            .target_id = e->target_id,
+            .type = e->type,
+            .properties_json = e->properties ? e->properties : "{}",
+            .url_path_gen = e->url_path ? e->url_path : "",
+            .local_name_gen = e->local_name ? e->local_name : "",
+        };
+        if (gb->row_edge_sink(&row, gb->row_sink_ctx) != 0) {
+            cbm_log_error("gbuf.row_sink.err", "kind", "edge");
+            return GB_ERR;
+        }
+    }
+    return 0;
+}
+
 static int count_live_nodes(cbm_gbuf_t *gb) {
     int count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1641,6 +1709,30 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     char indexed_at[CBM_SZ_64];
     generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
+    int edge_idx = 0;
+    char **url_paths = NULL;
+    char **local_names = NULL;
+    CBMDumpEdge *dump_edges = NULL;
+    bool has_row_sink = gbuf_has_row_sink(gb);
+    if (has_row_sink) {
+        CBM_PROF_START(t_build_edges_sink);
+        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths,
+                                      &local_names);
+        CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges_sink, edge_idx);
+        release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+
+        int sink_rc = emit_row_sink_nodes(gb, dump_nodes, node_idx);
+        if (sink_rc == 0) {
+            sink_rc = emit_row_sink_edges(gb, dump_edges, edge_idx);
+        }
+        if (sink_rc != 0) {
+            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes,
+                                temp_to_final);
+            free(src_nodes);
+            return sink_rc;
+        }
+    }
+
     /* Stream node rows to the DB in partitions. Under memory pressure, free each
      * partition's heavy properties_json once persisted — the heavy column is
      * write-once and never read again, so this bounds the dump/finalize peak.
@@ -1649,9 +1741,9 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
+        free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes,
+                            temp_to_final);
         free(src_nodes);
-        free(dump_nodes);
-        free(temp_to_final);
         return CBM_NOT_FOUND;
     }
 
@@ -1680,11 +1772,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
     CBM_PROF_END_N("dump", "2b_stream_append_nodes", t_append, node_idx);
 
-    int edge_idx = 0;
-    char **url_paths = NULL;
-    char **local_names = NULL;
-    CBMDumpEdge *dump_edges = NULL;
-    if (rc == 0) {
+    if (rc == 0 && !has_row_sink) {
         CBM_PROF_START(t_build_edges);
         dump_edges =
             build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);

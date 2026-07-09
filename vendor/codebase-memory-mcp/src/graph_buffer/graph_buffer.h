@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "graph_buffer/row_sink.h"
+
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -115,6 +117,12 @@ void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, vo
 /* Iterate all edges. */
 typedef void (*cbm_gbuf_edge_visitor_fn)(const cbm_gbuf_edge_t *edge, void *userdata);
 void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, void *userdata);
+
+/* Install row-sink callbacks used by the dump path. NULL callbacks preserve the
+ * normal SQLite dump behavior and emit no sink rows. The graph buffer does not
+ * take ownership of ctx. */
+void cbm_gbuf_set_row_sink(cbm_gbuf_t *gb, cbm_gbuf_row_node_sink_fn node_cb,
+                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx);
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 

@@ -310,6 +310,56 @@ where
     }
 }
 
+/// Runs a CBM row-sink node callback behind the Rust FFI panic/error boundary.
+///
+/// # Safety
+///
+/// `node` must either be NULL or point to a CBM-owned `cbm_gbuf_row_node_t`
+/// that remains valid for the duration of this call.
+pub unsafe fn guard_row_sink_node_callback<F>(
+    node: *const cbm_sys::cbm_gbuf_row_node_t,
+    f: F,
+) -> i32
+where
+    F: FnOnce(&cbm_sys::cbm_gbuf_row_node_t) -> Result<(), BridgeError> + std::panic::UnwindSafe,
+{
+    guard_ffi_callback(|| {
+        let node = unsafe { node.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_NODE",
+                "CBM row-sink node callback received NULL",
+                "Treat this as FFI contract drift; callbacks require a borrowed row pointer.",
+            )
+        })?;
+        f(node)
+    })
+}
+
+/// Runs a CBM row-sink edge callback behind the Rust FFI panic/error boundary.
+///
+/// # Safety
+///
+/// `edge` must either be NULL or point to a CBM-owned `cbm_gbuf_row_edge_t`
+/// that remains valid for the duration of this call.
+pub unsafe fn guard_row_sink_edge_callback<F>(
+    edge: *const cbm_sys::cbm_gbuf_row_edge_t,
+    f: F,
+) -> i32
+where
+    F: FnOnce(&cbm_sys::cbm_gbuf_row_edge_t) -> Result<(), BridgeError> + std::panic::UnwindSafe,
+{
+    guard_ffi_callback(|| {
+        let edge = unsafe { edge.as_ref() }.ok_or_else(|| {
+            envelope(
+                "ASTRO_CBM_ROW_SINK_NULL_EDGE",
+                "CBM row-sink edge callback received NULL",
+                "Treat this as FFI contract drift; callbacks require a borrowed row pointer.",
+            )
+        })?;
+        f(edge)
+    })
+}
+
 pub struct ExtractedFile {
     ptr: NonNull<cbm_sys::CBMFileResult>,
     _source: Vec<u8>,
@@ -1309,6 +1359,67 @@ mod tests {
         );
         assert_eq!(guard_ffi_callback(|| panic!("boom")), CALLBACK_PANIC);
         assert_eq!(guard_ffi_callback(|| Ok(())), CALLBACK_OK);
+    }
+
+    #[test]
+    fn row_sink_callback_guards_map_null_error_and_panic() {
+        let node = cbm_sys::cbm_gbuf_row_node_t {
+            id: 1,
+            project: c"demo".as_ptr(),
+            label: c"Function".as_ptr(),
+            name: c"handler".as_ptr(),
+            qualified_name: c"demo.handler".as_ptr(),
+            file_path: c"src/main.rs".as_ptr(),
+            start_line: 1,
+            end_line: 3,
+            properties_json: c"{}".as_ptr(),
+        };
+        assert_eq!(
+            unsafe {
+                guard_row_sink_node_callback(&node, |row| {
+                    assert_eq!(row.id, 1);
+                    Ok(())
+                })
+            },
+            CALLBACK_OK
+        );
+        assert_eq!(
+            unsafe { guard_row_sink_node_callback(std::ptr::null(), |_| Ok(())) },
+            CALLBACK_ERROR
+        );
+        assert_eq!(
+            unsafe {
+                guard_row_sink_node_callback(&node, |_| -> Result<(), BridgeError> {
+                    panic!("row sink panic")
+                })
+            },
+            CALLBACK_PANIC
+        );
+
+        let edge = cbm_sys::cbm_gbuf_row_edge_t {
+            id: 1,
+            project: c"demo".as_ptr(),
+            source_id: 1,
+            target_id: 2,
+            type_: c"IMPORTS".as_ptr(),
+            properties_json: c"{\"local_name\":\"alpha\"}".as_ptr(),
+            url_path_gen: c"".as_ptr(),
+            local_name_gen: c"alpha".as_ptr(),
+        };
+        assert_eq!(
+            unsafe {
+                guard_row_sink_edge_callback(&edge, |row| {
+                    let local_name = CStr::from_ptr(row.local_name_gen);
+                    assert_eq!(local_name, c"alpha");
+                    Ok(())
+                })
+            },
+            CALLBACK_OK
+        );
+        assert_eq!(
+            unsafe { guard_row_sink_edge_callback(std::ptr::null(), |_| Ok(())) },
+            CALLBACK_ERROR
+        );
     }
 
     #[test]

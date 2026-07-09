@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "graph_buffer/row_sink.h"
+
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -48,6 +50,11 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
+
+/* Install dump-row sink callbacks for the full pipeline. NULL callbacks keep
+ * the normal SQLite dump behavior and emit no sink rows. */
+void cbm_pipeline_set_sink(cbm_pipeline_t *p, cbm_gbuf_row_node_sink_fn node_cb,
+                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

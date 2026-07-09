@@ -81,6 +81,9 @@ struct cbm_pipeline {
     cbm_index_mode_t mode;
     atomic_int cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    cbm_gbuf_row_node_sink_fn row_node_sink;
+    cbm_gbuf_row_edge_sink_fn row_edge_sink;
+    void *row_sink_ctx;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -181,6 +184,19 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_sink(cbm_pipeline_t *p, cbm_gbuf_row_node_sink_fn node_cb,
+                           cbm_gbuf_row_edge_sink_fn edge_cb, void *ctx) {
+    if (!p) {
+        return;
+    }
+    p->row_node_sink = node_cb;
+    p->row_edge_sink = edge_cb;
+    p->row_sink_ctx = ctx;
+    if (p->gbuf) {
+        cbm_gbuf_set_row_sink(p->gbuf, node_cb, edge_cb, ctx);
     }
 }
 
@@ -1324,6 +1340,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
+    cbm_gbuf_set_row_sink(p->gbuf, p->row_node_sink, p->row_edge_sink, p->row_sink_ctx);
     p->registry = cbm_registry_new();
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL

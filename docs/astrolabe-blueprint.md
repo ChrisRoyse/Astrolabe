@@ -568,11 +568,13 @@ Narrow, C-to-Rust-safe, versioned:
 | FFI surface | Direction | Phase |
 |---|---|---|
 | `cbm_extract_file(...) -> CBMFileResult*` + result accessors + `cbm_free_result` | Rustâ†’C | B |
-| `cbm_pipeline_new/run/cancel/free` with a **row-sink callback** (new: `cbm_pipeline_set_sink(cb, ctx)` streaming nodes/edges instead of/alongside SQLite dump) | Rustâ†’C (+Câ†’Rust callback) | B |
+| `cbm_pipeline_new/run/cancel/free` with a **row-sink callback** (new: `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)` streaming nodes/edges instead of/alongside SQLite dump) | Rustâ†’C (+Câ†’Rust callback) | B |
 | `cbm_mcp_server_new/handle_tool/free` (legacy tool pass-through) | Rustâ†’C | B |
 | `cbm_discover_ex`, `cbm_git_context_resolve`, `cbm_githistory_compute` | Rustâ†’C | B/C |
 | Allocator: both sides bound to mimalloc (`cbm_alloc_init` + Rust `mimalloc` global) | â€” | B |
 | Error/panic policy: C returns status codes (already); Rust callbacks are `catch_unwind`-wrapped, abort-on-double-panic | â€” | B |
+
+Current row-sink integration status: vendored CBM exposes borrowed dump-row node/edge structs with final SQLite IDs, a graph-buffer sink, and `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)`. A NULL sink keeps the existing SQLite dump path; a non-zero callback return aborts before the SQLite writer is opened. Rust has panic/error guards for these callbacks, and `astrolabe-ingest` has a snapshot parity adapter that routes callback-equivalent rows through the canonical SQLite importer. That adapter is a contract and parity harness, not the final direct vault writer.
 
 ## 7. Cross-cutting policies
 
@@ -1711,7 +1713,7 @@ Unmodified CBM behavior. The dial exists so one binary serves all stages.
 
 ### Stage V2 â€” `primary` flip (Phases 6â€“9)
 - Read paths flip tool-by-tool to the vault (search first, then schema/status/snippets); SQLite becomes the **lowered artifact**, regenerated from the vault after each index (04 Â§6) â€” Cypher, UI, and any straggler tools keep working unchanged against it.
-- Write path: streaming FFI sink from the pipeline replaces the dump-then-import hop (single parse, single write); SQLite regeneration becomes a lowering pass.
+- Target write path: streaming FFI sink from the pipeline replaces the dump-then-import hop (single parse, single write); SQLite regeneration becomes a lowering pass. The current row-sink patch provides the dump-row callback contract and Rust parity harness; direct vault writes, corpus byte-equivalence, sanitizer coverage, slow-consumer bounds, thread instrumentation, and performance gates are still required before defaulting the primary dial.
 - Guard: per-tool flip flags + tripwired A/B (search results, latency) before each tool's flip is defaulted.
 - Rollback per tool = flip the flag back (SQLite is still complete).
 
@@ -1778,7 +1780,7 @@ New make target in a thin overlay (patch): `make -f Makefile.cbm libcbm` = all `
 ## 3. Minimal upstream patches (kept small, upstreamable)
 
 1. `Makefile.cbm`: `libcbm` target (+ `-fvisibility=hidden` with explicit `CBM_API` exports).
-2. `cbm_embed.h` (new): stable embedding API â€” init (`cbm_alloc_init`, log sink, supervisor host-mark opt-out), version string, plus the **row-sink hook** `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)` for Phase-B streaming (a ~200-line addition to `graph_buffer.c` dump path, guarded by NULL default = current behavior).
+2. `cbm_embed.h` (new): stable embedding API â€” init (`cbm_alloc_init`, log sink, supervisor host-mark opt-out), version string, plus the **row-sink hook** `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)` for Phase-B streaming. The current upstreamable patch surface is `graph_buffer/row_sink.h`, `cbm_gbuf_set_row_sink`, and `cbm_pipeline_set_sink`; NULL default preserves current behavior, and callback refusal fails closed before SQLite open. The final `cbm_embed.h` facade remains a packaging/API step.
 3. Log sink already pluggable (`cbm_log_set_sink_ex`) â€” route C logs into Rust `tracing`.
 4. Nothing else. All other integration lives on the Rust side.
 

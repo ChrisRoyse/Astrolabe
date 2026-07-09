@@ -4,10 +4,80 @@
  * RED phase: Tests define expected behavior for node/edge insertion,
  * lookup, dedup, delete, and dump to SQLite.
  */
+#include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
 #include <string.h>
+
+static int make_temp_gbuf_db(char *path, size_t pathsz, const char *name) {
+    snprintf(path, pathsz, "/tmp/cbm_gbuf_%s_XXXXXX", name);
+    int fd = cbm_mkstemp(path);
+    if (fd < 0) {
+        return -1;
+    }
+    close(fd);
+    unlink(path);
+    return 0;
+}
+
+static cbm_gbuf_t *make_row_sink_fixture(void) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/repo");
+    if (!gb) {
+        return NULL;
+    }
+    int64_t consumer = cbm_gbuf_upsert_node(gb, "File", "consumer.ts",
+                                            "proj.consumer.ts.__file__", "consumer.ts", 1, 3,
+                                            "{\"source_snippet\":\"import { Alpha }\"}");
+    int64_t lib = cbm_gbuf_upsert_node(gb, "File", "lib.ts", "proj.lib.ts.__file__", "lib.ts", 1,
+                                       2, "{}");
+    cbm_gbuf_insert_edge(gb, consumer, lib, "CALLS", "{\"confidence\":0.9}");
+    cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"Alpha\"}");
+    return gb;
+}
+
+typedef struct {
+    int node_count;
+    int edge_count;
+    int imports_seen;
+    int bad_rows;
+    int fail_on_edge;
+    char import_local_name[64];
+} row_sink_state_t;
+
+static int test_row_node_sink(const cbm_gbuf_row_node_t *node, void *ctx) {
+    row_sink_state_t *state = (row_sink_state_t *)ctx;
+    if (!node || !state) {
+        return -1;
+    }
+    state->node_count++;
+    if (node->id != state->node_count || !node->project || strcmp(node->project, "proj") != 0 ||
+        !node->qualified_name || !node->properties_json) {
+        state->bad_rows++;
+    }
+    return 0;
+}
+
+static int test_row_edge_sink(const cbm_gbuf_row_edge_t *edge, void *ctx) {
+    row_sink_state_t *state = (row_sink_state_t *)ctx;
+    if (!edge || !state) {
+        return -1;
+    }
+    if (state->fail_on_edge) {
+        return -1;
+    }
+    state->edge_count++;
+    if (edge->id != state->edge_count || edge->source_id != 1 || edge->target_id != 2 ||
+        !edge->project || strcmp(edge->project, "proj") != 0 || !edge->properties_json) {
+        state->bad_rows++;
+    }
+    if (edge->type && strcmp(edge->type, "IMPORTS") == 0) {
+        state->imports_seen++;
+        snprintf(state->import_local_name, sizeof(state->import_local_name), "%s",
+                 edge->local_name_gen ? edge->local_name_gen : "");
+    }
+    return 0;
+}
 
 /* ── Node operations ───────────────────────────────────────────── */
 
@@ -363,6 +433,68 @@ TEST(gbuf_dump_empty) {
     /* NULL store should be handled gracefully — we just skip */
     (void)rc;
 
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_row_sink_receives_final_dump_rows) {
+    char path[256];
+    ASSERT_EQ(make_temp_gbuf_db(path, sizeof(path), "row_sink"), 0);
+    cbm_gbuf_t *gb = make_row_sink_fixture();
+    ASSERT_NOT_NULL(gb);
+    row_sink_state_t state = {0};
+    cbm_gbuf_set_row_sink(gb, test_row_node_sink, test_row_edge_sink, &state);
+
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+    ASSERT_EQ(state.bad_rows, 0);
+    ASSERT_EQ(state.node_count, 2);
+    ASSERT_EQ(state.edge_count, 2);
+    ASSERT_EQ(state.imports_seen, 1);
+    ASSERT_STR_EQ(state.import_local_name, "Alpha");
+
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(store, "proj"), 2);
+    cbm_store_close(store);
+
+    unlink(path);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_row_sink_failure_aborts_before_sqlite_open) {
+    char path[256];
+    ASSERT_EQ(make_temp_gbuf_db(path, sizeof(path), "row_sink_fail"), 0);
+    cbm_gbuf_t *gb = make_row_sink_fixture();
+    ASSERT_NOT_NULL(gb);
+    row_sink_state_t state = {.fail_on_edge = 1};
+    cbm_gbuf_set_row_sink(gb, test_row_node_sink, test_row_edge_sink, &state);
+
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), -1);
+    ASSERT_EQ(state.node_count, 2);
+    ASSERT_EQ(state.edge_count, 0);
+    ASSERT_NEQ(access(path, F_OK), 0);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_row_sink_null_default_writes_sqlite) {
+    char path[256];
+    ASSERT_EQ(make_temp_gbuf_db(path, sizeof(path), "row_sink_null"), 0);
+    cbm_gbuf_t *gb = make_row_sink_fixture();
+    ASSERT_NOT_NULL(gb);
+    cbm_gbuf_set_row_sink(gb, NULL, NULL, NULL);
+
+    ASSERT_EQ(cbm_gbuf_dump_to_sqlite(gb, path), 0);
+    cbm_store_t *store = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(store, "proj"), 2);
+    cbm_store_close(store);
+
+    unlink(path);
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -1030,6 +1162,9 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_delete_edges_by_type);
     RUN_TEST(gbuf_edge_count_by_type);
     RUN_TEST(gbuf_dump_empty);
+    RUN_TEST(gbuf_row_sink_receives_final_dump_rows);
+    RUN_TEST(gbuf_row_sink_failure_aborts_before_sqlite_open);
+    RUN_TEST(gbuf_row_sink_null_default_writes_sqlite);
     RUN_TEST(gbuf_flush_to_store);
     RUN_TEST(gbuf_many_nodes);
 
