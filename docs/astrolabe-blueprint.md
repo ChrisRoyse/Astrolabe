@@ -1368,6 +1368,14 @@ All indexes carry `built_at_seq`/`base_seq` freshness (StaleOk default, Fresh on
 
 `find_similar{by: structural|semantic|api|profile|co_change}`, `agree`/`disagree` (cross-lens consensus/anomaly â€” clone taxonomy 8.3), `define` (association-derived definition), `traverse` (scored walks, direction-aware), `skills` (HDBSCAN capability tree) â€” all direct Sextant features exposed once slots exist.
 
+Skill discovery artifacts use `astrolabe.skill_tree.v1` and
+`astro.kernel.skill_discovery_knobs.v1`: cluster membership is deterministic,
+singleton/noise symbols remain outside skills, each skill has a membership hash,
+and `skills` search is a scope/filter mode rather than a new top-level tool.
+The current seed implementation uses registry-declared token-overlap knobs for
+artifact/search contract tests; HDBSCAN/vector clustering replaces only the
+cluster producer, not the artifact contract.
+
 ## 5. Scale posture
 
 Default in-RAM HNSW at repo scale (â‰¤1M symbols fine); DiskANN/SPANN builds offered for monorepos; kernel-first funnel activates > 10M records (org-vault). Quantized (3.5-bit) vectors in indexes with measured-recall gate; raw rescoring for top-k.
