@@ -67,6 +67,17 @@ pub fn route_cbm_logs_to_tracing() {
 }
 
 pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), BridgeError> {
+    initialize_cbm_host_process_with_log_mode(binary_path, false)
+}
+
+pub fn initialize_cbm_host_process_silent(binary_path: Option<&str>) -> Result<(), BridgeError> {
+    initialize_cbm_host_process_with_log_mode(binary_path, true)
+}
+
+fn initialize_cbm_host_process_with_log_mode(
+    binary_path: Option<&str>,
+    silent: bool,
+) -> Result<(), BridgeError> {
     cbm_sys::initialize_allocator_bindings_first();
     let binary_path = binary_path.map(CString::new).transpose()?;
 
@@ -75,6 +86,13 @@ pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), Brid
     // the duration of the call; CBM copies it internally.
     unsafe {
         cbm_sys::cbm_log_init_from_env();
+        if silent {
+            cbm_sys::cbm_log_set_level(cbm_sys::CBMLogLevel_CBM_LOG_NONE);
+            cbm_sys::cbm_log_set_sink_ex(
+                Some(cbm_log_silent_sink),
+                cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
+            );
+        }
         cbm_sys::cbm_index_supervisor_mark_host();
         cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
 
@@ -89,6 +107,8 @@ pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), Brid
 
     Ok(())
 }
+
+unsafe extern "C" fn cbm_log_silent_sink(_line: *const c_char) {}
 
 pub struct CbmIndexWorkerRole {
     _response_out: Option<CString>,

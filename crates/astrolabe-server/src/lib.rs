@@ -39,21 +39,39 @@ pub const LEGACY_TOOLS: &[&str] = &[
 
 pub const LEGACY_ALIASES: &[&str] = &["trace_call_path"];
 
+const HOOK_AUGMENT_BUDGET_MS: u64 = 300;
+const HOOK_STDIN_CAP_BYTES: u64 = 256 * 1024;
+const HOOK_MIN_TOKEN_BYTES: usize = 4;
+const HOOK_MAX_TOKEN_BYTES: usize = 96;
+const HOOK_RESULT_LIMIT: u64 = 5;
+const HOOK_MAX_WALKUP: usize = 8;
+
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::CodebaseMemoryMcp
 }
 
 pub fn run_from_env() -> i32 {
-    initialize_tracing();
-    astrolabe_bridge::route_cbm_logs_to_tracing();
-
     let args: Vec<String> = env::args().collect();
+    let hook_mode = is_hook_augment_invocation(&args);
+    let _hook_deadline = hook_mode.then(|| HookDeadline::start(HOOK_AUGMENT_BUDGET_MS));
+    if !hook_mode {
+        initialize_tracing();
+        astrolabe_bridge::route_cbm_logs_to_tracing();
+    }
     let binary_path = env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
         .or_else(|| args.first().cloned());
 
-    if let Err(err) = astrolabe_bridge::initialize_cbm_host_process(binary_path.as_deref()) {
+    let startup = if hook_mode {
+        astrolabe_bridge::initialize_cbm_host_process_silent(binary_path.as_deref())
+    } else {
+        astrolabe_bridge::initialize_cbm_host_process(binary_path.as_deref())
+    };
+    if let Err(err) = startup {
+        if hook_mode {
+            return 0;
+        }
         eprintln!("astrolabe: startup failed: {err}");
         return 1;
     }
@@ -61,10 +79,17 @@ pub fn run_from_env() -> i32 {
     match dispatch(&args[1..]) {
         Ok(code) => code,
         Err(err) => {
+            if hook_mode {
+                return 0;
+            }
             eprintln!("astrolabe: {err}");
             1
         }
     }
+}
+
+fn is_hook_augment_invocation(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "hook-augment")
 }
 
 fn dispatch(args: &[String]) -> Result<i32, DynError> {
@@ -74,6 +99,7 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
 
     match args[0].as_str() {
         "cli" => run_cli(&args[1..]),
+        "hook-augment" => run_hook_augment(),
         "verify" => run_verify(&args[1..]),
         "--version" | "-V" => {
             println!("astrolabe {}", env!("CARGO_PKG_VERSION"));
@@ -98,7 +124,7 @@ fn initialize_tracing() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | hook-augment | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -250,6 +276,233 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
         eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
     }
     Ok(code)
+}
+
+fn run_hook_augment() -> Result<i32, DynError> {
+    let output = hook_augment_output().ok().flatten();
+    if let Some(output) = output {
+        println!("{output}");
+    }
+    Ok(0)
+}
+
+fn hook_augment_output() -> Result<Option<String>, DynError> {
+    let mut input = String::new();
+    io::stdin()
+        .take(HOOK_STDIN_CAP_BYTES + 1)
+        .read_to_string(&mut input)?;
+    if input.len() > HOOK_STDIN_CAP_BYTES as usize {
+        return Ok(None);
+    }
+
+    let payload = serde_json::from_str::<serde_json::Value>(&input)?;
+    let tool = payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if tool != "Grep" && tool != "Glob" {
+        return Ok(None);
+    }
+
+    let pattern = payload
+        .get("tool_input")
+        .and_then(|input| input.get("pattern"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(token) = hook_extract_token(pattern) else {
+        return Ok(None);
+    };
+
+    let cwd = payload
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_hook_path)
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok())
+                .map(|path| normalize_hook_path(&path))
+        });
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    if !hook_path_is_abs(&cwd) {
+        return Ok(None);
+    }
+
+    let runner = CbmToolRunner::new_default()?;
+    let Some(context) = hook_resolve_context(&runner, &cwd, &token)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": context
+            }
+        })
+        .to_string(),
+    ))
+}
+
+fn normalize_hook_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn hook_extract_token(pattern: &str) -> Option<String> {
+    let bytes = pattern.as_bytes();
+    let mut best_start = 0;
+    let mut best_len = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let len = i - start;
+            if len > best_len {
+                best_start = start;
+                best_len = len;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if best_len < HOOK_MIN_TOKEN_BYTES {
+        return None;
+    }
+    let len = best_len.min(HOOK_MAX_TOKEN_BYTES);
+    Some(pattern[best_start..best_start + len].to_string())
+}
+
+fn hook_path_is_abs(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.first() == Some(&b'/') {
+        return true;
+    }
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'/')
+}
+
+fn hook_parent(path: &str) -> Option<String> {
+    let slash = path.rfind('/')?;
+    if slash == 0 {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    if slash == 2 && bytes.get(1) == Some(&b':') {
+        return None;
+    }
+    Some(path[..slash].to_string())
+}
+
+fn hook_resolve_context(
+    runner: &CbmToolRunner,
+    cwd: &str,
+    token: &str,
+) -> Result<Option<String>, DynError> {
+    let mut dir = cwd.to_string();
+    for _ in 0..HOOK_MAX_WALKUP {
+        if !hook_path_is_abs(&dir) {
+            break;
+        }
+        if let Ok(project) = astrolabe_bridge::cbm_project_name_from_path(&dir) {
+            let args = serde_json::json!({
+                "project": project,
+                "name_pattern": format!(".*{token}.*"),
+                "limit": HOOK_RESULT_LIMIT
+            })
+            .to_string();
+            let raw = migration::handle_tool_raw(runner, "search_graph", &args)?;
+            match hook_context_from_search_graph(&raw, token)? {
+                HookSearch::Hits(context) => return Ok(Some(context)),
+                HookSearch::NoHits => return Ok(None),
+                HookSearch::ToolError => {}
+            }
+        }
+        let Some(parent) = hook_parent(&dir) else {
+            break;
+        };
+        dir = parent;
+    }
+    Ok(None)
+}
+
+enum HookSearch {
+    Hits(String),
+    NoHits,
+    ToolError,
+}
+
+fn hook_context_from_search_graph(raw: &str, token: &str) -> Result<HookSearch, DynError> {
+    let value = serde_json::from_str::<serde_json::Value>(raw)?;
+    if value
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(HookSearch::ToolError);
+    }
+
+    let inner = value
+        .get("structuredContent")
+        .cloned()
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    let Some(results) = inner.get("results").and_then(serde_json::Value::as_array) else {
+        return Ok(HookSearch::NoHits);
+    };
+    if results.is_empty() {
+        return Ok(HookSearch::NoHits);
+    }
+
+    let mut context = format!(
+        "[astrolabe] {} graph symbol(s) match \"{}\" (advisory, freshness=best_effort, trust=provisional; normal search results are unaffected):",
+        results.len(),
+        token
+    );
+    for result in results.iter().take(HOOK_RESULT_LIMIT as usize) {
+        let qualified_name = result
+            .get("qualified_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let name = result
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let display = qualified_name.unwrap_or(name);
+        let file_path = result
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let label = result
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        context.push_str("\n- ");
+        context.push_str(display);
+        if !file_path.is_empty() {
+            context.push_str("  ");
+            context.push_str(file_path);
+        }
+        if !label.is_empty() {
+            context.push_str("  ");
+            context.push_str(label);
+        }
+    }
+    Ok(HookSearch::Hits(context))
 }
 
 fn run_verify_chain_cli(
@@ -424,6 +677,30 @@ struct ParentWatchdog {
     handle: Option<JoinHandle<()>>,
 }
 
+struct HookDeadline {
+    done: Arc<AtomicBool>,
+}
+
+impl HookDeadline {
+    fn start(budget_ms: u64) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let thread_done = Arc::clone(&done);
+        let _ = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(budget_ms));
+            if !thread_done.load(Ordering::Relaxed) {
+                process::exit(0);
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for HookDeadline {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
 impl ParentWatchdog {
     fn start() -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -526,6 +803,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn hook_token_uses_longest_identifier_and_bounds_noise() {
+        assert_eq!(
+            hook_extract_token(".*short someIndexedSymbol more.*").as_deref(),
+            Some("someIndexedSymbol")
+        );
+        assert!(hook_extract_token("a|bc|123").is_none());
+        let long = format!("prefix {}", "A".repeat(HOOK_MAX_TOKEN_BYTES + 20));
+        assert_eq!(
+            hook_extract_token(&long).unwrap().len(),
+            HOOK_MAX_TOKEN_BYTES
+        );
+    }
+
+    #[test]
+    fn hook_path_walk_handles_posix_and_windows_roots() {
+        assert!(hook_path_is_abs("/tmp/repo/src"));
+        assert!(hook_path_is_abs("C:/repo/src"));
+        assert!(hook_path_is_abs("C:"));
+        assert!(!hook_path_is_abs("repo/src"));
+        assert_eq!(hook_parent("/tmp/repo/src").as_deref(), Some("/tmp/repo"));
+        assert_eq!(hook_parent("/tmp"), None);
+        assert_eq!(hook_parent("C:/repo/src").as_deref(), Some("C:/repo"));
+        assert_eq!(hook_parent("C:/repo"), None);
+        assert_eq!(hook_parent("C:"), None);
+    }
+
+    #[test]
+    fn hook_context_formats_search_graph_hits_with_provisional_label() {
+        let raw = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "results": [{
+                        "qualified_name": "demo.someIndexedSymbol",
+                        "name": "someIndexedSymbol",
+                        "file_path": "src/main.c",
+                        "label": "Function"
+                    }]
+                }).to_string()
+            }],
+            "isError": false
+        })
+        .to_string();
+
+        let HookSearch::Hits(context) =
+            hook_context_from_search_graph(&raw, "someIndexedSymbol").expect("hook result parses")
+        else {
+            panic!("expected hook hits");
+        };
+        assert!(context.contains("trust=provisional"));
+        assert!(context.contains("demo.someIndexedSymbol"));
+        assert!(context.contains("src/main.c"));
+    }
+
+    #[test]
+    fn hook_context_distinguishes_errors_from_empty_results() {
+        let empty = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"results\":[]}"}],
+            "isError": false
+        })
+        .to_string();
+        assert!(matches!(
+            hook_context_from_search_graph(&empty, "nothing").unwrap(),
+            HookSearch::NoHits
+        ));
+
+        let error = r#"{"content":[{"type":"text","text":"missing project"}],"isError":true}"#;
+        assert!(matches!(
+            hook_context_from_search_graph(error, "nothing").unwrap(),
+            HookSearch::ToolError
+        ));
     }
 
     #[test]

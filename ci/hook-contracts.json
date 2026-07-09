@@ -1,0 +1,66 @@
+{
+  "schema": "astrolabe.hook_contracts.v1",
+  "budget_ms": 300,
+  "timeout_exit_ceiling_ms": 900,
+  "hooks": [
+    {
+      "id": "claude-pretooluse-grep-glob",
+      "agent": "Claude Code",
+      "event": "PreToolUse",
+      "matcher": "Grep|Glob",
+      "mode": "binary_augmenter",
+      "command": "hook-augment",
+      "backstop_timeout_sec": 5,
+      "stdout_contract": "hookSpecificOutput_or_empty",
+      "failure_contract": "exit_0_empty_stdout_stderr"
+    },
+    {
+      "id": "claude-sessionstart",
+      "agent": "Claude Code",
+      "event": "SessionStart",
+      "matcher": "startup|resume|clear|compact",
+      "mode": "static_reminder",
+      "source_marker": "CMM_SESSION_REMINDER_SCRIPT"
+    },
+    {
+      "id": "claude-subagentstart",
+      "agent": "Claude Code",
+      "event": "SubagentStart",
+      "matcher": "*",
+      "mode": "static_reminder",
+      "source_marker": "CMM_SUBAGENT_REMINDER_SCRIPT"
+    },
+    {
+      "id": "codex-sessionstart",
+      "agent": "Codex CLI",
+      "event": "SessionStart",
+      "matcher": "startup|resume|clear|compact",
+      "mode": "static_reminder",
+      "source_marker": "CODEX_HOOK_BEGIN"
+    },
+    {
+      "id": "gemini-beforetool",
+      "agent": "Gemini CLI",
+      "event": "BeforeTool",
+      "matcher": "google_search|grep_search",
+      "mode": "static_reminder",
+      "source_marker": "GEMINI_HOOK_COMMAND"
+    },
+    {
+      "id": "gemini-sessionstart",
+      "agent": "Gemini CLI",
+      "event": "SessionStart",
+      "matcher": "startup",
+      "mode": "static_reminder",
+      "source_marker": "cbm_upsert_gemini_session_hooks"
+    },
+    {
+      "id": "antigravity-sessionstart",
+      "agent": "Antigravity",
+      "event": "SessionStart",
+      "matcher": "startup",
+      "mode": "static_reminder",
+      "source_marker": "cbm_upsert_gemini_session_hooks"
+    }
+  ]
+}
