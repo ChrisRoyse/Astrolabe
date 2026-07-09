@@ -21,6 +21,7 @@
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
+#include "watcher/watcher.h"
 
 CBM_API void cbm_cli_set_version(const char *ver);
 CBM_API void cbm_index_set_worker_role(bool is_worker, const char *response_out);

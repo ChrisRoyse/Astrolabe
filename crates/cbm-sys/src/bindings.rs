@@ -3171,6 +3171,59 @@ unsafe extern "C" {
         sql: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
 }
+pub type cbm_watcher_t = cbm_watcher;
+pub type cbm_index_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        project_name: *const ::std::os::raw::c_char,
+        root_path: *const ::std::os::raw::c_char,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int,
+>;
+unsafe extern "C" {
+    pub fn cbm_watcher_new(
+        store: *mut cbm_store_t,
+        index_fn: cbm_index_fn,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> *mut cbm_watcher_t;
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_free(w: *mut cbm_watcher_t);
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_watch(
+        w: *mut cbm_watcher_t,
+        project_name: *const ::std::os::raw::c_char,
+        root_path: *const ::std::os::raw::c_char,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_unwatch(w: *mut cbm_watcher_t, project_name: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_touch(w: *mut cbm_watcher_t, project_name: *const ::std::os::raw::c_char);
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_poll_once(w: *mut cbm_watcher_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_run(
+        w: *mut cbm_watcher_t,
+        base_interval_ms: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_stop(w: *mut cbm_watcher_t);
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_watch_count(w: *mut cbm_watcher_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_poll_interval_ms(file_count: ::std::os::raw::c_int)
+    -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_watcher_root_missing_errno(err: ::std::os::raw::c_int) -> bool;
+}
 unsafe extern "C" {
     pub fn cbm_cli_set_version(ver: *const ::std::os::raw::c_char);
 }

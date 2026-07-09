@@ -5,7 +5,8 @@ use std::error::Error;
 use std::ffi::{CStr, CString, NulError};
 use std::fmt;
 use std::marker::PhantomData;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
@@ -756,6 +757,269 @@ pub struct Route {
     pub method: Option<String>,
 }
 
+struct CbmStore {
+    ptr: NonNull<cbm_sys::cbm_store_t>,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CbmStore {
+    fn open_memory() -> Result<Self, BridgeError> {
+        cbm_sys::initialize_allocator_bindings_first();
+        // SAFETY: cbm_store_open_memory takes no borrowed inputs and returns
+        // an owned store handle or NULL on allocation/open failure.
+        let ptr = unsafe { cbm_sys::cbm_store_open_memory() };
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_STORE_INIT",
+                    "cbm_store_open_memory returned NULL",
+                    "Check CBM allocator initialization and startup diagnostics.",
+                )
+            })?,
+            _not_send_or_sync: PhantomData,
+        })
+    }
+}
+
+impl Drop for CbmStore {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the cbm_store_t pointer.
+        unsafe {
+            cbm_sys::cbm_store_close(self.ptr.as_ptr());
+        }
+    }
+}
+
+type WatchCallback = dyn FnMut(&str, &str) -> Result<(), BridgeError>;
+
+struct WatcherCallbackState {
+    callback: Box<WatchCallback>,
+    last_error: Option<BridgeError>,
+}
+
+pub struct CbmWatcher {
+    ptr: NonNull<cbm_sys::cbm_watcher_t>,
+    _store: CbmStore,
+    callback_state: Box<WatcherCallbackState>,
+    owner: ThreadId,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl CbmWatcher {
+    pub fn new_for_polling<F>(callback: F) -> Result<Self, BridgeError>
+    where
+        F: FnMut(&str, &str) -> Result<(), BridgeError> + 'static,
+    {
+        let store = CbmStore::open_memory()?;
+        let mut callback_state = Box::new(WatcherCallbackState {
+            callback: Box::new(callback),
+            last_error: None,
+        });
+        let user_data = callback_state.as_mut() as *mut WatcherCallbackState as *mut c_void;
+        // SAFETY: store is owned by the returned CbmWatcher and therefore
+        // outlives the C watcher. callback_state is heap-allocated and remains
+        // at a stable address while C may call the trampoline.
+        let ptr = unsafe {
+            cbm_sys::cbm_watcher_new(
+                store.ptr.as_ptr(),
+                Some(watcher_index_trampoline),
+                user_data,
+            )
+        };
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or_else(|| {
+                envelope(
+                    "ASTRO_CBM_WATCHER_INIT",
+                    "cbm_watcher_new returned NULL",
+                    "Check CBM allocator initialization and startup diagnostics.",
+                )
+            })?,
+            _store: store,
+            callback_state,
+            owner: thread::current().id(),
+            _not_send_or_sync: PhantomData,
+        })
+    }
+
+    pub fn watch(&mut self, project_name: &str, root_path: &str) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        validate_project_name(project_name)?;
+        validate_shell_arg(root_path)?;
+        let project_name = CString::new(project_name)?;
+        let root_path = CString::new(root_path)?;
+        // SAFETY: watcher pointer is owned by self and thread-affine. C copies
+        // project_name and root_path during the call.
+        unsafe {
+            cbm_sys::cbm_watcher_watch(
+                self.ptr.as_ptr(),
+                project_name.as_ptr(),
+                root_path.as_ptr(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn unwatch(&mut self, project_name: &str) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        validate_project_name(project_name)?;
+        let project_name = CString::new(project_name)?;
+        // SAFETY: watcher pointer is owned by self and thread-affine. The C
+        // string is live for the duration of the call.
+        unsafe {
+            cbm_sys::cbm_watcher_unwatch(self.ptr.as_ptr(), project_name.as_ptr());
+        }
+        Ok(())
+    }
+
+    pub fn touch(&mut self, project_name: &str) -> Result<(), BridgeError> {
+        self.ensure_owner_thread()?;
+        validate_project_name(project_name)?;
+        let project_name = CString::new(project_name)?;
+        // SAFETY: watcher pointer is owned by self and thread-affine. The C
+        // string is live for the duration of the call.
+        unsafe {
+            cbm_sys::cbm_watcher_touch(self.ptr.as_ptr(), project_name.as_ptr());
+        }
+        Ok(())
+    }
+
+    pub fn poll_once(&mut self) -> Result<i32, BridgeError> {
+        self.ensure_owner_thread()?;
+        self.callback_state.last_error = None;
+        // SAFETY: watcher pointer is owned by self and thread-affine.
+        let reindexed = unsafe { cbm_sys::cbm_watcher_poll_once(self.ptr.as_ptr()) };
+        if let Some(err) = self.callback_state.last_error.take() {
+            Err(err)
+        } else {
+            Ok(reindexed)
+        }
+    }
+
+    pub fn watch_count(&self) -> Result<i32, BridgeError> {
+        self.ensure_owner_thread()?;
+        Ok(self.raw_watch_count())
+    }
+
+    pub fn poll_interval_ms(file_count: i32) -> i32 {
+        // SAFETY: pure CBM helper with no pointer inputs.
+        unsafe { cbm_sys::cbm_watcher_poll_interval_ms(file_count) }
+    }
+
+    pub fn root_missing_errno(errno: i32) -> bool {
+        // SAFETY: pure CBM helper with no pointer inputs.
+        unsafe { cbm_sys::cbm_watcher_root_missing_errno(errno) }
+    }
+
+    fn raw_watch_count(&self) -> i32 {
+        // SAFETY: watcher pointer is owned by self and thread-affine.
+        unsafe { cbm_sys::cbm_watcher_watch_count(self.ptr.as_ptr()) }
+    }
+
+    fn ensure_owner_thread(&self) -> Result<(), BridgeError> {
+        if thread::current().id() == self.owner {
+            Ok(())
+        } else {
+            Err(envelope(
+                "ASTRO_CBM_THREAD_AFFINITY",
+                "CbmWatcher used from a different thread than the creating thread",
+                "Create one CbmWatcher per thread; do not share cbm_watcher_t across threads.",
+            ))
+        }
+    }
+}
+
+impl Drop for CbmWatcher {
+    fn drop(&mut self) {
+        // SAFETY: self uniquely owns the cbm_watcher_t pointer. The watcher is
+        // not running on a background Rust thread in this wrapper.
+        unsafe {
+            cbm_sys::cbm_watcher_stop(self.ptr.as_ptr());
+            cbm_sys::cbm_watcher_free(self.ptr.as_ptr());
+        }
+    }
+}
+
+unsafe extern "C" fn watcher_index_trampoline(
+    project_name: *const c_char,
+    root_path: *const c_char,
+    user_data: *mut c_void,
+) -> c_int {
+    if user_data.is_null() {
+        return CALLBACK_ERROR;
+    }
+
+    // SAFETY: user_data was created from a live WatcherCallbackState Box in
+    // CbmWatcher::new_for_polling and remains valid until CbmWatcher::drop.
+    let state = unsafe { &mut *(user_data as *mut WatcherCallbackState) };
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if project_name.is_null() || root_path.is_null() {
+            return Err(envelope(
+                "ASTRO_CBM_NULL_CALLBACK_ARG",
+                "CBM watcher callback received a NULL project name or root path",
+                "Treat this as an FFI contract drift and inspect the watcher caller.",
+            ));
+        }
+        // SAFETY: CBM calls the callback with NUL-terminated strings valid for
+        // the duration of the callback.
+        let project_name = unsafe { CStr::from_ptr(project_name) }.to_str()?;
+        // SAFETY: same callback string contract as project_name.
+        let root_path = unsafe { CStr::from_ptr(root_path) }.to_str()?;
+        (state.callback)(project_name, root_path)
+    })) {
+        Ok(Ok(())) => CALLBACK_OK,
+        Ok(Err(err)) => {
+            state.last_error = Some(err);
+            CALLBACK_ERROR
+        }
+        Err(_) => {
+            state.last_error = Some(envelope(
+                "ASTRO_FFI_CALLBACK_PANIC",
+                "Rust watcher callback panicked before returning to C",
+                "Keep panic boundaries inside Rust; convert watcher callback failures into status codes.",
+            ));
+            CALLBACK_PANIC
+        }
+    }
+}
+
+fn validate_shell_arg(value: &str) -> Result<(), BridgeError> {
+    let has_shell_metachar = value.chars().any(|ch| match ch {
+        '\'' | '"' | ';' | '|' | '&' | '$' | '`' | '<' | '>' | '\n' | '\r' => true,
+        #[cfg(not(windows))]
+        '\\' => true,
+        _ => false,
+    });
+    if has_shell_metachar {
+        Err(envelope(
+            "ASTRO_CBM_UNSAFE_SHELL_ARG",
+            "watch root path contains a shell metacharacter rejected by CBM",
+            "Pass a canonical repository path without quotes, shell operators, or newlines.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_project_name(value: &str) -> Result<(), BridgeError> {
+    let valid = !value.is_empty()
+        && !value.starts_with('.')
+        && !value.contains("..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.');
+    if valid {
+        Ok(())
+    } else {
+        Err(envelope(
+            "ASTRO_CBM_INVALID_PROJECT_NAME",
+            "project name is not safe for CBM cache path construction",
+            "Use only ASCII letters, numbers, dash, underscore, and dot; do not use path separators or dot-dot.",
+        ))
+    }
+}
+
 pub struct CbmToolRunner {
     ptr: NonNull<cbm_sys::cbm_mcp_server_t>,
     owner: ThreadId,
@@ -1045,6 +1309,35 @@ mod tests {
         );
         assert_eq!(guard_ffi_callback(|| panic!("boom")), CALLBACK_PANIC);
         assert_eq!(guard_ffi_callback(|| Ok(())), CALLBACK_OK);
+    }
+
+    #[test]
+    fn watcher_poll_interval_uses_cbm_adaptive_bounds() {
+        assert_eq!(CbmWatcher::poll_interval_ms(0), 5000);
+        assert_eq!(CbmWatcher::poll_interval_ms(1000), 7000);
+        assert_eq!(CbmWatcher::poll_interval_ms(100000), 60000);
+    }
+
+    #[test]
+    fn watcher_rejects_inputs_cbm_would_silently_ignore() {
+        let mut watcher = CbmWatcher::new_for_polling(|_, _| Ok(())).unwrap();
+        assert_eq!(
+            watcher
+                .watch("bad/name", "/tmp/astrolabe-watcher-inputs")
+                .unwrap_err()
+                .envelope()
+                .code,
+            "ASTRO_CBM_INVALID_PROJECT_NAME"
+        );
+        assert_eq!(
+            watcher
+                .watch("safe-name", "/tmp/astrolabe;watcher")
+                .unwrap_err()
+                .envelope()
+                .code,
+            "ASTRO_CBM_UNSAFE_SHELL_ARG"
+        );
+        assert_eq!(watcher.watch_count().unwrap(), 0);
     }
 
     #[test]

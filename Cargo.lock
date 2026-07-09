@@ -91,6 +91,9 @@ name = "astrolabe-bridge"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-weave",
+ "calyx-aster",
+ "calyx-core",
  "cbm-sys",
  "libc",
  "serde",
