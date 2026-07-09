@@ -246,11 +246,13 @@ pub fn handle_jsonrpc_raw(
     let Some(request_obj) = request.as_object() else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
-    if request_obj
-        .get("method")
-        .and_then(Value::as_str)
-        .is_none_or(|method| method != "tools/call")
-    {
+    let Some(method) = request_obj.get("method").and_then(Value::as_str) else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    if method == "tools/list" {
+        return handle_tools_list_jsonrpc(runner, request_json);
+    }
+    if method != "tools/call" {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
 
@@ -289,6 +291,80 @@ pub fn handle_jsonrpc_raw(
     let args_json = serde_json::to_string(&arguments)?;
     let result_raw = handle_tool_raw(runner, tool_name, &args_json)?;
     Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?))
+}
+
+fn handle_tools_list_jsonrpc(
+    runner: &CbmToolRunner,
+    request_json: &str,
+) -> Result<Option<String>, DynError> {
+    let Some(response) = runner.handle_jsonrpc_raw(request_json)? else {
+        return Ok(None);
+    };
+    Ok(Some(augment_tools_list_response(&response)?))
+}
+
+fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> {
+    let mut response: Value = serde_json::from_str(response_json)?;
+    let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
+        return Ok(response_json.to_string());
+    };
+    if result.contains_key("nextCursor") {
+        return Ok(response_json.to_string());
+    }
+    let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
+        return Ok(response_json.to_string());
+    };
+    if !tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("get_provenance"))
+    {
+        tools.push(get_provenance_tool_definition());
+    }
+    Ok(serde_json::to_string(&response)?)
+}
+
+fn get_provenance_tool_definition() -> Value {
+    json!({
+        "name": "get_provenance",
+        "title": "Get Provenance",
+        "description": "Return labeled Astrolabe provenance for a shadow-indexed project. Modes are lineage, answer_trace, verify_chain, and reproduce.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["lineage", "answer_trace", "verify_chain", "reproduce"]
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": "Symbol id or answer id required by lineage, answer_trace, and reproduce."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Alias for subject_id."
+                }
+            },
+            "required": ["project", "mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
@@ -5105,6 +5181,60 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("invalid calyx dial")
+        );
+    }
+
+    #[test]
+    fn tools_list_discovers_get_provenance_on_final_page() {
+        let runner = CbmToolRunner::new(":memory:").unwrap();
+        let first = handle_jsonrpc_raw(
+            &runner,
+            r#"{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}"#,
+        )
+        .unwrap()
+        .expect("tools/list response");
+        let first_value: Value = serde_json::from_str(&first).unwrap();
+
+        let final_value = if let Some(cursor) = first_value["result"]["nextCursor"].as_str() {
+            let first_tools = first_value["result"]["tools"].as_array().unwrap();
+            assert!(
+                !first_tools
+                    .iter()
+                    .any(|tool| tool["name"] == "get_provenance")
+            );
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/list",
+                "params": {"cursor": cursor},
+            });
+            let final_page = handle_jsonrpc_raw(&runner, &serde_json::to_string(&request).unwrap())
+                .unwrap()
+                .expect("final tools/list page");
+            serde_json::from_str::<Value>(&final_page).unwrap()
+        } else {
+            first_value
+        };
+
+        assert!(final_value["result"]["nextCursor"].is_null());
+        let tools = final_value["result"]["tools"].as_array().unwrap();
+        let get_provenance = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_provenance")
+            .expect("get_provenance tool definition");
+        assert_eq!(
+            get_provenance["inputSchema"]["required"],
+            json!(["project", "mode"])
+        );
+        assert!(
+            get_provenance["inputSchema"]["properties"]["mode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("verify_chain"))
+        );
+        assert_eq!(
+            get_provenance["outputSchema"]["required"],
+            json!(["content", "isError"])
         );
     }
 
