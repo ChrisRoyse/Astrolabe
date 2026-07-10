@@ -31,12 +31,37 @@ read_pin() {
   ' VENDORED.md
 }
 
+verify_worktree() {
+  local name="$1"
+  local path="$2"
+  local untracked
+
+  if ! git diff --quiet -- "$path"; then
+    echo "ERROR: ASTRO_VENDOR_WORKTREE_DIRTY: $name tracked files differ from the index" >&2
+    echo "  path: $path" >&2
+    git status --short --untracked-files=no -- "$path" >&2
+    exit 1
+  fi
+
+  untracked="$(git ls-files --others --exclude-standard -- "$path")"
+  if [[ -n "$untracked" ]]; then
+    echo "ERROR: ASTRO_VENDOR_UNTRACKED: $name contains non-ignored untracked paths" >&2
+    echo "  path: $path" >&2
+    while IFS= read -r file; do
+      printf '  %s\n' "$file" >&2
+    done <<< "$untracked"
+    exit 1
+  fi
+}
+
 verify_tree() {
   local name="$1"
   local path="$2"
   local expected
   local root_tree
   local actual
+
+  verify_worktree "$name" "$path"
 
   expected="$(read_pin "$path")"
   if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then

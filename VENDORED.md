@@ -22,4 +22,7 @@ repository state.
 5. Run `bash scripts/verify-pins.sh`.
 
 Submodules are forbidden for these parents. `scripts/verify-pins.sh` fails if a
-`.gitmodules` file or a vendor gitlink appears.
+`.gitmodules` file or a vendor gitlink appears. It also rejects tracked vendor
+files that differ from the index and non-ignored untracked paths under either
+vendor root. A staged parent update is valid only when its working tree is clean
+and its staged tree SHA matches the updated binding pin above.
