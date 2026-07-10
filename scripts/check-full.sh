@@ -4,6 +4,32 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+TARGET_CLEANUP_OWNER="${ASTROLABE_TARGET_CLEANUP_OWNER:-check-full}"
+case "$TARGET_CLEANUP_OWNER" in
+  check-full)
+    cleanup_target() {
+      local status=$?
+      if ! bash "$ROOT/scripts/clean-target.sh"; then
+        return 1
+      fi
+      return "$status"
+    }
+    bash "$ROOT/scripts/clean-target.sh"
+    trap cleanup_target EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    ;;
+  check-release)
+    ;;
+  *)
+    echo "ERROR: invalid ASTROLABE_TARGET_CLEANUP_OWNER: $TARGET_CLEANUP_OWNER" >&2
+    exit 2
+    ;;
+esac
+
+WORKSPACE_TEST_TIMEOUT_SECS="${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS:-480}"
+WORKSPACE_TEST_DEFERRED_EXIT=125
+
 if ! command -v rustc >/dev/null 2>&1; then
   echo "ERROR: rustc not found on PATH" >&2
   exit 1
@@ -54,8 +80,19 @@ LABEL="${ASTROLABE_CHECK_LABEL:-$DEFAULT_LABEL}"
 CC_BIN="${CC:-$DEFAULT_CC}"
 CXX_BIN="${CXX:-$DEFAULT_CXX}"
 
-echo "=== Portable Astrolabe aggregate ==="
-bash scripts/check.sh
+echo "=== Portable Astrolabe aggregate (workspace test deadline: ${WORKSPACE_TEST_TIMEOUT_SECS}s) ==="
+if ASTROLABE_TARGET_CLEANUP_OWNER="$TARGET_CLEANUP_OWNER" \
+  ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS="$WORKSPACE_TEST_TIMEOUT_SECS" \
+  bash scripts/check.sh; then
+  :
+else
+  status=$?
+  if [[ "$status" -eq "$WORKSPACE_TEST_DEFERRED_EXIT" ]]; then
+    echo "DEFERRED[ASTRO_NATIVE_AGGREGATE]: workspace test deadline reached; downstream suites were not started"
+    echo "CONTINUATION[ASTRO_NATIVE_AGGREGATE]: ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0 bash scripts/check-full.sh"
+  fi
+  exit "$status"
+fi
 
 echo "=== Upstream CBM lint suite ==="
 bash scripts/ci-cbm-lint.sh

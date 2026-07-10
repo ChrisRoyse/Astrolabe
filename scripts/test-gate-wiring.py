@@ -17,6 +17,8 @@ FILES = (
     "scripts/check-full.sh",
     "scripts/check-release.sh",
     "scripts/ci-cbm-test.sh",
+    "scripts/check-workspace-tests.py",
+    "scripts/clean-target.sh",
 )
 
 
@@ -93,6 +95,16 @@ def main() -> int:
         require_error(checker.validate(fixture), "required order")
         copy_fixture(fixture)
 
+        workspace_test = fixture / "scripts/check-workspace-tests.py"
+        rewrite(workspace_test, '"taskkill"', '"taskkill-disabled"')
+        require_error(checker.validate(fixture), "taskkill")
+        copy_fixture(fixture)
+
+        clean_target = fixture / "scripts/clean-target.sh"
+        rewrite(clean_target, 'rm -rf -- "$TARGET_DIR"', 'rm -rf -- "$ROOT"')
+        require_error(checker.validate(fixture), "clean-target.sh")
+        copy_fixture(fixture)
+
         release = fixture / "scripts/check-release.sh"
         rewrite(
             release,
@@ -104,7 +116,7 @@ def main() -> int:
 
         rewrite(
             release,
-            'exec bash "$ROOT/scripts/release-predicate.sh" "$@"',
+            'bash "$ROOT/scripts/release-predicate.sh" "$@"',
             'bash "$ROOT/scripts/release-predicate.sh" "$@"\necho "predicate was not final"',
         )
         require_error(checker.validate(fixture), "release-predicate.sh last")

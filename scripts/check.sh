@@ -4,6 +4,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+TARGET_CLEANUP_OWNER="${ASTROLABE_TARGET_CLEANUP_OWNER:-check}"
+case "$TARGET_CLEANUP_OWNER" in
+  check)
+    cleanup_target() {
+      local status=$?
+      if ! bash "$ROOT/scripts/clean-target.sh"; then
+        return 1
+      fi
+      return "$status"
+    }
+    bash "$ROOT/scripts/clean-target.sh"
+    trap cleanup_target EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    ;;
+  check-full|check-release)
+    ;;
+  *)
+    echo "ERROR: invalid ASTROLABE_TARGET_CLEANUP_OWNER: $TARGET_CLEANUP_OWNER" >&2
+    exit 2
+    ;;
+esac
+
 if command -v cargo >/dev/null 2>&1; then
   CARGO_BIN="cargo"
 elif [[ -n "${USERPROFILE:-}" && -x "$USERPROFILE/.cargo/bin/cargo.exe" ]]; then
@@ -33,6 +56,7 @@ bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py
 "$PYTHON_BIN" scripts/test-gate-wiring.py
+"$PYTHON_BIN" scripts/test-check-workspace-tests.py
 "$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
 "$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
@@ -46,7 +70,21 @@ bash scripts/check-unsafe-boundary.sh
 "$CARGO_BIN" metadata --format-version 1 >/dev/null
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 "$CARGO_BIN" build --workspace
-"$CARGO_BIN" test --workspace
+if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
+  if "$PYTHON_BIN" scripts/check-workspace-tests.py \
+    --cargo "$CARGO_BIN" \
+    --timeout-secs "$ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS"; then
+    :
+  else
+    status=$?
+    if [[ "$status" -eq 125 ]]; then
+      echo "DEFERRED[ASTRO_WORKSPACE_TEST_TIMEOUT]: portable runtime checks were not started"
+    fi
+    exit "$status"
+  fi
+else
+  "$CARGO_BIN" test --workspace
+fi
 bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh

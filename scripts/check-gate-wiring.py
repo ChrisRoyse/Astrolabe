@@ -56,6 +56,8 @@ def validate(root: Path) -> list[str]:
     full = read(root, "scripts/check-full.sh", errors)
     release = read(root, "scripts/check-release.sh", errors)
     cbm_test = read(root, "scripts/ci-cbm-test.sh", errors)
+    workspace_test = read(root, "scripts/check-workspace-tests.py", errors)
+    clean_target = read(root, "scripts/clean-target.sh", errors)
 
     require(
         check,
@@ -93,6 +95,19 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    require(
+        check,
+        "scripts/test-check-workspace-tests.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/check-workspace-tests.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(check, "scripts/clean-target.sh", "scripts/check.sh", errors)
     require_order(
         check,
         (
@@ -128,6 +143,19 @@ def validate(root: Path) -> list[str]:
     require(full, "ASTROLABE_RUST_TARGET", "scripts/check-full.sh", errors)
     require(full, 'HOST_TARGET" != "$RUSTC_HOST', "scripts/check-full.sh", errors)
     require(full, "x86_64-pc-windows-gnu", "scripts/check-full.sh", errors)
+    require(
+        full,
+        "ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS",
+        "scripts/check-full.sh",
+        errors,
+    )
+    require(
+        full,
+        "DEFERRED[ASTRO_NATIVE_AGGREGATE]",
+        "scripts/check-full.sh",
+        errors,
+    )
+    require(full, "scripts/clean-target.sh", "scripts/check-full.sh", errors)
     for label in (
         "linux-x64-gcc",
         "linux-x64-clang",
@@ -165,14 +193,37 @@ def validate(root: Path) -> list[str]:
         "scripts/check-release.sh",
         errors,
     )
+    require(release, "scripts/clean-target.sh", "scripts/check-release.sh", errors)
+    require(release, "trap cleanup_target EXIT", "scripts/check-release.sh", errors)
     executable_lines = [
         line.strip()
         for line in release.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    expected_last = 'exec bash "$ROOT/scripts/release-predicate.sh" "$@"'
+    expected_last = 'bash "$ROOT/scripts/release-predicate.sh" "$@"'
     if not executable_lines or executable_lines[-1] != expected_last:
         errors.append("scripts/check-release.sh must execute release-predicate.sh last")
+
+    require(
+        workspace_test,
+        "subprocess.CREATE_NEW_PROCESS_GROUP",
+        "scripts/check-workspace-tests.py",
+        errors,
+    )
+    require(workspace_test, '"taskkill"', "scripts/check-workspace-tests.py", errors)
+    require(
+        workspace_test,
+        "DEFERRED_EXIT = 125",
+        "scripts/check-workspace-tests.py",
+        errors,
+    )
+    require(clean_target, 'rm -rf -- "$TARGET_DIR"', "scripts/clean-target.sh", errors)
+    require(
+        clean_target,
+        "CLEANUP[ASTRO_TARGET]",
+        "scripts/clean-target.sh",
+        errors,
+    )
 
     if not re.search(r"(?ms)^  schedule:\s*$\n\s+- cron:", workflow):
         errors.append("ci.yml must define a scheduled trigger")
