@@ -660,6 +660,11 @@ cbm: $(BUILD_DIR)/codebase-memory-mcp
 ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
 ASTRO_ALLOC_SHIM_SRC = $(ASTROLABE_PATCH_DIR)/astro_alloc_shim.c
 ASTRO_ALLOC_SHIM_OBJ = $(LIBCBM_DIR)/astro_alloc_shim.o
+ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py
+ASTRO_MEM_PRESSURE_SRC = src/foundation/mem.c
+ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c
+ASTRO_MEM_PRESSURE_OBJ = $(LIBCBM_DIR)/src/foundation/mem.o
+PYTHON ?= python
 LIBCBM_DIR = $(BUILD_DIR)/libcbm
 LIBCBM_CONFIG_STAMP ?=
 LIBCBM_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -729,6 +734,14 @@ $(LIBCBM_DIR)/$(MIMALLOC_SRC:.c=.o): $(MIMALLOC_SRC) | $(BUILD_DIR)
 $(ASTRO_ALLOC_SHIM_OBJ): $(ASTRO_ALLOC_SHIM_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) -Ivendored/mimalloc/include -Ivendored/mimalloc/src -c -o $@ $<
+
+$(ASTRO_MEM_PRESSURE_OVERLAY): $(ASTRO_MEM_PRESSURE_SRC) $(ASTRO_MEM_PRESSURE_PATCH) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_MEM_PRESSURE_PATCH) $< $@
+
+$(ASTRO_MEM_PRESSURE_OBJ): $(ASTRO_MEM_PRESSURE_OVERLAY) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<
 
 $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)

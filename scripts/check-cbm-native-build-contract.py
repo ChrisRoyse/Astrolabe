@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_RS = ROOT / "crates" / "cbm-sys" / "build.rs"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
+MEM_PRESSURE_PATCH = ROOT / "patches" / "cbm" / "apply_mem_pressure_patch.py"
 
 
 def require(condition: bool, message: str) -> None:
@@ -17,6 +18,7 @@ def require(condition: bool, message: str) -> None:
 def main() -> None:
     build_rs = BUILD_RS.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
+    mem_pressure_patch = MEM_PRESSURE_PATCH.read_text(encoding="utf-8")
 
     require(
         '.arg(make_path(patched_makefile))' in build_rs,
@@ -32,9 +34,25 @@ def main() -> None:
         "cbm-sys must pass a normalized build-configuration stamp to GNU Make",
     )
     require(
-        "path.replace('\\\\', \"/\")" in build_rs,
+        "value.replace('\\\\', \"/\")" in build_rs,
         "the Windows Make path conversion must replace backslashes",
     )
+    require(
+        "fn make_command_path(value: &str) -> String" in build_rs,
+        "Make-facing executable overrides must use the shared path conversion",
+    )
+    for variable, local in [
+        ("CC", "cc"),
+        ("CXX", "cxx"),
+        ("AR", "ar"),
+        ("LD", "ld"),
+        ("NM", "nm"),
+        ("OBJCOPY", "objcopy"),
+    ]:
+        require(
+            f'format!("{variable}={{}}", make_command_path(&{local}))' in build_rs,
+            f"{variable} must be normalized before GNU Make receives it",
+        )
     for source_dir in ('join("src")', 'join("internal/cbm")', 'join("vendored")'):
         require(
             source_dir in build_rs,
@@ -49,14 +67,21 @@ def main() -> None:
         "the build-configuration stamp must preserve mtime when content is unchanged",
     )
     require(
-        "libcbm_build_config(&build_script, &patched_makefile)" in build_rs,
-        "the configuration stamp must cover build.rs and Makefile.cbm",
+        "libcbm_build_config(&build_script, &patched_makefile, &mem_pressure_patch)" in build_rs,
+        "the configuration stamp must cover build.rs, Makefile.cbm, and source overlays",
+    )
+    require(
+        'let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");'
+        in build_rs
+        and "cargo:rerun-if-changed={}" in build_rs,
+        "Cargo must rebuild when the CBM pressure-log overlay changes",
     )
     require(
         '"TARGET"' in build_rs
         and '"PATH"' in build_rs
-        and '"CBM_SYS_ASAN"' in build_rs,
-        "the configuration stamp must cover target, tool lookup, and ASan mode",
+        and '"CBM_SYS_ASAN"' in build_rs
+        and '"PYTHON"' in build_rs,
+        "the configuration stamp must cover target, tool lookup, overlay execution, and ASan mode",
     )
     require(
         "LIBCBM_DEPFILES = $(LIBCBM_OBJS:.o=.d)" in makefile,
@@ -131,6 +156,25 @@ def main() -> None:
     require(
         'println!("cargo:rustc-link-lib=advapi32");' in build_rs,
         "native Windows links must include the token-privilege system library",
+    )
+    require(
+        'PERCENT_BUFFER_DECLARATION = "char pct_str[CBM_SZ_16];"' in mem_pressure_patch
+        and 'PATCHED_PERCENT_BUFFER_DECLARATION = "char pct_str[CBM_SZ_32];"'
+        in mem_pressure_patch
+        and "EXPECTED_PERCENT_BUFFER_COUNT = 2" in mem_pressure_patch,
+        "the pressure-log overlay must expand exactly the two size_t percentage buffers",
+    )
+    require(
+        "ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py"
+        in makefile
+        and "ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c" in makefile
+        and "$(ASTRO_MEM_PRESSURE_OBJ): $(ASTRO_MEM_PRESSURE_OVERLAY)" in makefile
+        and "$(PYTHON) $(ASTRO_MEM_PRESSURE_PATCH) $< $@" in makefile,
+        "libcbm must compile the generated pressure-log overlay instead of mutating vendor mem.c",
+    )
+    require(
+        "$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<" in makefile,
+        "the generated foundation overlay must retain its original local-header search path",
     )
 
     print("native Windows libcbm build contract verified")

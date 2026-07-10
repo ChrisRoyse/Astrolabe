@@ -16,6 +16,7 @@ const LIBCBM_BUILD_ENV_VARS: &[&str] = &[
     "LD",
     "NM",
     "OBJCOPY",
+    "PYTHON",
     "ARCHFLAGS",
     "CFLAGS_EXTRA",
     "CXXFLAGS_EXTRA",
@@ -32,6 +33,7 @@ fn main() {
     let cbm_root = repo_root.join("vendor/codebase-memory-mcp");
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
+    let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
     let build_support = manifest_dir.join("build_support.rs");
@@ -43,6 +45,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", build_support.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
+    println!("cargo:rerun-if-changed={}", mem_pressure_patch.display());
     for path in [
         cbm_root.join("src"),
         cbm_root.join("internal/cbm"),
@@ -69,7 +72,7 @@ fn main() {
     }
 
     let build_script = manifest_dir.join("build.rs");
-    let config = libcbm_build_config(&build_script, &patched_makefile);
+    let config = libcbm_build_config(&build_script, &patched_makefile, &mem_pressure_patch);
     // Preserve mtime on no-op reruns so Make only invalidates objects when the
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
@@ -90,22 +93,22 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
         .arg("libcbm");
 
     if let Ok(cc) = env::var("CC") {
-        command.arg(format!("CC={cc}"));
+        command.arg(format!("CC={}", make_command_path(&cc)));
     }
     if let Ok(cxx) = env::var("CXX") {
-        command.arg(format!("CXX={cxx}"));
+        command.arg(format!("CXX={}", make_command_path(&cxx)));
     }
     if let Ok(ar) = env::var("AR") {
-        command.arg(format!("AR={ar}"));
+        command.arg(format!("AR={}", make_command_path(&ar)));
     }
     if let Ok(ld) = env::var("LD") {
-        command.arg(format!("LD={ld}"));
+        command.arg(format!("LD={}", make_command_path(&ld)));
     }
     if let Ok(nm) = env::var("NM") {
-        command.arg(format!("NM={nm}"));
+        command.arg(format!("NM={}", make_command_path(&nm)));
     }
     if let Ok(objcopy) = env::var("OBJCOPY") {
-        command.arg(format!("OBJCOPY={objcopy}"));
+        command.arg(format!("OBJCOPY={}", make_command_path(&objcopy)));
     }
     let asan_enabled = env::var_os("CBM_SYS_ASAN").is_some();
     if asan_enabled || env::var_os("CFLAGS_EXTRA").is_some() {
@@ -138,9 +141,13 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
     }
 }
 
-fn libcbm_build_config(build_script: &Path, patched_makefile: &Path) -> Vec<u8> {
+fn libcbm_build_config(
+    build_script: &Path,
+    patched_makefile: &Path,
+    mem_pressure_patch: &Path,
+) -> Vec<u8> {
     let mut config = Vec::new();
-    for path in [build_script, patched_makefile] {
+    for path in [build_script, patched_makefile, mem_pressure_patch] {
         config.extend_from_slice(path.to_string_lossy().as_bytes());
         config.push(b'\n');
         config.extend_from_slice(&fs::read(path).unwrap_or_else(|err| {
@@ -176,11 +183,15 @@ fn write_if_changed(path: &Path, contents: &[u8]) {
 }
 
 fn make_path(path: &Path) -> String {
-    let path = path.to_string_lossy();
+    let value = path.to_string_lossy();
+    make_command_path(&value)
+}
+
+fn make_command_path(value: &str) -> String {
     if cfg!(windows) {
-        path.replace('\\', "/")
+        value.replace('\\', "/")
     } else {
-        path.into_owned()
+        value.to_owned()
     }
 }
 
