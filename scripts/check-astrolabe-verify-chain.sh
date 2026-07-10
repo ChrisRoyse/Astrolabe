@@ -20,6 +20,21 @@ if [[ -n "${ASTROLABE_RUST_TARGET:-}" ]]; then
   target_dir="$ROOT/target/$ASTROLABE_RUST_TARGET/debug"
 fi
 
+native_path() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if ! command -v cygpath >/dev/null 2>&1; then
+        echo "ERROR: cygpath is required to pass native Windows paths" >&2
+        exit 1
+      fi
+      cygpath -m "$1"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
 bin="${1:-$target_dir/astrolabe}"
 if [[ ! -x "$bin" && -x "$bin.exe" ]]; then
   bin="$bin.exe"
@@ -35,19 +50,21 @@ vault_id="${ASTROLABE_VERIFY_CHAIN_VAULT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}"
 vault_salt="${ASTROLABE_VERIFY_CHAIN_VAULT_SALT:-astrolabe-verify-chain-ci-salt}"
 vault_dir="${ASTROLABE_VERIFY_CHAIN_VAULT:-$ROOT/target/astrolabe-verify-chain-vault}"
 out_dir="${ASTROLABE_VERIFY_CHAIN_OUT:-$ROOT/target/astrolabe-verify-chain}"
+native_vault_dir="$(native_path "$vault_dir")"
+native_out_dir="$(native_path "$out_dir")"
 
 rm -rf "$vault_dir" "$out_dir"
 mkdir -p "$vault_dir" "$out_dir"
 
 cargo run -p astrolabe-ingest --example build_verify_fixture "${target_args[@]}" -- \
-  "$vault_dir" "$vault_id" "$vault_salt" > "$out_dir/build.txt"
+  "$native_vault_dir" "$vault_id" "$vault_salt" > "$out_dir/build.txt"
 
-printf '{"vault":"%s"}' "$vault_dir" | "$bin" cli verify_chain > "$out_dir/verify-chain.txt"
-printf '{"vault":"%s"}' "$vault_dir" | "$bin" cli --json verify_chain > "$out_dir/verify-chain.json"
-"$bin" verify --json --deep --vault "$vault_dir" --vault-id "$vault_id" --vault-salt "$vault_salt" \
+printf '{"vault":"%s"}' "$native_vault_dir" | "$bin" cli verify_chain > "$out_dir/verify-chain.txt"
+printf '{"vault":"%s"}' "$native_vault_dir" | "$bin" cli --json verify_chain > "$out_dir/verify-chain.json"
+"$bin" verify --json --deep --vault "$native_vault_dir" --vault-id "$vault_id" --vault-salt "$vault_salt" \
   > "$out_dir/verify-deep.json"
 
-"$PYTHON_BIN" - "$out_dir/verify-chain.json" "$out_dir/verify-deep.json" <<'PY'
+"$PYTHON_BIN" - "$native_out_dir/verify-chain.json" "$native_out_dir/verify-deep.json" <<'PY'
 import json
 import sys
 

@@ -128,7 +128,19 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/check-windows-gnu-toolchain-contract.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/test-check-workspace-tests.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-verify-chain-native-path.py",
         "scripts/check.sh",
         errors,
     )

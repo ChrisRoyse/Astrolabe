@@ -171,6 +171,11 @@ def main() -> None:
         "the relocatable link must not expand every object on the command line",
     )
     require(
+        "MINGW_RELOC_LD_FLAGS := --allow-multiple-definition" in makefile
+        and "$(MINGW_RELOC_LD_FLAGS)" in link_lines[0],
+        "MinGW relocatable linking must allow the known CRT import-symbol duplicates",
+    )
+    require(
         'if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi'
         in makefile,
         "MinGW static objects must discard DLL-only export directives",

@@ -74,12 +74,15 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
-# --allow-multiple-definition (MinGW CRT symbol clashes).
+# --allow-multiple-definition (MinGW CRT symbol clashes). The relocatable
+# libcbm merge needs the same allowance before the archive is formed.
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
+MINGW_RELOC_LD_FLAGS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+MINGW_RELOC_LD_FLAGS := --allow-multiple-definition
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -785,7 +788,7 @@ $(LIBCBM_DIR)/%.o: %.S | $(BUILD_DIR)
 
 $(LIBCBM_RELOC): $(LIBCBM_OBJS)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
-	$(LD) -r $(NO_EXECSTACK_LD_FLAG) -o $@ @$(LIBCBM_OBJECTS_RSP)
+	$(LD) -r $(NO_EXECSTACK_LD_FLAG) $(MINGW_RELOC_LD_FLAGS) -o $@ @$(LIBCBM_OBJECTS_RSP)
 	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
 	if command -v $(OBJCOPY) >/dev/null 2>&1; then \
 		if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi; \

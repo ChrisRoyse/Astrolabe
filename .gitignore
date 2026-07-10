@@ -59,6 +59,7 @@ logs/
 tmp/
 .tmp/
 .cache/
+/.toolchains/
 *.log
 *.tmp
 *.sqlite

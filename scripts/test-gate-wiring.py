@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import shutil
 import tempfile
@@ -54,8 +55,21 @@ def require_error(errors: list[str], fragment: str) -> None:
 
 def main() -> int:
     checker = load_checker()
-    scratch = ROOT / "target"
+    scratch_parent = ROOT / ".tmp"
+    scratch_parent_existed = scratch_parent.exists()
+    scratch = scratch_parent / "gate-wiring"
+    shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True, exist_ok=True)
+
+    def cleanup_scratch() -> None:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if not scratch_parent_existed:
+            try:
+                scratch_parent.rmdir()
+            except OSError:
+                pass
+
+    atexit.register(cleanup_scratch)
     with tempfile.TemporaryDirectory(prefix="gate-wiring-", dir=scratch) as temp:
         fixture = Path(temp)
         copy_fixture(fixture)
@@ -109,6 +123,26 @@ def main() -> int:
             "",
         )
         require_error(checker.validate(fixture), "test-native-cargo-fmt.py")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/test-verify-chain-native-path.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "test-verify-chain-native-path.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "check-windows-gnu-toolchain-contract.py"
+        )
         copy_fixture(fixture)
 
         rewrite(
@@ -171,6 +205,8 @@ def main() -> int:
         )
         require_error(checker.validate(fixture), "WRITE_RELEASE_ARTIFACT")
 
+    cleanup_scratch()
+    assert not scratch.exists()
     print("gate wiring self-test passed")
     return 0
 
