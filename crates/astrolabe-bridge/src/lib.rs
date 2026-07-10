@@ -1261,10 +1261,52 @@ struct WatcherCallbackState {
     last_error: Option<BridgeError>,
 }
 
+struct WatcherCallbackOwner {
+    ptr: NonNull<WatcherCallbackState>,
+}
+
+impl WatcherCallbackOwner {
+    fn new(callback: Box<WatchCallback>) -> Self {
+        let state = Box::new(WatcherCallbackState {
+            callback,
+            last_error: None,
+        });
+        // Box::into_raw transfers the allocation into this owner without
+        // creating a Box-derived reference that can be invalidated by moves.
+        let ptr = NonNull::new(Box::into_raw(state)).expect("Box::into_raw returned NULL");
+        Self { ptr }
+    }
+
+    fn user_data(&self) -> *mut c_void {
+        self.ptr.as_ptr().cast::<c_void>()
+    }
+
+    fn clear_last_error(&mut self) {
+        // SAFETY: this owner uniquely owns the allocation, and no C callback is
+        // active while poll_once prepares the state.
+        drop(unsafe { replace_watcher_last_error(self.ptr.as_ptr(), None) });
+    }
+
+    fn take_last_error(&mut self) -> Option<BridgeError> {
+        // SAFETY: cbm_watcher_poll_once has returned, so no C callback is active.
+        unsafe { replace_watcher_last_error(self.ptr.as_ptr(), None) }
+    }
+}
+
+impl Drop for WatcherCallbackOwner {
+    fn drop(&mut self) {
+        // SAFETY: ptr came from exactly one Box::into_raw call and this owner is
+        // its only reclamation path.
+        unsafe {
+            drop(Box::from_raw(self.ptr.as_ptr()));
+        }
+    }
+}
+
 pub struct CbmWatcher {
     ptr: NonNull<cbm_sys::cbm_watcher_t>,
+    callback_state: WatcherCallbackOwner,
     _store: CbmStore,
-    callback_state: Box<WatcherCallbackState>,
     owner: ThreadId,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -1275,14 +1317,11 @@ impl CbmWatcher {
         F: FnMut(&str, &str) -> Result<(), BridgeError> + 'static,
     {
         let store = CbmStore::open_memory()?;
-        let mut callback_state = Box::new(WatcherCallbackState {
-            callback: Box::new(callback),
-            last_error: None,
-        });
-        let user_data = callback_state.as_mut() as *mut WatcherCallbackState as *mut c_void;
+        let callback_state = WatcherCallbackOwner::new(Box::new(callback));
+        let user_data = callback_state.user_data();
         // SAFETY: store is owned by the returned CbmWatcher and therefore
-        // outlives the C watcher. callback_state is heap-allocated and remains
-        // at a stable address while C may call the trampoline.
+        // outlives the C watcher. callback_state owns a Box::into_raw allocation
+        // at a stable address until after the C watcher is stopped and freed.
         let ptr = unsafe {
             cbm_sys::cbm_watcher_new(
                 store.ptr.as_ptr(),
@@ -1298,8 +1337,8 @@ impl CbmWatcher {
                     "Check CBM allocator initialization and startup diagnostics.",
                 )
             })?,
-            _store: store,
             callback_state,
+            _store: store,
             owner: thread::current().id(),
             _not_send_or_sync: PhantomData,
         })
@@ -1349,10 +1388,10 @@ impl CbmWatcher {
 
     pub fn poll_once(&mut self) -> Result<i32, BridgeError> {
         self.ensure_owner_thread()?;
-        self.callback_state.last_error = None;
+        self.callback_state.clear_last_error();
         // SAFETY: watcher pointer is owned by self and thread-affine.
         let reindexed = unsafe { cbm_sys::cbm_watcher_poll_once(self.ptr.as_ptr()) };
-        if let Some(err) = self.callback_state.last_error.take() {
+        if let Some(err) = self.callback_state.take_last_error() {
             Err(err)
         } else {
             Ok(reindexed)
@@ -1395,12 +1434,23 @@ impl CbmWatcher {
 impl Drop for CbmWatcher {
     fn drop(&mut self) {
         // SAFETY: self uniquely owns the cbm_watcher_t pointer. The watcher is
-        // not running on a background Rust thread in this wrapper.
+        // not running on a background Rust thread in this wrapper. After this
+        // method returns, callback_state reconstructs its Box before _store is
+        // dropped, so C cannot retain or use user_data past reclamation.
         unsafe {
             cbm_sys::cbm_watcher_stop(self.ptr.as_ptr());
             cbm_sys::cbm_watcher_free(self.ptr.as_ptr());
         }
     }
+}
+
+unsafe fn replace_watcher_last_error(
+    state: *mut WatcherCallbackState,
+    replacement: Option<BridgeError>,
+) -> Option<BridgeError> {
+    // SAFETY: caller guarantees state points to the live Box::into_raw
+    // allocation and that no competing callback access is active.
+    unsafe { ptr::replace(ptr::addr_of_mut!((*state).last_error), replacement) }
 }
 
 unsafe extern "C" fn watcher_index_trampoline(
@@ -1412,9 +1462,9 @@ unsafe extern "C" fn watcher_index_trampoline(
         return CALLBACK_ERROR;
     }
 
-    // SAFETY: user_data was created from a live WatcherCallbackState Box in
-    // CbmWatcher::new_for_polling and remains valid until CbmWatcher::drop.
-    let state = unsafe { &mut *(user_data as *mut WatcherCallbackState) };
+    // user_data is the allocation pointer returned by Box::into_raw and remains
+    // valid until after the C watcher is stopped and freed.
+    let state = user_data.cast::<WatcherCallbackState>();
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         if project_name.is_null() || root_path.is_null() {
             return Err(envelope(
@@ -1428,19 +1478,29 @@ unsafe extern "C" fn watcher_index_trampoline(
         let project_name = unsafe { CStr::from_ptr(project_name) }.to_str()?;
         // SAFETY: same callback string contract as project_name.
         let root_path = unsafe { CStr::from_ptr(root_path) }.to_str()?;
-        (state.callback)(project_name, root_path)
+        // SAFETY: C invokes this thread-affine callback synchronously, so this
+        // is the only active access to the callback field.
+        let callback = unsafe { &mut *ptr::addr_of_mut!((*state).callback) };
+        callback(project_name, root_path)
     })) {
         Ok(Ok(())) => CALLBACK_OK,
         Ok(Err(err)) => {
-            state.last_error = Some(err);
+            // SAFETY: state remains live and the callback borrow ended above.
+            drop(unsafe { replace_watcher_last_error(state, Some(err)) });
             CALLBACK_ERROR
         }
         Err(_) => {
-            state.last_error = Some(envelope(
-                "ASTRO_FFI_CALLBACK_PANIC",
-                "Rust watcher callback panicked before returning to C",
-                "Keep panic boundaries inside Rust; convert watcher callback failures into status codes.",
-            ));
+            // SAFETY: state remains live and catch_unwind ended callback access.
+            drop(unsafe {
+                replace_watcher_last_error(
+                    state,
+                    Some(envelope(
+                        "ASTRO_FFI_CALLBACK_PANIC",
+                        "Rust watcher callback panicked before returning to C",
+                        "Keep panic boundaries inside Rust; convert watcher callback failures into status codes.",
+                    )),
+                )
+            });
             CALLBACK_PANIC
         }
     }
@@ -1744,6 +1804,11 @@ unsafe fn array_slice<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[inline(never)]
+    fn move_watcher_callback_owner(owner: WatcherCallbackOwner) -> WatcherCallbackOwner {
+        owner
+    }
 
     #[test]
     fn exposes_both_parent_roots() {
@@ -2134,6 +2199,111 @@ mod tests {
         assert!(state.nodes.is_empty());
         let error = state.error.take().expect("thread drift is recorded");
         assert_eq!(error.envelope().code, "ASTRO_CBM_ROW_SINK_THREAD");
+    }
+
+    #[test]
+    fn watcher_callback_owner_keeps_raw_pointer_stable_and_reports_error() {
+        let mut calls = 0;
+        let owner = WatcherCallbackOwner::new(Box::new(move |project, root| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(envelope(
+                    "ASTRO_WATCH_TEST_ERROR",
+                    format!("{project}:{root}"),
+                    "test remediation",
+                ))
+            }
+        }));
+        let user_data = owner.user_data();
+        let mut moved_owner = move_watcher_callback_owner(owner);
+        assert_eq!(moved_owner.user_data(), user_data);
+
+        moved_owner.clear_last_error();
+        let project = CString::new("demo").unwrap();
+        let root = CString::new("C:/code/demo").unwrap();
+        // SAFETY: strings and user_data remain live for this synchronous call.
+        let success =
+            unsafe { watcher_index_trampoline(project.as_ptr(), root.as_ptr(), user_data) };
+        assert_eq!(success, CALLBACK_OK);
+        assert!(moved_owner.take_last_error().is_none());
+
+        moved_owner.clear_last_error();
+        // SAFETY: strings and user_data remain live for this synchronous call.
+        let error_status =
+            unsafe { watcher_index_trampoline(project.as_ptr(), root.as_ptr(), user_data) };
+        assert_eq!(error_status, CALLBACK_ERROR);
+        let error = moved_owner
+            .take_last_error()
+            .expect("callback error is recorded through raw state");
+        assert_eq!(error.envelope().code, "ASTRO_WATCH_TEST_ERROR");
+        assert_eq!(error.envelope().message, "demo:C:/code/demo");
+    }
+
+    #[test]
+    fn watcher_callback_owner_preserves_null_and_panic_mapping() {
+        let mut null_owner = WatcherCallbackOwner::new(Box::new(|_, _| {
+            panic!("NULL callback arguments must be rejected before invocation")
+        }));
+        let root = CString::new("C:/code/demo").unwrap();
+        // SAFETY: user_data and root remain live; NULL is an intentional probe.
+        let null_status =
+            unsafe { watcher_index_trampoline(ptr::null(), root.as_ptr(), null_owner.user_data()) };
+        assert_eq!(null_status, CALLBACK_ERROR);
+        assert_eq!(
+            null_owner
+                .take_last_error()
+                .expect("NULL argument error recorded")
+                .envelope()
+                .code,
+            "ASTRO_CBM_NULL_CALLBACK_ARG"
+        );
+
+        let mut panic_owner =
+            WatcherCallbackOwner::new(Box::new(|_, _| panic!("watcher callback panic probe")));
+        let project = CString::new("demo").unwrap();
+        // SAFETY: strings and user_data remain live for this synchronous call.
+        let panic_status = unsafe {
+            watcher_index_trampoline(project.as_ptr(), root.as_ptr(), panic_owner.user_data())
+        };
+        assert_eq!(panic_status, CALLBACK_PANIC);
+        assert_eq!(
+            panic_owner
+                .take_last_error()
+                .expect("panic error recorded")
+                .envelope()
+                .code,
+            "ASTRO_FFI_CALLBACK_PANIC"
+        );
+    }
+
+    #[test]
+    fn watcher_callback_owner_drops_captured_state_exactly_once_after_move() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = DropProbe(Arc::clone(&drops));
+        let owner = WatcherCallbackOwner::new(Box::new(move |_, _| {
+            let _keep_probe_captured = &probe;
+            Ok(())
+        }));
+        let user_data = owner.user_data();
+        let moved_owner = move_watcher_callback_owner(owner);
+        assert_eq!(moved_owner.user_data(), user_data);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(moved_owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
