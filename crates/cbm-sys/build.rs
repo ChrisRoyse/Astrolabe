@@ -7,6 +7,22 @@ use std::process::Command;
 
 use build_support::normalize_bindings;
 
+const LIBCBM_BUILD_ENV_VARS: &[&str] = &[
+    "PATH",
+    "MAKE",
+    "CC",
+    "CXX",
+    "AR",
+    "LD",
+    "NM",
+    "OBJCOPY",
+    "ARCHFLAGS",
+    "CFLAGS_EXTRA",
+    "CXXFLAGS_EXTRA",
+    "CBM_SYS_ASAN",
+    "STATIC",
+];
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest_dir
@@ -21,20 +37,19 @@ fn main() {
     let build_support = manifest_dir.join("build_support.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("cbm-build");
+    let config_stamp = out_dir.join("libcbm-build-config.stamp");
 
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", build_support.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
-    println!("cargo:rerun-if-changed={}", mimalloc_header.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        cbm_root.join("src/mcp/mcp.c").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        cbm_root.join("src/mcp/mcp.h").display()
-    );
+    for path in [
+        cbm_root.join("src"),
+        cbm_root.join("internal/cbm"),
+        cbm_root.join("vendored"),
+    ] {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("VENDORED.md").display()
@@ -44,35 +59,26 @@ fn main() {
         "cargo:rustc-env=CBM_MIMALLOC_VERSION={}",
         read_mimalloc_version(&mimalloc_header)
     );
-    for var in [
-        "MAKE",
-        "CC",
-        "CXX",
-        "AR",
-        "LD",
-        "NM",
-        "OBJCOPY",
-        "ARCHFLAGS",
-        "CFLAGS_EXTRA",
-        "CXXFLAGS_EXTRA",
-        "CBM_SYS_ASAN",
-        "ASTROLABE_UPDATE_BINDINGS",
-    ] {
+    for var in LIBCBM_BUILD_ENV_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
+    println!("cargo:rerun-if-env-changed=ASTROLABE_UPDATE_BINDINGS");
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     if env::var_os("CBM_SYS_ASAN").is_some() {
         println!("cargo:rustc-cfg=cbm_sys_asan");
     }
 
-    if build_dir.exists() {
-        fs::remove_dir_all(&build_dir).expect("failed to clear stale libcbm build directory");
-    }
-    run_make(&cbm_root, &patched_makefile, &build_dir);
+    let build_script = manifest_dir.join("build.rs");
+    let config = libcbm_build_config(&build_script, &patched_makefile);
+    // Preserve mtime on no-op reruns so Make only invalidates objects when the
+    // effective native build configuration changes.
+    write_if_changed(&config_stamp, &config);
+    run_make(&cbm_root, &patched_makefile, &build_dir, &config_stamp);
     verify_bindings(&manifest_dir, &cbm_root, &header);
     emit_link_directives(&build_dir);
 }
 
-fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
+fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_stamp: &Path) {
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     let mut command = Command::new(&make);
     command
@@ -80,6 +86,7 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
         .arg("-f")
         .arg(make_path(patched_makefile))
         .arg(format!("BUILD_DIR={}", make_path(build_dir)))
+        .arg(format!("LIBCBM_CONFIG_STAMP={}", make_path(config_stamp)))
         .arg("libcbm");
 
     if let Ok(cc) = env::var("CC") {
@@ -129,6 +136,43 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
     if !status.success() {
         panic!("libcbm.a build failed with status {status}");
     }
+}
+
+fn libcbm_build_config(build_script: &Path, patched_makefile: &Path) -> Vec<u8> {
+    let mut config = Vec::new();
+    for path in [build_script, patched_makefile] {
+        config.extend_from_slice(path.to_string_lossy().as_bytes());
+        config.push(b'\n');
+        config.extend_from_slice(&fs::read(path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read libcbm build configuration input {}: {err}",
+                path.display()
+            )
+        }));
+        config.push(b'\n');
+    }
+    for var in std::iter::once("TARGET").chain(LIBCBM_BUILD_ENV_VARS.iter().copied()) {
+        config.extend_from_slice(var.as_bytes());
+        config.push(b'=');
+        match env::var_os(var) {
+            Some(value) => config.extend_from_slice(value.to_string_lossy().as_bytes()),
+            None => config.extend_from_slice(b"<unset>"),
+        }
+        config.push(b'\n');
+    }
+    config
+}
+
+fn write_if_changed(path: &Path, contents: &[u8]) {
+    if fs::read(path).is_ok_and(|existing| existing == contents) {
+        return;
+    }
+    fs::write(path, contents).unwrap_or_else(|err| {
+        panic!(
+            "failed to write libcbm build configuration stamp {}: {err}",
+            path.display()
+        )
+    });
 }
 
 fn make_path(path: &Path) -> String {

@@ -661,6 +661,7 @@ ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
 ASTRO_ALLOC_SHIM_SRC = $(ASTROLABE_PATCH_DIR)/astro_alloc_shim.c
 ASTRO_ALLOC_SHIM_OBJ = $(LIBCBM_DIR)/astro_alloc_shim.o
 LIBCBM_DIR = $(BUILD_DIR)/libcbm
+LIBCBM_CONFIG_STAMP ?=
 LIBCBM_SRCS = $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
               $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(CBM_DIR)/lsp_all.c $(PREPROCESSOR_SRC) \
               $(MIMALLOC_SRC) $(SQLITE3_SRC) $(CBM_DIR)/vendored/lz4/lz4.c \
@@ -672,6 +673,10 @@ LIBCBM_C_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(filter %.c,$(LIBCBM_SRCS)))
 LIBCBM_CXX_OBJS = $(patsubst %.cpp,$(LIBCBM_DIR)/%.o,$(filter %.cpp,$(LIBCBM_SRCS)))
 LIBCBM_ASM_OBJS = $(patsubst %.S,$(LIBCBM_DIR)/%.o,$(UNIXCODER_BLOB_SRC))
 LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ)
+# Compiler depfiles cover transitive includes; the config stamp covers command
+# inputs that Make cannot infer from source timestamps.
+LIBCBM_DEPFILES = $(LIBCBM_OBJS:.o=.d)
+LIBCBM_DEPFLAGS = -MMD -MP
 LIBCBM_CFLAGS = $(CFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_CXXFLAGS = $(CXXFLAGS_PROD) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -fvisibility=hidden -DCBM_BUILDING_LIB=1
@@ -684,6 +689,18 @@ LIBCBM_GRAMMAR_CFLAGS = $(GRAMMAR_CFLAGS) -g -O1 $(CFLAGS_EXTRA) -fvisibility=hi
 LIBCBM_SQLITE3_CFLAGS = $(SQLITE3_CFLAGS) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 LIBCBM_MIMALLOC_CFLAGS = $(MIMALLOC_CFLAGS_TEST) $(CFLAGS_EXTRA) -fvisibility=hidden -DCBM_BUILDING_LIB=1
 endif
+LIBCBM_CFLAGS += $(LIBCBM_DEPFLAGS)
+LIBCBM_CXXFLAGS += $(LIBCBM_DEPFLAGS)
+LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_DEPFLAGS)
+LIBCBM_SQLITE3_CFLAGS += $(LIBCBM_DEPFLAGS)
+LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_DEPFLAGS)
+
+ifneq ($(strip $(LIBCBM_CONFIG_STAMP)),)
+$(LIBCBM_OBJS): $(LIBCBM_CONFIG_STAMP)
+endif
+
+-include $(LIBCBM_DEPFILES)
+
 LIBCBM_A = $(BUILD_DIR)/libcbm.a
 LIBCBM_RELOC = $(BUILD_DIR)/libcbm.o
 LIBCBM_EXPORTS = $(BUILD_DIR)/libcbm.exports
@@ -703,7 +720,7 @@ $(LIBCBM_DIR)/$(CBM_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 
 $(LIBCBM_DIR)/$(CBM_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS_PROD) -fvisibility=hidden -w -I$(CBM_DIR)/vendored -c -o $@ $<
+	$(CXX) $(LIBCBM_CXXFLAGS) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 $(LIBCBM_DIR)/$(MIMALLOC_SRC:.c=.o): $(MIMALLOC_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -719,15 +736,15 @@ $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 
 $(LIBCBM_DIR)/$(TRE_SRC:.c=.o): $(TRE_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) $(TRE_CFLAGS) -O2 -fvisibility=hidden -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) $(LIBCBM_DEPFLAGS) -O2 -fvisibility=hidden -c -o $@ $<
 
 $(LIBCBM_DIR)/$(CBM_DIR)/vendored/lz4/%.o: $(CBM_DIR)/vendored/lz4/%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 $(LIBCBM_DIR)/$(CBM_DIR)/vendored/zstd/zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) -std=c11 -D_DEFAULT_SOURCE -O2 -fvisibility=hidden -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 $(LIBCBM_DIR)/%.o: %.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -737,9 +754,13 @@ $(LIBCBM_DIR)/%.o: %.cpp | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CXX) $(LIBCBM_CXXFLAGS) -c -o $@ $<
 
+$(LIBCBM_DIR)/$(UNIXCODER_BLOB_SRC:.S=.o): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_DEPFLAGS) -fvisibility=hidden -c -o $@ $<
+
 $(LIBCBM_DIR)/%.o: %.S | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(CC) -fvisibility=hidden -c -o $@ $<
+	$(CC) $(LIBCBM_DEPFLAGS) -fvisibility=hidden -c -o $@ $<
 
 $(LIBCBM_RELOC): $(LIBCBM_OBJS)
 	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
