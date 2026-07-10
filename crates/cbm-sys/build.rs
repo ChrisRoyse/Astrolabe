@@ -217,6 +217,7 @@ fn emit_link_directives(build_dir: &Path) {
         println!("cargo:rustc-link-lib=ws2_32");
         println!("cargo:rustc-link-lib=psapi");
         println!("cargo:rustc-link-lib=shell32");
+        println!("cargo:rustc-link-lib=advapi32");
     }
     if env::var_os("CBM_SYS_ASAN").is_some() && target.contains("linux") {
         println!("cargo:rustc-link-lib=asan");

@@ -750,6 +750,7 @@ $(LIBCBM_RELOC): $(LIBCBM_OBJS)
 	$(LD) -r $(NO_EXECSTACK_LD_FLAG) -o $@ @$(LIBCBM_OBJECTS_RSP)
 	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
 	if command -v $(OBJCOPY) >/dev/null 2>&1; then \
+		if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi; \
 		$(OBJCOPY) --keep-global-symbols=$(LIBCBM_EXPORTS) $@; \
 	else \
 		echo "WARNING: objcopy not found; libcbm symbol localization skipped"; \

@@ -49,6 +49,15 @@ def main() -> None:
         "$(LIBCBM_OBJS)" not in link_lines[0],
         "the relocatable link must not expand every object on the command line",
     )
+    require(
+        'if [ "$(IS_MINGW)" = "yes" ]; then $(OBJCOPY) --remove-section=.drectve $@; fi'
+        in makefile,
+        "MinGW static objects must discard DLL-only export directives",
+    )
+    require(
+        'println!("cargo:rustc-link-lib=advapi32");' in build_rs,
+        "native Windows links must include the token-privilege system library",
+    )
 
     print("native Windows libcbm build contract verified")
 
