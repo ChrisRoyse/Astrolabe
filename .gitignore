@@ -67,6 +67,9 @@ tmp/
 *.db-wal
 *.db-shm
 
+# Local agent / tooling config
+.claude/
+
 # Editor / OS files
 .vscode/
 .idea/
