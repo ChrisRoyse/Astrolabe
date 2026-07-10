@@ -60,10 +60,12 @@ def build_upstream():
             "make",
             "-C",
             ROOT / "vendor" / "codebase-memory-mcp",
+            "-f",
+            ROOT / "patches" / "cbm" / "Makefile.cbm",
             f"BUILD_DIR={build_dir}",
-            "codebase-memory-mcp",
+            "cbm",
         ],
-        timeout=240,
+        timeout=900,
     )
     built = build_dir / f"codebase-memory-mcp{exe}"
     if not built.exists():
@@ -137,6 +139,32 @@ def cli_tool(binary, cache, tool, args):
     if payload.get("isError") is True:
         raise SystemExit(f"{tool} returned isError=true: {payload}")
     return payload["structuredContent"]
+
+
+def lower_cbm_sqlite(source, project, output, determinism_output=None):
+    argv = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "astrolabe-lower",
+        "--example",
+        "lower_cbm_sqlite",
+        "--",
+        source,
+        project,
+        output,
+    ]
+    if determinism_output is not None:
+        argv.append(determinism_output)
+    proc = run(argv, timeout=900)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"lower_cbm_sqlite example did not return JSON: {exc}\n{proc.stdout}")
+    if payload.get("schema") != "astrolabe-lower-example-v1":
+        raise SystemExit(f"lower_cbm_sqlite example schema drift: {payload}")
+    return payload
 
 
 def sqlite_rows(path, sql):
@@ -409,27 +437,23 @@ def main():
         )
         native_db = native_cache / f"{PROJECT}.db"
         lowered_db = lowered_cache / f"{PROJECT}.db"
+        determinism_db = lowered_cache / f"{PROJECT}.determinism.db"
         if not native_db.exists():
             raise SystemExit(f"native CBM DB missing: {native_db}")
 
-        run(
-            [
-                "cargo",
-                "run",
-                "-q",
-                "-p",
-                "astrolabe-lower",
-                "--example",
-                "lower_cbm_sqlite",
-                "--",
-                native_db,
-                PROJECT,
-                lowered_db,
-            ],
-            timeout=900,
-        )
+        lower_report = lower_cbm_sqlite(native_db, PROJECT, lowered_db, determinism_db)
         if not lowered_db.exists():
             raise SystemExit(f"lowered DB missing: {lowered_db}")
+        if not determinism_db.exists():
+            raise SystemExit(f"determinism DB missing: {determinism_db}")
+        determinism = lower_report.get("determinism", {})
+        if determinism.get("byte_identical") is not True:
+            raise SystemExit(f"lowered artifact bytes were not deterministic: {determinism}")
+        if determinism.get("artifact_sha256_matches") is not True:
+            raise SystemExit(f"lowered artifact hashes were not deterministic: {determinism}")
+        roundtrip = lower_report.get("roundtrip", {})
+        if roundtrip.get("matches_original_cx_ids") is not True:
+            raise SystemExit(f"lowered artifact roundtrip changed CxIds: {roundtrip}")
 
         assert_equal("schema", schema_rows(native_db), schema_rows(lowered_db))
 
@@ -500,6 +524,14 @@ def main():
             "project": PROJECT,
             "nodes": len(native_nodes),
             "edges": len(sqlite_rows(native_db, edge_sql)),
+            "determinism": {
+                "artifact_sha256": lower_report["lower"]["artifact_sha256"],
+                "byte_identical": True,
+            },
+            "roundtrip": {
+                "cx_id_count": len(roundtrip.get("cx_ids", [])),
+                "matches_original_cx_ids": True,
+            },
             "upstream": str(upstream),
         }
         if ui is not None:
