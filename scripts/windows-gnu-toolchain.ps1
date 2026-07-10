@@ -144,6 +144,14 @@ function Set-ToolchainEnvironment {
     $env:OBJCOPY = Join-Path $MingwBin "objcopy.exe"
 }
 
+function Set-WorkspaceTempEnvironment {
+    param([string]$WorkspaceTemp)
+
+    $env:TEMP = $WorkspaceTemp
+    $env:TMP = $WorkspaceTemp
+    $env:TMPDIR = $WorkspaceTemp
+}
+
 function Test-PinnedToolchain {
     param([string]$MingwBin)
 
@@ -205,6 +213,7 @@ if (-not [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::Ordinal
 }
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
+$workspaceTemp = Join-Path $target "tmp"
 if (Test-Path -LiteralPath $target) {
     throw "target must be absent before toolchain work: $target"
 }
@@ -239,7 +248,13 @@ foreach ($argument in $commandArgs) {
 }
 
 $commandExit = 0
+$previousTempEnvironment = @{}
+foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+    $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+}
 try {
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
+    New-Item -ItemType Directory -Path $workspaceTemp -Force | Out-Null
     & $Command @commandArgs
     if ($null -ne $LASTEXITCODE) {
         $commandExit = $LASTEXITCODE
@@ -251,6 +266,15 @@ finally {
     }
     if (Test-Path -LiteralPath $target) {
         throw "target cleanup failed: $target remains"
+    }
+    foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+        $previous = $previousTempEnvironment[$name]
+        if ($null -eq $previous) {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item -Path "Env:$name" -Value $previous.Value
+        }
     }
     Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
 }

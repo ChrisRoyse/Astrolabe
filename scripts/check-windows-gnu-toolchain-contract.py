@@ -61,6 +61,22 @@ def main() -> None:
         "the launcher must place its runtime first and use the bundled GNU Make",
     )
     require(
+        '$workspaceTemp = Join-Path $target "tmp"' in runner
+        and 'Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp' in runner
+        and 'function Set-WorkspaceTempEnvironment' in runner
+        and '$env:TEMP = $WorkspaceTemp' in runner
+        and '$env:TMP = $WorkspaceTemp' in runner
+        and '$env:TMPDIR = $WorkspaceTemp' in runner
+        and 'New-Item -ItemType Directory -Path $workspaceTemp -Force' in runner,
+        "the launcher must confine child temporary output to target/tmp",
+    )
+    require(
+        '$previousTempEnvironment = @{}' in runner
+        and 'Set-Item -Path "Env:$name" -Value $previous.Value' in runner
+        and 'Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue' in runner,
+        "the launcher must restore its caller's temporary-directory environment",
+    )
+    require(
         '[string]$CommandArgsJson = "[]"' in runner
         and 'ConvertFrom-Json -InputObject $CommandArgsJson' in runner,
         "the launcher must forward command arguments without PowerShell flag parsing",
