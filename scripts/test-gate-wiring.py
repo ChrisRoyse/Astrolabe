@@ -66,6 +66,23 @@ def main() -> int:
         require_error(checker.validate(fixture), "portable-gates job")
         copy_fixture(fixture)
 
+        check = fixture / "scripts/check.sh"
+        rewrite(
+            check,
+            'bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform',
+            '"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform\nbash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
+        )
+        require_error(checker.validate(fixture), "portable-before-egress order")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            "scripts/check-egress-deny.py --allow-unsupported-platform",
+            "scripts/check-egress-deny.py",
+        )
+        require_error(checker.validate(fixture), "allow-unsupported-platform")
+        copy_fixture(fixture)
+
         full = fixture / "scripts/check-full.sh"
         rewrite(
             full,

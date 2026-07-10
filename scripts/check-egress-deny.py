@@ -62,8 +62,15 @@ def base_env(cache):
     return env
 
 
-def require_strace():
+def require_strace(*, allow_unsupported_platform=False):
     if not sys.platform.startswith("linux"):
+        if allow_unsupported_platform:
+            print(
+                "SKIP[ASTRO_EGRESS_LINUX_REQUIRED]: "
+                "scripts/check-egress-deny.py is the only skipped gate; "
+                "Linux strace coverage is required from CI job portable-gates"
+            )
+            return None
         raise SystemExit(
             "ASTRO_EGRESS_LINUX_REQUIRED: egress-deny harness requires Linux strace injection"
         )
@@ -273,9 +280,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--astrolabe", type=Path)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument(
+        "--allow-unsupported-platform",
+        action="store_true",
+        help="Emit a named skip outside Linux; intended only for the cross-platform aggregate.",
+    )
     args = parser.parse_args()
 
-    strace = require_strace()
+    strace = require_strace(
+        allow_unsupported_platform=args.allow_unsupported_platform
+    )
+    if strace is None:
+        return
     astrolabe = args.astrolabe or default_astrolabe()
     if astrolabe is None or not astrolabe.exists():
         raise SystemExit(

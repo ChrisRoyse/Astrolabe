@@ -68,6 +68,31 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    require(
+        check,
+        "scripts/test-egress-platform.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require_order(
+        check,
+        (
+            "scripts/check-lowered-parity.py",
+            "scripts/check-shadow-parity.py",
+            "scripts/check-cross-process-vault.py",
+            "scripts/check-cross-process-servers.py",
+            "scripts/check-astrolabe-watchdog.sh",
+            "scripts/check-egress-deny.py",
+        ),
+        "scripts/check.sh portable-before-egress order",
+        errors,
+    )
+    require(
+        check,
+        "scripts/check-egress-deny.py --allow-unsupported-platform",
+        "scripts/check.sh",
+        errors,
+    )
 
     require_order(
         full,
@@ -135,6 +160,7 @@ def validate(root: Path) -> list[str]:
         "ci.yml portable-gates job",
         errors,
     )
+    require(portable, "strace", "ci.yml portable-gates job", errors)
 
     benchmark = workflow_job(workflow, "row-sink-benchmark", errors)
     require(

@@ -31,6 +31,7 @@ bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py
 "$PYTHON_BIN" scripts/test-gate-wiring.py
+"$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
 "$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
 "$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
@@ -50,7 +51,6 @@ bash scripts/check-mcp-parity.sh
 "$PYTHON_BIN" scripts/check-installer-roundtrip.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-hook-contracts.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-server-manifest.py
-"$PYTHON_BIN" scripts/check-egress-deny.py --astrolabe "$ROOT/target/debug/astrolabe"
 if [[ "${ASTROLABE_CHECK_UI_SMOKE:-0}" == "1" ]]; then
   "$PYTHON_BIN" scripts/check-lowered-parity.py --ui-smoke
 else
@@ -60,3 +60,4 @@ fi
 "$PYTHON_BIN" scripts/check-cross-process-vault.py
 "$PYTHON_BIN" scripts/check-cross-process-servers.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"
+"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"
