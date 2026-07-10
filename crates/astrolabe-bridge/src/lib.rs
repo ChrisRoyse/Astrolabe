@@ -193,17 +193,19 @@ unsafe extern "C" fn cbm_log_tracing_sink(line: *const c_char) {
     if line.is_null() {
         return;
     }
-    // SAFETY: CBM calls the sink with a NUL-terminated line valid for the call.
-    let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
-    if line.starts_with("level=error") {
-        tracing::error!(target: "cbm", "{line}");
-    } else if line.starts_with("level=warn") {
-        tracing::warn!(target: "cbm", "{line}");
-    } else if line.starts_with("level=debug") {
-        tracing::debug!(target: "cbm", "{line}");
-    } else {
-        tracing::info!(target: "cbm", "{line}");
-    }
+    drop(std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: CBM calls the sink with a NUL-terminated line valid for the call.
+        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
+        if line.starts_with("level=error") {
+            tracing::error!(target: "cbm", "{line}");
+        } else if line.starts_with("level=warn") {
+            tracing::warn!(target: "cbm", "{line}");
+        } else if line.starts_with("level=debug") {
+            tracing::debug!(target: "cbm", "{line}");
+        } else {
+            tracing::info!(target: "cbm", "{line}");
+        }
+    })));
 }
 
 #[cfg(unix)]
@@ -1805,6 +1807,36 @@ unsafe fn array_slice<'a, T>(
 mod tests {
     use super::*;
 
+    struct PanicOnLogEventSubscriber {
+        levels: std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>,
+    }
+
+    impl tracing::Subscriber for PanicOnLogEventSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.levels
+                .lock()
+                .expect("log level recorder is not poisoned")
+                .push(*event.metadata().level());
+            panic!("tracing subscriber panic probe");
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     #[inline(never)]
     fn move_watcher_callback_owner(owner: WatcherCallbackOwner) -> WatcherCallbackOwner {
         owner
@@ -1815,6 +1847,39 @@ mod tests {
         let (calyx, cbm) = parent_roots();
         assert!(calyx.ends_with("vendor/calyx"));
         assert!(cbm.ends_with("vendor/codebase-memory-mcp"));
+    }
+
+    #[test]
+    fn cbm_log_tracing_sink_contains_subscriber_panics_and_preserves_levels() {
+        let levels = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = PanicOnLogEventSubscriber {
+            levels: std::sync::Arc::clone(&levels),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            // SAFETY: NULL is an explicitly supported no-op input.
+            unsafe { cbm_log_tracing_sink(ptr::null()) };
+            for line in [
+                "level=error msg=error",
+                "level=warn msg=warn",
+                "level=debug msg=debug",
+                "level=info msg=info",
+            ] {
+                let line = CString::new(line).expect("test log line has no NUL");
+                // SAFETY: line remains live and NUL-terminated for this call.
+                unsafe { cbm_log_tracing_sink(line.as_ptr()) };
+            }
+        });
+
+        assert_eq!(
+            *levels.lock().expect("log level recorder is not poisoned"),
+            [
+                tracing::Level::ERROR,
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::INFO,
+            ]
+        );
     }
 
     #[test]
