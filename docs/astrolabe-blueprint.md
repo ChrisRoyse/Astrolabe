@@ -866,6 +866,13 @@ At assay time (08), each lens gets a capability card and the gate runs per repo:
 | S8 Ã— S14 | interaction | centralityÃ—coverage: load-bearing-but-untested detector |
 | S18 Ã— S17 | agreement | does the implementation match the route it serves |
 
+**Shape-safe scalar contract.** S19 x S18 uses direct cosine because both slots share the
+frozen semantic embedding space. Every other designed pair compares the two slots' own
+same-symbol similarity profiles across comparable peers, then takes cosine of those profiles.
+The system never coerces, truncates, or randomly projects unrelated frozen vector spaces into a
+fabricated common coordinate system. At least two comparable peers are required; otherwise the
+cross-term is explicitly Absent.
+
 ## 8. Panel evolution
 
 `astro.panel.v1` ships as above. Version bumps: v1â†’v2 when the gate + deficit loop (14) proposes new lenses (e.g. dataflow-graph signature, ownership lens, security-pattern lens). Old slots retire non-destructively (history remains readable). The sufficiency report per anchor axis is the roadmap for what lens to add next â€” instrumentation guided by measured deficits, not intuition.

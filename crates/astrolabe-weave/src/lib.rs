@@ -770,6 +770,26 @@ impl EagerAgreementKind {
             Self::RouteMatch => (SIM_SEMANTIC_SLOT, SLOT_ROUTE_MATCH),
         }
     }
+
+    const fn comparator(self) -> EagerCrossTermComparator {
+        match self {
+            // S19 and S18 are embeddings in the same frozen 768-dimensional space.
+            Self::DocDrift => EagerCrossTermComparator::DirectAgreement,
+            // The other designed pairs have distinct frozen source shapes. Their
+            // agreement is the cosine between per-symbol similarity neighborhoods.
+            Self::NameTruth
+            | Self::CloneTaxonomy
+            | Self::ComplexityChurn
+            | Self::CentralityCoverage
+            | Self::RouteMatch => EagerCrossTermComparator::NeighborhoodAgreement,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EagerCrossTermComparator {
+    DirectAgreement,
+    NeighborhoodAgreement,
 }
 
 impl fmt::Display for EagerAgreementKind {
@@ -815,6 +835,8 @@ pub enum CrossTermAbsentReason {
     ZeroNorm { slot: SlotId },
     InvalidSchema { slot: SlotId, message: String },
     ShapeMismatch,
+    InsufficientNeighborhood { comparable_peer_count: usize },
+    ZeroSimilarityProfile { slot: SlotId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1488,15 +1510,16 @@ fn anomaly_finding_order(left: &AnomalyFinding, right: &AnomalyFinding) -> Order
 
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
     let mut rows = Vec::with_capacity(nodes.len() * EagerAgreementKind::ALL.len());
-    for node in nodes {
-        for kind in EagerAgreementKind::ALL {
-            let (left_slot, right_slot) = kind.slots();
+    for kind in EagerAgreementKind::ALL {
+        let (left_slot, right_slot) = kind.slots();
+        let values = cross_term_values(nodes, kind);
+        for (node, value) in nodes.iter().zip(values) {
             rows.push(EagerCrossTermRow {
                 qualified_name: node.qualified_name.clone(),
                 kind,
                 left_slot,
                 right_slot,
-                value: cross_term_value(node, left_slot, right_slot),
+                value,
                 persisted: true,
             });
         }
@@ -1529,25 +1552,134 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
     }
 }
 
-fn cross_term_value(
-    node: &SimilarityNode,
-    left_slot: SlotId,
-    right_slot: SlotId,
+fn cross_term_values(nodes: &[SimilarityNode], kind: EagerAgreementKind) -> Vec<CrossTermValue> {
+    let (left_slot, right_slot) = kind.slots();
+    let operands = nodes
+        .iter()
+        .map(|node| {
+            (
+                cross_term_operand(node, left_slot),
+                cross_term_operand(node, right_slot),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    match kind.comparator() {
+        EagerCrossTermComparator::DirectAgreement => operands
+            .iter()
+            .map(|(left, right)| direct_cross_term_value(left, right))
+            .collect(),
+        EagerCrossTermComparator::NeighborhoodAgreement => (0..operands.len())
+            .map(|node_index| {
+                neighborhood_cross_term_value(node_index, left_slot, right_slot, &operands)
+            })
+            .collect(),
+    }
+}
+
+fn direct_cross_term_value(
+    left: &Result<NormalizedVector, CrossTermAbsentReason>,
+    right: &Result<NormalizedVector, CrossTermAbsentReason>,
 ) -> CrossTermValue {
-    let left = match cross_term_operand(node, left_slot) {
+    let left = match left {
         Ok(value) => value,
-        Err(reason) => return CrossTermValue::Absent { reason },
+        Err(reason) => {
+            return CrossTermValue::Absent {
+                reason: reason.clone(),
+            };
+        }
     };
-    let right = match cross_term_operand(node, right_slot) {
+    let right = match right {
         Ok(value) => value,
-        Err(reason) => return CrossTermValue::Absent { reason },
+        Err(reason) => {
+            return CrossTermValue::Absent {
+                reason: reason.clone(),
+            };
+        }
     };
-    match cosine(&left, &right) {
+    match cosine(left, right) {
         Some(value) => CrossTermValue::Scalar(value),
         None => CrossTermValue::Absent {
             reason: CrossTermAbsentReason::ShapeMismatch,
         },
     }
+}
+
+fn neighborhood_cross_term_value(
+    node_index: usize,
+    left_slot: SlotId,
+    right_slot: SlotId,
+    operands: &[CrossTermOperandPair],
+) -> CrossTermValue {
+    let (left, right) = &operands[node_index];
+    let left = match left {
+        Ok(value) => value,
+        Err(reason) => {
+            return CrossTermValue::Absent {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let right = match right {
+        Ok(value) => value,
+        Err(reason) => {
+            return CrossTermValue::Absent {
+                reason: reason.clone(),
+            };
+        }
+    };
+
+    let mut left_scores = Vec::with_capacity(operands.len().saturating_sub(1));
+    let mut right_scores = Vec::with_capacity(operands.len().saturating_sub(1));
+    for (peer_index, (peer_left, peer_right)) in operands.iter().enumerate() {
+        if peer_index == node_index {
+            continue;
+        }
+        let (Ok(peer_left), Ok(peer_right)) = (peer_left, peer_right) else {
+            continue;
+        };
+        let (Some(left_score), Some(right_score)) =
+            (cosine(left, peer_left), cosine(right, peer_right))
+        else {
+            continue;
+        };
+        left_scores.push(left_score);
+        right_scores.push(right_score);
+    }
+
+    if left_scores.len() < 2 {
+        return CrossTermValue::Absent {
+            reason: CrossTermAbsentReason::InsufficientNeighborhood {
+                comparable_peer_count: left_scores.len(),
+            },
+        };
+    }
+
+    let left_norm = dense_norm(&left_scores);
+    if zero_norm(left_norm) {
+        return CrossTermValue::Absent {
+            reason: CrossTermAbsentReason::ZeroSimilarityProfile { slot: left_slot },
+        };
+    }
+    let right_norm = dense_norm(&right_scores);
+    if zero_norm(right_norm) {
+        return CrossTermValue::Absent {
+            reason: CrossTermAbsentReason::ZeroSimilarityProfile { slot: right_slot },
+        };
+    }
+
+    let profile_dim = left_scores.len() as u32;
+    let left_profile = NormalizedVector::Dense {
+        dim: profile_dim,
+        data: left_scores,
+        norm: left_norm,
+    };
+    let right_profile = NormalizedVector::Dense {
+        dim: profile_dim,
+        data: right_scores,
+        norm: right_norm,
+    };
+    direct_cross_term_value(&Ok(left_profile), &Ok(right_profile))
 }
 
 fn cross_term_operand(
@@ -1818,6 +1950,11 @@ enum NormalizedVector {
     },
 }
 
+type CrossTermOperandPair = (
+    Result<NormalizedVector, CrossTermAbsentReason>,
+    Result<NormalizedVector, CrossTermAbsentReason>,
+);
+
 fn cosine(left: &NormalizedVector, right: &NormalizedVector) -> Option<f32> {
     let score = match (left, right) {
         (
@@ -1903,6 +2040,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    use astrolabe_domain::SymbolLabel;
+    use astrolabe_panel::{FixtureSlotRuntime, PanelDriver, PanelInput};
     use calyx_assay::{
         AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag,
     };
@@ -2856,27 +2995,109 @@ mod tests {
     }
 
     #[test]
-    fn golden_cross_terms_compute_dense_and_sparse_cosine() {
-        let node = SimilarityNode::new("symbol")
-            .with_slot(SLOT_DOC_SEMANTIC, dense(&[1.0, 0.0]))
-            .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.6, 0.8]))
-            .with_slot(SLOT_NAME_SEMANTIC, sparse(8, &[(1, 1.0), (3, 1.0)]))
-            .with_slot(SIM_API_SLOT, sparse(8, &[(1, 1.0), (3, 1.0)]))
-            .with_slot(SIM_STRUCT_SLOT, dense(&[0.6, 0.8]))
-            .with_slot(SLOT_COMPLEXITY, dense(&[1.0, 1.0]))
-            .with_slot(SLOT_CHURN, dense(&[1.0, 1.0]))
-            .with_slot(SLOT_GRAPH_POSITION, dense(&[1.0, 1.0]))
-            .with_slot(SLOT_TEST_COVERAGE, dense(&[1.0, 1.0]))
-            .with_slot(SLOT_ROUTE_MATCH, dense(&[0.6, 0.8]));
+    fn frozen_panel_shapes_produce_all_designed_cross_term_scalars() {
+        let nodes = vec![
+            frozen_panel_cross_term_node("symbol.alpha", 3),
+            frozen_panel_cross_term_node("symbol.beta", 5),
+            frozen_panel_cross_term_node("symbol.gamma", 7),
+        ];
+        assert!(matches!(
+            nodes[0].slots.get(&SLOT_NAME_SEMANTIC),
+            Some(SlotVector::Dense { dim: 768, .. })
+        ));
+        assert!(matches!(
+            nodes[0].slots.get(&SIM_API_SLOT),
+            Some(SlotVector::Sparse { dim: 262_144, .. })
+        ));
+        assert!(matches!(
+            nodes[0].slots.get(&SIM_STRUCT_SLOT),
+            Some(SlotVector::Sparse { dim: 65_536, .. })
+        ));
+        assert!(matches!(
+            nodes[0].slots.get(&SLOT_GRAPH_POSITION),
+            Some(SlotVector::Dense { dim: 16, .. })
+        ));
+        assert!(matches!(
+            nodes[0].slots.get(&SLOT_TEST_COVERAGE),
+            Some(SlotVector::Dense { dim: 4, .. })
+        ));
+        assert!(matches!(
+            nodes[0].slots.get(&SLOT_ROUTE_MATCH),
+            Some(SlotVector::Sparse { dim: 4_096, .. })
+        ));
 
-        let plan = plan_eager_cross_terms(&[node]);
-        let doc = row_value(&plan, EagerAgreementKind::DocDrift);
-        let name = row_value(&plan, EagerAgreementKind::NameTruth);
+        let plan = plan_eager_cross_terms(&nodes);
 
-        assert!((doc - 0.6).abs() <= f32::EPSILON);
-        assert_eq!(name, 1.0);
-        assert_eq!(plan.abundance.scalar_count, 6);
+        for kind in EagerAgreementKind::ALL {
+            let rows = plan
+                .rows
+                .iter()
+                .filter(|row| row.kind == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), nodes.len(), "{kind}");
+            assert!(
+                rows.iter()
+                    .all(|row| matches!(row.value, CrossTermValue::Scalar(_))),
+                "{kind} must not be structurally absent"
+            );
+        }
+        assert_eq!(
+            plan.abundance.scalar_count,
+            nodes.len() * EagerAgreementKind::ALL.len()
+        );
         assert_eq!(plan.abundance.absent_count, 0);
+        let name_truth = plan
+            .rows
+            .iter()
+            .find(|row| row.kind == EagerAgreementKind::NameTruth)
+            .expect("name-truth row");
+        assert!(
+            anomaly_substrate_row_from_eager_cross_term(name_truth, "xterm:frozen-panel").is_some()
+        );
+    }
+
+    #[test]
+    fn heterogeneous_cross_terms_require_two_comparable_peers() {
+        let nodes = vec![
+            frozen_panel_cross_term_node("symbol.alpha", 3),
+            frozen_panel_cross_term_node("symbol.beta", 5),
+        ];
+
+        let plan = plan_eager_cross_terms(&nodes);
+        let name_truth = plan
+            .rows
+            .iter()
+            .find(|row| row.kind == EagerAgreementKind::NameTruth)
+            .expect("name-truth row");
+
+        assert_eq!(
+            name_truth.value,
+            CrossTermValue::Absent {
+                reason: CrossTermAbsentReason::InsufficientNeighborhood {
+                    comparable_peer_count: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn name_truth_uses_frozen_shape_peer_similarity_profiles() {
+        let aligned = vec![
+            name_truth_frozen_node("symbol.alpha", 0, 0),
+            name_truth_frozen_node("symbol.beta", 0, 0),
+            name_truth_frozen_node("symbol.gamma", 1, 1),
+        ];
+        let misaligned = vec![
+            name_truth_frozen_node("symbol.alpha", 0, 0),
+            name_truth_frozen_node("symbol.beta", 0, 1),
+            name_truth_frozen_node("symbol.gamma", 1, 0),
+        ];
+
+        let aligned_score = named_cross_term_value(&plan_eager_cross_terms(&aligned));
+        let misaligned_score = named_cross_term_value(&plan_eager_cross_terms(&misaligned));
+
+        assert_eq!(aligned_score, 1.0);
+        assert_eq!(misaligned_score, 0.0);
     }
 
     #[test]
@@ -2977,23 +3198,60 @@ mod tests {
             .with_slot(SLOT_ROUTE_MATCH, dense(&[1.0, 0.0]))
     }
 
+    fn frozen_panel_cross_term_node(qn: &str, source_len: usize) -> SimilarityNode {
+        let mut input = PanelInput::fixture(SymbolLabel::Function);
+        input.source_bytes = vec![b'x'; source_len];
+        let readout = PanelDriver::default()
+            .measure(&input, &FixtureSlotRuntime)
+            .expect("frozen panel readout");
+        SimilarityNode {
+            qualified_name: qn.to_string(),
+            slots: readout.slots,
+        }
+    }
+
+    fn name_truth_frozen_node(qn: &str, name_index: usize, api_index: u32) -> SimilarityNode {
+        let mut name = vec![0.0; 768];
+        name[name_index] = 1.0;
+        SimilarityNode::new(qn)
+            .with_slot(
+                SLOT_NAME_SEMANTIC,
+                SlotVector::Dense {
+                    dim: 768,
+                    data: name,
+                },
+            )
+            .with_slot(
+                SIM_API_SLOT,
+                SlotVector::Sparse {
+                    dim: 262_144,
+                    entries: vec![SparseEntry {
+                        idx: api_index,
+                        val: 1.0,
+                    }],
+                },
+            )
+    }
+
+    fn named_cross_term_value(plan: &EagerCrossTermPlan) -> f32 {
+        match plan
+            .rows
+            .iter()
+            .find(|row| {
+                row.qualified_name == "symbol.alpha" && row.kind == EagerAgreementKind::NameTruth
+            })
+            .expect("name-truth row")
+            .value
+        {
+            CrossTermValue::Scalar(value) => value,
+            CrossTermValue::Absent { ref reason } => panic!("expected scalar, got {reason:?}"),
+        }
+    }
+
     fn dense(data: &[f32]) -> SlotVector {
         SlotVector::Dense {
             dim: data.len() as u32,
             data: data.to_vec(),
-        }
-    }
-
-    fn sparse(dim: u32, entries: &[(u32, f32)]) -> SlotVector {
-        SlotVector::Sparse {
-            dim,
-            entries: entries
-                .iter()
-                .map(|(idx, val)| SparseEntry {
-                    idx: *idx,
-                    val: *val,
-                })
-                .collect(),
         }
     }
 
@@ -3023,19 +3281,6 @@ mod tests {
             .iter()
             .map(|edge| (edge.source_qn.as_str(), edge.target_qn.as_str()))
             .collect()
-    }
-
-    fn row_value(plan: &EagerCrossTermPlan, kind: EagerAgreementKind) -> f32 {
-        match plan
-            .rows
-            .iter()
-            .find(|row| row.kind == kind)
-            .expect("cross term row")
-            .value
-        {
-            CrossTermValue::Scalar(value) => value,
-            CrossTermValue::Absent { ref reason } => panic!("expected scalar, got {reason:?}"),
-        }
     }
 
     fn anomaly_fixture_rows() -> Vec<AnomalySubstrateRow> {
