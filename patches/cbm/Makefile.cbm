@@ -34,9 +34,13 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
+# GNU Make expands $(shell ...) through a POSIX shell. Keep recipe commands in
+# their native form, but normalize Windows separators for compiler probes.
+CC_FOR_SHELL := $(subst \,/,$(CC))
+
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
-IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
@@ -77,7 +81,7 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # --allow-multiple-definition (MinGW CRT symbol clashes). The relocatable
 # libcbm merge needs the same allowance before the archive is formed.
 # Auto-detected via compiler; no manual override needed.
-IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
+IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
 MINGW_RELOC_LD_FLAGS :=
 ifeq ($(IS_MINGW),yes)

@@ -89,6 +89,12 @@ def main() -> None:
         and "$(MINGW_RELOC_LD_FLAGS)" in makefile,
         "the relocatable libcbm link must tolerate MinGW CRT import duplicates",
     )
+    require(
+        'CC_FOR_SHELL := $(subst \\,/,$(CC))' in makefile
+        and 'IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E -' in makefile
+        and 'IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E -' in makefile,
+        "the CBM overlay must normalize a native compiler path before POSIX shell probes",
+    )
 
     print("Windows GNU toolchain contract verified")
 
