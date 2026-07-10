@@ -4,12 +4,33 @@
     {"id": "claude-code", "detect": {"dir": ".claude"}},
     {"id": "codex", "detect": {"dir": ".codex"}},
     {"id": "gemini", "detect": {"dir": ".gemini"}},
-    {"id": "zed", "detect": {"dir": ".config/zed"}},
+    {
+      "id": "zed",
+      "detect": {
+        "dir": ".config/zed",
+        "windows_dir": "AppData/Local/Zed",
+        "macos_dir": "Library/Application Support/Zed"
+      }
+    },
     {"id": "opencode", "detect": {"fake_cli": "opencode"}},
     {"id": "antigravity", "detect": {"dir": ".gemini/antigravity-cli"}},
     {"id": "aider", "detect": {"fake_cli": "aider"}},
-    {"id": "kilocode", "detect": {"dir": ".config/Code/User/globalStorage/kilocode.kilo-code"}},
-    {"id": "vscode", "detect": {"dir": ".config/Code/User"}},
+    {
+      "id": "kilocode",
+      "detect": {
+        "dir": ".config/Code/User/globalStorage/kilocode.kilo-code",
+        "windows_dir": "AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+        "macos_dir": "Library/Application Support/Code/User/globalStorage/kilocode.kilo-code"
+      }
+    },
+    {
+      "id": "vscode",
+      "detect": {
+        "dir": ".config/Code/User",
+        "windows_dir": "AppData/Roaming/Code/User",
+        "macos_dir": "Library/Application Support/Code/User"
+      }
+    },
     {"id": "cursor", "detect": {"dir": ".cursor"}},
     {"id": "openclaw", "detect": {"dir": ".openclaw"}},
     {"id": "kiro", "detect": {"dir": ".kiro"}},

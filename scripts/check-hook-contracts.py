@@ -274,7 +274,10 @@ def main():
     astrolabe = resolve_binary(args.astrolabe)
     shim = resolve_binary(args.shim)
 
-    work = Path(tempfile.mkdtemp(prefix="astrolabe-hook-contract-"))
+    target = ROOT / "target"
+    target_existed = target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="astrolabe-hook-contract-", dir=target))
     try:
         repo = work / "repo"
         src = repo / "src"
@@ -308,6 +311,11 @@ def main():
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if not target_existed:
+            try:
+                target.rmdir()
+            except OSError:
+                pass
 
     print(
         "hook contracts verified: "

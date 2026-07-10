@@ -152,6 +152,12 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/test-installer-roundtrip-fixture.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/check-workspace-tests.py",
         "scripts/check.sh",
         errors,

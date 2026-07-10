@@ -147,6 +147,16 @@ def main() -> int:
 
         rewrite(
             check,
+            '"$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "test-installer-roundtrip-fixture.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
             '"$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py\n',
             "",
         )

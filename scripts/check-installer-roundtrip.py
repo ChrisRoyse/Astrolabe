@@ -64,13 +64,26 @@ def write_executable(path, text):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def fixture_detect_dir(detect, *, os_name=None, platform=None):
+    if os_name is None:
+        os_name = os.name
+    if platform is None:
+        platform = sys.platform
+    if os_name == "nt":
+        return detect.get("windows_dir", detect.get("dir"))
+    if platform == "darwin":
+        return detect.get("macos_dir", detect.get("dir"))
+    return detect.get("dir")
+
+
 def setup_fake_home(home, fixture):
     fakebin = home / "fakebin"
     fakebin.mkdir(parents=True)
     for agent in fixture["agents"]:
         detect = agent.get("detect") or {}
-        if "dir" in detect:
-            (home / detect["dir"]).mkdir(parents=True, exist_ok=True)
+        detect_dir = fixture_detect_dir(detect)
+        if detect_dir:
+            (home / detect_dir).mkdir(parents=True, exist_ok=True)
         if "fake_cli" in detect:
             write_executable(fakebin / detect["fake_cli"], "#!/usr/bin/env sh\nexit 0\n")
     for command in fixture.get("shadowed_system_commands", []):
@@ -80,11 +93,35 @@ def setup_fake_home(home, fixture):
     return fakebin
 
 
+def fixture_environment(home, fakebin):
+    temp = home / "tmp"
+    temp.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["APPDATA"] = str(home / "AppData" / "Roaming")
+    env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
+    env["CBM_CACHE_DIR"] = str(home / ".cache")
+    env["TEMP"] = str(temp)
+    env["TMP"] = str(temp)
+    env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
+    env["SHELL"] = "/bin/sh"
+    return env
+
+
+def installed_binary_relative_path(os_name=None):
+    if os_name is None:
+        os_name = os.name
+    suffix = ".exe" if os_name == "nt" else ""
+    return f".local/bin/codebase-memory-mcp{suffix}"
+
+
 def snapshot_files(home):
     files = {}
     for path in sorted(home.rglob("*")):
         if path.is_file():
-            files[str(path.relative_to(home))] = path.read_bytes()
+            files[path.relative_to(home).as_posix()] = path.read_bytes()
     return files
 
 
@@ -128,15 +165,15 @@ def assert_plan(binary, env, expected_agents):
 
 
 def run_roundtrip(binary, fixture):
-    home = Path(tempfile.mkdtemp(prefix=f"astrolabe-installer-{binary.name}-"))
+    target = ROOT / "target"
+    target_existed = target.exists()
+    target.mkdir(parents=True, exist_ok=True)
+    home = Path(
+        tempfile.mkdtemp(prefix=f"astrolabe-installer-{binary.name}-", dir=target)
+    )
     try:
         fakebin = setup_fake_home(home, fixture)
-        env = dict(os.environ)
-        env["HOME"] = str(home)
-        env["XDG_CONFIG_HOME"] = str(home / ".config")
-        env["CBM_CACHE_DIR"] = str(home / ".cache")
-        env["PATH"] = str(fakebin) + os.pathsep + env.get("PATH", "")
-        env["SHELL"] = "/bin/sh"
+        env = fixture_environment(home, fakebin)
         expected_agents = [agent["id"] for agent in fixture["agents"]]
 
         baseline = snapshot_files(home)
@@ -146,7 +183,7 @@ def run_roundtrip(binary, fixture):
 
         run([binary, "install", "-y", "--force"], env=env, timeout=120)
         installed = snapshot_files(home)
-        installed_binary = ".local/bin/codebase-memory-mcp"
+        installed_binary = installed_binary_relative_path()
         if installed_binary not in installed:
             fail(f"{binary.name} install did not write {installed_binary}")
 
@@ -163,6 +200,11 @@ def run_roundtrip(binary, fixture):
         }
     finally:
         shutil.rmtree(home, ignore_errors=True)
+        if not target_existed:
+            try:
+                target.rmdir()
+            except OSError:
+                pass
 
 
 def main():

@@ -62,6 +62,7 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/test-check-workspace-tests.py
 "$PYTHON_BIN" scripts/test-verify-chain-native-path.py
 "$PYTHON_BIN" scripts/test-native-binary-resolution.py
+"$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py
 "$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
 "$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
