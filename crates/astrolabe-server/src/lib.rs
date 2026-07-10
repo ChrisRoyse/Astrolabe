@@ -13,7 +13,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use astrolabe_bridge::CbmToolRunner;
+use astrolabe_bridge::{BridgeError, CbmToolRunner, ErrorEnvelope};
 
 mod migration;
 
@@ -145,14 +145,25 @@ fn run_server() -> Result<i32, DynError> {
     Ok(0)
 }
 
-pub fn serve_jsonrpc<R, W>(
-    runner: &CbmToolRunner,
+pub fn serve_jsonrpc<R, W>(runner: &CbmToolRunner, reader: R, writer: W) -> Result<(), DynError>
+where
+    R: BufRead,
+    W: Write,
+{
+    serve_jsonrpc_with_handler(reader, writer, |request| {
+        migration::handle_jsonrpc_raw(runner, request)
+    })
+}
+
+fn serve_jsonrpc_with_handler<R, W, F>(
     mut reader: R,
     mut writer: W,
+    mut handler: F,
 ) -> Result<(), DynError>
 where
     R: BufRead,
     W: Write,
+    F: FnMut(&str) -> Result<Option<String>, DynError>,
 {
     let mut line = String::new();
     loop {
@@ -170,7 +181,7 @@ where
             let mut body = vec![0_u8; content_len];
             reader.read_exact(&mut body)?;
             let request = String::from_utf8(body)?;
-            if let Some(response) = migration::handle_jsonrpc_raw(runner, &request)? {
+            if let Some(response) = dispatch_jsonrpc_request(&request, &mut handler)? {
                 write!(
                     writer,
                     "Content-Length: {}\r\n\r\n{}",
@@ -182,11 +193,89 @@ where
             continue;
         }
 
-        if let Some(response) = migration::handle_jsonrpc_raw(runner, &line)? {
+        if let Some(response) = dispatch_jsonrpc_request(&line, &mut handler)? {
             writeln!(writer, "{response}")?;
             writer.flush()?;
         }
     }
+}
+
+fn dispatch_jsonrpc_request<F>(
+    request_json: &str,
+    handler: &mut F,
+) -> Result<Option<String>, DynError>
+where
+    F: FnMut(&str) -> Result<Option<String>, DynError>,
+{
+    match handler(request_json) {
+        Ok(response) => Ok(response),
+        Err(error) => handler_error_response(request_json, error.as_ref()),
+    }
+}
+
+fn handler_error_response(
+    request_json: &str,
+    error: &(dyn Error + Send + Sync + 'static),
+) -> Result<Option<String>, DynError> {
+    let envelope = request_error_envelope(error);
+    tracing::warn!(
+        code = %envelope.code,
+        message = %envelope.message,
+        "server.request_handler_error"
+    );
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(request_json) else {
+        return Ok(None);
+    };
+    let Some(request) = request.as_object() else {
+        return Ok(None);
+    };
+    let Some(id) = request
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number() || id.is_null())
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let response = if method == "tools/call" {
+        let text = serde_json::to_string(&envelope)?;
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": envelope,
+                "isError": true
+            }
+        })
+    } else {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": envelope
+            }
+        })
+    };
+    Ok(Some(serde_json::to_string(&response)?))
+}
+
+fn request_error_envelope(error: &(dyn Error + Send + Sync + 'static)) -> ErrorEnvelope {
+    if let Some(error) = error.downcast_ref::<BridgeError>() {
+        return error.envelope().clone();
+    }
+    ErrorEnvelope::new(
+        "ASTRO_MCP_HANDLER_INTERNAL",
+        error.to_string(),
+        "Retry the request after checking the named persisted store or lock; if it repeats, inspect Astrolabe diagnostics while keeping the MCP session open.",
+    )
 }
 
 fn trim_line_ending(line: &mut String) {
@@ -1078,6 +1167,150 @@ mod tests {
     }
 
     #[test]
+    fn tool_handler_error_is_structured_and_line_loop_continues() {
+        let first = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index_status","arguments":{}}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}"#;
+        let input = Cursor::new(format!("{first}\n{second}\n"));
+        let mut output = Vec::new();
+        let mut calls = 0;
+
+        serve_jsonrpc_with_handler(input, &mut output, |_| {
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::other("config database busy").into());
+            }
+            Ok(Some(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"alive":true}}"#.to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["result"]["isError"], true);
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["code"],
+            "ASTRO_MCP_HANDLER_INTERNAL"
+        );
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["message"],
+            "config database busy"
+        );
+        assert!(
+            responses[0]["result"]["structuredContent"]["remediation"]
+                .as_str()
+                .is_some_and(|value| value.contains("Retry"))
+        );
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["result"]["alive"], true);
+    }
+
+    #[test]
+    fn content_length_loop_continues_after_handler_error() {
+        let first = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index_status","arguments":{}}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":4,"method":"ping","params":{}}"#;
+        let input = Cursor::new(format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            first.len(),
+            first,
+            second.len(),
+            second
+        ));
+        let mut output = Vec::new();
+        let mut calls = 0;
+
+        serve_jsonrpc_with_handler(input, &mut output, |_| {
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::other("vault temporarily unavailable").into());
+            }
+            Ok(Some(
+                r#"{"jsonrpc":"2.0","id":4,"result":{"alive":true}}"#.to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        let responses = framed_json_responses(&output);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 3);
+        assert_eq!(responses[0]["result"]["isError"], true);
+        assert_eq!(responses[1]["id"], 4);
+        assert_eq!(responses[1]["result"]["alive"], true);
+    }
+
+    #[test]
+    fn non_tool_handler_error_uses_jsonrpc_internal_error() {
+        let error = io::Error::other("poisoned request state");
+        let response = handler_error_response(
+            r#"{"jsonrpc":"2.0","id":"req-5","method":"ping","params":{}}"#,
+            &error,
+        )
+        .unwrap()
+        .expect("request with id receives an error response");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["id"], "req-5");
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], "Internal error");
+        assert_eq!(
+            response["error"]["data"]["code"],
+            "ASTRO_MCP_HANDLER_INTERNAL"
+        );
+        assert_eq!(
+            response["error"]["data"]["message"],
+            "poisoned request state"
+        );
+        assert!(response["error"]["data"]["remediation"].is_string());
+    }
+
+    #[test]
+    fn notification_handler_error_emits_nothing_and_loop_continues() {
+        let notification = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"index_status","arguments":{}}}"#;
+        let request = r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#;
+        let input = Cursor::new(format!("{notification}\n{request}\n"));
+        let mut output = Vec::new();
+        let mut calls = 0;
+
+        serve_jsonrpc_with_handler(input, &mut output, |_| {
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::other("notification failed").into());
+            }
+            Ok(Some(
+                r#"{"jsonrpc":"2.0","id":6,"result":{"alive":true}}"#.to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        let responses = String::from_utf8(output).unwrap();
+        assert_eq!(responses.lines().count(), 1);
+        let response: serde_json::Value = serde_json::from_str(responses.trim()).unwrap();
+        assert_eq!(response["id"], 6);
+        assert_eq!(response["result"]["alive"], true);
+    }
+
+    #[test]
+    fn malformed_content_length_remains_transport_fatal() {
+        let input = Cursor::new(b"Content-Length: nope\r\n\r\n".as_slice());
+        let mut output = Vec::new();
+        let error = serve_jsonrpc_with_handler(input, &mut output, |_| {
+            panic!("handler must not run for malformed framing")
+        })
+        .expect_err("malformed Content-Length remains fatal");
+
+        assert!(error.to_string().contains("invalid digit"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn content_length_transport_returns_framed_response() {
         let runner = CbmToolRunner::new(":memory:").unwrap();
         let body = r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}"#;
@@ -1089,6 +1322,28 @@ mod tests {
         assert!(out.starts_with("Content-Length: "));
         assert!(out.contains(r#""id":3"#));
         assert!(out.contains(r#""result":{}"#));
+    }
+
+    fn framed_json_responses(mut bytes: &[u8]) -> Vec<serde_json::Value> {
+        let mut responses = Vec::new();
+        while !bytes.is_empty() {
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("framed response header terminator");
+            let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let content_len = header
+                .strip_prefix("Content-Length:")
+                .expect("Content-Length response header")
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            let body_start = header_end + 4;
+            let body_end = body_start + content_len;
+            responses.push(serde_json::from_slice(&bytes[body_start..body_end]).unwrap());
+            bytes = &bytes[body_end..];
+        }
+        responses
     }
 
     #[test]
