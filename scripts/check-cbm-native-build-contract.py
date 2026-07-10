@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD_RS = ROOT / "crates" / "cbm-sys" / "build.rs"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
 MEM_PRESSURE_PATCH = ROOT / "patches" / "cbm" / "apply_mem_pressure_patch.py"
+LAYOUT_PROBE = ROOT / "patches" / "cbm" / "astro_layout_probe.c"
 
 
 def require(condition: bool, message: str) -> None:
@@ -19,6 +20,8 @@ def main() -> None:
     build_rs = BUILD_RS.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
     mem_pressure_patch = MEM_PRESSURE_PATCH.read_text(encoding="utf-8")
+
+    require(LAYOUT_PROBE.is_file(), "the native C ABI layout probe must be present")
 
     require(
         '.arg(make_path(patched_makefile))' in build_rs,
@@ -77,6 +80,18 @@ def main() -> None:
         "Cargo must rebuild when the CBM pressure-log overlay changes",
     )
     require(
+        'let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");' in build_rs
+        and "layout_probe.display()" in build_rs,
+        "Cargo must rebuild when the native C ABI layout probe changes",
+    )
+    require(
+        "fn write_layout_test_bindings(" in build_rs
+        and 'write_layout_test_bindings(&out_dir, &cbm_root, &header);' in build_rs
+        and ".layout_tests(layout_tests)" in build_rs
+        and "generate_bindings(cbm_root, header, true, false)" in build_rs,
+        "cbm-sys must generate target-local type-only bindgen layout assertions",
+    )
+    require(
         '"TARGET"' in build_rs
         and '"PATH"' in build_rs
         and '"CBM_SYS_ASAN"' in build_rs
@@ -90,6 +105,13 @@ def main() -> None:
     require(
         "LIBCBM_DEPFLAGS = -MMD -MP" in makefile,
         "libcbm compiles must emit transitive-header depfiles",
+    )
+    require(
+        "ASTRO_LAYOUT_PROBE_SRC = $(ASTROLABE_PATCH_DIR)/astro_layout_probe.c" in makefile
+        and "ASTRO_LAYOUT_PROBE_OBJ = $(LIBCBM_DIR)/astro_layout_probe.o" in makefile
+        and "$(ASTRO_LAYOUT_PROBE_OBJ)" in makefile
+        and "-I$(ASTRO_FFI_INCLUDE_DIR) -c -o $@ $<" in makefile,
+        "libcbm must compile and retain the native C ABI layout probe",
     )
     require(
         "-include $(LIBCBM_DEPFILES)" in makefile,

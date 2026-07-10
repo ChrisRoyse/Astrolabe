@@ -20,6 +20,21 @@ pub const VENDORED_MIMALLOC_VERSION: &str = env!("CBM_MIMALLOC_VERSION");
 
 include!("bindings.rs");
 
+#[cfg(test)]
+#[allow(
+    clippy::all,
+    clashing_extern_declarations,
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unsafe_op_in_unsafe_fn,
+    unused_imports
+)]
+mod bindgen_layout_tests {
+    include!(concat!(env!("OUT_DIR"), "/cbm-layout-tests.rs"));
+}
+
 #[cfg(not(cbm_sys_asan))]
 #[global_allocator]
 static ASTROLABE_MIMALLOC: CbmMiMalloc = CbmMiMalloc;
@@ -294,7 +309,154 @@ unsafe fn store_error_message(store: *mut cbm_store_t) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::mem::{align_of, offset_of, size_of};
     use std::ptr::NonNull;
+
+    macro_rules! native_layout_field_name {
+        ($field:ident) => {
+            stringify!($field)
+        };
+        ($field:ident => $c_field:literal) => {
+            $c_field
+        };
+    }
+
+    macro_rules! assert_native_offsets {
+        ($rust_type:ty, $c_type:literal; $($rust_field:ident $(=> $c_field:literal)?),+ $(,)?) => {
+            $(
+                assert_native_field_offset(
+                    $c_type,
+                    native_layout_field_name!($rust_field $(=> $c_field)?),
+                    offset_of!($rust_type, $rust_field),
+                );
+            )+
+        };
+    }
+
+    fn assert_native_type_layout<T>(type_name: &str) {
+        let type_name_c = CString::new(type_name).expect("test type names contain no NUL");
+        let mut c_size = usize::MAX;
+        let mut c_align = usize::MAX;
+        let status =
+            unsafe { cbm_abi_layout_size(type_name_c.as_ptr(), &mut c_size, &mut c_align) };
+
+        assert_eq!(status, 0, "C ABI probe did not recognize type {type_name}");
+        assert_eq!(c_size, size_of::<T>(), "size mismatch for {type_name}");
+        assert_eq!(
+            c_align,
+            align_of::<T>(),
+            "alignment mismatch for {type_name}"
+        );
+    }
+
+    fn assert_native_field_offset(type_name: &str, field_name: &str, rust_offset: usize) {
+        let type_name_c = CString::new(type_name).expect("test type names contain no NUL");
+        let field_name_c = CString::new(field_name).expect("test field names contain no NUL");
+        let mut c_offset = usize::MAX;
+        let status = unsafe {
+            cbm_abi_layout_offset(type_name_c.as_ptr(), field_name_c.as_ptr(), &mut c_offset)
+        };
+
+        assert_eq!(
+            status, 0,
+            "C ABI probe did not recognize {type_name}.{field_name}"
+        );
+        assert_eq!(
+            c_offset, rust_offset,
+            "field offset mismatch for {type_name}.{field_name}"
+        );
+    }
+
+    #[test]
+    fn bindgen_layout_assertions_cover_consumed_ffi_structs() {
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/cbm-layout-tests.rs"));
+        for type_name in [
+            "CBMFileResult",
+            "cbm_gbuf_row_node_t",
+            "cbm_gbuf_row_edge_t",
+        ] {
+            assert!(
+                generated.contains(&format!("Size of {type_name}")),
+                "bindgen did not generate a size assertion for {type_name}"
+            );
+            assert!(
+                generated.contains(&format!("Alignment of {type_name}")),
+                "bindgen did not generate an alignment assertion for {type_name}"
+            );
+            assert!(
+                generated.contains(&format!("Offset of field: {type_name}::")),
+                "bindgen did not generate field-offset assertions for {type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_c_layout_matches_rust_bindings() {
+        assert_native_type_layout::<CBMFileResult>("CBMFileResult");
+        assert_native_offsets!(
+            CBMFileResult,
+            "CBMFileResult";
+            arena,
+            defs,
+            calls,
+            imports,
+            usages,
+            throws,
+            rw,
+            type_refs,
+            env_accesses,
+            type_assigns,
+            impl_traits,
+            resolved_calls,
+            string_refs,
+            infra_bindings,
+            channels,
+            module_qn,
+            namespace_name,
+            exports,
+            constants,
+            global_vars,
+            macros,
+            has_error,
+            error_msg,
+            is_test_file,
+            imports_count,
+            cached_tree,
+            cached_lang,
+            source,
+            source_len,
+        );
+
+        assert_native_type_layout::<cbm_gbuf_row_node_t>("cbm_gbuf_row_node_t");
+        assert_native_offsets!(
+            cbm_gbuf_row_node_t,
+            "cbm_gbuf_row_node_t";
+            id,
+            project,
+            label,
+            name,
+            qualified_name,
+            file_path,
+            start_line,
+            end_line,
+            properties_json,
+        );
+
+        assert_native_type_layout::<cbm_gbuf_row_edge_t>("cbm_gbuf_row_edge_t");
+        assert_native_offsets!(
+            cbm_gbuf_row_edge_t,
+            "cbm_gbuf_row_edge_t";
+            id,
+            project,
+            source_id,
+            target_id,
+            type_ => "type",
+            properties_json,
+            url_path_gen,
+            local_name_gen,
+        );
+    }
 
     #[test]
     fn exposes_cbm_vendor_root() {

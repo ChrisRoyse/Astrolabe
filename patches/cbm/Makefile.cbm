@@ -660,6 +660,10 @@ cbm: $(BUILD_DIR)/codebase-memory-mcp
 ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
 ASTRO_ALLOC_SHIM_SRC = $(ASTROLABE_PATCH_DIR)/astro_alloc_shim.c
 ASTRO_ALLOC_SHIM_OBJ = $(LIBCBM_DIR)/astro_alloc_shim.o
+ASTRO_LAYOUT_PROBE_SRC = $(ASTROLABE_PATCH_DIR)/astro_layout_probe.c
+ASTRO_LAYOUT_PROBE_OBJ = $(LIBCBM_DIR)/astro_layout_probe.o
+ASTRO_FFI_INCLUDE_DIR = $(ASTROLABE_PATCH_DIR)/../../crates/cbm-sys/include
+ASTRO_FFI_HEADER = $(ASTRO_FFI_INCLUDE_DIR)/astro_ffi.h
 ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py
 ASTRO_MEM_PRESSURE_SRC = src/foundation/mem.c
 ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c
@@ -677,7 +681,7 @@ endif
 LIBCBM_C_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(filter %.c,$(LIBCBM_SRCS)))
 LIBCBM_CXX_OBJS = $(patsubst %.cpp,$(LIBCBM_DIR)/%.o,$(filter %.cpp,$(LIBCBM_SRCS)))
 LIBCBM_ASM_OBJS = $(patsubst %.S,$(LIBCBM_DIR)/%.o,$(UNIXCODER_BLOB_SRC))
-LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ)
+LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ) $(ASTRO_LAYOUT_PROBE_OBJ)
 # Compiler depfiles cover transitive includes; the config stamp covers command
 # inputs that Make cannot infer from source timestamps.
 LIBCBM_DEPFILES = $(LIBCBM_OBJS:.o=.d)
@@ -734,6 +738,10 @@ $(LIBCBM_DIR)/$(MIMALLOC_SRC:.c=.o): $(MIMALLOC_SRC) | $(BUILD_DIR)
 $(ASTRO_ALLOC_SHIM_OBJ): $(ASTRO_ALLOC_SHIM_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) -Ivendored/mimalloc/include -Ivendored/mimalloc/src -c -o $@ $<
+
+$(ASTRO_LAYOUT_PROBE_OBJ): $(ASTRO_LAYOUT_PROBE_SRC) $(ASTRO_FFI_HEADER) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTRO_FFI_INCLUDE_DIR) -c -o $@ $<
 
 $(ASTRO_MEM_PRESSURE_OVERLAY): $(ASTRO_MEM_PRESSURE_SRC) $(ASTRO_MEM_PRESSURE_PATCH) | $(BUILD_DIR)
 	mkdir -p $(dir $@)

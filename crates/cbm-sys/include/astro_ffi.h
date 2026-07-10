@@ -51,4 +51,10 @@ CBM_API void cbm_mimalloc_process_info(size_t *elapsed_msecs,
                                        size_t *peak_commit,
                                        size_t *page_faults);
 
+/* Native test probes implemented by Astrolabe's libcbm patch. They make the
+ * C compiler's size, alignment, and field offsets observable to Rust tests. */
+CBM_API int cbm_abi_layout_size(const char *type_name, size_t *size_out, size_t *align_out);
+CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
+                                  size_t *offset_out);
+
 #endif /* ASTROLABE_ASTRO_FFI_H */

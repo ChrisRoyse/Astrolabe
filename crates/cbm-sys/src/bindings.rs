@@ -3395,3 +3395,17 @@ unsafe extern "C" {
         page_faults: *mut usize,
     );
 }
+unsafe extern "C" {
+    pub fn cbm_abi_layout_size(
+        type_name: *const ::std::os::raw::c_char,
+        size_out: *mut usize,
+        align_out: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_abi_layout_offset(
+        type_name: *const ::std::os::raw::c_char,
+        field_name: *const ::std::os::raw::c_char,
+        offset_out: *mut usize,
+    ) -> ::std::os::raw::c_int;
+}

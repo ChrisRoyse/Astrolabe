@@ -33,6 +33,7 @@ fn main() {
     let cbm_root = repo_root.join("vendor/codebase-memory-mcp");
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
+    let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");
     let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
@@ -45,6 +46,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", build_support.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
+    println!("cargo:rerun-if-changed={}", layout_probe.display());
     println!("cargo:rerun-if-changed={}", mem_pressure_patch.display());
     for path in [
         cbm_root.join("src"),
@@ -77,6 +79,7 @@ fn main() {
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
     run_make(&cbm_root, &patched_makefile, &build_dir, &config_stamp);
+    write_layout_test_bindings(&out_dir, &cbm_root, &header);
     verify_bindings(&manifest_dir, &cbm_root, &header);
     emit_link_directives(&build_dir);
 }
@@ -195,8 +198,13 @@ fn make_command_path(value: &str) -> String {
     }
 }
 
+fn write_layout_test_bindings(out_dir: &Path, cbm_root: &Path, header: &Path) {
+    let generated = generate_bindings(cbm_root, header, true, false);
+    write_if_changed(&out_dir.join("cbm-layout-tests.rs"), generated.as_bytes());
+}
+
 fn verify_bindings(manifest_dir: &Path, cbm_root: &Path, header: &Path) {
-    let generated = generate_bindings(cbm_root, header);
+    let generated = generate_bindings(cbm_root, header, false, true);
     let bindings_path = manifest_dir.join("src/bindings.rs");
 
     if env::var_os("ASTROLABE_UPDATE_BINDINGS").is_some() {
@@ -220,8 +228,13 @@ fn verify_bindings(manifest_dir: &Path, cbm_root: &Path, header: &Path) {
     }
 }
 
-fn generate_bindings(cbm_root: &Path, header: &Path) -> String {
-    let bindings = bindgen::Builder::default()
+fn generate_bindings(
+    cbm_root: &Path,
+    header: &Path,
+    layout_tests: bool,
+    include_functions: bool,
+) -> String {
+    let mut builder = bindgen::Builder::default()
         .header(header.display().to_string())
         .clang_arg(format!("-I{}", cbm_root.join("internal/cbm").display()))
         .clang_arg(format!(
@@ -232,7 +245,6 @@ fn generate_bindings(cbm_root: &Path, header: &Path) -> String {
         ))
         .clang_arg(format!("-I{}", cbm_root.join("src").display()))
         .clang_arg(format!("-I{}", cbm_root.join("src/foundation").display()))
-        .allowlist_function("cbm_.*")
         .allowlist_type("CBM.*")
         .allowlist_type("cbm_.*")
         .allowlist_type("TS.*")
@@ -246,7 +258,11 @@ fn generate_bindings(cbm_root: &Path, header: &Path) -> String {
         .blocklist_type("sqlite3")
         .opaque_type("TS.*")
         .derive_default(true)
-        .layout_tests(false)
+        .layout_tests(layout_tests);
+    if include_functions {
+        builder = builder.allowlist_function("cbm_.*");
+    }
+    let bindings = builder
         .generate()
         .expect("failed to generate cbm-sys bindings");
     bindings.to_string()
