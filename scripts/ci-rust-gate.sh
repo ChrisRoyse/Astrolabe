@@ -205,7 +205,7 @@ run_astrolabe_bridge_asan() {
 }
 
 cd "$ROOT"
-run_logged "astrolabe-fmt-$LABEL" cargo fmt --check --all
+run_logged "astrolabe-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all -- --check
 run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets --target "$TARGET_TRIPLE" -- -D warnings
 run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace --target "$TARGET_TRIPLE"
 run_logged "astrolabe-verify-chain-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/$TARGET_TRIPLE/debug/astrolabe"

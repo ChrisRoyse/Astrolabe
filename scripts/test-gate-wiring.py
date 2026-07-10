@@ -17,6 +17,7 @@ FILES = (
     "scripts/check-full.sh",
     "scripts/check-release.sh",
     "scripts/ci-cbm-test.sh",
+    "scripts/ci-rust-gate.sh",
     "scripts/check-workspace-tests.py",
     "scripts/clean-target.sh",
 )
@@ -100,6 +101,31 @@ def main() -> int:
             "",
         )
         require_error(checker.validate(fixture), "test-parity-corpus-contract.py")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/test-native-cargo-fmt.py\n',
+            "",
+        )
+        require_error(checker.validate(fixture), "test-native-cargo-fmt.py")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check\n',
+            "",
+        )
+        require_error(checker.validate(fixture), "native-cargo-fmt.py --all -- --check")
+        copy_fixture(fixture)
+
+        rust_gate = fixture / "scripts/ci-rust-gate.sh"
+        rewrite(
+            rust_gate,
+            'python3 "$ROOT/scripts/native-cargo-fmt.py" --all -- --check',
+            "cargo fmt --check --all",
+        )
+        require_error(checker.validate(fixture), "scripts/ci-rust-gate.sh")
         copy_fixture(fixture)
 
         full = fixture / "scripts/check-full.sh"

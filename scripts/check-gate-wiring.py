@@ -56,6 +56,7 @@ def validate(root: Path) -> list[str]:
     full = read(root, "scripts/check-full.sh", errors)
     release = read(root, "scripts/check-release.sh", errors)
     cbm_test = read(root, "scripts/ci-cbm-test.sh", errors)
+    rust_gate = read(root, "scripts/ci-rust-gate.sh", errors)
     workspace_test = read(root, "scripts/check-workspace-tests.py", errors)
     clean_target = read(root, "scripts/clean-target.sh", errors)
 
@@ -99,6 +100,24 @@ def validate(root: Path) -> list[str]:
         check,
         "scripts/test-parity-corpus-contract.py",
         "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-native-cargo-fmt.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/native-cargo-fmt.py --all -- --check",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        rust_gate,
+        'python3 "$ROOT/scripts/native-cargo-fmt.py" --all -- --check',
+        "scripts/ci-rust-gate.sh",
         errors,
     )
     require(
