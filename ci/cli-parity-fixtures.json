@@ -19,6 +19,11 @@
     "get_provenance": {},
     "optimizer_status": {},
     "get_readiness": {},
+    "impute_fields": {
+      "project": "cli-parity-impute-fields",
+      "target": "symbol:demo:parse_config",
+      "field": "doc"
+    },
     "team_artifact": {}
   }
 }
