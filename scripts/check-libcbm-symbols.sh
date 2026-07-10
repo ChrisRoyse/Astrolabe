@@ -29,7 +29,7 @@ PY
   fi
 fi
 if [[ -z "$LIB" || ! -f "$LIB" ]]; then
-  echo "ERROR: libcbm.a not found. Run `cargo test -p cbm-sys --no-run` first or pass the path." >&2
+  echo 'ERROR: libcbm.a not found. Run `cargo test -p cbm-sys --no-run` first or pass the path.' >&2
   exit 1
 fi
 

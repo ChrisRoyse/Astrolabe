@@ -91,6 +91,12 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/test-check-libcbm-symbols.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/check-allocator-contract.py",
         "scripts/check.sh",
         errors,
