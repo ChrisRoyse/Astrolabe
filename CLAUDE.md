@@ -6,6 +6,14 @@ ASTROLABE fuses Calyx (Rust association-native DB engine, `vendor/calyx`) with c
 
 **GitHub issues are the single source of truth for what is done, in progress, and remaining.** The blueprint describes the *design*; it never records *progress*. If you learn something about project state, it goes in an issue comment. If it isn't on an issue, it didn't happen.
 
+## Execution context (mandatory)
+
+- **Canonical workspace:** all repository work starts from and remains rooted at `C:\code\Astrolabe`. Run commands with that exact directory as the working directory. Do not use a copied checkout, shadow tree, `/mnt/c/...` path, or project-owned output directory outside this workspace.
+- **Native Windows only:** never invoke `wsl`, `wsl.exe`, a WSL distribution, or a command through a WSL path. Use PowerShell and native Windows executables. If a POSIX shell is required, use a verified Git for Windows executable such as `C:\Program Files\Git\bin\bash.exe`; `C:\Windows\System32\bash.exe` is the WSL launcher and is forbidden.
+- **No WSL-derived evidence:** tests, builds, checks, logs, and issue evidence produced under WSL do not count toward a Definition of Done. Re-run them natively from the canonical workspace. A gate that cannot run natively must be reported and tracked; WSL is not an allowed workaround.
+- **Workspace-local outputs:** repository-controlled build products, test databases, logs, fixtures, and temporary outputs must stay under `C:\code\Astrolabe`, normally under `target/`, and must never be staged or committed.
+- **Clean after every use:** every build, test, or check invocation (or one explicitly identified contiguous verification batch) owns its `target/` output and must delete `C:\code\Astrolabe\target` immediately after evidence is captured, including on failure or interruption. Verify that `target/` is absent before starting unrelated work and before every pause, stop, issue close, turn end, or handoff. Never allow build output to accumulate between sessions.
+
 ## Issue workflow (mandatory, in order)
 
 1. **Pick**: choose an issue labeled `status:ready` in the lowest-numbered open milestone (phases must complete in dependency-spine order: `P0 → P1 → P2 → (P3 ∥ P4) → P5 → P6 → (P7 ∥ P8) → P9`; see EPIC #65). Never start a `status:blocked` or `status:needs-spec` issue.
@@ -14,7 +22,7 @@ ASTROLABE fuses Calyx (Rust association-native DB engine, `vendor/calyx`) with c
 4. **Work in scope**: implement ONLY what the issue's Scope section says. Discovered adjacent work = file a new issue with labels + milestone + a `Blocked by:`/`Blocks:` line, and link it in a comment. Never expand scope in place.
 5. **Commit discipline**: every commit message body must reference the issue (`Refs #N`, or `Closes #N` on the final commit). No commit may touch `docs/astrolabe-blueprint.md` to record progress — status prose in the blueprint is banned (design corrections are fine).
 6. **Prove, then check the box**: a DoD checkbox may only be checked in the same session that ran its verification (test name + result pasted in a comment). Tests must verify persisted state (FSV byte readback), not API echoes.
-7. **Gate before done**: run `bash scripts/check.sh` (or, on Windows, the portable subset it documents) plus the issue's named gates. Paste the tail of the output in the closing comment. If a gate fails for a pre-existing reason, file/link an issue for it — do not skip silently. After collecting local build/test evidence, remove the repo-local `target/` directory and verify it is absent before closing, stopping, or handing off.
+7. **Gate before done**: run the native-Windows aggregate gate plus the issue's named gates from `C:\code\Astrolabe`. Until a PowerShell aggregate exists, `scripts/check.sh` may be invoked only with a verified native Git for Windows Bash executable, never the WSL launcher. Paste the command, native execution context, and output tail in the closing comment. If a gate is unavailable or fails for a pre-existing reason, file/link an issue for it — do not skip silently and do not use WSL as a substitute. In a `finally`/equivalent cleanup path, remove repo-local `target/` and verify it is absent.
 8. **Close**: when every DoD box is checked with evidence, close the issue, tick its checkbox in EPIC #65, and move the `status:*` label off. If you must stop early, comment exactly: what's done, what's not, the next concrete step, and any local uncommitted state; swap to `status:ready` if another agent can resume, or `status:blocked` naming the blocker.
 
 ## Standing invariants (every PR — the HONEST conjunct; violating these = do not merge)
@@ -30,12 +38,12 @@ ASTROLABE fuses Calyx (Rust association-native DB engine, `vendor/calyx`) with c
 
 - `crates/astrolabe-domain` — identity spine (canonical_input_bytes, CxId/series). `astrolabe-ingest` — SQLite→vault import, registry, projections, ledger verify. `astrolabe-lower` — vault→SQLite lowered artifact, team artifact. `astrolabe-panel` — lens panel S0–S22. `astrolabe-weave` — similarity graphs, cross-terms, reactive, anomalies. `astrolabe-kernel` — kernels, bridges, label propagation, skills. `astrolabe-guard` / `astrolabe-oracle` / `astrolabe-assay` / `astrolabe-anchors` / `astrolabe-provenance` — contract crates being brought live per phase. `astrolabe-bridge` + `cbm-sys` — FFI to libcbm. `astrolabe-server` — MCP surface.
 - ⚠️ `crates/astrolabe-server/src/migration.rs` is under decomposition (see the refactor issue). **Do not add new code to it**; new MCP tool logic goes in the module structure that issue defines.
-- Verification: `scripts/check.sh` (aggregate local gate), `scripts/release-predicate.py` (DONE predicate), `ci/` (gate configs). CI: `.github/workflows/ci.yml`.
+- Verification: `scripts/check.sh` (aggregate local gate; native Git for Windows Bash only on this machine), `scripts/release-predicate.py` (DONE predicate), `ci/` (gate configs). CI: `.github/workflows/ci.yml`.
 - Vendored parents are pinned (`VENDORED.md`, `scripts/verify-pins.sh`). Never edit `vendor/` except via documented patch flow in `patches/`.
 
 ## Build notes
 
 - Toolchain: pinned via `rust-toolchain.toml` (Rust 1.95, edition 2024). The C half needs GNU make + a C toolchain (`cbm-sys/build.rs` respects `MAKE`/`CC`/`CXX`/`AR`).
 - Pure-Rust work: `cargo check -p <crate> --all-targets` is fast; full workspace check requires the C toolchain.
-- Windows: some gates are POSIX/Linux-only (egress-deny needs strace). Run what's portable; never fake a gate result.
-- Target hygiene: local cargo/build/test/check commands may create or grow `./target`. Treat it as disposable evidence workspace, not persistent state. Before issue close, turn end, or handoff, delete `./target` (or run an equivalent clean that removes it) and verify `target/` is absent. Never leave repo-local build artifacts to accumulate; if cleanup is blocked by a live process, stop the process if it is yours or file/link an issue with the exact blocker.
+- Windows: some gates are currently POSIX/Linux-only (egress-deny needs strace). Run only native-Windows-compatible gates locally and record unavailable coverage honestly. Never invoke WSL and never fake a gate result; file/link the native-Windows coverage gap.
+- Target hygiene: local cargo/build/test/check commands may create or grow `./target`. Treat it as disposable evidence workspace, not persistent state. Delete `./target` immediately after each command or contiguous verification batch, whether it passes, fails, or is interrupted, and verify it is absent. Also verify absence before issue close, turn end, pause, stop, or handoff. If cleanup is blocked by a live process, stop the process if it is yours or file/link an issue with the exact blocker; never leave repo-local build artifacts to accumulate.
