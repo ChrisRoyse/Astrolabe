@@ -1,7 +1,11 @@
+mod build_support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use build_support::normalize_bindings;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -14,10 +18,12 @@ fn main() {
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
+    let build_support = manifest_dir.join("build_support.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("cbm-build");
 
     println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", build_support.display());
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
     println!("cargo:rerun-if-changed={}", mimalloc_header.display());
@@ -150,7 +156,7 @@ fn verify_bindings(manifest_dir: &Path, cbm_root: &Path, header: &Path) {
             bindings_path.display()
         )
     });
-    if normalize(&committed) != normalize(&generated) {
+    if normalize_bindings(&committed) != normalize_bindings(&generated) {
         panic!(
             "cbm-sys bindings are stale. Run \
              `ASTROLABE_UPDATE_BINDINGS=1 cargo build -p cbm-sys`, review \
@@ -179,6 +185,7 @@ fn generate_bindings(cbm_root: &Path, header: &Path) -> String {
         .blocklist_function("cbm_mcp_server_run")
         .blocklist_function("cbm_store_get_db")
         .blocklist_type("FILE")
+        .blocklist_type("_iobuf")
         .blocklist_type("_IO_.*")
         .blocklist_type("__off.*")
         .blocklist_type("sqlite3")
@@ -215,10 +222,6 @@ fn emit_link_directives(build_dir: &Path) {
         println!("cargo:rustc-link-lib=asan");
         println!("cargo:rustc-link-arg=-fsanitize=address");
     }
-}
-
-fn normalize(s: &str) -> String {
-    s.replace("\r\n", "\n")
 }
 
 fn extra_flags(var: &str, asan_enabled: bool) -> String {

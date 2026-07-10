@@ -56,6 +56,21 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cbm_arena_destroy(a: *mut CBMArena);
 }
+pub const cbm_read_status_t_CBM_READ_OK: cbm_read_status_t = 0;
+pub const cbm_read_status_t_CBM_READ_OPEN_FAIL: cbm_read_status_t = 1;
+pub const cbm_read_status_t_CBM_READ_EMPTY: cbm_read_status_t = 2;
+pub const cbm_read_status_t_CBM_READ_OVERSIZED: cbm_read_status_t = 3;
+pub const cbm_read_status_t_CBM_READ_OOM: cbm_read_status_t = 4;
+pub type cbm_read_status_t = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn cbm_max_file_bytes() -> ::std::os::raw::c_long;
+}
+unsafe extern "C" {
+    pub fn cbm_cypher_max_depth() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_mcp_max_depth() -> ::std::os::raw::c_int;
+}
 pub type TSStateId = u16;
 pub type TSSymbol = u16;
 pub type TSFieldId = u16;
