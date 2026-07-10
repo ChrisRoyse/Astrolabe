@@ -22,7 +22,7 @@ fi
 
 case "$HOST_TARGET" in
   x86_64-pc-windows-gnu)
-    DEFAULT_LABEL="windows-local-mingw"
+    DEFAULT_LABEL="windows-x64-mingw"
     DEFAULT_CC="gcc"
     DEFAULT_CXX="g++"
     ;;
@@ -30,13 +30,16 @@ case "$HOST_TARGET" in
     echo "ERROR: native Windows checks require a GNU-host Rust toolchain; MSVC cannot link the MinGW libcbm archive" >&2
     exit 1
     ;;
-  *-unknown-linux-gnu)
-    DEFAULT_LABEL="linux-local"
+  x86_64-unknown-linux-gnu)
+    case "${CC:-cc}" in
+      *clang*) DEFAULT_LABEL="linux-x64-clang" ;;
+      *) DEFAULT_LABEL="linux-x64-gcc" ;;
+    esac
     DEFAULT_CC="cc"
     DEFAULT_CXX="c++"
     ;;
-  *-apple-darwin)
-    DEFAULT_LABEL="macos-local"
+  aarch64-apple-darwin)
+    DEFAULT_LABEL="macos-arm64-clang"
     DEFAULT_CC="cc"
     DEFAULT_CXX="c++"
     ;;

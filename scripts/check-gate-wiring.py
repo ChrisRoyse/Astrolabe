@@ -55,6 +55,7 @@ def validate(root: Path) -> list[str]:
     check = read(root, "scripts/check.sh", errors)
     full = read(root, "scripts/check-full.sh", errors)
     release = read(root, "scripts/check-release.sh", errors)
+    cbm_test = read(root, "scripts/ci-cbm-test.sh", errors)
 
     require(
         check,
@@ -77,6 +78,12 @@ def validate(root: Path) -> list[str]:
     require(
         check,
         "scripts/test-verify-pins.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-cbm-skip-count.py",
         "scripts/check.sh",
         errors,
     )
@@ -115,6 +122,13 @@ def validate(root: Path) -> list[str]:
     require(full, "ASTROLABE_RUST_TARGET", "scripts/check-full.sh", errors)
     require(full, 'HOST_TARGET" != "$RUSTC_HOST', "scripts/check-full.sh", errors)
     require(full, "x86_64-pc-windows-gnu", "scripts/check-full.sh", errors)
+    for label in (
+        "linux-x64-gcc",
+        "linux-x64-clang",
+        "macos-arm64-clang",
+        "windows-x64-mingw",
+    ):
+        require(full, label, "scripts/check-full.sh", errors)
     require(
         full,
         'bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"',
@@ -125,6 +139,12 @@ def validate(root: Path) -> list[str]:
         full,
         'bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"',
         "scripts/check-full.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        'bash "$ROOT/scripts/check-cbm-skip-count.sh" "$LABEL" "$skipped"',
+        "scripts/ci-cbm-test.sh",
         errors,
     )
 

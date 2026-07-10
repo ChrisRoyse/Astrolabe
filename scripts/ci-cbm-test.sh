@@ -72,10 +72,7 @@ if [[ "$total" -ne "$expected" ]]; then
   exit 1
 fi
 
-if [[ "$skipped" -gt 0 ]] && ! grep -q "^| CBM | $LABEL |" "$ROOT/ci/known-skips.md"; then
-  echo "ERROR: CBM reported $skipped skipped tests for $LABEL, but ci/known-skips.md has no entry." >&2
-  exit 1
-fi
+bash "$ROOT/scripts/check-cbm-skip-count.sh" "$LABEL" "$skipped"
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {

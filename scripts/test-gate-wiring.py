@@ -16,6 +16,7 @@ FILES = (
     "scripts/check.sh",
     "scripts/check-full.sh",
     "scripts/check-release.sh",
+    "scripts/ci-cbm-test.sh",
 )
 
 
