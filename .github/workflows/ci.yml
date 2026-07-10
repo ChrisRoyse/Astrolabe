@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 0"
 
 permissions:
   contents: read
@@ -39,6 +41,9 @@ jobs:
       - name: Verify Calyx path dependencies
         run: python3 scripts/check-calyx-path-deps.py
 
+      - name: Verify aggregate and release gate wiring
+        run: python3 scripts/check-gate-wiring.py
+
       - name: Summary
         run: |
           {
@@ -49,6 +54,30 @@ jobs:
             echo "- No todo!()/unimplemented!() in crates/."
             echo "- Unsafe Rust remained confined to astrolabe-bridge and cbm-sys."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  portable-gates:
+    name: portable aggregate / linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install portable aggregate dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev clang strace
+
+      - name: Cache portable aggregate outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: portable-${{ runner.os }}-${{ hashFiles('VENDORED.md') }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run portable aggregate
+        run: bash scripts/check.sh
 
   cbm-lint:
     name: cbm lint / clang-tidy cppcheck format
@@ -211,15 +240,54 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
         run: bash scripts/ci-rust-gate.sh "${{ matrix.label }}" "${{ matrix.target }}"
 
+  row-sink-benchmark:
+    name: scheduled / row-sink overhead
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev clang
+
+      - name: Cache benchmark build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: row-sink-${{ runner.os }}-${{ hashFiles('VENDORED.md') }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run measured row-sink overhead gate
+        env:
+          ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT: "1"
+        run: bash scripts/bench-row-sink-overhead.sh
+
+      - name: Upload row-sink benchmark artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: row-sink-overhead-${{ github.sha }}
+          path: |
+            target/astrolabe-row-sink-overhead-bench.json
+            target/astrolabe-release-predicate/bench-ratios.json
+          if-no-files-found: error
+          retention-days: 30
+
   ci-ok:
     name: ci-ok
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [pins, cbm-lint, cbm-tests, rust]
+    needs: [pins, portable-gates, cbm-lint, cbm-tests, rust, row-sink-benchmark]
     if: ${{ always() }}
     steps:
       - name: Require every CI stage
         env:
+          EVENT_NAME: ${{ github.event_name }}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           python3 - <<'PY'
@@ -228,7 +296,13 @@ jobs:
           import sys
 
           needs = json.loads(os.environ["NEEDS_JSON"])
-          bad = {name: data["result"] for name, data in needs.items() if data["result"] != "success"}
+          optional_skips = {"row-sink-benchmark"} if os.environ["EVENT_NAME"] != "schedule" else set()
+          bad = {
+              name: data["result"]
+              for name, data in needs.items()
+              if data["result"] != "success"
+              and not (data["result"] == "skipped" and name in optional_skips)
+          }
           if bad:
               print(f"CI NOT OK: {bad}")
               sys.exit(1)
