@@ -32,9 +32,12 @@ pub const ASTRO_EDGE_DANGLING: &str = "ASTRO_EDGE_DANGLING";
 pub const ASTRO_INGEST_SQLITE_INVALID: &str = "ASTRO_INGEST_SQLITE_INVALID";
 /// Refusal code for post-write readback mismatches.
 pub const ASTRO_INGEST_READBACK_MISMATCH: &str = "ASTRO_INGEST_READBACK_MISMATCH";
+/// Refusal code for malformed quantization gate inputs.
+pub const ASTRO_QUANTIZATION_GATE_INVALID: &str = "ASTRO_QUANTIZATION_GATE_INVALID";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
+const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits, guard-FAR, and provenance for every requested quantization candidate.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
 const PROJECT_ROW_PREFIX: &[u8] = b"astrolabe:cbm-project:v1:";
@@ -52,6 +55,7 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
+const SCHEMA_QUANTIZATION_GATE: &str = "astrolabe.quantization_gate.v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
 /// Import configuration for a CBM SQLite dump.
@@ -67,6 +71,8 @@ pub struct SqliteImportOptions {
     pub workers: usize,
     /// Slots with source inputs available to the panel runtime.
     pub available_slots: BTreeSet<SlotId>,
+    /// Optional measured quantization gate for candidate compressed slots.
+    pub quantization_gate: Option<QuantizationGateConfig>,
 }
 
 impl SqliteImportOptions {
@@ -81,6 +87,7 @@ impl SqliteImportOptions {
                 .iter()
                 .map(|slot| slot.slot_id())
                 .collect(),
+            quantization_gate: None,
         }
     }
 
@@ -98,6 +105,150 @@ impl SqliteImportOptions {
         self.available_slots = slots.into_iter().collect();
         self
     }
+
+    /// Attaches a measured quantization gate to this import.
+    pub fn with_quantization_gate(mut self, gate: QuantizationGateConfig) -> Self {
+        self.quantization_gate = Some(gate);
+        self
+    }
+}
+
+/// Measured non-regression policy for candidate quantization.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuantizationGateConfig {
+    /// Candidate slot measurements to evaluate.
+    pub measurements: Vec<QuantizationGateMeasurement>,
+    /// Guard-designated slots that must retain raw sidecar bytes.
+    pub guard_slots: BTreeSet<u16>,
+    /// Minimum acceptable candidate recall@k, in millipoints.
+    pub min_recall_millipoints: u16,
+    /// Maximum acceptable recall drop from raw to candidate, in millipoints.
+    pub max_recall_drop_millipoints: u16,
+    /// Maximum acceptable guard FAR increase from raw to candidate, in millipoints.
+    pub max_guard_far_regression_millipoints: u16,
+    /// Whether candidate panel bits must be at least raw panel bits.
+    pub require_panel_bits_non_regression: bool,
+}
+
+impl QuantizationGateConfig {
+    /// Builds a strict measured gate with Astrolabe's conservative defaults.
+    pub fn strict(measurements: Vec<QuantizationGateMeasurement>) -> Self {
+        Self {
+            measurements,
+            guard_slots: BTreeSet::new(),
+            min_recall_millipoints: 950,
+            max_recall_drop_millipoints: 0,
+            max_guard_far_regression_millipoints: 0,
+            require_panel_bits_non_regression: true,
+        }
+    }
+
+    /// Marks slots that must retain raw CF sidecars.
+    pub fn with_guard_slots<I>(mut self, slots: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.guard_slots = slots.into_iter().collect();
+        self
+    }
+}
+
+/// Measured evidence for one candidate quantization policy.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuantizationGateMeasurement {
+    /// Panel slot id.
+    pub slot: u16,
+    /// Human-readable candidate policy, e.g. `turboquant_3p5`.
+    pub candidate_policy: String,
+    /// Baseline raw recall@k, in millipoints.
+    pub recall_at_k_raw_millipoints: u16,
+    /// Candidate quantized recall@k, in millipoints.
+    pub recall_at_k_candidate_millipoints: u16,
+    /// Baseline raw panel bits, in millibits.
+    pub panel_bits_raw_millibits: u64,
+    /// Candidate quantized panel bits, in millibits.
+    pub panel_bits_candidate_millibits: u64,
+    /// Baseline raw guard false-accept rate, in millipoints.
+    pub guard_far_raw_millipoints: u16,
+    /// Candidate quantized guard false-accept rate, in millipoints.
+    pub guard_far_candidate_millipoints: u16,
+    /// Measurement provenance; must be non-empty.
+    pub provenance_refs: Vec<String>,
+}
+
+/// Per-slot quantization gate decision.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuantizationSlotDecision {
+    /// Panel slot id.
+    pub slot: u16,
+    /// Candidate policy evaluated for this slot.
+    pub candidate_policy: String,
+    /// Decision for this slot: `accepted`, `refused_raw`, or `raw_guard`.
+    pub decision: String,
+    /// Whether this candidate passed the gate.
+    pub pass: bool,
+    /// Baseline raw recall@k, in millipoints.
+    pub recall_at_k_raw_millipoints: u16,
+    /// Candidate quantized recall@k, in millipoints.
+    pub recall_at_k_candidate_millipoints: u16,
+    /// Baseline raw panel bits, in millibits.
+    pub panel_bits_raw_millibits: u64,
+    /// Candidate quantized panel bits, in millibits.
+    pub panel_bits_candidate_millibits: u64,
+    /// Baseline raw guard FAR, in millipoints.
+    pub guard_far_raw_millipoints: u16,
+    /// Candidate quantized guard FAR, in millipoints.
+    pub guard_far_candidate_millipoints: u16,
+    /// Measurement provenance copied from the gate input.
+    pub provenance_refs: Vec<String>,
+    /// Fail-closed reason when `pass=false`.
+    pub reason: Option<String>,
+    /// Operator-facing remediation when refused.
+    pub remediation: Option<String>,
+}
+
+/// Policy ceilings carried with a quantization report.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuantizationGatePolicyReport {
+    /// Minimum acceptable candidate recall@k, in millipoints.
+    pub min_recall_millipoints: u16,
+    /// Maximum acceptable recall drop from raw to candidate, in millipoints.
+    pub max_recall_drop_millipoints: u16,
+    /// Maximum acceptable guard FAR increase, in millipoints.
+    pub max_guard_far_regression_millipoints: u16,
+    /// Whether candidate panel bits must be at least raw panel bits.
+    pub require_panel_bits_non_regression: bool,
+}
+
+/// Quantization gate summary attached to an import report and ledger payload.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SqliteImportQuantizationReport {
+    /// Stable report schema.
+    pub schema: String,
+    /// Overall status: `unconfigured`, `applied`, `refused_raw`, or `raw_guard`.
+    pub status: String,
+    /// True only when at least one candidate slot passed and no candidate failed.
+    pub applied: bool,
+    /// Current persisted storage mode for Astrolabe-owned imports.
+    pub storage_mode: String,
+    /// Explicit policy labels and ceilings.
+    pub policy: QuantizationGatePolicyReport,
+    /// Per-slot measured decisions.
+    pub slots: Vec<QuantizationSlotDecision>,
+    /// Number of accepted candidate slots.
+    pub accepted_slot_count: usize,
+    /// Number of refused candidate slots.
+    pub refused_slot_count: usize,
+    /// Number of guard-designated raw sidecar slots.
+    pub guard_slot_count: usize,
+    /// Raw guard-slot sidecar rows verified from CF readback.
+    pub raw_guard_slot_rows_verified: usize,
+    /// Raw guard-slot sidecar rows expected from the prepared import.
+    pub expected_raw_guard_slot_rows: usize,
+    /// Trust label for this report.
+    pub trust: String,
+    /// Freshness label for this report.
+    pub freshness: String,
 }
 
 /// Exact skipped-edge accounting for an import batch.
@@ -118,6 +269,8 @@ pub struct SqliteImportReadback {
     pub graph_rows_verified: usize,
     /// Typed edge Graph CF rows decoded and field-compared.
     pub edge_rows_verified: usize,
+    /// Guard raw sidecar slot CF rows byte-compared after quantization gating.
+    pub raw_guard_slot_rows_verified: usize,
     /// Expected Base CF rows for the imported non-structural symbols.
     pub expected_base_rows: usize,
     /// Expected slot sidecar rows for the imported non-structural symbols.
@@ -126,6 +279,8 @@ pub struct SqliteImportReadback {
     pub expected_graph_rows: usize,
     /// Expected typed edge rows.
     pub expected_edge_rows: usize,
+    /// Expected guard raw sidecar slot CF rows.
+    pub expected_raw_guard_slot_rows: usize,
 }
 
 /// Summary of a CBM SQLite-to-Aster import batch.
@@ -161,6 +316,8 @@ pub struct SqliteImportReport {
     pub ledger_rows_after: usize,
     /// Exact skipped-edge counters.
     pub edge_skips: EdgeSkipCounters,
+    /// Measured quantization gate decision and raw guard-slot readback counts.
+    pub quantization: SqliteImportQuantizationReport,
     /// Post-write CF readback verification counts.
     pub readback: SqliteImportReadback,
     /// Imported constellation ids in deterministic node-id order.
@@ -493,6 +650,7 @@ struct IngestLedgerPayload {
     expected_slot_rows: u64,
     expected_graph_rows: u64,
     expected_edge_rows: u64,
+    quantization: SqliteImportQuantizationReport,
     first_cx_id: Option<String>,
     last_cx_id: Option<String>,
 }
@@ -600,6 +758,7 @@ where
         .iter()
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
+    let mut quantization = quantization_gate_report(options, &prepared);
     verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
     let (planned_graph_rows_written, planned_edge_rows_written) =
         count_changed_graph_rows(vault, before_snapshot, &prepared)?;
@@ -607,6 +766,7 @@ where
         input.sqlite_fingerprint,
         options,
         &prepared,
+        &quantization,
         IngestLedgerStats {
             sqlite_node_vectors,
             new_cx_ids,
@@ -615,9 +775,15 @@ where
             edge_rows_written: planned_edge_rows_written,
         },
     )?;
-    let (ledger_ref, graph_rows_written, edge_rows_written) =
-        write_import_rows(vault, &prepared, input.sqlite_fingerprint, payload)?;
-    let readback = verify_import_readback(vault, &prepared)?;
+    let (ledger_ref, graph_rows_written, edge_rows_written) = write_import_rows(
+        vault,
+        &prepared,
+        input.sqlite_fingerprint,
+        payload,
+        options.quantization_gate.as_ref(),
+    )?;
+    let readback = verify_import_readback(vault, &prepared, options.quantization_gate.as_ref())?;
+    quantization.raw_guard_slot_rows_verified = readback.raw_guard_slot_rows_verified;
     let ledger_rows_after = ledger_row_count(vault)?;
 
     Ok(SqliteImportReport {
@@ -636,6 +802,7 @@ where
         ledger_rows_before: input.ledger_rows_before,
         ledger_rows_after,
         edge_skips: prepared.edge_skips,
+        quantization,
         readback,
         cx_ids,
     })
@@ -1125,7 +1292,240 @@ fn validate_options(options: &SqliteImportOptions) -> IngestResult<()> {
         )
         .into());
     }
+    if let Some(gate) = &options.quantization_gate {
+        validate_quantization_gate_config(gate)?;
+    }
     Ok(())
+}
+
+fn validate_quantization_gate_config(gate: &QuantizationGateConfig) -> IngestResult<()> {
+    if gate.min_recall_millipoints > 1000
+        || gate.max_recall_drop_millipoints > 1000
+        || gate.max_guard_far_regression_millipoints > 1000
+    {
+        return Err(quantization_gate_invalid(
+            "quantization gate millipoint policy values must be <= 1000",
+        ));
+    }
+    let known_slots = default_panel_slots()
+        .iter()
+        .map(|slot| slot.slot)
+        .collect::<BTreeSet<_>>();
+    for slot in &gate.guard_slots {
+        if !known_slots.contains(slot) {
+            return Err(quantization_gate_invalid(format!(
+                "guard slot S{slot} is not in the frozen panel roster"
+            )));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for measurement in &gate.measurements {
+        if !known_slots.contains(&measurement.slot) {
+            return Err(quantization_gate_invalid(format!(
+                "quantization measurement slot S{} is not in the frozen panel roster",
+                measurement.slot
+            )));
+        }
+        if !seen.insert(measurement.slot) {
+            return Err(quantization_gate_invalid(format!(
+                "quantization measurement for slot S{} is duplicated",
+                measurement.slot
+            )));
+        }
+        if measurement.candidate_policy.trim().is_empty() {
+            return Err(quantization_gate_invalid(format!(
+                "quantization measurement for slot S{} has empty candidate_policy",
+                measurement.slot
+            )));
+        }
+        if measurement.recall_at_k_raw_millipoints > 1000
+            || measurement.recall_at_k_candidate_millipoints > 1000
+            || measurement.guard_far_raw_millipoints > 1000
+            || measurement.guard_far_candidate_millipoints > 1000
+        {
+            return Err(quantization_gate_invalid(format!(
+                "quantization measurement for slot S{} has millipoint values > 1000",
+                measurement.slot
+            )));
+        }
+        if measurement
+            .provenance_refs
+            .iter()
+            .all(|provenance| provenance.trim().is_empty())
+        {
+            return Err(quantization_gate_invalid(format!(
+                "quantization measurement for slot S{} requires non-empty provenance",
+                measurement.slot
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn quantization_gate_report(
+    options: &SqliteImportOptions,
+    prepared: &PreparedBatch,
+) -> SqliteImportQuantizationReport {
+    let Some(gate) = &options.quantization_gate else {
+        return SqliteImportQuantizationReport {
+            schema: SCHEMA_QUANTIZATION_GATE.to_string(),
+            status: "unconfigured".to_string(),
+            applied: false,
+            storage_mode: "raw_cf".to_string(),
+            policy: QuantizationGatePolicyReport {
+                min_recall_millipoints: 0,
+                max_recall_drop_millipoints: 0,
+                max_guard_far_regression_millipoints: 0,
+                require_panel_bits_non_regression: true,
+            },
+            slots: Vec::new(),
+            accepted_slot_count: 0,
+            refused_slot_count: 0,
+            guard_slot_count: 0,
+            raw_guard_slot_rows_verified: 0,
+            expected_raw_guard_slot_rows: 0,
+            trust: "provisional".to_string(),
+            freshness: "not_evaluated".to_string(),
+        };
+    };
+    let slots = gate
+        .measurements
+        .iter()
+        .map(|measurement| quantization_slot_decision(gate, measurement))
+        .collect::<Vec<_>>();
+    let accepted_slot_count = slots
+        .iter()
+        .filter(|slot| slot.decision == "accepted")
+        .count();
+    let refused_slot_count = slots
+        .iter()
+        .filter(|slot| slot.decision == "refused_raw")
+        .count();
+    let status = if refused_slot_count > 0 {
+        "refused_raw"
+    } else if accepted_slot_count > 0 {
+        "applied"
+    } else {
+        "raw_guard"
+    };
+    SqliteImportQuantizationReport {
+        schema: SCHEMA_QUANTIZATION_GATE.to_string(),
+        status: status.to_string(),
+        applied: status == "applied",
+        storage_mode: "raw_cf_with_measured_gate".to_string(),
+        policy: QuantizationGatePolicyReport {
+            min_recall_millipoints: gate.min_recall_millipoints,
+            max_recall_drop_millipoints: gate.max_recall_drop_millipoints,
+            max_guard_far_regression_millipoints: gate.max_guard_far_regression_millipoints,
+            require_panel_bits_non_regression: gate.require_panel_bits_non_regression,
+        },
+        slots,
+        accepted_slot_count,
+        refused_slot_count,
+        guard_slot_count: gate.guard_slots.len(),
+        raw_guard_slot_rows_verified: 0,
+        expected_raw_guard_slot_rows: expected_raw_guard_slot_rows(prepared, gate),
+        trust: "verified".to_string(),
+        freshness: "fresh".to_string(),
+    }
+}
+
+fn quantization_slot_decision(
+    gate: &QuantizationGateConfig,
+    measurement: &QuantizationGateMeasurement,
+) -> QuantizationSlotDecision {
+    if gate.guard_slots.contains(&measurement.slot) {
+        return QuantizationSlotDecision {
+            slot: measurement.slot,
+            candidate_policy: measurement.candidate_policy.clone(),
+            decision: "raw_guard".to_string(),
+            pass: true,
+            recall_at_k_raw_millipoints: measurement.recall_at_k_raw_millipoints,
+            recall_at_k_candidate_millipoints: measurement.recall_at_k_candidate_millipoints,
+            panel_bits_raw_millibits: measurement.panel_bits_raw_millibits,
+            panel_bits_candidate_millibits: measurement.panel_bits_candidate_millibits,
+            guard_far_raw_millipoints: measurement.guard_far_raw_millipoints,
+            guard_far_candidate_millipoints: measurement.guard_far_candidate_millipoints,
+            provenance_refs: measurement.provenance_refs.clone(),
+            reason: Some("guard-designated slots are stored raw".to_string()),
+            remediation: None,
+        };
+    }
+    let reasons = quantization_refusal_reasons(gate, measurement);
+    let pass = reasons.is_empty();
+    QuantizationSlotDecision {
+        slot: measurement.slot,
+        candidate_policy: measurement.candidate_policy.clone(),
+        decision: if pass { "accepted" } else { "refused_raw" }.to_string(),
+        pass,
+        recall_at_k_raw_millipoints: measurement.recall_at_k_raw_millipoints,
+        recall_at_k_candidate_millipoints: measurement.recall_at_k_candidate_millipoints,
+        panel_bits_raw_millibits: measurement.panel_bits_raw_millibits,
+        panel_bits_candidate_millibits: measurement.panel_bits_candidate_millibits,
+        guard_far_raw_millipoints: measurement.guard_far_raw_millipoints,
+        guard_far_candidate_millipoints: measurement.guard_far_candidate_millipoints,
+        provenance_refs: measurement.provenance_refs.clone(),
+        reason: (!pass).then(|| reasons.join("; ")),
+        remediation: (!pass).then(|| {
+            "keep raw slot storage and rerun the quantization replay with a non-regressing candidate"
+                .to_string()
+        }),
+    }
+}
+
+fn quantization_refusal_reasons(
+    gate: &QuantizationGateConfig,
+    measurement: &QuantizationGateMeasurement,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if measurement.recall_at_k_candidate_millipoints < gate.min_recall_millipoints {
+        reasons.push(format!(
+            "candidate recall_at_k {} < required {}",
+            measurement.recall_at_k_candidate_millipoints, gate.min_recall_millipoints
+        ));
+    }
+    let recall_drop = measurement
+        .recall_at_k_raw_millipoints
+        .saturating_sub(measurement.recall_at_k_candidate_millipoints);
+    if recall_drop > gate.max_recall_drop_millipoints {
+        reasons.push(format!(
+            "candidate recall drop {recall_drop} > allowed {}",
+            gate.max_recall_drop_millipoints
+        ));
+    }
+    if gate.require_panel_bits_non_regression
+        && measurement.panel_bits_candidate_millibits < measurement.panel_bits_raw_millibits
+    {
+        reasons.push(format!(
+            "candidate panel bits {} < raw {}",
+            measurement.panel_bits_candidate_millibits, measurement.panel_bits_raw_millibits
+        ));
+    }
+    let far_regression = measurement
+        .guard_far_candidate_millipoints
+        .saturating_sub(measurement.guard_far_raw_millipoints);
+    if far_regression > gate.max_guard_far_regression_millipoints {
+        reasons.push(format!(
+            "candidate guard FAR regression {far_regression} > allowed {}",
+            gate.max_guard_far_regression_millipoints
+        ));
+    }
+    reasons
+}
+
+fn expected_raw_guard_slot_rows(prepared: &PreparedBatch, gate: &QuantizationGateConfig) -> usize {
+    prepared
+        .constellations
+        .iter()
+        .map(|prepared| {
+            prepared
+                .constellation
+                .slots
+                .keys()
+                .filter(|slot| gate.guard_slots.contains(&slot.get()))
+                .count()
+        })
+        .sum()
 }
 
 fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNodeRow>> {
@@ -2090,6 +2490,7 @@ fn write_import_rows<C>(
     prepared: &PreparedBatch,
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
+    quantization_gate: Option<&QuantizationGateConfig>,
 ) -> IngestResult<(LedgerRef, usize, usize)>
 where
     C: Clock,
@@ -2097,28 +2498,41 @@ where
     let snapshot = vault.latest_seq();
     let mut rows = Vec::new();
     for prepared_cx in &prepared.constellations {
-        if vault
+        let base_exists = vault
             .read_cf_at(
                 snapshot,
                 ColumnFamily::Base,
                 &base_key(prepared_cx.identity.cx_id),
             )?
-            .is_some()
-        {
-            continue;
-        }
-        let constellation = prepared_cx.constellation.clone();
-        rows.push((
-            ColumnFamily::Base,
-            base_key(constellation.cx_id),
-            encode::encode_constellation_base(&constellation)?,
-        ));
-        for (slot, vector) in &constellation.slots {
+            .is_some();
+        let constellation = &prepared_cx.constellation;
+        if !base_exists {
             rows.push((
-                ColumnFamily::slot(*slot),
-                slot_key(constellation.cx_id),
-                encode::encode_slot_vector(vector)?,
+                ColumnFamily::Base,
+                base_key(constellation.cx_id),
+                encode::encode_constellation_base(constellation)?,
             ));
+            for (slot, vector) in &constellation.slots {
+                rows.push((
+                    ColumnFamily::slot(*slot),
+                    slot_key(constellation.cx_id),
+                    encode::encode_slot_vector(vector)?,
+                ));
+            }
+        }
+        if let Some(gate) = quantization_gate {
+            for (slot, vector) in &constellation.slots {
+                if !gate.guard_slots.contains(&slot.get()) {
+                    continue;
+                }
+                let key = slot_key(constellation.cx_id);
+                let raw_bytes = encode::encode_slot_vector(vector)?;
+                if vault.read_cf_at(snapshot, ColumnFamily::slot_raw(*slot), &key)?
+                    != Some(raw_bytes.clone())
+                {
+                    rows.push((ColumnFamily::slot_raw(*slot), key, raw_bytes));
+                }
+            }
         }
     }
 
@@ -2181,6 +2595,7 @@ where
 fn verify_import_readback<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
+    quantization_gate: Option<&QuantizationGateConfig>,
 ) -> IngestResult<SqliteImportReadback>
 where
     C: Clock,
@@ -2188,6 +2603,7 @@ where
     let snapshot = vault.latest_seq();
     let mut base_rows_verified = 0;
     let mut slot_rows_verified = 0;
+    let mut raw_guard_slot_rows_verified = 0;
     for prepared_cx in &prepared.constellations {
         let base_bytes = vault
             .read_cf_at(
@@ -2216,6 +2632,30 @@ where
                 )));
             }
             slot_rows_verified += 1;
+        }
+        if let Some(gate) = quantization_gate {
+            for (slot, expected) in &prepared_cx.constellation.slots {
+                if !gate.guard_slots.contains(&slot.get()) {
+                    continue;
+                }
+                let expected_bytes = encode::encode_slot_vector(expected)?;
+                let raw_bytes = vault
+                    .read_cf_at(
+                        snapshot,
+                        ColumnFamily::slot_raw(*slot),
+                        &slot_key(decoded.cx_id),
+                    )?
+                    .ok_or_else(|| {
+                        readback_mismatch(format!("guard raw slot {slot} CF row missing"))
+                    })?;
+                if raw_bytes != expected_bytes {
+                    return Err(readback_mismatch(format!(
+                        "guard raw slot {slot} CF bytes changed for {}",
+                        decoded.cx_id
+                    )));
+                }
+                raw_guard_slot_rows_verified += 1;
+            }
         }
     }
 
@@ -2258,10 +2698,14 @@ where
         .sum();
     let expected_edge_rows = prepared.edge_rows.len();
     let expected_graph_rows = prepared.graph_rows.len() + expected_edge_rows;
+    let expected_raw_guard_slot_rows = quantization_gate
+        .map(|gate| expected_raw_guard_slot_rows(prepared, gate))
+        .unwrap_or(0);
     if base_rows_verified != expected_base_rows
         || slot_rows_verified != expected_slot_rows
         || graph_rows_verified != expected_graph_rows
         || edge_rows_verified != expected_edge_rows
+        || raw_guard_slot_rows_verified != expected_raw_guard_slot_rows
     {
         return Err(readback_mismatch(
             "readback verified counts did not match committed counts",
@@ -2273,10 +2717,12 @@ where
         slot_rows_verified,
         graph_rows_verified,
         edge_rows_verified,
+        raw_guard_slot_rows_verified,
         expected_base_rows,
         expected_slot_rows,
         expected_graph_rows,
         expected_edge_rows,
+        expected_raw_guard_slot_rows,
     })
 }
 
@@ -2901,6 +3347,7 @@ fn ingest_ledger_payload(
     sqlite_fingerprint: [u8; 32],
     options: &SqliteImportOptions,
     prepared: &PreparedBatch,
+    quantization: &SqliteImportQuantizationReport,
     stats: IngestLedgerStats,
 ) -> IngestResult<Vec<u8>> {
     let first = prepared
@@ -2935,6 +3382,7 @@ fn ingest_ledger_payload(
             .sum(),
         expected_graph_rows: (prepared.graph_rows.len() + prepared.edge_rows.len()) as u64,
         expected_edge_rows: prepared.edge_rows.len() as u64,
+        quantization: quantization.clone(),
         first_cx_id: first,
         last_cx_id: last,
     };
@@ -3234,6 +3682,14 @@ fn invalid_sqlite(message: impl Into<String>) -> IngestError {
     IngestError::refused(ASTRO_INGEST_SQLITE_INVALID, message, SQLITE_REMEDIATION)
 }
 
+fn quantization_gate_invalid(message: impl Into<String>) -> IngestError {
+    IngestError::refused(
+        ASTRO_QUANTIZATION_GATE_INVALID,
+        message,
+        QUANTIZATION_GATE_REMEDIATION,
+    )
+}
+
 fn readback_mismatch(message: impl Into<String>) -> IngestError {
     IngestError::refused(
         ASTRO_INGEST_READBACK_MISMATCH,
@@ -3389,6 +3845,28 @@ mod tests {
 
     fn options(workers: usize) -> SqliteImportOptions {
         SqliteImportOptions::new("demo", "commit-1", 7).with_workers(workers)
+    }
+
+    fn quantization_measurement(
+        slot: u16,
+        raw_recall: u16,
+        candidate_recall: u16,
+        raw_bits: u64,
+        candidate_bits: u64,
+        raw_far: u16,
+        candidate_far: u16,
+    ) -> QuantizationGateMeasurement {
+        QuantizationGateMeasurement {
+            slot,
+            candidate_policy: "turboquant_3p5".to_string(),
+            recall_at_k_raw_millipoints: raw_recall,
+            recall_at_k_candidate_millipoints: candidate_recall,
+            panel_bits_raw_millibits: raw_bits,
+            panel_bits_candidate_millibits: candidate_bits,
+            guard_far_raw_millipoints: raw_far,
+            guard_far_candidate_millipoints: candidate_far,
+            provenance_refs: vec![format!("quantization_replay:test:S{slot}")],
+        }
     }
 
     fn basic_fixture(path: &Path) {
@@ -3782,6 +4260,139 @@ mod tests {
             payload.get("edge_rows_written").and_then(Value::as_u64),
             Some(0)
         );
+    }
+
+    #[test]
+    fn quantization_gate_refuses_recall_loss_and_ledgers_raw_decision() {
+        let path = temp_db("quant-refuse");
+        basic_fixture(&path);
+        let vault = vault();
+        let gate = QuantizationGateConfig::strict(vec![quantization_measurement(
+            18, 960, 900, 1_200, 1_200, 4, 4,
+        )]);
+
+        let report = import_sqlite_to_vault(
+            &path,
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1).with_quantization_gate(gate),
+        )
+        .expect("import sqlite");
+
+        assert_eq!(report.quantization.schema, SCHEMA_QUANTIZATION_GATE);
+        assert_eq!(report.quantization.status, "refused_raw");
+        assert!(!report.quantization.applied);
+        assert_eq!(report.quantization.refused_slot_count, 1);
+        assert_eq!(report.quantization.accepted_slot_count, 0);
+        assert_eq!(report.quantization.raw_guard_slot_rows_verified, 0);
+        let decision = &report.quantization.slots[0];
+        assert_eq!(decision.slot, 18);
+        assert_eq!(decision.decision, "refused_raw");
+        assert!(!decision.pass);
+        assert_eq!(decision.recall_at_k_candidate_millipoints, 900);
+        assert!(
+            decision
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("candidate recall_at_k")
+        );
+
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(report.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let entry = decode(&ledger).expect("decode ledger");
+        let payload: Value = serde_json::from_slice(&entry.payload).expect("payload json");
+        assert_eq!(payload["quantization"]["status"], "refused_raw");
+        assert_eq!(
+            payload["quantization"]["slots"][0]["recall_at_k_candidate_millipoints"],
+            900
+        );
+        assert_eq!(
+            payload["quantization"]["slots"][0]["provenance_refs"][0],
+            "quantization_replay:test:S18"
+        );
+    }
+
+    #[test]
+    fn quantization_gate_applies_measured_candidate_and_preserves_guard_raw_cf_bytes() {
+        let path = temp_db("quant-apply-guard-raw");
+        basic_fixture(&path);
+        let vault = vault();
+        let gate = QuantizationGateConfig::strict(vec![quantization_measurement(
+            19, 960, 960, 1_200, 1_260, 4, 4,
+        )])
+        .with_guard_slots([18]);
+
+        let report = import_sqlite_to_vault(
+            &path,
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1).with_quantization_gate(gate),
+        )
+        .expect("import sqlite");
+
+        assert_eq!(report.quantization.status, "applied");
+        assert!(report.quantization.applied);
+        assert_eq!(report.quantization.accepted_slot_count, 1);
+        assert_eq!(report.quantization.refused_slot_count, 0);
+        assert_eq!(report.quantization.guard_slot_count, 1);
+        assert_eq!(report.readback.raw_guard_slot_rows_verified, 1);
+        assert_eq!(report.readback.expected_raw_guard_slot_rows, 1);
+        assert_eq!(report.quantization.raw_guard_slot_rows_verified, 1);
+        assert_eq!(report.quantization.expected_raw_guard_slot_rows, 1);
+        let decision = &report.quantization.slots[0];
+        assert_eq!(decision.slot, 19);
+        assert_eq!(decision.decision, "accepted");
+        assert!(decision.pass);
+        assert_eq!(decision.panel_bits_candidate_millibits, 1_260);
+
+        let cx_id = report.cx_ids[0];
+        let slot_key = slot_key(cx_id);
+        let quantized_cf_bytes = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::slot(SlotId::new(18)),
+                &slot_key,
+            )
+            .expect("read slot")
+            .expect("slot row");
+        let raw_cf_bytes = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::slot_raw(SlotId::new(18)),
+                &slot_key,
+            )
+            .expect("read raw slot")
+            .expect("raw slot row");
+        assert_eq!(raw_cf_bytes.len(), quantized_cf_bytes.len());
+        assert_eq!(raw_cf_bytes, quantized_cf_bytes);
+        assert!(matches!(
+            encode::decode_slot_vector(&raw_cf_bytes).expect("decode raw guard slot"),
+            SlotVector::Dense { dim: 768, .. }
+        ));
+
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(report.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let entry = decode(&ledger).expect("decode ledger");
+        let payload: Value = serde_json::from_slice(&entry.payload).expect("payload json");
+        assert_eq!(payload["quantization"]["status"], "applied");
+        assert_eq!(
+            payload["quantization"]["slots"][0]["panel_bits_candidate_millibits"],
+            1_260
+        );
+        assert_eq!(payload["quantization"]["expected_raw_guard_slot_rows"], 1);
     }
 
     #[test]

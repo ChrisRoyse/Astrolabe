@@ -849,6 +849,8 @@ Not every lens applies to every atom kind. `Absent{NotApplicable}` is the mechan
 | S22 Multi | 4-bit rotated SQ (rotsq is CBM's own; Calyx TurboQuant equivalent) |
 | Guard-designated slots (see 10) | **raw always** (gentler levels for identity/guard slots, per handbook Â§11) |
 
+Implementation status: `astrolabe-ingest` accepts a measured `astrolabe.quantization_gate.v1` import gate, ledgers both `applied` and `refused_raw` decisions with recall/bits/FAR/provenance, keeps Astrolabe-owned storage in raw CF mode until compressed slot-envelope integration is wired, and verifies guard-designated `.raw` slot sidecars by reading actual Aster CF bytes after import.
+
 ## 6. Capability gating (what survives per repo)
 
 At assay time (08), each lens gets a capability card and the gate runs per repo: **Retire** if max pairwise correlation with an existing admitted lens > 0.6 (redundant â€” e.g., in some repos `complexity_log` and `complexity_ple` will collapse into one); **Park** if no grounded signal or < 0.05 bits about every anchor axis; **Admit** otherwise; **stratified override** keeps sole carriers of rare-critical strata (e.g. `error_surface` may be globally weak but the only carrier for incident-anchored symbols). Gate decisions are ledgered and reversible. Expected steady state: 12â€“18 active lenses per repo out of 22 â€” *measured*, not guessed, and different per repo. Effective-rank (`n_eff`) reported in `get_architecture` so redundancy is visible.

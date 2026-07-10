@@ -24,9 +24,11 @@ pub use registry::{
 };
 pub use sqlite_import::{
     ASTRO_EDGE_DANGLING, ASTRO_INGEST_READBACK_MISMATCH, ASTRO_INGEST_SQLITE_INVALID,
-    CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
-    CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
-    SqliteImportDeepVerifyCounts, SqliteImportOptions, SqliteImportReadback, SqliteImportReport,
+    ASTRO_QUANTIZATION_GATE_INVALID, CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot,
+    CbmProjectRow, CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, CxGraphErasureReport,
+    EdgeSkipCounters, QuantizationGateConfig, QuantizationGateMeasurement,
+    QuantizationGatePolicyReport, QuantizationSlotDecision, SqliteImportDeepVerifyCounts,
+    SqliteImportOptions, SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
     erase_imported_cx_graph_rows, import_cbm_graph_snapshot_to_vault,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, read_cbm_graph_snapshot,
 };
