@@ -16,6 +16,7 @@ $ArchiveSha256 = "BC0DE4321141730E83FD2457B1F7639946CC66787BF98BA9B03770D06D414D
 $ToolchainDirectoryName = "mingw-14.1.0-posix-seh-msvcrt-rt_v12-rev0"
 $ExpectedGccVersion = "14.1.0"
 $ExpectedGccTriple = "x86_64-w64-mingw32"
+$ExpectedMakeSha256 = "35F7A48546FC3A64B39E3B6AB13CBBCDBF2DAC9C79707714858975E94C7E8A0B"
 $RequiredTools = @(
     "gcc.exe",
     "g++.exe",
@@ -23,7 +24,8 @@ $RequiredTools = @(
     "ld.exe",
     "nm.exe",
     "objcopy.exe",
-    "mingw32-make.exe"
+    "mingw32-make.exe",
+    "make.exe"
 )
 $RuntimeDlls = @("libgcc_s_seh-1.dll", "libwinpthread-1.dll")
 
@@ -96,13 +98,44 @@ function Install-PinnedToolchain {
     }
 }
 
+function Ensure-BundledMakeAlias {
+    param([string]$MingwBin)
+
+    $source = Join-Path $MingwBin "mingw32-make.exe"
+    $alias = Join-Path $MingwBin "make.exe"
+    Require-Path $source "pinned MinGW GNU Make is missing"
+
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+    if ($sourceHash -ne $ExpectedMakeSha256) {
+        throw "pinned MinGW GNU Make hash mismatch: expected $ExpectedMakeSha256, got $sourceHash"
+    }
+
+    if (Test-Path -LiteralPath $alias) {
+        if (-not (Test-Path -LiteralPath $alias -PathType Leaf)) {
+            throw "pinned GNU Make alias is not a file: $alias"
+        }
+        $aliasHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $alias).Hash
+        if ($aliasHash -ne $ExpectedMakeSha256) {
+            Remove-Item -LiteralPath $alias -Force
+        }
+    }
+    if (-not (Test-Path -LiteralPath $alias -PathType Leaf)) {
+        Copy-Item -LiteralPath $source -Destination $alias
+    }
+
+    $aliasHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $alias).Hash
+    if ($aliasHash -ne $ExpectedMakeSha256) {
+        throw "pinned GNU Make alias hash mismatch: expected $ExpectedMakeSha256, got $aliasHash"
+    }
+}
+
 function Set-ToolchainEnvironment {
     param([string]$MingwBin, [string]$GitBin, [string]$GitUsrBin)
 
     $env:PATH = "$MingwBin;$GitUsrBin;$GitBin;$env:PATH"
     $env:SHELL = Join-Path $GitUsrBin "sh.exe"
     $env:RUSTUP_TOOLCHAIN = $RustToolchain
-    $env:MAKE = Join-Path $MingwBin "mingw32-make.exe"
+    $env:MAKE = Join-Path $MingwBin "make.exe"
     $env:CC = Join-Path $MingwBin "gcc.exe"
     $env:CXX = Join-Path $MingwBin "g++.exe"
     $env:AR = Join-Path $MingwBin "ar.exe"
@@ -188,6 +221,7 @@ if ($Bootstrap) {
     Install-PinnedToolchain -ToolsRoot $toolsRoot -MingwRoot $mingwRoot
 }
 Require-Path (Join-Path $mingwBin "gcc.exe") "pinned MinGW toolchain is missing; rerun with -Bootstrap"
+Ensure-BundledMakeAlias -MingwBin $mingwBin
 Set-ToolchainEnvironment -MingwBin $mingwBin -GitBin $gitBin -GitUsrBin $gitUsrBin
 Test-PinnedToolchain -MingwBin $mingwBin
 Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, runtime $mingwBin"

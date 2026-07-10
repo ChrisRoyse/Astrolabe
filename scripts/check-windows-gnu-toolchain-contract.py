@@ -41,6 +41,15 @@ def main() -> None:
         "the launcher must validate the compiler identity",
     )
     require(
+        '$ExpectedMakeSha256 = "35F7A48546FC3A64B39E3B6AB13CBBCDBF2DAC9C79707714858975E94C7E8A0B"'
+        in runner
+        and "Ensure-BundledMakeAlias" in runner
+        and 'Copy-Item -LiteralPath $source -Destination $alias' in runner
+        and '"mingw32-make.exe",' in runner
+        and '"make.exe"' in runner,
+        "the launcher must expose a hash-verified make.exe alias from the pinned bundle",
+    )
+    require(
         '"libgcc_s_seh-1.dll", "libwinpthread-1.dll"' in runner
         and 'Get-FileHash -Algorithm SHA256' in runner
         and 'runtime DLL mismatch' in runner,
@@ -48,7 +57,7 @@ def main() -> None:
     )
     require(
         '$env:PATH = "$MingwBin;$GitUsrBin;$GitBin;$env:PATH"' in runner
-        and '$env:MAKE = Join-Path $MingwBin "mingw32-make.exe"' in runner,
+        and '$env:MAKE = Join-Path $MingwBin "make.exe"' in runner,
         "the launcher must place its runtime first and use the bundled GNU Make",
     )
     require(
