@@ -246,20 +246,16 @@ UI_SRCS = \
     src/ui/httpd.c \
     src/ui/embedded_stub.c
 
-# mimalloc (vendored, global allocator override)
+# mimalloc (vendored; global allocator override on MinGW only)
 #
-# Override strategy is platform-specific:
-#  * Unix (macOS/Linux): rely on static-link-order override — the prod mimalloc
-#    object is linked first so its strong malloc/free symbols win. We do NOT
-#    define MI_MALLOC_OVERRIDE here: that would compile alloc-override.c's
-#    forwarding definitions (malloc/free/posix_memalign/...) which, on macOS's
-#    two-level namespace, makes the binary's free == mi_free while system
-#    libraries keep allocating via the system allocator — pointers crossing that
-#    boundary hit "mimalloc: error: mi_free: invalid pointer". (Repro:
-#    `codebase-memory-mcp index <dir>` aborted on every run.)
-#  * Windows (MinGW, static CRT): the link-order trick fails (#424's allocator
-#    mismatch), so we define MI_MALLOC_OVERRIDE=1 to compile the static-CRT
-#    override added in mimalloc 3.3.0 (the _MSC_VER / _ACRTIMP /
+# Routing is platform-specific:
+#  * Unix (macOS/Linux): ordinary CBM C allocation remains on libc. Defining
+#    MI_MALLOC_OVERRIDE would make this binary's free == mi_free while system
+#    libraries keep allocating through the platform allocator; pointers crossing
+#    that boundary caused "mi_free: invalid pointer" aborts on macOS. Rust plus
+#    the explicitly bound tree-sitter/SQLite paths still use this mimalloc object.
+#  * Windows (MinGW, static CRT): define MI_MALLOC_OVERRIDE=1 to compile the
+#    static-CRT override added in mimalloc 3.3.0 (the _MSC_VER / _ACRTIMP /
 #    _CRT_HYBRIDPATCHABLE entry points) which take precedence over the static
 #    CRT's malloc/free.
 # Note: mimalloc's source gates the override body on MI_MALLOC_OVERRIDE (CMake

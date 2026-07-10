@@ -41,6 +41,7 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-shell-arg-audit.py
 "$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact
 "$PYTHON_BIN" scripts/check-cbm-native-build-contract.py
+"$PYTHON_BIN" scripts/check-allocator-contract.py
 "$CARGO_BIN" metadata --format-version 1 >/dev/null
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 "$CARGO_BIN" build --workspace

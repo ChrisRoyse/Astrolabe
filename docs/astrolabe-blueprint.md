@@ -47,7 +47,7 @@ codebase-memory-mcp                          Calyx
 | 16 | [16_INCREMENTAL_REACTIVE.md](16_INCREMENTAL_REACTIVE.md) | Incremental indexing, watcher â†’ reactive triggers, MVCC time-travel over code history, recurrence series. |
 | 17 | [17_PERFORMANCE_SCALE.md](17_PERFORMANCE_SCALE.md) | Budgets and complexity: Linux-kernel-scale numbers, sampling strategies, quantization, lowering, memory discipline. |
 | 18 | [18_MIGRATION_COMPAT.md](18_MIGRATION_COMPAT.md) | Shadow â†’ flip â†’ native migration (the Leapable pattern), SQLite as lowered artifact, existing-user compatibility. |
-| 19 | [19_BUILD_TOOLCHAIN.md](19_BUILD_TOOLCHAIN.md) | Building C+Rust as one binary: FFI design, `libcbm` static library, allocator unification, cross-platform matrix, packaging. |
+| 19 | [19_BUILD_TOOLCHAIN.md](19_BUILD_TOOLCHAIN.md) | Building C+Rust as one binary: FFI design, `libcbm` static library, allocator topology, cross-platform matrix, packaging. |
 | 20 | [20_TESTING_VERIFICATION.md](20_TESTING_VERIFICATION.md) | Test strategy: parity harnesses, determinism probes, FSV byte-verification, invariants, soak, agent-level evals. |
 | 21 | [21_RISKS_BLINDSPOTS.md](21_RISKS_BLINDSPOTS.md) | The risk register: ~30 risks (licensing, scale, flaky anchors, cold start, allocators, nondeterminismâ€¦) with mitigations. |
 | 22 | [22_ROADMAP.md](22_ROADMAP.md) | Phased delivery P0â€“P10, milestone gates, effort estimates, the ASTROLABE_DONE predicate. |
@@ -85,7 +85,7 @@ codebase-memory-mcp                          Calyx
 | D6 | Anchors: tests/CI first-class; SZZ bug archaeology; agent task outcomes as Reward anchors; survival anchors provisional-only | 06 |
 | D7 | CBM's `SIMILAR_TO`/`SEMANTICALLY_RELATED` passes retained as candidate generators; *scoring/admission* moves to measured (Assay + Anneal) | 07, 08 |
 | D8 | MCP tool surface: 14 legacy tools retained (behavior-compatible), ~16 new tools, consolidated via modes | 15 |
-| D9 | mimalloc unified as the global allocator for both C and Rust halves | 19 |
+| D9 | One vendored mimalloc implementation with platform-specific routing and strict cross-boundary ownership | 19 |
 | D10 | Ship CPU-only by default (nomic vectors are lookup tables; Calyx CPU paths); GPU strictly opt-in | 03, 17 |
 
 ## Terminology bridge (both projects' words for the same things)
@@ -380,7 +380,7 @@ Every unit of real work â€” a test run, a review, a revert, an agent task �
 | 11.6 | 3D graph UI upgraded: kernel membership as size/glow, trust/provenance colors, grounding-gap overlay, agreement-graph view, satellite galaxies for cross-repo (existing) | [CBM] graph-ui | P10 |
 | 11.7 | ADR grounded: the Architecture Decision Record becomes anchored â€” decisions link to the kernel members they govern; drift between ADR text and measured architecture flagged | [CBM] manage_adr; [FUSE] | P8 |
 | 11.8 | Full CLI parity: every MCP tool invokable as `astrolabe cli <tool> '<json>'`; progress sink; `--json` | [CBM] cli runner | P6 |
-| 11.9 | Memory discipline preserved: RAM-first with budgets (mimalloc RSS tracking, retention caps, backpressure naps) + Calyx bounded allocators/caches â€” one allocator, one budget | [CBM] mem.c; [CX] alloc/cache; unified | P1 |
+| 11.9 | Memory discipline preserved: RAM-first with process-RSS budgets, retention caps, backpressure naps, one vendored mimalloc implementation, and platform-specific allocator routing | [CBM] mem.c; [CX] alloc/cache; topology | P1 |
 | 11.10 | Diagnostics & health: NDJSON trajectory + Prometheus-style metrics + chain-verify gauge + readiness â€” one health surface | [CBM] diagnostics; [CX] daemon metrics patterns | P9 |
 
 ## Tier 12 â€” Emergent / moonshot (possible once Tiers 1â€“10 exist)
@@ -510,7 +510,7 @@ Why this split is doctrine-clean: Calyx's "single source of truth / no side stor
 â”‚                          â”‚     search,registry,anneal,forge,paths,     â”‚
 â”‚                          â”‚     mincut,buildinfo,fsv,testkit}           â”‚
 â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤
-â”‚  FOUNDATION: mimalloc (unified allocator) Â· worker pool Â· logging      â”‚
+â”‚  FOUNDATION: mimalloc topology Â· worker pool Â· logging                â”‚
 â”‚  (stderr, structured) Â· limits/budgets Â· subprocess supervisor         â”‚
 â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
@@ -573,7 +573,7 @@ Narrow, C-to-Rust-safe, versioned:
 | `cbm_pipeline_new/run/cancel/free` with a **row-sink callback** (new: `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)` streaming nodes/edges instead of/alongside SQLite dump) | Rustâ†’C (+Câ†’Rust callback) | B |
 | `cbm_mcp_server_new/handle_tool/free` (legacy tool pass-through) | Rustâ†’C | B |
 | `cbm_discover_ex`, `cbm_git_context_resolve`, `cbm_githistory_compute` | Rustâ†’C | B/C |
-| Allocator: both sides bound to mimalloc (`cbm_alloc_init` + Rust `mimalloc` global) | â€” | B |
+| Allocator: Rust + tree-sitter/SQLite use one vendored mimalloc; MinGW globally overrides the static CRT; ordinary Unix CBM C allocation remains libc-owned | â€” | B |
 | Error/panic policy: C returns status codes (already); Rust callbacks are `catch_unwind`-wrapped, abort-on-double-panic | â€” | B |
 
 Current row-sink integration status: vendored CBM exposes borrowed dump-row node/edge structs with final SQLite IDs, a graph-buffer sink, and `cbm_pipeline_set_sink(node_cb, edge_cb, ctx)`. A NULL sink keeps the existing SQLite dump path; a non-zero callback return aborts before the SQLite writer is opened. Rust has panic/error guards for these callbacks, and `astrolabe-ingest` has a snapshot parity adapter that routes callback-equivalent rows through the canonical SQLite importer. That adapter is a contract and parity harness, not the final direct vault writer.
@@ -582,7 +582,7 @@ Current row-sink integration status: vendored CBM exposes borrowed dump-row node
 
 - **Fail-closed everywhere.** Every tool error returns `{code, message, remediation}`. CBM's C statuses are mapped into the same envelope. New `ASTRO_*` codes namespaced beside `CALYX_*` ones.
 - **Determinism.** Seeded RNG only, injected clocks, content-addressed ids. The vault layer is order-independent (content addressing absorbs CBM's known parallel-vs-sequential graph divergence â€” same symbols â‡’ same CxIds regardless of worker interleave; edge sets still parity-checked, see 20).
-- **Memory.** One budget: CBM's `cbm_mem` RSS budget (tiered 25/35/50% of RAM) governs extraction; Calyx bounded allocators/caches govern the intelligence lane; both on mimalloc. Backpressure naps preserved.
+- **Memory.** One process-RSS budget: CBM's `cbm_mem` tiered 25/35/50% limits govern extraction; Calyx bounded allocators/caches govern the intelligence lane. Allocator routing is platform-specific and ownership boundaries remain explicit. Backpressure naps preserved.
 - **Security.** stdio MCP unauthenticated by design (agent-local), loopback-only UI, secrets never ledgered (redaction), CBM secret filters retained, `cbm_validate_shell_arg` discipline retained for all subprocess spawns.
 - **GPU strictly optional (D10).** Default build: CPU-only â€” nomic vectors are a lookup table; Assay/kernels/guard are CPU. Optional features: `cuda` (Forge kernels), `tei` (resident embedder endpoints), `onnx` (real model lenses). Fail-loud when enabled but unavailable; never silent fallback.
 - **Platforms.** macOS (arm64/x64), Linux (arm64/x64, musl static), Windows (x64). Windows is a first-class target (both parents support it; cuVS/Linux-only paths excluded from default).
@@ -1677,7 +1677,7 @@ Serving targets: `search_graph` p99 â‰¤ 50ms warm (tripwire 200ms); `get_con
 
 ## 3. Memory budget (one discipline, two engines)
 
-- Global: mimalloc unified; CBM's tiered RSS budget (25/35/50% of RAM) remains the master budget; extraction retention caps + backpressure naps unchanged.
+- Global: CBM's process-RSS budget (25/35/50% of RAM) remains the master budget; one vendored mimalloc implementation is routed per platform, and extraction retention caps + backpressure naps remain unchanged.
 - Calyx side: bounded allocators (arena/slab), LRU-TTL caches (byte-capped), memtable caps, reader-lease GC (5s default), background lane 15% CPU / 512MiB.
 - Vault sizing at L: ~500K constellations Ã— (~1.2KB header/meta + quantized slots ~1.6KB [768d @3.5bpc Ã—3 dense + small dense + sparse avg]) â‰ˆ **1.5â€“2.5 GB** + graph CF ~0.5GB + indexes ~1GB â‡’ ~3â€“4 GB on disk (vs ~0.5â€“1GB SQLite today). Quantization is the lever; raw sidecars only for guard slots.
 - In-RAM serving: HNSW quantized (~700MB at L) â€” DiskANN option below 1/10th RAM if needed.
@@ -1791,15 +1791,15 @@ New make target in a thin overlay (patch): `make -f Makefile.cbm libcbm` = all `
 
 ## 4. FFI safety rules
 
-- **Ownership:** every `CBMFileResult*`/JSON string crossing the boundary has an explicit `cbm_free_*`; Rust wrappers are RAII (`Drop` calls free); no Rust-allocated memory ever freed by C or vice versa (mimalloc-unified but still disciplined).
+- **Ownership:** every `CBMFileResult*`/JSON string crossing the boundary has an explicit `cbm_free_*`; Rust wrappers are RAII (`Drop` calls free); no Rust-allocated memory is freed by C or vice versa, regardless of the platform's allocator routing.
 - **Panics:** every Rust callback passed into C is `catch_unwind`-wrapped â†’ error status; panic = abort in release for the sink path (no unwinding across FFI).
 - **Threads:** libcbm's per-thread parser/slab TLS respected â€” extraction FFI called only from the C-managed worker pool (Phase B streams from inside the pipeline), or from a dedicated Rust thread per `cbm_mcp_server_t` (the struct is documented not-thread-safe; one server handle per thread).
 - **Strings:** UTF-8 both sides; Windows wide-path handling stays inside libcbm (it already owns it).
 - **Errors:** C status codes + `isError` JSON envelopes mapped to `{code,message,remediation}`; unknown C failures become `ASTRO_CBM_INTERNAL` with stderr capture attached.
 
-## 5. Allocator unification (D9)
+## 5. Allocator topology (D9)
 
-C side already binds tree-sitter/SQLite to mimalloc (`cbm_alloc_init`, must run first). Rust side sets `#[global_allocator] static A: MiMalloc` (mimalloc crate pinned to the **same vendored mimalloc version** â€” build both from the one vendored source to avoid two arenas). Result: one heap, one RSS accounting (`mi_process_info` remains truthful), CBM's budget/pressure logic governs the whole process.
+C binds tree-sitter/SQLite to mimalloc through `cbm_alloc_init` (which must run first), while Rust's `#[global_allocator]` delegates to shims over the same vendored mimalloc source. MinGW also enables mimalloc's static-CRT global override. Linux and macOS deliberately leave ordinary CBM C allocation on libc because overriding process `malloc`/`free` breaks system-library ownership boundaries. Therefore `mi_process_info` heap counters cannot establish one-heap routing on Unix; process-wide budgeting uses `cbm_mem_rss()` with OS RSS, and every FFI allocation retains an explicit owning-side deallocator.
 
 ## 6. Platform matrix
 
@@ -1839,7 +1839,7 @@ Both parents bring strong, different testing cultures: CBM's 5,900+ gating cases
 ## 2. Fusion test layers (new)
 
 ### L1 â€” FFI/bridge correctness
-Bindgen drift gate; RAII/leak tests (LSan) over every wrapper; panic-across-FFI tests (injected callback panics â†’ clean error, no UB); thread-model tests (parser TLS, one-server-per-thread); allocator unification test (single mi heap, RSS accounting sane).
+Bindgen drift gate; RAII/leak tests (LSan) over every wrapper; panic-across-FFI tests (injected callback panics â†’ clean error, no UB); thread-model tests (parser TLS, one-server-per-thread); allocator-topology tests (one mimalloc implementation, platform routing, explicit ownership, process-RSS budgeting).
 
 ### L2 â€” Mapping parity (the shadow-stage harness, 18)
 For a corpus of pinned repos (S/M/L, multi-language):
@@ -1902,7 +1902,7 @@ Every identified risk, honestly stated, with mitigation and owner-phase. Severit
 | # | Risk | Sev | Mitigation |
 |---|---|---|---|
 | R4 | Câ†”Rust link matrix (esp. Windows MinGW vs MSVC) | ðŸŸ  | `-gnu` toolchain mandate v1 (19 Â§6); CI link tests all platforms from P0; two-binary fallback mode (Rust shells to cbm CLI) always works |
-| R5 | Two allocators / RSS blindness | ðŸŸ  | single vendored mimalloc for both halves (D9); allocator unification test (20 L1) |
+| R5 | Allocator topology / cross-heap ownership | ðŸŸ  | one vendored mimalloc implementation, platform-specific routing, explicit owning-side deallocators, process-RSS budgeting, and topology tests (D9; 20 L1) |
 | R6 | Panic/UB across FFI | ðŸŸ  | catch_unwind wrappers, abort-on-unwind at sink boundary, LSan/ASan bridge suites |
 | R7 | Binary size (grammars + Rust engine) | ðŸŸ¡ | LTO+strip both halves; grammar set already dominates CBM (~baseline); target <150MB; optional slim build (top-40 grammars) |
 | R8 | Index-time overhead breaks the "fast" promise | ðŸŸ  | hard overhead gates â‰¤1.3Ã—/1.5Ã— (17); panel is lookup/encode-only by design; lowering debounced; shadow stage lets users opt out |
@@ -1959,7 +1959,7 @@ Every identified risk, honestly stated, with mitigation and owner-phase. Severit
 Eleven phases, each independently shippable, each with a falsifiable exit gate. Effort in engineer-weeks (ew) assumes 1â€“2 senior engineers fluent in both Rust and C; ranges reflect unknowns discovered in P0. Dependency spine: P0â†’P1â†’P2â†’(P3âˆ¥P4)â†’P5â†’P6â†’(P7âˆ¥P8)â†’P9â†’P10.
 
 ## P0 â€” Foundations & proof of link (3â€“5 ew)
-Workspace + subtrees pinned; `libcbm.a` target + `cbm-sys` bindgen; Rust binary that (a) links both halves on Linux/macOS/Windows-gnu, (b) passes all legacy tools through `cbm_mcp_handle_tool` FFI, (c) unified mimalloc, logs routed.
+Workspace + subtrees pinned; `libcbm.a` target + `cbm-sys` bindgen; Rust binary that (a) links both halves on Linux/macOS/Windows-gnu, (b) passes all legacy tools through `cbm_mcp_handle_tool` FFI, (c) enforces the platform-specific single-mimalloc topology and ownership contract, and (d) routes logs.
 **Gate:** all 14 legacy tools byte-parity vs upstream binary on the parity corpus; CI green on 3 platforms; ASan/LSan clean bridge.
 
 ## P1 â€” Constellations (shadow ingest) (4â€“6 ew)

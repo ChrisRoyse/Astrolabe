@@ -77,4 +77,4 @@ for binary in "${binaries[@]}"; do
   fi
 done
 
-echo "single vendored mimalloc implementation verified"
+echo "one vendored mimalloc implementation and one CBM shim surface verified; allocator routing is platform-specific"

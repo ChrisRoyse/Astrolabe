@@ -87,6 +87,12 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    require(
+        check,
+        "scripts/check-allocator-contract.py",
+        "scripts/check.sh",
+        errors,
+    )
     require_order(
         check,
         (
