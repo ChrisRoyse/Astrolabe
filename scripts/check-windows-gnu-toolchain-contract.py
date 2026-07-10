@@ -61,14 +61,19 @@ def main() -> None:
         "the launcher must place its runtime first and use the bundled GNU Make",
     )
     require(
-        '$workspaceTemp = Join-Path $target "tmp"' in runner
+        '$workspaceTempParent = Join-Path $root ".tmp"' in runner
+        and '$workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"'
+        in runner
+        and '$workspaceTemp = Join-Path $target "tmp"' not in runner
         and 'Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp' in runner
         and 'function Set-WorkspaceTempEnvironment' in runner
         and '$env:TEMP = $WorkspaceTemp' in runner
         and '$env:TMP = $WorkspaceTemp' in runner
         and '$env:TMPDIR = $WorkspaceTemp' in runner
-        and 'New-Item -ItemType Directory -Path $workspaceTemp -Force' in runner,
-        "the launcher must confine child temporary output to target/tmp",
+        and 'New-Item -ItemType Directory -Path $workspaceTemp -Force' in runner
+        and 'Remove-Item -LiteralPath $workspaceTemp -Recurse -Force' in runner
+        and 'CLEANUP[ASTRO_WORKSPACE_TEMP]' in runner,
+        "the launcher must confine and remove child temporary output within the workspace",
     )
     require(
         '$previousTempEnvironment = @{}' in runner

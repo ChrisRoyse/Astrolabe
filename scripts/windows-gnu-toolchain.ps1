@@ -213,9 +213,14 @@ if (-not [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::Ordinal
 }
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
-$workspaceTemp = Join-Path $target "tmp"
+$workspaceTempParent = Join-Path $root ".tmp"
+$workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
+$workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
 if (Test-Path -LiteralPath $target) {
     throw "target must be absent before toolchain work: $target"
+}
+if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
+    throw "workspace temporary parent is not a directory: $workspaceTempParent"
 }
 
 $toolsRoot = Join-Path $root ".toolchains"
@@ -261,11 +266,36 @@ try {
     }
 }
 finally {
+    $cleanupErrors = @()
     if (Test-Path -LiteralPath $target) {
-        Remove-Item -LiteralPath $target -Recurse -Force
+        try {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+        catch {
+            $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
+        }
     }
     if (Test-Path -LiteralPath $target) {
-        throw "target cleanup failed: $target remains"
+        $cleanupErrors += "target cleanup failed: $target remains"
+    }
+    if (Test-Path -LiteralPath $workspaceTemp) {
+        try {
+            Remove-Item -LiteralPath $workspaceTemp -Recurse -Force
+        }
+        catch {
+            $cleanupErrors += "workspace temporary cleanup failed: $($_.Exception.Message)"
+        }
+    }
+    if (Test-Path -LiteralPath $workspaceTemp) {
+        $cleanupErrors += "workspace temporary cleanup failed: $workspaceTemp remains"
+    }
+    if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
+        try {
+            Remove-Item -LiteralPath $workspaceTempParent -Force
+        }
+        catch {
+            $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
+        }
     }
     foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
         $previous = $previousTempEnvironment[$name]
@@ -276,7 +306,11 @@ finally {
             Set-Item -Path "Env:$name" -Value $previous.Value
         }
     }
+    if ($cleanupErrors.Count -gt 0) {
+        throw ($cleanupErrors -join "; ")
+    }
     Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+    Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
 }
 
 if ($commandExit -ne 0) {
