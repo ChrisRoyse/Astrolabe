@@ -18,6 +18,17 @@ def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def workspace_tempdir(prefix):
+    target = ROOT / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=target)
+
+
 def base_env(cache_dir, quiet=True):
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache_dir)
@@ -49,7 +60,7 @@ def run_process(argv, *, stdin="", cache_dir, timeout=90, quiet=True):
 
 
 def run_pair(upstream, astrolabe, run_fn):
-    with tempfile.TemporaryDirectory(prefix="astrolabe-parity-") as tmp:
+    with workspace_tempdir("astrolabe-parity-") as tmp:
         cache = Path(tmp) / "cache"
         cache.mkdir()
         left = run_fn(upstream, cache)
@@ -121,6 +132,93 @@ def cli_request(binary, cache, tool, args, raw):
     return run_process(argv, cache_dir=cache)
 
 
+def jsonrpc_result(result, label):
+    if result["rc"] != 0:
+        fail(f"{label} returned rc={result['rc']}: {result['stderr']}")
+    lines = [line for line in result["stdout"].splitlines() if line.strip()]
+    if len(lines) != 1:
+        fail(f"{label} expected one JSON-RPC response, got {len(lines)}: {result['stdout']!r}")
+    try:
+        response = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        fail(f"{label} response was not JSON: {lines[0]!r}: {exc}")
+    if "error" in response:
+        fail(f"{label} returned JSON-RPC error: {response['error']!r}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        fail(f"{label} result was not an object: {result!r}")
+    return result
+
+
+def advertised_tools(binary):
+    with workspace_tempdir("astrolabe-mcp-tools-") as tmp:
+        cache = Path(tmp) / "cache"
+        cache.mkdir()
+        tools = []
+        cursor = None
+        request_id = 1
+        while True:
+            params = {} if cursor is None else {"cursor": cursor}
+            result = jsonrpc_result(
+                server_request(
+                    binary,
+                    cache,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/list",
+                        "params": params,
+                    },
+                ),
+                f"{binary.name} tools/list",
+            )
+            request_id += 1
+            page = result.get("tools")
+            if not isinstance(page, list):
+                fail(f"{binary.name} tools/list result missing tools array")
+            for definition in page:
+                name = definition.get("name") if isinstance(definition, dict) else None
+                if not isinstance(name, str) or not name:
+                    fail(f"{binary.name} tools/list returned invalid tool: {definition!r}")
+                tools.append(name)
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor:
+                fail(f"{binary.name} tools/list returned invalid nextCursor: {cursor!r}")
+    if len(tools) != len(set(tools)):
+        fail(f"{binary.name} tools/list returned duplicate tool names")
+    return tools
+
+
+def corpus_tool_names(corpus):
+    tool_cases = corpus.get("tool_cases")
+    if not isinstance(tool_cases, list) or not tool_cases:
+        fail("MCP parity corpus must contain a non-empty tool_cases array")
+    names = []
+    for entry in tool_cases:
+        if not isinstance(entry, dict):
+            fail(f"MCP parity tool case must be an object: {entry!r}")
+        name = entry.get("tool")
+        cases = entry.get("cases")
+        if not isinstance(name, str) or not name:
+            fail(f"MCP parity tool case missing non-empty tool name: {entry!r}")
+        if not isinstance(cases, list) or not cases:
+            fail(f"MCP parity tool case for {name} must contain at least one case")
+        names.append(name)
+    if len(names) != len(set(names)):
+        fail("MCP parity corpus contains duplicate tool entries")
+    return set(names)
+
+
+def check_tool_case_coverage(upstream_tools, astrolabe_tools, corpus):
+    shared = set(upstream_tools) & set(astrolabe_tools)
+    covered = corpus_tool_names(corpus)
+    missing = sorted(shared - covered)
+    if missing:
+        fail("shared advertised tools missing MCP parity cases: " + ", ".join(missing))
+
+
 def check_server_parity(upstream, astrolabe, corpus, drop_keys):
     cases = list(corpus["server_requests"])
     next_id = 100
@@ -186,7 +284,7 @@ def check_cli_parity(upstream, astrolabe, corpus, drop_keys):
 
 
 def check_log_channel(astrolabe):
-    with tempfile.TemporaryDirectory(prefix="astrolabe-log-channel-") as tmp:
+    with workspace_tempdir("astrolabe-log-channel-") as tmp:
         root = Path(tmp)
         repo = root / "repo"
         cache = root / "cache"
@@ -239,12 +337,19 @@ def main():
     if not astrolabe.exists():
         raise SystemExit(f"missing astrolabe binary: {astrolabe}")
 
-    corpus = load_json(CORPUS)
-    drop_keys = set(load_json(NORMALIZERS)["drop_keys"])
-    check_server_parity(upstream, astrolabe, corpus, drop_keys)
-    check_cli_parity(upstream, astrolabe, corpus, drop_keys)
-    check_log_channel(astrolabe)
-    print("MCP parity verified")
+    target = ROOT / "target"
+    target_existed = target.exists()
+    try:
+        corpus = load_json(CORPUS)
+        drop_keys = set(load_json(NORMALIZERS)["drop_keys"])
+        check_tool_case_coverage(advertised_tools(upstream), advertised_tools(astrolabe), corpus)
+        check_server_parity(upstream, astrolabe, corpus, drop_keys)
+        check_cli_parity(upstream, astrolabe, corpus, drop_keys)
+        check_log_channel(astrolabe)
+        print("MCP parity verified")
+    finally:
+        if not target_existed and target.exists():
+            target.rmdir()
 
 
 if __name__ == "__main__":

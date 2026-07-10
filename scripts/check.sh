@@ -53,6 +53,7 @@ bash scripts/verify-pins.sh
 "$PYTHON_BIN" scripts/test-verify-pins.py
 "$PYTHON_BIN" scripts/test-cbm-skip-count.py
 "$PYTHON_BIN" scripts/test-check-libcbm-symbols.py
+"$PYTHON_BIN" scripts/test-parity-corpus-contract.py
 bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py

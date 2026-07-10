@@ -97,6 +97,12 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/test-parity-corpus-contract.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/check-allocator-contract.py",
         "scripts/check.sh",
         errors,

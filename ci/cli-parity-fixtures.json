@@ -1,29 +1,157 @@
 {
-  "schema": "astrolabe.cli_parity_fixtures.v1",
-  "tools": {
-    "index_repository": {},
-    "list_projects": {},
-    "delete_project": {},
-    "index_status": {},
-    "search_graph": {},
-    "trace_path": {},
-    "detect_changes": {},
-    "query_graph": {},
-    "get_graph_schema": {},
-    "get_code_snippet": {},
-    "get_architecture": {},
-    "search_code": {},
-    "manage_adr": {},
-    "ingest_traces": {},
-    "detect_anomalies": {},
-    "get_provenance": {},
-    "optimizer_status": {},
-    "get_readiness": {},
-    "impute_fields": {
-      "project": "cli-parity-impute-fields",
-      "target": "symbol:demo:parse_config",
-      "field": "doc"
+  "schema": "astrolabe.cli_parity_fixtures.v2",
+  "setup": [
+    {
+      "tool": "index_repository",
+      "args": {
+        "repo_path": "$ASTROLABE_CLI_PARITY_REPO",
+        "mode": "full",
+        "name": "cli_parity",
+        "calyx": "shadow"
+      }
     },
-    "team_artifact": {}
+    {
+      "tool": "index_repository",
+      "args": {
+        "repo_path": "$ASTROLABE_CLI_PARITY_REPO",
+        "mode": "full",
+        "name": "cli_parity_delete",
+        "calyx": "shadow"
+      }
+    }
+  ],
+  "tools": {
+    "index_repository": {
+      "args": {
+        "repo_path": "$ASTROLABE_CLI_PARITY_REINDEX_REPO",
+        "mode": "full",
+        "name": "cli_parity_reindex",
+        "calyx": "shadow"
+      }
+    },
+    "list_projects": {
+      "args": {},
+      "allow_empty_args": true
+    },
+    "delete_project": {
+      "args": {
+        "project": "cli_parity_delete"
+      }
+    },
+    "index_status": {
+      "args": {
+        "project": "cli_parity"
+      }
+    },
+    "search_graph": {
+      "args": {
+        "project": "cli_parity",
+        "query": "main",
+        "limit": 5
+      }
+    },
+    "trace_path": {
+      "args": {
+        "project": "cli_parity",
+        "function_name": "main",
+        "direction": "both",
+        "depth": 2
+      }
+    },
+    "detect_changes": {
+      "args": {
+        "project": "cli_parity",
+        "scope": "all",
+        "depth": 1
+      }
+    },
+    "query_graph": {
+      "args": {
+        "project": "cli_parity",
+        "query": "MATCH (n) RETURN n LIMIT 1",
+        "max_rows": 1
+      }
+    },
+    "get_graph_schema": {
+      "args": {
+        "project": "cli_parity"
+      }
+    },
+    "get_code_snippet": {
+      "args": {
+        "project": "cli_parity",
+        "qualified_name": "main"
+      }
+    },
+    "get_architecture": {
+      "args": {
+        "project": "cli_parity",
+        "aspects": ["overview"]
+      }
+    },
+    "search_code": {
+      "args": {
+        "project": "cli_parity",
+        "pattern": "helper",
+        "mode": "compact",
+        "limit": 3
+      }
+    },
+    "manage_adr": {
+      "args": {
+        "project": "cli_parity",
+        "mode": "sections",
+        "sections": ["Context"]
+      }
+    },
+    "ingest_traces": {
+      "args": {
+        "project": "cli_parity",
+        "traces": [
+          {
+            "caller": "main",
+            "callee": "helper",
+            "count": 1
+          }
+        ]
+      }
+    },
+    "detect_anomalies": {
+      "args": {
+        "project": "cli_parity"
+      }
+    },
+    "get_provenance": {
+      "args": {
+        "project": "cli_parity",
+        "mode": "verify_chain"
+      }
+    },
+    "optimizer_status": {
+      "args": {
+        "project": "cli_parity",
+        "mode": "status"
+      }
+    },
+    "get_readiness": {
+      "args": {
+        "project": "cli_parity",
+        "scope": "cli_parity"
+      }
+    },
+    "impute_fields": {
+      "args": {
+        "project": "cli_parity",
+        "target": "symbol:cli_parity:main",
+        "field": "doc"
+      }
+    },
+    "team_artifact": {
+      "args": {
+        "mode": "export",
+        "project": "cli_parity",
+        "artifact_dir": "$ASTROLABE_CLI_PARITY_ARTIFACT_DIR"
+      }
+    }
   }
 }

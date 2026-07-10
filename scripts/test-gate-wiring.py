@@ -94,6 +94,14 @@ def main() -> int:
         require_error(checker.validate(fixture), "test-check-libcbm-symbols.py")
         copy_fixture(fixture)
 
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/test-parity-corpus-contract.py\n',
+            "",
+        )
+        require_error(checker.validate(fixture), "test-parity-corpus-contract.py")
+        copy_fixture(fixture)
+
         full = fixture / "scripts/check-full.sh"
         rewrite(
             full,
