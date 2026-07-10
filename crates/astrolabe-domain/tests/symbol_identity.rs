@@ -1,7 +1,7 @@
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
     ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, SeriesId, SymbolLabel,
-    SymbolRecord, canonical_input_bytes, cx_id, frame, series_id,
+    SymbolRecord, canonical_input_bytes, cx_id, frame, series_id, series_id_parts,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
@@ -64,7 +64,7 @@ fn golden_symbol_identity_is_byte_exact() {
     );
     assert_eq!(
         series_id(&symbol).expect("series id").to_string(),
-        "67c3e74d1d11c279bc148240aeb2d107"
+        "3458f1dd23fa8bd2a3c23afaeb7b8a59"
     );
     assert_eq!(
         cx_id(&symbol, PANEL_VERSION).expect("cx id").to_string(),
@@ -229,6 +229,26 @@ proptest! {
         right.extend_from_slice(&frame(&d));
 
         prop_assert_ne!(left, right);
+    }
+
+    #[test]
+    fn distinct_identity_tuples_produce_distinct_series_ids(
+        left_project in "[A-Za-z0-9_.:/-]{1,12}",
+        left_qn in "[A-Za-z0-9_.:/-]{1,24}",
+        left_label in "[A-Za-z0-9_.:/-]{1,12}",
+        right_project in "[A-Za-z0-9_.:/-]{1,12}",
+        right_qn in "[A-Za-z0-9_.:/-]{1,24}",
+        right_label in "[A-Za-z0-9_.:/-]{1,12}",
+    ) {
+        prop_assume!(
+            (&left_project, &left_qn, &left_label)
+                != (&right_project, &right_qn, &right_label)
+        );
+
+        prop_assert_ne!(
+            series_id_parts(&left_project, &left_qn, &left_label).expect("left series id"),
+            series_id_parts(&right_project, &right_qn, &right_label).expect("right series id")
+        );
     }
 
     #[test]

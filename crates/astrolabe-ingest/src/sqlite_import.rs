@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
     ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, EdgeKind,
-    SeriesId, SymbolIdentity, SymbolLabel, SymbolRecord,
+    SERIES_ID_TAG, SeriesId, SymbolIdentity, SymbolLabel, SymbolRecord,
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{IngestError, IngestResult};
+use crate::{
+    ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
+    SERIES_ID_V1_REBUILD_REMEDIATION,
+};
 
 /// Dangling edge refusal/skip code from blueprint `04_DATA_MODEL.md` section 7.
 pub const ASTRO_EDGE_DANGLING: &str = "ASTRO_EDGE_DANGLING";
@@ -38,7 +41,8 @@ pub const ASTRO_QUANTIZATION_GATE_INVALID: &str = "ASTRO_QUANTIZATION_GATE_INVAL
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits, guard-FAR, and provenance for every requested quantization candidate.";
-const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v1:";
+const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
+const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
 const PROJECT_ROW_PREFIX: &[u8] = b"astrolabe:cbm-project:v1:";
 const FILE_HASH_ROW_PREFIX: &[u8] = b"astrolabe:file-hash:v1:";
@@ -46,7 +50,8 @@ const PROJECT_SUMMARY_ROW_PREFIX: &[u8] = b"astrolabe:project-summary:v1:";
 const TOKEN_VECTOR_ROW_PREFIX: &[u8] = b"astrolabe:token-vector:v1:";
 const CBM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:cbm-edge:v1:";
 pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
-const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v1";
+const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v2";
+const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v2";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
 const SCHEMA_PROJECT_ROW: &str = "astrolabe-cbm-project-v1";
 const SCHEMA_FILE_HASH_ROW: &str = "astrolabe-file-hash-v1";
@@ -467,6 +472,7 @@ struct PreparedEdgeRow {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct NodeMapRow {
     schema: String,
+    series_id_schema: String,
     project: String,
     node_id: i64,
     qualified_name: String,
@@ -718,6 +724,7 @@ where
     C: Clock,
     R: SlotRuntime + Sync,
 {
+    ensure_no_legacy_series_state(vault)?;
     let sqlite_node_vectors = input
         .nodes
         .iter()
@@ -2265,7 +2272,7 @@ fn symbol_metadata(
     let mut metadata = BTreeMap::new();
     metadata.insert(
         "astrolabe_schema".to_string(),
-        "astrolabe-sqlite-symbol-v1".to_string(),
+        SCHEMA_SYMBOL_METADATA.to_string(),
     );
     metadata.insert("project".to_string(), node.symbol.project.clone());
     metadata.insert(
@@ -2277,6 +2284,7 @@ fn symbol_metadata(
     metadata.insert("file_path".to_string(), node.symbol.rel_file_path.clone());
     metadata.insert("language".to_string(), node.symbol.language.clone());
     metadata.insert("source_node_id".to_string(), node.id.to_string());
+    metadata.insert("series_id_schema".to_string(), SERIES_ID_TAG.to_string());
     metadata.insert("series_id".to_string(), identity.series_id.to_string());
     metadata.insert("commit".to_string(), options.commit.clone());
     if let Some(hash) = node.node_vector_sha256 {
@@ -2294,6 +2302,7 @@ fn node_map_graph_row(
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
     let row = NodeMapRow {
         schema: SCHEMA_NODE_MAP.to_string(),
+        series_id_schema: SERIES_ID_TAG.to_string(),
         project: prepared.symbol.project.clone(),
         node_id: prepared.node_id,
         qualified_name: prepared.symbol.qualified_name.clone(),
@@ -2742,7 +2751,14 @@ fn verify_base_fields(
             prepared.identity.cx_id
         )));
     }
-    for key in ["qualified_name", "label", "source_node_id", "series_id"] {
+    for key in [
+        "astrolabe_schema",
+        "qualified_name",
+        "label",
+        "source_node_id",
+        "series_id_schema",
+        "series_id",
+    ] {
         if decoded.metadata.get(key) != prepared.constellation.metadata.get(key) {
             return Err(readback_mismatch(format!(
                 "Base CF metadata {key} differs for {}",
@@ -2760,6 +2776,7 @@ pub(crate) fn verify_sqlite_import_deep<C>(
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let snapshot = vault.latest_seq();
     let mut counts = SqliteImportDeepVerifyCounts::default();
 
@@ -2773,6 +2790,13 @@ where
                 counts.node_map_rows += 1;
                 if row.schema != SCHEMA_NODE_MAP {
                     errors.push(format!("node map {} has wrong schema", hex_lower(&key)));
+                    continue;
+                }
+                if row.series_id_schema != SERIES_ID_TAG {
+                    errors.push(format!(
+                        "node map {} has wrong SeriesId schema",
+                        hex_lower(&key)
+                    ));
                     continue;
                 }
                 match vault.read_cf_at(snapshot, ColumnFamily::Base, &base_key(row.cx_id))? {
@@ -2845,6 +2869,7 @@ pub fn read_cbm_graph_snapshot<C>(
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let snapshot = vault.latest_seq();
     let mut panel_version = None;
     let mut nodes = Vec::new();
@@ -2857,6 +2882,12 @@ where
             return Err(IngestError::InvalidInput(format!(
                 "node map row {} has wrong schema {}",
                 row.node_id, row.schema
+            )));
+        }
+        if row.series_id_schema != SERIES_ID_TAG {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} has wrong SeriesId schema {}",
+                row.node_id, row.series_id_schema
             )));
         }
         let base = vault
@@ -3061,6 +3092,7 @@ pub fn erase_imported_cx_graph_rows<C>(
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let snapshot = vault.latest_seq();
     let mut rows = Vec::new();
     let tombstone = tombstone_value();
@@ -3322,9 +3354,11 @@ fn verify_node_map_matches_base(
     errors: &mut Vec<String>,
 ) {
     let expected = [
+        ("astrolabe_schema", SCHEMA_SYMBOL_METADATA),
         ("qualified_name", row.qualified_name.as_str()),
         ("label", row.label.as_str()),
         ("file_path", row.file_path.as_str()),
+        ("series_id_schema", row.series_id_schema.as_str()),
     ];
     for (key, value) in expected {
         if decoded.metadata_value(key) != Some(value) {
@@ -3400,6 +3434,36 @@ where
             &ledger_range(0, u64::MAX),
         )?
         .len())
+}
+
+fn ensure_no_legacy_series_state<C>(vault: &AsterVault<C>) -> IngestResult<()>
+where
+    C: Clock,
+{
+    crate::registry::ensure_no_legacy_series_registry(vault)?;
+    ensure_no_legacy_node_maps(vault)
+}
+
+pub(crate) fn ensure_no_legacy_node_maps<C>(vault: &AsterVault<C>) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let legacy_rows = vault
+        .scan_cf_range_at(
+            snapshot,
+            ColumnFamily::Graph,
+            &prefix_range(LEGACY_NODE_MAP_PREFIX_V1),
+        )?
+        .len();
+    if legacy_rows != 0 {
+        return Err(IngestError::refused(
+            ASTRO_SERIES_ID_V1_REBUILD_REQUIRED,
+            format!("vault contains collision-prone v1 node-map state: rows={legacy_rows}"),
+            SERIES_ID_V1_REBUILD_REMEDIATION,
+        ));
+    }
+    Ok(())
 }
 
 fn graph_key(prefix: &[u8], project: &str, node_id: i64) -> IngestResult<Vec<u8>> {
@@ -4176,6 +4240,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_node_map_is_refused_before_v2_mutation() {
+        let vault = vault();
+        let mut legacy_key = LEGACY_NODE_MAP_PREFIX_V1.to_vec();
+        legacy_key.extend_from_slice(b"legacy-row");
+        vault
+            .write_cf(ColumnFamily::Graph, legacy_key, b"legacy-v1".to_vec())
+            .expect("write legacy node-map marker");
+        let before = vault.latest_seq();
+
+        let err = import_cbm_graph_snapshot_to_vault_direct(
+            &edge_snapshot(),
+            [3; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("legacy node map refused");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+        assert_eq!(err.remediation(), Some(SERIES_ID_V1_REBUILD_REMEDIATION));
+        assert_eq!(vault.latest_seq(), before);
+        assert!(
+            vault
+                .scan_cf_range_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Graph,
+                    &prefix_range(NODE_MAP_PREFIX),
+                )
+                .expect("scan v2 node maps")
+                .is_empty()
+        );
+
+        let err = read_cbm_graph_snapshot(&vault, "demo")
+            .expect_err("snapshot read refuses legacy node map");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+        let err = crate::read_registry_snapshot(&vault)
+            .expect_err("registry read refuses legacy node map");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+        let err = crate::verify_deep(&vault).expect_err("deep verify refuses legacy node map");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+    }
+
+    #[test]
     fn fsv_import_decodes_base_slot_graph_and_ledger_rows() {
         let path = temp_db("fsv");
         basic_fixture(&path);
@@ -4223,6 +4329,26 @@ mod tests {
             Some("demo.math.add")
         );
         assert_eq!(decoded.metadata_value("label"), Some("Function"));
+        assert_eq!(
+            decoded.metadata_value("astrolabe_schema"),
+            Some(SCHEMA_SYMBOL_METADATA)
+        );
+        assert_eq!(
+            decoded.metadata_value("series_id_schema"),
+            Some(SERIES_ID_TAG)
+        );
+        let node_maps = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(NODE_MAP_PREFIX),
+            )
+            .expect("scan v2 node maps");
+        assert_eq!(node_maps.len(), 1);
+        let node_map: NodeMapRow =
+            serde_json::from_slice(&node_maps[0].1).expect("decode v2 node map");
+        assert_eq!(node_map.schema, SCHEMA_NODE_MAP);
+        assert_eq!(node_map.series_id_schema, SERIES_ID_TAG);
 
         let slot_zero = vault
             .read_cf_at(

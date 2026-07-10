@@ -23,8 +23,8 @@ pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const CALYX_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/calyx");
 /// Version tag prepended to every symbol canonical byte sequence.
 pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v1";
-/// Prefix used when deriving stable series identifiers.
-pub const SERIES_ID_TAG: &str = "astro-series-v1";
+/// Domain tag framed into every stable series identifier preimage.
+pub const SERIES_ID_TAG: &str = "astro-series-v2";
 /// Prefix used to build the per-project Calyx vault salt.
 pub const VAULT_SALT_PREFIX: &str = "astrolabe-v1:";
 /// Error code used when a symbol carries a non-finite scalar.
@@ -838,14 +838,14 @@ pub fn series_id(symbol: &SymbolRecord) -> Result<SeriesId> {
 pub fn series_id_parts(project: &str, qualified_name: &str, label: &str) -> Result<SeriesId> {
     validate_identity_parts(project, qualified_name, label)?;
 
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(SERIES_ID_TAG.as_bytes());
-    hasher.update(project.as_bytes());
-    hasher.update(qualified_name.as_bytes());
-    hasher.update(label.as_bytes());
+    let mut preimage = Vec::new();
+    append_frame(&mut preimage, SERIES_ID_TAG.as_bytes());
+    append_frame(&mut preimage, project.as_bytes());
+    append_frame(&mut preimage, qualified_name.as_bytes());
+    append_frame(&mut preimage, label.as_bytes());
 
     let mut out = [0_u8; ID_BYTES];
-    out.copy_from_slice(&hasher.finalize().as_bytes()[..ID_BYTES]);
+    out.copy_from_slice(&blake3::hash(&preimage).as_bytes()[..ID_BYTES]);
     Ok(SeriesId::from_bytes(out))
 }
 
@@ -974,11 +974,17 @@ mod tests {
     }
 
     #[test]
-    fn series_id_is_raw_concatenation_not_framed() {
-        let id = series_id_parts("ab", "c", "d").expect("series id");
-        let framed = calyx::content_address([b"astro-series-v1".as_slice(), b"ab", b"c", b"d"]);
+    fn series_id_v2_frames_every_field_and_separates_boundary_shifts() {
+        let left = series_id_parts("ab", "c", "d").expect("left series id");
+        let right = series_id_parts("a", "bc", "d").expect("right series id");
+        assert_ne!(left, right);
 
-        assert_ne!(id.as_bytes(), &framed);
+        let mut expected_preimage = frame(SERIES_ID_TAG.as_bytes());
+        expected_preimage.extend_from_slice(&frame(b"ab"));
+        expected_preimage.extend_from_slice(&frame(b"c"));
+        expected_preimage.extend_from_slice(&frame(b"d"));
+        let expected = blake3::hash(&expected_preimage);
+        assert_eq!(left.as_bytes(), &expected.as_bytes()[..ID_BYTES]);
     }
 
     #[test]

@@ -612,7 +612,7 @@ CBM identity: `(project, qualified_name)` unique per index run; integer `id` rea
 
 | Level | Key | Properties |
 |---|---|---|
-| **Series** (the symbol through time) | `series_id = blake3_16("astro-series-v1" â€– project â€– qualified_name â€– label)` | Stable across edits & reindexes. Owns: the recurrence series (change/failure events), anchors that outlive versions, lead/lag analysis, forecasting. |
+| **Series** (the symbol through time) | `series_id = blake3_16(frame("astro-series-v2") || frame(project) || frame(qualified_name) || frame(label))` | Stable across edits & reindexes. `frame(x) = be_u64(len(x)) || x`, so the hash preimage has unambiguous field boundaries. Owns: the recurrence series (change/failure events), anchors that outlive versions, lead/lag analysis, forecasting. |
 | **Version** (one state of the symbol) | `CxId = content_address(canonical_input_bytes, panel_version, vault_salt)` | Immutable. Owns: slots, scalars, per-version anchors, graph edges (edges connect versions; series-level projections derived). |
 
 **Canonical input bytes** (mirrors `calyx-poly`'s `MarketSnapshot::canonical_input_bytes` â€” frame every observed field, fail closed on non-finite/missing invariants):

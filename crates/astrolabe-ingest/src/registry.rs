@@ -14,26 +14,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::ledger_verify::{verify_chain, verify_ledger_pairing};
 use crate::sqlite_import::verify_sqlite_import_deep;
+use crate::{ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, SERIES_ID_V1_REBUILD_REMEDIATION};
 
 /// Namespace prefix for every Astrolabe series registry key stored in Aster.
-pub const ASTRO_SERIES_REGISTRY_PREFIX: &[u8] = b"astrolabe:series-registry:v1:";
+pub const ASTRO_SERIES_REGISTRY_PREFIX: &[u8] = b"astrolabe:series-registry:v2:";
 /// Stable failure code for `astrolabe verify --deep` invariant violations.
 pub const ASTRO_VERIFY_DEEP_FAILED: &str = "ASTRO_VERIFY_DEEP_FAILED";
 /// Maximum QN key bytes before the CBM-style FNV tail fallback is applied.
 pub const QN_KEY_MAX_BYTES: usize = 255;
 
 const QN_HASH_SUFFIX_BYTES: usize = 9;
+const LEGACY_SERIES_REGISTRY_PREFIX_V1: &[u8] = b"astrolabe:series-registry:v1:";
 const SERIES_ROW_TAG: &[u8] = b"series:";
 const REVERSE_ROW_TAG: &[u8] = b"reverse:";
 const QN_ROW_TAG: &[u8] = b"qn:";
 const SPLIT_ROW_TAG: &[u8] = b"split:";
 const RECURRENCE_ROW_TAG: &[u8] = b"recurrence:";
-const SCHEMA_SERIES: &str = "astrolabe-series-row-v1";
-const SCHEMA_REVERSE: &str = "astrolabe-series-reverse-v1";
-const SCHEMA_QN: &str = "astrolabe-series-qn-index-v1";
-const SCHEMA_RECURRENCE: &str = "astrolabe-series-recurrence-v1";
-const SCHEMA_SPLIT: &str = "astrolabe-series-split-v1";
-const SCHEMA_REGISTRY_LEDGER: &str = "astrolabe-series-registry-ledger-v1";
+const SCHEMA_SERIES: &str = "astrolabe-series-row-v2";
+const SCHEMA_REVERSE: &str = "astrolabe-series-reverse-v2";
+const SCHEMA_QN: &str = "astrolabe-series-qn-index-v2";
+const SCHEMA_RECURRENCE: &str = "astrolabe-series-recurrence-v2";
+const SCHEMA_SPLIT: &str = "astrolabe-series-split-v2";
+const SCHEMA_REGISTRY_LEDGER: &str = "astrolabe-series-registry-ledger-v2";
 const ASTROLABE_REGISTRY_ACTOR: &str = "astrolabe-registry";
 
 /// Result type for Astrolabe ingest and registry operations.
@@ -504,6 +506,7 @@ pub fn ingest_series_batch<C>(
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let mut prepared = Vec::with_capacity(inputs.len());
     for input in inputs {
         prepared.push(prepare_input(input.clone())?);
@@ -519,6 +522,7 @@ pub fn ingest_series_batch_parallel<C>(
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let prepared = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(inputs.len());
         for input in inputs.iter().cloned() {
@@ -540,6 +544,7 @@ pub fn read_registry_snapshot<C>(vault: &AsterVault<C>) -> IngestResult<Registry
 where
     C: Clock,
 {
+    ensure_no_legacy_series_state(vault)?;
     let snapshot = vault.latest_seq();
     let range = registry_range();
     Ok(RegistrySnapshot {
@@ -1051,6 +1056,38 @@ fn registry_range() -> KeyRange {
     calyx_aster::cf::prefix_range(ASTRO_SERIES_REGISTRY_PREFIX)
 }
 
+fn ensure_no_legacy_series_state<C>(vault: &AsterVault<C>) -> IngestResult<()>
+where
+    C: Clock,
+{
+    ensure_no_legacy_series_registry(vault)?;
+    crate::sqlite_import::ensure_no_legacy_node_maps(vault)
+}
+
+pub(crate) fn ensure_no_legacy_series_registry<C>(vault: &AsterVault<C>) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let range = calyx_aster::cf::prefix_range(LEGACY_SERIES_REGISTRY_PREFIX_V1);
+    let legacy_kv = vault
+        .scan_cf_range_at(snapshot, ColumnFamily::Kv, &range)?
+        .len();
+    let legacy_recurrence = vault
+        .scan_cf_range_at(snapshot, ColumnFamily::Recurrence, &range)?
+        .len();
+    if legacy_kv != 0 || legacy_recurrence != 0 {
+        return Err(IngestError::refused(
+            ASTRO_SERIES_ID_V1_REBUILD_REQUIRED,
+            format!(
+                "vault contains collision-prone v1 series state: kv_rows={legacy_kv}, recurrence_rows={legacy_recurrence}"
+            ),
+            SERIES_ID_V1_REBUILD_REMEDIATION,
+        ));
+    }
+    Ok(())
+}
+
 fn registry_kind(key: &[u8]) -> Option<&'static [u8]> {
     let rest = key.strip_prefix(ASTRO_SERIES_REGISTRY_PREFIX)?;
     [SERIES_ROW_TAG, REVERSE_ROW_TAG, QN_ROW_TAG, SPLIT_ROW_TAG]
@@ -1137,6 +1174,40 @@ mod tests {
 
     fn series_row(vault: &AsterVault<FixedClock>, id: SeriesId) -> StoredSeriesRegistryRow {
         serde_json::from_slice(&series_row_bytes(vault, id)).expect("decode series row")
+    }
+
+    #[test]
+    fn legacy_v1_registry_is_refused_before_v2_mutation() {
+        let vault = vault();
+        let mut legacy_key = LEGACY_SERIES_REGISTRY_PREFIX_V1.to_vec();
+        legacy_key.extend_from_slice(SERIES_ROW_TAG);
+        legacy_key.extend_from_slice(&[7; 16]);
+        vault
+            .write_cf(ColumnFamily::Kv, legacy_key, b"legacy-v1".to_vec())
+            .expect("write legacy registry marker");
+        let before = vault.latest_seq();
+        let version = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+
+        let err = ingest_series_batch(&vault, &[version]).expect_err("legacy registry refused");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+        assert_eq!(err.remediation(), Some(SERIES_ID_V1_REBUILD_REMEDIATION));
+        assert_eq!(vault.latest_seq(), before);
+        assert!(
+            vault
+                .scan_cf_range_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Kv,
+                    &calyx_aster::cf::prefix_range(ASTRO_SERIES_REGISTRY_PREFIX),
+                )
+                .expect("scan v2 registry")
+                .is_empty()
+        );
+
+        let err = verify_deep(&vault).expect_err("deep verify refuses legacy registry");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+        let err = crate::read_cbm_graph_snapshot(&vault, "demo")
+            .expect_err("graph read refuses legacy registry");
+        assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
     }
 
     #[test]

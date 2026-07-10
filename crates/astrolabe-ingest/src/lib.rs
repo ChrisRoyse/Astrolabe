@@ -34,6 +34,10 @@ pub use sqlite_import::{
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+/// Refusal code for vault state that still carries collision-prone v1 SeriesIds.
+pub const ASTRO_SERIES_ID_V1_REBUILD_REQUIRED: &str = "ASTRO_SERIES_ID_V1_REBUILD_REQUIRED";
+
+pub(crate) const SERIES_ID_V1_REBUILD_REMEDIATION: &str = "Rebuild the vault from source/CBM bytes so every series-bearing row is derived with the framed astro-series-v2 identity contract.";
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
