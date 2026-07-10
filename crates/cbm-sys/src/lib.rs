@@ -307,6 +307,25 @@ mod tests {
         assert_mimalloc_version_matches_vendored();
     }
 
+    #[test]
+    fn cbm_owned_strings_use_the_cbm_deallocator() {
+        initialize_allocator_bindings_first();
+        let path = CString::new(r"C:\code\Astrolabe").expect("static path contains no NUL");
+
+        for _ in 0..1024 {
+            let value = NonNull::new(unsafe { cbm_project_name_from_path(path.as_ptr()) })
+                .expect("cbm_project_name_from_path returned NULL");
+            assert!(
+                !unsafe { CStr::from_ptr(value.as_ptr()) }
+                    .to_bytes()
+                    .is_empty()
+            );
+            unsafe {
+                cbm_free_string(value.as_ptr());
+            }
+        }
+    }
+
     #[cfg(not(cbm_sys_asan))]
     #[test]
     fn rust_and_c_allocations_share_mimalloc_accounting() {

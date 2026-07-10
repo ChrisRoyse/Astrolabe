@@ -3323,6 +3323,9 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn cbm_free_string(value: *mut ::std::os::raw::c_char);
+}
+unsafe extern "C" {
     pub fn cbm_index_set_worker_role(is_worker: bool, response_out: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {

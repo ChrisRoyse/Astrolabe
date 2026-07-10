@@ -1690,9 +1690,10 @@ struct CStringAllocation(NonNull<c_char>);
 
 impl Drop for CStringAllocation {
     fn drop(&mut self) {
-        // SAFETY: CBM documents these heap strings as caller-free with C free().
+        // SAFETY: this pointer came from a CBM owned-string API and must be
+        // released through the allocator selected inside libcbm.
         unsafe {
-            libc::free(self.0.as_ptr().cast());
+            cbm_sys::cbm_free_string(self.0.as_ptr());
         }
     }
 }
@@ -1986,12 +1987,46 @@ mod tests {
     fn installer_plan_wrapper_is_record_only_json() {
         let dir = temp_dir("installer-plan");
         std::fs::create_dir_all(&dir).expect("create installer plan home");
-        let plan =
-            cbm_install_plan_json(dir.to_str().unwrap(), "/tmp/codebase-memory-mcp").unwrap();
+        let binary = dir.join("codebase-memory-mcp.exe");
+        let plan = cbm_install_plan_json(dir.to_str().unwrap(), binary.to_str().unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&plan).unwrap();
         assert_eq!(value["type"], "agent.install.plan.v1");
         assert_eq!(value["writes_started"], false);
         assert_eq!(value["network_after_install"], false);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn owned_string_wrappers_release_through_cbm() {
+        let dir = temp_dir("owned-strings");
+        std::fs::create_dir_all(&dir).expect("create owned-string fixture directory");
+        let path = dir.to_str().expect("utf8 fixture path");
+        let binary = dir.join("codebase-memory-mcp.exe");
+
+        assert!(!cbm_project_name_from_path(path).unwrap().is_empty());
+        let plan = cbm_install_plan_json(path, binary.to_str().expect("utf8 binary path")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plan).unwrap()["type"],
+            "agent.install.plan.v1"
+        );
+
+        let runner = CbmToolRunner::new(":memory:").expect("create in-memory CBM tool runner");
+        let tool = runner
+            .handle_tool_raw("not_a_tool", "{}")
+            .expect("CBM tool error response string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool).unwrap()["isError"],
+            true
+        );
+        let response = runner
+            .handle_jsonrpc_raw(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+            .expect("CBM JSON-RPC response")
+            .expect("tools/list is not a notification");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["id"],
+            1
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 

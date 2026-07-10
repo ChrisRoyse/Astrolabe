@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #include "cbm.h"
 #include "mimalloc.h"
@@ -11,6 +12,10 @@
 #define CBM_API __attribute__((visibility("default")))
 #endif
 #endif
+
+CBM_API void cbm_free_string(char *value) {
+    free(value);
+}
 
 CBM_API void *cbm_mimalloc_malloc(size_t size) {
     return mi_malloc(size);
