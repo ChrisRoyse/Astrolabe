@@ -137,6 +137,16 @@ def main() -> int:
 
         rewrite(
             check,
+            '"$PYTHON_BIN" scripts/test-native-binary-resolution.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "test-native-binary-resolution.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
             '"$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py\n',
             "",
         )

@@ -36,6 +36,8 @@ def resolve_binary(path):
     candidate = Path(path)
     if candidate.exists():
         return candidate
+    if candidate.suffix == "" and candidate.with_name(candidate.name + ".exe").exists():
+        return candidate.with_name(candidate.name + ".exe")
     fail(f"binary not found: {candidate}")
 
 
