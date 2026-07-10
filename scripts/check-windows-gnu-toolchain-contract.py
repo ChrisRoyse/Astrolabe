@@ -36,6 +36,28 @@ def main() -> None:
         "the launcher must pin and hash-check Rust CI's compatible MinGW bundle",
     )
     require(
+        'clang+llvm-20.1.8-x86_64-pc-windows-msvc.tar.xz' in runner
+        and 'F229769F11D6A6EDC8ADA599C0CDA964B7DEE6AB1A08C6CF9DD7F513E85B107F'
+        in runner
+        and 'function Install-PinnedLlvm' in runner
+        and 'outer extraction of $LlvmArchiveName' in runner
+        and 'inner extraction of $LlvmArchiveName' in runner,
+        "the launcher must pin and hash-check a compatible workspace-local LLVM archive",
+    )
+    require(
+        '$CppcheckRepository = "https://github.com/cppcheck-opensource/cppcheck.git"'
+        in runner
+        and '$CppcheckTag = "2.20.0"' in runner
+        and '$CppcheckCommit = "502C802A69C78F3D8CFD9973AA2108AE169C73B5"'
+        in runner
+        and 'function Install-PinnedCppcheck' in runner
+        and '& $gitExe clone --depth 1 --branch $CppcheckTag $CppcheckRepository $source'
+        in runner
+        and 'rev-parse HEAD' in runner
+        and 'RDYNAMIC=' in runner,
+        "the launcher must build cppcheck from the pinned upstream source commit",
+    )
+    require(
         '$ExpectedGccVersion = "14.1.0"' in runner
         and '$ExpectedGccTriple = "x86_64-w64-mingw32"' in runner,
         "the launcher must validate the compiler identity",
@@ -56,9 +78,26 @@ def main() -> None:
         "the launcher must reject a mixed MinGW runtime",
     )
     require(
-        '$env:PATH = "$MingwBin;$GitUsrBin;$GitBin;$env:PATH"' in runner
-        and '$env:MAKE = Join-Path $MingwBin "make.exe"' in runner,
-        "the launcher must place its runtime first and use the bundled GNU Make",
+        '$env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$GitUsrBin;$GitBin;$env:PATH"'
+        in runner
+        and '$env:MAKE = Join-Path $MingwBin "make.exe"' in runner
+        and '$env:CLANG_TIDY = Join-Path $LlvmBin "clang-tidy.exe"' in runner
+        and '$env:CLANG_FORMAT = Join-Path $LlvmBin "clang-format.exe"' in runner
+        and '$env:CPPCHECK = Join-Path $CppcheckRoot "cppcheck.exe"' in runner
+        and '$ExpectedClangTidyVersion = "20.1.8"' in runner,
+        "the launcher must select pinned LLVM and cppcheck tools with the bundled GNU Make",
+    )
+    require(
+        'function Remove-StalePinnedLlvm' in runner
+        and 'Remove-StalePinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot' in runner,
+        "the launcher must prune obsolete launcher-managed LLVM cache roots after bootstrap",
+    )
+    require(
+        'function Remove-StalePinnedCppcheck' in runner
+        and 'Remove-StalePinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot'
+        in runner
+        and 'Join-Path $package "cfg\\std.cfg"' in runner,
+        "the launcher must retain cppcheck data and prune obsolete launcher-managed cppcheck cache roots",
     )
     require(
         '$workspaceTempParent = Join-Path $root ".tmp"' in runner
@@ -86,7 +125,7 @@ def main() -> None:
         and 'ConvertFrom-Json -InputObject $CommandArgsJson' in runner,
         "the launcher must forward command arguments without PowerShell flag parsing",
     )
-    for variable in ("RUSTUP_TOOLCHAIN", "CC", "CXX", "AR", "LD", "NM", "OBJCOPY"):
+    for variable in ("RUSTUP_TOOLCHAIN", "CC", "CXX", "AR", "LD", "NM", "OBJCOPY", "CPPCHECK"):
         require(
             f'$env:{variable}' in runner,
             f"the launcher must set {variable} for child commands",

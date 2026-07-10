@@ -842,6 +842,7 @@ clean-c:
 LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
+CLANG_FORMAT_FOR_SHELL := $(subst \,/,$(CLANG_FORMAT))
 CPPCHECK ?= cppcheck
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
@@ -855,6 +856,11 @@ LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
+ASTRO_GRAPH_BUFFER_FORMAT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_graph_buffer_format_patch.py
+ASTRO_GRAPH_BUFFER_FORMAT_SRC = src/graph_buffer/graph_buffer.c
+ASTRO_FORMAT_OVERLAY_DIR ?= $(BUILD_DIR)/astrolabe-format-overlay
+ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY = $(ASTRO_FORMAT_OVERLAY_DIR)/src/graph_buffer/graph_buffer.c
+ASTRO_LINT_FORMAT_SRCS = $(filter-out $(ASTRO_GRAPH_BUFFER_FORMAT_SRC),$(LINT_SRCS))
 
 # clang-tidy: deep static analysis (config in .clang-tidy)
 lint-tidy:
@@ -885,6 +891,17 @@ lint-cppcheck:
 lint-format:
 	@echo "=== clang-format ==="
 	@$(CLANG_FORMAT) --dry-run --Werror $(LINT_SRCS) $(LINT_HDRS)
+
+# Astrolabe keeps the imported tree pristine. This target validates the exact
+# reviewed format-only overlay alongside every remaining upstream lint source.
+$(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY): $(ASTRO_GRAPH_BUFFER_FORMAT_SRC) $(ASTRO_GRAPH_BUFFER_FORMAT_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_GRAPH_BUFFER_FORMAT_PATCH) $< $@
+
+lint-format-astrolabe: $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY)
+	@echo "=== clang-format (Astrolabe overlay) ==="
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror $(ASTRO_LINT_FORMAT_SRCS) $(LINT_HDRS)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_GRAPH_BUFFER_FORMAT_SRC) < $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY)
 
 # Ban ALL NOLINT variants EXCEPT whitelisted NOLINT(misc-no-recursion).
 # The whitelist is in src/foundation/recursion_whitelist.h with documented reasoning.

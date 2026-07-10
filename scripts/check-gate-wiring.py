@@ -55,6 +55,7 @@ def validate(root: Path) -> list[str]:
     check = read(root, "scripts/check.sh", errors)
     full = read(root, "scripts/check-full.sh", errors)
     release = read(root, "scripts/check-release.sh", errors)
+    cbm_lint = read(root, "scripts/ci-cbm-lint.sh", errors)
     cbm_test = read(root, "scripts/ci-cbm-test.sh", errors)
     rust_gate = read(root, "scripts/ci-rust-gate.sh", errors)
     workspace_test = read(root, "scripts/check-workspace-tests.py", errors)
@@ -87,6 +88,18 @@ def validate(root: Path) -> list[str]:
     require(
         check,
         "scripts/test-cbm-skip-count.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-cbm-lint-platform.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-cbm-format-overlay.py",
         "scripts/check.sh",
         errors,
     )
@@ -236,6 +249,49 @@ def validate(root: Path) -> list[str]:
         "scripts/ci-cbm-test.sh",
         errors,
     )
+    require(cbm_lint, 'HOST_OS="$(uname -s)"', "scripts/ci-cbm-lint.sh", errors)
+    require(
+        cbm_lint,
+        "SKIP[ASTRO_CBM_CLANG_TIDY_LINUX_REQUIRED]",
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        "INFO[ASTRO_CBM_CPPCHECK_LINUX_ABI]",
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        "--platform=unix64",
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        'if [[ "$HOST_OS" == "Linux" ]]; then',
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        "make -f Makefile.cbm lint-tidy",
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        'make -f "$ROOT/patches/cbm/Makefile.cbm" lint-format-astrolabe',
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
 
     require_order(
         release,
@@ -299,6 +355,15 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(portable, "strace", "ci.yml portable-gates job", errors)
+
+    lint = workflow_job(workflow, "cbm-lint", errors)
+    require(lint, "runs-on: ubuntu-latest", "ci.yml cbm-lint job", errors)
+    require(
+        lint,
+        "run: bash scripts/ci-cbm-lint.sh",
+        "ci.yml cbm-lint job",
+        errors,
+    )
 
     benchmark = workflow_job(workflow, "row-sink-benchmark", errors)
     require(

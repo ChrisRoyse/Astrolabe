@@ -8,6 +8,11 @@ The execution boundary is non-negotiable:
 - Use native Windows processes only. Never invoke WSL, `wsl.exe`, a WSL distribution, `C:\Windows\System32\bash.exe`, or `/mnt/c/...` paths.
 - WSL is not part of this development environment. Do not install, start, invoke, or retain WSL services or processes for this project. Before handoff, verify `WSLService`, `wsl`, `wslhost`, and `vmmemWSL` are absent; when WSL removal is explicitly requested, use native Windows management tools to stop, disable, or uninstall it and record any permission or host-level blocker in GitHub.
 - Native Git for Windows Bash is allowed only when a repository POSIX script requires it; verify the executable resolves under `C:\Program Files\Git\`, not Windows System32.
+- Run native Cargo, C build, and aggregate commands through `scripts\\windows-gnu-toolchain.ps1`; it pins the matching GNU runtime and LLVM analysis tools, confines temporary files to a launcher-owned workspace child, and removes that child and `target/` on exit.
+- The launcher builds the pinned Cppcheck 2.20.0 source commit with its matching GNU compiler and retains only the active launcher-managed Cppcheck cache root.
+- CBM format validation uses the hash-checked temporary overlay in `patches/cbm`; never run an in-place formatter or patch against either vendor tree.
+- On non-Linux hosts, blocking Cppcheck targets `unix64` and emits `INFO[ASTRO_CBM_CPPCHECK_LINUX_ABI]` to match the required Linux CI ABI; native runtime suites still own Windows behavior.
+- On non-Linux native aggregates, `SKIP[ASTRO_CBM_CLANG_TIDY_LINUX_REQUIRED]` means the required Linux `cbm lint / clang-tidy cppcheck format` CI job owns clang-tidy; it is not local analyzer-pass evidence. The other CBM lint gates still run.
 - Keep repository-controlled outputs inside the workspace, normally in `target/`.
 - Delete `C:\code\Astrolabe\target` after every build/test/check batch, including failure or interruption, and verify it is absent before any pause, stop, issue close, turn end, or handoff.
 - `scripts/check-full.sh` bounds its workspace-test phase by default and exits `125` with a `DEFERRED[...]` continuation when the deadline is reached; that is incomplete evidence, never a passing aggregate. Use its printed continuation with `ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0` only when a full, unbounded native run is intentional.

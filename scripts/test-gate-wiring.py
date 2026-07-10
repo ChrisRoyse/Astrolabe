@@ -17,6 +17,7 @@ FILES = (
     "scripts/check.sh",
     "scripts/check-full.sh",
     "scripts/check-release.sh",
+    "scripts/ci-cbm-lint.sh",
     "scripts/ci-cbm-test.sh",
     "scripts/ci-rust-gate.sh",
     "scripts/check-workspace-tests.py",
@@ -111,6 +112,22 @@ def main() -> int:
 
         rewrite(
             check,
+            '"$PYTHON_BIN" scripts/test-cbm-lint-platform.py\n',
+            "",
+        )
+        require_error(checker.validate(fixture), "test-cbm-lint-platform.py")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/test-cbm-format-overlay.py\n',
+            "",
+        )
+        require_error(checker.validate(fixture), "test-cbm-format-overlay.py")
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
             '"$PYTHON_BIN" scripts/test-parity-corpus-contract.py\n',
             "",
         )
@@ -189,6 +206,31 @@ def main() -> int:
             "bash scripts/ci-cbm-test.sh\n\necho \"=== Upstream CBM runtime suite ===\"\nbash scripts/ci-cbm-lint.sh",
         )
         require_error(checker.validate(fixture), "required order")
+        copy_fixture(fixture)
+
+        cbm_lint = fixture / "scripts/ci-cbm-lint.sh"
+        rewrite(
+            cbm_lint,
+            "SKIP[ASTRO_CBM_CLANG_TIDY_LINUX_REQUIRED]",
+            "SKIP[ASTRO_CBM_CLANG_TIDY_REMOVED]",
+        )
+        require_error(checker.validate(fixture), "ASTRO_CBM_CLANG_TIDY_LINUX_REQUIRED")
+        copy_fixture(fixture)
+
+        rewrite(
+            cbm_lint,
+            "--platform=unix64",
+            "--platform=removed",
+        )
+        require_error(checker.validate(fixture), "--platform=unix64")
+        copy_fixture(fixture)
+
+        rewrite(
+            cbm_lint,
+            "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+            "INFO[ASTRO_CBM_FORMAT_REMOVED]",
+        )
+        require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT_OVERLAY")
         copy_fixture(fixture)
 
         workspace_test = fixture / "scripts/check-workspace-tests.py"

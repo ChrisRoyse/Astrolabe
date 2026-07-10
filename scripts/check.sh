@@ -52,6 +52,8 @@ fi
 bash scripts/verify-pins.sh
 "$PYTHON_BIN" scripts/test-verify-pins.py
 "$PYTHON_BIN" scripts/test-cbm-skip-count.py
+"$PYTHON_BIN" scripts/test-cbm-lint-platform.py
+"$PYTHON_BIN" scripts/test-cbm-format-overlay.py
 "$PYTHON_BIN" scripts/test-check-libcbm-symbols.py
 "$PYTHON_BIN" scripts/test-parity-corpus-contract.py
 "$PYTHON_BIN" scripts/test-native-cargo-fmt.py
