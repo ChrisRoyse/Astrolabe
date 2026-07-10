@@ -72,8 +72,8 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
     command
         .current_dir(cbm_root)
         .arg("-f")
-        .arg(patched_makefile)
-        .arg(format!("BUILD_DIR={}", build_dir.display()))
+        .arg(make_path(patched_makefile))
+        .arg(format!("BUILD_DIR={}", make_path(build_dir)))
         .arg("libcbm");
 
     if let Ok(cc) = env::var("CC") {
@@ -122,6 +122,15 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path) {
     });
     if !status.success() {
         panic!("libcbm.a build failed with status {status}");
+    }
+}
+
+fn make_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
     }
 }
 

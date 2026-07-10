@@ -691,6 +691,7 @@ endif
 LIBCBM_A = $(BUILD_DIR)/libcbm.a
 LIBCBM_RELOC = $(BUILD_DIR)/libcbm.o
 LIBCBM_EXPORTS = $(BUILD_DIR)/libcbm.exports
+LIBCBM_OBJECTS_RSP = $(BUILD_DIR)/libcbm.objects.rsp
 
 $(LIBCBM_DIR)/$(CBM_DIR)/grammar_%.o: $(CBM_DIR)/grammar_%.c | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -745,7 +746,8 @@ $(LIBCBM_DIR)/%.o: %.S | $(BUILD_DIR)
 	$(CC) -fvisibility=hidden -c -o $@ $<
 
 $(LIBCBM_RELOC): $(LIBCBM_OBJS)
-	$(LD) -r $(NO_EXECSTACK_LD_FLAG) -o $@ $(LIBCBM_OBJS)
+	$(file >$(LIBCBM_OBJECTS_RSP),$(LIBCBM_OBJS))
+	$(LD) -r $(NO_EXECSTACK_LD_FLAG) -o $@ @$(LIBCBM_OBJECTS_RSP)
 	$(NM) -g $@ | awk '$$1 != "U" && $$2 != "U" {print $$NF}' | grep -E '^_?cbm_' > $(LIBCBM_EXPORTS)
 	if command -v $(OBJCOPY) >/dev/null 2>&1; then \
 		$(OBJCOPY) --keep-global-symbols=$(LIBCBM_EXPORTS) $@; \
