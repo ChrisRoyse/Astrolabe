@@ -228,13 +228,13 @@ enum ShadowRefreshStatus {
 
 #[derive(Debug)]
 struct ShadowImportLock {
-    _file: fs::File,
+    _guard: fs::File,
     path: PathBuf,
 }
 
 #[derive(Debug)]
 struct LoweredSqliteLock {
-    _file: fs::File,
+    _guard: fs::File,
     path: PathBuf,
 }
 
@@ -246,15 +246,15 @@ struct BackgroundLaneOwner {
 
 impl Drop for ShadowImportLock {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
         let _ = fs::remove_file(&self.path);
+        let _ = self._guard.unlock();
     }
 }
 
 impl Drop for LoweredSqliteLock {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
         let _ = fs::remove_file(&self.path);
+        let _ = self._guard.unlock();
     }
 }
 
@@ -1461,25 +1461,12 @@ fn try_shadow_import_lock(
 ) -> Result<Option<ShadowImportLock>, DynError> {
     fs::create_dir_all(cache_dir)?;
     let lock_path = shadow_import_lock_path(cache_dir, project);
-    let mut lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    match lock.try_lock() {
-        Ok(()) => {
-            lock.set_len(0)?;
-            writeln!(lock, "pid={}", std::process::id())?;
-            lock.sync_all()?;
-            Ok(Some(ShadowImportLock {
-                _file: lock,
-                path: lock_path,
-            }))
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    Ok(
+        try_readable_marker_lock(&lock_path)?.map(|guard| ShadowImportLock {
+            _guard: guard,
+            path: lock_path,
+        }),
+    )
 }
 
 fn shadow_import_busy_summary_at(cache_dir: &Path, project: &str) -> Value {
@@ -1512,6 +1499,32 @@ fn shadow_import_current_summary(verify_status: &str, lowered_exists: bool) -> V
 
 fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{SHADOW_IMPORT_LOCK_SUFFIX}"))
+}
+
+fn try_readable_marker_lock(marker_path: &Path) -> Result<Option<fs::File>, DynError> {
+    let guard_path = marker_path.with_extension("lock.guard");
+    let guard = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(guard_path)?;
+    match guard.try_lock() {
+        Ok(()) => {
+            // Windows refuses reads of an exclusively locked file, so the marker
+            // carries observable ownership metadata while the sidecar owns the lock.
+            let mut marker = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(marker_path)?;
+            writeln!(marker, "pid={}", std::process::id())?;
+            marker.sync_all()?;
+            Ok(Some(guard))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn background_lane_owners() -> &'static Mutex<BTreeMap<String, BackgroundLaneOwner>> {
@@ -4627,25 +4640,12 @@ fn try_lowered_sqlite_lock(
 ) -> Result<Option<LoweredSqliteLock>, DynError> {
     fs::create_dir_all(cache_dir)?;
     let lock_path = lowered_sqlite_lock_path(cache_dir, project);
-    let mut lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    match lock.try_lock() {
-        Ok(()) => {
-            lock.set_len(0)?;
-            writeln!(lock, "pid={}", std::process::id())?;
-            lock.sync_all()?;
-            Ok(Some(LoweredSqliteLock {
-                _file: lock,
-                path: lock_path,
-            }))
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    Ok(
+        try_readable_marker_lock(&lock_path)?.map(|guard| LoweredSqliteLock {
+            _guard: guard,
+            path: lock_path,
+        }),
+    )
 }
 
 fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
