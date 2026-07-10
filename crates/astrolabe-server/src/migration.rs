@@ -5298,6 +5298,7 @@ fn optimizer_status_json_at(
     let frozen_knobs = optimizer_freeze_status_json(cache_dir, project, global_freeze)?;
     let recent_changes = optimizer_recent_changes_json(cache_dir, project);
     let reactive_triggers = optimizer_reactive_triggers_json(cache_dir, project);
+    let drift_alarms = optimizer_drift_alarms_json(cache_dir, project);
     let janitor = optimizer_janitor_status_json_at(
         cache_dir,
         project,
@@ -5338,7 +5339,7 @@ fn optimizer_status_json_at(
         "recent_changes": recent_changes,
         "pending_proposals": optimizer_pending_proposals_json(cache_dir, project)?,
         "guard_health": optimizer_guard_health_json(cache_dir, project)?,
-        "drift_alarms": optimizer_drift_alarms_json(),
+        "drift_alarms": drift_alarms,
         "reactive_triggers": reactive_triggers,
         "capabilities": {
             "status": "enabled",
@@ -6704,16 +6705,73 @@ fn optimizer_guard_health_invalid_json(
     })
 }
 
-fn optimizer_drift_alarms_json() -> Value {
-    json!({
-        "status": "unavailable",
-        "alarm_count": Value::Null,
-        "alarms": [],
-        "freshness": "not_evaluated",
-        "trust": "provisional",
-        "reason": "drift alarm rows are not yet stored as optimizer-visible state",
-        "remediation": "wire live xterm/assay/reactive drift rows before serving drift alarms from optimizer_status",
-    })
+fn optimizer_drift_alarms_json(cache_dir: &Path, project: &str) -> Value {
+    match optimizer_drift_alarms_json_result(cache_dir, project) {
+        Ok(value) => value,
+        Err(error) => optimizer_unavailable_json(
+            "drift_alarms",
+            &format!("drift anomaly report read failed: {error}"),
+            "repair anomaly report metadata or live XTerm/Assay/Reactive CF rows before trusting optimizer drift alarms",
+        ),
+    }
+}
+
+fn optimizer_drift_alarms_json_result(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let report = read_anomaly_report(cache_dir, project)?;
+    if report.get("status").and_then(Value::as_str) == Some("unavailable") {
+        return Ok(json!({
+            "status": "unavailable",
+            "alarm_count": Value::Null,
+            "alarms": [],
+            "skipped_count": Value::Null,
+            "skipped": [],
+            "freshness": "not_evaluated",
+            "trust": "provisional",
+            "source": "detect_anomalies:kind=drift",
+            "reason": report.get("reason").cloned().unwrap_or_else(|| json!("drift anomaly report unavailable")),
+            "remediation": report.get("remediation").cloned().unwrap_or_else(|| json!("rerun index_repository with anomaly substrate metadata or live drift rows")),
+        }));
+    }
+
+    let filtered = filter_anomaly_report_json(report, Some("drift"))?;
+    let alarms = filtered
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let skipped = filtered
+        .get("skipped")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let status = if !skipped.is_empty() {
+        "partial"
+    } else if alarms.is_empty() {
+        "empty"
+    } else {
+        "read"
+    };
+    let trust = if filtered.get("trust").and_then(Value::as_str) == Some("verified")
+        && skipped.is_empty()
+    {
+        "verified"
+    } else {
+        "provisional"
+    };
+    Ok(json!({
+        "status": status,
+        "alarm_count": alarms.len(),
+        "alarms": alarms,
+        "skipped_count": skipped.len(),
+        "skipped": skipped,
+        "freshness": filtered.get("freshness").cloned().unwrap_or_else(|| json!("fresh")),
+        "trust": trust,
+        "source": "detect_anomalies:kind=drift",
+        "source_state": filtered.get("source_state").cloned().unwrap_or_else(|| json!({
+            "source": format!("config:{}", metadata_key(project, "anomaly_report_json")),
+        })),
+        "artifact_sha256": filtered.get("artifact_sha256").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn optimizer_recent_changes_json(cache_dir: &Path, project: &str) -> Value {
@@ -10078,7 +10136,12 @@ mod tests {
         assert_eq!(status["budget"]["janitor"]["trust"], "verified");
         assert_eq!(status["pending_proposals"]["status"], "unavailable");
         assert_eq!(status["guard_health"]["status"], "unavailable");
-        assert_eq!(status["drift_alarms"]["status"], "unavailable");
+        assert_eq!(status["drift_alarms"]["status"], "empty");
+        assert_eq!(status["drift_alarms"]["alarm_count"], 0);
+        assert_eq!(
+            status["drift_alarms"]["source"],
+            "detect_anomalies:kind=drift"
+        );
         assert_eq!(status["reactive_triggers"]["status"], "read");
         assert_eq!(status["reactive_triggers"]["unacknowledged_count"], 0);
         assert_eq!(
@@ -10101,6 +10164,61 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|state| state["state"] == "not_armed")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimizer_status_reads_drift_alarms_from_anomaly_report() {
+        let dir = temp_dir("optimizer-drift-alarms");
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let outcome = sample_shadow_outcome(&dir, security);
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        let report = detect_anomalies(
+            &[AnomalySubstrateRow::new(
+                AnomalyKind::Drift,
+                "slot:S18:week-2026-27",
+                850,
+                "MMD drift alarm for semantic slot",
+                ["assay:mmd:slot18:week27"],
+                ["MMD:S18", "guard_reject_rate:S18"],
+            )],
+            &[AnomalyCalibration::new(
+                AnomalyKind::Drift,
+                500,
+                800,
+                "calibration:drift:v1",
+            )],
+            None,
+            true,
+        )
+        .unwrap();
+        let anomalies = anomaly_report_json(&report, 0);
+        write_config_value(
+            &dir,
+            &metadata_key("demo", "anomaly_report_json"),
+            &anomalies.to_string(),
+        )
+        .unwrap();
+        let raw = read_anomaly_report_metadata(&dir, "demo").unwrap();
+        assert_eq!(raw, anomalies);
+
+        let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+        let drift = &status["drift_alarms"];
+        assert_eq!(drift["status"], "read");
+        assert_eq!(drift["alarm_count"], 1);
+        assert_eq!(drift["trust"], "verified");
+        assert_eq!(drift["source"], "detect_anomalies:kind=drift");
+        assert_eq!(drift["alarms"][0]["kind"], "drift");
+        assert_eq!(drift["alarms"][0]["subject_id"], "slot:S18:week-2026-27");
+        assert_eq!(
+            drift["alarms"][0]["substrate_provenance_refs"],
+            json!(["assay:mmd:slot18:week27"])
+        );
+        assert_eq!(
+            drift["source_state"]["source"],
+            format!("config:{}", metadata_key("demo", "anomaly_report_json"))
         );
         fs::remove_dir_all(&dir).ok();
     }
