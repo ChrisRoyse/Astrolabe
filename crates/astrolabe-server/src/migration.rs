@@ -317,15 +317,7 @@ pub fn handle_jsonrpc_raw(
     let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     };
-    if tool_name != "index_repository"
-        && tool_name != "index_status"
-        && tool_name != "get_architecture"
-        && tool_name != "detect_anomalies"
-        && tool_name != "get_provenance"
-        && tool_name != "optimizer_status"
-        && tool_name != "get_readiness"
-        && tool_name != "team_artifact"
-    {
+    if !should_intercept_tool_call(tool_name) {
         return Ok(runner.handle_jsonrpc_raw(request_json)?);
     }
 
@@ -343,6 +335,19 @@ pub fn handle_jsonrpc_raw(
     let args_json = serde_json::to_string(&arguments)?;
     let result_raw = handle_tool_raw(runner, tool_name, &args_json)?;
     Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?))
+}
+
+fn should_intercept_tool_call(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "index_repository" | "index_status" | "get_architecture"
+    ) || is_advertised_astrolabe_tool(tool_name)
+}
+
+fn is_advertised_astrolabe_tool(tool_name: &str) -> bool {
+    astrolabe_tool_definitions()
+        .iter()
+        .any(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
 }
 
 fn handle_tools_list_jsonrpc(
@@ -689,12 +694,7 @@ fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, 
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
-        "detect_anomalies" => Ok(true),
-        "get_provenance" => Ok(true),
-        "optimizer_status" => Ok(true),
-        "get_readiness" => Ok(true),
-        "impute_fields" => Ok(true),
-        "team_artifact" => Ok(true),
+        name if is_advertised_astrolabe_tool(name) => Ok(true),
         _ => Ok(false),
     }
 }
@@ -10824,6 +10824,121 @@ mod tests {
                 .unwrap()
                 .contains("invalid calyx dial")
         );
+    }
+
+    #[test]
+    fn advertised_astrolabe_tools_are_intercepted_by_jsonrpc_gate() {
+        for definition in astrolabe_tool_definitions() {
+            let name = definition["name"].as_str().expect("tool name");
+            assert!(
+                should_intercept_tool_call(name),
+                "{name} advertised but not intercepted by tools/call"
+            );
+        }
+        assert!(should_intercept_tool_call("index_repository"));
+        assert!(should_intercept_tool_call("index_status"));
+        assert!(should_intercept_tool_call("get_architecture"));
+        assert!(!should_intercept_tool_call("search_code"));
+    }
+
+    #[test]
+    fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
+        let runner = CbmToolRunner::new(":memory:").unwrap();
+        let project = format!("jsonrpc-advertised-dispatch-{}", std::process::id());
+        let cases = [
+            (
+                "get_provenance",
+                json!({"project": project.clone(), "mode": "verify_chain"}),
+                "get_provenance requires calyx shadow indexing",
+            ),
+            (
+                "detect_anomalies",
+                json!({"project": project.clone()}),
+                "detect_anomalies requires calyx shadow indexing",
+            ),
+            (
+                "optimizer_status",
+                json!({"project": project.clone()}),
+                "optimizer_status requires calyx shadow indexing",
+            ),
+            (
+                "get_readiness",
+                json!({"project": project.clone()}),
+                "get_readiness requires calyx shadow indexing",
+            ),
+            (
+                "impute_fields",
+                json!({
+                    "project": project.clone(),
+                    "target": "symbol:demo:parse_config",
+                    "field": "doc"
+                }),
+                "impute_fields requires calyx shadow indexing",
+            ),
+            (
+                "team_artifact",
+                json!({"mode": "export", "project": project}),
+                "team_artifact export requires calyx shadow indexing",
+            ),
+        ];
+        let advertised = astrolabe_tool_definitions()
+            .iter()
+            .map(|definition| definition["name"].as_str().expect("tool name").to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(advertised.len(), cases.len());
+
+        for (index, (name, arguments, expected_text)) in cases.into_iter().enumerate() {
+            assert!(advertised.contains(name), "{name} is not advertised");
+            let id = 8110 + index;
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                }
+            });
+            let response = handle_jsonrpc_raw(&runner, &serde_json::to_string(&request).unwrap())
+                .unwrap()
+                .expect("jsonrpc response");
+            let value: Value = serde_json::from_str(&response).unwrap();
+
+            assert_eq!(value["id"], json!(id), "{name}");
+            assert_eq!(value["result"]["isError"], true, "{name}");
+            let text = value["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(expected_text), "{name}: {text}");
+            assert!(!text.contains("unknown tool"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn impute_fields_jsonrpc_call_reaches_astrolabe_handler() {
+        let runner = CbmToolRunner::new(":memory:").unwrap();
+        let project = format!("jsonrpc-impute-dispatch-{}", std::process::id());
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 8101,
+            "method": "tools/call",
+            "params": {
+                "name": "impute_fields",
+                "arguments": {
+                    "project": project,
+                    "target": "symbol:demo:parse_config",
+                    "field": "doc"
+                }
+            }
+        });
+        let response = handle_jsonrpc_raw(&runner, &serde_json::to_string(&request).unwrap())
+            .unwrap()
+            .expect("jsonrpc response");
+        let value: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(value["id"], 8101);
+        assert_eq!(value["result"]["isError"], true);
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("impute_fields requires calyx shadow indexing"));
+        assert!(!text.contains("unknown tool"));
     }
 
     #[test]
