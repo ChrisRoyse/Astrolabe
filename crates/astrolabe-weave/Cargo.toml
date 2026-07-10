@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 astrolabe-domain.workspace = true
 calyx-aster.workspace = true
+calyx-assay.workspace = true
 calyx-core.workspace = true
 calyx-ledger.workspace = true
 calyx-loom.workspace = true

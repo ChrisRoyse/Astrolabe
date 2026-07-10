@@ -203,9 +203,11 @@ dependencies = [
  "astrolabe-panel",
  "astrolabe-provenance",
  "astrolabe-weave",
+ "calyx-assay",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "calyx-loom",
  "rusqlite",
  "serde_json",
  "sha2",
@@ -218,6 +220,7 @@ name = "astrolabe-weave"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "calyx-assay",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
@@ -339,6 +342,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+
+[[package]]
+name = "calyx-assay"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-loom",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "calyx-aster"

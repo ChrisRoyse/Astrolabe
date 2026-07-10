@@ -23,6 +23,7 @@ astrolabe-provenance = { path = "crates/astrolabe-provenance" }
 astrolabe-weave = { path = "crates/astrolabe-weave" }
 cbm-sys = { path = "crates/cbm-sys" }
 calyx-aster = { path = "vendor/calyx/crates/calyx-aster" }
+calyx-assay = { path = "vendor/calyx/crates/calyx-assay" }
 calyx-core = { path = "vendor/calyx/crates/calyx-core" }
 calyx-ledger = { path = "vendor/calyx/crates/calyx-ledger" }
 calyx-loom = { path = "vendor/calyx/crates/calyx-loom" }

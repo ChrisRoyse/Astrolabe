@@ -49,8 +49,9 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
-    SubscriptionId, acknowledge_reactive_subscription, anomaly_report_artifact_bytes,
-    detect_anomalies, recover_reactive_state,
+    LiveAnomalyInputs, SubscriptionId, acknowledge_reactive_subscription,
+    anomaly_report_artifact_bytes, detect_anomalies, live_anomaly_inputs_from_vault,
+    recover_reactive_state,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
@@ -843,7 +844,7 @@ fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<St
                 "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
                 "bridges": read_bridges_metadata(&cache_dir, &project)?,
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
-                "anomalies": read_anomaly_report_metadata(&cache_dir, &project)?,
+                "anomalies": read_anomaly_report(&cache_dir, &project)?,
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
             },
         }),
@@ -865,7 +866,7 @@ fn handle_detect_anomalies(args_json: &str) -> Result<String, DynError> {
     }
     let kind_filter = string_arg(args_obj, "kind");
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let report = read_anomaly_report_metadata(&cache_dir, &project)?;
+    let report = read_anomaly_report(&cache_dir, &project)?;
     let security = read_security_screen_metadata(&cache_dir, &project)?;
     let report = merge_prompt_injection_anomalies(report, security, &project);
     let filtered = match filter_anomaly_report_json(report, kind_filter) {
@@ -3298,6 +3299,57 @@ fn anomaly_report_unavailable_json(reason: &str) -> Value {
     })
 }
 
+fn read_anomaly_report(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    match read_live_anomaly_report(cache_dir, project) {
+        Ok(Some(report)) => Ok(report),
+        Ok(None) => read_anomaly_report_metadata(cache_dir, project),
+        Err(error) => Ok(anomaly_report_unavailable_json(&format!(
+            "live anomaly CF read failed: {error}"
+        ))),
+    }
+}
+
+fn read_live_anomaly_report(cache_dir: &Path, project: &str) -> Result<Option<Value>, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(None);
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![
+            ColumnFamily::XTerm,
+            ColumnFamily::Assay,
+            ColumnFamily::Reactive,
+        ],
+    )?;
+    let inputs = live_anomaly_inputs_from_vault(&vault)?;
+    if !inputs.has_anomaly_inputs() {
+        return Ok(None);
+    }
+    let report = detect_anomalies(&inputs.substrates, &inputs.calibrations, None, true)?;
+    let mut value = anomaly_report_json(&report, inputs.skipped_rows);
+    value["source"] = json!("AsterVault:ColumnFamily::XTerm+Assay+Reactive");
+    value["source_state"] = live_anomaly_source_state_json(&inputs, &vault_dir);
+    refresh_anomaly_report_counts_and_artifact(&mut value);
+    Ok(Some(value))
+}
+
+fn live_anomaly_source_state_json(inputs: &LiveAnomalyInputs, vault_dir: &Path) -> Value {
+    json!({
+        "source": "AsterVault:ColumnFamily::XTerm+Assay+Reactive",
+        "vault_dir": vault_dir,
+        "snapshot": inputs.snapshot,
+        "xterm_rows_read": inputs.xterm_rows_read,
+        "assay_rows_read": inputs.assay_rows_read,
+        "reactive_fired_rows_read": inputs.reactive_rows_read,
+        "schema_skipped_rows": inputs.skipped_rows,
+        "freshness": "fresh",
+        "trust": if inputs.skipped_rows == 0 { "verified" } else { "provisional" },
+    })
+}
+
 fn read_anomaly_report_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
     let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "anomaly_report_json"))?
     else {
@@ -4745,7 +4797,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "skill_tree": read_skill_tree_metadata(cache_dir, project)?,
         "bridges": read_bridges_metadata(cache_dir, project)?,
         "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
-        "anomalies": read_anomaly_report_metadata(cache_dir, project)?,
+        "anomalies": read_anomaly_report(cache_dir, project)?,
         "provenance": read_provenance_metadata(cache_dir, project)?,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
@@ -8947,6 +8999,175 @@ mod tests {
         let text = value["content"][0]["text"].as_str().unwrap();
         let text_value: Value = serde_json::from_str(text).unwrap();
         assert_eq!(text_value["astrolabe"]["anomalies"], anomalies);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn anomaly_report_prefers_live_vault_rows_over_stored_metadata() {
+        use astrolabe_weave::{
+            ASSAY_ANOMALY_PAYLOAD_SCHEMA, NoveltyVerdict, ReactiveEngine, ReactiveSignals,
+            SIM_SEMANTIC_SLOT, SLOT_DOC_SEMANTIC, TriggerCondition,
+        };
+        use calyx_assay::{
+            AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag,
+        };
+        use calyx_aster::cf::{XTermKind, xterm_key};
+        use calyx_core::{AnchorKind, CxId};
+        use calyx_loom::agreement_graph::XtermRow;
+        use calyx_loom::{
+            CrossTermKey, CrossTermKind as LoomCrossTermKind, CrossTermValue as LoomCrossTermValue,
+            SignalProvenanceTag,
+        };
+        use std::sync::Arc;
+
+        struct NewRegionSignals;
+        impl ReactiveSignals for NewRegionSignals {
+            fn novelty(
+                &self,
+                _cx_id: CxId,
+                _tau_override: Option<f32>,
+            ) -> calyx_core::Result<NoveltyVerdict> {
+                Ok(NoveltyVerdict::NewRegion)
+            }
+
+            fn occurrence_count(&self, _series: CxId) -> calyx_core::Result<u64> {
+                Ok(0)
+            }
+
+            fn slot_drift(&self, _slot: calyx_core::SlotId) -> calyx_core::Result<f32> {
+                Ok(0.0)
+            }
+        }
+
+        let dir = temp_dir("anomaly-live-readback");
+        let vault_dir = vault_dir(&dir, "demo");
+        let salt = vault_salt("demo");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            salt.as_bytes().to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let doc_cx = CxId::from_input(b"astrolabe-server-live-doc", 1, b"doc");
+        let ood_cx = CxId::from_input(b"astrolabe-server-live-ood", 1, b"ood");
+        let xterm_row = XtermRow {
+            key: CrossTermKey {
+                cx_id: doc_cx,
+                a: SLOT_DOC_SEMANTIC,
+                b: SIM_SEMANTIC_SLOT,
+                kind: LoomCrossTermKind::Agreement,
+            },
+            value: LoomCrossTermValue::Scalar(0.10),
+            tag: SignalProvenanceTag::Derived,
+        };
+        let xterm_key = xterm_key(
+            doc_cx,
+            SLOT_DOC_SEMANTIC,
+            SIM_SEMANTIC_SLOT,
+            XTermKind::Agreement,
+        );
+        let xterm_value = serde_json::to_vec(&xterm_row).unwrap();
+        vault
+            .write_cf_batch([(ColumnFamily::XTerm, xterm_key.clone(), xterm_value.clone())])
+            .unwrap();
+
+        let mut assay = AssayStore::default();
+        assay.put_with_payload(
+            AssayCacheKey::scoped(
+                DEFAULT_PANEL_VERSION,
+                "week-2026-27",
+                VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+                AnchorKind::Reward,
+            ),
+            AssaySubject::Panel,
+            MiEstimate::point(1.0, 16, EstimatorKind::PanelSufficiency, TrustTag::Trusted),
+            "assay:mmd:slot18:week27",
+            vault.snapshot(),
+            json!({
+                "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+                "anomaly_calibrations": [
+                    {"kind":"doc_drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:doc-drift:v1"},
+                    {"kind":"drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:drift:v1"},
+                    {"kind":"ood_commit","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:ood-commit:v1"}
+                ],
+                "anomaly_substrates": [
+                    {
+                        "kind":"drift",
+                        "subject_id":"slot:S18:week-2026-27",
+                        "score_millipoints":850,
+                        "message":"MMD drift alarm for semantic slot",
+                        "substrate_provenance_refs":["assay:mmd:slot18:week27"],
+                        "lens_evidence":["MMD:S18"]
+                    }
+                ]
+            }),
+        );
+        assay.persist_to_vault(&vault).unwrap();
+
+        let mut engine = ReactiveEngine::new(Arc::new(calyx_core::FixedClock::new(1_786_320_000)));
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .unwrap();
+        let ingest_ref = vault
+            .append_ledger_entry(
+                calyx_ledger::EntryKind::Ingest,
+                SubjectId::Cx(ood_cx),
+                b"live anomaly new region ingest".to_vec(),
+                ActorId::Service("astrolabe-server-test".to_string()),
+            )
+            .unwrap();
+        engine
+            .evaluate_post_ingest_durable(&vault, ood_cx, ingest_ref, &NewRegionSignals)
+            .unwrap();
+        vault.flush().unwrap();
+        drop(engine);
+        drop(vault);
+
+        write_config_value(
+            &dir,
+            &metadata_key("demo", "anomaly_report_json"),
+            &anomaly_report_unavailable_json("stale stored metadata").to_string(),
+        )
+        .unwrap();
+        let stored = read_anomaly_report_metadata(&dir, "demo").unwrap();
+        assert_eq!(stored["status"], "unavailable");
+
+        let report = read_anomaly_report(&dir, "demo").unwrap();
+        assert_eq!(
+            report["source"],
+            "AsterVault:ColumnFamily::XTerm+Assay+Reactive"
+        );
+        assert_eq!(report["source_state"]["xterm_rows_read"], 1);
+        assert_eq!(report["source_state"]["assay_rows_read"], 1);
+        assert_eq!(report["source_state"]["reactive_fired_rows_read"], 1);
+        assert_eq!(report["finding_count"], 3);
+        assert_eq!(report["trust"], "verified");
+        let findings = report["findings"].as_array().unwrap();
+        assert!(findings.iter().any(|finding| {
+            finding["kind"] == "doc_drift"
+                && finding["subject_id"] == format!("cx:{doc_cx}")
+                && finding["substrate_provenance_refs"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("AsterVault:ColumnFamily::XTerm:key:")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding["kind"] == "drift"
+                && finding["substrate_provenance_refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|source| source.as_str().unwrap().contains("ColumnFamily::Assay"))
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding["kind"] == "ood_commit"
+                && finding["substrate_provenance_refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|source| source.as_str().unwrap().contains("ColumnFamily::Reactive"))
+        }));
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -6,11 +6,13 @@ use std::error::Error;
 use std::fmt;
 
 use astrolabe_domain::EdgeKind;
-use calyx_aster::cf::ColumnFamily;
+use calyx_assay::AssayStore;
+use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, CxId, LedgerRef, SlotId, SlotVector, SparseEntry, VaultStore};
 use calyx_ledger::decode as decode_ledger;
 use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_loom::agreement_graph::XtermRow;
 pub use calyx_loom::reactive::{
     DEFAULT_MAX_AUDIT_ENTRIES as CALYX_REACTIVE_AUDIT_CAP,
     DEFAULT_MAX_QUEUE_DEPTH as CALYX_REACTIVE_QUEUE_CAP,
@@ -22,7 +24,9 @@ pub use calyx_loom::{
     ReactiveSignalSet, ReactiveSignals, SeriesStore, SubscriptionId, TriggerCondition,
     TriggerFired, TriggerId, decode_audit_entry, decode_trigger_fired, reactive_row_key,
 };
+use calyx_loom::{CrossTermKind as LoomCrossTermKind, CrossTermValue as LoomCrossTermValue};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
@@ -51,6 +55,8 @@ pub const PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE: usize =
 pub const DETECT_ANOMALIES_SCHEMA: &str = "astrolabe.detect_anomalies.v1";
 pub const ASTRO_ANOMALY_INVALID_KIND: &str = "ASTRO_ANOMALY_INVALID_KIND";
 pub const ASTROLABE_REACTIVE_ACK_TAG: &str = "astrolabe_reactive_ack_v1";
+pub const ASSAY_ANOMALY_PAYLOAD_SCHEMA: &str = "astrolabe.assay_anomalies.v1";
+pub const REACTIVE_NEW_REGION_SCORE_POLICY: &str = "policy:reactive_new_region_binary_score:v1";
 
 pub const SLOT_COMPLEXITY: SlotId = SlotId::new(2);
 pub const SLOT_GRAPH_POSITION: SlotId = SlotId::new(8);
@@ -1010,6 +1016,23 @@ pub struct SkippedAnomalySubstrate {
     pub trust: &'static str,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveAnomalyInputs {
+    pub snapshot: u64,
+    pub substrates: Vec<AnomalySubstrateRow>,
+    pub calibrations: Vec<AnomalyCalibration>,
+    pub skipped_rows: usize,
+    pub xterm_rows_read: usize,
+    pub assay_rows_read: usize,
+    pub reactive_rows_read: usize,
+}
+
+impl LiveAnomalyInputs {
+    pub fn has_anomaly_inputs(&self) -> bool {
+        !self.substrates.is_empty() || !self.calibrations.is_empty() || self.skipped_rows > 0
+    }
+}
+
 pub fn anomaly_substrate_row_from_eager_cross_term(
     row: &EagerCrossTermRow,
     substrate_provenance_ref: impl Into<String>,
@@ -1040,6 +1063,304 @@ pub fn anomaly_substrate_row_from_eager_cross_term(
             row.right_slot.get()
         )],
     ))
+}
+
+pub fn live_anomaly_inputs_from_vault<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<LiveAnomalyInputs>
+where
+    C: Clock,
+{
+    let snapshot = vault.snapshot();
+    let mut inputs = LiveAnomalyInputs {
+        snapshot,
+        ..LiveAnomalyInputs::default()
+    };
+
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::XTerm)? {
+        inputs.xterm_rows_read += 1;
+        let row: XtermRow = serde_json::from_slice(&value).map_err(|error| {
+            CalyxError::aster_corrupt_shard(format!("decode live XTerm anomaly row: {error}"))
+        })?;
+        let expected_key = xterm_key(
+            row.key.cx_id,
+            row.key.a,
+            row.key.b,
+            xterm_kind_from_loom(row.key.kind),
+        );
+        if key != expected_key {
+            return Err(CalyxError::aster_corrupt_shard(
+                "live XTerm CF key does not match decoded row key",
+            ));
+        }
+        if let Some(substrate) = anomaly_substrate_row_from_live_xterm(&row, &key) {
+            inputs.substrates.push(substrate);
+        }
+    }
+
+    let assay = AssayStore::load_from_vault(vault)?;
+    for row in assay.rows() {
+        inputs.assay_rows_read += 1;
+        let Some(payload) = row.payload.as_ref() else {
+            continue;
+        };
+        if payload.get("schema").and_then(Value::as_str) != Some(ASSAY_ANOMALY_PAYLOAD_SCHEMA) {
+            continue;
+        }
+        let provenance = format!(
+            "AsterVault:ColumnFamily::Assay:provenance:{}:seq:{}",
+            row.provenance, row.written_at_seq
+        );
+        add_anomaly_payload_inputs(payload, &provenance, &mut inputs);
+    }
+
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Reactive)? {
+        let row_key = reactive_row_key(&key)?;
+        if row_key.kind != ReactiveRowKind::Fired {
+            continue;
+        }
+        inputs.reactive_rows_read += 1;
+        let event = decode_trigger_fired(&value)?;
+        if let Some(substrate) = anomaly_substrate_row_from_reactive_event(&event, &key) {
+            inputs.substrates.push(substrate);
+        }
+    }
+
+    inputs.substrates.sort_by(anomaly_substrate_order);
+    inputs.calibrations.sort_by(anomaly_calibration_order);
+    Ok(inputs)
+}
+
+fn anomaly_substrate_row_from_live_xterm(
+    row: &XtermRow,
+    key: &[u8],
+) -> Option<AnomalySubstrateRow> {
+    if row.key.kind != LoomCrossTermKind::Agreement {
+        return None;
+    }
+    let kind = anomaly_kind_for_xterm_pair(row.key.a, row.key.b)?;
+    let LoomCrossTermValue::Scalar(value) = row.value else {
+        return None;
+    };
+    let agreement_millipoints = agreement_to_millipoints(value);
+    let (left, right, label) = match kind {
+        AnomalyKind::DocDrift => (
+            SLOT_DOC_SEMANTIC,
+            SIM_SEMANTIC_SLOT,
+            EagerAgreementKind::DocDrift.wire_name(),
+        ),
+        AnomalyKind::NameTruth => (
+            SLOT_NAME_SEMANTIC,
+            SIM_API_SLOT,
+            EagerAgreementKind::NameTruth.wire_name(),
+        ),
+        _ => return None,
+    };
+    Some(AnomalySubstrateRow::new(
+        kind,
+        format!("cx:{}", row.key.cx_id),
+        1_000_u64.saturating_sub(agreement_millipoints),
+        format!("live XTerm {label} agreement={agreement_millipoints} millipoints"),
+        [format!(
+            "AsterVault:ColumnFamily::XTerm:key:{}",
+            hex_lower_bytes(key)
+        )],
+        [
+            format!("live_xterm:{label}:S{}xS{}", left.get(), right.get()),
+            format!("xterm_tag:{:?}", row.tag),
+        ],
+    ))
+}
+
+fn anomaly_kind_for_xterm_pair(left: SlotId, right: SlotId) -> Option<AnomalyKind> {
+    if same_slot_pair(left, right, SLOT_DOC_SEMANTIC, SIM_SEMANTIC_SLOT) {
+        Some(AnomalyKind::DocDrift)
+    } else if same_slot_pair(left, right, SLOT_NAME_SEMANTIC, SIM_API_SLOT) {
+        Some(AnomalyKind::NameTruth)
+    } else {
+        None
+    }
+}
+
+fn same_slot_pair(
+    left: SlotId,
+    right: SlotId,
+    expected_left: SlotId,
+    expected_right: SlotId,
+) -> bool {
+    (left == expected_left && right == expected_right)
+        || (left == expected_right && right == expected_left)
+}
+
+fn anomaly_substrate_row_from_reactive_event(
+    event: &TriggerFired,
+    key: &[u8],
+) -> Option<AnomalySubstrateRow> {
+    let TriggerCondition::NewRegion { .. } = event.condition_snapshot else {
+        return None;
+    };
+    Some(AnomalySubstrateRow::new(
+        AnomalyKind::OodCommit,
+        format!("cx:{}", event.cx_id),
+        1_000,
+        format!(
+            "NewRegion trigger fired for cx {} at ledger seq {}",
+            event.cx_id, event.ledger_ref.seq
+        ),
+        [
+            format!(
+                "AsterVault:ColumnFamily::Reactive:key:{}",
+                hex_lower_bytes(key)
+            ),
+            format!("ledger:{}", event.ledger_ref.seq),
+        ],
+        [
+            "NewRegion".to_string(),
+            REACTIVE_NEW_REGION_SCORE_POLICY.to_string(),
+        ],
+    ))
+}
+
+fn add_anomaly_payload_inputs(
+    payload: &Value,
+    row_provenance: &str,
+    inputs: &mut LiveAnomalyInputs,
+) {
+    let mut saw_input = false;
+    match payload.get("anomaly_substrates").and_then(Value::as_array) {
+        Some(values) => {
+            saw_input = true;
+            for value in values {
+                match anomaly_substrate_from_payload_value(value, row_provenance) {
+                    Some(substrate) => inputs.substrates.push(substrate),
+                    None => inputs.skipped_rows += 1,
+                }
+            }
+        }
+        None => {
+            if payload.get("anomaly_substrates").is_some() {
+                inputs.skipped_rows += 1;
+            }
+        }
+    }
+    match payload
+        .get("anomaly_calibrations")
+        .and_then(Value::as_array)
+    {
+        Some(values) => {
+            saw_input = true;
+            for value in values {
+                match anomaly_calibration_from_payload_value(value, row_provenance) {
+                    Some(calibration) => inputs.calibrations.push(calibration),
+                    None => inputs.skipped_rows += 1,
+                }
+            }
+        }
+        None => {
+            if payload.get("anomaly_calibrations").is_some() {
+                inputs.skipped_rows += 1;
+            }
+        }
+    }
+    if !saw_input {
+        inputs.skipped_rows += 1;
+    }
+}
+
+fn anomaly_substrate_from_payload_value(
+    value: &Value,
+    row_provenance: &str,
+) -> Option<AnomalySubstrateRow> {
+    let kind = value.get("kind")?.as_str()?.parse::<AnomalyKind>().ok()?;
+    let subject_id = value.get("subject_id")?.as_str()?.trim();
+    if subject_id.is_empty() {
+        return None;
+    }
+    let score = value.get("score_millipoints")?.as_u64()?;
+    if score > 1_000 {
+        return None;
+    }
+    let message = value.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let mut provenance = string_array_value(value, "substrate_provenance_refs");
+    provenance.push(row_provenance.to_string());
+    if provenance.iter().any(|item| item.trim().is_empty()) {
+        return None;
+    }
+    Some(AnomalySubstrateRow::new(
+        kind,
+        subject_id.to_string(),
+        score,
+        message.to_string(),
+        provenance,
+        string_array_value(value, "lens_evidence"),
+    ))
+}
+
+fn anomaly_calibration_from_payload_value(
+    value: &Value,
+    row_provenance: &str,
+) -> Option<AnomalyCalibration> {
+    let kind = value.get("kind")?.as_str()?.parse::<AnomalyKind>().ok()?;
+    let medium = value.get("medium_min_score_millipoints")?.as_u64()?;
+    let high = value.get("high_min_score_millipoints")?.as_u64()?;
+    if medium > high || high > 1_000 {
+        return None;
+    }
+    let provenance = value
+        .get("provenance_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(row_provenance);
+    Some(AnomalyCalibration::new(kind, medium, high, provenance))
+}
+
+fn string_array_value(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn xterm_kind_from_loom(kind: LoomCrossTermKind) -> XTermKind {
+    match kind {
+        LoomCrossTermKind::Concat => XTermKind::Concat,
+        LoomCrossTermKind::Interaction => XTermKind::Interaction,
+        LoomCrossTermKind::Agreement => XTermKind::Agreement,
+        LoomCrossTermKind::Delta => XTermKind::Delta,
+    }
+}
+
+fn anomaly_substrate_order(left: &AnomalySubstrateRow, right: &AnomalySubstrateRow) -> Ordering {
+    left.kind
+        .cmp(&right.kind)
+        .then_with(|| left.subject_id.cmp(&right.subject_id))
+        .then_with(|| right.score_millipoints.cmp(&left.score_millipoints))
+}
+
+fn anomaly_calibration_order(left: &AnomalyCalibration, right: &AnomalyCalibration) -> Ordering {
+    left.kind
+        .cmp(&right.kind)
+        .then_with(|| left.provenance_ref.cmp(&right.provenance_ref))
+}
+
+fn hex_lower_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub fn detect_anomalies(
@@ -1582,14 +1903,22 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    use calyx_aster::cf::ColumnFamily;
+    use calyx_assay::{
+        AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag,
+    };
+    use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
     use calyx_aster::vault::{AsterVault, VaultOptions};
     use calyx_core::{
-        CxId, FixedClock, LedgerRef, Result as CalyxResult, SparseEntry, SystemClock, VaultId,
-        VaultStore,
+        AnchorKind, CxId, FixedClock, LedgerRef, Result as CalyxResult, SparseEntry, SystemClock,
+        VaultId, VaultStore,
     };
     use calyx_ledger::{ActorId, EntryKind, SubjectId};
-    use calyx_loom::CALYX_REACTIVE_QUEUE_FULL;
+    use calyx_loom::agreement_graph::XtermRow;
+    use calyx_loom::{
+        CALYX_REACTIVE_QUEUE_FULL, CrossTermKey, CrossTermKind as LoomCrossTermKind,
+        CrossTermValue as LoomCrossTermValue, SignalProvenanceTag,
+    };
+    use serde_json::json;
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
@@ -1787,6 +2116,142 @@ mod tests {
         assert!(text.contains("finding\tdoc_drift\tdemo.docs.lie\thigh\t900\txterm:doc-bad"));
         assert!(text.contains("calibration:doc-drift:v1"));
         assert!(text.contains("finding\tood_commit\tcommit:alien-1\thigh\t950"));
+    }
+
+    #[test]
+    fn live_anomaly_inputs_read_xterm_assay_and_reactive_cf_rows() {
+        let (dir, vault) = reactive_vault("live-anomalies");
+        let doc_cx = cx(101);
+        let xterm_row = XtermRow {
+            key: CrossTermKey {
+                cx_id: doc_cx,
+                a: SLOT_DOC_SEMANTIC,
+                b: SIM_SEMANTIC_SLOT,
+                kind: LoomCrossTermKind::Agreement,
+            },
+            value: LoomCrossTermValue::Scalar(0.10),
+            tag: SignalProvenanceTag::Derived,
+        };
+        let xterm_key = xterm_key(
+            doc_cx,
+            SLOT_DOC_SEMANTIC,
+            SIM_SEMANTIC_SLOT,
+            XTermKind::Agreement,
+        );
+        let xterm_value = serde_json::to_vec(&xterm_row).expect("encode xterm row");
+        vault
+            .write_cf_batch([(ColumnFamily::XTerm, xterm_key.clone(), xterm_value.clone())])
+            .expect("write xterm row");
+
+        let mut assay = AssayStore::default();
+        assay.put_with_payload(
+            AssayCacheKey::scoped(
+                7,
+                "week-2026-27",
+                reactive_vault_id(),
+                AnchorKind::Reward,
+            ),
+            AssaySubject::Panel,
+            MiEstimate::point(1.0, 16, EstimatorKind::PanelSufficiency, TrustTag::Trusted),
+            "assay:mmd:slot18:week27",
+            vault.snapshot(),
+            json!({
+                "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+                "anomaly_calibrations": [
+                    {"kind":"doc_drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:doc-drift:v1"},
+                    {"kind":"drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:drift:v1"},
+                    {"kind":"ood_commit","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:ood-commit:v1"}
+                ],
+                "anomaly_substrates": [
+                    {
+                        "kind":"drift",
+                        "subject_id":"slot:S18:week-2026-27",
+                        "score_millipoints":850,
+                        "message":"MMD drift alarm for semantic slot",
+                        "substrate_provenance_refs":["assay:mmd:slot18:week27"],
+                        "lens_evidence":["MMD:S18","guard_reject_rate:S18"]
+                    }
+                ]
+            }),
+        );
+        assay.persist_to_vault(&vault).expect("persist assay row");
+
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_320_000)));
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .expect("register new-region trigger");
+        engine
+            .evaluate_post_ingest_durable(
+                &vault,
+                cx(202),
+                lref(42),
+                &ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0),
+            )
+            .expect("persist new-region fired row");
+        vault.flush().expect("flush live anomaly CF rows");
+
+        let reopened = open_reactive_vault(&dir);
+        let raw_xterm = reopened
+            .read_cf_at(reopened.snapshot(), ColumnFamily::XTerm, &xterm_key)
+            .expect("read xterm CF")
+            .expect("xterm row present");
+        assert_eq!(raw_xterm, xterm_value);
+
+        let inputs =
+            live_anomaly_inputs_from_vault(&reopened).expect("read live anomaly input rows");
+        assert!(inputs.has_anomaly_inputs());
+        assert_eq!(inputs.xterm_rows_read, 1);
+        assert_eq!(inputs.assay_rows_read, 1);
+        assert_eq!(inputs.reactive_rows_read, 1);
+        assert_eq!(inputs.skipped_rows, 0);
+
+        let report = detect_anomalies(&inputs.substrates, &inputs.calibrations, None, true)
+            .expect("detect live anomalies");
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .map(|finding| (
+                    finding.kind.as_str().to_string(),
+                    finding.subject_id.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ood_commit".to_string(), format!("cx:{}", cx(202))),
+                ("doc_drift".to_string(), format!("cx:{doc_cx}")),
+                ("drift".to_string(), "slot:S18:week-2026-27".to_string()),
+            ]
+        );
+        let doc = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == AnomalyKind::DocDrift)
+            .expect("doc drift finding");
+        assert!(doc.substrate_provenance_refs.contains(&format!(
+            "AsterVault:ColumnFamily::XTerm:key:{}",
+            hex_lower_bytes(&xterm_key)
+        )));
+        let drift = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == AnomalyKind::Drift)
+            .expect("drift finding");
+        assert!(
+            drift
+                .substrate_provenance_refs
+                .iter()
+                .any(|source| source.contains("ColumnFamily::Assay"))
+        );
+        let ood = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == AnomalyKind::OodCommit)
+            .expect("ood finding");
+        assert!(
+            ood.lens_evidence
+                .contains(&REACTIVE_NEW_REGION_SCORE_POLICY.to_string())
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
