@@ -22,6 +22,35 @@ note: required because it's used within this closure
 note: required by a bound in `spawn`
  --> $RUST/std/src/thread/functions.rs
 
+error[E0277]: `NonNull<astrolabe_bridge::WatcherCallbackState>` cannot be sent between threads safely
+ --> tests/trybuild/cbm_watcher_send.rs:3:24
+  |
+3 |     std::thread::spawn(move || drop(watcher));
+  |     ------------------ -------^^^^^^^^^^^^^^
+  |     |                  |
+  |     |                  `NonNull<astrolabe_bridge::WatcherCallbackState>` cannot be sent between threads safely
+  |     |                  within this `{closure@$DIR/tests/trybuild/cbm_watcher_send.rs:3:24: 3:31}`
+  |     required by a bound introduced by this call
+  |
+  = help: within `{closure@$DIR/tests/trybuild/cbm_watcher_send.rs:3:24: 3:31}`, the trait `Send` is not implemented for `NonNull<astrolabe_bridge::WatcherCallbackState>`
+note: required because it appears within the type `astrolabe_bridge::WatcherCallbackOwner`
+ --> src/lib.rs
+  |
+  | struct WatcherCallbackOwner {
+  |        ^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `CbmWatcher`
+ --> src/lib.rs
+  |
+  | pub struct CbmWatcher {
+  |            ^^^^^^^^^^
+note: required because it's used within this closure
+ --> tests/trybuild/cbm_watcher_send.rs:3:24
+  |
+3 |     std::thread::spawn(move || drop(watcher));
+  |                        ^^^^^^^
+note: required by a bound in `spawn`
+ --> $RUST/std/src/thread/functions.rs
+
 error[E0277]: `NonNull<cbm_sys::cbm_store>` cannot be sent between threads safely
  --> tests/trybuild/cbm_watcher_send.rs:3:24
   |
@@ -76,40 +105,3 @@ note: required because it's used within this closure
   |                        ^^^^^^^
 note: required by a bound in `spawn`
  --> $RUST/std/src/thread/functions.rs
-
-error[E0277]: `(dyn for<'a, 'b> FnMut(&'a str, &'b str) -> Result<(), BridgeError> + 'static)` cannot be sent between threads safely
- --> tests/trybuild/cbm_watcher_send.rs:3:24
-  |
-3 |     std::thread::spawn(move || drop(watcher));
-  |     ------------------ ^^^^^^^^^^^^^^^^^^^^^ `(dyn for<'a, 'b> FnMut(&'a str, &'b str) -> Result<(), BridgeError> + 'static)` cannot be sent between threads safely
-  |     |
-  |     required by a bound introduced by this call
-  |
-  = help: the trait `Send` is not implemented for `(dyn for<'a, 'b> FnMut(&'a str, &'b str) -> Result<(), BridgeError> + 'static)`
-  = note: required for `std::ptr::Unique<(dyn for<'a, 'b> FnMut(&'a str, &'b str) -> Result<(), BridgeError> + 'static)>` to implement `Send`
-note: required because it appears within the type `Box<(dyn for<'a, 'b> FnMut(&'a str, &'b str) -> Result<(), BridgeError> + 'static)>`
- --> $RUST/alloc/src/boxed.rs
-note: required because it appears within the type `astrolabe_bridge::WatcherCallbackState`
- --> src/lib.rs
-  |
-  | struct WatcherCallbackState {
-  |        ^^^^^^^^^^^^^^^^^^^^
-  = note: required for `std::ptr::Unique<astrolabe_bridge::WatcherCallbackState>` to implement `Send`
-note: required because it appears within the type `Box<astrolabe_bridge::WatcherCallbackState>`
- --> $RUST/alloc/src/boxed.rs
-note: required because it appears within the type `CbmWatcher`
- --> src/lib.rs
-  |
-  | pub struct CbmWatcher {
-  |            ^^^^^^^^^^
-note: required because it's used within this closure
- --> tests/trybuild/cbm_watcher_send.rs:3:24
-  |
-3 |     std::thread::spawn(move || drop(watcher));
-  |                        ^^^^^^^
-note: required by a bound in `spawn`
- --> $RUST/std/src/thread/functions.rs
-help: use parentheses to call this trait object
-  |
-3 |     std::thread::spawn(move || drop(watcher)(/* &str */, /* &str */));
-  |                                             ++++++++++++++++++++++++
