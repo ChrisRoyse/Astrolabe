@@ -7,8 +7,12 @@ if [[ $# -ne 3 ]]; then
 fi
 
 LABEL="$1"
-CC_BIN="$2"
-CXX_BIN="$3"
+# Backslashed Windows compiler paths survive quoted bash use but are mangled
+# inside the pinned Makefile's $(shell echo | $(CC) ...) MinGW autodetection,
+# which silently drops WIN32_LIBS from the link. Normalize to forward
+# slashes; POSIX paths are unaffected.
+CC_BIN="${2//\\//}"
+CXX_BIN="${3//\\//}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CBM="$ROOT/vendor/codebase-memory-mcp"
