@@ -162,6 +162,53 @@ def main() -> int:
         )
         expect_failure(run_checker(fixture), "session lock")
 
+        # #197: dropping the staged atomic claim (writing the lock in place
+        # again) must be caught.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            '$launcherLockStage = "$launcherLock.$PID.tmp"',
+            "$launcherLockStage = $launcherLock",
+        )
+        expect_failure(run_checker(fixture), "atomically")
+
+        # #197: a clobbering move would let a lost claim race overwrite a live
+        # session's lock.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop",
+            "Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -Force -ErrorAction Stop",
+        )
+        expect_failure(run_checker(fixture), "atomically")
+
+        # #197: the lost-race refusal must stay a named boundary.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "ASTRO_LAUNCHER_LOCK_RACE",
+            "ASTRO_LAUNCHER_LOCK_SILENT",
+        )
+        expect_failure(run_checker(fixture), "atomically")
+
+        # #197: pid schema validation must stay a parse, not a bare cast.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "[int]::TryParse([string]$lockState.pid",
+            "[int]::Parse([string]$lockState.pid",
+        )
+        expect_failure(run_checker(fixture), "pid schema")
+
+        # #197: zero/negative pids must stay invalid.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "$parsedLockPid -gt 0",
+            "$parsedLockPid -ge 0",
+        )
+        expect_failure(run_checker(fixture), "pid schema")
+
         copy_fixture(fixture)
         rewrite(
             runner,
