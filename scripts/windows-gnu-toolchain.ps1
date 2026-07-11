@@ -28,6 +28,11 @@ $CppcheckTag = "2.20.0"
 $CppcheckCommit = "502C802A69C78F3D8CFD9973AA2108AE169C73B5"
 $CppcheckDirectoryName = "cppcheck-2.20.0-x86_64-w64-mingw32"
 $ExpectedCppcheckVersion = "2.20.0"
+$RipgrepVersion = "14.1.1"
+$RipgrepArchiveName = "ripgrep-14.1.1-x86_64-pc-windows-msvc.zip"
+$RipgrepArchiveUrl = "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip"
+$ExpectedRipgrepSha256 = "D0F534024C42AFD6CB4D38907C25CD2B249B79BBE6CC1DBEE8E3E37C2B6E25A1"
+$RipgrepDirectoryName = "ripgrep-14.1.1-x86_64-pc-windows-msvc"
 $GitInstallRoot = "C:\Program Files\Git"
 $RequiredTools = @(
     "gcc.exe",
@@ -291,6 +296,62 @@ function Remove-StalePinnedCppcheck {
         }
 }
 
+function Install-PinnedRipgrep {
+    param([string]$ToolsRoot, [string]$RipgrepRoot)
+
+    if (Test-Path -LiteralPath $RipgrepRoot) {
+        return
+    }
+
+    New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
+    $staging = Join-Path $ToolsRoot ".installing-ripgrep-$PID"
+    try {
+        New-Item -ItemType Directory -Path $staging -ErrorAction Stop | Out-Null
+        $archive = Join-Path $staging $RipgrepArchiveName
+        & curl.exe --fail --location --retry 3 --output $archive $RipgrepArchiveUrl
+        Require-Success "download of $RipgrepArchiveName"
+
+        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        if ($actualHash -ne $ExpectedRipgrepSha256) {
+            throw "pinned ripgrep archive hash mismatch: expected $ExpectedRipgrepSha256, got $actualHash"
+        }
+
+        $sevenZip = Get-SevenZip
+        & $sevenZip x "-o$staging" $archive | Out-Null
+        Require-Success "extraction of $RipgrepArchiveName"
+
+        $extractedRoot = Join-Path $staging $RipgrepDirectoryName
+        Require-Path (Join-Path $extractedRoot "rg.exe") "archive did not contain the expected ripgrep binary"
+        if (Test-Path -LiteralPath $RipgrepRoot) {
+            throw "pinned ripgrep destination appeared during installation: $RipgrepRoot"
+        }
+        Move-Item -LiteralPath $extractedRoot -Destination $RipgrepRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force
+        }
+    }
+}
+
+function Remove-StalePinnedRipgrep {
+    param([string]$ToolsRoot, [string]$RipgrepRoot)
+
+    if (-not (Test-Path -LiteralPath $ToolsRoot -PathType Container)) {
+        return
+    }
+
+    $currentRoot = (Resolve-Path -LiteralPath $RipgrepRoot -ErrorAction Stop).Path
+    Get-ChildItem -LiteralPath $ToolsRoot -Directory -Force |
+        Where-Object {
+            $_.Name -match '^(?:ripgrep-[0-9]+[.][0-9]+[.][0-9]+-x86_64-pc-windows-msvc)$' -and
+            -not [string]::Equals($_.FullName, $currentRoot, [StringComparison]::OrdinalIgnoreCase)
+        } |
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
+}
+
 function Ensure-BundledMakeAlias {
     param([string]$MingwBin)
 
@@ -327,11 +388,12 @@ function Set-ToolchainEnvironment {
         [string]$MingwBin,
         [string]$LlvmBin,
         [string]$CppcheckRoot,
+        [string]$RipgrepRoot,
         [string]$GitBin,
         [string]$GitUsrBin
     )
 
-    $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$GitUsrBin;$GitBin;$env:PATH"
+    $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$RipgrepRoot;$GitUsrBin;$GitBin;$env:PATH"
     $env:SHELL = Join-Path $GitUsrBin "sh.exe"
     $env:BASH = Join-Path $GitBin "bash.exe"
     $env:RUSTUP_TOOLCHAIN = $RustToolchain
@@ -345,6 +407,7 @@ function Set-ToolchainEnvironment {
     $env:CLANG_TIDY = Join-Path $LlvmBin "clang-tidy.exe"
     $env:CLANG_FORMAT = Join-Path $LlvmBin "clang-format.exe"
     $env:CPPCHECK = Join-Path $CppcheckRoot "cppcheck.exe"
+    $env:RIPGREP = Join-Path $RipgrepRoot "rg.exe"
 }
 
 function Set-WorkspaceTempEnvironment {
@@ -356,7 +419,7 @@ function Set-WorkspaceTempEnvironment {
 }
 
 function Test-PinnedToolchain {
-    param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot)
+    param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot)
 
     foreach ($tool in $RequiredTools) {
         Require-Path (Join-Path $MingwBin $tool) "pinned MinGW tool is missing"
@@ -416,6 +479,14 @@ function Test-PinnedToolchain {
     Require-Success "cppcheck version check"
     if ($cppcheckVersion -notmatch [regex]::Escape($ExpectedCppcheckVersion)) {
         throw "unexpected cppcheck version; expected $ExpectedCppcheckVersion, got: $cppcheckVersion"
+    }
+
+    $rgExe = Join-Path $RipgrepRoot "rg.exe"
+    Require-Path $rgExe "pinned ripgrep is missing"
+    $ripgrepVersion = (& $rgExe --version) -join "`n"
+    Require-Success "ripgrep version check"
+    if ($ripgrepVersion -notmatch [regex]::Escape($RipgrepVersion)) {
+        throw "unexpected ripgrep version; expected $RipgrepVersion, got: $ripgrepVersion"
     }
 
     & $env:MAKE --version | Out-Null
@@ -486,6 +557,7 @@ $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
 $llvmBin = Join-Path $llvmRoot "bin"
 $cppcheckRoot = Join-Path $toolsRoot $CppcheckDirectoryName
+$ripgrepRoot = Join-Path $toolsRoot $RipgrepDirectoryName
 $gitRoot = $GitInstallRoot
 $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
@@ -501,12 +573,15 @@ Ensure-BundledMakeAlias -MingwBin $mingwBin
 if ($Bootstrap) {
     Install-PinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
     Install-PinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot -MingwBin $mingwBin -GitBin $gitBin -GitUsrBin $gitUsrBin
+    Install-PinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
     Remove-StalePinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
     Remove-StalePinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot
+    Remove-StalePinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
 }
 Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
 Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
-Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -GitBin $gitBin -GitUsrBin $gitUsrBin
+Require-Path (Join-Path $ripgrepRoot "rg.exe") "pinned ripgrep is missing; rerun with -Bootstrap"
+Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin
 # No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
 # host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
 # (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
@@ -514,8 +589,8 @@ Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cp
 # Set-ToolchainEnvironment prepends $GitBin to the child PATH; $Command is invoked
 # by explicit path. An explicitly-passed bash $Command is still validated by
 # Assert-AllowedBashCommand above. See #205.
-Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot
-Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, runtime $mingwBin"
+Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot
+Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, runtime $mingwBin"
 
 if ([string]::IsNullOrWhiteSpace($Command)) {
     Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
