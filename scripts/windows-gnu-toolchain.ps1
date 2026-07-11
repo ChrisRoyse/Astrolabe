@@ -28,6 +28,8 @@ $CppcheckTag = "2.20.0"
 $CppcheckCommit = "502C802A69C78F3D8CFD9973AA2108AE169C73B5"
 $CppcheckDirectoryName = "cppcheck-2.20.0-x86_64-w64-mingw32"
 $ExpectedCppcheckVersion = "2.20.0"
+$GitInstallRoot = "C:\Program Files\Git"
+$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")
 $RequiredTools = @(
     "gcc.exe",
     "g++.exe",
@@ -45,6 +47,95 @@ function Require-Path {
     param([string]$Path, [string]$Message)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "${Message}: $Path"
+    }
+}
+
+function Test-PathUnderRoot {
+    param([string]$Path, [string]$Root)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar) +
+        [IO.Path]::DirectorySeparatorChar
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    return $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-NoWslState {
+    param([string]$GitRoot)
+
+    $wslService = Get-Service -Name "WSLService" -ErrorAction SilentlyContinue
+    if ($null -ne $wslService) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_SERVICE_PRESENT]: uninstall machine-wide WSL from an elevated native Windows PowerShell session before Astrolabe work (status=$($wslService.Status), startup=$($wslService.StartType))"
+    }
+
+    $activeWslProcesses = @()
+    foreach ($name in $ForbiddenWslProcessNames) {
+        foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+            $activeWslProcesses += "$($process.ProcessName):$($process.Id)"
+        }
+    }
+    if ($activeWslProcesses.Count -gt 0) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_PROCESS_ACTIVE]: stop and remove forbidden WSL processes before Astrolabe work: $($activeWslProcesses -join ', ')"
+    }
+
+    $nonGitBashProcesses = @()
+    foreach ($process in @(Get-Process -Name "bash" -ErrorAction SilentlyContinue)) {
+        $processPath = $null
+        try {
+            $processPath = $process.Path
+        }
+        catch {
+            # An unverifiable Bash process is not acceptable in this fail-closed boundary.
+        }
+        if (-not (Test-PathUnderRoot -Path $processPath -Root $GitRoot)) {
+            $displayPath = if ([string]::IsNullOrWhiteSpace($processPath)) { "unresolved" } else { $processPath }
+            $nonGitBashProcesses += "$($process.Id):$displayPath"
+        }
+    }
+    if ($nonGitBashProcesses.Count -gt 0) {
+        throw "WSL_BOUNDARY[ASTRO_NON_GIT_BASH_ACTIVE]: only Bash under $GitRoot is allowed; stop forbidden or unverifiable Bash processes: $($nonGitBashProcesses -join ', ')"
+    }
+}
+
+function Assert-AllowedBashCommand {
+    param([string]$Command, [string]$GitRoot)
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        return
+    }
+    $leaf = [IO.Path]::GetFileName($Command)
+    if ($leaf -notin @("bash", "bash.exe")) {
+        return
+    }
+    if ([IO.Path]::IsPathRooted($Command) -or $Command.Contains("\") -or $Command.Contains("/")) {
+        $resolved = (Resolve-Path -LiteralPath $Command -ErrorAction Stop).Path
+        if (-not (Test-PathUnderRoot -Path $resolved -Root $GitRoot)) {
+            throw "WSL_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolved"
+        }
+    }
+}
+
+function Assert-NativeGitBashResolution {
+    param([string]$GitRoot, [string]$Command)
+
+    $resolvedBash = (Get-Command -Name "bash.exe" -CommandType Application -ErrorAction Stop).Source
+    if (-not (Test-PathUnderRoot -Path $resolvedBash -Root $GitRoot)) {
+        throw "WSL_BOUNDARY[ASTRO_BASH_RESOLUTION_FORBIDDEN]: bash.exe must resolve under $GitRoot, found $resolvedBash"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Command) -and
+        [IO.Path]::GetFileName($Command) -in @("bash", "bash.exe")) {
+        $resolvedCommand = if ([IO.Path]::IsPathRooted($Command) -or $Command.Contains("\") -or $Command.Contains("/")) {
+            (Resolve-Path -LiteralPath $Command -ErrorAction Stop).Path
+        }
+        else {
+            (Get-Command -Name $Command -CommandType Application -ErrorAction Stop).Source
+        }
+        if (-not (Test-PathUnderRoot -Path $resolvedCommand -Root $GitRoot)) {
+            throw "WSL_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolvedCommand"
+        }
     }
 }
 
@@ -292,6 +383,7 @@ function Set-ToolchainEnvironment {
 
     $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$GitUsrBin;$GitBin;$env:PATH"
     $env:SHELL = Join-Path $GitUsrBin "sh.exe"
+    $env:BASH = Join-Path $GitBin "bash.exe"
     $env:RUSTUP_TOOLCHAIN = $RustToolchain
     $env:MAKE = Join-Path $MingwBin "make.exe"
     $env:CC = Join-Path $MingwBin "gcc.exe"
@@ -409,10 +501,13 @@ $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
 $llvmBin = Join-Path $llvmRoot "bin"
 $cppcheckRoot = Join-Path $toolsRoot $CppcheckDirectoryName
-$gitBin = "C:\Program Files\Git\bin"
-$gitUsrBin = "C:\Program Files\Git\usr\bin"
+$gitRoot = $GitInstallRoot
+$gitBin = Join-Path $gitRoot "bin"
+$gitUsrBin = Join-Path $gitRoot "usr\bin"
 Require-Path (Join-Path $gitBin "bash.exe") "native Git for Windows Bash is required"
 Require-Path (Join-Path $gitUsrBin "sh.exe") "native Git for Windows shell is required"
+Assert-NoWslState -GitRoot $gitRoot
+Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot
 
 if ($Bootstrap) {
     Install-PinnedToolchain -ToolsRoot $toolsRoot -MingwRoot $mingwRoot
@@ -428,6 +523,7 @@ if ($Bootstrap) {
 Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
 Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
 Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -GitBin $gitBin -GitUsrBin $gitUsrBin
+Assert-NativeGitBashResolution -GitRoot $gitRoot -Command $Command
 Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot
 Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, runtime $mingwBin"
 

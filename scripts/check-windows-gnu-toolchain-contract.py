@@ -15,6 +15,10 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(f"Windows GNU toolchain contract failed: {message}")
 
 
+def appears_before(text: str, first: str, second: str) -> bool:
+    return first in text and second in text and text.index(first) < text.index(second)
+
+
 def main() -> None:
     require(RUNNER.is_file(), "the native Windows GNU launcher must exist")
     runner = RUNNER.read_text(encoding="utf-8")
@@ -80,6 +84,7 @@ def main() -> None:
     require(
         '$env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$GitUsrBin;$GitBin;$env:PATH"'
         in runner
+        and '$env:BASH = Join-Path $GitBin "bash.exe"' in runner
         and '$env:MAKE = Join-Path $MingwBin "make.exe"' in runner
         and '$env:CLANG_TIDY = Join-Path $LlvmBin "clang-tidy.exe"' in runner
         and '$env:CLANG_FORMAT = Join-Path $LlvmBin "clang-format.exe"' in runner
@@ -131,8 +136,45 @@ def main() -> None:
             f"the launcher must set {variable} for child commands",
         )
     require(
-        "WSL_DISTRO_NAME" in runner,
-        "the launcher must fail rather than run from a WSL environment",
+        "WSL_DISTRO_NAME" in runner
+        and '$GitInstallRoot = "C:\\Program Files\\Git"' in runner
+        and '$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")'
+        in runner
+        and "function Assert-NoWslState" in runner
+        and 'Get-Service -Name "WSLService"' in runner
+        and 'Get-Process -Name $name' in runner
+        and 'Get-Process -Name "bash"' in runner
+        and "ASTRO_WSL_SERVICE_PRESENT" in runner
+        and "ASTRO_WSL_PROCESS_ACTIVE" in runner
+        and "ASTRO_NON_GIT_BASH_ACTIVE" in runner,
+        "the launcher must fail closed on installed WSL or active WSL/non-Git Bash processes",
+    )
+    require(
+        "function Assert-AllowedBashCommand" in runner
+        and "function Assert-NativeGitBashResolution" in runner
+        and 'Get-Command -Name "bash.exe" -CommandType Application' in runner
+        and "ASTRO_BASH_COMMAND_FORBIDDEN" in runner
+        and "ASTRO_BASH_RESOLUTION_FORBIDDEN" in runner,
+        "the launcher must reject Bash resolution outside the pinned Git for Windows root",
+    )
+    require(
+        appears_before(
+            runner, "Assert-NoWslState -GitRoot $gitRoot", "if ($Bootstrap)"
+        )
+        and appears_before(
+            runner,
+            "Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot",
+            "if ($Bootstrap)",
+        ),
+        "the WSL and Bash-command preflight must run before bootstrap work",
+    )
+    require(
+        appears_before(
+            runner,
+            "Assert-NativeGitBashResolution -GitRoot $gitRoot -Command $Command",
+            "Test-PinnedToolchain -MingwBin $mingwBin",
+        ),
+        "Git Bash resolution must be verified before toolchain command work",
     )
     require(
         'Remove-Item -LiteralPath $target -Recurse -Force' in runner

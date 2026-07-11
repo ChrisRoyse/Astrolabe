@@ -184,6 +184,16 @@ def main() -> int:
 
         rewrite(
             check,
+            '"$PYTHON_BIN" scripts/test-windows-gnu-toolchain-contract.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "test-windows-gnu-toolchain-contract.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
             '"$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check\n',
             "",
         )
