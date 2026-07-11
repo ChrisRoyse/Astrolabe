@@ -246,7 +246,7 @@ pub(crate) struct HookDeadline {
 }
 
 impl HookDeadline {
-    fn start(budget_ms: u64) -> Self {
+    pub(crate) fn start(budget_ms: u64) -> Self {
         let done = Arc::new(AtomicBool::new(false));
         let thread_done = Arc::clone(&done);
         let _ = thread::spawn(move || {
