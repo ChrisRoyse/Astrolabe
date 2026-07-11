@@ -186,16 +186,82 @@ def fts_rows(path):
     )
 
 
+# A whitelist entry suppresses a divergence when every one of its matcher keys
+# equals the corresponding field on that divergence. These are the only keys a
+# divergence carries (see the compare_* helpers), so an entry that names none of
+# them has no discriminating power: `all(...)` over an empty match set is True,
+# which would silently suppress *every* divergence. Entries are therefore
+# validated fail-closed at load time — see validate_whitelist_entries.
+MATCHER_KEYS = ("kind", "field", "qn", "native", "shadow")
+# Non-matching metadata a maintainer may attach to document an entry. Never used
+# to match a divergence, so it cannot widen suppression.
+METADATA_KEYS = ("justification",)
+ALLOWED_ENTRY_KEYS = frozenset(MATCHER_KEYS) | frozenset(METADATA_KEYS)
+
+
+def _whitelist_error(code, message, remediation):
+    return SystemExit(
+        json.dumps(
+            {"code": code, "message": message, "remediation": remediation},
+            sort_keys=True,
+        )
+    )
+
+
+def validate_whitelist_entries(entries, source):
+    if not isinstance(entries, list):
+        raise _whitelist_error(
+            "shadow_parity_whitelist_entries_not_list",
+            f"shadow-parity whitelist 'entries' in {source} must be a JSON array",
+            "set 'entries' to a JSON array of matcher objects; see "
+            "ci/shadow-parity-whitelist.json",
+        )
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise _whitelist_error(
+                "shadow_parity_whitelist_entry_not_object",
+                f"shadow-parity whitelist entry #{index} in {source} is not a JSON object",
+                "replace it with an object naming at least one matcher key "
+                f"({', '.join(MATCHER_KEYS)})",
+            )
+        unknown = sorted(set(entry) - ALLOWED_ENTRY_KEYS)
+        if unknown:
+            raise _whitelist_error(
+                "shadow_parity_whitelist_entry_unknown_keys",
+                f"shadow-parity whitelist entry #{index} in {source} has "
+                f"unrecognized key(s): {', '.join(unknown)}",
+                "remove the unrecognized key(s); allowed keys are "
+                f"{', '.join(sorted(ALLOWED_ENTRY_KEYS))}",
+            )
+        matchers = [key for key in entry if key in MATCHER_KEYS]
+        if not matchers:
+            raise _whitelist_error(
+                "shadow_parity_whitelist_entry_no_matcher",
+                f"shadow-parity whitelist entry #{index} in {source} specifies no "
+                "concrete matcher; an empty or metadata-only entry would suppress "
+                "every divergence",
+                "add at least one discriminating matcher key "
+                f"({', '.join(MATCHER_KEYS)}) so the entry targets a specific "
+                "divergence class",
+            )
+    return entries
+
+
 def load_whitelist(path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema") != "astrolabe-shadow-parity-whitelist-v1":
         raise SystemExit(f"unexpected whitelist schema in {path}")
-    return payload.get("entries", [])
+    return validate_whitelist_entries(payload.get("entries", []), str(path))
 
 
 def is_whitelisted(divergence, entries):
     for entry in entries:
-        if all(divergence.get(key) == value for key, value in entry.items()):
+        matchers = {key: value for key, value in entry.items() if key in MATCHER_KEYS}
+        # Defense in depth: validate_whitelist_entries already guarantees at
+        # least one matcher, but never let a matcher-less entry blanket-match.
+        if matchers and all(
+            divergence.get(key) == value for key, value in matchers.items()
+        ):
             return True
     return False
 
@@ -431,8 +497,170 @@ def write_summary(path, dashboard):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def run_selftest():
+    """Prove the whitelist validator is fail-closed without touching binaries.
+
+    (a) a {} (or metadata-only) entry raises a structured validation error naming
+        its index, (b) legitimate entries still load and match, (c) suppression
+        counts (divergences / suppressed / unwhitelisted) stay reported.
+    """
+    failures = []
+
+    def check(name, condition, detail=""):
+        status = "ok" if condition else "FAIL"
+        suffix = f" — {detail}" if detail else ""
+        print(f"[selftest] {name}: {status}{suffix}")
+        if not condition:
+            failures.append(name)
+
+    tmp = Path(tempfile.mkdtemp(prefix="astrolabe-shadow-parity-selftest-"))
+    try:
+        # (a) empty entry {} at index 1 must raise a structured validation error.
+        empty_path = tmp / "empty-entry.json"
+        empty_path.write_text(
+            json.dumps(
+                {
+                    "schema": "astrolabe-shadow-parity-whitelist-v1",
+                    "entries": [{"kind": "fts", "field": "f23"}, {}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_whitelist(empty_path)
+            check("empty_entry_rejected", False, "load_whitelist did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "empty_entry_rejected",
+                payload.get("code") == "shadow_parity_whitelist_entry_no_matcher"
+                and "#1" in payload.get("message", "")
+                and bool(payload.get("remediation")),
+                json.dumps(payload, sort_keys=True),
+            )
+
+        # metadata-only entry (justification, no matcher) is likewise rejected.
+        meta_path = tmp / "metadata-only.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "schema": "astrolabe-shadow-parity-whitelist-v1",
+                    "entries": [{"justification": "known-good drift"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_whitelist(meta_path)
+            check("metadata_only_rejected", False, "load_whitelist did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "metadata_only_rejected",
+                payload.get("code") == "shadow_parity_whitelist_entry_no_matcher"
+                and "#0" in payload.get("message", ""),
+                json.dumps(payload, sort_keys=True),
+            )
+
+        # unknown key is rejected so a typo cannot silently broaden a matcher.
+        typo_path = tmp / "unknown-key.json"
+        typo_path.write_text(
+            json.dumps(
+                {
+                    "schema": "astrolabe-shadow-parity-whitelist-v1",
+                    "entries": [{"kynd": "fts"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_whitelist(typo_path)
+            check("unknown_key_rejected", False, "load_whitelist did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "unknown_key_rejected",
+                payload.get("code") == "shadow_parity_whitelist_entry_unknown_keys"
+                and "#0" in payload.get("message", ""),
+                json.dumps(payload, sort_keys=True),
+            )
+
+        # (b) legitimate entries still load and match (subset match + justification).
+        legit_path = tmp / "legit.json"
+        legit_path.write_text(
+            json.dumps(
+                {
+                    "schema": "astrolabe-shadow-parity-whitelist-v1",
+                    "entries": [
+                        {"kind": "fts", "field": "f23", "justification": "known FTS drift"},
+                        {"kind": "node_field", "field": "properties"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries = load_whitelist(legit_path)
+        check("legit_loads", len(entries) == 2, f"{len(entries)} entries")
+
+        divergences = [
+            {"kind": "fts", "field": "f23"},  # -> entry 0
+            {
+                "kind": "node_field",
+                "qn": "src::f01",
+                "field": "properties",
+                "native": "a",
+                "shadow": "b",
+            },  # -> entry 1 (subset match on kind+field)
+            {"kind": "schema", "field": "sqlite_master"},  # not whitelisted
+            {
+                "kind": "node_field",
+                "qn": "src::f02",
+                "field": "name",
+                "native": "x",
+                "shadow": "y",
+            },  # not whitelisted (field != properties)
+        ]
+        unwhitelisted = [d for d in divergences if not is_whitelisted(d, entries)]
+        check("legit_exact_match", is_whitelisted(divergences[0], entries) is True)
+        check("legit_subset_match", is_whitelisted(divergences[1], entries) is True)
+        check("non_match_class_kept", is_whitelisted(divergences[2], entries) is False)
+        check("non_match_field_kept", is_whitelisted(divergences[3], entries) is False)
+
+        # (c) suppression counts remain reported.
+        suppressed = len(divergences) - len(unwhitelisted)
+        check("divergence_count", len(divergences) == 4, str(len(divergences)))
+        check("suppressed_count", suppressed == 2, str(suppressed))
+        check("unwhitelisted_count", len(unwhitelisted) == 2, str(len(unwhitelisted)))
+        print(
+            "[selftest] counts "
+            + json.dumps(
+                {
+                    "divergences": len(divergences),
+                    "suppressed": suppressed,
+                    "unwhitelisted": len(unwhitelisted),
+                },
+                sort_keys=True,
+            )
+        )
+
+        # The shipped whitelist (entries: []) must still load cleanly.
+        shipped = load_whitelist(WHITELIST)
+        check("shipped_whitelist_loads", shipped == [], f"{len(shipped)} entries")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if failures:
+        raise SystemExit(f"shadow-parity whitelist self-test failed: {failures}")
+    print("[selftest] all checks passed")
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run the whitelist-validation self-test (no binaries) and exit",
+    )
     parser.add_argument("--upstream", type=Path)
     parser.add_argument("--astrolabe", type=Path)
     parser.add_argument("--whitelist", type=Path, default=WHITELIST)
@@ -444,6 +672,10 @@ def main():
     parser.add_argument("--expect-failure", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     args = parser.parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return
 
     upstream = args.upstream or default_upstream() or build_upstream()
     astrolabe = args.astrolabe or default_astrolabe() or build_astrolabe()
