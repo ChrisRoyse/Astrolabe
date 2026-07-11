@@ -215,7 +215,9 @@ pub(crate) fn scope_summaries_from_row_sink_rows(rows: &CbmPipelineRows) -> Valu
     scope_summaries_json(&summaries, skipped_properties)
 }
 
-pub(crate) fn scope_summary_inputs_from_rows(rows: &CbmPipelineRows) -> (Vec<ScopeSummaryInput>, usize) {
+pub(crate) fn scope_summary_inputs_from_rows(
+    rows: &CbmPipelineRows,
+) -> (Vec<ScopeSummaryInput>, usize) {
     let fingerprint = hex_lower(&row_sink_fingerprint(rows));
     let mut by_scope = BTreeMap::<String, Vec<ScopeSummaryMember>>::new();
     let mut grounded_by_scope = BTreeMap::<String, bool>::new();
@@ -324,7 +326,10 @@ pub(crate) fn scope_node_provenance(
         })
 }
 
-pub(crate) fn scope_recall_for_node(properties: &Value, scope: &str) -> Option<ScopeRecallMeasurement> {
+pub(crate) fn scope_recall_for_node(
+    properties: &Value,
+    scope: &str,
+) -> Option<ScopeRecallMeasurement> {
     let recall = properties.get("scope_recall")?;
     let direct = recall
         .get("recalled")
@@ -449,7 +454,10 @@ pub(crate) fn kernel_context_unavailable_json(reason: &str) -> Value {
     })
 }
 
-pub(crate) fn read_kernel_context_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn read_kernel_context_metadata(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "kernel_context_json"))?
     else {
         return Ok(kernel_context_unavailable_json(

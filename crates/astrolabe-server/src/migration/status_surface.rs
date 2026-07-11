@@ -1,7 +1,8 @@
 use super::*;
 pub(crate) const HEALTH_SURFACE_SCHEMA: &str = "astrolabe.health.v1";
 pub(crate) const PERIODIC_VERIFY_CHAIN_SCHEMA: &str = "astrolabe.periodic_verify_chain.v1";
-pub(crate) const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str = "astrolabe.periodic_verify_chain_tick.v1";
+pub(crate) const PERIODIC_VERIFY_CHAIN_TICK_SCHEMA: &str =
+    "astrolabe.periodic_verify_chain_tick.v1";
 
 pub(crate) fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
@@ -291,7 +292,10 @@ pub(crate) fn persist_periodic_verify_status_at(
     Ok(())
 }
 
-pub(crate) fn periodic_verify_status_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn periodic_verify_status_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let Some(status) =
         read_config_value(cache_dir, &metadata_key(project, "periodic_verify_status"))?
     else {

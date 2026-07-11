@@ -228,7 +228,10 @@ pub(crate) fn optimizer_drift_alarms_json(cache_dir: &Path, project: &str) -> Va
     }
 }
 
-pub(crate) fn optimizer_drift_alarms_json_result(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn optimizer_drift_alarms_json_result(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let report = read_anomaly_report(cache_dir, project)?;
     if report.get("status").and_then(Value::as_str) == Some("unavailable") {
         return Ok(json!({

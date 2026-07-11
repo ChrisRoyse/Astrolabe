@@ -119,7 +119,10 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
     Ok(serde_json::to_string(&response)?)
 }
 
-pub(crate) fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
+pub(crate) fn should_wrap_tool(
+    tool_name: &str,
+    args: &Map<String, Value>,
+) -> Result<bool, DynError> {
     match tool_name {
         "index_repository" => {
             if args.contains_key("calyx") || args.contains_key("calyx_search") {
@@ -147,7 +150,10 @@ pub(crate) fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Re
     }
 }
 
-pub(crate) fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+pub(crate) fn handle_index_repository(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
     let Ok(args) = serde_json::from_str::<Value>(args_json) else {
         return Ok(runner.handle_tool_raw("index_repository", args_json)?);
     };
@@ -228,7 +234,10 @@ pub(crate) fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -
     )
 }
 
-pub(crate) fn handle_index_status(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+pub(crate) fn handle_index_status(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
     let Ok(args) = serde_json::from_str::<Value>(args_json) else {
         return Ok(runner.handle_tool_raw("index_status", args_json)?);
     };
@@ -267,7 +276,10 @@ pub(crate) fn handle_index_status(runner: &CbmToolRunner, args_json: &str) -> Re
     augment_tool_result(&result, summary)
 }
 
-pub(crate) fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+pub(crate) fn handle_get_architecture(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
     let result = runner.handle_tool_raw("get_architecture", args_json)?;
     if tool_result_is_error(&result)? {
         return Ok(result);

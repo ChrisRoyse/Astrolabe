@@ -60,7 +60,10 @@ pub(crate) fn parse_search_scale_override(
     }))
 }
 
-pub(crate) fn optional_u64_field(obj: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+pub(crate) fn optional_u64_field(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
     match obj.get(key) {
         Some(value) => value
             .as_u64()
@@ -96,7 +99,10 @@ pub(crate) fn default_search_scale_settings(source: &str) -> Result<SearchScaleS
     })
 }
 
-pub(crate) fn apply_search_scale_override(settings: &mut SearchScaleSettings, request: SearchScaleOverride) {
+pub(crate) fn apply_search_scale_override(
+    settings: &mut SearchScaleSettings,
+    request: SearchScaleOverride,
+) {
     if let Some(index_backend) = request.index_backend {
         settings.index_backend = index_backend;
     }
@@ -175,14 +181,21 @@ pub(crate) fn read_search_scale_settings_from_config(
     }))
 }
 
-pub(crate) fn required_u64_metadata(value: &Value, key: &str, subject: &str) -> Result<u64, DynError> {
+pub(crate) fn required_u64_metadata(
+    value: &Value,
+    key: &str,
+    subject: &str,
+) -> Result<u64, DynError> {
     value
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("stored {subject} missing {key}").into())
 }
 
-pub(crate) fn read_search_scale_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn read_search_scale_metadata(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "search_scale_json"))?
     else {
         return Ok(search_scale_unavailable_json(

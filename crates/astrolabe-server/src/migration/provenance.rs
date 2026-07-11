@@ -172,7 +172,10 @@ pub(crate) fn answer_trace_from_properties(
     })
 }
 
-pub(crate) fn answer_hop_from_value(value: &Value, skipped_properties: &mut usize) -> Option<AnswerHop> {
+pub(crate) fn answer_hop_from_value(
+    value: &Value,
+    skipped_properties: &mut usize,
+) -> Option<AnswerHop> {
     let from_symbol = value
         .get("from_symbol")
         .or_else(|| value.get("from"))
@@ -363,7 +366,10 @@ pub(crate) fn provenance_surface_with_chain(
     surface
 }
 
-pub(crate) fn refresh_manifest_vault_fingerprints(store: &mut Map<String, Value>, vault_fingerprint: &str) {
+pub(crate) fn refresh_manifest_vault_fingerprints(
+    store: &mut Map<String, Value>,
+    vault_fingerprint: &str,
+) {
     let Some(manifests) = store.get_mut("manifests").and_then(Value::as_object_mut) else {
         return;
     };
@@ -671,7 +677,9 @@ pub(crate) fn symbol_lineage_from_json(value: &Value) -> Result<SymbolLineage, D
     })
 }
 
-pub(crate) fn lineage_event_from_json(value: &Value) -> Result<astrolabe_provenance::LineageEvent, DynError> {
+pub(crate) fn lineage_event_from_json(
+    value: &Value,
+) -> Result<astrolabe_provenance::LineageEvent, DynError> {
     Ok(astrolabe_provenance::LineageEvent {
         kind: required_string_field(value, "kind")?,
         ledger: ledger_pointer_from_json(required_value_field(value, "ledger")?)?,

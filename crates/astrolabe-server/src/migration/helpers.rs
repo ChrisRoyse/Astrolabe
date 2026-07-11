@@ -18,7 +18,10 @@ pub(crate) fn value_map(entries: impl IntoIterator<Item = (String, Value)>) -> V
     Value::Object(entries.into_iter().collect())
 }
 
-pub(crate) fn required_value_field<'a>(value: &'a Value, field: &str) -> Result<&'a Value, DynError> {
+pub(crate) fn required_value_field<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<&'a Value, DynError> {
     required_object(value, "object")?
         .get(field)
         .ok_or_else(|| format!("missing field {field}").into())
@@ -117,7 +120,9 @@ pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynEr
     Ok(serde_json::to_string(&Value::Object(sanitized))?)
 }
 
-pub(crate) fn index_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
+pub(crate) fn index_project_from_args(
+    args: &Map<String, Value>,
+) -> Result<Option<String>, DynError> {
     if let Some(name) = string_arg(args, "name") {
         return Ok(Some(astrolabe_bridge::cbm_project_name_from_path(name)?));
     }
@@ -126,7 +131,9 @@ pub(crate) fn index_project_from_args(args: &Map<String, Value>) -> Result<Optio
         .transpose()?)
 }
 
-pub(crate) fn status_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
+pub(crate) fn status_project_from_args(
+    args: &Map<String, Value>,
+) -> Result<Option<String>, DynError> {
     for key in ["project", "project_name", "project_id", "projectName"] {
         if let Some(project) = string_arg(args, key) {
             if project.contains('/') || project.contains('\\') {

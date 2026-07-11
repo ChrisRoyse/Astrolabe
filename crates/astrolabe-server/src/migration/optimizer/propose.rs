@@ -426,7 +426,10 @@ pub(crate) fn optimizer_propose_refused_json(
     })
 }
 
-pub(crate) fn optimizer_pending_proposals_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn optimizer_pending_proposals_json(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let key = metadata_key(project, "optimizer_proposals_json");
     if let Some(raw) = read_config_value(cache_dir, &key)? {
         return Ok(match serde_json::from_str::<Value>(&raw) {

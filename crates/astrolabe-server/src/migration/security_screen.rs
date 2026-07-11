@@ -245,7 +245,12 @@ pub(crate) fn dependency_ood_screen_json(subject: &str) -> Value {
     })
 }
 
-pub(crate) fn skipped_screen_json(screen: &str, subject: &str, reason: &str, remediation: &str) -> Value {
+pub(crate) fn skipped_screen_json(
+    screen: &str,
+    subject: &str,
+    reason: &str,
+    remediation: &str,
+) -> Value {
     json!({
         "screen": screen,
         "subject": subject,
@@ -258,7 +263,10 @@ pub(crate) fn skipped_screen_json(screen: &str, subject: &str, reason: &str, rem
     })
 }
 
-pub(crate) fn read_security_screen_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn read_security_screen_metadata(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let subject = security_screen_subject(project);
     let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "security_screen_json"))?
     else {

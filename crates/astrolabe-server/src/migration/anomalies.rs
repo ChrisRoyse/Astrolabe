@@ -172,7 +172,10 @@ pub(crate) fn read_anomaly_report(cache_dir: &Path, project: &str) -> Result<Val
     }
 }
 
-pub(crate) fn read_live_anomaly_report(cache_dir: &Path, project: &str) -> Result<Option<Value>, DynError> {
+pub(crate) fn read_live_anomaly_report(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<Value>, DynError> {
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
     if !vault_dir.exists() {
         return Ok(None);
@@ -199,7 +202,10 @@ pub(crate) fn read_live_anomaly_report(cache_dir: &Path, project: &str) -> Resul
     Ok(Some(value))
 }
 
-pub(crate) fn live_anomaly_source_state_json(inputs: &LiveAnomalyInputs, vault_dir: &Path) -> Value {
+pub(crate) fn live_anomaly_source_state_json(
+    inputs: &LiveAnomalyInputs,
+    vault_dir: &Path,
+) -> Value {
     json!({
         "source": "AsterVault:ColumnFamily::XTerm+Assay+Reactive",
         "vault_dir": vault_dir,
@@ -213,7 +219,10 @@ pub(crate) fn live_anomaly_source_state_json(inputs: &LiveAnomalyInputs, vault_d
     })
 }
 
-pub(crate) fn read_anomaly_report_metadata(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn read_anomaly_report_metadata(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let Some(raw) = read_config_value(cache_dir, &metadata_key(project, "anomaly_report_json"))?
     else {
         return Ok(anomaly_report_unavailable_json(
@@ -249,7 +258,11 @@ pub(crate) fn filter_anomaly_report_json(
     Ok(report)
 }
 
-pub(crate) fn merge_prompt_injection_anomalies(mut report: Value, security: Value, project: &str) -> Value {
+pub(crate) fn merge_prompt_injection_anomalies(
+    mut report: Value,
+    security: Value,
+    project: &str,
+) -> Value {
     let Some(prompt) = security.get("prompt_injection") else {
         return report;
     };

@@ -72,7 +72,10 @@ pub(crate) fn optimizer_freeze_status_json(
     }))
 }
 
-pub(crate) fn optimizer_guard_health_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn optimizer_guard_health_json(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let security_screen = read_security_screen_metadata(cache_dir, project)?;
     let security_screen_status = security_screen
         .get("status")

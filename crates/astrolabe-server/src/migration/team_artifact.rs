@@ -295,7 +295,9 @@ where
     tool_json_error_result(value)
 }
 
-pub(crate) fn team_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
+pub(crate) fn team_project_from_args(
+    args: &Map<String, Value>,
+) -> Result<Option<String>, DynError> {
     if let Some(project) = status_project_from_args(args)? {
         return Ok(Some(project));
     }
@@ -304,7 +306,10 @@ pub(crate) fn team_project_from_args(args: &Map<String, Value>) -> Result<Option
         .transpose()?)
 }
 
-pub(crate) fn team_artifact_dir_from_args(args: &Map<String, Value>, mode: &str) -> Result<PathBuf, String> {
+pub(crate) fn team_artifact_dir_from_args(
+    args: &Map<String, Value>,
+    mode: &str,
+) -> Result<PathBuf, String> {
     if let Some(path) = string_arg(args, "artifact_dir")
         .or_else(|| string_arg(args, "output_dir"))
         .or_else(|| string_arg(args, "input_dir"))

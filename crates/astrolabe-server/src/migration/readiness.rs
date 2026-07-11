@@ -137,7 +137,10 @@ pub(crate) fn readiness_unavailable_tier(
     })
 }
 
-pub(crate) fn readiness_tier_measurements_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn readiness_tier_measurements_json(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     let key = metadata_key(project, "readiness_tiers_json");
     let Some(raw) = read_config_value(cache_dir, &key)? else {
         return Ok(json!({
@@ -167,7 +170,10 @@ pub(crate) fn readiness_tier_measurements_json(cache_dir: &Path, project: &str) 
     })
 }
 
-pub(crate) fn readiness_tier_measurements_config_json(value: Value, key: &str) -> Result<Value, String> {
+pub(crate) fn readiness_tier_measurements_config_json(
+    value: Value,
+    key: &str,
+) -> Result<Value, String> {
     let Some(object) = value.as_object() else {
         return Err("readiness_tiers_json must be an object".to_string());
     };
@@ -242,7 +248,10 @@ pub(crate) fn readiness_measurement_tier_invalid(tier: &Value) -> Option<&'stati
     None
 }
 
-pub(crate) fn readiness_tier_measurements_invalid_json(key: &str, reason: impl Into<String>) -> Value {
+pub(crate) fn readiness_tier_measurements_invalid_json(
+    key: &str,
+    reason: impl Into<String>,
+) -> Value {
     json!({
         "schema": READINESS_TIER_MEASUREMENTS_SCHEMA,
         "status": "invalid",

@@ -72,7 +72,10 @@ pub(crate) fn background_lane_owners() -> &'static Mutex<BTreeMap<String, Backgr
     OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-pub(crate) fn background_lane_status_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+pub(crate) fn background_lane_status_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Value, DynError> {
     fs::create_dir_all(cache_dir)?;
     let lock_path = background_lane_lock_path(cache_dir, project);
     let lock_key = lock_path.to_string_lossy().into_owned();

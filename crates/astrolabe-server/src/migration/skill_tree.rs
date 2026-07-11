@@ -28,7 +28,9 @@ pub(crate) fn skill_inputs_from_row_sink_rows(rows: &CbmPipelineRows) -> Vec<Ski
         .collect()
 }
 
-pub(crate) fn skill_tokens_for_node(node: &astrolabe_bridge::CbmPipelineNodeRow) -> BTreeSet<String> {
+pub(crate) fn skill_tokens_for_node(
+    node: &astrolabe_bridge::CbmPipelineNodeRow,
+) -> BTreeSet<String> {
     let mut tokens = BTreeSet::new();
     push_skill_tokens(&mut tokens, &node.name);
     push_skill_tokens(&mut tokens, &node.file_path);

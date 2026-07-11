@@ -858,7 +858,10 @@ pub(crate) fn stores_summary(
     Value::Object(stores)
 }
 
-pub(crate) fn persist_shadow_outcome(project: &str, outcome: &ShadowImportOutcome) -> Result<(), DynError> {
+pub(crate) fn persist_shadow_outcome(
+    project: &str,
+    outcome: &ShadowImportOutcome,
+) -> Result<(), DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     persist_shadow_outcome_at(&cache_dir, project, outcome)
 }
