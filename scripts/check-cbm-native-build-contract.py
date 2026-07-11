@@ -56,11 +56,34 @@ def main() -> None:
             f'format!("{variable}={{}}", make_command_path(&{local}))' in build_rs,
             f"{variable} must be normalized before GNU Make receives it",
         )
-    for source_dir in ('join("src")', 'join("internal/cbm")', 'join("vendored")'):
-        require(
-            source_dir in build_rs,
-            f"Cargo must recursively watch the CBM {source_dir} directory",
+    # #192 narrowed the rerun-if surface: the pinned CBM trees are deliberately
+    # NOT watched file-by-file. VENDORED.md (rewritten by every sanctioned pin
+    # bump) and the patches/cbm overlay inputs are the only vendor-change
+    # channels Cargo needs to see; scripts/verify-pins.sh rejects direct vendor
+    # edits. Statements are split on ';' so multi-line println! calls are
+    # evaluated whole.
+    statements = build_rs.split(";")
+    require(
+        any(
+            "rerun-if-changed" in statement and 'join("VENDORED.md")' in statement
+            for statement in statements
+        ),
+        "Cargo must watch VENDORED.md as the sanctioned vendor-change signal (#192)",
+    )
+    stale_tree_watches = [
+        statement.strip()
+        for statement in statements
+        if "rerun-if-changed" in statement
+        and any(
+            f'join("{tree}")' in statement
+            for tree in ("src", "internal/cbm", "vendored")
         )
+    ]
+    require(
+        not stale_tree_watches,
+        "the pinned CBM trees must not be watched file-by-file "
+        f"(#192 rerun-if narrowing): {stale_tree_watches}",
+    )
     require(
         "remove_dir_all" not in build_rs,
         "cbm-sys must preserve its libcbm build directory across ordinary reruns",
@@ -84,12 +107,18 @@ def main() -> None:
         and "layout_probe.display()" in build_rs,
         "Cargo must rebuild when the native C ABI layout probe changes",
     )
+    # #192 collapsed the former double bindgen parse: one layout-test-bearing
+    # parse feeds both consumers — the OUT_DIR layout-test include gets the
+    # superset verbatim, and the committed-bindings diff strips the layout-test
+    # functions before comparing.
     require(
         "fn write_layout_test_bindings(" in build_rs
-        and 'write_layout_test_bindings(&out_dir, &cbm_root, &header);' in build_rs
-        and ".layout_tests(layout_tests)" in build_rs
-        and "generate_bindings(cbm_root, header, true, false)" in build_rs,
-        "cbm-sys must generate target-local type-only bindgen layout assertions",
+        and "write_layout_test_bindings(&out_dir, &generated);" in build_rs
+        and ".layout_tests(true)" in build_rs
+        and "generate_bindings(&cbm_root, &header)" in build_rs
+        and "build_support::strip_layout_tests(generated)" in build_rs,
+        "cbm-sys must generate target-local bindgen layout assertions from the "
+        "single shared parse (#192)",
     )
     require(
         '"TARGET"' in build_rs
