@@ -83,10 +83,10 @@ def main() -> int:
 
         rewrite(
             runner,
-            'Get-Service -Name "WSLService"',
-            'Get-Service -Name "WSLServiceRemoved"',
+            '$ForbiddenWslServiceNames = @("WSLService", "LxssManager")',
+            '$ForbiddenWslServiceNames = @()',
         )
-        expect_failure(run_checker(fixture), "installed WSL")
+        expect_failure(run_checker(fixture), "WSL services")
 
         copy_fixture(fixture)
         rewrite(
@@ -99,10 +99,34 @@ def main() -> int:
         copy_fixture(fixture)
         rewrite(
             runner,
+            '$WslInstallRoot = "C:\\Program Files\\WSL"',
+            '$WslInstallRoot = "C:\\Program Files\\WSL-removed"',
+        )
+        expect_failure(run_checker(fixture), "install roots")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            '$WslDistributionRegistryRoot = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"',
+            '$WslDistributionRegistryRoot = "HKCU:\\Software\\Removed"',
+        )
+        expect_failure(run_checker(fixture), "distributions")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
             "Assert-NoWslState -GitRoot $gitRoot",
             "Write-Output 'WSL preflight removed'",
         )
         expect_failure(run_checker(fixture), "preflight must run before bootstrap")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "ASTRO_HOST_MAINTENANCE_ACTIVE",
+            "ASTRO_HOST_MAINTENANCE_REMOVED",
+        )
+        expect_failure(run_checker(fixture), "host maintenance")
 
         copy_fixture(fixture)
         rewrite(

@@ -194,6 +194,26 @@ def main() -> int:
 
         rewrite(
             check,
+            '"$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "check-native-aggregate-wrapper.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            '"$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py\n',
+            "",
+        )
+        require_error(
+            checker.validate(fixture), "test-native-aggregate-wrapper.py"
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
             '"$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check\n',
             "",
         )

@@ -120,6 +120,17 @@ def main() -> None:
         "the launcher must confine and remove child temporary output within the workspace",
     )
     require(
+        '$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"'
+        in runner
+        and "ASTRO_HOST_MAINTENANCE_ACTIVE" in runner
+        and appears_before(
+            runner,
+            "ASTRO_HOST_MAINTENANCE_ACTIVE",
+            "target must be absent before toolchain work",
+        ),
+        "the launcher must fail before target creation while host maintenance is active",
+    )
+    require(
         '$previousTempEnvironment = @{}' in runner
         and 'Set-Item -Path "Env:$name" -Value $previous.Value' in runner
         and 'Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue' in runner,
@@ -138,16 +149,26 @@ def main() -> None:
     require(
         "WSL_DISTRO_NAME" in runner
         and '$GitInstallRoot = "C:\\Program Files\\Git"' in runner
+        and '$WslInstallRoot = "C:\\Program Files\\WSL"' in runner
+        and "$WslUninstallRegistryRoots" in runner
+        and '$WslDistributionRegistryRoot = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"'
+        in runner
+        and '$ForbiddenWslServiceNames = @("WSLService", "LxssManager")' in runner
         and '$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")'
         in runner
         and "function Assert-NoWslState" in runner
-        and 'Get-Service -Name "WSLService"' in runner
+        and "Get-Service -Name $name" in runner
+        and "Get-ChildItem -LiteralPath $registryRoot" in runner
+        and "Get-ChildItem -LiteralPath $WslDistributionRegistryRoot" in runner
         and 'Get-Process -Name $name' in runner
         and 'Get-Process -Name "bash"' in runner
         and "ASTRO_WSL_SERVICE_PRESENT" in runner
+        and "ASTRO_WSL_INSTALL_ROOT_PRESENT" in runner
+        and "ASTRO_WSL_PACKAGE_PRESENT" in runner
+        and "ASTRO_WSL_DISTRIBUTION_PRESENT" in runner
         and "ASTRO_WSL_PROCESS_ACTIVE" in runner
         and "ASTRO_NON_GIT_BASH_ACTIVE" in runner,
-        "the launcher must fail closed on installed WSL or active WSL/non-Git Bash processes",
+        "the launcher must fail closed on WSL services, packages, install roots, distributions, or active WSL/non-Git Bash processes",
     )
     require(
         "function Assert-AllowedBashCommand" in runner

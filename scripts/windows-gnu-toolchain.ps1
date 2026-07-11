@@ -29,6 +29,13 @@ $CppcheckCommit = "502C802A69C78F3D8CFD9973AA2108AE169C73B5"
 $CppcheckDirectoryName = "cppcheck-2.20.0-x86_64-w64-mingw32"
 $ExpectedCppcheckVersion = "2.20.0"
 $GitInstallRoot = "C:\Program Files\Git"
+$WslInstallRoot = "C:\Program Files\WSL"
+$WslUninstallRegistryRoots = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+$WslDistributionRegistryRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
+$ForbiddenWslServiceNames = @("WSLService", "LxssManager")
 $ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")
 $RequiredTools = @(
     "gcc.exe",
@@ -65,9 +72,54 @@ function Test-PathUnderRoot {
 function Assert-NoWslState {
     param([string]$GitRoot)
 
-    $wslService = Get-Service -Name "WSLService" -ErrorAction SilentlyContinue
-    if ($null -ne $wslService) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_SERVICE_PRESENT]: uninstall machine-wide WSL from an elevated native Windows PowerShell session before Astrolabe work (status=$($wslService.Status), startup=$($wslService.StartType))"
+    $installedWslServices = @()
+    foreach ($name in $ForbiddenWslServiceNames) {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $service) {
+            $installedWslServices += "$($service.Name):$($service.Status):$($service.StartType)"
+        }
+    }
+    if ($installedWslServices.Count -gt 0) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_SERVICE_PRESENT]: uninstall machine-wide WSL services from an elevated native Windows PowerShell session before Astrolabe work: $($installedWslServices -join ', ')"
+    }
+
+    if (Test-Path -LiteralPath $WslInstallRoot) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_INSTALL_ROOT_PRESENT]: uninstall machine-wide WSL before Astrolabe work; residual install root found at $WslInstallRoot"
+    }
+
+    $installedWslPackages = @()
+    foreach ($registryRoot in $WslUninstallRegistryRoots) {
+        foreach ($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction SilentlyContinue)) {
+            $package = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            # Uninstall registry keys routinely omit DisplayName/DisplayVersion;
+            # under Set-StrictMode a direct property access on such a key throws
+            # instead of evaluating the boundary. Probe the property set.
+            $packageDisplayName = if ($null -ne $package -and $package.PSObject.Properties['DisplayName']) { $package.DisplayName } else { $null }
+            if ($packageDisplayName -eq "Windows Subsystem for Linux") {
+                $packageDisplayVersion = if ($package.PSObject.Properties['DisplayVersion']) { $package.DisplayVersion } else { "unknown" }
+                $installedWslPackages += "${packageDisplayName}:${packageDisplayVersion}:$($key.PSChildName)"
+            }
+        }
+    }
+    if ($installedWslPackages.Count -gt 0) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_PACKAGE_PRESENT]: uninstall machine-wide WSL packages before Astrolabe work: $($installedWslPackages -join ', ')"
+    }
+
+    $registeredDistributions = @()
+    foreach ($key in @(Get-ChildItem -LiteralPath $WslDistributionRegistryRoot -ErrorAction SilentlyContinue)) {
+        $distribution = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+        # Same StrictMode hazard as the uninstall keys: DistributionName may be
+        # absent from a lxss subkey; probe before reading.
+        $distributionName = if ($null -ne $distribution -and $distribution.PSObject.Properties['DistributionName'] -and $distribution.DistributionName) {
+            $distribution.DistributionName
+        }
+        else {
+            $key.PSChildName
+        }
+        $registeredDistributions += $distributionName
+    }
+    if ($registeredDistributions.Count -gt 0) {
+        throw "WSL_BOUNDARY[ASTRO_WSL_DISTRIBUTION_PRESENT]: unregister and remove WSL distributions before Astrolabe work: $($registeredDistributions -join ', ')"
     }
 
     $activeWslProcesses = @()
@@ -488,6 +540,10 @@ $target = Join-Path $root "target"
 $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
+$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"
+if (Test-Path -LiteralPath $hostMaintenanceLock) {
+    throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_ACTIVE]: native toolchain work is blocked while host maintenance is active: $hostMaintenanceLock"
+}
 if (Test-Path -LiteralPath $target) {
     throw "target must be absent before toolchain work: $target"
 }

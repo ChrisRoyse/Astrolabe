@@ -78,6 +78,8 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-cbm-native-build-contract.py
 "$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py
 "$PYTHON_BIN" scripts/test-windows-gnu-toolchain-contract.py
+"$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py
+"$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py
 "$PYTHON_BIN" scripts/check-allocator-contract.py
 "$CARGO_BIN" metadata --format-version 1 >/dev/null
 "$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check

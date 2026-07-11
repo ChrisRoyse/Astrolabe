@@ -42,11 +42,10 @@ Prerequisites and toolchain facts:
   powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1 -Bootstrap
   ```
 
-- Run every native Cargo or aggregate command **through the launcher** so it selects the matching runtime and pinned lint tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned `.tmp` child inside the workspace, and removes that child and `target/` on exit. Child arguments are passed as JSON:
+- Run every native Cargo or aggregate command **through the launcher** so it selects the matching runtime and pinned lint tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned `.tmp` child inside the workspace, and removes that child and `target/` on exit. Aggregate evidence must stream directly through the repository wrapper, which creates no log file and must not be wrapped in `Tee-Object` or redirected to a host-side file:
 
   ```powershell
-  $toolArgs = '["scripts/check-full.sh"]'
-  .\scripts\windows-gnu-toolchain.ps1 -Command 'C:\Program Files\Git\bin\bash.exe' -CommandArgsJson $toolArgs
+  .\scripts\invoke-native-aggregate.ps1 -Gate full -UnboundedWorkspaceTests
   ```
 
 - DLL search order matters: the MinGW `bin` directory must precede the Rust GNU host `bin` on `PATH` so `libstdc++-6.dll` loads its matching `libgcc_s_seh-1.dll`. The launcher arranges this; that is one reason not to bypass it.
