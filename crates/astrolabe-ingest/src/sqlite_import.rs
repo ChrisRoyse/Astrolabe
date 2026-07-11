@@ -42,11 +42,19 @@ pub const ASTRO_QUANTIZATION_GATE_INVALID: &str = "ASTRO_QUANTIZATION_GATE_INVAL
 /// the raw-edge schema, leaving only typed constellation-to-constellation edge
 /// rows that silently omit dangling and structural-endpoint edges.
 pub const ASTRO_LEGACY_CBM_EDGE_ROWS: &str = "ASTRO_LEGACY_CBM_EDGE_ROWS";
+/// Refusal code for a vault whose read-back finds no `astrolabe:cbm-project:v1`
+/// row for the requested project. Every import persists at least one project row
+/// (`metadata_graph_rows` over a guaranteed-non-empty project set), so an empty
+/// read means a corrupt/erased vault, a legacy vault predating project rows, or a
+/// project name that was never imported. Fabricating a placeholder project row
+/// here would silently mask that state.
+pub const ASTRO_MISSING_CBM_PROJECT_ROW: &str = "ASTRO_MISSING_CBM_PROJECT_ROW";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits, guard-FAR, and provenance for every requested quantization candidate.";
 const LEGACY_CBM_EDGE_ROWS_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists complete astrolabe:cbm-edge:v1 raw edge rows before reading or lowering its graph snapshot.";
+const MISSING_CBM_PROJECT_ROW_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists an astrolabe:cbm-project:v1 row, and confirm the requested project name matches an imported project before reading or lowering its graph snapshot.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
@@ -970,6 +978,14 @@ fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> 
         )
         .map_err(|error| invalid_sqlite(format!("create row-sink schema: {error}")))?;
 
+    // Legitimate (not a silent fallback): the CBM row-sink pipeline emits nodes
+    // and edges but no project-metadata rows, so production snapshots
+    // (`pipeline_rows_to_graph_snapshot`) always carry `projects: Vec::new()`.
+    // The project identity is authoritative -- `snapshot.project` is validated to
+    // equal `options.project` before this path runs -- so synthesizing a single
+    // provenance-carrying project row for the temp SQLite mirrors the documented
+    // table-absent branch in `read_projects`. A genuinely empty/misidentified
+    // import is still caught downstream by the >=1-node refusal, not masked here.
     let projects = if snapshot.projects.is_empty() {
         vec![CbmProjectRow {
             schema: SCHEMA_PROJECT_ROW.to_string(),
@@ -1123,6 +1139,14 @@ fn snapshot_metadata_rows(
         }
     }
     if projects.is_empty() {
+        // Legitimate (not a silent fallback): this is the production direct row-sink
+        // path. `pipeline_rows_to_graph_snapshot` builds every snapshot with an empty
+        // `projects` vec because the CBM pipeline emits no project-metadata rows, and
+        // `snapshot.project` was validated to equal `options.project` before this
+        // runs. Synthesize one provenance-carrying project row from the authoritative
+        // project name and the source fingerprint so the metadata graph row is
+        // labeled; a genuinely empty/misidentified import is still caught downstream
+        // by the >=1-node refusal rather than masked here.
         projects.push(RawProjectRow {
             name: options.project.clone(),
             indexed_at: hex_lower(&source_fingerprint_sha256),
@@ -3099,14 +3123,21 @@ where
         |row: &CbmProjectRow| (&row.schema, SCHEMA_PROJECT_ROW, &row.project),
     )?;
     if projects.is_empty() {
-        projects.push(CbmProjectRow {
-            schema: SCHEMA_PROJECT_ROW.to_string(),
-            project: project.to_string(),
-            indexed_at: String::new(),
-            root_path: String::new(),
-            commit: String::new(),
-            sqlite_fingerprint_sha256: String::new(),
-        });
+        // Every import persists an `astrolabe:cbm-project:v1` row for the project
+        // (`metadata_graph_rows` iterates a project set that `read_projects` /
+        // `snapshot_metadata_rows` guarantee is non-empty). Their absence at
+        // read-back therefore means a corrupt/erased vault, a legacy vault
+        // predating project rows, or a project name that was never imported.
+        // Fabricating a placeholder `{project, indexed_at:"", ...}` row would
+        // return a clean-looking snapshot for a project the vault does not carry,
+        // masking the missing provenance. Refuse fail-closed instead.
+        return Err(IngestError::refused(
+            ASTRO_MISSING_CBM_PROJECT_ROW,
+            format!(
+                "vault has no astrolabe:cbm-project:v1 row for project {project:?}; the project row is missing, erased, or the requested project was never imported"
+            ),
+            MISSING_CBM_PROJECT_ROW_REMEDIATION,
+        ));
     }
     projects.sort_by(|left, right| left.project.cmp(&right.project));
 
@@ -4900,6 +4931,95 @@ mod tests {
             .expect_err("legacy vault snapshot read must refuse");
         assert_eq!(err.code(), Some(ASTRO_LEGACY_CBM_EDGE_ROWS));
         assert_eq!(err.remediation(), Some(LEGACY_CBM_EDGE_ROWS_REMEDIATION));
+    }
+
+    #[test]
+    fn snapshot_read_refuses_vault_missing_cbm_project_row() {
+        // A modern import always persists an `astrolabe:cbm-project:v1` row for the
+        // project. Reading back must therefore find one; when it does not (corrupt,
+        // erased, legacy, or never-imported project) the read must refuse
+        // fail-closed instead of fabricating a placeholder project row that would
+        // return a clean-looking snapshot for a project the vault does not carry.
+        let path = temp_db("missing-cbm-project-row");
+        full_vocabulary_fixture(&path);
+        let vault = vault();
+        import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import full edge vocabulary");
+
+        // Edge case: exactly one project row -> read succeeds and carries "demo".
+        let demo_key = project_key(PROJECT_ROW_PREFIX, "demo");
+        let persisted_demo = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Graph, &demo_key)
+            .expect("read demo project row");
+        assert!(
+            persisted_demo.is_some(),
+            "import must persist a cbm-project row for demo"
+        );
+        let baseline = read_cbm_graph_snapshot(&vault, "demo").expect("modern snapshot read");
+        assert_eq!(baseline.projects.len(), 1);
+        assert_eq!(baseline.projects[0].project, "demo");
+        assert!(!baseline.nodes.is_empty());
+        assert!(!baseline.edges.is_empty());
+
+        // Edge case: multiple project rows present -> reading one still returns only
+        // that project's row, and the sibling does not trip the refusal.
+        let other_row = CbmProjectRow {
+            schema: SCHEMA_PROJECT_ROW.to_string(),
+            project: "other".to_string(),
+            indexed_at: String::new(),
+            root_path: String::new(),
+            commit: "commit-other".to_string(),
+            sqlite_fingerprint_sha256: hex_lower(&[9_u8; 32]),
+        };
+        vault
+            .write_cf(
+                ColumnFamily::Graph,
+                project_key(PROJECT_ROW_PREFIX, "other"),
+                serde_json::to_vec(&other_row).expect("encode sibling project row"),
+            )
+            .expect("write sibling project row");
+        let with_sibling =
+            read_cbm_graph_snapshot(&vault, "demo").expect("read demo with sibling project");
+        assert_eq!(with_sibling.projects.len(), 1);
+        assert_eq!(with_sibling.projects[0].project, "demo");
+
+        // Edge case: zero matching project rows -> tombstone the persisted demo row
+        // (raw edges remain, so the #99 edge check passes and control reaches the
+        // project-row check) and confirm the bytes are gone before re-reading.
+        let tombstone = tombstone_value();
+        vault
+            .write_cf_batch_with_ledger_entry(
+                vec![(ColumnFamily::Graph, demo_key.clone(), tombstone)],
+                EntryKind::Admin,
+                SubjectId::Query(b"astro-missing-project-row-test".to_vec()),
+                serde_json::to_vec(&json!({"schema": "astrolabe-missing-project-row-test"}))
+                    .expect("encode tombstone payload"),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("tombstone demo project row");
+        vault
+            .purge_tombstoned_cfs(&[ColumnFamily::Graph])
+            .expect("purge tombstoned demo project row");
+
+        // FSV: the demo project row bytes are actually absent from the Graph CF.
+        assert!(
+            vault
+                .read_cf_at(vault.latest_seq(), ColumnFamily::Graph, &demo_key)
+                .expect("re-read demo project row")
+                .is_none(),
+            "demo cbm-project row must be gone after purge"
+        );
+
+        let err = read_cbm_graph_snapshot(&vault, "demo")
+            .expect_err("vault missing its cbm-project row must refuse");
+        assert_eq!(err.code(), Some(ASTRO_MISSING_CBM_PROJECT_ROW));
+        assert_eq!(err.remediation(), Some(MISSING_CBM_PROJECT_ROW_REMEDIATION));
+
+        // A project name that was never imported is refused the same way rather than
+        // fabricating an empty snapshot for it.
+        let ghost = read_cbm_graph_snapshot(&vault, "never-imported")
+            .expect_err("never-imported project must refuse");
+        assert_eq!(ghost.code(), Some(ASTRO_MISSING_CBM_PROJECT_ROW));
     }
 
     #[test]
