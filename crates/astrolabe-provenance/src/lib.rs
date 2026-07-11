@@ -9,6 +9,14 @@ pub const ASTRO_PROVENANCE_UNKNOWN_MODE: &str = "ASTRO_PROVENANCE_UNKNOWN_MODE";
 pub const ASTRO_PROVENANCE_NOT_FOUND: &str = "ASTRO_PROVENANCE_NOT_FOUND";
 pub const ASTRO_PROVENANCE_MANIFEST_TAMPERED: &str = "ASTRO_PROVENANCE_MANIFEST_TAMPERED";
 pub const REPRODUCE_DRIFT_EXCEEDED: &str = "REPRODUCE_DRIFT_EXCEEDED";
+pub const ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT: &str = "ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT";
+
+/// Warning code emitted when a `verify_chain` report carries a broken ledger chain.
+pub const PROVENANCE_WARN_CHAIN_BROKEN: &str = "chain_broken";
+/// Warning code emitted when a `verify_chain` report carries a corrupt ledger chain.
+pub const PROVENANCE_WARN_CHAIN_CORRUPT: &str = "chain_corrupt";
+/// Warning code emitted when a lineage/answer/reproduce artifact predates the ledger head.
+pub const PROVENANCE_WARN_STALE: &str = "stale";
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
@@ -88,11 +96,41 @@ pub struct Freshness {
 }
 
 impl Freshness {
+    /// Freshness of an artifact that is current as of `seq` (no staleness gap).
     pub fn fresh(seq: u64) -> Self {
         Self {
             seq,
             stale_by: None,
         }
+    }
+
+    /// Evaluates the freshness of an artifact computed as of `as_of_seq` against the
+    /// current ledger `head_seq`.
+    ///
+    /// When the artifact predates the head, the exact gap is recorded as a measured,
+    /// human-readable `stale_by` label so a consumer can observe a stale provenance
+    /// answer instead of the unconditional fresh claim the previous `fresh(head)`
+    /// default produced. When the artifact is at or ahead of the head it is fresh.
+    pub fn evaluate(as_of_seq: u64, head_seq: u64) -> Self {
+        if as_of_seq >= head_seq {
+            Self {
+                seq: as_of_seq,
+                stale_by: None,
+            }
+        } else {
+            let behind = head_seq - as_of_seq;
+            Self {
+                seq: as_of_seq,
+                stale_by: Some(format!(
+                    "{behind} ledger entries behind head seq {head_seq}"
+                )),
+            }
+        }
+    }
+
+    /// Returns true when this freshness carries a measured staleness gap.
+    pub const fn is_stale(&self) -> bool {
+        self.stale_by.is_some()
     }
 }
 
@@ -243,14 +281,15 @@ pub fn get_provenance(
                     "index or import the symbol first",
                 )
             })?;
+            let provenance = lineage
+                .versions
+                .last()
+                .map(|event| event.ledger.clone())
+                .unwrap_or_else(|| store.ledger_head.clone());
             Ok(response(
-                store,
                 mode,
-                lineage
-                    .versions
-                    .last()
-                    .map(|event| event.ledger.clone())
-                    .unwrap_or_else(|| store.ledger_head.clone()),
+                provenance,
+                Freshness::fresh(store.ledger_head.seq),
                 Vec::new(),
                 ProvenancePayload::Lineage(lineage),
             ))
@@ -264,22 +303,27 @@ pub fn get_provenance(
                     "request provenance for a recorded answer id",
                 )
             })?;
-            let warnings = answer_trace_warnings(&trace);
+            let freshness = Freshness::evaluate(trace.freshness.seq, store.ledger_head.seq);
+            let mut warnings = answer_trace_warnings(&trace);
+            warnings.extend(stale_warning(&freshness, &trace.answer_id));
             Ok(response(
-                store,
                 mode,
                 store.ledger_head.clone(),
+                freshness,
                 warnings,
                 ProvenancePayload::AnswerTrace(trace),
             ))
         }
-        ProvenanceMode::VerifyChain => Ok(response(
-            store,
-            mode,
-            store.chain.provenance.clone(),
-            Vec::new(),
-            ProvenancePayload::VerifyChain(store.chain.clone()),
-        )),
+        ProvenanceMode::VerifyChain => {
+            let warnings = verify_chain_warnings(&store.chain);
+            Ok(response(
+                mode,
+                store.chain.provenance.clone(),
+                Freshness::fresh(store.ledger_head.seq),
+                warnings,
+                ProvenancePayload::VerifyChain(store.chain.clone()),
+            ))
+        }
         ProvenanceMode::Reproduce => {
             let subject_id = required_subject(query, mode)?;
             let record = store.reproductions.get(subject_id).ok_or_else(|| {
@@ -299,19 +343,39 @@ pub fn get_provenance(
                     "rerun with the recorded lenses/seeds or quarantine the answer until reproduction is bit-exact",
                 ));
             }
+            // Cross-validate the two independent reproduce signals: a bit-exact digest
+            // match must report exactly zero drift, and any nonzero drift must be
+            // accompanied by a digest change. A record that violates this invariant is
+            // internally contradictory (tampered or malformed) and must never be
+            // laundered into a verified-looking report.
+            let bit_exact = record.recorded_digest == record.current_digest;
+            if bit_exact != (record.drift_microunits == 0) {
+                return Err(astrolabe_domain::DomainError::new(
+                    ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT,
+                    format!(
+                        "answer {} reproduce record is inconsistent: digests {} but drift is {} microunits",
+                        record.answer_id,
+                        if bit_exact { "match" } else { "differ" },
+                        record.drift_microunits
+                    ),
+                    "re-derive the reproduce record; a bit-exact digest match must report zero drift and any drift must accompany a digest change",
+                ));
+            }
             let report = ReproduceReport {
                 answer_id: record.answer_id.clone(),
-                bit_exact: record.recorded_digest == record.current_digest,
+                bit_exact,
                 drift_microunits: record.drift_microunits,
                 drift_bound_microunits: record.drift_bound_microunits,
                 recorded_digest: record.recorded_digest.clone(),
                 current_digest: record.current_digest.clone(),
             };
+            let freshness = Freshness::evaluate(record.ledger.seq, store.ledger_head.seq);
+            let warnings = stale_warning(&freshness, &record.answer_id);
             Ok(response(
-                store,
                 mode,
                 record.ledger.clone(),
-                Vec::new(),
+                freshness,
+                warnings,
                 ProvenancePayload::Reproduce(report),
             ))
         }
@@ -355,7 +419,10 @@ pub fn verify_pack_manifest_claim(
         vault_fingerprint: expected.vault_fingerprint.clone(),
         member_hash: expected.member_hash.clone(),
         verified_checks: vec!["pack_id", "ledger_ref", "vault_fingerprint", "member_hash"],
-        freshness: Freshness::fresh(store.ledger_head.seq),
+        // Integrity is verified against the stored manifest, but freshness is an
+        // orthogonal axis: a manifest recorded behind the current head is reported
+        // stale so a consumer can observe the gap even on a passing verification.
+        freshness: Freshness::evaluate(expected.ledger_ref.seq, store.ledger_head.seq),
         trust: "verified",
         provenance: store.ledger_head.clone(),
     })
@@ -426,9 +493,9 @@ pub fn provenance_response_artifact_bytes(response: &ProvenanceResponse) -> Vec<
 }
 
 fn response(
-    store: &ProvenanceStore,
     mode: ProvenanceMode,
     provenance: LedgerPointer,
+    freshness: Freshness,
     warnings: Vec<ProvenanceWarning>,
     payload: ProvenancePayload,
 ) -> ProvenanceResponse {
@@ -440,10 +507,41 @@ fn response(
         } else {
             "provisional"
         },
-        freshness: Freshness::fresh(store.ledger_head.seq),
+        freshness,
         provenance,
         warnings,
         payload,
+    }
+}
+
+/// Emits coded warnings that degrade envelope trust for a non-`Intact` verify_chain
+/// report. A broken or corrupt chain is the exact condition `verify_chain` exists to
+/// surface, so the report is still served — but never under a `verified` envelope.
+fn verify_chain_warnings(chain: &ChainVerification) -> Vec<ProvenanceWarning> {
+    match &chain.status {
+        ChainStatus::Intact => Vec::new(),
+        ChainStatus::Broken { seq } => vec![ProvenanceWarning {
+            code: PROVENANCE_WARN_CHAIN_BROKEN,
+            message: format!(
+                "ledger chain broken at seq {seq}; provenance is not trustworthy at or past this entry"
+            ),
+        }],
+        ChainStatus::Corrupt { seq, reason } => vec![ProvenanceWarning {
+            code: PROVENANCE_WARN_CHAIN_CORRUPT,
+            message: format!("ledger chain corrupt at seq {seq}: {reason}"),
+        }],
+    }
+}
+
+/// Emits a coded staleness warning (degrading envelope trust) when an artifact
+/// predates the ledger head, so a stale provenance answer is observable.
+fn stale_warning(freshness: &Freshness, subject_id: &str) -> Vec<ProvenanceWarning> {
+    match &freshness.stale_by {
+        None => Vec::new(),
+        Some(gap) => vec![ProvenanceWarning {
+            code: PROVENANCE_WARN_STALE,
+            message: format!("{subject_id} provenance is {gap}"),
+        }],
     }
 }
 
@@ -516,19 +614,149 @@ mod tests {
     #[test]
     fn all_get_provenance_modes_return_labeled_envelopes() {
         let store = provenance_fixture();
-        for (mode, subject) in [
-            ("lineage", Some("symbol:auth.login")),
-            ("answer_trace", Some("answer:pack-1")),
-            ("verify_chain", None),
-            ("reproduce", Some("answer:pack-1")),
+        // Expected freshness seq is the artifact's own as-of seq, not an unconditional
+        // head stamp: lineage/verify_chain report current head, answer_trace reports the
+        // seq the answer was computed at, reproduce reports the record's ledger seq.
+        for (mode, subject, expected_freshness_seq) in [
+            ("lineage", Some("symbol:auth.login"), store.ledger_head.seq),
+            ("answer_trace", Some("answer:pack-1"), 23),
+            ("verify_chain", None, store.ledger_head.seq),
+            ("reproduce", Some("answer:pack-1"), 24),
         ] {
             let response = get_provenance(&store, &ProvenanceQuery::new(mode, subject))
                 .expect("mode response");
             assert_eq!(response.schema, GET_PROVENANCE_SCHEMA);
-            assert_eq!(response.freshness.seq, store.ledger_head.seq);
+            assert_eq!(
+                response.freshness.seq, expected_freshness_seq,
+                "mode {mode} freshness seq"
+            );
             assert!(!response.provenance.chain_hash.is_empty());
             assert!(matches!(response.trust, "verified" | "provisional"));
         }
+    }
+
+    #[test]
+    fn freshness_evaluate_measures_staleness_gap_exactly() {
+        // At or ahead of head: fresh, no gap.
+        assert_eq!(Freshness::evaluate(42, 42), Freshness::fresh(42));
+        assert_eq!(Freshness::evaluate(50, 42).stale_by, None);
+        // Behind head: exact measured gap, artifact seq preserved.
+        let stale = Freshness::evaluate(23, 42);
+        assert_eq!(stale.seq, 23);
+        assert!(stale.is_stale());
+        assert_eq!(
+            stale.stale_by.as_deref(),
+            Some("19 ledger entries behind head seq 42")
+        );
+    }
+
+    #[test]
+    fn stale_answer_trace_is_observable_and_degrades_trust() {
+        // Regression for freshness theater: the fixture answer was computed at seq 23
+        // while head is 42. The old fresh(head) default hid this; the envelope must now
+        // carry the exact staleness and drop out of "verified".
+        let store = provenance_fixture();
+        let response = get_provenance(
+            &store,
+            &ProvenanceQuery::new("answer_trace", Some("answer:pack-1")),
+        )
+        .expect("answer trace");
+        assert_eq!(response.freshness.seq, 23);
+        assert_eq!(
+            response.freshness.stale_by.as_deref(),
+            Some("19 ledger entries behind head seq 42")
+        );
+        assert_eq!(response.trust, "provisional");
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|w| w.code == PROVENANCE_WARN_STALE)
+        );
+
+        // A trace computed at head is fresh and stays verified.
+        let fresh = get_provenance(
+            &store,
+            &ProvenanceQuery::new("answer_trace", Some("answer:at-head")),
+        )
+        .expect("fresh answer trace");
+        assert_eq!(fresh.freshness.seq, store.ledger_head.seq);
+        assert_eq!(fresh.freshness.stale_by, None);
+        assert_eq!(fresh.trust, "verified");
+        assert!(fresh.warnings.is_empty());
+    }
+
+    #[test]
+    fn broken_chain_is_labeled_provisional_not_verified() {
+        // Regression for fail-open verify_chain: a broken chain must never be served
+        // under a verified envelope, and the broken status must survive byte readback.
+        let store = broken_chain_fixture();
+        let response =
+            get_provenance(&store, &ProvenanceQuery::new("verify_chain", None)).expect("verify");
+        assert_eq!(response.trust, "provisional");
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(response.warnings[0].code, PROVENANCE_WARN_CHAIN_BROKEN);
+        assert!(response.warnings[0].message.contains("seq 5"));
+
+        let bytes = provenance_response_artifact_bytes(&response);
+        let path = std::env::temp_dir().join(format!(
+            "astrolabe-provenance-broken-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("write");
+        let readback = std::fs::read(&path).expect("read");
+        std::fs::remove_file(&path).ok();
+        let text = String::from_utf8(readback).expect("utf8");
+        assert!(text.contains("trust=provisional"), "text: {text}");
+        assert!(text.contains("verify_chain\tbroken"), "text: {text}");
+        assert!(text.contains("warning\tchain_broken"), "text: {text}");
+    }
+
+    #[test]
+    fn corrupt_chain_is_labeled_provisional_not_verified() {
+        let store = corrupt_chain_fixture();
+        let response =
+            get_provenance(&store, &ProvenanceQuery::new("verify_chain", None)).expect("verify");
+        assert_eq!(response.trust, "provisional");
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(response.warnings[0].code, PROVENANCE_WARN_CHAIN_CORRUPT);
+        assert!(response.warnings[0].message.contains("hash mismatch"));
+    }
+
+    #[test]
+    fn intact_chain_stays_verified() {
+        let store = provenance_fixture();
+        let response =
+            get_provenance(&store, &ProvenanceQuery::new("verify_chain", None)).expect("verify");
+        assert_eq!(response.trust, "verified");
+        assert!(response.warnings.is_empty());
+    }
+
+    #[test]
+    fn inconsistent_reproduce_records_fail_closed() {
+        let store = provenance_fixture();
+        // Equal digests but nonzero drift: a bit-exact match cannot have drifted.
+        let err = get_provenance(
+            &store,
+            &ProvenanceQuery::new("reproduce", Some("answer:phantom-drift")),
+        )
+        .expect_err("phantom drift refused");
+        assert_eq!(err.code(), ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT);
+        assert!(err.message().contains("match"));
+        assert!(err.message().contains("500"));
+
+        // Differing digests but zero drift: a changed output cannot report zero drift.
+        let err = get_provenance(
+            &store,
+            &ProvenanceQuery::new("reproduce", Some("answer:phantom-match")),
+        )
+        .expect_err("phantom match refused");
+        assert_eq!(err.code(), ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT);
+        assert!(err.message().contains("differ"));
+        assert!(
+            err.remediation()
+                .contains("bit-exact digest match must report zero drift")
+        );
     }
 
     #[test]
@@ -557,12 +785,24 @@ mod tests {
         .expect("incomplete answer trace");
 
         assert_eq!(response.trust, "provisional");
-        assert_eq!(response.warnings.len(), 2);
-        assert!(
+        // Two unprovenanced warnings (missing fusion + guard lineage) plus one stale
+        // warning: the incomplete answer was computed at seq 30 while head is 42.
+        assert_eq!(response.warnings.len(), 3);
+        assert_eq!(
             response
                 .warnings
                 .iter()
-                .all(|warning| warning.code == "unprovenanced")
+                .filter(|warning| warning.code == "unprovenanced")
+                .count(),
+            2
+        );
+        assert_eq!(
+            response
+                .warnings
+                .iter()
+                .filter(|warning| warning.code == PROVENANCE_WARN_STALE)
+                .count(),
+            1
         );
         let ProvenancePayload::AnswerTrace(trace) = response.payload else {
             panic!("expected answer trace payload");
@@ -607,6 +847,13 @@ mod tests {
             vec!["pack_id", "ledger_ref", "vault_fingerprint", "member_hash"]
         );
         assert_eq!(report.trust, "verified");
+        // Verified integrity, but freshness reflects the manifest's own ledger_ref seq
+        // (24) against head (42): the old fresh(head) stamp claimed currency it lacked.
+        assert_eq!(report.freshness.seq, manifest.ledger_ref.seq);
+        assert_eq!(
+            report.freshness.stale_by.as_deref(),
+            Some("18 ledger entries behind head seq 42")
+        );
 
         let mut tampered = manifest;
         tampered.member_hash = "tampered-members".to_string();
@@ -689,6 +936,17 @@ mod tests {
                 freshness: Freshness::fresh(30),
             },
         );
+        answers.insert(
+            "answer:at-head".to_string(),
+            AnswerTrace {
+                answer_id: "answer:at-head".to_string(),
+                kernel_entry: Some(LedgerPointer::new(40, "hash-40")),
+                hops: Vec::new(),
+                fusion_weights_ref: Some(LedgerPointer::new(41, "hash-41")),
+                guard_verdict_ref: Some(LedgerPointer::new(42, "hash-42")),
+                freshness: Freshness::fresh(42),
+            },
+        );
 
         let mut reproductions = BTreeMap::new();
         reproductions.insert(
@@ -711,6 +969,30 @@ mod tests {
                 drift_microunits: 2_000,
                 drift_bound_microunits: 1_000,
                 ledger: LedgerPointer::new(31, "hash-31"),
+            },
+        );
+        // Equal digests yet nonzero drift within bound: internally contradictory.
+        reproductions.insert(
+            "answer:phantom-drift".to_string(),
+            ReproduceRecord {
+                answer_id: "answer:phantom-drift".to_string(),
+                recorded_digest: "digest-same".to_string(),
+                current_digest: "digest-same".to_string(),
+                drift_microunits: 500,
+                drift_bound_microunits: 1_000,
+                ledger: LedgerPointer::new(32, "hash-32"),
+            },
+        );
+        // Differing digests yet zero drift: internally contradictory.
+        reproductions.insert(
+            "answer:phantom-match".to_string(),
+            ReproduceRecord {
+                answer_id: "answer:phantom-match".to_string(),
+                recorded_digest: "digest-a".to_string(),
+                current_digest: "digest-b".to_string(),
+                drift_microunits: 0,
+                drift_bound_microunits: 1_000,
+                ledger: LedgerPointer::new(33, "hash-33"),
             },
         );
 
@@ -739,5 +1021,30 @@ mod tests {
             reproductions,
             manifests,
         }
+    }
+
+    fn broken_chain_fixture() -> ProvenanceStore {
+        let mut store = provenance_fixture();
+        store.chain = ChainVerification {
+            status: ChainStatus::Broken { seq: 5 },
+            checked_from: 0,
+            checked_to: 5,
+            provenance: store.ledger_head.clone(),
+        };
+        store
+    }
+
+    fn corrupt_chain_fixture() -> ProvenanceStore {
+        let mut store = provenance_fixture();
+        store.chain = ChainVerification {
+            status: ChainStatus::Corrupt {
+                seq: 8,
+                reason: "hash mismatch".to_string(),
+            },
+            checked_from: 0,
+            checked_to: 8,
+            provenance: store.ledger_head.clone(),
+        };
+        store
     }
 }
