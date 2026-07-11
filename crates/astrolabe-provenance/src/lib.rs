@@ -17,6 +17,9 @@ pub const PROVENANCE_WARN_CHAIN_BROKEN: &str = "chain_broken";
 pub const PROVENANCE_WARN_CHAIN_CORRUPT: &str = "chain_corrupt";
 /// Warning code emitted when a lineage/answer/reproduce artifact predates the ledger head.
 pub const PROVENANCE_WARN_STALE: &str = "stale";
+/// Warning code emitted when a `verify_chain` report attested an empty ledger range:
+/// zero entries were checked, so chain integrity is unverified — never `verified`.
+pub const PROVENANCE_WARN_CHAIN_EMPTY: &str = "chain_empty";
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
@@ -178,9 +181,37 @@ pub struct AnswerHop {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChainVerification {
     pub status: ChainStatus,
+    /// Inclusive lower bound of the attested ledger sequence range.
     pub checked_from: u64,
-    pub checked_to: u64,
+    /// Exclusive upper bound of the attested ledger sequence range. When it equals
+    /// `checked_from` the range is empty: zero entries were checked and no sequence is
+    /// fabricated as verified. Storing the exclusive end — rather than an inclusive
+    /// `checked_to` derived via `end - 1` — removes the empty-range off-by-one that let
+    /// an unchecked ledger (`end == 0`) claim seq 0 had been verified.
+    pub checked_end: u64,
     pub provenance: LedgerPointer,
+}
+
+impl ChainVerification {
+    /// True when zero ledger sequences fall in the attested range.
+    pub const fn is_empty_range(&self) -> bool {
+        self.checked_end <= self.checked_from
+    }
+
+    /// Count of ledger sequences attested by this report.
+    pub const fn checked_count(&self) -> u64 {
+        self.checked_end.saturating_sub(self.checked_from)
+    }
+
+    /// Inclusive last sequence actually checked, or `None` for an empty range. An empty
+    /// range never fabricates seq 0 (or any other sequence) as checked.
+    pub const fn last_checked_seq(&self) -> Option<u64> {
+        if self.is_empty_range() {
+            None
+        } else {
+            Some(self.checked_end - 1)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -428,6 +459,101 @@ pub fn verify_pack_manifest_claim(
     })
 }
 
+/// The genesis chain hash that precedes the first ledger link.
+pub const GENESIS_CHAIN_HASH: [u8; 32] = [0u8; 32];
+
+/// A single persisted ledger link as read back from durable storage: its sequence, the
+/// payload bytes committed at that sequence, the chain hash it claims to extend, and the
+/// rolling chain hash it claims to produce.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LedgerLink {
+    pub seq: u64,
+    pub payload: Vec<u8>,
+    pub prev_chain_hash: [u8; 32],
+    pub chain_hash: [u8; 32],
+}
+
+impl LedgerLink {
+    /// Builds a well-formed link that correctly extends `prev_chain_hash`, computing the
+    /// rolling chain hash over the canonical preimage. Production links are sealed the
+    /// same way before being persisted, so a chain of `sealed` links verifies intact.
+    pub fn sealed(seq: u64, payload: impl Into<Vec<u8>>, prev_chain_hash: [u8; 32]) -> Self {
+        let payload = payload.into();
+        let chain_hash = link_chain_hash(&prev_chain_hash, seq, &payload);
+        Self {
+            seq,
+            payload,
+            prev_chain_hash,
+            chain_hash,
+        }
+    }
+}
+
+/// Canonical rolling-hash preimage for a ledger link:
+/// `prev_chain_hash (32 bytes) || seq (8 bytes, little-endian) || payload`.
+fn link_chain_hash(prev_chain_hash: &[u8; 32], seq: u64, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev_chain_hash);
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
+}
+
+/// Recomputes the rolling hash chain over `links` and returns an honest
+/// [`ChainVerification`]. The links must form a contiguous sequence beginning at
+/// `checked_from`. A link is rejected as [`ChainStatus::Broken`] if it breaks sequence
+/// contiguity or fails to extend the previous link's chain hash, and as
+/// [`ChainStatus::Corrupt`] if its stored `chain_hash` does not match the value
+/// recomputed from its own bytes — the exact signature of a tampered payload or hash. An
+/// empty slice yields an explicit empty checked range and never fabricates a checked seq.
+pub fn verify_ledger_chain(checked_from: u64, links: &[LedgerLink]) -> ChainVerification {
+    let checked_end = checked_from.saturating_add(links.len() as u64);
+    let provenance = match links.last() {
+        Some(last) => LedgerPointer::new(last.seq, hex_lower(&last.chain_hash)),
+        None => LedgerPointer::new(checked_from, hex_lower(&GENESIS_CHAIN_HASH)),
+    };
+    let mut prev_chain_hash: Option<[u8; 32]> = None;
+    let mut expected_seq = checked_from;
+    let mut status = ChainStatus::Intact;
+    for link in links {
+        if link.seq != expected_seq {
+            status = ChainStatus::Broken { seq: link.seq };
+            break;
+        }
+        if let Some(prev) = prev_chain_hash
+            && link.prev_chain_hash != prev
+        {
+            status = ChainStatus::Broken { seq: link.seq };
+            break;
+        }
+        let recomputed = link_chain_hash(&link.prev_chain_hash, link.seq, &link.payload);
+        if recomputed != link.chain_hash {
+            status = ChainStatus::Corrupt {
+                seq: link.seq,
+                reason: "recomputed chain hash does not match stored chain hash".to_string(),
+            };
+            break;
+        }
+        prev_chain_hash = Some(link.chain_hash);
+        expected_seq = expected_seq.saturating_add(1);
+    }
+    ChainVerification {
+        status,
+        checked_from,
+        checked_end,
+        provenance,
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
 pub fn provenance_response_artifact_bytes(response: &ProvenanceResponse) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("schema=");
@@ -472,7 +598,15 @@ pub fn provenance_response_artifact_bytes(response: &ProvenanceResponse) -> Vec<
             out.push('\t');
             out.push_str(&chain.checked_from.to_string());
             out.push('\t');
-            out.push_str(&chain.checked_to.to_string());
+            out.push_str(&chain.checked_end.to_string());
+            out.push('\t');
+            match chain.last_checked_seq() {
+                Some(seq) => {
+                    out.push_str("last_checked_seq=");
+                    out.push_str(&seq.to_string());
+                }
+                None => out.push_str("checked=empty"),
+            }
             out.push('\n');
         }
         ProvenancePayload::Reproduce(report) => {
@@ -519,7 +653,21 @@ fn response(
 /// surface, so the report is still served — but never under a `verified` envelope.
 fn verify_chain_warnings(chain: &ChainVerification) -> Vec<ProvenanceWarning> {
     match &chain.status {
-        ChainStatus::Intact => Vec::new(),
+        ChainStatus::Intact => {
+            if chain.is_empty_range() {
+                // An empty attested range verified nothing. Absence of evidence is not
+                // evidence of integrity, so the envelope must never read `verified`.
+                vec![ProvenanceWarning {
+                    code: PROVENANCE_WARN_CHAIN_EMPTY,
+                    message: format!(
+                        "verify_chain attested an empty ledger range [{}, {}); no entries were checked, so chain integrity is unverified",
+                        chain.checked_from, chain.checked_end
+                    ),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
         ChainStatus::Broken { seq } => vec![ProvenanceWarning {
             code: PROVENANCE_WARN_CHAIN_BROKEN,
             message: format!(
@@ -730,6 +878,169 @@ mod tests {
             get_provenance(&store, &ProvenanceQuery::new("verify_chain", None)).expect("verify");
         assert_eq!(response.trust, "verified");
         assert!(response.warnings.is_empty());
+    }
+
+    fn store_with_chain(chain: ChainVerification) -> ProvenanceStore {
+        let mut store = provenance_fixture();
+        store.chain = chain;
+        store
+    }
+
+    fn sealed_chain(start: u64, count: u64) -> Vec<LedgerLink> {
+        let mut links = Vec::new();
+        let mut prev = GENESIS_CHAIN_HASH;
+        for offset in 0..count {
+            let seq = start + offset;
+            let link = LedgerLink::sealed(seq, format!("ledger-entry-{seq}").into_bytes(), prev);
+            prev = link.chain_hash;
+            links.push(link);
+        }
+        links
+    }
+
+    #[test]
+    fn tampered_ledger_link_is_reported_corrupt_not_verified() {
+        // Build a genuinely valid chain of real, correctly-sealed links.
+        let mut links = sealed_chain(0, 4);
+        let intact = verify_ledger_chain(0, &links);
+        assert_eq!(intact.status, ChainStatus::Intact);
+        // Sanity: the untampered chain rides a verified envelope.
+        let intact_response = get_provenance(
+            &store_with_chain(intact),
+            &ProvenanceQuery::new("verify_chain", None),
+        )
+        .expect("verify intact");
+        assert_eq!(intact_response.trust, "verified");
+        assert!(intact_response.warnings.is_empty());
+
+        // Persist a link's payload bytes, flip a single bit, read back, re-verify. This
+        // is a real byte-level tamper of persisted chain state, not a hand-built verdict.
+        let path =
+            std::env::temp_dir().join(format!("astrolabe-ledger-link-{}.bin", std::process::id()));
+        std::fs::write(&path, &links[2].payload).expect("persist link payload");
+        let mut readback = std::fs::read(&path).expect("read link payload");
+        std::fs::remove_file(&path).ok();
+        readback[0] ^= 0x01;
+        links[2].payload = readback;
+
+        let tampered = verify_ledger_chain(0, &links);
+        match &tampered.status {
+            ChainStatus::Corrupt { seq, .. } => assert_eq!(*seq, 2, "tamper at seq 2"),
+            other => panic!("tampered chain must be Corrupt, got {other:?}"),
+        }
+
+        // The envelope must refuse to call the tampered chain verified.
+        let response = get_provenance(
+            &store_with_chain(tampered),
+            &ProvenanceQuery::new("verify_chain", None),
+        )
+        .expect("verify tampered");
+        assert_ne!(
+            response.trust, "verified",
+            "tampered chain must not be verified"
+        );
+        assert_eq!(response.trust, "provisional");
+        assert_eq!(response.warnings[0].code, PROVENANCE_WARN_CHAIN_CORRUPT);
+
+        // And the verdict survives byte readback of the served artifact (FSV).
+        let bytes = provenance_response_artifact_bytes(&response);
+        let apath =
+            std::env::temp_dir().join(format!("astrolabe-tamper-{}.txt", std::process::id()));
+        std::fs::write(&apath, &bytes).expect("write artifact");
+        let text = String::from_utf8(std::fs::read(&apath).expect("read artifact")).expect("utf8");
+        std::fs::remove_file(&apath).ok();
+        assert!(text.contains("trust=provisional"), "text: {text}");
+        assert!(text.contains("verify_chain\tcorrupt"), "text: {text}");
+        assert!(text.contains("warning\tchain_corrupt"), "text: {text}");
+    }
+
+    #[test]
+    fn broken_continuity_is_reported_broken_not_verified() {
+        let mut links = sealed_chain(0, 3);
+        // Sever the link between seq 1 and seq 2, then re-seal seq 2 so its own hash is
+        // self-consistent — isolating a continuity break from a hash-mismatch corruption.
+        links[2].prev_chain_hash = [0xAB; 32];
+        links[2].chain_hash =
+            link_chain_hash(&links[2].prev_chain_hash, links[2].seq, &links[2].payload);
+        let chain = verify_ledger_chain(0, &links);
+        assert_eq!(chain.status, ChainStatus::Broken { seq: 2 });
+
+        let response = get_provenance(
+            &store_with_chain(chain),
+            &ProvenanceQuery::new("verify_chain", None),
+        )
+        .expect("verify broken");
+        assert_ne!(response.trust, "verified");
+        assert_eq!(response.warnings[0].code, PROVENANCE_WARN_CHAIN_BROKEN);
+    }
+
+    #[test]
+    fn empty_ledger_range_is_unverified_not_falsely_verified() {
+        // An empty vault: verifying zero links must not fabricate a checked seq 0, and
+        // must not ride a `verified` envelope. Regression for the `end - 1` off-by-one.
+        let chain = verify_ledger_chain(0, &[]);
+        assert_eq!(chain.status, ChainStatus::Intact);
+        assert!(chain.is_empty_range());
+        assert_eq!(chain.checked_from, 0);
+        assert_eq!(chain.checked_end, 0);
+        assert_eq!(
+            chain.last_checked_seq(),
+            None,
+            "empty range must not fabricate a seq"
+        );
+        assert_eq!(chain.checked_count(), 0);
+
+        let response = get_provenance(
+            &store_with_chain(chain),
+            &ProvenanceQuery::new("verify_chain", None),
+        )
+        .expect("verify empty");
+        assert_ne!(response.trust, "verified", "empty range is not verified");
+        assert_eq!(response.trust, "provisional");
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(response.warnings[0].code, PROVENANCE_WARN_CHAIN_EMPTY);
+
+        // The persisted artifact records the empty range explicitly, never last_checked_seq=0.
+        let text = String::from_utf8(provenance_response_artifact_bytes(&response)).expect("utf8");
+        assert!(
+            text.contains("verify_chain\tintact\t0\t0\tchecked=empty"),
+            "text: {text}"
+        );
+        assert!(
+            !text.contains("last_checked_seq"),
+            "empty range must not fabricate a seq: {text}"
+        );
+        assert!(text.contains("trust=provisional"), "text: {text}");
+        assert!(text.contains("warning\tchain_empty"), "text: {text}");
+    }
+
+    #[test]
+    fn single_element_range_checks_exactly_one_seq() {
+        // Boundary: a one-entry ledger checks exactly seq `checked_from`; checked_end is
+        // exclusive (checked_from + 1). No off-by-one in either direction.
+        let links = sealed_chain(7, 1);
+        let chain = verify_ledger_chain(7, &links);
+        assert_eq!(chain.status, ChainStatus::Intact);
+        assert!(!chain.is_empty_range());
+        assert_eq!(chain.checked_from, 7);
+        assert_eq!(chain.checked_end, 8);
+        assert_eq!(chain.last_checked_seq(), Some(7));
+        assert_eq!(chain.checked_count(), 1);
+
+        let response = get_provenance(
+            &store_with_chain(chain),
+            &ProvenanceQuery::new("verify_chain", None),
+        )
+        .expect("verify single");
+        // A genuinely checked single-entry intact chain rides a verified envelope.
+        assert_eq!(response.trust, "verified");
+        assert!(response.warnings.is_empty());
+
+        let text = String::from_utf8(provenance_response_artifact_bytes(&response)).expect("utf8");
+        assert!(
+            text.contains("verify_chain\tintact\t7\t8\tlast_checked_seq=7"),
+            "text: {text}"
+        );
     }
 
     #[test]
@@ -1013,7 +1324,8 @@ mod tests {
             chain: ChainVerification {
                 status: ChainStatus::Intact,
                 checked_from: 0,
-                checked_to: ledger_head.seq,
+                // Exclusive end past the head seq: a non-empty attested range.
+                checked_end: ledger_head.seq + 1,
                 provenance: ledger_head.clone(),
             },
             symbols,
@@ -1028,7 +1340,7 @@ mod tests {
         store.chain = ChainVerification {
             status: ChainStatus::Broken { seq: 5 },
             checked_from: 0,
-            checked_to: 5,
+            checked_end: 6,
             provenance: store.ledger_head.clone(),
         };
         store
@@ -1042,7 +1354,7 @@ mod tests {
                 reason: "hash mismatch".to_string(),
             },
             checked_from: 0,
-            checked_to: 8,
+            checked_end: 9,
             provenance: store.ledger_head.clone(),
         };
         store
