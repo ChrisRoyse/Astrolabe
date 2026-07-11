@@ -177,6 +177,7 @@ def main() -> None:
         and "Get-ChildItem -LiteralPath $WslDistributionRegistryRoot" in runner
         and 'Get-Process -Name $name' in runner
         and 'Get-Process -Name "bash"' in runner
+        and 'Get-Process -Id $process.Id -ErrorAction SilentlyContinue' in runner
         and "ASTRO_WSL_SERVICE_PRESENT" in runner
         and "ASTRO_WSL_INSTALL_ROOT_PRESENT" in runner
         and "ASTRO_WSL_PACKAGE_PRESENT" in runner

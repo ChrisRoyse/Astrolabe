@@ -131,6 +131,14 @@ def main() -> int:
         copy_fixture(fixture)
         rewrite(
             runner,
+            "Get-Process -Id $process.Id -ErrorAction SilentlyContinue",
+            "Get-Process -Id 0 -ErrorAction SilentlyContinue",
+        )
+        expect_failure(run_checker(fixture), "WSL services")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
             "ASTRO_LAUNCHER_LOCK_HELD",
             "ASTRO_LAUNCHER_LOCK_DISABLED",
         )

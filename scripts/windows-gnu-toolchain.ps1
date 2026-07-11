@@ -149,9 +149,18 @@ function Assert-NoWslState {
             $processPath = $process.Path
         }
         catch {
-            # An unverifiable Bash process is not acceptable in this fail-closed boundary.
+            # An unverifiable LIVE Bash process is not acceptable in this
+            # fail-closed boundary; the liveness re-probe below separates it
+            # from a process that exited between enumeration and inspection.
         }
         if (-not (Test-PathUnderRoot -Path $processPath -Root $GitRoot)) {
+            # Transient Git Bash helpers (statusline scripts, tool shells)
+            # routinely exit mid-audit, leaving Path unreadable. A process
+            # that no longer exists is not live boundary state; only a
+            # still-live process may fail the boundary.
+            if ($null -eq (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                continue
+            }
             $displayPath = if ([string]::IsNullOrWhiteSpace($processPath)) { "unresolved" } else { $processPath }
             $nonGitBashProcesses += "$($process.Id):$displayPath"
         }
