@@ -303,7 +303,9 @@ impl SecurityGroundingNote {
     /// Both [`PromptInjectionReport::grounding_notes`] and the MCP server's JSON
     /// projection call this constructor, so the note wording cannot drift
     /// between the contract crate and the surface that serves it.
-    pub fn from_prompt_injection_finding(finding: &PromptInjectionFinding) -> SecurityGroundingNote {
+    pub fn from_prompt_injection_finding(
+        finding: &PromptInjectionFinding,
+    ) -> SecurityGroundingNote {
         SecurityGroundingNote {
             kind: finding.kind,
             source_id: finding.source_id.clone(),
