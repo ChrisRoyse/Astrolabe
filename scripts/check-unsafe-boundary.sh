@@ -4,13 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# The unsafe-boundary scan is only meaningful if ripgrep is present. Without it
-# the `if rg ...; then` guard below silently evaluates false (rg exits 127) and
-# the check would print "verified" without inspecting a single file — a silent
-# fallback that hides an unbounded unsafe surface. Fail closed instead.
-if ! command -v rg >/dev/null 2>&1; then
-  echo "ERROR: ripgrep (rg) is required to scan for the unsafe Rust boundary but was not found on PATH; install ripgrep and re-run" >&2
-  exit 127
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=python3
+  else
+    PYTHON_BIN=python
+  fi
 fi
 
 missing=()
@@ -33,9 +33,35 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
-if rg -n '\bunsafe\b' crates --glob '*.rs' \
-  --glob '!crates/cbm-sys/**' \
-  --glob '!crates/astrolabe-bridge/**'; then
+# Textual backstop to the compiler-enforced forbid(unsafe_code) attributes
+# above. It scans the comment/string-blanked code view (rust_prod_lines), so
+# prose in doc comments and deliberately dangerous string-literal corpora
+# (e.g. the guard vulnerability patterns) are data, not violations — only an
+# `unsafe` token in reachable code fails. A missing interpreter or module
+# fails closed through set -e semantics below.
+if ! "$PYTHON_BIN" - <<'PY'
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "scripts")
+import rust_prod_lines
+
+pattern = re.compile(r"\bunsafe\b")
+violations = []
+for path in sorted(Path("crates").rglob("*.rs")):
+    posix = path.as_posix()
+    if posix.startswith("crates/cbm-sys/") or posix.startswith("crates/astrolabe-bridge/"):
+        continue
+    view = rust_prod_lines.code_view(path.read_text(encoding="utf-8"))
+    for number, line in enumerate(view.split("\n"), start=1):
+        if pattern.search(line):
+            violations.append(f"{posix}:{number}:{line.strip()}")
+for violation in violations:
+    print(violation)
+sys.exit(1 if violations else 0)
+PY
+then
   echo "ERROR: unsafe Rust is confined to astrolabe-bridge and cbm-sys" >&2
   exit 1
 fi
