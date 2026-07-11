@@ -742,7 +742,16 @@ try {
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.
+    # #226: the server may outlive this session (worktree sessions never stop it),
+    # so it must NOT inherit the per-session workspace temp — a server whose temp
+    # dir is deleted at session end fatally poisons every later compile with
+    # "Failed to create temp dir". Start it with a stable temp under the shared
+    # cache root, then restore the per-session temp for the child command.
+    $sccacheServerTemp = Join-Path $sccacheDir "server-tmp"
+    New-Item -ItemType Directory -Path $sccacheServerTemp -Force | Out-Null
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $sccacheServerTemp
     & $sccacheExe --start-server *> $null
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     & $sccacheExe --zero-stats *> $null
     Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0"
     & $Command @commandArgs
