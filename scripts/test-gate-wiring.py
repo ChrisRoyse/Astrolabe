@@ -233,6 +233,25 @@ def main() -> int:
         require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT_OVERLAY")
         copy_fixture(fixture)
 
+        cbm_test = fixture / "scripts/ci-cbm-test.sh"
+        rewrite(
+            cbm_test,
+            "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]",
+            "SKIP[ASTRO_CBM_SANITIZERS_REMOVED]",
+        )
+        require_error(checker.validate(fixture), "ASTRO_CBM_SANITIZERS_LINUX_REQUIRED")
+        copy_fixture(fixture)
+
+        rewrite(
+            cbm_test,
+            "ERROR: sanitizers are required on Linux CBM gates",
+            "WARN: sanitizers are optional on Linux CBM gates",
+        )
+        require_error(
+            checker.validate(fixture), "sanitizers are required on Linux CBM gates"
+        )
+        copy_fixture(fixture)
+
         workspace_test = fixture / "scripts/check-workspace-tests.py"
         rewrite(workspace_test, '"taskkill"', '"taskkill-disabled"')
         require_error(checker.validate(fixture), "taskkill")

@@ -249,6 +249,24 @@ def validate(root: Path) -> list[str]:
         "scripts/ci-cbm-test.sh",
         errors,
     )
+    require(
+        cbm_test,
+        "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        "-fsanitize=address,undefined",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        "ERROR: sanitizers are required on Linux CBM gates",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
     require(cbm_lint, 'HOST_OS="$(uname -s)"', "scripts/ci-cbm-lint.sh", errors)
     require(
         cbm_lint,

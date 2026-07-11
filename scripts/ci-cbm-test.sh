@@ -33,6 +33,29 @@ case "$LABEL" in
     ;;
 esac
 
+# Sanitizer availability is measured against the actual toolchain, never
+# assumed. The pinned Makefile.cbm defaults to ASan+UBSan and documents
+# `SANITIZE=` as the Windows disable override; MinGW-w64 GCC ships no
+# sanitizer runtimes. A disabled run is named and counted, and Linux gates
+# may never disable sanitizers because they own that coverage.
+SANITIZE_OVERRIDES=()
+PROBE_DIR="$LOG_DIR/cbm-sanitizer-probe-${LABEL}"
+rm -rf -- "$PROBE_DIR"
+mkdir -p "$PROBE_DIR"
+printf 'int main(void) { return 0; }\n' > "$PROBE_DIR/probe.c"
+if "$CC_BIN" -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$PROBE_DIR/probe.c" -o "$PROBE_DIR/probe-bin" \
+  > "$PROBE_DIR/probe.log" 2>&1; then
+  echo "INFO[ASTRO_CBM_SANITIZERS_ACTIVE]: $CC_BIN links -fsanitize=address,undefined; running the CBM suite sanitized"
+else
+  if [[ "$LABEL" == linux-* ]]; then
+    echo "ERROR: sanitizers are required on Linux CBM gates; $CC_BIN failed to link the sanitizer probe (log: $PROBE_DIR/probe.log)" >&2
+    exit 1
+  fi
+  echo "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]: $CC_BIN cannot link the sanitizer probe (no toolchain runtime); running the CBM suite with SANITIZE= per the pinned Makefile.cbm Windows override. Sanitizer coverage of the CBM C suite is owned by the required Linux CI jobs cbm tests / linux-x64-gcc and linux-x64-clang."
+  SANITIZE_OVERRIDES+=("SANITIZE=")
+fi
+
 expected="$(
   find tests -path 'tests/repro' -prune -o -name '*.c' -print0 |
     xargs -0 grep -h -o 'RUN_TEST(' |
@@ -45,7 +68,7 @@ if [[ ! "$expected" =~ ^[0-9]+$ || "$expected" -le 0 ]]; then
 fi
 
 set +e
-scripts/test.sh "CC=$CC_BIN" "CXX=$CXX_BIN" 2>&1 | tee "$LOG"
+scripts/test.sh "CC=$CC_BIN" "CXX=$CXX_BIN" ${SANITIZE_OVERRIDES[@]+"${SANITIZE_OVERRIDES[@]}"} 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
