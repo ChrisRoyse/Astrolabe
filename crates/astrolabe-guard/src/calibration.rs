@@ -284,19 +284,19 @@ fn comment_string_mask(source: &str, syntax: &LanguageSyntax) -> Vec<bool> {
             continue;
         }
         // Block comments.
-        if let Some((open, close)) = syntax.block_comment {
-            if bytes[i..].starts_with(open.as_bytes()) {
-                let search_from = i + open.len();
-                let end = source[search_from..]
-                    .find(close)
-                    .map(|offset| search_from + offset + close.len())
-                    .unwrap_or(bytes.len());
-                for slot in mask.iter_mut().take(end).skip(i) {
-                    *slot = true;
-                }
-                i = end;
-                continue;
+        if let Some((open, close)) = syntax.block_comment
+            && bytes[i..].starts_with(open.as_bytes())
+        {
+            let search_from = i + open.len();
+            let end = source[search_from..]
+                .find(close)
+                .map(|offset| search_from + offset + close.len())
+                .unwrap_or(bytes.len());
+            for slot in mask.iter_mut().take(end).skip(i) {
+                *slot = true;
             }
+            i = end;
+            continue;
         }
         // Triple-quoted strings (Python).
         if syntax.triple_quotes
@@ -646,19 +646,20 @@ fn off_by_one_mutants(source: &str, mask: &[bool], out: &mut Vec<Mutant>) {
         // Reject floats (followed by `.`) and hex/suffix runs.
         let is_float = end < bytes.len() && bytes[end] == b'.';
         let has_suffix = end < bytes.len() && is_ident_byte(bytes[end]);
-        if !is_float && !has_suffix {
-            if let Ok(value) = source[i..end].parse::<u128>() {
-                let bumped = (value + 1).to_string();
-                let mut code = String::with_capacity(source.len() + 1);
-                code.push_str(&source[..i]);
-                code.push_str(&bumped);
-                code.push_str(&source[end..]);
-                out.push(Mutant {
-                    operator: MutationOperator::OffByOne,
-                    site: i,
-                    code,
-                });
-            }
+        if !is_float
+            && !has_suffix
+            && let Ok(value) = source[i..end].parse::<u128>()
+        {
+            let bumped = (value + 1).to_string();
+            let mut code = String::with_capacity(source.len() + 1);
+            code.push_str(&source[..i]);
+            code.push_str(&bumped);
+            code.push_str(&source[end..]);
+            out.push(Mutant {
+                operator: MutationOperator::OffByOne,
+                site: i,
+                code,
+            });
         }
         i = end.max(i + 1);
     }
@@ -1744,11 +1745,7 @@ mod tests {
         let counts = corpus.generator_counts();
         // All four generators contribute.
         for (generator, count) in counts {
-            assert!(
-                *&count > 0,
-                "generator {} contributed 0",
-                generator.as_str()
-            );
+            assert!(count > 0, "generator {} contributed 0", generator.as_str());
         }
         // No single generator exceeds the cap.
         let total = corpus.bad_cases.len();
