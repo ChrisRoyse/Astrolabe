@@ -677,6 +677,37 @@ where
         }
     }
 
+    // Reverse walk: an orphan reverse-index row whose owning (forward) series row is
+    // missing decodes cleanly and must still fail closed, naming the exact reverse key.
+    for (cx_id, series_id) in &reverse {
+        if !series.contains_key(series_id) {
+            errors.push(format!(
+                "reverse row {} points to missing series {}",
+                cx_id, series_id
+            ));
+        }
+    }
+
+    // Recurrence walk: an orphan recurrence row whose owning series row is missing, or
+    // whose occurrence_id falls outside the owning series version count, decodes cleanly
+    // and must still fail closed, naming the exact recurrence key (series:occurrence).
+    for (series_id, occurrence_id) in recurrence.keys() {
+        match series.get(series_id) {
+            None => errors.push(format!(
+                "recurrence row {}:{} points to missing series {}",
+                series_id, occurrence_id, series_id
+            )),
+            Some(series_row) => {
+                if *occurrence_id == 0 || *occurrence_id > series_row.version_count {
+                    errors.push(format!(
+                        "recurrence row {}:{} occurrence_id out of range for series {} (version_count={})",
+                        series_id, occurrence_id, series_id, series_row.version_count
+                    ));
+                }
+            }
+        }
+    }
+
     let ledger_chain = verify_chain(vault)?;
     if !ledger_chain.is_intact() {
         errors.push(format!(
@@ -1572,6 +1603,172 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("points to missing series"))
+        );
+    }
+
+    #[test]
+    fn verify_deep_fails_on_orphan_reverse_row_missing_series() {
+        let vault = vault();
+        let version = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        ingest_series_batch(&vault, &[version]).expect("ingest");
+        verify_deep(&vault).expect("clean vault verifies clean before planting");
+
+        // Plant a reverse-index row whose owning series row does not exist. It decodes
+        // cleanly and is never referenced by any series version, so only the reverse walk
+        // can catch it.
+        let orphan_cx = CxId::from_bytes([0xAB; 16]);
+        let missing_series = SeriesId::from_bytes([0xCD; 16]);
+        let orphan = ReverseIndexRow {
+            schema: SCHEMA_REVERSE.to_string(),
+            cx_id: orphan_cx,
+            series_id: missing_series,
+        };
+        vault
+            .write_cf(
+                ColumnFamily::Kv,
+                reverse_index_key(orphan_cx),
+                serde_json::to_vec(&orphan).expect("encode reverse"),
+            )
+            .expect("plant orphan reverse row");
+
+        // Read the planted bytes back from the CF to prove the orphan is truly persisted.
+        let planted = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Kv,
+                &reverse_index_key(orphan_cx),
+            )
+            .expect("read planted reverse")
+            .expect("planted reverse row exists");
+        assert_eq!(
+            planted,
+            serde_json::to_vec(&orphan).expect("encode reverse")
+        );
+
+        let err = verify_deep(&vault).expect_err("orphan reverse should fail verify");
+        assert_eq!(err.code(), Some(ASTRO_VERIFY_DEEP_FAILED));
+        let IngestError::VerifyFailed(errors) = err else {
+            panic!("unexpected verify error kind");
+        };
+        assert!(
+            errors.iter().any(|error| {
+                error.contains(&orphan_cx.to_string())
+                    && error.contains(&missing_series.to_string())
+                    && error.contains("points to missing series")
+            }),
+            "expected orphan reverse finding naming planted keys, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_deep_fails_on_orphan_recurrence_row_missing_series() {
+        let vault = vault();
+        let version = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        ingest_series_batch(&vault, &[version]).expect("ingest");
+        verify_deep(&vault).expect("clean vault verifies clean before planting");
+
+        // Plant a recurrence row whose owning series row does not exist.
+        let missing_series = SeriesId::from_bytes([0x5A; 16]);
+        let orphan = RecurrenceRow {
+            schema: SCHEMA_RECURRENCE.to_string(),
+            series_id: missing_series,
+            occurrence_id: 1,
+            kind: "Recurrence".to_string(),
+            commit: "c9".to_string(),
+            prev_cx: None,
+            new_cx: CxId::from_bytes([0x33; 16]),
+        };
+        vault
+            .write_cf(
+                ColumnFamily::Recurrence,
+                recurrence_key(missing_series, 1),
+                serde_json::to_vec(&orphan).expect("encode recurrence"),
+            )
+            .expect("plant orphan recurrence row");
+
+        let planted = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Recurrence,
+                &recurrence_key(missing_series, 1),
+            )
+            .expect("read planted recurrence")
+            .expect("planted recurrence row exists");
+        assert_eq!(
+            planted,
+            serde_json::to_vec(&orphan).expect("encode recurrence")
+        );
+
+        let err = verify_deep(&vault).expect_err("orphan recurrence should fail verify");
+        assert_eq!(err.code(), Some(ASTRO_VERIFY_DEEP_FAILED));
+        let IngestError::VerifyFailed(errors) = err else {
+            panic!("unexpected verify error kind");
+        };
+        let planted_key = format!("{missing_series}:1");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains(&planted_key)
+                    && error.contains(&missing_series.to_string())
+                    && error.contains("points to missing series")
+            }),
+            "expected orphan recurrence finding naming planted key {planted_key}, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_deep_fails_on_recurrence_occurrence_beyond_version_count() {
+        let vault = vault();
+        let version = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        let series_id = version.symbol.series_id().expect("series id");
+        let cx_id = version.symbol.cx_id(7).expect("cx id");
+        ingest_series_batch(&vault, &[version]).expect("ingest");
+        verify_deep(&vault).expect("clean vault verifies clean before planting");
+
+        // Plant a recurrence row for the real series but with an occurrence_id far beyond
+        // the series version_count (1). The forward series->recurrence walk only visits
+        // ordinal 1, so only the recurrence walk can catch this orphan occurrence.
+        let beyond = 99_u64;
+        let orphan = RecurrenceRow {
+            schema: SCHEMA_RECURRENCE.to_string(),
+            series_id,
+            occurrence_id: beyond,
+            kind: "Recurrence".to_string(),
+            commit: "c1".to_string(),
+            prev_cx: Some(cx_id),
+            new_cx: cx_id,
+        };
+        vault
+            .write_cf(
+                ColumnFamily::Recurrence,
+                recurrence_key(series_id, beyond),
+                serde_json::to_vec(&orphan).expect("encode recurrence"),
+            )
+            .expect("plant out-of-range recurrence row");
+
+        let planted = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Recurrence,
+                &recurrence_key(series_id, beyond),
+            )
+            .expect("read planted recurrence")
+            .expect("planted recurrence row exists");
+        assert_eq!(
+            planted,
+            serde_json::to_vec(&orphan).expect("encode recurrence")
+        );
+
+        let err = verify_deep(&vault).expect_err("out-of-range recurrence should fail verify");
+        assert_eq!(err.code(), Some(ASTRO_VERIFY_DEEP_FAILED));
+        let IngestError::VerifyFailed(errors) = err else {
+            panic!("unexpected verify error kind");
+        };
+        let planted_key = format!("{series_id}:{beyond}");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains(&planted_key) && error.contains("occurrence_id out of range")
+            }),
+            "expected out-of-range recurrence finding naming planted key {planted_key}, got: {errors:?}"
         );
     }
 
