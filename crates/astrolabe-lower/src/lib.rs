@@ -44,6 +44,21 @@ pub enum LowerError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
+    /// Input refused fail-closed with a stable `ASTRO_*` code and operator remediation.
+    ///
+    /// The code is stored structurally (never embedded in a formatted message),
+    /// so machine consumers can dispatch on [`LowerError::code`] without parsing
+    /// display text, and a refusal can never carry a code that drifts from its
+    /// message.
+    Refused {
+        /// Stable machine-readable refusal code (an `ASTRO_*` constant).
+        code: &'static str,
+        /// Human-readable description of what was refused.
+        message: String,
+        /// Operator-facing remediation for clearing the refusal.
+        remediation: &'static str,
+    },
+    /// Caller supplied an invalid input that has no stable refusal code.
     InvalidInput(String),
 }
 
@@ -55,12 +70,59 @@ impl fmt::Display for LowerError {
             Self::Sqlite(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
+            Self::Refused {
+                code,
+                message,
+                remediation,
+            } => write!(f, "{code}: {message} Remediation: {remediation}"),
             Self::InvalidInput(message) => f.write_str(message),
         }
     }
 }
 
 impl Error for LowerError {}
+
+impl LowerError {
+    /// Builds a fail-closed refusal carrying a stable machine-readable code and
+    /// its operator remediation.
+    pub fn refused(
+        code: &'static str,
+        message: impl Into<String>,
+        remediation: &'static str,
+    ) -> Self {
+        Self::Refused {
+            code,
+            message: message.into(),
+            remediation,
+        }
+    }
+
+    /// Returns the stable refusal code when this error carries one.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Refused { code, .. } => Some(code),
+            Self::Ingest(err) => err.code(),
+            Self::Calyx(_)
+            | Self::Sqlite(_)
+            | Self::Json(_)
+            | Self::Io(_)
+            | Self::InvalidInput(_) => None,
+        }
+    }
+
+    /// Returns the operator-facing remediation when this error carries one.
+    pub fn remediation(&self) -> Option<&str> {
+        match self {
+            Self::Refused { remediation, .. } => Some(remediation),
+            Self::Ingest(err) => err.remediation(),
+            Self::Calyx(_)
+            | Self::Sqlite(_)
+            | Self::Json(_)
+            | Self::Io(_)
+            | Self::InvalidInput(_) => None,
+        }
+    }
+}
 
 impl From<astrolabe_ingest::IngestError> for LowerError {
     fn from(value: astrolabe_ingest::IngestError) -> Self {
@@ -1143,6 +1205,92 @@ mod tests {
     }
 
     #[test]
+    fn malformed_signature_hex_is_signature_coded_not_vault_bytes() {
+        let fixture = team_fixture(
+            "team-malformed-sig-hex",
+            &TeamArtifactExportOptions::with_signing_key([13; 32]),
+        );
+        // Inject a non-hex byte into the signature hex while keeping even length,
+        // so decoding fails on the signature field specifically (not the vault
+        // export container). This is the exact taxonomy bug from #132: the hex
+        // decoder used to hardcode the vault-bytes component code.
+        rewrite_manifest_json(&fixture.artifact_dir, |value| {
+            let signature_hex = value["signature"]["signature_hex"]
+                .as_str()
+                .expect("signature hex");
+            assert!(
+                signature_hex.len().is_multiple_of(2),
+                "fixture signature hex must have even length"
+            );
+            let mutated = format!("z{}", &signature_hex[1..]);
+            assert_eq!(
+                mutated.len(),
+                signature_hex.len(),
+                "mutation must preserve even hex length"
+            );
+            value["signature"]["signature_hex"] = Value::String(mutated);
+        });
+
+        let err = import_team_artifact(
+            &fixture.artifact_dir,
+            temp_path("team-malformed-sig-hex-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("malformed signature hex is refused");
+
+        assert_ne!(
+            err.code(),
+            Some(ASTRO_TEAM_ARTIFACT_VAULT_BYTES),
+            "malformed signature hex must NOT carry the vault-bytes component code"
+        );
+        assert_refusal(
+            &err,
+            ASTRO_TEAM_ARTIFACT_SIGNATURE,
+            "signature contains non-hex bytes",
+            "Re-export the team artifact with a valid signature over the ledger Merkle root, \
+             or import without an expected signer if the artifact is intentionally unsigned.",
+        );
+
+        cleanup_team_fixture(&fixture);
+    }
+
+    #[test]
+    fn corrupt_vault_bytes_refusal_carries_exact_contract() {
+        let fixture = team_fixture(
+            "team-corrupt-vault-bytes",
+            &TeamArtifactExportOptions::unsigned(),
+        );
+        // Corrupt the real compressed vault export bytes without updating the
+        // manifest hash, so the vault-bytes integrity check refuses the import.
+        flip_first_byte(&fixture.artifact_dir.join(VAULT_EXPORT_ZST_NAME));
+
+        let err = import_team_artifact(
+            &fixture.artifact_dir,
+            temp_path("team-corrupt-vault-bytes-adopt.db"),
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("corrupt vault bytes is refused");
+
+        assert_refusal(
+            &err,
+            ASTRO_TEAM_ARTIFACT_VAULT_BYTES,
+            "vault.export.zst compressed bytes do not match artifact.json",
+            "Re-export the team artifact; vault.export.zst is missing, corrupt, \
+             or does not match artifact.json.",
+        );
+        assert_eq!(
+            err.remediation(),
+            Some(
+                "Re-export the team artifact; vault.export.zst is missing, corrupt, \
+                 or does not match artifact.json."
+            ),
+            "structured remediation accessor must expose the vault-bytes remediation"
+        );
+
+        cleanup_team_fixture(&fixture);
+    }
+
+    #[test]
     fn legacy_plain_graph_db_zst_imports_without_vault_export() {
         let source = temp_path("team-legacy-source.db");
         let lowered = temp_path("team-legacy-lowered.db");
@@ -1361,11 +1509,26 @@ mod tests {
     }
 
     fn assert_err_code(error: &LowerError, code: &str) {
-        let text = error.to_string();
-        assert!(
-            text.contains(code),
-            "expected error code {code} in {text:?}"
+        assert_eq!(
+            error.code(),
+            Some(code),
+            "expected structured refusal code {code}, got error {error:?}"
         );
+    }
+
+    fn assert_refusal(error: &LowerError, code: &str, message: &str, remediation: &str) {
+        match error {
+            LowerError::Refused {
+                code: got_code,
+                message: got_message,
+                remediation: got_remediation,
+            } => {
+                assert_eq!(*got_code, code, "refusal code");
+                assert_eq!(got_message, message, "refusal message");
+                assert_eq!(*got_remediation, remediation, "refusal remediation");
+            }
+            other => panic!("expected structured LowerError::Refused, got {other:?}"),
+        }
     }
 
     fn hex_to_32(input: &str) -> [u8; 32] {
