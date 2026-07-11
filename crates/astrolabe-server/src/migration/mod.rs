@@ -104,8 +104,8 @@ mod shadow_import;
 use shadow_import::*;
 
 mod status_surface;
-use status_surface::*;
 pub(crate) use status_surface::periodic_verify_chain_tick;
+use status_surface::*;
 
 mod optimizer;
 use optimizer::*;
@@ -117,11 +117,15 @@ mod readiness;
 use readiness::*;
 
 mod dispatch;
+// Non-test code reaches dispatch only through the two public entry points; the
+// glob is needed by the colocated tests, which drive the gate internals directly.
+#[cfg(test)]
 use dispatch::*;
 pub use dispatch::{handle_jsonrpc_raw, handle_tool_raw};
 
 #[cfg(test)]
 mod tests;
+
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
 

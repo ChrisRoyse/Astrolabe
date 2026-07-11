@@ -9,7 +9,7 @@ pub(crate) enum MigrationDial {
 }
 
 impl MigrationDial {
-    fn parse(value: &Value) -> Result<Self, String> {
+    pub(crate) fn parse(value: &Value) -> Result<Self, String> {
         match value.as_str() {
             Some("off") => Ok(Self::Off),
             Some("shadow") => Ok(Self::Shadow),
@@ -20,7 +20,7 @@ impl MigrationDial {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Shadow => "shadow",
@@ -28,7 +28,11 @@ impl MigrationDial {
     }
 }
 
-pub(crate) fn read_config_u64(cache_dir: &Path, project: &str, key: &str) -> Result<Option<u64>, DynError> {
+pub(crate) fn read_config_u64(
+    cache_dir: &Path,
+    project: &str,
+    key: &str,
+) -> Result<Option<u64>, DynError> {
     Ok(read_config_value(cache_dir, &metadata_key(project, key))?
         .and_then(|value| value.parse::<u64>().ok()))
 }
@@ -43,7 +47,11 @@ pub(crate) fn read_dial(project: &str) -> Result<MigrationDial, DynError> {
     read_dial_at(&cache_dir, project)
 }
 
-pub(crate) fn persist_dial_at(cache_dir: &Path, project: &str, dial: MigrationDial) -> Result<(), DynError> {
+pub(crate) fn persist_dial_at(
+    cache_dir: &Path,
+    project: &str,
+    dial: MigrationDial,
+) -> Result<(), DynError> {
     write_config_value(cache_dir, &dial_key(project), dial.as_str())
 }
 
