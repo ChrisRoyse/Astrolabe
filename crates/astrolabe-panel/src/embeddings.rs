@@ -542,16 +542,37 @@ mod tests {
     fn golden_embeddings_s18_s20_are_exact_bitpatterns() {
         let table = test_table();
         let input = fixture_static_embedding_input();
+        // Fail closed: the golden source must actually carry goldens. The required
+        // minimum is derived from the golden set itself (GOLDEN_SHA_BY_SLOT.len()),
+        // not a hand-picked constant, so a blanked/merge-lost table cannot pass by
+        // comparing zero vectors.
+        assert!(
+            !GOLDEN_SHA_BY_SLOT.is_empty(),
+            "golden source `GOLDEN_SHA_BY_SLOT` (crates/astrolabe-panel/src/embeddings.rs) is empty; \
+             S18-S20 embedding byte-exactness cannot be enforced. Regenerate goldens with the \
+             #[ignore] golden generator and restore the constant."
+        );
+        let mut checked = 0usize;
         for (slot, expected) in GOLDEN_SHA_BY_SLOT {
+            assert!(
+                !expected.is_empty(),
+                "golden SHA for slot {slot} in `GOLDEN_SHA_BY_SLOT` \
+                 (crates/astrolabe-panel/src/embeddings.rs) is empty; \
+                 regenerate the S18-S20 embedding golden for this slot."
+            );
             let vector = encode_embedding_slot(SlotId::new(*slot), &input, table.as_ref())
                 .expect("embedding vector");
             let actual = hex_lower(&sha256_digest_bytes(&slot_vector_bytes(&vector)));
-            if expected.is_empty() {
-                eprintln!("slot {slot}: {actual}");
-                continue;
-            }
             assert_eq!(actual, *expected, "slot {slot} embedding drifted");
+            checked += 1;
         }
+        assert_eq!(
+            checked,
+            GOLDEN_SHA_BY_SLOT.len(),
+            "compared {checked} S18-S20 goldens but the golden source defines {}; \
+             every declared golden slot must be byte-checked.",
+            GOLDEN_SHA_BY_SLOT.len()
+        );
     }
 
     #[test]
@@ -567,11 +588,13 @@ mod tests {
             .expect("second OOV vector");
         assert_eq!(slot_vector_bytes(&first), slot_vector_bytes(&second));
         let actual = hex_lower(&sha256_digest_bytes(&slot_vector_bytes(&first)));
-        if OOV_GOLDEN_SHA.is_empty() {
-            eprintln!("oov: {actual}");
-        } else {
-            assert_eq!(actual, OOV_GOLDEN_SHA);
-        }
+        assert!(
+            !OOV_GOLDEN_SHA.is_empty(),
+            "golden source `OOV_GOLDEN_SHA` (crates/astrolabe-panel/src/embeddings.rs) is empty; \
+             the OOV deterministic-fallback byte-exactness cannot be enforced. Regenerate the \
+             OOV golden with the #[ignore] golden generator and restore the constant."
+        );
+        assert_eq!(actual, OOV_GOLDEN_SHA, "OOV embedding drifted");
     }
 
     #[test]
@@ -612,11 +635,13 @@ mod tests {
         )
         .expect("S22 vector");
         let actual = hex_lower(&sha256_digest_bytes(&slot_vector_bytes(&vector)));
-        if S22_GOLDEN_SHA.is_empty() {
-            eprintln!("s22: {actual}");
-        } else {
-            assert_eq!(actual, S22_GOLDEN_SHA, "S22 token_multi drifted");
-        }
+        assert!(
+            !S22_GOLDEN_SHA.is_empty(),
+            "golden source `S22_GOLDEN_SHA` (crates/astrolabe-panel/src/embeddings.rs) is empty; \
+             the S22 token_multi byte-exactness cannot be enforced. Regenerate the S22 golden \
+             with the #[ignore] golden generator and restore the constant."
+        );
+        assert_eq!(actual, S22_GOLDEN_SHA, "S22 token_multi drifted");
         let SlotVector::Multi { token_dim, tokens } = vector else {
             panic!("S22 must emit Multi");
         };
