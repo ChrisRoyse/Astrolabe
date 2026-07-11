@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod detmath;
 mod embeddings;
 mod lenses;
 mod unicode61;

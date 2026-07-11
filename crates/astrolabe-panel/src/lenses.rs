@@ -1081,7 +1081,7 @@ fn encode_api_callees(calls: &[ApiCall]) -> PanelResult<SlotVector> {
             continue;
         }
         if call.resolved {
-            let weight = call.call_count.ln_1p();
+            let weight = crate::detmath::ln_1p(call.call_count);
             if weight != 0.0 {
                 terms.push((format!("resolved:{trimmed}"), weight));
             }
@@ -1187,21 +1187,21 @@ fn encode_graph_position(input: &GraphPositionInput) -> PanelResult<SlotVector> 
     };
     let mut data = Vec::with_capacity(GRAPH_POSITION_DIM as usize);
     data.extend([
-        input.call_in.ln_1p(),
-        input.call_out.ln_1p(),
-        input.dataflow_in.ln_1p(),
-        input.dataflow_out.ln_1p(),
-        input.type_in.ln_1p(),
-        input.type_out.ln_1p(),
-        input.service_in.ln_1p(),
-        input.service_out.ln_1p(),
+        crate::detmath::ln_1p(input.call_in),
+        crate::detmath::ln_1p(input.call_out),
+        crate::detmath::ln_1p(input.dataflow_in),
+        crate::detmath::ln_1p(input.dataflow_out),
+        crate::detmath::ln_1p(input.type_in),
+        crate::detmath::ln_1p(input.type_out),
+        crate::detmath::ln_1p(input.service_in),
+        crate::detmath::ln_1p(input.service_out),
         input.sampled_betweenness,
         input.pagerank,
         input.clustering_coeff,
         input.neighbor_label_entropy,
-        total_in.ln_1p(),
-        total_out.ln_1p(),
-        total.ln_1p(),
+        crate::detmath::ln_1p(total_in),
+        crate::detmath::ln_1p(total_out),
+        crate::detmath::ln_1p(total),
         balance,
     ]);
 
@@ -1226,7 +1226,7 @@ fn encode_path_hierarchy(input: &PathHierarchyInput) -> PanelResult<SlotVector> 
     if !components.is_empty() {
         terms.push((
             format!("depth:{}", components.len()),
-            (components.len() as f32).ln_1p(),
+            crate::detmath::ln_1p(components.len() as f32),
         ));
     }
     hashed_sparse("path_hierarchy", PATH_HIERARCHY_DIM, terms)
@@ -1241,7 +1241,7 @@ fn encode_churn_profile(input: &ChurnProfileInput) -> PanelResult<SlotVector> {
     dense(
         SlotId::new(10),
         vec![
-            input.change_count.ln_1p(),
+            crate::detmath::ln_1p(input.change_count),
             positive_day_log(input.age_days),
             positive_day_log(input.days_since),
             input.co_change_degree,
@@ -1256,8 +1256,9 @@ fn encode_churn_profile(input: &ChurnProfileInput) -> PanelResult<SlotVector> {
 fn encode_recency(input: &RecencyInput) -> PanelResult<SlotVector> {
     ensure_finite_scalar("recency.days_since_modified", input.days_since_modified)?;
     ensure_non_negative("recency.days_since_modified", input.days_since_modified)?;
-    let decay =
-        (-std::f32::consts::LN_2 * input.days_since_modified / RECENCY_HALF_LIFE_DAYS).exp();
+    let decay = crate::detmath::exp(
+        -std::f32::consts::LN_2 * input.days_since_modified / RECENCY_HALF_LIFE_DAYS,
+    );
     let mut data = Vec::with_capacity(RECENCY_DIM as usize);
     data.push(decay);
     dense(SlotId::new(11), data)
@@ -1564,12 +1565,12 @@ fn bool_to_f32(value: bool) -> f32 {
 }
 
 fn positive_day_log(value: f32) -> f32 {
-    value.max(1.0).ln()
+    crate::detmath::ln(value.max(1.0))
 }
 
 fn signed_log(value: f32) -> PanelResult<f32> {
     ensure_finite_scalar("signed_log", value)?;
-    Ok(value.signum() * value.abs().ln_1p())
+    Ok(value.signum() * crate::detmath::ln_1p(value.abs()))
 }
 
 fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
@@ -1864,21 +1865,21 @@ mod tests {
         assert_eq!(
             data,
             vec![
-                1.0_f32.ln_1p(),
-                2.0_f32.ln_1p(),
-                3.0_f32.ln_1p(),
-                4.0_f32.ln_1p(),
-                5.0_f32.ln_1p(),
-                6.0_f32.ln_1p(),
-                7.0_f32.ln_1p(),
-                8.0_f32.ln_1p(),
+                crate::detmath::ln_1p(1.0),
+                crate::detmath::ln_1p(2.0),
+                crate::detmath::ln_1p(3.0),
+                crate::detmath::ln_1p(4.0),
+                crate::detmath::ln_1p(5.0),
+                crate::detmath::ln_1p(6.0),
+                crate::detmath::ln_1p(7.0),
+                crate::detmath::ln_1p(8.0),
                 0.25,
                 0.125,
                 0.5,
                 1.5,
-                total_in.ln_1p(),
-                total_out.ln_1p(),
-                total.ln_1p(),
+                crate::detmath::ln_1p(total_in),
+                crate::detmath::ln_1p(total_out),
+                crate::detmath::ln_1p(total),
                 (total_out - total_in) / total,
             ]
         );
