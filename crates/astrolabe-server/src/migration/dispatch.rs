@@ -1,0 +1,479 @@
+use super::*;
+
+pub fn handle_tool_raw(
+    runner: &CbmToolRunner,
+    tool_name: &str,
+    args_json: &str,
+) -> Result<String, DynError> {
+    match tool_name {
+        "index_repository" => handle_index_repository(runner, args_json),
+        "index_status" => handle_index_status(runner, args_json),
+        "get_architecture" => handle_get_architecture(runner, args_json),
+        "detect_anomalies" => handle_detect_anomalies(args_json),
+        "get_provenance" => handle_get_provenance(args_json),
+        "optimizer_status" => handle_optimizer_status(args_json),
+        "get_readiness" => handle_get_readiness(args_json),
+        "impute_fields" => handle_impute_fields(args_json),
+        "team_artifact" => handle_team_artifact(args_json),
+        _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
+    }
+}
+
+pub fn handle_jsonrpc_raw(
+    runner: &CbmToolRunner,
+    request_json: &str,
+) -> Result<Option<String>, DynError> {
+    let Ok(request) = serde_json::from_str::<Value>(request_json) else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    let Some(request_obj) = request.as_object() else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    let Some(method) = request_obj.get("method").and_then(Value::as_str) else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    if method == "tools/list" {
+        return handle_tools_list_jsonrpc(runner, request_json);
+    }
+    if method != "tools/call" {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    }
+
+    let Some(id) = request_obj
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number())
+    else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    let Some(params) = request_obj.get("params").and_then(Value::as_object) else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    if !should_intercept_tool_call(tool_name) {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    }
+
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let Some(args_obj) = arguments.as_object() else {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    };
+    if !should_wrap_tool(tool_name, args_obj)? {
+        return Ok(runner.handle_jsonrpc_raw(request_json)?);
+    }
+
+    let args_json = serde_json::to_string(&arguments)?;
+    let result_raw = handle_tool_raw(runner, tool_name, &args_json)?;
+    Ok(Some(jsonrpc_result_response(id.clone(), &result_raw)?))
+}
+
+pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "index_repository" | "index_status" | "get_architecture"
+    ) || is_advertised_astrolabe_tool(tool_name)
+}
+
+pub(crate) fn is_advertised_astrolabe_tool(tool_name: &str) -> bool {
+    astrolabe_tool_definitions()
+        .iter()
+        .any(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
+}
+
+pub(crate) fn handle_tools_list_jsonrpc(
+    runner: &CbmToolRunner,
+    request_json: &str,
+) -> Result<Option<String>, DynError> {
+    let Some(response) = runner.handle_jsonrpc_raw(request_json)? else {
+        return Ok(None);
+    };
+    Ok(Some(augment_tools_list_response(&response)?))
+}
+
+pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String, DynError> {
+    let mut response: Value = serde_json::from_str(response_json)?;
+    let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
+        return Ok(response_json.to_string());
+    };
+    if result.contains_key("nextCursor") {
+        return Ok(response_json.to_string());
+    }
+    let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
+        return Ok(response_json.to_string());
+    };
+    for definition in astrolabe_tool_definitions() {
+        let Some(name) = definition.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        {
+            tools.push(definition);
+        }
+    }
+    Ok(serde_json::to_string(&response)?)
+}
+
+pub(crate) fn should_wrap_tool(tool_name: &str, args: &Map<String, Value>) -> Result<bool, DynError> {
+    match tool_name {
+        "index_repository" => {
+            if args.contains_key("calyx") || args.contains_key("calyx_search") {
+                return Ok(true);
+            }
+            let Some(project) = index_project_from_args(args)? else {
+                return Ok(false);
+            };
+            Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        "index_status" => {
+            let Some(project) = status_project_from_args(args)? else {
+                return Ok(false);
+            };
+            Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        "get_architecture" => {
+            let Some(project) = status_project_from_args(args)? else {
+                return Ok(false);
+            };
+            Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        name if is_advertised_astrolabe_tool(name) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+pub(crate) fn handle_index_repository(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+    };
+
+    let search_scale_override = match parse_search_scale_override(args_obj) {
+        Ok(value) => value,
+        Err(message) => return tool_error_result(message),
+    };
+    let project = index_project_from_args(args_obj)?;
+    let explicit_dial = args_obj.get("calyx");
+    let dial = match explicit_dial {
+        Some(value) => match MigrationDial::parse(value) {
+            Ok(dial) => dial,
+            Err(message) => return tool_error_result(message),
+        },
+        None => project
+            .as_ref()
+            .map(|project| read_dial(project))
+            .transpose()?
+            .unwrap_or(MigrationDial::Off),
+    };
+
+    if explicit_dial.is_none() && dial == MigrationDial::Off {
+        if search_scale_override.is_some() {
+            return tool_error_result(
+                "calyx_search requires calyx=\"shadow\" or a persisted shadow dial for this project",
+            );
+        }
+        return Ok(runner.handle_tool_raw("index_repository", args_json)?);
+    }
+
+    let sanitized_args = strip_calyx_arg(args_obj)?;
+    let (result, row_sink) = match runner.handle_index_repository_with_rows(&sanitized_args) {
+        Ok(run) => (run.raw_json, row_sink_import_candidate_from_rows(run.rows)),
+        Err(error) => (
+            runner.handle_tool_raw("index_repository", &sanitized_args)?,
+            RowSinkImportCandidate::Unavailable(format!(
+                "single-run row-sink index_repository failed: {error}"
+            )),
+        ),
+    };
+    if tool_result_is_error(&result)? {
+        return Ok(result);
+    }
+
+    let project = project
+        .or_else(|| project_from_tool_result(&result))
+        .ok_or("index_repository succeeded without a project name")?;
+    persist_dial(&project, dial)?;
+    if dial == MigrationDial::Off {
+        return Ok(result);
+    }
+    let search_scale_settings =
+        match search_scale_settings_for_import(&project, search_scale_override) {
+            Ok(settings) => settings,
+            Err(error) => return tool_error_result(format!("search scale config failed: {error}")),
+        };
+
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
+        return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
+    };
+    let outcome = match import_shadow_vault(&project, Some(row_sink), &search_scale_settings) {
+        Ok(outcome) => outcome,
+        Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
+    };
+    persist_shadow_outcome(&project, &outcome)?;
+    augment_tool_result(
+        &result,
+        json!({
+            "calyx": "shadow",
+            "vault_fingerprint": outcome.sqlite_fingerprint_sha256,
+            "grounding_summary": grounding_summary(&outcome),
+        }),
+    )
+}
+
+pub(crate) fn handle_index_status(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return Ok(runner.handle_tool_raw("index_status", args_json)?);
+    }
+
+    let result = runner.handle_tool_raw("index_status", args_json)?;
+    if tool_result_is_error(&result)? {
+        return Ok(result);
+    }
+    let refresh_status = match ensure_shadow_import_current(&project) {
+        Ok(status) => status,
+        Err(error) => {
+            return tool_error_result(format!("shadow import recovery failed: {error}"));
+        }
+    };
+    let mut summary = shadow_status_summary(&project)?;
+    if refresh_status == ShadowRefreshStatus::Busy
+        && let Some(summary_obj) = summary.as_object_mut()
+    {
+        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+        merge_object(
+            summary_obj,
+            shadow_import_busy_summary_at(&cache_dir, &project)
+                .as_object()
+                .expect("busy summary object"),
+        );
+    }
+    augment_tool_result(&result, summary)
+}
+
+pub(crate) fn handle_get_architecture(runner: &CbmToolRunner, args_json: &str) -> Result<String, DynError> {
+    let result = runner.handle_tool_raw("get_architecture", args_json)?;
+    if tool_result_is_error(&result)? {
+        return Ok(result);
+    }
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(result);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(result);
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return Ok(result);
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return Ok(result);
+    }
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    augment_tool_result(
+        &result,
+        json!({
+            "astrolabe": {
+                "skill_tree": read_skill_tree_metadata(&cache_dir, &project)?,
+                "bridges": read_bridges_metadata(&cache_dir, &project)?,
+                "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
+                "anomalies": read_anomaly_report(&cache_dir, &project)?,
+                "provenance": read_provenance_metadata(&cache_dir, &project)?,
+            },
+        }),
+    )
+}
+
+pub(crate) fn handle_detect_anomalies(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("detect_anomalies arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("detect_anomalies requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "detect_anomalies requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let kind_filter = string_arg(args_obj, "kind");
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let report = read_anomaly_report(&cache_dir, &project)?;
+    let security = read_security_screen_metadata(&cache_dir, &project)?;
+    let report = merge_prompt_injection_anomalies(report, security, &project);
+    let filtered = match filter_anomaly_report_json(report, kind_filter) {
+        Ok(filtered) => filtered,
+        Err(error) => return tool_error_result(error.to_string()),
+    };
+    tool_json_result(filtered)
+}
+
+pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("get_provenance arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("get_provenance requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "get_provenance requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let Some(mode) = string_arg(args_obj, "mode") else {
+        return tool_error_result(
+            "get_provenance requires mode: lineage, answer_trace, verify_chain, or reproduce",
+        );
+    };
+    let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let store = match provenance_store_for_project(&cache_dir, &project) {
+        Ok(store) => store,
+        Err(error) => return tool_error_result(error.to_string()),
+    };
+    let response = match get_provenance(&store, &ProvenanceQuery::new(mode, subject_id)) {
+        Ok(response) => response,
+        Err(error) => {
+            return tool_error_result(format!(
+                "{}: {}; remediation: {}",
+                error.code(),
+                error.message(),
+                error.remediation()
+            ));
+        }
+    };
+    tool_json_result(provenance_response_json(&project, &response))
+}
+
+pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("optimizer_status arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("optimizer_status requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "optimizer_status requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let mode = string_arg(args_obj, "mode").unwrap_or("status");
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    match mode {
+        "status" => {
+            let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
+            tool_json_result(optimizer_status_json_at(
+                &cache_dir,
+                &project,
+                anneal_env.as_deref(),
+            )?)
+        }
+        "ack_triggers" => {
+            let Some(raw_subscription_id) = string_arg(args_obj, "subscription_id") else {
+                return tool_error_result(
+                    "ASTRO_OPTIMIZER_ACK_SUBSCRIPTION_REQUIRED: optimizer_status mode=\"ack_triggers\" requires subscription_id; remediation: read optimizer_status.reactive_triggers.subscriptions and retry with one returned subscription_id",
+                );
+            };
+            let subscription_id = match SubscriptionId::from_str(raw_subscription_id) {
+                Ok(subscription_id) => subscription_id,
+                Err(error) => {
+                    return tool_error_result(format!(
+                        "ASTRO_OPTIMIZER_ACK_SUBSCRIPTION_INVALID: invalid subscription_id {raw_subscription_id:?}: {error}; remediation: use a subscription_id returned by optimizer_status.reactive_triggers.subscriptions"
+                    ));
+                }
+            };
+            let value = optimizer_ack_triggers_json_at(&cache_dir, &project, subscription_id)?;
+            if value.get("status").and_then(Value::as_str) == Some("refused") {
+                tool_json_error_result(value)
+            } else {
+                tool_json_result(value)
+            }
+        }
+        "propose" => {
+            let anneal_env = std::env::var("ASTRO_ANNEAL").ok();
+            let value = optimizer_propose_json_at(&cache_dir, &project, anneal_env.as_deref())?;
+            if value.get("status").and_then(Value::as_str) == Some("refused") {
+                tool_json_error_result(value)
+            } else {
+                tool_json_result(value)
+            }
+        }
+        other => tool_error_result(format!(
+            "ASTRO_OPTIMIZER_MODE_UNSUPPORTED: optimizer_status mode {other:?} is not available; remediation: use mode=\"status\", mode=\"ack_triggers\", or mode=\"propose\""
+        )),
+    }
+}
+
+pub(crate) fn handle_get_readiness(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("get_readiness arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("get_readiness requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "get_readiness requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let scope = string_arg(args_obj, "scope");
+    let axis = string_arg(args_obj, "axis");
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
+}
+
+pub(crate) fn handle_impute_fields(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("impute_fields arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("impute_fields requires project");
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "impute_fields requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let Some(target) = string_arg(args_obj, "target") else {
+        return tool_error_result("impute_fields requires target");
+    };
+    let Some(field) = string_arg(args_obj, "field") else {
+        return tool_error_result("impute_fields requires field");
+    };
+    if !matches!(field, "doc" | "types" | "callees" | "tests") {
+        return tool_error_result(
+            "impute_fields field must be one of doc, types, callees, or tests",
+        );
+    }
+    let write_as_trusted = args_obj
+        .get("write_as_trusted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let value = impute_fields_json_at(&cache_dir, &project, target, field, write_as_trusted)?;
+    if value.get("status").and_then(Value::as_str) == Some("refused") {
+        tool_json_error_result(value)
+    } else {
+        tool_json_result(value)
+    }
+}
