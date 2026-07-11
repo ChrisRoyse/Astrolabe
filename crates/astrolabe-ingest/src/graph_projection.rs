@@ -5,7 +5,7 @@ use astrolabe_domain::EdgeKind;
 use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId};
+use calyx_core::{Clock, CxId, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
@@ -422,18 +422,31 @@ where
     C: Clock,
 {
     let desired = build_projection_bytes(kind, source, options.workers)?;
-    let existing = existing_projection_rows(vault, kind)?;
-    let existing_by_region = existing_segments_by_region(&existing, kind);
+    let snapshot = vault.latest_seq();
+    // Enumerate persisted segment keys WITHOUT loading their (potentially large) CSR byte values.
+    // The prior path scanned every persisted segment's full bytes into a map that coexisted with
+    // the freshly built `desired` segment bytes — old+new whole-projection copies held at once
+    // (#101). A key-only scan is enough to detect regions that must be tombstoned, and each desired
+    // segment is compared against persisted bytes via an on-demand point read that holds a single
+    // segment at a time.
+    let existing_by_region = existing_segment_regions(vault, snapshot, kind)?;
     let desired_by_region = desired
         .segments
         .iter()
         .map(|segment| (segment.region, segment))
         .collect::<BTreeMap<_, _>>();
+    // Compare each desired segment against its persisted bytes once (single point read per
+    // segment), recording staleness so the write loop below reuses the decision without a second
+    // read and without retaining any persisted bytes.
+    let mut segment_is_stale = Vec::with_capacity(desired.segments.len());
     let mut stale_regions = BTreeSet::new();
     for segment in &desired.segments {
-        if existing.get(&segment.key) != Some(&segment.bytes) {
+        let persisted = vault.read_cf_at(snapshot, ColumnFamily::Kernel, &segment.key)?;
+        let stale = persisted.as_deref() != Some(segment.bytes.as_slice());
+        if stale {
             stale_regions.insert(segment.region);
         }
+        segment_is_stale.push(stale);
     }
     for region in existing_by_region.keys() {
         if !desired_by_region.contains_key(region) {
@@ -456,8 +469,8 @@ where
 
     let mut rows = Vec::new();
     let mut segments_written = 0;
-    for segment in &desired.segments {
-        if existing.get(&segment.key) != Some(&segment.bytes) {
+    for (segment, stale) in desired.segments.iter().zip(&segment_is_stale) {
+        if *stale {
             rows.push((
                 ColumnFamily::Kernel,
                 segment.key.clone(),
@@ -473,7 +486,9 @@ where
             segments_tombstoned += 1;
         }
     }
-    let manifest_written = existing.get(&desired.manifest_key) != Some(&desired.manifest_bytes);
+    let manifest_persisted =
+        vault.read_cf_at(snapshot, ColumnFamily::Kernel, &desired.manifest_key)?;
+    let manifest_written = manifest_persisted.as_deref() != Some(desired.manifest_bytes.as_slice());
     if manifest_written {
         rows.push((
             ColumnFamily::Kernel,
@@ -1209,25 +1224,27 @@ impl<'a> SegmentReader<'a> {
     }
 }
 
-fn existing_projection_rows<C>(
+/// Maps each persisted segment region to its key using a key-only scan.
+///
+/// This never loads the segment CSR byte values, keeping projection re-materialization from
+/// holding the entire persisted projection in memory alongside the freshly built one (#101).
+fn existing_segment_regions<C>(
     vault: &AsterVault<C>,
+    snapshot: Seq,
     kind: GraphProjectionKind,
-) -> IngestResult<BTreeMap<Vec<u8>, Vec<u8>>>
+) -> IngestResult<BTreeMap<u8, Vec<u8>>>
 where
     C: Clock,
 {
-    Ok(graph_projection_csr_rows(vault, kind)?
+    Ok(vault
+        .scan_cf_range_keys_at(
+            snapshot,
+            ColumnFamily::Kernel,
+            &prefix_range(&projection_prefix(kind)),
+        )?
         .into_iter()
-        .collect::<BTreeMap<_, _>>())
-}
-
-fn existing_segments_by_region(
-    rows: &BTreeMap<Vec<u8>, Vec<u8>>,
-    kind: GraphProjectionKind,
-) -> BTreeMap<u8, Vec<u8>> {
-    rows.keys()
-        .filter_map(|key| segment_region_from_key(kind, key).map(|region| (region, key.clone())))
-        .collect()
+        .filter_map(|key| segment_region_from_key(kind, &key).map(|region| (region, key)))
+        .collect())
 }
 
 fn manifest_key(kind: GraphProjectionKind) -> Vec<u8> {
