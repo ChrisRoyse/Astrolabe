@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::thread;
 
 use astrolabe_domain::EdgeKind;
 use calyx_aster::cf::{ColumnFamily, prefix_range};
@@ -420,7 +421,7 @@ fn materialize_graph_projection_from_source<C>(
 where
     C: Clock,
 {
-    let desired = build_projection_bytes(kind, source)?;
+    let desired = build_projection_bytes(kind, source, options.workers)?;
     let existing = existing_projection_rows(vault, kind)?;
     let existing_by_region = existing_segments_by_region(&existing, kind);
     let desired_by_region = desired
@@ -589,25 +590,10 @@ fn validate_source_edge_row(key: &[u8], row: &EdgeGraphRow) -> IngestResult<()> 
 fn build_projection_bytes(
     kind: GraphProjectionKind,
     source: &SourceEdges,
+    workers: usize,
 ) -> IngestResult<ProjectionBytes> {
     let csr = build_projection_csr(kind, source)?;
-    let mut segments = Vec::new();
-    for (region, segment) in segment_projection(&csr)? {
-        let bytes = encode_segment(&segment)?;
-        let stream_blake3 = blake3::hash(&bytes).to_hex().to_string();
-        segments.push(ProjectionSegmentBytes {
-            region,
-            key: segment_key(kind, region),
-            manifest: ProjectionManifestRegion {
-                region,
-                node_count: segment.nodes.len(),
-                edge_count: segment.edges.len(),
-                total_bytes: bytes.len(),
-                stream_blake3,
-            },
-            bytes,
-        });
-    }
+    let mut segments = encode_region_segments(kind, segment_projection(&csr)?, workers)?;
     segments.sort_by_key(|segment| segment.region);
     let manifest = ProjectionManifest {
         schema: PROJECTION_SCHEMA.to_string(),
@@ -628,6 +614,73 @@ fn build_projection_bytes(
         manifest_bytes: serde_json::to_vec(&manifest)?,
         manifest_key: manifest_key(kind),
         segments,
+    })
+}
+
+/// Encodes each region CSR segment into its persisted bytes, sharding the
+/// independent per-region encode + BLAKE3 hash across `workers`.
+///
+/// Region segments are disjoint (each owns a distinct region id and node/edge
+/// slice) and encoding is pure, so partitioning the regions across worker threads
+/// and merging their outputs is a merge-order-invariant reduction: every region is
+/// encoded exactly once and [`build_projection_bytes`] sorts the merged segments
+/// by region. The persisted bytes are therefore byte-identical for any `workers`,
+/// which is the property `projection_bytes_are_deterministic_across_workers_and_repeated_builds`
+/// asserts. This is the caller-visible `workers` knob's real effect; it no longer
+/// only round-trips into the materialize report.
+fn encode_region_segments(
+    kind: GraphProjectionKind,
+    regions: Vec<(u8, DecodedSegment)>,
+    workers: usize,
+) -> IngestResult<Vec<ProjectionSegmentBytes>> {
+    let worker_count = workers.min(regions.len()).max(1);
+    if worker_count == 1 {
+        return regions
+            .into_iter()
+            .map(|(region, segment)| encode_region_segment(kind, region, &segment))
+            .collect();
+    }
+
+    let chunk_size = regions.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in regions.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                chunk
+                    .into_iter()
+                    .map(|(region, segment)| encode_region_segment(kind, region, &segment))
+                    .collect::<IngestResult<Vec<_>>>()
+            }));
+        }
+        let mut out = Vec::new();
+        for handle in handles {
+            out.extend(handle.join().map_err(|_| {
+                projection_corrupt("graph projection region-encode worker panicked")
+            })??);
+        }
+        Ok(out)
+    })
+}
+
+fn encode_region_segment(
+    kind: GraphProjectionKind,
+    region: u8,
+    segment: &DecodedSegment,
+) -> IngestResult<ProjectionSegmentBytes> {
+    let bytes = encode_segment(segment)?;
+    let stream_blake3 = blake3::hash(&bytes).to_hex().to_string();
+    Ok(ProjectionSegmentBytes {
+        region,
+        key: segment_key(kind, region),
+        manifest: ProjectionManifestRegion {
+            region,
+            node_count: segment.nodes.len(),
+            edge_count: segment.edges.len(),
+            total_bytes: bytes.len(),
+            stream_blake3,
+        },
+        bytes,
     })
 }
 
@@ -1751,6 +1804,19 @@ mod tests {
         )
         .expect("one worker materialize");
         assert_eq!(report.workers, 1);
+        // The `workers` knob shards the per-region encode; the cross-worker
+        // equality below is only meaningful if projections actually span multiple
+        // regions, so a single-region corpus could not partition into shards.
+        let max_regions = report
+            .projections
+            .iter()
+            .map(|entry| entry.source_regions.len())
+            .max()
+            .expect("at least one projection");
+        assert!(
+            max_regions > 1,
+            "fixture must span multiple regions to exercise worker sharding, got {max_regions}"
+        );
         let first_rows = all_projection_rows(&one_worker);
         let replay = materialize_graph_projections(
             &one_worker,
@@ -1765,15 +1831,24 @@ mod tests {
         );
         assert_eq!(first_rows, all_projection_rows(&one_worker));
 
-        let eight_worker = vault();
-        write_sources(&eight_worker, reversed);
-        let report = materialize_graph_projections(
-            &eight_worker,
-            &GraphProjectionBuildOptions::new().with_workers(8),
-        )
-        .expect("eight worker materialize");
-        assert_eq!(report.workers, 8);
-        assert_eq!(first_rows, all_projection_rows(&eight_worker));
+        // Every worker count must reproduce the single-worker bytes exactly, even
+        // when the source rows are ingested in reverse order. A merge that dropped,
+        // duplicated, or misordered a region's encoded segment would diverge here.
+        for workers in [2usize, 3, 5, 8, 64] {
+            let sharded = vault();
+            write_sources(&sharded, reversed.clone());
+            let report = materialize_graph_projections(
+                &sharded,
+                &GraphProjectionBuildOptions::new().with_workers(workers),
+            )
+            .unwrap_or_else(|error| panic!("{workers} worker materialize failed: {error}"));
+            assert_eq!(report.workers, workers);
+            assert_eq!(
+                first_rows,
+                all_projection_rows(&sharded),
+                "projection bytes diverged at workers={workers}"
+            );
+        }
     }
 
     #[test]

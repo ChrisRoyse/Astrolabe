@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
+use std::thread;
 
 use astrolabe_domain::EdgeKind;
 use calyx_assay::AssayStore;
@@ -734,8 +736,13 @@ pub fn plan_similarity_edges(
         }
 
         let threshold = config.thresholds.threshold(family);
-        let (family_edges, pair_counts) =
-            plan_family_edges(family, threshold, config.per_node_cap, &vectors);
+        let (family_edges, pair_counts) = plan_family_edges(
+            family,
+            threshold,
+            config.per_node_cap,
+            &vectors,
+            config.worker_count,
+        );
         skips.pair_counts.insert(family, pair_counts);
         edges.extend(family_edges);
     }
@@ -1709,11 +1716,7 @@ fn cross_term_operand(
         return Err(CrossTermAbsentReason::MissingSlot { slot });
     };
     match normalized_vector(vector) {
-        Ok(Some(vector)) => Ok(vector),
-        Ok(None) => Err(CrossTermAbsentReason::UnsupportedSlotShape {
-            slot,
-            shape: "empty",
-        }),
+        Ok(vector) => Ok(vector),
         Err(reason) => Err(cross_term_absent_reason(slot, reason)),
     }
 }
@@ -1826,11 +1829,10 @@ fn collect_family_vectors(
             continue;
         };
         match normalized_vector(vector) {
-            Ok(Some(vector)) => out.push(IndexedVector {
+            Ok(vector) => out.push(IndexedVector {
                 qualified_name: node.qualified_name.clone(),
                 vector,
             }),
-            Ok(None) => {}
             Err(reason) => skips.vector_skips.push(SimilarityVectorSkip {
                 family,
                 qualified_name: node.qualified_name.clone(),
@@ -1842,9 +1844,16 @@ fn collect_family_vectors(
     out
 }
 
-fn normalized_vector(
-    vector: &SlotVector,
-) -> Result<Option<NormalizedVector>, SimilarityVectorSkipReason> {
+/// Normalizes one slot vector for similarity/cross-term scoring, or attributes an
+/// explicit [`SimilarityVectorSkipReason`] when it cannot participate.
+///
+/// The result is deliberately `Result<NormalizedVector, _>` with no intermediate
+/// "absent but not an error" state: every non-degenerate Dense/Sparse vector
+/// yields `Ok`, and every other case (invalid schema, zero norm, multi/absent
+/// shape) is a counted `Err`. Keeping this total — rather than an
+/// `Ok(Option<..>)` whose `None` arm one caller silently dropped and another
+/// mapped to a reason — means no caller can lose a vector without recording why.
+fn normalized_vector(vector: &SlotVector) -> Result<NormalizedVector, SimilarityVectorSkipReason> {
     if let Err(error) = vector.validate_schema() {
         return Err(SimilarityVectorSkipReason::InvalidSchema {
             message: error.to_string(),
@@ -1857,11 +1866,11 @@ fn normalized_vector(
             if zero_norm(norm) {
                 return Err(SimilarityVectorSkipReason::ZeroNorm);
             }
-            Ok(Some(NormalizedVector::Dense {
+            Ok(NormalizedVector::Dense {
                 dim: *dim,
                 data: data.clone(),
                 norm,
-            }))
+            })
         }
         SlotVector::Sparse { dim, entries } => {
             let norm = sparse_norm(entries);
@@ -1870,11 +1879,11 @@ fn normalized_vector(
             }
             let mut entries = entries.clone();
             entries.sort_by_key(|entry| entry.idx);
-            Ok(Some(NormalizedVector::Sparse {
+            Ok(NormalizedVector::Sparse {
                 dim: *dim,
                 entries,
                 norm,
-            }))
+            })
         }
         SlotVector::Multi { .. } => {
             Err(SimilarityVectorSkipReason::UnsupportedSlotShape { shape: "multi" })
@@ -1907,11 +1916,75 @@ fn plan_family_edges(
     threshold: f32,
     per_node_cap: usize,
     vectors: &[IndexedVector],
+    worker_count: usize,
+) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
+    // Each source `i` computes its own bounded top-`per_node_cap` outgoing edges
+    // against the strictly-greater targets `j > i`, and every
+    // [`SimilarityPairCounts`] field is a plain sum over sources. The source
+    // ranges therefore partition into independent shards whose per-shard outputs
+    // reduce order-invariantly (edge concatenation followed by the total
+    // [`stable_edge_order`] sort in the caller; count fields by integer addition).
+    // Sharding by source range across `worker_count` workers is the parallel path
+    // the planner config exposes; a non-invariant reduction (double-counting at a
+    // shard boundary, or splitting one source's per-cap admission across shards)
+    // would change the plan, which the worker-invariance test asserts against.
+    let source_count = vectors.len();
+    let worker_count = worker_count.min(source_count).max(1);
+    if worker_count == 1 {
+        return plan_source_range(family, threshold, per_node_cap, vectors, 0..source_count);
+    }
+
+    let chunk_size = source_count.div_ceil(worker_count);
+    let shards =
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut start = 0;
+            while start < source_count {
+                let end = (start + chunk_size).min(source_count);
+                let range = start..end;
+                handles.push(scope.spawn(move || {
+                    plan_source_range(family, threshold, per_node_cap, vectors, range)
+                }));
+                start = end;
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("similarity planner worker panicked"))
+                .collect::<Vec<_>>()
+        });
+
+    let mut admitted = Vec::new();
+    let mut counts = SimilarityPairCounts::default();
+    for (shard_edges, shard_counts) in shards {
+        admitted.extend(shard_edges);
+        counts.candidate_pairs += shard_counts.candidate_pairs;
+        counts.incompatible_shape_pairs += shard_counts.incompatible_shape_pairs;
+        counts.below_threshold_pairs += shard_counts.below_threshold_pairs;
+        counts.cap_dropped_pairs += shard_counts.cap_dropped_pairs;
+    }
+    counts.admitted_pairs = admitted.len();
+    (admitted, counts)
+}
+
+/// Plans the bounded per-source admissions for one shard of source indices.
+///
+/// `sources` is a contiguous slice of source positions into `vectors`; each
+/// source still scans every strictly-greater target `j > i`, so a shard reads all
+/// of `vectors` but only emits edges (and counts pairs) for the sources it owns.
+/// This keeps each source's per-`per_node_cap` admission wholly inside one shard,
+/// which is what makes the sharded plan byte-identical to the serial plan.
+fn plan_source_range(
+    family: SimilarityFamily,
+    threshold: f32,
+    per_node_cap: usize,
+    vectors: &[IndexedVector],
+    sources: Range<usize>,
 ) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
     let mut counts = SimilarityPairCounts::default();
     let mut admitted = Vec::new();
 
-    for (i, left) in vectors.iter().enumerate() {
+    for i in sources {
+        let left = &vectors[i];
         // Top-`per_node_cap` targets for this source. The heap's max (`peek`) is
         // the *least preferred* admitted edge (lowest weight, ties broken by the
         // larger target qualified name) — exactly the edge a better candidate
@@ -3027,29 +3100,67 @@ mod tests {
     }
 
     #[test]
-    fn worker_count_does_not_change_deterministic_admission() {
-        let mut one_worker = struct_only_config();
-        one_worker.worker_count = 1;
-        one_worker.per_node_cap = 2;
-        one_worker.thresholds.sim_struct_min_score = 0.30;
+    fn worker_count_shards_source_loop_without_changing_the_plan() {
+        // Enough sources that worker_count > 1 genuinely partitions the source
+        // loop into multiple shards (32 sources -> 8 shards of 4 at worker_count=8,
+        // uneven shards at worker_count=3). A low threshold plus a small per-node
+        // cap forces real above-threshold admission *and* per-source cap eviction,
+        // so a shard boundary that split one source's admission or double-counted a
+        // pair would produce a different plan than the serial baseline.
+        let mut base = struct_only_config();
+        base.per_node_cap = 3;
+        base.thresholds.sim_struct_min_score = 0.10;
+        base.exact_pair_node_limit = None;
 
-        let mut eight_workers = one_worker.clone();
-        eight_workers.worker_count = 8;
+        let nodes = (0..32)
+            .map(|index| {
+                let qualified_name = format!("node-{index:03}");
+                // Overlapping sparse support guarantees many above-threshold pairs.
+                sparse_node(
+                    &qualified_name,
+                    SimilarityFamily::Struct,
+                    8,
+                    &[
+                        ((index % 8) as u32, 1.0),
+                        (((index + 1) % 8) as u32, 1.0),
+                        (((index + 2) % 8) as u32, 1.0),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
 
-        let nodes = vec![
-            sparse_node("zeta", SimilarityFamily::Struct, 8, &[(0, 1.0), (1, 1.0)]),
-            sparse_node("alpha", SimilarityFamily::Struct, 8, &[(0, 1.0), (1, 1.0)]),
-            sparse_node("delta", SimilarityFamily::Struct, 8, &[(0, 1.0), (2, 1.0)]),
-            sparse_node("beta", SimilarityFamily::Struct, 8, &[(1, 1.0), (2, 1.0)]),
-        ];
+        let mut serial_config = base.clone();
+        serial_config.worker_count = 1;
+        let serial = plan_similarity_edges(&nodes, &serial_config).expect("serial plan");
 
-        let left = plan_similarity_edges(&nodes, &one_worker).expect("one-worker plan");
-        let right = plan_similarity_edges(&nodes, &eight_workers).expect("eight-worker plan");
+        // The baseline must exercise both admission and cap eviction; otherwise the
+        // cross-worker equality below would be trivially satisfied by an empty plan.
+        assert!(!serial.edges.is_empty(), "baseline must admit edges");
+        let struct_counts = serial
+            .skips
+            .pair_counts
+            .get(&SimilarityFamily::Struct)
+            .expect("struct pair counts");
+        assert!(
+            struct_counts.admitted_pairs > 0 && struct_counts.cap_dropped_pairs > 0,
+            "baseline must admit and cap-drop pairs: {struct_counts:?}"
+        );
 
-        assert_eq!(left.edges, right.edges);
-        assert_eq!(left.skips, right.skips);
-        assert_eq!(left.workers_requested, 1);
-        assert_eq!(right.workers_requested, 8);
+        for worker_count in [2usize, 3, 5, 8, 32, 64] {
+            let mut config = base.clone();
+            config.worker_count = worker_count;
+            let sharded = plan_similarity_edges(&nodes, &config)
+                .unwrap_or_else(|error| panic!("{worker_count}-worker plan failed: {error:?}"));
+            assert_eq!(
+                sharded.edges, serial.edges,
+                "edges diverged at worker_count={worker_count}"
+            );
+            assert_eq!(
+                sharded.skips, serial.skips,
+                "skip report diverged at worker_count={worker_count}"
+            );
+            assert_eq!(sharded.workers_requested, worker_count);
+        }
     }
 
     #[test]
@@ -3159,7 +3270,7 @@ mod tests {
         assert!(!zero_norm(above_sq));
         assert!(matches!(
             normalized_vector(&above),
-            Ok(Some(NormalizedVector::Dense { .. }))
+            Ok(NormalizedVector::Dense { .. })
         ));
 
         // Just below the floor: squared norm underflows to subnormal -> zero.
@@ -3205,7 +3316,7 @@ mod tests {
                 dim: 1,
                 data: data.to_vec(),
             }),
-            Ok(Some(NormalizedVector::Dense { .. }))
+            Ok(NormalizedVector::Dense { .. })
         ));
     }
 

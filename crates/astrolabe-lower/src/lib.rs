@@ -987,6 +987,80 @@ mod tests {
     }
 
     #[test]
+    fn lower_refuses_legacy_vault_missing_raw_cbm_edge_rows() {
+        use calyx_aster::cf::prefix_range;
+        use calyx_aster::mvcc::tombstone_value;
+
+        // On-disk raw CBM edge row prefix owned by astrolabe-ingest. A modern
+        // import persists one raw row per source edge; a legacy vault imported
+        // before that schema landed carries only typed astrolabe:edge:v1 rows.
+        // Lowering such a vault must fail closed rather than silently drop the
+        // dangling and structural-endpoint edges the typed rows never contained.
+        const CBM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:cbm-edge:v1:";
+
+        let source = temp_path("legacy-source.db");
+        let lowered = temp_path("legacy-lowered.db");
+        fixture_sqlite(&source);
+        let source_vault = vault();
+        import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-legacy", 1),
+        )
+        .expect("import source sqlite");
+
+        // Baseline: the modern vault lowers cleanly.
+        lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+            .expect("lower modern vault");
+
+        // Downgrade to a legacy vault by tombstoning every raw CBM edge row.
+        let tombstone = tombstone_value();
+        let raw_rows = source_vault
+            .scan_cf_range_at(
+                source_vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(CBM_EDGE_ROW_PREFIX),
+            )
+            .expect("scan raw cbm edge rows");
+        assert!(
+            !raw_rows.is_empty(),
+            "fixture must persist raw cbm edge rows to downgrade"
+        );
+        let downgrade = raw_rows
+            .into_iter()
+            .map(|(key, _)| (ColumnFamily::Graph, key, tombstone.clone()))
+            .collect::<Vec<_>>();
+        source_vault
+            .write_cf_batch_with_ledger_entry(
+                downgrade,
+                EntryKind::Admin,
+                SubjectId::Query(b"astro-lower-legacy-edge-downgrade".to_vec()),
+                serde_json::to_vec(&json!({"schema": "astrolabe-legacy-edge-downgrade-test"}))
+                    .expect("encode downgrade payload"),
+                ActorId::Service(ASTRO_LOWER_ACTOR.to_string()),
+            )
+            .expect("tombstone raw cbm edge rows");
+        source_vault
+            .purge_tombstoned_cfs(&[ColumnFamily::Graph])
+            .expect("purge tombstoned raw cbm edge rows");
+
+        let err = lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+            .expect_err("lowering a legacy vault must refuse");
+        assert_eq!(
+            err.code(),
+            Some(astrolabe_ingest::ASTRO_LEGACY_CBM_EDGE_ROWS)
+        );
+        assert!(
+            err.remediation().is_some(),
+            "legacy-edge refusal must carry operator remediation"
+        );
+
+        cleanup(&source);
+        cleanup(&lowered);
+    }
+
+    #[test]
     fn erasure_regenerates_lowered_sqlite_without_erased_bytes() {
         let source = temp_path("erasure-source.db");
         let before_lowered = temp_path("erasure-before.db");
