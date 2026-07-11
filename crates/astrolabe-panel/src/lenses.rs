@@ -513,7 +513,7 @@ impl DeterministicEncoderLens {
         }
         Ok(Self {
             slot_id,
-            contract: FrozenLensContract::for_slot(slot),
+            contract: FrozenLensContract::for_slot(slot)?,
         })
     }
 
@@ -1766,7 +1766,7 @@ mod tests {
     fn determinism_probes_pass_registration_gate_for_s0_s9() {
         for lens in s0_s9_lenses().expect("build deterministic lenses") {
             let slot = slot_spec(lens.slot_id()).expect("slot spec");
-            let contract = FrozenLensContract::for_slot(slot);
+            let contract = FrozenLensContract::for_slot(slot).expect("slot contract");
             let proof = contract
                 .verify_determinism_probe(&lens, &lens.probe_input().expect("probe input"))
                 .expect("determinism proof");
@@ -1778,7 +1778,7 @@ mod tests {
     fn determinism_probes_pass_registration_gate_for_s10_s17_s21() {
         for lens in s10_s17_s21_lenses().expect("build deterministic lenses") {
             let slot = slot_spec(lens.slot_id()).expect("slot spec");
-            let contract = FrozenLensContract::for_slot(slot);
+            let contract = FrozenLensContract::for_slot(slot).expect("slot contract");
             let proof = contract
                 .verify_determinism_probe(&lens, &lens.probe_input().expect("probe input"))
                 .expect("determinism proof");

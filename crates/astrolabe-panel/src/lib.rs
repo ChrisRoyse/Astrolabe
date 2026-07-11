@@ -194,20 +194,22 @@ impl FrozenLensContract {
     }
 
     /// Creates the default frozen contract for a v1 panel slot.
-    pub fn for_slot(slot: &PanelSlotSpec) -> Self {
+    ///
+    /// For the deterministic S0-S17/S21 encoder slots, `weights_sha` binds the
+    /// encoder's actual frozen-fixture output (see [`encoder_weights_identity`]),
+    /// so any change to the encoder math or its goldens moves the frozen lens
+    /// identity. Fails closed if the deterministic encoder cannot produce a
+    /// concrete vector for its frozen probe fixture, rather than minting a bogus
+    /// identity that omits the math.
+    pub fn for_slot(slot: &PanelSlotSpec) -> PanelResult<Self> {
         let shape = shape_fingerprint(slot.shape);
         let weights_sha = if matches!(slot.slot, 18 | 19 | 20 | 22) {
             nomic_weights_identity()
         } else {
-            sha256_digest(&[
-                PANEL_SCHEMA_ID.as_bytes(),
-                slot.key.as_bytes(),
-                shape.as_bytes(),
-                b"default-encoder-v1",
-            ])
+            encoder_weights_identity(slot, &shape)?
         };
         let corpus_hash = sha256_digest(&[b"corpus-independent"]);
-        Self::new(
+        Ok(Self::new(
             slot.key,
             weights_sha,
             corpus_hash,
@@ -215,7 +217,7 @@ impl FrozenLensContract {
             slot.modality,
             LensDType::F32,
             slot.norm,
-        )
+        ))
     }
 
     /// Stable content-addressed id for this contract.
@@ -607,7 +609,10 @@ pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
 }
 
 /// Returns the default frozen contracts for every v1 slot.
-pub fn default_contracts() -> Vec<FrozenLensContract> {
+///
+/// Fails closed if any deterministic encoder slot cannot bind its real output into
+/// `weights_sha` (see [`FrozenLensContract::for_slot`]).
+pub fn default_contracts() -> PanelResult<Vec<FrozenLensContract>> {
     PANEL_V1_SLOTS
         .iter()
         .map(FrozenLensContract::for_slot)
@@ -1378,6 +1383,78 @@ pub fn sha256_digest(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Frozen tag distinguishing the deterministic-encoder weights identity domain.
+const DETERMINISTIC_ENCODER_WEIGHTS_TAG: &[u8] = b"astro.panel.v1.deterministic-encoder.weights.v1";
+
+/// Canonical bit-exact serialization of a lens output vector for content-addressing.
+///
+/// Uses the raw IEEE-754 bit patterns (never a lossy text form) so the folded
+/// identity moves on any real change to the encoder's numeric output. Fails
+/// closed on `Absent`/`Multi`: the deterministic S0-S17/S21 encoders must yield a
+/// concrete dense or sparse vector on their complete frozen probe fixture, and an
+/// empty/degenerate result must never be folded into a "same version" hash.
+fn slot_vector_identity_bytes(vector: &SlotVector) -> PanelResult<Vec<u8>> {
+    let mut out = Vec::new();
+    match vector {
+        SlotVector::Dense { dim, data } => {
+            out.extend_from_slice(b"D");
+            out.extend_from_slice(&dim.to_be_bytes());
+            for value in data {
+                out.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+        SlotVector::Sparse { dim, entries } => {
+            out.extend_from_slice(b"S");
+            out.extend_from_slice(&dim.to_be_bytes());
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for entry in entries {
+                out.extend_from_slice(&entry.idx.to_be_bytes());
+                out.extend_from_slice(&entry.val.to_bits().to_be_bytes());
+            }
+        }
+        SlotVector::Multi { .. } | SlotVector::Absent { .. } => {
+            return Err(PanelError::new(
+                ASTRO_PANEL_VECTOR_INVALID,
+                "deterministic encoder produced no concrete vector for its frozen weights probe",
+                "Provide a complete encoder fixture so weights_sha binds the encoder's real output.",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Folds an already-serialized encoder output into the deterministic weights identity.
+///
+/// Split out so tests can drive the exact identity math with known output bytes and
+/// assert that different encoder output yields a different `weights_sha`.
+fn encoder_weights_identity_from(
+    slot: &PanelSlotSpec,
+    shape: &str,
+    output_bytes: &[u8],
+) -> [u8; 32] {
+    sha256_digest(&[
+        PANEL_SCHEMA_ID.as_bytes(),
+        slot.key.as_bytes(),
+        shape.as_bytes(),
+        DETERMINISTIC_ENCODER_WEIGHTS_TAG,
+        output_bytes,
+    ])
+}
+
+/// Derives the deterministic S0-S17/S21 `weights_sha` from the encoder's actual
+/// output on the frozen probe fixture.
+///
+/// This makes `weights_sha` a *measurement* of the encoder rather than a fixed
+/// constant: any change to the encoder algorithm, its weights, or its frozen
+/// goldens changes the fixture output and therefore the identity. Fails closed if
+/// the encoder cannot produce a concrete vector for the fixture.
+fn encoder_weights_identity(slot: &PanelSlotSpec, shape: &str) -> PanelResult<[u8; 32]> {
+    let fixture = lenses::fixture_encoder_input();
+    let output = lenses::encode_slot(slot.slot_id(), &fixture)?;
+    let output_bytes = slot_vector_identity_bytes(&output)?;
+    Ok(encoder_weights_identity_from(slot, shape, &output_bytes))
+}
+
 fn validate_vector(
     contract: &FrozenLensContract,
     lens_id: LensId,
@@ -1552,8 +1629,8 @@ mod tests {
 
     #[test]
     fn contract_lens_id_is_stable_and_all_fields_participate() {
-        let base = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[0]);
-        let same = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[0]);
+        let base = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[0]).expect("slot 0 contract");
+        let same = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[0]).expect("slot 0 contract");
         assert_eq!(base.lens_id(), same.lens_id());
 
         let mut changed = Vec::new();
@@ -1582,6 +1659,127 @@ mod tests {
         for contract in changed {
             assert_ne!(base.lens_id(), contract.lens_id());
         }
+    }
+
+    // Regression for #199: the deterministic-encoder `weights_sha` must be a
+    // measurement of the encoder's actual output, not a fixed constant that omits
+    // the math. These tests run the REAL encoder (no mocks) and read back the exact
+    // computed sha bytes.
+
+    #[test]
+    fn deterministic_weights_sha_moves_with_encoder_output_and_is_stable() {
+        // Slot 2 (S2 complexity-log) is a deterministic encoder whose output
+        // depends on the ComplexityMetrics fields. Two fixtures differing only in a
+        // value that the encoder folds into its output must yield different frozen
+        // outputs, and therefore different weights_sha under the fixed shape/key.
+        let slot = slot_spec(SlotId::new(2)).expect("slot 2 spec");
+        let shape = shape_fingerprint(slot.shape);
+
+        let fixture = fixture_encoder_input();
+        let mut mutated = fixture.clone();
+        // Perturb one previously-excluded encoder input (a real complexity weight).
+        mutated
+            .complexity
+            .as_mut()
+            .expect("fixture carries S2 complexity")
+            .cyclomatic += 1.0;
+
+        let out_a = encode_slot(SlotId::new(2), &fixture).expect("encode base fixture");
+        let out_b = encode_slot(SlotId::new(2), &mutated).expect("encode mutated fixture");
+        let bytes_a = slot_vector_identity_bytes(&out_a).expect("base output bytes");
+        let bytes_b = slot_vector_identity_bytes(&out_b).expect("mutated output bytes");
+        // Precondition: the encoder really produces different output for the two
+        // configs (otherwise the test would not exercise the fix).
+        assert_ne!(
+            bytes_a, bytes_b,
+            "encoder must produce different output for the two configs"
+        );
+
+        let sha_a = encoder_weights_identity_from(slot, &shape, &bytes_a);
+        let sha_b = encoder_weights_identity_from(slot, &shape, &bytes_b);
+
+        // (a) Different encoder output => different weights_sha. This is the bug fix:
+        // the folded output makes the identity move with the math.
+        assert_ne!(
+            sha_a, sha_b,
+            "weights_sha must change when encoder output changes; sha_a={sha_a:02x?}"
+        );
+
+        // Demonstrate the OLD formula (schema+key+shape+"default-encoder-v1", no
+        // output) collides for the two behaviorally-different encoders — exactly the
+        // false "same version" claim #199 reported.
+        let old_sha_a = sha256_digest(&[
+            PANEL_SCHEMA_ID.as_bytes(),
+            slot.key.as_bytes(),
+            shape.as_bytes(),
+            b"default-encoder-v1",
+        ]);
+        let old_sha_b = old_sha_a; // identical inputs => identical hash for both encoders
+        assert_eq!(
+            old_sha_a, old_sha_b,
+            "pre-fix formula collides (documents the bug)"
+        );
+        assert_ne!(
+            sha_a, old_sha_a,
+            "fixed weights_sha must differ from the pre-fix output-excluding hash"
+        );
+
+        // (b) Determinism: byte-identical config yields identical sha across two
+        // fully independent computations from scratch.
+        let contract_1 = FrozenLensContract::for_slot(slot).expect("slot 2 contract #1");
+        let contract_2 = FrozenLensContract::for_slot(slot).expect("slot 2 contract #2");
+        assert_eq!(
+            contract_1.weights_sha, contract_2.weights_sha,
+            "identical config must yield identical weights_sha"
+        );
+        // And the production path binds the same output we folded by hand.
+        assert_eq!(
+            contract_1.weights_sha, sha_a,
+            "for_slot must fold the encoder's real fixture output"
+        );
+    }
+
+    #[test]
+    fn every_deterministic_slot_weights_sha_binds_its_own_output() {
+        // No two deterministic slots may share a weights_sha (each binds its own
+        // distinct encoder output), and every one is reproducible.
+        let mut seen: BTreeMap<String, u16> = BTreeMap::new();
+        for slot in PANEL_V1_SLOTS
+            .iter()
+            .filter(|s| !matches!(s.slot, 18 | 19 | 20 | 22))
+        {
+            let a = FrozenLensContract::for_slot(slot).expect("deterministic contract a");
+            let b = FrozenLensContract::for_slot(slot).expect("deterministic contract b");
+            assert_eq!(
+                a.weights_sha, b.weights_sha,
+                "slot {} weights_sha must be deterministic",
+                slot.slot
+            );
+            let hex = format!("{:02x?}", a.weights_sha);
+            if let Some(prev) = seen.insert(hex.clone(), slot.slot) {
+                panic!(
+                    "slots {prev} and {} share weights_sha {hex}; each must bind its own output",
+                    slot.slot
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_encoder_output_fails_closed_instead_of_bogus_sha() {
+        // (iii) An empty/degenerate encoder output must fail closed rather than
+        // produce a bogus "same version" sha. An empty EncoderLensInput leaves every
+        // slot-specific field None, so encode_slot emits an explicit Absent vector,
+        // which slot_vector_identity_bytes must refuse.
+        let empty = EncoderLensInput::default();
+        let absent = encode_slot(SlotId::new(2), &empty).expect("encode empty input");
+        assert!(
+            absent.is_absent(),
+            "empty config must yield an Absent vector"
+        );
+        let err = slot_vector_identity_bytes(&absent)
+            .expect_err("Absent output must not be foldable into weights_sha");
+        assert_eq!(err.code(), ASTRO_PANEL_VECTOR_INVALID);
     }
 
     #[test]
@@ -1726,7 +1924,7 @@ mod tests {
 
     #[test]
     fn encoder_change_plan_bumps_version_and_emits_lazy_backfill_hook() {
-        let previous = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[18]);
+        let previous = FrozenLensContract::for_slot(&PANEL_V1_SLOTS[18]).expect("slot 18 contract");
         let mut next = previous.clone();
         next.weights_sha[31] ^= 0x44;
 

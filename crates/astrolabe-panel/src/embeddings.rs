@@ -291,7 +291,7 @@ impl StaticEmbeddingLens {
                 "Enable the astrolabe-panel `multi-vector` feature to register S22.",
             ));
         }
-        let contract = FrozenLensContract::for_slot(slot);
+        let contract = FrozenLensContract::for_slot(slot)?;
         if contract.weights_sha != table.weights_sha() {
             return Err(PanelError::new(
                 ASTRO_PANEL_CONTRACT_INVALID,
