@@ -744,7 +744,7 @@ mod tests {
             OutcomeAnchorRequest::from_test_run(&run, "ci:github:777", 1_786_400_000, None)
                 .expect("test_run request");
         let cx_ids = fixture_cx_ids(&request);
-        let (dir, vault) = anchor_vault("idempotency");
+        let (_dir, vault) = anchor_vault("idempotency");
 
         let first = ingest_outcome_anchors(&vault, &request, &cx_ids, "astrolabe-anchors-test")
             .expect("first ingest");
@@ -778,7 +778,6 @@ mod tests {
             "refusal leaves rows untouched"
         );
         drop(vault);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -840,7 +839,6 @@ mod tests {
         let payload_text = String::from_utf8(entry.payload.clone()).expect("utf8 payload");
         assert!(!payload_text.contains("demo::adds"));
         drop(reopened);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -859,7 +857,7 @@ mod tests {
         )
         .expect("prefix-valid request");
         let cx_ids = fixture_cx_ids(&request);
-        let (dir, vault) = anchor_vault("redaction");
+        let (_dir, vault) = anchor_vault("redaction");
 
         let error = ingest_outcome_anchors(&vault, &request, &cx_ids, "astrolabe-anchors-test")
             .expect_err("secret-shaped source must refuse at the ledger writer");
@@ -873,7 +871,6 @@ mod tests {
             "refusal must leave zero anchor rows"
         );
         drop(vault);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -898,7 +895,7 @@ mod tests {
         )
         .expect("manual label request");
         let cx_ids = BTreeMap::from([("known.symbol".to_string(), cx(9))]);
-        let (dir, vault) = anchor_vault("unmapped");
+        let (_dir, vault) = anchor_vault("unmapped");
 
         let report = ingest_outcome_anchors(&vault, &request, &cx_ids, "astrolabe-anchors-test")
             .expect("ingest with unmapped subject");
@@ -908,7 +905,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row.anchors[0].confidence, 0.6);
         drop(vault);
-        let _ = fs::remove_dir_all(dir);
     }
 
     fn cases(run: &ParsedTestRun) -> Vec<(&str, TestStatus)> {
@@ -933,7 +929,30 @@ mod tests {
             .expect("scan anchors CF")
     }
 
-    fn anchor_vault(name: &str) -> (PathBuf, AsterVault<SystemClock>) {
+    /// RAII %TEMP% durable-vault directory: removed recursively on drop (#133, #236).
+    struct TempVaultDir(PathBuf);
+
+    impl std::ops::Deref for TempVaultDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempVaultDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempVaultDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn anchor_vault(name: &str) -> (TempVaultDir, AsterVault<SystemClock>) {
         let dir = std::env::temp_dir().join(format!(
             "astrolabe-anchors-{name}-{}-{}",
             std::process::id(),
@@ -942,7 +961,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create test vault dir");
         let vault = open_anchor_vault(&dir);
-        (dir, vault)
+        (TempVaultDir(dir), vault)
     }
 
     fn open_anchor_vault(dir: &Path) -> AsterVault<SystemClock> {
