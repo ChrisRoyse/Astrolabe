@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -23,11 +25,23 @@ def load_module(name: str, path: Path):
 
 
 def expect_failure(callback, label: str) -> None:
+    # The validators under test report rejection by printing an "ERROR: ..." line
+    # to stderr and raising SystemExit(1). These negative cases are *expected* to
+    # fire, so their ERROR lines must not leak into the aggregate gate's evidence
+    # stream where they read as real failures. Capture stderr here, confirm the
+    # rejection was genuine (an ERROR message plus exit code 1), and keep the
+    # noise out of the stream.
+    captured = io.StringIO()
     try:
-        callback()
+        with contextlib.redirect_stderr(captured):
+            callback()
     except SystemExit as exc:
         if exc.code != 1:
             raise AssertionError(f"{label} exited {exc.code}, expected 1") from exc
+        if "ERROR:" not in captured.getvalue():
+            raise AssertionError(
+                f"{label} exited 1 without an ERROR message: {captured.getvalue()!r}"
+            )
     else:
         raise AssertionError(f"{label} unexpectedly passed")
 
