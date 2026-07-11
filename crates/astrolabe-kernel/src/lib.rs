@@ -28,6 +28,7 @@ pub const ASTRO_PROPAGATED_LABEL_TRUST_WRITE: &str = "ASTRO_PROPAGATED_LABEL_TRU
 pub const ASTRO_SKILL_DISCOVERY_KNOB_RANGE: &str = "ASTRO_SKILL_DISCOVERY_KNOB_RANGE";
 pub const ASTRO_SKILL_SEARCH_CAP_RANGE: &str = "ASTRO_SKILL_SEARCH_CAP_RANGE";
 pub const ASTRO_SKILL_DISCOVERY_NODE_LIMIT: &str = "ASTRO_SKILL_DISCOVERY_NODE_LIMIT";
+pub const ASTRO_SKILL_UNKNOWN_ID: &str = "ASTRO_SKILL_UNKNOWN_ID";
 pub const DEFAULT_FUNNEL_ACTIVATION_RECORDS: u64 = 10_000_000;
 pub const MIN_FUNNEL_ACTIVATION_RECORDS: u64 = 1_000;
 pub const MAX_FUNNEL_ACTIVATION_RECORDS: u64 = 1_000_000_000;
@@ -1625,6 +1626,15 @@ pub fn skill_tree_artifact_bytes(tree: &SkillTree) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Filter `candidates` down to the members of the skill named by `skill_id`,
+/// capped at `max_results`.
+///
+/// Fails closed rather than returning an empty result for two operator errors,
+/// so a genuinely empty match is never confused with a misconfigured request:
+/// - `max_results == 0` → [`ASTRO_SKILL_SEARCH_CAP_RANGE`].
+/// - `skill_id` not present in `tree` (typo'd or stale id) →
+///   [`ASTRO_SKILL_UNKNOWN_ID`]. An unknown skill is indistinguishable from
+///   "no candidates matched" if it returns `Ok(vec![])`, so it is refused.
 pub fn filter_results_within_skill(
     tree: &SkillTree,
     skill_id: &str,
@@ -1639,7 +1649,11 @@ pub fn filter_results_within_skill(
         ));
     }
     let Some(skill) = tree.skills.iter().find(|skill| skill.skill_id == skill_id) else {
-        return Ok(Vec::new());
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_SKILL_UNKNOWN_ID,
+            format!("skill_id {skill_id} is not present in the skill tree"),
+            "pass a skill_id returned by build_skill_tree; a stale or typo'd id is refused rather than returning silently empty results",
+        ));
     };
     let members = skill.members.iter().collect::<BTreeSet<_>>();
     Ok(candidates
@@ -2640,6 +2654,31 @@ mod tests {
             build_skill_tree(&fixture, &out_of_range).expect_err("out-of-range limit refused");
         assert_eq!(range_err.code(), ASTRO_SKILL_DISCOVERY_KNOB_RANGE);
         assert!(range_err.message().contains(SKILL_MAX_SYMBOLS_KNOB));
+    }
+
+    #[test]
+    fn skill_scoped_filter_refuses_unknown_skill_id() {
+        let tree = build_skill_tree(&skill_fixture(), &SkillDiscoveryConfig::default())
+            .expect("build skill tree");
+        let candidates = vec!["auth.login".to_string(), "auth.logout".to_string()];
+        // A stale/typo'd skill id must not masquerade as "no candidates matched".
+        let err = filter_results_within_skill(&tree, "skill:does-not-exist", &candidates, 5)
+            .expect_err("unknown skill id refused");
+        assert_eq!(err.code(), ASTRO_SKILL_UNKNOWN_ID);
+        assert!(err.message().contains("skill:does-not-exist"));
+        assert!(err.remediation().contains("build_skill_tree"));
+
+        // A real skill id with no matching candidates still returns Ok(empty),
+        // so the refusal above is specifically about the unknown id, not empties.
+        let auth = tree
+            .skills
+            .iter()
+            .find(|skill| skill.name == "skill:auth-user")
+            .expect("auth skill");
+        let none_match =
+            filter_results_within_skill(&tree, &auth.skill_id, &["health.ping".to_string()], 5)
+                .expect("known skill with no members present returns empty");
+        assert!(none_match.is_empty());
     }
 
     fn bridge_fixture_scopes() -> (BridgeScopeKernel, BridgeScopeKernel) {
