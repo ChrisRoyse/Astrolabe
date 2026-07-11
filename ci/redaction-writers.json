@@ -51,6 +51,55 @@
       "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
     },
     {
+      "file": "crates/astrolabe-anchors/src/lib.rs",
+      "function": "ingest_outcome_anchors",
+      "method": "append_ledger_entry",
+      "payload_contract": "one Grounding entry per anchor ingest group commit; payload carries schema tag, outcome kind, source id, observed_at, counts (anchors_written/deduplicated/unmapped/rows_written), and a blake3 anchor_dump_hash over the persisted anchor rows; no test case ids, symbol names, or source text; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-anchors::tests::fsv_pairing_sampled_anchor_rows_match_their_grounding_ledger_entry byte-verifies same-commit anchor/ledger pairing; astrolabe-anchors::tests::secret_shaped_source_refused_at_the_ledger_writer_with_no_rows_written verifies secret-shaped payloads refuse with zero rows written"
+    },
+    {
+      "file": "crates/astrolabe-anchors/src/lib.rs",
+      "function": "ingest_outcome_anchors",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "one Grounding entry per anchor ingest group commit; payload carries schema tag, outcome kind, source id, observed_at, counts (anchors_written/deduplicated/unmapped/rows_written), and a blake3 anchor_dump_hash over the persisted anchor rows; no test case ids, symbol names, or source text; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-anchors::tests::fsv_pairing_sampled_anchor_rows_match_their_grounding_ledger_entry byte-verifies same-commit anchor/ledger pairing; astrolabe-anchors::tests::secret_shaped_source_refused_at_the_ledger_writer_with_no_rows_written verifies secret-shaped payloads refuse with zero rows written"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/sqlite_import.rs",
+      "function": "inject_node_property_fault",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "deliberate shadow-parity fault marker (#19): Admin group commit whose payload carries schema tag astrolabe-parity-fault-v1, project name, one node qualified name, and the perturbed field name; the written row value is the fixed inert marker {\"astrolabe_vault_fault\":true}; no source text",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::sqlite_import::tests::fsv_injected_node_fault_perturbs_persisted_row_with_intact_chain byte-verifies the perturbed persisted row, its paired Admin ledger entry, and that the hash chain stays intact"
+    },
+    {
+      "file": "crates/astrolabe-weave/src/sim_rows.rs",
+      "function": "persist_similarity_edges",
+      "method": "append_ledger_entry",
+      "payload_contract": "SIM_* persistence group commit (Ingest); payload carries schema tag, edge and per-family counts, rows written/unchanged/tombstoned, and a blake3 edge_dump_hash over the persisted rows; no source text or slot vectors; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-weave::tests::sim_edges_fsv_readback_is_bit_stable_against_recomputed_plan byte-verifies persisted SIM_* rows and their paired ledger entry"
+    },
+    {
+      "file": "crates/astrolabe-weave/src/sim_rows.rs",
+      "function": "persist_similarity_edges",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "SIM_* persistence group commit (Ingest); payload carries schema tag, edge and per-family counts, rows written/unchanged/tombstoned, and a blake3 edge_dump_hash over the persisted rows; no source text or slot vectors; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-weave::tests::sim_edges_fsv_readback_is_bit_stable_against_recomputed_plan byte-verifies persisted SIM_* rows and their paired ledger entry"
+    },
+    {
+      "file": "crates/astrolabe-weave/src/xterm_rows.rs",
+      "function": "persist_eager_cross_terms",
+      "method": "append_ledger_entry",
+      "payload_contract": "eager cross-term persistence group commit (Measure); payload carries schema tag, symbol/designed-pair counts, rows written/unchanged/tombstoned, absent-by-kind counts, abundance accounting, and a blake3 xterm_dump_hash over the persisted rows; no source text or slot vectors; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-weave::tests::xterm_fsv_readback_is_bit_stable_and_ledger_paired byte-verifies persisted XTerm rows and their paired ledger entry"
+    },
+    {
+      "file": "crates/astrolabe-weave/src/xterm_rows.rs",
+      "function": "persist_eager_cross_terms",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "eager cross-term persistence group commit (Measure); payload carries schema tag, symbol/designed-pair counts, rows written/unchanged/tombstoned, absent-by-kind counts, abundance accounting, and a blake3 xterm_dump_hash over the persisted rows; no source text or slot vectors; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-weave::tests::xterm_fsv_readback_is_bit_stable_and_ledger_paired byte-verifies persisted XTerm rows and their paired ledger entry"
+    },
+    {
       "file": "crates/astrolabe-weave/src/lib.rs",
       "function": "append_reactive_ack_ledger",
       "method": "append_ledger_entry",

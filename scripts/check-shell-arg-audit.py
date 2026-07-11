@@ -85,11 +85,17 @@ def discover_sites() -> set[tuple[str, str, str]]:
         lines = rust_prod_lines.strip_test_spans(
             path.read_text(encoding="utf-8").splitlines()
         )
-        for index, line in enumerate(lines):
+        # Discovery runs on the comment/string-blanked view so shell-sensitive
+        # text inside string literals (e.g. the guard vulnerability-pattern
+        # corpus) is data, not a call site — the same view
+        # validator_precedes_call evaluates, so every discovered site is one
+        # that check can actually validate.
+        view_lines = rust_prod_lines.code_view("\n".join(lines)).split("\n")
+        for index, line in enumerate(view_lines):
             for call, pattern in SHELL_SENSITIVE_CALLS.items():
                 if pattern.search(line) is None:
                     continue
-                sites.add((relative, enclosing_function(lines, index), call))
+                sites.add((relative, enclosing_function(view_lines, index), call))
     return sites
 
 
