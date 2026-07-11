@@ -165,18 +165,21 @@ def main() -> int:
         copy_fixture(fixture)
         rewrite(
             runner,
-            'Get-Command -Name "bash.exe" -CommandType Application',
-            'Get-Command -Name "bash.exe"',
+            "ASTRO_BASH_COMMAND_FORBIDDEN",
+            "ASTRO_BASH_COMMAND_UNGUARDED",
         )
-        expect_failure(run_checker(fixture), "Bash resolution outside")
+        expect_failure(run_checker(fixture), "allowlist bash commands")
 
+        # Reintroducing ambient bash.exe resolution policing (removed in 70866c7 because
+        # it crashes when WSL coexists) must be caught by the contract's `not in runner`
+        # guard.
         copy_fixture(fixture)
         rewrite(
             runner,
-            "Assert-NativeGitBashResolution -GitRoot $gitRoot -Command $Command",
-            "Write-Output 'Bash resolution check removed'",
+            "function Assert-AllowedBashCommand {",
+            'Get-Command -Name "bash.exe" -CommandType Application | Out-Null\n\nfunction Assert-AllowedBashCommand {',
         )
-        expect_failure(run_checker(fixture), "resolution must be verified")
+        expect_failure(run_checker(fixture), "policing ambient bash.exe resolution")
 
     print("Windows GNU toolchain contract negative tests passed")
     return 0

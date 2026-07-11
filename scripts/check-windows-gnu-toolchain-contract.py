@@ -86,7 +86,7 @@ def main() -> None:
         "the launcher must reject a mixed MinGW runtime",
     )
     require(
-        '$env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$GitUsrBin;$GitBin;$env:PATH"'
+        '$env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$RipgrepRoot;$GitUsrBin;$GitBin;$env:PATH"'
         in runner
         and '$env:BASH = Join-Path $GitBin "bash.exe"' in runner
         and '$env:MAKE = Join-Path $MingwBin "make.exe"' in runner
@@ -95,6 +95,13 @@ def main() -> None:
         and '$env:CPPCHECK = Join-Path $CppcheckRoot "cppcheck.exe"' in runner
         and '$ExpectedClangTidyVersion = "20.1.8"' in runner,
         "the launcher must select pinned LLVM and cppcheck tools with the bundled GNU Make",
+    )
+    require(
+        'function Install-PinnedRipgrep' in runner
+        and 'function Remove-StalePinnedRipgrep' in runner
+        and '$env:RIPGREP = Join-Path $RipgrepRoot "rg.exe"' in runner
+        and '$ExpectedRipgrepSha256' in runner,
+        "the launcher must provision pinned ripgrep so check-unsafe-boundary can scan",
     )
     require(
         'function Remove-StalePinnedLlvm' in runner
@@ -200,11 +207,15 @@ def main() -> None:
     )
     require(
         "function Assert-AllowedBashCommand" in runner
-        and "function Assert-NativeGitBashResolution" in runner
-        and 'Get-Command -Name "bash.exe" -CommandType Application' in runner
         and "ASTRO_BASH_COMMAND_FORBIDDEN" in runner
-        and "ASTRO_BASH_RESOLUTION_FORBIDDEN" in runner,
-        "the launcher must reject Bash resolution outside the pinned Git for Windows root",
+        # Commit 70866c7 removed ambient bash.exe *resolution* policing: with WSL
+        # coexisting (permitted, direction reversed 2026-07-11), bash.exe resolves to
+        # multiple ambient paths and the old Get-Command/.Source path crashed every
+        # native gate at startup. The launcher must keep the bash-command allowlist
+        # but MUST NOT reintroduce resolution policing (WSL-coexistence invariant).
+        and "Assert-NativeGitBashResolution" not in runner
+        and 'Get-Command -Name "bash.exe" -CommandType Application' not in runner,
+        "the launcher must allowlist bash commands without policing ambient bash.exe resolution (WSL coexistence)",
     )
     require(
         appears_before(
@@ -216,14 +227,6 @@ def main() -> None:
             "if ($Bootstrap)",
         ),
         "native-context and Bash-command checks must run before bootstrap work",
-    )
-    require(
-        appears_before(
-            runner,
-            "Assert-NativeGitBashResolution -GitRoot $gitRoot -Command $Command",
-            "Test-PinnedToolchain -MingwBin $mingwBin",
-        ),
-        "Git Bash resolution must be verified before toolchain command work",
     )
     require(
         'Remove-Item -LiteralPath $target -Recurse -Force' in runner
