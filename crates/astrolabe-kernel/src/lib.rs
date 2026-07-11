@@ -21,6 +21,8 @@ pub const LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB: &str =
 pub const ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED: &str = "ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED";
 pub const ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT: &str = "ASTRO_BRIDGE_MISSING_COUNTERPART_VAULT";
 pub const ASTRO_LABEL_PROPAGATION_KNOB_RANGE: &str = "ASTRO_LABEL_PROPAGATION_KNOB_RANGE";
+pub const ASTRO_LABEL_SEED_CONFIDENCE_RANGE: &str = "ASTRO_LABEL_SEED_CONFIDENCE_RANGE";
+pub const ASTRO_LABEL_MATH_PARSE: &str = "ASTRO_LABEL_MATH_PARSE";
 pub const ASTRO_PROPAGATED_LABEL_TRUST_WRITE: &str = "ASTRO_PROPAGATED_LABEL_TRUST_WRITE";
 pub const ASTRO_SKILL_DISCOVERY_KNOB_RANGE: &str = "ASTRO_SKILL_DISCOVERY_KNOB_RANGE";
 pub const ASTRO_SKILL_SEARCH_CAP_RANGE: &str = "ASTRO_SKILL_SEARCH_CAP_RANGE";
@@ -36,6 +38,19 @@ pub const MAX_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 1_000;
 pub const DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 500;
 pub const MIN_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 1;
 pub const MAX_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 999;
+
+/// Millipoints scale: `1000` millipoints denote full confidence (`1.0`). It is
+/// the fixed denominator of the per-hop decay floor `floor(c * decay / 1000)`
+/// and the upper bound of a well-formed confidence.
+pub const LABEL_CONFIDENCE_MILLIPOINTS_SCALE: u64 = 1_000;
+/// Smallest confidence a label seed may carry. Zero is rejected because a
+/// zero-confidence seed produces no reachable labels yet still asserts a claim;
+/// the accepted seed-confidence domain is the closed interval
+/// `[MIN_SEED_CONFIDENCE_MILLIPOINTS, MAX_SEED_CONFIDENCE_MILLIPOINTS]`.
+pub const MIN_SEED_CONFIDENCE_MILLIPOINTS: u64 = 1;
+/// Largest confidence a label seed may carry: full confidence on the millipoints
+/// scale. Any seed above this is malformed (it would inflate downstream trust).
+pub const MAX_SEED_CONFIDENCE_MILLIPOINTS: u64 = LABEL_CONFIDENCE_MILLIPOINTS_SCALE;
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
@@ -756,6 +771,11 @@ impl LabelTrust {
 pub struct LabelSeed {
     pub symbol_id: String,
     pub label: String,
+    /// Seed confidence on the millipoints scale. The accepted domain is the
+    /// closed interval `[MIN_SEED_CONFIDENCE_MILLIPOINTS,
+    /// MAX_SEED_CONFIDENCE_MILLIPOINTS]` = `[1, 1000]`; `propagate_labels`
+    /// rejects any out-of-range seed fail-closed with
+    /// [`ASTRO_LABEL_SEED_CONFIDENCE_RANGE`].
     pub confidence_millipoints: u64,
     pub provenance_ref: String,
 }
@@ -850,6 +870,9 @@ pub fn propagate_labels(
     config: &LabelPropagationConfig,
 ) -> astrolabe_domain::Result<LabelPropagationReport> {
     validate_label_propagation_knob(config.decay_milliper_step)?;
+    for seed in seeds {
+        validate_seed_confidence(seed)?;
+    }
 
     let tombstoned = tombstones
         .iter()
@@ -897,10 +920,10 @@ pub fn propagate_labels(
                 if tombstoned.contains(neighbor) {
                     continue;
                 }
-                let next_confidence = frontier
-                    .confidence_millipoints
-                    .saturating_mul(config.decay_milliper_step)
-                    / 1_000;
+                let next_confidence = decay_confidence_one_hop(
+                    frontier.confidence_millipoints,
+                    config.decay_milliper_step,
+                );
                 if next_confidence == 0 {
                     continue;
                 }
@@ -931,9 +954,11 @@ pub fn propagate_labels(
                     provenance: LabelPropagationProvenance {
                         seed_provenance_ref: seed.provenance_ref.clone(),
                         graph_provenance_refs: path_provenance_refs,
-                        math: format!(
-                            "floor(seed_confidence_millipoints * {}^distance / 1000^distance)",
-                            LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB
+                        math: label_propagation_math(
+                            seed.confidence_millipoints,
+                            config.decay_milliper_step,
+                            distance,
+                            next_confidence,
                         ),
                     },
                     freshness: "fresh",
@@ -1041,6 +1066,8 @@ pub fn label_propagation_artifact_bytes(report: &LabelPropagationReport) -> Vec<
         out.push_str(&label.provenance.seed_provenance_ref);
         out.push('\t');
         out.push_str(&label.provenance.graph_provenance_refs.join(","));
+        out.push('\t');
+        out.push_str(&label.provenance.math);
         out.push('\n');
     }
     out.into_bytes()
@@ -1227,6 +1254,94 @@ fn validate_label_propagation_knob(value: u64) -> astrolabe_domain::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_seed_confidence(seed: &LabelSeed) -> astrolabe_domain::Result<()> {
+    let value = seed.confidence_millipoints;
+    if value < MIN_SEED_CONFIDENCE_MILLIPOINTS || value > MAX_SEED_CONFIDENCE_MILLIPOINTS {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_LABEL_SEED_CONFIDENCE_RANGE,
+            format!(
+                "label seed {} for {} has confidence_millipoints={} outside accepted domain {}..={}",
+                seed.symbol_id,
+                seed.label,
+                value,
+                MIN_SEED_CONFIDENCE_MILLIPOINTS,
+                MAX_SEED_CONFIDENCE_MILLIPOINTS
+            ),
+            "provide seed confidence_millipoints within [1,1000] (1000 millipoints = full confidence)",
+        ));
+    }
+    Ok(())
+}
+
+/// Apply one propagation hop's decay floor: `floor(confidence * decay / 1000)`.
+/// This is the single source of truth for the per-hop recurrence used both by
+/// `propagate_labels` and by the emitted provenance math string, so a recompute
+/// from that string reproduces the stored confidence exactly.
+fn decay_confidence_one_hop(confidence: u64, decay: u64) -> u64 {
+    confidence.saturating_mul(decay) / LABEL_CONFIDENCE_MILLIPOINTS_SCALE
+}
+
+/// Emit a self-contained, machine-parseable provenance math string that states
+/// the actual computation inputs (`c0` = seed confidence, `factor` = decay,
+/// `denominator` = millipoints scale, `hops` = distance) and the recurrence
+/// (`iterated_per_hop_floor`). Recomputing from the stated values via
+/// [`recompute_from_label_math`] reproduces `result` — the stored confidence —
+/// exactly. `result` is the real propagated value, not a re-derivation, so a
+/// test can prove the inputs recompute to the persisted output.
+fn label_propagation_math(seed_confidence: u64, decay: u64, hops: u64, result: u64) -> String {
+    format!(
+        "recurrence=iterated_per_hop_floor; c0={}; factor={}; denominator={}; hops={}; result={}",
+        seed_confidence, decay, LABEL_CONFIDENCE_MILLIPOINTS_SCALE, hops, result
+    )
+}
+
+/// Recompute a propagated confidence from an emitted provenance math string by
+/// replaying the exact iterated per-hop decay floor over the stated inputs.
+/// Fail-closed on any missing/malformed field or a zero denominator so a
+/// consumer can independently verify a stored label's confidence from its
+/// provenance alone.
+pub fn recompute_from_label_math(math: &str) -> astrolabe_domain::Result<u64> {
+    fn field(math: &str, key: &str) -> astrolabe_domain::Result<u64> {
+        let raw = math
+            .split("; ")
+            .find_map(|part| {
+                part.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix('='))
+            })
+            .ok_or_else(|| {
+                astrolabe_domain::DomainError::new(
+                    ASTRO_LABEL_MATH_PARSE,
+                    format!("label provenance math is missing field {key}: {math}"),
+                    "recompute only from a provenance string emitted by label_propagation_math",
+                )
+            })?;
+        raw.parse::<u64>().map_err(|err| {
+            astrolabe_domain::DomainError::new(
+                ASTRO_LABEL_MATH_PARSE,
+                format!("label provenance math field {key} is not a u64 ({raw}): {err}"),
+                "recompute only from a provenance string emitted by label_propagation_math",
+            )
+        })
+    }
+
+    let c0 = field(math, "c0")?;
+    let factor = field(math, "factor")?;
+    let denominator = field(math, "denominator")?;
+    let hops = field(math, "hops")?;
+    if denominator == 0 {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_LABEL_MATH_PARSE,
+            format!("label provenance math has zero denominator: {math}"),
+            "recompute only from a provenance string emitted by label_propagation_math",
+        ));
+    }
+    let mut confidence = c0;
+    for _ in 0..hops {
+        confidence = confidence.saturating_mul(factor) / denominator;
+    }
+    Ok(confidence)
 }
 
 fn label_adjacency(
@@ -1918,11 +2033,15 @@ mod tests {
             billing.provenance.graph_provenance_refs,
             vec!["edge:auth-token", "edge:token-billing"]
         );
-        assert!(
-            billing
-                .provenance
-                .math
-                .contains(LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
+        // billing.charge is two hops from the 1000-millipoint seed at decay 500:
+        // c0=1000 -> floor(1000*500/1000)=500 -> floor(500*500/1000)=250.
+        assert_eq!(
+            billing.provenance.math,
+            "recurrence=iterated_per_hop_floor; c0=1000; factor=500; denominator=1000; hops=2; result=250"
+        );
+        assert_eq!(
+            recompute_from_label_math(&billing.provenance.math).expect("recompute billing math"),
+            billing.confidence_millipoints
         );
         assert!(
             report
@@ -2052,6 +2171,167 @@ mod tests {
                 .contains(LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB)
         );
         assert!(err.remediation().contains("registered knob bounds"));
+    }
+
+    #[test]
+    fn seed_confidence_above_domain_is_rejected_naming_the_seed() {
+        // 5_000_000 millipoints = 5000x — the exact inflation the audit found.
+        let err = propagate_labels(
+            &[
+                LabelSeed::new(
+                    "auth.login",
+                    "security-sensitive",
+                    1_000,
+                    "seed:security-review:1",
+                ),
+                LabelSeed::new(
+                    "billing.charge",
+                    "pii-adjacent",
+                    5_000_000,
+                    "seed:security-review:2",
+                ),
+            ],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect_err("out-of-range seed confidence refused");
+
+        assert_eq!(err.code(), ASTRO_LABEL_SEED_CONFIDENCE_RANGE);
+        assert_eq!(
+            err.message(),
+            "label seed billing.charge for pii-adjacent has confidence_millipoints=5000000 \
+             outside accepted domain 1..=1000"
+        );
+        assert!(err.remediation().contains("[1,1000]"));
+    }
+
+    #[test]
+    fn seed_confidence_zero_is_rejected() {
+        let err = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                0,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &LabelPropagationConfig::default(),
+        )
+        .expect_err("zero seed confidence refused");
+        assert_eq!(err.code(), ASTRO_LABEL_SEED_CONFIDENCE_RANGE);
+    }
+
+    #[test]
+    fn seed_confidence_domain_boundaries_are_accepted() {
+        for confidence in [
+            MIN_SEED_CONFIDENCE_MILLIPOINTS,
+            MAX_SEED_CONFIDENCE_MILLIPOINTS,
+        ] {
+            propagate_labels(
+                &[LabelSeed::new(
+                    "auth.login",
+                    "security-sensitive",
+                    confidence,
+                    "seed:security-review:1",
+                )],
+                &label_graph_fixture(),
+                &[],
+                &LabelPropagationConfig::default(),
+            )
+            .expect("boundary seed confidence accepted");
+        }
+    }
+
+    #[test]
+    fn provenance_math_recomputes_to_persisted_confidence_from_stored_bytes() {
+        // Full state verification: run a real propagation over the small graph,
+        // serialize to bytes, write and read them back from disk, then parse the
+        // emitted provenance math string and recompute the confidence from its
+        // stated inputs — proving the string reproduces the stored value.
+        let config = LabelPropagationConfig::default();
+        let report = propagate_labels(
+            &[LabelSeed::new(
+                "auth.login",
+                "security-sensitive",
+                1_000,
+                "seed:security-review:1",
+            )],
+            &label_graph_fixture(),
+            &[],
+            &config,
+        )
+        .expect("propagate labels");
+        assert!(!report.labels.is_empty());
+
+        let bytes = label_propagation_artifact_bytes(&report);
+        let path = std::env::temp_dir().join(format!(
+            "astrolabe-label-math-fsv-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("write label artifact");
+        let readback = std::fs::read(&path).expect("read label artifact");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(readback, bytes);
+
+        let text = String::from_utf8(readback).expect("utf8 label artifact");
+        // Index the persisted (symbol -> (stored confidence, stored math)) rows
+        // straight from the serialized bytes; nothing here reads the in-memory
+        // report, so the recompute is against persisted state only.
+        let mut persisted = std::collections::BTreeMap::<String, (u64, String)>::new();
+        for line in text.lines() {
+            let Some(row) = line.strip_prefix("label\t") else {
+                continue;
+            };
+            let cols = row.split('\t').collect::<Vec<_>>();
+            let symbol_id = cols[0].to_string();
+            let confidence = cols[2].parse::<u64>().expect("stored confidence is u64");
+            let math = cols[8].to_string();
+            persisted.insert(symbol_id, (confidence, math));
+        }
+        // Every propagated label must be present in the readback and recompute
+        // byte/value-exactly from its own persisted provenance math string.
+        assert_eq!(persisted.len(), report.labels.len());
+        for label in &report.labels {
+            let (stored_confidence, stored_math) = persisted
+                .get(&label.symbol_id)
+                .expect("label persisted in readback");
+            assert_eq!(*stored_confidence, label.confidence_millipoints);
+            let recomputed =
+                recompute_from_label_math(stored_math).expect("recompute from persisted math");
+            assert_eq!(recomputed, *stored_confidence);
+        }
+
+        // billing.charge is the two-hop case where the previous single-floor
+        // formula floor(seed*d^k/1000^k) would still agree; assert an inputs set
+        // where the iterated recurrence and the single-floor formula diverge, so
+        // the recompute genuinely exercises the corrected math.
+        let seed = 3_u64;
+        let decay = 900_u64;
+        let hops = 2_u64;
+        let mut iterated = seed;
+        for _ in 0..hops {
+            iterated = iterated.saturating_mul(decay) / LABEL_CONFIDENCE_MILLIPOINTS_SCALE;
+        }
+        let single_floor = seed.saturating_mul(decay.pow(hops as u32))
+            / LABEL_CONFIDENCE_MILLIPOINTS_SCALE.pow(hops as u32);
+        assert_ne!(
+            iterated, single_floor,
+            "test inputs must expose the divergence"
+        );
+        let math = label_propagation_math(seed, decay, hops, iterated);
+        assert_eq!(
+            recompute_from_label_math(&math).expect("recompute divergent math"),
+            iterated
+        );
+    }
+
+    #[test]
+    fn recompute_from_label_math_is_fail_closed_on_malformed_string() {
+        let err =
+            recompute_from_label_math("not a math string").expect_err("malformed math rejected");
+        assert_eq!(err.code(), ASTRO_LABEL_MATH_PARSE);
     }
 
     #[test]
