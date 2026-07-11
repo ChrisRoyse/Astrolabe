@@ -148,12 +148,32 @@ pub(crate) enum ShadowContentVerdict {
     },
 }
 
+/// A chain-verify result already computed by the caller for one vault dir, so a
+/// single status response does not re-walk the whole ledger per section (#96). It
+/// is honored only when the freshness evaluation resolves the same vault dir;
+/// any mismatch recomputes (fails closed) instead of trusting a stale result.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnownChainVerify<'a> {
+    pub(crate) vault_dir: &'a Path,
+    pub(crate) intact: bool,
+}
+
 /// Evaluates shadow-import freshness against the live CBM SQLite by content, not
 /// existence (#93): recompute the source fingerprint and compare it to the watermark
 /// persisted at import time. Any missing verify-relevant input fails closed.
 pub(crate) fn evaluate_shadow_content_freshness(
     cache_dir: &Path,
     project: &str,
+) -> Result<ShadowContentVerdict, DynError> {
+    evaluate_shadow_content_freshness_with_verify(cache_dir, project, None)
+}
+
+/// [`evaluate_shadow_content_freshness`] with an optional caller-shared chain-verify
+/// result (#96: one verify per status response instead of one per section).
+pub(crate) fn evaluate_shadow_content_freshness_with_verify(
+    cache_dir: &Path,
+    project: &str,
+    known_verify: Option<KnownChainVerify<'_>>,
 ) -> Result<ShadowContentVerdict, DynError> {
     let source_path = sqlite_path(cache_dir, project);
     if !source_path.exists() {
@@ -200,9 +220,14 @@ pub(crate) fn evaluate_shadow_content_freshness(
         .map(PathBuf::from)
         .unwrap_or_else(|| vault_dir(cache_dir, project));
     let verify_intact = configured_vault_dir.exists()
-        && astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)
-            .map(|report| report.is_intact())
-            .unwrap_or(false);
+        && match known_verify {
+            // #96: reuse the caller's verify result for the same vault dir rather
+            // than re-walking the ledger; a dir mismatch recomputes (fails closed).
+            Some(known) if known.vault_dir == configured_vault_dir => known.intact,
+            _ => astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)
+                .map(|report| report.is_intact())
+                .unwrap_or(false),
+        };
     if !verify_intact {
         return Ok(ShadowContentVerdict::Unverifiable {
             code: ASTRO_SHADOW_VERIFY_NOT_INTACT,

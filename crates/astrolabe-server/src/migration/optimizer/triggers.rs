@@ -1,5 +1,7 @@
 use super::*;
 
+use calyx_aster::cf::{KeyRange, ledger_key};
+
 pub(crate) fn optimizer_ack_triggers_json_at(
     cache_dir: &Path,
     project: &str,
@@ -319,8 +321,54 @@ pub(crate) fn optimizer_recent_changes_json_result(
         vec![ColumnFamily::Ledger],
     )?;
     let snapshot = vault.snapshot();
+    // #96: read only the ledger tail instead of walking every entry per status
+    // call. The `ledger_seq` watermark is persisted at import time and the ledger
+    // is append-only within a vault generation, so the live head is >= the
+    // watermark and the range [watermark - (limit-1), ..) always contains the
+    // true last `limit` entries. Every degradation from the tail path is labeled
+    // in the `scan` object; an underfilled tail (e.g. a watermark ahead of the
+    // visible ledger after a rebuild race) falls back to the labeled full scan
+    // rather than under-reporting recent changes.
+    let watermark = read_config_u64(cache_dir, project, "ledger_seq")?;
+    let (raw_rows, scan) = match watermark {
+        Some(head) => {
+            let tail_start = head.saturating_sub(OPTIMIZER_RECENT_CHANGE_LIMIT as u64 - 1);
+            let range = KeyRange {
+                start: ledger_key(tail_start),
+                end: None,
+            };
+            let rows = vault.scan_cf_range_at(snapshot, ColumnFamily::Ledger, &range)?;
+            if tail_start == 0 || rows.len() >= OPTIMIZER_RECENT_CHANGE_LIMIT {
+                let scan = json!({
+                    "mode": "ledger_tail",
+                    "watermark_source": metadata_key(project, "ledger_seq"),
+                    "watermark_seq": head,
+                    "range_start_seq": tail_start,
+                });
+                (rows, scan)
+            } else {
+                let rows = vault.scan_cf_at(snapshot, ColumnFamily::Ledger)?;
+                let scan = json!({
+                    "mode": "full",
+                    "reason": "tail_scan_underfilled",
+                    "watermark_seq": head,
+                    "range_start_seq": tail_start,
+                });
+                (rows, scan)
+            }
+        }
+        None => {
+            let rows = vault.scan_cf_at(snapshot, ColumnFamily::Ledger)?;
+            let scan = json!({
+                "mode": "full",
+                "reason": "no persisted ledger_seq watermark",
+                "watermark_source": metadata_key(project, "ledger_seq"),
+            });
+            (rows, scan)
+        }
+    };
     let mut entries = Vec::new();
-    for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
+    for (key, bytes) in raw_rows {
         let key_seq = parse_aster_ledger_seq(&key)?;
         let entry = decode_ledger(&bytes)?;
         if entry.seq != key_seq {
@@ -357,6 +405,7 @@ pub(crate) fn optimizer_recent_changes_json_result(
         "vault_dir": vault_dir,
         "snapshot": snapshot,
         "limit": OPTIMIZER_RECENT_CHANGE_LIMIT,
+        "scan": scan,
         "ledger_rows_read": total_rows,
         "entry_count": tail.len(),
         "entries": tail,

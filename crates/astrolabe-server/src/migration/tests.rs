@@ -2469,7 +2469,12 @@ fn optimizer_status_reads_ledger_tail_and_labels_inactive_surfaces() {
     assert_eq!(status["source_state"]["ledger_head"], 17);
     assert_eq!(status["source_state"]["ledger_rows"], 18);
     assert_eq!(status["recent_changes"]["status"], "read");
-    assert_eq!(status["recent_changes"]["ledger_rows_read"], 18);
+    // #96: the tail scan reads only [watermark - 15, ..) instead of every ledger
+    // row, and labels the scan mode instead of degrading silently.
+    assert_eq!(status["recent_changes"]["scan"]["mode"], "ledger_tail");
+    assert_eq!(status["recent_changes"]["scan"]["watermark_seq"], 17);
+    assert_eq!(status["recent_changes"]["scan"]["range_start_seq"], 2);
+    assert_eq!(status["recent_changes"]["ledger_rows_read"], 16);
     assert_eq!(status["recent_changes"]["entry_count"], 16);
     let entries = status["recent_changes"]["entries"].as_array().unwrap();
     assert_eq!(entries.first().unwrap()["seq"], 2);
@@ -2518,6 +2523,165 @@ fn optimizer_status_reads_ledger_tail_and_labels_inactive_surfaces() {
             .iter()
             .all(|state| state["state"] == "not_armed")
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_recent_changes_tail_includes_entries_appended_after_watermark() {
+    // #96 FSV: entries appended to the persisted ledger AFTER the import watermark
+    // (e.g. durable trigger acks) must still surface in the tail scan. The scan
+    // range starts below the watermark, so the true persisted tail — read back
+    // through the vault bytes, not any API echo — is always covered.
+    let dir = temp_dir("optimizer-recent-tail-appended");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"optimizer-recent-tail-appended".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    for seq in 0..18_u64 {
+        vault
+            .append_ledger_entry(
+                calyx_ledger::EntryKind::Anneal,
+                SubjectId::Query(format!("optimizer-change-{seq}").into_bytes()),
+                format!(r#"{{"seq":{seq}}}"#).into_bytes(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .unwrap();
+    }
+
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(&dir, security);
+    outcome.vault_dir = vault_dir;
+    outcome.vault_salt = "optimizer-recent-tail-appended".to_string();
+    outcome.ledger_seq = 17;
+    outcome.ledger_rows_after = 18;
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    // Post-import appends: the watermark metadata stays at 17 while the persisted
+    // ledger head moves to 19.
+    for seq in 18..20_u64 {
+        vault
+            .append_ledger_entry(
+                calyx_ledger::EntryKind::Anneal,
+                SubjectId::Query(format!("optimizer-change-{seq}").into_bytes()),
+                format!(r#"{{"seq":{seq}}}"#).into_bytes(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .unwrap();
+    }
+    drop(vault);
+
+    let recent = optimizer_recent_changes_json(&dir, "demo");
+    assert_eq!(recent["status"], "read");
+    assert_eq!(recent["scan"]["mode"], "ledger_tail");
+    assert_eq!(recent["scan"]["watermark_seq"], 17);
+    assert_eq!(recent["scan"]["range_start_seq"], 2);
+    // Range [2, ..) covers seqs 2..=19: 18 rows read, last 16 returned.
+    assert_eq!(recent["ledger_rows_read"], 18);
+    assert_eq!(recent["entry_count"], 16);
+    let entries = recent["entries"].as_array().unwrap();
+    assert_eq!(entries.first().unwrap()["seq"], 4);
+    assert_eq!(entries.last().unwrap()["seq"], 19);
+    assert!(entries.iter().all(|entry| entry["verified_hash"] == true));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_recent_changes_falls_back_to_labeled_full_scan() {
+    // #96 FSV: a watermark ahead of the visible ledger (rebuild race) must not
+    // under-report recent changes — the underfilled tail falls back to the full
+    // scan and LABELS the degradation; a missing watermark likewise full-scans
+    // with a labeled reason instead of degrading silently.
+    let dir = temp_dir("optimizer-recent-full-fallback");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"optimizer-recent-full-fallback".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    for seq in 0..18_u64 {
+        vault
+            .append_ledger_entry(
+                calyx_ledger::EntryKind::Anneal,
+                SubjectId::Query(format!("optimizer-change-{seq}").into_bytes()),
+                format!(r#"{{"seq":{seq}}}"#).into_bytes(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .unwrap();
+    }
+    drop(vault);
+
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(&dir, security);
+    outcome.vault_dir = vault_dir;
+    outcome.vault_salt = "optimizer-recent-full-fallback".to_string();
+    // Overshoot: metadata claims head 40 while the persisted ledger tops out at 17.
+    outcome.ledger_seq = 40;
+    outcome.ledger_rows_after = 18;
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let recent = optimizer_recent_changes_json(&dir, "demo");
+    assert_eq!(recent["status"], "read");
+    assert_eq!(recent["scan"]["mode"], "full");
+    assert_eq!(recent["scan"]["reason"], "tail_scan_underfilled");
+    assert_eq!(recent["scan"]["watermark_seq"], 40);
+    assert_eq!(recent["scan"]["range_start_seq"], 25);
+    assert_eq!(recent["ledger_rows_read"], 18);
+    assert_eq!(recent["entry_count"], 16);
+    let entries = recent["entries"].as_array().unwrap();
+    assert_eq!(entries.first().unwrap()["seq"], 2);
+    assert_eq!(entries.last().unwrap()["seq"], 17);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadow_freshness_shared_verify_is_honored_only_for_the_same_vault_dir() {
+    // #96: a caller-shared chain-verify result is used only when it names the
+    // exact vault dir the freshness gate resolves; any mismatch recomputes from
+    // the persisted vault bytes (fail closed) instead of trusting a stale result.
+    let dir = temp_dir("shadow-freshness-shared-verify");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+    let configured_vault_dir = read_config_value(&dir, &metadata_key("demo", "vault_dir"))
+        .unwrap()
+        .map(PathBuf::from)
+        .unwrap();
+
+    // Same dir: the caller's (deliberately false) verify result is honored — the
+    // gate refuses NOT_INTACT without re-walking the intact persisted chain.
+    let verdict = evaluate_shadow_content_freshness_with_verify(
+        &dir,
+        "demo",
+        Some(KnownChainVerify {
+            vault_dir: &configured_vault_dir,
+            intact: false,
+        }),
+    )
+    .unwrap();
+    match verdict {
+        ShadowContentVerdict::Unverifiable { code, .. } => {
+            assert_eq!(code, ASTRO_SHADOW_VERIFY_NOT_INTACT);
+        }
+        other => panic!("expected shared not-intact refusal, got {other:?}"),
+    }
+
+    // Mismatched dir: the shared result is ignored and the gate recomputes from
+    // the real vault bytes, which verify intact → Fresh.
+    let other_dir = dir.join("some-other.astrolabe-vault");
+    let verdict = evaluate_shadow_content_freshness_with_verify(
+        &dir,
+        "demo",
+        Some(KnownChainVerify {
+            vault_dir: &other_dir,
+            intact: false,
+        }),
+    )
+    .unwrap();
+    assert_eq!(verdict, ShadowContentVerdict::Fresh);
     fs::remove_dir_all(&dir).ok();
 }
 

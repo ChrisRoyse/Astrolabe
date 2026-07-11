@@ -33,13 +33,19 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
     let panel_version = read_config_value(cache_dir, &metadata_key(project, "panel_version"))?
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_PANEL_VERSION);
-    let verify_status = if configured_vault_dir.exists() {
+    // #96: one chain verify per index_status response. The result computed here is
+    // shared with the content-freshness gate below instead of that gate re-walking
+    // the whole ledger a second time within the same call.
+    let (verify_status, verify_intact) = if configured_vault_dir.exists() {
         match astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir) {
-            Ok(report) => report.status,
-            Err(error) => format!("error:{error}"),
+            Ok(report) => {
+                let intact = report.is_intact();
+                (report.status, intact)
+            }
+            Err(error) => (format!("error:{error}"), false),
         }
     } else {
-        "missing".to_string()
+        ("missing".to_string(), false)
     };
     let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
         .and_then(|value| value.parse::<u64>().ok());
@@ -48,7 +54,14 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
     // fingerprint and compares it to the persisted watermark rather than trusting
     // artifact existence. (`verify_status`/`lowered_exists` above remain the raw
     // structural inputs the health surface reports.)
-    let content_verdict = evaluate_shadow_content_freshness(cache_dir, project)?;
+    let content_verdict = evaluate_shadow_content_freshness_with_verify(
+        cache_dir,
+        project,
+        Some(KnownChainVerify {
+            vault_dir: &configured_vault_dir,
+            intact: verify_intact,
+        }),
+    )?;
     let background_lane = background_lane_status_at(cache_dir, project)?;
     let periodic_verify = periodic_verify_status_at(cache_dir, project)?;
     let health = health_surface_json(
