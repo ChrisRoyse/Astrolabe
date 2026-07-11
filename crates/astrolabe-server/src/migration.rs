@@ -4967,7 +4967,10 @@ fn persist_periodic_verify_status_at(
     checked_range_end: Option<u64>,
     error_text: Option<&str>,
 ) -> Result<(), DynError> {
-    let conn = open_config(cache_dir)?;
+    let mut conn = open_config(cache_dir)?;
+    // Atomic multi-key persist — a crash mid-write must not leave torn
+    // periodic-verify metadata that a status reader would treat as current (#95).
+    let tx = conn.transaction()?;
     for (key, value) in [
         ("periodic_verify_status", status.to_string()),
         (
@@ -4998,11 +5001,12 @@ fn persist_periodic_verify_status_at(
             error_text.unwrap_or_default().to_string(),
         ),
     ] {
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             params![metadata_key(project, key), value],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -7895,7 +7899,7 @@ fn persist_shadow_outcome_at(
     project: &str,
     outcome: &ShadowImportOutcome,
 ) -> Result<(), DynError> {
-    let conn = open_config(cache_dir)?;
+    let mut conn = open_config(cache_dir)?;
     let security_screen_json = serde_json::to_string(&outcome.security_screen)?;
     let search_scale_json = serde_json::to_string(&outcome.search_scale)?;
     let skill_tree_json = serde_json::to_string(&outcome.skill_tree)?;
@@ -7903,6 +7907,10 @@ fn persist_shadow_outcome_at(
     let kernel_context_json = serde_json::to_string(&outcome.kernel_context)?;
     let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
+    // Atomic multi-key persist: a crash or error mid-write must not leave a torn
+    // mix of new and old metadata that a reader would serve as fresh/verified
+    // (e.g. a new vault_fingerprint beside a stale kernel_context_json) — #95.
+    let tx = conn.transaction()?;
     for (key, value) in [
         ("vault_dir", outcome.vault_dir.display().to_string()),
         ("vault_id", outcome.vault_id.clone()),
@@ -7959,11 +7967,12 @@ fn persist_shadow_outcome_at(
         ("anomaly_report_json", anomaly_report_json),
         ("provenance_json", provenance_json),
     ] {
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             params![metadata_key(project, key), value],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -7987,9 +7996,21 @@ fn write_config_value(cache_dir: &Path, key: &str, value: &str) -> Result<(), Dy
     Ok(())
 }
 
+/// SQLITE_BUSY retry window for the shared config store — an operational
+/// resilience timeout under cross-process access (multiple agent MCP processes
+/// on one repo, #76), not a result-determining threshold.
+const CONFIG_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
+
 fn open_config(cache_dir: &Path) -> Result<Connection, DynError> {
     fs::create_dir_all(cache_dir)?;
     let conn = Connection::open(cache_dir.join("_config.db"))?;
+    // Concurrency + durability hardening for the per-project config store, which
+    // multiple agent MCP processes may touch on one repo (#76): busy_timeout
+    // retries instead of failing the server on SQLITE_BUSY; WAL lets readers
+    // proceed during a writer's transaction; synchronous=NORMAL stays crash-safe
+    // under WAL without an fsync per commit.
+    conn.busy_timeout(std::time::Duration::from_millis(CONFIG_DB_BUSY_TIMEOUT_MS))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)",
         [],
@@ -8122,6 +8143,69 @@ mod tests {
             "corrupt persisted dial must fail closed naming the value, got: {msg}"
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_store_uses_wal_and_busy_timeout() {
+        let dir = temp_dir("config-pragmas");
+        let conn = open_config(&dir).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "config store must run in WAL mode for concurrent readers (#95/#76)"
+        );
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy_timeout, CONFIG_DB_BUSY_TIMEOUT_MS as i64,
+            "config store must set a SQLITE_BUSY retry window"
+        );
+        drop(conn);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_multi_key_persist_is_atomic_all_or_nothing() {
+        let dir = temp_dir("config-atomic");
+        // A write inside a transaction dropped WITHOUT commit (as on a crash or an
+        // error mid-persist) must leave nothing behind — the atomicity guarantee
+        // persist_shadow_outcome_at / persist_periodic_verify now rely on.
+        {
+            let mut conn = open_config(&dir).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                params!["torn_key", "torn_value"],
+            )
+            .unwrap();
+            // tx dropped here without commit -> rollback
+        }
+        // FSV against the store: the uncommitted key must not be persisted.
+        assert_eq!(
+            read_config_value(&dir, "torn_key").unwrap(),
+            None,
+            "uncommitted transaction must roll back — no torn metadata persisted"
+        );
+        // Positive control: a committed write IS visible.
+        {
+            let mut conn = open_config(&dir).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                params!["committed_key", "committed_value"],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            read_config_value(&dir, "committed_key").unwrap(),
+            Some("committed_value".to_string())
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -11627,6 +11711,18 @@ mod tests {
                start_line INTEGER DEFAULT 0,
                end_line INTEGER DEFAULT 0,
                properties TEXT DEFAULT '{}'
+             );
+             CREATE TABLE edges (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               source_id INTEGER NOT NULL,
+               target_id INTEGER NOT NULL,
+               type TEXT NOT NULL,
+               properties TEXT DEFAULT '{}',
+               url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+               local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                 THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+               UNIQUE(source_id, target_id, type, local_name_gen)
              );",
         )
         .unwrap();
