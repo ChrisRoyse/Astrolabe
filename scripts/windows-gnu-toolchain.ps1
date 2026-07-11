@@ -616,9 +616,16 @@ if (Test-Path -LiteralPath $launcherLock) {
             $lockState = $null
         }
     }
+    # #197: schema validation is fail-closed — the pid field must parse as a
+    # positive integer. A malformed pid (for example a clobbered or truncated
+    # manifest) must surface as the named UNREADABLE boundary below, never as
+    # an unnamed cast exception.
     $lockOwnerPid = $null
     if ($null -ne $lockState -and $lockState.PSObject.Properties['pid']) {
-        $lockOwnerPid = [int]$lockState.pid
+        $parsedLockPid = 0
+        if ([int]::TryParse([string]$lockState.pid, [ref]$parsedLockPid) -and $parsedLockPid -gt 0) {
+            $lockOwnerPid = $parsedLockPid
+        }
     }
     if ($null -eq $lockOwnerPid) {
         throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock exists but names no readable pid; verify no toolchain session is live, then remove it manually: $launcherLock"
@@ -639,12 +646,24 @@ if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralP
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
 }
 New-Item -ItemType Directory -Path $workspaceTempParent -Force | Out-Null
-New-Item -ItemType File -Path $launcherLock -ErrorAction Stop | Out-Null
+# #197: atomic lock claim — write the full manifest to a PID-named staging
+# sibling, then move it onto the lock name WITHOUT clobbering. No reader can
+# ever observe a claimed-but-empty or half-written lock (the #186 UNREADABLE
+# race), and a concurrent claim between the boundary check above and this move
+# surfaces as a named fail-closed refusal instead of overwriting a live lock.
+$launcherLockStage = "$launcherLock.$PID.tmp"
 [ordered]@{
     pid = $PID
     started = (Get-Date).ToString("o")
     command = ("$Command $CommandArgsJson").Trim()
-} | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLock -Encoding UTF8
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLockStage -Encoding UTF8
+try {
+    Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop
+}
+catch {
+    Remove-Item -LiteralPath $launcherLockStage -Force -ErrorAction SilentlyContinue
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_RACE]: another launcher session claimed this workspace between the lock check and the atomic claim; never stop or clean a live session's run - wait for the lock to release: $launcherLock"
+}
 
 $toolsRoot = Join-Path $root ".toolchains"
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName

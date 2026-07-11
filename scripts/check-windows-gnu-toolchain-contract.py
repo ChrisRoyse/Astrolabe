@@ -183,6 +183,19 @@ def main() -> None:
         "the launcher must hold a fail-closed session lock: refuse a live holder, remove only dead-pid stale locks, and release the lock on every exit path",
     )
     require(
+        '$launcherLockStage = "$launcherLock.$PID.tmp"' in runner
+        and "Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock" in runner
+        and "ASTRO_LAUNCHER_LOCK_RACE" in runner
+        and "Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -Force"
+        not in runner,
+        "the launcher must claim its session lock atomically: stage the full manifest beside the lock, move without clobbering, and refuse a lost claim race with a named boundary (#197)",
+    )
+    require(
+        "[int]::TryParse([string]$lockState.pid" in runner
+        and "$parsedLockPid -gt 0" in runner,
+        "the launcher must validate the lock pid schema fail-closed: a non-integer or non-positive pid is the named UNREADABLE boundary, never an unnamed cast error (#197)",
+    )
+    require(
         '$previousTempEnvironment = @{}' in runner
         and 'Set-Item -Path "Env:$name" -Value $previous.Value' in runner
         and 'Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue' in runner,
