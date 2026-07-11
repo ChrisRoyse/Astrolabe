@@ -596,8 +596,33 @@ if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-if (-not [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::OrdinalIgnoreCase)) {
+# #226: a registered git worktree of the canonical workspace (a `.git` FILE under
+# .claude\worktrees\) is a valid launcher root for parallel-session verification.
+# It keeps its own target/, .tmp/, and session lock, and shares the canonical
+# pinned .toolchains and .sccache. Everything else stays canonical-only.
+$worktreeParent = Join-Path (Join-Path $ExpectedWorkspace ".claude") "worktrees"
+$isCanonicalRoot = [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::OrdinalIgnoreCase)
+$isWorktreeRoot = (-not $isCanonicalRoot) -and
+    $root.StartsWith($worktreeParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-Path -LiteralPath (Join-Path $root ".git") -PathType Leaf)
+if (-not ($isCanonicalRoot -or $isWorktreeRoot)) {
     throw "canonical workspace required: $ExpectedWorkspace (found $root)"
+}
+if ($isWorktreeRoot -and $Bootstrap) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_BOOTSTRAP_CANONICAL_ONLY]: -Bootstrap installs pinned tools and must run from $ExpectedWorkspace, not worktree $root"
+}
+if ($isWorktreeRoot) {
+    Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
+    # #226: give each worktree its own sccache SERVER (port) while still sharing
+    # the on-disk cache. The server is otherwise machine-wide, so an orphan left
+    # by a sibling session that was started under a since-deleted per-session temp
+    # dir would serve this session and fatally poison every compile with
+    # "Failed to create temp dir". The port is a deterministic function of the
+    # worktree path, so reruns in one worktree reuse one warm server.
+    $rootBytes = [System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())
+    $rootHash = [System.Security.Cryptography.SHA256]::HashData($rootBytes)
+    $env:SCCACHE_SERVER_PORT = [string](49152 + ([BitConverter]::ToUInt16($rootHash, 0) % 16000))
+    Write-Output "SCCACHE[ASTRO_CACHE_WORKTREE_PORT]: SCCACHE_SERVER_PORT=$env:SCCACHE_SERVER_PORT"
 }
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
@@ -665,7 +690,9 @@ catch {
     throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_RACE]: another launcher session claimed this workspace between the lock check and the atomic claim; never stop or clean a live session's run - wait for the lock to release: $launcherLock"
 }
 
-$toolsRoot = Join-Path $root ".toolchains"
+# #226: pinned tools always live in the canonical workspace so worktree sessions
+# reuse one bootstrapped bundle instead of re-downloading per worktree.
+$toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
 $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
@@ -676,7 +703,9 @@ $sccacheRoot = Join-Path $toolsRoot $SccacheDirectoryName
 $sccacheExe = Join-Path $sccacheRoot "sccache.exe"
 # #190: workspace-local compiler cache, sibling of .toolchains/.tmp. It survives the
 # target/ wipe (the finally block deletes target/ and the workspace temp, never this).
-$sccacheDir = Join-Path $root ".sccache"
+# #226: the cache is canonical-workspace-shared so worktree sessions hit the same
+# warm content-addressed cache; sccache's disk cache is safe under concurrency.
+$sccacheDir = Join-Path $ExpectedWorkspace ".sccache"
 $gitRoot = $GitInstallRoot
 $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
@@ -742,7 +771,16 @@ try {
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.
+    # #226: the server may outlive this session (worktree sessions never stop it),
+    # so it must NOT inherit the per-session workspace temp — a server whose temp
+    # dir is deleted at session end fatally poisons every later compile with
+    # "Failed to create temp dir". Start it with a stable temp under the shared
+    # cache root, then restore the per-session temp for the child command.
+    $sccacheServerTemp = Join-Path $sccacheDir "server-tmp"
+    New-Item -ItemType Directory -Path $sccacheServerTemp -Force | Out-Null
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $sccacheServerTemp
     & $sccacheExe --start-server *> $null
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     & $sccacheExe --zero-stats *> $null
     Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0"
     & $Command @commandArgs
@@ -757,7 +795,14 @@ finally {
     try {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
         & $sccacheExe --show-stats
-        & $sccacheExe --stop-server *> $null
+        if ($isCanonicalRoot) {
+            & $sccacheExe --stop-server *> $null
+        }
+        else {
+            # #226: the sccache server is machine-wide and may be serving a live
+            # canonical-workspace session; a worktree session must not stop it.
+            Write-Output "SCCACHE[ASTRO_CACHE_SERVER_LEFT_RUNNING]: worktree session leaves the shared sccache server up"
+        }
     }
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"

@@ -503,10 +503,18 @@ pub struct CbmPipelineRows {
     pub edges: Vec<CbmPipelineEdgeRow>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// Result of a single `index_repository` run with the pipeline row sink attached.
+///
+/// The raw tool result and the row capture succeed or fail independently (#123):
+/// by the time the sink outcome is known the index has already completed, so a
+/// sink failure must not discard `raw_json` and force the caller into a full
+/// second index run. `rows` carries the sink failure instead.
+#[derive(Debug)]
 pub struct CbmIndexRepositoryRows {
+    /// Raw JSON tool result of the completed `index_repository` run.
     pub raw_json: String,
-    pub rows: CbmPipelineRows,
+    /// Captured pipeline rows, or the row-sink failure for this same run.
+    pub rows: Result<CbmPipelineRows, BridgeError>,
 }
 
 struct PipelineRowSinkState {
@@ -1642,21 +1650,24 @@ impl CbmToolRunner {
             take_c_string(ptr)
         };
         let raw_json = raw_result?;
-        if let Some(error) = sink.error {
-            return Err(error);
-        }
-        let project = project_from_tool_result(&raw_json)
-            .or_else(|| sink.nodes.first().map(|node| node.project.clone()))
-            .or_else(|| sink.edges.first().map(|edge| edge.project.clone()))
-            .unwrap_or_default();
-        Ok(CbmIndexRepositoryRows {
-            raw_json,
-            rows: CbmPipelineRows {
-                project,
-                nodes: sink.nodes,
-                edges: sink.edges,
-            },
-        })
+        // #123: the index already ran to completion here — a row-sink failure is
+        // returned ALONGSIDE the raw result rather than discarding it, so the
+        // caller never has to rerun the whole index to recover the tool result.
+        let rows = match sink.error {
+            Some(error) => Err(error),
+            None => {
+                let project = project_from_tool_result(&raw_json)
+                    .or_else(|| sink.nodes.first().map(|node| node.project.clone()))
+                    .or_else(|| sink.edges.first().map(|edge| edge.project.clone()))
+                    .unwrap_or_default();
+                Ok(CbmPipelineRows {
+                    project,
+                    nodes: sink.nodes,
+                    edges: sink.edges,
+                })
+            }
+        };
+        Ok(CbmIndexRepositoryRows { raw_json, rows })
     }
 
     pub fn handle_tool(
@@ -2082,27 +2093,16 @@ mod tests {
             project_from_tool_result(&run.raw_json).as_deref(),
             Some(project.as_str())
         );
-        assert_eq!(run.rows.project, project);
+        let rows = run.rows.expect("row sink capture for the completed run");
+        assert_eq!(rows.project, project);
         assert!(
-            run.rows
-                .nodes
+            rows.nodes
                 .iter()
                 .any(|node| node.qualified_name.ends_with(".main")),
-            "expected main function in MCP row sink: {:?}",
-            run.rows
+            "expected main function in MCP row sink: {rows:?}",
         );
-        assert!(
-            run.rows
-                .nodes
-                .iter()
-                .all(|node| node.project == run.rows.project)
-        );
-        assert!(
-            run.rows
-                .edges
-                .iter()
-                .all(|edge| edge.project == run.rows.project)
-        );
+        assert!(rows.nodes.iter().all(|node| node.project == rows.project));
+        assert!(rows.edges.iter().all(|edge| edge.project == rows.project));
 
         // `_db_guard` deletes the registration on scope exit (fail-closed).
         std::fs::remove_dir_all(dir).ok();
@@ -2152,7 +2152,10 @@ mod tests {
             let run = runner
                 .handle_index_repository_with_rows(&args)
                 .expect("single MCP index_repository run with row sink");
-            assert_eq!(run.rows.project, project);
+            assert_eq!(
+                run.rows.expect("row sink capture").project,
+                project
+            );
             // Mid-run source-of-truth read: the registration exists on disk.
             assert!(
                 db_path.exists(),
