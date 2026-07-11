@@ -28,6 +28,7 @@ calyx-core = { path = "vendor/calyx/crates/calyx-core" }
 calyx-ledger = { path = "vendor/calyx/crates/calyx-ledger" }
 calyx-loom = { path = "vendor/calyx/crates/calyx-loom" }
 calyx-paths = { path = "vendor/calyx/crates/calyx-paths" }
+calyx-sextant = { path = "vendor/calyx/crates/calyx-sextant" }
 
 [profile.release]
 codegen-units = 1
