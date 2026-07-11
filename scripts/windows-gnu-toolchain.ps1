@@ -596,8 +596,23 @@ if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-if (-not [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::OrdinalIgnoreCase)) {
+# #226: a registered git worktree of the canonical workspace (a `.git` FILE under
+# .claude\worktrees\) is a valid launcher root for parallel-session verification.
+# It keeps its own target/, .tmp/, and session lock, and shares the canonical
+# pinned .toolchains and .sccache. Everything else stays canonical-only.
+$worktreeParent = Join-Path (Join-Path $ExpectedWorkspace ".claude") "worktrees"
+$isCanonicalRoot = [string]::Equals($root, $ExpectedWorkspace, [StringComparison]::OrdinalIgnoreCase)
+$isWorktreeRoot = (-not $isCanonicalRoot) -and
+    $root.StartsWith($worktreeParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-Path -LiteralPath (Join-Path $root ".git") -PathType Leaf)
+if (-not ($isCanonicalRoot -or $isWorktreeRoot)) {
     throw "canonical workspace required: $ExpectedWorkspace (found $root)"
+}
+if ($isWorktreeRoot -and $Bootstrap) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_BOOTSTRAP_CANONICAL_ONLY]: -Bootstrap installs pinned tools and must run from $ExpectedWorkspace, not worktree $root"
+}
+if ($isWorktreeRoot) {
+    Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
 }
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
@@ -646,7 +661,9 @@ New-Item -ItemType File -Path $launcherLock -ErrorAction Stop | Out-Null
     command = ("$Command $CommandArgsJson").Trim()
 } | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLock -Encoding UTF8
 
-$toolsRoot = Join-Path $root ".toolchains"
+# #226: pinned tools always live in the canonical workspace so worktree sessions
+# reuse one bootstrapped bundle instead of re-downloading per worktree.
+$toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
 $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
@@ -657,7 +674,9 @@ $sccacheRoot = Join-Path $toolsRoot $SccacheDirectoryName
 $sccacheExe = Join-Path $sccacheRoot "sccache.exe"
 # #190: workspace-local compiler cache, sibling of .toolchains/.tmp. It survives the
 # target/ wipe (the finally block deletes target/ and the workspace temp, never this).
-$sccacheDir = Join-Path $root ".sccache"
+# #226: the cache is canonical-workspace-shared so worktree sessions hit the same
+# warm content-addressed cache; sccache's disk cache is safe under concurrency.
+$sccacheDir = Join-Path $ExpectedWorkspace ".sccache"
 $gitRoot = $GitInstallRoot
 $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
@@ -738,7 +757,14 @@ finally {
     try {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
         & $sccacheExe --show-stats
-        & $sccacheExe --stop-server *> $null
+        if ($isCanonicalRoot) {
+            & $sccacheExe --stop-server *> $null
+        }
+        else {
+            # #226: the sccache server is machine-wide and may be serving a live
+            # canonical-workspace session; a worktree session must not stop it.
+            Write-Output "SCCACHE[ASTRO_CACHE_SERVER_LEFT_RUNNING]: worktree session leaves the shared sccache server up"
+        }
     }
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
