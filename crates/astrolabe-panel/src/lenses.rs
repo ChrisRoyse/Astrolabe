@@ -1081,7 +1081,7 @@ fn encode_api_callees(calls: &[ApiCall]) -> PanelResult<SlotVector> {
             continue;
         }
         if call.resolved {
-            let weight = call.call_count.ln_1p();
+            let weight = crate::detmath::ln_1p(call.call_count);
             if weight != 0.0 {
                 terms.push((format!("resolved:{trimmed}"), weight));
             }
@@ -1187,21 +1187,21 @@ fn encode_graph_position(input: &GraphPositionInput) -> PanelResult<SlotVector> 
     };
     let mut data = Vec::with_capacity(GRAPH_POSITION_DIM as usize);
     data.extend([
-        input.call_in.ln_1p(),
-        input.call_out.ln_1p(),
-        input.dataflow_in.ln_1p(),
-        input.dataflow_out.ln_1p(),
-        input.type_in.ln_1p(),
-        input.type_out.ln_1p(),
-        input.service_in.ln_1p(),
-        input.service_out.ln_1p(),
+        crate::detmath::ln_1p(input.call_in),
+        crate::detmath::ln_1p(input.call_out),
+        crate::detmath::ln_1p(input.dataflow_in),
+        crate::detmath::ln_1p(input.dataflow_out),
+        crate::detmath::ln_1p(input.type_in),
+        crate::detmath::ln_1p(input.type_out),
+        crate::detmath::ln_1p(input.service_in),
+        crate::detmath::ln_1p(input.service_out),
         input.sampled_betweenness,
         input.pagerank,
         input.clustering_coeff,
         input.neighbor_label_entropy,
-        total_in.ln_1p(),
-        total_out.ln_1p(),
-        total.ln_1p(),
+        crate::detmath::ln_1p(total_in),
+        crate::detmath::ln_1p(total_out),
+        crate::detmath::ln_1p(total),
         balance,
     ]);
 
@@ -1226,7 +1226,7 @@ fn encode_path_hierarchy(input: &PathHierarchyInput) -> PanelResult<SlotVector> 
     if !components.is_empty() {
         terms.push((
             format!("depth:{}", components.len()),
-            (components.len() as f32).ln_1p(),
+            crate::detmath::ln_1p(components.len() as f32),
         ));
     }
     hashed_sparse("path_hierarchy", PATH_HIERARCHY_DIM, terms)
@@ -1241,7 +1241,7 @@ fn encode_churn_profile(input: &ChurnProfileInput) -> PanelResult<SlotVector> {
     dense(
         SlotId::new(10),
         vec![
-            input.change_count.ln_1p(),
+            crate::detmath::ln_1p(input.change_count),
             positive_day_log(input.age_days),
             positive_day_log(input.days_since),
             input.co_change_degree,
@@ -1256,8 +1256,9 @@ fn encode_churn_profile(input: &ChurnProfileInput) -> PanelResult<SlotVector> {
 fn encode_recency(input: &RecencyInput) -> PanelResult<SlotVector> {
     ensure_finite_scalar("recency.days_since_modified", input.days_since_modified)?;
     ensure_non_negative("recency.days_since_modified", input.days_since_modified)?;
-    let decay =
-        (-std::f32::consts::LN_2 * input.days_since_modified / RECENCY_HALF_LIFE_DAYS).exp();
+    let decay = crate::detmath::exp(
+        -std::f32::consts::LN_2 * input.days_since_modified / RECENCY_HALF_LIFE_DAYS,
+    );
     let mut data = Vec::with_capacity(RECENCY_DIM as usize);
     data.push(decay);
     dense(SlotId::new(11), data)
@@ -1564,12 +1565,12 @@ fn bool_to_f32(value: bool) -> f32 {
 }
 
 fn positive_day_log(value: f32) -> f32 {
-    value.max(1.0).ln()
+    crate::detmath::ln(value.max(1.0))
 }
 
 fn signed_log(value: f32) -> PanelResult<f32> {
     ensure_finite_scalar("signed_log", value)?;
-    Ok(value.signum() * value.abs().ln_1p())
+    Ok(value.signum() * crate::detmath::ln_1p(value.abs()))
 }
 
 fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
@@ -1661,8 +1662,12 @@ fn tokenize_like_unicode61(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
+        // Frozen Unicode-6.1 classification/case-fold (see `crate::unicode61`):
+        // std's `is_alphanumeric`/`to_lowercase` track the toolchain's Unicode
+        // version and would drift frozen S7/S18-S20/S22 outputs on a rustc
+        // upgrade.
+        if crate::unicode61::is_alnum(ch) {
+            current.push(crate::unicode61::fold(ch));
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
         }
@@ -1815,6 +1820,26 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_is_frozen_to_unicode_6_1_not_the_toolchain() {
+        // U+19B0 (New Tai Lue vowel sign) is a separator under Unicode 6.1
+        // (category Mc) but alphanumeric under Unicode 8.0+, so a frozen 6.1
+        // tokenizer must SPLIT on it. A std `is_alphanumeric`-backed tokenizer
+        // would keep "ab<U+19B0>cd" as one token and fail this golden.
+        assert_eq!(
+            cbm_camel_split_tokens("ab\u{19B0}cd"),
+            vec!["ab", "cd", "ab", "cd"],
+        );
+
+        // U+A7B4 (LATIN CAPITAL LETTER BETA) is alphanumeric in 6.1 but has no
+        // 6.1 case-fold rule, so frozen folding leaves it unchanged; std's
+        // newer `to_lowercase` would emit U+A7B5 and fail this golden.
+        assert_eq!(
+            cbm_camel_split_tokens("X\u{A7B4}"),
+            vec!["x\u{A7B4}", "x\u{A7B4}"],
+        );
+    }
+
+    #[test]
     fn s8_graph_position_dimension_order_is_frozen() {
         let input = GraphPositionInput {
             call_in: 1.0,
@@ -1840,21 +1865,21 @@ mod tests {
         assert_eq!(
             data,
             vec![
-                1.0_f32.ln_1p(),
-                2.0_f32.ln_1p(),
-                3.0_f32.ln_1p(),
-                4.0_f32.ln_1p(),
-                5.0_f32.ln_1p(),
-                6.0_f32.ln_1p(),
-                7.0_f32.ln_1p(),
-                8.0_f32.ln_1p(),
+                crate::detmath::ln_1p(1.0),
+                crate::detmath::ln_1p(2.0),
+                crate::detmath::ln_1p(3.0),
+                crate::detmath::ln_1p(4.0),
+                crate::detmath::ln_1p(5.0),
+                crate::detmath::ln_1p(6.0),
+                crate::detmath::ln_1p(7.0),
+                crate::detmath::ln_1p(8.0),
                 0.25,
                 0.125,
                 0.5,
                 1.5,
-                total_in.ln_1p(),
-                total_out.ln_1p(),
-                total.ln_1p(),
+                crate::detmath::ln_1p(total_in),
+                crate::detmath::ln_1p(total_out),
+                crate::detmath::ln_1p(total),
                 (total_out - total_in) / total,
             ]
         );

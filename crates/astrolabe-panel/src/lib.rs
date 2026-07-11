@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod detmath;
 mod embeddings;
 mod lenses;
+mod unicode61;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -16,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use embeddings::{
-    NOMIC_EMBED_DIM, NOMIC_TOKEN_COUNT, NOMIC_VECTOR_BLOB_SHA256, StaticEmbeddingInput,
-    StaticEmbeddingLens, StaticEmbeddingTable, fixture_static_embedding_input, s18_s20_lenses,
+    NOMIC_EMBED_DIM, NOMIC_TOKEN_COUNT, NOMIC_TOKEN_TABLE_SHA256, NOMIC_VECTOR_BLOB_SHA256,
+    StaticEmbeddingInput, StaticEmbeddingLens, StaticEmbeddingTable,
+    fixture_static_embedding_input, nomic_weights_identity, s18_s20_lenses,
 };
 pub use lenses::{
     ApiCall, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
@@ -194,7 +197,7 @@ impl FrozenLensContract {
     pub fn for_slot(slot: &PanelSlotSpec) -> Self {
         let shape = shape_fingerprint(slot.shape);
         let weights_sha = if matches!(slot.slot, 18 | 19 | 20 | 22) {
-            NOMIC_VECTOR_BLOB_SHA256
+            nomic_weights_identity()
         } else {
             sha256_digest(&[
                 PANEL_SCHEMA_ID.as_bytes(),

@@ -34,6 +34,17 @@ pub const NOMIC_VECTOR_BLOB_SHA256: [u8; 32] = [
     0xba, 0xc1, 0x2f, 0x6d, 0x92, 0x0c, 0x69, 0x1b, 0x3b, 0x3b, 0x4c, 0xd7, 0x08, 0xf9, 0x9e, 0x83,
 ];
 
+/// SHA-256 of the raw bytes of
+/// `vendor/codebase-memory-mcp/vendored/nomic/code_tokens.txt` (LF-normalized by
+/// `.gitattributes`). The token file assigns each vector row its token identity,
+/// so a reordered/edited table with the same row count would silently change
+/// S18-S20/S22 outputs under the same lens id. Freezing this hash makes any such
+/// drift fail closed in `load_from_paths`.
+pub const NOMIC_TOKEN_TABLE_SHA256: [u8; 32] = [
+    0xc9, 0x28, 0xf5, 0xe2, 0xf9, 0xdd, 0x85, 0xf2, 0x29, 0x4a, 0x50, 0xa0, 0x5d, 0xd9, 0xf2, 0xf8,
+    0xbc, 0x95, 0x19, 0x27, 0x27, 0x57, 0x9a, 0xa1, 0x6b, 0x06, 0x2f, 0xf8, 0xef, 0x30, 0x1d, 0x25,
+];
+
 const CODE_VECTORS_REL: &str = "../../vendor/codebase-memory-mcp/vendored/nomic/code_vectors.bin";
 const CODE_TOKENS_REL: &str = "../../vendor/codebase-memory-mcp/vendored/nomic/code_tokens.txt";
 
@@ -66,14 +77,22 @@ impl StaticEmbeddingTable {
             manifest_dir.join(CODE_VECTORS_REL),
             manifest_dir.join(CODE_TOKENS_REL),
             NOMIC_VECTOR_BLOB_SHA256,
+            NOMIC_TOKEN_TABLE_SHA256,
         )
     }
 
-    /// Loads a token table and vector blob, failing closed when the SHA or layout drifts.
+    /// Loads a token table and vector blob, failing closed when either SHA, the
+    /// layout, or the token-uniqueness invariant drifts.
+    ///
+    /// The vector blob and the token table are both content-verified: the blob
+    /// carries the row vectors, the token table binds each row to its token
+    /// identity, and both are folded into `weights_sha` so the frozen lens
+    /// version changes if either input changes.
     pub fn load_from_paths(
         blob_path: impl AsRef<Path>,
         tokens_path: impl AsRef<Path>,
         expected_sha: [u8; 32],
+        expected_tokens_sha: [u8; 32],
     ) -> PanelResult<Self> {
         let blob = fs::read(blob_path.as_ref()).map_err(|err| {
             PanelError::new(
@@ -105,6 +124,15 @@ impl StaticEmbeddingTable {
                 "Restore the vendored code_tokens.txt table before registering embedding lenses.",
             )
         })?;
+        let actual_tokens_sha: [u8; 32] = Sha256::digest(token_text.as_bytes()).into();
+        if actual_tokens_sha != expected_tokens_sha {
+            return Err(PanelError::new(
+                ASTRO_PANEL_CONTRACT_INVALID,
+                "nomic token table SHA-256 does not match the frozen contract",
+                "Use the exact vendored code_tokens.txt that matches NOMIC_TOKEN_TABLE_SHA256; \
+                 a reordered or edited table changes S18-S20/S22 outputs and requires a new lens version.",
+            ));
+        }
         let mut token_to_index = HashMap::with_capacity(NOMIC_TOKEN_COUNT);
         let mut row_count = 0_usize;
         for (idx, token) in token_text.lines().enumerate() {
@@ -116,8 +144,12 @@ impl StaticEmbeddingTable {
                     "Keep code_tokens.txt aligned with code_vectors.bin.",
                 ));
             }
-            if !token.is_empty() {
-                token_to_index.insert(token.to_string(), idx);
+            if !token.is_empty() && token_to_index.insert(token.to_string(), idx).is_some() {
+                return Err(PanelError::new(
+                    ASTRO_PANEL_CONTRACT_INVALID,
+                    format!("nomic token table contains a duplicate token at row {idx}: {token:?}"),
+                    "Keep every non-empty token in code_tokens.txt unique so a single row maps to a single vector.",
+                ));
             }
         }
         if row_count != NOMIC_TOKEN_COUNT {
@@ -135,11 +167,12 @@ impl StaticEmbeddingTable {
         Ok(Self {
             token_to_index,
             vectors,
-            weights_sha: actual_sha,
+            weights_sha: nomic_weights_identity_from(&actual_sha, &actual_tokens_sha),
         })
     }
 
-    /// SHA-256 verified for the loaded vector blob.
+    /// Frozen weights identity for the loaded table: SHA-256 over the vector
+    /// blob SHA and the token table SHA (see [`nomic_weights_identity`]).
     pub const fn weights_sha(&self) -> [u8; 32] {
         self.weights_sha
     }
@@ -396,6 +429,24 @@ fn encode_embedding_slot(
     }
 }
 
+/// Frozen weights identity for the S18-S20/S22 static embedding lenses.
+///
+/// The identity folds both content addresses of the vendored nomic table — the
+/// vector blob and the token-index table — under a domain-separated SHA-256, so
+/// the lens version (and every content address derived from it) changes if the
+/// vectors *or* the token ordering changes.
+pub fn nomic_weights_identity() -> [u8; 32] {
+    nomic_weights_identity_from(&NOMIC_VECTOR_BLOB_SHA256, &NOMIC_TOKEN_TABLE_SHA256)
+}
+
+fn nomic_weights_identity_from(blob_sha: &[u8; 32], tokens_sha: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"astrolabe.panel.nomic.weights.v1");
+    hasher.update(blob_sha);
+    hasher.update(tokens_sha);
+    hasher.finalize().into()
+}
+
 fn validate_blob_layout(blob: &[u8]) -> PanelResult<()> {
     if blob.len() != NOMIC_VECTOR_BLOB_LEN {
         return Err(PanelError::new(
@@ -500,7 +551,10 @@ mod tests {
     #[test]
     fn blob_integrity_gate_verifies_sha_and_refuses_corruption() {
         let table = test_table();
-        assert_eq!(table.weights_sha(), NOMIC_VECTOR_BLOB_SHA256);
+        // The weights identity folds BOTH the vector blob SHA and the token
+        // table SHA; it must not be the bare blob SHA (#103).
+        assert_eq!(table.weights_sha(), nomic_weights_identity());
+        assert_ne!(table.weights_sha(), NOMIC_VECTOR_BLOB_SHA256);
 
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let blob_path = manifest_dir.join(CODE_VECTORS_REL);
@@ -519,17 +573,103 @@ mod tests {
             &corrupt_path,
             &token_path,
             NOMIC_VECTOR_BLOB_SHA256,
+            NOMIC_TOKEN_TABLE_SHA256,
         )
         .expect_err("corrupt blob refused");
         let _ = fs::remove_file(corrupt_path);
         assert_eq!(err.code(), ASTRO_PANEL_CONTRACT_INVALID);
     }
 
+    /// #103: a reordered/edited token table with the SAME row count must fail
+    /// closed on the frozen token SHA instead of silently reassigning vectors,
+    /// and a duplicate non-empty token must be rejected. Both assertions read
+    /// the real vendored blob so only the token table varies.
+    #[test]
+    fn token_table_content_is_verified_and_duplicates_rejected() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let blob_path = manifest_dir.join(CODE_VECTORS_REL);
+        let token_path = manifest_dir.join(CODE_TOKENS_REL);
+        let original = fs::read_to_string(&token_path).expect("read tokens");
+        let rows: Vec<&str> = original.lines().collect();
+        assert_eq!(rows.len(), NOMIC_TOKEN_COUNT);
+
+        // Two distinct non-empty rows to reorder / duplicate.
+        let first_nonempty = rows
+            .iter()
+            .position(|token| !token.is_empty())
+            .expect("a non-empty token");
+        let second_nonempty = rows
+            .iter()
+            .enumerate()
+            .skip(first_nonempty + 1)
+            .find(|(_, token)| !token.is_empty() && **token != rows[first_nonempty])
+            .map(|(idx, _)| idx)
+            .expect("a second distinct non-empty token");
+
+        // (a) Reorder two rows: same count, DIFFERENT bytes -> SHA gate rejects.
+        let mut reordered = rows.clone();
+        reordered.swap(first_nonempty, second_nonempty);
+        let reordered_text = reordered.join("\n") + "\n";
+        assert_eq!(reordered_text.lines().count(), NOMIC_TOKEN_COUNT);
+        let reordered_path = std::env::temp_dir().join(format!(
+            "astrolabe-reordered-tokens-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&reordered_path, &reordered_text).expect("write reordered tokens");
+        let err = StaticEmbeddingTable::load_from_paths(
+            &blob_path,
+            &reordered_path,
+            NOMIC_VECTOR_BLOB_SHA256,
+            NOMIC_TOKEN_TABLE_SHA256,
+        )
+        .expect_err("reordered token table refused");
+        let _ = fs::remove_file(&reordered_path);
+        assert_eq!(err.code(), ASTRO_PANEL_CONTRACT_INVALID);
+        assert!(
+            err.message().contains("token table SHA-256"),
+            "expected token SHA rejection, got: {}",
+            err.message()
+        );
+
+        // (b) Duplicate a token: pass the tampered file's OWN SHA so it clears
+        // the content gate and the duplicate-rejection path is what fails.
+        let mut duped = rows.clone();
+        duped[second_nonempty] = duped[first_nonempty];
+        let duped_text = duped.join("\n") + "\n";
+        assert_eq!(duped_text.lines().count(), NOMIC_TOKEN_COUNT);
+        let duped_sha: [u8; 32] = Sha256::digest(duped_text.as_bytes()).into();
+        let duped_path = std::env::temp_dir().join(format!(
+            "astrolabe-duped-tokens-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&duped_path, &duped_text).expect("write duped tokens");
+        let err = StaticEmbeddingTable::load_from_paths(
+            &blob_path,
+            &duped_path,
+            NOMIC_VECTOR_BLOB_SHA256,
+            duped_sha,
+        )
+        .expect_err("duplicate token refused");
+        let _ = fs::remove_file(&duped_path);
+        assert_eq!(err.code(), ASTRO_PANEL_CONTRACT_INVALID);
+        assert!(
+            err.message().contains("duplicate token"),
+            "expected duplicate rejection, got: {}",
+            err.message()
+        );
+    }
+
     #[test]
     fn static_embedding_contract_uses_blob_sha_and_probes_are_deterministic() {
         let table = Arc::clone(test_table());
         for lens in s18_s20_lenses(Arc::clone(&table)).expect("embedding lenses") {
-            assert_eq!(lens.contract().weights_sha, NOMIC_VECTOR_BLOB_SHA256);
+            assert_eq!(lens.contract().weights_sha, nomic_weights_identity());
             let proof = lens
                 .contract()
                 .verify_determinism_probe(&lens, &lens.probe_input().expect("probe input"))

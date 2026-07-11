@@ -11,6 +11,7 @@ use astrolabe_domain::{
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
+use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{
@@ -259,8 +260,14 @@ pub struct SqliteImportQuantizationReport {
 /// Exact skipped-edge accounting for an import batch.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSkipCounters {
-    /// Edges whose source or target node id was absent from the SQLite node table.
+    /// Edges skipped because a source or target node id was genuinely absent from the
+    /// SQLite node table (dangling reference / corrupt or truncated dump).
     pub dangling: usize,
+    /// Edges skipped because a source or target endpoint is a structural node
+    /// (Project/Branch/Folder) that is persisted as a structural row rather than a
+    /// constellation, and therefore has no typed edge target. This is a by-design skip,
+    /// not corruption, so it is counted separately from `dangling`.
+    pub structural_endpoint: usize,
 }
 
 /// Readback verification summary for a SQLite import batch.
@@ -652,6 +659,7 @@ struct IngestLedgerPayload {
     edge_inputs: u64,
     edge_rows_written: u64,
     edge_dangling_skipped: u64,
+    edge_structural_endpoint_skipped: u64,
     expected_base_rows: u64,
     expected_slot_rows: u64,
     expected_graph_rows: u64,
@@ -683,13 +691,7 @@ where
 {
     validate_options(options)?;
 
-    let sqlite_bytes = fs::read(sqlite_path.as_ref()).map_err(|error| {
-        invalid_sqlite(format!(
-            "read SQLite input {}: {error}",
-            sqlite_path.as_ref().display()
-        ))
-    })?;
-    let sqlite_fingerprint = sha256_digest(&sqlite_bytes);
+    let sqlite_fingerprint = fingerprint_sqlite_file(sqlite_path.as_ref())?;
     let ledger_rows_before = ledger_row_count(vault)?;
 
     let connection = Connection::open_with_flags(
@@ -725,6 +727,15 @@ where
     R: SlotRuntime + Sync,
 {
     ensure_no_legacy_series_state(vault)?;
+    if input.nodes.is_empty() {
+        // A dump that yields zero node rows for the requested project imports zero
+        // constellations. Refuse rather than appending an Ingest ledger record for an
+        // empty vault that would otherwise be reported as a successful import.
+        return Err(invalid_sqlite(
+            "SQLite import produced zero nodes for the requested project; \
+             refusing to record an empty import as successful",
+        ));
+    }
     let sqlite_node_vectors = input
         .nodes
         .iter()
@@ -1625,7 +1636,11 @@ fn read_node_vectors(
 
 fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
     if !table_exists(connection, "edges")? {
-        return Ok(Vec::new());
+        return Err(invalid_sqlite(
+            "SQLite dump has no edges table; a Codebase Memory MCP dump always \
+             carries an edges table, so a missing one signals a truncated or \
+             misidentified input",
+        ));
     }
     let mut statement = connection
         .prepare(
@@ -1707,6 +1722,11 @@ fn read_projects(
     sqlite_fingerprint: [u8; 32],
 ) -> IngestResult<Vec<RawProjectRow>> {
     if !table_exists(connection, "projects")? {
+        // Schema-light inputs (row-sink parity fixtures, minimal dumps) may omit the
+        // projects table entirely. Synthesize a provenance-carrying project row from the
+        // source fingerprint so the metadata graph row is still labeled, and rely on the
+        // downstream ≥1-node refusal to reject a genuinely empty/misidentified import
+        // rather than silently succeeding.
         return Ok(vec![RawProjectRow {
             name: options.project.clone(),
             indexed_at: hex_lower(&sqlite_fingerprint),
@@ -1730,11 +1750,13 @@ fn read_projects(
         out.push(row.map_err(|error| invalid_sqlite(format!("read projects row: {error}")))?);
     }
     if out.is_empty() {
-        out.push(RawProjectRow {
-            name: options.project.clone(),
-            indexed_at: hex_lower(&sqlite_fingerprint),
-            root_path: String::new(),
-        });
+        // The projects table exists but does not contain the requested project. This is a
+        // typo'd `--project` or a truncated dump; fail closed instead of fabricating a
+        // project row and reporting a successful-but-empty import.
+        return Err(invalid_sqlite(format!(
+            "project {:?} is absent from the SQLite projects table; no such project to import",
+            options.project
+        )));
     }
     Ok(out)
 }
@@ -1927,7 +1949,13 @@ where
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
     let sqlite_edges = edges.len();
-    let (edge_rows, edge_skips) = prepare_edge_rows(options, &constellations, edges)?;
+    let structural_node_ids = nodes
+        .iter()
+        .filter(|node| node.label.is_structural())
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let (edge_rows, edge_skips) =
+        prepare_edge_rows(options, &constellations, &structural_node_ids, edges)?;
 
     Ok(PreparedBatch {
         constellations,
@@ -2041,6 +2069,7 @@ fn raw_edge_graph_rows(
 fn prepare_edge_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedConstellation],
+    structural_node_ids: &BTreeSet<i64>,
     edges: Vec<RawEdgeRow>,
 ) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
     let cx_by_node = constellations
@@ -2051,12 +2080,21 @@ fn prepare_edge_rows(
     let mut skips = EdgeSkipCounters::default();
 
     for edge in edges {
-        let Some(src) = cx_by_node.get(&edge.source_id).copied() else {
-            skips.dangling += 1;
-            continue;
-        };
-        let Some(dst) = cx_by_node.get(&edge.target_id).copied() else {
-            skips.dangling += 1;
+        let src = cx_by_node.get(&edge.source_id).copied();
+        let dst = cx_by_node.get(&edge.target_id).copied();
+        let (Some(src), Some(dst)) = (src, dst) else {
+            // The edge cannot become a typed constellation-to-constellation row. Attribute
+            // the skip: a genuinely missing endpoint (not a constellation, not a structural
+            // node) is a dangling reference; otherwise the only non-constellation endpoints
+            // are structural nodes (Project/Branch/Folder), which are a by-design skip.
+            let missing_endpoint = |cx: Option<CxId>, node_id: i64| {
+                cx.is_none() && !structural_node_ids.contains(&node_id)
+            };
+            if missing_endpoint(src, edge.source_id) || missing_endpoint(dst, edge.target_id) {
+                skips.dangling += 1;
+            } else {
+                skips.structural_endpoint += 1;
+            }
             continue;
         };
         let kind = EdgeKind::from_cbm_type(&edge.edge_type).ok_or_else(|| {
@@ -2575,26 +2613,45 @@ where
         return Ok((ledger_ref, graph_rows_written, edge_rows_written));
     }
 
-    let ledger_seq = ledger_row_count(vault)? as u64;
-    vault.write_cf_batch_with_ledger_entry(
+    // Deriving the ledger seq from a pre-commit `ledger_row_count` is a TOCTOU under the
+    // supported cross-process concurrency: an interleaved append from another process
+    // would make a fixed index point at someone else's entry. Instead, capture the commit
+    // snapshot seq returned by the atomic group commit and read the newest ledger row as
+    // of exactly that snapshot — later concurrent commits live at higher seqs and are
+    // invisible here, so the entry recovered is unambiguously this run's record.
+    let commit_seq = vault.write_cf_batch_with_ledger_entry(
         rows,
         EntryKind::Ingest,
         SubjectId::Query(sqlite_fingerprint.to_vec()),
         payload,
         ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
     )?;
-    let ledger_ref = read_ledger_ref(vault, ledger_seq)?;
+    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
     Ok((ledger_ref, graph_rows_written, edge_rows_written))
 }
 
-fn read_ledger_ref<C>(vault: &AsterVault<C>, seq: u64) -> IngestResult<LedgerRef>
+/// Recovers the ledger reference for the group commit that produced `commit_seq`.
+///
+/// The read is pinned to `commit_seq`, so the newest Ledger CF row at that snapshot is the
+/// entry this commit staged, regardless of concurrent cross-process appends that land at
+/// later snapshots. Fails closed if the ledger key and encoded entry seq disagree.
+fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: Seq) -> IngestResult<LedgerRef>
 where
     C: Clock,
 {
-    let bytes = vault
-        .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(seq))?
-        .ok_or_else(|| readback_mismatch(format!("Ledger CF row {seq} missing after import")))?;
-    let entry = decode(&bytes)?;
+    let (key, value) = vault
+        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
+        .into_iter()
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .ok_or_else(|| readback_mismatch("Ledger CF empty at import commit snapshot"))?;
+    let key_seq = parse_aster_ledger_seq(&key)?;
+    let entry = decode(&value)?;
+    if entry.seq != key_seq {
+        return Err(readback_mismatch(format!(
+            "Ledger CF key seq {key_seq} does not match encoded entry seq {}",
+            entry.seq
+        )));
+    }
     Ok(LedgerRef {
         seq: entry.seq,
         hash: entry.entry_hash,
@@ -3408,6 +3465,7 @@ fn ingest_ledger_payload(
         edge_inputs: prepared.edge_rows.len() as u64,
         edge_rows_written: stats.edge_rows_written as u64,
         edge_dangling_skipped: prepared.edge_skips.dangling as u64,
+        edge_structural_endpoint_skipped: prepared.edge_skips.structural_endpoint as u64,
         expected_base_rows: prepared.constellations.len() as u64,
         expected_slot_rows: prepared
             .constellations
@@ -3427,8 +3485,11 @@ fn ledger_row_count<C>(vault: &AsterVault<C>) -> IngestResult<usize>
 where
     C: Clock,
 {
+    // Count by scanning keys only. Materializing every Ledger CF value (three times per
+    // import) just to take a length needlessly copied the entire ledger payload set into
+    // memory; the key-only scan keeps the count O(rows) in keys, not values.
     Ok(vault
-        .scan_cf_range_at(
+        .scan_cf_range_keys_at(
             vault.latest_seq(),
             ColumnFamily::Ledger,
             &ledger_range(0, u64::MAX),
@@ -3730,6 +3791,34 @@ fn hex_value(value: u8) -> Option<u8> {
 
 fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Pure I/O read-buffer size for streaming the SQLite fingerprint. This is an
+/// implementation detail of how bytes are fed to SHA-256, not a threshold or measurement:
+/// the fingerprint value is identical for any positive buffer size.
+const FINGERPRINT_CHUNK_BYTES: usize = 1 << 20;
+
+/// Streams the SQLite input through SHA-256 in bounded chunks.
+///
+/// Fingerprinting formerly read the entire dump into memory (`fs::read`), so a multi-GB
+/// dump was held in full alongside the parsed graph. Streaming keeps peak memory bounded
+/// by [`FINGERPRINT_CHUNK_BYTES`] while producing the identical digest.
+fn fingerprint_sqlite_file(path: &Path) -> IngestResult<[u8; 32]> {
+    use std::io::Read;
+    let read_error = |error: std::io::Error| {
+        invalid_sqlite(format!("read SQLite input {}: {error}", path.display()))
+    };
+    let mut file = fs::File::open(path).map_err(&read_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; FINGERPRINT_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(&read_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -5035,5 +5124,281 @@ mod tests {
             );
             assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn streamed_fingerprint_equals_whole_file_sha256_across_chunk_boundaries() {
+        let path = temp_db("fingerprint-stream");
+        // Multi-chunk payload with a partial final chunk to exercise the streaming loop's
+        // chunk boundaries.
+        let len = FINGERPRINT_CHUNK_BYTES * 2 + 12_345;
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            bytes.push(((i * 31 + 7) % 256) as u8);
+        }
+        fs::write(&path, &bytes).expect("write fingerprint fixture");
+
+        let streamed = fingerprint_sqlite_file(&path).expect("stream fingerprint");
+        // The streamed digest must be byte-identical to hashing the whole file at once.
+        assert_eq!(streamed, sha256_digest(&bytes));
+        assert_eq!(
+            streamed,
+            sha256_digest(&fs::read(&path).expect("read back"))
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ledger_row_count_matches_appended_entries() {
+        let vault = vault();
+        assert_eq!(ledger_row_count(&vault).expect("empty ledger count"), 0);
+        for tag in 0..3u8 {
+            vault
+                .append_ledger_entry(
+                    EntryKind::Ingest,
+                    SubjectId::Query(vec![tag]),
+                    b"{}".to_vec(),
+                    ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+                )
+                .expect("append ledger entry");
+        }
+        // The key-only count must equal the number of persisted ledger rows.
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 3);
+    }
+
+    #[test]
+    fn ledger_ref_at_commit_ignores_later_concurrent_appends() {
+        // Models the supported cross-process race: this run's group commit lands, then an
+        // interleaved append from another process lands at a later snapshot. Recovering the
+        // run record must resolve to this run's entry, not the later one.
+        let vault = vault();
+        let commit_seq = vault
+            .write_cf_batch_with_ledger_entry(
+                vec![(
+                    ColumnFamily::Graph,
+                    b"astrolabe:test-run-record".to_vec(),
+                    b"v1".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"this-run".to_vec()),
+                b"{}".to_vec(),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("run-record group commit");
+        let run_record = ledger_ref_at_commit(&vault, commit_seq).expect("recover run record");
+
+        // An interleaved cross-process append lands at a strictly later snapshot.
+        let interleaved = vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Query(b"other-process".to_vec()),
+                b"{}".to_vec(),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("interleaved append");
+        assert_ne!(run_record.seq, interleaved.seq);
+
+        // Pinned to the run's commit snapshot, recovery still names the run's own entry even
+        // though a newer entry now exists. (A read at the latest snapshot would wrongly
+        // return the interleaved entry.)
+        let recovered = ledger_ref_at_commit(&vault, commit_seq).expect("recover after append");
+        assert_eq!(recovered.seq, run_record.seq);
+        assert_eq!(recovered.hash, run_record.hash);
+
+        let latest = ledger_ref_at_commit(&vault, vault.latest_seq()).expect("latest ref");
+        assert_eq!(latest.seq, interleaved.seq);
+        assert_eq!(latest.hash, interleaved.hash);
+    }
+
+    fn structural_endpoint_fixture(path: &Path) {
+        let connection = create_db(path);
+        let function = insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            10,
+            12,
+            r#"{"language":"rust","source_snippet":"fn add() -> i32 { 1 }","signature":"fn add() -> i32"}"#,
+        );
+        let project = insert_node(
+            &connection,
+            "Project",
+            "demo",
+            "demo",
+            "",
+            0,
+            0,
+            r#"{"source_snippet":"demo project"}"#,
+        );
+        // Structural-endpoint edge: the Project (a structural node persisted as a
+        // structural row, not a constellation) contains the function. It must be counted
+        // as a structural-endpoint skip, not as a dangling reference.
+        insert_edge(&connection, project, function, "CONTAINS", "{}");
+        // Genuinely dangling edge: target 9999 is not present in the node table at all.
+        insert_edge(&connection, function, 9999, "CALLS", "{}");
+    }
+
+    #[test]
+    fn structural_endpoint_edges_counted_separately_from_dangling() {
+        let path = temp_db("structural-endpoint");
+        structural_endpoint_fixture(&path);
+        let vault = vault();
+
+        let report = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import sqlite");
+
+        // The structural-endpoint edge and the dangling edge are attributed to distinct
+        // counters; neither becomes a typed edge row.
+        assert_eq!(report.edge_skips.structural_endpoint, 1);
+        assert_eq!(report.edge_skips.dangling, 1);
+        assert_eq!(report.sqlite_edges, 2);
+        assert_eq!(report.edge_rows_written, 0);
+
+        // FSV: the persisted ledger payload records the split accounting so operators can
+        // tell a corrupt dump (dangling) from a by-design structural skip.
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(report.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let entry = decode(&ledger).expect("decode ledger");
+        let payload: Value = serde_json::from_slice(&entry.payload).expect("payload json");
+        assert_eq!(
+            payload
+                .get("edge_structural_endpoint_skipped")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload.get("edge_dangling_skipped").and_then(Value::as_u64),
+            Some(1)
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn import_refuses_project_absent_from_projects_table() {
+        // A real Codebase Memory MCP dump carries a projects table. A typo'd `--project`
+        // (or a dump for a different project) must fail closed instead of synthesizing a
+        // project row and reporting a successful-but-empty import.
+        let path = temp_db("absent-project");
+        let connection = create_db(&path);
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                     name TEXT PRIMARY KEY,
+                     indexed_at TEXT NOT NULL,
+                     root_path TEXT NOT NULL
+                 );
+                 INSERT INTO projects(name, indexed_at, root_path)
+                     VALUES ('other', 'idx', '/tmp/other');",
+            )
+            .expect("create projects table");
+        insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            1,
+            2,
+            r#"{"source_snippet":"x"}"#,
+        );
+        drop(connection);
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("absent project must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(
+            err.to_string()
+                .contains("absent from the SQLite projects table"),
+            "{err}"
+        );
+        // Fail closed: no persisted rows and no ledger record for the refused import.
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+                .expect("scan base")
+                .is_empty()
+        );
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+                .expect("scan graph")
+                .is_empty()
+        );
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn import_refuses_zero_nodes_for_project() {
+        // A truncated dump with the schema present but no node rows imports zero
+        // constellations; it must refuse rather than record an empty vault as a success.
+        let path = temp_db("zero-nodes");
+        drop(create_db(&path));
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("zero nodes must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(err.to_string().contains("zero nodes"), "{err}");
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+                .expect("scan base")
+                .is_empty()
+        );
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn import_refuses_missing_edges_table() {
+        // A missing edges table signals a truncated or misidentified input and must be
+        // treated as invalid rather than yielding a silently edge-free import.
+        let path = temp_db("missing-edges");
+        let connection = Connection::open(&path).expect("open sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE nodes (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project TEXT NOT NULL,
+                     label TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     qualified_name TEXT NOT NULL,
+                     file_path TEXT DEFAULT '',
+                     start_line INTEGER DEFAULT 0,
+                     end_line INTEGER DEFAULT 0,
+                     properties TEXT DEFAULT '{}',
+                     UNIQUE(project, qualified_name)
+                 );",
+            )
+            .expect("create nodes-only schema");
+        insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            1,
+            2,
+            r#"{"source_snippet":"x"}"#,
+        );
+        drop(connection);
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("missing edges table must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(err.to_string().contains("no edges table"), "{err}");
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
     }
 }
