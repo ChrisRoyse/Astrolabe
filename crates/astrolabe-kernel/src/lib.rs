@@ -1282,7 +1282,7 @@ fn validate_label_propagation_knob(value: u64) -> astrolabe_domain::Result<()> {
 
 fn validate_seed_confidence(seed: &LabelSeed) -> astrolabe_domain::Result<()> {
     let value = seed.confidence_millipoints;
-    if value < MIN_SEED_CONFIDENCE_MILLIPOINTS || value > MAX_SEED_CONFIDENCE_MILLIPOINTS {
+    if !(MIN_SEED_CONFIDENCE_MILLIPOINTS..=MAX_SEED_CONFIDENCE_MILLIPOINTS).contains(&value) {
         return Err(astrolabe_domain::DomainError::new(
             ASTRO_LABEL_SEED_CONFIDENCE_RANGE,
             format!(
