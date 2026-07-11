@@ -3658,11 +3658,8 @@ fn provenance_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
         {
             store.reproductions.insert(record.answer_id.clone(), record);
         }
-        if let Some(manifest) = pack_manifest_from_properties(
-            &properties,
-            &store.vault_fingerprint,
-            &mut skipped_properties,
-        ) {
+        if let Some(manifest) = pack_manifest_from_properties(&properties, &mut skipped_properties)
+        {
             store.manifests.insert(manifest.pack_id.clone(), manifest);
         }
     }
@@ -3773,21 +3770,15 @@ fn answer_trace_from_properties(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let max_seq = [
-        kernel_entry.as_ref(),
-        fusion_weights_ref.as_ref(),
-        guard_verdict_ref.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|pointer| pointer.seq)
-    .chain(hops.iter().map(|hop| hop.ledger.seq))
-    .max()
-    .unwrap_or(0);
-    let freshness = value
-        .get("freshness")
-        .and_then(freshness_from_value)
-        .unwrap_or_else(|| Freshness::fresh(max_seq));
+    // The freshness block carries the answer's as-of ledger watermark; downstream
+    // freshness is measured as the gap between it and the current head. A missing block
+    // used to be fabricated as `fresh(max input seq)`, an unfalsifiable freshness claim.
+    // Require it: an absent or malformed freshness block means the trace is skipped
+    // (counted in `skipped_properties`), never defaulted to fresh.
+    let Some(freshness) = value.get("freshness").and_then(freshness_from_value) else {
+        *skipped_properties += 1;
+        return None;
+    };
     Some(AnswerTrace {
         answer_id: answer_id.to_string(),
         kernel_entry,
@@ -3881,7 +3872,6 @@ fn reproduce_record_from_properties(
 
 fn pack_manifest_from_properties(
     properties: &Value,
-    default_vault_fingerprint: &str,
     skipped_properties: &mut usize,
 ) -> Option<PackManifest> {
     let value = properties
@@ -3899,17 +3889,21 @@ fn pack_manifest_from_properties(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (Some(pack_id), Some(ledger_ref), Some(member_hash)) = (pack_id, ledger_ref, member_hash)
-    else {
-        *skipped_properties += 1;
-        return None;
-    };
+    // `vault_fingerprint` is one of the four checks a manifest is verified against, so it
+    // is required, not defaulted. A manifest declaring no fingerprint used to be stamped
+    // with the store default — letting a fingerprint-less manifest "verify". It is now a
+    // required field: absent/empty means the manifest is skipped (counted), not fabricated.
     let vault_fingerprint = value
         .get("vault_fingerprint")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default_vault_fingerprint);
+        .filter(|value| !value.is_empty());
+    let (Some(pack_id), Some(ledger_ref), Some(member_hash), Some(vault_fingerprint)) =
+        (pack_id, ledger_ref, member_hash, vault_fingerprint)
+    else {
+        *skipped_properties += 1;
+        return None;
+    };
     Some(PackManifest {
         pack_id: pack_id.to_string(),
         ledger_ref,
@@ -4126,14 +4120,23 @@ fn provenance_store_for_project(
         .into());
     }
     let verify = astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)?;
-    let chain_hash = read_config_value(
-        cache_dir,
-        &metadata_key(project, "lowered_vault_fingerprint_sha256"),
-    )?
-    .unwrap_or_else(|| store.ledger_head.chain_hash.clone());
-    let ledger_seq = read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(store.ledger_head.seq);
+    // Verify-relevant metadata must be present and well-formed. A missing fingerprint
+    // used to silently fall back to the ledger chain hash and a corrupt `ledger_seq`
+    // silently fell back to the persisted head seq, fabricating verification inputs and
+    // a freshness watermark. Both now fail closed with a coded `{code,message,remediation}`
+    // error rather than reading as verified/fresh.
+    let chain_hash = astrolabe_provenance::require_verify_metadata(
+        "lowered_vault_fingerprint_sha256",
+        read_config_value(
+            cache_dir,
+            &metadata_key(project, "lowered_vault_fingerprint_sha256"),
+        )?
+        .as_deref(),
+    )?;
+    let ledger_seq = astrolabe_provenance::require_ledger_seq(
+        "ledger_seq",
+        read_config_value(cache_dir, &metadata_key(project, "ledger_seq"))?.as_deref(),
+    )?;
     let ledger_head = LedgerPointer::new(ledger_seq, chain_hash.clone());
     store.vault_fingerprint = chain_hash;
     store.ledger_head = ledger_head.clone();
@@ -11576,6 +11579,7 @@ mod tests {
                         "provenance_manifest": {
                             "pack_id":"pack:auth",
                             "ledger_ref":{"seq":24,"chain_hash":"hash-24"},
+                            "vault_fingerprint":"2222222222222222222222222222222222222222222222222222222222222222",
                             "member_hash":"members-auth"
                         }
                     }"#.to_string(),
