@@ -18,7 +18,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = "astrolabe_egress_deny"
 SHADOW_VAULT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-TRACE_SYSCALLS = ("connect(", "bind(", "listen(", "socket(")
+# #92: datagram sends are traced AND denied — an unconnected UDP socket can
+# exfiltrate via sendto/sendmsg/sendmmsg without ever calling connect(2).
+SEND_SYSCALLS = ("sendto(", "sendmsg(", "sendmmsg(")
+TRACE_SYSCALLS = ("connect(", "bind(", "listen(", "socket(") + SEND_SYSCALLS
+INJECTED_SYSCALLS = "connect,sendto,sendmsg,sendmmsg"
 
 
 def run(argv, *, env=None, timeout=240):
@@ -92,7 +96,7 @@ def strace_prefix(strace, trace_path):
         "-e",
         "trace=network",
         "-e",
-        "inject=connect:error=ENETUNREACH",
+        f"inject={INJECTED_SYSCALLS}:error=ENETUNREACH",
     ]
 
 
@@ -135,6 +139,16 @@ def trace_report(trace_path):
     text = Path(trace_path).read_text(encoding="utf-8", errors="replace")
     lines = [line for line in text.splitlines() if any(syscall in line for syscall in TRACE_SYSCALLS)]
     blocked = [line for line in lines if "connect(" in line and "(INJECTED)" in line]
+    injected_sends = [
+        line
+        for line in lines
+        if any(syscall in line for syscall in SEND_SYSCALLS) and "(INJECTED)" in line
+    ]
+    # #92: denied datagram sends to non-local destinations are egress violations;
+    # loopback/AF_UNIX-destined sends are counted and labeled separately so the
+    # whitelist is visible, never silent.
+    blocked_sends = [line for line in injected_sends if not is_local_send_dest(line)]
+    local_blocked_sends = [line for line in injected_sends if is_local_send_dest(line)]
     non_loopback_binds = [
         line
         for line in lines
@@ -147,6 +161,10 @@ def trace_report(trace_path):
         "network_syscall_count": len(lines),
         "blocked_connect_count": len(blocked),
         "blocked_connects": blocked[:10],
+        "blocked_send_count": len(blocked_sends),
+        "blocked_sends": blocked_sends[:10],
+        "local_blocked_send_count": len(local_blocked_sends),
+        "local_blocked_sends": local_blocked_sends[:10],
         "non_loopback_binds": non_loopback_binds[:10],
     }
 
@@ -159,10 +177,19 @@ def is_loopback_bind(line):
     )
 
 
+def is_local_send_dest(line):
+    """True for datagram sends whose destination is loopback or an AF_UNIX path."""
+    return "AF_UNIX" in line or is_loopback_bind(line)
+
+
 def assert_trace_clean(label, report):
     if report["blocked_connect_count"]:
         raise SystemExit(
             f"{label} attempted denied network egress: {json.dumps(report['blocked_connects'], indent=2)}"
+        )
+    if report["blocked_send_count"]:
+        raise SystemExit(
+            f"{label} attempted denied datagram egress: {json.dumps(report['blocked_sends'], indent=2)}"
         )
     if report["non_loopback_binds"]:
         raise SystemExit(
@@ -379,9 +406,15 @@ def main():
             "schema": "astrolabe.egress_deny.v1",
             "status": "verified",
             "project": PROJECT,
-            "harness": "strace_connect_enetunreach",
+            "harness": "strace_connect_send_enetunreach",
             "blocked_connect_count": sum(
                 report["blocked_connect_count"] for report in reports.values()
+            ),
+            "blocked_send_count": sum(
+                report["blocked_send_count"] for report in reports.values()
+            ),
+            "local_blocked_send_count": sum(
+                report["local_blocked_send_count"] for report in reports.values()
             ),
             "index_shadow": {
                 "calyx": index_content.get("calyx"),

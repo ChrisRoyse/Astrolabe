@@ -76,6 +76,55 @@ def main() -> int:
             if actual != "/usr/bin/strace":
                 raise AssertionError(f"unexpected strace path: {actual!r}")
 
+    # #92: datagram sends must be traced AND injected — an unconnected UDP socket
+    # exfiltrates via sendto/sendmsg/sendmmsg without ever calling connect(2).
+    for syscall in ("sendto(", "sendmsg(", "sendmmsg("):
+        if syscall not in harness.TRACE_SYSCALLS:
+            raise AssertionError(f"{syscall!r} missing from TRACE_SYSCALLS")
+    prefix = harness.strace_prefix("/usr/bin/strace", "/tmp/trace")
+    inject = next(arg for arg in prefix if arg.startswith("inject="))
+    for syscall in ("connect", "sendto", "sendmsg", "sendmmsg"):
+        if syscall not in inject:
+            raise AssertionError(f"{syscall!r} missing from strace injection: {inject!r}")
+
+    # Synthetic-trace policy check: non-local injected datagram sends are
+    # violations; loopback/AF_UNIX injected sends are counted and labeled but
+    # not fatal; the report shape feeds assert_trace_clean fail-closed.
+    import tempfile
+
+    remote_send = (
+        '1000  sendto(3, "x", 1, 0, {sa_family=AF_INET, sin_port=htons(53), '
+        'sin_addr=inet_addr("8.8.8.8")}, 16) = -1 ENETUNREACH (INJECTED)'
+    )
+    local_send = (
+        '1000  sendto(4, "x", 1, 0, {sa_family=AF_INET, sin_port=htons(514), '
+        'sin_addr=inet_addr("127.0.0.1")}, 16) = -1 ENETUNREACH (INJECTED)'
+    )
+    unix_send = (
+        '1000  sendmsg(5, {msg_name={sa_family=AF_UNIX, '
+        'sun_path="/run/x.sock"}, ...}, 0) = -1 ENETUNREACH (INJECTED)'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        trace = Path(tmp) / "synthetic.trace"
+        trace.write_text(
+            "\n".join([remote_send, local_send, unix_send]) + "\n", encoding="utf-8"
+        )
+        report = harness.trace_report(trace)
+        if report["blocked_send_count"] != 1 or "8.8.8.8" not in report["blocked_sends"][0]:
+            raise AssertionError(f"remote datagram send not flagged: {report!r}")
+        if report["local_blocked_send_count"] != 2:
+            raise AssertionError(f"local datagram sends not labeled: {report!r}")
+        expect_exit(
+            lambda: harness.assert_trace_clean("synthetic", report),
+            "denied datagram egress",
+        )
+
+        trace.write_text("\n".join([local_send, unix_send]) + "\n", encoding="utf-8")
+        local_only = harness.trace_report(trace)
+        if local_only["blocked_send_count"] != 0:
+            raise AssertionError(f"local-only sends must not be violations: {local_only!r}")
+        harness.assert_trace_clean("synthetic-local", local_only)
+
     print("egress platform policy self-test passed")
     return 0
 
