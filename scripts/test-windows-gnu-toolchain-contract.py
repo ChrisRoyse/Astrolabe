@@ -14,6 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
     "patches/cbm/Makefile.cbm",
     "scripts/check-windows-gnu-toolchain-contract.py",
     "scripts/windows-gnu-toolchain.ps1",
@@ -32,6 +34,13 @@ def rewrite(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     if text.count(old) != 1:
         raise AssertionError(f"expected one fixture occurrence of {old!r}")
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def rewrite_all(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        raise AssertionError(f"expected at least one fixture occurrence of {old!r}")
     path.write_text(text.replace(old, new), encoding="utf-8")
 
 
@@ -127,6 +136,54 @@ def main() -> int:
             "ASTRO_HOST_MAINTENANCE_REMOVED",
         )
         expect_failure(run_checker(fixture), "host maintenance")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "ASTRO_DISM_PROCESS_ACTIVE",
+            "ASTRO_DISM_PROCESS_IGNORED",
+        )
+        expect_failure(run_checker(fixture), "active DISM servicing")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "Assert-NoActiveHostServicing\nAssert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root",
+            "Write-Output 'DISM preflight removed'\nAssert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root",
+        )
+        expect_failure(run_checker(fixture), "active DISM servicing")
+
+        copy_fixture(fixture)
+        rewrite_all(
+            runner,
+            "ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE",
+            "ASTRO_HOST_MAINTENANCE_LOCK_IGNORED",
+        )
+        expect_failure(run_checker(fixture), "owner-bound host maintenance")
+
+        copy_fixture(fixture)
+        rewrite_all(
+            runner,
+            "result_paths",
+            "unowned_paths",
+        )
+        expect_failure(run_checker(fixture), "owner-bound host maintenance")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "ASTRO_HOST_MAINTENANCE_STALE",
+            "ASTRO_HOST_MAINTENANCE_REMOVED",
+        )
+        expect_failure(run_checker(fixture), "owner-bound host maintenance")
+
+        copy_fixture(fixture)
+        rewrite(
+            fixture / "AGENTS.md",
+            "active native DISM",
+            "untracked servicing",
+        )
+        expect_failure(run_checker(fixture), "doctrine")
 
         copy_fixture(fixture)
         rewrite(

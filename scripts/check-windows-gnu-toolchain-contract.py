@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "windows-gnu-toolchain.ps1"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
 GITIGNORE = ROOT / ".gitignore"
+AGENTS = ROOT / "AGENTS.md"
+CLAUDE = ROOT / "CLAUDE.md"
 
 
 def require(condition: bool, message: str) -> None:
@@ -24,6 +26,8 @@ def main() -> None:
     runner = RUNNER.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
     gitignore = GITIGNORE.read_text(encoding="utf-8")
+    agents = AGENTS.read_text(encoding="utf-8")
+    claude = CLAUDE.read_text(encoding="utf-8")
 
     require(
         '$ExpectedWorkspace = "C:\\code\\Astrolabe"' in runner,
@@ -120,15 +124,57 @@ def main() -> None:
         "the launcher must confine and remove child temporary output within the workspace",
     )
     require(
+        '$HostServicingProcessNames = @("Dism", "DismHost")' in runner
+        and "function Assert-NoActiveHostServicing" in runner
+        and 'Get-Process -Name $name -ErrorAction SilentlyContinue' in runner
+        and 'Get-Process -Id $servicingProcess.Id -ErrorAction SilentlyContinue'
+        in runner
+        and "ASTRO_DISM_PROCESS_ACTIVE" in runner
+        and (
+            "Assert-NoActiveHostServicing\n"
+            "Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root"
+        )
+        in runner
+        and appears_before(
+            runner,
+            "ASTRO_DISM_PROCESS_ACTIVE",
+            "target must be absent before toolchain work",
+        ),
+        "the launcher must fail before target creation while active DISM servicing exists",
+    )
+    require(
         '$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"'
         in runner
+        and "function Assert-HostMaintenanceBoundary" in runner
+        and "owner_pids" in runner
+        and "result_paths" in runner
+        and '$requiredProperties = @("issue", "owner_pids", "result_paths", "started", "purpose")'
+        in runner
+        and "Test-PathUnderRoot -Path ([string]$resultPath) -Root $WorkspaceRoot"
+        in runner
+        and 'Get-Process -Id $ownerPid -ErrorAction SilentlyContinue' in runner
+        and "ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE" in runner
         and "ASTRO_HOST_MAINTENANCE_ACTIVE" in runner
+        and "ASTRO_HOST_MAINTENANCE_STALE" in runner
+        and (
+            "Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock "
+            "-WorkspaceRoot $root"
+        )
+        in runner
+        and "Remove-Item -LiteralPath $hostMaintenanceLock" not in runner
         and appears_before(
             runner,
             "ASTRO_HOST_MAINTENANCE_ACTIVE",
             "target must be absent before toolchain work",
         ),
-        "the launcher must fail before target creation while host maintenance is active",
+        "the launcher must preserve owner-bound host maintenance and fail closed on live, stale, or unreadable locks",
+    )
+    require(
+        "active native DISM" in agents
+        and "owner-bound host-maintenance lock" in agents
+        and "active native DISM" in claude
+        and "owner-bound host-maintenance lock" in claude,
+        "doctrine must require active-DISM refusal and owner-bound host-maintenance serialization",
     )
     require(
         '$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"'

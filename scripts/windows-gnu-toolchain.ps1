@@ -37,6 +37,7 @@ $WslUninstallRegistryRoots = @(
 $WslDistributionRegistryRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
 $ForbiddenWslServiceNames = @("WSLService", "LxssManager")
 $ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")
+$HostServicingProcessNames = @("Dism", "DismHost")
 $RequiredTools = @(
     "gcc.exe",
     "g++.exe",
@@ -65,6 +66,90 @@ function Remove-LauncherLockFile {
     if (Test-Path -LiteralPath $LockPath) {
         throw "launcher lock cleanup failed: $LockPath remains"
     }
+}
+
+function Assert-NoActiveHostServicing {
+    $activeServicingProcesses = @()
+    foreach ($name in $HostServicingProcessNames) {
+        foreach ($servicingProcess in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+            if ($null -ne (Get-Process -Id $servicingProcess.Id -ErrorAction SilentlyContinue)) {
+                $activeServicingProcesses += "$($servicingProcess.ProcessName):$($servicingProcess.Id)"
+            }
+        }
+    }
+    if ($activeServicingProcesses.Count -gt 0) {
+        throw "HOST_BOUNDARY[ASTRO_DISM_PROCESS_ACTIVE]: native toolchain work is blocked while Windows DISM servicing is active; wait for the owning host-maintenance issue to record completion: $($activeServicingProcesses -join ', ')"
+    }
+}
+
+function Assert-HostMaintenanceBoundary {
+    param([string]$LockPath, [string]$WorkspaceRoot)
+
+    if (-not (Test-Path -LiteralPath $LockPath)) {
+        return
+    }
+
+    $lockRaw = $null
+    $lockState = $null
+    try {
+        $lockRaw = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($lockRaw)) {
+            $lockState = ConvertFrom-Json -InputObject $lockRaw -ErrorAction Stop
+        }
+    }
+    catch {
+        $lockState = $null
+    }
+    if ($null -eq $lockState) {
+        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock exists but is not readable owner-bound JSON; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
+    }
+
+    $requiredProperties = @("issue", "owner_pids", "result_paths", "started", "purpose")
+    foreach ($propertyName in $requiredProperties) {
+        if (-not $lockState.PSObject.Properties[$propertyName]) {
+            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock is missing required property '$propertyName'; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
+        }
+    }
+
+    $ownerPidValues = @($lockState.owner_pids)
+    if ($ownerPidValues.Count -eq 0) {
+        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock names no owner_pids; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
+    }
+
+    $resultPaths = @($lockState.result_paths)
+    if ($resultPaths.Count -eq 0) {
+        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock names no result_paths; never remove it until the owning issue records direct process-state evidence: $LockPath"
+    }
+    foreach ($resultPath in $resultPaths) {
+        if (-not (Test-PathUnderRoot -Path ([string]$resultPath) -Root $WorkspaceRoot)) {
+            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: every host-maintenance result path must stay under the canonical workspace; never remove the lock until the owning issue records direct process-state evidence: $LockPath"
+        }
+    }
+
+    $ownerPids = @()
+    foreach ($value in $ownerPidValues) {
+        $ownerPid = 0
+        if (-not [int]::TryParse([string]$value, [ref]$ownerPid) -or $ownerPid -le 0) {
+            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock contains an invalid owner pid; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
+        }
+        $ownerPids += $ownerPid
+    }
+    $ownerPids = @($ownerPids | Sort-Object -Unique)
+
+    $liveOwners = @()
+    foreach ($ownerPid in $ownerPids) {
+        $owner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+        if ($null -ne $owner) {
+            $liveOwners += "$($owner.ProcessName):$ownerPid"
+        }
+    }
+    $issue = if ($lockState.PSObject.Properties['issue']) { $lockState.issue } else { "unknown" }
+    $purpose = if ($lockState.PSObject.Properties['purpose']) { $lockState.purpose } else { "unknown" }
+    if ($liveOwners.Count -gt 0) {
+        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_ACTIVE]: owner-bound host maintenance is active (issue=$issue, purpose=$purpose, owners=$($liveOwners -join ', ')); never remove or replace its lock or result paths: $LockPath"
+    }
+
+    throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_STALE]: host-maintenance owners are no longer live (issue=$issue, owner_pids=$($ownerPids -join ', ')); record direct completion/cleanup evidence on the owning issue before manually removing the lock and its owned paths: $LockPath"
 }
 
 function Test-PathUnderRoot {
@@ -560,9 +645,8 @@ $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
 $hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"
-if (Test-Path -LiteralPath $hostMaintenanceLock) {
-    throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_ACTIVE]: native toolchain work is blocked while host maintenance is active: $hostMaintenanceLock"
-}
+Assert-NoActiveHostServicing
+Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root
 $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 if (Test-Path -LiteralPath $launcherLock) {
     $lockRaw = Get-Content -LiteralPath $launcherLock -Raw -ErrorAction SilentlyContinue
