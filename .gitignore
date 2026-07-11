@@ -60,6 +60,7 @@ tmp/
 .tmp/
 .cache/
 /.toolchains/
+/.sccache/
 *.log
 *.tmp
 *.sqlite

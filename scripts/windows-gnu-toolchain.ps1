@@ -33,6 +33,16 @@ $RipgrepArchiveName = "ripgrep-14.1.1-x86_64-pc-windows-msvc.zip"
 $RipgrepArchiveUrl = "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip"
 $ExpectedRipgrepSha256 = "D0F534024C42AFD6CB4D38907C25CD2B249B79BBE6CC1DBEE8E3E37C2B6E25A1"
 $RipgrepDirectoryName = "ripgrep-14.1.1-x86_64-pc-windows-msvc"
+$SccacheVersion = "0.16.0"
+$SccacheArchiveName = "sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
+$SccacheArchiveUrl = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
+$SccacheArchiveSha256 = "B8514ED7552E148B0A032114F745118DCB801791ADAFAFEAF9935E4BFB0EDF1B"
+$SccacheDirectoryName = "sccache-0.16.0-x86_64-pc-windows-msvc"
+$SccacheExtractedDirectoryName = "sccache-v0.16.0-x86_64-pc-windows-msvc"
+$ExpectedSccacheVersion = "0.16.0"
+# #190: content-addressed compiler-cache budget. The cache lives in a launcher-owned
+# workspace-local dir that survives the target/ wipe, so this bounds on-disk growth.
+$SccacheCacheSize = "20G"
 $GitInstallRoot = "C:\Program Files\Git"
 $RequiredTools = @(
     "gcc.exe",
@@ -352,6 +362,62 @@ function Remove-StalePinnedRipgrep {
         }
 }
 
+function Install-PinnedSccache {
+    param([string]$ToolsRoot, [string]$SccacheRoot)
+
+    if (Test-Path -LiteralPath $SccacheRoot) {
+        return
+    }
+
+    New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
+    $staging = Join-Path $ToolsRoot ".installing-sccache-$PID"
+    try {
+        New-Item -ItemType Directory -Path $staging -ErrorAction Stop | Out-Null
+        $archive = Join-Path $staging $SccacheArchiveName
+        & curl.exe --fail --location --retry 3 --output $archive $SccacheArchiveUrl
+        Require-Success "download of $SccacheArchiveName"
+
+        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        if ($actualHash -ne $SccacheArchiveSha256) {
+            throw "pinned sccache archive hash mismatch: expected $SccacheArchiveSha256, got $actualHash"
+        }
+
+        $sevenZip = Get-SevenZip
+        & $sevenZip x "-o$staging" $archive | Out-Null
+        Require-Success "extraction of $SccacheArchiveName"
+
+        $extractedRoot = Join-Path $staging $SccacheExtractedDirectoryName
+        Require-Path (Join-Path $extractedRoot "sccache.exe") "archive did not contain the expected sccache binary"
+        if (Test-Path -LiteralPath $SccacheRoot) {
+            throw "pinned sccache destination appeared during installation: $SccacheRoot"
+        }
+        Move-Item -LiteralPath $extractedRoot -Destination $SccacheRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force
+        }
+    }
+}
+
+function Remove-StalePinnedSccache {
+    param([string]$ToolsRoot, [string]$SccacheRoot)
+
+    if (-not (Test-Path -LiteralPath $ToolsRoot -PathType Container)) {
+        return
+    }
+
+    $currentRoot = (Resolve-Path -LiteralPath $SccacheRoot -ErrorAction Stop).Path
+    Get-ChildItem -LiteralPath $ToolsRoot -Directory -Force |
+        Where-Object {
+            $_.Name -match '^(?:sccache-[0-9]+[.][0-9]+[.][0-9]+-x86_64-pc-windows-msvc)$' -and
+            -not [string]::Equals($_.FullName, $currentRoot, [StringComparison]::OrdinalIgnoreCase)
+        } |
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
+}
+
 function Ensure-BundledMakeAlias {
     param([string]$MingwBin)
 
@@ -390,7 +456,9 @@ function Set-ToolchainEnvironment {
         [string]$CppcheckRoot,
         [string]$RipgrepRoot,
         [string]$GitBin,
-        [string]$GitUsrBin
+        [string]$GitUsrBin,
+        [string]$SccacheExe,
+        [string]$SccacheDir
     )
 
     $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$RipgrepRoot;$GitUsrBin;$GitBin;$env:PATH"
@@ -408,6 +476,15 @@ function Set-ToolchainEnvironment {
     $env:CLANG_FORMAT = Join-Path $LlvmBin "clang-format.exe"
     $env:CPPCHECK = Join-Path $CppcheckRoot "cppcheck.exe"
     $env:RIPGREP = Join-Path $RipgrepRoot "rg.exe"
+    # #190: route rustc through the content-addressed sccache so compilation reuse
+    # survives the mandated target/ wipe. SCCACHE_DIR is a launcher-owned,
+    # workspace-local dir (sibling of .toolchains/.tmp, gitignored) that the
+    # target/temp cleanup below deliberately does NOT delete. sccache refuses to
+    # cache incremental artifacts, so incremental compilation must be disabled.
+    $env:RUSTC_WRAPPER = $SccacheExe
+    $env:SCCACHE_DIR = $SccacheDir
+    $env:SCCACHE_CACHE_SIZE = $SccacheCacheSize
+    $env:CARGO_INCREMENTAL = "0"
 }
 
 function Set-WorkspaceTempEnvironment {
@@ -432,7 +509,7 @@ function Set-WorkspaceTempEnvironment {
 }
 
 function Test-PinnedToolchain {
-    param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot)
+    param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot, [string]$SccacheExe)
 
     foreach ($tool in $RequiredTools) {
         Require-Path (Join-Path $MingwBin $tool) "pinned MinGW tool is missing"
@@ -504,6 +581,13 @@ function Test-PinnedToolchain {
 
     & $env:MAKE --version | Out-Null
     Require-Success "GNU Make check"
+
+    Require-Path $SccacheExe "pinned sccache is missing"
+    $sccacheVersion = (& $SccacheExe --version) -join "`n"
+    Require-Success "sccache version check"
+    if ($sccacheVersion -notmatch [regex]::Escape($ExpectedSccacheVersion)) {
+        throw "unexpected sccache version; expected $ExpectedSccacheVersion, got: $sccacheVersion"
+    }
 }
 
 if ($env:OS -ne "Windows_NT") {
@@ -571,6 +655,11 @@ $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
 $llvmBin = Join-Path $llvmRoot "bin"
 $cppcheckRoot = Join-Path $toolsRoot $CppcheckDirectoryName
 $ripgrepRoot = Join-Path $toolsRoot $RipgrepDirectoryName
+$sccacheRoot = Join-Path $toolsRoot $SccacheDirectoryName
+$sccacheExe = Join-Path $sccacheRoot "sccache.exe"
+# #190: workspace-local compiler cache, sibling of .toolchains/.tmp. It survives the
+# target/ wipe (the finally block deletes target/ and the workspace temp, never this).
+$sccacheDir = Join-Path $root ".sccache"
 $gitRoot = $GitInstallRoot
 $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
@@ -587,14 +676,18 @@ if ($Bootstrap) {
     Install-PinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
     Install-PinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot -MingwBin $mingwBin -GitBin $gitBin -GitUsrBin $gitUsrBin
     Install-PinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
+    Install-PinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
     Remove-StalePinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
     Remove-StalePinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot
     Remove-StalePinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
+    Remove-StalePinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
 }
 Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
 Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
 Require-Path (Join-Path $ripgrepRoot "rg.exe") "pinned ripgrep is missing; rerun with -Bootstrap"
-Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin
+Require-Path $sccacheExe "pinned sccache is missing; rerun with -Bootstrap"
+New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
+Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin -SccacheExe $sccacheExe -SccacheDir $sccacheDir
 # No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
 # host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
 # (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
@@ -602,8 +695,8 @@ Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cp
 # Set-ToolchainEnvironment prepends $GitBin to the child PATH; $Command is invoked
 # by explicit path. An explicitly-passed bash $Command is still validated by
 # Assert-AllowedBashCommand above. See #205.
-Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot
-Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, runtime $mingwBin"
+Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -SccacheExe $sccacheExe
+Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, sccache $ExpectedSccacheVersion, runtime $mingwBin"
 
 if ([string]::IsNullOrWhiteSpace($Command)) {
     Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
@@ -629,12 +722,29 @@ foreach ($name in @("TEMP", "TMP", "TMPDIR", "CBM_CACHE_DIR")) {
 try {
     Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     New-Item -ItemType Directory -Path $workspaceTemp -Force | Out-Null
+    # #190: ensure the sccache server is up and zero its counters so --show-stats in
+    # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
+    # $sccacheDir persists across runs and the target/ wipe.
+    & $sccacheExe --start-server *> $null
+    & $sccacheExe --zero-stats *> $null
+    Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0"
     & $Command @commandArgs
     if ($null -ne $LASTEXITCODE) {
         $commandExit = $LASTEXITCODE
     }
 }
 finally {
+    # #190: surface this run's sccache stats to the evidence stream, then stop the
+    # server (flushes stats, releases any handles under the workspace temp) BEFORE the
+    # target/temp cleanup below. The on-disk cache in $sccacheDir is intentionally kept.
+    try {
+        Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
+        & $sccacheExe --show-stats
+        & $sccacheExe --stop-server *> $null
+    }
+    catch {
+        Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
+    }
     $cleanupErrors = @()
     if (Test-Path -LiteralPath $target) {
         try {
