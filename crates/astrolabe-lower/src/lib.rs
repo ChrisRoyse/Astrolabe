@@ -2244,8 +2244,7 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("read back busy_timeout");
         assert_eq!(
-            busy_timeout,
-            LOWERED_DB_BUSY_TIMEOUT_MS as i64,
+            busy_timeout, LOWERED_DB_BUSY_TIMEOUT_MS as i64,
             "lowered sqlite must set a SQLITE_BUSY retry window (#76)"
         );
         let journal_mode: String = connection
