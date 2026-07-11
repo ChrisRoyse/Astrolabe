@@ -69,12 +69,12 @@ use helpers::*;
 
 mod config_store;
 use config_store::*;
+
+mod locks;
+use locks::*;
 const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
-const SHADOW_IMPORT_LOCK_SUFFIX: &str = ".astrolabe-shadow-import.lock";
-const BACKGROUND_LANE_LOCK_SUFFIX: &str = ".astrolabe-background-lane.lock";
-const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const CBM_TEAM_ARTIFACT_DIR: &str = ".codebase-memory";
 const ASTRO_TEAM_ARTIFACT_ERROR: &str = "ASTRO_TEAM_ARTIFACT_ERROR";
 const ASTRO_TEAM_ARTIFACT_NOT_READY: &str = "ASTRO_TEAM_ARTIFACT_NOT_READY";
@@ -92,8 +92,6 @@ const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow import watermark
 const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) to rebuild it";
 const SHADOW_VERIFY_NOT_INTACT_REMEDIATION: &str = "the vault ledger chain does not verify intact; quarantine the vault and rerun index_repository with calyx=\"shadow\" to rebuild from current source";
 const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) so the vault and lowered artifact are rebuilt from current source";
-const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
 const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
@@ -228,38 +226,6 @@ enum ShadowRefreshStatus {
     Current,
     Refreshed,
     Busy,
-}
-
-#[derive(Debug)]
-struct ShadowImportLock {
-    _guard: fs::File,
-    path: PathBuf,
-}
-
-#[derive(Debug)]
-struct LoweredSqliteLock {
-    _guard: fs::File,
-    path: PathBuf,
-}
-
-#[derive(Debug)]
-struct BackgroundLaneOwner {
-    _file: fs::File,
-    _path: PathBuf,
-}
-
-impl Drop for ShadowImportLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        let _ = self._guard.unlock();
-    }
-}
-
-impl Drop for LoweredSqliteLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        let _ = self._guard.unlock();
-    }
 }
 
 impl SlotRuntime for ShadowSlotRuntime {
@@ -1627,147 +1593,6 @@ fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> Value {
             "remediation": remediation,
         }),
     }
-}
-
-fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
-    cache_dir.join(format!("{project}{SHADOW_IMPORT_LOCK_SUFFIX}"))
-}
-
-fn try_readable_marker_lock(marker_path: &Path) -> Result<Option<fs::File>, DynError> {
-    let guard_path = marker_path.with_extension("lock.guard");
-    let guard = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(guard_path)?;
-    match guard.try_lock() {
-        Ok(()) => {
-            // Windows refuses reads of an exclusively locked file, so the marker
-            // carries observable ownership metadata while the sidecar owns the lock.
-            let mut marker = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(marker_path)?;
-            writeln!(marker, "pid={}", std::process::id())?;
-            marker.sync_all()?;
-            Ok(Some(guard))
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn background_lane_owners() -> &'static Mutex<BTreeMap<String, BackgroundLaneOwner>> {
-    static OWNERS: OnceLock<Mutex<BTreeMap<String, BackgroundLaneOwner>>> = OnceLock::new();
-    OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn background_lane_status_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
-    fs::create_dir_all(cache_dir)?;
-    let lock_path = background_lane_lock_path(cache_dir, project);
-    let lock_key = lock_path.to_string_lossy().into_owned();
-    let mut owners = background_lane_owners()
-        .lock()
-        .map_err(|_| "background lane owner registry poisoned")?;
-    if owners.contains_key(&lock_key) {
-        return Ok(background_lane_owner_summary(&lock_path));
-    }
-
-    let mut lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    match lock.try_lock() {
-        Ok(()) => {
-            lock.set_len(0)?;
-            writeln!(lock, "schema=astrolabe-background-lane-v1")?;
-            writeln!(lock, "project={project}")?;
-            writeln!(lock, "pid={}", std::process::id())?;
-            lock.sync_all()?;
-            owners.insert(
-                lock_key,
-                BackgroundLaneOwner {
-                    _file: lock,
-                    _path: lock_path.clone(),
-                },
-            );
-            Ok(background_lane_owner_summary(&lock_path))
-        }
-        Err(std::fs::TryLockError::WouldBlock) => Ok(background_lane_follower_summary(&lock_path)),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn background_lane_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
-    cache_dir.join(format!("{project}{BACKGROUND_LANE_LOCK_SUFFIX}"))
-}
-
-fn background_lane_owner_summary(lock_path: &Path) -> Value {
-    background_lane_summary(
-        "owner",
-        "this-process",
-        "fresh",
-        "verified",
-        lock_path,
-        true,
-    )
-}
-
-fn background_lane_follower_summary(lock_path: &Path) -> Value {
-    background_lane_summary(
-        "follower",
-        "another-process",
-        "stale_ok",
-        "provisional",
-        lock_path,
-        false,
-    )
-}
-
-fn background_lane_summary(
-    status: &str,
-    owner: &str,
-    freshness: &str,
-    trust: &str,
-    lock_path: &Path,
-    eligible_owner: bool,
-) -> Value {
-    json!({
-        "schema": "astrolabe-background-lane-v1",
-        "status": status,
-        "owner": owner,
-        "pid": if eligible_owner {
-            Value::from(u64::from(std::process::id()))
-        } else {
-            Value::Null
-        },
-        "lock_path": lock_path,
-        "freshness": freshness,
-        "trust": trust,
-        "single_owner": eligible_owner,
-        "remediation": if eligible_owner {
-            Value::Null
-        } else {
-            Value::String("use the elected owner process for vault-backed background work, or stop that process and retry".to_string())
-        },
-        "lanes": {
-            "watcher": background_lane_worker_summary(eligible_owner),
-            "anneal": background_lane_worker_summary(eligible_owner),
-        },
-    })
-}
-
-fn background_lane_worker_summary(eligible_owner: bool) -> Value {
-    json!({
-        "eligible_owner": eligible_owner,
-        "active": false,
-        "activation": "not_enabled_in_shadow_stage",
-        "trust": "verified",
-    })
 }
 
 fn import_shadow_vault(
@@ -4719,41 +4544,6 @@ where
         )
         .map_err(Into::into)
     })
-}
-
-fn with_lowered_sqlite_lock<T>(
-    cache_dir: &Path,
-    project: &str,
-    work: impl FnOnce() -> Result<T, DynError>,
-) -> Result<T, DynError> {
-    let started = Instant::now();
-    loop {
-        if let Some(_lock) = try_lowered_sqlite_lock(cache_dir, project)? {
-            return work();
-        }
-        if started.elapsed() >= LOWERED_SQLITE_LOCK_TIMEOUT {
-            return Err(format!(
-                "timed out waiting for lowered SQLite lock: {}",
-                lowered_sqlite_lock_path(cache_dir, project).display()
-            )
-            .into());
-        }
-        thread::sleep(LOWERED_SQLITE_LOCK_POLL);
-    }
-}
-
-fn try_lowered_sqlite_lock(
-    cache_dir: &Path,
-    project: &str,
-) -> Result<Option<LoweredSqliteLock>, DynError> {
-    fs::create_dir_all(cache_dir)?;
-    let lock_path = lowered_sqlite_lock_path(cache_dir, project);
-    Ok(
-        try_readable_marker_lock(&lock_path)?.map(|guard| LoweredSqliteLock {
-            _guard: guard,
-            path: lock_path,
-        }),
-    )
 }
 
 fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
@@ -7896,10 +7686,6 @@ fn sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
 
 fn lowered_sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{LOWERED_SQLITE_SUFFIX}"))
-}
-
-fn lowered_sqlite_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
-    cache_dir.join(format!("{project}{LOWERED_SQLITE_LOCK_SUFFIX}"))
 }
 
 fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
