@@ -19,13 +19,14 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 pub use team_artifact::{
-    ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
-    ASTRO_TEAM_ARTIFACT_MERKLE_ROOT, ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
-    ASTRO_TEAM_ARTIFACT_SIGNATURE, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
-    ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME, TEAM_ARTIFACT_SCHEMA,
-    TeamArtifactExportOptions, TeamArtifactExportReport, TeamArtifactImportOptions,
-    TeamArtifactImportReport, TeamArtifactManifest, TeamArtifactSignature, TeamLedgerHead,
-    VAULT_EXPORT_ZST_NAME, export_team_artifact, import_team_artifact,
+    ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION, ASTRO_TEAM_ARTIFACT_GRAPH_BYTES,
+    ASTRO_TEAM_ARTIFACT_LEDGER_TAIL, ASTRO_TEAM_ARTIFACT_MERKLE_ROOT,
+    ASTRO_TEAM_ARTIFACT_MISSING_GRAPH, ASTRO_TEAM_ARTIFACT_SIGNATURE,
+    ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER, ASTRO_TEAM_ARTIFACT_VAULT_BYTES, GRAPH_DB_ZST_NAME,
+    TEAM_ARTIFACT_SCHEMA, TeamArtifactExportOptions, TeamArtifactExportReport,
+    TeamArtifactImportOptions, TeamArtifactImportReport, TeamArtifactManifest,
+    TeamArtifactSignature, TeamLedgerHead, VAULT_EXPORT_ZST_NAME, export_team_artifact,
+    import_team_artifact,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -727,11 +728,29 @@ fn lower_ledger_payload(
     vault_fingerprint_sha256: &str,
     artifact_sha256: &str,
 ) -> LowerResult<Vec<u8>> {
+    // `artifact_sha256` carries the FULL 64-hex SHA-256 of the lowered artifact,
+    // not a truncated prefix. This `asl_v1` Admin entry lives inside the
+    // chain-verified, Merkle-rooted, signed ledger, so recording the whole
+    // digest makes it a full-strength (256-bit) commitment to the lowered graph
+    // bytes. Team-artifact import cross-checks the adopted graph against this
+    // field (`team_artifact::ensure_graph_bound_to_ledger`) to bind the graph to
+    // the signed envelope; a truncated prefix would leave a ~2^64 second-preimage
+    // gap in that tamper-evidence guarantee (see #84).
+    //
+    // The field name MUST stay on Calyx's benign-long-token allowlist, or the
+    // ledger group-commit hook rejects the whole write with
+    // `CALYX_LEDGER_SECRET_IN_PAYLOAD` ("long non-whitespace token"): a bare
+    // 64-hex digest reads as a secret. `calyx-ledger::redaction` allows a
+    // <=64-char hex token only under a field named `hash`/`root`/`input_hash`,
+    // ending in `_hash`/`_id`/`_sha256`/`_digest`, etc. Hence `_sha256` (like the
+    // sibling `project_sha256`); renaming this back to a bare `artifact` would
+    // silently break every lowering. `vault_fp` stays a 16-hex prefix, safely
+    // under the 40-char `SECRET_TOKEN_MIN` run threshold.
     Ok(serde_json::to_vec(&json!({
         "schema": "asl_v1",
         "project_sha256": hex_lower(&sha256_digest(rows.project.as_bytes())),
         "vault_fp": &vault_fingerprint_sha256[..16],
-        "artifact": &artifact_sha256[..16],
+        "artifact_sha256": artifact_sha256,
         "nodes": rows.nodes.len(),
         "edges": rows.edges.len(),
         "skipped": rows.skipped_edges,
@@ -1098,6 +1117,35 @@ mod tests {
         );
         verify_lowered_sqlite(&adopted, &fixture.lower_report);
 
+        // #84 full-state verification of the graph-binding attestation, read
+        // from the actual persisted ledger bytes in the bundled vault export.
+        // The digest MUST be the full 64-hex SHA-256 under the Calyx-allowlisted
+        // `artifact_sha256` field name: a bare `artifact` field is rejected by
+        // the ledger secret hook (CALYX_LEDGER_SECRET_IN_PAYLOAD), and a
+        // truncated prefix would reopen the ~2^64 second-preimage gap.
+        let attestation = team_artifact::asl_v1_attestation_payload(&fixture.artifact_dir);
+        let bound_digest = attestation
+            .get("artifact_sha256")
+            .and_then(serde_json::Value::as_str)
+            .expect("asl_v1 attestation must carry the artifact_sha256 field");
+        assert_eq!(
+            bound_digest.len(),
+            64,
+            "artifact_sha256 must be the full 64-hex SHA-256, not a truncated prefix"
+        );
+        assert!(
+            bound_digest.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "artifact_sha256 must be lowercase hex"
+        );
+        assert_eq!(
+            bound_digest, fixture.export.manifest.graph_db_sha256,
+            "ledger attestation must commit to the exact lowered graph bytes"
+        );
+        assert!(
+            attestation.get("artifact").is_none(),
+            "must not use the bare `artifact` field — Calyx secret hook rejects a bare 64-hex token"
+        );
+
         let wrong = import_team_artifact(
             &fixture.artifact_dir,
             temp_path("team-signed-wrong-key.db"),
@@ -1202,6 +1250,125 @@ mod tests {
         .expect_err("signature tamper refused");
         assert_err_code(&err, ASTRO_TEAM_ARTIFACT_SIGNATURE);
         cleanup_team_fixture(&signature);
+    }
+
+    #[test]
+    fn coordinated_graph_tamper_on_signed_artifact_is_refused() {
+        // #84 regression / synthetic full-state verification.
+        //
+        // The Ed25519 signature covers only the ledger Merkle root, so an
+        // attacker who swaps graph.db.zst AND rewrites the matching hash fields
+        // in the *unsigned* artifact.json previously imported with
+        // signature_status="verified". The graph is now bound to the signed
+        // ledger via the asl_v1 lowering attestation, so the swap must be
+        // refused before any graph is adopted.
+        let fixture = team_fixture(
+            "team-coordinated-signed",
+            &TeamArtifactExportOptions::with_signing_key([23; 32]),
+        );
+
+        // Baseline: the untampered signed artifact still imports as verified
+        // (proves the new binding check does not regress the honest path).
+        let baseline_adopted = temp_path("team-coordinated-signed-baseline.db");
+        cleanup(&baseline_adopted);
+        let baseline = import_team_artifact(
+            &fixture.artifact_dir,
+            &baseline_adopted,
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect("baseline untampered signed import");
+        assert_eq!(baseline.signature_status, "verified");
+        assert_eq!(
+            baseline.graph_db_sha256, fixture.export.manifest.graph_db_sha256,
+            "baseline adopts the legitimate graph"
+        );
+
+        // Attacker payload: a valid but *different* SQLite file the importer
+        // would happily adopt if the swap were undetected.
+        let malicious = temp_path("team-coordinated-signed-malicious.db");
+        fixture_sqlite(&malicious);
+        let malicious_bytes = fs::read(&malicious).expect("read malicious graph");
+        let malicious_hash = hex_lower(&sha256_digest(&malicious_bytes));
+        assert_ne!(
+            malicious_hash, fixture.export.manifest.graph_db_sha256,
+            "attacker graph must differ from the legitimate graph"
+        );
+
+        coordinated_graph_swap(&fixture.artifact_dir, &malicious_bytes);
+
+        // Prove the artifact is now internally self-consistent (the graph bytes
+        // match the rewritten unsigned manifest) — i.e. the OLD graph-bytes check
+        // would pass. Only the signed-ledger binding catches the tamper.
+        let post_manifest: Value = serde_json::from_slice(
+            &fs::read(fixture.artifact_dir.join("artifact.json")).expect("read tampered manifest"),
+        )
+        .expect("decode tampered manifest");
+        assert_eq!(
+            post_manifest["graph_db_sha256"].as_str(),
+            Some(malicious_hash.as_str()),
+            "coordinated tamper rewrote the manifest graph hash to the malicious graph"
+        );
+
+        let adopted = temp_path("team-coordinated-signed-adopt.db");
+        cleanup(&adopted);
+        let err = import_team_artifact(
+            &fixture.artifact_dir,
+            &adopted,
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("coordinated graph tamper on signed artifact must be refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION);
+
+        // Full-state verification against the source of truth (the filesystem):
+        // the refused import must NOT have written the malicious graph anywhere.
+        assert!(
+            !adopted.exists(),
+            "refused import must not adopt the malicious graph to disk"
+        );
+
+        cleanup(&malicious);
+        cleanup(&baseline_adopted);
+        cleanup(&adopted);
+        cleanup_team_fixture(&fixture);
+    }
+
+    #[test]
+    fn coordinated_graph_tamper_on_unsigned_artifact_is_refused() {
+        // Same coordinated swap on an unsigned artifact: the graph must still be
+        // bound to the (chain-verified) ledger's asl_v1 attestation and refused.
+        let fixture = team_fixture(
+            "team-coordinated-unsigned",
+            &TeamArtifactExportOptions::unsigned(),
+        );
+
+        let malicious = temp_path("team-coordinated-unsigned-malicious.db");
+        fixture_sqlite(&malicious);
+        let malicious_bytes = fs::read(&malicious).expect("read malicious graph");
+        assert_ne!(
+            hex_lower(&sha256_digest(&malicious_bytes)),
+            fixture.export.manifest.graph_db_sha256,
+            "attacker graph must differ from the legitimate graph"
+        );
+
+        coordinated_graph_swap(&fixture.artifact_dir, &malicious_bytes);
+
+        let adopted = temp_path("team-coordinated-unsigned-adopt.db");
+        cleanup(&adopted);
+        let err = import_team_artifact(
+            &fixture.artifact_dir,
+            &adopted,
+            &TeamArtifactImportOptions::new(),
+        )
+        .expect_err("coordinated graph tamper on unsigned artifact must be refused");
+        assert_err_code(&err, ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION);
+        assert!(
+            !adopted.exists(),
+            "refused import must not adopt the malicious graph to disk"
+        );
+
+        cleanup(&malicious);
+        cleanup(&adopted);
+        cleanup_team_fixture(&fixture);
     }
 
     #[test]
@@ -1490,6 +1657,23 @@ mod tests {
         rewrite_manifest_json(artifact_dir, |manifest| {
             manifest["vault_export_zst_sha256"] =
                 Value::String(hex_lower(&sha256_digest(&next_zst)));
+        });
+    }
+
+    /// Simulates the #84 coordinated tamper: replace the compressed graph with
+    /// attacker-chosen bytes and rewrite the *unsigned* artifact.json so its
+    /// self-consistency checks (`graph_db_zst_sha256` / `graph_db_sha256`) still
+    /// pass. The ledger, Merkle root, and any signature are left untouched.
+    fn coordinated_graph_swap(artifact_dir: &Path, malicious_graph: &[u8]) {
+        let graph_zst = zstd::stream::encode_all(Cursor::new(malicious_graph), 3)
+            .expect("encode malicious graph");
+        fs::write(artifact_dir.join(GRAPH_DB_ZST_NAME), &graph_zst)
+            .expect("write malicious graph.db.zst");
+        let zst_hash = hex_lower(&sha256_digest(&graph_zst));
+        let raw_hash = hex_lower(&sha256_digest(malicious_graph));
+        rewrite_manifest_json(artifact_dir, move |value| {
+            value["graph_db_zst_sha256"] = Value::String(zst_hash);
+            value["graph_db_sha256"] = Value::String(raw_hash);
         });
     }
 

@@ -8,8 +8,8 @@ use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::AsterVault;
 use calyx_core::Clock;
 use calyx_ledger::{
-    LedgerRow, MemoryLedgerStore, MerkleExportBundle, VerifyResult, decode, merkle_root,
-    verify_chain as calyx_verify_chain, verify_signature,
+    ActorId, EntryKind, LedgerRow, MemoryLedgerStore, MerkleExportBundle, VerifyResult, decode,
+    merkle_root, verify_chain as calyx_verify_chain, verify_signature,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,7 @@ const ZSTD_LEVEL: i32 = 3;
 
 pub const ASTRO_TEAM_ARTIFACT_MISSING_GRAPH: &str = "ASTRO_TEAM_ARTIFACT_MISSING_GRAPH";
 pub const ASTRO_TEAM_ARTIFACT_GRAPH_BYTES: &str = "ASTRO_TEAM_ARTIFACT_GRAPH_BYTES";
+pub const ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION: &str = "ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION";
 pub const ASTRO_TEAM_ARTIFACT_VAULT_BYTES: &str = "ASTRO_TEAM_ARTIFACT_VAULT_BYTES";
 pub const ASTRO_TEAM_ARTIFACT_LEDGER_TAIL: &str = "ASTRO_TEAM_ARTIFACT_LEDGER_TAIL";
 pub const ASTRO_TEAM_ARTIFACT_MERKLE_ROOT: &str = "ASTRO_TEAM_ARTIFACT_MERKLE_ROOT";
@@ -298,6 +299,13 @@ pub fn import_team_artifact(
         ));
     }
 
+    // Bind the adopted graph bytes to the signed/chain-verified ledger. Without
+    // this, the Ed25519 signature and Merkle root cover only the ledger, and the
+    // graph is checked solely against the unsigned artifact.json — so a
+    // coordinated swap of graph.db.zst plus rewritten hash fields would import as
+    // "verified" (#84).
+    ensure_graph_bound_to_ledger(&ledger_rows, &graph_hash)?;
+
     let signature_status = verify_optional_signature(&manifest, root, range_end, options)?;
     write_adopted_graph(&adopted_graph_path, &graph_bytes)?;
 
@@ -475,6 +483,95 @@ fn ensure_intact_chain(store: &MemoryLedgerStore, range_end: u64) -> LowerResult
     }
 }
 
+/// Cross-checks the adopted graph bytes against the lowering attestation carried
+/// inside the verified ledger.
+///
+/// The team-artifact Ed25519 signature and Merkle root cover only the ledger
+/// (`MerkleExportBundle{range, root}`); the graph bytes are otherwise validated
+/// only against the unsigned `artifact.json`. The lowering pipeline records the
+/// full SHA-256 of the lowered artifact in an `Admin`/`astrolabe-lower` ledger
+/// entry with `schema:"asl_v1"` (see `crate::lower_ledger_payload`), which *is*
+/// inside the chain-verified, Merkle-rooted, signed envelope. Requiring the
+/// adopted graph hash to equal that recorded attestation binds the graph to the
+/// signed ledger, so a coordinated swap of `graph.db.zst` plus rewritten
+/// `artifact.json` hash fields can no longer import as verified (#84).
+///
+/// `rows` are already chain-verified and Merkle-root-matched by the caller.
+/// Fail-closed: absence of a matching attestation is a refusal, never a
+/// silent pass.
+fn ensure_graph_bound_to_ledger(rows: &[LedgerRow], graph_hash: &str) -> LowerResult<()> {
+    let mut saw_attestation = false;
+    for row in rows {
+        let entry = decode(&row.bytes).map_err(|error| {
+            refuse(
+                TeamArtifactRefusal::LedgerTail,
+                format!(
+                    "decode ledger seq {} for graph attestation: {error}",
+                    row.seq
+                ),
+            )
+        })?;
+        if entry.kind != EntryKind::Admin {
+            continue;
+        }
+        if !matches!(&entry.actor, ActorId::Service(actor) if actor == crate::ASTRO_LOWER_ACTOR) {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&entry.payload) else {
+            continue;
+        };
+        if payload.get("schema").and_then(serde_json::Value::as_str) != Some("asl_v1") {
+            continue;
+        }
+        saw_attestation = true;
+        // Field name must match `crate::lower_ledger_payload` exactly. It is
+        // `artifact_sha256` (not `artifact`) because Calyx's ledger secret hook
+        // only lets a 64-hex digest through under an allowlisted field suffix
+        // such as `_sha256`; see the note in `lower_ledger_payload`.
+        if payload
+            .get("artifact_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(graph_hash)
+        {
+            return Ok(());
+        }
+    }
+    let message = if saw_attestation {
+        "adopted graph bytes do not match any lowering attestation in the verified ledger"
+    } else {
+        "verified ledger carries no lowering attestation to bind the adopted graph bytes"
+    };
+    Err(refuse(TeamArtifactRefusal::GraphAttestation, message))
+}
+
+/// Test-only: extract the `asl_v1` lowering attestation payload from the vault
+/// export bundled in an exported team artifact, decoding the *actual persisted
+/// ledger bytes* (hex row -> Calyx `decode` -> JSON payload) rather than any
+/// in-memory value. Used to full-state-verify that the graph digest is recorded
+/// under the Calyx-allowlisted `artifact_sha256` field name (#84).
+#[cfg(test)]
+pub(crate) fn asl_v1_attestation_payload(artifact_dir: &Path) -> serde_json::Value {
+    let vault_zst =
+        fs::read(artifact_dir.join(VAULT_EXPORT_ZST_NAME)).expect("read bundled vault.export.zst");
+    let export = read_vault_export(&vault_zst).expect("read vault export");
+    let rows = rows_from_export(&export).expect("rows from vault export");
+    for row in &rows {
+        let entry = decode(&row.bytes).expect("decode persisted ledger row");
+        if entry.kind != EntryKind::Admin {
+            continue;
+        }
+        if !matches!(&entry.actor, ActorId::Service(actor) if actor == crate::ASTRO_LOWER_ACTOR) {
+            continue;
+        }
+        let payload: serde_json::Value =
+            serde_json::from_slice(&entry.payload).expect("decode ledger payload JSON");
+        if payload.get("schema").and_then(serde_json::Value::as_str) == Some("asl_v1") {
+            return payload;
+        }
+    }
+    panic!("no asl_v1 lowering attestation found in the persisted vault-export ledger");
+}
+
 fn ensure_manifest_head_matches(
     manifest: &TeamArtifactManifest,
     rows: &[LedgerRow],
@@ -630,6 +727,10 @@ enum TeamArtifactRefusal {
     MissingGraph,
     /// The lowered graph bytes are missing, corrupt, or mismatch `artifact.json`.
     GraphBytes,
+    /// The adopted graph bytes are not attested by the verified ledger: no
+    /// `asl_v1` lowering entry commits to their SHA-256, so the graph is not
+    /// bound to the signed envelope.
+    GraphAttestation,
     /// The vault export container is missing, corrupt, or mismatches `artifact.json`.
     VaultBytes,
     /// The exported ledger tail is malformed, non-contiguous, or mismatches `artifact.json`.
@@ -647,6 +748,7 @@ impl TeamArtifactRefusal {
         match self {
             Self::MissingGraph => ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
             Self::GraphBytes => ASTRO_TEAM_ARTIFACT_GRAPH_BYTES,
+            Self::GraphAttestation => ASTRO_TEAM_ARTIFACT_GRAPH_ATTESTATION,
             Self::VaultBytes => ASTRO_TEAM_ARTIFACT_VAULT_BYTES,
             Self::LedgerTail => ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
             Self::MerkleRoot => ASTRO_TEAM_ARTIFACT_MERKLE_ROOT,
@@ -662,6 +764,9 @@ impl TeamArtifactRefusal {
             }
             Self::GraphBytes => {
                 "Re-download or re-export the team artifact; the graph.db bytes are corrupt or do not match artifact.json."
+            }
+            Self::GraphAttestation => {
+                "Do not adopt this graph: its bytes are not attested by the signed ledger. Obtain a team artifact whose graph.db matches the ledger's asl_v1 lowering entry, or re-export it from the source vault that produced the graph."
             }
             Self::VaultBytes => {
                 "Re-export the team artifact; vault.export.zst is missing, corrupt, or does not match artifact.json."
