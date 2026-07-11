@@ -10,6 +10,14 @@ pub const ASTRO_PROVENANCE_NOT_FOUND: &str = "ASTRO_PROVENANCE_NOT_FOUND";
 pub const ASTRO_PROVENANCE_MANIFEST_TAMPERED: &str = "ASTRO_PROVENANCE_MANIFEST_TAMPERED";
 pub const REPRODUCE_DRIFT_EXCEEDED: &str = "REPRODUCE_DRIFT_EXCEEDED";
 pub const ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT: &str = "ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT";
+/// Error code: a verify-relevant provenance metadatum required to evaluate freshness or
+/// verification was absent from persisted metadata. Fail closed rather than fabricate a
+/// value that reads as fresh/verified.
+pub const ASTRO_PROVENANCE_METADATA_MISSING: &str = "ASTRO_PROVENANCE_METADATA_MISSING";
+/// Error code: a verify-relevant provenance metadatum was persisted but is empty or
+/// unparseable (corrupt). Fail closed rather than silently fall back to a persisted or
+/// derived value that would read as verified.
+pub const ASTRO_PROVENANCE_METADATA_CORRUPT: &str = "ASTRO_PROVENANCE_METADATA_CORRUPT";
 
 /// Warning code emitted when a `verify_chain` report carries a broken ledger chain.
 pub const PROVENANCE_WARN_CHAIN_BROKEN: &str = "chain_broken";
@@ -135,6 +143,57 @@ impl Freshness {
     pub const fn is_stale(&self) -> bool {
         self.stale_by.is_some()
     }
+}
+
+/// Requires a persisted, non-empty verify-relevant string metadatum (e.g. a vault
+/// fingerprint that participates in verification).
+///
+/// `raw` is the raw persisted config value: `None` means the key was absent, `Some(text)`
+/// is the persisted string. This fails **closed** — with a coded, remediation-bearing
+/// [`astrolabe_domain::DomainError`] — rather than defaulting a missing/empty value to a
+/// derived value (such as the ledger chain hash) that would let a fingerprint-less
+/// artifact read as verified. A verification input that is silently fabricated is
+/// indistinguishable from a measured one, which is precisely the "freshness theater" this
+/// guards against.
+pub fn require_verify_metadata(field: &str, raw: Option<&str>) -> astrolabe_domain::Result<String> {
+    match raw.map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        Some(_) => Err(astrolabe_domain::DomainError::new(
+            ASTRO_PROVENANCE_METADATA_CORRUPT,
+            format!("verify-relevant provenance metadata `{field}` is present but empty"),
+            "re-run index_repository so the provenance surface persists a non-empty value; refusing rather than fabricating a verification input",
+        )),
+        None => Err(astrolabe_domain::DomainError::new(
+            ASTRO_PROVENANCE_METADATA_MISSING,
+            format!("verify-relevant provenance metadata `{field}` is absent"),
+            "re-run index_repository so the provenance surface persists this field; refusing rather than defaulting a verification input",
+        )),
+    }
+}
+
+/// Requires a persisted, parseable ledger sequence watermark.
+///
+/// The sequence is the artifact's "as-of" watermark: freshness is measured as the gap
+/// between it and the current ledger head, so a fabricated value produces an unfalsifiable
+/// freshness claim. `None` (key absent) fails closed as
+/// [`ASTRO_PROVENANCE_METADATA_MISSING`]; a present-but-unparseable value fails closed as
+/// [`ASTRO_PROVENANCE_METADATA_CORRUPT`] — never the previous silent fall-back to a
+/// persisted sequence.
+pub fn require_ledger_seq(field: &str, raw: Option<&str>) -> astrolabe_domain::Result<u64> {
+    let Some(text) = raw.map(str::trim) else {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_PROVENANCE_METADATA_MISSING,
+            format!("verify-relevant ledger sequence `{field}` is absent"),
+            "re-run index_repository so the provenance surface persists this ledger sequence; refusing rather than defaulting the freshness watermark",
+        ));
+    };
+    text.parse::<u64>().map_err(|_| {
+        astrolabe_domain::DomainError::new(
+            ASTRO_PROVENANCE_METADATA_CORRUPT,
+            format!("verify-relevant ledger sequence `{field}` is not a valid sequence: {text:?}"),
+            "re-run index_repository so the provenance surface persists a valid ledger sequence; refusing rather than defaulting the freshness watermark",
+        )
+    })
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -796,6 +855,59 @@ mod tests {
             stale.stale_by.as_deref(),
             Some("19 ledger entries behind head seq 42")
         );
+    }
+
+    #[test]
+    fn require_ledger_seq_measures_freshness_or_fails_closed() {
+        // (i) Metadata present + as-of watermark at/ahead of head -> fresh, no gap.
+        let as_of = require_ledger_seq("ledger_seq", Some("142")).expect("valid seq");
+        assert_eq!(as_of, 142);
+        assert_eq!(Freshness::evaluate(as_of, 142).stale_by, None);
+        assert!(!Freshness::evaluate(as_of, 142).is_stale());
+
+        // (ii) Metadata present + old watermark -> exact measured staleness delta.
+        let old = require_ledger_seq("ledger_seq", Some("42")).expect("valid seq");
+        let fr = Freshness::evaluate(old, 142);
+        assert!(fr.is_stale());
+        assert_eq!(
+            fr.stale_by.as_deref(),
+            Some("100 ledger entries behind head seq 142")
+        );
+
+        // (iii-a) Verify-relevant watermark MISSING -> fail closed, never a silent default.
+        let missing = require_ledger_seq("ledger_seq", None).expect_err("must refuse");
+        assert_eq!(missing.code(), ASTRO_PROVENANCE_METADATA_MISSING);
+        assert!(!missing.remediation().is_empty());
+
+        // (iii-b) Present but corrupt (unparseable) -> fail closed as corrupt, not fall-back.
+        let corrupt = require_ledger_seq("ledger_seq", Some("not-a-seq")).expect_err("must refuse");
+        assert_eq!(corrupt.code(), ASTRO_PROVENANCE_METADATA_CORRUPT);
+        // Empty string is also corrupt, never a defaulted zero.
+        assert_eq!(
+            require_ledger_seq("ledger_seq", Some("   "))
+                .expect_err("must refuse")
+                .code(),
+            ASTRO_PROVENANCE_METADATA_CORRUPT
+        );
+    }
+
+    #[test]
+    fn require_verify_metadata_refuses_missing_or_empty_fingerprint() {
+        // Present + non-empty -> trimmed value returned.
+        assert_eq!(
+            require_verify_metadata("lowered_vault_fingerprint_sha256", Some("  abc123  "))
+                .expect("valid"),
+            "abc123"
+        );
+        // Missing -> fail closed (no fall-back to the ledger chain hash).
+        let missing = require_verify_metadata("lowered_vault_fingerprint_sha256", None)
+            .expect_err("must refuse");
+        assert_eq!(missing.code(), ASTRO_PROVENANCE_METADATA_MISSING);
+        // Present but empty -> fail closed as corrupt (no fabricated verification input).
+        let empty =
+            require_verify_metadata("vault_fingerprint", Some("   ")).expect_err("must refuse");
+        assert_eq!(empty.code(), ASTRO_PROVENANCE_METADATA_CORRUPT);
+        assert!(!empty.remediation().is_empty());
     }
 
     #[test]
