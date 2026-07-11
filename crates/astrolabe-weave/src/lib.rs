@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod search;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;

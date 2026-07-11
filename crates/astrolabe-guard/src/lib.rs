@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod calibration;
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SECURITY_SCREEN_SCHEMA: &str = "astrolabe.security_screen.v1";
 pub const PROMPT_INJECTION_FINDING_KIND: &str = "prompt_injection";
