@@ -8,6 +8,7 @@ import re
 import sys
 from pathlib import Path
 
+import rust_prod_lines
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "ci" / "shell-arg-audit.json"
@@ -74,11 +75,16 @@ def main() -> int:
 
 def discover_sites() -> set[tuple[str, str, str]]:
     sites: set[tuple[str, str, str]] = set()
+    test_files, test_dirs = rust_prod_lines.cfg_test_module_files(ROOT / "crates")
     for path in sorted((ROOT / "crates").glob("*/src/**/*.rs")):
         relative = path.relative_to(ROOT).as_posix()
         if relative == "crates/cbm-sys/src/bindings.rs":
             continue
-        lines = production_lines(path.read_text(encoding="utf-8").splitlines())
+        if rust_prod_lines.is_test_only_file(path, test_files, test_dirs):
+            continue
+        lines = rust_prod_lines.strip_test_spans(
+            path.read_text(encoding="utf-8").splitlines()
+        )
         for index, line in enumerate(lines):
             for call, pattern in SHELL_SENSITIVE_CALLS.items():
                 if pattern.search(line) is None:
@@ -88,32 +94,46 @@ def discover_sites() -> set[tuple[str, str, str]]:
 
 
 def validator_precedes_call(entry: dict) -> bool:
+    """Structural check (#118): the validator CALL must appear before the audited
+    call inside the named function's code, evaluated on the comment/string-blanked
+    view — a comment or string mentioning the validator can no longer satisfy it."""
     path = ROOT / entry["file"]
-    lines = production_lines(path.read_text(encoding="utf-8").splitlines())
-    validator = entry["validator"]
-    call = entry["call"]
+    source_lines = rust_prod_lines.strip_test_spans(
+        path.read_text(encoding="utf-8").splitlines()
+    )
+    view_lines = rust_prod_lines.code_view("\n".join(source_lines)).split("\n")
+    infos = rust_prod_lines.line_depths(view_lines)
     function = entry["function"]
-    in_function = False
-    saw_validator = False
-    for line in lines:
-        match = FN_RE.match(line)
-        if match:
-            in_function = match.group(1) == function
-            saw_validator = False
-        if not in_function:
+    validator_name = entry["validator"].split("(")[0].strip()
+    call = entry["call"]
+    validator_re = re.compile(rf"\b{re.escape(validator_name)}\s*\(")
+    call_re = re.compile(rf"\b{re.escape(call)}\s*\(")
+
+    index = 0
+    total = len(view_lines)
+    while index < total:
+        match = FN_RE.match(view_lines[index])
+        if match is None or match.group(1) != function:
+            index += 1
             continue
-        if validator in line:
-            saw_validator = True
-        if call in line:
-            return saw_validator
+        base_depth = infos[index][0]
+        end = index
+        opened = False
+        while end < total:
+            _start, end_depth, max_depth, _semis = infos[end]
+            if max_depth > base_depth:
+                opened = True
+            if opened and end_depth <= base_depth:
+                break
+            end += 1
+        body = "\n".join(view_lines[index : min(end + 1, total)])
+        validator_match = validator_re.search(body)
+        call_match = call_re.search(body)
+        if call_match is None:
+            index = end + 1
+            continue
+        return validator_match is not None and validator_match.start() < call_match.start()
     return False
-
-
-def production_lines(lines: list[str]) -> list[str]:
-    for index, line in enumerate(lines):
-        if line.strip() == "#[cfg(test)]":
-            return lines[:index]
-    return lines
 
 
 def enclosing_function(lines: list[str], index: int) -> str:
