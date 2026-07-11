@@ -58,6 +58,8 @@ bash scripts/verify-pins.sh
 "$PYTHON_BIN" scripts/test-parity-corpus-contract.py
 "$PYTHON_BIN" scripts/test-native-cargo-fmt.py
 bash scripts/check-no-todo.sh
+"$PYTHON_BIN" scripts/check-no-mocks.py
+"$PYTHON_BIN" scripts/test-check-no-mocks.py
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py
 "$PYTHON_BIN" scripts/test-gate-wiring.py

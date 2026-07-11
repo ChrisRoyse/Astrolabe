@@ -123,6 +123,18 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/check-no-mocks.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/test-check-no-mocks.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/native-cargo-fmt.py --all -- --check",
         "scripts/check.sh",
         errors,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Self-tests for the egress harness platform capability boundary."""
+# ASTRO_ALLOW_TEST_DOUBLE_FILE(platform-dispatch branches cannot all be real on one host; sys.platform/shutil.which are patched only to select the branch, whose real behavior is owned by that platform's native run or required CI job)
 
 from __future__ import annotations
 
