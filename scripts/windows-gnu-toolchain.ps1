@@ -416,6 +416,19 @@ function Set-WorkspaceTempEnvironment {
     $env:TEMP = $WorkspaceTemp
     $env:TMP = $WorkspaceTemp
     $env:TMPDIR = $WorkspaceTemp
+    # CBM store redirection (#194): codebase-memory-mcp registers a project by
+    # writing <cache_dir>/<project>.db, where cache_dir is resolved by
+    # cbm_resolve_cache_dir() (vendor/codebase-memory-mcp/src/foundation/platform.c)
+    # with priority CBM_CACHE_DIR > $HOME/.cache/codebase-memory-mcp. Astrolabe
+    # tests that call cbm_mcp_server_new(NULL) (astrolabe-bridge row-sink tool-runner,
+    # vendored C integration tests) would otherwise persist project .db files into the
+    # operator's GLOBAL store and never clean them up. Pinning CBM_CACHE_DIR to a
+    # launcher-owned child of the workspace temp keeps every registration inside .tmp,
+    # so it is deleted together with $workspaceTemp on launcher exit. Single-point,
+    # fail-closed root-cause fix covering both the Rust and C test families.
+    $cbmCacheDir = Join-Path $WorkspaceTemp "cbm-cache"
+    New-Item -ItemType Directory -Path $cbmCacheDir -Force | Out-Null
+    $env:CBM_CACHE_DIR = $cbmCacheDir
 }
 
 function Test-PinnedToolchain {
@@ -610,7 +623,7 @@ foreach ($argument in $commandArgs) {
 
 $commandExit = 0
 $previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+foreach ($name in @("TEMP", "TMP", "TMPDIR", "CBM_CACHE_DIR")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
@@ -659,7 +672,7 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
-    foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+    foreach ($name in @("TEMP", "TMP", "TMPDIR", "CBM_CACHE_DIR")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
             Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue

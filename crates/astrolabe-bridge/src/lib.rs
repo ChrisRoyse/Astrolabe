@@ -1910,6 +1910,24 @@ mod tests {
         }
     }
 
+    /// RAII guard that deletes a codebase-memory-mcp project's persisted `.db`
+    /// (plus WAL/SHM/journal sidecars) from the resolved cache dir on drop —
+    /// including during panic unwind. A tool-runner test registers a project via
+    /// `cbm_mcp_server_new(NULL)` + `index_repository`, which persists
+    /// `<cbm_cache_dir()>/<project>.db`; a plain post-assert cleanup is fail-open
+    /// (skipped when an earlier assertion panics), leaking the registration into
+    /// the operator's global CBM store. Cleaning on drop makes teardown
+    /// fail-closed regardless of assertion outcome (#194).
+    struct CbmProjectDbGuard {
+        project: String,
+    }
+
+    impl Drop for CbmProjectDbGuard {
+        fn drop(&mut self) {
+            cleanup_cbm_project_db(&self.project);
+        }
+    }
+
     #[test]
     fn extracts_fixture_with_owned_accessors() {
         let file = ExtractedFile::extract(
@@ -2036,6 +2054,12 @@ mod tests {
         })
         .to_string();
 
+        // Fail-closed teardown: delete the registered project .db even if any
+        // assertion below panics, so this test never leaks a registration into the
+        // operator's global CBM store (#194).
+        let _db_guard = CbmProjectDbGuard {
+            project: project.clone(),
+        };
         let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
         let run = runner
             .handle_index_repository_with_rows(&args)
@@ -2072,7 +2096,79 @@ mod tests {
                 .all(|edge| edge.project == run.rows.project)
         );
 
-        cleanup_cbm_project_db(&run.rows.project);
+        // `_db_guard` deletes the registration on scope exit (fail-closed).
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regression for #194: prove — by reading the persisted `.db` file on disk
+    /// (full state verification, not a return value) — that a tool-runner
+    /// `index_repository` run registers exactly one project db in the resolved CBM
+    /// cache dir and that teardown removes it, leaving zero store residue.
+    #[test]
+    fn tool_runner_index_repository_leaves_no_store_residue() {
+        let dir = temp_dir("tool-runner-residue");
+        let repo = dir.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).expect("create fixture repo");
+        std::fs::write(
+            src.join("main.c"),
+            "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
+        )
+        .expect("write C fixture");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let project = format!("row-sink-residue-{}-{nanos}", std::process::id());
+        let args = serde_json::json!({
+            "repo_path": repo.to_str().expect("utf8 repo path"),
+            "mode": "full",
+            "name": project,
+        })
+        .to_string();
+
+        let cache_dir = cbm_cache_dir().expect("resolve CBM cache dir");
+        let db_path = cache_dir.join(format!("{project}.db"));
+        // Precondition: nonexistent before the run.
+        assert!(
+            !db_path.exists(),
+            "precondition violated: project db already present before index: {}",
+            db_path.display()
+        );
+
+        {
+            let _db_guard = CbmProjectDbGuard {
+                project: project.clone(),
+            };
+            let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+            let run = runner
+                .handle_index_repository_with_rows(&args)
+                .expect("single MCP index_repository run with row sink");
+            assert_eq!(run.rows.project, project);
+            // Mid-run source-of-truth read: the registration exists on disk.
+            assert!(
+                db_path.exists(),
+                "index_repository must persist the project db at {}",
+                db_path.display()
+            );
+        } // guard drops here -> fail-closed teardown
+
+        // Post-teardown source-of-truth read: registration removed, zero residue.
+        assert!(
+            !db_path.exists(),
+            "teardown must delete the project db (store residue leaked): {}",
+            db_path.display()
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut raw = db_path.as_os_str().to_os_string();
+            raw.push(suffix);
+            let sidecar = std::path::PathBuf::from(raw);
+            assert!(
+                !sidecar.exists(),
+                "teardown must delete sidecar {}",
+                sidecar.display()
+            );
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 
