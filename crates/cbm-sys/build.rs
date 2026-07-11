@@ -48,13 +48,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
     println!("cargo:rerun-if-changed={}", layout_probe.display());
     println!("cargo:rerun-if-changed={}", mem_pressure_patch.display());
-    for path in [
-        cbm_root.join("src"),
-        cbm_root.join("internal/cbm"),
-        cbm_root.join("vendored"),
-    ] {
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
+    // The vendored CBM tree is deliberately NOT watched file-by-file (#192).
+    // It is pinned: every sanctioned change lands through the VENDORED.md pin
+    // procedure (which rewrites the binding tree SHA below) or through the
+    // watched patches/cbm inputs above, and scripts/verify-pins.sh rejects
+    // direct vendor edits. Watching the whole src/, internal/cbm, and
+    // vendored/ trees made any mtime churn re-run this script — paying the
+    // make walk plus a full libclang bindgen parse — without any input Cargo
+    // could not already see via VENDORED.md. Within one build, Make depfiles
+    // (-MMD -MP) plus the config stamp own C-level incremental correctness.
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("VENDORED.md").display()
@@ -79,8 +81,14 @@ fn main() {
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
     run_make(&cbm_root, &patched_makefile, &build_dir, &config_stamp);
-    write_layout_test_bindings(&out_dir, &cbm_root, &header);
-    verify_bindings(&manifest_dir, &cbm_root, &header);
+    // One libclang parse per build-script run (#192): generate the superset
+    // (functions + layout tests) once, then derive both consumers from it —
+    // the OUT_DIR layout-test include gets the superset verbatim (its module
+    // allows clashing extern declarations and dead code), and the committed
+    // bindings diff strips the layout-test functions before comparing.
+    let generated = generate_bindings(&cbm_root, &header);
+    write_layout_test_bindings(&out_dir, &generated);
+    verify_bindings(&manifest_dir, &generated);
     emit_link_directives(&build_dir);
 }
 
@@ -204,13 +212,12 @@ fn make_command_path(value: &str) -> String {
     }
 }
 
-fn write_layout_test_bindings(out_dir: &Path, cbm_root: &Path, header: &Path) {
-    let generated = generate_bindings(cbm_root, header, true, false);
+fn write_layout_test_bindings(out_dir: &Path, generated: &str) {
     write_if_changed(&out_dir.join("cbm-layout-tests.rs"), generated.as_bytes());
 }
 
-fn verify_bindings(manifest_dir: &Path, cbm_root: &Path, header: &Path) {
-    let generated = generate_bindings(cbm_root, header, false, true);
+fn verify_bindings(manifest_dir: &Path, generated: &str) {
+    let generated = build_support::strip_layout_tests(generated);
     let bindings_path = manifest_dir.join("src/bindings.rs");
 
     if env::var_os("ASTROLABE_UPDATE_BINDINGS").is_some() {
@@ -234,13 +241,8 @@ fn verify_bindings(manifest_dir: &Path, cbm_root: &Path, header: &Path) {
     }
 }
 
-fn generate_bindings(
-    cbm_root: &Path,
-    header: &Path,
-    layout_tests: bool,
-    include_functions: bool,
-) -> String {
-    let mut builder = bindgen::Builder::default()
+fn generate_bindings(cbm_root: &Path, header: &Path) -> String {
+    let builder = bindgen::Builder::default()
         .header(header.display().to_string())
         .clang_arg(format!("-I{}", cbm_root.join("internal/cbm").display()))
         .clang_arg(format!(
@@ -255,6 +257,7 @@ fn generate_bindings(
         .allowlist_type("cbm_.*")
         .allowlist_type("TS.*")
         .allowlist_var("CBM_.*")
+        .allowlist_function("cbm_.*")
         .blocklist_function("cbm_mcp_server_run")
         .blocklist_function("cbm_store_get_db")
         .blocklist_type("FILE")
@@ -264,10 +267,7 @@ fn generate_bindings(
         .blocklist_type("sqlite3")
         .opaque_type("TS.*")
         .derive_default(true)
-        .layout_tests(layout_tests);
-    if include_functions {
-        builder = builder.allowlist_function("cbm_.*");
-    }
+        .layout_tests(true);
     let bindings = builder
         .generate()
         .expect("failed to generate cbm-sys bindings");

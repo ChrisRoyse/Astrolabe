@@ -81,7 +81,15 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py
 "$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py
 "$PYTHON_BIN" scripts/check-allocator-contract.py
-"$CARGO_BIN" metadata --format-version 1 >/dev/null
+# Resolve workspace metadata once per aggregate run (#192) and hand the JSON
+# to every downstream consumer via ASTRO_CARGO_METADATA_JSON. Consumers filter
+# to workspace_members, so the full resolve here (which also validates the
+# lockfile for the --offline resolves below) matches their former --no-deps
+# view. The cache lives under target/, owned by this run's cleanup.
+mkdir -p "$ROOT/target"
+ASTRO_CARGO_METADATA_JSON="$ROOT/target/astro-cargo-metadata.json"
+"$CARGO_BIN" metadata --format-version 1 >"$ASTRO_CARGO_METADATA_JSON"
+export ASTRO_CARGO_METADATA_JSON
 "$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 "$CARGO_BIN" build --workspace

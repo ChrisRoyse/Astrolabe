@@ -41,7 +41,32 @@ def canonical_path(path: Path) -> Path:
         return path
 
 
+def workspace_packages(metadata: dict) -> list[dict]:
+    """Filter to workspace members so a full-resolve cache matches --no-deps."""
+    members = set(metadata.get("workspace_members") or [])
+    packages = metadata.get("packages", [])
+    if not members:
+        return packages
+    filtered = [package for package in packages if package.get("id") in members]
+    return filtered or packages
+
+
 def load_metadata(manifest_path: Path | None = None) -> dict:
+    if manifest_path is None:
+        # Reuse the aggregate run's single metadata resolve when the driver
+        # provides one (#192). A set-but-unreadable cache is an error, never a
+        # silent fallback to a live resolve.
+        cache_path = os.environ.get("ASTRO_CARGO_METADATA_JSON")
+        if cache_path:
+            try:
+                with open(cache_path, encoding="utf-8") as handle:
+                    return json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise FormatterError(
+                    "ASTRO_CARGO_METADATA_JSON is set but unreadable "
+                    f"({cache_path}): {exc}"
+                ) from exc
+
     base_command = [
         cargo_binary(),
         "metadata",
@@ -86,15 +111,28 @@ def collect_all_targets(
 
     targets: dict[Path, Target] = {}
     visited_dependency_names: set[str] = set()
+    # One `cargo metadata` resolve returns every package of its workspace, so
+    # crates sharing a workspace (the 8+ vendor/calyx path deps) must reuse the
+    # first resolve instead of re-running cargo per manifest (#192).
+    loaded_workspaces: list[tuple[set[Path], dict]] = []
+
+    def load_with_workspace_reuse(current_manifest: Path | None) -> dict:
+        if current_manifest is not None:
+            manifest = canonical_path(current_manifest)
+            for known_manifests, metadata in loaded_workspaces:
+                if manifest in known_manifests:
+                    return metadata
+        return metadata_loader(current_manifest)
 
     def visit(current_manifest: Path | None) -> None:
-        metadata = metadata_loader(current_manifest)
-        packages = metadata.get("packages", [])
+        metadata = load_with_workspace_reuse(current_manifest)
+        packages = workspace_packages(metadata)
         package_manifests = {
             canonical_path(Path(package["manifest_path"]))
             for package in packages
             if package.get("manifest_path")
         }
+        loaded_workspaces.append((package_manifests, metadata))
 
         for package in packages:
             for target in package.get("targets", []):
