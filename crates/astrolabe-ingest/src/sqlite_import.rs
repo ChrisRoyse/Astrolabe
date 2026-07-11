@@ -756,11 +756,15 @@ where
         .count();
     let sqlite_nodes = input.nodes.len();
     let extracted = extract_nodes(input.nodes)?;
+    // Hand ownership of the extracted node graph to `prepare_batch` (moved, not borrowed) so the
+    // full `Vec<ExtractedNode>` does not stay alive in this frame alongside the prepared
+    // constellations and serialized graph rows. Holding raw -> extracted -> prepared -> serialized
+    // stages concurrently was the ~4x whole-graph memory hazard tracked by #101.
     let prepared = prepare_batch(
         vault,
         runtime,
         options,
-        &extracted,
+        extracted,
         input.edges,
         input.metadata,
         input.sqlite_fingerprint,
@@ -1943,7 +1947,7 @@ fn prepare_batch<C, R>(
     vault: &AsterVault<C>,
     runtime: &R,
     options: &SqliteImportOptions,
-    nodes: &[ExtractedNode],
+    nodes: Vec<ExtractedNode>,
     edges: Vec<RawEdgeRow>,
     metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
@@ -1953,11 +1957,15 @@ where
     R: SlotRuntime + Sync,
 {
     let driver = PanelDriver::new(options.panel_version)?;
-    let non_structural = nodes
-        .iter()
-        .filter(|node| !node.label.is_structural())
-        .cloned()
-        .collect::<Vec<_>>();
+    // Split the owned node graph into structural and non-structural buckets by MOVE. `partition`
+    // is order-preserving and hands each `ExtractedNode` to exactly one bucket, so no whole-graph
+    // clone is created (the previous `.iter().filter().cloned()` held a second full copy of every
+    // non-structural node alongside the borrowed `extracted` slice). The small structural bucket is
+    // retained for the structural rows and endpoint set; the non-structural bucket is consumed by
+    // the parallel constellation builder.
+    let (structural, non_structural): (Vec<ExtractedNode>, Vec<ExtractedNode>) = nodes
+        .into_iter()
+        .partition(|node| node.label.is_structural());
     let mut constellations =
         prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
     constellations.sort_by_key(|prepared| prepared.node_id);
@@ -1966,11 +1974,8 @@ where
     for prepared in &constellations {
         graph_rows.push(node_map_graph_row(options, prepared)?);
     }
-    let structural_only = nodes
-        .iter()
-        .filter(|node| node.label.is_structural())
-        .count();
-    for node in nodes.iter().filter(|node| node.label.is_structural()) {
+    let structural_only = structural.len();
+    for node in &structural {
         graph_rows.push(structural_graph_row(options, node)?);
     }
     graph_rows.extend(raw_edge_graph_rows(options, &edges, sqlite_fingerprint)?);
@@ -1978,9 +1983,8 @@ where
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
     let sqlite_edges = edges.len();
-    let structural_node_ids = nodes
+    let structural_node_ids = structural
         .iter()
-        .filter(|node| node.label.is_structural())
         .map(|node| node.id)
         .collect::<BTreeSet<_>>();
     let (edge_rows, edge_skips) =
@@ -2235,10 +2239,25 @@ where
     }
 
     let chunk_size = nodes.len().div_ceil(worker_count);
+    // Carve the owned node graph into per-worker owned chunks by MOVE. `chunks(_).to_vec()` cloned
+    // every node into a second whole-graph copy that coexisted with the original `nodes` Vec for
+    // the duration of the scope; draining `into_iter()` in bounded takes moves each node exactly
+    // once into its worker chunk and releases the source Vec, so peak memory holds one copy of the
+    // node graph, not two (#101). Chunk sizes/boundaries are identical to the prior `chunks()`
+    // partition, and the caller re-sorts constellations by node_id, so output is byte-identical and
+    // worker-count invariant.
+    let mut owned_chunks: Vec<Vec<ExtractedNode>> = Vec::with_capacity(worker_count);
+    let mut drain = nodes.into_iter();
+    loop {
+        let chunk: Vec<ExtractedNode> = drain.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        owned_chunks.push(chunk);
+    }
     thread::scope(|scope| {
         let mut handles = Vec::new();
-        for chunk in nodes.chunks(chunk_size) {
-            let chunk = chunk.to_vec();
+        for chunk in owned_chunks {
             handles.push(scope.spawn(move || {
                 chunk
                     .into_iter()
@@ -5190,6 +5209,31 @@ mod tests {
                 expected = Some(left.cx_ids);
             }
         }
+    }
+
+    #[test]
+    fn worker_count_yields_byte_identical_cfs() {
+        // FSV proof for #101: the parallel constellation builder now carves the owned node graph
+        // into per-worker chunks by MOVE (no `chunk.to_vec()` whole-graph clone) and `prepare_batch`
+        // splits structural/non-structural by MOVE (no `.cloned()` copy). Both restructurings must
+        // leave the persisted output byte-identical regardless of worker count. `edge_fixture` has
+        // multiple non-structural nodes plus a structural node, so a multi-worker run genuinely
+        // splits the graph across chunks rather than degenerating to a single chunk.
+        let path = temp_db("worker-byte-parity");
+        edge_fixture(&path);
+
+        let sequential = vault();
+        let parallel = vault();
+
+        let one = import_sqlite_to_vault(&path, &sequential, &FixtureSlotRuntime, &options(1))
+            .expect("sequential import");
+        let many = import_sqlite_to_vault(&path, &parallel, &FixtureSlotRuntime, &options(8))
+            .expect("parallel import");
+
+        assert_eq!(one, many, "import report differs across worker counts");
+        assert_import_cfs_match_raw(&sequential, &parallel);
+
+        fs::remove_file(path).ok();
     }
 
     #[test]
