@@ -84,6 +84,22 @@ def main() -> int:
 
         rewrite(
             wrapper,
+            '$env:WSL_DISTRO_NAME -or $env:WSL_INTEROP',
+            '$env:WSL_DISTRO_NAME',
+        )
+        expect_failure(run_checker(fixture), "canonical native Windows execution")
+
+        copy_fixture(fixture)
+        rewrite(
+            wrapper,
+            '$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path',
+            'Get-Service -Name WSLService | Out-Null\n$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path',
+        )
+        expect_failure(run_checker(fixture), "must not inspect personal WSL")
+
+        copy_fixture(fixture)
+        rewrite(
+            wrapper,
             "NATIVE_AGGREGATE[ASTRO_STDOUT_ONLY]",
             "NATIVE_AGGREGATE[ASTRO_LOG_FILE_ALLOWED]",
         )

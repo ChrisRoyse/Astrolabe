@@ -12,8 +12,8 @@ $ExpectedWorkspace = "C:\code\Astrolabe"
 if ($env:OS -ne "Windows_NT") {
     throw "invoke-native-aggregate.ps1 is native Windows only"
 }
-if ($env:WSL_DISTRO_NAME) {
-    throw "WSL execution is forbidden; run from native Windows PowerShell"
+if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
+    throw "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: run from native Windows PowerShell"
 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path

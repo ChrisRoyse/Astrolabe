@@ -123,59 +123,43 @@ def main() -> None:
         and 'CLEANUP[ASTRO_WORKSPACE_TEMP]' in runner,
         "the launcher must confine and remove child temporary output within the workspace",
     )
-    require(
-        '$HostServicingProcessNames = @("Dism", "DismHost")' in runner
-        and "function Assert-NoActiveHostServicing" in runner
-        and 'Get-Process -Name $name -ErrorAction SilentlyContinue' in runner
-        and 'Get-Process -Id $servicingProcess.Id -ErrorAction SilentlyContinue'
-        in runner
-        and "ASTRO_DISM_PROCESS_ACTIVE" in runner
-        and (
-            "Assert-NoActiveHostServicing\n"
-            "Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root"
+    forbidden_host_state = (
+        '$WslInstallRoot',
+        '$WslUninstallRegistryRoots',
+        '$WslDistributionRegistryRoot',
+        '$ForbiddenWslServiceNames',
+        '$ForbiddenWslProcessNames',
+        'Assert-NoWslState',
+        'ASTRO_WSL_SERVICE_PRESENT',
+        'ASTRO_WSL_INSTALL_ROOT_PRESENT',
+        'ASTRO_WSL_PACKAGE_PRESENT',
+        'ASTRO_WSL_DISTRIBUTION_PRESENT',
+        'ASTRO_WSL_PROCESS_ACTIVE',
+        'ASTRO_NON_GIT_BASH_ACTIVE',
+        'Get-Process -Name "bash"',
+        'Windows\\CurrentVersion\\Lxss',
+        'C:\\Program Files\\WSL',
+        '$HostServicingProcessNames',
+        'Assert-NoActiveHostServicing',
+        'Assert-HostMaintenanceBoundary',
+        'host-maintenance.lock',
+        'ASTRO_DISM_PROCESS_ACTIVE',
+        'ASTRO_HOST_MAINTENANCE_',
+        'DismHost.exe',
+    )
+    for token in forbidden_host_state:
+        require(
+            token not in runner,
+            f"the launcher must not inspect or manage personal WSL or host servicing ({token})",
         )
-        in runner
-        and appears_before(
-            runner,
-            "ASTRO_DISM_PROCESS_ACTIVE",
-            "target must be absent before toolchain work",
-        ),
-        "the launcher must fail before target creation while active DISM servicing exists",
-    )
-    require(
-        '$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"'
-        in runner
-        and "function Assert-HostMaintenanceBoundary" in runner
-        and "owner_pids" in runner
-        and "result_paths" in runner
-        and '$requiredProperties = @("issue", "owner_pids", "result_paths", "started", "purpose")'
-        in runner
-        and "Test-PathUnderRoot -Path ([string]$resultPath) -Root $WorkspaceRoot"
-        in runner
-        and 'Get-Process -Id $ownerPid -ErrorAction SilentlyContinue' in runner
-        and "ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE" in runner
-        and "ASTRO_HOST_MAINTENANCE_ACTIVE" in runner
-        and "ASTRO_HOST_MAINTENANCE_STALE" in runner
-        and (
-            "Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock "
-            "-WorkspaceRoot $root"
+    for name, document in (("AGENTS.md", agents), ("CLAUDE.md", claude)):
+        require(
+            "WSL coexistence" in document
+            and "must never fail closed on its presence" in document
+            and "must never stop, disable, uninstall" in document
+            and "no operating-system servicing" in document,
+            f"{name} must keep personal WSL and host servicing outside project authority",
         )
-        in runner
-        and "Remove-Item -LiteralPath $hostMaintenanceLock" not in runner
-        and appears_before(
-            runner,
-            "ASTRO_HOST_MAINTENANCE_ACTIVE",
-            "target must be absent before toolchain work",
-        ),
-        "the launcher must preserve owner-bound host maintenance and fail closed on live, stale, or unreadable locks",
-    )
-    require(
-        "active native DISM" in agents
-        and "owner-bound host-maintenance lock" in agents
-        and "active native DISM" in claude
-        and "owner-bound host-maintenance lock" in claude,
-        "doctrine must require active-DISM refusal and owner-bound host-maintenance serialization",
-    )
     require(
         '$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"'
         in runner
@@ -208,29 +192,11 @@ def main() -> None:
             f"the launcher must set {variable} for child commands",
         )
     require(
-        "WSL_DISTRO_NAME" in runner
-        and '$GitInstallRoot = "C:\\Program Files\\Git"' in runner
-        and '$WslInstallRoot = "C:\\Program Files\\WSL"' in runner
-        and "$WslUninstallRegistryRoots" in runner
-        and '$WslDistributionRegistryRoot = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"'
-        in runner
-        and '$ForbiddenWslServiceNames = @("WSLService", "LxssManager")' in runner
-        and '$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")'
-        in runner
-        and "function Assert-NoWslState" in runner
-        and "Get-Service -Name $name" in runner
-        and "Get-ChildItem -LiteralPath $registryRoot" in runner
-        and "Get-ChildItem -LiteralPath $WslDistributionRegistryRoot" in runner
-        and 'Get-Process -Name $name' in runner
-        and 'Get-Process -Name "bash"' in runner
-        and 'Get-Process -Id $process.Id -ErrorAction SilentlyContinue' in runner
-        and "ASTRO_WSL_SERVICE_PRESENT" in runner
-        and "ASTRO_WSL_INSTALL_ROOT_PRESENT" in runner
-        and "ASTRO_WSL_PACKAGE_PRESENT" in runner
-        and "ASTRO_WSL_DISTRIBUTION_PRESENT" in runner
-        and "ASTRO_WSL_PROCESS_ACTIVE" in runner
-        and "ASTRO_NON_GIT_BASH_ACTIVE" in runner,
-        "the launcher must fail closed on WSL services, packages, install roots, distributions, or active WSL/non-Git Bash processes",
+        '$env:OS -ne "Windows_NT"' in runner
+        and '$env:WSL_DISTRO_NAME -or $env:WSL_INTEROP' in runner
+        and "ASTRO_NATIVE_CONTEXT_REQUIRED" in runner
+        and '$GitInstallRoot = "C:\\Program Files\\Git"' in runner,
+        "the launcher must require an actual native Windows execution context without probing host WSL state",
     )
     require(
         "function Assert-AllowedBashCommand" in runner
@@ -242,14 +208,14 @@ def main() -> None:
     )
     require(
         appears_before(
-            runner, "Assert-NoWslState -GitRoot $gitRoot", "if ($Bootstrap)"
+            runner, "ASTRO_NATIVE_CONTEXT_REQUIRED", "if ($Bootstrap)"
         )
         and appears_before(
             runner,
             "Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot",
             "if ($Bootstrap)",
         ),
-        "the WSL and Bash-command preflight must run before bootstrap work",
+        "native-context and Bash-command checks must run before bootstrap work",
     )
     require(
         appears_before(

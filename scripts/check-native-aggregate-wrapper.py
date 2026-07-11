@@ -25,10 +25,23 @@ def main() -> None:
 
     require(
         '$ExpectedWorkspace = "C:\\code\\Astrolabe"' in wrapper
-        and "WSL_DISTRO_NAME" in wrapper
+        and '$env:WSL_DISTRO_NAME -or $env:WSL_INTEROP' in wrapper
+        and "ASTRO_NATIVE_CONTEXT_REQUIRED" in wrapper
         and '$env:OS -ne "Windows_NT"' in wrapper,
         "the wrapper must require canonical native Windows execution",
     )
+    for token in (
+        "Get-Service",
+        "Get-Process",
+        "Get-AppxPackage",
+        "Lxss",
+        "host-maintenance",
+        "DismHost",
+    ):
+        require(
+            token not in wrapper,
+            f"the wrapper must not inspect personal WSL or host servicing via {token}",
+        )
     require(
         '$gitBash = "C:\\Program Files\\Git\\bin\\bash.exe"' in wrapper
         and '"scripts\\windows-gnu-toolchain.ps1"' in wrapper

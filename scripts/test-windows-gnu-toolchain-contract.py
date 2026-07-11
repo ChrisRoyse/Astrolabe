@@ -37,13 +37,6 @@ def rewrite(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new), encoding="utf-8")
 
 
-def rewrite_all(path: Path, old: str, new: str) -> None:
-    text = path.read_text(encoding="utf-8")
-    if old not in text:
-        raise AssertionError(f"expected at least one fixture occurrence of {old!r}")
-    path.write_text(text.replace(old, new), encoding="utf-8")
-
-
 def run_checker(fixture: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "scripts/check-windows-gnu-toolchain-contract.py"],
@@ -92,106 +85,58 @@ def main() -> int:
 
         rewrite(
             runner,
-            '$ForbiddenWslServiceNames = @("WSLService", "LxssManager")',
-            '$ForbiddenWslServiceNames = @()',
+            '$env:WSL_DISTRO_NAME -or $env:WSL_INTEROP',
+            '$env:WSL_DISTRO_NAME',
         )
-        expect_failure(run_checker(fixture), "WSL services")
+        expect_failure(run_checker(fixture), "actual native Windows execution context")
 
         copy_fixture(fixture)
         rewrite(
             runner,
-            '$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")',
-            '$ForbiddenWslProcessNames = @("wsl")',
+            "ASTRO_NATIVE_CONTEXT_REQUIRED",
+            "ASTRO_NATIVE_CONTEXT_REMOVED",
         )
-        expect_failure(run_checker(fixture), "active WSL/non-Git Bash")
+        expect_failure(run_checker(fixture), "actual native Windows execution context")
 
         copy_fixture(fixture)
         rewrite(
             runner,
-            '$WslInstallRoot = "C:\\Program Files\\WSL"',
-            '$WslInstallRoot = "C:\\Program Files\\WSL-removed"',
+            '$GitInstallRoot = "C:\\Program Files\\Git"',
+            '$GitInstallRoot = "C:\\Program Files\\Git"\n$WslInstallRoot = "C:\\Program Files\\WSL"',
         )
-        expect_failure(run_checker(fixture), "install roots")
+        expect_failure(run_checker(fixture), "must not inspect or manage personal WSL")
 
         copy_fixture(fixture)
         rewrite(
             runner,
-            '$WslDistributionRegistryRoot = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss"',
-            '$WslDistributionRegistryRoot = "HKCU:\\Software\\Removed"',
+            "function Assert-AllowedBashCommand {",
+            'Get-Process -Name "bash" | Out-Null\n\nfunction Assert-AllowedBashCommand {',
         )
-        expect_failure(run_checker(fixture), "distributions")
+        expect_failure(run_checker(fixture), "must not inspect or manage personal WSL")
 
         copy_fixture(fixture)
         rewrite(
             runner,
-            "Assert-NoWslState -GitRoot $gitRoot",
-            "Write-Output 'WSL preflight removed'",
+            '$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"',
+            '$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"\n$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"',
         )
-        expect_failure(run_checker(fixture), "preflight must run before bootstrap")
-
-        copy_fixture(fixture)
-        rewrite(
-            runner,
-            "ASTRO_HOST_MAINTENANCE_ACTIVE",
-            "ASTRO_HOST_MAINTENANCE_REMOVED",
-        )
-        expect_failure(run_checker(fixture), "host maintenance")
-
-        copy_fixture(fixture)
-        rewrite(
-            runner,
-            "ASTRO_DISM_PROCESS_ACTIVE",
-            "ASTRO_DISM_PROCESS_IGNORED",
-        )
-        expect_failure(run_checker(fixture), "active DISM servicing")
-
-        copy_fixture(fixture)
-        rewrite(
-            runner,
-            "Assert-NoActiveHostServicing\nAssert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root",
-            "Write-Output 'DISM preflight removed'\nAssert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root",
-        )
-        expect_failure(run_checker(fixture), "active DISM servicing")
-
-        copy_fixture(fixture)
-        rewrite_all(
-            runner,
-            "ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE",
-            "ASTRO_HOST_MAINTENANCE_LOCK_IGNORED",
-        )
-        expect_failure(run_checker(fixture), "owner-bound host maintenance")
-
-        copy_fixture(fixture)
-        rewrite_all(
-            runner,
-            "result_paths",
-            "unowned_paths",
-        )
-        expect_failure(run_checker(fixture), "owner-bound host maintenance")
-
-        copy_fixture(fixture)
-        rewrite(
-            runner,
-            "ASTRO_HOST_MAINTENANCE_STALE",
-            "ASTRO_HOST_MAINTENANCE_REMOVED",
-        )
-        expect_failure(run_checker(fixture), "owner-bound host maintenance")
+        expect_failure(run_checker(fixture), "must not inspect or manage personal WSL")
 
         copy_fixture(fixture)
         rewrite(
             fixture / "AGENTS.md",
-            "active native DISM",
-            "untracked servicing",
+            "must never fail closed on its presence",
+            "may fail closed on its presence",
         )
-        expect_failure(run_checker(fixture), "doctrine")
+        expect_failure(run_checker(fixture), "outside project authority")
 
         copy_fixture(fixture)
         rewrite(
             runner,
-            "Get-Process -Id $process.Id -ErrorAction SilentlyContinue",
-            "Get-Process -Id 0 -ErrorAction SilentlyContinue",
+            "Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot",
+            "Write-Output 'Bash command check removed'",
         )
-        expect_failure(run_checker(fixture), "WSL services")
+        expect_failure(run_checker(fixture), "checks must run before bootstrap")
 
         copy_fixture(fixture)
         rewrite(

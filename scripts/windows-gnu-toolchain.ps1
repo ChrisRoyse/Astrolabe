@@ -29,15 +29,6 @@ $CppcheckCommit = "502C802A69C78F3D8CFD9973AA2108AE169C73B5"
 $CppcheckDirectoryName = "cppcheck-2.20.0-x86_64-w64-mingw32"
 $ExpectedCppcheckVersion = "2.20.0"
 $GitInstallRoot = "C:\Program Files\Git"
-$WslInstallRoot = "C:\Program Files\WSL"
-$WslUninstallRegistryRoots = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-)
-$WslDistributionRegistryRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
-$ForbiddenWslServiceNames = @("WSLService", "LxssManager")
-$ForbiddenWslProcessNames = @("wsl", "wslhost", "vmmemWSL", "wslservice")
-$HostServicingProcessNames = @("Dism", "DismHost")
 $RequiredTools = @(
     "gcc.exe",
     "g++.exe",
@@ -68,90 +59,6 @@ function Remove-LauncherLockFile {
     }
 }
 
-function Assert-NoActiveHostServicing {
-    $activeServicingProcesses = @()
-    foreach ($name in $HostServicingProcessNames) {
-        foreach ($servicingProcess in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
-            if ($null -ne (Get-Process -Id $servicingProcess.Id -ErrorAction SilentlyContinue)) {
-                $activeServicingProcesses += "$($servicingProcess.ProcessName):$($servicingProcess.Id)"
-            }
-        }
-    }
-    if ($activeServicingProcesses.Count -gt 0) {
-        throw "HOST_BOUNDARY[ASTRO_DISM_PROCESS_ACTIVE]: native toolchain work is blocked while Windows DISM servicing is active; wait for the owning host-maintenance issue to record completion: $($activeServicingProcesses -join ', ')"
-    }
-}
-
-function Assert-HostMaintenanceBoundary {
-    param([string]$LockPath, [string]$WorkspaceRoot)
-
-    if (-not (Test-Path -LiteralPath $LockPath)) {
-        return
-    }
-
-    $lockRaw = $null
-    $lockState = $null
-    try {
-        $lockRaw = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop
-        if (-not [string]::IsNullOrWhiteSpace($lockRaw)) {
-            $lockState = ConvertFrom-Json -InputObject $lockRaw -ErrorAction Stop
-        }
-    }
-    catch {
-        $lockState = $null
-    }
-    if ($null -eq $lockState) {
-        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock exists but is not readable owner-bound JSON; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
-    }
-
-    $requiredProperties = @("issue", "owner_pids", "result_paths", "started", "purpose")
-    foreach ($propertyName in $requiredProperties) {
-        if (-not $lockState.PSObject.Properties[$propertyName]) {
-            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock is missing required property '$propertyName'; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
-        }
-    }
-
-    $ownerPidValues = @($lockState.owner_pids)
-    if ($ownerPidValues.Count -eq 0) {
-        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock names no owner_pids; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
-    }
-
-    $resultPaths = @($lockState.result_paths)
-    if ($resultPaths.Count -eq 0) {
-        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock names no result_paths; never remove it until the owning issue records direct process-state evidence: $LockPath"
-    }
-    foreach ($resultPath in $resultPaths) {
-        if (-not (Test-PathUnderRoot -Path ([string]$resultPath) -Root $WorkspaceRoot)) {
-            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: every host-maintenance result path must stay under the canonical workspace; never remove the lock until the owning issue records direct process-state evidence: $LockPath"
-        }
-    }
-
-    $ownerPids = @()
-    foreach ($value in $ownerPidValues) {
-        $ownerPid = 0
-        if (-not [int]::TryParse([string]$value, [ref]$ownerPid) -or $ownerPid -le 0) {
-            throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_LOCK_UNREADABLE]: host-maintenance lock contains an invalid owner pid; never remove it or its result paths until the owning issue records direct process-state evidence: $LockPath"
-        }
-        $ownerPids += $ownerPid
-    }
-    $ownerPids = @($ownerPids | Sort-Object -Unique)
-
-    $liveOwners = @()
-    foreach ($ownerPid in $ownerPids) {
-        $owner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-        if ($null -ne $owner) {
-            $liveOwners += "$($owner.ProcessName):$ownerPid"
-        }
-    }
-    $issue = if ($lockState.PSObject.Properties['issue']) { $lockState.issue } else { "unknown" }
-    $purpose = if ($lockState.PSObject.Properties['purpose']) { $lockState.purpose } else { "unknown" }
-    if ($liveOwners.Count -gt 0) {
-        throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_ACTIVE]: owner-bound host maintenance is active (issue=$issue, purpose=$purpose, owners=$($liveOwners -join ', ')); never remove or replace its lock or result paths: $LockPath"
-    }
-
-    throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_STALE]: host-maintenance owners are no longer live (issue=$issue, owner_pids=$($ownerPids -join ', ')); record direct completion/cleanup evidence on the owning issue before manually removing the lock and its owned paths: $LockPath"
-}
-
 function Test-PathUnderRoot {
     param([string]$Path, [string]$Root)
 
@@ -162,97 +69,6 @@ function Test-PathUnderRoot {
         [IO.Path]::DirectorySeparatorChar
     $fullPath = [IO.Path]::GetFullPath($Path)
     return $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
-}
-
-function Assert-NoWslState {
-    param([string]$GitRoot)
-
-    $installedWslServices = @()
-    foreach ($name in $ForbiddenWslServiceNames) {
-        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if ($null -ne $service) {
-            $installedWslServices += "$($service.Name):$($service.Status):$($service.StartType)"
-        }
-    }
-    if ($installedWslServices.Count -gt 0) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_SERVICE_PRESENT]: uninstall machine-wide WSL services from an elevated native Windows PowerShell session before Astrolabe work: $($installedWslServices -join ', ')"
-    }
-
-    if (Test-Path -LiteralPath $WslInstallRoot) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_INSTALL_ROOT_PRESENT]: uninstall machine-wide WSL before Astrolabe work; residual install root found at $WslInstallRoot"
-    }
-
-    $installedWslPackages = @()
-    foreach ($registryRoot in $WslUninstallRegistryRoots) {
-        foreach ($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction SilentlyContinue)) {
-            $package = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
-            # Uninstall registry keys routinely omit DisplayName/DisplayVersion;
-            # under Set-StrictMode a direct property access on such a key throws
-            # instead of evaluating the boundary. Probe the property set.
-            $packageDisplayName = if ($null -ne $package -and $package.PSObject.Properties['DisplayName']) { $package.DisplayName } else { $null }
-            if ($packageDisplayName -eq "Windows Subsystem for Linux") {
-                $packageDisplayVersion = if ($package.PSObject.Properties['DisplayVersion']) { $package.DisplayVersion } else { "unknown" }
-                $installedWslPackages += "${packageDisplayName}:${packageDisplayVersion}:$($key.PSChildName)"
-            }
-        }
-    }
-    if ($installedWslPackages.Count -gt 0) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_PACKAGE_PRESENT]: uninstall machine-wide WSL packages before Astrolabe work: $($installedWslPackages -join ', ')"
-    }
-
-    $registeredDistributions = @()
-    foreach ($key in @(Get-ChildItem -LiteralPath $WslDistributionRegistryRoot -ErrorAction SilentlyContinue)) {
-        $distribution = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
-        # Same StrictMode hazard as the uninstall keys: DistributionName may be
-        # absent from a lxss subkey; probe before reading.
-        $distributionName = if ($null -ne $distribution -and $distribution.PSObject.Properties['DistributionName'] -and $distribution.DistributionName) {
-            $distribution.DistributionName
-        }
-        else {
-            $key.PSChildName
-        }
-        $registeredDistributions += $distributionName
-    }
-    if ($registeredDistributions.Count -gt 0) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_DISTRIBUTION_PRESENT]: unregister and remove WSL distributions before Astrolabe work: $($registeredDistributions -join ', ')"
-    }
-
-    $activeWslProcesses = @()
-    foreach ($name in $ForbiddenWslProcessNames) {
-        foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
-            $activeWslProcesses += "$($process.ProcessName):$($process.Id)"
-        }
-    }
-    if ($activeWslProcesses.Count -gt 0) {
-        throw "WSL_BOUNDARY[ASTRO_WSL_PROCESS_ACTIVE]: stop and remove forbidden WSL processes before Astrolabe work: $($activeWslProcesses -join ', ')"
-    }
-
-    $nonGitBashProcesses = @()
-    foreach ($process in @(Get-Process -Name "bash" -ErrorAction SilentlyContinue)) {
-        $processPath = $null
-        try {
-            $processPath = $process.Path
-        }
-        catch {
-            # An unverifiable LIVE Bash process is not acceptable in this
-            # fail-closed boundary; the liveness re-probe below separates it
-            # from a process that exited between enumeration and inspection.
-        }
-        if (-not (Test-PathUnderRoot -Path $processPath -Root $GitRoot)) {
-            # Transient Git Bash helpers (statusline scripts, tool shells)
-            # routinely exit mid-audit, leaving Path unreadable. A process
-            # that no longer exists is not live boundary state; only a
-            # still-live process may fail the boundary.
-            if ($null -eq (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
-                continue
-            }
-            $displayPath = if ([string]::IsNullOrWhiteSpace($processPath)) { "unresolved" } else { $processPath }
-            $nonGitBashProcesses += "$($process.Id):$displayPath"
-        }
-    }
-    if ($nonGitBashProcesses.Count -gt 0) {
-        throw "WSL_BOUNDARY[ASTRO_NON_GIT_BASH_ACTIVE]: only Bash under $GitRoot is allowed; stop forbidden or unverifiable Bash processes: $($nonGitBashProcesses -join ', ')"
-    }
 }
 
 function Assert-AllowedBashCommand {
@@ -268,7 +84,7 @@ function Assert-AllowedBashCommand {
     if ([IO.Path]::IsPathRooted($Command) -or $Command.Contains("\") -or $Command.Contains("/")) {
         $resolved = (Resolve-Path -LiteralPath $Command -ErrorAction Stop).Path
         if (-not (Test-PathUnderRoot -Path $resolved -Root $GitRoot)) {
-            throw "WSL_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolved"
+            throw "EXECUTION_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolved"
         }
     }
 }
@@ -278,7 +94,7 @@ function Assert-NativeGitBashResolution {
 
     $resolvedBash = (Get-Command -Name "bash.exe" -CommandType Application -ErrorAction Stop).Source
     if (-not (Test-PathUnderRoot -Path $resolvedBash -Root $GitRoot)) {
-        throw "WSL_BOUNDARY[ASTRO_BASH_RESOLUTION_FORBIDDEN]: bash.exe must resolve under $GitRoot, found $resolvedBash"
+        throw "EXECUTION_BOUNDARY[ASTRO_BASH_RESOLUTION_FORBIDDEN]: bash.exe must resolve under $GitRoot, found $resolvedBash"
     }
 
     if (-not [string]::IsNullOrWhiteSpace($Command) -and
@@ -290,7 +106,7 @@ function Assert-NativeGitBashResolution {
             (Get-Command -Name $Command -CommandType Application -ErrorAction Stop).Source
         }
         if (-not (Test-PathUnderRoot -Path $resolvedCommand -Root $GitRoot)) {
-            throw "WSL_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolvedCommand"
+            throw "EXECUTION_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolvedCommand"
         }
     }
 }
@@ -631,8 +447,8 @@ function Test-PinnedToolchain {
 if ($env:OS -ne "Windows_NT") {
     throw "windows-gnu-toolchain.ps1 is native Windows only"
 }
-if ($env:WSL_DISTRO_NAME) {
-    throw "WSL execution is forbidden; run this launcher from native Windows PowerShell"
+if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
+    throw "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: run this launcher from native Windows PowerShell"
 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -644,9 +460,6 @@ $target = Join-Path $root "target"
 $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
-$hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"
-Assert-NoActiveHostServicing
-Assert-HostMaintenanceBoundary -LockPath $hostMaintenanceLock -WorkspaceRoot $root
 $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 if (Test-Path -LiteralPath $launcherLock) {
     $lockRaw = Get-Content -LiteralPath $launcherLock -Raw -ErrorAction SilentlyContinue
@@ -700,7 +513,6 @@ $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
 Require-Path (Join-Path $gitBin "bash.exe") "native Git for Windows Bash is required"
 Require-Path (Join-Path $gitUsrBin "sh.exe") "native Git for Windows shell is required"
-Assert-NoWslState -GitRoot $gitRoot
 Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot
 
 if ($Bootstrap) {
