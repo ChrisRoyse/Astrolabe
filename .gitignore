@@ -69,8 +69,10 @@ tmp/
 *.db-wal
 *.db-shm
 
-# Local agent / tooling config
-.claude/
+# Local agent / tooling config — except project skills, which are shared
+# repository artifacts (see issue #230).
+.claude/*
+!.claude/skills/
 
 # Editor / OS files
 .vscode/
