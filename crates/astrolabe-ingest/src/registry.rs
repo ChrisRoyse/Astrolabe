@@ -35,7 +35,7 @@ const SCHEMA_REVERSE: &str = "astrolabe-series-reverse-v2";
 const SCHEMA_QN: &str = "astrolabe-series-qn-index-v2";
 const SCHEMA_RECURRENCE: &str = "astrolabe-series-recurrence-v2";
 const SCHEMA_SPLIT: &str = "astrolabe-series-split-v2";
-const SCHEMA_REGISTRY_LEDGER: &str = "astrolabe-series-registry-ledger-v2";
+const SCHEMA_REGISTRY_BATCH_LEDGER: &str = "astrolabe-registry-batch-ledger-v1";
 const ASTROLABE_REGISTRY_ACTOR: &str = "astrolabe-registry";
 
 /// Result type for Astrolabe ingest and registry operations.
@@ -276,15 +276,20 @@ pub struct SeriesSplitRecord {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-struct SeriesRegistryLedgerPayload {
+struct SeriesRegistryBatchLedgerPayload {
     schema: String,
-    project_digest: String,
-    commit_digest: String,
-    series_id: SeriesId,
-    cx_id: CxId,
-    version_count: u64,
+    /// Inputs presented to the batch (before idempotent de-duplication).
+    input_count: u64,
+    /// Inputs that appended a new series version (non-idempotent applications).
+    versions_added: u64,
+    /// Ambiguous-rename split records written by the batch.
+    splits_written: u64,
+    /// Distinct CF rows physically written by the batch's single group commit.
     changed_rows: u64,
-    split_written: bool,
+    /// blake3 over the applied `(series_id, cx_id, version_count, commit)` tuples in the
+    /// batch's canonical (sorted) order, so the single ledger entry still fixes the exact
+    /// set of versions the commit admitted.
+    batch_digest: String,
 }
 
 /// Git rename status parsed from CBM-compatible status lines.
@@ -796,11 +801,39 @@ where
             ))
     });
 
-    let mut mutated_rows = 0;
     let inputs = prepared.len();
+
+    // Stage every input against an in-memory working set seeded from the batch-start
+    // snapshot, accumulating the CF mutations for the whole batch. This replaces the former
+    // per-symbol `write_cf_batch_with_ledger_entry` loop (N fsync'd commits + N ledger rows
+    // for N symbols) with a single group commit and a single batch-level ledger entry.
+    let mut batch = RegistryBatch::new(vault.latest_seq());
     for input in prepared {
-        mutated_rows += apply_one(vault, input)?;
+        stage_one(vault, &mut batch, input)?;
     }
+
+    // Determine which staged rows differ from the batch-start snapshot. Iterating the
+    // deduped write map (a BTreeMap) yields a deterministic, key-sorted change set.
+    let mut changed = Vec::with_capacity(batch.writes.len());
+    for ((cf, key), value) in &batch.writes {
+        if vault.read_cf_at(batch.snapshot, *cf, key)?.as_ref() != Some(value) {
+            changed.push((*cf, key.clone(), value.clone()));
+        }
+    }
+    let mutated_rows = changed.len();
+
+    if !changed.is_empty() {
+        let payload =
+            series_registry_batch_ledger_payload(&batch, inputs as u64, mutated_rows as u64);
+        vault.write_cf_batch_with_ledger_entry(
+            changed,
+            EntryKind::Ingest,
+            SubjectId::Query(batch.digest.finalize().as_bytes().to_vec()),
+            payload?,
+            ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string()),
+        )?;
+    }
+
     Ok(SeriesIngestReport {
         inputs,
         mutated_rows,
@@ -808,7 +841,74 @@ where
     })
 }
 
-fn apply_one<C>(vault: &AsterVault<C>, prepared: PreparedVersionInput) -> IngestResult<usize>
+/// In-memory accumulator for a single registry ingest batch.
+///
+/// Series rows evolve in `series` (seeded once from the batch-start snapshot), and every
+/// resulting CF mutation is deduped by `(cf, key)` in `writes` so a series touched by
+/// multiple versions in one batch collapses to its final row while distinct version rows
+/// (reverse/recurrence keyed per version) are all retained.
+struct RegistryBatch {
+    snapshot: Seq,
+    series: BTreeMap<SeriesId, Option<StoredSeriesRegistryRow>>,
+    writes: BTreeMap<(ColumnFamily, Vec<u8>), Vec<u8>>,
+    versions_added: u64,
+    splits_written: u64,
+    digest: blake3::Hasher,
+}
+
+impl RegistryBatch {
+    fn new(snapshot: Seq) -> Self {
+        Self {
+            snapshot,
+            series: BTreeMap::new(),
+            writes: BTreeMap::new(),
+            versions_added: 0,
+            splits_written: 0,
+            digest: blake3::Hasher::new(),
+        }
+    }
+
+    /// Returns the current in-batch series row, seeding it from the snapshot on first touch.
+    fn current_series<C>(
+        &mut self,
+        vault: &AsterVault<C>,
+        series_id: SeriesId,
+    ) -> IngestResult<Option<StoredSeriesRegistryRow>>
+    where
+        C: Clock,
+    {
+        if !self.series.contains_key(&series_id) {
+            let seeded = read_series_row_at(vault, self.snapshot, series_id)?;
+            self.series.insert(series_id, seeded);
+        }
+        Ok(self.series.get(&series_id).cloned().flatten())
+    }
+
+    /// Records the evolved series row: updates the working set and stages the CF write.
+    fn set_series(
+        &mut self,
+        series_id: SeriesId,
+        row: StoredSeriesRegistryRow,
+    ) -> IngestResult<()> {
+        self.push(
+            ColumnFamily::Kv,
+            series_row_key(series_id),
+            serde_json::to_vec(&row)?,
+        );
+        self.series.insert(series_id, Some(row));
+        Ok(())
+    }
+
+    fn push(&mut self, cf: ColumnFamily, key: Vec<u8>, value: Vec<u8>) {
+        self.writes.insert((cf, key), value);
+    }
+}
+
+fn stage_one<C>(
+    vault: &AsterVault<C>,
+    batch: &mut RegistryBatch,
+    prepared: PreparedVersionInput,
+) -> IngestResult<()>
 where
     C: Clock,
 {
@@ -817,7 +917,7 @@ where
     let mut rename_record = None;
 
     if let Some(rename) = &prepared.input.rename {
-        let candidates = rename_candidates(vault, &prepared, rename)?;
+        let candidates = batch_rename_candidates(vault, batch, &prepared, rename)?;
         if candidates.len() == 1 {
             series_id = candidates[0];
             rename_record = Some(RenameRecord {
@@ -830,13 +930,14 @@ where
         }
     }
 
-    let existing = read_series_row(vault, series_id)?;
+    let existing = batch.current_series(vault, series_id)?;
     if existing.as_ref().is_some_and(|row| {
         row.versions
             .iter()
             .any(|version| version.cx_id == prepared.cx_id)
     }) {
-        return Ok(0);
+        // Idempotent: this exact version is already present, so the input stages nothing.
+        return Ok(());
     }
 
     let (row, prev_cx) = match existing {
@@ -905,85 +1006,65 @@ where
         series_id,
     };
 
-    let mut rows = vec![
-        (
-            ColumnFamily::Kv,
-            series_row_key(series_id),
-            serde_json::to_vec(&row)?,
+    let ordinal = row.version_count;
+    batch.set_series(series_id, row)?;
+    batch.push(
+        ColumnFamily::Kv,
+        reverse_index_key(prepared.cx_id),
+        serde_json::to_vec(&reverse)?,
+    );
+    batch.push(
+        ColumnFamily::Kv,
+        qn_index_key(
+            &prepared.input.symbol.project,
+            &prepared.input.symbol.label,
+            &prepared.input.symbol.qualified_name,
         ),
-        (
-            ColumnFamily::Kv,
-            reverse_index_key(prepared.cx_id),
-            serde_json::to_vec(&reverse)?,
-        ),
-        (
-            ColumnFamily::Kv,
-            qn_index_key(
-                &prepared.input.symbol.project,
-                &prepared.input.symbol.label,
-                &prepared.input.symbol.qualified_name,
-            ),
-            serde_json::to_vec(&qn)?,
-        ),
-        (
-            ColumnFamily::Recurrence,
-            recurrence_key(series_id, row.version_count),
-            serde_json::to_vec(&recurrence)?,
-        ),
-    ];
-    let split_written = split_record.is_some();
+        serde_json::to_vec(&qn)?,
+    );
+    batch.push(
+        ColumnFamily::Recurrence,
+        recurrence_key(series_id, ordinal),
+        serde_json::to_vec(&recurrence)?,
+    );
     if let Some(split) = split_record {
-        rows.push((
+        batch.push(
             ColumnFamily::Kv,
             split_record_key(&split.split_id),
             serde_json::to_vec(&split)?,
-        ));
+        );
+        batch.splits_written += 1;
     }
 
-    let snapshot = vault.latest_seq();
-    let mut changed = Vec::new();
-    for (cf, key, value) in rows {
-        if vault.read_cf_at(snapshot, cf, &key)?.as_ref() != Some(&value) {
-            changed.push((cf, key, value));
-        }
-    }
-    let changed_len = changed.len();
-    if !changed.is_empty() {
-        vault.write_cf_batch_with_ledger_entry(
-            changed,
-            EntryKind::Ingest,
-            SubjectId::Cx(prepared.cx_id),
-            series_registry_ledger_payload(&prepared, series_id, &row, changed_len, split_written)?,
-            ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string()),
-        )?;
-    }
-    Ok(changed_len)
+    // Fold this application into the batch provenance digest in canonical order.
+    batch.digest.update(series_id.to_string().as_bytes());
+    batch.digest.update(prepared.cx_id.to_string().as_bytes());
+    batch.digest.update(&ordinal.to_le_bytes());
+    batch.digest.update(prepared.input.commit.as_bytes());
+    batch.versions_added += 1;
+
+    Ok(())
 }
 
-fn series_registry_ledger_payload(
-    prepared: &PreparedVersionInput,
-    series_id: SeriesId,
-    row: &StoredSeriesRegistryRow,
-    changed_rows: usize,
-    split_written: bool,
+fn series_registry_batch_ledger_payload(
+    batch: &RegistryBatch,
+    input_count: u64,
+    changed_rows: u64,
 ) -> IngestResult<Vec<u8>> {
-    let payload = SeriesRegistryLedgerPayload {
-        schema: SCHEMA_REGISTRY_LEDGER.to_string(),
-        project_digest: hex_lower(
-            blake3::hash(prepared.input.symbol.project.as_bytes()).as_bytes(),
-        ),
-        commit_digest: hex_lower(blake3::hash(prepared.input.commit.as_bytes()).as_bytes()),
-        series_id,
-        cx_id: prepared.cx_id,
-        version_count: row.version_count,
-        changed_rows: changed_rows as u64,
-        split_written,
+    let payload = SeriesRegistryBatchLedgerPayload {
+        schema: SCHEMA_REGISTRY_BATCH_LEDGER.to_string(),
+        input_count,
+        versions_added: batch.versions_added,
+        splits_written: batch.splits_written,
+        changed_rows,
+        batch_digest: hex_lower(batch.digest.finalize().as_bytes()),
     };
     Ok(serde_json::to_vec(&payload)?)
 }
 
-fn rename_candidates<C>(
+fn batch_rename_candidates<C>(
     vault: &AsterVault<C>,
+    batch: &RegistryBatch,
     prepared: &PreparedVersionInput,
     rename: &RenameHint,
 ) -> IngestResult<Vec<SeriesId>>
@@ -999,25 +1080,29 @@ where
         &prepared.input.symbol.label,
         &rename.old_qualified_name,
     );
-    let Some(value) = vault.read_cf_at(vault.latest_seq(), ColumnFamily::Kv, &key)? else {
+    // A qn-index row staged earlier in this same batch wins over the committed snapshot, so
+    // a rename can continue a series first observed within the batch.
+    let value = if let Some(staged) = batch.writes.get(&(ColumnFamily::Kv, key.clone())) {
+        Some(staged.clone())
+    } else {
+        vault.read_cf_at(batch.snapshot, ColumnFamily::Kv, &key)?
+    };
+    let Some(value) = value else {
         return Ok(Vec::new());
     };
     let row: QnIndexRow = serde_json::from_slice(&value)?;
     Ok(vec![row.series_id])
 }
 
-fn read_series_row<C>(
+fn read_series_row_at<C>(
     vault: &AsterVault<C>,
+    snapshot: Seq,
     series_id: SeriesId,
 ) -> IngestResult<Option<StoredSeriesRegistryRow>>
 where
     C: Clock,
 {
-    let Some(value) = vault.read_cf_at(
-        vault.latest_seq(),
-        ColumnFamily::Kv,
-        &series_row_key(series_id),
-    )?
+    let Some(value) = vault.read_cf_at(snapshot, ColumnFamily::Kv, &series_row_key(series_id))?
     else {
         return Ok(None);
     };
@@ -1389,6 +1474,95 @@ mod tests {
                 assert_eq!(row.prev_cx, Some(cx_ids[(ordinal - 2) as usize]));
             }
         }
+    }
+
+    #[test]
+    fn batch_ingest_coalesces_distinct_symbols_into_one_ledger_entry() {
+        let vault = vault();
+        let inputs = vec![
+            input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1"),
+            input("demo.math.sub", "src/math.rs", "fn sub() { 1 }", 20, "c1"),
+            input("demo.math.mul", "src/math.rs", "fn mul() { 1 }", 30, "c1"),
+        ];
+
+        let report = ingest_series_batch(&vault, &inputs).expect("ingest batch");
+
+        // Three new series, four registry rows each (series/reverse/qn/recurrence), written
+        // by a single group commit.
+        assert_eq!(report.mutated_rows, 12);
+
+        // FSV: exactly one Ledger CF row for the whole batch, where the per-symbol loop
+        // previously wrote one fsync'd commit and one ledger row per symbol.
+        let ledger_rows = vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan ledger");
+        assert_eq!(ledger_rows.len(), 1);
+
+        let entry = calyx_ledger::decode(&ledger_rows[0].1).expect("decode ledger entry");
+        assert_eq!(entry.kind, EntryKind::Ingest);
+        let payload: SeriesRegistryBatchLedgerPayload =
+            serde_json::from_slice(&entry.payload).expect("decode batch payload");
+        assert_eq!(payload.schema, SCHEMA_REGISTRY_BATCH_LEDGER);
+        assert_eq!(payload.input_count, 3);
+        assert_eq!(payload.versions_added, 3);
+        assert_eq!(payload.splits_written, 0);
+        assert_eq!(payload.changed_rows, 12);
+
+        verify_deep(&vault).expect("verify deep");
+    }
+
+    #[test]
+    fn batch_accumulates_two_versions_of_one_series_in_a_single_commit() {
+        // Two versions of the same series in one batch must accumulate through the in-memory
+        // working set (the second version reads the first's staged row, not the vault) and
+        // still land in a single commit.
+        let vault = vault();
+        let v1 = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        let v2 = input("demo.math.add", "src/math.rs", "fn add() { 2 }", 10, "c2");
+        let series_id = v1.symbol.series_id().expect("series id");
+        let cx1 = v1.symbol.cx_id(7).expect("cx1");
+        let cx2 = v2.symbol.cx_id(7).expect("cx2");
+
+        ingest_series_batch(&vault, &[v1, v2]).expect("ingest two versions in one batch");
+
+        // Single commit for both versions.
+        assert_eq!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+                .expect("scan ledger")
+                .len(),
+            1
+        );
+
+        // The final series row reflects both versions in commit order.
+        let row = series_row(&vault, series_id);
+        assert_eq!(row.version_count, 2);
+        assert_eq!(row.current_cx_id, cx2);
+        assert_eq!(
+            row.versions
+                .iter()
+                .map(|version| version.cx_id)
+                .collect::<Vec<_>>(),
+            vec![cx1, cx2]
+        );
+
+        // Both per-version recurrence rows persist (byte readback).
+        for (ordinal, cx) in [(1u64, cx1), (2, cx2)] {
+            let bytes = vault
+                .read_cf_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Recurrence,
+                    &recurrence_key(series_id, ordinal),
+                )
+                .expect("read recurrence")
+                .expect("recurrence row");
+            let recurrence: RecurrenceRow =
+                serde_json::from_slice(&bytes).expect("decode recurrence");
+            assert_eq!(recurrence.occurrence_id, ordinal);
+            assert_eq!(recurrence.new_cx, cx);
+        }
+
+        verify_deep(&vault).expect("verify deep");
     }
 
     #[test]
