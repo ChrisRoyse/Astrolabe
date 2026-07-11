@@ -36,6 +36,17 @@ pub const ASTRO_LOWERED_SQLITE_SCHEMA: &str = "astrolabe-lowered-sqlite-v1";
 pub const ASTRO_META_SCHEMA: &str = "astrolabe-astro-meta-v1";
 pub const DEFAULT_LOWERED_AT: &str = "1970-01-01T00:00:00Z";
 
+/// SQLITE_BUSY retry window for the throwaway lowered-artifact db (#76). Since the
+/// content-freshness watermark work (#221), `index_status` re-lowers on a source
+/// mismatch while another `index_status` process may still hold a shared read lock
+/// on the same lowered sidecar; with no busy timeout the writer returns
+/// "database is locked" immediately instead of waiting for the reader to drain,
+/// which reddens the cross-process gate (check-cross-process-vault.py). Mirrors the
+/// config store's CONFIG_DB_BUSY_TIMEOUT_MS operational-resilience window
+/// (crates/astrolabe-server/src/migration.rs). journal_mode stays OFF because the
+/// artifact is fully rebuilt each lowering; this only changes lock-wait behaviour.
+const LOWERED_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
+
 pub type LowerResult<T> = Result<T, LowerError>;
 
 #[derive(Debug)]
@@ -403,6 +414,29 @@ fn lower_edge(id: i64, edge: CbmGraphEdge, source_id: i64, target_id: i64) -> Lo
     }
 }
 
+/// Open the throwaway lowered-artifact SQLite db with the fixed pragmas and the
+/// #76 SQLITE_BUSY retry window. Kept as a named helper so the busy-timeout
+/// contract is directly asserted by `lowered_connection_sets_busy_timeout`.
+fn open_lowered_connection(output_path: &Path) -> LowerResult<Connection> {
+    let connection = Connection::open_with_flags(
+        output_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // #76: wait for a transient shared-lock holder (a concurrent index_status
+    // reader of the same lowered sidecar) instead of failing SQLITE_BUSY at once.
+    connection.busy_timeout(std::time::Duration::from_millis(LOWERED_DB_BUSY_TIMEOUT_MS))?;
+    connection.execute_batch(
+        "PRAGMA page_size=4096;\
+         PRAGMA journal_mode=OFF;\
+         PRAGMA synchronous=OFF;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA encoding='UTF-8';",
+    )?;
+    Ok(connection)
+}
+
 fn write_sqlite_artifact(
     output_path: &Path,
     rows: &LoweredRows,
@@ -417,19 +451,7 @@ fn write_sqlite_artifact(
     }
     remove_existing_sqlite(output_path)?;
 
-    let mut connection = Connection::open_with_flags(
-        output_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    connection.execute_batch(
-        "PRAGMA page_size=4096;\
-         PRAGMA journal_mode=OFF;\
-         PRAGMA synchronous=OFF;\
-         PRAGMA foreign_keys=ON;\
-         PRAGMA encoding='UTF-8';",
-    )?;
+    let mut connection = open_lowered_connection(output_path)?;
     create_cbm_schema(&connection)?;
     let transaction = connection.transaction()?;
     insert_rows(
@@ -2207,5 +2229,34 @@ mod tests {
     fn cleanup_dir(path: &Path) {
         let _ = fs::remove_dir_all(path);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn lowered_connection_sets_busy_timeout() {
+        // FSV (#76): the lowered-artifact connection must carry a SQLITE_BUSY retry
+        // window so a concurrent index_status reader of the same sidecar cannot force
+        // an immediate "database is locked" on the re-lowering writer. Read the
+        // pragma back off the real connection rather than trusting the setter.
+        let path = temp_path("busy-timeout.astrolabe-lowered.db");
+        cleanup(&path);
+        let connection = open_lowered_connection(&path).expect("open lowered connection");
+        let busy_timeout: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("read back busy_timeout");
+        assert_eq!(
+            busy_timeout,
+            LOWERED_DB_BUSY_TIMEOUT_MS as i64,
+            "lowered sqlite must set a SQLITE_BUSY retry window (#76)"
+        );
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read back journal_mode");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "off",
+            "lowered sqlite stays journal_mode=OFF (fully rebuilt artifact)"
+        );
+        drop(connection);
+        cleanup(&path);
     }
 }
