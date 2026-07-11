@@ -613,6 +613,16 @@ if ($isWorktreeRoot -and $Bootstrap) {
 }
 if ($isWorktreeRoot) {
     Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
+    # #226: give each worktree its own sccache SERVER (port) while still sharing
+    # the on-disk cache. The server is otherwise machine-wide, so an orphan left
+    # by a sibling session that was started under a since-deleted per-session temp
+    # dir would serve this session and fatally poison every compile with
+    # "Failed to create temp dir". The port is a deterministic function of the
+    # worktree path, so reruns in one worktree reuse one warm server.
+    $rootBytes = [System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())
+    $rootHash = [System.Security.Cryptography.SHA256]::HashData($rootBytes)
+    $env:SCCACHE_SERVER_PORT = [string](49152 + ([BitConverter]::ToUInt16($rootHash, 0) % 16000))
+    Write-Output "SCCACHE[ASTRO_CACHE_WORKTREE_PORT]: SCCACHE_SERVER_PORT=$env:SCCACHE_SERVER_PORT"
 }
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
