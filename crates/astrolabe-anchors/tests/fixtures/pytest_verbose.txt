@@ -1,0 +1,22 @@
+============================= test session starts =============================
+platform linux -- Python 3.12.4, pytest-8.2.2, pluggy-1.5.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/dev/demo
+collected 4 items
+
+tests/test_calc.py::test_adds PASSED                                     [ 25%]
+tests/test_calc.py::test_subtracts FAILED                                [ 50%]
+tests/test_io.py::test_reads SKIPPED (requires network)                  [ 75%]
+tests/test_io.py::test_writes PASSED                                     [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_subtracts ________________________________
+
+    def test_subtracts():
+>       assert calc.sub(3, 2) == 2
+E       assert 1 == 2
+
+tests/test_calc.py:14: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_calc.py::test_subtracts - assert 1 == 2
+================== 1 failed, 2 passed, 1 skipped in 0.14s ==================

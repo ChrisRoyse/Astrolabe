@@ -32,6 +32,24 @@ use calyx_loom::{CrossTermKind as LoomCrossTermKind, CrossTermValue as LoomCross
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod ann;
+mod sim_rows;
+mod xterm_rows;
+
+pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
+pub use sim_rows::{
+    ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
+    SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
+    SimilarityPersistReport, persist_similarity_edges, read_similarity_edge_rows,
+    sim_edge_graph_key,
+};
+pub use xterm_rows::{
+    ASTRO_XTERM_CX_ID_MISSING, ASTRO_XTERM_ROW_CORRUPT, EagerCrossTermPersistReport,
+    PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
+    agreement_graph_from_persisted_rows, designed_kind_for_slots, eager_xterm_dump_bytes,
+    eager_xterm_key, lazy_agreement, persist_eager_cross_terms, read_eager_cross_term_rows,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
@@ -50,6 +68,38 @@ pub const DEFAULT_SIM_PROFILE_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIMILARITY_PER_NODE_CAP: usize = 10;
 pub const DEFAULT_SIMILARITY_WORKERS: usize = 1;
 pub const DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT: usize = 50_000;
+/// MinHash signature length for LSH banding candidate generation.
+///
+/// v1 prior carried over from CBM's retained MinHash pipeline (128-permutation
+/// signatures behind the 512-hex `fp` fingerprint budget). Annealable later.
+pub const DEFAULT_SIMILARITY_LSH_PERMUTATIONS: usize = 128;
+/// LSH band count over the MinHash signature (rows per band = permutations / bands).
+///
+/// v1 derivation from CBM's 0.95-Jaccard admission prior: with 128 permutations
+/// and 32 bands (4 rows/band) the banding S-curve crosses 0.5 near Jaccard
+/// (1/32)^(1/4) ≈ 0.42, so a pair at the 0.95-Jaccard admission prior is missed
+/// with probability (1 − 0.95⁴)³² ≈ 4e-24 — candidate recall at the admission
+/// threshold is effectively 1 while pairs far below it stay unprobed.
+pub const DEFAULT_SIMILARITY_LSH_BANDS: usize = 32;
+/// Deterministic namespace seed for LSH hash derivation and HNSW level draws.
+///
+/// A fixed identity ("ASTROLAB" as big-endian ASCII), not a tuned quantity: any
+/// value yields a valid deterministic plan; changing it changes candidate sets,
+/// so it is pinned in config for reproducibility.
+pub const DEFAULT_SIMILARITY_ANN_SEED: u64 = u64::from_be_bytes(*b"ASTROLAB");
+/// Candidate head-room multiplier for ANN generation.
+///
+/// Both generators probe `per_node_cap × this` candidates per node (HNSW query
+/// k, LSH within-bucket pairing span) so that ownership filtering and exact
+/// rescoring still leave `per_node_cap` admissible edges. v1 default 3 is a
+/// declared knob (annealable later), not a measurement.
+pub const DEFAULT_SIMILARITY_ANN_CANDIDATE_MULTIPLIER: usize = 3;
+/// HNSW beam width (`ef`) used for candidate queries.
+///
+/// v1 prior: 2× the vendored index's own default beam floor (`max_neighbors ×
+/// 2 = 64`), a declared knob (annealable later). Raised automatically to the
+/// query k when k exceeds it, since the index fails closed on `ef < k`.
+pub const DEFAULT_SIMILARITY_HNSW_EF_SEARCH: usize = 128;
 /// Squared-L2-norm floor below which a slot/profile vector is treated as a
 /// degenerate zero vector and skipped from similarity and cross-term scoring.
 ///
@@ -440,6 +490,13 @@ impl SimilarityFamily {
         }
     }
 
+    /// Parses a persisted wire name back into its family.
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|family| family.wire_name() == name)
+    }
+
     pub const fn slot(self) -> SlotId {
         match self {
             Self::Struct => SIM_STRUCT_SLOT,
@@ -465,7 +522,7 @@ impl SimilarityFamily {
         }
     }
 
-    const fn sort_index(self) -> u8 {
+    pub(crate) const fn sort_index(self) -> u8 {
         match self {
             Self::Struct => 0,
             Self::Semantic => 1,
@@ -511,6 +568,49 @@ impl Default for SimilarityThresholds {
     }
 }
 
+/// How candidate pairs are generated for one similarity family before exact
+/// cosine scoring and admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityCandidateStrategy {
+    /// Score every pair (subject to `exact_pair_node_limit`). Exhaustive and
+    /// exact; O(n²) evaluations.
+    ExactPairs,
+    /// ANN candidate generation: MinHash/LSH banding for sparse slot vectors
+    /// (S1-style trigram / hashed-set shapes) and a seeded, scalar8-quantized
+    /// HNSW for dense slot vectors where LSH does not apply. Admission still
+    /// rescores every candidate with the exact cosine.
+    Ann,
+}
+
+/// Named ANN candidate-generation knobs (see the `DEFAULT_SIMILARITY_*`
+/// constants for the documented v1 defaults and their derivations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnCandidateConfig {
+    /// MinHash signature length for LSH banding.
+    pub minhash_permutations: usize,
+    /// LSH band count; rows per band = `minhash_permutations / lsh_bands`.
+    pub lsh_bands: usize,
+    /// Deterministic namespace seed for LSH hash derivation and HNSW levels.
+    pub seed: u64,
+    /// Candidate head-room multiplier (HNSW query k and LSH bucket pair span
+    /// are `per_node_cap × this`).
+    pub candidate_multiplier: usize,
+    /// HNSW beam width for candidate queries (raised to k when k exceeds it).
+    pub hnsw_ef_search: usize,
+}
+
+impl Default for AnnCandidateConfig {
+    fn default() -> Self {
+        Self {
+            minhash_permutations: DEFAULT_SIMILARITY_LSH_PERMUTATIONS,
+            lsh_bands: DEFAULT_SIMILARITY_LSH_BANDS,
+            seed: DEFAULT_SIMILARITY_ANN_SEED,
+            candidate_multiplier: DEFAULT_SIMILARITY_ANN_CANDIDATE_MULTIPLIER,
+            hnsw_ef_search: DEFAULT_SIMILARITY_HNSW_EF_SEARCH,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimilarityPlannerConfig {
     pub thresholds: SimilarityThresholds,
@@ -518,6 +618,11 @@ pub struct SimilarityPlannerConfig {
     pub worker_count: usize,
     pub disabled_families: BTreeSet<SimilarityFamily>,
     pub exact_pair_node_limit: Option<usize>,
+    /// Per-family candidate generation strategy. Families not present use the
+    /// scalable default, [`SimilarityCandidateStrategy::Ann`].
+    pub candidate_strategies: BTreeMap<SimilarityFamily, SimilarityCandidateStrategy>,
+    /// Named ANN candidate-generation knobs.
+    pub ann: AnnCandidateConfig,
 }
 
 impl SimilarityPlannerConfig {
@@ -530,6 +635,23 @@ impl SimilarityPlannerConfig {
         self.exact_pair_node_limit = limit;
         self
     }
+
+    pub fn with_candidate_strategy(
+        mut self,
+        family: SimilarityFamily,
+        strategy: SimilarityCandidateStrategy,
+    ) -> Self {
+        self.candidate_strategies.insert(family, strategy);
+        self
+    }
+
+    /// Resolves the candidate strategy for one family (default: `Ann`).
+    pub fn candidate_strategy(&self, family: SimilarityFamily) -> SimilarityCandidateStrategy {
+        self.candidate_strategies
+            .get(&family)
+            .copied()
+            .unwrap_or(SimilarityCandidateStrategy::Ann)
+    }
 }
 
 impl Default for SimilarityPlannerConfig {
@@ -540,6 +662,8 @@ impl Default for SimilarityPlannerConfig {
             worker_count: DEFAULT_SIMILARITY_WORKERS,
             disabled_families: BTreeSet::new(),
             exact_pair_node_limit: Some(DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT),
+            candidate_strategies: BTreeMap::new(),
+            ann: AnnCandidateConfig::default(),
         }
     }
 }
@@ -613,6 +737,9 @@ pub struct SimilaritySkipReport {
     pub vector_skips: Vec<SimilarityVectorSkip>,
     pub family_opt_outs: Vec<SimilarityFamilyOptOut>,
     pub pair_counts: BTreeMap<SimilarityFamily, SimilarityPairCounts>,
+    /// Per-family ANN candidate-generation accounting (present exactly for the
+    /// families planned with [`SimilarityCandidateStrategy::Ann`]).
+    pub ann_reports: BTreeMap<SimilarityFamily, AnnFamilyReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,11 +784,34 @@ pub struct SimilarityPairCounts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimilarityPlanError {
-    EmptyQualifiedName { node_index: usize },
-    DuplicateQualifiedName { qualified_name: String },
-    InvalidPerNodeCap { value: usize },
-    InvalidWorkerCount { value: usize },
-    InvalidThreshold { field: &'static str, value: f32 },
+    EmptyQualifiedName {
+        node_index: usize,
+    },
+    DuplicateQualifiedName {
+        qualified_name: String,
+    },
+    InvalidPerNodeCap {
+        value: usize,
+    },
+    InvalidWorkerCount {
+        value: usize,
+    },
+    InvalidThreshold {
+        field: &'static str,
+        value: f32,
+    },
+    /// An ANN configuration knob is out of its valid domain.
+    InvalidAnnConfig {
+        field: &'static str,
+        value: usize,
+        requirement: &'static str,
+    },
+    /// The ANN candidate generator failed; the plan refuses rather than
+    /// silently falling back to another candidate source.
+    AnnCandidateFailure {
+        family: SimilarityFamily,
+        message: String,
+    },
 }
 
 impl fmt::Display for SimilarityPlanError {
@@ -697,6 +847,19 @@ impl fmt::Display for SimilarityPlanError {
                     "similarity threshold {field} must be finite and in [0, 1], got {value}"
                 )
             }
+            Self::InvalidAnnConfig {
+                field,
+                value,
+                requirement,
+            } => {
+                write!(
+                    f,
+                    "similarity ann config {field} = {value} is invalid: {requirement}"
+                )
+            }
+            Self::AnnCandidateFailure { family, message } => {
+                write!(f, "ann candidate generation failed for {family}: {message}")
+            }
         }
     }
 }
@@ -724,18 +887,34 @@ pub fn plan_similarity_edges(
         }
 
         let vectors = collect_family_vectors(nodes, family, &mut skips);
-        if let Some(limit) = config.exact_pair_node_limit
-            && vectors.len() > limit
-        {
-            skips.family_opt_outs.push(SimilarityFamilyOptOut {
-                family,
-                slot: family.slot(),
-                reason: SimilarityFamilyOptOutReason::ExactCandidateLimitExceeded,
-                node_count: vectors.len(),
-                limit: Some(limit),
-            });
-            continue;
-        }
+        let strategy = config.candidate_strategy(family);
+        let candidate_lists = match strategy {
+            SimilarityCandidateStrategy::ExactPairs => {
+                if let Some(limit) = config.exact_pair_node_limit
+                    && vectors.len() > limit
+                {
+                    skips.family_opt_outs.push(SimilarityFamilyOptOut {
+                        family,
+                        slot: family.slot(),
+                        reason: SimilarityFamilyOptOutReason::ExactCandidateLimitExceeded,
+                        node_count: vectors.len(),
+                        limit: Some(limit),
+                    });
+                    continue;
+                }
+                None
+            }
+            SimilarityCandidateStrategy::Ann => {
+                let generated = ann::generate_family_candidates(
+                    family,
+                    &vectors,
+                    &config.ann,
+                    config.per_node_cap,
+                )?;
+                skips.ann_reports.insert(family, generated.report);
+                Some(generated.per_source)
+            }
+        };
 
         let threshold = config.thresholds.threshold(family);
         let (family_edges, pair_counts) = plan_family_edges(
@@ -744,6 +923,7 @@ pub fn plan_similarity_edges(
             config.per_node_cap,
             &vectors,
             config.worker_count,
+            candidate_lists.as_deref(),
         );
         skips.pair_counts.insert(family, pair_counts);
         edges.extend(family_edges);
@@ -1710,6 +1890,19 @@ fn neighborhood_cross_term_value(
     direct_cross_term_value(&Ok(left_profile), &Ok(right_profile))
 }
 
+/// Computes the direct agreement between two slots of one symbol with the
+/// eager planner's absent-aware semantics (used by the lazy on-demand path).
+pub(crate) fn lazy_direct_agreement(
+    node: &SimilarityNode,
+    left_slot: SlotId,
+    right_slot: SlotId,
+) -> CrossTermValue {
+    direct_cross_term_value(
+        &cross_term_operand(node, left_slot),
+        &cross_term_operand(node, right_slot),
+    )
+}
+
 fn cross_term_operand(
     node: &SimilarityNode,
     slot: SlotId,
@@ -1790,6 +1983,7 @@ fn validate_plan_request(
             value: config.worker_count,
         });
     }
+    validate_ann_config(&config.ann)?;
     for family in SimilarityFamily::ALL {
         let value = config.thresholds.threshold(family);
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -1810,6 +2004,47 @@ fn validate_plan_request(
                 qualified_name: node.qualified_name.clone(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_ann_config(ann: &AnnCandidateConfig) -> Result<(), SimilarityPlanError> {
+    if ann.minhash_permutations == 0 {
+        return Err(SimilarityPlanError::InvalidAnnConfig {
+            field: "minhash_permutations",
+            value: ann.minhash_permutations,
+            requirement: "must be greater than zero",
+        });
+    }
+    if ann.lsh_bands == 0 {
+        return Err(SimilarityPlanError::InvalidAnnConfig {
+            field: "lsh_bands",
+            value: ann.lsh_bands,
+            requirement: "must be greater than zero",
+        });
+    }
+    if ann.lsh_bands > ann.minhash_permutations
+        || !ann.minhash_permutations.is_multiple_of(ann.lsh_bands)
+    {
+        return Err(SimilarityPlanError::InvalidAnnConfig {
+            field: "lsh_bands",
+            value: ann.lsh_bands,
+            requirement: "must divide minhash_permutations exactly",
+        });
+    }
+    if ann.candidate_multiplier == 0 {
+        return Err(SimilarityPlanError::InvalidAnnConfig {
+            field: "candidate_multiplier",
+            value: ann.candidate_multiplier,
+            requirement: "must be greater than zero",
+        });
+    }
+    if ann.hnsw_ef_search == 0 {
+        return Err(SimilarityPlanError::InvalidAnnConfig {
+            field: "hnsw_ef_search",
+            value: ann.hnsw_ef_search,
+            requirement: "must be greater than zero",
+        });
     }
     Ok(())
 }
@@ -1919,6 +2154,7 @@ fn plan_family_edges(
     per_node_cap: usize,
     vectors: &[IndexedVector],
     worker_count: usize,
+    candidates: Option<&[Vec<usize>]>,
 ) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
     // Each source `i` computes its own bounded top-`per_node_cap` outgoing edges
     // against the strictly-greater targets `j > i`, and every
@@ -1933,27 +2169,33 @@ fn plan_family_edges(
     let source_count = vectors.len();
     let worker_count = worker_count.min(source_count).max(1);
     if worker_count == 1 {
-        return plan_source_range(family, threshold, per_node_cap, vectors, 0..source_count);
+        return plan_source_range(
+            family,
+            threshold,
+            per_node_cap,
+            vectors,
+            0..source_count,
+            candidates,
+        );
     }
 
     let chunk_size = source_count.div_ceil(worker_count);
-    let shards =
-        thread::scope(|scope| {
-            let mut handles = Vec::new();
-            let mut start = 0;
-            while start < source_count {
-                let end = (start + chunk_size).min(source_count);
-                let range = start..end;
-                handles.push(scope.spawn(move || {
-                    plan_source_range(family, threshold, per_node_cap, vectors, range)
-                }));
-                start = end;
-            }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("similarity planner worker panicked"))
-                .collect::<Vec<_>>()
-        });
+    let shards = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut start = 0;
+        while start < source_count {
+            let end = (start + chunk_size).min(source_count);
+            let range = start..end;
+            handles.push(scope.spawn(move || {
+                plan_source_range(family, threshold, per_node_cap, vectors, range, candidates)
+            }));
+            start = end;
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("similarity planner worker panicked"))
+            .collect::<Vec<_>>()
+    });
 
     let mut admitted = Vec::new();
     let mut counts = SimilarityPairCounts::default();
@@ -1981,6 +2223,7 @@ fn plan_source_range(
     per_node_cap: usize,
     vectors: &[IndexedVector],
     sources: Range<usize>,
+    candidates: Option<&[Vec<usize>]>,
 ) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
     let mut counts = SimilarityPairCounts::default();
     let mut admitted = Vec::new();
@@ -1993,33 +2236,32 @@ fn plan_source_range(
         // evicts. `per_node_cap` is validated as non-zero upstream, so once the
         // heap is full `peek` is always `Some`.
         let mut top: BinaryHeap<AdmissionCandidate> = BinaryHeap::with_capacity(per_node_cap);
-        for right in vectors.iter().skip(i + 1) {
-            counts.candidate_pairs += 1;
-            let Some(score) = cosine(&left.vector, &right.vector) else {
-                counts.incompatible_shape_pairs += 1;
-                continue;
-            };
-            if score < threshold {
-                counts.below_threshold_pairs += 1;
-                continue;
-            }
-            let candidate = AdmissionCandidate {
-                weight: score,
-                target_qn: right.qualified_name.clone(),
-            };
-            if top.len() < per_node_cap {
-                top.push(candidate);
-            } else {
-                // The heap is full: exactly one candidate is dropped this step,
-                // either the incoming one or the evicted worst admitted edge.
-                let outranks_worst = top
-                    .peek()
-                    .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less);
-                if outranks_worst {
-                    top.pop();
-                    top.push(candidate);
+        match candidates {
+            // Exhaustive scoring: every strictly-greater target is a candidate.
+            None => {
+                for right in vectors.iter().skip(i + 1) {
+                    consider_target(left, right, threshold, per_node_cap, &mut top, &mut counts);
                 }
-                counts.cap_dropped_pairs += 1;
+            }
+            // ANN scoring: only the generated per-source candidate targets are
+            // scored; every list entry is a strictly-greater index (the lower
+            // qualified name owns the pair), so ownership and admission are the
+            // same discipline as the exhaustive path.
+            Some(lists) => {
+                for &right_index in &lists[i] {
+                    debug_assert!(
+                        right_index > i,
+                        "candidate lists must hold targets > source"
+                    );
+                    consider_target(
+                        left,
+                        &vectors[right_index],
+                        threshold,
+                        per_node_cap,
+                        &mut top,
+                        &mut counts,
+                    );
+                }
             }
         }
 
@@ -2039,6 +2281,47 @@ fn plan_source_range(
 
     counts.admitted_pairs = admitted.len();
     (admitted, counts)
+}
+
+/// Scores one candidate pair with the exact cosine and applies threshold and
+/// streaming per-source cap admission. This is the single admission path for
+/// both the exhaustive and the ANN candidate sources; every constant it applies
+/// (`threshold`, `per_node_cap`) arrives from [`SimilarityPlannerConfig`].
+fn consider_target(
+    left: &IndexedVector,
+    right: &IndexedVector,
+    threshold: f32,
+    per_node_cap: usize,
+    top: &mut BinaryHeap<AdmissionCandidate>,
+    counts: &mut SimilarityPairCounts,
+) {
+    counts.candidate_pairs += 1;
+    let Some(score) = cosine(&left.vector, &right.vector) else {
+        counts.incompatible_shape_pairs += 1;
+        return;
+    };
+    if score < threshold {
+        counts.below_threshold_pairs += 1;
+        return;
+    }
+    let candidate = AdmissionCandidate {
+        weight: score,
+        target_qn: right.qualified_name.clone(),
+    };
+    if top.len() < per_node_cap {
+        top.push(candidate);
+    } else {
+        // The heap is full: exactly one candidate is dropped this step,
+        // either the incoming one or the evicted worst admitted edge.
+        let outranks_worst = top
+            .peek()
+            .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less);
+        if outranks_worst {
+            top.pop();
+            top.push(candidate);
+        }
+        counts.cap_dropped_pairs += 1;
+    }
 }
 
 /// Heap element for the streaming per-source top-`k` admission in
@@ -2089,13 +2372,13 @@ fn stable_edge_order(left: &SimilarityEdge, right: &SimilarityEdge) -> Ordering 
 }
 
 #[derive(Debug, Clone)]
-struct IndexedVector {
-    qualified_name: String,
-    vector: NormalizedVector,
+pub(crate) struct IndexedVector {
+    pub(crate) qualified_name: String,
+    pub(crate) vector: NormalizedVector,
 }
 
 #[derive(Debug, Clone)]
-enum NormalizedVector {
+pub(crate) enum NormalizedVector {
     Dense {
         dim: u32,
         data: Vec<f32>,
@@ -2197,6 +2480,39 @@ fn format_score(value: f32) -> String {
     format!("{value:.9}")
 }
 
+/// Canonical byte dump of a similarity edge set for determinism probes and
+/// ledger content hashing.
+///
+/// Edges are emitted in [`stable_edge_order`] as one tab-separated line each:
+/// family wire name, source and target qualified names, slot, graph edge kind,
+/// metric, and the exact IEEE-754 bit patterns (hex) of weight and threshold —
+/// so two dumps are byte-identical exactly when the planned edge sets are
+/// bit-identical.
+pub fn similarity_edge_dump_bytes(edges: &[SimilarityEdge]) -> Vec<u8> {
+    let mut sorted: Vec<&SimilarityEdge> = edges.iter().collect();
+    sorted.sort_by(|left, right| stable_edge_order(left, right));
+    let mut out = String::new();
+    for edge in sorted {
+        out.push_str(edge.family.wire_name());
+        out.push('\t');
+        out.push_str(&edge.source_qn);
+        out.push('\t');
+        out.push_str(&edge.target_qn);
+        out.push('\t');
+        out.push_str(&edge.slot.get().to_string());
+        out.push('\t');
+        out.push_str(edge.graph_edge_kind.as_str());
+        out.push('\t');
+        out.push_str(edge.metric.as_str());
+        out.push('\t');
+        out.push_str(&format!("{:08x}", edge.weight.to_bits()));
+        out.push('\t');
+        out.push_str(&format!("{:08x}", edge.threshold.to_bits()));
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2227,7 +2543,7 @@ mod tests {
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
 
     #[test]
@@ -2863,7 +3179,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss() {
         let (dir, vault) = reactive_vault("queue-soak");
@@ -3191,6 +3507,520 @@ mod tests {
                 && skip.node_count == 3
                 && skip.limit == Some(2)
         }));
+    }
+
+    #[test]
+    fn ann_lsh_golden_knn_matches_expected_edges_with_cap_and_ownership() {
+        // Two identical-support groups: every within-group pair is Jaccard 1,
+        // so LSH banding is *guaranteed* to co-bucket them (identical MinHash
+        // signatures in every band); cross-group pairs score cosine 0 and can
+        // never be admitted even if a band collided. The admitted edge set is
+        // therefore an exact golden expectation, not a recall hope.
+        let mut config = ann_family_config(SimilarityFamily::Struct);
+        config.per_node_cap = 2;
+        config.thresholds.sim_struct_min_score = 0.50;
+        // Exact-square norms (25 and 100) keep the identical-pair cosine at
+        // exactly 1.0 in f32, so the weight assertion is bit-exact.
+        let group_a = &[(0, 3.0), (1, 4.0)];
+        let group_b = &[(10, 6.0), (11, 8.0)];
+        let nodes = vec![
+            sparse_node("a1", SimilarityFamily::Struct, 16, group_a),
+            sparse_node("a2", SimilarityFamily::Struct, 16, group_a),
+            sparse_node("a3", SimilarityFamily::Struct, 16, group_a),
+            sparse_node("b1", SimilarityFamily::Struct, 16, group_b),
+            sparse_node("b2", SimilarityFamily::Struct, 16, group_b),
+        ];
+
+        let plan = plan_similarity_edges(&nodes, &config).expect("lsh similarity plan");
+
+        // Lower QN owns each pair; per-source cap 2 admits both a-group
+        // targets for a1.
+        assert_eq!(
+            edge_qns(&plan.edges),
+            vec![("a1", "a2"), ("a1", "a3"), ("a2", "a3"), ("b1", "b2")]
+        );
+        assert!(plan.edges.iter().all(|edge| edge.weight == 1.0));
+        assert!(
+            plan.edges
+                .iter()
+                .all(|edge| edge.family == SimilarityFamily::Struct
+                    && edge.graph_edge_kind == EdgeKind::SimilarTo)
+        );
+
+        let report = plan
+            .skips
+            .ann_reports
+            .get(&SimilarityFamily::Struct)
+            .expect("lsh ann report");
+        assert_eq!(report.sparse_pool_nodes, 5);
+        assert_eq!(report.dense_pool_nodes, 0);
+        assert!(report.lsh_buckets > 0);
+        assert!(report.lsh_candidate_pairs >= 4);
+        assert_eq!(report.hnsw_candidate_pairs, 0);
+        assert_eq!(report.hnsw_dim_groups, 0);
+
+        // Cap boundary: with cap 1, a1 keeps only its smallest-QN tied target
+        // and the dropped candidate is accounted, never silently lost.
+        let mut capped = config.clone();
+        capped.per_node_cap = 1;
+        let capped_plan = plan_similarity_edges(&nodes, &capped).expect("capped lsh plan");
+        assert_eq!(
+            edge_qns(&capped_plan.edges),
+            vec![("a1", "a2"), ("a2", "a3"), ("b1", "b2")]
+        );
+        let counts = capped_plan
+            .skips
+            .pair_counts
+            .get(&SimilarityFamily::Struct)
+            .expect("capped struct pair counts");
+        assert_eq!(counts.cap_dropped_pairs, 1);
+        assert_eq!(counts.admitted_pairs, 3);
+    }
+
+    #[test]
+    fn ann_hnsw_golden_knn_matches_exact_plan_on_dense_fixture() {
+        // Small dense pool: the seeded HNSW is exhaustive at this scale and the
+        // query k (cap × multiplier + 1) covers the pool, so the ANN plan must
+        // reproduce the exact plan bit-for-bit — including ownership and cap
+        // behavior — while candidates come from the quantized index.
+        let mut exact = family_only_config(SimilarityFamily::Semantic);
+        exact.per_node_cap = 2;
+        exact.thresholds.sim_semantic_min_score = 0.60;
+        let mut ann = exact.clone();
+        ann.candidate_strategies
+            .insert(SimilarityFamily::Semantic, SimilarityCandidateStrategy::Ann);
+
+        let nodes = vec![
+            dense_node("u1", SimilarityFamily::Semantic, &[1.0, 0.0, 0.0, 0.0]),
+            dense_node("u2", SimilarityFamily::Semantic, &[0.9, 0.1, 0.0, 0.0]),
+            dense_node("u3", SimilarityFamily::Semantic, &[0.8, 0.2, 0.1, 0.0]),
+            dense_node("u4", SimilarityFamily::Semantic, &[0.0, 0.0, 1.0, 0.0]),
+            dense_node("u5", SimilarityFamily::Semantic, &[0.0, 0.0, 0.9, 0.2]),
+        ];
+
+        let exact_plan = plan_similarity_edges(&nodes, &exact).expect("exact plan");
+        let ann_plan = plan_similarity_edges(&nodes, &ann).expect("ann plan");
+
+        assert_eq!(ann_plan.edges, exact_plan.edges);
+        assert!(!ann_plan.edges.is_empty(), "fixture must admit edges");
+        assert_eq!(
+            similarity_edge_dump_bytes(&ann_plan.edges),
+            similarity_edge_dump_bytes(&exact_plan.edges)
+        );
+        assert!(
+            ann_plan
+                .edges
+                .iter()
+                .any(|edge| edge.source_qn == "u4" && edge.target_qn == "u5"),
+            "second cluster pair must be admitted: {:?}",
+            edge_qns(&ann_plan.edges)
+        );
+
+        let report = ann_plan
+            .skips
+            .ann_reports
+            .get(&SimilarityFamily::Semantic)
+            .expect("hnsw ann report");
+        assert_eq!(report.dense_pool_nodes, 5);
+        assert_eq!(report.sparse_pool_nodes, 0);
+        assert_eq!(report.hnsw_dim_groups, 1);
+        assert!(report.hnsw_candidate_pairs >= exact_plan.edges.len());
+        assert_eq!(report.quant_scale_measurements.len(), 1);
+        let measurement = &report.quant_scale_measurements[0];
+        assert_eq!(measurement.dim, 4);
+        assert_eq!(measurement.pool_nodes, 5);
+        // The scale is measured from the pool (max |component| / 127), not a
+        // constant.
+        assert_eq!(measurement.scale(), 1.0 / 127.0);
+    }
+
+    #[test]
+    fn similarity_determinism_probe_three_runs_1_vs_8_workers_byte_identical() {
+        // DoD determinism probe (locally runnable; GitHub Actions is banned by
+        // owner directive): same mixed sparse+dense corpus, ANN strategies for
+        // all families, three runs at 1 worker and three at 8 workers must
+        // produce byte-identical canonical edge dumps and identical skip
+        // accounting.
+        let config = SimilarityPlannerConfig {
+            exact_pair_node_limit: None,
+            per_node_cap: 3,
+            thresholds: SimilarityThresholds {
+                sim_struct_min_score: 0.30,
+                sim_semantic_min_score: 0.30,
+                sim_api_min_score: 0.30,
+                sim_profile_min_score: 0.30,
+            },
+            candidate_strategies: SimilarityFamily::ALL
+                .into_iter()
+                .map(|family| (family, SimilarityCandidateStrategy::Ann))
+                .collect(),
+            ..SimilarityPlannerConfig::default()
+        };
+
+        let nodes = (0..40)
+            .map(|index: u32| {
+                let mut node = SimilarityNode::new(format!("probe-{index:03}"));
+                // Sparse struct + api supports with heavy overlap.
+                for (family, stride) in [
+                    (SimilarityFamily::Struct, 1u32),
+                    (SimilarityFamily::Api, 3u32),
+                ] {
+                    node = node.with_slot(
+                        family.slot(),
+                        SlotVector::Sparse {
+                            dim: 16,
+                            entries: (0..4)
+                                .map(|offset| SparseEntry {
+                                    idx: (index * stride + offset * 2) % 16,
+                                    val: ((index + offset) % 5 + 1) as f32,
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+                // Dense semantic + profile vectors from exact rationals.
+                for (family, salt) in [
+                    (SimilarityFamily::Semantic, 7u32),
+                    (SimilarityFamily::Profile, 11u32),
+                ] {
+                    node = node.with_slot(
+                        family.slot(),
+                        SlotVector::Dense {
+                            dim: 6,
+                            data: (0..6)
+                                .map(|component| {
+                                    ((index * salt + component * 5) % 13) as f32 / 13.0
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+                node
+            })
+            .collect::<Vec<_>>();
+
+        let mut dumps = Vec::new();
+        let mut skip_reports = Vec::new();
+        for worker_count in [1usize, 8] {
+            for _run in 0..3 {
+                let mut run_config = config.clone();
+                run_config.worker_count = worker_count;
+                let plan = plan_similarity_edges(&nodes, &run_config).expect("probe plan");
+                assert!(!plan.edges.is_empty(), "probe corpus must admit edges");
+                dumps.push(similarity_edge_dump_bytes(&plan.edges));
+                skip_reports.push(plan.skips);
+            }
+        }
+        for (index, dump) in dumps.iter().enumerate().skip(1) {
+            assert_eq!(
+                dump, &dumps[0],
+                "edge dump {index} diverged from run 0 (byte compare)"
+            );
+        }
+        for (index, skips) in skip_reports.iter().enumerate().skip(1) {
+            assert_eq!(
+                skips, &skip_reports[0],
+                "skip report {index} diverged from run 0"
+            );
+        }
+        // Every family must have really used the ANN generator.
+        for family in SimilarityFamily::ALL {
+            assert!(
+                skip_reports[0].ann_reports.contains_key(&family),
+                "family {family} missing ann accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_thresholds_are_config_read_with_no_magic_numbers_in_admission_path() {
+        // Named defaults: every per-family admission threshold is a documented
+        // config field.
+        let thresholds = SimilarityThresholds::default();
+        for (family, expected) in [
+            (SimilarityFamily::Struct, DEFAULT_SIM_STRUCT_MIN_SCORE),
+            (SimilarityFamily::Semantic, DEFAULT_SIM_SEMANTIC_MIN_SCORE),
+            (SimilarityFamily::Api, DEFAULT_SIM_API_MIN_SCORE),
+            (SimilarityFamily::Profile, DEFAULT_SIM_PROFILE_MIN_SCORE),
+        ] {
+            assert_eq!(thresholds.threshold(family), expected);
+        }
+        let config = SimilarityPlannerConfig::default();
+        assert_eq!(config.per_node_cap, DEFAULT_SIMILARITY_PER_NODE_CAP);
+        assert_eq!(
+            config.ann.minhash_permutations,
+            DEFAULT_SIMILARITY_LSH_PERMUTATIONS
+        );
+        assert_eq!(config.ann.lsh_bands, DEFAULT_SIMILARITY_LSH_BANDS);
+        assert_eq!(config.ann.seed, DEFAULT_SIMILARITY_ANN_SEED);
+        assert_eq!(
+            config.ann.candidate_multiplier,
+            DEFAULT_SIMILARITY_ANN_CANDIDATE_MULTIPLIER
+        );
+        assert_eq!(config.ann.hnsw_ef_search, DEFAULT_SIMILARITY_HNSW_EF_SEARCH);
+
+        // A changed config threshold must flow into admission and onto edges.
+        let mut tightened = ann_family_config(SimilarityFamily::Semantic);
+        tightened.thresholds.sim_semantic_min_score = 0.99;
+        let nodes = vec![
+            dense_node("left", SimilarityFamily::Semantic, &[1.0, 0.0]),
+            dense_node("right", SimilarityFamily::Semantic, &[0.6, 0.8]),
+        ];
+        let plan = plan_similarity_edges(&nodes, &tightened).expect("tightened plan");
+        assert!(
+            plan.edges.is_empty(),
+            "0.6 cosine must fail a 0.99 threshold"
+        );
+        let mut loosened = ann_family_config(SimilarityFamily::Semantic);
+        loosened.thresholds.sim_semantic_min_score = 0.25;
+        let plan = plan_similarity_edges(&nodes, &loosened).expect("loosened plan");
+        assert_eq!(plan.edges.len(), 1);
+        assert_eq!(plan.edges[0].threshold, 0.25);
+
+        // Grep gate: the admission path (candidate scoring, threshold, cap)
+        // must contain no inline float literal — every score-scale constant
+        // arrives through SimilarityPlannerConfig.
+        let source = include_str!("lib.rs");
+        for function in [
+            "fn consider_target(",
+            "fn plan_source_range(",
+            "fn plan_family_edges(",
+        ] {
+            let body = function_body(source, function);
+            if let Some(literal) = first_float_literal(body) {
+                panic!("magic float literal {literal:?} found in {function} admission path");
+            }
+        }
+
+        // Invalid ANN knobs are refused, not defaulted.
+        let mut bad = SimilarityPlannerConfig::default();
+        bad.ann.lsh_bands = 3; // does not divide 128
+        let err = plan_similarity_edges(&[], &bad).expect_err("invalid bands refused");
+        assert!(matches!(
+            err,
+            SimilarityPlanError::InvalidAnnConfig {
+                field: "lsh_bands",
+                ..
+            }
+        ));
+        let mut bad = SimilarityPlannerConfig::default();
+        bad.ann.candidate_multiplier = 0;
+        let err = plan_similarity_edges(&[], &bad).expect_err("zero multiplier refused");
+        assert!(matches!(
+            err,
+            SimilarityPlanError::InvalidAnnConfig {
+                field: "candidate_multiplier",
+                ..
+            }
+        ));
+    }
+
+    /// Returns the body text of `marker`'s function (from its signature line to
+    /// the first column-zero closing brace).
+    fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("admission function present");
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").expect("function body terminator");
+        &rest[..end]
+    }
+
+    /// Finds the first float literal (`<digit>.<digit>`) in a code slice.
+    fn first_float_literal(body: &str) -> Option<&str> {
+        let bytes = body.as_bytes();
+        for index in 1..bytes.len().saturating_sub(1) {
+            if bytes[index] == b'.'
+                && bytes[index - 1].is_ascii_digit()
+                && bytes[index + 1].is_ascii_digit()
+            {
+                let start = index - 1;
+                let end = (index + 2).min(bytes.len());
+                return Some(&body[start..end]);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn ann_disabled_family_produces_zero_edges_with_accounting() {
+        // Scale-control DoD: a family opted out by config yields zero SIM_*
+        // edges, an explicit accounted opt-out, and no ANN pass at all.
+        let mut config = SimilarityPlannerConfig {
+            exact_pair_node_limit: None,
+            candidate_strategies: SimilarityFamily::ALL
+                .into_iter()
+                .map(|family| (family, SimilarityCandidateStrategy::Ann))
+                .collect(),
+            ..SimilarityPlannerConfig::default()
+        }
+        .with_disabled_family(SimilarityFamily::Struct);
+        config.thresholds.sim_semantic_min_score = 0.10;
+
+        let entries = &[(0, 1.0), (1, 1.0)];
+        let nodes = vec![
+            sparse_node("s1", SimilarityFamily::Struct, 8, entries)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[1.0, 0.0])),
+            sparse_node("s2", SimilarityFamily::Struct, 8, entries)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.9, 0.1])),
+        ];
+
+        let plan = plan_similarity_edges(&nodes, &config).expect("opt-out plan");
+
+        assert!(
+            plan.edges
+                .iter()
+                .all(|edge| edge.family != SimilarityFamily::Struct),
+            "opted-out family must produce zero edges"
+        );
+        assert!(
+            plan.edges
+                .iter()
+                .any(|edge| edge.family == SimilarityFamily::Semantic),
+            "enabled family still plans edges"
+        );
+        assert!(plan.skips.family_opt_outs.iter().any(|skip| {
+            skip.family == SimilarityFamily::Struct
+                && skip.slot == SIM_STRUCT_SLOT
+                && skip.reason == SimilarityFamilyOptOutReason::DisabledByConfig
+        }));
+        assert!(
+            !plan
+                .skips
+                .ann_reports
+                .contains_key(&SimilarityFamily::Struct),
+            "opted-out family must not run the ANN generator"
+        );
+        assert!(
+            !plan
+                .skips
+                .pair_counts
+                .contains_key(&SimilarityFamily::Struct)
+        );
+    }
+
+    #[test]
+    fn sim_edges_fsv_readback_is_bit_stable_against_recomputed_plan() {
+        // FSV DoD: persist SIM_* rows, reopen the vault, decode the raw Graph
+        // CF bytes, and compare weights bit-for-bit (tolerance 0) against an
+        // independently recomputed plan from the same inputs, plus the paired
+        // ledger entry carrying the canonical dump hash.
+        let config = SimilarityPlannerConfig {
+            exact_pair_node_limit: None,
+            per_node_cap: 2,
+            thresholds: SimilarityThresholds {
+                sim_struct_min_score: 0.50,
+                sim_semantic_min_score: 0.50,
+                ..SimilarityThresholds::default()
+            },
+            candidate_strategies: SimilarityFamily::ALL
+                .into_iter()
+                .map(|family| (family, SimilarityCandidateStrategy::Ann))
+                .collect(),
+            ..SimilarityPlannerConfig::default()
+        };
+
+        let group = &[(0, 1.0), (1, 2.0), (2, 3.0)];
+        let nodes = vec![
+            sparse_node("fsv.a", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[1.0, 0.0, 0.0])),
+            sparse_node("fsv.b", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.9, 0.2, 0.1])),
+            sparse_node("fsv.c", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.0, 1.0, 0.0])),
+        ];
+        let plan = plan_similarity_edges(&nodes, &config).expect("fsv plan");
+        assert!(
+            plan.edges
+                .iter()
+                .any(|edge| edge.family == SimilarityFamily::Struct)
+                && plan
+                    .edges
+                    .iter()
+                    .any(|edge| edge.family == SimilarityFamily::Semantic),
+            "fixture must admit edges in both families: {:?}",
+            edge_qns(&plan.edges)
+        );
+
+        let (dir, vault) = reactive_vault("sim-edges-fsv");
+        let report = persist_similarity_edges(&vault, &plan, "astrolabe-weave-test")
+            .expect("persist sim edges");
+        assert_eq!(report.edge_count, plan.edges.len());
+        assert_eq!(report.rows_written, plan.edges.len());
+        assert_eq!(report.rows_tombstoned, 0);
+        drop(vault);
+
+        // Reopen: everything below reads persisted bytes, not API echoes.
+        let reopened = open_reactive_vault(&dir);
+        let persisted = read_similarity_edge_rows(&reopened).expect("read sim edge rows");
+        assert_eq!(persisted.len(), plan.edges.len());
+
+        // Independent recomputation from the same inputs (same code path must
+        // be bit-stable). All fixture QNs share one length, so CF key order
+        // (family, source, target) matches the plan's stable edge order and a
+        // positional zip is a total comparison.
+        let recomputed = plan_similarity_edges(&nodes, &config).expect("recomputed plan");
+        assert_eq!(recomputed.edges.len(), persisted.len());
+        for (row, edge) in persisted.iter().zip(recomputed.edges.iter()) {
+            assert_eq!(row.row.family, edge.family.wire_name());
+            assert_eq!(row.row.source_qn, edge.source_qn);
+            assert_eq!(row.row.target_qn, edge.target_qn);
+            assert_eq!(row.row.slot, edge.slot.get());
+            assert_eq!(row.row.etype, edge.graph_edge_kind.code());
+            // Tolerance 0: exact bit patterns.
+            assert_eq!(row.row.weight_bits, edge.weight.to_bits());
+            assert_eq!(row.row.threshold_bits, edge.threshold.to_bits());
+            assert_eq!(row.row.props, edge.graph_properties());
+            assert_eq!(
+                row.key,
+                sim_edge_graph_key(edge.family, &edge.source_qn, &edge.target_qn)
+            );
+        }
+
+        // Ledger pairing: the mutation's ledger entry exists at the reported
+        // seq and its payload hash matches the recomputed canonical dump hash.
+        let ledger_bytes = reopened
+            .read_cf_at(
+                reopened.snapshot(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(report.ledger_ref.seq),
+            )
+            .expect("read ledger row")
+            .expect("ledger row present");
+        let entry = decode_ledger(&ledger_bytes).expect("decode ledger entry");
+        assert_eq!(entry.entry_hash, report.ledger_ref.hash);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&entry.payload).expect("ledger payload json");
+        assert_eq!(payload["schema"], SIM_EDGE_LEDGER_SCHEMA);
+        assert_eq!(
+            payload["edge_count"].as_u64(),
+            Some(plan.edges.len() as u64)
+        );
+        let expected_hash = hex_lower_bytes(
+            blake3::hash(&similarity_edge_dump_bytes(&recomputed.edges)).as_bytes(),
+        );
+        assert_eq!(payload["edge_dump_hash"], expected_hash);
+        assert_eq!(report.edge_dump_hash, expected_hash);
+
+        // Idempotent re-persist: no rewrites, still audited.
+        let second = persist_similarity_edges(&reopened, &plan, "astrolabe-weave-test")
+            .expect("idempotent persist");
+        assert_eq!(second.rows_written, 0);
+        assert_eq!(second.rows_unchanged, plan.edges.len());
+        assert_eq!(second.rows_tombstoned, 0);
+        assert!(second.ledger_ref.seq > report.ledger_ref.seq);
+
+        // Reconciliation: a tighter plan tombstones stale rows and readback
+        // then matches the new plan exactly.
+        let mut tighter_config = config.clone();
+        tighter_config.thresholds.sim_semantic_min_score = 0.995;
+        let tighter = plan_similarity_edges(&nodes, &tighter_config).expect("tighter plan");
+        assert!(tighter.edges.len() < plan.edges.len());
+        let third = persist_similarity_edges(&reopened, &tighter, "astrolabe-weave-test")
+            .expect("reconciling persist");
+        assert!(third.rows_tombstoned > 0);
+        let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
+        assert_eq!(after.len(), tighter.edges.len());
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3575,20 +4405,459 @@ mod tests {
         assert_eq!(plan.abundance.lazy_pair_count, 450);
     }
 
+    #[test]
+    fn eager_cross_term_golden_agreements_are_bit_exact() {
+        // Hand-computed direct agreements (DocDrift shares the frozen semantic
+        // space, so it is plain cosine): [3,4]x[3,4] = 25/(5*5) = 1.0 exactly;
+        // [1,0]x[3,4] = 3/(1*5) = 0.6 (the f32 nearest to 3/5, bit-identical
+        // to the 0.6f32 literal); orthogonal = 0.0 exactly.
+        for (doc, code, expected) in [
+            (vec![3.0f32, 4.0], vec![3.0f32, 4.0], 1.0f32),
+            (vec![1.0, 0.0], vec![3.0, 4.0], 0.6),
+            (vec![1.0, 0.0], vec![0.0, 4.0], 0.0),
+        ] {
+            let node = SimilarityNode::new("golden")
+                .with_slot(SLOT_DOC_SEMANTIC, dense(&doc))
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&code));
+            let plan = plan_eager_cross_terms(&[node]);
+            let row = plan
+                .rows
+                .iter()
+                .find(|row| row.kind == EagerAgreementKind::DocDrift)
+                .expect("doc drift row");
+            let CrossTermValue::Scalar(value) = row.value else {
+                panic!("expected scalar for {doc:?} x {code:?}");
+            };
+            assert_eq!(
+                value.to_bits(),
+                expected.to_bits(),
+                "agreement for {doc:?} x {code:?} must be bit-exact"
+            );
+        }
+
+        // The same contract holds for the lazy on-demand (non-designed) path.
+        let node = SimilarityNode::new("lazy")
+            .with_slot(SLOT_COMPLEXITY, dense(&[1.0, 0.0]))
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[3.0, 4.0]));
+        let CrossTermValue::Scalar(value) =
+            lazy_agreement(&node, SLOT_COMPLEXITY, SLOT_DOC_SEMANTIC)
+        else {
+            panic!("expected lazy scalar");
+        };
+        assert_eq!(value.to_bits(), 0.6f32.to_bits());
+        assert!(
+            lazy_agreement(&node, SLOT_CHURN, SLOT_DOC_SEMANTIC).is_absent(),
+            "missing lazy operand stays absent, never zero"
+        );
+    }
+
+    #[test]
+    fn xterm_cf_materializes_exactly_six_designed_pairs_per_symbol() {
+        // Materialization policy DoD: after weave persistence the XTerm CF
+        // holds exactly the six designed agreement pairs per symbol — nothing
+        // lazy, nothing extra, no Delta/Interaction/Concat rows.
+        // Three frozen-panel symbols: the neighborhood comparators need two
+        // comparable peers, so all six designed kinds stay scalar.
+        let nodes = vec![
+            frozen_panel_cross_term_node("mat.alpha", 3),
+            frozen_panel_cross_term_node("mat.beta", 5),
+            frozen_panel_cross_term_node("mat.gamma", 7),
+        ];
+        let plan = plan_eager_cross_terms(&nodes);
+        assert_eq!(plan.abundance.scalar_count, 18);
+        let cx_ids = BTreeMap::from([
+            ("mat.alpha".to_string(), cx(31)),
+            ("mat.beta".to_string(), cx(32)),
+            ("mat.gamma".to_string(), cx(33)),
+        ]);
+
+        let (dir, vault) = reactive_vault("xterm-materialization");
+        let report = persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist eager cross terms");
+        assert_eq!(report.symbol_count, 3);
+        assert_eq!(report.rows_written, 18);
+        assert_eq!(report.rows_tombstoned, 0);
+        assert!(report.absent_by_kind.is_empty());
+
+        // Raw CF scan: exactly symbol_count x 6 rows exist, every one a
+        // designed Agreement pair.
+        let raw_rows = vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::XTerm)
+            .expect("scan xterm cf");
+        assert_eq!(raw_rows.len(), 18);
+        let persisted = read_eager_cross_term_rows(&vault).expect("read designed rows");
+        assert_eq!(persisted.len(), 18);
+        for symbol_cx in [cx(31), cx(32), cx(33)] {
+            let kinds = persisted
+                .iter()
+                .filter(|row| row.row.key.cx_id == symbol_cx)
+                .map(|row| row.kind)
+                .collect::<Vec<_>>();
+            assert_eq!(kinds.len(), 6);
+            for kind in EagerAgreementKind::ALL {
+                assert!(kinds.contains(&kind), "{kind} row missing for {symbol_cx}");
+            }
+        }
+        assert!(
+            persisted
+                .iter()
+                .all(|row| row.row.key.kind == LoomCrossTermKind::Agreement
+                    && row.row.tag == SignalProvenanceTag::Derived)
+        );
+
+        // The agreement-graph aspect substrate reads the same persisted rows.
+        let graph = agreement_graph_from_persisted_rows(&vault).expect("agreement graph");
+        assert_eq!(graph.len(), 6);
+        for edge in &graph {
+            assert_eq!(edge.scalar_count, 3, "{}", edge.kind);
+            assert!(edge.mean_agreement.is_some(), "{}", edge.kind);
+            assert_eq!(edge.provenance, "AsterVault:ColumnFamily::XTerm:agreement");
+        }
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn xterm_fsv_readback_is_bit_stable_and_ledger_paired() {
+        // FSV DoD: persist -> drop -> reopen -> decode raw XTerm CF bytes and
+        // compare scalars bit-for-bit against an independently recomputed
+        // plan; the paired ledger entry carries the canonical dump hash and
+        // the abundance accounting (07 §7 output shape).
+        let nodes = vec![
+            frozen_panel_cross_term_node("fsv.alpha", 3),
+            frozen_panel_cross_term_node("fsv.beta", 5),
+            frozen_panel_cross_term_node("fsv.gamma", 7),
+        ];
+        let plan = plan_eager_cross_terms(&nodes);
+        assert_eq!(plan.abundance.scalar_count, 18, "frozen fixture all-scalar");
+        let cx_ids = BTreeMap::from([
+            ("fsv.alpha".to_string(), cx(41)),
+            ("fsv.beta".to_string(), cx(42)),
+            ("fsv.gamma".to_string(), cx(43)),
+        ]);
+
+        let (dir, vault) = reactive_vault("xterm-fsv");
+        let report = persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist eager cross terms");
+        assert_eq!(report.rows_written, 18);
+        drop(vault);
+
+        let reopened = open_reactive_vault(&dir);
+        let persisted = read_eager_cross_term_rows(&reopened).expect("read persisted rows");
+        assert_eq!(persisted.len(), 18);
+
+        // Independent recomputation (same code path must be bit-stable).
+        let recomputed = plan_eager_cross_terms(&nodes);
+        let cx_by_qn = |qn: &str| *cx_ids.get(qn).expect("cx id");
+        for row in &recomputed.rows {
+            let CrossTermValue::Scalar(expected) = &row.value else {
+                panic!("frozen fixture must stay all-scalar");
+            };
+            let key = eager_xterm_key(cx_by_qn(&row.qualified_name), row.kind);
+            let persisted_row = persisted
+                .iter()
+                .find(|candidate| candidate.key == key)
+                .unwrap_or_else(|| panic!("persisted row missing for {}", row.kind));
+            let LoomCrossTermValue::Scalar(actual) = persisted_row.row.value else {
+                panic!("persisted row must be scalar");
+            };
+            // Tolerance 0: exact bit patterns.
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{}", row.kind);
+            assert_eq!(persisted_row.row.key.a, row.left_slot);
+            assert_eq!(persisted_row.row.key.b, row.right_slot);
+        }
+
+        // Ledger pairing + abundance output shape.
+        let ledger_bytes = reopened
+            .read_cf_at(
+                reopened.snapshot(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(report.ledger_ref.seq),
+            )
+            .expect("read ledger row")
+            .expect("ledger row present");
+        let entry = decode_ledger(&ledger_bytes).expect("decode ledger entry");
+        assert_eq!(entry.entry_hash, report.ledger_ref.hash);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&entry.payload).expect("ledger payload json");
+        assert_eq!(payload["schema"], XTERM_EAGER_LEDGER_SCHEMA);
+        let expected_hash = hex_lower_bytes(
+            blake3::hash(&eager_xterm_dump_bytes(&recomputed, &cx_ids).expect("recomputed dump"))
+                .as_bytes(),
+        );
+        assert_eq!(payload["xterm_dump_hash"], expected_hash);
+        assert_eq!(report.xterm_dump_hash, expected_hash);
+        let abundance = &payload["abundance"];
+        assert_eq!(abundance["symbol_count"].as_u64(), Some(3));
+        assert_eq!(abundance["panel_slot_count"].as_u64(), Some(22));
+        assert_eq!(
+            abundance["possible_pair_count_per_symbol"].as_u64(),
+            Some(231)
+        );
+        assert_eq!(abundance["raw_yield"].as_u64(), Some(3 * 254));
+        assert_eq!(abundance["eager_pair_count_per_symbol"].as_u64(), Some(6));
+        assert_eq!(abundance["materialized_count"].as_u64(), Some(18));
+        assert_eq!(abundance["scalar_count"].as_u64(), Some(18));
+        assert_eq!(abundance["absent_count"].as_u64(), Some(0));
+        assert_eq!(abundance["lazy_pair_count"].as_u64(), Some(3 * 225));
+
+        // Idempotent re-persist: no rewrites, still audited.
+        let second = persist_eager_cross_terms(&reopened, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("idempotent persist");
+        assert_eq!(second.rows_written, 0);
+        assert_eq!(second.rows_unchanged, 18);
+        assert_eq!(second.rows_tombstoned, 0);
+        assert!(second.ledger_ref.seq > report.ledger_ref.seq);
+
+        // Reconciliation: an absent operand tombstones the owned stale row and
+        // is counted per kind — never zero-filled, never silently dropped.
+        let mut degraded_nodes = nodes.clone();
+        degraded_nodes[0].slots.insert(
+            SLOT_DOC_SEMANTIC,
+            SlotVector::Absent {
+                reason: calyx_core::AbsentReason::LensUnavailable,
+            },
+        );
+        let degraded = plan_eager_cross_terms(&degraded_nodes);
+        let third =
+            persist_eager_cross_terms(&reopened, &degraded, &cx_ids, "astrolabe-weave-test")
+                .expect("reconciling persist");
+        assert_eq!(third.rows_tombstoned, 1);
+        assert_eq!(
+            third.absent_by_kind.get(&EagerAgreementKind::DocDrift),
+            Some(&1)
+        );
+        let after = read_eager_cross_term_rows(&reopened).expect("read reconciled rows");
+        assert_eq!(after.len(), 17);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doc_drift_lying_docs_rank_top_from_persisted_state_and_honest_docs_do_not() {
+        // P3 exit-gate component: on the pinned fixture corpus, a symbol whose
+        // docs lie about its code ranks at the top of doc-drift findings and a
+        // well-documented symbol produces no finding — evaluated from
+        // persisted XTerm CF state via the live anomaly reader, not from
+        // planner echoes.
+        let lying = SimilarityNode::new("corpus.docs.lie")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[1.0, 0.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.0, 1.0, 0.0]));
+        let drifting = SimilarityNode::new("corpus.docs.stale")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[1.0, 0.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[3.0, 4.0, 0.0]));
+        let honest = SimilarityNode::new("corpus.docs.honest")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[3.0, 4.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[3.0, 4.0, 0.0]));
+        let plan = plan_eager_cross_terms(&[lying, drifting, honest]);
+        let cx_ids = BTreeMap::from([
+            ("corpus.docs.lie".to_string(), cx(51)),
+            ("corpus.docs.stale".to_string(), cx(52)),
+            ("corpus.docs.honest".to_string(), cx(53)),
+        ]);
+
+        let (dir, vault) = reactive_vault("doc-drift-corpus");
+        persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist doc drift corpus");
+        vault.flush().expect("flush corpus rows");
+
+        let inputs = live_anomaly_inputs_from_vault(&vault).expect("live anomaly inputs");
+        let calibrations = vec![AnomalyCalibration::new(
+            AnomalyKind::DocDrift,
+            300,
+            800,
+            "calibration:doc-drift:v1",
+        )];
+        let report = detect_anomalies(&inputs.substrates, &calibrations, Some("doc_drift"), true)
+            .expect("doc drift report");
+
+        assert!(!report.findings.is_empty(), "lying docs must be findable");
+        // Top finding is the lying symbol (agreement 0 => score 1000, high).
+        assert_eq!(report.findings[0].subject_id, format!("cx:{}", cx(51)));
+        assert_eq!(report.findings[0].severity, AnomalySeverity::High);
+        assert_eq!(report.findings[0].score_millipoints, 1_000);
+        // The drifting symbol (agreement 0.6 => score 400) ranks below, medium.
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.subject_id == format!("cx:{}", cx(52))
+                    && finding.severity == AnomalySeverity::Medium)
+        );
+        // The honest symbol (agreement 1.0 => score 0) never appears.
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.subject_id != format!("cx:{}", cx(53))),
+            "well-documented symbol must not rank as doc drift"
+        );
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn name_truth_misleading_name_ranks_from_persisted_state() {
+        // Name-truth half of the sanity gate: a symbol whose name embedding
+        // aligns with a different API neighborhood than its peers ranks as a
+        // name-truth anomaly from persisted state; consistent peers do not.
+        // Two consistent clusters (alpha/beta named-and-calling alike, gamma
+        // its own consistent cluster) plus one symbol whose name matches the
+        // alpha cluster while its calls match gamma's: its name-similarity and
+        // API-similarity peer profiles are orthogonal (agreement 0), while
+        // alpha's stay positively aligned.
+        let corpus = vec![
+            name_truth_frozen_node("corpus.name.alpha", 0, 0),
+            name_truth_frozen_node("corpus.name.beta", 0, 0),
+            name_truth_frozen_node("corpus.name.gamma", 1, 1),
+            name_truth_frozen_node("corpus.name.misleads", 0, 1),
+        ];
+        let plan = plan_eager_cross_terms(&corpus);
+        let cx_ids = BTreeMap::from([
+            ("corpus.name.alpha".to_string(), cx(61)),
+            ("corpus.name.beta".to_string(), cx(64)),
+            ("corpus.name.gamma".to_string(), cx(63)),
+            ("corpus.name.misleads".to_string(), cx(62)),
+        ]);
+
+        let (dir, vault) = reactive_vault("name-truth-corpus");
+        persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist name truth corpus");
+
+        let inputs = live_anomaly_inputs_from_vault(&vault).expect("live anomaly inputs");
+        let calibrations = vec![AnomalyCalibration::new(
+            AnomalyKind::NameTruth,
+            500,
+            900,
+            "calibration:name-truth:v1",
+        )];
+        let report = detect_anomalies(&inputs.substrates, &calibrations, Some("name_truth"), true)
+            .expect("name truth report");
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.subject_id == format!("cx:{}", cx(62))),
+            "misleading name must rank as a name-truth anomaly: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.subject_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.subject_id != format!("cx:{}", cx(61))),
+            "a consistently named symbol must not rank as a name-truth anomaly"
+        );
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Absent-propagation DoD: for every designed pair, degrading either
+        /// operand slot of one symbol (missing, explicit Absent, unsupported
+        /// multi shape, or zero norm) makes that symbol's cross-term Absent —
+        /// never a zero-filled scalar — regardless of the surrounding corpus.
+        #[test]
+        fn any_absent_input_slot_propagates_to_absent_cross_term(
+            kind_index in 0usize..EagerAgreementKind::ALL.len(),
+            degrade_left in proptest::bool::ANY,
+            degrade_mode in 0u8..4,
+            peer_seed in 1u32..64,
+        ) {
+            let kind = EagerAgreementKind::ALL[kind_index];
+            let (left_slot, right_slot) = kind.slots();
+            let degraded_slot = if degrade_left { left_slot } else { right_slot };
+
+            // A healthy 3-node corpus (peers keep neighborhood kinds scalar).
+            let mut nodes = (0u32..3)
+                .map(|index| {
+                    let mut node = SimilarityNode::new(format!("prop-{index}"));
+                    for slot in [
+                        SLOT_DOC_SEMANTIC, SIM_SEMANTIC_SLOT, SLOT_NAME_SEMANTIC,
+                        SIM_API_SLOT, SIM_STRUCT_SLOT, SLOT_COMPLEXITY, SLOT_CHURN,
+                        SLOT_GRAPH_POSITION, SLOT_TEST_COVERAGE, SLOT_ROUTE_MATCH,
+                    ] {
+                        let component = ((peer_seed + index + u32::from(slot.get())) % 7 + 1) as f32;
+                        node = node.with_slot(slot, dense(&[component, 1.0]));
+                    }
+                    node
+                })
+                .collect::<Vec<_>>();
+
+            match degrade_mode {
+                0 => {
+                    nodes[0].slots.remove(&degraded_slot);
+                }
+                1 => {
+                    nodes[0].slots.insert(
+                        degraded_slot,
+                        SlotVector::Absent { reason: calyx_core::AbsentReason::Deferred },
+                    );
+                }
+                2 => {
+                    nodes[0].slots.insert(
+                        degraded_slot,
+                        SlotVector::Multi { token_dim: 2, tokens: vec![vec![1.0, 0.0]] },
+                    );
+                }
+                _ => {
+                    nodes[0].slots.insert(degraded_slot, dense(&[0.0, 0.0]));
+                }
+            }
+
+            let plan = plan_eager_cross_terms(&nodes);
+            let row = plan
+                .rows
+                .iter()
+                .find(|row| row.qualified_name == "prop-0" && row.kind == kind)
+                .expect("designed row for degraded symbol");
+            proptest::prop_assert!(
+                row.value.is_absent(),
+                "{kind} must be absent when {degraded_slot:?} is degraded (mode {degrade_mode}), got {:?}",
+                row.value
+            );
+        }
+    }
+
     fn struct_only_config() -> SimilarityPlannerConfig {
         family_only_config(SimilarityFamily::Struct)
     }
 
+    /// Exact-pairs config for one family: these fixtures pin the exhaustive
+    /// planner core (candidate universe = all pairs), which the ANN tests use
+    /// as their ground truth.
     fn family_only_config(family: SimilarityFamily) -> SimilarityPlannerConfig {
         let disabled_families = SimilarityFamily::ALL
             .into_iter()
             .filter(|candidate| *candidate != family)
             .collect();
+        let candidate_strategies = SimilarityFamily::ALL
+            .into_iter()
+            .map(|family| (family, SimilarityCandidateStrategy::ExactPairs))
+            .collect();
         SimilarityPlannerConfig {
             disabled_families,
             exact_pair_node_limit: None,
+            candidate_strategies,
             ..SimilarityPlannerConfig::default()
         }
+    }
+
+    /// ANN-strategy config for one family (LSH for sparse pools, quantized
+    /// HNSW for dense pools).
+    fn ann_family_config(family: SimilarityFamily) -> SimilarityPlannerConfig {
+        let mut config = family_only_config(family);
+        config
+            .candidate_strategies
+            .insert(family, SimilarityCandidateStrategy::Ann);
+        config
     }
 
     fn dense_node(qn: &str, family: SimilarityFamily, data: &[f32]) -> SimilarityNode {
@@ -3946,6 +5215,34 @@ mod tests {
                 }
             })
             .expect("Rss line in smaps_rollup")
+    }
+
+    /// Native Windows resident-set probe for the soak harness.
+    ///
+    /// `astrolabe-weave` forbids `unsafe`, so instead of a direct
+    /// `GetProcessMemoryInfo` FFI call this shells out to PowerShell for the
+    /// process's working set — the Windows analogue of Linux `Rss` — which is
+    /// exact enough for the 512 MiB soak delta bound.
+    #[cfg(target_os = "windows")]
+    fn resident_set_bytes() -> u64 {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
+            ])
+            .output()
+            .expect("query working set via powershell");
+        assert!(
+            output.status.success(),
+            "powershell working-set query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 working set")
+            .trim()
+            .parse::<u64>()
+            .expect("parse working set bytes")
     }
 
     fn cx(byte: u8) -> CxId {
