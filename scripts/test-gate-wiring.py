@@ -13,7 +13,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check-gate-wiring.py"
 FILES = (
-    ".github/workflows/ci.yml",
     "scripts/check.sh",
     "scripts/check-full.sh",
     "scripts/check-release.sh",
@@ -75,15 +74,6 @@ def main() -> int:
         fixture = Path(temp)
         copy_fixture(fixture)
         assert checker.validate(fixture) == []
-
-        workflow = fixture / ".github/workflows/ci.yml"
-        rewrite(
-            workflow,
-            "run: bash scripts/check.sh",
-            "run: bash scripts/check-missing.sh",
-        )
-        require_error(checker.validate(fixture), "portable-gates job")
-        copy_fixture(fixture)
 
         check = fixture / "scripts/check.sh"
         rewrite(
@@ -325,25 +315,6 @@ def main() -> int:
             'bash "$ROOT/scripts/release-predicate.sh" "$@"\necho "predicate was not final"',
         )
         require_error(checker.validate(fixture), "release-predicate.sh last")
-        copy_fixture(fixture)
-
-        rewrite(
-            workflow,
-            'ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT: "1"',
-            'ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT: "0"',
-        )
-        require_error(checker.validate(fixture), "WRITE_RELEASE_ARTIFACT")
-        copy_fixture(fixture)
-
-        # A v5 bump (or any non-v4 annotation) on the SHA-pinned upload-artifact
-        # must fail closed, guarding the row-sink benchmark against a silent
-        # major-version drift.
-        rewrite(
-            workflow,
-            "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4",
-            "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5",
-        )
-        require_error(checker.validate(fixture), "annotated '# v4'")
 
     cleanup_scratch()
     assert not scratch.exists()

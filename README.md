@@ -53,14 +53,14 @@ Prerequisites and toolchain facts:
 
 ## Verification
 
-- `scripts/check.sh` — portable aggregate (all portable gates; emits the named `SKIP[ASTRO_EGRESS_LINUX_REQUIRED]` for the one Linux/strace probe, which the required Linux `portable-gates` CI job owns).
+- `scripts/check.sh` — portable aggregate (all portable gates; emits the named `SKIP[ASTRO_EGRESS_LINUX_REQUIRED]` for the one Linux/strace probe — a recorded coverage gap tracked in [#224](https://github.com/ChrisRoyse/Astrolabe/issues/224), closable by a manual Linux-host run, never pass evidence).
 - `scripts/check-full.sh` — complete local gate. It bounds the workspace-test phase by default; exit `125` with `DEFERRED[ASTRO_NATIVE_AGGREGATE]` means downstream suites did not run and is **not** passing evidence. Use the printed `ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0` continuation for an intentional full run.
 - `scripts/check-release.sh` — full release gate (binary size + `ASTROLABE_DONE` predicate).
 - Formatter: `python scripts/native-cargo-fmt.py --all -- --check`. Do **not** run bare `cargo fmt --all` on Windows — upstream cargo-fmt builds one command line beyond the OS limit on this workspace graph.
-- CBM lint: `scripts/ci-cbm-lint.sh` (on non-Linux hosts, clang-tidy is owned by the required Linux CI job and is skipped by name; cppcheck/format/NOLINT gates still run).
-- CI configuration lives in `.github/workflows/ci.yml` and `ci/`.
+- CBM lint: `scripts/ci-cbm-lint.sh` (historical filename; it is a local gate — on non-Linux hosts clang-tidy is skipped by name as a tracked coverage gap; cppcheck/format/NOLINT gates still run).
+- **There is no CI/CD.** GitHub Actions is banned in this repository (owner directive, 2026-07-11): no workflows, no required checks, no hosted pipelines. All verification is local full-state verification — the scripts above, run natively, with evidence recorded on the closing GitHub issue. The `ci/` directory holds local gate configs consumed by the check scripts; the name is historical, and nothing in it is GitHub configuration ([#224](https://github.com/ChrisRoyse/Astrolabe/issues/224)).
 
-Platform-limited gates are skipped **by name** (`SKIP[...]`/`INFO[...]` markers), never silently; a named skip is coverage ownership by the required Linux CI job, not local pass evidence.
+Platform-limited gates are skipped **by name** (`SKIP[...]`/`INFO[...]` markers), never silently; a named skip is a recorded, issue-tracked coverage gap — not local pass evidence.
 
 ## Hygiene invariants (enforced by the workflow)
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Verify that aggregate, release, and scheduled gates have durable callers."""
+"""Verify that aggregate and release gates have durable local callers.
+
+Hosted CI/CD is banned (owner directive 2026-07-11; see issue #224): there is
+no workflow file to validate, and no gate may claim a CI job as its caller.
+Every gate's durable caller is a local script reachable from check.sh,
+check-full.sh, or check-release.sh.
+"""
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
@@ -38,20 +43,8 @@ def require_order(
         cursor = index + len(needle)
 
 
-def workflow_job(workflow: str, name: str, errors: list[str]) -> str:
-    match = re.search(
-        rf"(?ms)^  {re.escape(name)}:\s*$\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
-        workflow,
-    )
-    if match is None:
-        errors.append(f"ci.yml is missing job {name!r}")
-        return ""
-    return match.group(1)
-
-
 def validate(root: Path) -> list[str]:
     errors: list[str] = []
-    workflow = read(root, ".github/workflows/ci.yml", errors)
     check = read(root, "scripts/check.sh", errors)
     full = read(root, "scripts/check-full.sh", errors)
     release = read(root, "scripts/check-release.sh", errors)
@@ -414,92 +407,10 @@ def validate(root: Path) -> list[str]:
         errors,
     )
 
-    if not re.search(r"(?ms)^  schedule:\s*$\n\s+- cron:", workflow):
-        errors.append("ci.yml must define a scheduled trigger")
-
-    pins = workflow_job(workflow, "pins", errors)
-    require(
-        pins,
-        "python3 scripts/check-gate-wiring.py",
-        "ci.yml pins job",
-        errors,
-    )
-
-    portable = workflow_job(workflow, "portable-gates", errors)
-    require(
-        portable,
-        "run: bash scripts/check.sh",
-        "ci.yml portable-gates job",
-        errors,
-    )
-    require(portable, "strace", "ci.yml portable-gates job", errors)
-
-    lint = workflow_job(workflow, "cbm-lint", errors)
-    require(lint, "runs-on: ubuntu-latest", "ci.yml cbm-lint job", errors)
-    require(
-        lint,
-        "run: bash scripts/ci-cbm-lint.sh",
-        "ci.yml cbm-lint job",
-        errors,
-    )
-
-    benchmark = workflow_job(workflow, "row-sink-benchmark", errors)
-    require(
-        benchmark,
-        "github.event_name == 'schedule'",
-        "ci.yml row-sink-benchmark job",
-        errors,
-    )
-    require(
-        benchmark,
-        'ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT: "1"',
-        "ci.yml row-sink-benchmark job",
-        errors,
-    )
-    require(
-        benchmark,
-        "run: bash scripts/bench-row-sink-overhead.sh",
-        "ci.yml row-sink-benchmark job",
-        errors,
-    )
-    require(
-        benchmark,
-        "target/astrolabe-row-sink-overhead-bench.json",
-        "ci.yml row-sink-benchmark upload",
-        errors,
-    )
-    require(
-        benchmark,
-        "target/astrolabe-release-predicate/bench-ratios.json",
-        "ci.yml row-sink-benchmark upload",
-        errors,
-    )
-    # CI actions are pinned to full commit SHAs (see commit "Pin CI actions to
-    # commit SHAs + add Dependabot to keep them fresh") with a trailing "# vN"
-    # annotation that Dependabot maintains. Require the upload-artifact pin to be
-    # a SHA annotated as major version 4 so the gate keeps guarding the v4 major
-    # (a v5 bump would carry "# v5" and fail closed here) without regressing the
-    # SHA-pinning hardening back to a mutable tag.
-    if not re.search(
-        r"uses:\s*actions/upload-artifact@[0-9a-fA-F]{40}\s*#\s*v4(?!\d)",
-        benchmark,
-    ):
-        errors.append(
-            "ci.yml row-sink-benchmark upload must pin "
-            "actions/upload-artifact to a commit SHA annotated '# v4'"
-        )
-
-    ci_ok = workflow_job(workflow, "ci-ok", errors)
-    if not re.search(r"needs:\s*\[[^\]]*portable-gates[^\]]*\]", ci_ok):
-        errors.append("ci.yml ci-ok job must require portable-gates")
-    if not re.search(r"needs:\s*\[[^\]]*row-sink-benchmark[^\]]*\]", ci_ok):
-        errors.append("ci.yml ci-ok job must account for row-sink-benchmark")
-    require(
-        ci_ok,
-        'optional_skips = {"row-sink-benchmark"}',
-        "ci.yml ci-ok job",
-        errors,
-    )
+    # No hosted CI exists to validate (banned; #224). The row-sink overhead
+    # benchmark lost its scheduled CI caller with the workflow's removal;
+    # scripts/bench-row-sink-overhead.sh remains locally runnable and its
+    # coverage gap is tracked on #224.
 
     return errors
 

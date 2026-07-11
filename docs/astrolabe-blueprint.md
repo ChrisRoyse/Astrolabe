@@ -61,6 +61,8 @@ codebase-memory-mcp                          Calyx
 - **Agent/tooling design:** 15 â†’ 09 â†’ 12 â†’ 13.
 - **Implementer starting P0:** 22 â†’ 19 â†’ 03 â†’ 04 â†’ 20.
 
+> **Design correction (2026-07-11, owner): CI/CD retired — full state verification only.** GitHub Actions and all hosted CI/CD are **banned** for this repository: `.github/` is deleted; there are no workflows, required checks, or CI jobs, and none may be added. Wherever this blueprint says "CI" about *our* pipeline — "in CI", "CI-blocking", "CI-gated", "CI green on N platforms", "required Linux job" — read: **the equivalent locally executed verification gate** (`scripts/check.sh` / `scripts/check-full.sh` / `scripts/check-release.sh` / the native aggregate via the launcher / `scripts/release-predicate.sh`), run from the canonical workspace, with FSV evidence recorded on the closing GitHub issue. Platform-limited probes are named, issue-tracked coverage gaps (#224) closable by documented manual runs — never CI-owned skips. Unaffected and still in scope: parsing **end-users'** CI artifacts as anchor sources (JUnit XML / pytest / cargo test JSON / go test / vitest, `anchor_outcome`, trace ingestion) — that is product functionality over user-supplied data; only pipelines for this repository are banned.
+
 ## Executive summary (10 claims)
 
 1. **CBM is the world's best code decomposer/instrumenter** (158 languages, 9-family type-aware LSP, cross-service and cross-repo linking). Calyx is the world's only association-native grounded-intelligence database. CBM produces exactly the input Calyx's doctrine demands: *atoms + all base associations, computed from the ground up*.
@@ -1698,7 +1700,7 @@ Content addressing makes vault state order-independent (fixes the class of CBM's
 
 Default CPU: nomic lookup + SIMD (wide/AVX) covers everything. Optional features: `tei` (real embedder endpoints for S23+), `cuda` (Forge GEMM/topk for massive re-embeds, cuVS Linux-only) â€” fail-loud, never silent fallback, never required for any Tier 1â€“11 capability.
 
-## 6. Benchmark harness (CI-gated)
+## 6. Benchmark harness (gate-blocking, local)
 
 Repos: small OSS service (S), CBM itself (M-ish), linux/fs subset (L-class) â€” CBM's existing bench scripts extended. Metrics: wall time per stage, RSS peak, vault size, search p99, recall@10 vs legacy path, kernel recall, incremental latency. Regression gates: overhead ratios above + no serving-path regression >10%. Published per release (honest numbers doctrine).
 
@@ -1819,9 +1821,9 @@ C binds tree-sitter/SQLite to mimalloc through `cbm_alloc_init` (which must run 
 
 CUDA/TEI/ONNX features excluded from default builds on all platforms.
 
-## 7. CI pipeline
+## 7. Verification pipeline *(design correction 2026-07-11: local gates only — hosted CI is banned; see 00_INDEX)*
 
-Stages: (1) C gate â€” upstream CBM lint/tests (clang-tidy -Werror, cppcheck, 5.9K tests, ASan/UBSan) unchanged; (2) Rust gate â€” fmt, clippy -D warnings, nextest (Calyx crates + astrolabe crates); (3) FFI gate â€” bindgen drift check, link test all platforms, LSan on bridge tests; (4) parity + determinism suites (20); (5) bench gate (17 Â§6); (6) release â€” cross-builds, checksums, VirusTotal scan (CBM's release discipline inherited).
+Stages, all executed as local scripts from the canonical workspace: (1) C gate â€” upstream CBM lint/tests (clang-tidy -Werror, cppcheck, 5.9K tests, ASan/UBSan) unchanged; (2) Rust gate â€” fmt, clippy -D warnings, nextest (Calyx crates + astrolabe crates); (3) FFI gate â€” bindgen drift check, link test all platforms, LSan on bridge tests; (4) parity + determinism suites (20); (5) bench gate (17 Â§6); (6) release â€” cross-builds, checksums, VirusTotal scan (CBM's release discipline inherited).
 
 ## 8. Packaging & distribution
 
@@ -1842,7 +1844,7 @@ Both parents bring strong, different testing cultures: CBM's 5,900+ gating cases
 
 - CBM: full `make test` (ASan/UBSan), lint gates, repro runner (status board), Windows suite, shell guards.
 - Calyx crates: nextest suites, proptests, pinned invariants (error catalogs, CF counts), fuzz targets.
-- Both run in CI as-is against the vendored SHAs â€” upstream regressions caught at the pin.
+- Both run as-is in the local aggregate gates against the vendored SHAs â€” upstream regressions caught at the pin.
 
 ## 2. Fusion test layers (new)
 
@@ -1857,7 +1859,7 @@ For a corpus of pinned repos (S/M/L, multi-language):
 - search parity: legacy vs fused path â€” overlap@10 tracked, regressions gated;
 - idempotency: reindex-unchanged â‡’ zero new CxIds, zero ledger mutations beyond the run record.
 
-### L3 â€” Determinism probes (CI-blocking)
+### L3 â€” Determinism probes (gate-blocking)
 Same repo, 1 vs 8 workers, three runs: identical CxId sets, identical eager cross-terms, identical kernel membership (given same seed), identical pack for identical (task, budget, seed). All randomness enumerated and seeded (assay sampling, pivots, bandit, replay).
 
 ### L4 â€” FSV byte-verification (Calyx doctrine, applied)
@@ -1968,7 +1970,7 @@ Eleven phases, each independently shippable, each with a falsifiable exit gate. 
 
 ## P0 â€” Foundations & proof of link (3â€“5 ew)
 Workspace + subtrees pinned; `libcbm.a` target + `cbm-sys` bindgen; Rust binary that (a) links both halves on Linux/macOS/Windows-gnu, (b) passes all legacy tools through `cbm_mcp_handle_tool` FFI, (c) enforces the platform-specific single-mimalloc topology and ownership contract, and (d) routes logs.
-**Gate:** all 14 legacy tools byte-parity vs upstream binary on the parity corpus; CI green on 3 platforms; ASan/LSan clean bridge.
+**Gate:** all 14 legacy tools byte-parity vs upstream binary on the parity corpus; aggregate gates green natively (non-native platform coverage = tracked gaps per #224 runbooks); ASan/LSan clean bridge.
 
 ## P1 â€” Constellations (shadow ingest) (4â€“6 ew)
 `astrolabe-domain` (canonical bytes, series registry) + `astrolabe-panel` (panel v1, S0â€“S21, frozen seed registry) + `astrolabe-ingest` (SQLiteâ†’vault importer) + ledger wiring + `verify_chain`.
@@ -2024,7 +2026,7 @@ Core (P0â€“P6, the "insanely useful" milestone): **26â€“39 ew**. Full 
 
 ## First week of work (concrete kickoff list)
 
-1. Create repo, subtree both upstreams at pinned SHAs, stand up 3-platform CI running both parents' native test suites.
+1. Create repo, subtree both upstreams at pinned SHAs, run both parents' native test suites through the local gates (3-platform hosted CI retired per the 2026-07-11 design correction; #2 closed not-planned).
 2. Write `Makefile.cbm` `libcbm` patch + `astro_ffi.h`; get `cbm-sys` linking + one FFI call (`cbm_extract_file` on a fixture) green everywhere.
 3. Pass-through server: Rust MCP loop delegating all 14 tools; run CBM's MCP tests against it.
 4. Draft `canonical_input_bytes` + golden tests (the identity spine everything hangs on).
