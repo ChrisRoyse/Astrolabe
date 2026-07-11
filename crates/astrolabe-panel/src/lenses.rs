@@ -1661,8 +1661,12 @@ fn tokenize_like_unicode61(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            current.extend(ch.to_lowercase());
+        // Frozen Unicode-6.1 classification/case-fold (see `crate::unicode61`):
+        // std's `is_alphanumeric`/`to_lowercase` track the toolchain's Unicode
+        // version and would drift frozen S7/S18-S20/S22 outputs on a rustc
+        // upgrade.
+        if crate::unicode61::is_alnum(ch) {
+            current.push(crate::unicode61::fold(ch));
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
         }
@@ -1812,6 +1816,26 @@ mod tests {
         }
 
         assert_eq!(cbm_camel_split_text("HTMLParser"), "HTMLParser HTML Parser");
+    }
+
+    #[test]
+    fn tokenizer_is_frozen_to_unicode_6_1_not_the_toolchain() {
+        // U+19B0 (New Tai Lue vowel sign) is a separator under Unicode 6.1
+        // (category Mc) but alphanumeric under Unicode 8.0+, so a frozen 6.1
+        // tokenizer must SPLIT on it. A std `is_alphanumeric`-backed tokenizer
+        // would keep "ab<U+19B0>cd" as one token and fail this golden.
+        assert_eq!(
+            cbm_camel_split_tokens("ab\u{19B0}cd"),
+            vec!["ab", "cd", "ab", "cd"],
+        );
+
+        // U+A7B4 (LATIN CAPITAL LETTER BETA) is alphanumeric in 6.1 but has no
+        // 6.1 case-fold rule, so frozen folding leaves it unchanged; std's
+        // newer `to_lowercase` would emit U+A7B5 and fail this golden.
+        assert_eq!(
+            cbm_camel_split_tokens("X\u{A7B4}"),
+            vec!["x\u{A7B4}", "x\u{A7B4}"],
+        );
     }
 
     #[test]

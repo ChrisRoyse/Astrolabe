@@ -2,6 +2,7 @@
 
 mod embeddings;
 mod lenses;
+mod unicode61;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
