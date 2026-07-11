@@ -89,28 +89,6 @@ function Assert-AllowedBashCommand {
     }
 }
 
-function Assert-NativeGitBashResolution {
-    param([string]$GitRoot, [string]$Command)
-
-    $resolvedBash = (Get-Command -Name "bash.exe" -CommandType Application -ErrorAction Stop).Source
-    if (-not (Test-PathUnderRoot -Path $resolvedBash -Root $GitRoot)) {
-        throw "EXECUTION_BOUNDARY[ASTRO_BASH_RESOLUTION_FORBIDDEN]: bash.exe must resolve under $GitRoot, found $resolvedBash"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($Command) -and
-        [IO.Path]::GetFileName($Command) -in @("bash", "bash.exe")) {
-        $resolvedCommand = if ([IO.Path]::IsPathRooted($Command) -or $Command.Contains("\") -or $Command.Contains("/")) {
-            (Resolve-Path -LiteralPath $Command -ErrorAction Stop).Path
-        }
-        else {
-            (Get-Command -Name $Command -CommandType Application -ErrorAction Stop).Source
-        }
-        if (-not (Test-PathUnderRoot -Path $resolvedCommand -Root $GitRoot)) {
-            throw "EXECUTION_BOUNDARY[ASTRO_BASH_COMMAND_FORBIDDEN]: Bash command must resolve under $GitRoot, found $resolvedCommand"
-        }
-    }
-}
-
 function Require-Success {
     param([string]$Step)
     if ($LASTEXITCODE -ne 0) {
@@ -529,7 +507,13 @@ if ($Bootstrap) {
 Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
 Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
 Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -GitBin $gitBin -GitUsrBin $gitUsrBin
-Assert-NativeGitBashResolution -GitRoot $gitRoot -Command $Command
+# No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
+# host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
+# (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
+# PS 5.1). The launcher uses Git bash explicitly via $env:BASH/$env:SHELL, and
+# Set-ToolchainEnvironment prepends $GitBin to the child PATH; $Command is invoked
+# by explicit path. An explicitly-passed bash $Command is still validated by
+# Assert-AllowedBashCommand above. See #205.
 Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot
 Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, runtime $mingwBin"
 
