@@ -1,6 +1,6 @@
 # ASTROLABE — Agent Operating Manual
 
-ASTROLABE fuses Calyx (Rust association-native DB engine, `vendor/calyx`) with codebase-memory-mcp (C code-graph MCP server, `vendor/codebase-memory-mcp`) into one Rust-host binary (`crates/astrolabe-server`) with the C half linked as `libcbm.a` (`crates/cbm-sys`, `crates/astrolabe-bridge`). Plan of record: `docs/astrolabe-blueprint.md`. **State of record: GitHub issues — nothing else.**
+ASTROLABE fuses Calyx (Rust association-native DB engine, `vendor/calyx`) with codebase-memory-mcp (C code-graph MCP server, `vendor/codebase-memory-mcp`) into one Rust-host binary (`crates/astrolabe-server`) with the C half linked as `libcbm.a` (`crates/cbm-sys`, `crates/astrolabe-bridge`). Plan of record: `docs/astrolabe-blueprint.md`. Binding upstream doctrine: `docs/BUILDING_ON_CALYX.md` (the Calyx builder's handbook the blueprint derives from — embed-vs-encode, atoms → all base associations → differentiate → kernel → compose, the anti-pattern list; on conflict the blueprint's code-domain decisions win, recorded there as design corrections). **State of record: GitHub issues — nothing else.**
 
 ## The one rule that outranks all others
 
