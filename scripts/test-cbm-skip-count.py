@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -86,8 +87,21 @@ def copy_fixture(root: Path) -> tuple[Path, Path]:
 
 def main() -> int:
     bash = native_bash()
-    scratch = ROOT / "target"
+    scratch_parent = ROOT / ".tmp"
+    scratch_parent_existed = scratch_parent.exists()
+    scratch = scratch_parent / "cbm-skip-count"
+    shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True, exist_ok=True)
+
+    def cleanup_scratch() -> None:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if not scratch_parent_existed:
+            try:
+                scratch_parent.rmdir()
+            except OSError:
+                pass
+
+    atexit.register(cleanup_scratch)
     with tempfile.TemporaryDirectory(prefix="cbm-skip-count-", dir=scratch) as temp:
         fixture = Path(temp)
         checker, manifest = copy_fixture(fixture)
@@ -151,6 +165,8 @@ def main() -> int:
             "ASTRO_CBM_SKIP_BASELINE_INVALID",
         )
 
+    cleanup_scratch()
+    assert not scratch.exists()
     print("CBM exact skip-count self-test passed")
     return 0
 
