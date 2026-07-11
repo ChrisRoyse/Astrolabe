@@ -38,10 +38,15 @@ pub const ASTRO_INGEST_SQLITE_INVALID: &str = "ASTRO_INGEST_SQLITE_INVALID";
 pub const ASTRO_INGEST_READBACK_MISMATCH: &str = "ASTRO_INGEST_READBACK_MISMATCH";
 /// Refusal code for malformed quantization gate inputs.
 pub const ASTRO_QUANTIZATION_GATE_INVALID: &str = "ASTRO_QUANTIZATION_GATE_INVALID";
+/// Refusal code for a legacy vault whose raw `astrolabe:cbm-edge:v1` rows predate
+/// the raw-edge schema, leaving only typed constellation-to-constellation edge
+/// rows that silently omit dangling and structural-endpoint edges.
+pub const ASTRO_LEGACY_CBM_EDGE_ROWS: &str = "ASTRO_LEGACY_CBM_EDGE_ROWS";
 
 const SQLITE_REMEDIATION: &str = "Open a valid Codebase Memory MCP SQLite dump with nodes, edges, and optional node_vectors tables.";
 const READBACK_REMEDIATION: &str = "Stop ingest, inspect the Aster vault, and rerun astrolabe verify --deep before trusting the batch.";
 const QUANTIZATION_GATE_REMEDIATION: &str = "Provide measured recall, panel-bits, guard-FAR, and provenance for every requested quantization candidate.";
+const LEGACY_CBM_EDGE_ROWS_REMEDIATION: &str = "Re-import the project from its Codebase Memory MCP SQLite dump so the vault persists complete astrolabe:cbm-edge:v1 raw edge rows before reading or lowering its graph snapshot.";
 const NODE_MAP_PREFIX: &[u8] = b"astrolabe:node-map:v2:";
 const LEGACY_NODE_MAP_PREFIX_V1: &[u8] = b"astrolabe:node-map:v1:";
 const STRUCTURAL_NODE_PREFIX: &[u8] = b"astrolabe:structural-node:v1:";
@@ -3055,27 +3060,28 @@ where
         });
     }
     if edges.is_empty() {
-        for row in read_graph_rows::<C, EdgeGraphRow>(vault, snapshot, EDGE_ROW_PREFIX)? {
-            if row.project != project {
-                continue;
-            }
-            validate_edge_snapshot_row(&row)?;
-            let properties_json = row.properties_json.unwrap_or_else(|| {
-                serde_json::to_string(&row.props).unwrap_or_else(|_| "{}".into())
-            });
-            ensure_json_object_text(&properties_json, "edge properties")?;
-            edges.push(CbmGraphEdge {
-                sqlite_edge_id: row.sqlite_edge_id,
-                project: row.project,
-                source_node_id: row.source_node_id,
-                target_node_id: row.target_node_id,
-                src: Some(row.src),
-                dst: Some(row.dst),
-                edge_type: row.edge_type,
-                local_name_gen: row.local_name_gen,
-                weight: row.weight,
-                properties_json,
-            });
+        // Every modern import persists a raw `astrolabe:cbm-edge:v1` row for each
+        // source edge (see `raw_edge_graph_rows`), covering dangling and
+        // structural-endpoint edges that never become typed
+        // constellation-to-constellation rows. Their absence while typed
+        // `astrolabe:edge:v1` rows still exist means the vault was imported before
+        // the raw-edge schema landed. Silently substituting the typed rows would
+        // drop the dangling and structural-endpoint edges and report
+        // skipped_edges=0, so the lowered artifact would diverge from the source
+        // CBM graph with clean counters. Refuse fail-closed instead.
+        let legacy_typed_edges =
+            read_graph_rows::<C, EdgeGraphRow>(vault, snapshot, EDGE_ROW_PREFIX)?
+                .into_iter()
+                .filter(|row| row.project == project)
+                .count();
+        if legacy_typed_edges != 0 {
+            return Err(IngestError::refused(
+                ASTRO_LEGACY_CBM_EDGE_ROWS,
+                format!(
+                    "project {project:?} has {legacy_typed_edges} typed astrolabe:edge:v1 row(s) but no raw astrolabe:cbm-edge:v1 rows; this vault predates the raw-edge schema and its lowered graph would silently omit dangling and structural-endpoint edges"
+                ),
+                LEGACY_CBM_EDGE_ROWS_REMEDIATION,
+            ));
         }
     }
     edges.sort_by(|left, right| {
@@ -3311,45 +3317,6 @@ fn ensure_json_object_text(value: &str, label: &str) -> IngestResult<()> {
     if !parsed.is_object() {
         return Err(IngestError::InvalidInput(format!(
             "{label} JSON must be an object"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_edge_snapshot_row(row: &EdgeGraphRow) -> IngestResult<()> {
-    if row.schema != SCHEMA_EDGE_ROW {
-        return Err(IngestError::InvalidInput(format!(
-            "edge row {} has wrong schema {}",
-            row.sqlite_edge_id, row.schema
-        )));
-    }
-    match EdgeKind::from_cbm_type(&row.edge_type) {
-        Some(kind) if kind.code() == row.etype => {}
-        Some(kind) => {
-            return Err(IngestError::InvalidInput(format!(
-                "edge row {} etype {} does not match {}",
-                row.sqlite_edge_id,
-                row.etype,
-                kind.as_str()
-            )));
-        }
-        None => {
-            return Err(IngestError::InvalidInput(format!(
-                "edge row {} has unknown type {}",
-                row.sqlite_edge_id, row.edge_type
-            )));
-        }
-    }
-    if !(row.weight.is_finite() && (0.0..=1.0).contains(&row.weight)) {
-        return Err(IngestError::InvalidInput(format!(
-            "edge row {} weight {} is outside [0, 1]",
-            row.sqlite_edge_id, row.weight
-        )));
-    }
-    if !row.props.is_object() {
-        return Err(IngestError::InvalidInput(format!(
-            "edge row {} props are not an object",
-            row.sqlite_edge_id
         )));
     }
     Ok(())
@@ -4859,6 +4826,80 @@ mod tests {
 
         let deep = crate::verify_deep(&vault).expect("deep verify full vocabulary");
         assert_eq!(deep.sqlite_edge_rows, EdgeKind::ALL.len());
+    }
+
+    #[test]
+    fn snapshot_read_refuses_legacy_vault_missing_raw_cbm_edge_rows() {
+        // A modern import persists both raw astrolabe:cbm-edge:v1 rows and typed
+        // astrolabe:edge:v1 rows. Simulate a legacy vault by tombstoning only the
+        // raw rows, leaving the typed rows behind. Reading the snapshot must then
+        // refuse fail-closed instead of silently substituting the typed rows (which
+        // omit dangling/structural-endpoint edges) and reporting skipped_edges=0.
+        let path = temp_db("legacy-cbm-edge");
+        full_vocabulary_fixture(&path);
+        let vault = vault();
+        import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import full edge vocabulary");
+
+        // Baseline: the modern vault reads its raw edges without refusal.
+        let baseline = read_cbm_graph_snapshot(&vault, "demo").expect("modern snapshot read");
+        assert_eq!(baseline.edges.len(), EdgeKind::ALL.len());
+
+        // Tombstone every raw astrolabe:cbm-edge:v1 row to reproduce a legacy vault.
+        let tombstone = tombstone_value();
+        let raw_edge_rows = vault
+            .scan_cf_range_at(
+                vault.latest_seq(),
+                ColumnFamily::Graph,
+                &prefix_range(CBM_EDGE_ROW_PREFIX),
+            )
+            .expect("scan raw cbm edge rows");
+        assert_eq!(raw_edge_rows.len(), EdgeKind::ALL.len());
+        let downgrade = raw_edge_rows
+            .into_iter()
+            .map(|(key, _)| (ColumnFamily::Graph, key, tombstone.clone()))
+            .collect::<Vec<_>>();
+        vault
+            .write_cf_batch_with_ledger_entry(
+                downgrade,
+                EntryKind::Admin,
+                SubjectId::Query(b"astro-legacy-edge-downgrade".to_vec()),
+                serde_json::to_vec(&json!({"schema": "astrolabe-legacy-edge-downgrade-test"}))
+                    .expect("encode downgrade payload"),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("tombstone raw cbm edge rows");
+        vault
+            .purge_tombstoned_cfs(&[ColumnFamily::Graph])
+            .expect("purge tombstoned raw cbm edge rows");
+
+        // Raw rows are gone; typed astrolabe:edge:v1 rows still remain.
+        assert!(
+            vault
+                .scan_cf_range_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Graph,
+                    &prefix_range(CBM_EDGE_ROW_PREFIX),
+                )
+                .expect("scan raw cbm edge rows after downgrade")
+                .is_empty()
+        );
+        assert_eq!(
+            vault
+                .scan_cf_range_at(
+                    vault.latest_seq(),
+                    ColumnFamily::Graph,
+                    &prefix_range(EDGE_ROW_PREFIX),
+                )
+                .expect("scan typed edge rows after downgrade")
+                .len(),
+            EdgeKind::ALL.len()
+        );
+
+        let err = read_cbm_graph_snapshot(&vault, "demo")
+            .expect_err("legacy vault snapshot read must refuse");
+        assert_eq!(err.code(), Some(ASTRO_LEGACY_CBM_EDGE_ROWS));
+        assert_eq!(err.remediation(), Some(LEGACY_CBM_EDGE_ROWS_REMEDIATION));
     }
 
     #[test]
