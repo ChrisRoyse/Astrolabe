@@ -493,6 +493,19 @@ function Set-WorkspaceTempEnvironment {
     $env:TEMP = $WorkspaceTemp
     $env:TMP = $WorkspaceTemp
     $env:TMPDIR = $WorkspaceTemp
+    # The launcher relocates TEMP inside the workspace checkout. Stop git
+    # repository discovery from ascending out of the temp tree, or every
+    # "outside any checkout" temp directory inherits the Astrolabe repo
+    # identity — vendored calyx-buildinfo's outside-checkout FSV asserts
+    # exactly that property, and fixture repos created inside temp dirs are
+    # below the ceiling so their own discovery is unaffected (relates #175).
+    $tempCeiling = (Split-Path -Parent $WorkspaceTemp) -replace '\\', '/'
+    if ($env:GIT_CEILING_DIRECTORIES) {
+        $env:GIT_CEILING_DIRECTORIES = "$tempCeiling;$($env:GIT_CEILING_DIRECTORIES)"
+    }
+    else {
+        $env:GIT_CEILING_DIRECTORIES = $tempCeiling
+    }
     # NOTE (#194): a launcher-level CBM_CACHE_DIR redirect was tried here to keep
     # codebase-memory-mcp project registrations out of the operator's global store,
     # but it splits the vendored C tests' write path from their read path — those
@@ -762,7 +775,7 @@ foreach ($argument in $commandArgs) {
 
 $commandExit = 0
 $previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
@@ -844,7 +857,7 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
-    foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
+    foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
             Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue

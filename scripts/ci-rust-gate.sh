@@ -262,5 +262,10 @@ run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${TARGET_
 # bump. Named skip, never pass evidence; the behavioral Calyx gates below
 # (check/nextest/doctest) and all Astrolabe-crate clippy stay blocking.
 echo "SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]: vendored Calyx clippy is upstream-owned at the pin; tracked in #234 (upstream ChrisRoyse/Calyx#824)"
-run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
+# calyx-poly's issue035 FSV test hard-depends on a machine-local Polymarket
+# capture that no longer exists anywhere (its metadata.json sha256 cross-check
+# makes the dataset unfabricatable). Excluded by name until upstream ships a
+# fixture or a self-skip: tracked in Astrolabe #235, fix in ChrisRoyse/Calyx#825.
+echo "SKIP[ASTRO_CALYX_ISSUE035_DATASET_LOCAL]: calyx-poly issue035 FSV needs the absent local capture; tracked in #235 (upstream ChrisRoyse/Calyx#825)"
+run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}" -E 'not test(issue035_historical_backfill_loader_fsv)'
 run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
