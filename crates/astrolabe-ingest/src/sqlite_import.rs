@@ -259,8 +259,14 @@ pub struct SqliteImportQuantizationReport {
 /// Exact skipped-edge accounting for an import batch.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSkipCounters {
-    /// Edges whose source or target node id was absent from the SQLite node table.
+    /// Edges skipped because a source or target node id was genuinely absent from the
+    /// SQLite node table (dangling reference / corrupt or truncated dump).
     pub dangling: usize,
+    /// Edges skipped because a source or target endpoint is a structural node
+    /// (Project/Branch/Folder) that is persisted as a structural row rather than a
+    /// constellation, and therefore has no typed edge target. This is a by-design skip,
+    /// not corruption, so it is counted separately from `dangling`.
+    pub structural_endpoint: usize,
 }
 
 /// Readback verification summary for a SQLite import batch.
@@ -652,6 +658,7 @@ struct IngestLedgerPayload {
     edge_inputs: u64,
     edge_rows_written: u64,
     edge_dangling_skipped: u64,
+    edge_structural_endpoint_skipped: u64,
     expected_base_rows: u64,
     expected_slot_rows: u64,
     expected_graph_rows: u64,
@@ -1947,7 +1954,13 @@ where
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
     let sqlite_edges = edges.len();
-    let (edge_rows, edge_skips) = prepare_edge_rows(options, &constellations, edges)?;
+    let structural_node_ids = nodes
+        .iter()
+        .filter(|node| node.label.is_structural())
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let (edge_rows, edge_skips) =
+        prepare_edge_rows(options, &constellations, &structural_node_ids, edges)?;
 
     Ok(PreparedBatch {
         constellations,
@@ -2061,6 +2074,7 @@ fn raw_edge_graph_rows(
 fn prepare_edge_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedConstellation],
+    structural_node_ids: &BTreeSet<i64>,
     edges: Vec<RawEdgeRow>,
 ) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
     let cx_by_node = constellations
@@ -2071,12 +2085,21 @@ fn prepare_edge_rows(
     let mut skips = EdgeSkipCounters::default();
 
     for edge in edges {
-        let Some(src) = cx_by_node.get(&edge.source_id).copied() else {
-            skips.dangling += 1;
-            continue;
-        };
-        let Some(dst) = cx_by_node.get(&edge.target_id).copied() else {
-            skips.dangling += 1;
+        let src = cx_by_node.get(&edge.source_id).copied();
+        let dst = cx_by_node.get(&edge.target_id).copied();
+        let (Some(src), Some(dst)) = (src, dst) else {
+            // The edge cannot become a typed constellation-to-constellation row. Attribute
+            // the skip: a genuinely missing endpoint (not a constellation, not a structural
+            // node) is a dangling reference; otherwise the only non-constellation endpoints
+            // are structural nodes (Project/Branch/Folder), which are a by-design skip.
+            let missing_endpoint = |cx: Option<CxId>, node_id: i64| {
+                cx.is_none() && !structural_node_ids.contains(&node_id)
+            };
+            if missing_endpoint(src, edge.source_id) || missing_endpoint(dst, edge.target_id) {
+                skips.dangling += 1;
+            } else {
+                skips.structural_endpoint += 1;
+            }
             continue;
         };
         let kind = EdgeKind::from_cbm_type(&edge.edge_type).ok_or_else(|| {
@@ -3428,6 +3451,7 @@ fn ingest_ledger_payload(
         edge_inputs: prepared.edge_rows.len() as u64,
         edge_rows_written: stats.edge_rows_written as u64,
         edge_dangling_skipped: prepared.edge_skips.dangling as u64,
+        edge_structural_endpoint_skipped: prepared.edge_skips.structural_endpoint as u64,
         expected_base_rows: prepared.constellations.len() as u64,
         expected_slot_rows: prepared
             .constellations
@@ -5055,6 +5079,77 @@ mod tests {
             );
             assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0, "{name}");
         }
+    }
+
+    fn structural_endpoint_fixture(path: &Path) {
+        let connection = create_db(path);
+        let function = insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            10,
+            12,
+            r#"{"language":"rust","source_snippet":"fn add() -> i32 { 1 }","signature":"fn add() -> i32"}"#,
+        );
+        let project = insert_node(
+            &connection,
+            "Project",
+            "demo",
+            "demo",
+            "",
+            0,
+            0,
+            r#"{"source_snippet":"demo project"}"#,
+        );
+        // Structural-endpoint edge: the Project (a structural node persisted as a
+        // structural row, not a constellation) contains the function. It must be counted
+        // as a structural-endpoint skip, not as a dangling reference.
+        insert_edge(&connection, project, function, "CONTAINS", "{}");
+        // Genuinely dangling edge: target 9999 is not present in the node table at all.
+        insert_edge(&connection, function, 9999, "CALLS", "{}");
+    }
+
+    #[test]
+    fn structural_endpoint_edges_counted_separately_from_dangling() {
+        let path = temp_db("structural-endpoint");
+        structural_endpoint_fixture(&path);
+        let vault = vault();
+
+        let report = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import sqlite");
+
+        // The structural-endpoint edge and the dangling edge are attributed to distinct
+        // counters; neither becomes a typed edge row.
+        assert_eq!(report.edge_skips.structural_endpoint, 1);
+        assert_eq!(report.edge_skips.dangling, 1);
+        assert_eq!(report.sqlite_edges, 2);
+        assert_eq!(report.edge_rows_written, 0);
+
+        // FSV: the persisted ledger payload records the split accounting so operators can
+        // tell a corrupt dump (dangling) from a by-design structural skip.
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(report.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let entry = decode(&ledger).expect("decode ledger");
+        let payload: Value = serde_json::from_slice(&entry.payload).expect("payload json");
+        assert_eq!(
+            payload
+                .get("edge_structural_endpoint_skipped")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload.get("edge_dangling_skipped").and_then(Value::as_u64),
+            Some(1)
+        );
+        fs::remove_file(path).ok();
     }
 
     #[test]
