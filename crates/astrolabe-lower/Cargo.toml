@@ -23,6 +23,6 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 astrolabe-panel.workspace = true
-
-[target.'cfg(unix)'.dev-dependencies]
+# #133: dev-dependency on every platform so tests/cbm_store_lowered.rs (the
+# real CBM C store opening the lowered artifact) executes natively on Windows.
 cbm-sys.workspace = true

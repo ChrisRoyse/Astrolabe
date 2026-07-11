@@ -3994,18 +3994,71 @@ mod tests {
         )
     }
 
-    fn temp_db(name: &str) -> std::path::PathBuf {
+    /// RAII %TEMP% SQLite fixture: removes the file and its -wal/-shm/-journal
+    /// sidecars on drop so no test leaks fixtures into the OS temp directory
+    /// (#133). Derefs to `Path`, so call sites use it exactly like a path.
+    struct TempDb(std::path::PathBuf);
+
+    impl std::ops::Deref for TempDb {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDb {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let base = self.0.as_os_str().to_os_string();
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let mut name = base.clone();
+                name.push(suffix);
+                let _ = fs::remove_file(std::path::PathBuf::from(name));
+            }
+        }
+    }
+
+    fn temp_db(name: &str) -> TempDb {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        TempDb(std::env::temp_dir().join(format!(
             "astrolabe-ingest-{name}-{}-{nanos}.db",
             std::process::id()
-        ))
+        )))
     }
 
-    fn durable_vault(name: &str) -> (std::path::PathBuf, AsterVault<FixedClock>) {
+    /// RAII %TEMP% durable-vault directory: removed recursively on drop (#133).
+    struct TempVaultDir(std::path::PathBuf);
+
+    impl std::ops::Deref for TempVaultDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempVaultDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempVaultDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn durable_vault(name: &str) -> (TempVaultDir, AsterVault<FixedClock>) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
@@ -4023,7 +4076,7 @@ mod tests {
             FixedClock::new(1_785_400_000),
         )
         .expect("open durable test vault");
-        (dir, vault)
+        (TempVaultDir(dir), vault)
     }
 
     fn create_db(path: &Path) -> Connection {
@@ -4484,10 +4537,8 @@ mod tests {
         import_sqlite_to_vault(&path, &source_vault, &FixtureSlotRuntime, &options(1))
             .expect("import sqlite");
 
-        let before =
-            read_cbm_graph_snapshot(&source_vault, "demo").expect("snapshot before fault");
-        let fault =
-            inject_node_property_fault(&source_vault, "demo").expect("inject vault fault");
+        let before = read_cbm_graph_snapshot(&source_vault, "demo").expect("snapshot before fault");
+        let fault = inject_node_property_fault(&source_vault, "demo").expect("inject vault fault");
         assert_eq!(fault.field, "properties");
 
         // FSV: the perturbed properties are read back from the persisted
