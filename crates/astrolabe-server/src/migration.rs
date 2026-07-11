@@ -145,6 +145,18 @@ struct ShadowImportOutcome {
     vault_salt: String,
     sqlite_path: PathBuf,
     sqlite_fingerprint_sha256: String,
+    /// Content-freshness watermark (#221): the SHA-256 of the CBM SQLite *source file*
+    /// bytes (`fingerprint_sqlite_hex`), captured at import time and independent of how
+    /// the graph was imported. `evaluate_shadow_content_freshness` recomputes exactly this
+    /// digest over the live source and compares byte-for-byte. It MUST be the source-file
+    /// fingerprint — never the row-sink content fingerprint (`row_sink_fingerprint`, a
+    /// digest over the in-memory rows) that the direct import path records in
+    /// `sqlite_fingerprint_sha256`. Those two digests are computed over different inputs
+    /// with different domain separators and can never be equal, so persisting the row-sink
+    /// value as the watermark made freshness permanently Stale after every row-sink import,
+    /// which triggered a runner-less refresh that clobbered the provenance surface as
+    /// "unavailable" and broke get_provenance end-to-end.
+    content_freshness_watermark_sha256: String,
     lowered_sqlite_path: PathBuf,
     lowered_artifact_sha256: String,
     lowered_vault_fingerprint_sha256: String,
@@ -1796,6 +1808,17 @@ fn import_shadow_vault(
         .into());
     }
 
+    // Content-freshness watermark (#221): fingerprint the CBM SQLite *source file* exactly
+    // as `evaluate_shadow_content_freshness` will later recompute it over the live source.
+    // This is deliberately the source-file digest, NOT `report.sqlite_fingerprint_sha256`:
+    // in the row-sink direct import path that report field carries `row_sink_fingerprint`
+    // (a digest over the in-memory rows with a different domain separator), which is
+    // incommensurable with `fingerprint_sqlite_hex` and would make freshness permanently
+    // Stale, triggering a runner-less refresh that clobbers the provenance surface. Captured
+    // here at the top so it reflects the source bytes at import-decision time.
+    let content_freshness_watermark_sha256 =
+        astrolabe_ingest::fingerprint_sqlite_hex(&sqlite_path)?;
+
     let vault_dir = vault_dir(&cache_dir, project);
     fs::create_dir_all(&vault_dir)?;
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID)?;
@@ -1840,6 +1863,7 @@ fn import_shadow_vault(
         vault_salt,
         sqlite_path,
         sqlite_fingerprint_sha256: hex_lower(&report.sqlite_fingerprint_sha256),
+        content_freshness_watermark_sha256,
         lowered_sqlite_path,
         lowered_artifact_sha256: lower_report.artifact_sha256,
         lowered_vault_fingerprint_sha256: lower_report.vault_fingerprint_sha256,
@@ -8063,15 +8087,19 @@ fn persist_shadow_outcome_at(
         ("vault_id", outcome.vault_id.clone()),
         ("vault_salt", outcome.vault_salt.clone()),
         ("sqlite_path", outcome.sqlite_path.display().to_string()),
-        // Content-freshness watermark (#93/#221): the SHA-256 of the CBM SQLite source
-        // at import time. `evaluate_shadow_content_freshness` reads this exact key with
-        // no fallback and re-fingerprints the live source against it; if the key is
-        // absent it returns Unverifiable(FINGERPRINT_MISSING) and `ensure_shadow_import_current`
-        // re-imports with no row-sink candidate, clobbering the just-persisted provenance
-        // with an "unavailable" surface. Persist it so a fresh import stays Fresh.
+        // Content-freshness watermark (#93/#221): the SHA-256 of the CBM SQLite *source
+        // file* at import time, taken from `content_freshness_watermark_sha256` — NOT from
+        // `sqlite_fingerprint_sha256`, which in the row-sink direct import path carries the
+        // row-sink content digest and is incommensurable with what the freshness gate
+        // recomputes. `evaluate_shadow_content_freshness` reads this exact key with no
+        // fallback and re-fingerprints the live source against it; if the key is absent (or,
+        // previously, held the wrong-domain row digest so it never matched) freshness reads
+        // Stale/Unverifiable and `ensure_shadow_import_current` re-imports with no row-sink
+        // candidate, clobbering the just-persisted provenance with an "unavailable" surface.
+        // Persist the source-file digest so an unchanged source stays Fresh.
         (
             "vault_fingerprint",
-            outcome.sqlite_fingerprint_sha256.clone(),
+            outcome.content_freshness_watermark_sha256.clone(),
         ),
         (
             "lowered_sqlite_path",
@@ -8094,10 +8122,6 @@ fn persist_shadow_outcome_at(
         (
             "lowered_skipped_edges",
             outcome.lowered_skipped_edges.to_string(),
-        ),
-        (
-            "vault_fingerprint",
-            outcome.sqlite_fingerprint_sha256.clone(),
         ),
         ("ledger_seq", outcome.ledger_seq.to_string()),
         ("ledger_rows", outcome.ledger_rows_after.to_string()),
@@ -8506,22 +8530,30 @@ mod tests {
 
     #[test]
     fn shadow_outcome_persists_vault_fingerprint_watermark_for_content_freshness() {
-        // Regression for #221 (a #93 persist gap): evaluate_shadow_content_freshness reads
-        // the "vault_fingerprint" config key with NO fallback and re-fingerprints the live
-        // CBM source against it. persist_shadow_outcome_at previously never wrote that key,
-        // so freshness always returned Unverifiable(FINGERPRINT_MISSING); ensure_shadow_import_current
-        // (run right after every fresh import) then re-imported with no row-sink candidate and
-        // clobbered the just-persisted provenance surface as "unavailable", so get_provenance's
-        // happy path failed end-to-end. Prove the watermark is persisted, read back byte-for-byte
-        // from the real config store, equal to the source fingerprint.
+        // Regression for #221: evaluate_shadow_content_freshness reads the "vault_fingerprint"
+        // config key with NO fallback and re-fingerprints the live CBM source against it.
+        // persist_shadow_outcome_at must write that key from the source-file digest
+        // (content_freshness_watermark_sha256), NOT from sqlite_fingerprint_sha256, which in
+        // the row-sink direct import path carries the incommensurable row-sink content digest.
+        // The original #93 gap never wrote the key; the deeper #221 root cause wrote the wrong
+        // digest, so freshness never matched, ensure_shadow_import_current re-imported with no
+        // row-sink candidate, and the just-persisted provenance surface was clobbered as
+        // "unavailable" — breaking get_provenance's happy path end-to-end. Prove the watermark
+        // is persisted, read back byte-for-byte, equal to the source-file digest and distinct
+        // from the divergent report digest.
         let dir = temp_dir("shadow-vault-fingerprint-watermark");
         let outcome = sample_shadow_outcome(
             &dir,
             security_screen_from_row_sink_rows(&sample_pipeline_rows()),
         );
         assert!(
-            !outcome.sqlite_fingerprint_sha256.is_empty(),
-            "sample outcome must carry a source fingerprint to persist as the watermark"
+            !outcome.content_freshness_watermark_sha256.is_empty(),
+            "sample outcome must carry a source-file watermark to persist"
+        );
+        assert_ne!(
+            outcome.content_freshness_watermark_sha256, outcome.sqlite_fingerprint_sha256,
+            "test fixture must model the row-sink divergence: the watermark and the report \
+             fingerprint differ, so this test can prove persist selects the watermark"
         );
 
         persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
@@ -8531,9 +8563,14 @@ mod tests {
             .unwrap()
             .expect("vault_fingerprint watermark must be persisted for content-freshness (#221)");
         assert_eq!(
-            persisted, outcome.sqlite_fingerprint_sha256,
-            "persisted vault_fingerprint must equal the source fingerprint that \
+            persisted, outcome.content_freshness_watermark_sha256,
+            "persisted vault_fingerprint must equal the source-file digest that \
              evaluate_shadow_content_freshness recomputes and compares against"
+        );
+        assert_ne!(
+            persisted, outcome.sqlite_fingerprint_sha256,
+            "persisted vault_fingerprint must NOT be the row-sink report digest — that is the \
+             exact #221 defect"
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -9628,6 +9665,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_parity_provenance_seed_matches_production_schema() {
+        // The CLI-parity harness (scripts/check-cli-parity.py::seed_provenance_metadata)
+        // seeds this exact surface into the config store so get_provenance has a
+        // deterministic, current-schema surface to read (the 2-line fixture repo carries no
+        // real provenance blocks). Assert the shared fixture deserializes through the SAME
+        // production reader get_provenance uses, so a chain-schema rename — e.g. the
+        // checked_to -> checked_end drift that silently rotted the old inline Python seed and
+        // broke #221 — fails HERE in a fast unit test instead of only in the slow native
+        // cli-parity gate. Single source of truth: ci/cli-parity-provenance-seed.json.
+        let seed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("ci")
+            .join("cli-parity-provenance-seed.json");
+        let raw = std::fs::read_to_string(&seed_path).unwrap_or_else(|error| {
+            panic!("read provenance seed {}: {error}", seed_path.display())
+        });
+        let surface: Value =
+            serde_json::from_str(&raw).expect("provenance seed must be valid JSON");
+        assert_eq!(
+            surface["status"], "built",
+            "seed must be a built surface so get_provenance reads the store, not the \
+             unavailable branch"
+        );
+        let store_json = surface
+            .get("store")
+            .expect("seed surface must carry a store object");
+        // Exact deserialize path handle_get_provenance -> provenance_store_for_project uses.
+        // A missing/renamed chain field (checked_from/checked_end) fails right here with the
+        // same "missing field ..." error the CLI would otherwise surface post-native-build.
+        let store = provenance_store_from_json(store_json)
+            .expect("seed store must deserialize through the production reader");
+        // And the chain must round-trip through the production (de)serializer unchanged.
+        let rebuilt = chain_verification_from_json(&chain_verification_json(&store.chain))
+            .expect("seed chain must round-trip through chain_verification_(json|from_json)");
+        assert_eq!(rebuilt.checked_from, store.chain.checked_from);
+        assert_eq!(rebuilt.checked_end, store.chain.checked_end);
+    }
+
+    #[test]
     fn provenance_summary_persists_reads_back_and_augments_architecture_payload() {
         let dir = temp_dir("provenance-readback");
         let provenance = sample_provenance();
@@ -10165,8 +10242,12 @@ mod tests {
         outcome.vault_dir = vault_dir;
         outcome.lowered_sqlite_path = lowered_path;
         outcome.sqlite_path = source_path;
-        // The watermark persisted at import time is the source content fingerprint.
-        outcome.sqlite_fingerprint_sha256 = fingerprint.clone();
+        // Faithfully model the row-sink direct import (#221): the report/ledger fingerprint
+        // is the row-sink content digest, which is NOT the source-file digest. The
+        // freshness watermark must still be the source-file digest that
+        // evaluate_shadow_content_freshness recomputes.
+        outcome.sqlite_fingerprint_sha256 = "ab".repeat(32);
+        outcome.content_freshness_watermark_sha256 = fingerprint.clone();
         outcome.ledger_seq = 0;
         outcome.ledger_rows_after = 0;
         outcome.verify_chain_status = "intact".to_string();
@@ -10179,6 +10260,17 @@ mod tests {
         let dir = temp_dir("shadow-freshness-fresh");
         let fingerprint = seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
 
+        // #221 root-cause regression: the fixture models the row-sink direct import, whose
+        // report digest ("ab"*32) is incommensurable with the source-file digest. Before the
+        // fix the row digest was persisted as the watermark, so this returned Stale, which
+        // triggered a runner-less refresh that clobbered provenance and broke get_provenance.
+        // With the watermark correctly sourced from the source-file digest, an unchanged
+        // source reads Fresh.
+        assert_ne!(
+            fingerprint,
+            "ab".repeat(32),
+            "fixture must model a report/watermark divergence for the #221 regression"
+        );
         let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
         assert_eq!(verdict, ShadowContentVerdict::Fresh);
 
@@ -12116,6 +12208,10 @@ mod tests {
             vault_salt: "astrolabe-shadow-v1:demo".to_string(),
             sqlite_path: root.join("demo.db"),
             sqlite_fingerprint_sha256: "00".repeat(32),
+            // Deliberately distinct from sqlite_fingerprint_sha256 to model the row-sink
+            // divergence (#221): the freshness watermark is the source-file digest, not the
+            // row-sink content digest recorded in sqlite_fingerprint_sha256.
+            content_freshness_watermark_sha256: "44".repeat(32),
             lowered_sqlite_path: root.join("demo.astrolabe-lowered.db"),
             lowered_artifact_sha256: "11".repeat(32),
             lowered_vault_fingerprint_sha256: "22".repeat(32),

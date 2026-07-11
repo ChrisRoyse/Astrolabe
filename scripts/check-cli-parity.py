@@ -15,6 +15,12 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "ci" / "cli-parity-fixtures.json"
+# Canonical provenance surface shared with the Rust reader. Single source of truth for
+# the seeded get_provenance surface schema (#221); a Rust guard test
+# (cli_parity_provenance_seed_matches_production_schema) asserts this exact file
+# deserializes through the production reader, so a schema rename fails fast there instead
+# of silently rotting this seed (the checked_to -> checked_end drift that broke cli-parity).
+PROVENANCE_SEED = ROOT / "ci" / "cli-parity-provenance-seed.json"
 FIXTURE_REPO_TOKEN = "$ASTROLABE_CLI_PARITY_REPO"
 FIXTURE_REINDEX_REPO_TOKEN = "$ASTROLABE_CLI_PARITY_REINDEX_REPO"
 FIXTURE_ARTIFACT_TOKEN = "$ASTROLABE_CLI_PARITY_ARTIFACT_DIR"
@@ -258,27 +264,16 @@ def initialize_fixture_git(repo):
 
 
 def seed_provenance_metadata(cache_dir, project):
-    pointer = {"seq": 0, "chain_hash": "cli-parity-seed"}
-    store = {
-        "vault_fingerprint": "cli-parity-seed",
-        "ledger_head": pointer,
-        "chain": {
-            "status": {"status": "intact"},
-            "checked_from": 0,
-            "checked_to": 0,
-            "provenance": pointer,
-        },
-        "symbols": {},
-        "answers": {},
-        "reproductions": {},
-        "manifests": {},
-    }
-    surface = {
-        "schema": "astrolabe.provenance_surface.v1",
-        "tool_schema": "astrolabe.get_provenance.v1",
-        "status": "built",
-        "store": store,
-    }
+    # Load the canonical surface from the shared fixture rather than hand-duplicating the
+    # provenance schema here. The prior inline dict silently rotted when production renamed
+    # the chain field checked_to -> checked_end, so get_provenance failed only in the slow
+    # native cli-parity gate (#221). The shared file is guard-tested by the Rust reader.
+    if not PROVENANCE_SEED.is_file():
+        fail(f"provenance seed fixture is missing: {PROVENANCE_SEED}")
+    surface = load_json(PROVENANCE_SEED)
+    surface.pop("_comment", None)
+    if surface.get("status") == "unavailable" or "store" not in surface:
+        fail(f"provenance seed fixture must carry a built surface with a store: {PROVENANCE_SEED}")
     key = f"{CONFIG_KEY_PREFIX}{project}.provenance_json"
     connection = sqlite3.connect(cache_dir / "_config.db")
     try:

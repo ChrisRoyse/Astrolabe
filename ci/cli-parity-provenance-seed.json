@@ -1,0 +1,20 @@
+{
+  "_comment": "Canonical provenance surface seeded into the CLI-parity config store so get_provenance has a deterministic, current-schema surface to read (the 2-line fixture repo carries no real provenance blocks). SINGLE SOURCE OF TRUTH: consumed by scripts/check-cli-parity.py::seed_provenance_metadata AND asserted against the production reader by crates/astrolabe-server/src/migration.rs::cli_parity_provenance_seed_matches_production_schema. The store.chain schema MUST track astrolabe-provenance ChainVerification / migration.rs chain_verification_from_json (status, checked_from, checked_end, provenance) — a rename here or there breaks the fast Rust guard test before the slow native cli-parity gate. This file replaced a hand-duplicated Python dict that silently rotted from checked_to -> checked_end (#221).",
+  "schema": "astrolabe.provenance_surface.v1",
+  "tool_schema": "astrolabe.get_provenance.v1",
+  "status": "built",
+  "store": {
+    "vault_fingerprint": "cli-parity-seed",
+    "ledger_head": { "seq": 0, "chain_hash": "cli-parity-seed" },
+    "chain": {
+      "status": { "status": "intact" },
+      "checked_from": 0,
+      "checked_end": 0,
+      "provenance": { "seq": 0, "chain_hash": "cli-parity-seed" }
+    },
+    "symbols": {},
+    "answers": {},
+    "reproductions": {},
+    "manifests": {}
+  }
+}
