@@ -493,19 +493,17 @@ function Set-WorkspaceTempEnvironment {
     $env:TEMP = $WorkspaceTemp
     $env:TMP = $WorkspaceTemp
     $env:TMPDIR = $WorkspaceTemp
-    # CBM store redirection (#194): codebase-memory-mcp registers a project by
-    # writing <cache_dir>/<project>.db, where cache_dir is resolved by
-    # cbm_resolve_cache_dir() (vendor/codebase-memory-mcp/src/foundation/platform.c)
-    # with priority CBM_CACHE_DIR > $HOME/.cache/codebase-memory-mcp. Astrolabe
-    # tests that call cbm_mcp_server_new(NULL) (astrolabe-bridge row-sink tool-runner,
-    # vendored C integration tests) would otherwise persist project .db files into the
-    # operator's GLOBAL store and never clean them up. Pinning CBM_CACHE_DIR to a
-    # launcher-owned child of the workspace temp keeps every registration inside .tmp,
-    # so it is deleted together with $workspaceTemp on launcher exit. Single-point,
-    # fail-closed root-cause fix covering both the Rust and C test families.
-    $cbmCacheDir = Join-Path $WorkspaceTemp "cbm-cache"
-    New-Item -ItemType Directory -Path $cbmCacheDir -Force | Out-Null
-    $env:CBM_CACHE_DIR = $cbmCacheDir
+    # NOTE (#194): a launcher-level CBM_CACHE_DIR redirect was tried here to keep
+    # codebase-memory-mcp project registrations out of the operator's global store,
+    # but it splits the vendored C tests' write path from their read path — those
+    # tests index via cbm_mcp_server_new(NULL) (which honours CBM_CACHE_DIR) yet open
+    # the db at a HARDCODED $HOME/.cache/codebase-memory-mcp/<project>.db (e.g.
+    # tests/test_edge_types_probe.c:104, test_integration.c), so a redirect empties
+    # the store they assert on and regresses ~808 CBM C tests. Test-pollution of the
+    # global store is therefore fixed at the source instead: the Rust row-sink test
+    # cleans up via a fail-closed Drop guard, and leaking vendored C tests are patched
+    # to unlink their registration on teardown (patch flow). Do NOT set CBM_CACHE_DIR
+    # globally in the launcher.
 }
 
 function Test-PinnedToolchain {
@@ -716,7 +714,7 @@ foreach ($argument in $commandArgs) {
 
 $commandExit = 0
 $previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR", "CBM_CACHE_DIR")) {
+foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
@@ -782,7 +780,7 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
-    foreach ($name in @("TEMP", "TMP", "TMPDIR", "CBM_CACHE_DIR")) {
+    foreach ($name in @("TEMP", "TMP", "TMPDIR")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
             Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
