@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The unsafe-boundary scan is only meaningful if ripgrep is present. Without it
+# the `if rg ...; then` guard below silently evaluates false (rg exits 127) and
+# the check would print "verified" without inspecting a single file — a silent
+# fallback that hides an unbounded unsafe surface. Fail closed instead.
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ERROR: ripgrep (rg) is required to scan for the unsafe Rust boundary but was not found on PATH; install ripgrep and re-run" >&2
+  exit 127
+fi
+
 missing=()
 for crate_dir in crates/*; do
   [[ -d "$crate_dir" ]] || continue

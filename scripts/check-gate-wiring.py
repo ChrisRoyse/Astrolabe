@@ -474,12 +474,20 @@ def validate(root: Path) -> list[str]:
         "ci.yml row-sink-benchmark upload",
         errors,
     )
-    require(
+    # CI actions are pinned to full commit SHAs (see commit "Pin CI actions to
+    # commit SHAs + add Dependabot to keep them fresh") with a trailing "# vN"
+    # annotation that Dependabot maintains. Require the upload-artifact pin to be
+    # a SHA annotated as major version 4 so the gate keeps guarding the v4 major
+    # (a v5 bump would carry "# v5" and fail closed here) without regressing the
+    # SHA-pinning hardening back to a mutable tag.
+    if not re.search(
+        r"uses:\s*actions/upload-artifact@[0-9a-fA-F]{40}\s*#\s*v4(?!\d)",
         benchmark,
-        "uses: actions/upload-artifact@v4",
-        "ci.yml row-sink-benchmark upload",
-        errors,
-    )
+    ):
+        errors.append(
+            "ci.yml row-sink-benchmark upload must pin "
+            "actions/upload-artifact to a commit SHA annotated '# v4'"
+        )
 
     ci_ok = workflow_job(workflow, "ci-ok", errors)
     if not re.search(r"needs:\s*\[[^\]]*portable-gates[^\]]*\]", ci_ok):

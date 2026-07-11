@@ -333,6 +333,17 @@ def main() -> int:
             'ASTROLABE_ROW_SINK_BENCH_WRITE_RELEASE_ARTIFACT: "0"',
         )
         require_error(checker.validate(fixture), "WRITE_RELEASE_ARTIFACT")
+        copy_fixture(fixture)
+
+        # A v5 bump (or any non-v4 annotation) on the SHA-pinned upload-artifact
+        # must fail closed, guarding the row-sink benchmark against a silent
+        # major-version drift.
+        rewrite(
+            workflow,
+            "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4",
+            "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v5",
+        )
+        require_error(checker.validate(fixture), "annotated '# v4'")
 
     cleanup_scratch()
     assert not scratch.exists()
