@@ -101,4 +101,8 @@ echo "=== Upstream CBM runtime suite ==="
 bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"
 
 echo "=== Astrolabe and Calyx Rust suites ($HOST_TARGET) ==="
-bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
+# #189: check-full asserts HOST_TARGET == RUSTC_HOST above, so an explicit --target
+# in ci-rust-gate would only fork a redundant target/<triple>/debug tree that shares
+# nothing with the target/debug tree check.sh just built. Opt this native run into the
+# unified single-tree path (ci-rust-gate collapses --target and shares the calyx tree).
+ASTROLABE_UNIFIED_TARGET_DIR=1 bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"

@@ -33,6 +33,31 @@ SH
   export PATH="$PY3_SHIM:$PATH"
 fi
 
+RUSTC_HOST="$(rustc -vV | sed -n 's/^host: //p')"
+if [[ -z "$RUSTC_HOST" ]]; then
+  echo "ERROR: ci-rust-gate could not determine rustc host triple" >&2
+  exit 1
+fi
+# #189: On the native aggregate path, check-full.sh sets ASTROLABE_UNIFIED_TARGET_DIR=1
+# and passes the rustc host as the target. An explicit --target forks a redundant
+# target/<triple>/debug tree that shares nothing with the implicit target/debug tree
+# built by check.sh, forcing a second from-cold compile of the whole workspace + the
+# calyx path-deps + libcbm within one gate run. When the requested target IS the rustc
+# host, drop the redundant --target so every phase reuses one target/debug tree, and
+# point the calyx sub-gate at the same shared target dir. CI (which does not set the
+# flag) keeps its explicit per-triple trees and separate calyx tree unchanged.
+if [[ "${ASTROLABE_UNIFIED_TARGET_DIR:-0}" == "1" && "$TARGET_TRIPLE" == "$RUSTC_HOST" ]]; then
+  TARGET_ARGS=()
+  TARGET_SUBDIR="debug"
+  PARITY_ENV=()
+  CALYX_TARGET_DIR_ARGS=(--target-dir "$ROOT/target")
+else
+  TARGET_ARGS=("${TARGET_ARGS[@]}")
+  TARGET_SUBDIR="$TARGET_TRIPLE/debug"
+  PARITY_ENV=(ASTROLABE_RUST_TARGET="$TARGET_TRIPLE")
+  CALYX_TARGET_DIR_ARGS=()
+fi
+
 run_logged() {
   local name="$1"
   shift
@@ -119,10 +144,10 @@ run_cbm_sys_asan() {
   set +e
   {
     env CC=clang CXX=clang++ CBM_SYS_ASAN=1 \
-      cargo test -p cbm-sys --test fixtures --target "$TARGET_TRIPLE" --no-run ||
+      cargo test -p cbm-sys --test fixtures "${TARGET_ARGS[@]}" --no-run ||
       exit $?
 
-    local test_dir="$ROOT/target/$TARGET_TRIPLE/debug/deps"
+    local test_dir="$ROOT/target/$TARGET_SUBDIR/deps"
     local test_bin
     test_bin="$(
       find "$test_dir" -maxdepth 1 -type f -name 'fixtures-*' -perm -u+x -printf '%T@ %p\n' |
@@ -164,10 +189,10 @@ run_astrolabe_bridge_asan() {
   set +e
   {
     env CC=clang CXX=clang++ CBM_SYS_ASAN=1 \
-      cargo test -p astrolabe-bridge --lib --target "$TARGET_TRIPLE" --no-run ||
+      cargo test -p astrolabe-bridge --lib "${TARGET_ARGS[@]}" --no-run ||
       exit $?
 
-    local test_dir="$ROOT/target/$TARGET_TRIPLE/debug/deps"
+    local test_dir="$ROOT/target/$TARGET_SUBDIR/deps"
     local test_bin
     test_bin="$(
       find "$test_dir" -maxdepth 1 -type f -name 'astrolabe_bridge-*' -perm -u+x -printf '%T@ %p\n' |
@@ -206,25 +231,25 @@ run_astrolabe_bridge_asan() {
 
 cd "$ROOT"
 run_logged "astrolabe-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all -- --check
-run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets --target "$TARGET_TRIPLE" -- -D warnings
-run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace --target "$TARGET_TRIPLE"
-run_logged "astrolabe-verify-chain-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/$TARGET_TRIPLE/debug/astrolabe"
+run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets "${TARGET_ARGS[@]}" -- -D warnings
+run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}"
+run_logged "astrolabe-verify-chain-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/$TARGET_SUBDIR/astrolabe"
 run_logged "astrolabe-ingest-lscale-bench-$LABEL" bash scripts/bench-ingest-lscale.sh --ci-smoke
 run_logged "libcbm-symbols-$LABEL" bash scripts/check-libcbm-symbols.sh
-run_logged "single-mimalloc-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-single-mimalloc.sh
-run_logged "mcp-parity-$LABEL" env ASTROLABE_RUST_TARGET="$TARGET_TRIPLE" bash scripts/check-mcp-parity.sh
+run_logged "single-mimalloc-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-single-mimalloc.sh
+run_logged "mcp-parity-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-mcp-parity.sh
 if [[ "$TARGET_TRIPLE" != *windows* ]]; then
-  run_logged "astrolabe-watchdog-$LABEL" bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/$TARGET_TRIPLE/debug/astrolabe"
+  run_logged "astrolabe-watchdog-$LABEL" bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/$TARGET_SUBDIR/astrolabe"
 fi
 if [[ "$TARGET_TRIPLE" == *linux-gnu ]]; then
   run_cbm_sys_asan
   run_astrolabe_bridge_asan
 fi
-run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc --target "$TARGET_TRIPLE"
+run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}"
 
 cd "$ROOT/vendor/calyx"
 bash scripts/cargo-fmt-workspace.sh --check
-run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets --target "$TARGET_TRIPLE"
-run_logged "calyx-clippy-$LABEL" cargo clippy --workspace --all-targets --target "$TARGET_TRIPLE" -- -D warnings
-run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace --target "$TARGET_TRIPLE"
-run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc --target "$TARGET_TRIPLE"
+run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
+run_logged "calyx-clippy-$LABEL" cargo clippy --workspace --all-targets "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}" -- -D warnings
+run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
+run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
