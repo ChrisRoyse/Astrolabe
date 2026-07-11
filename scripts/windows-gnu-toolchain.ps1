@@ -57,6 +57,16 @@ function Require-Path {
     }
 }
 
+function Remove-LauncherLockFile {
+    param([string]$LockPath)
+    if (Test-Path -LiteralPath $LockPath) {
+        Remove-Item -LiteralPath $LockPath -Force
+    }
+    if (Test-Path -LiteralPath $LockPath) {
+        throw "launcher lock cleanup failed: $LockPath remains"
+    }
+}
+
 function Test-PathUnderRoot {
     param([string]$Path, [string]$Root)
 
@@ -544,12 +554,47 @@ $hostMaintenanceLock = Join-Path $workspaceTempParent "host-maintenance.lock"
 if (Test-Path -LiteralPath $hostMaintenanceLock) {
     throw "HOST_BOUNDARY[ASTRO_HOST_MAINTENANCE_ACTIVE]: native toolchain work is blocked while host maintenance is active: $hostMaintenanceLock"
 }
+$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
+if (Test-Path -LiteralPath $launcherLock) {
+    $lockRaw = Get-Content -LiteralPath $launcherLock -Raw -ErrorAction SilentlyContinue
+    $lockState = $null
+    if (-not [string]::IsNullOrWhiteSpace($lockRaw)) {
+        try {
+            $lockState = ConvertFrom-Json -InputObject $lockRaw
+        }
+        catch {
+            $lockState = $null
+        }
+    }
+    $lockOwnerPid = $null
+    if ($null -ne $lockState -and $lockState.PSObject.Properties['pid']) {
+        $lockOwnerPid = [int]$lockState.pid
+    }
+    if ($null -eq $lockOwnerPid) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock exists but names no readable pid; verify no toolchain session is live, then remove it manually: $launcherLock"
+    }
+    $lockHolder = Get-Process -Id $lockOwnerPid -ErrorAction SilentlyContinue
+    if ($null -ne $lockHolder) {
+        $lockCommand = if ($lockState.PSObject.Properties['command']) { $lockState.command } else { "unknown" }
+        $lockStarted = if ($lockState.PSObject.Properties['started']) { $lockState.started } else { "unknown" }
+        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_HELD]: another launcher session owns this workspace (pid=$lockOwnerPid, started=$lockStarted, command=$lockCommand); never stop or clean a live session's run - wait for the lock to release: $launcherLock"
+    }
+    Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_LOCK_STALE]: removing lock left by dead pid $lockOwnerPid"
+    Remove-Item -LiteralPath $launcherLock -Force
+}
 if (Test-Path -LiteralPath $target) {
     throw "target must be absent before toolchain work: $target"
 }
 if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
 }
+New-Item -ItemType Directory -Path $workspaceTempParent -Force | Out-Null
+New-Item -ItemType File -Path $launcherLock -ErrorAction Stop | Out-Null
+[ordered]@{
+    pid = $PID
+    started = (Get-Date).ToString("o")
+    command = ("$Command $CommandArgsJson").Trim()
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLock -Encoding UTF8
 
 $toolsRoot = Join-Path $root ".toolchains"
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
@@ -585,6 +630,10 @@ Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersio
 
 if ([string]::IsNullOrWhiteSpace($Command)) {
     Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
+    Remove-LauncherLockFile -LockPath $launcherLock
+    if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
+        Remove-Item -LiteralPath $workspaceTempParent -Force -ErrorAction SilentlyContinue
+    }
     exit 0
 }
 
@@ -631,6 +680,12 @@ finally {
     }
     if (Test-Path -LiteralPath $workspaceTemp) {
         $cleanupErrors += "workspace temporary cleanup failed: $workspaceTemp remains"
+    }
+    try {
+        Remove-LauncherLockFile -LockPath $launcherLock
+    }
+    catch {
+        $cleanupErrors += "launcher lock cleanup failed: $($_.Exception.Message)"
     }
     if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
         try {

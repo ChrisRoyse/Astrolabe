@@ -131,6 +131,30 @@ def main() -> int:
         copy_fixture(fixture)
         rewrite(
             runner,
+            "ASTRO_LAUNCHER_LOCK_HELD",
+            "ASTRO_LAUNCHER_LOCK_DISABLED",
+        )
+        expect_failure(run_checker(fixture), "session lock")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "ASTRO_LAUNCHER_LOCK_STALE",
+            "ASTRO_LAUNCHER_LOCK_QUIET",
+        )
+        expect_failure(run_checker(fixture), "session lock")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "function Remove-LauncherLockFile",
+            "function Remove-LauncherLockDisabled",
+        )
+        expect_failure(run_checker(fixture), "session lock")
+
+        copy_fixture(fixture)
+        rewrite(
+            runner,
             'Get-Command -Name "bash.exe" -CommandType Application',
             'Get-Command -Name "bash.exe"',
         )

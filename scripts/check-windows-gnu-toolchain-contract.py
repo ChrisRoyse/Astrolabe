@@ -131,6 +131,21 @@ def main() -> None:
         "the launcher must fail before target creation while host maintenance is active",
     )
     require(
+        '$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"'
+        in runner
+        and "ASTRO_LAUNCHER_LOCK_HELD" in runner
+        and "ASTRO_LAUNCHER_LOCK_UNREADABLE" in runner
+        and "ASTRO_LAUNCHER_LOCK_STALE" in runner
+        and "function Remove-LauncherLockFile" in runner
+        and "launcher lock cleanup failed" in runner
+        and appears_before(
+            runner,
+            "ASTRO_LAUNCHER_LOCK_HELD",
+            "target must be absent before toolchain work",
+        ),
+        "the launcher must hold a fail-closed session lock: refuse a live holder, remove only dead-pid stale locks, and release the lock on every exit path",
+    )
+    require(
         '$previousTempEnvironment = @{}' in runner
         and 'Set-Item -Path "Env:$name" -Value $previous.Value' in runner
         and 'Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue' in runner,
