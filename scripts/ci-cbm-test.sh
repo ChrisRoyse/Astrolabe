@@ -53,15 +53,68 @@ else
     exit 1
   fi
   echo "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]: $CC_BIN cannot link the sanitizer probe (no toolchain runtime); running the CBM suite with SANITIZE= per the pinned Makefile.cbm Windows override. Sanitizer coverage of the CBM C suite is owned by the required Linux CI jobs cbm tests / linux-x64-gcc and linux-x64-clang."
-  SANITIZE_OVERRIDES+=("SANITIZE=")
+  # Unsanitized GCC value-range analysis promotes alloc-size-larger-than to
+  # a -Werror failure in pinned CBM sources that upstream compiles only
+  # sanitized or with clang. The diagnostic is parameterized, so GCC has no
+  # -Wno-error= form; disable it through the same documented make override
+  # and announce the suppression, never silently.
+  echo "INFO[ASTRO_CBM_UNSANITIZED_WERROR_DEMOTION]: -Wno-alloc-size-larger-than applied to the unsanitized CBM test build (GCC offers no -Wno-error= form for this parameterized diagnostic)"
+  SANITIZE_OVERRIDES+=("SANITIZE=-Wno-alloc-size-larger-than")
 fi
 
-expected="$(
-  find tests -path 'tests/repro' -prune -o -name '*.c' -print0 |
-    xargs -0 grep -h -o 'RUN_TEST(' |
-    wc -l |
-    tr -d '[:space:]'
-)"
+# The toolchain launcher confines TEMP/TMP to a child directory inside this
+# repository, so a "non-git" CBM fixture would otherwise discover the outer
+# Astrolabe .git and report is_git=true. Stop git upward discovery at the
+# temp root; fixtures that create their own repositories are unaffected.
+TMP_ROOT="${TMPDIR:-${TMP:-${TEMP:-}}}"
+if [[ -n "$TMP_ROOT" ]]; then
+  export GIT_CEILING_DIRECTORIES="${TMP_ROOT//\\//}"
+fi
+
+case "$LABEL" in
+  windows-*-mingw)
+    # Source-derived counting overstates native Windows: registrations
+    # behind POSIX-only conditional compilation never build, and the
+    # upstream incremental suite cannot set up (see the totals manifest).
+    # Read the exact measured baseline instead, in the known-skips style.
+    TOTALS_MANIFEST="$ROOT/ci/cbm-test-totals.md"
+    if [[ ! -f "$TOTALS_MANIFEST" ]]; then
+      echo "ERROR: ASTRO_CBM_TOTALS_MANIFEST_MISSING: $TOTALS_MANIFEST" >&2
+      exit 1
+    fi
+    row="$(
+      awk -F'|' -v target="$LABEL" '
+        function trim(value) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+          return value
+        }
+        {
+          system_name = trim($2)
+          label = trim($3)
+          if (system_name == "CBM" && label == target) {
+            matches++
+            expected = trim($4)
+          }
+        }
+        END { printf "%d|%s\n", matches, expected }
+      ' "$TOTALS_MANIFEST"
+    )"
+    matches="${row%%|*}"
+    expected="${row#*|}"
+    if [[ "$matches" != "1" ]]; then
+      echo "ERROR: ASTRO_CBM_TOTALS_BASELINE_AMBIGUOUS: expected exactly one CBM row for $LABEL, found $matches" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    expected="$(
+      find tests -path 'tests/repro' -prune -o -name '*.c' -print0 |
+        xargs -0 grep -h -o 'RUN_TEST(' |
+        wc -l |
+        tr -d '[:space:]'
+    )"
+    ;;
+esac
 if [[ ! "$expected" =~ ^[0-9]+$ || "$expected" -le 0 ]]; then
   echo "ERROR: failed to derive CBM expected test count from pinned source." >&2
   exit 1
@@ -72,7 +125,10 @@ scripts/test.sh "CC=$CC_BIN" "CXX=$CXX_BIN" ${SANITIZE_OVERRIDES[@]+"${SANITIZE_
 rc=${PIPESTATUS[0]}
 set -e
 
-summary="$(grep -E '[0-9]+ passed' "$LOG" | tail -n 1 || true)"
+# Anchored: the unit-suite summary starts with its count; later harness
+# steps (security-strings) print prefixed "N passed" lines that must not
+# shadow it.
+summary="$(grep -E '^[[:space:]]*[0-9]+ passed' "$LOG" | tail -n 1 || true)"
 if [[ -z "$summary" ]]; then
   echo "ERROR: CBM test summary was not found in $LOG" >&2
   exit 1
@@ -87,6 +143,16 @@ skipped="${skipped:-0}"
 if [[ ! "$passed" =~ ^[0-9]+$ || ! "$failed" =~ ^[0-9]+$ || ! "$skipped" =~ ^[0-9]+$ ]]; then
   echo "ERROR: failed to parse CBM test summary: $summary" >&2
   exit 1
+fi
+
+if [[ "$LABEL" == windows-*-mingw ]] && grep -q 'SETUP FAILED' "$LOG"; then
+  # The upstream incremental suite's fixture clone builds its shell command
+  # with POSIX single quoting and runs it through system(), which is cmd.exe
+  # in a native Windows binary; the clone always fails there and upstream
+  # treats that as a graceful suite skip that never registers its tests. The
+  # totals baseline already excludes those registrations; this marker names
+  # the degradation and its coverage owner.
+  echo "SKIP[ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED]: the upstream incremental suite cannot set up on native Windows (POSIX shell quoting through system()); its registrations are excluded from the ci/cbm-test-totals.md baseline. Incremental coverage is owned by the required Linux CI jobs cbm tests / linux-x64-gcc and linux-x64-clang."
 fi
 
 total=$((passed + failed + skipped))

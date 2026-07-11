@@ -263,7 +263,25 @@ def validate(root: Path) -> list[str]:
     )
     require(
         cbm_test,
+        "ci/cbm-test-totals.md",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
         "ERROR: sanitizers are required on Linux CBM gates",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        "SKIP[ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED]",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        "GIT_CEILING_DIRECTORIES",
         "scripts/ci-cbm-test.sh",
         errors,
     )

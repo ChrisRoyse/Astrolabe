@@ -252,6 +252,16 @@ def main() -> int:
         )
         copy_fixture(fixture)
 
+        rewrite(
+            cbm_test,
+            "SKIP[ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED]",
+            "SKIP[ASTRO_CBM_INCREMENTAL_REMOVED]",
+        )
+        require_error(
+            checker.validate(fixture), "ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED"
+        )
+        copy_fixture(fixture)
+
         workspace_test = fixture / "scripts/check-workspace-tests.py"
         rewrite(workspace_test, '"taskkill"', '"taskkill-disabled"')
         require_error(checker.validate(fixture), "taskkill")
