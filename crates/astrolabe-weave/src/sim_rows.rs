@@ -305,7 +305,10 @@ where
 /// Recovers the ledger reference for the group commit that produced
 /// `commit_seq` (read pinned to that snapshot, so concurrent later appends are
 /// invisible; same TOCTOU-safe pattern as the ingest importer).
-fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: u64) -> calyx_core::Result<LedgerRef>
+pub(crate) fn ledger_ref_at_commit<C>(
+    vault: &AsterVault<C>,
+    commit_seq: u64,
+) -> calyx_core::Result<LedgerRef>
 where
     C: Clock,
 {

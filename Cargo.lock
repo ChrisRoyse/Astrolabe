@@ -291,6 +291,7 @@ dependencies = [
  "calyx-ledger",
  "calyx-loom",
  "calyx-sextant",
+ "proptest",
  "serde",
  "serde_json",
 ]

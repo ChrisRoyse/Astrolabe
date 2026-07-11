@@ -32,6 +32,7 @@ use serde_json::Value;
 
 mod ann;
 mod sim_rows;
+mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use sim_rows::{
@@ -39,6 +40,12 @@ pub use sim_rows::{
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
     SimilarityPersistReport, persist_similarity_edges, read_similarity_edge_rows,
     sim_edge_graph_key,
+};
+pub use xterm_rows::{
+    ASTRO_XTERM_CX_ID_MISSING, ASTRO_XTERM_ROW_CORRUPT, EagerCrossTermPersistReport,
+    PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
+    agreement_graph_from_persisted_rows, designed_kind_for_slots, eager_xterm_dump_bytes,
+    eager_xterm_key, lazy_agreement, persist_eager_cross_terms, read_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -1879,6 +1886,19 @@ fn neighborhood_cross_term_value(
         norm: right_norm,
     };
     direct_cross_term_value(&Ok(left_profile), &Ok(right_profile))
+}
+
+/// Computes the direct agreement between two slots of one symbol with the
+/// eager planner's absent-aware semantics (used by the lazy on-demand path).
+pub(crate) fn lazy_direct_agreement(
+    node: &SimilarityNode,
+    left_slot: SlotId,
+    right_slot: SlotId,
+) -> CrossTermValue {
+    direct_cross_term_value(
+        &cross_term_operand(node, left_slot),
+        &cross_term_operand(node, right_slot),
+    )
 }
 
 fn cross_term_operand(
@@ -4381,6 +4401,427 @@ mod tests {
         assert_eq!(plan.abundance.materialized_count, 12);
         assert_eq!(plan.abundance.raw_yield, 508);
         assert_eq!(plan.abundance.lazy_pair_count, 450);
+    }
+
+    #[test]
+    fn eager_cross_term_golden_agreements_are_bit_exact() {
+        // Hand-computed direct agreements (DocDrift shares the frozen semantic
+        // space, so it is plain cosine): [3,4]x[3,4] = 25/(5*5) = 1.0 exactly;
+        // [1,0]x[3,4] = 3/(1*5) = 0.6 (the f32 nearest to 3/5, bit-identical
+        // to the 0.6f32 literal); orthogonal = 0.0 exactly.
+        for (doc, code, expected) in [
+            (vec![3.0f32, 4.0], vec![3.0f32, 4.0], 1.0f32),
+            (vec![1.0, 0.0], vec![3.0, 4.0], 0.6),
+            (vec![1.0, 0.0], vec![0.0, 4.0], 0.0),
+        ] {
+            let node = SimilarityNode::new("golden")
+                .with_slot(SLOT_DOC_SEMANTIC, dense(&doc))
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&code));
+            let plan = plan_eager_cross_terms(&[node]);
+            let row = plan
+                .rows
+                .iter()
+                .find(|row| row.kind == EagerAgreementKind::DocDrift)
+                .expect("doc drift row");
+            let CrossTermValue::Scalar(value) = row.value else {
+                panic!("expected scalar for {doc:?} x {code:?}");
+            };
+            assert_eq!(
+                value.to_bits(),
+                expected.to_bits(),
+                "agreement for {doc:?} x {code:?} must be bit-exact"
+            );
+        }
+
+        // The same contract holds for the lazy on-demand (non-designed) path.
+        let node = SimilarityNode::new("lazy")
+            .with_slot(SLOT_COMPLEXITY, dense(&[1.0, 0.0]))
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[3.0, 4.0]));
+        let CrossTermValue::Scalar(value) =
+            lazy_agreement(&node, SLOT_COMPLEXITY, SLOT_DOC_SEMANTIC)
+        else {
+            panic!("expected lazy scalar");
+        };
+        assert_eq!(value.to_bits(), 0.6f32.to_bits());
+        assert!(
+            lazy_agreement(&node, SLOT_CHURN, SLOT_DOC_SEMANTIC).is_absent(),
+            "missing lazy operand stays absent, never zero"
+        );
+    }
+
+    #[test]
+    fn xterm_cf_materializes_exactly_six_designed_pairs_per_symbol() {
+        // Materialization policy DoD: after weave persistence the XTerm CF
+        // holds exactly the six designed agreement pairs per symbol — nothing
+        // lazy, nothing extra, no Delta/Interaction/Concat rows.
+        // Three frozen-panel symbols: the neighborhood comparators need two
+        // comparable peers, so all six designed kinds stay scalar.
+        let nodes = vec![
+            frozen_panel_cross_term_node("mat.alpha", 3),
+            frozen_panel_cross_term_node("mat.beta", 5),
+            frozen_panel_cross_term_node("mat.gamma", 7),
+        ];
+        let plan = plan_eager_cross_terms(&nodes);
+        assert_eq!(plan.abundance.scalar_count, 18);
+        let cx_ids = BTreeMap::from([
+            ("mat.alpha".to_string(), cx(31)),
+            ("mat.beta".to_string(), cx(32)),
+            ("mat.gamma".to_string(), cx(33)),
+        ]);
+
+        let (dir, vault) = reactive_vault("xterm-materialization");
+        let report = persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist eager cross terms");
+        assert_eq!(report.symbol_count, 3);
+        assert_eq!(report.rows_written, 18);
+        assert_eq!(report.rows_tombstoned, 0);
+        assert!(report.absent_by_kind.is_empty());
+
+        // Raw CF scan: exactly symbol_count x 6 rows exist, every one a
+        // designed Agreement pair.
+        let raw_rows = vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::XTerm)
+            .expect("scan xterm cf");
+        assert_eq!(raw_rows.len(), 18);
+        let persisted = read_eager_cross_term_rows(&vault).expect("read designed rows");
+        assert_eq!(persisted.len(), 18);
+        for symbol_cx in [cx(31), cx(32), cx(33)] {
+            let kinds = persisted
+                .iter()
+                .filter(|row| row.row.key.cx_id == symbol_cx)
+                .map(|row| row.kind)
+                .collect::<Vec<_>>();
+            assert_eq!(kinds.len(), 6);
+            for kind in EagerAgreementKind::ALL {
+                assert!(kinds.contains(&kind), "{kind} row missing for {symbol_cx}");
+            }
+        }
+        assert!(
+            persisted
+                .iter()
+                .all(|row| row.row.key.kind == LoomCrossTermKind::Agreement
+                    && row.row.tag == SignalProvenanceTag::Derived)
+        );
+
+        // The agreement-graph aspect substrate reads the same persisted rows.
+        let graph = agreement_graph_from_persisted_rows(&vault).expect("agreement graph");
+        assert_eq!(graph.len(), 6);
+        for edge in &graph {
+            assert_eq!(edge.scalar_count, 3, "{}", edge.kind);
+            assert!(edge.mean_agreement.is_some(), "{}", edge.kind);
+            assert_eq!(edge.provenance, "AsterVault:ColumnFamily::XTerm:agreement");
+        }
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn xterm_fsv_readback_is_bit_stable_and_ledger_paired() {
+        // FSV DoD: persist -> drop -> reopen -> decode raw XTerm CF bytes and
+        // compare scalars bit-for-bit against an independently recomputed
+        // plan; the paired ledger entry carries the canonical dump hash and
+        // the abundance accounting (07 §7 output shape).
+        let nodes = vec![
+            frozen_panel_cross_term_node("fsv.alpha", 3),
+            frozen_panel_cross_term_node("fsv.beta", 5),
+            frozen_panel_cross_term_node("fsv.gamma", 7),
+        ];
+        let plan = plan_eager_cross_terms(&nodes);
+        assert_eq!(plan.abundance.scalar_count, 18, "frozen fixture all-scalar");
+        let cx_ids = BTreeMap::from([
+            ("fsv.alpha".to_string(), cx(41)),
+            ("fsv.beta".to_string(), cx(42)),
+            ("fsv.gamma".to_string(), cx(43)),
+        ]);
+
+        let (dir, vault) = reactive_vault("xterm-fsv");
+        let report = persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist eager cross terms");
+        assert_eq!(report.rows_written, 18);
+        drop(vault);
+
+        let reopened = open_reactive_vault(&dir);
+        let persisted = read_eager_cross_term_rows(&reopened).expect("read persisted rows");
+        assert_eq!(persisted.len(), 18);
+
+        // Independent recomputation (same code path must be bit-stable).
+        let recomputed = plan_eager_cross_terms(&nodes);
+        let cx_by_qn = |qn: &str| *cx_ids.get(qn).expect("cx id");
+        for row in &recomputed.rows {
+            let CrossTermValue::Scalar(expected) = &row.value else {
+                panic!("frozen fixture must stay all-scalar");
+            };
+            let key = eager_xterm_key(cx_by_qn(&row.qualified_name), row.kind);
+            let persisted_row = persisted
+                .iter()
+                .find(|candidate| candidate.key == key)
+                .unwrap_or_else(|| panic!("persisted row missing for {}", row.kind));
+            let LoomCrossTermValue::Scalar(actual) = persisted_row.row.value else {
+                panic!("persisted row must be scalar");
+            };
+            // Tolerance 0: exact bit patterns.
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{}", row.kind);
+            assert_eq!(persisted_row.row.key.a, row.left_slot);
+            assert_eq!(persisted_row.row.key.b, row.right_slot);
+        }
+
+        // Ledger pairing + abundance output shape.
+        let ledger_bytes = reopened
+            .read_cf_at(
+                reopened.snapshot(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(report.ledger_ref.seq),
+            )
+            .expect("read ledger row")
+            .expect("ledger row present");
+        let entry = decode_ledger(&ledger_bytes).expect("decode ledger entry");
+        assert_eq!(entry.entry_hash, report.ledger_ref.hash);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&entry.payload).expect("ledger payload json");
+        assert_eq!(payload["schema"], XTERM_EAGER_LEDGER_SCHEMA);
+        let expected_hash = hex_lower_bytes(
+            blake3::hash(&eager_xterm_dump_bytes(&recomputed, &cx_ids).expect("recomputed dump"))
+                .as_bytes(),
+        );
+        assert_eq!(payload["xterm_dump_hash"], expected_hash);
+        assert_eq!(report.xterm_dump_hash, expected_hash);
+        let abundance = &payload["abundance"];
+        assert_eq!(abundance["symbol_count"].as_u64(), Some(3));
+        assert_eq!(abundance["panel_slot_count"].as_u64(), Some(22));
+        assert_eq!(
+            abundance["possible_pair_count_per_symbol"].as_u64(),
+            Some(231)
+        );
+        assert_eq!(abundance["raw_yield"].as_u64(), Some(3 * 254));
+        assert_eq!(abundance["eager_pair_count_per_symbol"].as_u64(), Some(6));
+        assert_eq!(abundance["materialized_count"].as_u64(), Some(18));
+        assert_eq!(abundance["scalar_count"].as_u64(), Some(18));
+        assert_eq!(abundance["absent_count"].as_u64(), Some(0));
+        assert_eq!(abundance["lazy_pair_count"].as_u64(), Some(3 * 225));
+
+        // Idempotent re-persist: no rewrites, still audited.
+        let second = persist_eager_cross_terms(&reopened, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("idempotent persist");
+        assert_eq!(second.rows_written, 0);
+        assert_eq!(second.rows_unchanged, 18);
+        assert_eq!(second.rows_tombstoned, 0);
+        assert!(second.ledger_ref.seq > report.ledger_ref.seq);
+
+        // Reconciliation: an absent operand tombstones the owned stale row and
+        // is counted per kind — never zero-filled, never silently dropped.
+        let mut degraded_nodes = nodes.clone();
+        degraded_nodes[0].slots.insert(
+            SLOT_DOC_SEMANTIC,
+            SlotVector::Absent {
+                reason: calyx_core::AbsentReason::LensUnavailable,
+            },
+        );
+        let degraded = plan_eager_cross_terms(&degraded_nodes);
+        let third =
+            persist_eager_cross_terms(&reopened, &degraded, &cx_ids, "astrolabe-weave-test")
+                .expect("reconciling persist");
+        assert_eq!(third.rows_tombstoned, 1);
+        assert_eq!(
+            third.absent_by_kind.get(&EagerAgreementKind::DocDrift),
+            Some(&1)
+        );
+        let after = read_eager_cross_term_rows(&reopened).expect("read reconciled rows");
+        assert_eq!(after.len(), 17);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doc_drift_lying_docs_rank_top_from_persisted_state_and_honest_docs_do_not() {
+        // P3 exit-gate component: on the pinned fixture corpus, a symbol whose
+        // docs lie about its code ranks at the top of doc-drift findings and a
+        // well-documented symbol produces no finding — evaluated from
+        // persisted XTerm CF state via the live anomaly reader, not from
+        // planner echoes.
+        let lying = SimilarityNode::new("corpus.docs.lie")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[1.0, 0.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.0, 1.0, 0.0]));
+        let drifting = SimilarityNode::new("corpus.docs.stale")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[1.0, 0.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[3.0, 4.0, 0.0]));
+        let honest = SimilarityNode::new("corpus.docs.honest")
+            .with_slot(SLOT_DOC_SEMANTIC, dense(&[3.0, 4.0, 0.0]))
+            .with_slot(SIM_SEMANTIC_SLOT, dense(&[3.0, 4.0, 0.0]));
+        let plan = plan_eager_cross_terms(&[lying, drifting, honest]);
+        let cx_ids = BTreeMap::from([
+            ("corpus.docs.lie".to_string(), cx(51)),
+            ("corpus.docs.stale".to_string(), cx(52)),
+            ("corpus.docs.honest".to_string(), cx(53)),
+        ]);
+
+        let (dir, vault) = reactive_vault("doc-drift-corpus");
+        persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist doc drift corpus");
+        vault.flush().expect("flush corpus rows");
+
+        let inputs = live_anomaly_inputs_from_vault(&vault).expect("live anomaly inputs");
+        let calibrations = vec![AnomalyCalibration::new(
+            AnomalyKind::DocDrift,
+            300,
+            800,
+            "calibration:doc-drift:v1",
+        )];
+        let report = detect_anomalies(&inputs.substrates, &calibrations, Some("doc_drift"), true)
+            .expect("doc drift report");
+
+        assert!(!report.findings.is_empty(), "lying docs must be findable");
+        // Top finding is the lying symbol (agreement 0 => score 1000, high).
+        assert_eq!(report.findings[0].subject_id, format!("cx:{}", cx(51)));
+        assert_eq!(report.findings[0].severity, AnomalySeverity::High);
+        assert_eq!(report.findings[0].score_millipoints, 1_000);
+        // The drifting symbol (agreement 0.6 => score 400) ranks below, medium.
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.subject_id == format!("cx:{}", cx(52))
+                    && finding.severity == AnomalySeverity::Medium)
+        );
+        // The honest symbol (agreement 1.0 => score 0) never appears.
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.subject_id != format!("cx:{}", cx(53))),
+            "well-documented symbol must not rank as doc drift"
+        );
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn name_truth_misleading_name_ranks_from_persisted_state() {
+        // Name-truth half of the sanity gate: a symbol whose name embedding
+        // aligns with a different API neighborhood than its peers ranks as a
+        // name-truth anomaly from persisted state; consistent peers do not.
+        // Two consistent clusters (alpha/beta named-and-calling alike, gamma
+        // its own consistent cluster) plus one symbol whose name matches the
+        // alpha cluster while its calls match gamma's: its name-similarity and
+        // API-similarity peer profiles are orthogonal (agreement 0), while
+        // alpha's stay positively aligned.
+        let corpus = vec![
+            name_truth_frozen_node("corpus.name.alpha", 0, 0),
+            name_truth_frozen_node("corpus.name.beta", 0, 0),
+            name_truth_frozen_node("corpus.name.gamma", 1, 1),
+            name_truth_frozen_node("corpus.name.misleads", 0, 1),
+        ];
+        let plan = plan_eager_cross_terms(&corpus);
+        let cx_ids = BTreeMap::from([
+            ("corpus.name.alpha".to_string(), cx(61)),
+            ("corpus.name.beta".to_string(), cx(64)),
+            ("corpus.name.gamma".to_string(), cx(63)),
+            ("corpus.name.misleads".to_string(), cx(62)),
+        ]);
+
+        let (dir, vault) = reactive_vault("name-truth-corpus");
+        persist_eager_cross_terms(&vault, &plan, &cx_ids, "astrolabe-weave-test")
+            .expect("persist name truth corpus");
+
+        let inputs = live_anomaly_inputs_from_vault(&vault).expect("live anomaly inputs");
+        let calibrations = vec![AnomalyCalibration::new(
+            AnomalyKind::NameTruth,
+            500,
+            900,
+            "calibration:name-truth:v1",
+        )];
+        let report = detect_anomalies(&inputs.substrates, &calibrations, Some("name_truth"), true)
+            .expect("name truth report");
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.subject_id == format!("cx:{}", cx(62))),
+            "misleading name must rank as a name-truth anomaly: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.subject_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.subject_id != format!("cx:{}", cx(61))),
+            "a consistently named symbol must not rank as a name-truth anomaly"
+        );
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Absent-propagation DoD: for every designed pair, degrading either
+        /// operand slot of one symbol (missing, explicit Absent, unsupported
+        /// multi shape, or zero norm) makes that symbol's cross-term Absent —
+        /// never a zero-filled scalar — regardless of the surrounding corpus.
+        #[test]
+        fn any_absent_input_slot_propagates_to_absent_cross_term(
+            kind_index in 0usize..EagerAgreementKind::ALL.len(),
+            degrade_left in proptest::bool::ANY,
+            degrade_mode in 0u8..4,
+            peer_seed in 1u32..64,
+        ) {
+            let kind = EagerAgreementKind::ALL[kind_index];
+            let (left_slot, right_slot) = kind.slots();
+            let degraded_slot = if degrade_left { left_slot } else { right_slot };
+
+            // A healthy 3-node corpus (peers keep neighborhood kinds scalar).
+            let mut nodes = (0u32..3)
+                .map(|index| {
+                    let mut node = SimilarityNode::new(format!("prop-{index}"));
+                    for slot in [
+                        SLOT_DOC_SEMANTIC, SIM_SEMANTIC_SLOT, SLOT_NAME_SEMANTIC,
+                        SIM_API_SLOT, SIM_STRUCT_SLOT, SLOT_COMPLEXITY, SLOT_CHURN,
+                        SLOT_GRAPH_POSITION, SLOT_TEST_COVERAGE, SLOT_ROUTE_MATCH,
+                    ] {
+                        let component = ((peer_seed + index + u32::from(slot.get())) % 7 + 1) as f32;
+                        node = node.with_slot(slot, dense(&[component, 1.0]));
+                    }
+                    node
+                })
+                .collect::<Vec<_>>();
+
+            match degrade_mode {
+                0 => {
+                    nodes[0].slots.remove(&degraded_slot);
+                }
+                1 => {
+                    nodes[0].slots.insert(
+                        degraded_slot,
+                        SlotVector::Absent { reason: calyx_core::AbsentReason::Deferred },
+                    );
+                }
+                2 => {
+                    nodes[0].slots.insert(
+                        degraded_slot,
+                        SlotVector::Multi { token_dim: 2, tokens: vec![vec![1.0, 0.0]] },
+                    );
+                }
+                _ => {
+                    nodes[0].slots.insert(degraded_slot, dense(&[0.0, 0.0]));
+                }
+            }
+
+            let plan = plan_eager_cross_terms(&nodes);
+            let row = plan
+                .rows
+                .iter()
+                .find(|row| row.qualified_name == "prop-0" && row.kind == kind)
+                .expect("designed row for degraded symbol");
+            proptest::prop_assert!(
+                row.value.is_absent(),
+                "{kind} must be absent when {degraded_slot:?} is degraded (mode {degrade_mode}), got {:?}",
+                row.value
+            );
+        }
     }
 
     fn struct_only_config() -> SimilarityPlannerConfig {
