@@ -409,7 +409,7 @@ pub fn fuse_rrf(
 /// contract, not a silent default: absence of evidence earns no boost.
 pub fn apply_temporal_boost(
     plan: &SearchPlan,
-    results: &mut Vec<FusedResult>,
+    results: &mut [FusedResult],
     recency_millis_by_symbol: &BTreeMap<String, u64>,
 ) -> Result<(), SearchError> {
     if plan.temporal_alpha_millis == 0 {
