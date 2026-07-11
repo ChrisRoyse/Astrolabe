@@ -54,6 +54,7 @@ codebase-memory-mcp                          Calyx
 
 ## Reading order
 
+- **Doctrine (read before all else):** [BUILDING_ON_CALYX.md](BUILDING_ON_CALYX.md) - the binding Calyx builder's handbook this blueprint derives from (embed-vs-encode; atoms -> all base associations -> differentiate -> kernel -> compose; the anti-pattern list). On conflict, this blueprint's code-domain decisions win, recorded here as design corrections.
 - **Decision-maker:** 01 â†’ 02 â†’ 22 â†’ 21.
 - **Architect:** 03 â†’ 04 â†’ 05 â†’ 19 â†’ 18 â†’ 17.
 - **Intelligence design:** 05 â†’ 06 â†’ 07 â†’ 08 â†’ 09 â†’ 10 â†’ 11.
