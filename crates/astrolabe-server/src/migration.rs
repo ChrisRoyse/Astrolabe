@@ -12,8 +12,8 @@ use astrolabe_bridge::{CbmPipelineRows, CbmToolRunner};
 use astrolabe_guard::{
     PROMPT_INJECTION_FINDING_KIND, PROMPT_INJECTION_PATTERN_REGISTRY_VERSION,
     PromptInjectionFamily, PromptInjectionFinding, PromptScreenInput, PromptSourceKind,
-    SECURITY_SCREEN_SCHEMA, SecurityFindingSeverity, dependency_ood_screen_unavailable,
-    screen_prompt_injection_inputs,
+    SECURITY_SCREEN_SCHEMA, SecurityFindingSeverity, SecurityGroundingNote,
+    dependency_ood_screen_unavailable, screen_prompt_injection_inputs,
 };
 use astrolabe_ingest::{
     CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, SqliteImportOptions,
@@ -2065,19 +2065,17 @@ fn prompt_injection_finding_json(finding: &PromptInjectionFinding) -> Value {
 }
 
 fn prompt_injection_grounding_note_json(finding: &PromptInjectionFinding) -> Value {
+    // Single source of truth: the grounding-note text is owned by the guard
+    // contract crate. We only serialize the note it builds — never re-derive
+    // the message string here (that copy previously drifted from guard).
+    let note = SecurityGroundingNote::from_prompt_injection_finding(finding);
     json!({
-        "kind": finding.kind,
-        "source_id": finding.source_id,
-        "source_kind": finding.source_kind.as_str(),
-        "trust": finding.trust,
-        "freshness": finding.freshness,
-        "message": format!(
-            "prompt-injection-shaped prose matched {} ({}) in {}; {}",
-            finding.pattern_id,
-            prompt_injection_family_str(finding.family),
-            finding.source_kind.as_str(),
-            finding.remediation
-        ),
+        "kind": note.kind,
+        "source_id": note.source_id,
+        "source_kind": note.source_kind.as_str(),
+        "trust": note.trust,
+        "freshness": note.freshness,
+        "message": note.message,
     })
 }
 
