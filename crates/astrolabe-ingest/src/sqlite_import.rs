@@ -3838,6 +3838,20 @@ fn fingerprint_sqlite_file(path: &Path) -> IngestResult<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Streams the byte content of a Codebase Memory MCP SQLite file and returns its
+/// lower-hex SHA-256 fingerprint.
+///
+/// This is the exact content fingerprint persisted as a shadow import's
+/// `vault_fingerprint` watermark (see [`SqliteImportReport::sqlite_fingerprint_sha256`],
+/// which is `hex_lower` of the same digest computed at import time). Recomputing it
+/// over the live source and comparing against that persisted watermark is how callers
+/// verify shadow freshness from content rather than from mere artifact existence
+/// (issue #93). Fails closed with [`ASTRO_INGEST_SQLITE_INVALID`] when the file cannot
+/// be read.
+pub fn fingerprint_sqlite_hex(path: impl AsRef<Path>) -> IngestResult<String> {
+    Ok(hex_lower(&fingerprint_sqlite_file(path.as_ref())?))
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -5351,6 +5365,47 @@ mod tests {
             sha256_digest(&fs::read(&path).expect("read back"))
         );
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fingerprint_sqlite_hex_matches_watermark_and_tracks_content_changes() {
+        // The public helper must return the lower-hex of the streamed SHA-256 that
+        // an import persists as `sqlite_fingerprint_sha256` (the shadow
+        // `vault_fingerprint` watermark). Content freshness (issue #93) compares this
+        // recomputed value byte-for-byte against that watermark, so the two derivations
+        // must be identical and the value must change when the source bytes change.
+        let path = temp_db("fingerprint-hex");
+        let bytes = b"astrolabe cbm sqlite content v1".to_vec();
+        fs::write(&path, &bytes).expect("write fixture");
+
+        let hex = fingerprint_sqlite_hex(&path).expect("hex fingerprint");
+        // Identical to hex_lower of the streamed digest an import records as the watermark.
+        assert_eq!(
+            hex,
+            hex_lower(&fingerprint_sqlite_file(&path).expect("digest"))
+        );
+        assert_eq!(hex, hex_lower(&sha256_digest(&bytes)));
+        // Deterministic across calls.
+        assert_eq!(
+            hex,
+            fingerprint_sqlite_hex(&path).expect("hex fingerprint again")
+        );
+
+        // A single out-of-band byte change must change the fingerprint: existence is
+        // unchanged, but content — and therefore freshness — is not.
+        let mut mutated = bytes.clone();
+        mutated.push(b'!');
+        fs::write(&path, &mutated).expect("rewrite fixture");
+        let hex_after = fingerprint_sqlite_hex(&path).expect("hex fingerprint after mutation");
+        assert_ne!(
+            hex, hex_after,
+            "content mutation must change the fingerprint"
+        );
+
+        // A missing source fails closed rather than returning a fabricated digest.
+        fs::remove_file(&path).ok();
+        let err = fingerprint_sqlite_hex(&path).expect_err("missing source must fail closed");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
     }
 
     #[test]
