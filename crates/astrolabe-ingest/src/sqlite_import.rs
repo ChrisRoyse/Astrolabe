@@ -725,6 +725,15 @@ where
     R: SlotRuntime + Sync,
 {
     ensure_no_legacy_series_state(vault)?;
+    if input.nodes.is_empty() {
+        // A dump that yields zero node rows for the requested project imports zero
+        // constellations. Refuse rather than appending an Ingest ledger record for an
+        // empty vault that would otherwise be reported as a successful import.
+        return Err(invalid_sqlite(
+            "SQLite import produced zero nodes for the requested project; \
+             refusing to record an empty import as successful",
+        ));
+    }
     let sqlite_node_vectors = input
         .nodes
         .iter()
@@ -1625,7 +1634,11 @@ fn read_node_vectors(
 
 fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
     if !table_exists(connection, "edges")? {
-        return Ok(Vec::new());
+        return Err(invalid_sqlite(
+            "SQLite dump has no edges table; a Codebase Memory MCP dump always \
+             carries an edges table, so a missing one signals a truncated or \
+             misidentified input",
+        ));
     }
     let mut statement = connection
         .prepare(
@@ -1707,6 +1720,11 @@ fn read_projects(
     sqlite_fingerprint: [u8; 32],
 ) -> IngestResult<Vec<RawProjectRow>> {
     if !table_exists(connection, "projects")? {
+        // Schema-light inputs (row-sink parity fixtures, minimal dumps) may omit the
+        // projects table entirely. Synthesize a provenance-carrying project row from the
+        // source fingerprint so the metadata graph row is still labeled, and rely on the
+        // downstream ≥1-node refusal to reject a genuinely empty/misidentified import
+        // rather than silently succeeding.
         return Ok(vec![RawProjectRow {
             name: options.project.clone(),
             indexed_at: hex_lower(&sqlite_fingerprint),
@@ -1730,11 +1748,13 @@ fn read_projects(
         out.push(row.map_err(|error| invalid_sqlite(format!("read projects row: {error}")))?);
     }
     if out.is_empty() {
-        out.push(RawProjectRow {
-            name: options.project.clone(),
-            indexed_at: hex_lower(&sqlite_fingerprint),
-            root_path: String::new(),
-        });
+        // The projects table exists but does not contain the requested project. This is a
+        // typo'd `--project` or a truncated dump; fail closed instead of fabricating a
+        // project row and reporting a successful-but-empty import.
+        return Err(invalid_sqlite(format!(
+            "project {:?} is absent from the SQLite projects table; no such project to import",
+            options.project
+        )));
     }
     Ok(out)
 }
@@ -5035,5 +5055,126 @@ mod tests {
             );
             assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn import_refuses_project_absent_from_projects_table() {
+        // A real Codebase Memory MCP dump carries a projects table. A typo'd `--project`
+        // (or a dump for a different project) must fail closed instead of synthesizing a
+        // project row and reporting a successful-but-empty import.
+        let path = temp_db("absent-project");
+        let connection = create_db(&path);
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                     name TEXT PRIMARY KEY,
+                     indexed_at TEXT NOT NULL,
+                     root_path TEXT NOT NULL
+                 );
+                 INSERT INTO projects(name, indexed_at, root_path)
+                     VALUES ('other', 'idx', '/tmp/other');",
+            )
+            .expect("create projects table");
+        insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            1,
+            2,
+            r#"{"source_snippet":"x"}"#,
+        );
+        drop(connection);
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("absent project must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(
+            err.to_string()
+                .contains("absent from the SQLite projects table"),
+            "{err}"
+        );
+        // Fail closed: no persisted rows and no ledger record for the refused import.
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+                .expect("scan base")
+                .is_empty()
+        );
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+                .expect("scan graph")
+                .is_empty()
+        );
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn import_refuses_zero_nodes_for_project() {
+        // A truncated dump with the schema present but no node rows imports zero
+        // constellations; it must refuse rather than record an empty vault as a success.
+        let path = temp_db("zero-nodes");
+        drop(create_db(&path));
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("zero nodes must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(err.to_string().contains("zero nodes"), "{err}");
+        assert!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
+                .expect("scan base")
+                .is_empty()
+        );
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn import_refuses_missing_edges_table() {
+        // A missing edges table signals a truncated or misidentified input and must be
+        // treated as invalid rather than yielding a silently edge-free import.
+        let path = temp_db("missing-edges");
+        let connection = Connection::open(&path).expect("open sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE nodes (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project TEXT NOT NULL,
+                     label TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     qualified_name TEXT NOT NULL,
+                     file_path TEXT DEFAULT '',
+                     start_line INTEGER DEFAULT 0,
+                     end_line INTEGER DEFAULT 0,
+                     properties TEXT DEFAULT '{}',
+                     UNIQUE(project, qualified_name)
+                 );",
+            )
+            .expect("create nodes-only schema");
+        insert_node(
+            &connection,
+            "Function",
+            "add",
+            "demo.math.add",
+            "src/math.rs",
+            1,
+            2,
+            r#"{"source_snippet":"x"}"#,
+        );
+        drop(connection);
+
+        let vault = vault();
+        let err = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect_err("missing edges table must refuse");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert!(err.to_string().contains("no edges table"), "{err}");
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+        fs::remove_file(path).ok();
     }
 }
