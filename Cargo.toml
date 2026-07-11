@@ -34,3 +34,27 @@ codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = "symbols"
+
+# ── Dev/test profile: debuginfo tuning (issue #188) ─────────────────────────
+# Mirrors vendor/calyx/Cargo.toml, which is silently ignored here: Cargo reads
+# profiles only from the workspace root being built, and vendor/calyx is an
+# excluded path-dep tree. Upstream Calyx measured the cargo default (debug = 2,
+# full DWARF) at ~280 MB per dev/test executable and a ~190 GB shared target/;
+# this workspace re-creates target/ from cold every gate run, so full DWARF
+# multiplies the cost of the mandated wipe. `line-tables-only` keeps function
+# names + file:line in panic/test backtraces — everything `cargo test`/`cargo
+# check` gates actually consume — while cutting object size and link time.
+# Declared knob per standing invariant 4; measured before/after on #188.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies (incl. the 8 calyx path-dep crates) are never stepped into
+# during gate work; dropping their debuginfo is the largest target/-size win
+# with zero loss of first-party debuggability.
+[profile.dev.package."*"]
+debug = false
+
+# Build scripts and proc-macros run at build time and are never debugged
+# interactively; no debuginfo needed.
+[profile.dev.build-override]
+debug = false
