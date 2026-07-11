@@ -189,12 +189,25 @@ pub(crate) fn handle_index_repository(
     }
 
     let sanitized_args = strip_calyx_arg(args_obj)?;
+    // #123: the row-sink run returns its raw result even when row capture fails,
+    // so a sink failure keeps the first (completed) index run and only labels the
+    // row-sink candidate unavailable. The full rerun below remains ONLY for
+    // errors where no usable raw result exists (pre-run argument encoding, or an
+    // unusable tool result), and its label says exactly that.
     let (result, row_sink) = match runner.handle_index_repository_with_rows(&sanitized_args) {
-        Ok(run) => (run.raw_json, row_sink_import_candidate_from_rows(run.rows)),
+        Ok(run) => {
+            let candidate = match run.rows {
+                Ok(rows) => row_sink_import_candidate_from_rows(rows),
+                Err(error) => RowSinkImportCandidate::Unavailable(format!(
+                    "row-sink capture failed; completed index result kept without a rerun: {error}"
+                )),
+            };
+            (run.raw_json, candidate)
+        }
         Err(error) => (
             runner.handle_tool_raw("index_repository", &sanitized_args)?,
             RowSinkImportCandidate::Unavailable(format!(
-                "single-run row-sink index_repository failed: {error}"
+                "single-run row-sink index_repository returned no usable result; reran without a row sink: {error}"
             )),
         ),
     };
