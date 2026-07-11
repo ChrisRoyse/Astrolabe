@@ -11,6 +11,7 @@ use astrolabe_domain::{
 };
 use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots};
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
+use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{
@@ -2618,26 +2619,45 @@ where
         return Ok((ledger_ref, graph_rows_written, edge_rows_written));
     }
 
-    let ledger_seq = ledger_row_count(vault)? as u64;
-    vault.write_cf_batch_with_ledger_entry(
+    // Deriving the ledger seq from a pre-commit `ledger_row_count` is a TOCTOU under the
+    // supported cross-process concurrency: an interleaved append from another process
+    // would make a fixed index point at someone else's entry. Instead, capture the commit
+    // snapshot seq returned by the atomic group commit and read the newest ledger row as
+    // of exactly that snapshot — later concurrent commits live at higher seqs and are
+    // invisible here, so the entry recovered is unambiguously this run's record.
+    let commit_seq = vault.write_cf_batch_with_ledger_entry(
         rows,
         EntryKind::Ingest,
         SubjectId::Query(sqlite_fingerprint.to_vec()),
         payload,
         ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
     )?;
-    let ledger_ref = read_ledger_ref(vault, ledger_seq)?;
+    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
     Ok((ledger_ref, graph_rows_written, edge_rows_written))
 }
 
-fn read_ledger_ref<C>(vault: &AsterVault<C>, seq: u64) -> IngestResult<LedgerRef>
+/// Recovers the ledger reference for the group commit that produced `commit_seq`.
+///
+/// The read is pinned to `commit_seq`, so the newest Ledger CF row at that snapshot is the
+/// entry this commit staged, regardless of concurrent cross-process appends that land at
+/// later snapshots. Fails closed if the ledger key and encoded entry seq disagree.
+fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: Seq) -> IngestResult<LedgerRef>
 where
     C: Clock,
 {
-    let bytes = vault
-        .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(seq))?
-        .ok_or_else(|| readback_mismatch(format!("Ledger CF row {seq} missing after import")))?;
-    let entry = decode(&bytes)?;
+    let (key, value) = vault
+        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
+        .into_iter()
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .ok_or_else(|| readback_mismatch("Ledger CF empty at import commit snapshot"))?;
+    let key_seq = parse_aster_ledger_seq(&key)?;
+    let entry = decode(&value)?;
+    if entry.seq != key_seq {
+        return Err(readback_mismatch(format!(
+            "Ledger CF key seq {key_seq} does not match encoded entry seq {}",
+            entry.seq
+        )));
+    }
     Ok(LedgerRef {
         seq: entry.seq,
         hash: entry.entry_hash,
@@ -5079,6 +5099,50 @@ mod tests {
             );
             assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn ledger_ref_at_commit_ignores_later_concurrent_appends() {
+        // Models the supported cross-process race: this run's group commit lands, then an
+        // interleaved append from another process lands at a later snapshot. Recovering the
+        // run record must resolve to this run's entry, not the later one.
+        let vault = vault();
+        let commit_seq = vault
+            .write_cf_batch_with_ledger_entry(
+                vec![(
+                    ColumnFamily::Graph,
+                    b"astrolabe:test-run-record".to_vec(),
+                    b"v1".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"this-run".to_vec()),
+                b"{}".to_vec(),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("run-record group commit");
+        let run_record = ledger_ref_at_commit(&vault, commit_seq).expect("recover run record");
+
+        // An interleaved cross-process append lands at a strictly later snapshot.
+        let interleaved = vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Query(b"other-process".to_vec()),
+                b"{}".to_vec(),
+                ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+            )
+            .expect("interleaved append");
+        assert_ne!(run_record.seq, interleaved.seq);
+
+        // Pinned to the run's commit snapshot, recovery still names the run's own entry even
+        // though a newer entry now exists. (A read at the latest snapshot would wrongly
+        // return the interleaved entry.)
+        let recovered = ledger_ref_at_commit(&vault, commit_seq).expect("recover after append");
+        assert_eq!(recovered.seq, run_record.seq);
+        assert_eq!(recovered.hash, run_record.hash);
+
+        let latest = ledger_ref_at_commit(&vault, vault.latest_seq()).expect("latest ref");
+        assert_eq!(latest.seq, interleaved.seq);
+        assert_eq!(latest.hash, interleaved.hash);
     }
 
     fn structural_endpoint_fixture(path: &Path) {
