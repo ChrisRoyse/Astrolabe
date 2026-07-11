@@ -7857,11 +7857,22 @@ fn read_dial_at(cache_dir: &Path, project: &str) -> Result<MigrationDial, DynErr
     let Some(value) = read_config_value(cache_dir, &dial_key(project))? else {
         return Ok(MigrationDial::Off);
     };
-    Ok(match value.as_str() {
-        "shadow" => MigrationDial::Shadow,
-        "off" => MigrationDial::Off,
-        _ => MigrationDial::Off,
-    })
+    // A present-but-unrecognized persisted value is corrupt or from an
+    // incompatible version — fail closed with a named, actionable error instead
+    // of silently coercing to Off (which would disable all shadow wrapping and
+    // surface confusing "requires calyx shadow indexing" refusals downstream).
+    // Absence of the row is handled above as the legitimate unconfigured default.
+    match value.as_str() {
+        "shadow" => Ok(MigrationDial::Shadow),
+        "off" => Ok(MigrationDial::Off),
+        other => Err(format!(
+            "ASTRO_MIGRATION_DIAL_CORRUPT: persisted calyx dial for project {project:?} is {other:?}, \
+             expected \"off\" or \"shadow\"; the stored migration state is corrupt or from an \
+             incompatible version. Remediation: re-issue a request with calyx=\"off\" or \
+             calyx=\"shadow\" for this project to overwrite the invalid persisted dial."
+        )
+        .into()),
+    }
 }
 
 fn persist_shadow_outcome(project: &str, outcome: &ShadowImportOutcome) -> Result<(), DynError> {
@@ -8059,6 +8070,45 @@ mod tests {
             .unwrap();
         assert_eq!(value, "shadow");
         assert_eq!(read_dial_at(&dir, "demo").unwrap(), MigrationDial::Shadow);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_persisted_dial_fails_closed_not_off() {
+        let dir = temp_dir("dial-corrupt");
+
+        // Absent dial row is the legitimate unconfigured default (Off), not an error.
+        assert_eq!(read_dial_at(&dir, "absent").unwrap(), MigrationDial::Off);
+
+        // Both valid persisted values round-trip through the real store.
+        persist_dial_at(&dir, "sh", MigrationDial::Shadow).unwrap();
+        assert_eq!(read_dial_at(&dir, "sh").unwrap(), MigrationDial::Shadow);
+        persist_dial_at(&dir, "of", MigrationDial::Off).unwrap();
+        assert_eq!(read_dial_at(&dir, "of").unwrap(), MigrationDial::Off);
+
+        // FSV: inject a corrupt / future-version dial value straight into the
+        // config store (never written by persist_dial_at), then verify against
+        // the source of truth that it is actually persisted.
+        write_config_value(&dir, &dial_key("corrupt"), "quantum").unwrap();
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![dial_key("corrupt")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "quantum", "corrupt value must be persisted for a real test");
+        drop(conn);
+
+        // read_dial_at must FAIL CLOSED naming the value — not silently return Off.
+        let err = read_dial_at(&dir, "corrupt").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ASTRO_MIGRATION_DIAL_CORRUPT") && msg.contains("quantum"),
+            "corrupt persisted dial must fail closed naming the value, got: {msg}"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 
