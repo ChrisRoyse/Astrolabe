@@ -170,7 +170,10 @@ pub(crate) enum HookSearch {
     ToolError,
 }
 
-pub(crate) fn hook_context_from_search_graph(raw: &str, token: &str) -> Result<HookSearch, DynError> {
+pub(crate) fn hook_context_from_search_graph(
+    raw: &str,
+    token: &str,
+) -> Result<HookSearch, DynError> {
     let value = serde_json::from_str::<serde_json::Value>(raw)?;
     if value
         .get("isError")

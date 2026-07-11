@@ -99,7 +99,11 @@ pub(crate) fn installer_local_dir(home: &Path) -> PathBuf {
     )
 }
 
-pub(crate) fn known_installer_config_files_for_dirs(home: &Path, config: &Path, local: &Path) -> Vec<PathBuf> {
+pub(crate) fn known_installer_config_files_for_dirs(
+    home: &Path,
+    config: &Path,
+    local: &Path,
+) -> Vec<PathBuf> {
     vec![
         home.join(".claude/settings.json"),
         home.join(".claude/.mcp.json"),
