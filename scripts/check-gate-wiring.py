@@ -303,6 +303,18 @@ def validate(root: Path) -> list[str]:
         "scripts/ci-cbm-test.sh",
         errors,
     )
+    require(
+        cbm_test,
+        'CC_BIN="${2//\\\\//}"',
+        "scripts/ci-cbm-test.sh compiler-path normalization",
+        errors,
+    )
+    require(
+        cbm_test,
+        'CXX_BIN="${3//\\\\//}"',
+        "scripts/ci-cbm-test.sh compiler-path normalization",
+        errors,
+    )
     require(cbm_lint, 'HOST_OS="$(uname -s)"', "scripts/ci-cbm-lint.sh", errors)
     require(
         cbm_lint,

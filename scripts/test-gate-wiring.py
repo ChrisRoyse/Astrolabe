@@ -272,6 +272,14 @@ def main() -> int:
         )
         copy_fixture(fixture)
 
+        rewrite(cbm_test, 'CC_BIN="${2//\\\\//}"', 'CC_BIN="$2"')
+        require_error(checker.validate(fixture), "compiler-path normalization")
+        copy_fixture(fixture)
+
+        rewrite(cbm_test, 'CXX_BIN="${3//\\\\//}"', 'CXX_BIN="$3"')
+        require_error(checker.validate(fixture), "compiler-path normalization")
+        copy_fixture(fixture)
+
         workspace_test = fixture / "scripts/check-workspace-tests.py"
         rewrite(workspace_test, '"taskkill"', '"taskkill-disabled"')
         require_error(checker.validate(fixture), "taskkill")
