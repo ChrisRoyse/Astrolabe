@@ -16,6 +16,7 @@ pub const SCOPE_SUMMARY_SCHEMA: &str = "astrolabe.scope_summary.v1";
 pub const FUNNEL_ACTIVATION_RECORDS_KNOB: &str = "search.funnel.activation_records";
 pub const SKILL_MIN_CLUSTER_SIZE_KNOB: &str = "skills.min_cluster_size";
 pub const SKILL_MIN_SHARED_TOKEN_PERMILLE_KNOB: &str = "skills.min_shared_token_permille";
+pub const SKILL_MAX_SYMBOLS_KNOB: &str = "skills.discovery.max_symbols";
 pub const LABEL_PROPAGATION_DECAY_MILLIPER_STEP_KNOB: &str =
     "labels.propagation.decay_milliper_step";
 pub const ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED: &str = "ASTRO_SEARCH_INDEX_BUDGET_EXCEEDED";
@@ -26,6 +27,7 @@ pub const ASTRO_LABEL_MATH_PARSE: &str = "ASTRO_LABEL_MATH_PARSE";
 pub const ASTRO_PROPAGATED_LABEL_TRUST_WRITE: &str = "ASTRO_PROPAGATED_LABEL_TRUST_WRITE";
 pub const ASTRO_SKILL_DISCOVERY_KNOB_RANGE: &str = "ASTRO_SKILL_DISCOVERY_KNOB_RANGE";
 pub const ASTRO_SKILL_SEARCH_CAP_RANGE: &str = "ASTRO_SKILL_SEARCH_CAP_RANGE";
+pub const ASTRO_SKILL_DISCOVERY_NODE_LIMIT: &str = "ASTRO_SKILL_DISCOVERY_NODE_LIMIT";
 pub const DEFAULT_FUNNEL_ACTIVATION_RECORDS: u64 = 10_000_000;
 pub const MIN_FUNNEL_ACTIVATION_RECORDS: u64 = 1_000;
 pub const MAX_FUNNEL_ACTIVATION_RECORDS: u64 = 1_000_000_000;
@@ -35,6 +37,17 @@ pub const MAX_SKILL_MIN_CLUSTER_SIZE: u64 = 10_000;
 pub const DEFAULT_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 500;
 pub const MIN_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 1;
 pub const MAX_SKILL_MIN_SHARED_TOKEN_PERMILLE: u64 = 1_000;
+/// Node-limit guard for the quadratic skill-discovery sweep. `build_skill_tree`
+/// re-scans every symbol against every other symbol (BTreeSet token
+/// intersection/union per pair), so its cost grows as O(n²); without a bound it
+/// is unusable on the monorepos (10^5–10^6 symbols) the discovery targets. The
+/// default mirrors the weave similarity planner's exact-pair node limit
+/// (`astrolabe_weave::DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT` = 50_000): the
+/// same 50_000-node bound on the same class of O(n²) exact-pair sweep. Raise the
+/// registered knob (bounded opt-out) only for an intentionally larger run.
+pub const DEFAULT_SKILL_MAX_SYMBOLS: u64 = 50_000;
+pub const MIN_SKILL_MAX_SYMBOLS: u64 = 2;
+pub const MAX_SKILL_MAX_SYMBOLS: u64 = 1_000_000;
 pub const DEFAULT_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 500;
 pub const MIN_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 1;
 pub const MAX_LABEL_PROPAGATION_DECAY_MILLIPER_STEP: u64 = 999;
@@ -99,6 +112,16 @@ pub const SKILL_DISCOVERY_KNOBS: &[U64KnobDeclaration] = &[
         unit: "permille",
         source: "docs/astrolabe-blueprint.md#12-search-unification",
         rationale: "seed deterministic skill discovery from exemplar token overlap before HDBSCAN/vector clustering is wired",
+    },
+    U64KnobDeclaration {
+        registry_version: SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
+        name: SKILL_MAX_SYMBOLS_KNOB,
+        default: DEFAULT_SKILL_MAX_SYMBOLS,
+        min: MIN_SKILL_MAX_SYMBOLS,
+        max: MAX_SKILL_MAX_SYMBOLS,
+        unit: "symbols",
+        source: "docs/astrolabe-blueprint.md#12-search-unification",
+        rationale: "bound the O(n^2) token-Jaccard component sweep; default matches the weave similarity planner exact-pair node limit (50_000) on the same class of quadratic sweep, fail closed above it until inverted-index blocking replaces the seed algorithm",
     },
 ];
 
@@ -1433,6 +1456,12 @@ impl SkillSymbolInput {
 pub struct SkillDiscoveryConfig {
     pub min_cluster_size: u64,
     pub min_shared_token_permille: u64,
+    /// Registry-declared node-limit guard (`SKILL_MAX_SYMBOLS_KNOB`). The
+    /// discovery sweep is O(n²); inputs above this bound are refused fail-closed
+    /// with [`ASTRO_SKILL_DISCOVERY_NODE_LIMIT`] rather than silently running an
+    /// unbounded scan. Raise it within the registered bounds to opt into a
+    /// larger, intentionally slower run.
+    pub max_symbols: u64,
 }
 
 impl Default for SkillDiscoveryConfig {
@@ -1440,6 +1469,7 @@ impl Default for SkillDiscoveryConfig {
         Self {
             min_cluster_size: DEFAULT_SKILL_MIN_CLUSTER_SIZE,
             min_shared_token_permille: DEFAULT_SKILL_MIN_SHARED_TOKEN_PERMILLE,
+            max_symbols: DEFAULT_SKILL_MAX_SYMBOLS,
         }
     }
 }
@@ -1478,6 +1508,24 @@ pub fn build_skill_tree(
         config.min_shared_token_permille,
         SKILL_DISCOVERY_KNOBS,
     )?;
+    validate_skill_knob(
+        SKILL_MAX_SYMBOLS_KNOB,
+        config.max_symbols,
+        SKILL_DISCOVERY_KNOBS,
+    )?;
+
+    if inputs.len() as u64 > config.max_symbols {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_SKILL_DISCOVERY_NODE_LIMIT,
+            format!(
+                "skill discovery input has {} symbols, exceeding the O(n^2) node limit {}={}",
+                inputs.len(),
+                SKILL_MAX_SYMBOLS_KNOB,
+                config.max_symbols
+            ),
+            "raise the skills.discovery.max_symbols knob within its registered bounds to opt into a larger run, or narrow the discovery scope",
+        ));
+    }
 
     let mut symbols = inputs.to_vec();
     symbols.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
@@ -2520,11 +2568,78 @@ mod tests {
         let config = SkillDiscoveryConfig {
             min_cluster_size: 1,
             min_shared_token_permille: DEFAULT_SKILL_MIN_SHARED_TOKEN_PERMILLE,
+            max_symbols: DEFAULT_SKILL_MAX_SYMBOLS,
         };
         let err = build_skill_tree(&skill_fixture(), &config).expect_err("invalid knob refused");
         assert_eq!(err.code(), ASTRO_SKILL_DISCOVERY_KNOB_RANGE);
         assert!(err.message().contains(SKILL_MIN_CLUSTER_SIZE_KNOB));
         assert!(err.remediation().contains("registered bounds"));
+    }
+
+    #[test]
+    fn skill_max_symbols_is_registry_declared_with_measured_default() {
+        let knob = SKILL_DISCOVERY_KNOBS
+            .iter()
+            .find(|knob| knob.name == SKILL_MAX_SYMBOLS_KNOB)
+            .expect("skills.discovery.max_symbols knob is declared");
+        assert_eq!(knob.registry_version, SKILL_DISCOVERY_KNOB_REGISTRY_VERSION);
+        assert_eq!(knob.default, DEFAULT_SKILL_MAX_SYMBOLS);
+        assert_eq!(knob.min, MIN_SKILL_MAX_SYMBOLS);
+        assert_eq!(knob.max, MAX_SKILL_MAX_SYMBOLS);
+        // The default is the measured weave exact-pair node bound, not a magic
+        // constant: same 50_000 ceiling on the same class of O(n^2) sweep.
+        assert_eq!(DEFAULT_SKILL_MAX_SYMBOLS, 50_000);
+        assert_eq!(MIN_SKILL_MAX_SYMBOLS, 2);
+        assert_eq!(MAX_SKILL_MAX_SYMBOLS, 1_000_000);
+    }
+
+    #[test]
+    fn skill_discovery_node_limit_is_fail_closed_and_bounded_opt_out() {
+        // Seven-symbol fixture with an in-bounds node limit of 2 must be refused
+        // before the O(n^2) sweep runs — a coded, actionable error, not a
+        // silently-truncated or unbounded scan.
+        let guarded = SkillDiscoveryConfig {
+            min_cluster_size: DEFAULT_SKILL_MIN_CLUSTER_SIZE,
+            min_shared_token_permille: DEFAULT_SKILL_MIN_SHARED_TOKEN_PERMILLE,
+            max_symbols: 2,
+        };
+        let fixture = skill_fixture();
+        assert_eq!(fixture.len(), 7);
+        let err = build_skill_tree(&fixture, &guarded).expect_err("node limit refused");
+        assert_eq!(err.code(), ASTRO_SKILL_DISCOVERY_NODE_LIMIT);
+        assert!(err.message().contains("7 symbols"));
+        assert!(err.message().contains(SKILL_MAX_SYMBOLS_KNOB));
+        assert!(err.message().contains("=2"));
+        assert!(err.remediation().contains(SKILL_MAX_SYMBOLS_KNOB));
+
+        // Raising the knob within its registered bounds is the bounded opt-out:
+        // the exact same input now clusters, proving the guard was the only gate.
+        let opted_in = SkillDiscoveryConfig {
+            max_symbols: 7,
+            ..SkillDiscoveryConfig::default()
+        };
+        let tree = build_skill_tree(&fixture, &opted_in).expect("opt-in run clusters");
+        assert!(
+            tree.skills
+                .iter()
+                .any(|skill| skill.name == "skill:auth-user")
+        );
+        assert!(
+            tree.skills
+                .iter()
+                .any(|skill| skill.name == "skill:billing-payment")
+        );
+
+        // A node limit itself outside the registered bounds is a distinct,
+        // fail-closed knob-range error naming the offending knob.
+        let out_of_range = SkillDiscoveryConfig {
+            max_symbols: MAX_SKILL_MAX_SYMBOLS + 1,
+            ..SkillDiscoveryConfig::default()
+        };
+        let range_err =
+            build_skill_tree(&fixture, &out_of_range).expect_err("out-of-range limit refused");
+        assert_eq!(range_err.code(), ASTRO_SKILL_DISCOVERY_KNOB_RANGE);
+        assert!(range_err.message().contains(SKILL_MAX_SYMBOLS_KNOB));
     }
 
     fn bridge_fixture_scopes() -> (BridgeScopeKernel, BridgeScopeKernel) {
