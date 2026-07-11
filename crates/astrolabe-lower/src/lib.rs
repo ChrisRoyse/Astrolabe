@@ -47,6 +47,24 @@ pub const DEFAULT_LOWERED_AT: &str = "1970-01-01T00:00:00Z";
 /// artifact is fully rebuilt each lowering; this only changes lock-wait behaviour.
 const LOWERED_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 
+/// Stable refusal code: the lowered artifact file is absent on disk.
+pub const ASTRO_LOWER_ARTIFACT_MISSING: &str = "ASTRO_LOWER_ARTIFACT_MISSING";
+/// Stable refusal code: the artifact's `astro_meta` row is missing, duplicated,
+/// undecodable, or disagrees with the ledgered lowering manifest.
+pub const ASTRO_LOWER_ARTIFACT_META_INVALID: &str = "ASTRO_LOWER_ARTIFACT_META_INVALID";
+/// Stable refusal code: no ledgered lowering manifest in this vault binds the
+/// artifact's claimed vault fingerprint for the requested project.
+pub const ASTRO_LOWER_ARTIFACT_UNBOUND: &str = "ASTRO_LOWER_ARTIFACT_UNBOUND";
+/// Stable refusal code: the artifact bytes on disk do not hash to the digest
+/// the ledgered lowering manifest committed to.
+pub const ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH: &str =
+    "ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH";
+/// Stable refusal code: the artifact was lowered from an older vault state than
+/// the vault's current content fingerprint.
+pub const ASTRO_LOWER_ARTIFACT_STALE: &str = "ASTRO_LOWER_ARTIFACT_STALE";
+
+const ARTIFACT_VERIFY_REMEDIATION: &str = "Regenerate the lowered artifact from the current vault with lower_cbm_sqlite; never serve a lowered artifact that fails load-time verification.";
+
 pub type LowerResult<T> = Result<T, LowerError>;
 
 #[derive(Debug)]
@@ -280,6 +298,225 @@ where
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::CodebaseMemoryMcp
+}
+
+/// Load-time verification report for a lowered SQLite artifact (#178, scope item 3).
+///
+/// Returned only when every check passed: the on-disk bytes hash to the
+/// digest the ledgered lowering manifest committed to, the artifact's
+/// `astro_meta` row matches that manifest, and the artifact's vault
+/// fingerprint equals the fingerprint recomputed from the vault's current
+/// content — so a caller holding this value is provably not serving stale or
+/// tampered derived state.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoweredArtifactVerification {
+    /// Project the artifact serves.
+    pub project: String,
+    /// Verified artifact path.
+    pub artifact_path: PathBuf,
+    /// SHA-256 of the artifact bytes read back from disk during verification.
+    pub artifact_sha256: String,
+    /// Vault content fingerprint recorded in `astro_meta` and the manifest.
+    pub vault_fingerprint_sha256: String,
+    /// Non-lowering ledger head hash the artifact was lowered from.
+    pub source_ledger_head_hash: String,
+    /// Panel version recorded at lowering time.
+    pub panel_version: Option<u32>,
+    /// Lowering timestamp recorded at lowering time.
+    pub lowered_at: String,
+}
+
+/// Verifies a lowered SQLite artifact against its vault before it is served.
+///
+/// Fail-closed (#178): a missing file, an unreadable or duplicated
+/// `astro_meta` row, a fingerprint with no ledgered manifest, disk bytes that
+/// do not hash to the manifest digest, or staleness against the vault's
+/// current content each return a [`LowerError::Refused`] with a stable
+/// `ASTRO_LOWER_ARTIFACT_*` code and operator remediation. Callers must treat
+/// every error as "do not serve this artifact".
+pub fn verify_lowered_artifact<C>(
+    vault: &AsterVault<C>,
+    artifact_path: impl AsRef<Path>,
+    project: &str,
+) -> LowerResult<LoweredArtifactVerification>
+where
+    C: Clock,
+{
+    let artifact_path = artifact_path.as_ref().to_path_buf();
+    let bytes = match fs::read(&artifact_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LowerError::refused(
+                ASTRO_LOWER_ARTIFACT_MISSING,
+                format!(
+                    "lowered artifact is missing at {}.",
+                    artifact_path.display()
+                ),
+                ARTIFACT_VERIFY_REMEDIATION,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let artifact_sha256 = hex_lower(&sha256_digest(&bytes));
+    let meta = read_astro_meta(&artifact_path)?;
+
+    let manifest_key = lowered_manifest_key(project, &meta.vault_fingerprint);
+    let manifest_bytes = vault
+        .read_cf_at(vault.latest_seq(), ColumnFamily::Kernel, &manifest_key)?
+        .ok_or_else(|| {
+            LowerError::refused(
+                ASTRO_LOWER_ARTIFACT_UNBOUND,
+                format!(
+                    "no lowering manifest in this vault binds project {project} at the artifact's claimed vault fingerprint {}.",
+                    fingerprint_prefix(&meta.vault_fingerprint),
+                ),
+                ARTIFACT_VERIFY_REMEDIATION,
+            )
+        })?;
+    let manifest = serde_json::from_slice::<LoweredSqliteManifest>(&manifest_bytes)
+        .map_err(|error| meta_invalid(format!("decode ledgered lowering manifest: {error}.")))?;
+    if manifest.schema != ASTRO_LOWERED_SQLITE_SCHEMA || manifest.project != project {
+        return Err(meta_invalid(format!(
+            "ledgered lowering manifest carries schema {} for project {}; expected {ASTRO_LOWERED_SQLITE_SCHEMA} for project {project}.",
+            manifest.schema, manifest.project
+        )));
+    }
+    if manifest.artifact_sha256 != artifact_sha256 {
+        return Err(LowerError::refused(
+            ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH,
+            format!(
+                "artifact bytes at {} hash to {artifact_sha256} but the ledgered manifest committed to {}.",
+                artifact_path.display(),
+                manifest.artifact_sha256
+            ),
+            ARTIFACT_VERIFY_REMEDIATION,
+        ));
+    }
+    if manifest.vault_fingerprint_sha256 != meta.vault_fingerprint
+        || manifest.source_ledger_head_hash != meta.ledger_head_hash
+        || manifest.panel_version != meta.panel_version
+    {
+        return Err(meta_invalid(
+            "astro_meta row does not match the ledgered lowering manifest.".to_string(),
+        ));
+    }
+
+    let current_head = source_ledger_head_hash(vault)?;
+    let current_snapshot = read_cbm_graph_snapshot(vault, project)?;
+    let current_fingerprint = snapshot_fingerprint(&current_snapshot, &current_head);
+    if current_fingerprint != meta.vault_fingerprint {
+        return Err(LowerError::refused(
+            ASTRO_LOWER_ARTIFACT_STALE,
+            format!(
+                "artifact was lowered at vault fingerprint {} but the vault now fingerprints {}; refusing to serve stale derived state.",
+                fingerprint_prefix(&meta.vault_fingerprint),
+                fingerprint_prefix(&current_fingerprint),
+            ),
+            ARTIFACT_VERIFY_REMEDIATION,
+        ));
+    }
+
+    Ok(LoweredArtifactVerification {
+        project: project.to_string(),
+        artifact_path,
+        artifact_sha256,
+        vault_fingerprint_sha256: meta.vault_fingerprint,
+        source_ledger_head_hash: meta.ledger_head_hash,
+        panel_version: meta.panel_version,
+        lowered_at: meta.lowered_at,
+    })
+}
+
+struct AstroMetaRow {
+    vault_fingerprint: String,
+    ledger_head_hash: String,
+    panel_version: Option<u32>,
+    lowered_at: String,
+}
+
+fn meta_invalid(message: String) -> LowerError {
+    LowerError::refused(
+        ASTRO_LOWER_ARTIFACT_META_INVALID,
+        message,
+        ARTIFACT_VERIFY_REMEDIATION,
+    )
+}
+
+/// First 16 characters of a fingerprint for refusal messages, tolerant of
+/// tampered non-ASCII content (falls back to the full string rather than
+/// slicing through a UTF-8 boundary).
+fn fingerprint_prefix(fingerprint: &str) -> &str {
+    fingerprint.get(..16).unwrap_or(fingerprint)
+}
+
+fn read_astro_meta(path: &Path) -> LowerResult<AstroMetaRow> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        meta_invalid(format!(
+            "open lowered artifact {}: {error}.",
+            path.display()
+        ))
+    })?;
+    connection.busy_timeout(std::time::Duration::from_millis(LOWERED_DB_BUSY_TIMEOUT_MS))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT schema, vault_fingerprint, ledger_head_hash, panel_version, lowered_at \
+             FROM astro_meta",
+        )
+        .map_err(|error| {
+            meta_invalid(format!("read astro_meta from {}: {error}.", path.display()))
+        })?;
+    let mut rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| {
+            meta_invalid(format!(
+                "read astro_meta rows from {}: {error}.",
+                path.display()
+            ))
+        })?;
+    if rows.len() != 1 {
+        return Err(meta_invalid(format!(
+            "astro_meta must contain exactly one row; found {}.",
+            rows.len()
+        )));
+    }
+    let Some((schema, vault_fingerprint, ledger_head_hash, panel_version, lowered_at)) = rows.pop()
+    else {
+        return Err(meta_invalid(
+            "astro_meta row disappeared mid-read.".to_string(),
+        ));
+    };
+    if schema != ASTRO_META_SCHEMA {
+        return Err(meta_invalid(format!(
+            "astro_meta schema is {schema}; expected {ASTRO_META_SCHEMA}."
+        )));
+    }
+    let panel_version = match panel_version {
+        None => None,
+        Some(value) => Some(u32::try_from(value).map_err(|_| {
+            meta_invalid(format!(
+                "astro_meta panel_version {value} does not fit u32."
+            ))
+        })?),
+    };
+    Ok(AstroMetaRow {
+        vault_fingerprint,
+        ledger_head_hash,
+        panel_version,
+        lowered_at,
+    })
 }
 
 fn validate_options(options: &LowerSqliteOptions) -> LowerResult<()> {
@@ -2257,5 +2494,169 @@ mod tests {
         );
         drop(connection);
         cleanup(&path);
+    }
+
+    /// Imports the fixture into a fresh vault and lowers it, returning the
+    /// pieces the load-time verification tests need.
+    fn lowered_fixture(
+        source_name: &str,
+        lowered_name: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        AsterVault<SystemClock>,
+        LoweredSqliteReport,
+    ) {
+        let source = temp_path(source_name);
+        let lowered = temp_path(lowered_name);
+        fixture_sqlite(&source);
+        let source_vault = vault();
+        import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import source sqlite");
+        let report = lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+            .expect("lower sqlite artifact");
+        (source, lowered, source_vault, report)
+    }
+
+    #[test]
+    fn fsv_verify_lowered_artifact_accepts_fresh_artifact() {
+        let (source, lowered, source_vault, report) =
+            lowered_fixture("verify-source.db", "verify-fresh.db");
+
+        let verification = verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect("fresh lowered artifact must verify");
+        assert_eq!(verification.project, "demo");
+        assert_eq!(verification.artifact_sha256, report.artifact_sha256);
+        assert_eq!(
+            verification.vault_fingerprint_sha256,
+            report.vault_fingerprint_sha256
+        );
+        assert_eq!(
+            verification.source_ledger_head_hash,
+            report.source_ledger_head_hash
+        );
+        // FSV: the accepted digest is the actual on-disk byte hash, not an API echo.
+        assert_eq!(
+            verification.artifact_sha256,
+            hex_lower(&sha256_digest(
+                fs::read(&lowered).expect("read lowered bytes")
+            ))
+        );
+
+        cleanup(&source);
+        cleanup(&lowered);
+    }
+
+    #[test]
+    fn verify_lowered_artifact_refuses_tampered_bytes() {
+        let (source, lowered, source_vault, report) =
+            lowered_fixture("tamper-source.db", "tamper-lowered.db");
+
+        // Tamper one persisted byte: append a trailing byte. SQLite still opens
+        // (the header's page count bounds its reads) and astro_meta still reads
+        // back clean, but the disk bytes no longer hash to the digest the
+        // ledgered manifest committed to.
+        let mut bytes = fs::read(&lowered).expect("read lowered bytes");
+        bytes.push(0xA5);
+        fs::write(&lowered, &bytes).expect("write tampered bytes");
+        assert_ne!(
+            hex_lower(&sha256_digest(&bytes)),
+            report.artifact_sha256,
+            "tamper must actually change the persisted digest"
+        );
+
+        let err = verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect_err("tampered artifact bytes must refuse");
+        assert_eq!(err.code(), Some(ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH));
+        assert!(
+            err.remediation().is_some(),
+            "byte-tamper refusal must carry operator remediation"
+        );
+
+        cleanup(&source);
+        cleanup(&lowered);
+    }
+
+    #[test]
+    fn verify_lowered_artifact_refuses_perturbed_astro_meta() {
+        let (source, lowered, source_vault, _report) =
+            lowered_fixture("meta-tamper-source.db", "meta-tamper-lowered.db");
+
+        // Tamper the persisted astro_meta fingerprint in place. The perturbed
+        // fingerprint keys no ledgered lowering manifest, so verification must
+        // refuse the artifact as unbound rather than trusting its own claim.
+        let connection = Connection::open(&lowered).expect("open lowered for tamper");
+        connection
+            .execute(
+                "UPDATE astro_meta SET vault_fingerprint = ?1",
+                params![format!("{:0>64}", "beef")],
+            )
+            .expect("perturb astro_meta fingerprint");
+        drop(connection);
+
+        let err = verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect_err("perturbed astro_meta must refuse");
+        assert_eq!(err.code(), Some(ASTRO_LOWER_ARTIFACT_UNBOUND));
+        assert!(
+            err.remediation().is_some(),
+            "unbound refusal must carry operator remediation"
+        );
+
+        cleanup(&source);
+        cleanup(&lowered);
+    }
+
+    #[test]
+    fn verify_lowered_artifact_refuses_stale_artifact() {
+        let (source, lowered, source_vault, _report) =
+            lowered_fixture("stale-source.db", "stale-lowered.db");
+
+        // Advance the vault past the artifact: a second import appends its run
+        // ledger entry, so the non-lowering ledger head (and therefore the
+        // current vault content fingerprint) moves past what the artifact was
+        // lowered from. Serving it now would be serving stale derived state.
+        import_sqlite_to_vault(
+            &source,
+            &source_vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-b", 1),
+        )
+        .expect("second import advances the vault");
+
+        let err = verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect_err("stale artifact must refuse");
+        assert_eq!(err.code(), Some(ASTRO_LOWER_ARTIFACT_STALE));
+        assert!(
+            err.remediation().is_some(),
+            "stale refusal must carry operator remediation"
+        );
+
+        // Re-lowering from the current vault clears the refusal.
+        lower_cbm_sqlite(&source_vault, &lowered, &LowerSqliteOptions::new("demo"))
+            .expect("re-lower from current vault");
+        verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect("freshly re-lowered artifact must verify");
+
+        cleanup(&source);
+        cleanup(&lowered);
+    }
+
+    #[test]
+    fn verify_lowered_artifact_refuses_missing_file() {
+        let lowered = temp_path("missing-lowered.db");
+        cleanup(&lowered);
+        let source_vault = vault();
+        let err = verify_lowered_artifact(&source_vault, &lowered, "demo")
+            .expect_err("missing artifact must refuse");
+        assert_eq!(err.code(), Some(ASTRO_LOWER_ARTIFACT_MISSING));
+        assert!(
+            err.remediation().is_some(),
+            "missing-artifact refusal must carry operator remediation"
+        );
     }
 }

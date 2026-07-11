@@ -6,12 +6,14 @@ use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, CxId, Seq};
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::sqlite_import::{EDGE_ROW_PREFIX, EdgeGraphRow, SCHEMA_EDGE_ROW};
+use crate::sqlite_import::{
+    ASTRO_INGEST_READBACK_MISMATCH, EDGE_ROW_PREFIX, EdgeGraphRow, SCHEMA_EDGE_ROW,
+};
 use crate::{IngestError, IngestResult};
 
 /// Stable failure code for corrupt or stale persisted graph projections.
@@ -234,6 +236,14 @@ pub struct GraphProjectionMaterializeEntry {
     pub edge_count: usize,
     /// Number of untyped association edges after decoding.
     pub association_edge_count: usize,
+    /// Kernel CF rows (segments, tombstones, manifest) re-read and
+    /// byte-verified at the commit snapshot after the write (#178). Zero when
+    /// the materialization wrote nothing.
+    pub rows_readback_verified: usize,
+    /// Whether the commit's paired ledger entry was read back and verified
+    /// (#178). `false` only when the materialization wrote nothing, so no
+    /// ledger entry was due.
+    pub ledger_paired: bool,
 }
 
 /// Materialization result for one or more projections.
@@ -480,8 +490,10 @@ where
         }
     }
     let mut segments_tombstoned = 0;
+    let mut tombstoned_keys = Vec::new();
     for (region, key) in existing_by_region {
         if !desired_by_region.contains_key(&region) {
+            tombstoned_keys.push(key.clone());
             rows.push((ColumnFamily::Kernel, key, tombstone_value()));
             segments_tombstoned += 1;
         }
@@ -497,7 +509,8 @@ where
         ));
     }
 
-    if !rows.is_empty() {
+    let wrote_rows = !rows.is_empty();
+    if wrote_rows {
         let payload = serde_json::to_vec(&json!({
             "schema": "agp_v1",
             "projection": kind.name(),
@@ -517,6 +530,19 @@ where
             ActorId::Service(ASTROLABE_PROJECTION_ACTOR.to_string()),
         )?;
     }
+    let (rows_readback_verified, ledger_paired) = if wrote_rows {
+        let verified = verify_projection_commit_readback(
+            vault,
+            kind,
+            &desired,
+            &segment_is_stale,
+            manifest_written,
+            &tombstoned_keys,
+        )?;
+        (verified, true)
+    } else {
+        (0, false)
+    };
 
     Ok(GraphProjectionMaterializeEntry {
         kind,
@@ -533,7 +559,101 @@ where
         node_count: desired.csr.nodes.len(),
         edge_count: desired.csr.edges.len(),
         association_edge_count: desired.csr.association_edge_count,
+        rows_readback_verified,
+        ledger_paired,
     })
+}
+
+/// Post-commit FSV for one projection materialization (#178 scope item 1).
+///
+/// Re-reads every Kernel CF row the commit wrote at the commit snapshot and
+/// compares persisted bytes against the bytes that were staged: written
+/// segments and the manifest must read back byte-identical, tombstoned keys
+/// must no longer read back as live values, and the commit's paired ledger
+/// entry (Kernel kind, projection actor, projection-name subject) must exist.
+/// Any divergence is a fail-closed readback refusal — the mutation is never
+/// acked as verified on trust.
+fn verify_projection_commit_readback<C>(
+    vault: &AsterVault<C>,
+    kind: GraphProjectionKind,
+    desired: &ProjectionBytes,
+    segment_is_stale: &[bool],
+    manifest_written: bool,
+    tombstoned_keys: &[Vec<u8>],
+) -> IngestResult<usize>
+where
+    C: Clock,
+{
+    let commit_seq = vault.latest_seq();
+    let mut rows_verified = 0;
+    for (segment, stale) in desired.segments.iter().zip(segment_is_stale) {
+        if !*stale {
+            continue;
+        }
+        let persisted = vault
+            .read_cf_at(commit_seq, ColumnFamily::Kernel, &segment.key)?
+            .ok_or_else(|| projection_readback(kind, "segment row missing at commit snapshot"))?;
+        if persisted != segment.bytes {
+            return Err(projection_readback(
+                kind,
+                "segment row bytes changed between commit and readback",
+            ));
+        }
+        rows_verified += 1;
+    }
+    if manifest_written {
+        let persisted = vault
+            .read_cf_at(commit_seq, ColumnFamily::Kernel, &desired.manifest_key)?
+            .ok_or_else(|| projection_readback(kind, "manifest row missing at commit snapshot"))?;
+        if persisted != desired.manifest_bytes {
+            return Err(projection_readback(
+                kind,
+                "manifest row bytes changed between commit and readback",
+            ));
+        }
+        rows_verified += 1;
+    }
+    for key in tombstoned_keys {
+        if let Some(persisted) = vault.read_cf_at(commit_seq, ColumnFamily::Kernel, key)?
+            && persisted != tombstone_value()
+        {
+            return Err(projection_readback(
+                kind,
+                "tombstoned segment still reads back as a live value",
+            ));
+        }
+        rows_verified += 1;
+    }
+
+    let (_key, ledger_bytes) = vault
+        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
+        .into_iter()
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .ok_or_else(|| {
+            projection_readback(kind, "Ledger CF empty at projection commit snapshot")
+        })?;
+    let entry = decode(&ledger_bytes)?;
+    if entry.kind != EntryKind::Kernel {
+        return Err(projection_readback(
+            kind,
+            "paired ledger entry has the wrong entry kind",
+        ));
+    }
+    if !matches!(&entry.actor, ActorId::Service(actor) if actor == ASTROLABE_PROJECTION_ACTOR) {
+        return Err(projection_readback(
+            kind,
+            "paired ledger entry names the wrong actor",
+        ));
+    }
+    if !matches!(&entry.subject, SubjectId::Query(subject) if subject.as_slice() == kind.name().as_bytes())
+    {
+        return Err(projection_readback(
+            kind,
+            "paired ledger entry names the wrong subject",
+        ));
+    }
+
+    Ok(rows_verified)
 }
 
 fn read_source_edges<C>(vault: &AsterVault<C>) -> IngestResult<SourceEdges>
@@ -1490,6 +1610,14 @@ fn projection_corrupt(message: impl Into<String>) -> IngestError {
     )
 }
 
+fn projection_readback(kind: GraphProjectionKind, message: &str) -> IngestError {
+    IngestError::refused(
+        ASTRO_INGEST_READBACK_MISMATCH,
+        format!("{} projection commit readback: {message}", kind.name()),
+        PROJECTION_REMEDIATION,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1918,5 +2046,96 @@ mod tests {
                 &prefix_range(GRAPH_PROJECTION_CSR_PREFIX),
             )
             .expect("scan all projection rows")
+    }
+
+    #[test]
+    fn fsv_materialize_verifies_commit_readback_and_ledger_pairing() {
+        let vault = vault();
+        write_sources(&vault, fixture_rows());
+        let report = materialize_graph_projections(&vault, &GraphProjectionBuildOptions::new())
+            .expect("materialize projections");
+        for entry in &report.projections {
+            assert!(
+                entry.ledger_paired,
+                "{} first materialization must verify its paired ledger entry",
+                entry.kind.name()
+            );
+            let expected_rows = entry.segments_written
+                + entry.segments_tombstoned
+                + usize::from(entry.manifest_written);
+            assert_eq!(
+                entry.rows_readback_verified,
+                expected_rows,
+                "{} must read back every committed row",
+                entry.kind.name()
+            );
+            assert!(
+                entry.rows_readback_verified > 0,
+                "{} first materialization must write and verify rows",
+                entry.kind.name()
+            );
+        }
+
+        // An unchanged replay commits nothing, so no readback rows are due and
+        // no new ledger entry exists to pair with — and that absence is labeled
+        // (`ledger_paired=false`) instead of silently claiming verification.
+        let replay = materialize_graph_projections(&vault, &GraphProjectionBuildOptions::new())
+            .expect("replay projections");
+        for entry in &replay.projections {
+            assert_eq!(entry.rows_readback_verified, 0, "{}", entry.kind.name());
+            assert!(!entry.ledger_paired, "{}", entry.kind.name());
+        }
+    }
+
+    #[test]
+    fn projection_commit_readback_detects_tampered_segment_bytes() {
+        let vault = vault();
+        write_sources(&vault, fixture_rows());
+        materialize_graph_projection(
+            &vault,
+            GraphProjectionKind::CallGraph,
+            &GraphProjectionBuildOptions::new(),
+        )
+        .expect("materialize call graph");
+        let source = read_source_edges(&vault).expect("source edges");
+        let desired =
+            build_projection_bytes(GraphProjectionKind::CallGraph, &source, 1).expect("desired");
+        let stale = vec![true; desired.segments.len()];
+
+        // Baseline: the freshly committed bytes read back clean.
+        let verified = verify_projection_commit_readback(
+            &vault,
+            GraphProjectionKind::CallGraph,
+            &desired,
+            &stale,
+            true,
+            &[],
+        )
+        .expect("clean commit readback");
+        assert_eq!(verified, desired.segments.len() + 1);
+
+        // Tamper the persisted bytes of the first committed segment; the same
+        // readback must now fail closed with the readback-mismatch code.
+        vault
+            .write_cf_batch([(
+                ColumnFamily::Kernel,
+                desired.segments[0].key.clone(),
+                b"tampered-projection-bytes".to_vec(),
+            )])
+            .expect("tamper persisted segment");
+        let err = verify_projection_commit_readback(
+            &vault,
+            GraphProjectionKind::CallGraph,
+            &desired,
+            &stale,
+            true,
+            &[],
+        )
+        .expect_err("tampered segment must fail commit readback");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_READBACK_MISMATCH));
+        assert!(
+            err.remediation().is_some(),
+            "readback refusal must carry operator remediation"
+        );
     }
 }

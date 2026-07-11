@@ -1,4 +1,7 @@
-#![cfg(unix)]
+// Runs on every platform (#133): the real-CBM-C-store-opens-the-lowered-artifact
+// claim must execute natively on the Windows dev machine, not only under a unix
+// gate. cbm-sys links the native libcbm archive, so building this test needs the
+// pinned GNU toolchain (make + GCC) — the same requirement as the shipped binary.
 
 use std::fs;
 use std::path::{Path, PathBuf};
