@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+blake3 = "1"
 
 [lib]
 path = "src/lib.rs"

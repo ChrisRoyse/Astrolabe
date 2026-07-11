@@ -3629,7 +3629,9 @@ fn provenance_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
         chain: ChainVerification {
             status: ChainStatus::Intact,
             checked_from: 0,
-            checked_to: 0,
+            // Row-sink provenance has no durable ledger: the attested range is empty
+            // (checked_end == checked_from), so no sequence is fabricated as verified.
+            checked_end: 0,
             provenance: ledger_head,
         },
         symbols: BTreeMap::new(),
@@ -4028,7 +4030,11 @@ fn chain_verification_from_report(
     ChainVerification {
         status,
         checked_from: verify.checked_range_start,
-        checked_to: verify.checked_range_end.saturating_sub(1),
+        // `checked_range_end` is already the exclusive upper bound. Passing it straight
+        // through (instead of the former `end - 1`) removes the empty-range off-by-one:
+        // an unchecked ledger (`end == 0`) now reports an empty range rather than falsely
+        // claiming seq 0 was verified.
+        checked_end: verify.checked_range_end,
         provenance,
     }
 }
@@ -4432,7 +4438,10 @@ fn chain_verification_json(chain: &ChainVerification) -> Value {
     json!({
         "status": status,
         "checked_from": chain.checked_from,
-        "checked_to": chain.checked_to,
+        "checked_end": chain.checked_end,
+        // Inclusive last checked seq, or null for an empty attested range: never a
+        // fabricated seq 0 for an unchecked ledger.
+        "last_checked_seq": chain.last_checked_seq(),
         "provenance": ledger_pointer_json(&chain.provenance),
     })
 }
@@ -4453,7 +4462,7 @@ fn chain_verification_from_json(value: &Value) -> Result<ChainVerification, DynE
     Ok(ChainVerification {
         status,
         checked_from: required_u64_field(value, "checked_from")?,
-        checked_to: required_u64_field(value, "checked_to")?,
+        checked_end: required_u64_field(value, "checked_end")?,
         provenance: ledger_pointer_from_json(required_value_field(value, "provenance")?)?,
     })
 }
@@ -8098,7 +8107,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, "quantum", "corrupt value must be persisted for a real test");
+        assert_eq!(
+            stored, "quantum",
+            "corrupt value must be persisted for a real test"
+        );
         drop(conn);
 
         // read_dial_at must FAIL CLOSED naming the value — not silently return Off.
@@ -9433,7 +9445,7 @@ mod tests {
         };
         assert_eq!(chain.status.as_str(), "intact");
         assert_eq!(chain.checked_from, verify.checked_range_start);
-        assert_eq!(chain.checked_to, verify.checked_range_end.saturating_sub(1));
+        assert_eq!(chain.checked_end, verify.checked_range_end);
         assert_eq!(chain.provenance.chain_hash, "44".repeat(32));
 
         let lineage = get_provenance(&store, &ProvenanceQuery::new("lineage", Some("auth.login")))

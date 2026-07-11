@@ -188,6 +188,7 @@ name = "astrolabe-provenance"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "blake3",
 ]
 
 [[package]]
