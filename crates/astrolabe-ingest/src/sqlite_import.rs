@@ -77,6 +77,16 @@ const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 const SCHEMA_QUANTIZATION_GATE: &str = "astrolabe.quantization_gate.v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
+/// SQLITE_BUSY retry window for the read-only CBM source connection — an
+/// operational-resilience knob, not a measured value (#76). Concurrent agent
+/// MCP/CLI processes on one repo can hold a brief write lock on the CBM store
+/// (journal transitions, registration rows) while another process's shadow
+/// import reads the same file; with no busy timeout the reader returns
+/// "database is locked" immediately and reddens the cross-process gate
+/// (check-cross-process-vault.py). Mirrors LOWERED_DB_BUSY_TIMEOUT_MS
+/// (astrolabe-lower) and CONFIG_DB_BUSY_TIMEOUT_MS (astrolabe-server).
+const CBM_SOURCE_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// Import configuration for a CBM SQLite dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteImportOptions {
@@ -707,11 +717,7 @@ where
     let sqlite_fingerprint = fingerprint_sqlite_file(sqlite_path.as_ref())?;
     let ledger_rows_before = ledger_row_count(vault)?;
 
-    let connection = Connection::open_with_flags(
-        sqlite_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
+    let connection = open_cbm_source_connection(sqlite_path.as_ref())?;
     let raw_metadata = read_metadata_rows(&connection, options, sqlite_fingerprint)?;
     let raw_nodes = read_nodes(&connection, &options.project)?;
     let raw_edges = read_edges(&connection, &options.project)?;
@@ -727,6 +733,23 @@ where
             ledger_rows_before,
         },
     )
+}
+
+/// Open the CBM source SQLite read-only with the #76 SQLITE_BUSY retry window.
+/// Kept as a named helper so the busy-timeout contract is directly asserted by
+/// `cbm_source_connection_sets_busy_timeout`.
+fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
+    let connection = Connection::open_with_flags(
+        sqlite_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(
+            CBM_SOURCE_DB_BUSY_TIMEOUT_MS,
+        ))
+        .map_err(|error| invalid_sqlite(format!("set SQLite busy timeout: {error}")))?;
+    Ok(connection)
 }
 
 fn import_raw_cbm_rows_to_vault<C, R>(
@@ -5581,6 +5604,26 @@ mod tests {
         fs::remove_file(&path).ok();
         let err = fingerprint_sqlite_hex(&path).expect_err("missing source must fail closed");
         assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+    }
+
+    #[test]
+    fn cbm_source_connection_sets_busy_timeout() {
+        // FSV (#76): the read-only CBM source connection must carry a
+        // SQLITE_BUSY retry window so a concurrent process briefly holding a
+        // write lock on the CBM store never turns a shadow import into an
+        // immediate "database is locked" failure. Read the pragma back from
+        // the live connection rather than trusting the constructor.
+        let db = temp_db("busy-timeout");
+        drop(create_db(&db));
+        let connection =
+            open_cbm_source_connection(db.as_ref()).expect("open CBM source read-only");
+        let busy_timeout: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("read back busy_timeout");
+        assert_eq!(
+            busy_timeout, CBM_SOURCE_DB_BUSY_TIMEOUT_MS as i64,
+            "CBM source connection must set a SQLITE_BUSY retry window (#76)"
+        );
     }
 
     #[test]
