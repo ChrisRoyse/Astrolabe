@@ -2152,10 +2152,7 @@ mod tests {
             let run = runner
                 .handle_index_repository_with_rows(&args)
                 .expect("single MCP index_repository run with row sink");
-            assert_eq!(
-                run.rows.expect("row sink capture").project,
-                project
-            );
+            assert_eq!(run.rows.expect("row sink capture").project, project);
             // Mid-run source-of-truth read: the registration exists on disk.
             assert!(
                 db_path.exists(),
