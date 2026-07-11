@@ -46,6 +46,25 @@ pub const DEFAULT_SIM_PROFILE_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIMILARITY_PER_NODE_CAP: usize = 10;
 pub const DEFAULT_SIMILARITY_WORKERS: usize = 1;
 pub const DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT: usize = 50_000;
+/// Squared-L2-norm floor below which a slot/profile vector is treated as a
+/// degenerate zero vector and skipped from similarity and cross-term scoring.
+///
+/// # Scale
+/// [`dense_norm`] and [`sparse_norm`] return the **squared** L2 norm (the sum of
+/// squares), and `cosine` divides by `norm.sqrt()`. This knob is therefore declared
+/// on the *squared* scale so [`zero_norm`] classifies on the same scale as the value
+/// it receives. The equivalent *linear* L2-norm floor is `sqrt(f32::MIN_POSITIVE)`
+/// ≈ 1.08e-19.
+///
+/// # Derivation (measured, not a policy magic number)
+/// The only legitimate reason to reject a vector here is numerical: `cosine` computes
+/// `dot / (left_norm.sqrt() * right_norm.sqrt())`, which is well defined precisely
+/// while each squared norm stays within the *normal* (non-subnormal) IEEE-754 binary32
+/// range. The floor is thus the smallest normal binary32 value, `f32::MIN_POSITIVE`
+/// (≈ 1.1755e-38). Any genuinely non-zero vector — including the ~1e-4-linear-norm
+/// vectors (squared ≈ 1e-8) that the previous `norm <= f32::EPSILON` (≈ 1.19e-7) test
+/// misclassified as zero — sits far above this floor and is scored normally.
+pub const DEFAULT_MIN_VECTOR_SQUARED_NORM: f32 = f32::MIN_POSITIVE;
 pub const ASTROLABE_REACTIVE_REGISTRY_CAP: usize = CALYX_REACTIVE_REGISTRY_CAP;
 pub const ASTROLABE_REACTIVE_QUEUE_CAP: usize = CALYX_REACTIVE_QUEUE_CAP;
 pub const ASTROLABE_REACTIVE_AUDIT_CAP: usize = CALYX_REACTIVE_AUDIT_CAP;
@@ -2023,8 +2042,16 @@ fn sparse_norm(entries: &[SparseEntry]) -> f32 {
     entries.iter().map(|entry| entry.val * entry.val).sum()
 }
 
-fn zero_norm(norm: f32) -> bool {
-    norm <= f32::EPSILON
+fn zero_norm(squared_norm: f32) -> bool {
+    // `squared_norm` is the sum of squares produced by `dense_norm`/`sparse_norm`
+    // (the *squared* L2 norm), so the guard must compare on the squared scale.
+    // A vector is degenerate only when that squared norm underflows out of the
+    // normal IEEE-754 binary32 range — below `DEFAULT_MIN_VECTOR_SQUARED_NORM`
+    // (`f32::MIN_POSITIVE`) the norm is subnormal or exactly zero and cannot be
+    // meaningfully normalized in `cosine`. The previous `<= f32::EPSILON` test
+    // compared this squared value against unit-scale float spacing (~1.19e-7),
+    // wrongly classifying small-but-real vectors (linear norm ≲ 3.45e-4) as zero.
+    squared_norm < DEFAULT_MIN_VECTOR_SQUARED_NORM
 }
 
 fn format_score(value: f32) -> String {
@@ -2933,6 +2960,119 @@ mod tests {
             "multi",
             SimilarityVectorSkipReason::UnsupportedSlotShape { shape: "multi" }
         ));
+    }
+
+    #[test]
+    fn zero_norm_knob_is_declared_on_the_squared_scale() {
+        // The guard receives the *squared* L2 norm, so the declared floor lives on
+        // that scale and equals the smallest normal binary32 value.
+        assert_eq!(DEFAULT_MIN_VECTOR_SQUARED_NORM, f32::MIN_POSITIVE);
+
+        // dense_norm / sparse_norm return the sum of squares (the squared norm),
+        // which is exactly what zero_norm is fed.
+        assert_eq!(dense_norm(&[3.0, 4.0]), 25.0);
+        assert_eq!(
+            sparse_norm(&[
+                SparseEntry { idx: 0, val: 3.0 },
+                SparseEntry { idx: 5, val: 4.0 },
+            ]),
+            25.0
+        );
+    }
+
+    #[test]
+    fn zero_norm_classifies_vectors_at_the_declared_floor_boundary() {
+        // Linear-norm floor equivalent to the declared squared-norm knob.
+        let floor_norm = DEFAULT_MIN_VECTOR_SQUARED_NORM.sqrt();
+
+        // Just above the floor: squared norm stays a normal f32 -> NOT zero.
+        let above = SlotVector::Dense {
+            dim: 1,
+            data: vec![floor_norm * 2.0],
+        };
+        let above_sq = dense_norm(&[floor_norm * 2.0]);
+        assert!(above_sq >= DEFAULT_MIN_VECTOR_SQUARED_NORM);
+        assert!(!zero_norm(above_sq));
+        assert!(matches!(
+            normalized_vector(&above),
+            Ok(Some(NormalizedVector::Dense { .. }))
+        ));
+
+        // Just below the floor: squared norm underflows to subnormal -> zero.
+        let below = SlotVector::Dense {
+            dim: 1,
+            data: vec![floor_norm * 0.5],
+        };
+        let below_sq = dense_norm(&[floor_norm * 0.5]);
+        assert!(below_sq < DEFAULT_MIN_VECTOR_SQUARED_NORM);
+        assert!(zero_norm(below_sq));
+        assert!(matches!(
+            normalized_vector(&below),
+            Err(SimilarityVectorSkipReason::ZeroNorm)
+        ));
+
+        // Exactly zero is always degenerate.
+        assert!(zero_norm(dense_norm(&[0.0, 0.0])));
+        assert!(matches!(
+            normalized_vector(&SlotVector::Dense {
+                dim: 2,
+                data: vec![0.0, 0.0],
+            }),
+            Err(SimilarityVectorSkipReason::ZeroNorm)
+        ));
+    }
+
+    #[test]
+    fn small_but_real_vector_is_no_longer_zero_classified() {
+        // A vector with linear L2 norm 1e-4 (squared 1e-8). This is the exact class
+        // of small-but-real vector the audit flagged.
+        let data = [1.0e-4_f32];
+        let squared = dense_norm(&data);
+        assert!((squared - 1.0e-8).abs() <= 1.0e-12);
+
+        // The OLD guard (`squared_norm <= f32::EPSILON`) would have classified this
+        // as ZeroNorm — assert that premise so this test is a genuine regression
+        // that fails against the pre-fix code.
+        assert!(squared <= f32::EPSILON);
+        // The FIXED guard, on the correct scale, keeps it.
+        assert!(!zero_norm(squared));
+        assert!(matches!(
+            normalized_vector(&SlotVector::Dense {
+                dim: 1,
+                data: data.to_vec(),
+            }),
+            Ok(Some(NormalizedVector::Dense { .. }))
+        ));
+    }
+
+    #[test]
+    fn small_but_real_vectors_form_edges_instead_of_zero_norm_skips() {
+        // Full-state regression through the real planner: two identical, tiny-norm
+        // (~1e-4) vectors must produce a similarity edge (cosine = 1.0), NOT be
+        // skipped as ZeroNorm. Under the old `<= f32::EPSILON` guard both nodes were
+        // dropped and no edge existed.
+        let config = family_only_config(SimilarityFamily::Semantic);
+        let nodes = vec![
+            dense_node("small_a", SimilarityFamily::Semantic, &[1.0e-4, 2.0e-4]),
+            dense_node("small_b", SimilarityFamily::Semantic, &[1.0e-4, 2.0e-4]),
+        ];
+
+        let plan = plan_similarity_edges(&nodes, &config).expect("similarity plan");
+
+        assert!(
+            !has_vector_skip(&plan, "small_a", SimilarityVectorSkipReason::ZeroNorm),
+            "small_a must not be skipped as ZeroNorm"
+        );
+        assert!(
+            !has_vector_skip(&plan, "small_b", SimilarityVectorSkipReason::ZeroNorm),
+            "small_b must not be skipped as ZeroNorm"
+        );
+        assert!(
+            plan.edges
+                .iter()
+                .any(|edge| edge.family == SimilarityFamily::Semantic),
+            "expected a semantic similarity edge between the two small-norm nodes"
+        );
     }
 
     #[test]
