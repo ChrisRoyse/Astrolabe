@@ -10,9 +10,9 @@
     },
     {
       "file": "crates/astrolabe-ingest/src/registry.rs",
-      "function": "apply_one",
+      "function": "apply_prepared_batch",
       "method": "write_cf_batch_with_ledger_entry",
-      "payload_contract": "project and commit are digested; payload carries series_id, cx_id, version count, and changed-row counts only",
+      "payload_contract": "single group-commit ledger entry (commit 81ea730 coalesced the former per-item apply_one path); SeriesRegistryBatchLedgerPayload carries only counts (input_count, versions_added, splits_written, changed_rows) plus a blake3 batch_digest over the applied (series_id, cx_id, version_count, commit) tuples in canonical sorted order; no raw symbols or source text",
       "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land"
     },
     {
