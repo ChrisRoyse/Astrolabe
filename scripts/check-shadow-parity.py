@@ -409,6 +409,40 @@ def search_result_name(row):
     return row.get("name")
 
 
+def inject_vault_fault(vault_dir, tmp):
+    """Perturb one node-map row inside the REAL durable shadow vault (#19).
+
+    Runs the perturb_vault_and_lower example, which rewrites the persisted row
+    through the normal ledger-paired batch path and re-lowers the perturbed
+    vault. Returns (fault_payload, perturbed_lowered_db_path).
+    """
+    output = tmp / "vault-fault-lowered.db"
+    proc = run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "astrolabe-lower",
+            "--example",
+            "perturb_vault_and_lower",
+            "--",
+            vault_dir,
+            SHADOW_VAULT_ID,
+            f"astrolabe-shadow-v1:{PROJECT}",
+            PROJECT,
+            output,
+        ],
+        timeout=900,
+    )
+    payload = json.loads(proc.stdout)
+    if payload.get("schema") != "astrolabe-vault-fault-example-v1":
+        raise SystemExit(f"vault fault example schema drift: {payload}")
+    if not output.exists():
+        raise SystemExit(f"vault fault example did not produce {output}")
+    return payload, output
+
+
 def inject_sqlite_fault(path):
     connection = sqlite3.connect(path)
     try:
@@ -669,6 +703,12 @@ def main():
     parser.add_argument("--write-release-artifact", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--inject-fault", action="store_true")
+    parser.add_argument(
+        "--inject-vault-fault",
+        action="store_true",
+        help="perturb one node property in the REAL durable shadow vault and "
+        "require the parity comparison to fail naming the exact QN and field",
+    )
     parser.add_argument("--expect-failure", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     args = parser.parse_args()
@@ -777,6 +817,42 @@ def main():
         if deep["sqlite_edge_rows"] <= 0 or deep["sqlite_edge_rows"] > second_grounding["sqlite_edges"]:
             unwhitelisted.append({"kind": "deep_verify", "field": "sqlite_edge_rows"})
 
+        vault_fault = None
+        if args.inject_vault_fault:
+            # Perturb the REAL durable shadow vault only after the clean state
+            # fully verified above, then require the lowered-vs-native node
+            # comparison to fail naming the exact QN and field.
+            fault_payload, fault_lowered = inject_vault_fault(vault_dir, tmp)
+            fault_divergences = []
+            compare_nodes(native_db, fault_lowered, fault_divergences)
+            named = [
+                div
+                for div in fault_divergences
+                if div.get("kind") == "node_field"
+                and div.get("qn") == fault_payload["qualified_name"]
+                and div.get("field") == fault_payload["field"]
+            ]
+            if not named:
+                raise SystemExit(
+                    "vault-fault injection was NOT detected: perturbed "
+                    f"qn={fault_payload['qualified_name']} "
+                    f"field={fault_payload['field']} but node comparison "
+                    f"reported only: {json.dumps(fault_divergences, sort_keys=True)}"
+                )
+            vault_fault = {
+                "qn": fault_payload["qualified_name"],
+                "field": fault_payload["field"],
+                "detected": True,
+                "divergences": named,
+            }
+            unwhitelisted.append(
+                {
+                    "kind": "vault_fault",
+                    "qn": fault_payload["qualified_name"],
+                    "field": fault_payload["field"],
+                }
+            )
+
         status = "verified" if not unwhitelisted else "failed"
         dashboard = {
             "schema": "astrolabe-shadow-parity-dashboard-v1",
@@ -788,6 +864,7 @@ def main():
             "divergences": divergences,
             "unwhitelisted": unwhitelisted,
             "injected_fault_qn": injected_qn,
+            "injected_vault_fault": vault_fault,
             "idempotency": {"first": first_idem, "second": second_idem},
             "lowered_sqlite": {
                 "first": first_lowered,

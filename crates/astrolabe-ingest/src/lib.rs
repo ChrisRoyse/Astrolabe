@@ -27,11 +27,12 @@ pub use sqlite_import::{
     ASTRO_LEGACY_CBM_EDGE_ROWS, ASTRO_MISSING_CBM_PROJECT_ROW, ASTRO_QUANTIZATION_GATE_INVALID,
     CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
     CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
-    QuantizationGateConfig, QuantizationGateMeasurement, QuantizationGatePolicyReport,
-    QuantizationSlotDecision, SqliteImportDeepVerifyCounts, SqliteImportOptions,
-    SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
+    InjectedNodeFault, QuantizationGateConfig, QuantizationGateMeasurement,
+    QuantizationGatePolicyReport, QuantizationSlotDecision, SqliteImportDeepVerifyCounts,
+    SqliteImportOptions, SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
     erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
-    import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, read_cbm_graph_snapshot,
+    import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault,
+    inject_node_property_fault, read_cbm_graph_snapshot,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

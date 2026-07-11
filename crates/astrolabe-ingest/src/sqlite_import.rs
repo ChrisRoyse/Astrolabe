@@ -3307,6 +3307,81 @@ where
     })
 }
 
+/// Report of a deliberately injected node-property fault (#19 L2 parity harness).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InjectedNodeFault {
+    /// Qualified name of the perturbed node.
+    pub qualified_name: String,
+    /// Node field that was perturbed (always `properties`).
+    pub field: String,
+    /// The sentinel properties JSON now persisted in the vault.
+    pub properties_json: String,
+}
+
+/// Deliberately perturbs one persisted node-map row's properties in the vault.
+///
+/// Exists solely for the L2 shadow-parity harness (#19): it proves the parity
+/// gate bites on real vault-state divergence — not just on SQLite-side
+/// perturbation — by rewriting the lowest-qualified-name node-map row for
+/// `project` with a sentinel properties object, committed through the normal
+/// ledger-paired batch path so the chain stays intact while the graph content
+/// diverges. Returns the exact QN/field so the harness can assert its failure
+/// names them. Never call this outside a fault-injection gate.
+pub fn inject_node_property_fault<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> IngestResult<InjectedNodeFault>
+where
+    C: Clock,
+{
+    const FAULT_PROPERTIES: &str = "{\"astrolabe_vault_fault\":true}";
+    const FAULT_ACTOR: &str = "astrolabe-parity-fault";
+    let snapshot = vault.latest_seq();
+    let rows = vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(NODE_MAP_PREFIX),
+    )?;
+    let mut selected: Option<(Vec<u8>, NodeMapRow)> = None;
+    for (key, value) in rows {
+        let row: NodeMapRow = decode_graph_row(&key, &value)?;
+        if row.project != project || row.schema != SCHEMA_NODE_MAP {
+            continue;
+        }
+        if selected
+            .as_ref()
+            .is_none_or(|(_, current)| row.qualified_name < current.qualified_name)
+        {
+            selected = Some((key, row));
+        }
+    }
+    let Some((key, mut row)) = selected else {
+        return Err(IngestError::InvalidInput(format!(
+            "no node-map rows found for project {project}; import before injecting a fault"
+        )));
+    };
+    row.properties_json = Some(FAULT_PROPERTIES.to_string());
+    let value = serde_json::to_vec(&row)?;
+    let payload = serde_json::to_vec(&json!({
+        "schema": "astrolabe-parity-fault-v1",
+        "project": project,
+        "qualified_name": row.qualified_name,
+        "field": "properties",
+    }))?;
+    vault.write_cf_batch_with_ledger_entry(
+        [(ColumnFamily::Graph, key, value)],
+        EntryKind::Admin,
+        SubjectId::Query(FAULT_ACTOR.as_bytes().to_vec()),
+        payload,
+        ActorId::Service(FAULT_ACTOR.to_string()),
+    )?;
+    Ok(InjectedNodeFault {
+        qualified_name: row.qualified_name,
+        field: "properties".to_string(),
+        properties_json: FAULT_PROPERTIES.to_string(),
+    })
+}
+
 fn read_graph_rows<C, T>(
     vault: &AsterVault<C>,
     snapshot: Seq,
@@ -4399,6 +4474,55 @@ mod tests {
         assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
         let err = crate::verify_deep(&vault).expect_err("deep verify refuses legacy node map");
         assert_eq!(err.code(), Some(ASTRO_SERIES_ID_V1_REBUILD_REQUIRED));
+    }
+
+    #[test]
+    fn fsv_injected_node_fault_perturbs_persisted_row_with_intact_chain() {
+        let path = temp_db("vault-fault");
+        basic_fixture(&path);
+        let source_vault = vault();
+        import_sqlite_to_vault(&path, &source_vault, &FixtureSlotRuntime, &options(1))
+            .expect("import sqlite");
+
+        let before =
+            read_cbm_graph_snapshot(&source_vault, "demo").expect("snapshot before fault");
+        let fault =
+            inject_node_property_fault(&source_vault, "demo").expect("inject vault fault");
+        assert_eq!(fault.field, "properties");
+
+        // FSV: the perturbed properties are read back from the persisted
+        // node-map row via the same snapshot path lowering uses — not echoed
+        // from the injection call.
+        let after = read_cbm_graph_snapshot(&source_vault, "demo").expect("snapshot after fault");
+        let perturbed = after
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == fault.qualified_name)
+            .expect("perturbed node present in snapshot");
+        assert_eq!(perturbed.properties_json, fault.properties_json);
+        let original = before
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == fault.qualified_name)
+            .expect("node present before fault");
+        assert_ne!(
+            original.properties_json, perturbed.properties_json,
+            "fault must actually change the persisted properties"
+        );
+
+        // The fault commits through the ledger-paired batch path, so the chain
+        // stays intact while the graph content diverges — exactly the class of
+        // semantic corruption only the parity gate can catch.
+        let chain = crate::verify_chain(&source_vault).expect("verify chain after fault");
+        assert_eq!(chain.status, "intact");
+
+        // A vault without the project refuses fail-closed.
+        let empty = vault();
+        let err = inject_node_property_fault(&empty, "demo")
+            .expect_err("empty vault must refuse fault injection");
+        assert!(err.to_string().contains("no node-map rows"), "{err}");
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]
