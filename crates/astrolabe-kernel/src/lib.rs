@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
@@ -358,6 +359,12 @@ pub struct BridgeReport {
     pub scope_b: String,
     pub cache_key: String,
     pub bridges: Vec<BridgeResult>,
+    /// Count of conflicting duplicate `symbol_id` rows dropped while canonicalizing
+    /// the two scopes (a scope row that disagreed with the retained row on
+    /// qualified name, kernel weight, or provenance). Exact-duplicate collapses are
+    /// not counted. Non-zero means the source scopes carried contradictory rows for
+    /// the same symbol; the retained rows are the deterministic sorted-first choice.
+    pub conflicting_duplicate_symbols: usize,
     pub freshness: &'static str,
     pub trust: &'static str,
 }
@@ -381,8 +388,8 @@ pub struct BridgeProvenancePair {
 }
 
 pub fn bridge_symbols(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) -> BridgeReport {
-    let left_symbols = canonical_symbol_map(scope_a);
-    let right_symbols = canonical_symbol_map(scope_b);
+    let (left_symbols, left_dropped) = canonical_symbol_map(scope_a);
+    let (right_symbols, right_dropped) = canonical_symbol_map(scope_b);
     let trust = bridge_trust(scope_a, scope_b);
     let mut bridges = left_symbols
         .iter()
@@ -416,6 +423,7 @@ pub fn bridge_symbols(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) 
         scope_b: scope_b.scope_id.clone(),
         cache_key: bridge_cache_key(scope_a, scope_b),
         bridges,
+        conflicting_duplicate_symbols: left_dropped + right_dropped,
         freshness: "fresh",
         trust,
     }
@@ -447,6 +455,9 @@ pub fn bridge_report_artifact_bytes(report: &BridgeReport) -> Vec<u8> {
     out.push('\n');
     out.push_str("trust=");
     out.push_str(report.trust);
+    out.push('\n');
+    out.push_str("conflicting_duplicate_symbols=");
+    out.push_str(&report.conflicting_duplicate_symbols.to_string());
     out.push('\n');
     for bridge in &report.bridges {
         out.push_str("bridge\t");
@@ -653,7 +664,20 @@ pub fn diff_declared_bridge_boundaries(
     }
 }
 
-fn canonical_symbol_map(scope: &BridgeScopeKernel) -> BTreeMap<String, BridgeKernelSymbol> {
+/// Collapses a scope's symbols to one canonical row per `symbol_id`, keeping the
+/// deterministic sorted-first row (smallest `qualified_name`, then
+/// `provenance_ref`), and returns how many *conflicting* duplicate rows were
+/// dropped.
+///
+/// A second row for a `symbol_id` that is byte-identical to the retained row is a
+/// harmless collapse. A second row that disagrees on `qualified_name`,
+/// `kernel_weight`, or `provenance_ref` is a real loss of information — exactly the
+/// silent drop the doctrine forbids — so it is counted and surfaced on the
+/// [`BridgeReport`]. The retained row (and therefore the bridge output and cache
+/// key) is unchanged; only the previously-unrecorded conflict count is new.
+fn canonical_symbol_map(
+    scope: &BridgeScopeKernel,
+) -> (BTreeMap<String, BridgeKernelSymbol>, usize) {
     let mut symbols = scope.symbols.clone();
     symbols.sort_by(|left, right| {
         left.symbol_id
@@ -661,11 +685,21 @@ fn canonical_symbol_map(scope: &BridgeScopeKernel) -> BTreeMap<String, BridgeKer
             .then_with(|| left.qualified_name.cmp(&right.qualified_name))
             .then_with(|| left.provenance_ref.cmp(&right.provenance_ref))
     });
-    let mut map = BTreeMap::new();
+    let mut map: BTreeMap<String, BridgeKernelSymbol> = BTreeMap::new();
+    let mut conflicting_dropped = 0usize;
     for symbol in symbols {
-        map.entry(symbol.symbol_id.clone()).or_insert(symbol);
+        match map.entry(symbol.symbol_id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(symbol);
+            }
+            Entry::Occupied(retained) => {
+                if retained.get() != &symbol {
+                    conflicting_dropped += 1;
+                }
+            }
+        }
     }
-    map
+    (map, conflicting_dropped)
 }
 
 fn symbol_id_set(scope: &BridgeScopeKernel) -> BTreeSet<String> {
@@ -685,7 +719,7 @@ fn bridge_trust(scope_a: &BridgeScopeKernel, scope_b: &BridgeScopeKernel) -> &'s
 }
 
 fn bridge_scope_hash(scope: &BridgeScopeKernel) -> String {
-    let symbols = canonical_symbol_map(scope);
+    let (symbols, _conflicting_dropped) = canonical_symbol_map(scope);
     let mut canonical = String::new();
     canonical.push_str(&scope.scope_id);
     canonical.push('\t');
@@ -1848,6 +1882,101 @@ mod tests {
         assert_eq!(report.bridges[1].combined_kernel_weight, 90);
         assert_eq!(report.bridges[0].provenance.scope_a, "ledger:frontend:2");
         assert_eq!(report.bridges[0].provenance.scope_b, "ledger:backend:5");
+        // The clean fixture carries no duplicate symbol_ids, so nothing is dropped.
+        assert_eq!(report.conflicting_duplicate_symbols, 0);
+    }
+
+    #[test]
+    fn conflicting_duplicate_symbols_are_counted_not_silently_dropped() {
+        // frontend carries three rows for `shared.audit`: the retained canonical
+        // row, an exact duplicate of it (a harmless collapse), and a conflicting
+        // row that disagrees on qualified_name/weight/provenance (a real drop). It
+        // also carries an exact-duplicate pair for `frontend.only`. Only the two
+        // conflicting rows must be counted.
+        let frontend = BridgeScopeKernel::new(
+            "frontend",
+            "app-vault",
+            "frontend-dirty-v1",
+            true,
+            vec![
+                BridgeKernelSymbol::new(
+                    "shared.audit",
+                    "demo.shared.audit",
+                    90,
+                    "ledger:frontend:2",
+                ),
+                // Exact duplicate of the retained row -> NOT counted.
+                BridgeKernelSymbol::new(
+                    "shared.audit",
+                    "demo.shared.audit",
+                    90,
+                    "ledger:frontend:2",
+                ),
+                // Conflicting row (weight + provenance + qn differ) -> counted.
+                BridgeKernelSymbol::new(
+                    "shared.audit",
+                    "demo.shared.audit.shadow",
+                    55,
+                    "ledger:frontend:9",
+                ),
+                BridgeKernelSymbol::new(
+                    "frontend.only",
+                    "demo.frontend.only",
+                    10,
+                    "ledger:frontend:1",
+                ),
+                // Exact duplicate -> NOT counted.
+                BridgeKernelSymbol::new(
+                    "frontend.only",
+                    "demo.frontend.only",
+                    10,
+                    "ledger:frontend:1",
+                ),
+                // A second conflicting row for frontend.only -> counted.
+                BridgeKernelSymbol::new(
+                    "frontend.only",
+                    "demo.frontend.only",
+                    11,
+                    "ledger:frontend:1",
+                ),
+            ],
+        );
+        let backend = BridgeScopeKernel::new(
+            "backend",
+            "app-vault",
+            "backend-dirty-v1",
+            true,
+            vec![BridgeKernelSymbol::new(
+                "shared.audit",
+                "demo.shared.audit",
+                100,
+                "ledger:backend:5",
+            )],
+        );
+
+        let report = bridge_symbols(&frontend, &backend);
+
+        // Two conflicting drops (one per symbol_id); the two exact duplicates are
+        // collapsed without being counted.
+        assert_eq!(report.conflicting_duplicate_symbols, 2);
+
+        // The retained row is the deterministic sorted-first choice, so the bridge
+        // reflects qn `demo.shared.audit` at weight 90, not the shadow row.
+        assert_eq!(report.bridges.len(), 1);
+        let bridge = &report.bridges[0];
+        assert_eq!(bridge.symbol_id, "shared.audit");
+        assert_eq!(bridge.qualified_name, "demo.shared.audit");
+        assert_eq!(bridge.scope_a_kernel_weight, 90);
+        assert_eq!(bridge.provenance.scope_a, "ledger:frontend:2");
+        assert_eq!(bridge.combined_kernel_weight, 190);
+
+        // The count is persisted in the report artifact bytes (FSV readback).
+        let bytes = bridge_report_artifact_bytes(&report);
+        let text = String::from_utf8(bytes).expect("utf8 bridge artifact");
+        assert!(
+            text.contains("conflicting_duplicate_symbols=2\n"),
+            "artifact must record the dropped-duplicate count: {text}"
+        );
     }
 
     #[test]

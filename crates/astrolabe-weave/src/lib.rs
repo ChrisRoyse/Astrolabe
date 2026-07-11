@@ -1716,11 +1716,7 @@ fn cross_term_operand(
         return Err(CrossTermAbsentReason::MissingSlot { slot });
     };
     match normalized_vector(vector) {
-        Ok(Some(vector)) => Ok(vector),
-        Ok(None) => Err(CrossTermAbsentReason::UnsupportedSlotShape {
-            slot,
-            shape: "empty",
-        }),
+        Ok(vector) => Ok(vector),
         Err(reason) => Err(cross_term_absent_reason(slot, reason)),
     }
 }
@@ -1833,11 +1829,10 @@ fn collect_family_vectors(
             continue;
         };
         match normalized_vector(vector) {
-            Ok(Some(vector)) => out.push(IndexedVector {
+            Ok(vector) => out.push(IndexedVector {
                 qualified_name: node.qualified_name.clone(),
                 vector,
             }),
-            Ok(None) => {}
             Err(reason) => skips.vector_skips.push(SimilarityVectorSkip {
                 family,
                 qualified_name: node.qualified_name.clone(),
@@ -1849,9 +1844,16 @@ fn collect_family_vectors(
     out
 }
 
-fn normalized_vector(
-    vector: &SlotVector,
-) -> Result<Option<NormalizedVector>, SimilarityVectorSkipReason> {
+/// Normalizes one slot vector for similarity/cross-term scoring, or attributes an
+/// explicit [`SimilarityVectorSkipReason`] when it cannot participate.
+///
+/// The result is deliberately `Result<NormalizedVector, _>` with no intermediate
+/// "absent but not an error" state: every non-degenerate Dense/Sparse vector
+/// yields `Ok`, and every other case (invalid schema, zero norm, multi/absent
+/// shape) is a counted `Err`. Keeping this total — rather than an
+/// `Ok(Option<..>)` whose `None` arm one caller silently dropped and another
+/// mapped to a reason — means no caller can lose a vector without recording why.
+fn normalized_vector(vector: &SlotVector) -> Result<NormalizedVector, SimilarityVectorSkipReason> {
     if let Err(error) = vector.validate_schema() {
         return Err(SimilarityVectorSkipReason::InvalidSchema {
             message: error.to_string(),
@@ -1864,11 +1866,11 @@ fn normalized_vector(
             if zero_norm(norm) {
                 return Err(SimilarityVectorSkipReason::ZeroNorm);
             }
-            Ok(Some(NormalizedVector::Dense {
+            Ok(NormalizedVector::Dense {
                 dim: *dim,
                 data: data.clone(),
                 norm,
-            }))
+            })
         }
         SlotVector::Sparse { dim, entries } => {
             let norm = sparse_norm(entries);
@@ -1877,11 +1879,11 @@ fn normalized_vector(
             }
             let mut entries = entries.clone();
             entries.sort_by_key(|entry| entry.idx);
-            Ok(Some(NormalizedVector::Sparse {
+            Ok(NormalizedVector::Sparse {
                 dim: *dim,
                 entries,
                 norm,
-            }))
+            })
         }
         SlotVector::Multi { .. } => {
             Err(SimilarityVectorSkipReason::UnsupportedSlotShape { shape: "multi" })
@@ -3268,7 +3270,7 @@ mod tests {
         assert!(!zero_norm(above_sq));
         assert!(matches!(
             normalized_vector(&above),
-            Ok(Some(NormalizedVector::Dense { .. }))
+            Ok(NormalizedVector::Dense { .. })
         ));
 
         // Just below the floor: squared norm underflows to subnormal -> zero.
@@ -3314,7 +3316,7 @@ mod tests {
                 dim: 1,
                 data: data.to_vec(),
             }),
-            Ok(Some(NormalizedVector::Dense { .. }))
+            Ok(NormalizedVector::Dense { .. })
         ));
     }
 
