@@ -87,8 +87,14 @@ fn main() {
 fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_stamp: &Path) {
     let make = env::var("MAKE").unwrap_or_else(|_| "make".to_string());
     let mut command = Command::new(&make);
+    // Build libcbm's 150+ translation units in parallel. `NUM_JOBS` is set by
+    // Cargo to the parallelism it chose for this build (a provided measurement,
+    // not a magic constant); mirroring it keeps the C compile within Cargo's job
+    // budget instead of serializing every object. Falls back to 1 if unset.
+    let make_jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string());
     command
         .current_dir(cbm_root)
+        .arg(format!("-j{make_jobs}"))
         .arg("-f")
         .arg(make_path(patched_makefile))
         .arg(format!("BUILD_DIR={}", make_path(build_dir)))
