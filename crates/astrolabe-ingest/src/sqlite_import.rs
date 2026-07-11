@@ -691,13 +691,7 @@ where
 {
     validate_options(options)?;
 
-    let sqlite_bytes = fs::read(sqlite_path.as_ref()).map_err(|error| {
-        invalid_sqlite(format!(
-            "read SQLite input {}: {error}",
-            sqlite_path.as_ref().display()
-        ))
-    })?;
-    let sqlite_fingerprint = sha256_digest(&sqlite_bytes);
+    let sqlite_fingerprint = fingerprint_sqlite_file(sqlite_path.as_ref())?;
     let ledger_rows_before = ledger_row_count(vault)?;
 
     let connection = Connection::open_with_flags(
@@ -3491,8 +3485,11 @@ fn ledger_row_count<C>(vault: &AsterVault<C>) -> IngestResult<usize>
 where
     C: Clock,
 {
+    // Count by scanning keys only. Materializing every Ledger CF value (three times per
+    // import) just to take a length needlessly copied the entire ledger payload set into
+    // memory; the key-only scan keeps the count O(rows) in keys, not values.
     Ok(vault
-        .scan_cf_range_at(
+        .scan_cf_range_keys_at(
             vault.latest_seq(),
             ColumnFamily::Ledger,
             &ledger_range(0, u64::MAX),
@@ -3794,6 +3791,34 @@ fn hex_value(value: u8) -> Option<u8> {
 
 fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Pure I/O read-buffer size for streaming the SQLite fingerprint. This is an
+/// implementation detail of how bytes are fed to SHA-256, not a threshold or measurement:
+/// the fingerprint value is identical for any positive buffer size.
+const FINGERPRINT_CHUNK_BYTES: usize = 1 << 20;
+
+/// Streams the SQLite input through SHA-256 in bounded chunks.
+///
+/// Fingerprinting formerly read the entire dump into memory (`fs::read`), so a multi-GB
+/// dump was held in full alongside the parsed graph. Streaming keeps peak memory bounded
+/// by [`FINGERPRINT_CHUNK_BYTES`] while producing the identical digest.
+fn fingerprint_sqlite_file(path: &Path) -> IngestResult<[u8; 32]> {
+    use std::io::Read;
+    let read_error = |error: std::io::Error| {
+        invalid_sqlite(format!("read SQLite input {}: {error}", path.display()))
+    };
+    let mut file = fs::File::open(path).map_err(&read_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; FINGERPRINT_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(&read_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -5099,6 +5124,46 @@ mod tests {
             );
             assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn streamed_fingerprint_equals_whole_file_sha256_across_chunk_boundaries() {
+        let path = temp_db("fingerprint-stream");
+        // Multi-chunk payload with a partial final chunk to exercise the streaming loop's
+        // chunk boundaries.
+        let len = FINGERPRINT_CHUNK_BYTES * 2 + 12_345;
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            bytes.push(((i * 31 + 7) % 256) as u8);
+        }
+        fs::write(&path, &bytes).expect("write fingerprint fixture");
+
+        let streamed = fingerprint_sqlite_file(&path).expect("stream fingerprint");
+        // The streamed digest must be byte-identical to hashing the whole file at once.
+        assert_eq!(streamed, sha256_digest(&bytes));
+        assert_eq!(
+            streamed,
+            sha256_digest(&fs::read(&path).expect("read back"))
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ledger_row_count_matches_appended_entries() {
+        let vault = vault();
+        assert_eq!(ledger_row_count(&vault).expect("empty ledger count"), 0);
+        for tag in 0..3u8 {
+            vault
+                .append_ledger_entry(
+                    EntryKind::Ingest,
+                    SubjectId::Query(vec![tag]),
+                    b"{}".to_vec(),
+                    ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+                )
+                .expect("append ledger entry");
+        }
+        // The key-only count must equal the number of persisted ledger rows.
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 3);
     }
 
     #[test]
