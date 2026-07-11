@@ -30,7 +30,7 @@ pub use sqlite_import::{
     QuantizationGateConfig, QuantizationGateMeasurement, QuantizationGatePolicyReport,
     QuantizationSlotDecision, SqliteImportDeepVerifyCounts, SqliteImportOptions,
     SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
-    erase_imported_cx_graph_rows, import_cbm_graph_snapshot_to_vault,
+    erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, read_cbm_graph_snapshot,
 };
 

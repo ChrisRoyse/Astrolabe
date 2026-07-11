@@ -74,6 +74,20 @@ const LOWERED_SQLITE_LOCK_SUFFIX: &str = ".astrolabe-lowered.lock";
 const CBM_TEAM_ARTIFACT_DIR: &str = ".codebase-memory";
 const ASTRO_TEAM_ARTIFACT_ERROR: &str = "ASTRO_TEAM_ARTIFACT_ERROR";
 const ASTRO_TEAM_ARTIFACT_NOT_READY: &str = "ASTRO_TEAM_ARTIFACT_NOT_READY";
+// Shadow-import content-freshness refusal codes (#93). Freshness is derived by
+// recomputing the live CBM SQLite fingerprint and comparing it to the watermark
+// persisted at import time — never from artifact/row/file existence. Each code below
+// marks a verify-relevant input that is missing, so freshness cannot be asserted and
+// the surface fails closed rather than reporting current/fresh/verified.
+const ASTRO_SHADOW_SOURCE_MISSING: &str = "ASTRO_SHADOW_SOURCE_MISSING";
+const ASTRO_SHADOW_FINGERPRINT_MISSING: &str = "ASTRO_SHADOW_FINGERPRINT_MISSING";
+const ASTRO_SHADOW_LOWERED_MISSING: &str = "ASTRO_SHADOW_LOWERED_MISSING";
+const ASTRO_SHADOW_VERIFY_NOT_INTACT: &str = "ASTRO_SHADOW_VERIFY_NOT_INTACT";
+const SHADOW_SOURCE_MISSING_REMEDIATION: &str = "run index_repository with calyx=\"shadow\" to build the CBM SQLite source and shadow vault before reading shadow freshness";
+const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow import watermark is recorded; run index_repository with calyx=\"shadow\" so the vault_fingerprint content watermark is persisted";
+const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) to rebuild it";
+const SHADOW_VERIFY_NOT_INTACT_REMEDIATION: &str = "the vault ledger chain does not verify intact; quarantine the vault and rerun index_repository with calyx=\"shadow\" to rebuild from current source";
+const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) so the vault and lowered artifact are rebuilt from current source";
 const LOWERED_SQLITE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOWERED_SQLITE_LOCK_POLL: Duration = Duration::from_millis(25);
 const BRIDGE_COLLECTION_SCHEMA: &str = "astrolabe.bridge_collection.v1";
@@ -1424,26 +1438,129 @@ fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
     }
 }
 
-fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    if !sqlite_path(&cache_dir, project).exists() {
-        return Ok(ShadowRefreshStatus::Current);
+/// Content-verified freshness verdict for a persisted shadow import (#93).
+///
+/// Freshness is derived by recomputing the live CBM SQLite fingerprint and comparing
+/// it to the `vault_fingerprint` watermark persisted at import time — never from mere
+/// artifact/row/file existence (an emptied vault still verifies intact-with-0-rows, and
+/// a stale watermark still "exists"). Every path that cannot prove a byte-for-byte
+/// content match fails closed as [`ShadowContentVerdict::Unverifiable`] rather than
+/// reporting current/fresh/verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShadowContentVerdict {
+    /// The live CBM SQLite fingerprint equals the persisted watermark and the derived
+    /// artifacts (lowered SQLite + intact vault chain) are present.
+    Fresh,
+    /// The live CBM SQLite fingerprint differs from the persisted watermark: the source
+    /// mutated out of band since the last shadow import.
+    Stale { expected: String, actual: String },
+    /// A verify-relevant input is missing, so freshness cannot be asserted from content.
+    Unverifiable {
+        code: &'static str,
+        message: String,
+        remediation: &'static str,
+        /// True only when the CBM SQLite source itself is absent, so no re-import is
+        /// possible and the refresh trigger has nothing to act on.
+        source_missing: bool,
+    },
+}
+
+/// Evaluates shadow-import freshness against the live CBM SQLite by content, not
+/// existence (#93): recompute the source fingerprint and compare it to the watermark
+/// persisted at import time. Any missing verify-relevant input fails closed.
+fn evaluate_shadow_content_freshness(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<ShadowContentVerdict, DynError> {
+    let source_path = sqlite_path(cache_dir, project);
+    if !source_path.exists() {
+        return Ok(ShadowContentVerdict::Unverifiable {
+            code: ASTRO_SHADOW_SOURCE_MISSING,
+            message: format!(
+                "{ASTRO_SHADOW_SOURCE_MISSING}: CBM SQLite source {} is missing; shadow freshness cannot be verified against content",
+                source_path.display()
+            ),
+            remediation: SHADOW_SOURCE_MISSING_REMEDIATION,
+            source_missing: true,
+        });
     }
 
-    let fingerprint = read_config_value(&cache_dir, &metadata_key(project, "vault_fingerprint"))?;
-    let configured_vault_dir = read_config_value(&cache_dir, &metadata_key(project, "vault_dir"))?
-        .map(PathBuf::from)
-        .unwrap_or_else(|| vault_dir(&cache_dir, project));
+    let Some(expected) = read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?
+    else {
+        return Ok(ShadowContentVerdict::Unverifiable {
+            code: ASTRO_SHADOW_FINGERPRINT_MISSING,
+            message: format!(
+                "{ASTRO_SHADOW_FINGERPRINT_MISSING}: no persisted vault_fingerprint watermark for project {project:?}; a prior shadow import never recorded one"
+            ),
+            remediation: SHADOW_FINGERPRINT_MISSING_REMEDIATION,
+            source_missing: false,
+        });
+    };
+
     let configured_lowered_path =
-        read_config_value(&cache_dir, &metadata_key(project, "lowered_sqlite_path"))?
+        read_config_value(cache_dir, &metadata_key(project, "lowered_sqlite_path"))?
             .map(PathBuf::from)
-            .unwrap_or_else(|| lowered_sqlite_path(&cache_dir, project));
+            .unwrap_or_else(|| lowered_sqlite_path(cache_dir, project));
+    if !configured_lowered_path.exists() {
+        return Ok(ShadowContentVerdict::Unverifiable {
+            code: ASTRO_SHADOW_LOWERED_MISSING,
+            message: format!(
+                "{ASTRO_SHADOW_LOWERED_MISSING}: lowered artifact {} is missing; the shadow surface cannot be served",
+                configured_lowered_path.display()
+            ),
+            remediation: SHADOW_LOWERED_MISSING_REMEDIATION,
+            source_missing: false,
+        });
+    }
+
+    let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
     let verify_intact = configured_vault_dir.exists()
         && astrolabe_ingest::verify_chain_vault_path(&configured_vault_dir)
             .map(|report| report.is_intact())
             .unwrap_or(false);
-    if fingerprint.is_some() && verify_intact && configured_lowered_path.exists() {
-        return Ok(ShadowRefreshStatus::Current);
+    if !verify_intact {
+        return Ok(ShadowContentVerdict::Unverifiable {
+            code: ASTRO_SHADOW_VERIFY_NOT_INTACT,
+            message: format!(
+                "{ASTRO_SHADOW_VERIFY_NOT_INTACT}: vault ledger chain for project {project:?} does not verify intact"
+            ),
+            remediation: SHADOW_VERIFY_NOT_INTACT_REMEDIATION,
+            source_missing: false,
+        });
+    }
+
+    // Content gate: recompute the live CBM SQLite fingerprint and compare it to the
+    // watermark persisted at import time. Existence of the artifacts above is necessary
+    // but never sufficient — only a byte-for-byte fingerprint match proves freshness.
+    let actual = astrolabe_ingest::fingerprint_sqlite_hex(&source_path)?;
+    if actual == expected {
+        Ok(ShadowContentVerdict::Fresh)
+    } else {
+        Ok(ShadowContentVerdict::Stale { expected, actual })
+    }
+}
+
+fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    match evaluate_shadow_content_freshness(&cache_dir, project)? {
+        // Live source fingerprint matches the persisted watermark: nothing to refresh.
+        ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
+        // No CBM source present, so no re-import is possible. This is not a freshness
+        // claim — the status summary labels this state unverified/fail-closed; the
+        // refresh trigger simply has no source to act on.
+        ShadowContentVerdict::Unverifiable {
+            source_missing: true,
+            ..
+        } => return Ok(ShadowRefreshStatus::Current),
+        // Stale content, or a missing/broken derived artifact with a live source:
+        // fall through and re-import to reconcile against the current source.
+        ShadowContentVerdict::Stale { .. }
+        | ShadowContentVerdict::Unverifiable {
+            source_missing: false,
+            ..
+        } => {}
     }
 
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, project)? else {
@@ -1483,18 +1600,43 @@ fn shadow_import_busy_summary_at(cache_dir: &Path, project: &str) -> Value {
     })
 }
 
-fn shadow_import_current_summary(verify_status: &str, lowered_exists: bool) -> Value {
-    let current = verify_status == "intact" && lowered_exists;
-    json!({
-        "status": if current { "current" } else { "unverified" },
-        "freshness": if current { "fresh" } else { "stale_or_missing" },
-        "trust": if current { "verified" } else { "provisional" },
-        "remediation": if current {
-            Value::Null
-        } else {
-            Value::String("run index_repository with calyx shadow or retry index_status after shadow import completes".to_string())
-        },
-    })
+fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> Value {
+    // The label is derived from a content verdict (#93): `current/fresh/verified` is
+    // emitted only when the live CBM SQLite fingerprint matches the persisted watermark.
+    // Mismatch is reported stale; any missing verify-relevant input fails closed as
+    // unverified — never fresh/verified from mere artifact existence.
+    match verdict {
+        ShadowContentVerdict::Fresh => json!({
+            "status": "current",
+            "freshness": "fresh",
+            "trust": "verified",
+            "verification": "content_fingerprint_match",
+            "remediation": Value::Null,
+        }),
+        ShadowContentVerdict::Stale { expected, actual } => json!({
+            "status": "stale",
+            "freshness": "stale",
+            "trust": "provisional",
+            "verification": "content_fingerprint_mismatch",
+            "expected_vault_fingerprint": expected,
+            "actual_vault_fingerprint": actual,
+            "remediation": SHADOW_STALE_REMEDIATION,
+        }),
+        ShadowContentVerdict::Unverifiable {
+            code,
+            message,
+            remediation,
+            ..
+        } => json!({
+            "status": "unverified",
+            "freshness": "stale_or_missing",
+            "trust": "provisional",
+            "verification": "content_unverifiable",
+            "code": code,
+            "message": message,
+            "remediation": remediation,
+        }),
+    }
 }
 
 fn shadow_import_lock_path(cache_dir: &Path, project: &str) -> PathBuf {
@@ -4767,6 +4909,11 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
     let ledger_rows = read_config_value(cache_dir, &metadata_key(project, "ledger_rows"))?
         .and_then(|value| value.parse::<u64>().ok());
     let lowered_exists = lowered_path.exists();
+    // Content-verified shadow freshness (#93): recomputes the live CBM SQLite
+    // fingerprint and compares it to the persisted watermark rather than trusting
+    // artifact existence. (`verify_status`/`lowered_exists` above remain the raw
+    // structural inputs the health surface reports.)
+    let content_verdict = evaluate_shadow_content_freshness(cache_dir, project)?;
     let background_lane = background_lane_status_at(cache_dir, project)?;
     let periodic_verify = periodic_verify_status_at(cache_dir, project)?;
     let health = health_surface_json(
@@ -4784,7 +4931,7 @@ fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, Dy
         "vault_fingerprint": fingerprint,
         "vault_ledger_head": ledger_seq,
         "panel_version": panel_version,
-        "shadow_import": shadow_import_current_summary(&verify_status, lowered_exists),
+        "shadow_import": shadow_import_current_summary(&content_verdict),
         "background_lane": background_lane,
         "periodic_verify": periodic_verify,
         "health": health,
@@ -9910,22 +10057,205 @@ mod tests {
     }
 
     #[test]
-    fn shadow_import_status_labels_unverified_state() {
-        let current = shadow_import_current_summary("intact", true);
+    fn shadow_import_status_labels_from_content_verdict() {
+        // Fresh (live fingerprint == persisted watermark) is the only verdict that
+        // labels current/fresh/verified (#93).
+        let current = shadow_import_current_summary(&ShadowContentVerdict::Fresh);
         assert_eq!(current["status"], "current");
+        assert_eq!(current["freshness"], "fresh");
         assert_eq!(current["trust"], "verified");
+        assert_eq!(current["verification"], "content_fingerprint_match");
         assert!(current["remediation"].is_null());
 
-        let unverified = shadow_import_current_summary("missing", false);
-        assert_eq!(unverified["status"], "unverified");
-        assert_eq!(unverified["freshness"], "stale_or_missing");
-        assert_eq!(unverified["trust"], "provisional");
-        assert!(
-            unverified["remediation"]
-                .as_str()
-                .unwrap()
-                .contains("retry index_status")
+        // A content mismatch is reported stale, not verified, and carries both
+        // fingerprints so the drift is observable.
+        let stale = shadow_import_current_summary(&ShadowContentVerdict::Stale {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        });
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["freshness"], "stale");
+        assert_eq!(stale["trust"], "provisional");
+        assert_eq!(stale["verification"], "content_fingerprint_mismatch");
+        assert_eq!(stale["expected_vault_fingerprint"], "aa".repeat(32));
+        assert_eq!(stale["actual_vault_fingerprint"], "bb".repeat(32));
+
+        // A missing verify-relevant input fails closed: unverified with a machine
+        // code + remediation, never fresh/verified.
+        let unverifiable = shadow_import_current_summary(&ShadowContentVerdict::Unverifiable {
+            code: ASTRO_SHADOW_FINGERPRINT_MISSING,
+            message: format!("{ASTRO_SHADOW_FINGERPRINT_MISSING}: no watermark"),
+            remediation: SHADOW_FINGERPRINT_MISSING_REMEDIATION,
+            source_missing: false,
+        });
+        assert_eq!(unverifiable["status"], "unverified");
+        assert_eq!(unverifiable["freshness"], "stale_or_missing");
+        assert_eq!(unverifiable["trust"], "provisional");
+        assert_eq!(unverifiable["verification"], "content_unverifiable");
+        assert_eq!(unverifiable["code"], ASTRO_SHADOW_FINGERPRINT_MISSING);
+        assert!(!unverifiable["remediation"].as_str().unwrap().is_empty());
+    }
+
+    /// Builds a physical shadow-import fixture under `dir`: an empty (intact) vault, a
+    /// lowered sidecar, a real CBM SQLite source file, and persisted metadata whose
+    /// `vault_fingerprint` watermark is the content fingerprint of that source.
+    fn seed_shadow_content_fixture(dir: &Path, source_bytes: &[u8]) -> String {
+        let vault_dir = dir.join("demo.astrolabe-vault");
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            b"shadow-content-fixture".to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        drop(vault);
+        let lowered_path = dir.join("demo.astrolabe-lowered.db");
+        fs::write(&lowered_path, b"lowered sidecar exists").unwrap();
+        let source_path = sqlite_path(dir, "demo");
+        fs::write(&source_path, source_bytes).unwrap();
+        let fingerprint = astrolabe_ingest::fingerprint_sqlite_hex(&source_path).unwrap();
+
+        let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+        let mut outcome = sample_shadow_outcome(dir, security);
+        outcome.vault_dir = vault_dir;
+        outcome.lowered_sqlite_path = lowered_path;
+        outcome.sqlite_path = source_path;
+        // The watermark persisted at import time is the source content fingerprint.
+        outcome.sqlite_fingerprint_sha256 = fingerprint.clone();
+        outcome.ledger_seq = 0;
+        outcome.ledger_rows_after = 0;
+        outcome.verify_chain_status = "intact".to_string();
+        persist_shadow_outcome_at(dir, "demo", &outcome).unwrap();
+        fingerprint
+    }
+
+    #[test]
+    fn shadow_content_freshness_fresh_only_on_matching_fingerprint() {
+        let dir = temp_dir("shadow-freshness-fresh");
+        let fingerprint = seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+        let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+        assert_eq!(verdict, ShadowContentVerdict::Fresh);
+
+        // FSV: the persisted watermark read back from the config store equals the
+        // recomputed live source fingerprint.
+        let persisted =
+            read_config_value(&dir, &metadata_key("demo", "vault_fingerprint")).unwrap();
+        assert_eq!(persisted.as_deref(), Some(fingerprint.as_str()));
+
+        // The full status surface labels it current/fresh/verified.
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["shadow_import"]["status"], "current");
+        assert_eq!(summary["shadow_import"]["trust"], "verified");
+        assert_eq!(summary["shadow_import"]["freshness"], "fresh");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_content_freshness_stale_on_out_of_band_source_mutation() {
+        let dir = temp_dir("shadow-freshness-stale");
+        let watermark = seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+        // Out-of-band mutation of the CBM SQLite (e.g. a legacy detect_changes reindex)
+        // changes the content while every artifact still EXISTS and the vault still
+        // verifies intact. Existence-only logic would keep labeling this current.
+        let source_path = sqlite_path(&dir, "demo");
+        fs::write(&source_path, b"cbm sqlite content v2 mutated").unwrap();
+        let live = astrolabe_ingest::fingerprint_sqlite_hex(&source_path).unwrap();
+        assert_ne!(watermark, live);
+
+        let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+        assert_eq!(
+            verdict,
+            ShadowContentVerdict::Stale {
+                expected: watermark,
+                actual: live,
+            }
         );
+
+        // The status surface reports stale/provisional, never current/verified.
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["shadow_import"]["status"], "stale");
+        assert_eq!(summary["shadow_import"]["trust"], "provisional");
+        assert_eq!(summary["shadow_import"]["freshness"], "stale");
+        assert_eq!(
+            summary["shadow_import"]["verification"],
+            "content_fingerprint_mismatch"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_content_freshness_fails_closed_when_watermark_missing() {
+        let dir = temp_dir("shadow-freshness-no-watermark");
+        seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+        // Verify-relevant content is present, but the freshness watermark itself is
+        // absent: freshness cannot be asserted, so it must fail closed rather than
+        // report current from artifact existence.
+        let mut conn = open_config(&dir).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "DELETE FROM config WHERE key = ?",
+            params![metadata_key("demo", "vault_fingerprint")],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+        match verdict {
+            ShadowContentVerdict::Unverifiable {
+                code,
+                source_missing,
+                ..
+            } => {
+                assert_eq!(code, ASTRO_SHADOW_FINGERPRINT_MISSING);
+                assert!(!source_missing);
+            }
+            other => panic!("expected fingerprint-missing unverifiable, got {other:?}"),
+        }
+
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["shadow_import"]["status"], "unverified");
+        assert_eq!(
+            summary["shadow_import"]["code"],
+            ASTRO_SHADOW_FINGERPRINT_MISSING
+        );
+        assert_ne!(summary["shadow_import"]["trust"], "verified");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shadow_content_freshness_fails_closed_when_source_missing() {
+        let dir = temp_dir("shadow-freshness-no-source");
+        seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+        // The CBM SQLite source vanished out of band while the vault, lowered artifact,
+        // and watermark all still exist. Freshness must fail closed as unverified — the
+        // pre-fix code returned Current for a missing source.
+        fs::remove_file(sqlite_path(&dir, "demo")).unwrap();
+
+        let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+        match verdict {
+            ShadowContentVerdict::Unverifiable {
+                code,
+                source_missing,
+                ..
+            } => {
+                assert_eq!(code, ASTRO_SHADOW_SOURCE_MISSING);
+                assert!(source_missing);
+            }
+            other => panic!("expected source-missing unverifiable, got {other:?}"),
+        }
+
+        let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+        assert_eq!(summary["shadow_import"]["status"], "unverified");
+        assert_eq!(
+            summary["shadow_import"]["code"],
+            ASTRO_SHADOW_SOURCE_MISSING
+        );
+        assert_ne!(summary["shadow_import"]["freshness"], "fresh");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
