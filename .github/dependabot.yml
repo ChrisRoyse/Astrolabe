@@ -1,0 +1,14 @@
+# Keeps SHA-pinned GitHub Actions current without reintroducing mutable tags (#120).
+# Actions in .github/workflows are pinned to full commit SHAs (supply-chain hardening);
+# Dependabot proposes SHA bumps here so the pins do not silently rot behind upstream
+# security fixes. It rewrites both the SHA and the trailing `# vN` tag comment.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "area:security"
