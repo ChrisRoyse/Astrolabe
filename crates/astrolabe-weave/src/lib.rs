@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
 
@@ -1883,6 +1883,25 @@ fn normalized_vector(
     }
 }
 
+/// Bounded per-source admission for one similarity family.
+///
+/// `vectors` is sorted ascending by qualified name (see
+/// [`collect_family_vectors`]), so for the pair `(i, j)` with `i < j` the source
+/// is always the lexicographically smaller qualified name. Each source therefore
+/// keeps at most `per_node_cap` outgoing edges, chosen as the highest-weight
+/// targets (ties broken by the smaller target qualified name — the historical
+/// admission-order tie-break).
+///
+/// Rather than buffer every above-threshold candidate and sort the whole set —
+/// O(admissible pairs) ≈ O(n²) [`SimilarityEdge`]s, each owning two cloned
+/// `String`s, which is infeasible on near-duplicate corpora — this streams a
+/// per-source top-`k` [`BinaryHeap`]. Peak intermediate memory is bounded to
+/// `per_node_cap` [`AdmissionCandidate`]s at a time plus the O(n · per_node_cap)
+/// admitted output, independent of how many pairs clear the threshold. The
+/// admitted set and every [`SimilarityPairCounts`] field are byte-for-byte
+/// identical to the former sort-then-cap implementation. (Reducing the O(n²)
+/// cosine *evaluation* count — as opposed to candidate memory — is the ANN/LSH
+/// candidate-generation work tracked in #20.)
 fn plan_family_edges(
     family: SimilarityFamily,
     threshold: f32,
@@ -1890,13 +1909,17 @@ fn plan_family_edges(
     vectors: &[IndexedVector],
 ) -> (Vec<SimilarityEdge>, SimilarityPairCounts) {
     let mut counts = SimilarityPairCounts::default();
-    let mut candidates = Vec::new();
+    let mut admitted = Vec::new();
 
-    for i in 0..vectors.len() {
-        for j in (i + 1)..vectors.len() {
+    for (i, left) in vectors.iter().enumerate() {
+        // Top-`per_node_cap` targets for this source. The heap's max (`peek`) is
+        // the *least preferred* admitted edge (lowest weight, ties broken by the
+        // larger target qualified name) — exactly the edge a better candidate
+        // evicts. `per_node_cap` is validated as non-zero upstream, so once the
+        // heap is full `peek` is always `Some`.
+        let mut top: BinaryHeap<AdmissionCandidate> = BinaryHeap::with_capacity(per_node_cap);
+        for right in vectors.iter().skip(i + 1) {
             counts.candidate_pairs += 1;
-            let left = &vectors[i];
-            let right = &vectors[j];
             let Some(score) = cosine(&left.vector, &right.vector) else {
                 counts.incompatible_shape_pairs += 1;
                 continue;
@@ -1905,40 +1928,81 @@ fn plan_family_edges(
                 counts.below_threshold_pairs += 1;
                 continue;
             }
-            candidates.push(SimilarityEdge {
+            let candidate = AdmissionCandidate {
+                weight: score,
+                target_qn: right.qualified_name.clone(),
+            };
+            if top.len() < per_node_cap {
+                top.push(candidate);
+            } else {
+                // The heap is full: exactly one candidate is dropped this step,
+                // either the incoming one or the evicted worst admitted edge.
+                let outranks_worst = top
+                    .peek()
+                    .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less);
+                if outranks_worst {
+                    top.pop();
+                    top.push(candidate);
+                }
+                counts.cap_dropped_pairs += 1;
+            }
+        }
+
+        for candidate in top.into_vec() {
+            admitted.push(SimilarityEdge {
                 family,
                 source_qn: left.qualified_name.clone(),
-                target_qn: right.qualified_name.clone(),
+                target_qn: candidate.target_qn,
                 slot: family.slot(),
                 graph_edge_kind: family.graph_edge_kind(),
                 metric: SimilarityMetric::Cosine,
-                weight: score,
+                weight: candidate.weight,
                 threshold,
             });
         }
     }
 
-    candidates.sort_by(admission_order);
-    let mut admitted = Vec::new();
-    let mut source_counts = BTreeMap::<String, usize>::new();
-    for edge in candidates {
-        let count = source_counts.entry(edge.source_qn.clone()).or_default();
-        if *count < per_node_cap {
-            *count += 1;
-            admitted.push(edge);
-        } else {
-            counts.cap_dropped_pairs += 1;
-        }
-    }
     counts.admitted_pairs = admitted.len();
     (admitted, counts)
 }
 
-fn admission_order(left: &SimilarityEdge, right: &SimilarityEdge) -> Ordering {
-    left.source_qn
-        .cmp(&right.source_qn)
-        .then_with(|| right.weight.total_cmp(&left.weight))
-        .then_with(|| left.target_qn.cmp(&right.target_qn))
+/// Heap element for the streaming per-source top-`k` admission in
+/// [`plan_family_edges`].
+///
+/// [`Ord`] is defined so a max-heap surfaces the *least preferred* admitted edge:
+/// lowest weight first, and among equal weights the larger target qualified name.
+/// That is the reverse of the admission preference (highest weight, then smaller
+/// target qualified name), so `candidate.cmp(worst) == Ordering::Less` means the
+/// candidate outranks the current worst and should evict it — reproducing the
+/// former "sort by (weight desc, target_qn asc), keep the first `per_node_cap`"
+/// selection without materializing the full candidate list.
+#[derive(Debug)]
+struct AdmissionCandidate {
+    weight: f32,
+    target_qn: String,
+}
+
+impl PartialEq for AdmissionCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for AdmissionCandidate {}
+
+impl PartialOrd for AdmissionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AdmissionCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .weight
+            .total_cmp(&self.weight)
+            .then_with(|| self.target_qn.cmp(&other.target_qn))
+    }
 }
 
 fn stable_edge_order(left: &SimilarityEdge, right: &SimilarityEdge) -> Ordering {
@@ -2838,6 +2902,106 @@ mod tests {
         assert_eq!(counts.below_threshold_pairs, 3);
         assert_eq!(counts.cap_dropped_pairs, 1);
         assert_eq!(counts.admitted_pairs, 2);
+    }
+
+    #[test]
+    fn streaming_top_k_keeps_highest_weight_targets_per_source() {
+        // A hub node "a" (smallest qualified name, hence the source of every one
+        // of its edges) is above threshold with four targets at strictly
+        // distinct cosines; the four leaf nodes have pairwise-disjoint sparse
+        // supports so every non-hub pair scores exactly zero. With per_node_cap
+        // = 2 the streaming heap must retain the two HIGHEST-weight targets and
+        // evict the rest. A bottom-k / broken-eviction rewrite keeps the wrong
+        // targets and fails this test.
+        let mut config = struct_only_config();
+        config.per_node_cap = 2;
+        config.thresholds.sim_struct_min_score = 0.10;
+        let nodes = vec![
+            sparse_node(
+                "a",
+                SimilarityFamily::Struct,
+                8,
+                &[(0, 4.0), (1, 3.0), (2, 2.0), (3, 1.0)],
+            ),
+            sparse_node("b", SimilarityFamily::Struct, 8, &[(0, 1.0)]),
+            sparse_node("c", SimilarityFamily::Struct, 8, &[(1, 1.0)]),
+            sparse_node("d", SimilarityFamily::Struct, 8, &[(2, 1.0)]),
+            sparse_node("e", SimilarityFamily::Struct, 8, &[(3, 1.0)]),
+        ];
+
+        let plan = plan_similarity_edges(&nodes, &config).expect("similarity plan");
+
+        // Only the top two targets by weight survive: a-b (4/sqrt30 ≈ 0.7303)
+        // and a-c (3/sqrt30 ≈ 0.5477). a-d and a-e are cap-dropped.
+        assert_eq!(edge_qns(&plan.edges), vec![("a", "b"), ("a", "c")]);
+        let hub_norm = 30.0_f32.sqrt();
+        assert!((plan.edges[0].weight - 4.0 / hub_norm).abs() <= f32::EPSILON);
+        assert!((plan.edges[1].weight - 3.0 / hub_norm).abs() <= f32::EPSILON);
+        // The retained weights are strictly greater than every evicted one,
+        // proving top-k (not bottom-k) selection.
+        assert!(plan.edges[1].weight > 2.0 / hub_norm);
+
+        let counts = plan
+            .skips
+            .pair_counts
+            .get(&SimilarityFamily::Struct)
+            .expect("struct pair counts");
+        assert_eq!(counts.candidate_pairs, 10); // C(5,2)
+        assert_eq!(counts.below_threshold_pairs, 6); // every disjoint leaf pair
+        assert_eq!(counts.incompatible_shape_pairs, 0);
+        assert_eq!(counts.cap_dropped_pairs, 2); // a-d, a-e
+        assert_eq!(counts.admitted_pairs, 2);
+    }
+
+    #[test]
+    fn near_duplicate_corpus_admits_bounded_tie_broken_neighbors() {
+        // Six identical nodes: every one of the C(6,2)=15 pairs scores exactly
+        // 1.0, the O(n^2) near-duplicate case the buffering fix targets. With
+        // per_node_cap = 2 each source keeps its two smallest-qualified-name
+        // targets (the weight-tie break), giving a closed-form admitted count
+        // and cap-drop count that a mis-bounded planner cannot reproduce.
+        let mut config = struct_only_config();
+        config.per_node_cap = 2;
+        config.thresholds.sim_struct_min_score = 0.50;
+        let entries = &[(0, 1.0), (1, 1.0)];
+        let nodes = vec![
+            sparse_node("n0", SimilarityFamily::Struct, 8, entries),
+            sparse_node("n1", SimilarityFamily::Struct, 8, entries),
+            sparse_node("n2", SimilarityFamily::Struct, 8, entries),
+            sparse_node("n3", SimilarityFamily::Struct, 8, entries),
+            sparse_node("n4", SimilarityFamily::Struct, 8, entries),
+            sparse_node("n5", SimilarityFamily::Struct, 8, entries),
+        ];
+
+        let plan = plan_similarity_edges(&nodes, &config).expect("similarity plan");
+
+        // Source n_i keeps targets n_{i+1..=i+2} (smallest qn first):
+        // n0->n1,n2 · n1->n2,n3 · n2->n3,n4 · n3->n4,n5 · n4->n5. Total 9.
+        assert_eq!(
+            edge_qns(&plan.edges),
+            vec![
+                ("n0", "n1"),
+                ("n0", "n2"),
+                ("n1", "n2"),
+                ("n1", "n3"),
+                ("n2", "n3"),
+                ("n2", "n4"),
+                ("n3", "n4"),
+                ("n3", "n5"),
+                ("n4", "n5"),
+            ]
+        );
+        assert!(plan.edges.iter().all(|edge| edge.weight == 1.0));
+
+        let counts = plan
+            .skips
+            .pair_counts
+            .get(&SimilarityFamily::Struct)
+            .expect("struct pair counts");
+        assert_eq!(counts.candidate_pairs, 15); // C(6,2)
+        assert_eq!(counts.below_threshold_pairs, 0);
+        assert_eq!(counts.admitted_pairs, 9);
+        assert_eq!(counts.cap_dropped_pairs, 6); // 15 above-threshold - 9 admitted
     }
 
     #[test]
