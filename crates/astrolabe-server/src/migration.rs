@@ -8063,6 +8063,16 @@ fn persist_shadow_outcome_at(
         ("vault_id", outcome.vault_id.clone()),
         ("vault_salt", outcome.vault_salt.clone()),
         ("sqlite_path", outcome.sqlite_path.display().to_string()),
+        // Content-freshness watermark (#93/#221): the SHA-256 of the CBM SQLite source
+        // at import time. `evaluate_shadow_content_freshness` reads this exact key with
+        // no fallback and re-fingerprints the live source against it; if the key is
+        // absent it returns Unverifiable(FINGERPRINT_MISSING) and `ensure_shadow_import_current`
+        // re-imports with no row-sink candidate, clobbering the just-persisted provenance
+        // with an "unavailable" surface. Persist it so a fresh import stays Fresh.
+        (
+            "vault_fingerprint",
+            outcome.sqlite_fingerprint_sha256.clone(),
+        ),
         (
             "lowered_sqlite_path",
             outcome.lowered_sqlite_path.display().to_string(),
@@ -8492,6 +8502,41 @@ mod tests {
                 .unwrap()
                 .contains("prompt-injection-shaped prose")
         );
+    }
+
+    #[test]
+    fn shadow_outcome_persists_vault_fingerprint_watermark_for_content_freshness() {
+        // Regression for #221 (a #93 persist gap): evaluate_shadow_content_freshness reads
+        // the "vault_fingerprint" config key with NO fallback and re-fingerprints the live
+        // CBM source against it. persist_shadow_outcome_at previously never wrote that key,
+        // so freshness always returned Unverifiable(FINGERPRINT_MISSING); ensure_shadow_import_current
+        // (run right after every fresh import) then re-imported with no row-sink candidate and
+        // clobbered the just-persisted provenance surface as "unavailable", so get_provenance's
+        // happy path failed end-to-end. Prove the watermark is persisted, read back byte-for-byte
+        // from the real config store, equal to the source fingerprint.
+        let dir = temp_dir("shadow-vault-fingerprint-watermark");
+        let outcome = sample_shadow_outcome(
+            &dir,
+            security_screen_from_row_sink_rows(&sample_pipeline_rows()),
+        );
+        assert!(
+            !outcome.sqlite_fingerprint_sha256.is_empty(),
+            "sample outcome must carry a source fingerprint to persist as the watermark"
+        );
+
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        // FSV: read the persisted watermark straight back out of the config store.
+        let persisted = read_config_value(&dir, &metadata_key("demo", "vault_fingerprint"))
+            .unwrap()
+            .expect("vault_fingerprint watermark must be persisted for content-freshness (#221)");
+        assert_eq!(
+            persisted, outcome.sqlite_fingerprint_sha256,
+            "persisted vault_fingerprint must equal the source fingerprint that \
+             evaluate_shadow_content_freshness recomputes and compares against"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
