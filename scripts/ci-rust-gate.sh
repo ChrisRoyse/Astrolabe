@@ -248,7 +248,12 @@ fi
 run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}"
 
 cd "$ROOT/vendor/calyx"
-bash scripts/cargo-fmt-workspace.sh --check
+# The vendored scripts/cargo-fmt-workspace.sh mapfile-parses Windows python3
+# output, which carries CRLF: every package name gains a trailing \r and
+# `cargo fmt -p` refuses it ("is not a member of the workspace"). Vendor is
+# pinned, so run our own Windows-safe batching formatter over the same Calyx
+# workspace members instead (upstream fix tracked in ChrisRoyse/Calyx).
+run_logged "calyx-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all --manifest-path "$ROOT/vendor/calyx/Cargo.toml" -- --check
 run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
 run_logged "calyx-clippy-$LABEL" cargo clippy --workspace --all-targets "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}" -- -D warnings
 run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
