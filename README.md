@@ -28,9 +28,9 @@ The blueprint records *design*; it never records *progress*. All state — done,
 - `crates/astrolabe-server` — the MCP surface (wraps the CBM tool runner, adds Astrolabe-native tools).
 - `vendor/` — pinned upstream sources (`VENDORED.md`, `scripts/verify-pins.sh`). **Never edit vendor trees directly**; use the documented patch flow in `patches/`.
 
-## Building natively on Windows (the only supported dev environment here)
+## Building natively on Windows
 
-**WSL is prohibited for this project.** All work runs from `C:\code\Astrolabe` with native Windows executables. If a POSIX shell is required, use a verified Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`) — never `C:\Windows\System32\bash.exe` (that is the WSL launcher).
+Build and test evidence is produced with the native Windows GNU toolchain, because the Rust host and the static `libcbm.a` archive must share one ABI. All work runs from `C:\code\Astrolabe` with native Windows executables; for POSIX scripts use a Git for Windows bash (`C:\Program Files\Git\bin\bash.exe`) so the toolchain stays consistent. WSL may be installed and running on the machine — that is fine; project tooling does not detect, block on, or modify it.
 
 Prerequisites and toolchain facts:
 
