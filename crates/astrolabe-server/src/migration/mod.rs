@@ -64,6 +64,9 @@ use sha2::{Digest, Sha256};
 
 use crate::DynError;
 
+mod helpers;
+use helpers::*;
+
 const CONFIG_KEY_PREFIX: &str = "astrolabe.calyx.";
 const SHADOW_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
@@ -3406,20 +3409,6 @@ fn anomaly_inputs_from_rows(
     (substrates, calibrations, skipped_properties)
 }
 
-fn string_array_field(value: &Value, field: &str) -> Vec<String> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn anomaly_report_json(report: &AnomalyReport, skipped_properties: usize) -> Value {
     let artifact_bytes = anomaly_report_artifact_bytes(report);
     let status = if skipped_properties > 0 || !report.skipped.is_empty() {
@@ -4634,38 +4623,6 @@ fn chain_verification_from_json(value: &Value) -> Result<ChainVerification, DynE
     })
 }
 
-fn value_map(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
-    Value::Object(entries.into_iter().collect())
-}
-
-fn required_value_field<'a>(value: &'a Value, field: &str) -> Result<&'a Value, DynError> {
-    required_object(value, "object")?
-        .get(field)
-        .ok_or_else(|| format!("missing field {field}").into())
-}
-
-fn required_string_field(value: &Value, field: &str) -> Result<String, DynError> {
-    required_value_field(value, field)?
-        .as_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("field {field} must be a string").into())
-}
-
-fn required_u64_field(value: &Value, field: &str) -> Result<u64, DynError> {
-    required_value_field(value, field)?
-        .as_u64()
-        .ok_or_else(|| format!("field {field} must be an unsigned integer").into())
-}
-
-fn required_object<'a>(
-    value: &'a Value,
-    context: &str,
-) -> Result<&'a Map<String, Value>, DynError> {
-    value
-        .as_object()
-        .ok_or_else(|| format!("{context} must be a JSON object").into())
-}
-
 fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraphSnapshot {
     let project = rows.project.clone();
     let nodes = rows
@@ -5255,13 +5212,6 @@ fn periodic_verify_remediation(status: &str) -> Value {
 fn read_config_u64(cache_dir: &Path, project: &str, key: &str) -> Result<Option<u64>, DynError> {
     Ok(read_config_value(cache_dir, &metadata_key(project, key))?
         .and_then(|value| value.parse::<u64>().ok()))
-}
-
-fn unix_epoch_millis() -> u64 {
-    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn health_surface_json(
@@ -6135,17 +6085,6 @@ fn optimizer_freeze_status_json(
     }))
 }
 
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 fn optimizer_tripwires_json(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
     let key = metadata_key(project, "optimizer_tripwires_json");
     if let Some(raw) = read_config_value(cache_dir, &key)? {
@@ -6730,12 +6669,6 @@ fn optimizer_proposal_candidate_invalid(candidate: &Value) -> Option<&'static st
         return Some("requires non-empty string provenance");
     }
     None
-}
-
-fn json_string_array_nonempty(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_array)
-        .is_some_and(|values| !values.is_empty() && values.iter().all(Value::is_string))
 }
 
 fn optimizer_proposals_invalid_json(key: &str, reason: impl Into<String>) -> Value {
@@ -7367,12 +7300,6 @@ fn imputed_doc_guard_check_passed(guard_check: Option<&Value>) -> bool {
         && json_string_array_nonempty(object.get("provenance"))
 }
 
-fn json_string_array_contains(value: Option<&Value>, needle: &str) -> bool {
-    value
-        .and_then(Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
-}
-
 fn impute_fields_invalid_json(
     project: &str,
     target: &str,
@@ -7896,134 +7823,6 @@ fn stores_summary(
     Value::Object(stores)
 }
 
-fn augment_tool_result(result: &str, additions: Value) -> Result<String, DynError> {
-    let additions = additions
-        .as_object()
-        .ok_or("tool result additions must be a JSON object")?;
-    let mut value: Value = serde_json::from_str(result)?;
-    if let Some(structured) = value
-        .get_mut("structuredContent")
-        .and_then(Value::as_object_mut)
-    {
-        merge_object(structured, additions);
-    }
-
-    if let Some(text) = value
-        .get_mut("content")
-        .and_then(Value::as_array_mut)
-        .and_then(|items| items.first_mut())
-        .and_then(|item| item.get_mut("text"))
-        && let Some(raw_text) = text.as_str()
-        && let Ok(mut text_value) = serde_json::from_str::<Value>(raw_text)
-        && let Some(text_obj) = text_value.as_object_mut()
-    {
-        merge_object(text_obj, additions);
-        *text = Value::String(serde_json::to_string(&text_value)?);
-    }
-
-    Ok(serde_json::to_string(&value)?)
-}
-
-fn merge_object(target: &mut Map<String, Value>, additions: &Map<String, Value>) {
-    for (key, value) in additions {
-        target.insert(key.clone(), value.clone());
-    }
-}
-
-fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynError> {
-    let mut sanitized = args.clone();
-    sanitized.remove("calyx");
-    sanitized.remove("calyx_search");
-    Ok(serde_json::to_string(&Value::Object(sanitized))?)
-}
-
-fn index_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
-    if let Some(name) = string_arg(args, "name") {
-        return Ok(Some(astrolabe_bridge::cbm_project_name_from_path(name)?));
-    }
-    Ok(string_arg(args, "repo_path")
-        .map(astrolabe_bridge::cbm_project_name_from_path)
-        .transpose()?)
-}
-
-fn status_project_from_args(args: &Map<String, Value>) -> Result<Option<String>, DynError> {
-    for key in ["project", "project_name", "project_id", "projectName"] {
-        if let Some(project) = string_arg(args, key) {
-            if project.contains('/') || project.contains('\\') {
-                return Ok(Some(astrolabe_bridge::cbm_project_name_from_path(project)?));
-            }
-            return Ok(Some(project.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-fn string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-}
-
-fn project_from_tool_result(result: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(result).ok()?;
-    value
-        .get("structuredContent")
-        .and_then(|content| content.get("project"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn tool_result_is_error(result: &str) -> Result<bool, DynError> {
-    let value: Value = serde_json::from_str(result)?;
-    Ok(value
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false))
-}
-
-fn tool_error_result(message: impl Into<String>) -> Result<String, DynError> {
-    Ok(serde_json::to_string(&json!({
-        "content": [{"type": "text", "text": message.into()}],
-        "isError": true,
-    }))?)
-}
-
-fn tool_json_result(value: Value) -> Result<String, DynError> {
-    let text = serde_json::to_string(&value)?;
-    Ok(serde_json::to_string(&json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": value,
-        "isError": false,
-    }))?)
-}
-
-fn tool_json_error_result(value: Value) -> Result<String, DynError> {
-    let text = serde_json::to_string(&value)?;
-    Ok(serde_json::to_string(&json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": value,
-        "isError": true,
-    }))?)
-}
-
-fn refresh_value_artifact_hash(value: &mut Value) {
-    let mut artifact_source = value.clone();
-    if let Some(object) = artifact_source.as_object_mut() {
-        object.remove("artifact_sha256");
-    }
-    let artifact_bytes = serde_json::to_vec(&artifact_source).unwrap_or_default();
-    value["artifact_sha256"] = json!(hex_lower(&Sha256::digest(&artifact_bytes)));
-}
-
-fn jsonrpc_result_response(id: Value, result_raw: &str) -> Result<String, DynError> {
-    let result: Value = serde_json::from_str(result_raw)?;
-    Ok(serde_json::to_string(&json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    }))?)
-}
-
 fn persist_dial(project: &str, dial: MigrationDial) -> Result<(), DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     persist_dial_at(&cache_dir, project, dial)
@@ -8225,27 +8024,6 @@ fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
 
 fn vault_salt(project: &str) -> String {
     format!("astrolabe-shadow-v1:{project}")
-}
-
-fn cx_id_set_sha256(ids: &[calyx_core::CxId]) -> String {
-    let mut sorted = ids.to_vec();
-    sorted.sort();
-    let mut hasher = Sha256::new();
-    hasher.update(b"astrolabe-shadow-cx-id-set-v1");
-    for id in sorted {
-        hasher.update(id.as_bytes());
-    }
-    hex_lower(&hasher.finalize())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]
