@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="com.demo.CalcTest" tests="3" failures="1" errors="1" skipped="0" time="0.153">
+    <testcase name="adds" classname="com.demo.CalcTest" time="0.012"/>
+    <testcase name="subtracts" classname="com.demo.CalcTest" time="0.034">
+      <failure message="expected 1 but was 2" type="org.junit.ComparisonFailure">org.junit.ComparisonFailure: expected 1 but was 2
+    at com.demo.CalcTest.subtracts(CalcTest.java:31)</failure>
+    </testcase>
+    <testcase name="divides" classname="com.demo.CalcTest" time="0.107">
+      <error message="/ by zero" type="java.lang.ArithmeticException">java.lang.ArithmeticException: / by zero
+    at com.demo.Calc.div(Calc.java:9)</error>
+    </testcase>
+  </testsuite>
+  <testsuite name="com.demo.IoTest" tests="2" failures="0" errors="0" skipped="1" time="0.044">
+    <testcase name="reads" classname="com.demo.IoTest" time="0.000">
+      <skipped message="requires network"/>
+    </testcase>
+    <testcase name="writes" classname="com.demo.IoTest" time="0.044"/>
+  </testsuite>
+</testsuites>

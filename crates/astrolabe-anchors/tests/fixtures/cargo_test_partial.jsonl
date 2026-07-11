@@ -1,0 +1,4 @@
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "demo::adds" }
+{ "type": "test", "name": "demo::adds", "event": "ok" }
+{ "type": "test", "event": "started", "name": "demo::subtracts" }
