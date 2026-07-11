@@ -8,8 +8,8 @@ use calyx_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ASTRO_PANEL_CONTRACT_INVALID, ASTRO_PANEL_VECTOR_INVALID, FrozenLensContract, PanelError,
-    PanelResult, seed_spec_for_lens, slot_spec,
+    ASTRO_PANEL_CONTRACT_INVALID, ASTRO_PANEL_S21_ZERO_SIGNAL, ASTRO_PANEL_VECTOR_INVALID,
+    FrozenLensContract, PanelError, PanelResult, seed_spec_for_lens, slot_spec,
 };
 
 const AST_PROFILE_DIM: u32 = 25;
@@ -1376,6 +1376,18 @@ fn encode_record_vec(input: &RecordVectorInput) -> PanelResult<SlotVector> {
         })?;
         ensure_finite_scalar(key, value)?;
         data.push(value);
+    }
+    // A record vector whose frozen scalars are all zero (plausible: a never-changed,
+    // untested symbol) has zero L2 norm and cannot be unit-normalized. Emitting a
+    // hard error here would abort the entire panel readout for the symbol and lose
+    // every other slot. Per Calyx doctrine a slot that cannot be measured becomes an
+    // explicit labeled absence, never a panel-wide abort and never a silent zero
+    // vector. Record the degradation reason so the readout summary can count it.
+    // See issue #124.
+    if data.iter().all(|value| *value == 0.0) {
+        return Ok(SlotVector::Absent {
+            reason: AbsentReason::Error(ASTRO_PANEL_S21_ZERO_SIGNAL.to_string()),
+        });
     }
     l2_normalize(&mut data)?;
     dense(SlotId::new(21), data)

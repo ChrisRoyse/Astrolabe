@@ -49,6 +49,11 @@ pub const ASTRO_PANEL_CONTRACT_INVALID: &str = "ASTRO_PANEL_CONTRACT_INVALID";
 pub const ASTRO_PANEL_VECTOR_INVALID: &str = "ASTRO_PANEL_VECTOR_INVALID";
 /// Error code returned when the seed registry bytes drift from the frozen table.
 pub const ASTRO_PANEL_SEED_REGISTRY_INVALID: &str = "ASTRO_PANEL_SEED_REGISTRY_INVALID";
+/// Stable reason label recorded on the S21 slot when the frozen record scalars carry
+/// no measurable signal (all zero). Such a vector has zero L2 norm and cannot be
+/// unit-normalized, so the slot degrades to an explicit labeled absence instead of
+/// aborting the whole panel readout for the symbol.
+pub const ASTRO_PANEL_S21_ZERO_SIGNAL: &str = "ASTRO_PANEL_S21_ZERO_SIGNAL";
 
 /// Result type for panel operations.
 pub type PanelResult<T> = std::result::Result<T, PanelError>;
@@ -778,6 +783,50 @@ pub struct PanelReadout {
     pub slots: BTreeMap<SlotId, SlotVector>,
     /// Exact scalar measurements from the source symbol.
     pub scalars: BTreeMap<String, f64>,
+    /// Roll-up accounting for how every slot resolved, so no degradation is silent.
+    #[serde(default)]
+    pub summary: PanelReadoutSummary,
+}
+
+/// Accounting roll-up for a [`PanelReadout`].
+///
+/// Every one of the [`PANEL_V1_SLOTS`] lands in exactly one bucket: a real measured
+/// vector, a structural non-applicability, or an explicitly labeled degradation (with
+/// the reason recorded both on its slot and here). The buckets always sum to the full
+/// slot count, so a degraded or skipped slot can never be silently lost.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelReadoutSummary {
+    /// Count of slots carrying a real measured vector (`Dense`/`Sparse`/`Multi`).
+    pub measured: usize,
+    /// Count of slots absent because the lens does not apply to this symbol/modality.
+    pub not_applicable: usize,
+    /// Slots that degraded to a labeled absence, mapped to the recorded reason label.
+    pub degraded: BTreeMap<SlotId, String>,
+}
+
+impl PanelReadoutSummary {
+    /// Number of slots that degraded to a labeled absence.
+    pub fn degradation_count(&self) -> usize {
+        self.degraded.len()
+    }
+
+    /// Total number of slots accounted for across every bucket.
+    pub fn accounted_slots(&self) -> usize {
+        self.measured + self.not_applicable + self.degraded.len()
+    }
+}
+
+/// Returns the stable reason label recorded for a degraded (non-applicable-excluded)
+/// slot absence, so degradations carry a durable machine-readable tag.
+fn absent_reason_label(reason: &AbsentReason) -> String {
+    match reason {
+        AbsentReason::NotApplicable => "not_applicable".to_string(),
+        AbsentReason::Redacted => "redacted".to_string(),
+        AbsentReason::LensUnavailable => "lens_unavailable".to_string(),
+        AbsentReason::Deferred => "deferred".to_string(),
+        AbsentReason::LensInactive => "lens_inactive".to_string(),
+        AbsentReason::Error(code) => code.clone(),
+    }
 }
 
 /// Default Astrolabe panel driver.
@@ -820,6 +869,7 @@ impl PanelDriver {
         validate_scalar_sidecar(&input.scalars)?;
         let applicable = applicable_slot_ids(input.label);
         let mut slots = BTreeMap::new();
+        let mut summary = PanelReadoutSummary::default();
         for slot in PANEL_V1_SLOTS {
             let slot_id = slot.slot_id();
             let vector = if !applicable.contains(&slot_id) {
@@ -835,6 +885,19 @@ impl PanelDriver {
                 validate_slot_shape(*slot, &vector)?;
                 vector
             };
+            match &vector {
+                SlotVector::Absent {
+                    reason: AbsentReason::NotApplicable,
+                } => summary.not_applicable += 1,
+                SlotVector::Absent { reason } => {
+                    summary
+                        .degraded
+                        .insert(slot_id, absent_reason_label(reason));
+                }
+                SlotVector::Dense { .. } | SlotVector::Sparse { .. } | SlotVector::Multi { .. } => {
+                    summary.measured += 1
+                }
+            }
             slots.insert(slot_id, vector);
         }
         Ok(PanelReadout {
@@ -843,6 +906,7 @@ impl PanelDriver {
             label: input.label,
             slots,
             scalars: input.scalars.clone(),
+            summary,
         })
     }
 }
@@ -1820,5 +1884,112 @@ mod tests {
             SymbolLabel::Branch,
             SymbolLabel::Folder,
         ])
+    }
+
+    /// Drives the real deterministic S0-S17/S21 encoders from one combined
+    /// `EncoderLensInput`, so a genuine all-zero S21 record vector exercises the real
+    /// measurement path through `PanelDriver::measure` rather than a fixture stub.
+    struct EncoderInputRuntime {
+        input: EncoderLensInput,
+    }
+
+    impl SlotRuntime for EncoderInputRuntime {
+        fn measure_slot(
+            &self,
+            slot: &PanelSlotSpec,
+            _input: &PanelInput,
+        ) -> PanelResult<SlotVector> {
+            encode_slot(slot.slot_id(), &self.input)
+        }
+    }
+
+    #[test]
+    fn all_zero_s21_record_vector_degrades_that_slot_without_aborting_the_panel() {
+        // The deterministic encoder slots the combined fixture input can measure.
+        let encoder_slots: Vec<SlotId> = (0_u16..=17)
+            .chain(std::iter::once(21))
+            .map(SlotId::new)
+            .collect();
+        let s21 = SlotId::new(21);
+
+        // Baseline: a fully populated fixture symbol measures S21 as a real dense vector,
+        // so S21 is absent from the degraded roll-up.
+        let baseline_runtime = EncoderInputRuntime {
+            input: fixture_encoder_input(),
+        };
+        let baseline = PanelDriver::default()
+            .measure(
+                &PanelInput::with_available_slots(SymbolLabel::Method, encoder_slots.clone()),
+                &baseline_runtime,
+            )
+            .expect("baseline readout");
+        assert!(
+            matches!(baseline.slots.get(&s21), Some(SlotVector::Dense { .. })),
+            "baseline S21 must be a real dense vector, got {:?}",
+            baseline.slots.get(&s21)
+        );
+        assert!(!baseline.summary.degraded.contains_key(&s21));
+        let baseline_degradations = baseline.summary.degradation_count();
+
+        // Degenerate real symbol: all 24 frozen record scalars are zero (never-changed,
+        // untested). This previously zero-normed in l2_normalize and aborted the whole
+        // panel readout for the symbol.
+        let mut degenerate = fixture_encoder_input();
+        let zero_scalars: BTreeMap<String, f32> = RECORD_VECTOR_SCALAR_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), 0.0_f32))
+            .collect();
+        degenerate.record_vec = Some(RecordVectorInput {
+            scalars: zero_scalars,
+        });
+        let runtime = EncoderInputRuntime { input: degenerate };
+        let readout = PanelDriver::default()
+            .measure(
+                &PanelInput::with_available_slots(SymbolLabel::Method, encoder_slots.clone()),
+                &runtime,
+            )
+            .expect("panel readout must not abort on an all-zero S21 record vector");
+
+        // S21 is an explicit labeled absence carrying the recorded reason, never a zero
+        // vector and never a panel-wide abort.
+        assert_eq!(
+            readout.slots.get(&s21),
+            Some(&SlotVector::Absent {
+                reason: AbsentReason::Error(ASTRO_PANEL_S21_ZERO_SIGNAL.to_string()),
+            }),
+            "all-zero S21 must degrade to a labeled absence"
+        );
+
+        // The degradation is counted and labeled in the readout summary (no silent skip):
+        // exactly one more degraded slot than the baseline, and it is S21 with its reason.
+        assert_eq!(
+            readout.summary.degraded.get(&s21).map(String::as_str),
+            Some(ASTRO_PANEL_S21_ZERO_SIGNAL),
+            "S21 degradation must be recorded with its reason label"
+        );
+        assert_eq!(
+            readout.summary.degradation_count(),
+            baseline_degradations + 1,
+            "the all-zero S21 slot must add exactly one degradation to the readout"
+        );
+
+        // Every other deterministic encoder slot (S0-S17) still carries a real vector —
+        // one degenerate lens does not destroy the rest of the constellation readout.
+        for slot in 0_u16..=17 {
+            let slot_id = SlotId::new(slot);
+            let vector = readout.slots.get(&slot_id).expect("slot emitted");
+            assert!(
+                matches!(vector, SlotVector::Dense { .. } | SlotVector::Sparse { .. }),
+                "S{slot} must carry a real measured vector, got {vector:?}"
+            );
+        }
+
+        // Every panel slot is accounted for across the buckets; nothing is silently lost.
+        assert_eq!(readout.summary.accounted_slots(), PANEL_V1_SLOTS.len());
+        assert!(
+            readout.summary.measured >= 18,
+            "S0-S17 must be counted as measured, got {}",
+            readout.summary.measured
+        );
     }
 }
