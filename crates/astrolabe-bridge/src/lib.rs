@@ -1513,13 +1513,21 @@ fn validate_shell_arg(value: &str) -> Result<(), BridgeError> {
         '\'' | '"' | ';' | '|' | '&' | '$' | '`' | '<' | '>' | '\n' | '\r' => true,
         #[cfg(not(windows))]
         '\\' => true,
+        // cmd.exe expands %VAR% (and %X:~n,m% substring forms that can
+        // materialize quotes) INSIDE double quotes at the CBM _popen sites,
+        // and `^` escapes / `!VAR!` delayed expansion are the other documented
+        // cmd.exe injection channels. POSIX shells treat these as literal
+        // filename characters, so the rejection is Windows-only, mirroring the
+        // `\\` platform split above. Audit #136.
+        #[cfg(windows)]
+        '%' | '^' | '!' => true,
         _ => false,
     });
     if has_shell_metachar {
         Err(envelope(
             "ASTRO_CBM_UNSAFE_SHELL_ARG",
             "watch root path contains a shell metacharacter rejected by CBM",
-            "Pass a canonical repository path without quotes, shell operators, or newlines.",
+            "Pass a canonical repository path without quotes, shell operators, newlines, or cmd.exe expansion characters (% ^ !).",
         ))
     } else {
         Ok(())
@@ -2506,6 +2514,30 @@ mod tests {
                 "ASTRO_CBM_UNSAFE_SHELL_ARG",
                 "path should be rejected: {path:?}"
             );
+        }
+        // Windows-only cmd.exe expansion channels (audit #136): _popen runs
+        // `cmd.exe /c` where %VAR% expands inside double quotes, %X:~n,m%
+        // substring forms can materialize quotes, `^` escapes the next
+        // character, and !VAR! is delayed expansion.
+        #[cfg(windows)]
+        {
+            let cmd_expansion_paths = [
+                "C:/repos/%USERPROFILE%",
+                "C:/repos/%PATH:~0,1%evil",
+                "C:/repos/astrolabe^watcher",
+                "C:/repos/!TEMP!",
+            ];
+            for path in cmd_expansion_paths {
+                assert_eq!(
+                    watcher
+                        .watch("safe-name", path)
+                        .unwrap_err()
+                        .envelope()
+                        .code,
+                    "ASTRO_CBM_UNSAFE_SHELL_ARG",
+                    "cmd.exe expansion path should be rejected: {path:?}"
+                );
+            }
         }
         assert_eq!(watcher.watch_count().unwrap(), 0);
     }
