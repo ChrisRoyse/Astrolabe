@@ -2541,7 +2541,7 @@ mod tests {
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
 
     #[test]
@@ -3177,7 +3177,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss() {
         let (dir, vault) = reactive_vault("queue-soak");
@@ -5213,6 +5213,34 @@ mod tests {
                 }
             })
             .expect("Rss line in smaps_rollup")
+    }
+
+    /// Native Windows resident-set probe for the soak harness.
+    ///
+    /// `astrolabe-weave` forbids `unsafe`, so instead of a direct
+    /// `GetProcessMemoryInfo` FFI call this shells out to PowerShell for the
+    /// process's working set — the Windows analogue of Linux `Rss` — which is
+    /// exact enough for the 512 MiB soak delta bound.
+    #[cfg(target_os = "windows")]
+    fn resident_set_bytes() -> u64 {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
+            ])
+            .output()
+            .expect("query working set via powershell");
+        assert!(
+            output.status.success(),
+            "powershell working-set query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 working set")
+            .trim()
+            .parse::<u64>()
+            .expect("parse working set bytes")
     }
 
     fn cx(byte: u8) -> CxId {
