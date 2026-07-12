@@ -114,20 +114,23 @@ CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 # at a dir under target/ (cleaned with it). The gate resolves operator_temp via the
 # OS known-folder (REAL_TEMP), not the env, so this contains honest writes WITHOUT
 # blinding the gate to any test that bypasses the redirect via an absolute path.
-SUITE_TMP="$ROOT/target/suite-tmp"
+# Suite temp sits one level below a dedicated ceiling (target/suite-tmp/tmp under
+# ceiling target/suite-tmp). It is inside this git checkout, so env::temp_dir()
+# resolves inside the repo -- breaking tests that assume temp is outside a checkout
+# (calyx-buildinfo compute_for_dir_outside_checkout_errors runs `git rev-parse` in
+# env::temp_dir() and expects failure). target/ is git-ignored build output;
+# GIT_CEILING_DIRECTORIES stops git's upward .git search at target/suite-tmp. The
+# temp must nest UNDER the ceiling (a ceiling only blocks a walk crossing it from
+# below), which also keeps git from other target/ subtrees (release-artifact commit
+# stamping) and the source tree resolving $ROOT/.git normally. Native path for git.exe.
+SUITE_CEIL="$ROOT/target/suite-tmp"
+SUITE_TMP="$SUITE_CEIL/tmp"
 mkdir -p "$SUITE_TMP"
 export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"
-# The suite temp now lives under target/ (inside this git checkout), so
-# std::env::temp_dir() resolves inside the repo -- breaking tests that assume temp
-# is outside a checkout (e.g. calyx-buildinfo compute_for_dir_outside_checkout_errors
-# runs `git rev-parse` in env::temp_dir() and expects failure). target/ is
-# git-ignored build output; stop git's upward .git search at target/ so a sandbox
-# there behaves like an out-of-repo temp. git from $ROOT / the source tree is
-# unaffected. Native Windows path form for git.exe.
 if command -v cygpath >/dev/null 2>&1; then
-  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$ROOT/target")"
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$SUITE_CEIL")"
 else
-  export GIT_CEILING_DIRECTORIES="$ROOT/target"
+  export GIT_CEILING_DIRECTORIES="$SUITE_CEIL"
 fi
 "$CARGO_BIN" build --workspace
 if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then

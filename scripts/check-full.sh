@@ -37,22 +37,26 @@ WORKSPACE_TEST_DEFERRED_EXIT=125
 # the OS known-folder (REAL_TEMP), not the env, so this contains honest writes WITHOUT
 # blinding the gate to a test that bypasses the redirect. check.sh also sets this for
 # its own standalone bracket; setting it here makes every child phase inherit it.
-AGG_SUITE_TMP="$ROOT/target/suite-tmp"
+# The suite temp lives one level BELOW a dedicated ceiling dir (target/suite-tmp/tmp
+# under ceiling target/suite-tmp). It is inside this git checkout, so
+# std::env::temp_dir() resolves to a path *inside* the repo -- breaking tests that
+# assume temp is outside a checkout (calyx-buildinfo compute_for_dir_outside_checkout_errors
+# runs `git rev-parse HEAD` in env::temp_dir() and expects failure). target/ is
+# git-ignored build output, so GIT_CEILING_DIRECTORIES tells git to stop its upward
+# .git search at target/suite-tmp. The nesting matters: a ceiling only blocks a walk
+# that crosses it FROM BELOW, so the temp must sit *under* the ceiling (git started
+# in the ceiling dir itself still walks up). This isolates the temp: git from other
+# target/ subtrees (release-predicate artifact commit stamping in
+# target/hazard-suite-selftest/probe, target/astrolabe-release-predicate) and from
+# the source tree still finds $ROOT/.git. Native Windows path form for git.exe.
+AGG_SUITE_CEIL="$ROOT/target/suite-tmp"
+AGG_SUITE_TMP="$AGG_SUITE_CEIL/tmp"
 mkdir -p "$AGG_SUITE_TMP"
 export TMP="$AGG_SUITE_TMP" TEMP="$AGG_SUITE_TMP" TMPDIR="$AGG_SUITE_TMP"
-# Redirecting the suite temp under target/ (inside this git checkout) makes
-# std::env::temp_dir() resolve to a path *inside* the repo, which breaks any test
-# that assumes temp is outside a checkout -- e.g. calyx-buildinfo's
-# compute_for_dir_outside_checkout_errors, which runs `git rev-parse HEAD` in
-# env::temp_dir() and expects it to fail. target/ is git-ignored build output, so
-# tell git to stop its upward .git search at target/: a sandbox there then behaves
-# like a real out-of-repo temp. git from $ROOT (release-artifact commit stamping)
-# and from the source tree is unaffected -- the ceiling only blocks the walk that
-# crosses target/ upward. Native Windows path form for git.exe.
 if command -v cygpath >/dev/null 2>&1; then
-  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$ROOT/target")"
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$AGG_SUITE_CEIL")"
 else
-  export GIT_CEILING_DIRECTORIES="$ROOT/target"
+  export GIT_CEILING_DIRECTORIES="$AGG_SUITE_CEIL"
 fi
 
 if ! command -v rustc >/dev/null 2>&1; then
