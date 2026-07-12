@@ -2918,7 +2918,14 @@ mod tests {
 
     #[test]
     fn tool_runner_index_repository_collects_rows_from_single_mcp_run() {
+        // #246/#248: the tool-runner index must land in a RUN-SCOPED store, never the
+        // operator's ~/.cache. `set_cbm_cache_dir` is a process-global override, so the
+        // work runs in a spawned child (the `set_cbm_cache_dir_child_probe` pattern) to
+        // stay isolated from sibling test threads; the parent then FSV-asserts the
+        // operator home store is byte-identical.
+        let before = home_store_entries();
         let dir = temp_dir("tool-runner-row-sink");
+        let store = dir.join("store");
         let repo = dir.join("repo");
         let src = repo.join("src");
         std::fs::create_dir_all(&src).expect("create fixture repo");
@@ -2927,60 +2934,126 @@ mod tests {
             "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
         )
         .expect("write C fixture");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "tests::tool_runner_collect_rows_child_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRO_PROBE_STORE", &store)
+            .env("ASTRO_PROBE_REPO", &repo)
+            .output()
+            .expect("spawn the tool-runner row-sink probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "tool-runner row-sink probe failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("tool-runner collect-rows probe passed"),
+            "probe did not run its assertions:\n{stdout}"
+        );
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "a run-scoped tool-runner index must not touch the operator home store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by tool_runner_index_repository_collects_rows_from_single_mcp_run"]
+    fn tool_runner_collect_rows_child_probe() {
+        let store = PathBuf::from(std::env::var("ASTRO_PROBE_STORE").expect("parent sets store"));
+        let repo = std::env::var("ASTRO_PROBE_REPO").expect("parent sets repo");
+        std::fs::create_dir_all(&store).expect("create run-scoped store");
+        let before = home_store_entries();
+        let resolved = set_cbm_cache_dir(&store).expect("configure run-scoped store");
+        assert_eq!(
+            resolved.canonicalize().expect("configured store exists"),
+            store.canonicalize().expect("store dir created"),
+            "libcbm must resolve the run-scoped store"
+        );
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
         let project = format!("row-sink-tool-{}-{nanos}", std::process::id());
         let args = serde_json::json!({
-            "repo_path": repo.to_str().expect("utf8 repo path"),
+            "repo_path": repo,
             "mode": "full",
             "name": project,
         })
         .to_string();
-
-        // Fail-closed teardown: delete the registered project .db even if any
-        // assertion below panics, so this test never leaks a registration into the
-        // operator's global CBM store (#194).
-        let _db_guard = CbmProjectDbGuard {
-            project: project.clone(),
-        };
-        let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
-        let run = runner
-            .handle_index_repository_with_rows(&args)
-            .expect("single MCP index_repository run with row sink");
-        let value: serde_json::Value =
-            serde_json::from_str(&run.raw_json).expect("valid MCP tool result JSON");
+        let db = store.join(format!("{project}.db"));
+        {
+            // Fail-closed teardown from the RUN-SCOPED store even on panic (#194).
+            let _db_guard = CbmProjectDbGuard {
+                project: project.clone(),
+            };
+            let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+            let run = runner
+                .handle_index_repository_with_rows(&args)
+                .expect("single MCP index_repository run with row sink");
+            let value: serde_json::Value =
+                serde_json::from_str(&run.raw_json).expect("valid MCP tool result JSON");
+            assert_eq!(
+                value.get("isError").and_then(serde_json::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                project_from_tool_result(&run.raw_json).as_deref(),
+                Some(project.as_str())
+            );
+            let rows = run.rows.expect("row sink capture for the completed run");
+            assert_eq!(rows.project, project);
+            assert!(
+                rows.nodes
+                    .iter()
+                    .any(|node| node.qualified_name.ends_with(".main")),
+                "expected main function in MCP row sink: {rows:?}",
+            );
+            assert!(rows.nodes.iter().all(|node| node.project == rows.project));
+            assert!(rows.edges.iter().all(|edge| edge.project == rows.project));
+            // FSV: the SQLite db is under the RUN-SCOPED store, not the home store.
+            assert!(
+                db.is_file(),
+                "index_repository must persist {project}.db under the run-scoped store {}; found: {:?}",
+                store.display(),
+                std::fs::read_dir(&store)
+                    .map(|d| d
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
+        } // guard drops here -> fail-closed teardown from the run-scoped store
+        clear_cbm_cache_dir();
         assert_eq!(
-            value.get("isError").and_then(serde_json::Value::as_bool),
-            Some(false)
+            before,
+            home_store_entries(),
+            "a run-scoped tool-runner index must not touch the operator home store"
         );
-        assert_eq!(
-            project_from_tool_result(&run.raw_json).as_deref(),
-            Some(project.as_str())
-        );
-        let rows = run.rows.expect("row sink capture for the completed run");
-        assert_eq!(rows.project, project);
-        assert!(
-            rows.nodes
-                .iter()
-                .any(|node| node.qualified_name.ends_with(".main")),
-            "expected main function in MCP row sink: {rows:?}",
-        );
-        assert!(rows.nodes.iter().all(|node| node.project == rows.project));
-        assert!(rows.edges.iter().all(|edge| edge.project == rows.project));
-
-        // `_db_guard` deletes the registration on scope exit (fail-closed).
-        std::fs::remove_dir_all(dir).ok();
+        println!("tool-runner collect-rows probe passed: {}", db.display());
     }
 
     /// Regression for #194: prove — by reading the persisted `.db` file on disk
     /// (full state verification, not a return value) — that a tool-runner
-    /// `index_repository` run registers exactly one project db in the resolved CBM
-    /// cache dir and that teardown removes it, leaving zero store residue.
+    /// `index_repository` run registers exactly one project db and that teardown
+    /// removes it, leaving zero store residue. #246/#248: the store is now
+    /// RUN-SCOPED (never the operator's ~/.cache), set in a spawned child because
+    /// `set_cbm_cache_dir` is a process-global override; the parent additionally
+    /// FSV-asserts the operator home store is byte-identical.
     #[test]
     fn tool_runner_index_repository_leaves_no_store_residue() {
+        let before = home_store_entries();
         let dir = temp_dir("tool-runner-residue");
+        let store = dir.join("store");
         let repo = dir.join("repo");
         let src = repo.join("src");
         std::fs::create_dir_all(&src).expect("create fixture repo");
@@ -2989,19 +3062,64 @@ mod tests {
             "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
         )
         .expect("write C fixture");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "tests::tool_runner_residue_child_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRO_PROBE_STORE", &store)
+            .env("ASTRO_PROBE_REPO", &repo)
+            .output()
+            .expect("spawn the tool-runner residue probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "tool-runner residue probe failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("tool-runner residue probe passed"),
+            "probe did not run its assertions:\n{stdout}"
+        );
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "a run-scoped tool-runner index must not touch the operator home store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by tool_runner_index_repository_leaves_no_store_residue"]
+    fn tool_runner_residue_child_probe() {
+        let store = PathBuf::from(std::env::var("ASTRO_PROBE_STORE").expect("parent sets store"));
+        let repo = std::env::var("ASTRO_PROBE_REPO").expect("parent sets repo");
+        std::fs::create_dir_all(&store).expect("create run-scoped store");
+        let before = home_store_entries();
+        set_cbm_cache_dir(&store).expect("configure run-scoped store");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
         let project = format!("row-sink-residue-{}-{nanos}", std::process::id());
         let args = serde_json::json!({
-            "repo_path": repo.to_str().expect("utf8 repo path"),
+            "repo_path": repo,
             "mode": "full",
             "name": project,
         })
         .to_string();
 
         let cache_dir = cbm_cache_dir().expect("resolve CBM cache dir");
+        assert_eq!(
+            cache_dir.canonicalize().expect("run-scoped store exists"),
+            store.canonicalize().expect("store dir created"),
+            "cbm_cache_dir must resolve to the run-scoped store, not the operator home"
+        );
         let db_path = cache_dir.join(format!("{project}.db"));
         // Precondition: nonexistent before the run.
         assert!(
@@ -3019,7 +3137,8 @@ mod tests {
                 .handle_index_repository_with_rows(&args)
                 .expect("single MCP index_repository run with row sink");
             assert_eq!(run.rows.expect("row sink capture").project, project);
-            // Mid-run source-of-truth read: the registration exists on disk.
+            // Mid-run source-of-truth read: the registration exists on disk in the
+            // run-scoped store.
             assert!(
                 db_path.exists(),
                 "index_repository must persist the project db at {}",
@@ -3043,7 +3162,13 @@ mod tests {
                 sidecar.display()
             );
         }
-        std::fs::remove_dir_all(dir).ok();
+        clear_cbm_cache_dir();
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "a run-scoped tool-runner index must not touch the operator home store"
+        );
+        println!("tool-runner residue probe passed: {}", db_path.display());
     }
 
     #[test]
