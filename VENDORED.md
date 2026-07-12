@@ -7,7 +7,7 @@ repository state.
 
 | System | Path | Source | Binding tree SHA |
 |---|---|---|---|
-| Calyx | `vendor/calyx` | local import from `./Calyx` | `6e0e3444e9543b8de03ba943e0d376947f533530` |
+| Calyx | `vendor/calyx` | local import from `./Calyx` | `7a910cf8a3a265e3947e421d3e96dcada3440ea7` |
 | codebase-memory-mcp | `vendor/codebase-memory-mcp` | local import from `./codebasememorymcp` | `49358971c30820dac674b8e036877e3b6c0ff172` |
 
 ## Update Procedure

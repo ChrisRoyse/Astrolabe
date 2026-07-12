@@ -12,6 +12,10 @@ where
         options: VaultOptions,
         clock: C,
     ) -> Result<Self> {
+        // Startup guard (#276): refuse to open a durable vault if crash-injection
+        // failpoints are armed in an optimized, non-test build. No-op in normal
+        // and debug/test builds.
+        crate::vault::failpoints::guard_against_production_failpoints()?;
         DurableVault::validate_options(&options)?;
         let clock = std::sync::Arc::new(clock);
         let vault_root = vault_dir.as_ref().to_path_buf();

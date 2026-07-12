@@ -11,6 +11,7 @@ mod cursor;
 mod dedup_commit;
 mod durable;
 pub mod encode;
+mod failpoints;
 mod gc_bridge;
 pub mod grant;
 mod htap;
@@ -50,6 +51,9 @@ use std::sync::{Arc, Mutex};
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use context::VaultContext;
 pub use durable::VaultOptions;
+pub use failpoints::{
+    CRASH_FSV_ARMED_IN_PRODUCTION, crash_fsv_guard_decision, guard_against_production_failpoints,
+};
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use htap::HtapDualRead;
 pub use key::{CALYX_DECRYPTION_FAILED, CALYX_ENCRYPTION_FAILED, CALYX_VAULT_KEY_MISSING};

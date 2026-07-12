@@ -65,6 +65,30 @@
       "kind": "disk_full_recovery",
       "target_os": "windows",
       "evidence": ["CALYX_DISK_PRESSURE", "verify_chain"]
+    },
+    {
+      "id": "crash_after_mvcc_commit_recovery",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay",
+      "kind": "crash_recovery",
+      "evidence": ["CALYX_ASTER_CRASH_FSV_AFTER_MVCC_COMMIT_MARKER", "verify_chain"]
+    },
+    {
+      "id": "crash_after_checkpoint_recovery",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "kill_after_checkpoint_reopens_intact_chain_via_manifest",
+      "kind": "crash_recovery",
+      "evidence": ["CALYX_ASTER_CRASH_FSV_AFTER_CHECKPOINT_MARKER", "verify_chain"]
+    },
+    {
+      "id": "crash_fsv_production_guard",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "crash_fsv_production_guard_refuses_armed_optimized_build",
+      "kind": "production_failpoint_guard",
+      "evidence": ["CALYX_CRASH_FSV_ARMED_IN_PRODUCTION", "crash_fsv_guard_decision"]
     }
   ]
 }
