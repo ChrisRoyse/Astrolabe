@@ -162,6 +162,10 @@ DEPENDENCIES: dict[str, list[str]] = {
         "scripts/check-native-aggregate-wrapper.py",
         "scripts/invoke-native-aggregate.ps1",
     ],
+    "test-check-hook-contracts.py": [
+        "scripts/check-hook-contracts.py",
+        "ci/hook-contracts.json",
+    ],
 }
 
 

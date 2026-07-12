@@ -87,6 +87,9 @@ def validate(root: Path) -> list[str]:
     # #278: the causal-attribution control proof must run every aggregate -- it is the
     # standing guard that shared-root policing is by process tree, not name pattern.
     require(check, "scripts/test-no-escape-attribution.py", "scripts/check.sh", errors)
+    # #281: the hook-budget measurement is min-of-N with per-trial correctness;
+    # its self-test must stay wired so a single-sample regression cannot return.
+    require(check, "scripts/test-check-hook-contracts.py", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py snapshot", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py verify", "scripts/check.sh", errors)
     # #280: the standalone `cargo build --workspace` was dropped (cargo test
