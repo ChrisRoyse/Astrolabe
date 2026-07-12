@@ -6,9 +6,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
-import json
 from pathlib import Path
-import sqlite3
 import tempfile
 
 
@@ -111,21 +109,11 @@ def main() -> int:
         cli.initialize_fixture_git(primary)
         assert (primary / ".git").is_dir()
         assert (primary / "README.md").read_text(encoding="utf-8") == "CLI parity fixture change\n"
-        cache = fixture_root / "cache"
-        cache.mkdir()
-        cli.seed_provenance_metadata(cache, "cli_parity")
-        connection = sqlite3.connect(cache / "_config.db")
-        try:
-            stored = connection.execute(
-                "SELECT value FROM config WHERE key = ?",
-                ("astrolabe.calyx.cli_parity.provenance_json",),
-            ).fetchone()
-        finally:
-            connection.close()
-        assert stored is not None
-        surface = json.loads(stored[0])
-        assert surface["status"] == "built"
-        assert surface["store"]["chain"]["status"] == {"status": "intact"}
+    # #243: the seed-provenance self-test was removed with seed_provenance_metadata.
+    # The CLI-parity gate no longer seeds a fake surface; it reads back the real
+    # persisted provenance surface and asserts its deterministic fail-closed
+    # contract (get_provenance expect_error fixture), so there is nothing to seed
+    # or schema-check here anymore.
     expect_failure(
         lambda: cli.validate_fixtures(
             {
