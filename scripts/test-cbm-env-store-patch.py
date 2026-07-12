@@ -101,6 +101,21 @@ def main() -> None:
         "http_server.c handle_ui_config NULL-checks the resolver (#241)",
     )
 
+    # #267: find_in_path must stop truncating PATH into a fixed 4096-byte buffer.
+    cli = patched_by_file["src/cli/cli.c"]
+    expect(
+        "char path_copy[CLI_BUF_4K]" not in cli,
+        "cli.c find_in_path no longer copies PATH into a fixed 4096-byte buffer (#267)",
+    )
+    expect(
+        "malloc(path_len + CLI_SKIP_ONE)" in cli and "free(path_copy)" in cli,
+        "cli.c find_in_path sizes the PATH copy to its real length on the heap (#267)",
+    )
+    expect(
+        'win_exts[] = {".exe", ".cmd", ".bat", ".ps1"' in cli,
+        "cli.c find_in_path preserves the Windows PATHEXT probe loop (#221)",
+    )
+
     # Capacity agreement across the C header, the C impl static_assert, and Rust.
     declared = None
     for line in CONSTANTS.read_text(encoding="utf-8").splitlines():
