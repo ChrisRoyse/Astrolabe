@@ -13,19 +13,21 @@ else
   exit 127
 fi
 
-TARGET_ARGS=()
+# #189: this gate used to fork its own target/<triple>/debug tree whenever
+# ASTROLABE_RUST_TARGET was set, which the Rust gate set to the host triple --
+# so the parity binary was rebuilt from cold into a second artifact tree that
+# shared nothing with the target/debug tree the aggregate had just built. The
+# aggregate no longer passes a redundant --target on the native path (see
+# scripts/ci-rust-gate.sh), so there is exactly ONE tree: target/debug. Resolve
+# it directly rather than re-encoding the split here.
 TARGET_DIR="$ROOT/target"
-if [[ -n "${ASTROLABE_RUST_TARGET:-}" ]]; then
-  TARGET_ARGS=(--target "$ASTROLABE_RUST_TARGET")
-  TARGET_DIR="$ROOT/target/$ASTROLABE_RUST_TARGET"
-fi
 
 EXE=""
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;;
 esac
 
-cargo build -p astrolabe-server --bin astrolabe "${TARGET_ARGS[@]}"
+cargo build -p astrolabe-server --bin astrolabe
 
 CBM_BUILD_DIR="$ROOT/target/cbm-parity"
 make -C "$ROOT/vendor/codebase-memory-mcp" \

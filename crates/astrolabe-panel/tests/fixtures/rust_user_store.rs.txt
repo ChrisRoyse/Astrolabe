@@ -1,0 +1,17 @@
+/// Loads a user record over HTTP/2 and caches the decoded response.
+///
+/// Returns `UserError::NotFound` when the upstream store has no row for `id`.
+pub fn loadUserHTTP2(&self, id: UserId) -> Result<User, UserError> {
+    // Fast path: the LRU cache already holds a decoded record.
+    if let Some(cached) = self.cache.get(&id) {
+        return Ok(cached.clone());
+    }
+    let request = self.client.get(self.endpoint.join(&id.to_string())?);
+    let response = request.header("accept", "application/json").send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(UserError::NotFound { id });
+    }
+    let user: User = response.json()?;
+    self.cache.insert(id, user.clone());
+    Ok(user)
+}

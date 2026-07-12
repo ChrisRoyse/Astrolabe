@@ -64,17 +64,26 @@ bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py
 "$PYTHON_BIN" scripts/test-gate-wiring.py
+"$PYTHON_BIN" scripts/check-degradation-labels.py
+"$PYTHON_BIN" scripts/test-degradation-labels.py
 "$PYTHON_BIN" scripts/test-check-workspace-tests.py
 "$PYTHON_BIN" scripts/test-verify-chain-native-path.py
 "$PYTHON_BIN" scripts/test-native-binary-resolution.py
 "$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py
 "$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
+"$PYTHON_BIN" scripts/test-check-hazard-suite.py
+"$PYTHON_BIN" scripts/test-check-no-escape.py
+"$PYTHON_BIN" scripts/test-cbm-spawn-patch.py
+"$PYTHON_BIN" scripts/test-cbm-spawn-fsv.py
+"$PYTHON_BIN" scripts/test-cbm-env-store-patch.py
+"$PYTHON_BIN" scripts/test-cbm-env-contract.py
+"$PYTHON_BIN" scripts/check-cbm-env-contract.py
 "$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
-"$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-license-notices.py
 "$PYTHON_BIN" scripts/check-redaction-writers.py
 "$PYTHON_BIN" scripts/check-shell-arg-audit.py
-"$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-hazard-suite.py
 "$PYTHON_BIN" scripts/test-cbm-mem-pressure-patch.py
 "$PYTHON_BIN" scripts/check-cbm-native-build-contract.py
 "$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py
@@ -93,6 +102,36 @@ ASTRO_CARGO_METADATA_JSON="$ROOT/target/astro-cargo-metadata.json"
 export ASTRO_CARGO_METADATA_JSON
 "$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
+# #237: snapshot the protected roots BEFORE the build/test phase can touch them.
+"$PYTHON_BIN" scripts/check-no-escape.py snapshot --out "$ROOT/target/no-escape-before.json"
+# #246: give the suite a run-scoped scratch sandbox. The workspace tests (notably
+# the Calyx integration tests) create scratch dirs via std::env::temp_dir(), which
+# honors TMP/TEMP/TMPDIR on Windows; without an explicit sandbox they land in the
+# operator's real %TEMP% and (correctly) trip the #237 no-escape gate. The gate that
+# brackets this phase only *catches* escapes -- it never established a sandbox to
+# escape from, so containment cannot depend on the launcher having redirected TMP
+# (it demonstrably did not reach the cargo-test child processes). Point env::temp_dir
+# at a dir under target/ (cleaned with it). The gate resolves operator_temp via the
+# OS known-folder (REAL_TEMP), not the env, so this contains honest writes WITHOUT
+# blinding the gate to any test that bypasses the redirect via an absolute path.
+# Suite temp sits one level below a dedicated ceiling (target/suite-tmp/tmp under
+# ceiling target/suite-tmp). It is inside this git checkout, so env::temp_dir()
+# resolves inside the repo -- breaking tests that assume temp is outside a checkout
+# (calyx-buildinfo compute_for_dir_outside_checkout_errors runs `git rev-parse` in
+# env::temp_dir() and expects failure). target/ is git-ignored build output;
+# GIT_CEILING_DIRECTORIES stops git's upward .git search at target/suite-tmp. The
+# temp must nest UNDER the ceiling (a ceiling only blocks a walk crossing it from
+# below), which also keeps git from other target/ subtrees (release-artifact commit
+# stamping) and the source tree resolving $ROOT/.git normally. Native path for git.exe.
+SUITE_CEIL="$ROOT/target/suite-tmp"
+SUITE_TMP="$SUITE_CEIL/tmp"
+mkdir -p "$SUITE_TMP"
+export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"
+if command -v cygpath >/dev/null 2>&1; then
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$SUITE_CEIL")"
+else
+  export GIT_CEILING_DIRECTORIES="$SUITE_CEIL"
+fi
 "$CARGO_BIN" build --workspace
 if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
   if "$PYTHON_BIN" scripts/check-workspace-tests.py \
@@ -109,6 +148,26 @@ if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
 else
   "$CARGO_BIN" test --workspace
 fi
+# #240/#246/#248: the binary-driving checks below run the astrolabe /
+# codebase-memory-mcp binaries and, without an explicit store, resolve
+# CBM_CACHE_DIR->HOME->USERPROFILE to the operator's REAL
+# ~/.cache/codebase-memory-mcp -- opening _config.db (the migration dial) there and
+# churning its WAL sidecars, which the #237 no-escape gate (correctly) flags as an
+# escape of the exclusive cbm_project_store_home_cache root. Point every downstream
+# check at a run-scoped store under target/ so none touches the operator's real store
+# (check-*.py that already set their own CBM_CACHE_DIR override this per-subprocess).
+# Set AFTER the workspace test so the cbm-sys/bridge tests -- which assert real-store
+# behavior and include $HOME-hardcoded CBM cases -- run unaffected.
+CBM_STORE_SANDBOX="$ROOT/target/cbm-store-sandbox"
+mkdir -p "$CBM_STORE_SANDBOX"
+# The native astrolabe/codebase-memory-mcp binaries need a Windows path here. Git
+# Bash auto-mangles TMP/TEMP/TMPDIR for native children but NOT CBM_CACHE_DIR, so an
+# MSYS "/c/..." value would reach the binary verbatim and be rejected/misresolved --
+# convert to the mixed "C:/..." form (as check-astrolabe-verify-chain.sh does).
+if command -v cygpath >/dev/null 2>&1; then
+  CBM_STORE_SANDBOX="$(cygpath -m "$CBM_STORE_SANDBOX")"
+fi
+export CBM_CACHE_DIR="$CBM_STORE_SANDBOX"
 bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
@@ -123,7 +182,15 @@ else
   "$PYTHON_BIN" scripts/check-lowered-parity.py
 fi
 "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact
+# #88: predicate artifacts are written ONLY after their attested tests have run
+# (cargo build + workspace test above), stamped with commit + UTC timestamp so a
+# run that dies in the build/test phase leaves no fresh 'pass' artifact behind.
+"$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact --cargo "$CARGO_BIN"
 "$PYTHON_BIN" scripts/check-cross-process-vault.py
 "$PYTHON_BIN" scripts/check-cross-process-servers.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"
 "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"
+# #237: re-read the protected roots AFTER the full suite and fail closed if any
+# test escaped its sandbox (added/modified/removed entry outside the run sandbox).
+"$PYTHON_BIN" scripts/check-no-escape.py verify --before "$ROOT/target/no-escape-before.json" --out "$ROOT/target/no-escape-after.json"

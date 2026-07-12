@@ -7,6 +7,24 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# #239: exit-code fidelity depends on native commands reporting through $LASTEXITCODE
+# and NOT raising terminating errors. PowerShell 7.3+ exposes
+# $PSNativeCommandUseErrorActionPreference; when it is $true, a native command that
+# exits non-zero throws under $ErrorActionPreference='Stop'. That would convert the
+# child command's real exit code (say 42) into a generic terminating error -> exit 1,
+# and it would make every $LASTEXITCODE check in this script (Require-Success and the
+# sccache lifecycle below) unreachable. Pin it off so exit codes are data, not errors.
+# Windows PowerShell 5.1 ignores the variable; assigning it there is inert.
+$PSNativeCommandUseErrorActionPreference = $false
+
+# #239: launcher-owned exit codes. These are protocol codes, not measurements. The
+# launcher's exit code is ALWAYS the child command's exit code when the child ran and
+# cleanup succeeded; these two codes are reserved for the cases where there is no child
+# exit code to report (launcher fault) or where reporting the child's green would hide a
+# hygiene violation (cleanup failure after a green child). Both are announced on stderr
+# with a named boundary label so they can never be confused with a child's own code.
+$LauncherFaultExitCode = 70
+$LauncherCleanupFailedExitCode = 71
 
 $ExpectedWorkspace = "C:\code\Astrolabe"
 $RustToolchain = "1.95.0-x86_64-pc-windows-gnu"
@@ -43,6 +61,23 @@ $ExpectedSccacheVersion = "0.16.0"
 # #190: content-addressed compiler-cache budget. The cache lives in a launcher-owned
 # workspace-local dir that survives the target/ wipe, so this bounds on-disk growth.
 $SccacheCacheSize = "20G"
+# #242: the sccache local daemon must never idle-exit mid-run. Its default idle timeout
+# is 600s; a long libcbm C build leaves rustc idle well past that, the daemon exits, and
+# the next Rust phase fires N concurrent sccache clients (cargo's parallel rustc, further
+# amplified by trybuild's NESTED cargo) that each auto-start a server on the same fixed
+# port -- all but one lose the bind race and die with WSAEADDRINUSE (os error 10048).
+# "0" means "run permanently" (mozilla/sccache docs/Configuration.md) and is a mode, not
+# a tunable threshold: it removes the race condition rather than widening a window.
+$SccacheIdleTimeout = "0"
+# #242: stable per-root server port window. Ports must sit OUTSIDE the Windows dynamic
+# (ephemeral) range -- `netsh int ipv4 show dynamicport tcp` reports 49152..65535 on this
+# host, and `netsh int ipv4 show excludedportrange protocol=tcp` reserves several 100-port
+# blocks inside it -- or a fixed listener can collide with an ephemeral/reserved port and
+# fail to bind with the very same os error 10048 for reasons unrelated to sccache. The
+# #226 derivation (49152 + hash % 16000) landed entirely inside that hazard. 20000..29999
+# is in the registered range, below the ephemeral floor.
+$SccacheServerPortBase = 20000
+$SccacheServerPortSpan = 10000
 $GitInstallRoot = "C:\Program Files\Git"
 $RequiredTools = @(
     "gcc.exe",
@@ -108,6 +143,37 @@ function Require-Success {
     param([string]$Step)
     if ($LASTEXITCODE -ne 0) {
         throw "$Step failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-NativeCapture {
+    <#
+      #239: run a native command and return its exit code AS DATA.
+
+      Windows PowerShell 5.1 converts anything a native command writes to stderr into an
+      ErrorRecord; under $ErrorActionPreference='Stop' that ErrorRecord is TERMINATING. So
+      `& sccache --stop-server` -- which prints "couldn't connect to server" on stderr and
+      exits 2 when the daemon has already idle-exited -- does not merely leak an exit code,
+      it can abort the launcher outright, even with `*> $null` attached. Neither the exit
+      code nor a stderr line from a cleanup step may decide this script's fate.
+
+      Drop to 'Continue' for the duration of the call so stderr is output, not an exception,
+      and hand the caller the exit code and the merged output to adjudicate explicitly.
+    #>
+    param([string]$Exe, [string[]]$Arguments)
+
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $Exe @Arguments 2>&1
+        $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = @($output | ForEach-Object { "$_" })
     }
 }
 
@@ -449,6 +515,32 @@ function Ensure-BundledMakeAlias {
     }
 }
 
+function Get-SccacheServerPort {
+    param([string]$Root)
+
+    # #226/#242: one sccache server per launcher root, on a port that is a deterministic
+    # function of that root, so (a) reruns in one root reuse one warm server, (b) sibling
+    # worktrees and the canonical workspace never share a daemon, and (c) the launcher's
+    # session lock -- which serialises launcher runs within a root -- therefore also makes
+    # THIS root's server unambiguously owned by THIS session. Every child, including
+    # trybuild's nested cargo, inherits SCCACHE_SERVER_PORT and so talks to the one server
+    # the launcher already started instead of racing to create its own.
+    #
+    # SHA256.Create()/ComputeHash is used rather than the .NET 5+ [SHA256]::HashData static:
+    # the launcher is documented as runnable under Windows PowerShell 5.1
+    # (`powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1`), whose
+    # .NET Framework 4.8 surface has no HashData.
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Root.ToLowerInvariant())
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($bytes)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    return [string]($SccacheServerPortBase + ([BitConverter]::ToUInt16($hash, 0) % $SccacheServerPortSpan))
+}
+
 function Set-ToolchainEnvironment {
     param(
         [string]$MingwBin,
@@ -458,7 +550,8 @@ function Set-ToolchainEnvironment {
         [string]$GitBin,
         [string]$GitUsrBin,
         [string]$SccacheExe,
-        [string]$SccacheDir
+        [string]$SccacheDir,
+        [string]$SccacheServerPort
     )
 
     $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$RipgrepRoot;$GitUsrBin;$GitBin;$env:PATH"
@@ -485,6 +578,15 @@ function Set-ToolchainEnvironment {
     $env:SCCACHE_DIR = $SccacheDir
     $env:SCCACHE_CACHE_SIZE = $SccacheCacheSize
     $env:CARGO_INCREMENTAL = "0"
+    # #242: every descendant of the child command -- cargo, its parallel rustc processes,
+    # and the NESTED cargo that trybuild spawns -- inherits these two, so they all address
+    # the single server this launcher pre-starts on this root's port and none of them ever
+    # takes the auto-start path that produced the os error 10048 bind race. RUSTC_WRAPPER
+    # is deliberately NOT unset for nested cargo: an unset wrapper would silently drop the
+    # trybuild phase out of the cache (an unlabelled degradation), whereas server
+    # inheritance keeps one consistent, cached, deterministic compile path.
+    $env:SCCACHE_SERVER_PORT = $SccacheServerPort
+    $env:SCCACHE_IDLE_TIMEOUT = $SccacheIdleTimeout
 }
 
 function Set-WorkspaceTempEnvironment {
@@ -632,17 +734,14 @@ if ($isWorktreeRoot -and $Bootstrap) {
 }
 if ($isWorktreeRoot) {
     Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
-    # #226: give each worktree its own sccache SERVER (port) while still sharing
-    # the on-disk cache. The server is otherwise machine-wide, so an orphan left
-    # by a sibling session that was started under a since-deleted per-session temp
-    # dir would serve this session and fatally poison every compile with
-    # "Failed to create temp dir". The port is a deterministic function of the
-    # worktree path, so reruns in one worktree reuse one warm server.
-    $rootBytes = [System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())
-    $rootHash = [System.Security.Cryptography.SHA256]::HashData($rootBytes)
-    $env:SCCACHE_SERVER_PORT = [string](49152 + ([BitConverter]::ToUInt16($rootHash, 0) % 16000))
-    Write-Output "SCCACHE[ASTRO_CACHE_WORKTREE_PORT]: SCCACHE_SERVER_PORT=$env:SCCACHE_SERVER_PORT"
 }
+# #226/#242: every root -- canonical AND worktree -- gets its own sccache server on a
+# deterministic, non-ephemeral port. #226 derived a port for worktrees only, which left the
+# canonical workspace on sccache's machine-wide default (127.0.0.1:4226): a stray default-port
+# server from any other project on this host, or an orphan started under a since-deleted
+# per-session temp dir, would then silently serve the canonical gate. Deriving the port here
+# for both roots makes server ownership follow the launcher session lock exactly.
+$sccacheServerPort = Get-SccacheServerPort -Root $root
 Set-Location -LiteralPath $root
 $target = Join-Path $root "target"
 $workspaceTempParent = Join-Path $root ".tmp"
@@ -752,7 +851,7 @@ Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missin
 Require-Path (Join-Path $ripgrepRoot "rg.exe") "pinned ripgrep is missing; rerun with -Bootstrap"
 Require-Path $sccacheExe "pinned sccache is missing; rerun with -Bootstrap"
 New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
-Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin -SccacheExe $sccacheExe -SccacheDir $sccacheDir
+Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin -SccacheExe $sccacheExe -SccacheDir $sccacheDir -SccacheServerPort $sccacheServerPort
 # No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
 # host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
 # (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
@@ -772,14 +871,36 @@ if ([string]::IsNullOrWhiteSpace($Command)) {
     exit 0
 }
 
-$commandArgs = @(ConvertFrom-Json -InputObject $CommandArgsJson)
+# Windows PowerShell 5.1's ConvertFrom-Json emits a JSON array as ONE object instead of
+# enumerating it, so `@(ConvertFrom-Json '["a","b"]')` yields an array-of-one-array there
+# while PowerShell 7 unrolls it into two strings. Under 5.1 -- the host CLAUDE.md documents
+# for `powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1` -- that
+# made every multi-argument invocation (including CLAUDE.md's own
+# '["test","-p","cbm-sys","--lib"]' example) fail the string check below. Normalise both
+# hosts to a flat argument list before validating.
+$parsedCommandArgs = ConvertFrom-Json -InputObject $CommandArgsJson
+$commandArgs = @()
+if ($null -ne $parsedCommandArgs) {
+    if (($parsedCommandArgs -is [System.Collections.IEnumerable]) -and ($parsedCommandArgs -isnot [string])) {
+        foreach ($argument in $parsedCommandArgs) {
+            $commandArgs += $argument
+        }
+    }
+    else {
+        $commandArgs += $parsedCommandArgs
+    }
+}
 foreach ($argument in $commandArgs) {
     if ($argument -isnot [string]) {
         throw "CommandArgsJson must contain only strings"
     }
 }
 
-$commandExit = 0
+# #239: $commandExit stays $null until the child command actually reports an exit code.
+# "the child never ran" and "the child exited 0" are different facts and must not collapse.
+$commandExit = $null
+$launcherFault = $null
+$cleanupErrors = @()
 $previousTempEnvironment = @{}
 foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -790,43 +911,89 @@ try {
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.
-    # #226: the server may outlive this session (worktree sessions never stop it),
-    # so it must NOT inherit the per-session workspace temp — a server whose temp
-    # dir is deleted at session end fatally poisons every later compile with
-    # "Failed to create temp dir". Start it with a stable temp under the shared
-    # cache root, then restore the per-session temp for the child command.
+    # #226: the server may outlive this session, so it must NOT inherit the per-session
+    # workspace temp — a server whose temp dir is deleted at session end fatally poisons
+    # every later compile with "Failed to create temp dir". Start it with a stable temp
+    # under the shared cache root, then restore the per-session temp for the child command.
     $sccacheServerTemp = Join-Path $sccacheDir "server-tmp"
     New-Item -ItemType Directory -Path $sccacheServerTemp -Force | Out-Null
     Set-WorkspaceTempEnvironment -WorkspaceTemp $sccacheServerTemp
-    & $sccacheExe --start-server *> $null
-    Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
-    & $sccacheExe --zero-stats *> $null
-    Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0"
-    & $Command @commandArgs
-    if ($null -ne $LASTEXITCODE) {
-        $commandExit = $LASTEXITCODE
+    # #242: replace any leftover daemon on THIS root's port before starting ours. The
+    # launcher session lock serialises launcher runs within a root, so a server on this
+    # port is either ours-from-a-previous-run or an orphan of a crashed run — in both
+    # cases its configuration (idle timeout, temp dir, cache dir) is unknown, and an
+    # orphan started under a since-deleted per-session temp poisons every compile. Stop
+    # it, then start one daemon whose environment we know exactly. Exit 2 here means
+    # "no server was listening", which is the normal, expected case.
+    $sccachePreStop = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--stop-server")
+    if ($sccachePreStop.ExitCode -eq 0) {
+        Write-Output "SCCACHE[ASTRO_CACHE_SERVER_REPLACED]: stopped a pre-existing sccache daemon on 127.0.0.1:$sccacheServerPort before starting this session's daemon"
     }
+    $sccacheStart = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--start-server")
+    Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
+    # #242: --zero-stats round-trips to the daemon, so its exit code is a direct readback of
+    # "a daemon is listening on this port and answering". If it is not, EVERY rustc invocation
+    # in the child would fail through the sccache wrapper; fail closed here with a named
+    # boundary instead of letting that surface as an unattributable mid-build error.
+    $sccacheZero = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--zero-stats")
+    if ($sccacheZero.ExitCode -ne 0) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_SERVER_UNAVAILABLE]: no sccache daemon is answering on 127.0.0.1:$sccacheServerPort ('--start-server' exit=$($sccacheStart.ExitCode), '--zero-stats' exit=$($sccacheZero.ExitCode)). Every rustc invocation would fail through RUSTC_WRAPPER. Remediation: check for a foreign listener on that port (Get-NetTCPConnection -LocalPort $sccacheServerPort) and for stale sccache.exe processes, then retry. Daemon output: $($sccacheStart.Output -join ' | ') $($sccacheZero.Output -join ' | ')"
+    }
+    Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0; SCCACHE_SERVER_PORT=$sccacheServerPort; SCCACHE_IDLE_TIMEOUT=$SccacheIdleTimeout"
+    # #239: the child's exit code is the ONLY thing that decides this launcher's exit code.
+    # $ErrorActionPreference drops to 'Continue' for the call because Windows PowerShell 5.1
+    # turns a native command's stderr into a TERMINATING ErrorRecord under 'Stop' — a child
+    # that merely writes a warning to stderr would otherwise be reported as a launcher fault
+    # instead of by its own exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command @commandArgs
+        # Capture immediately, before any cleanup command can overwrite $LASTEXITCODE.
+        $commandExit = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    Write-Output "LAUNCHER_EXIT[ASTRO_CHILD_EXIT]: child command exited with $commandExit"
+}
+catch {
+    # #239: a fault in the launcher itself (bad sccache daemon, unlaunchable command, ...)
+    # is NOT a child exit code. Record it, let the finally run, and report it below under
+    # its own reserved code so it can never be mistaken for the child's result.
+    $launcherFault = $_
 }
 finally {
-    # #190: surface this run's sccache stats to the evidence stream, then stop the
-    # server (flushes stats, releases any handles under the workspace temp) BEFORE the
-    # target/temp cleanup below. The on-disk cache in $sccacheDir is intentionally kept.
+    # #190: surface this run's sccache stats to the evidence stream, then stop the daemon
+    # (flushes stats, releases handles) BEFORE the target/temp cleanup below. The on-disk
+    # cache in $sccacheDir is intentionally kept.
+    # #226/#242: the daemon is bound to THIS root's derived port and the session lock makes
+    # this session its only user, so stopping it is correct for worktree roots too — it no
+    # longer risks tearing down a live canonical session's daemon, and it leaves no orphan
+    # behind for the next session to inherit blindly.
+    # #239: NOTHING in this block may change the launcher's exit code. Every native call
+    # here has its exit code captured and reported under a named label, never propagated.
     try {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
-        & $sccacheExe --show-stats
-        if ($isCanonicalRoot) {
-            & $sccacheExe --stop-server *> $null
+        $sccacheStats = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--show-stats")
+        foreach ($line in $sccacheStats.Output) {
+            Write-Output $line
         }
-        else {
-            # #226: the sccache server is machine-wide and may be serving a live
-            # canonical-workspace session; a worktree session must not stop it.
-            Write-Output "SCCACHE[ASTRO_CACHE_SERVER_LEFT_RUNNING]: worktree session leaves the shared sccache server up"
+        if ($sccacheStats.ExitCode -ne 0) {
+            Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: '$sccacheExe --show-stats' exit=$($sccacheStats.ExitCode)"
+        }
+        $sccacheStop = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--stop-server")
+        if ($sccacheStop.ExitCode -ne 0) {
+            # #239: sccache exits 2 from --stop-server when no daemon is listening (it has
+            # already idle-exited, or was never started). That is a cleanup-time degradation,
+            # named here, and it MUST NOT become this script's exit code — that leak is what
+            # made a fully green gate report red.
+            Write-Output "SCCACHE[ASTRO_CACHE_SERVER_STOP_NONZERO]: '$sccacheExe --stop-server' (127.0.0.1:$sccacheServerPort) exit=$($sccacheStop.ExitCode); the daemon was already gone. Cleanup-only degradation: the launcher exit code remains the child's. Daemon output: $($sccacheStop.Output -join ' | ')"
         }
     }
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
     }
-    $cleanupErrors = @()
     if (Test-Path -LiteralPath $target) {
         try {
             Remove-Item -LiteralPath $target -Recurse -Force
@@ -872,13 +1039,46 @@ finally {
             Set-Item -Path "Env:$name" -Value $previous.Value
         }
     }
-    if ($cleanupErrors.Count -gt 0) {
-        throw ($cleanupErrors -join "; ")
+    # #239: the finally block must NEVER throw. A throw here unwinds past the exit
+    # decision below and PowerShell reports a generic terminating error (exit 1),
+    # destroying the child's real exit code — a red-for-green AND a green-for-red hazard.
+    # Cleanup failures are recorded in $cleanupErrors and adjudicated below, loudly.
+    if ($cleanupErrors.Count -eq 0) {
+        Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+        Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
     }
-    Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
-    Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
 }
 
-if ($commandExit -ne 0) {
-    exit $commandExit
+# #239: THE exit-code contract, in one place.
+#
+#   1. Launcher fault (the child never produced an exit code)   -> $LauncherFaultExitCode
+#   2. Child ran, cleanup failed, child was non-zero            -> the child's exit code
+#      (a real hygiene failure is announced, but the child's own red is never overwritten)
+#   3. Child ran, cleanup failed, child was zero                -> $LauncherCleanupFailedExitCode
+#      (target/ or the workspace temp survived: a hygiene violation must not report green)
+#   4. Child ran, cleanup clean                                 -> the child's exit code
+#
+# In every case the exit is EXPLICIT. The previous code only called `exit` when the child
+# was non-zero and otherwise fell off the end of the script, which leaves $LASTEXITCODE as
+# whatever the last native command in the finally block set — `sccache --stop-server`,
+# exit 2 once the daemon had idle-timed-out. Callers that invoke this launcher in-session
+# (`& .\scripts\windows-gnu-toolchain.ps1 ...`, which is exactly what
+# scripts/invoke-native-aggregate.ps1 does before reading $LASTEXITCODE) then observed 2
+# and reported a fully green gate as red.
+if ($null -ne $launcherFault) {
+    if ($cleanupErrors.Count -gt 0) {
+        [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_FAILED]: " + ($cleanupErrors -join "; "))
+    }
+    [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_FAULT]: " + $launcherFault.Exception.Message)
+    [Console]::Error.WriteLine(($launcherFault | Out-String))
+    exit $LauncherFaultExitCode
 }
+if ($cleanupErrors.Count -gt 0) {
+    [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_FAILED]: " + ($cleanupErrors -join "; "))
+    if ($commandExit -ne 0) {
+        [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_FAILED]: reporting the child's exit code $commandExit; the cleanup failure above is additional, not a substitute.")
+        exit $commandExit
+    }
+    exit $LauncherCleanupFailedExitCode
+}
+exit $commandExit

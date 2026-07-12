@@ -93,14 +93,45 @@ def main() -> None:
         "the build-configuration stamp must preserve mtime when content is unchanged",
     )
     require(
-        "libcbm_build_config(&build_script, &patched_makefile, &mem_pressure_patch)" in build_rs,
-        "the configuration stamp must cover build.rs, Makefile.cbm, and source overlays",
+        "libcbm_build_config(&config_inputs)" in build_rs
+        and "&build_script," in build_rs
+        and "&patched_makefile," in build_rs
+        and "&mem_pressure_patch," in build_rs
+        and "&env_store_patch," in build_rs
+        and "&env_store_config_src," in build_rs
+        and "&env_store_config_hdr," in build_rs
+        and "config_inputs.extend(spawn_overlays" in build_rs,
+        "the configuration stamp must cover build.rs, Makefile.cbm, and every "
+        "source overlay (mem-pressure, env-store, and the #227/#228 spawn set)",
     )
     require(
         'let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");'
         in build_rs
         and "cargo:rerun-if-changed={}" in build_rs,
         "Cargo must rebuild when the CBM pressure-log overlay changes",
+    )
+    # #227/#228: every shell-free-spawn overlay input must be watched AND folded
+    # into the config stamp, or a change to the git-spawn helper/generators would
+    # not rebuild libcbm.a. Assert the whole set by path so the gate stays
+    # load-bearing as overlays are added.
+    for overlay in (
+        "astro_spawn.c",
+        "astro_spawn.h",
+        "astro_overlay.py",
+        "apply_spawn_git_context_patch.py",
+        "apply_spawn_artifact_patch.py",
+        "apply_spawn_watcher_patch.py",
+        "apply_spawn_githistory_patch.py",
+        "apply_shellarg_str_util_patch.py",
+    ):
+        require(
+            f'repo_root.join("patches/cbm/{overlay}")' in build_rs,
+            f"Cargo must rebuild when the CBM spawn overlay {overlay} changes",
+        )
+    require(
+        "for spawn_overlay in &spawn_overlays" in build_rs
+        and "cargo:rerun-if-changed={}" in build_rs,
+        "every spawn overlay must emit a rerun-if-changed directive",
     )
     require(
         'let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");' in build_rs

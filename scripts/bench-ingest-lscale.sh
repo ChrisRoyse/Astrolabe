@@ -6,21 +6,12 @@ OUT="${ASTROLABE_LSCALE_OUT:-$ROOT/target/astrolabe-ingest-lscale-bench.json}"
 TARGET_SECONDS="${ASTROLABE_LSCALE_TARGET_SECONDS:-300}"
 mkdir -p "$(dirname "$OUT")"
 
+# There is no hosted CI and therefore no step summary to write (#224): the
+# invoking process's stdout IS the evidence stream. Emit a named, greppable line.
 write_summary() {
   local status="$1"
   local detail="$2"
-  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    {
-      echo "### Astrolabe ingest L-scale benchmark"
-      echo
-      echo "| Metric | Value |"
-      echo "|---|---:|"
-      echo "| Status | $status |"
-      echo "| Target seconds | $TARGET_SECONDS |"
-      echo "| Detail | $detail |"
-      echo
-    } >> "$GITHUB_STEP_SUMMARY"
-  fi
+  echo "BENCH[astrolabe-ingest-lscale] status=$status target_seconds=$TARGET_SECONDS detail=$detail"
 }
 
 # Smoke mode (`--smoke`; `--ci-smoke` kept as a compatibility alias): when no

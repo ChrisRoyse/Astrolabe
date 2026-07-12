@@ -310,18 +310,109 @@ fn shadow_outcome_persists_vault_fingerprint_watermark_for_content_freshness() {
     let persisted = read_config_value(&dir, &metadata_key("demo", "vault_fingerprint"))
         .unwrap()
         .expect("vault_fingerprint watermark must be persisted for content-freshness (#221)");
+    // #223: the stored value is self-describing — algo:version:digest — so a consumer never
+    // has to assume which function produced it. Assert the exact persisted bytes.
     assert_eq!(
-        persisted, outcome.content_freshness_watermark_sha256,
-        "persisted vault_fingerprint must equal the source-file digest that \
-             evaluate_shadow_content_freshness recomputes and compares against"
+        persisted,
+        format!(
+            "sqlite-file-sha256:v1:{}",
+            outcome.content_freshness_watermark_sha256
+        ),
+        "persisted vault_fingerprint must be the domain-tagged source-file digest that \
+             evaluate_shadow_content_freshness parses and compares against"
     );
-    assert_ne!(
-        persisted, outcome.sqlite_fingerprint_sha256,
-        "persisted vault_fingerprint must NOT be the row-sink report digest — that is the \
+    assert!(
+        !persisted.contains(&outcome.sqlite_fingerprint_sha256),
+        "persisted vault_fingerprint must NOT carry the row-sink report digest — that is the \
              exact #221 defect"
+    );
+    // And it parses back into this server's domain with the digest intact.
+    assert_eq!(
+        parse_shadow_watermark(&persisted),
+        ShadowWatermark::Tagged {
+            algo: SHADOW_WATERMARK_ALGO.to_string(),
+            version: SHADOW_WATERMARK_VERSION.to_string(),
+            digest: outcome.content_freshness_watermark_sha256.clone(),
+        }
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadow_watermark_parse_classifies_every_stored_shape() {
+    // #223 unit gate on the self-describing watermark format. Only a value tagged with the
+    // domain this server computes is comparable; everything else is a distinct fail-closed
+    // class, never a silently-accepted digest.
+    let digest = "ab".repeat(32);
+
+    // This server's domain: round-trips through format -> parse with the digest intact.
+    let tagged = format_shadow_watermark(&digest);
+    assert_eq!(tagged, format!("sqlite-file-sha256:v1:{digest}"));
+    assert_eq!(
+        parse_shadow_watermark(&tagged),
+        ShadowWatermark::Tagged {
+            algo: SHADOW_WATERMARK_ALGO.to_string(),
+            version: SHADOW_WATERMARK_VERSION.to_string(),
+            digest: digest.clone(),
+        }
+    );
+
+    // A foreign algorithm domain (the #221 row-sink digest) parses as tagged-but-foreign:
+    // the caller sees the domain it was produced by and can refuse rather than compare.
+    assert_eq!(
+        parse_shadow_watermark(&format!("row-sink-sha256:v1:{digest}")),
+        ShadowWatermark::Tagged {
+            algo: "row-sink-sha256".to_string(),
+            version: "v1".to_string(),
+            digest: digest.clone(),
+        }
+    );
+    // A future version of our own algorithm is equally foreign to *this* gate.
+    assert_eq!(
+        parse_shadow_watermark(&format!("sqlite-file-sha256:v2:{digest}")),
+        ShadowWatermark::Tagged {
+            algo: SHADOW_WATERMARK_ALGO.to_string(),
+            version: "v2".to_string(),
+            digest: digest.clone(),
+        }
+    );
+
+    // A pre-#223 bare hex digest: legacy v0, domain unrecorded.
+    assert_eq!(
+        parse_shadow_watermark(&digest),
+        ShadowWatermark::LegacyUntagged {
+            digest: digest.clone(),
+        }
+    );
+
+    // Edge-case triad: empty, wrong field count, and non-hex/oversized values all fail
+    // closed as Malformed rather than being coerced into a comparable digest.
+    let too_many_fields = format!("sqlite-file-sha256:v1:{digest}:extra");
+    let uppercase_hex = "AB".repeat(32);
+    let overlong_hex = format!("{digest}beef");
+    for raw in [
+        "",
+        "   ",
+        "sqlite-file-sha256:v1",
+        too_many_fields.as_str(),
+        "sqlite-file-sha256::",
+        "not-a-watermark",
+        // Uppercase hex is not the encoding fingerprint_sqlite_hex emits.
+        uppercase_hex.as_str(),
+        // Right alphabet, wrong length.
+        overlong_hex.as_str(),
+        // Claims this server's domain, but the digest is not a SHA-256 hex.
+        "sqlite-file-sha256:v1:xyz",
+    ] {
+        assert!(
+            matches!(
+                parse_shadow_watermark(raw),
+                ShadowWatermark::Malformed { .. }
+            ),
+            "watermark {raw:?} must fail closed as Malformed"
+        );
+    }
 }
 
 #[test]
@@ -1363,7 +1454,17 @@ fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
     assert_eq!(provenance["reproduce_count"], 2);
     assert_eq!(provenance["manifest_count"], 1);
     assert_eq!(provenance["metadata_skipped_count"], 0);
-    assert_eq!(provenance["trust"], "verified");
+    // #209: row-sink provenance has no durable ledger, so its chain attests an empty range —
+    // it verified nothing. The metadata built completely (metadata_skipped_count == 0), which
+    // is exactly the case that used to ride `trust: "verified"`. A complete build over an
+    // unverified chain is still unverified.
+    assert_eq!(provenance["trust"], "provisional");
+    assert_eq!(provenance["freshness"], "not_evaluated");
+    assert_eq!(
+        provenance["warnings"][0]["code"],
+        PROVENANCE_WARN_CHAIN_EMPTY
+    );
+    assert!(provenance["remediation"].is_string());
 
     let store = provenance_store_from_json(&provenance["store"]).unwrap();
     for (mode, subject) in [
@@ -1933,18 +2034,46 @@ fn shadow_import_status_labels_from_content_verdict() {
     assert_eq!(current["verification"], "content_fingerprint_match");
     assert!(current["remediation"].is_null());
 
-    // A content mismatch is reported stale, not verified, and carries both
-    // fingerprints so the drift is observable.
+    // A content mismatch inside the SAME digest domain is real staleness: reported
+    // provisional with both fingerprints so the drift is observable, and — since #222 —
+    // labeled stale_reindex_required, because the read path deliberately does not
+    // reconcile it (doing so would clobber the row-sink-derived surfaces).
     let stale = shadow_import_current_summary(&ShadowContentVerdict::Stale {
         expected: "aa".repeat(32),
         actual: "bb".repeat(32),
     });
-    assert_eq!(stale["status"], "stale");
+    assert_eq!(stale["status"], "stale_reindex_required");
     assert_eq!(stale["freshness"], "stale");
     assert_eq!(stale["trust"], "provisional");
     assert_eq!(stale["verification"], "content_fingerprint_mismatch");
+    assert_eq!(stale["code"], ASTRO_SHADOW_STALE_REINDEX_REQUIRED);
     assert_eq!(stale["expected_vault_fingerprint"], "aa".repeat(32));
     assert_eq!(stale["actual_vault_fingerprint"], "bb".repeat(32));
+    assert_eq!(stale["derived_surfaces"], "last_known_good_preserved");
+    assert!(!stale["remediation"].as_str().unwrap().is_empty());
+
+    // A wrong-domain watermark is NOT staleness (#223): it is its own coded refusal, and
+    // it names the domain on both sides so the mismatch is diagnosable.
+    let mismatch = shadow_import_current_summary(&ShadowContentVerdict::WatermarkDomainMismatch {
+        code: ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH,
+        message: format!("{ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH}: foreign domain"),
+        remediation: SHADOW_WATERMARK_DOMAIN_MISMATCH_REMEDIATION,
+        persisted_algo: "row-sink-sha256".to_string(),
+        persisted_version: "v1".to_string(),
+        expected_algo: SHADOW_WATERMARK_ALGO,
+        expected_version: SHADOW_WATERMARK_VERSION,
+    });
+    assert_eq!(mismatch["status"], "watermark_domain_mismatch");
+    assert_ne!(mismatch["status"], "stale");
+    assert_ne!(mismatch["trust"], "verified");
+    assert_eq!(mismatch["code"], ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH);
+    assert_eq!(mismatch["persisted_watermark_algo"], "row-sink-sha256");
+    assert_eq!(mismatch["expected_watermark_algo"], SHADOW_WATERMARK_ALGO);
+    assert_eq!(
+        mismatch["watermark_format"],
+        SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION
+    );
+    assert!(!mismatch["remediation"].as_str().unwrap().is_empty());
 
     // A missing verify-relevant input fails closed: unverified with a machine
     // code + remediation, never fresh/verified.
@@ -2018,16 +2147,22 @@ fn shadow_content_freshness_fresh_only_on_matching_fingerprint() {
     let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
     assert_eq!(verdict, ShadowContentVerdict::Fresh);
 
-    // FSV: the persisted watermark read back from the config store equals the
-    // recomputed live source fingerprint.
-    let persisted = read_config_value(&dir, &metadata_key("demo", "vault_fingerprint")).unwrap();
-    assert_eq!(persisted.as_deref(), Some(fingerprint.as_str()));
+    // FSV: the persisted watermark read back from the config store is the domain-tagged
+    // (#223) form of the recomputed live source fingerprint — exact bytes.
+    let persisted = read_config_value(&dir, &metadata_key("demo", "vault_fingerprint"))
+        .unwrap()
+        .expect("watermark persisted");
+    assert_eq!(persisted, format!("sqlite-file-sha256:v1:{fingerprint}"));
 
-    // The full status surface labels it current/fresh/verified.
+    // The full status surface labels it current/fresh/verified and declares the format.
     let summary = shadow_status_summary_at(&dir, "demo").unwrap();
     assert_eq!(summary["shadow_import"]["status"], "current");
     assert_eq!(summary["shadow_import"]["trust"], "verified");
     assert_eq!(summary["shadow_import"]["freshness"], "fresh");
+    assert_eq!(
+        summary["shadow_import"]["watermark_format"],
+        SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -2053,16 +2188,320 @@ fn shadow_content_freshness_stale_on_out_of_band_source_mutation() {
         }
     );
 
-    // The status surface reports stale/provisional, never current/verified.
+    // The status surface reports stale_reindex_required/provisional, never current/verified,
+    // and carries both fingerprints (#222: the read path will not reconcile this itself).
     let summary = shadow_status_summary_at(&dir, "demo").unwrap();
-    assert_eq!(summary["shadow_import"]["status"], "stale");
+    assert_eq!(summary["shadow_import"]["status"], "stale_reindex_required");
     assert_eq!(summary["shadow_import"]["trust"], "provisional");
     assert_eq!(summary["shadow_import"]["freshness"], "stale");
     assert_eq!(
         summary["shadow_import"]["verification"],
         "content_fingerprint_mismatch"
     );
+    assert_eq!(
+        summary["shadow_import"]["code"],
+        ASTRO_SHADOW_STALE_REINDEX_REQUIRED
+    );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// Overwrites the persisted `vault_fingerprint` watermark with `raw`, byte-for-byte, so a
+/// test can drive the freshness gate against a watermark the current server would never
+/// write (a foreign domain, a legacy untagged digest, a corrupt value).
+fn overwrite_persisted_watermark(dir: &Path, project: &str, raw: &str) {
+    write_config_value(dir, &metadata_key(project, "vault_fingerprint"), raw).unwrap();
+    let readback = read_config_value(dir, &metadata_key(project, "vault_fingerprint"))
+        .unwrap()
+        .expect("seeded watermark persisted");
+    assert_eq!(readback, raw, "seeded watermark must land byte-for-byte");
+}
+
+#[test]
+fn shadow_content_freshness_refuses_foreign_watermark_domain_instead_of_reading_stale() {
+    // #223 core: a watermark produced by a DIFFERENT digest domain can never equal the
+    // digest this gate recomputes. Before the domain tag, that condition was
+    // indistinguishable from ordinary staleness and read `Stale` forever — which is exactly
+    // how the #221 row-sink-digest bug hid, and what drove the provenance-clobbering
+    // refresh. It must now fail loud with a coded refusal.
+    let dir = temp_dir("shadow-freshness-foreign-domain");
+    let true_digest = seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+    // The source is UNCHANGED — the only defect is the watermark's domain. Any verdict of
+    // `Stale` here would be a lie about the source.
+    overwrite_persisted_watermark(
+        &dir,
+        "demo",
+        &format!("row-sink-sha256:v1:{}", "ab".repeat(32)),
+    );
+
+    let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+    match &verdict {
+        ShadowContentVerdict::WatermarkDomainMismatch {
+            code,
+            remediation,
+            persisted_algo,
+            persisted_version,
+            expected_algo,
+            expected_version,
+            ..
+        } => {
+            assert_eq!(*code, ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH);
+            assert_eq!(persisted_algo, "row-sink-sha256");
+            assert_eq!(persisted_version, "v1");
+            assert_eq!(*expected_algo, SHADOW_WATERMARK_ALGO);
+            assert_eq!(*expected_version, SHADOW_WATERMARK_VERSION);
+            assert!(!remediation.is_empty());
+        }
+        other => panic!("expected ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH, got {other:?}"),
+    }
+    assert!(
+        !matches!(verdict, ShadowContentVerdict::Stale { .. }),
+        "a wrong-domain watermark must NOT masquerade as staleness (#223)"
+    );
+
+    let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+    assert_eq!(
+        summary["shadow_import"]["code"],
+        ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH
+    );
+    assert_eq!(
+        summary["shadow_import"]["status"],
+        "watermark_domain_mismatch"
+    );
+    assert_ne!(summary["shadow_import"]["trust"], "verified");
+
+    // The good watermark still round-trips, proving the fixture itself is sound.
+    overwrite_persisted_watermark(&dir, "demo", &format_shadow_watermark(&true_digest));
+    assert_eq!(
+        evaluate_shadow_content_freshness(&dir, "demo").unwrap(),
+        ShadowContentVerdict::Fresh
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadow_content_freshness_refuses_legacy_untagged_watermark_even_when_digest_matches() {
+    // #223 backward migration: a pre-tag (v0) bare hex digest records no domain. It may be
+    // the source-file digest (post-#221) or the incommensurable row-sink digest (pre-#221),
+    // and nothing in the stored bytes distinguishes them. So even a value that HAPPENS to
+    // equal the recomputed digest must not be accepted as Fresh — an unprovable domain is
+    // refused, not guessed. One reindex re-persists it tagged. Not a crash, not a silent
+    // pass.
+    let dir = temp_dir("shadow-freshness-legacy-v0");
+    let true_digest = seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+    // The strongest form of the case: the legacy value is the CORRECT digest, bare.
+    overwrite_persisted_watermark(&dir, "demo", &true_digest);
+
+    let verdict = evaluate_shadow_content_freshness(&dir, "demo").unwrap();
+    match &verdict {
+        ShadowContentVerdict::WatermarkDomainMismatch {
+            code,
+            persisted_algo,
+            persisted_version,
+            remediation,
+            ..
+        } => {
+            assert_eq!(*code, ASTRO_SHADOW_WATERMARK_LEGACY_UNTAGGED);
+            assert_eq!(persisted_algo, SHADOW_WATERMARK_LEGACY_ALGO);
+            assert_eq!(persisted_version, SHADOW_WATERMARK_LEGACY_VERSION);
+            assert!(!remediation.is_empty());
+        }
+        other => panic!("expected ASTRO_SHADOW_WATERMARK_LEGACY_UNTAGGED, got {other:?}"),
+    }
+    assert_ne!(
+        verdict,
+        ShadowContentVerdict::Fresh,
+        "an untagged v0 watermark must not silently pass, even matching (#223)"
+    );
+
+    // One reindex is the migration: re-persisting the same digest in the tagged form makes
+    // the project Fresh with no source change at all.
+    overwrite_persisted_watermark(&dir, "demo", &format_shadow_watermark(&true_digest));
+    assert_eq!(
+        evaluate_shadow_content_freshness(&dir, "demo").unwrap(),
+        ShadowContentVerdict::Fresh
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadow_content_freshness_refuses_malformed_watermark() {
+    // #223 invalid-format edge: corrupt stored metadata fails closed with a code and a
+    // remediation — never coerced into a comparable digest.
+    let dir = temp_dir("shadow-freshness-malformed-watermark");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+    overwrite_persisted_watermark(&dir, "demo", "sqlite-file-sha256:v1:not-a-digest");
+
+    match evaluate_shadow_content_freshness(&dir, "demo").unwrap() {
+        ShadowContentVerdict::WatermarkDomainMismatch { code, message, .. } => {
+            assert_eq!(code, ASTRO_SHADOW_WATERMARK_MALFORMED);
+            assert!(message.starts_with(ASTRO_SHADOW_WATERMARK_MALFORMED));
+        }
+        other => panic!("expected ASTRO_SHADOW_WATERMARK_MALFORMED, got {other:?}"),
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads the six row-sink-derived surface JSON blobs straight back out of the config
+/// store, as raw persisted strings — the bytes on disk, not an API echo.
+fn read_persisted_derived_surfaces(dir: &Path, project: &str) -> BTreeMap<String, String> {
+    let mut surfaces = BTreeMap::new();
+    for key in SHADOW_DERIVED_SURFACE_KEYS {
+        if let Some(value) = read_config_value(dir, &metadata_key(project, key)).unwrap() {
+            surfaces.insert(key.to_string(), value);
+        }
+    }
+    surfaces
+}
+
+#[test]
+fn shadow_refresh_preserves_last_known_good_surfaces_on_genuine_source_staleness() {
+    // #222 core regression. `ensure_shadow_import_current` runs on the index_status /
+    // team_artifact read path, where there is NO CbmToolRunner. Its only re-import passes
+    // row_sink = None, and that branch of import_shadow_vault_report fills provenance,
+    // security_screen, skill_tree, bridges, kernel_context, and anomalies with
+    // *_unavailable_json(..) — which persist_shadow_outcome then writes straight over the
+    // previously-good, row-sink-derived surfaces.
+    //
+    // So a caller who made a genuine out-of-band source change and then merely called
+    // index_status found get_provenance, detect_anomalies, and the security screen all
+    // silently downgraded to "unavailable", with no reindex having been requested. That is
+    // a silent fallback that destroys good state (standing invariants #2 and #3).
+    //
+    // Prove the fix by byte readback of the persisted surfaces, not an API echo: after the
+    // refresh trigger fires on a genuinely stale source, the surfaces on disk are still the
+    // good ones, and the status is stale_reindex_required.
+    let dir = temp_dir("shadow-refresh-preserves-surfaces");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+
+    let before = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(
+        before.len(),
+        SHADOW_DERIVED_SURFACE_KEYS.len(),
+        "fixture must persist every row-sink-derived surface"
+    );
+    let provenance_before = before
+        .get("provenance_json")
+        .expect("good provenance surface persisted");
+    let provenance_before_value: Value = serde_json::from_str(provenance_before).unwrap();
+    assert_ne!(
+        provenance_before_value["status"], "unavailable",
+        "fixture must seed a GOOD provenance surface, otherwise this test proves nothing"
+    );
+    println!("PERSISTED provenance_json BEFORE: {provenance_before}");
+
+    // Genuine out-of-band source mutation: the CBM SQLite really did change.
+    fs::write(
+        sqlite_path(&dir, "demo"),
+        b"cbm sqlite content v2 mutated out of band",
+    )
+    .unwrap();
+    assert!(matches!(
+        evaluate_shadow_content_freshness(&dir, "demo").unwrap(),
+        ShadowContentVerdict::Stale { .. }
+    ));
+
+    // This is exactly what handle_index_status does after the CBM runner returns.
+    let status = ensure_shadow_import_current_at(&dir, "demo").unwrap();
+    assert_eq!(
+        status,
+        ShadowRefreshStatus::StaleReindexRequired,
+        "a stale source with good surfaces and no row-sink candidate must refuse, not refresh"
+    );
+    assert_eq!(shadow_refresh_status_str(status), "stale_reindex_required");
+
+    // FSV: read the persisted surfaces back off disk. They must be byte-identical to the
+    // good ones — the refusal persisted NOTHING.
+    let after = read_persisted_derived_surfaces(&dir, "demo");
+    let provenance_after = after
+        .get("provenance_json")
+        .expect("provenance surface must still exist");
+    println!("PERSISTED provenance_json AFTER : {provenance_after}");
+    assert_eq!(
+        after, before,
+        "the freshness-triggered refresh must not overwrite ANY persisted derived surface"
+    );
+    let provenance_after_value: Value = serde_json::from_str(provenance_after).unwrap();
+    assert_ne!(
+        provenance_after_value["status"], "unavailable",
+        "#222: the good provenance surface was silently downgraded to unavailable"
+    );
+
+    // And the caller is told, in machine-readable form, that a reindex is required.
+    let summary = shadow_status_summary_at(&dir, "demo").unwrap();
+    assert_eq!(summary["shadow_import"]["status"], "stale_reindex_required");
+    assert_eq!(
+        summary["shadow_import"]["code"],
+        ASTRO_SHADOW_STALE_REINDEX_REQUIRED
+    );
+    assert_eq!(
+        summary["shadow_import"]["derived_surfaces"],
+        "last_known_good_preserved"
+    );
+    assert!(
+        !summary["shadow_import"]["remediation"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    // The served provenance surface is still the good one, not "unavailable".
+    assert_ne!(summary["provenance"]["status"], "unavailable");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn shadow_refresh_refuses_rather_than_clobbering_on_unusable_watermark_domain() {
+    // The same #222 preservation invariant on the #223 trigger: a wrong-domain watermark
+    // must not drive the surface-destroying refresh either. (Pre-#223 this was the live
+    // path — the #221 row digest read Stale forever, so every index_status call clobbered
+    // the provenance surface.)
+    let dir = temp_dir("shadow-refresh-preserves-on-domain-mismatch");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+    let before = read_persisted_derived_surfaces(&dir, "demo");
+    overwrite_persisted_watermark(
+        &dir,
+        "demo",
+        &format!("row-sink-sha256:v1:{}", "ab".repeat(32)),
+    );
+
+    let status = ensure_shadow_import_current_at(&dir, "demo").unwrap();
+    assert_eq!(status, ShadowRefreshStatus::StaleReindexRequired);
+
+    let after = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(
+        after, before,
+        "an unusable watermark domain must not trigger a surface-clobbering refresh"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_artifact_export_refuses_under_stale_reindex_required() {
+    // #222: team_artifact export is the second read-path caller of
+    // ensure_shadow_import_current. It must refuse to package an artifact from a shadow
+    // import that is provably not current, with the coded remediation.
+    let stale = team_artifact_export_refusal(ShadowRefreshStatus::StaleReindexRequired)
+        .expect("stale shadow state must refuse the export");
+    assert!(
+        stale.starts_with(ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED),
+        "export refusal must carry the coded prefix, got {stale:?}"
+    );
+    assert!(stale.contains("remediation:"));
+    assert!(stale.contains("index_repository"));
+    assert_eq!(
+        team_artifact_error_code(&stale),
+        ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED
+    );
+
+    // The concurrency refusal is preserved and still distinct.
+    let busy = team_artifact_export_refusal(ShadowRefreshStatus::Busy)
+        .expect("a busy shadow import must refuse the export");
+    assert!(busy.starts_with(ASTRO_TEAM_ARTIFACT_BUSY));
+
+    // Only a provably-current shadow import may export.
+    assert!(team_artifact_export_refusal(ShadowRefreshStatus::Current).is_none());
+    assert!(team_artifact_export_refusal(ShadowRefreshStatus::Refreshed).is_none());
 }
 
 #[test]
@@ -3586,6 +4025,553 @@ fn tool_definition<'a>(tools: &'a [Value], name: &str) -> &'a Value {
         .iter()
         .find(|tool| tool["name"] == name)
         .unwrap_or_else(|| panic!("{name} tool definition"))
+}
+
+// ---------------------------------------------------------------------------------------
+// #209 — a broken/empty embedded chain must never ride surface `trust: "verified"`.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn provenance_surface_never_rides_trust_verified_on_a_broken_or_empty_chain() {
+    // Source of truth: the persisted `provenance_json` row in the config store, read back
+    // through a separate connection — never the builder's return value.
+    let dir = temp_dir("provenance-chain-trust");
+    let rows = sample_provenance_rows();
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+
+    for (label, verify, expect_code) in [
+        // An `Intact` chain over an empty range verified nothing at all.
+        (
+            "intact_empty",
+            verify_chain_report("intact", 0, 0, None, None),
+            Some(PROVENANCE_WARN_CHAIN_EMPTY),
+        ),
+        (
+            "broken",
+            verify_chain_report("broken", 0, 4, Some(2), None),
+            Some(PROVENANCE_WARN_CHAIN_BROKEN),
+        ),
+        (
+            "corrupt",
+            verify_chain_report("corrupt", 0, 4, Some(3), Some("payload hash mismatch")),
+            Some(PROVENANCE_WARN_CHAIN_CORRUPT),
+        ),
+        // Control: only this one is genuinely verified.
+        (
+            "intact_nonempty",
+            verify_chain_report("intact", 0, 4, None, None),
+            None,
+        ),
+    ] {
+        // This is the surface that actually reaches disk: built, then handed the real
+        // post-import chain by `provenance_surface_with_chain`.
+        let surface = provenance_surface_with_chain(
+            provenance_from_row_sink_rows(&rows),
+            &"55".repeat(32),
+            4,
+            &verify,
+        );
+        // The metadata build is COMPLETE in every case, so a `verified` label here could
+        // only come from the old fail-open rule that ignored the embedded chain.
+        assert_eq!(
+            surface["metadata_skipped_count"], 0,
+            "{label}: metadata build is complete"
+        );
+
+        let mut outcome = sample_shadow_outcome(&dir, security.clone());
+        outcome.provenance = surface.clone();
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        // FSV: read the persisted bytes back off disk.
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "provenance_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let persisted: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            persisted, surface,
+            "{label}: persisted bytes match the surface"
+        );
+
+        match expect_code {
+            Some(code) => {
+                assert_ne!(
+                    persisted["trust"], "verified",
+                    "{label}: a surface embedding an unverified chain must NEVER be labeled \
+                     trust:verified"
+                );
+                assert_eq!(persisted["trust"], "provisional", "{label}");
+                assert_eq!(persisted["freshness"], "not_evaluated", "{label}");
+                assert_eq!(persisted["warnings"][0]["code"], code, "{label}");
+                assert!(
+                    persisted["remediation"].is_string(),
+                    "{label}: degraded surface carries remediation"
+                );
+            }
+            None => {
+                assert_eq!(
+                    persisted["trust"], "verified",
+                    "{label}: an intact chain over a non-empty range is genuinely verified"
+                );
+                assert_eq!(persisted["freshness"], "fresh", "{label}");
+                assert_eq!(persisted["warnings"], json!([]), "{label}");
+                assert!(persisted["remediation"].is_null(), "{label}");
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn provenance_surface_partial_metadata_stays_provisional_under_an_intact_chain() {
+    // The other conjunct: a verified chain does not launder a partial metadata build.
+    let store = ProvenanceStore {
+        vault_fingerprint: "66".repeat(32),
+        ledger_head: LedgerPointer::new(4, "66".repeat(32)),
+        chain: ChainVerification {
+            status: ChainStatus::Intact,
+            checked_from: 0,
+            checked_end: 4,
+            provenance: LedgerPointer::new(4, "66".repeat(32)),
+        },
+        symbols: BTreeMap::new(),
+        answers: BTreeMap::new(),
+        reproductions: BTreeMap::new(),
+        manifests: BTreeMap::new(),
+    };
+
+    let complete = provenance_surface_json(&store, 0);
+    assert_eq!(complete["trust"], "verified");
+    assert_eq!(complete["freshness"], "fresh");
+
+    let partial = provenance_surface_json(&store, 3);
+    assert_eq!(partial["status"], "partial");
+    assert_eq!(partial["trust"], "provisional");
+    // Freshness tracks the chain, which is intact here; only trust degrades.
+    assert_eq!(partial["freshness"], "fresh");
+}
+
+// ---------------------------------------------------------------------------------------
+// #122 — a propose readback-mismatch refusal must leave NO residual pending proposal.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn optimizer_propose_readback_mismatch_removes_the_queue_when_none_existed() {
+    let dir = temp_dir("optimizer-propose-rollback-removed");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    write_config_value(
+        &dir,
+        &deficits_key,
+        &sample_optimizer_deficits().to_string(),
+    )
+    .unwrap();
+    plant_proposal_queue_corruptor(&dir, &proposals_key);
+
+    // BEFORE: no proposal queue is persisted.
+    assert_eq!(read_config_value(&dir, &proposals_key).unwrap(), None);
+
+    let refused = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"], "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH",
+        "a storage-layer mismatch must be refused, not served"
+    );
+    assert!(refused["message"].is_string());
+    assert!(refused["remediation"].is_string());
+    assert_eq!(refused["rollback"]["status"], "removed");
+    assert_eq!(refused["rollback"]["residue"], "none");
+    assert_eq!(refused["rollback"]["verification"], "config_readback");
+
+    // AFTER (FSV): the row is gone from the persisted store — independent readback.
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let residue: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![&proposals_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        residue, None,
+        "the refused write must leave no proposal-queue row behind"
+    );
+
+    // And status mode must serve NO pending proposal.
+    let pending = optimizer_pending_proposals_json(&dir, "demo").unwrap();
+    assert_eq!(pending["status"], "unavailable");
+    assert_eq!(pending["proposals"], json!([]));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_propose_readback_mismatch_restores_the_prior_proposal_queue() {
+    let dir = temp_dir("optimizer-propose-rollback-restored");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    write_config_value(
+        &dir,
+        &deficits_key,
+        &sample_optimizer_deficits().to_string(),
+    )
+    .unwrap();
+
+    // A prior, valid, EMPTY queue. The compensating rollback must restore these exact bytes,
+    // leaving the store equivalent to "this propose never ran".
+    let prior = json!({
+        "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+        "project": "demo",
+        "status": "empty",
+        "proposal_count": 0,
+        "proposals": [],
+        "source": format!("config:{proposals_key}"),
+        "freshness": "fresh",
+        "trust": "verified",
+    });
+    let prior_bytes = prior.to_string();
+    write_config_value(&dir, &proposals_key, &prior_bytes).unwrap();
+    plant_proposal_queue_corruptor(&dir, &proposals_key);
+
+    let refused = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH");
+    assert_eq!(refused["rollback"]["status"], "restored_prior");
+    assert_eq!(refused["rollback"]["residue"], "none");
+
+    // AFTER (FSV): the persisted bytes are EXACTLY the pre-write value.
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let residue: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![&proposals_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        residue, prior_bytes,
+        "the rollback must restore the prior queue byte-for-byte"
+    );
+
+    // Status mode serves the prior queue, never the refused run's proposals.
+    let pending = optimizer_pending_proposals_json(&dir, "demo").unwrap();
+    assert_eq!(pending["status"], "empty");
+    assert_eq!(pending["proposal_count"], 0);
+    assert_eq!(pending["proposals"], json!([]));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_propose_pre_write_refusals_never_create_a_proposal_queue() {
+    // Edge triad, pre-write half: an absent deficit store (empty input) and an invalid one
+    // (invalid format) must both refuse without ever writing a queue row.
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+
+    let empty_dir = temp_dir("optimizer-propose-empty");
+    let refused = optimizer_propose_json_at(&empty_dir, "demo", None).unwrap();
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"], "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_MISSING",
+        "no measured deficits must refuse rather than invent proposals"
+    );
+    assert_eq!(read_config_value(&empty_dir, &proposals_key).unwrap(), None);
+    fs::remove_dir_all(&empty_dir).ok();
+
+    let invalid_dir = temp_dir("optimizer-propose-invalid");
+    write_config_value(&invalid_dir, &deficits_key, "{\"schema\":\"bogus\"}").unwrap();
+    let refused = optimizer_propose_json_at(&invalid_dir, "demo", None).unwrap();
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_INVALID");
+    assert_eq!(
+        read_config_value(&invalid_dir, &proposals_key).unwrap(),
+        None,
+        "a pre-write refusal must not create a proposal-queue row"
+    );
+    fs::remove_dir_all(&invalid_dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------
+// #198 — `skills.discovery.max_symbols` must be operator-settable within registered bounds,
+// fail closed above the cap, and be REJECTED (never clamped) outside the bounds.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn skill_discovery_refuses_over_the_default_node_limit_with_a_coded_remediable_error() {
+    // Just over the shipped 50_000 default, with NO operator override in play.
+    let refused = skill_tree_from_row_sink_rows(&synthetic_skill_rows(50_001));
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert_eq!(refused["max_symbols"], 50_000);
+    assert_eq!(refused["trust"], "provisional");
+    assert_eq!(refused["freshness"], "not_evaluated");
+    assert!(
+        refused["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("skills.discovery.max_symbols"),
+        "the refusal must tell the operator which knob to raise"
+    );
+
+    // Just under the default admits, so the cap is the only thing refusing above.
+    let admitted = skill_tree_from_row_sink_rows(&synthetic_skill_rows(0));
+    assert_eq!(admitted["status"], "built");
+    assert_eq!(admitted["skill_count"], 0);
+    assert_eq!(admitted["max_symbols"], 50_000);
+}
+
+#[test]
+fn skill_discovery_max_symbols_knob_gates_exactly_at_the_boundary() {
+    let rows = synthetic_skill_rows(6);
+
+    // AT the limit: admitted.
+    let at_limit = skill_tree_from_row_sink_rows_with_config(
+        &rows,
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(6),
+        })),
+    );
+    assert_eq!(at_limit["status"], "built");
+    assert_eq!(at_limit["max_symbols"], 6);
+
+    // ONE OVER the limit: refused, fail-closed.
+    let over_limit = skill_tree_from_row_sink_rows_with_config(
+        &rows,
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(5),
+        })),
+    );
+    assert_eq!(over_limit["status"], "refused");
+    assert_eq!(
+        over_limit["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert_eq!(over_limit["max_symbols"], 5);
+}
+
+#[test]
+fn skill_discovery_max_symbols_out_of_registered_bounds_is_rejected_not_clamped() {
+    // Registered bounds are [2, 1_000_000]. Six inputs would build under EITHER clamped
+    // bound, so a `built` surface here would prove a silent clamp had occurred.
+    let rows = synthetic_skill_rows(6);
+    for out_of_bounds in [1_u64, 1_000_001_u64] {
+        let refused = skill_tree_from_row_sink_rows_with_config(
+            &rows,
+            &skill_discovery_config(Some(&SkillDiscoveryOverride {
+                max_symbols: Some(out_of_bounds),
+            })),
+        );
+        assert_eq!(
+            refused["status"], "refused",
+            "max_symbols={out_of_bounds} is outside the registered bounds and must be refused"
+        );
+        assert_eq!(
+            refused["code"],
+            astrolabe_kernel::ASTRO_SKILL_DISCOVERY_KNOB_RANGE,
+            "max_symbols={out_of_bounds} must fail knob-range validation, not the node limit"
+        );
+        // The surface echoes the REQUESTED value: clamping it into range would be a silent
+        // fallback that left the operator believing a different cap was in force.
+        assert_eq!(refused["max_symbols"], out_of_bounds);
+        assert!(refused["remediation"].is_string());
+    }
+}
+
+#[test]
+fn calyx_skills_override_parses_rejects_bad_input_and_persists_the_coded_refusal() {
+    // Absent -> no override (registry defaults stay in force).
+    assert!(
+        parse_skill_discovery_override(&Map::new())
+            .unwrap()
+            .is_none()
+    );
+
+    let parsed = parse_skill_discovery_override(
+        json!({"calyx_skills": {"max_symbols": 60_000}})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(parsed.max_symbols, Some(60_000));
+    assert_eq!(
+        skill_discovery_config(Some(&parsed)).max_symbols,
+        60_000,
+        "an in-bounds override is applied verbatim"
+    );
+
+    // Invalid format: rejected fail-closed, never coerced.
+    let unknown =
+        parse_skill_discovery_override(json!({"calyx_skills": {"nope": 1}}).as_object().unwrap())
+            .unwrap_err();
+    assert!(unknown.contains("unknown calyx_skills field"));
+
+    let bad_type = parse_skill_discovery_override(
+        json!({"calyx_skills": {"max_symbols": "lots"}})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap_err();
+    assert!(bad_type.contains("unsigned integer"));
+
+    let not_object =
+        parse_skill_discovery_override(json!({"calyx_skills": 5}).as_object().unwrap())
+            .unwrap_err();
+    assert!(not_object.contains("must be a JSON object"));
+
+    // The knob is Astrolabe-side and is never forwarded to the CBM tool.
+    let sanitized: Value = serde_json::from_str(
+        &strip_calyx_arg(
+            json!({"repo_path": "/tmp/x", "calyx_skills": {"max_symbols": 60_000}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(sanitized.get("calyx_skills").is_none());
+    assert_eq!(sanitized["repo_path"], "/tmp/x");
+
+    // FSV: the coded refusal survives persist + independent readback off disk.
+    let dir = temp_dir("skill-discovery-refusal-readback");
+    let refused = skill_tree_from_row_sink_rows_with_config(
+        &synthetic_skill_rows(6),
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(5),
+        })),
+    );
+    let mut outcome = sample_shadow_outcome(
+        &dir,
+        security_screen_from_row_sink_rows(&sample_pipeline_rows()),
+    );
+    outcome.skill_tree = refused.clone();
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![metadata_key("demo", "skill_tree_json")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let persisted: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(persisted, refused);
+    assert_eq!(persisted["status"], "refused");
+    assert_eq!(
+        persisted["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert!(
+        persisted["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("skills.discovery.max_symbols")
+    );
+    assert_eq!(read_skill_tree_metadata(&dir, "demo").unwrap(), refused);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Builds a `VerifyChainReport` fixture for the #209 chain-label matrix.
+fn verify_chain_report(
+    status: &str,
+    checked_range_start: u64,
+    checked_range_end: u64,
+    at_seq: Option<u64>,
+    reason: Option<&str>,
+) -> astrolabe_ingest::VerifyChainReport {
+    astrolabe_ingest::VerifyChainReport {
+        status: status.to_string(),
+        ledger_rows: checked_range_end,
+        checked_range_start,
+        checked_range_end,
+        count: checked_range_end.saturating_sub(checked_range_start),
+        at_seq,
+        expected_hash: None,
+        found_hash: None,
+        reason: reason.map(ToOwned::to_owned),
+        quarantine_seq: None,
+        remediation: None,
+    }
+}
+
+/// A minimal measured-deficit store that yields exactly one generated proposal.
+fn sample_optimizer_deficits() -> Value {
+    json!({
+        "schema": OPTIMIZER_DEFICITS_SCHEMA,
+        "status": "measured",
+        "freshness": "fresh",
+        "trust": "verified",
+        "deficits": [{
+            "deficit_id": "deficit:test:1",
+            "axis": "coverage",
+            "scope": "payments",
+            "measured_bits": 0.61,
+            "required_bits": 1.0,
+            "suggested_action": "ProposeLens",
+            "template_family": "hashed_set",
+            "slot": "lock_atomic_usage",
+            "field": "lock_calls",
+            "freshness": "fresh",
+            "trust": "verified",
+            "provenance": ["measure_bits:test:12"],
+        }],
+    })
+}
+
+/// Plants a SQLite trigger that rewrites the proposal-queue row as it is inserted, so the
+/// production write-then-readback verification observes a genuine storage-layer mismatch.
+///
+/// This is fault injection at the real persistence layer, not a mock: the server code is
+/// untouched and unaware, and a value that does not survive its own round-trip is exactly the
+/// condition `ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH` exists to catch. The trigger matches
+/// only the freshly generated queue (`"status":"generated"`), so the compensating rollback's
+/// restore of a prior queue is not re-corrupted.
+fn plant_proposal_queue_corruptor(cache_dir: &Path, proposals_key: &str) {
+    let conn = open_config(cache_dir).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER corrupt_proposal_queue AFTER INSERT ON config \
+         WHEN NEW.key = '{proposals_key}' AND NEW.value LIKE '%\"status\":\"generated\"%' \
+         BEGIN UPDATE config SET value = '{{\"schema\":\"tampered\"}}' WHERE key = NEW.key; END;"
+    ))
+    .unwrap();
+}
+
+/// `symbol_count` discovery symbols with disjoint token sets, so the node-limit guard — not
+/// clustering behavior — is what the test observes.
+fn synthetic_skill_rows(symbol_count: usize) -> CbmPipelineRows {
+    let nodes = (0..symbol_count)
+        .map(|index| astrolabe_bridge::CbmPipelineNodeRow {
+            id: index as i64 + 1,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: format!("symbol{index}"),
+            qualified_name: format!("demo.symbol{index}"),
+            file_path: format!("src/file{index}.rs"),
+            start_line: 1,
+            end_line: 2,
+            properties_json: format!(r#"{{"docstring":"token{index}"}}"#),
+        })
+        .collect();
+    CbmPipelineRows {
+        project: "demo".to_string(),
+        nodes,
+        edges: Vec::new(),
+    }
 }
 
 fn sample_pipeline_rows() -> CbmPipelineRows {

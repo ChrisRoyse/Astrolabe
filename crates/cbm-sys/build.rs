@@ -35,6 +35,26 @@ fn main() {
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
     let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");
     let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");
+    // #240/#241: the store-resolution overlay. Its generator and the Astrolabe-owned
+    // translation unit it calls into are build inputs exactly like the mem-pressure
+    // patch: a change to either must invalidate every libcbm object.
+    let env_store_patch = repo_root.join("patches/cbm/env_apply_store_patch.py");
+    let env_store_config_src = repo_root.join("patches/cbm/env_store_config.c");
+    let env_store_config_hdr = repo_root.join("patches/cbm/env_store_config.h");
+    // #227/#228: the shell-free git-spawn helper, its shared overlay primitives,
+    // and every generator that routes a CBM git shell-out through it. Each is a
+    // build input exactly like the env-store overlay: a change to any of them
+    // must invalidate every libcbm object so Cargo rebuilds the archive.
+    let spawn_overlays = [
+        repo_root.join("patches/cbm/astro_spawn.c"),
+        repo_root.join("patches/cbm/astro_spawn.h"),
+        repo_root.join("patches/cbm/astro_overlay.py"),
+        repo_root.join("patches/cbm/apply_spawn_git_context_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_artifact_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_watcher_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_githistory_patch.py"),
+        repo_root.join("patches/cbm/apply_shellarg_str_util_patch.py"),
+    ];
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
     let build_support = manifest_dir.join("build_support.rs");
@@ -48,6 +68,12 @@ fn main() {
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
     println!("cargo:rerun-if-changed={}", layout_probe.display());
     println!("cargo:rerun-if-changed={}", mem_pressure_patch.display());
+    println!("cargo:rerun-if-changed={}", env_store_patch.display());
+    println!("cargo:rerun-if-changed={}", env_store_config_src.display());
+    println!("cargo:rerun-if-changed={}", env_store_config_hdr.display());
+    for spawn_overlay in &spawn_overlays {
+        println!("cargo:rerun-if-changed={}", spawn_overlay.display());
+    }
     // The vendored CBM tree is deliberately NOT watched file-by-file (#192).
     // It is pinned: every sanctioned change lands through the VENDORED.md pin
     // procedure (which rewrites the binding tree SHA below) or through the
@@ -76,7 +102,16 @@ fn main() {
     }
 
     let build_script = manifest_dir.join("build.rs");
-    let config = libcbm_build_config(&build_script, &patched_makefile, &mem_pressure_patch);
+    let mut config_inputs: Vec<&Path> = vec![
+        &build_script,
+        &patched_makefile,
+        &mem_pressure_patch,
+        &env_store_patch,
+        &env_store_config_src,
+        &env_store_config_hdr,
+    ];
+    config_inputs.extend(spawn_overlays.iter().map(|p| p.as_path()));
+    let config = libcbm_build_config(&config_inputs);
     // Preserve mtime on no-op reruns so Make only invalidates objects when the
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
@@ -158,13 +193,9 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
     }
 }
 
-fn libcbm_build_config(
-    build_script: &Path,
-    patched_makefile: &Path,
-    mem_pressure_patch: &Path,
-) -> Vec<u8> {
+fn libcbm_build_config(inputs: &[&Path]) -> Vec<u8> {
     let mut config = Vec::new();
-    for path in [build_script, patched_makefile, mem_pressure_patch] {
+    for path in inputs.iter().copied() {
         config.extend_from_slice(path.to_string_lossy().as_bytes());
         config.push(b'\n');
         config.extend_from_slice(&fs::read(path).unwrap_or_else(|err| {

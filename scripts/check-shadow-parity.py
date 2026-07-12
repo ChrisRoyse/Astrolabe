@@ -10,6 +10,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from release_artifact import write_artifact  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = "astrolabe_shadow_parity"
@@ -486,7 +490,6 @@ def write_dashboard(path, dashboard):
 
 
 def write_release_artifact(artifact_dir, dashboard):
-    artifact_dir.mkdir(parents=True, exist_ok=True)
     unwhitelisted_count = len(dashboard["unwhitelisted"])
     passed = dashboard["status"] == "verified" and unwhitelisted_count == 0
     artifact = {
@@ -509,8 +512,10 @@ def write_release_artifact(artifact_dir, dashboard):
         "second_run_edge_rows_written": dashboard["idempotency"]["second"]["edge_rows_written"],
         "deep_verify": dashboard["deep_verify"],
     }
-    path = artifact_dir / PARITY_DASHBOARD_ARTIFACT
-    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # #88: every release-predicate artifact is bound to its subject commit and
+    # generation instant, so a stale or foreign-commit artifact cannot satisfy a
+    # conjunct.
+    write_artifact(artifact_dir, PARITY_DASHBOARD_ARTIFACT, artifact, ROOT)
 
 
 def write_summary(path, dashboard):

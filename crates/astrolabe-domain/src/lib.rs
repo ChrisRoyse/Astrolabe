@@ -14,6 +14,9 @@ use std::str::FromStr;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod fsv;
+pub mod knobs;
+
 /// Re-export of the Calyx core crate used for vault identities and content addressing.
 pub use calyx_core as calyx;
 

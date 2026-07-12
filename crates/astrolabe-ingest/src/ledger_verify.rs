@@ -157,6 +157,193 @@ where
     Ok(counts)
 }
 
+/// Refusal code for a janitor budget outside the declared knob bounds.
+pub const ASTRO_FSV_JANITOR_BUDGET_INVALID: &str = "ASTRO_FSV_JANITOR_BUDGET_INVALID";
+
+const JANITOR_BUDGET_REMEDIATION: &str = "Set the janitor ledger-entries-per-slice budget inside the declared FSV knob bounds, or pass None to use the registry default.";
+
+/// A persisted checkpoint of the ledger prefix already verified by the janitor.
+///
+/// The janitor never re-walks the whole ledger per pass (#96): it caches how far
+/// it has verified (`verified_through`, an exclusive sequence bound) and only
+/// re-hashes the bounded suffix past that point, exactly like a transparent-log
+/// client that keeps its verified prefix and checks only the new tail
+/// (<https://research.swtch.com/tlog.pdf>).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JanitorCheckpoint {
+    /// Exclusive ledger sequence up to which the chain is already verified.
+    pub verified_through: u64,
+}
+
+impl JanitorCheckpoint {
+    /// A fresh checkpoint that has verified nothing yet.
+    pub const GENESIS: Self = Self {
+        verified_through: 0,
+    };
+}
+
+impl Default for JanitorCheckpoint {
+    fn default() -> Self {
+        Self::GENESIS
+    }
+}
+
+/// Result of one bounded background self-verification slice.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct JanitorSliceReport {
+    /// Chain status of the verified slice: `intact`, `broken`, or `corrupt`.
+    pub status: String,
+    /// Inclusive-start sequence of the slice this pass verified.
+    pub slice_start: u64,
+    /// Exclusive-end sequence of the slice this pass verified.
+    pub slice_end: u64,
+    /// Ledger entries re-hashed in this slice (bounded by the budget knob).
+    pub entries_verified: u64,
+    /// Checkpoint after this slice; feed it to the next slice.
+    pub checkpoint: JanitorCheckpoint,
+    /// True when the janitor has now verified the whole persisted ledger.
+    pub caught_up: bool,
+    /// First bad sequence when the slice was not intact.
+    pub at_seq: Option<u64>,
+    /// Corruption reason when the slice was corrupt.
+    pub reason: Option<String>,
+    /// Operator remediation when the slice was not intact.
+    pub remediation: Option<&'static str>,
+}
+
+impl JanitorSliceReport {
+    /// Returns true only when the verified slice re-hashed cleanly.
+    pub fn is_intact(&self) -> bool {
+        self.status == "intact"
+    }
+}
+
+/// Runs one bounded janitor self-verification slice against the persisted ledger.
+///
+/// Verifies the sequence range `[checkpoint.verified_through, end)` where `end`
+/// is bounded by the janitor budget so a single pass never re-walks the whole
+/// ledger (#96). The budget is the registry-declared knob
+/// [`astrolabe_domain::knobs::FSV_JANITOR_LEDGER_ENTRIES_PER_SLICE_KNOB`];
+/// `budget_override` may narrow or widen it within the declared bounds, and any
+/// value outside those bounds is refused fail-closed.
+///
+/// A non-intact slice is a fail-closed corruption signal: the returned report
+/// names the exact bad sequence and the checkpoint does **not** advance past it,
+/// so the next pass re-examines the same range rather than skipping corruption.
+///
+/// # Errors
+///
+/// Returns [`ASTRO_FSV_JANITOR_BUDGET_INVALID`] when `budget_override` is outside
+/// the declared knob bounds, or a Calyx error when the ledger cannot be scanned.
+pub fn verify_chain_slice<C>(
+    vault: &AsterVault<C>,
+    checkpoint: JanitorCheckpoint,
+    budget_override: Option<u64>,
+) -> IngestResult<JanitorSliceReport>
+where
+    C: Clock,
+{
+    let budget = resolve_janitor_budget(budget_override)?;
+    let store = AsterVaultLedgerStore { vault };
+    let rows = store.scan()?;
+    let height = rows
+        .iter()
+        .map(|row| row.seq.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+
+    let start = checkpoint.verified_through.min(height);
+    if start >= height {
+        // Already caught up: nothing new to verify, so no work and no rewalk.
+        return Ok(JanitorSliceReport {
+            status: "intact".to_string(),
+            slice_start: start,
+            slice_end: height,
+            entries_verified: 0,
+            checkpoint: JanitorCheckpoint {
+                verified_through: height,
+            },
+            caught_up: true,
+            at_seq: None,
+            reason: None,
+            remediation: None,
+        });
+    }
+    let end = start.saturating_add(budget).min(height);
+    let result = calyx_verify_chain(&store, start..end)?;
+    Ok(janitor_report_from_result(result, start, end, height))
+}
+
+fn resolve_janitor_budget(budget_override: Option<u64>) -> IngestResult<u64> {
+    let knob = astrolabe_domain::knobs::fsv_knob(
+        astrolabe_domain::knobs::FSV_JANITOR_LEDGER_ENTRIES_PER_SLICE_KNOB,
+    )
+    .expect("janitor budget knob is declared in the FSV knob registry");
+    match budget_override {
+        None => Ok(knob.default),
+        Some(value) if knob.accepts(value) => Ok(value),
+        Some(value) => Err(IngestError::refused(
+            ASTRO_FSV_JANITOR_BUDGET_INVALID,
+            format!(
+                "janitor ledger-entries-per-slice budget {value} is outside the declared knob bounds [{}, {}]",
+                knob.min, knob.max
+            ),
+            JANITOR_BUDGET_REMEDIATION,
+        )),
+    }
+}
+
+fn janitor_report_from_result(
+    result: VerifyResult,
+    slice_start: u64,
+    slice_end: u64,
+    height: u64,
+) -> JanitorSliceReport {
+    match result {
+        VerifyResult::Intact { count } => JanitorSliceReport {
+            status: "intact".to_string(),
+            slice_start,
+            slice_end,
+            entries_verified: count,
+            checkpoint: JanitorCheckpoint {
+                verified_through: slice_end,
+            },
+            caught_up: slice_end >= height,
+            at_seq: None,
+            reason: None,
+            remediation: None,
+        },
+        VerifyResult::Broken { at_seq, .. } => JanitorSliceReport {
+            status: "broken".to_string(),
+            slice_start,
+            slice_end,
+            entries_verified: 0,
+            // Do NOT advance past corruption: the checkpoint stays at the slice
+            // start so the next pass re-examines the same range.
+            checkpoint: JanitorCheckpoint {
+                verified_through: slice_start,
+            },
+            caught_up: false,
+            at_seq: Some(at_seq),
+            reason: None,
+            remediation: Some(VERIFY_CHAIN_REMEDIATION),
+        },
+        VerifyResult::Corrupt { at_seq, reason } => JanitorSliceReport {
+            status: "corrupt".to_string(),
+            slice_start,
+            slice_end,
+            entries_verified: 0,
+            checkpoint: JanitorCheckpoint {
+                verified_through: slice_start,
+            },
+            caught_up: false,
+            at_seq: Some(at_seq),
+            reason: Some(reason),
+            remediation: Some(VERIFY_CHAIN_REMEDIATION),
+        },
+    }
+}
+
 fn verify_store_chain(store: &dyn LedgerCfStore) -> IngestResult<VerifyChainReport> {
     let rows = store.scan()?;
     let row_end = rows
@@ -752,6 +939,91 @@ mod tests {
                 ActorId::Service("astrolabe-test".to_string()),
             )
             .expect("append ledger entry");
+    }
+
+    #[test]
+    fn janitor_slice_verifies_bounded_suffix_without_full_rewalk() {
+        // Ten entries, budget 3: each slice re-hashes at most 3 entries and the
+        // checkpoint advances, so no single pass rewalks the whole ledger (#96).
+        let vault = vault();
+        for index in 0..10 {
+            append_test_entry(&vault, format!("entry-{index}").as_bytes());
+        }
+
+        let mut checkpoint = JanitorCheckpoint::GENESIS;
+        let mut total = 0_u64;
+        let mut passes = 0;
+        loop {
+            let report = verify_chain_slice(&vault, checkpoint, Some(3)).expect("janitor slice");
+            assert_eq!(report.status, "intact");
+            assert!(
+                report.entries_verified <= 3,
+                "slice must respect the budget: {report:?}"
+            );
+            total += report.entries_verified;
+            checkpoint = report.checkpoint;
+            passes += 1;
+            if report.caught_up {
+                break;
+            }
+            assert!(passes < 20, "janitor did not converge");
+        }
+        assert_eq!(total, 10, "every entry verified exactly once across slices");
+        assert_eq!(checkpoint.verified_through, 10);
+
+        // A caught-up pass does zero work rather than rewalking.
+        let idle = verify_chain_slice(&vault, checkpoint, Some(3)).expect("idle slice");
+        assert!(idle.caught_up);
+        assert_eq!(idle.entries_verified, 0);
+    }
+
+    #[test]
+    fn janitor_slice_fails_closed_on_tampered_ledger_and_does_not_advance() {
+        // Real persisted bytes: append six entries, verify the first three via a
+        // clean slice (advancing the checkpoint), then flip a byte in a persisted
+        // ledger row and prove the next slice over that range reports broken at
+        // the exact seq and parks the checkpoint before the corruption.
+        let vault = vault();
+        for index in 0..6 {
+            append_test_entry(&vault, format!("entry-{index}").as_bytes());
+        }
+        let clean = verify_chain_slice(&vault, JanitorCheckpoint::GENESIS, Some(3))
+            .expect("clean first slice");
+        assert_eq!(clean.status, "intact");
+        assert_eq!(clean.checkpoint.verified_through, 3);
+
+        // Independent readback of the persisted ledger row, then a one-byte flip.
+        let mut tampered = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(4))
+            .expect("read persisted ledger row")
+            .expect("ledger row 4 exists");
+        tampered[20] ^= 0xff;
+        vault
+            .write_cf(ColumnFamily::Ledger, ledger_key(4), tampered)
+            .expect("persist tampered ledger row");
+
+        let report = verify_chain_slice(&vault, clean.checkpoint, Some(3))
+            .expect("janitor slice over tampered range");
+        assert_eq!(report.status, "broken");
+        assert_eq!(report.at_seq, Some(4));
+        assert_eq!(
+            report.checkpoint, clean.checkpoint,
+            "checkpoint must not advance past detected corruption"
+        );
+        assert!(report.remediation.is_some());
+    }
+
+    #[test]
+    fn janitor_budget_outside_knob_bounds_is_refused() {
+        let vault = vault();
+        append_test_entry(&vault, b"entry");
+        let err = verify_chain_slice(&vault, JanitorCheckpoint::GENESIS, Some(0))
+            .expect_err("zero budget must refuse");
+        assert_eq!(err.code(), Some(ASTRO_FSV_JANITOR_BUDGET_INVALID));
+        // The registry default is accepted when no override is supplied.
+        let ok = verify_chain_slice(&vault, JanitorCheckpoint::GENESIS, None)
+            .expect("default budget accepted");
+        assert!(ok.is_intact());
     }
 
     fn secret_payload() -> Vec<u8> {

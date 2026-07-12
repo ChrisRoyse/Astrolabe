@@ -6,7 +6,12 @@ BIN="${1:-$ROOT/target/debug/astrolabe}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    echo "skipping astrolabe parent watchdog test on Windows"
+    # #253: the parent-death watchdog is unimplemented on Windows
+    # (parent_process_id() -> None on non-unix; ParentWatchdog::start() no-ops),
+    # and this test uses Unix FIFO/kill/ps. This is a real Windows-scope coverage
+    # gap on the SHIPPING platform, not a port-phase deferral — surface it as a
+    # named, counted marker instead of a silent `exit 0` (standing invariant #3).
+    echo "SKIP[ASTRO_WATCHDOG_WINDOWS_UNIMPLEMENTED]: the astrolabe parent-death watchdog is not implemented on Windows and this Unix (FIFO/kill/ps) test cannot exercise it; NOT passing evidence, tracked in #253."
     exit 0
     ;;
 esac

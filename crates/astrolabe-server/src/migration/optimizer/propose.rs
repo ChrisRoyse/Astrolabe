@@ -111,22 +111,163 @@ pub(crate) fn optimizer_propose_json_at(
         "remediation": remediation,
     });
 
+    // #122: the queue is written *before* it can be verified, so a readback failure must be
+    // compensated, not merely reported. Capture the pre-write value first: the compensating
+    // rollback restores it, or deletes the key when the project had no queue, so a refusal
+    // leaves the store in a state equivalent to "this propose never ran".
+    let prior = read_config_value(cache_dir, &proposals_key)?;
     write_config_value(cache_dir, &proposals_key, &queue.to_string())?;
-    let raw_readback = read_config_value(cache_dir, &proposals_key)?
-        .ok_or_else(|| "optimizer proposal queue write was not readable".to_string())?;
-    let readback_value: Value = serde_json::from_str(&raw_readback)?;
-    if readback_value != queue {
-        return Ok(optimizer_propose_refused_json(
+
+    // Every post-write failure below leaves a row behind if it is not compensated — including
+    // the two that previously escaped as bare `?` errors (an unreadable key, and bytes that
+    // do not parse back as JSON). All three are readback failures of the same write.
+    let mismatch = match read_config_value(cache_dir, &proposals_key)? {
+        None => Some(
+            "optimizer proposal queue write was not readable back from the config store"
+                .to_string(),
+        ),
+        Some(raw) => match serde_json::from_str::<Value>(&raw) {
+            Err(error) => Some(format!(
+                "optimizer proposal queue readback did not parse as JSON: {error}"
+            )),
+            Ok(readback) if readback != queue => {
+                Some("optimizer proposal queue write did not match config readback".to_string())
+            }
+            Ok(_) => None,
+        },
+    };
+    if let Some(reason) = mismatch {
+        return Ok(optimizer_propose_readback_mismatch_json(
+            cache_dir,
             project,
-            "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH",
-            "optimizer proposal queue write did not match config readback",
-            "inspect the config store before retrying mode=\"propose\"",
-            format!("config:{proposals_key}"),
-            "provisional",
+            &proposals_key,
+            prior.as_deref(),
+            reason,
         ));
     }
 
     Ok(queue)
+}
+
+/// Outcome of the #122 compensating rollback, proven by an independent readback.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OptimizerProposalsRollback {
+    /// The project had no persisted queue before the refused write, so the key was removed.
+    Removed,
+    /// The project had a queue before the refused write, so those exact bytes were restored.
+    RestoredPrior,
+}
+
+impl OptimizerProposalsRollback {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::RestoredPrior => "restored_prior",
+        }
+    }
+}
+
+/// Builds the readback-mismatch refusal for `mode="propose"`, **after** compensating the
+/// write that failed verification (#122).
+///
+/// Without the compensation the handler refused while leaving the just-written queue
+/// persisted: `mode="status"` would then go on serving that different-yet-valid queue as
+/// pending, so durable state contradicted the refusal the caller was handed. This is the
+/// saga rule — a step that cannot be verified is undone, leaving the system equivalent to
+/// "the operation never ran".
+///
+/// The refusal always carries `{code, message, remediation}`. When the compensation itself
+/// cannot be verified, the refusal says so under a distinct code rather than implying a
+/// clean rollback that did not happen.
+pub(crate) fn optimizer_propose_readback_mismatch_json(
+    cache_dir: &Path,
+    project: &str,
+    proposals_key: &str,
+    prior: Option<&str>,
+    reason: String,
+) -> Value {
+    let rollback = match rollback_optimizer_proposals(cache_dir, proposals_key, prior) {
+        Ok(rollback) => rollback,
+        Err(error) => {
+            let mut refusal = optimizer_propose_refused_json(
+                project,
+                "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH_RESIDUE",
+                format!(
+                    "{reason}; the compensating rollback of that unverified write also failed: \
+                     {error}"
+                ),
+                format!(
+                    "the mismatched proposal queue may still be persisted at \
+                     config:{proposals_key}; repair the config store, then delete or restore \
+                     that key by hand before trusting mode=\"status\" pending proposals"
+                ),
+                format!("config:{proposals_key}"),
+                "provisional",
+            );
+            refusal["rollback"] = json!({
+                "status": "failed",
+                "key": format!("config:{proposals_key}"),
+                "residue": "unknown",
+                "freshness": "not_evaluated",
+                "trust": "provisional",
+            });
+            return refusal;
+        }
+    };
+    let mut refusal = optimizer_propose_refused_json(
+        project,
+        "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH",
+        reason,
+        "inspect the config store before retrying mode=\"propose\"; the unverified write was \
+         rolled back, so no proposal queue from this refused run is persisted",
+        format!("config:{proposals_key}"),
+        "provisional",
+    );
+    refusal["rollback"] = json!({
+        "status": rollback.as_str(),
+        "key": format!("config:{proposals_key}"),
+        "residue": "none",
+        // The rollback was proven by reading the key back, not by the delete/write returning
+        // Ok — a mutation's return value is not evidence of persisted state.
+        "verification": "config_readback",
+        "freshness": "fresh",
+        "trust": "verified",
+    });
+    refusal
+}
+
+/// Compensating transaction for an optimizer-propose write that failed readback verification.
+///
+/// Restores `prior`, or deletes the key when there was no prior value, then **independently
+/// reads the key back** to prove the residue is gone. Idempotent, so a retried compensation
+/// is safe. Returns an error if the store does not read back as the pre-write state — the
+/// caller surfaces that as a distinct refusal rather than claiming a clean rollback.
+fn rollback_optimizer_proposals(
+    cache_dir: &Path,
+    proposals_key: &str,
+    prior: Option<&str>,
+) -> Result<OptimizerProposalsRollback, DynError> {
+    let rollback = match prior {
+        Some(prior) => {
+            write_config_value(cache_dir, proposals_key, prior)?;
+            OptimizerProposalsRollback::RestoredPrior
+        }
+        None => {
+            delete_config_value(cache_dir, proposals_key)?;
+            OptimizerProposalsRollback::Removed
+        }
+    };
+    let observed = read_config_value(cache_dir, proposals_key)?;
+    if observed.as_deref() != prior {
+        return Err(format!(
+            "rollback of {proposals_key} did not read back as the pre-write state (expected {}, \
+             observed {})",
+            prior.map_or("the key to be absent", |_| "the prior queue bytes"),
+            observed.map_or("absent", |_| "a different value"),
+        )
+        .into());
+    }
+    Ok(rollback)
 }
 
 pub(crate) fn optimizer_deficits_config_value(value: Value, key: &str) -> Result<Value, String> {

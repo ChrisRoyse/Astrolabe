@@ -43,8 +43,9 @@ use astrolabe_lower::{
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use astrolabe_provenance::{
     AnswerHop, AnswerTrace, ChainStatus, ChainVerification, Freshness, GET_PROVENANCE_SCHEMA,
-    LedgerPointer, PackManifest, ProvenancePayload, ProvenanceQuery, ProvenanceResponse,
-    ProvenanceStore, ReproduceRecord, SymbolLineage, get_provenance,
+    LedgerPointer, PROVENANCE_WARN_CHAIN_BROKEN, PROVENANCE_WARN_CHAIN_CORRUPT,
+    PROVENANCE_WARN_CHAIN_EMPTY, PackManifest, ProvenancePayload, ProvenanceQuery,
+    ProvenanceResponse, ProvenanceStore, ReproduceRecord, SymbolLineage, get_provenance,
     provenance_response_artifact_bytes,
 };
 use astrolabe_weave::{
@@ -99,6 +100,9 @@ use anomalies::*;
 
 mod provenance;
 use provenance::*;
+
+mod shadow_watermark;
+use shadow_watermark::*;
 
 mod shadow_import;
 use shadow_import::*;
