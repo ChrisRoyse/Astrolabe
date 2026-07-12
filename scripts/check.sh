@@ -117,6 +117,18 @@ CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 SUITE_TMP="$ROOT/target/suite-tmp"
 mkdir -p "$SUITE_TMP"
 export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"
+# The suite temp now lives under target/ (inside this git checkout), so
+# std::env::temp_dir() resolves inside the repo -- breaking tests that assume temp
+# is outside a checkout (e.g. calyx-buildinfo compute_for_dir_outside_checkout_errors
+# runs `git rev-parse` in env::temp_dir() and expects failure). target/ is
+# git-ignored build output; stop git's upward .git search at target/ so a sandbox
+# there behaves like an out-of-repo temp. git from $ROOT / the source tree is
+# unaffected. Native Windows path form for git.exe.
+if command -v cygpath >/dev/null 2>&1; then
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$ROOT/target")"
+else
+  export GIT_CEILING_DIRECTORIES="$ROOT/target"
+fi
 "$CARGO_BIN" build --workspace
 if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
   if "$PYTHON_BIN" scripts/check-workspace-tests.py \

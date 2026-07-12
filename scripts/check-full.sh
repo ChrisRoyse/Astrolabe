@@ -40,6 +40,20 @@ WORKSPACE_TEST_DEFERRED_EXIT=125
 AGG_SUITE_TMP="$ROOT/target/suite-tmp"
 mkdir -p "$AGG_SUITE_TMP"
 export TMP="$AGG_SUITE_TMP" TEMP="$AGG_SUITE_TMP" TMPDIR="$AGG_SUITE_TMP"
+# Redirecting the suite temp under target/ (inside this git checkout) makes
+# std::env::temp_dir() resolve to a path *inside* the repo, which breaks any test
+# that assumes temp is outside a checkout -- e.g. calyx-buildinfo's
+# compute_for_dir_outside_checkout_errors, which runs `git rev-parse HEAD` in
+# env::temp_dir() and expects it to fail. target/ is git-ignored build output, so
+# tell git to stop its upward .git search at target/: a sandbox there then behaves
+# like a real out-of-repo temp. git from $ROOT (release-artifact commit stamping)
+# and from the source tree is unaffected -- the ceiling only blocks the walk that
+# crosses target/ upward. Native Windows path form for git.exe.
+if command -v cygpath >/dev/null 2>&1; then
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$ROOT/target")"
+else
+  export GIT_CEILING_DIRECTORIES="$ROOT/target"
+fi
 
 if ! command -v rustc >/dev/null 2>&1; then
   echo "ERROR: rustc not found on PATH" >&2
