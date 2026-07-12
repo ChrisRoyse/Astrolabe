@@ -47,6 +47,24 @@
       "kind": "reactive_queue_soak",
       "target_os": "linux",
       "evidence": ["CALYX_REACTIVE_QUEUE_CAP", "MAX_REACTIVE_SOAK_RSS_DELTA_BYTES"]
+    },
+    {
+      "id": "queue_churn_soak_10k_windows",
+      "crate": "astrolabe-weave",
+      "file": "crates/astrolabe-weave/src/lib.rs",
+      "test": "durable_reactive_churn_soak_10k_bounds_rss_and_keeps_exact_accounting",
+      "kind": "reactive_queue_churn_soak",
+      "target_os": "windows",
+      "evidence": ["REACTIVE_CHURN_SOAK_EVENTS", "MAX_REACTIVE_SOAK_RSS_DELTA_BYTES"]
+    },
+    {
+      "id": "disk_full_recovery_fails_closed",
+      "crate": "astrolabe-ingest",
+      "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
+      "test": "disk_full_write_fails_closed_and_vault_recovers_with_exact_ledger",
+      "kind": "disk_full_recovery",
+      "target_os": "windows",
+      "evidence": ["CALYX_DISK_PRESSURE", "verify_chain"]
     }
   ]
 }
