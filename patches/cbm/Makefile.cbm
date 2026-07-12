@@ -505,7 +505,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan libcbm cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-repro test-foundation test-tsan libcbm cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-cppcheck-astrolabe lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -1119,6 +1119,38 @@ lint-cppcheck:
 		-Isrc -Ivendored -Ivendored/sqlite3 \
 		-I$(CBM_DIR) -I$(TS_INCLUDE) \
 		$(LINT_SRCS)
+
+# cppcheck for Astrolabe-owned CBM C (#250): the vendored lint-cppcheck analyzes
+# only $(LINT_SRCS) (vendored). The Astrolabe-authored patches/cbm/*.c files are
+# the new-code surface most worth static analysis, but previously got clang-format
+# only. Same analyzer policy and suppressions as the vendored recipe so findings
+# stay directly comparable across the two source sets; varFuncNullUB is suppressed
+# here for the same reason it is upstream — cbm_log_error(...) is a sentinel-
+# terminated variadic macro (foundation/log.h: cbm_log(..., ##__VA_ARGS__, NULL)),
+# so the "NULL after last typed arg" finding is a false positive on every call
+# site, vendored or Astrolabe-owned. A real defect (e.g. a memory leak) is still
+# caught — see the control proof in #250.
+ASTRO_CPPCHECK_SRCS = $(ASTRO_ALLOC_SHIM_SRC) $(ASTRO_LAYOUT_PROBE_SRC) \
+                      $(ASTRO_SPAWN_SRC) $(ASTRO_ENV_STORE_CONFIG_SRC)
+
+lint-cppcheck-astrolabe:
+	@echo "=== cppcheck (Astrolabe-owned CBM C #250) ==="
+	@$(CPPCHECK) --enable=warning,style,performance,portability \
+		--std=c11 --language=c \
+		--suppressions-list=.cppcheck \
+		--error-exitcode=1 \
+		--inline-suppr \
+		--quiet \
+		--suppress=varFuncNullUB \
+		--suppress=intToPointerCast \
+		--suppress=unusedStructMember \
+		--suppress=nullPointerOutOfMemory \
+		--suppress=nullPointerArithmeticOutOfMemory \
+		--suppress=ctunullpointerOutOfMemory \
+		-Isrc -Ivendored -Ivendored/sqlite3 \
+		-I$(CBM_DIR) -I$(TS_INCLUDE) \
+		-I$(ASTROLABE_PATCH_DIR) -I$(ASTRO_FFI_INCLUDE_DIR) \
+		$(ASTRO_CPPCHECK_SRCS)
 
 # clang-format: formatting check (config in .clang-format, dry-run = no changes)
 lint-format:
