@@ -100,6 +100,20 @@ fi
 TARGET_SUBDIR="debug"
 CALYX_TARGET_DIR_ARGS=(--target-dir "$ROOT/target")
 
+# #189: enforce the single-tree invariant over the ambient environment for EVERY
+# child gate this script spawns. check-full.sh:39 supports an inherited
+# ASTROLABE_RUST_TARGET (asserted == host), and any child that reads it re-forks a
+# second cold target/<triple>/debug tree -- the exact duplication this issue removes.
+# check-mcp-parity.sh already resolves target/ directly, but check-single-mimalloc.sh
+# (:22-24) still appends --target "$ASTROLABE_RUST_TARGET" when the var is set. Rather
+# than patch each child, neutralize the variable once here: after the cross-target
+# refusal above, the target is provably the host, so the forked tree would only rebuild
+# identical objects. This unset is confined to this process and its children -- standalone
+# `bash scripts/check-single-mimalloc.sh` (invoked directly with the env set) keeps its
+# legitimate cross-target behavior; only the unified aggregate's children are pinned to
+# the one target/debug tree. Defense-in-depth for present and future child gates.
+unset ASTROLABE_RUST_TARGET
+
 run_logged() {
   local name="$1"
   shift
