@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+pub mod fsv;
 mod graph_projection;
 mod ledger_verify;
 mod registry;
 mod sqlite_import;
+
+pub use fsv::VaultMutationPlan;
 
 pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
@@ -12,7 +15,10 @@ pub use graph_projection::{
     ensure_graph_projection_csr, graph_projection_csr_rows, materialize_graph_projection,
     materialize_graph_projections, read_graph_projection_csr,
 };
-pub use ledger_verify::{VerifyChainReport, verify_chain, verify_chain_vault_path};
+pub use ledger_verify::{
+    ASTRO_FSV_JANITOR_BUDGET_INVALID, JanitorCheckpoint, JanitorSliceReport, VerifyChainReport,
+    verify_chain, verify_chain_slice, verify_chain_vault_path,
+};
 pub use registry::{
     ASTRO_SERIES_REGISTRY_PREFIX, ASTRO_VERIFY_DEEP_FAILED, DeepVerifyReport, GitRenameStatus,
     IngestError, IngestResult, QN_KEY_MAX_BYTES, QnIndexRow, RecurrenceRow, RenameHint,
