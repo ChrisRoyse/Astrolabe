@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from release_artifact import write_artifact  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "ci" / "license-notices.json"
@@ -79,7 +83,7 @@ def verify_license_notices() -> dict[str, Any]:
 
 
 def write_release_artifact(summary: dict[str, Any], artifact_dir: Path) -> None:
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    """Publish the license_gate artifact. Called only after verification succeeded (#88)."""
     artifact = {
         "schema": "astrolabe.license_gate.v1",
         "status": "pass",
@@ -89,9 +93,7 @@ def write_release_artifact(summary: dict[str, Any], artifact_dir: Path) -> None:
         "vendor_discovery": "git ls-files vendor",
         **summary,
     }
-    path = artifact_dir / LICENSE_GATE_ARTIFACT
-    path.write_text(json.dumps(artifact, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    print(f"license gate release artifact wrote: {path}")
+    write_artifact(artifact_dir, LICENSE_GATE_ARTIFACT, artifact, ROOT)
 
 
 def load_manifest() -> dict[str, Any]:

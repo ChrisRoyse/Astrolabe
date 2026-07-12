@@ -1,0 +1,68 @@
+{
+  "schema": "astrolabe.no_escape_roots.v1",
+  "_doc": [
+    "Registry of the operator state roots a test or gate run may never mutate (#237).",
+    "Path templates expand ${REAL_HOME}/${REAL_TEMP}/${REAL_CACHE}/${REAL_LOCALAPPDATA},",
+    "which scripts/check-no-escape.py resolves from the OS (SHGetKnownFolderPath / pwd),",
+    "NOT from the environment -- a sandbox that redirects HOME/TEMP must not be able to",
+    "blind the gate that polices it. ${VAR} also expands from the environment.",
+    "",
+    "mode=exclusive: the project owns this root outright. ANY added, removed, or modified",
+    "  entry is a leak and fails the build. Full recursive sha256 manifest.",
+    "mode=signature: the operator and the OS also write here (%TEMP%, $HOME), so a strict",
+    "  whole-root assertion would fail on unrelated third-party churn and get switched off.",
+    "  The assertion is scoped to entries whose top-level name matches signature_globs --",
+    "  precisely the escape shape of #133 (astrolabe-ingest-*) and #236 (astrolabe-anchors-*).",
+    "  Foreign entries are counted and reported, never used to pass or fail the gate."
+  ],
+  "signature_globs": [
+    "astrolabe*",
+    ".astrolabe*",
+    "calyx*",
+    ".calyx*",
+    "cbm*",
+    "codebase-memory*",
+    "libcbm*"
+  ],
+  "limits": {
+    "max_entries_per_root": 20000,
+    "max_hash_bytes_per_root": 536870912
+  },
+  "roots": [
+    {
+      "name": "cbm_project_store_home_cache",
+      "path": "${REAL_HOME}/.cache/codebase-memory-mcp",
+      "mode": "exclusive",
+      "note": "#194/#232: the CBM C suite registered 25 fixture projects here."
+    },
+    {
+      "name": "cbm_project_store_localappdata",
+      "path": "${REAL_LOCALAPPDATA}/codebase-memory-mcp",
+      "mode": "exclusive",
+      "note": "Windows cache resolution for the same store."
+    },
+    {
+      "name": "astrolabe_home_state",
+      "path": "${REAL_HOME}/.astrolabe",
+      "mode": "exclusive"
+    },
+    {
+      "name": "astrolabe_localappdata_state",
+      "path": "${REAL_LOCALAPPDATA}/astrolabe",
+      "mode": "exclusive"
+    },
+    {
+      "name": "operator_temp",
+      "path": "${REAL_TEMP}",
+      "mode": "signature",
+      "max_depth": 1,
+      "note": "#133 / #236: vault dirs escaped here on the panic path."
+    },
+    {
+      "name": "operator_home_top",
+      "path": "${REAL_HOME}",
+      "mode": "signature",
+      "max_depth": 1
+    }
+  ]
+}
