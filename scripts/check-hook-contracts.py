@@ -66,6 +66,15 @@ def validate_contract(contract):
         fail("hook contract budget_ms must be a positive integer")
     if budget_ms != 300:
         fail("hook contract budget_ms must remain the published 300ms")
+    # #281: the latency assertion is min-of-N, not single-sample. The trial
+    # count is a declared contract knob (HONEST invariant 4 — no implicit
+    # constant that should be a measurement parameter), bounded so it cannot
+    # be inflated to mask a genuine regression.
+    budget_trials = contract.get("budget_trials")
+    if not isinstance(budget_trials, int) or isinstance(budget_trials, bool):
+        fail("hook contract budget_trials must be an integer")
+    if not 1 <= budget_trials <= 10:
+        fail("hook contract budget_trials must be within [1, 10]")
     timeout_exit_ceiling_ms = contract.get("timeout_exit_ceiling_ms")
     if not isinstance(timeout_exit_ceiling_ms, int) or timeout_exit_ceiling_ms < budget_ms:
         fail("hook contract timeout_exit_ceiling_ms must be >= budget_ms")
@@ -85,7 +94,7 @@ def validate_contract(contract):
                 fail(f"hook {hook.get('id')} missing {key}")
         if hook["mode"] == "static_reminder" and not hook.get("source_marker"):
             fail(f"static hook {hook['id']} missing source_marker")
-    return budget_ms, timeout_exit_ceiling_ms
+    return budget_ms, budget_trials, timeout_exit_ceiling_ms
 
 
 def validate_source_markers(contract):
@@ -100,32 +109,68 @@ def validate_source_markers(contract):
         fail("Claude PreToolUse matcher drifted from Grep|Glob")
 
 
-def assert_hook_process(proc, elapsed_ms, *, budget_ms, label, expect_empty):
+def assert_hook_correctness(proc, *, label, expect_empty):
+    """Per-trial correctness contract: rc 0, silent stderr, no-op stdout empty.
+
+    A violation here is a product defect regardless of machine load, so it
+    fails immediately on ANY trial — retries apply to the latency sample only
+    (#281).
+    """
     if proc.returncode != 0:
         fail(f"{label} returned rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
-    if elapsed_ms > budget_ms:
-        fail(f"{label} exceeded {budget_ms}ms budget: {elapsed_ms:.1f}ms")
     if proc.stderr:
         fail(f"{label} wrote stderr on hook path: {proc.stderr[:200]!r}")
     if expect_empty and proc.stdout:
         fail(f"{label} wrote stdout for no-op hook: {proc.stdout[:200]!r}")
 
 
-def invoke_hook(binary, payload, env, budget_ms, label, expect_empty):
-    start = time.perf_counter()
-    proc = run([binary, "hook-augment"], stdin=payload, env=env, timeout=5)
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    assert_hook_process(
-        proc,
-        elapsed_ms,
-        budget_ms=budget_ms,
-        label=label,
-        expect_empty=expect_empty,
+def run_latency_trials(run_trial, check_trial, *, budget_ms, budget_trials, label):
+    """Min-of-N latency estimator (#281).
+
+    ``run_trial()`` returns ``(result, elapsed_ms)``; ``check_trial(result)``
+    enforces per-trial correctness and fails immediately on violation. The
+    latency assertion passes as soon as ANY sample meets the budget (fast path:
+    a healthy first trial adds zero cost). OS scheduler contention only
+    inflates samples, while a genuine product regression inflates all of them,
+    so min-of-N still bites on real regressions. If every sample exceeds the
+    budget the gate fails listing all samples.
+
+    Returns ``(result_of_passing_trial, samples)`` — samples include every
+    trial taken, so retries are visible in the report artifact, never silent.
+    """
+    samples = []
+    for _ in range(budget_trials):
+        result, elapsed_ms = run_trial()
+        check_trial(result)
+        samples.append(round(elapsed_ms, 1))
+        if elapsed_ms <= budget_ms:
+            return result, samples
+    fail(
+        f"{label} exceeded {budget_ms}ms budget in all {budget_trials} trials: "
+        f"samples_ms={samples}"
     )
-    return proc.stdout, elapsed_ms
 
 
-def assert_noop_hooks(binary, env, budget_ms):
+def invoke_hook(binary, payload, env, budget_ms, budget_trials, label, expect_empty):
+    def run_trial():
+        start = time.perf_counter()
+        proc = run([binary, "hook-augment"], stdin=payload, env=env, timeout=5)
+        return proc, (time.perf_counter() - start) * 1000
+
+    def check_trial(proc):
+        assert_hook_correctness(proc, label=label, expect_empty=expect_empty)
+
+    proc, samples = run_latency_trials(
+        run_trial,
+        check_trial,
+        budget_ms=budget_ms,
+        budget_trials=budget_trials,
+        label=label,
+    )
+    return proc.stdout, samples
+
+
+def assert_noop_hooks(binary, env, budget_ms, budget_trials):
     cases = [
         ("invalid-json", "not-json"),
         (
@@ -164,19 +209,21 @@ def assert_noop_hooks(binary, env, budget_ms):
     ]
     timings = {}
     for case, payload in cases:
-        _, elapsed_ms = invoke_hook(
+        _, samples = invoke_hook(
             binary,
             payload,
             env,
             budget_ms,
+            budget_trials,
             f"{binary.name} {case}",
             expect_empty=True,
         )
-        timings[case] = round(elapsed_ms, 1)
+        timings[case] = {"ms": samples[-1], "samples_ms": samples, "trials": len(samples)}
     return timings
 
 
-def assert_timeout_is_silent(binary, env, timeout_exit_ceiling_ms):
+def run_timeout_trial(binary, env, timeout_exit_ceiling_ms):
+    """One held-open-stdin trial: (exited_within_ceiling, elapsed_ms, rc, out, err)."""
     start = time.perf_counter()
     proc = subprocess.Popen(
         [str(binary), "hook-augment"],
@@ -191,20 +238,47 @@ def assert_timeout_is_silent(binary, env, timeout_exit_ceiling_ms):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
-        fail(f"{binary.name} held-open stdin did not exit before timeout ceiling")
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if proc.stdin:
+            proc.stdin.close()
+        return False, elapsed_ms, proc.returncode, "", ""
     elapsed_ms = (time.perf_counter() - start) * 1000
     stdout = proc.stdout.read() if proc.stdout else ""
     stderr = proc.stderr.read() if proc.stderr else ""
     if proc.stdin:
         proc.stdin.close()
-    if proc.returncode != 0:
-        fail(f"{binary.name} held-open stdin timeout returned rc={proc.returncode}")
-    if stdout or stderr:
-        fail(
-            f"{binary.name} held-open stdin timeout was not silent: "
-            f"stdout={stdout[:100]!r} stderr={stderr[:100]!r}"
+    return True, elapsed_ms, proc.returncode, stdout, stderr
+
+
+def assert_timeout_is_silent(binary, env, timeout_exit_ceiling_ms, budget_trials):
+    """Held-open-stdin exit test with the same min-of-N treatment (#281).
+
+    A trial that exits within the ceiling must also be correct (rc 0, silent);
+    correctness violations fail immediately. A trial that misses the ceiling is
+    retried — scheduler contention can defer the exit past the ceiling — and
+    only all-N misses fail the gate.
+    """
+    samples = []
+    for _ in range(budget_trials):
+        exited, elapsed_ms, rc, stdout, stderr = run_timeout_trial(
+            binary, env, timeout_exit_ceiling_ms
         )
-    return round(elapsed_ms, 1)
+        samples.append(round(elapsed_ms, 1))
+        if not exited:
+            continue
+        if rc != 0:
+            fail(f"{binary.name} held-open stdin timeout returned rc={rc}")
+        if stdout or stderr:
+            fail(
+                f"{binary.name} held-open stdin timeout was not silent: "
+                f"stdout={stdout[:100]!r} stderr={stderr[:100]!r}"
+            )
+        return {"ms": samples[-1], "samples_ms": samples, "trials": len(samples)}
+    fail(
+        f"{binary.name} held-open stdin did not exit before the "
+        f"{timeout_exit_ceiling_ms}ms ceiling in any of {budget_trials} trials: "
+        f"samples_ms={samples}"
+    )
 
 
 def index_fixture(astrolabe, env, repo):
@@ -225,7 +299,7 @@ def index_fixture(astrolabe, env, repo):
         fail(f"index_repository did not report nodes: {proc.stdout[:400]}")
 
 
-def assert_indexed_hook(binary, env, repo, budget_ms):
+def assert_indexed_hook(binary, env, repo, budget_ms, budget_trials):
     payload = json.dumps(
         {
             "hook_event_name": "PreToolUse",
@@ -234,11 +308,12 @@ def assert_indexed_hook(binary, env, repo, budget_ms):
             "tool_input": {"pattern": SYMBOL},
         }
     )
-    stdout, elapsed_ms = invoke_hook(
+    stdout, samples = invoke_hook(
         binary,
         payload,
         env,
         budget_ms,
+        budget_trials,
         f"{binary.name} indexed-grep",
         expect_empty=False,
     )
@@ -257,7 +332,7 @@ def assert_indexed_hook(binary, env, repo, budget_ms):
     for marker in [SYMBOL, "trust=provisional", "freshness=best_effort"]:
         if marker not in context:
             fail(f"{binary.name} hook context missing {marker!r}: {context[:300]!r}")
-    return round(elapsed_ms, 1)
+    return {"ms": samples[-1], "samples_ms": samples, "trials": len(samples)}
 
 
 def main():
@@ -269,7 +344,7 @@ def main():
     args = parser.parse_args()
 
     contract = load_json(CONTRACT)
-    budget_ms, timeout_exit_ceiling_ms = validate_contract(contract)
+    budget_ms, budget_trials, timeout_exit_ceiling_ms = validate_contract(contract)
     validate_source_markers(contract)
     astrolabe = resolve_binary(args.astrolabe)
     shim = resolve_binary(args.shim)
@@ -293,19 +368,25 @@ def main():
         index_fixture(astrolabe, env, repo)
         timings = {
             "noop": {
-                "astrolabe": assert_noop_hooks(astrolabe, env, budget_ms),
-                "codebase-memory-mcp": assert_noop_hooks(shim, env, budget_ms),
+                "astrolabe": assert_noop_hooks(astrolabe, env, budget_ms, budget_trials),
+                "codebase-memory-mcp": assert_noop_hooks(
+                    shim, env, budget_ms, budget_trials
+                ),
             },
-            "indexed_grep_ms": {
-                "astrolabe": assert_indexed_hook(astrolabe, env, repo, budget_ms),
-                "codebase-memory-mcp": assert_indexed_hook(shim, env, repo, budget_ms),
+            "indexed_grep": {
+                "astrolabe": assert_indexed_hook(
+                    astrolabe, env, repo, budget_ms, budget_trials
+                ),
+                "codebase-memory-mcp": assert_indexed_hook(
+                    shim, env, repo, budget_ms, budget_trials
+                ),
             },
-            "held_open_stdin_timeout_ms": {
+            "held_open_stdin_timeout": {
                 "astrolabe": assert_timeout_is_silent(
-                    astrolabe, env, timeout_exit_ceiling_ms
+                    astrolabe, env, timeout_exit_ceiling_ms, budget_trials
                 ),
                 "codebase-memory-mcp": assert_timeout_is_silent(
-                    shim, env, timeout_exit_ceiling_ms
+                    shim, env, timeout_exit_ceiling_ms, budget_trials
                 ),
             },
         }
@@ -321,8 +402,9 @@ def main():
         "hook contracts verified: "
         + json.dumps(
             {
-                "schema": "astrolabe.hook_contract_check.v1",
+                "schema": "astrolabe.hook_contract_check.v2",
                 "budget_ms": budget_ms,
+                "budget_trials": budget_trials,
                 "hooks": len(contract["hooks"]),
                 "timings": timings,
             },

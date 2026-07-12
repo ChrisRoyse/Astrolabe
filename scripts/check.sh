@@ -104,6 +104,7 @@ ASTRO_GATE_SELFTESTS_LIST=(
   scripts/test-cbm-mem-pressure-patch.py
   scripts/test-windows-gnu-toolchain-contract.py
   scripts/test-native-aggregate-wrapper.py
+  scripts/test-check-hook-contracts.py
 )
 # The mechanism ITSELF (fail-closed change-gating) is proven by an unconditional
 # meta-meta-test that must always run — never routed through the change-gate.
