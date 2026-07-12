@@ -64,6 +64,8 @@ bash scripts/check-no-todo.sh
 bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-gate-wiring.py
 "$PYTHON_BIN" scripts/test-gate-wiring.py
+"$PYTHON_BIN" scripts/check-degradation-labels.py
+"$PYTHON_BIN" scripts/test-degradation-labels.py
 "$PYTHON_BIN" scripts/test-check-workspace-tests.py
 "$PYTHON_BIN" scripts/test-verify-chain-native-path.py
 "$PYTHON_BIN" scripts/test-native-binary-resolution.py

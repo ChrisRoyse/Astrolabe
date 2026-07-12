@@ -56,6 +56,17 @@ def fixture(root: Path) -> Path:
     check_no_skips.parent.mkdir(parents=True)
     write_executable(check_no_skips, "#!/usr/bin/env bash\nprintf 'MOCK_NO_SKIPS\\n'\n")
 
+    # ci-cbm-lint.sh runs the CBM cache-path gate before it dispatches on the host
+    # platform. This fixture exercises the PLATFORM DISPATCH only, so the
+    # cache-path gate is stubbed here exactly like `make` and check-no-test-skips
+    # below -- but it must still be invoked, so its absence cannot silently drop
+    # the stage. (Without this stub the fixture died on a missing file, which is
+    # why this self-test was failing before #224.)
+    write_executable(
+        script.parent / "check-cbm-cache-paths.py",
+        "#!/usr/bin/env python3\nprint('MOCK_CACHE_PATHS')\n",
+    )
+
     bin_dir = root / "bin"
     bin_dir.mkdir()
     write_executable(bin_dir / "make", "#!/usr/bin/env bash\nprintf 'MOCK_MAKE %s\\n' \"$*\"\n")
@@ -92,6 +103,10 @@ def assert_path(
     output = process.stdout + process.stderr
     require(process.returncode == 0, f"{host} lint fixture failed:\n{output}")
     require("MOCK_NO_SKIPS" in output, f"{host} omitted the no-skips check:\n{output}")
+    require(
+        "MOCK_CACHE_PATHS" in output,
+        f"{host} omitted the CBM cache-path gate:\n{output}",
+    )
     for target in ("lint-cppcheck", "lint-format", "lint-no-suppress"):
         require(target in output, f"{host} omitted {target}:\n{output}")
 
@@ -101,8 +116,21 @@ def assert_path(
         require("--platform=unix64" not in output, f"{host} changed cppcheck ABI:\n{output}")
     else:
         require("lint-tidy" not in output, f"{host} unexpectedly ran clang-tidy:\n{output}")
-        require(SKIP in output, f"{host} omitted the named ownership skip:\n{output}")
-        require("required Linux CI job" in output, f"{host} omitted the CI owner:\n{output}")
+        require(SKIP in output, f"{host} omitted the named platform skip:\n{output}")
+        # The skip must carry the port-phase deferral classification and name its
+        # tracking issue, and must NOT name a CI job as its coverage owner (#224/#238).
+        require(
+            "DEFERRED[ASTRO_PORT_PHASE]" in output,
+            f"{host} omitted the port-phase deferral classification:\n{output}",
+        )
+        require(
+            "tracked in #238" in output,
+            f"{host} omitted the deferral tracking issue:\n{output}",
+        )
+        require(
+            "no CI job owns it." in output,
+            f"{host} omitted the explicit no-CI-owner disclaimer:\n{output}",
+        )
         require(
             "INFO[ASTRO_CBM_CPPCHECK_LINUX_ABI]" in output,
             f"{host} omitted the cppcheck ABI marker:\n{output}",

@@ -220,12 +220,39 @@ def main() -> int:
         copy_fixture(fixture)
 
         full = fixture / "scripts/check-full.sh"
+        # #193: the C phases now start concurrently, but their declaration order
+        # is still contractual -- swapping them must still trip the order check.
         rewrite(
             full,
-            "bash scripts/ci-cbm-lint.sh\n\necho \"=== Upstream CBM runtime suite ===\"\nbash scripts/ci-cbm-test.sh",
-            "bash scripts/ci-cbm-test.sh\n\necho \"=== Upstream CBM runtime suite ===\"\nbash scripts/ci-cbm-lint.sh",
+            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh\n'
+            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh',
+            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh\n'
+            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh',
         )
         require_error(checker.validate(fixture), "required order")
+        copy_fixture(fixture)
+
+        # #193: a failure in ANY concurrent phase must fail the aggregate with the
+        # phase named. Deleting the failure-attribution machinery must be caught.
+        rewrite(full, "ASTRO_GATE_PHASE_FAILED", "ASTRO_GATE_PHASE_IGNORED")
+        require_error(checker.validate(fixture), "ASTRO_GATE_PHASE_FAILED")
+        copy_fixture(fixture)
+
+        full_text = full.read_text(encoding="utf-8")
+        full.write_text(
+            full_text.replace("wait_phases", "join_phases"), encoding="utf-8"
+        )
+        require_error(checker.validate(fixture), "wait_phases")
+        copy_fixture(fixture)
+
+        # #189: the native gate must refuse a cross-target request rather than
+        # silently forking a second artifact tree.
+        rewrite(
+            rust_gate,
+            "ASTRO_RUST_GATE_CROSS_TARGET",
+            "ASTRO_RUST_GATE_ANYTARGET_OK",
+        )
+        require_error(checker.validate(fixture), "ASTRO_RUST_GATE_CROSS_TARGET")
         copy_fixture(fixture)
 
         cbm_lint = fixture / "scripts/ci-cbm-lint.sh"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Self-tests for the egress harness platform capability boundary."""
-# ASTRO_ALLOW_TEST_DOUBLE_FILE(platform-dispatch branches cannot all be real on one host; sys.platform/shutil.which are patched only to select the branch, whose real behavior is owned by that platform's native run or required CI job)
+# ASTRO_ALLOW_TEST_DOUBLE_FILE(platform-dispatch branches cannot all be real on one host; sys.platform/shutil.which are patched only to select the branch, whose real behavior is owned by a native run on that platform -- a tracked coverage gap, #238, never a CI job)
 
 from __future__ import annotations
 
@@ -54,7 +54,11 @@ def main() -> int:
         for fragment in (
             "SKIP[ASTRO_EGRESS_LINUX_REQUIRED]",
             "scripts/check-egress-deny.py is the only skipped gate",
-            "CI job portable-gates",
+            # The skip must carry the port-phase deferral classification and name
+            # its tracking issue -- never a CI job (hosted CI is banned; #224/#238).
+            "DEFERRED[ASTRO_PORT_PHASE]",
+            "tracked in #238",
+            "no CI job owns it.",
         ):
             if fragment not in skip:
                 raise AssertionError(f"missing {fragment!r} in skip output: {skip!r}")

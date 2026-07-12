@@ -69,10 +69,23 @@ def base_env(cache):
 def require_strace(*, allow_unsupported_platform=False):
     if not sys.platform.startswith("linux"):
         if allow_unsupported_platform:
+            # Hosted CI is banned (owner directive 2026-07-11): no CI job owns
+            # this probe and none may be claimed. The strace-based egress harness needs
+            # a Linux host, and Astrolabe is Windows-only scope until the system is
+            # fully operational natively -- so this coverage is deferred to the
+            # scheduled port phase, not abandoned and not awaiting a CI run.
+            # Named, counted, never passing evidence.
             print(
                 "SKIP[ASTRO_EGRESS_LINUX_REQUIRED]: "
                 "scripts/check-egress-deny.py is the only skipped gate; "
-                "Linux strace coverage is required from CI job portable-gates"
+                "the strace egress probe needs a Linux host, so egress-deny is "
+                "UNPROVEN on this platform."
+            )
+            print(
+                "DEFERRED[ASTRO_PORT_PHASE]: strace egress-deny coverage is "
+                "deferred to the port phase (Windows-only scope, owner directive "
+                "2026-07-11); tracked in #238. Not passing evidence; "
+                "no CI job owns it."
             )
             return None
         raise SystemExit(

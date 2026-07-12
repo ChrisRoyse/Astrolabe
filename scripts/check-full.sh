@@ -94,15 +94,101 @@ else
   exit "$status"
 fi
 
-echo "=== Upstream CBM lint suite ==="
-bash scripts/ci-cbm-lint.sh
+# ── #193: concurrent gate phases ────────────────────────────────────────────
+#
+# The phases below were strictly serial. The CBM C lint phase (cppcheck,
+# clang-format over a hash-checked overlay, NOLINT grep) compiles nothing and
+# writes no object into the vendor tree, so it is disjoint from the CBM C test
+# phase (which owns vendor/build/c) and from the Rust phase (whose libcbm build
+# lives in cbm-sys's OUT_DIR). Running it concurrently hides its whole wall clock
+# inside the CBM test phase.
+#
+# The concurrency lives INSIDE this one launcher invocation: these are child
+# processes of check-full.sh, never a second launcher, so the launcher's session
+# lock (#186/#197) stays single-launcher by construction.
+#
+# WHY THE RUST PHASE IS *NOT* IN THIS GROUP (measured, not assumed): both
+# scripts/ci-cbm-test.sh (the #194/#232 store-hermeticity gate) and the
+# astrolabe-bridge `cbm_cache_dir` FSV test that runs inside the Rust phase's
+# nextest assert EXCLUSIVE byte-identity of the operator's CBM store at
+# $HOME/.cache/codebase-memory-mcp -- each snapshots it and requires it unchanged
+# across its own run. Run concurrently, either can perturb (or create) that store
+# while the other holds a snapshot, producing a FALSE RED that has nothing to do
+# with the code under test. Weakening either assertion to permit concurrency
+# would weaken a real gate, so the Rust phase stays serial until the bridge test
+# is moved to a run-scoped store (filed separately; that change unlocks the much
+# larger cbm-test || rust-gate overlap).
+PHASE_LOG_DIR="$ROOT/target/gate-logs"
+PHASE_PIDS=()
+PHASE_NAMES=()
+PHASE_STARTS=()
 
-echo "=== Upstream CBM runtime suite ==="
-bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"
+phase_now() { date +%s; }
+
+# Each phase streams prefixed to stdout (so interleaved output stays attributable)
+# and tees an unprefixed per-phase log under target/gate-logs/.
+start_phase() {
+  local name="$1"
+  shift
+  mkdir -p "$PHASE_LOG_DIR"
+  echo "PHASE_START[$name]: $(date -u +%H:%M:%SZ) :: $*"
+  (
+    set +e
+    "$@" 2>&1 | tee "$PHASE_LOG_DIR/$name.log" | sed -u "s/^/[$name] /"
+    exit "${PIPESTATUS[0]}"
+  ) &
+  PHASE_PIDS+=("$!")
+  PHASE_NAMES+=("$name")
+  PHASE_STARTS+=("$(phase_now)")
+}
+
+# Waits for EVERY started phase before failing -- a phase that failed must not
+# leave its siblings' cargo/make process trees running into target/ cleanup.
+# A failure in ANY phase fails the aggregate, with the failing phase named.
+wait_phases() {
+  local failures=()
+  local index name pid rc elapsed
+  for index in "${!PHASE_PIDS[@]}"; do
+    name="${PHASE_NAMES[$index]}"
+    pid="${PHASE_PIDS[$index]}"
+    rc=0
+    wait "$pid" || rc=$?
+    elapsed=$(($(phase_now) - PHASE_STARTS[index]))
+    if [[ "$rc" -eq 0 ]]; then
+      echo "PHASE_OK[$name]: ${elapsed}s"
+    else
+      echo "PHASE_FAIL[$name]: exit $rc after ${elapsed}s (log: $PHASE_LOG_DIR/$name.log)" >&2
+      failures+=("$name(exit=$rc)")
+    fi
+  done
+  PHASE_PIDS=()
+  PHASE_NAMES=()
+  PHASE_STARTS=()
+  if [[ "${#failures[@]}" -gt 0 ]]; then
+    echo "ERROR: ASTRO_GATE_PHASE_FAILED: ${failures[*]}" >&2
+    return 1
+  fi
+  return 0
+}
+
+run_phase() {
+  local name="$1"
+  shift
+  start_phase "$name" "$@"
+  wait_phases
+}
+
+echo "=== Upstream CBM lint suite || CBM runtime suite (concurrent) ==="
+GATE_GROUP_START="$(phase_now)"
+start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh
+start_phase "cbm-test" bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"
+wait_phases
+echo "PHASE_GROUP[cbm-c]: $(($(phase_now) - GATE_GROUP_START))s wall clock for both C phases"
 
 echo "=== Astrolabe and Calyx Rust suites ($HOST_TARGET) ==="
-# #189: check-full asserts HOST_TARGET == RUSTC_HOST above, so an explicit --target
-# in ci-rust-gate would only fork a redundant target/<triple>/debug tree that shares
-# nothing with the target/debug tree check.sh just built. Opt this native run into the
-# unified single-tree path (ci-rust-gate collapses --target and shares the calyx tree).
-ASTROLABE_UNIFIED_TARGET_DIR=1 bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
+# #189: check-full asserts HOST_TARGET == RUSTC_HOST above, so ci-rust-gate now
+# refuses a cross-target request and passes no redundant --target: every phase of
+# this aggregate shares the single target/debug tree that check.sh built, instead
+# of forking target/<triple>/debug and vendor/calyx/target and recompiling the
+# workspace + calyx path-deps + libcbm from cold two more times.
+run_phase "rust-gate" bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
