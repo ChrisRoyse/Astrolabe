@@ -73,6 +73,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -84,9 +85,101 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROOTS = ROOT / "scripts" / "no-escape-roots.json"
 MANIFEST_SCHEMA = "astrolabe.no_escape_manifest.v1"
 ROOTS_SCHEMA = "astrolabe.no_escape_roots.v1"
+ATTRIBUTION_SCHEMA = "astrolabe.no_escape_attribution.v1"
+ATTRIBUTION_ENV = "ASTRO_NO_ESCAPE_ATTRIBUTION"
 READ_BLOCK_BYTES = 1 << 20
 
 ESCAPE_CODE = "ASTRO_TEST_SANDBOX_ESCAPE"
+
+# --------------------------------------------------------------------------
+# CAUSAL ATTRIBUTION (#278)
+#
+# The gate protects roots the operator SHARES with the OS and -- on this
+# machine -- with other Calyx/codebase-memory projects and concurrent MCP
+# servers. Deciding "is this delta OURS?" by NAME PATTERN (calyx*, cbm*) is
+# unsound there: a `cargo test` in the operator's OWN Calyx checkout drops
+# `calyx-retention-<pid>` dirs into %TEMP%, and a second Claude session's MCP
+# server writes ~/.cache/codebase-memory-mcp/_config.db -- both match the
+# project signature yet neither is ours. Nominal attribution turns that foreign
+# churn into a false ASTRO_TEST_SANDBOX_ESCAPE.
+#
+# Attribution is therefore CAUSAL: a delta is OURS only if it is traceable to a
+# process in THIS run's launcher-rooted process tree. The launcher records that
+# tree (Windows Job Object; every descendant PID) plus any protected-root path
+# it observed a tree process open, into an attribution manifest the gate reads.
+#   * tree_pids  -- every PID that belonged to our Job Object. The vendored test
+#                   scratch-dir convention embeds std::process::id() in the name
+#                   (`calyx-retention-mixed-<pid>`), so a PID token in a shared-
+#                   root entry that is in tree_pids proves the dir is ours.
+#   * owned_paths -- absolute protected-root paths a tree process opened for
+#                   write (for artifacts that carry no PID, e.g. store files).
+#
+# Confinement (launcher redirects TMP/TEMP/TMPDIR into the workspace; every gate
+# phase pins CBM_CACHE_DIR to a sandbox) means our env-respecting tests never
+# reach these operator roots at all, so in practice tree_pids/owned_paths are
+# EMPTY of operator-root entries on a clean run and the only deltas are foreign.
+# Attribution is the backstop for a regression that bypasses the redirect: such
+# a leak still carries our PID (Bazel's rule -- tests use unique, pid-stamped
+# paths), so it is attributed and RED. Foreign churn is counted, never policed.
+_PID_TOKEN = re.compile(r"(?<![0-9])([0-9]{2,7})(?![0-9])")
+
+
+def load_attribution(path: Path | None) -> dict[str, Any] | None:
+    """Load the launcher-produced causal-attribution manifest. None if absent."""
+    if path is None:
+        env_value = os.environ.get(ATTRIBUTION_ENV)
+        if env_value:
+            path = Path(env_value)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+            f"cannot read the causal-attribution manifest at {path}",
+            "the launcher writes this file (process-tree PIDs); regenerate it or unset "
+            f"{ATTRIBUTION_ENV}. The gate refuses to guess attribution.",
+            {"error": str(exc)},
+        )
+    if data.get("schema") != ATTRIBUTION_SCHEMA:
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+            f"attribution manifest has wrong schema: {data.get('schema')!r}",
+            f"set schema to {ATTRIBUTION_SCHEMA}",
+        )
+    try:
+        tree_pids = {int(pid) for pid in data.get("tree_pids", [])}
+    except (TypeError, ValueError) as exc:
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+            "attribution manifest tree_pids must be integers",
+            "the launcher writes integer PIDs; regenerate the manifest",
+            {"error": str(exc)},
+        )
+    owned_paths = {
+        os.path.normcase(os.path.abspath(str(entry))) for entry in data.get("owned_paths", [])
+    }
+    return {
+        "path": str(path),
+        "launcher_pid": data.get("launcher_pid"),
+        "tree_pids": tree_pids,
+        "owned_paths": owned_paths,
+    }
+
+
+def attribution_owns(top_name: str, abspath: Path, attribution: dict[str, Any]) -> bool:
+    """True iff this shared-root entry is causally traceable to our process tree."""
+    norm = os.path.normcase(os.path.abspath(str(abspath)))
+    for owned in attribution["owned_paths"]:
+        if norm == owned or norm.startswith(owned + os.sep):
+            return True
+    tree_pids = attribution["tree_pids"]
+    if tree_pids:
+        for token in _PID_TOKEN.findall(top_name):
+            if int(token) in tree_pids:
+                return True
+    return False
 
 
 def fail(code: str, message: str, remediation: str, details: dict[str, Any] | None = None) -> None:
@@ -298,6 +391,15 @@ def load_roots(path: Path) -> dict[str, Any]:
             "protected-root registry declares no roots, so the gate would police nothing",
             "declare the operator state roots in scripts/no-escape-roots.json",
         )
+    valid_modes = {"exclusive", "signature", "attributed"}
+    for declared in config["roots"]:
+        mode = declared.get("mode")
+        if mode not in valid_modes:
+            fail(
+                "ASTRO_NO_ESCAPE_BAD_REGISTRY",
+                f"root {declared.get('name')!r} has unknown mode {mode!r}",
+                f"mode must be one of {sorted(valid_modes)}",
+            )
     return config
 
 
@@ -332,7 +434,10 @@ def snapshot(config: dict[str, Any]) -> dict[str, Any]:
         entries: dict[str, list[Any]] = {}
         foreign = 0
         if exists:
-            if declared["mode"] == "exclusive":
+            # `attributed` roots are shared-by-design (the CBM store: concurrent
+            # MCP servers write it too) but small and worth a full byte manifest;
+            # they are hashed like an exclusive root and attributed at diff time.
+            if declared["mode"] in ("exclusive", "attributed"):
                 entries = scan_exclusive(path, limits, declared["name"])
             else:
                 entries, foreign = scan_signature(
@@ -380,18 +485,42 @@ def summarize(manifest: dict[str, Any]) -> None:
             print(f"        {head:<16} {fingerprint[1]:>10}  {rel}")
 
 
-def report_foreign_churn(before: dict[str, Any], after: dict[str, Any]) -> None:
+def report_foreign_churn(
+    before: dict[str, Any], after: dict[str, Any], reclassified: int = 0
+) -> None:
     """Label and count third-party churn in shared roots. Never a pass/fail signal."""
     foreign_before = sum(root["foreign_count"] for root in before["roots"])
     foreign_after = sum(root["foreign_count"] for root in after["roots"])
+    extra = ""
+    if reclassified:
+        extra = (
+            f"; plus {reclassified} signature-matching delta(s) NOT attributable to this "
+            "run's process tree (concurrent Calyx/CBM work), counted not policed"
+        )
     print(
         f"INFO[ASTRO_NO_ESCAPE_FOREIGN_CHURN]: {foreign_before} -> {foreign_after} "
-        "non-project entries in shared roots; counted, not policed"
+        f"non-project entries in shared roots; counted, not policed{extra}"
     )
 
 
-def diff_roots(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+def requires_attribution(config: dict[str, Any]) -> bool:
+    """True if any declared root is policed CAUSALLY (shared-by-design roots)."""
+    return any(root["mode"] in ("signature", "attributed") for root in config["roots"])
+
+
+def diff_roots(
+    before: dict[str, Any], after: dict[str, Any], attribution: dict[str, Any] | None
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (escapes, foreign_reclassified).
+
+    An escape is a delta CAUSALLY OURS. For `exclusive` roots (truly project-only)
+    every delta is ours. For `signature`/`attributed` roots (shared with the OS and
+    concurrent projects) a delta is ours only if the launcher-recorded process tree
+    proves it (attribution_owns); otherwise it is foreign churn -- counted, never
+    used to fail the build.
+    """
     escapes: list[dict[str, Any]] = []
+    foreign_reclassified = 0
     before_by_name = {root["name"]: root for root in before["roots"]}
     for root in after["roots"]:
         prior = before_by_name.get(root["name"])
@@ -403,38 +532,37 @@ def diff_roots(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, 
             )
         if not root["resolved"]:
             continue
+        causal = root["mode"] in ("signature", "attributed")
         prior_entries = prior["entries"]
         entries = root["entries"]
+        changes: list[tuple[str, str, list[Any], list[Any] | None]] = []
         for rel in sorted(set(entries) - set(prior_entries)):
-            escapes.append(
-                {
-                    "root": root["name"],
-                    "change": "ADDED",
-                    "path": str(Path(root["path"]) / rel),
-                    "fingerprint": entries[rel],
-                }
-            )
+            changes.append(("ADDED", rel, entries[rel], None))
         for rel in sorted(set(prior_entries) - set(entries)):
-            escapes.append(
-                {
-                    "root": root["name"],
-                    "change": "REMOVED",
-                    "path": str(Path(root["path"]) / rel),
-                    "fingerprint": prior_entries[rel],
-                }
-            )
+            changes.append(("REMOVED", rel, prior_entries[rel], None))
         for rel in sorted(set(prior_entries) & set(entries)):
             if prior_entries[rel] != entries[rel]:
-                escapes.append(
-                    {
-                        "root": root["name"],
-                        "change": "MODIFIED",
-                        "path": str(Path(root["path"]) / rel),
-                        "fingerprint": entries[rel],
-                        "was": prior_entries[rel],
-                    }
-                )
-    return escapes
+                changes.append(("MODIFIED", rel, entries[rel], prior_entries[rel]))
+        for change, rel, fingerprint, was in changes:
+            abspath = Path(root["path"]) / rel
+            if causal:
+                # attribution is guaranteed present for causal roots (the caller
+                # fails closed otherwise); a delta not traceable to our tree is
+                # foreign concurrent churn, not our escape.
+                top_name = rel.split("/", 1)[0]
+                if attribution is None or not attribution_owns(top_name, abspath, attribution):
+                    foreign_reclassified += 1
+                    continue
+            record: dict[str, Any] = {
+                "root": root["name"],
+                "change": change,
+                "path": str(abspath),
+                "fingerprint": fingerprint,
+            }
+            if was is not None:
+                record["was"] = was
+            escapes.append(record)
+    return escapes, foreign_reclassified
 
 
 # --------------------------------------------------------------------------
@@ -470,13 +598,32 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"before-snapshot has wrong schema: {before.get('schema')!r}",
             f"regenerate the snapshot; expected {MANIFEST_SCHEMA}",
         )
+    attribution = load_attribution(args.attribution)
+    if attribution is None and requires_attribution(config):
+        fail(
+            "ASTRO_NO_ESCAPE_NO_ATTRIBUTION",
+            "the registry declares shared-by-design roots (operator %TEMP%/$HOME, the CBM "
+            "store) that can only be policed by CAUSAL attribution, but no attribution "
+            "manifest was supplied, so the gate cannot tell this run's writes from a "
+            "concurrent Calyx/CBM process on this machine",
+            "run under the launcher (which records the process tree) or pass "
+            f"--attribution <manifest> / set {ATTRIBUTION_ENV}. The gate refuses to fall "
+            "back to name-pattern attribution, which false-positives on shared roots (#278).",
+        )
+    if attribution is not None:
+        print(
+            f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: launcher_pid={attribution['launcher_pid']}, "
+            f"{len(attribution['tree_pids'])} tree PID(s), "
+            f"{len(attribution['owned_paths'])} owned path(s) from {attribution['path']}"
+        )
+
     after = snapshot(config)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(after, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
-    escapes = diff_roots(before, after)
-    report_foreign_churn(before, after)
+    escapes, foreign_reclassified = diff_roots(before, after, attribution)
+    report_foreign_churn(before, after, foreign_reclassified)
 
     if escapes:
         for escape in escapes:
@@ -558,6 +705,57 @@ def sandbox_env(sandbox: Path, args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
+    """Run `command` on Windows inside a Job Object, returning (proc, tree_pids).
+
+    Descendants auto-join the job, so polling its process-id list while the child
+    runs captures the causal process tree (the same primitive the launcher uses for
+    the aggregate). Best-effort: any Win32 failure falls back to the direct child
+    PID rather than crashing the gate.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    tree_pids: set[int] = set()
+    proc = subprocess.Popen(command, cwd=cwd, env=env)
+    tree_pids.add(proc.pid)
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        # AssignProcessToJobObject via the live child handle subprocess already holds.
+        if not kernel32.AssignProcessToJobObject(job, int(proc._handle)):  # type: ignore[attr-defined]
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        capacity = 4096
+        job_basic_process_id_list = 3
+
+        def poll_pids() -> None:
+            class JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+                _fields_ = [
+                    ("NumberOfAssignedProcesses", wintypes.DWORD),
+                    ("NumberOfProcessIdsInList", wintypes.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * capacity),
+                ]
+
+            info = JOBOBJECT_BASIC_PROCESS_ID_LIST()
+            if kernel32.QueryInformationJobObject(
+                job, job_basic_process_id_list, ctypes.byref(info), ctypes.sizeof(info), None
+            ):
+                for index in range(min(info.NumberOfProcessIdsInList, capacity)):
+                    tree_pids.add(int(info.ProcessIdList[index]))
+
+        while proc.poll() is None:
+            poll_pids()
+            time.sleep(0.03)
+        poll_pids()
+        kernel32.CloseHandle(job)
+    except OSError:
+        proc.wait()
+    return proc, tree_pids
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not args.command:
         fail(
@@ -579,7 +777,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     env = sandbox_env(sandbox, args)
     print(f"=== running under sandbox: {' '.join(args.command)} ===")
-    proc = subprocess.run(args.command, cwd=args.cwd or ROOT, env=env, check=False)
+    if os.name == "nt":
+        # Capture the WHOLE descendant tree causally via a Job Object so an escape
+        # by a grandchild is still attributed to this run (the launcher uses the
+        # same primitive for the aggregate). Falls back to the direct child PID.
+        proc, tree_pids = run_in_job(args.command, cwd=args.cwd or ROOT, env=env)
+    else:
+        proc = subprocess.Popen(args.command, cwd=args.cwd or ROOT, env=env)
+        proc.wait()
+        tree_pids = {proc.pid}
 
     print("=== protected roots AFTER ===")
     after = snapshot(config)
@@ -588,8 +794,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         json.dumps(after, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
 
-    escapes = diff_roots(before, after)
-    report_foreign_churn(before, after)
+    # `run` owns the sandbox it just executed, so it can attribute causally from
+    # the process tree it captured -- unless the caller supplied an explicit
+    # manifest (the aggregate/self-tests do, to drive multi-PID/owned-path cases).
+    attribution = load_attribution(args.attribution)
+    if attribution is None:
+        attribution = {
+            "path": "<run: captured process tree>",
+            "launcher_pid": os.getpid(),
+            "tree_pids": tree_pids,
+            "owned_paths": set(),
+        }
+    print(
+        f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: {len(attribution['tree_pids'])} tree PID(s), "
+        f"{len(attribution['owned_paths'])} owned path(s)"
+    )
+
+    escapes, foreign_reclassified = diff_roots(before, after, attribution)
+    report_foreign_churn(before, after, foreign_reclassified)
     if escapes:
         for escape in escapes:
             print(
@@ -654,11 +876,26 @@ def main() -> int:
     verify = sub.add_parser("verify", help="fail closed if any protected root changed")
     verify.add_argument("--before", type=Path, required=True)
     verify.add_argument("--out", type=Path, default=None)
+    verify.add_argument(
+        "--attribution",
+        type=Path,
+        default=None,
+        help=(
+            "causal-attribution manifest (launcher process-tree PIDs). Required when the "
+            f"registry declares shared-by-design roots. Defaults to ${ATTRIBUTION_ENV}."
+        ),
+    )
     verify.set_defaults(func=cmd_verify)
 
     run = sub.add_parser("run", help="run a suite contained in a sandbox, then prove no escape")
     run.add_argument("--sandbox", type=Path, required=True)
     run.add_argument("--cwd", type=Path, default=None)
+    run.add_argument(
+        "--attribution",
+        type=Path,
+        default=None,
+        help="optional explicit attribution manifest; otherwise the captured tree is used.",
+    )
     run.add_argument("--fresh", action="store_true", help="remove an existing sandbox first")
     run.add_argument(
         "--require-sandbox-writes",
