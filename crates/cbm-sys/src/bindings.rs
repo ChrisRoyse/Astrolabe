@@ -61,7 +61,7 @@ pub const cbm_read_status_t_CBM_READ_OPEN_FAIL: cbm_read_status_t = 1;
 pub const cbm_read_status_t_CBM_READ_EMPTY: cbm_read_status_t = 2;
 pub const cbm_read_status_t_CBM_READ_OVERSIZED: cbm_read_status_t = 3;
 pub const cbm_read_status_t_CBM_READ_OOM: cbm_read_status_t = 4;
-pub type cbm_read_status_t = ::std::os::raw::c_uint;
+pub type cbm_read_status_t = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_max_file_bytes() -> ::std::os::raw::c_long;
 }
@@ -109,12 +109,12 @@ pub const TSInputEncoding_TSInputEncodingUTF8: TSInputEncoding = 0;
 pub const TSInputEncoding_TSInputEncodingUTF16LE: TSInputEncoding = 1;
 pub const TSInputEncoding_TSInputEncodingUTF16BE: TSInputEncoding = 2;
 pub const TSInputEncoding_TSInputEncodingCustom: TSInputEncoding = 3;
-pub type TSInputEncoding = ::std::os::raw::c_uint;
+pub type TSInputEncoding = ::std::os::raw::c_int;
 pub const TSSymbolType_TSSymbolTypeRegular: TSSymbolType = 0;
 pub const TSSymbolType_TSSymbolTypeAnonymous: TSSymbolType = 1;
 pub const TSSymbolType_TSSymbolTypeSupertype: TSSymbolType = 2;
 pub const TSSymbolType_TSSymbolTypeAuxiliary: TSSymbolType = 3;
-pub type TSSymbolType = ::std::os::raw::c_uint;
+pub type TSSymbolType = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(4))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -147,7 +147,7 @@ pub struct TSParseOptions {
 }
 pub const TSLogType_TSLogTypeParse: TSLogType = 0;
 pub const TSLogType_TSLogTypeLex: TSLogType = 1;
-pub type TSLogType = ::std::os::raw::c_uint;
+pub type TSLogType = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(8))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -183,7 +183,7 @@ pub const TSQuantifier_TSQuantifierZeroOrOne: TSQuantifier = 1;
 pub const TSQuantifier_TSQuantifierZeroOrMore: TSQuantifier = 2;
 pub const TSQuantifier_TSQuantifierOne: TSQuantifier = 3;
 pub const TSQuantifier_TSQuantifierOneOrMore: TSQuantifier = 4;
-pub type TSQuantifier = ::std::os::raw::c_uint;
+pub type TSQuantifier = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(8))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -193,7 +193,7 @@ pub struct TSQueryMatch {
 pub const TSQueryPredicateStepType_TSQueryPredicateStepTypeDone: TSQueryPredicateStepType = 0;
 pub const TSQueryPredicateStepType_TSQueryPredicateStepTypeCapture: TSQueryPredicateStepType = 1;
 pub const TSQueryPredicateStepType_TSQueryPredicateStepTypeString: TSQueryPredicateStepType = 2;
-pub type TSQueryPredicateStepType = ::std::os::raw::c_uint;
+pub type TSQueryPredicateStepType = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(4))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -207,7 +207,7 @@ pub const TSQueryError_TSQueryErrorField: TSQueryError = 3;
 pub const TSQueryError_TSQueryErrorCapture: TSQueryError = 4;
 pub const TSQueryError_TSQueryErrorStructure: TSQueryError = 5;
 pub const TSQueryError_TSQueryErrorLanguage: TSQueryError = 6;
-pub type TSQueryError = ::std::os::raw::c_uint;
+pub type TSQueryError = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(8))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -238,7 +238,7 @@ pub const TSWasmErrorKind_TSWasmErrorKindParse: TSWasmErrorKind = 1;
 pub const TSWasmErrorKind_TSWasmErrorKindCompile: TSWasmErrorKind = 2;
 pub const TSWasmErrorKind_TSWasmErrorKindInstantiate: TSWasmErrorKind = 3;
 pub const TSWasmErrorKind_TSWasmErrorKindAllocate: TSWasmErrorKind = 4;
-pub type TSWasmErrorKind = ::std::os::raw::c_uint;
+pub type TSWasmErrorKind = ::std::os::raw::c_int;
 #[repr(C)]
 #[repr(align(8))]
 #[derive(Debug, Default, Copy, Clone)]
@@ -405,7 +405,7 @@ pub const CBMLanguage_CBM_LANG_QML: CBMLanguage = 156;
 pub const CBMLanguage_CBM_LANG_CFSCRIPT: CBMLanguage = 157;
 pub const CBMLanguage_CBM_LANG_CFML: CBMLanguage = 158;
 pub const CBMLanguage_CBM_LANG_COUNT: CBMLanguage = 159;
-pub type CBMLanguage = ::std::os::raw::c_uint;
+pub type CBMLanguage = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMDefinition {
@@ -606,7 +606,7 @@ impl Default for CBMTypeAssign {
 }
 pub const CBMStringRefKind_CBM_STRREF_URL: CBMStringRefKind = 0;
 pub const CBMStringRefKind_CBM_STRREF_CONFIG: CBMStringRefKind = 1;
-pub type CBMStringRefKind = ::std::os::raw::c_uint;
+pub type CBMStringRefKind = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMStringRef {
@@ -642,7 +642,7 @@ impl Default for CBMInfraBinding {
 }
 pub const CBMChannelDirection_CBM_CHANNEL_EMIT: CBMChannelDirection = 0;
 pub const CBMChannelDirection_CBM_CHANNEL_LISTEN: CBMChannelDirection = 1;
-pub type CBMChannelDirection = ::std::os::raw::c_uint;
+pub type CBMChannelDirection = ::std::os::raw::c_int;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CBMChannel {
@@ -1241,7 +1241,7 @@ unsafe extern "C" {
 pub const cbm_index_mode_t_CBM_MODE_FULL: cbm_index_mode_t = 0;
 pub const cbm_index_mode_t_CBM_MODE_MODERATE: cbm_index_mode_t = 1;
 pub const cbm_index_mode_t_CBM_MODE_FAST: cbm_index_mode_t = 2;
-pub type cbm_index_mode_t = ::std::os::raw::c_uint;
+pub type cbm_index_mode_t = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_should_skip_dir(
         dirname: *const ::std::os::raw::c_char,
@@ -1331,13 +1331,13 @@ pub const CBMLogLevel_CBM_LOG_INFO: CBMLogLevel = 1;
 pub const CBMLogLevel_CBM_LOG_WARN: CBMLogLevel = 2;
 pub const CBMLogLevel_CBM_LOG_ERROR: CBMLogLevel = 3;
 pub const CBMLogLevel_CBM_LOG_NONE: CBMLogLevel = 4;
-pub type CBMLogLevel = ::std::os::raw::c_uint;
+pub type CBMLogLevel = ::std::os::raw::c_int;
 pub const CBMLogFormat_CBM_LOG_FORMAT_TEXT: CBMLogFormat = 0;
 pub const CBMLogFormat_CBM_LOG_FORMAT_JSON: CBMLogFormat = 1;
-pub type CBMLogFormat = ::std::os::raw::c_uint;
+pub type CBMLogFormat = ::std::os::raw::c_int;
 pub const CBMLogSinkMode_CBM_LOG_SINK_REPLACE: CBMLogSinkMode = 0;
 pub const CBMLogSinkMode_CBM_LOG_SINK_TEE: CBMLogSinkMode = 1;
-pub type CBMLogSinkMode = ::std::os::raw::c_uint;
+pub type CBMLogSinkMode = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_log_init_from_env();
 }
@@ -2757,7 +2757,7 @@ pub const cbm_risk_level_t_CBM_RISK_CRITICAL: cbm_risk_level_t = 0;
 pub const cbm_risk_level_t_CBM_RISK_HIGH: cbm_risk_level_t = 1;
 pub const cbm_risk_level_t_CBM_RISK_MEDIUM: cbm_risk_level_t = 2;
 pub const cbm_risk_level_t_CBM_RISK_LOW: cbm_risk_level_t = 3;
-pub type cbm_risk_level_t = ::std::os::raw::c_uint;
+pub type cbm_risk_level_t = ::std::os::raw::c_int;
 unsafe extern "C" {
     pub fn cbm_hop_to_risk(hop: ::std::os::raw::c_int) -> cbm_risk_level_t;
 }
@@ -3408,4 +3408,46 @@ unsafe extern "C" {
         field_name: *const ::std::os::raw::c_char,
         offset_out: *mut usize,
     ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_set_cache_dir(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_clear_cache_dir();
+}
+unsafe extern "C" {
+    pub fn cbm_astro_cache_dir_override() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_record_fault(
+        code: *const ::std::os::raw::c_char,
+        var: *const ::std::os::raw::c_char,
+        message: *const ::std::os::raw::c_char,
+        remediation: *const ::std::os::raw::c_char,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_record_truncation(
+        name: *const ::std::os::raw::c_char,
+        needed: usize,
+        capacity: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_record_unresolvable_store();
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_faulted_for(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_fault_code() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_fault_message() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_fault_remediation() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn cbm_astro_env_fault_clear();
 }

@@ -675,6 +675,24 @@ ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py
 ASTRO_MEM_PRESSURE_SRC = src/foundation/mem.c
 ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c
 ASTRO_MEM_PRESSURE_OBJ = $(LIBCBM_DIR)/src/foundation/mem.o
+
+# ── #240/#241: store-resolution overlay ──────────────────────────
+# Astrolabe-owned store configuration (explicit FFI parameter instead of
+# env-as-IPC) plus the fail-closed environment fault record, and the hash-checked
+# overlay that teaches the pinned CBM resolvers to use them. Nothing under
+# vendor/ is written: every patched source is regenerated into $(LIBCBM_DIR) and
+# compiled from there, and the explicit object rules below take precedence over
+# the generic $(LIBCBM_DIR)/%.o pattern rule.
+ASTRO_ENV_STORE_PATCH = $(ASTROLABE_PATCH_DIR)/env_apply_store_patch.py
+ASTRO_ENV_STORE_CONFIG_SRC = $(ASTROLABE_PATCH_DIR)/env_store_config.c
+ASTRO_ENV_STORE_CONFIG_HDR = $(ASTROLABE_PATCH_DIR)/env_store_config.h
+ASTRO_ENV_STORE_CONFIG_OBJ = $(LIBCBM_DIR)/env_store_config.o
+ASTRO_ENV_STORE_SRCS = src/foundation/platform.c src/pipeline/pipeline.c src/cli/cli.c \
+                       src/mcp/mcp.c src/ui/http_server.c
+ASTRO_ENV_STORE_OVERLAYS = $(patsubst %.c,$(LIBCBM_DIR)/%.c,$(ASTRO_ENV_STORE_SRCS))
+ASTRO_ENV_STORE_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(ASTRO_ENV_STORE_SRCS))
+ASTRO_ENV_STORE_INC = -I$(ASTROLABE_PATCH_DIR)
+
 PYTHON ?= python
 LIBCBM_DIR = $(BUILD_DIR)/libcbm
 LIBCBM_CONFIG_STAMP ?=
@@ -688,7 +706,7 @@ endif
 LIBCBM_C_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(filter %.c,$(LIBCBM_SRCS)))
 LIBCBM_CXX_OBJS = $(patsubst %.cpp,$(LIBCBM_DIR)/%.o,$(filter %.cpp,$(LIBCBM_SRCS)))
 LIBCBM_ASM_OBJS = $(patsubst %.S,$(LIBCBM_DIR)/%.o,$(UNIXCODER_BLOB_SRC))
-LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ) $(ASTRO_LAYOUT_PROBE_OBJ)
+LIBCBM_OBJS = $(LIBCBM_C_OBJS) $(LIBCBM_CXX_OBJS) $(LIBCBM_ASM_OBJS) $(ASTRO_ALLOC_SHIM_OBJ) $(ASTRO_LAYOUT_PROBE_OBJ) $(ASTRO_ENV_STORE_CONFIG_OBJ)
 # Compiler depfiles cover transitive includes; the config stamp covers command
 # inputs that Make cannot infer from source timestamps.
 LIBCBM_DEPFILES = $(LIBCBM_OBJS:.o=.d)
@@ -757,6 +775,40 @@ $(ASTRO_MEM_PRESSURE_OVERLAY): $(ASTRO_MEM_PRESSURE_SRC) $(ASTRO_MEM_PRESSURE_PA
 $(ASTRO_MEM_PRESSURE_OBJ): $(ASTRO_MEM_PRESSURE_OVERLAY) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<
+
+# ── #240/#241: store-resolution overlay build rules ──────────────
+# One generator, one hash-checked overlay per pinned source. The overlay is
+# written under $(LIBCBM_DIR); vendor/codebase-memory-mcp is never touched.
+$(ASTRO_ENV_STORE_CONFIG_OBJ): $(ASTRO_ENV_STORE_CONFIG_SRC) $(ASTRO_ENV_STORE_CONFIG_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -c -o $@ $<
+
+$(ASTRO_ENV_STORE_OVERLAYS): $(LIBCBM_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file $< $< $@
+
+# Each overlay object depends on its generated source plus the Astrolabe header
+# the overlay includes. The sub-directory -I mirrors the vendored source's own
+# directory so its quote-includes keep resolving from the generated location.
+$(LIBCBM_DIR)/src/foundation/platform.o: $(LIBCBM_DIR)/src/foundation/platform.c $(ASTRO_ENV_STORE_CONFIG_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/foundation -c -o $@ $<
+
+$(LIBCBM_DIR)/src/pipeline/pipeline.o: $(LIBCBM_DIR)/src/pipeline/pipeline.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/pipeline -c -o $@ $<
+
+$(LIBCBM_DIR)/src/cli/cli.o: $(LIBCBM_DIR)/src/cli/cli.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/cli -c -o $@ $<
+
+$(LIBCBM_DIR)/src/mcp/mcp.o: $(LIBCBM_DIR)/src/mcp/mcp.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/mcp -c -o $@ $<
+
+$(LIBCBM_DIR)/src/ui/http_server.o: $(LIBCBM_DIR)/src/ui/http_server.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/ui -c -o $@ $<
 
 $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -861,6 +913,18 @@ ASTRO_GRAPH_BUFFER_FORMAT_SRC = src/graph_buffer/graph_buffer.c
 ASTRO_FORMAT_OVERLAY_DIR ?= $(BUILD_DIR)/astrolabe-format-overlay
 ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY = $(ASTRO_FORMAT_OVERLAY_DIR)/src/graph_buffer/graph_buffer.c
 ASTRO_LINT_FORMAT_SRCS = $(filter-out $(ASTRO_GRAPH_BUFFER_FORMAT_SRC),$(LINT_SRCS))
+# #240/#241: format-check the generated store overlays too. The pinned vendor
+# sources stay in ASTRO_LINT_FORMAT_SRCS above (they are format-clean and must
+# remain so); these additional copies prove the OVERLAY Astrolabe actually
+# compiles into libcbm.a is format-clean as well, so a patched region can never
+# become the one unformatted corner of the C tree.
+ASTRO_ENV_STORE_FORMAT_OVERLAYS = $(patsubst %.c,$(ASTRO_FORMAT_OVERLAY_DIR)/%.c,$(ASTRO_ENV_STORE_SRCS))
+# clang-format resolves its style file by walking up from the assumed filename,
+# and this Makefile always runs with the CBM root as the working directory, so an
+# in-tree assumed name is what makes ./.clang-format the effective config for the
+# Astrolabe-owned sources that live outside the CBM tree.
+ASTRO_ENV_STORE_CONFIG_ASSUMED_C = src/foundation/env_store_config.c
+ASTRO_ENV_STORE_CONFIG_ASSUMED_H = src/foundation/env_store_config.h
 
 # clang-tidy: deep static analysis (config in .clang-tidy)
 lint-tidy:
@@ -898,10 +962,21 @@ $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY): $(ASTRO_GRAPH_BUFFER_FORMAT_SRC) $(ASTRO_G
 	mkdir -p $(dir $@)
 	$(PYTHON) $(ASTRO_GRAPH_BUFFER_FORMAT_PATCH) $< $@
 
-lint-format-astrolabe: $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY)
+$(ASTRO_ENV_STORE_FORMAT_OVERLAYS): $(ASTRO_FORMAT_OVERLAY_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file $< $< $@
+
+lint-format-astrolabe: $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY) $(ASTRO_ENV_STORE_FORMAT_OVERLAYS)
 	@echo "=== clang-format (Astrolabe overlay) ==="
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror $(ASTRO_LINT_FORMAT_SRCS) $(LINT_HDRS)
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_GRAPH_BUFFER_FORMAT_SRC) < $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY)
+	@echo "=== clang-format (Astrolabe store overlay #240/#241) ==="
+	@for src in $(ASTRO_ENV_STORE_SRCS); do \
+		$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$$src \
+			< $(ASTRO_FORMAT_OVERLAY_DIR)/$$src || exit 1; \
+	done
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_ENV_STORE_CONFIG_ASSUMED_C) < $(ASTRO_ENV_STORE_CONFIG_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_ENV_STORE_CONFIG_ASSUMED_H) < $(ASTRO_ENV_STORE_CONFIG_HDR)
 
 # Ban ALL NOLINT variants EXCEPT whitelisted NOLINT(misc-no-recursion).
 # The whitelist is in src/foundation/recursion_whitelist.h with documented reasoning.
