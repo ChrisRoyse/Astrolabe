@@ -2,11 +2,17 @@
 
 pub mod fsv;
 mod graph_projection;
+mod janitor;
 mod ledger_verify;
 mod registry;
 mod sqlite_import;
 
 pub use fsv::VaultMutationPlan;
+pub use janitor::{
+    ASTRO_FSV_JANITOR_CHAIN_DAMAGE, ASTRO_FSV_JANITOR_CHECKPOINT_CORRUPT,
+    ASTROLABE_FSV_JANITOR_ACTOR, FSV_JANITOR_SCRUB_LEDGER_SCHEMA, JANITOR_CHECKPOINT_KEY,
+    JanitorStepReport, janitor_startup_verify, read_janitor_checkpoint, run_janitor_scrub_step,
+};
 
 pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
