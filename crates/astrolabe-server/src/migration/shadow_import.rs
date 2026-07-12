@@ -9,11 +9,36 @@ pub(crate) const ASTRO_SHADOW_SOURCE_MISSING: &str = "ASTRO_SHADOW_SOURCE_MISSIN
 pub(crate) const ASTRO_SHADOW_FINGERPRINT_MISSING: &str = "ASTRO_SHADOW_FINGERPRINT_MISSING";
 pub(crate) const ASTRO_SHADOW_LOWERED_MISSING: &str = "ASTRO_SHADOW_LOWERED_MISSING";
 pub(crate) const ASTRO_SHADOW_VERIFY_NOT_INTACT: &str = "ASTRO_SHADOW_VERIFY_NOT_INTACT";
+/// Genuine source staleness that the read path refuses to reconcile on its own, because
+/// the refresh available to it cannot rebuild the row-sink-derived surfaces (#222).
+pub(crate) const ASTRO_SHADOW_STALE_REINDEX_REQUIRED: &str = "ASTRO_SHADOW_STALE_REINDEX_REQUIRED";
 pub(crate) const SHADOW_SOURCE_MISSING_REMEDIATION: &str = "run index_repository with calyx=\"shadow\" to build the CBM SQLite source and shadow vault before reading shadow freshness";
 pub(crate) const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow import watermark is recorded; run index_repository with calyx=\"shadow\" so the vault_fingerprint content watermark is persisted";
-pub(crate) const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) to rebuild it";
+/// #222: `index_status` deliberately no longer promises a background refresh here. The
+/// only refresh it can run has no `CbmToolRunner`, so it would overwrite the persisted
+/// provenance/security/skill/bridge/kernel/anomaly surfaces with "unavailable". A reindex
+/// is the honest remediation.
+pub(crate) const SHADOW_LOWERED_MISSING_REMEDIATION: &str = "the lowered artifact is absent; rerun index_repository with calyx=\"shadow\" to rebuild it from current source";
 pub(crate) const SHADOW_VERIFY_NOT_INTACT_REMEDIATION: &str = "the vault ledger chain does not verify intact; quarantine the vault and rerun index_repository with calyx=\"shadow\" to rebuild from current source";
-pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" (or retry index_status to trigger a background refresh) so the vault and lowered artifact are rebuilt from current source";
+pub(crate) const SHADOW_STALE_REMEDIATION: &str = "the CBM SQLite changed since the last shadow import; rerun index_repository with calyx=\"shadow\" so the vault, the lowered artifact, and the row-sink-derived surfaces (provenance, security screen, skill tree, bridges, kernel context, anomalies) are all rebuilt from current source. index_status will not reconcile this for you: it has no CBM tool runner and would have to overwrite those surfaces with \"unavailable\"";
+
+/// The config keys holding the row-sink-derived surfaces of a shadow import.
+///
+/// Every one of these is produced only by an import that carries a
+/// [`RowSinkImportCandidate::Available`] snapshot — i.e. one driven by a live
+/// `CbmToolRunner`. The `None` branch of [`import_shadow_vault_report`] replaces all of
+/// them with `*_unavailable_json(..)`, and [`persist_shadow_outcome_at`] then writes that
+/// over whatever was there. A freshness-triggered refresh has no runner, so if any of
+/// these keys already holds a value, refreshing would destroy last-known-good state
+/// (#222). [`has_persisted_derived_surfaces`] is the guard that makes that impossible.
+pub(crate) const SHADOW_DERIVED_SURFACE_KEYS: [&str; 6] = [
+    "provenance_json",
+    "security_screen_json",
+    "skill_tree_json",
+    "bridge_reports_json",
+    "kernel_context_json",
+    "anomaly_report_json",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowImportOutcome {
@@ -103,6 +128,20 @@ pub(crate) enum ShadowRefreshStatus {
     Current,
     Refreshed,
     Busy,
+    /// The shadow import is provably not current, and the read-path refresh cannot
+    /// reconcile it without destroying state (#222).
+    ///
+    /// [`ensure_shadow_import_current`] has no `CbmToolRunner`, so the only import it can
+    /// run passes `row_sink = None`; that import persists `*_unavailable_json(..)` over
+    /// every row-sink-derived surface. When such surfaces already exist, refreshing would
+    /// silently downgrade good provenance / security-screen / skill-tree / bridge /
+    /// kernel-context / anomaly state to "unavailable" — a silent fallback that destroys
+    /// good data (standing invariants #2 and #3). Instead the refresh **persists nothing**
+    /// and returns this status: the last-known-good surfaces are preserved, `index_status`
+    /// reports `shadow_import.status = "stale_reindex_required"` with a coded remediation,
+    /// and `team_artifact export` refuses. An explicit `index_repository` with
+    /// `calyx="shadow"` — which does have a runner — is the reconciliation path.
+    StaleReindexRequired,
 }
 
 impl SlotRuntime for ShadowSlotRuntime {
@@ -118,6 +157,7 @@ pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static
         ShadowRefreshStatus::Current => "current",
         ShadowRefreshStatus::Refreshed => "refreshed",
         ShadowRefreshStatus::Busy => "busy",
+        ShadowRefreshStatus::StaleReindexRequired => "stale_reindex_required",
     }
 }
 
@@ -135,8 +175,34 @@ pub(crate) enum ShadowContentVerdict {
     /// artifacts (lowered SQLite + intact vault chain) are present.
     Fresh,
     /// The live CBM SQLite fingerprint differs from the persisted watermark: the source
-    /// mutated out of band since the last shadow import.
+    /// mutated out of band since the last shadow import. Both digests were produced by the
+    /// same domain ([`SHADOW_WATERMARK_ALGO`]/[`SHADOW_WATERMARK_VERSION`]), so the
+    /// inequality is real staleness and not a units mismatch.
     Stale { expected: String, actual: String },
+    /// The persisted watermark's digest domain is not — or cannot be proven to be — the
+    /// domain the gate recomputes, so the two digests are incommensurable and comparing
+    /// them is meaningless (#223).
+    ///
+    /// This is deliberately **not** [`ShadowContentVerdict::Stale`]. A wrong-domain
+    /// watermark can never equal the recomputed digest, so reporting it as staleness makes
+    /// a systematic bug (#221) indistinguishable from ordinary source drift and reads
+    /// "permanently stale" forever. It fails closed with a code + remediation instead.
+    ///
+    /// Covers three fail-closed classes, distinguished by `code`:
+    /// [`ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH`] (a foreign algo/version tag),
+    /// [`ASTRO_SHADOW_WATERMARK_LEGACY_UNTAGGED`] (a pre-#223 bare digest whose domain was
+    /// never recorded), and [`ASTRO_SHADOW_WATERMARK_MALFORMED`] (corrupt metadata).
+    WatermarkDomainMismatch {
+        code: &'static str,
+        message: String,
+        remediation: &'static str,
+        /// The algo/version actually persisted, as recorded by the stored value itself.
+        persisted_algo: String,
+        persisted_version: String,
+        /// The algo/version this gate computes and would compare against.
+        expected_algo: &'static str,
+        expected_version: &'static str,
+    },
     /// A verify-relevant input is missing, so freshness cannot be asserted from content.
     Unverifiable {
         code: &'static str,
@@ -188,7 +254,8 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
         });
     }
 
-    let Some(expected) = read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?
+    let Some(persisted_watermark) =
+        read_config_value(cache_dir, &metadata_key(project, "vault_fingerprint"))?
     else {
         return Ok(ShadowContentVerdict::Unverifiable {
             code: ASTRO_SHADOW_FINGERPRINT_MISSING,
@@ -198,6 +265,53 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
             remediation: SHADOW_FINGERPRINT_MISSING_REMEDIATION,
             source_missing: false,
         });
+    };
+
+    // Domain gate (#223), before any comparison: the watermark describes which digest
+    // function produced it. Only a value tagged with the domain this gate recomputes is
+    // comparable. A foreign tag, a pre-#223 untagged digest, or a corrupt value fails
+    // loud with a code + remediation — never as ordinary staleness, which is what made
+    // the #221 wrong-domain watermark read "permanently Stale" and drove the
+    // provenance-clobbering refresh.
+    let expected = match parse_shadow_watermark(&persisted_watermark) {
+        ShadowWatermark::Tagged {
+            algo,
+            version,
+            digest,
+        } if algo == SHADOW_WATERMARK_ALGO && version == SHADOW_WATERMARK_VERSION => digest,
+        ShadowWatermark::Tagged { algo, version, .. } => {
+            return Ok(watermark_domain_mismatch_verdict(
+                ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH,
+                format!(
+                    "{ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH}: the persisted shadow freshness watermark for project {project:?} is tagged {algo}:{version}, but this gate recomputes {SHADOW_WATERMARK_ALGO}:{SHADOW_WATERMARK_VERSION}; the two digests are incommensurable, so no freshness comparison against it is meaningful"
+                ),
+                SHADOW_WATERMARK_DOMAIN_MISMATCH_REMEDIATION,
+                algo,
+                version,
+            ));
+        }
+        ShadowWatermark::LegacyUntagged { .. } => {
+            return Ok(watermark_domain_mismatch_verdict(
+                ASTRO_SHADOW_WATERMARK_LEGACY_UNTAGGED,
+                format!(
+                    "{ASTRO_SHADOW_WATERMARK_LEGACY_UNTAGGED}: the persisted shadow freshness watermark for project {project:?} is an untagged ({SHADOW_WATERMARK_LEGACY_VERSION}) bare digest that records no digest domain; it may be the {SHADOW_WATERMARK_ALGO} source-file digest or the incommensurable row-sink digest (#221), and nothing in the stored value distinguishes them, so it must not be compared"
+                ),
+                SHADOW_WATERMARK_LEGACY_UNTAGGED_REMEDIATION,
+                SHADOW_WATERMARK_LEGACY_ALGO.to_string(),
+                SHADOW_WATERMARK_LEGACY_VERSION.to_string(),
+            ));
+        }
+        ShadowWatermark::Malformed { raw, reason } => {
+            return Ok(watermark_domain_mismatch_verdict(
+                ASTRO_SHADOW_WATERMARK_MALFORMED,
+                format!(
+                    "{ASTRO_SHADOW_WATERMARK_MALFORMED}: the persisted shadow freshness watermark for project {project:?} ({raw:?}) does not parse: {reason}"
+                ),
+                SHADOW_WATERMARK_MALFORMED_REMEDIATION,
+                SHADOW_WATERMARK_UNPARSEABLE_ALGO.to_string(),
+                SHADOW_WATERMARK_UNPARSEABLE_VERSION.to_string(),
+            ));
+        }
     };
 
     let configured_lowered_path =
@@ -242,6 +356,8 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
     // Content gate: recompute the live CBM SQLite fingerprint and compare it to the
     // watermark persisted at import time. Existence of the artifacts above is necessary
     // but never sufficient — only a byte-for-byte fingerprint match proves freshness.
+    // Reaching here means the domain gate proved both digests come from the same domain,
+    // so an inequality is real staleness rather than a units mismatch (#223).
     let actual = astrolabe_ingest::fingerprint_sqlite_hex(&source_path)?;
     if actual == expected {
         Ok(ShadowContentVerdict::Fresh)
@@ -250,10 +366,80 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
     }
 }
 
+/// Builds the fail-closed [`ShadowContentVerdict::WatermarkDomainMismatch`] refusal (#223).
+fn watermark_domain_mismatch_verdict(
+    code: &'static str,
+    message: String,
+    remediation: &'static str,
+    persisted_algo: String,
+    persisted_version: String,
+) -> ShadowContentVerdict {
+    ShadowContentVerdict::WatermarkDomainMismatch {
+        code,
+        message,
+        remediation,
+        persisted_algo,
+        persisted_version,
+        expected_algo: SHADOW_WATERMARK_ALGO,
+        expected_version: SHADOW_WATERMARK_VERSION,
+    }
+}
+
+/// True when any row-sink-derived surface is already persisted for `project` (#222).
+///
+/// This is the guard that makes the destructive runner-less refresh impossible: it answers
+/// "is there last-known-good derived state here that a `row_sink = None` re-import would
+/// overwrite with `unavailable`?". See [`SHADOW_DERIVED_SURFACE_KEYS`].
+pub(crate) fn has_persisted_derived_surfaces(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<bool, DynError> {
+    for key in SHADOW_DERIVED_SURFACE_KEYS {
+        if read_config_value(cache_dir, &metadata_key(project, key))?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefreshStatus, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    match evaluate_shadow_content_freshness(&cache_dir, project)? {
-        // Live source fingerprint matches the persisted watermark: nothing to refresh.
+    ensure_shadow_import_current_at(&cache_dir, project)
+}
+
+/// [`ensure_shadow_import_current`] against an explicit CBM cache dir.
+///
+/// `cache_dir` must be the process CBM cache dir (`astrolabe_bridge::cbm_cache_dir`): the
+/// recovery-import branch below calls [`import_shadow_vault`], which resolves that dir
+/// itself. The parameter exists so the refusal paths — which persist nothing and never
+/// reach that branch — are directly testable against an isolated fixture root.
+///
+/// # Reconciliation policy (#222)
+///
+/// The refresh this function can run has **no `CbmToolRunner`**, so it must pass
+/// `row_sink = None` to [`import_shadow_vault`]. The `None` branch of
+/// [`import_shadow_vault_report`] fills every row-sink-derived surface with
+/// `*_unavailable_json(..)`, and [`persist_shadow_outcome`] writes those over whatever is
+/// stored. Refreshing on top of good surfaces therefore *destroys* them: a caller who made
+/// a genuine out-of-band source change and then merely called `index_status` used to find
+/// `get_provenance`, `detect_anomalies`, and the security screen all silently downgraded to
+/// "unavailable", with no reindex ever requested.
+///
+/// So the refresh runs **only when there is nothing to destroy** — i.e. when no derived
+/// surface has ever been persisted for this project. In every other not-current state it
+/// persists nothing and returns [`ShadowRefreshStatus::StaleReindexRequired`], preserving
+/// the last-known-good surfaces and pushing the caller to an explicit
+/// `index_repository(calyx="shadow")`, which does have a runner and can rebuild them.
+///
+/// (Threading a `CbmToolRunner` into this path is the eventual true-reconciliation design;
+/// it is deliberately out of scope here.)
+pub(crate) fn ensure_shadow_import_current_at(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<ShadowRefreshStatus, DynError> {
+    match evaluate_shadow_content_freshness(cache_dir, project)? {
+        // Live source fingerprint matches the persisted watermark, in the same digest
+        // domain: nothing to refresh.
         ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
         // No CBM source present, so no re-import is possible. This is not a freshness
         // claim — the status summary labels this state unverified/fail-closed; the
@@ -262,16 +448,27 @@ pub(crate) fn ensure_shadow_import_current(project: &str) -> Result<ShadowRefres
             source_missing: true,
             ..
         } => return Ok(ShadowRefreshStatus::Current),
-        // Stale content, or a missing/broken derived artifact with a live source:
-        // fall through and re-import to reconcile against the current source.
+        // Genuine staleness (#222), an unusable watermark domain (#223), or a
+        // missing/broken derived artifact while the source is live. All need
+        // reconciliation against current source — but only an import that can rebuild the
+        // derived surfaces may persist one.
         ShadowContentVerdict::Stale { .. }
+        | ShadowContentVerdict::WatermarkDomainMismatch { .. }
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
             ..
-        } => {}
+        } => {
+            if has_persisted_derived_surfaces(cache_dir, project)? {
+                return Ok(ShadowRefreshStatus::StaleReindexRequired);
+            }
+        }
     }
 
-    let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, project)? else {
+    // No derived surface has ever been persisted for this project, so the runner-less
+    // recovery import has no good state to overwrite: reconcile the vault and lowered
+    // artifact from source. The surfaces it writes are honestly labeled "unavailable"
+    // with a reason, and a later index_repository run replaces them with real ones.
+    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
         return Ok(ShadowRefreshStatus::Busy);
     };
     let search_scale_settings = search_scale_settings_for_import(project, None)?;
@@ -310,25 +507,68 @@ pub(crate) fn shadow_import_busy_summary_at(cache_dir: &Path, project: &str) -> 
 
 pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> Value {
     // The label is derived from a content verdict (#93): `current/fresh/verified` is
-    // emitted only when the live CBM SQLite fingerprint matches the persisted watermark.
-    // Mismatch is reported stale; any missing verify-relevant input fails closed as
-    // unverified — never fresh/verified from mere artifact existence.
+    // emitted only when the live CBM SQLite fingerprint matches the persisted watermark
+    // *in the same digest domain*. Genuine staleness is reported stale_reindex_required
+    // (#222 — the read path will not reconcile it, because doing so would clobber the
+    // row-sink-derived surfaces); a watermark whose domain is wrong or unprovable is
+    // reported as its own coded refusal (#223), never as staleness; any missing
+    // verify-relevant input fails closed as unverified. Never fresh/verified from mere
+    // artifact existence.
+    //
+    // Every arm declares `watermark_format` so a consumer can see which self-describing
+    // watermark contract this server writes and parses.
     match verdict {
         ShadowContentVerdict::Fresh => json!({
             "status": "current",
             "freshness": "fresh",
             "trust": "verified",
             "verification": "content_fingerprint_match",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
             "remediation": Value::Null,
         }),
         ShadowContentVerdict::Stale { expected, actual } => json!({
-            "status": "stale",
+            // #222: the read path detected the drift but deliberately did NOT re-import,
+            // because the only import it can run would overwrite the provenance, security
+            // screen, skill tree, bridges, kernel context, and anomaly surfaces with
+            // "unavailable". Those surfaces are preserved as last-known-good and the
+            // caller is told, in a machine-readable way, to reindex.
+            "status": "stale_reindex_required",
             "freshness": "stale",
             "trust": "provisional",
             "verification": "content_fingerprint_mismatch",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
+            "code": ASTRO_SHADOW_STALE_REINDEX_REQUIRED,
             "expected_vault_fingerprint": expected,
             "actual_vault_fingerprint": actual,
+            "derived_surfaces": "last_known_good_preserved",
             "remediation": SHADOW_STALE_REMEDIATION,
+        }),
+        ShadowContentVerdict::WatermarkDomainMismatch {
+            code,
+            message,
+            remediation,
+            persisted_algo,
+            persisted_version,
+            expected_algo,
+            expected_version,
+        } => json!({
+            // #223: NOT "stale". The persisted digest was produced by a different (or
+            // unprovable) function than the gate recomputes, so the two are incommensurable
+            // and comparing them would be meaningless. Fail loud with the domain on both
+            // sides so the mismatch is diagnosable rather than looking like ordinary drift.
+            "status": "watermark_domain_mismatch",
+            "freshness": "unverifiable",
+            "trust": "provisional",
+            "verification": "watermark_domain_mismatch",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
+            "code": code,
+            "message": message,
+            "persisted_watermark_algo": persisted_algo,
+            "persisted_watermark_version": persisted_version,
+            "expected_watermark_algo": expected_algo,
+            "expected_watermark_version": expected_version,
+            "derived_surfaces": "last_known_good_preserved",
+            "remediation": remediation,
         }),
         ShadowContentVerdict::Unverifiable {
             code,
@@ -340,6 +580,7 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
             "freshness": "stale_or_missing",
             "trust": "provisional",
             "verification": "content_unverifiable",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
             "code": code,
             "message": message,
             "remediation": remediation,
@@ -913,19 +1154,22 @@ pub(crate) fn persist_shadow_outcome_at(
         ("vault_id", outcome.vault_id.clone()),
         ("vault_salt", outcome.vault_salt.clone()),
         ("sqlite_path", outcome.sqlite_path.display().to_string()),
-        // Content-freshness watermark (#93/#221): the SHA-256 of the CBM SQLite *source
-        // file* at import time, taken from `content_freshness_watermark_sha256` — NOT from
-        // `sqlite_fingerprint_sha256`, which in the row-sink direct import path carries the
-        // row-sink content digest and is incommensurable with what the freshness gate
-        // recomputes. `evaluate_shadow_content_freshness` reads this exact key with no
-        // fallback and re-fingerprints the live source against it; if the key is absent (or,
-        // previously, held the wrong-domain row digest so it never matched) freshness reads
-        // Stale/Unverifiable and `ensure_shadow_import_current` re-imports with no row-sink
-        // candidate, clobbering the just-persisted provenance with an "unavailable" surface.
-        // Persist the source-file digest so an unchanged source stays Fresh.
+        // Content-freshness watermark (#93/#221/#223): the SHA-256 of the CBM SQLite
+        // *source file* at import time, taken from `content_freshness_watermark_sha256` —
+        // NOT from `sqlite_fingerprint_sha256`, which in the row-sink direct import path
+        // carries the row-sink content digest and is incommensurable with what the
+        // freshness gate recomputes.
+        //
+        // #223: it is persisted through `format_shadow_watermark`, so the stored value is
+        // self-describing (`sqlite-file-sha256:v1:<hex>`) and records which function
+        // produced it. `evaluate_shadow_content_freshness` parses the tag before comparing
+        // anything: a value from another domain now fails closed with
+        // ASTRO_SHADOW_WATERMARK_DOMAIN_MISMATCH instead of silently reading "permanently
+        // Stale" — the exact failure mode that let the #221 row-digest bug masquerade as
+        // ordinary staleness and drive the provenance-clobbering refresh.
         (
             "vault_fingerprint",
-            outcome.content_freshness_watermark_sha256.clone(),
+            format_shadow_watermark(&outcome.content_freshness_watermark_sha256),
         ),
         (
             "lowered_sqlite_path",

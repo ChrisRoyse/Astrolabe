@@ -100,6 +100,9 @@ use anomalies::*;
 mod provenance;
 use provenance::*;
 
+mod shadow_watermark;
+use shadow_watermark::*;
+
 mod shadow_import;
 use shadow_import::*;
 
