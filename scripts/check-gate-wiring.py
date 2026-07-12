@@ -96,6 +96,36 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    # #246: every path that RUNS workspace/Calyx tests must self-contain
+    # std::env::temp_dir() to the run-scoped suite-tmp sandbox, so no invocation
+    # leaks calyx-* / astrolabe-* scratch into the operator's real %TEMP%. The #237
+    # bracket lives INSIDE check.sh and does NOT cover ci-rust-gate.sh's Calyx
+    # nextest/doctest (they run as a later check-full phase, after check.sh's verify),
+    # so containment there cannot depend on the gate -- it must be a self-set property
+    # of the script itself. Both runners set the SAME sandbox path, so inheritance from
+    # check-full.sh remains an idempotent no-op.
+    for gate_text, gate_name in (
+        (check, "scripts/check.sh"),
+        (rust_gate, "scripts/ci-rust-gate.sh"),
+    ):
+        require(gate_text, 'SUITE_TMP="$SUITE_CEIL/tmp"', gate_name, errors)
+        require(
+            gate_text,
+            'export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"',
+            gate_name,
+            errors,
+        )
+        require(gate_text, "GIT_CEILING_DIRECTORIES", gate_name, errors)
+    # ci-rust-gate must establish the sandbox BEFORE it runs any test.
+    require_order(
+        rust_gate,
+        (
+            'export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"',
+            "nextest run",
+        ),
+        "scripts/ci-rust-gate.sh",
+        errors,
+    )
     # #88: hazard-suite must execute its tests (self-test wired) and predicate
     # artifacts must be written AFTER the workspace test, never before it.
     require(check, "scripts/test-check-hazard-suite.py", "scripts/check.sh", errors)

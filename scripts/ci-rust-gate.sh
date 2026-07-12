@@ -39,6 +39,34 @@ if [[ -z "$RUSTC_HOST" ]]; then
   exit 1
 fi
 
+# #246: self-contain std::env::temp_dir() scratch to a run-scoped sandbox under
+# target/ (cleaned with it) so this gate NEVER leaks calyx-* dirs into the
+# operator's real %TEMP% -- on EVERY invocation path, not only when check-full.sh
+# happened to export TMP first. The Calyx nextest and workspace doctest below create
+# scratch dirs via std::env::temp_dir(), which honors TMP/TEMP/TMPDIR on Windows; run
+# standalone (bash scripts/ci-rust-gate.sh <label> <target>) with no sandbox they land
+# in the operator's real %TEMP% and (correctly) trip the #237 no-escape gate. Containment
+# must be a property of this script, not an inherited convention. This mirrors check.sh's
+# self-set sandbox at the SAME path, so when check-full.sh has already exported it the
+# assignment is an idempotent no-op; standalone it closes the leak. The #237 gate resolves
+# operator_temp via the OS known-folder (REAL_TEMP), not the env, so this contains honest
+# writes without blinding the gate to a test that bypasses the redirect via an absolute
+# path. Suite temp nests one level BELOW a dedicated ceiling (target/suite-tmp/tmp under
+# ceiling target/suite-tmp): env::temp_dir() then resolves inside this checkout, so
+# GIT_CEILING_DIRECTORIES stops git's upward .git search at the ceiling for the
+# calyx-buildinfo test that runs `git rev-parse` in env::temp_dir() and expects failure.
+# A ceiling only blocks a walk crossing it from below, so temp sits under it. Native path
+# form for git.exe.
+SUITE_CEIL="$ROOT/target/suite-tmp"
+SUITE_TMP="$SUITE_CEIL/tmp"
+mkdir -p "$SUITE_TMP"
+export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"
+if command -v cygpath >/dev/null 2>&1; then
+  export GIT_CEILING_DIRECTORIES="$(cygpath -m "$SUITE_CEIL")"
+else
+  export GIT_CEILING_DIRECTORIES="$SUITE_CEIL"
+fi
+
 # ── #189: one artifact tree, never two ──────────────────────────────────────
 #
 # Cargo places artifacts in target/<triple>/debug when --target is passed and in
