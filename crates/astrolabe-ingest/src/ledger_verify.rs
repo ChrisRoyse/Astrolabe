@@ -488,6 +488,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use calyx_aster::cf::ledger_key;
+    use calyx_aster::pressure::{DiskPressureGuard, DiskSample, DiskSpaceProbe};
     use calyx_aster::vault::{AsterVault, VaultOptions};
     use calyx_core::{FixedClock, VaultId};
     use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -495,6 +496,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -772,6 +775,140 @@ mod tests {
             entry.subject,
             SubjectId::Query(ref value) if value == b"crash-fsv"
         ));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Toggleable disk-space probe for the disk-full recovery FSV (#60). The test
+    /// flips `available` blocks between "all free" and "none free" to drive
+    /// Calyx's disk-pressure guard across its high-water mark without a real
+    /// filesystem quota -- no VHD and no admin rights, so it runs natively on
+    /// Windows in a worktree.
+    #[derive(Clone)]
+    struct ToggleDiskProbe {
+        blocks: u64,
+        available: Arc<AtomicU64>,
+    }
+
+    impl DiskSpaceProbe for ToggleDiskProbe {
+        fn sample(&self, _path: &Path) -> CalyxResult<DiskSample> {
+            Ok(DiskSample {
+                blocks: self.blocks,
+                blocks_available: self.available.load(Ordering::SeqCst),
+            })
+        }
+    }
+
+    #[test]
+    fn disk_full_write_fails_closed_and_vault_recovers_with_exact_ledger() {
+        let root = test_dir("disk-full-recovery");
+        let vault_dir = root.join("vault");
+        fs::create_dir_all(&root).expect("create disk-full FSV root");
+
+        // 100 blocks total; `available` starts full (all free). The guard rejects a
+        // write once used_ratio (= 1 - available/total) reaches the high-water mark.
+        let available = Arc::new(AtomicU64::new(100));
+        let probe = ToggleDiskProbe {
+            blocks: 100,
+            available: Arc::clone(&available),
+        };
+        // high_water_ratio 0.85: available=0 -> used_ratio 1.0 >= 0.85 -> disk full;
+        // available=100 -> used_ratio 0.0 -> writes admitted.
+        let guard = DiskPressureGuard::with_probe(
+            vault_dir.clone(),
+            0.85,
+            Arc::new(FixedClock::new(42)),
+            Arc::new(probe),
+        );
+        let options = VaultOptions {
+            disk_pressure_guard: Some(guard),
+            ..VaultOptions::default()
+        };
+
+        let vault = AsterVault::new_durable(&vault_dir, vault_id(), b"ledger-disk-full", options)
+            .expect("open durable vault with disk guard");
+
+        // 1. Space free: a durable batch+ledger write commits.
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    b"row-before".to_vec(),
+                    b"v-before".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"before-full".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("write before disk-full commits");
+
+        // 2. Disk full: the next write must fail closed BEFORE any WAL append, so it
+        // leaves neither a data row nor a ledger entry (no torn write).
+        available.store(0, Ordering::SeqCst);
+        let err = vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    b"row-during".to_vec(),
+                    b"v-during".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"during-full".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect_err("write under disk pressure must fail closed");
+        assert_eq!(err.code, "CALYX_DISK_PRESSURE");
+
+        // 3. Recovery: space returns and a durable write commits again.
+        available.store(100, Ordering::SeqCst);
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(ColumnFamily::Kv, b"row-after".to_vec(), b"v-after".to_vec())],
+                EntryKind::Ingest,
+                SubjectId::Query(b"after-recovery".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("write after recovery commits");
+        vault.flush().expect("flush recovered vault");
+        drop(vault);
+
+        // 4. Independent readback: reopen with a plain handle (no guard) and prove
+        // the ledger chain is intact with EXACTLY the two committed entries -- the
+        // disk-full-rejected write left no ledger gap and no orphaned data row.
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-disk-full",
+            VaultOptions::default(),
+        )
+        .expect("reopen vault after disk-full episode");
+        let chain = verify_chain(&reopened).expect("verify recovered chain");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows, 2);
+        assert_eq!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-before")
+                .expect("read row-before")
+                .expect("row-before present"),
+            b"v-before"
+        );
+        assert_eq!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-after")
+                .expect("read row-after")
+                .expect("row-after present"),
+            b"v-after"
+        );
+        assert!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-during")
+                .expect("read row-during")
+                .is_none(),
+            "the disk-full-rejected write must have persisted nothing"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

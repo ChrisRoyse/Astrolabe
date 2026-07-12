@@ -2547,6 +2547,13 @@ mod tests {
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
+    /// Declared churn-soak scale (annealable later), not a measurement. The
+    /// reactive queue cap is 4096; the churn soak drives `REACTIVE_CHURN_SOAK_EVENTS`
+    /// evaluations well past that cap so the overflow / evict-oldest path is
+    /// exercised thousands of times, proving bounded RSS and exact accounting under
+    /// sustained pressure -- not just the single overflow the 4096 soak covers.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const REACTIVE_CHURN_SOAK_EVENTS: u64 = 10_000;
 
     #[test]
     fn identifies_calyx_parent() {
@@ -3230,6 +3237,86 @@ mod tests {
                 .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
                 .count(),
             1
+        );
+        assert_eq!(fired_events(&vault).len(), total_evals as usize);
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Windows-native 10K churn soak (#60). Where the 4096 soak pushes exactly one
+    /// event past the queue cap, this drives `REACTIVE_CHURN_SOAK_EVENTS` (10K)
+    /// evaluations through a durable vault, so the overflow / evict-oldest path
+    /// runs thousands of times. It proves the property scale claims: resident
+    /// memory stays under the declared bound and the persisted accounting stays
+    /// exact under sustained churn.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn durable_reactive_churn_soak_10k_bounds_rss_and_keeps_exact_accounting() {
+        let (dir, vault) = reactive_vault("churn-soak-10k");
+        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_321_000)));
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .expect("register churn soak trigger");
+        let signals =
+            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
+
+        let cap = CALYX_REACTIVE_QUEUE_CAP as u64;
+        let total_evals = REACTIVE_CHURN_SOAK_EVENTS;
+        assert!(
+            total_evals > cap,
+            "churn soak must drive past the queue cap: total_evals={total_evals} cap={cap}"
+        );
+        let rss_before = resident_set_bytes();
+
+        let mut ok_count = 0u64;
+        let mut overflow_count = 0u64;
+        for seq in 1..=total_evals {
+            let result = engine.evaluate_post_ingest_durable(&vault, cx(12), lref(seq), &signals);
+            if seq <= cap {
+                assert_eq!(result.expect("queue has capacity below cap"), 1);
+                ok_count += 1;
+            } else {
+                let err = result.expect_err("evaluation beyond queue cap overflows");
+                assert_eq!(err.code, CALYX_REACTIVE_QUEUE_FULL);
+                overflow_count += 1;
+            }
+        }
+        assert_eq!(ok_count, cap);
+        assert_eq!(overflow_count, total_evals - cap);
+
+        // Bounded RSS: the queue never exceeds its cap, so sustained churn far
+        // beyond the cap must not grow resident memory past the declared bound.
+        let rss_after = resident_set_bytes();
+        let rss_delta = rss_after.saturating_sub(rss_before);
+        assert!(
+            rss_delta <= MAX_REACTIVE_SOAK_RSS_DELTA_BYTES,
+            "reactive churn soak RSS delta {rss_delta} exceeded cap {MAX_REACTIVE_SOAK_RSS_DELTA_BYTES}"
+        );
+
+        // Queue stays capped and holds exactly the most-recent `cap` events
+        // (FIFO evict-oldest): first is total_evals-cap+1, last is total_evals.
+        assert_eq!(engine.queue().len(), CALYX_REACTIVE_QUEUE_CAP);
+        let queued_seqs = engine
+            .queue()
+            .iter()
+            .map(|event| event.ledger_ref.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(queued_seqs.first().copied(), Some(total_evals - cap + 1));
+        assert_eq!(queued_seqs.last().copied(), Some(total_evals));
+
+        // Independent readback of the persisted reactive CF: every evaluation
+        // fired and was audited; exactly one QUEUE_FULL warning per overflow.
+        let audits = all_audit_entries(&vault);
+        assert_eq!(
+            audits.iter().filter(|entry| entry.code.is_none()).count(),
+            total_evals as usize
+        );
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
+                .count(),
+            (total_evals - cap) as usize
         );
         assert_eq!(fired_events(&vault).len(), total_evals as usize);
         drop(vault);
