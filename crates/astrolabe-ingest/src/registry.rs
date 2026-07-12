@@ -12,9 +12,12 @@ use calyx_core::{CalyxError, Clock, CxId, Seq, VaultId};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 
+use crate::fsv::VaultMutationPlan;
 use crate::ledger_verify::{verify_chain, verify_ledger_pairing};
 use crate::sqlite_import::verify_sqlite_import_deep;
 use crate::{ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, SERIES_ID_V1_REBUILD_REMEDIATION};
+
+pub use astrolabe_domain::fsv::FsvAck;
 
 /// Namespace prefix for every Astrolabe series registry key stored in Aster.
 pub const ASTRO_SERIES_REGISTRY_PREFIX: &[u8] = b"astrolabe:series-registry:v2:";
@@ -373,7 +376,7 @@ impl SeriesVersionInput {
 }
 
 /// Summary of a registry ingest batch.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct SeriesIngestReport {
     /// Number of input versions considered.
     pub inputs: usize,
@@ -381,6 +384,12 @@ pub struct SeriesIngestReport {
     pub mutated_rows: usize,
     /// Latest Aster sequence after the batch.
     pub seq: Seq,
+    /// Engine-native FSV write-ack (#178): present exactly when the batch
+    /// persisted rows and every persisted row plus the paired ledger entry read
+    /// back and matched. `None` is a *labeled* absence — an idempotent batch that
+    /// changed nothing has no ledger entry to pair, so no `fsv:verified` claim is
+    /// made. A caller must never treat a `None` here as a verified mutation.
+    pub fsv: Option<FsvAck>,
 }
 
 /// Raw CF readback snapshot for registry verification.
@@ -822,22 +831,42 @@ where
     }
     let mutated_rows = changed.len();
 
-    if !changed.is_empty() {
+    let fsv = if changed.is_empty() {
+        // Idempotent batch: nothing persisted, so there is no ledger entry to
+        // pair and no `fsv:verified` claim to make. Reported as a labeled
+        // absence (`None`), never as a silent success.
+        None
+    } else {
+        let subject = SubjectId::Query(batch.digest.finalize().as_bytes().to_vec());
+        let actor = ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string());
+        // Build the FSV plan from the exact rows the commit will persist, before
+        // committing, so verification re-reads persisted bytes rather than the
+        // write set. Every registry row is a live content write (no tombstones).
+        let mut plan =
+            VaultMutationPlan::new("ingest_series_batch", EntryKind::Ingest, &actor, &subject);
+        for (cf, key, value) in &changed {
+            plan.push_content(*cf, key.clone(), value);
+        }
         let payload =
-            series_registry_batch_ledger_payload(&batch, inputs as u64, mutated_rows as u64);
+            series_registry_batch_ledger_payload(&batch, inputs as u64, mutated_rows as u64)?;
         vault.write_cf_batch_with_ledger_entry(
             changed,
             EntryKind::Ingest,
-            SubjectId::Query(batch.digest.finalize().as_bytes().to_vec()),
-            payload?,
-            ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string()),
+            subject,
+            payload,
+            actor,
         )?;
-    }
+        // Write-ack-after-readback: re-read every persisted row and the paired
+        // ledger entry at the commit snapshot. On any divergence this fails
+        // closed and the batch never reports success.
+        Some(plan.verify_committed(vault, vault.latest_seq())?)
+    };
 
     Ok(SeriesIngestReport {
         inputs,
         mutated_rows,
         seq: vault.latest_seq(),
+        fsv,
     })
 }
 
@@ -1387,6 +1416,216 @@ mod tests {
                 base_ledger_pairs: 0,
             }
         );
+    }
+
+    #[test]
+    fn fsv_series_batch_ack_binds_persisted_rows_and_paired_ledger() {
+        // The engine-native write-ack (#178) must be present, labeled full, and
+        // its ledger_seq must be the ledger entry actually persisted on disk.
+        let vault = vault();
+        let first = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        let report = ingest_series_batch(&vault, &[first]).expect("ingest");
+        assert_eq!(report.mutated_rows, 4);
+
+        let ack = report
+            .fsv
+            .as_ref()
+            .expect("verified mutation carries an ack");
+        assert_eq!(ack.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert!(ack.is_full_readback());
+        assert_eq!(ack.rows_planned(), 4);
+        assert_eq!(ack.rows_read_back(), 4);
+
+        // Independent readback: the ledger entry named by the ack really is the
+        // newest persisted Ledger CF row, and it is the batch Ingest entry.
+        let (_key, ledger_bytes) = vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan ledger")
+            .into_iter()
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .expect("ledger row exists");
+        let entry = calyx_ledger::decode(&ledger_bytes).expect("decode ledger");
+        assert_eq!(ack.ledger_seq(), entry.seq);
+        assert_eq!(entry.kind, EntryKind::Ingest);
+    }
+
+    #[test]
+    fn fsv_idempotent_replay_makes_no_verified_claim() {
+        // A batch that changes nothing persists no ledger entry, so it must NOT
+        // fabricate an `fsv:verified` ack. The absence is labeled (None), not a
+        // silent success — proving the negative of standing invariant 1/3.
+        let vault = vault();
+        let first = input("demo.math.add", "src/math.rs", "fn add() { 1 }", 10, "c1");
+        let ack = ingest_series_batch(&vault, std::slice::from_ref(&first))
+            .expect("first ingest")
+            .fsv;
+        assert!(ack.is_some(), "the first batch really mutated rows");
+
+        let replay = ingest_series_batch(&vault, &[first]).expect("idempotent replay");
+        assert_eq!(replay.mutated_rows, 0);
+        assert!(
+            replay.fsv.is_none(),
+            "an idempotent no-op batch must not claim fsv:verified"
+        );
+    }
+
+    #[test]
+    fn fsv_verify_committed_refuses_mutation_without_paired_ledger() {
+        // A data write with no ledger entry cannot ack: mutation⇔ledger pairing
+        // is enforced at the API, not by convention.
+        let vault = vault();
+        let key = b"astrolabe:series-registry:v2:series:unpaired".to_vec();
+        let value = b"payload".to_vec();
+        let mut plan = VaultMutationPlan::new(
+            "unpaired-test",
+            EntryKind::Ingest,
+            &ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string()),
+            &SubjectId::Query(b"unpaired".to_vec()),
+        );
+        plan.push_content(ColumnFamily::Kv, key.clone(), &value);
+        // Commit the row WITHOUT a ledger entry.
+        vault
+            .write_cf_batch([(ColumnFamily::Kv, key.clone(), value.clone())])
+            .expect("write data row without ledger");
+
+        let err = plan
+            .verify_committed(&vault, vault.latest_seq())
+            .expect_err("mutation without ledger must refuse");
+        assert_eq!(
+            err.code(),
+            Some(astrolabe_domain::fsv::ASTRO_FSV_LEDGER_UNPAIRED)
+        );
+    }
+
+    #[test]
+    fn fsv_verify_committed_detects_one_byte_tamper_in_persisted_kv_row_on_disk() {
+        // Gold-standard FSV: write one real Kv row to a durable vault, flush it
+        // to an on-disk SST, flip exactly one byte in that SST, reopen, and prove
+        // verify_committed reads the tampered bytes back and refuses fail-closed,
+        // naming the exact column family and key.
+        let dir = durable_vault_dir("fsv-kv-tamper");
+        fs::create_dir_all(&dir).expect("create durable vault dir");
+        let key = b"astrolabe:series-registry:v2:series:tamper".to_vec();
+        let value = b"the-canonical-persisted-registry-row-bytes".to_vec();
+        let subject = SubjectId::Query(b"tamper".to_vec());
+        let actor = ActorId::Service(ASTROLABE_REGISTRY_ACTOR.to_string());
+
+        {
+            let vault = AsterVault::new_durable(
+                &dir,
+                TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+                TEST_SALT.as_bytes().to_vec(),
+                VaultOptions::default(),
+            )
+            .expect("open durable vault");
+            let mut plan =
+                VaultMutationPlan::new("tamper-test", EntryKind::Ingest, &actor, &subject);
+            plan.push_content(ColumnFamily::Kv, key.clone(), &value);
+            vault
+                .write_cf_batch_with_ledger_entry(
+                    [(ColumnFamily::Kv, key.clone(), value.clone())],
+                    EntryKind::Ingest,
+                    subject.clone(),
+                    br#"{"schema":"astrolabe-fsv-tamper-test-v1"}"#.to_vec(),
+                    actor.clone(),
+                )
+                .expect("commit registry row + ledger");
+            // Clean commit reads back clean and produces a verified ack.
+            let ack = plan
+                .verify_committed(&vault, vault.latest_seq())
+                .expect("clean readback");
+            assert_eq!(ack.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+            vault.flush().expect("flush durable vault");
+        }
+
+        // Independent read of the persisted bytes BEFORE tamper.
+        let before = read_kv_sst_first_value(&dir);
+        // Flip one byte on disk and repair the SST CRCs so the corruption is not
+        // caught by the SST framing but only by the content-hash readback.
+        tamper_cf_sst_first_value(&dir, ColumnFamily::Kv);
+        let after = read_kv_sst_first_value(&dir);
+        assert_ne!(before, after, "the on-disk value byte really changed");
+
+        let vault = AsterVault::new_durable(
+            &dir,
+            TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+            TEST_SALT.as_bytes().to_vec(),
+            VaultOptions::default(),
+        )
+        .expect("reopen durable vault (ledger intact, data CF tampered)");
+        let mut plan = VaultMutationPlan::new("tamper-test", EntryKind::Ingest, &actor, &subject);
+        plan.push_content(ColumnFamily::Kv, key.clone(), &value);
+        let err = plan
+            .verify_committed(&vault, vault.latest_seq())
+            .expect_err("tampered persisted bytes must fail closed");
+        assert_eq!(
+            err.code(),
+            Some(astrolabe_domain::fsv::ASTRO_FSV_READBACK_MISMATCH)
+        );
+        assert!(err.to_string().contains("kv"), "names the CF: {err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Returns the value bytes of the first record in the Kv CF's SST.
+    fn read_kv_sst_first_value(vault_dir: &Path) -> Vec<u8> {
+        let (path, bytes) = read_cf_sst(vault_dir, ColumnFamily::Kv);
+        let _ = path;
+        let (_key_start, value_start, value_len) =
+            first_sst_record_offsets(&bytes).expect("first record");
+        bytes[value_start..value_start + value_len].to_vec()
+    }
+
+    fn read_cf_sst(vault_dir: &Path, cf: ColumnFamily) -> (std::path::PathBuf, Vec<u8>) {
+        let cf_dir = vault_dir.join("cf").join(cf.name());
+        for entry in fs::read_dir(&cf_dir).expect("read cf dir") {
+            let path = entry.expect("cf dir entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("sst") {
+                let bytes = fs::read(&path).expect("read cf sst");
+                if first_sst_record_offsets(&bytes).is_some() {
+                    return (path, bytes);
+                }
+            }
+        }
+        panic!("no SST with a record in {}", cf_dir.display());
+    }
+
+    fn tamper_cf_sst_first_value(vault_dir: &Path, cf: ColumnFamily) {
+        let (path, mut bytes) = read_cf_sst(vault_dir, cf);
+        let (key_start, value_start, value_len) =
+            first_sst_record_offsets(&bytes).expect("first record");
+        assert!(value_len > 0, "value must be non-empty");
+        bytes[value_start] ^= 0xff;
+        rewrite_sst_crcs(&mut bytes, key_start, value_start, value_len);
+        fs::write(&path, bytes).expect("write tampered cf sst");
+    }
+
+    fn first_sst_record_offsets(bytes: &[u8]) -> Option<(usize, usize, usize)> {
+        const HEADER_LEN: usize = 32;
+        const RECORD_HEADER_LEN: usize = 12;
+        if bytes.len() < HEADER_LEN + RECORD_HEADER_LEN {
+            return None;
+        }
+        let record = &bytes[HEADER_LEN..HEADER_LEN + RECORD_HEADER_LEN];
+        let key_len = u32::from_le_bytes(record[0..4].try_into().expect("key len")) as usize;
+        let value_len = u32::from_le_bytes(record[4..8].try_into().expect("value len")) as usize;
+        let key_start = HEADER_LEN + RECORD_HEADER_LEN;
+        let value_start = key_start + key_len;
+        let value_end = value_start + value_len;
+        (value_end <= bytes.len() && value_len > 0).then_some((key_start, value_start, value_len))
+    }
+
+    fn rewrite_sst_crcs(bytes: &mut [u8], key_start: usize, value_start: usize, value_len: usize) {
+        const HEADER_LEN: usize = 32;
+        let value_end = value_start + value_len;
+        let mut record_hasher = crc32fast::Hasher::new();
+        record_hasher.update(&bytes[key_start..value_start]);
+        record_hasher.update(&bytes[value_start..value_end]);
+        bytes[HEADER_LEN + 8..HEADER_LEN + 12]
+            .copy_from_slice(&record_hasher.finalize().to_le_bytes());
+
+        let mut body_hasher = crc32fast::Hasher::new();
+        body_hasher.update(&bytes[HEADER_LEN..]);
+        bytes[28..32].copy_from_slice(&body_hasher.finalize().to_le_bytes());
     }
 
     #[test]
