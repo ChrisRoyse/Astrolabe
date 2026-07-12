@@ -3000,19 +3000,27 @@ mod tests {
             s.push_str(&real);
             s
         };
-        // baseline (real PATH), operator-size (~4226 B), and ~8 KB.
+        // baseline (real PATH), operator-size (~4226 B), ~8 KB, ~33 KB (beyond the
+        // 32767-char SetEnvironmentVariable maximum — the #267 design correction
+        // removed the artificial read cap, so a PATH the OS lets a child inherit is
+        // searched in full; the only remaining refusal is genuine allocation
+        // failure), and unset (no spurious truncation fault on a missing PATH).
         let cases = [
-            ("baseline", real.clone()),
-            ("oversize_4226", make(4226)),
-            ("oversize_8192", make(8192)),
+            ("baseline", Some(real.clone())),
+            ("oversize_4226", Some(make(4226))),
+            ("oversize_8192", Some(make(8192))),
+            ("oversize_33000_beyond_setvar_max", Some(make(33000))),
+            ("unset", None),
         ];
         for (case, path_value) in cases {
-            if case != "baseline" {
-                assert!(
-                    path_value.len() > 4096,
-                    "[{case}] PATH must exceed the retired 4096 buffer: {}",
-                    path_value.len()
-                );
+            if let Some(value) = &path_value {
+                if case.starts_with("oversize") {
+                    assert!(
+                        value.len() > 4096,
+                        "[{case}] PATH must exceed the retired 4096 buffer: {}",
+                        value.len()
+                    );
+                }
             }
             let mut child = std::process::Command::new(&exe);
             child
@@ -3023,8 +3031,15 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("ASTRO_BRIDGE_PATH_CASE", case)
-                .env("PATH", &path_value);
+                .env("ASTRO_BRIDGE_PATH_CASE", case);
+            match &path_value {
+                Some(value) => {
+                    child.env("PATH", value);
+                }
+                None => {
+                    child.env_remove("PATH");
+                }
+            }
             let out = child.output().expect("spawn path-buffer probe");
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
