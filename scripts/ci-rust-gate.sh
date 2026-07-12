@@ -308,10 +308,21 @@ run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${CALYX_T
 # bump. Named skip, never pass evidence; the behavioral Calyx gates below
 # (check/nextest/doctest) and all Astrolabe-crate clippy stay blocking.
 echo "SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]: vendored Calyx clippy is upstream-owned at the pin; tracked in #234 (upstream ChrisRoyse/Calyx#824)"
-# calyx-poly's issue035 FSV test hard-depends on a machine-local Polymarket
-# capture that no longer exists anywhere (its metadata.json sha256 cross-check
-# makes the dataset unfabricatable). Excluded by name until upstream ships a
-# fixture or a self-skip: tracked in Astrolabe #235, fix in ChrisRoyse/Calyx#825.
-echo "SKIP[ASTRO_CALYX_ISSUE035_DATASET_LOCAL]: calyx-poly issue035 FSV needs the absent local capture; tracked in #235 (upstream ChrisRoyse/Calyx#825)"
-run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${CALYX_TARGET_DIR_ARGS[@]}" -E 'not test(issue035_historical_backfill_loader_fsv)'
+# calyx-poly's issue035 FSV test needs a resolved-market JSONL capture. The
+# machine-local Polymarket capture is gone, so #235 ships a committed synthetic
+# deterministic fixture (fixtures/calyx-issue035/) that satisfies the same
+# STRUCTURAL invariants the test asserts — parse real row shape, tag
+# terminal/reference/not-pre-resolution, persist + byte-readback, and fail closed
+# on malformed / missing-field / duplicate / pre-resolution-route edges. The
+# fixture's metadata.json body_sha256/body_bytes are self-consistent with
+# body.jsonl, so the test's cross-check still binds; only "these bytes came from
+# the real 2026-04 dump" is not reproduced, and the test asserts nothing about
+# that. The test no longer self-skips. cygpath -w so the path is C:\-style (the
+# test's assert_c_drive requires it); POLY_ISSUE35_FSV_ROOT lands under target/
+# so its readback output is cleaned with the rest of the build. (Astrolabe #235.)
+POLY_ISSUE35_HISTORICAL_JSONL="$(cygpath -w "$ROOT/fixtures/calyx-issue035/body.jsonl")"
+POLY_ISSUE35_FSV_ROOT="$(cygpath -w "$ROOT/target/fsv/issue35_backfill")"
+export POLY_ISSUE35_HISTORICAL_JSONL POLY_ISSUE35_FSV_ROOT
+run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${CALYX_TARGET_DIR_ARGS[@]}"
+unset POLY_ISSUE35_HISTORICAL_JSONL POLY_ISSUE35_FSV_ROOT
 run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc "${CALYX_TARGET_DIR_ARGS[@]}"

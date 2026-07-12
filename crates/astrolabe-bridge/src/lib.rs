@@ -2930,6 +2930,121 @@ mod tests {
         );
     }
 
+    // ── #267: find_in_path reads an oversized PATH without truncation ──────────
+
+    /// Child probe (#267): the install PLAN detects agent CLIs by searching PATH
+    /// (cbm_install_plan_json -> cbm_build_install_plan_json -> cbm_detect_agents
+    /// -> cbm_find_cli -> find_in_path). A developer PATH routinely exceeds the
+    /// retired 4096-byte buffer; run in a child so the big PATH is INHERITED (the
+    /// only way libcbm's C `environ` sees it — the #240 trap). FSV: after the plan
+    /// call, read the C fault state back and assert find_in_path recorded NO PATH
+    /// truncation fault.
+    #[test]
+    #[ignore = "spawned as a subprocess by cbm_install_plan_reads_oversized_path_without_truncation"]
+    fn cbm_path_buffer_child_probe() {
+        let case = std::env::var("ASTRO_BRIDGE_PATH_CASE").expect("parent selects a case");
+        let path_len = std::env::var_os("PATH").map(|p| p.len()).unwrap_or(0);
+        println!("path-buffer case={case} PATH_bytes_before={path_len}");
+        cbm_sys::initialize_allocator_bindings_first();
+        unsafe { cbm_sys::cbm_astro_env_fault_clear() };
+
+        let home = sandbox_home("path-buffer-home");
+        let binary = std::env::current_exe().expect("test binary path");
+        let plan = cbm_install_plan_json(
+            home.to_str().expect("utf8 home"),
+            binary.to_str().expect("utf8 binary"),
+        )
+        .expect("install plan must be produced even with a large PATH");
+        assert!(!plan.is_empty(), "install plan JSON must be non-empty");
+
+        // Source of truth = libcbm's process-global env-fault record. On the retired
+        // fixed-4096 buffer, find_in_path's cbm_safe_getenv("PATH", ...) truncates
+        // any PATH > 4095 bytes and records CBM_E_ENV_VALUE_TRUNCATED for PATH. The
+        // fix reads PATH into a heap buffer sized to its real length, so no fault.
+        let path_faulted = unsafe { cbm_sys::cbm_astro_env_faulted_for(c"PATH".as_ptr()) };
+        println!(
+            "path-buffer case={case} plan_bytes={} PATH_bytes={path_len} path_faulted={path_faulted}",
+            plan.len()
+        );
+        assert_eq!(
+            path_faulted, 0,
+            "find_in_path must read PATH ({path_len} bytes) in full without a truncation fault ({case})"
+        );
+        unsafe { cbm_sys::cbm_astro_env_fault_clear() };
+        println!("path-buffer case passed: {case}");
+    }
+
+    /// #267 X+X=Y: drive the install-plan agent search under PATHs that exceed the
+    /// retired 4096-byte buffer and assert no truncation fault fires. On the old
+    /// fixed buffer these cases emit `store.env.fault var=PATH` (reproduced in the
+    /// #248/native aggregate); with the heap-sized read they do not. The real PATH
+    /// is kept as a suffix so the child process still launches; the junk prefix
+    /// only inflates the byte length past 4096.
+    #[test]
+    fn cbm_install_plan_reads_oversized_path_without_truncation() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let real = std::env::var("PATH").unwrap_or_default();
+        let seg = if cfg!(windows) {
+            "C:\\astro267\\seg"
+        } else {
+            "/astro267/seg"
+        };
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let make = |target: usize| -> String {
+            let mut s = String::new();
+            let mut i = 0usize;
+            while s.len() < target {
+                s.push_str(&format!("{seg}{i:06}{sep}"));
+                i += 1;
+            }
+            s.push_str(&real);
+            s
+        };
+        // baseline (real PATH), operator-size (~4226 B), and ~8 KB.
+        let cases = [
+            ("baseline", real.clone()),
+            ("oversize_4226", make(4226)),
+            ("oversize_8192", make(8192)),
+        ];
+        for (case, path_value) in cases {
+            if case != "baseline" {
+                assert!(
+                    path_value.len() > 4096,
+                    "[{case}] PATH must exceed the retired 4096 buffer: {}",
+                    path_value.len()
+                );
+            }
+            let mut child = std::process::Command::new(&exe);
+            child
+                .args([
+                    "--exact",
+                    "tests::cbm_path_buffer_child_probe",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("ASTRO_BRIDGE_PATH_CASE", case)
+                .env("PATH", &path_value);
+            let out = child.output().expect("spawn path-buffer probe");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                out.status.success(),
+                "[{case}] probe failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("path-buffer case passed: {case}")),
+                "[{case}] probe did not assert:\n{stdout}"
+            );
+            // The heart of #267: no PATH truncation envelope on stderr (the C half
+            // prints ERROR[CBM_E_ENV_VALUE_TRUNCATED] on a fixed-buffer truncation).
+            assert!(
+                !stderr.contains("CBM_E_ENV_VALUE_TRUNCATED"),
+                "[{case}] find_in_path truncated PATH -- the #267 defect:\n{stderr}"
+            );
+        }
+    }
+
     /// #241 edge-case triad for the explicit setter, printing state before/after:
     /// empty input, over-limit input, and a NULL-equivalent (relative) path.
     ///

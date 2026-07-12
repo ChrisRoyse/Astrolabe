@@ -1511,43 +1511,11 @@ fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
     );
 }
 
-#[test]
-fn cli_parity_provenance_seed_matches_production_schema() {
-    // The CLI-parity harness (scripts/check-cli-parity.py::seed_provenance_metadata)
-    // seeds this exact surface into the config store so get_provenance has a
-    // deterministic, current-schema surface to read (the 2-line fixture repo carries no
-    // real provenance blocks). Assert the shared fixture deserializes through the SAME
-    // production reader get_provenance uses, so a chain-schema rename — e.g. the
-    // checked_to -> checked_end drift that silently rotted the old inline Python seed and
-    // broke #221 — fails HERE in a fast unit test instead of only in the slow native
-    // cli-parity gate. Single source of truth: ci/cli-parity-provenance-seed.json.
-    let seed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("ci")
-        .join("cli-parity-provenance-seed.json");
-    let raw = std::fs::read_to_string(&seed_path)
-        .unwrap_or_else(|error| panic!("read provenance seed {}: {error}", seed_path.display()));
-    let surface: Value = serde_json::from_str(&raw).expect("provenance seed must be valid JSON");
-    assert_eq!(
-        surface["status"], "built",
-        "seed must be a built surface so get_provenance reads the store, not the \
-             unavailable branch"
-    );
-    let store_json = surface
-        .get("store")
-        .expect("seed surface must carry a store object");
-    // Exact deserialize path handle_get_provenance -> provenance_store_for_project uses.
-    // A missing/renamed chain field (checked_from/checked_end) fails right here with the
-    // same "missing field ..." error the CLI would otherwise surface post-native-build.
-    let store = provenance_store_from_json(store_json)
-        .expect("seed store must deserialize through the production reader");
-    // And the chain must round-trip through the production (de)serializer unchanged.
-    let rebuilt = chain_verification_from_json(&chain_verification_json(&store.chain))
-        .expect("seed chain must round-trip through chain_verification_(json|from_json)");
-    assert_eq!(rebuilt.checked_from, store.chain.checked_from);
-    assert_eq!(rebuilt.checked_end, store.chain.checked_end);
-}
+// #243: cli_parity_provenance_seed_matches_production_schema was removed with the
+// CLI-parity seed. The gate no longer seeds a fake surface into the config store;
+// it reads back the real persisted provenance surface and asserts its deterministic
+// fail-closed contract, so there is no seed schema to guard here. The production
+// reader remains covered by the provenance surface/round-trip tests below.
 
 #[test]
 fn provenance_summary_persists_reads_back_and_augments_architecture_payload() {

@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -15,17 +14,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "ci" / "cli-parity-fixtures.json"
-# Canonical provenance surface shared with the Rust reader. Single source of truth for
-# the seeded get_provenance surface schema (#221); a Rust guard test
-# (cli_parity_provenance_seed_matches_production_schema) asserts this exact file
-# deserializes through the production reader, so a schema rename fails fast there instead
-# of silently rotting this seed (the checked_to -> checked_end drift that broke cli-parity).
-PROVENANCE_SEED = ROOT / "ci" / "cli-parity-provenance-seed.json"
 FIXTURE_REPO_TOKEN = "$ASTROLABE_CLI_PARITY_REPO"
 FIXTURE_REINDEX_REPO_TOKEN = "$ASTROLABE_CLI_PARITY_REINDEX_REPO"
 FIXTURE_ARTIFACT_TOKEN = "$ASTROLABE_CLI_PARITY_ARTIFACT_DIR"
-CONFIG_KEY_PREFIX = "astrolabe.calyx."
-PRIMARY_PROJECT = "cli_parity"
 
 
 def load_json(path):
@@ -140,7 +131,37 @@ def assert_happy_payload(tool, payload):
         fail(f"CLI {tool} result missing content array")
 
 
-def check_cli_tool(binary, cache_dir, tool, args):
+def assert_error_payload(tool, payload, expect):
+    # #243: some tools have a deterministic fail-closed contract on the fixture
+    # repo (e.g. get_provenance on a 2-line repo carries no provenance blocks, so
+    # the real persisted surface refuses). The gate asserts that REAL refusal
+    # instead of seeding a fake success over the persisted surface. This reads
+    # back the genuine CLI output and fails closed if it drifts from the pinned
+    # contract, so a provenance regression (a #221-class clobber that changes the
+    # refusal reason, or a fabricated success) is caught rather than masked.
+    if not isinstance(payload.get("isError"), bool):
+        fail(f"CLI {tool} result missing boolean isError")
+    if not payload["isError"]:
+        fail(
+            f"CLI {tool} returned isError=false but its fixture pins the fail-closed "
+            f"contract; the real persisted surface must refuse here: "
+            + json.dumps(payload, sort_keys=True)
+        )
+    if not isinstance(payload.get("content"), list):
+        fail(f"CLI {tool} result missing content array")
+    message_contains = expect.get("message_contains", [])
+    if not isinstance(message_contains, list) or not message_contains:
+        fail(f"fixture for {tool} expect_error.message_contains must be a non-empty list")
+    serialized = json.dumps(payload, sort_keys=True)
+    missing = [needle for needle in message_contains if needle not in serialized]
+    if missing:
+        fail(
+            f"CLI {tool} error payload drifted from the pinned fail-closed contract; "
+            f"missing substrings {missing}: " + serialized
+        )
+
+
+def check_cli_tool(binary, cache_dir, tool, args, expect_error=None):
     proc = run_process(
         [
             binary,
@@ -161,7 +182,10 @@ def check_cli_tool(binary, cache_dir, tool, args):
         payload = json.loads(lines[0])
     except json.JSONDecodeError as exc:
         fail(f"CLI {tool} stdout was not JSON: {lines[0]!r}: {exc}")
-    assert_happy_payload(tool, payload)
+    if expect_error is None:
+        assert_happy_payload(tool, payload)
+    else:
+        assert_error_payload(tool, payload, expect_error)
     if f"astrolabe cli progress: start tool={tool}" not in proc.stderr:
         fail(f"CLI {tool} missing progress start line: {proc.stderr!r}")
     if f"astrolabe cli progress: done tool={tool} exit=0" not in proc.stderr:
@@ -196,6 +220,22 @@ def validate_tool_fixture(tool, fixture):
         fail(f"fixture for {tool} allow_empty_args must be boolean")
     if not args and not allow_empty_args:
         fail(f"fixture for {tool} must use non-empty happy-path args")
+    expect_error = fixture.get("expect_error")
+    if expect_error is not None:
+        # #243: a fixture may pin a deterministic fail-closed contract instead of a
+        # happy payload. Validate its shape so a malformed contract fails fast.
+        if not isinstance(expect_error, dict):
+            fail(f"fixture for {tool} expect_error must be an object")
+        needles = expect_error.get("message_contains")
+        if (
+            not isinstance(needles, list)
+            or not needles
+            or not all(isinstance(needle, str) and needle for needle in needles)
+        ):
+            fail(
+                f"fixture for {tool} expect_error.message_contains must be a "
+                f"non-empty list of non-empty strings"
+            )
     return args
 
 
@@ -263,37 +303,17 @@ def initialize_fixture_git(repo):
     (repo / "README.md").write_text("CLI parity fixture change\n", encoding="utf-8")
 
 
-def seed_provenance_metadata(cache_dir, project):
-    # Load the canonical surface from the shared fixture rather than hand-duplicating the
-    # provenance schema here. The prior inline dict silently rotted when production renamed
-    # the chain field checked_to -> checked_end, so get_provenance failed only in the slow
-    # native cli-parity gate (#221). The shared file is guard-tested by the Rust reader.
-    if not PROVENANCE_SEED.is_file():
-        fail(f"provenance seed fixture is missing: {PROVENANCE_SEED}")
-    surface = load_json(PROVENANCE_SEED)
-    surface.pop("_comment", None)
-    if surface.get("status") == "unavailable" or "store" not in surface:
-        fail(f"provenance seed fixture must carry a built surface with a store: {PROVENANCE_SEED}")
-    key = f"{CONFIG_KEY_PREFIX}{project}.provenance_json"
-    connection = sqlite3.connect(cache_dir / "_config.db")
-    try:
-        connection.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        connection.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-            (key, json.dumps(surface, sort_keys=True, separators=(",", ":"))),
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
 def run_setup(binary, cache_dir, setup, context):
     for step in setup:
         tool = step["tool"]
         args = resolve_fixture_value(validate_tool_fixture(tool, step), context)
         check_cli_tool(binary, cache_dir, tool, args)
     initialize_fixture_git(Path(context[FIXTURE_REPO_TOKEN]))
-    seed_provenance_metadata(cache_dir, PRIMARY_PROJECT)
+    # #243: the real shadow import above persists the genuine provenance surface
+    # under astrolabe.calyx.cli_parity.provenance_json. It is NOT overwritten with
+    # a seed here -- the gate reads back that real surface (see the get_provenance
+    # expect_error fixture) so it can detect a provenance regression instead of
+    # masking one.
 
 
 def main():
@@ -330,7 +350,9 @@ def main():
             for tool in advertised:
                 fixture = tool_fixtures[tool]
                 tool_args = resolve_fixture_value(validate_tool_fixture(tool, fixture), context)
-                results[tool] = check_cli_tool(binary, cache, tool, tool_args)
+                results[tool] = check_cli_tool(
+                    binary, cache, tool, tool_args, fixture.get("expect_error")
+                )
     finally:
         if not target_existed and target.exists():
             target.rmdir()
