@@ -157,6 +157,55 @@ def run_gate(test_name: str, cargo: str) -> subprocess.CompletedProcess:
     )
 
 
+def launch_gate_paused(test_name: str, cargo: str, ready: Path) -> subprocess.Popen:
+    """Launch the gate so it pauses right after writing its incomplete sentinel.
+
+    The pause hook fires BEFORE any cargo child is spawned, so killing this process
+    reproduces a mid-suite death with nothing orphaned.
+    """
+    manifest_path = SCRATCH / f"manifest-{test_name}-paused.json"
+    manifest_path.write_text(json.dumps(manifest_for(test_name), indent=2), encoding="utf-8")
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = str(SCRATCH / "cargo-target")
+    env["ASTROLABE_HAZARD_SELFTEST_PAUSE_AFTER_SENTINEL"] = str(ready)
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(GATE),
+            "--write-release-artifact",
+            "--manifest",
+            str(manifest_path),
+            "--root",
+            str(CRATE),
+            "--artifact-dir",
+            str(ARTIFACT_DIR),
+            "--cargo",
+            cargo,
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+
+def assert_status(expected: str, context: str) -> dict:
+    """Independent readback: assert the artifact on disk has exactly `expected`.
+
+    Any 'pass' where a non-pass was expected is reported as an explicit false-green.
+    """
+    if not ARTIFACT.exists():
+        raise AssertionError(f"{context}: no artifact on disk (expected status {expected!r})")
+    data = json.loads(ARTIFACT.read_text(encoding="utf-8"))
+    status = data.get("status")
+    if expected != "pass" and status == "pass":
+        raise AssertionError(f"{context}: FALSE-GREEN -- artifact status is 'pass'")
+    if status != expected:
+        raise AssertionError(f"{context}: artifact status {status!r} != expected {expected!r}")
+    return data
+
+
 def head_commit() -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -180,7 +229,7 @@ def main() -> int:
     cargo = cargo_bin()
     print(f"cargo: {cargo}")
 
-    print("=== 1. CONTROL: the attested test FAILS -- no artifact may be published ===")
+    print("=== 1. CONTROL: the attested test FAILS -- no PASS artifact may be published ===")
     print(f"  artifact before: {artifact_state()}")
     result = run_gate("hazard_probe_fails", cargo)
     if result.returncode == 0:
@@ -188,17 +237,15 @@ def main() -> int:
     if "hazard.test_failed" not in result.stderr:
         raise AssertionError(f"gate failed without the coded error\n{result.stderr}")
     print(f"  artifact after : {artifact_state()}")
-    if ARTIFACT.exists():
-        raise AssertionError("a failing hazard suite still published a pass artifact")
-    print("  CONTROL PROOF: exit 1, hazard.test_failed, NO artifact on disk")
+    assert_status("incomplete", "a failing hazard suite")
+    print("  CONTROL PROOF: exit 1, hazard.test_failed, artifact status='incomplete' (never pass)")
 
     print("=== 2. CONTROL: an #[ignore]d test cannot be attested ===")
     result = run_gate("hazard_probe_ignored", cargo)
     if result.returncode == 0 or "hazard.ambiguous_execution" not in result.stderr:
         raise AssertionError(f"gate attested an ignored test\n{result.stdout}{result.stderr}")
-    if ARTIFACT.exists():
-        raise AssertionError("an ignored hazard test still published a pass artifact")
-    print("  CONTROL PROOF: exit 1, hazard.ambiguous_execution, NO artifact on disk")
+    assert_status("incomplete", "an ignored hazard test")
+    print("  CONTROL PROOF: exit 1, hazard.ambiguous_execution, artifact status='incomplete'")
 
     print("=== 3. the attested test PASSES -- artifact is published and commit-bound ===")
     before = int(time.time())
@@ -234,8 +281,51 @@ def main() -> int:
     if executed[0]["libtest_summary"]["ignored"] != 0:
         raise AssertionError("artifact attests an ignored test")
 
+    print("=== 4. CONTROL: a run that DIES mid-suite leaves 'incomplete', never a stale pass ===")
+    # Seed a stale PASS exactly as a prior green run would have left one: bound to
+    # the CURRENT commit and a FRESH timestamp, so the release predicate's own
+    # commit/freshness binding would NOT reject it. Only the sentinel closes this.
+    seed = {
+        "schema": "astrolabe.verify_chain_soak.v1",
+        "status": "pass",
+        "commit": head_commit(),
+        "commit_dirty": False,
+        "generated_at_unix": int(time.time()),
+        "note": "stale pass from an earlier run (self-test seed)",
+    }
+    ARTIFACT.write_text(json.dumps(seed, indent=2), encoding="utf-8")
+    if json.loads(ARTIFACT.read_text(encoding="utf-8")).get("status") != "pass":
+        raise AssertionError("seed did not write a stale pass")
+    print("  seeded stale artifact: status='pass'")
+
+    ready = SCRATCH / "paused.marker"
+    if ready.exists():
+        ready.unlink()
+    proc = launch_gate_paused("hazard_probe_passes", cargo, ready)
+    try:
+        deadline = time.time() + 120
+        while not ready.exists() and time.time() < deadline:
+            if proc.poll() is not None:
+                out, err = proc.communicate()
+                raise AssertionError(
+                    f"gate exited before reaching the pause hook (rc={proc.returncode})\n{out}{err}"
+                )
+            time.sleep(0.05)
+        if not ready.exists():
+            raise AssertionError("gate never reached the mid-run pause hook")
+        # The gate is now blocked AFTER writing its sentinel, BEFORE any test ran.
+        mid = assert_status("incomplete", "a running gate (stale pass must already be gone)")
+        print(f"  artifact while gate is mid-run: status={mid.get('status')!r}")
+    finally:
+        proc.kill()
+        proc.wait()
+    # The death is now real: the gate process is gone. Read the bytes off disk.
+    after = assert_status("incomplete", "a run that died mid-suite")
+    print(f"  artifact after mid-run death : status={after.get('status')!r}")
+    print("  CONTROL PROOF: stale pass overwritten -> 'incomplete'; death leaves 'incomplete', never pass")
+
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print("hazard suite self-test passed: no execution, no artifact; execution, commit-bound artifact")
+    print("hazard suite self-test passed: non-pass on failure/ignore/mid-run-death; commit-bound pass only on real execution")
     return 0
 
 
