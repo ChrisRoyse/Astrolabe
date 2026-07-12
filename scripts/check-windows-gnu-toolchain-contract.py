@@ -276,9 +276,19 @@ def main() -> None:
     )
     require(
         'CC_FOR_SHELL := $(subst \\,/,$(CC))' in makefile
-        and 'IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E -' in makefile
+        and 'CC_FAMILY := $(shell dump="$$(echo | $(CC_FOR_SHELL) -dM -E -' in makefile
         and 'IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E -' in makefile,
         "the CBM overlay must normalize a native compiler path before POSIX shell probes",
+    )
+    # #274: compiler-family detection must be fail-closed. A probe that cannot run
+    # the compiler (or a non-GCC/non-Clang compiler) must raise $(error) rather
+    # than silently resolving IS_GCC to a suppression state.
+    require(
+        'IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)' in makefile
+        and '$(error [#274] Makefile.cbm could not classify the compiler family'
+        in makefile
+        and 'ifeq ($(filter gcc clang,$(CC_FAMILY)),)' in makefile,
+        "the CBM overlay must fail closed when the compiler family cannot be classified (#274)",
     )
 
     print("Windows GNU toolchain contract verified")
