@@ -81,7 +81,7 @@ def main() -> None:
     )
     require(
         '"libgcc_s_seh-1.dll", "libwinpthread-1.dll"' in runner
-        and 'Get-FileHash -Algorithm SHA256' in runner
+        and 'Get-Sha256Hex' in runner
         and 'runtime DLL mismatch' in runner,
         "the launcher must reject a mixed MinGW runtime",
     )
