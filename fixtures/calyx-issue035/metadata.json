@@ -1,0 +1,20 @@
+{
+  "source_dataset": "SimpleFunctions/settled-markets/2026-04.jsonl",
+  "source_url": "https://huggingface.co/datasets/SimpleFunctions/settled-markets/resolve/main/2026-04.jsonl",
+  "synthetic": true,
+  "synthetic_note": "Deterministic FSV fixture for calyx-poly issue035 (#235). Replaces the absent machine-local capture. Self-consistent: body_sha256/body_bytes computed from these exact bytes.",
+  "record_count": 5,
+  "top_level_fields": [
+    "category",
+    "predicted_price",
+    "predicted_price_t24h",
+    "resolved_at",
+    "resolved_outcome",
+    "ticker",
+    "title",
+    "venue",
+    "volume"
+  ],
+  "body_sha256": "623d13cf7c022a8802eb3bfd63c7704d315dfe3818719c62e894b2b1b8f63e95",
+  "body_bytes": 1231
+}
