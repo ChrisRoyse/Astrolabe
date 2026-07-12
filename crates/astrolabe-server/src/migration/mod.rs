@@ -123,6 +123,9 @@ use impute::*;
 mod readiness;
 use readiness::*;
 
+mod anchor_outcome;
+use anchor_outcome::*;
+
 mod dispatch;
 // Non-test code reaches dispatch only through the two public entry points; the
 // glob is needed by the colocated tests, which drive the gate internals directly.

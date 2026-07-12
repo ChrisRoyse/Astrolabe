@@ -1,14 +1,77 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 6] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 7] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
         optimizer_status_tool_definition(),
         get_readiness_tool_definition(),
         impute_fields_tool_definition(),
+        anchor_outcome_tool_definition(),
         team_artifact_tool_definition(),
     ]
+}
+
+pub(crate) fn anchor_outcome_tool_definition() -> Value {
+    json!({
+        "name": "anchor_outcome",
+        "title": "Anchor Outcome",
+        "description": "Ground real-world outcome anchors for a shadow-indexed project. The test_run kind parses a JUnit/cargo/pytest/go/vitest report and writes one grounded TestPass anchor per resolved subject, paired with a Grounding ledger entry. Source must be 'ci:<provider>:<run_id>' (certain, confidence 1.0) or 'local:<context>' (provisional).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["test_run"],
+                    "description": "Outcome kind. Only test_run is wired with a built-in payload."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Enforced-prefix outcome source: 'ci:<provider>:<run_id>' for CI-resolved runs or 'local:<context>' for uncommitted local runs."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["junit_xml", "cargo_test_json", "pytest_verbose", "go_test_json", "vitest_json"],
+                    "description": "Test-report format for the report payload."
+                },
+                "report": {
+                    "type": "string",
+                    "description": "Full test-report text in the declared format. Partial or malformed reports refuse fail-closed."
+                },
+                "report_text": {
+                    "type": "string",
+                    "description": "Alias for report."
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Optional confidence. Omit for the source default (ci: exactly 1.0, local: 0.8). A ci: source may only carry exactly 1.0; a local: source must be finite in the open interval (0, 1)."
+                },
+                "observed_at": {
+                    "type": "integer",
+                    "description": "Server-observed epoch (seconds or ms) at which the outcome was observed. Defaults to the server wall clock; pass an explicit value for reproducible CI anchoring. 0 refuses."
+                }
+            },
+            "required": ["project", "source", "format"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn get_provenance_tool_definition() -> Value {

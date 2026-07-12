@@ -38,7 +38,7 @@ pub use sqlite_import::{
     SqliteImportOptions, SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
     erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, inject_node_property_fault,
-    read_cbm_graph_snapshot,
+    read_cbm_graph_snapshot, read_node_map_cx_ids,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

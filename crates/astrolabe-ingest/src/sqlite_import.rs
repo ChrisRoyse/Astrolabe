@@ -3341,6 +3341,51 @@ pub struct InjectedNodeFault {
     pub properties_json: String,
 }
 
+/// Resolves outcome subjects to current constellation ids from the node map.
+///
+/// Reads every `astrolabe:node-map:v2` row of `project` from the vault Graph CF
+/// and returns a `qualified_name -> cx_id` map, so the `anchor_outcome` tool can
+/// bind an outcome subject id (a symbol / test-case qualified name) to the
+/// constellation id to anchor. A qualified name carried by more than one node
+/// with differing `cx_id`s is ambiguous and is left out of the map, so the
+/// caller accounts it as an unresolved subject (counted, never a silent guess)
+/// rather than anchoring to a guessed constellation.
+pub fn read_node_map_cx_ids<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> IngestResult<BTreeMap<String, CxId>>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let mut resolved: BTreeMap<String, CxId> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
+        if row.project != project {
+            continue;
+        }
+        if row.schema != SCHEMA_NODE_MAP {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} has wrong schema {}",
+                row.node_id, row.schema
+            )));
+        }
+        match resolved.get(&row.qualified_name) {
+            Some(existing) if *existing == row.cx_id => {}
+            Some(_) => {
+                ambiguous.insert(row.qualified_name.clone());
+            }
+            None => {
+                resolved.insert(row.qualified_name.clone(), row.cx_id);
+            }
+        }
+    }
+    for name in &ambiguous {
+        resolved.remove(name);
+    }
+    Ok(resolved)
+}
+
 /// Deliberately perturbs one persisted node-map row's properties in the vault.
 ///
 /// Exists solely for the L2 shadow-parity harness (#19): it proves the parity
