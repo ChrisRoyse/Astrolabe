@@ -103,17 +103,24 @@ def write_manifest(
     owned_paths: list[Path],
     run_started_ns: int | None = None,
     pid_first_seen: dict[int, int] | None = None,
+    pid_intervals: dict[int, list[tuple[int, int | None]]] | None = None,
+    tree_pids: list[int] | None = None,
 ) -> None:
     manifest: dict = {
         "schema": "astrolabe.no_escape_attribution.v1",
         "launcher_pid": TREE_PID,
-        "tree_pids": [TREE_PID],
+        "tree_pids": tree_pids if tree_pids is not None else [TREE_PID],
         "owned_paths": [str(entry) for entry in owned_paths],
     }
     if run_started_ns is not None:
         manifest["run_started_unix_ns"] = run_started_ns
     if pid_first_seen is not None:
         manifest["pid_first_seen"] = {str(pid): ns for pid, ns in pid_first_seen.items()}
+    if pid_intervals is not None:
+        manifest["pid_intervals"] = {
+            str(pid): [[first, last] for first, last in spans]
+            for pid, spans in pid_intervals.items()
+        }
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
@@ -348,8 +355,103 @@ def main() -> int:
     print(f"  independent readback: {reused} predates our pid instance, counted not policed")
     shutil.rmtree(reused)
 
+    # ---- attempt-7 refinements (#278): pid instance LIFETIME windows ----
+
+    print("=== 12. DEAD INSTANCE (attempt-7 shape, real numbers): entry after our exit -> counted ===")
+    # Attempt 7 ground truth: foreign pid 46128 collided with a launcher-startup
+    # child of ours first seen 14:24:53 and long dead when the foreign sweep's dir
+    # appeared at 14:34:47. Reconstruct with the real offsets: run 14:20:00, our
+    # instance [14:24:53, 14:25:30], entry 14:34:47 -- in the run window, in the
+    # tree, INSIDE no lifetime interval.
+    snapshot(paths)
+    now_ns = time.time_ns()
+    base = now_ns - 20 * 60 * NS  # "14:20:00" = t0
+    dead_pid = 46128
+    dead_dir = paths["temp"] / f"calyx-erase-ledger-basic-{dead_pid}"
+    dead_dir.mkdir()
+    entry_ts = base + (14 * 60 + 47) * NS  # 14:34:47
+    os.utime(dead_dir, ns=(entry_ts, entry_ts))
+    lifetime_manifest = paths["fixture"] / "attribution-lifetime.json"
+    write_manifest(
+        lifetime_manifest,
+        owned_paths=[],
+        run_started_ns=base,
+        tree_pids=[TREE_PID, dead_pid],
+        pid_intervals={
+            TREE_PID: [(base, None)],
+            dead_pid: [(base + (4 * 60 + 53) * NS, base + (5 * 60 + 30) * NS)],  # 14:24:53-14:25:30
+        },
+    )
+    result = verify(paths, lifetime_manifest)
+    expect_clean(result, "dead-instance collision")
+    if "ASTRO_NO_ESCAPE_PID_INSTANCE_MISMATCH" not in result.stdout:
+        raise AssertionError(f"dead-instance collision was not labeled:\n{result.stdout}")
+    print(f"  independent readback: {dead_dir} postdates our pid {dead_pid} instance's exit, counted")
+    shutil.rmtree(dead_dir)
+
+    print("=== 13. REGRESSION GUARD: leak DURING the instance's lifetime -> still RED ===")
+    snapshot(paths)
+    now_ns = time.time_ns()
+    live_dir = paths["temp"] / f"calyx-retention-bad-metadata-{TREE_PID}"
+    live_dir.mkdir()
+    entry_ts = now_ns - 30 * NS
+    os.utime(live_dir, ns=(entry_ts, entry_ts))
+    write_manifest(
+        lifetime_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,
+        # closed interval that CONTAINS the entry: instance alive at write time
+        pid_intervals={TREE_PID: [(now_ns - 60 * NS, now_ns - 10 * NS)]},
+    )
+    expect_red(verify(paths, lifetime_manifest), live_dir.name, "leak within lifetime")
+    print(f"  independent readback: {live_dir} written during our instance's lifetime, policed")
+    shutil.rmtree(live_dir)
+
+    print("=== 14. ALIVE INSTANCE (no exit stamp): open window still attributes in-window -> RED ===")
+    snapshot(paths)
+    now_ns = time.time_ns()
+    alive_dir = paths["temp"] / f"calyx-retention-all-expired-{TREE_PID}"
+    alive_dir.mkdir()  # mtime now, in-window
+    write_manifest(
+        lifetime_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 60 * NS,
+        # null upper bound = never got an exit message = still alive: never 'assume dead'
+        pid_intervals={TREE_PID: [(now_ns - 60 * NS, None)]},
+    )
+    expect_red(verify(paths, lifetime_manifest), alive_dir.name, "open-window alive instance")
+    print(f"  independent readback: {alive_dir} attributed through the open (alive) window, policed")
+    shutil.rmtree(alive_dir)
+
+    print("=== 15. INTRA-TREE REUSE: same pid, two of OUR instances -> entry in ANY interval RED, between -> counted ===")
+    snapshot(paths)
+    now_ns = time.time_ns()
+    in_second = paths["temp"] / f"calyx-retention-rollup-apply-{TREE_PID}"
+    in_second.mkdir()
+    second_ts = now_ns - 20 * NS  # inside our second instance [t-30, t-10]
+    os.utime(in_second, ns=(second_ts, second_ts))
+    between = paths["temp"] / f"calyx-leapable-stdio-lifecycle-{TREE_PID}"
+    between.mkdir()
+    between_ts = now_ns - 45 * NS  # in the gap between our two instances
+    os.utime(between, ns=(between_ts, between_ts))
+    write_manifest(
+        lifetime_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,
+        pid_intervals={TREE_PID: [(now_ns - 100 * NS, now_ns - 55 * NS), (now_ns - 30 * NS, now_ns - 10 * NS)]},
+    )
+    result = verify(paths, lifetime_manifest)
+    expect_red(result, in_second.name, "second-instance leak")
+    if f"COUNTED[pid_instance] ADDED" not in result.stdout or between.name not in result.stdout:
+        raise AssertionError(f"between-instances entry was not counted:\n{result.stdout}")
+    if between.name in result.stderr:
+        raise AssertionError(f"between-instances entry was policed:\n{result.stderr}")
+    print(f"  {in_second.name} inside instance 2 -> RED; {between.name} between instances -> counted")
+    shutil.rmtree(in_second)
+    shutil.rmtree(between)
+
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print("no-escape attribution control passed: causal, windowed, pid-instance-aware (#278)")
+    print("no-escape attribution control passed: causal, windowed, instance-lifetime-aware (#278)")
     return 0
 
 

@@ -686,7 +686,10 @@ public class AstroTreeRecorder {
 
     const int JobObjectAssociateCompletionPortInformation = 7;
     const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
+    const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
+    const uint JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8;
     const uint STOP_SENTINEL = 0xFFFFFFFF;
+    const long OPEN = -1L;
 
     [StructLayout(LayoutKind.Sequential)]
     struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT { public IntPtr CompletionKey; public IntPtr CompletionPort; }
@@ -694,15 +697,22 @@ public class AstroTreeRecorder {
     IntPtr job, port;
     Thread thread;
     volatile bool stop;
-    // #278 attempt 6: pid alone is ambiguous under PID REUSE (a foreign batch's
-    // creator pid recycled by one of our thousands of short-lived children).
-    // Stamp each pid's FIRST-SEEN time so the gate only attributes an entry
-    // whose timestamp is >= that pid instance's birth in OUR tree.
-    readonly Dictionary<int, long> pidFirstSeenNs = new Dictionary<int, long>();
+    // #278 attempts 6+7: pid alone is ambiguous under PID REUSE, and first-seen
+    // alone still false-attributes DEAD instances (attempt 7: four foreign-sweep
+    // pids collided with startup children of ours first seen at 14:2x and long
+    // dead when the foreign dirs appeared at 14:34+). Record each pid's INSTANCE
+    // LIFETIME intervals [first_seen, last_seen] -- the port delivers both
+    // NEW_PROCESS and (ABNORMAL_)EXIT_PROCESS -- a list per pid, because the OS
+    // can recycle a pid WITHIN our own tree. last = OPEN(-1) means the instance
+    // had not exited when the manifest was written (serialized as null; the gate
+    // treats it as an open window -- never 'assume dead').
+    readonly Dictionary<int, List<long[]>> pidIntervals = new Dictionary<int, List<long[]>>();
     readonly object gate = new object();
     string manifestPath;
     int launcherPid;
     long runStartedNs;
+    bool dirty;
+    long lastFlushNs;
 
     static long NowUnixNs() {
         return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).Ticks * 100L;
@@ -732,7 +742,11 @@ public class AstroTreeRecorder {
         // binaries) inherits the job, so all descendant PIDs flow to the port.
         if (!AssignProcessToJobObject(r.job, GetCurrentProcess()))
             throw new Exception("AssignProcessToJobObject failed " + Marshal.GetLastWin32Error());
-        lock (r.gate) { r.pidFirstSeenNs[launcherPid] = r.runStartedNs; }
+        lock (r.gate) {
+            List<long[]> spans = new List<long[]>();
+            spans.Add(new long[] { r.runStartedNs, OPEN });
+            r.pidIntervals[launcherPid] = spans;
+        }
         r.Flush();
         r.thread = new Thread(r.Loop);
         r.thread.IsBackground = true;
@@ -740,28 +754,78 @@ public class AstroTreeRecorder {
         return r;
     }
 
-    void Loop() {
-        while (!stop) {
-            uint bytes; UIntPtr key; IntPtr ov;
-            if (GetQueuedCompletionStatus(port, out bytes, out key, out ov, 500)) {
-                if (bytes == JOB_OBJECT_MSG_NEW_PROCESS) {
-                    int pid = (int)ov.ToInt64();
-                    long now = NowUnixNs();
-                    bool added = false;
-                    lock (gate) {
-                        if (!pidFirstSeenNs.ContainsKey(pid)) { pidFirstSeenNs[pid] = now; added = true; }
-                    }
-                    if (added) Flush();
-                } else if (bytes == STOP_SENTINEL) {
-                    break;
-                }
+    void OnNewProcess(int pid, long now) {
+        lock (gate) {
+            List<long[]> spans;
+            if (!pidIntervals.TryGetValue(pid, out spans)) {
+                spans = new List<long[]>();
+                pidIntervals[pid] = spans;
+            }
+            // A NEW message for a pid whose last interval is still open is a
+            // duplicate; otherwise this is a fresh instance (possibly the OS
+            // recycling the pid WITHIN our tree) -> open a new interval.
+            if (spans.Count == 0 || spans[spans.Count - 1][1] != OPEN) {
+                spans.Add(new long[] { now, OPEN });
+                dirty = true;
             }
         }
     }
 
+    void OnExitProcess(int pid, long now) {
+        lock (gate) {
+            List<long[]> spans;
+            if (pidIntervals.TryGetValue(pid, out spans)) {
+                if (spans.Count > 0 && spans[spans.Count - 1][1] == OPEN) {
+                    spans[spans.Count - 1][1] = now;
+                    dirty = true;
+                }
+            } else {
+                // Exit for a pid we never saw born (port-association edge case):
+                // fail closed toward attribution -- treat it as alive since run
+                // start, dead now.
+                spans = new List<long[]>();
+                spans.Add(new long[] { runStartedNs, now });
+                pidIntervals[pid] = spans;
+                dirty = true;
+            }
+        }
+    }
+
+    void Loop() {
+        while (!stop) {
+            uint bytes; UIntPtr key; IntPtr ov;
+            bool got = GetQueuedCompletionStatus(port, out bytes, out key, out ov, 500);
+            if (got) {
+                long now = NowUnixNs();
+                if (bytes == JOB_OBJECT_MSG_NEW_PROCESS) {
+                    OnNewProcess((int)ov.ToInt64(), now);
+                } else if (bytes == JOB_OBJECT_MSG_EXIT_PROCESS || bytes == JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS) {
+                    OnExitProcess((int)ov.ToInt64(), now);
+                } else if (bytes == STOP_SENTINEL) {
+                    break;
+                }
+            }
+            // Throttled persistence: thousands of short-lived children generate
+            // ~2 messages each; rewrite the manifest at most once a second and
+            // always once more at Stop().
+            long tick = NowUnixNs();
+            bool doFlush;
+            lock (gate) { doFlush = dirty && (tick - lastFlushNs > 1000000000L); }
+            if (doFlush) Flush();
+        }
+    }
+
     void Flush() {
-        List<KeyValuePair<int, long>> snap;
-        lock (gate) { snap = new List<KeyValuePair<int, long>>(pidFirstSeenNs); }
+        List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
+        lock (gate) {
+            foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
+                List<long[]> copy = new List<long[]>();
+                foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
+                snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
+            }
+            dirty = false;
+            lastFlushNs = NowUnixNs();
+        }
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v1\",\"launcher_pid\":");
         sb.Append(launcherPid);
@@ -772,7 +836,20 @@ public class AstroTreeRecorder {
         sb.Append("],\"pid_first_seen\":{");
         for (int i = 0; i < snap.Count; i++) {
             if (i > 0) sb.Append(',');
-            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":"); sb.Append(snap[i].Value);
+            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":"); sb.Append(snap[i].Value[0][0]);
+        }
+        sb.Append("},\"pid_intervals\":{");
+        for (int i = 0; i < snap.Count; i++) {
+            if (i > 0) sb.Append(',');
+            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":[");
+            List<long[]> spans = snap[i].Value;
+            for (int j = 0; j < spans.Count; j++) {
+                if (j > 0) sb.Append(',');
+                sb.Append('['); sb.Append(spans[j][0]); sb.Append(',');
+                if (spans[j][1] == OPEN) sb.Append("null"); else sb.Append(spans[j][1]);
+                sb.Append(']');
+            }
+            sb.Append(']');
         }
         sb.Append("},\"owned_paths\":[]}");
         try {
@@ -787,6 +864,8 @@ public class AstroTreeRecorder {
         stop = true;
         PostQueuedCompletionStatus(port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero);
         if (thread != null) thread.Join(2000);
+        // Final write happens AFTER the tree is done, so nearly every instance
+        // carries a real exit stamp; anything still open stays an open window.
         Flush();
         if (port != IntPtr.Zero) CloseHandle(port);
         if (job != IntPtr.Zero) CloseHandle(job);
