@@ -1,11 +1,106 @@
 use super::*;
 
-pub(crate) fn skill_tree_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
-    let inputs = skill_inputs_from_row_sink_rows(rows);
-    match build_skill_tree(&inputs, &SkillDiscoveryConfig::default()) {
-        Ok(tree) => skill_tree_json(&tree),
-        Err(error) => skill_tree_unavailable_json(&format!("skill discovery failed: {error}")),
+/// Operator override for the registry-declared skill-discovery knobs (#198).
+///
+/// Only knobs an operator may legitimately tune are exposed. Bounds are deliberately **not**
+/// re-declared here: they live in the `astrolabe-kernel` knob registry, which stays the
+/// single source of truth for `skills.discovery.max_symbols`.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub(crate) struct SkillDiscoveryOverride {
+    /// `skills.discovery.max_symbols` — the node-limit guard on the O(n²) discovery sweep.
+    pub(crate) max_symbols: Option<u64>,
+}
+
+/// Parses the `calyx_skills` request object on `index_repository`.
+///
+/// An unknown field or a non-integer value is rejected outright. A numerically out-of-bounds
+/// `max_symbols` is passed through unchanged to the kernel's registry validation, which
+/// refuses it with `ASTRO_SKILL_DISCOVERY_KNOB_RANGE`. Out-of-range values are never clamped
+/// to the nearest bound: clamping is a silent fallback that would leave the operator
+/// believing they had raised the cap while the run quietly enforced a different one.
+pub(crate) fn parse_skill_discovery_override(
+    args: &Map<String, Value>,
+) -> Result<Option<SkillDiscoveryOverride>, String> {
+    let Some(value) = args.get("calyx_skills") else {
+        return Ok(None);
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "calyx_skills must be a JSON object".to_string())?;
+    for key in obj.keys() {
+        if key.as_str() != "max_symbols" {
+            return Err(format!(
+                "unknown calyx_skills field {key:?}; expected max_symbols"
+            ));
+        }
     }
+    let max_symbols =
+        match obj.get("max_symbols") {
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                "calyx_skills.max_symbols must be an unsigned integer".to_string()
+            })?),
+            None => None,
+        };
+    Ok(Some(SkillDiscoveryOverride { max_symbols }))
+}
+
+/// Builds the skill-discovery config for an import: registry defaults, with any operator
+/// override applied verbatim.
+///
+/// A value outside the registered bounds is carried through unchanged so `build_skill_tree`
+/// refuses it — it is never clamped into range.
+pub(crate) fn skill_discovery_config(
+    request: Option<&SkillDiscoveryOverride>,
+) -> SkillDiscoveryConfig {
+    let mut config = SkillDiscoveryConfig::default();
+    if let Some(max_symbols) = request.and_then(|request| request.max_symbols) {
+        config.max_symbols = max_symbols;
+    }
+    config
+}
+
+pub(crate) fn skill_tree_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
+    skill_tree_from_row_sink_rows_with_config(rows, &SkillDiscoveryConfig::default())
+}
+
+/// Runs skill discovery over the row-sink rows under `config` (#198).
+///
+/// A kernel refusal is surfaced with its `{code, message, remediation}` intact. Flattening it
+/// into an uncoded "unavailable" reason string — as this path previously did — stripped the
+/// operator's path to acting on it: `ASTRO_SKILL_DISCOVERY_NODE_LIMIT` is remediable by
+/// raising `skills.discovery.max_symbols` within its registered bounds, but only if the
+/// caller can see the code and the remediation.
+pub(crate) fn skill_tree_from_row_sink_rows_with_config(
+    rows: &CbmPipelineRows,
+    config: &SkillDiscoveryConfig,
+) -> Value {
+    let inputs = skill_inputs_from_row_sink_rows(rows);
+    match build_skill_tree(&inputs, config) {
+        Ok(tree) => skill_tree_json(&tree, config),
+        Err(error) => skill_tree_refused_json(&error, config),
+    }
+}
+
+/// Fail-closed skill-tree surface carrying the kernel's coded refusal verbatim (#198).
+pub(crate) fn skill_tree_refused_json(
+    error: &astrolabe_domain::DomainError,
+    config: &SkillDiscoveryConfig,
+) -> Value {
+    json!({
+        "schema": SKILL_TREE_SCHEMA,
+        "status": "refused",
+        "knob_registry_version": SKILL_DISCOVERY_KNOB_REGISTRY_VERSION,
+        "max_symbols": config.max_symbols,
+        "code": error.code(),
+        "message": error.message(),
+        "remediation": error.remediation(),
+        "skill_count": Value::Null,
+        "noise_count": Value::Null,
+        "skills": [],
+        "noise_symbols": [],
+        "freshness": "not_evaluated",
+        "trust": "provisional",
+    })
 }
 
 pub(crate) fn skill_inputs_from_row_sink_rows(rows: &CbmPipelineRows) -> Vec<SkillSymbolInput> {
@@ -64,12 +159,15 @@ pub(crate) fn push_skill_tokens(tokens: &mut BTreeSet<String>, text: &str) {
     }
 }
 
-pub(crate) fn skill_tree_json(tree: &SkillTree) -> Value {
+pub(crate) fn skill_tree_json(tree: &SkillTree, config: &SkillDiscoveryConfig) -> Value {
     let artifact_bytes = skill_tree_artifact_bytes(tree);
     json!({
         "schema": tree.schema,
         "status": "built",
         "knob_registry_version": tree.knob_registry_version,
+        // The node-limit bound this run actually enforced, so an operator reads back which
+        // cap admitted the tree instead of assuming the registry default was in force.
+        "max_symbols": config.max_symbols,
         "skill_count": tree.skills.len(),
         "noise_count": tree.noise_symbols.len(),
         "membership_hash": tree.membership_hash,

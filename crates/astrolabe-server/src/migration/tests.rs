@@ -1363,7 +1363,17 @@ fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
     assert_eq!(provenance["reproduce_count"], 2);
     assert_eq!(provenance["manifest_count"], 1);
     assert_eq!(provenance["metadata_skipped_count"], 0);
-    assert_eq!(provenance["trust"], "verified");
+    // #209: row-sink provenance has no durable ledger, so its chain attests an empty range —
+    // it verified nothing. The metadata built completely (metadata_skipped_count == 0), which
+    // is exactly the case that used to ride `trust: "verified"`. A complete build over an
+    // unverified chain is still unverified.
+    assert_eq!(provenance["trust"], "provisional");
+    assert_eq!(provenance["freshness"], "not_evaluated");
+    assert_eq!(
+        provenance["warnings"][0]["code"],
+        PROVENANCE_WARN_CHAIN_EMPTY
+    );
+    assert!(provenance["remediation"].is_string());
 
     let store = provenance_store_from_json(&provenance["store"]).unwrap();
     for (mode, subject) in [
@@ -3586,6 +3596,553 @@ fn tool_definition<'a>(tools: &'a [Value], name: &str) -> &'a Value {
         .iter()
         .find(|tool| tool["name"] == name)
         .unwrap_or_else(|| panic!("{name} tool definition"))
+}
+
+// ---------------------------------------------------------------------------------------
+// #209 — a broken/empty embedded chain must never ride surface `trust: "verified"`.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn provenance_surface_never_rides_trust_verified_on_a_broken_or_empty_chain() {
+    // Source of truth: the persisted `provenance_json` row in the config store, read back
+    // through a separate connection — never the builder's return value.
+    let dir = temp_dir("provenance-chain-trust");
+    let rows = sample_provenance_rows();
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+
+    for (label, verify, expect_code) in [
+        // An `Intact` chain over an empty range verified nothing at all.
+        (
+            "intact_empty",
+            verify_chain_report("intact", 0, 0, None, None),
+            Some(PROVENANCE_WARN_CHAIN_EMPTY),
+        ),
+        (
+            "broken",
+            verify_chain_report("broken", 0, 4, Some(2), None),
+            Some(PROVENANCE_WARN_CHAIN_BROKEN),
+        ),
+        (
+            "corrupt",
+            verify_chain_report("corrupt", 0, 4, Some(3), Some("payload hash mismatch")),
+            Some(PROVENANCE_WARN_CHAIN_CORRUPT),
+        ),
+        // Control: only this one is genuinely verified.
+        (
+            "intact_nonempty",
+            verify_chain_report("intact", 0, 4, None, None),
+            None,
+        ),
+    ] {
+        // This is the surface that actually reaches disk: built, then handed the real
+        // post-import chain by `provenance_surface_with_chain`.
+        let surface = provenance_surface_with_chain(
+            provenance_from_row_sink_rows(&rows),
+            &"55".repeat(32),
+            4,
+            &verify,
+        );
+        // The metadata build is COMPLETE in every case, so a `verified` label here could
+        // only come from the old fail-open rule that ignored the embedded chain.
+        assert_eq!(
+            surface["metadata_skipped_count"], 0,
+            "{label}: metadata build is complete"
+        );
+
+        let mut outcome = sample_shadow_outcome(&dir, security.clone());
+        outcome.provenance = surface.clone();
+        persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+        // FSV: read the persisted bytes back off disk.
+        let conn = Connection::open(dir.join("_config.db")).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params![metadata_key("demo", "provenance_json")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let persisted: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            persisted, surface,
+            "{label}: persisted bytes match the surface"
+        );
+
+        match expect_code {
+            Some(code) => {
+                assert_ne!(
+                    persisted["trust"], "verified",
+                    "{label}: a surface embedding an unverified chain must NEVER be labeled \
+                     trust:verified"
+                );
+                assert_eq!(persisted["trust"], "provisional", "{label}");
+                assert_eq!(persisted["freshness"], "not_evaluated", "{label}");
+                assert_eq!(persisted["warnings"][0]["code"], code, "{label}");
+                assert!(
+                    persisted["remediation"].is_string(),
+                    "{label}: degraded surface carries remediation"
+                );
+            }
+            None => {
+                assert_eq!(
+                    persisted["trust"], "verified",
+                    "{label}: an intact chain over a non-empty range is genuinely verified"
+                );
+                assert_eq!(persisted["freshness"], "fresh", "{label}");
+                assert_eq!(persisted["warnings"], json!([]), "{label}");
+                assert!(persisted["remediation"].is_null(), "{label}");
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn provenance_surface_partial_metadata_stays_provisional_under_an_intact_chain() {
+    // The other conjunct: a verified chain does not launder a partial metadata build.
+    let store = ProvenanceStore {
+        vault_fingerprint: "66".repeat(32),
+        ledger_head: LedgerPointer::new(4, "66".repeat(32)),
+        chain: ChainVerification {
+            status: ChainStatus::Intact,
+            checked_from: 0,
+            checked_end: 4,
+            provenance: LedgerPointer::new(4, "66".repeat(32)),
+        },
+        symbols: BTreeMap::new(),
+        answers: BTreeMap::new(),
+        reproductions: BTreeMap::new(),
+        manifests: BTreeMap::new(),
+    };
+
+    let complete = provenance_surface_json(&store, 0);
+    assert_eq!(complete["trust"], "verified");
+    assert_eq!(complete["freshness"], "fresh");
+
+    let partial = provenance_surface_json(&store, 3);
+    assert_eq!(partial["status"], "partial");
+    assert_eq!(partial["trust"], "provisional");
+    // Freshness tracks the chain, which is intact here; only trust degrades.
+    assert_eq!(partial["freshness"], "fresh");
+}
+
+// ---------------------------------------------------------------------------------------
+// #122 — a propose readback-mismatch refusal must leave NO residual pending proposal.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn optimizer_propose_readback_mismatch_removes_the_queue_when_none_existed() {
+    let dir = temp_dir("optimizer-propose-rollback-removed");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    write_config_value(
+        &dir,
+        &deficits_key,
+        &sample_optimizer_deficits().to_string(),
+    )
+    .unwrap();
+    plant_proposal_queue_corruptor(&dir, &proposals_key);
+
+    // BEFORE: no proposal queue is persisted.
+    assert_eq!(read_config_value(&dir, &proposals_key).unwrap(), None);
+
+    let refused = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"], "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH",
+        "a storage-layer mismatch must be refused, not served"
+    );
+    assert!(refused["message"].is_string());
+    assert!(refused["remediation"].is_string());
+    assert_eq!(refused["rollback"]["status"], "removed");
+    assert_eq!(refused["rollback"]["residue"], "none");
+    assert_eq!(refused["rollback"]["verification"], "config_readback");
+
+    // AFTER (FSV): the row is gone from the persisted store — independent readback.
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let residue: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![&proposals_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        residue, None,
+        "the refused write must leave no proposal-queue row behind"
+    );
+
+    // And status mode must serve NO pending proposal.
+    let pending = optimizer_pending_proposals_json(&dir, "demo").unwrap();
+    assert_eq!(pending["status"], "unavailable");
+    assert_eq!(pending["proposals"], json!([]));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_propose_readback_mismatch_restores_the_prior_proposal_queue() {
+    let dir = temp_dir("optimizer-propose-rollback-restored");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    write_config_value(
+        &dir,
+        &deficits_key,
+        &sample_optimizer_deficits().to_string(),
+    )
+    .unwrap();
+
+    // A prior, valid, EMPTY queue. The compensating rollback must restore these exact bytes,
+    // leaving the store equivalent to "this propose never ran".
+    let prior = json!({
+        "schema": OPTIMIZER_PROPOSALS_SCHEMA,
+        "project": "demo",
+        "status": "empty",
+        "proposal_count": 0,
+        "proposals": [],
+        "source": format!("config:{proposals_key}"),
+        "freshness": "fresh",
+        "trust": "verified",
+    });
+    let prior_bytes = prior.to_string();
+    write_config_value(&dir, &proposals_key, &prior_bytes).unwrap();
+    plant_proposal_queue_corruptor(&dir, &proposals_key);
+
+    let refused = optimizer_propose_json_at(&dir, "demo", None).unwrap();
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH");
+    assert_eq!(refused["rollback"]["status"], "restored_prior");
+    assert_eq!(refused["rollback"]["residue"], "none");
+
+    // AFTER (FSV): the persisted bytes are EXACTLY the pre-write value.
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let residue: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![&proposals_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        residue, prior_bytes,
+        "the rollback must restore the prior queue byte-for-byte"
+    );
+
+    // Status mode serves the prior queue, never the refused run's proposals.
+    let pending = optimizer_pending_proposals_json(&dir, "demo").unwrap();
+    assert_eq!(pending["status"], "empty");
+    assert_eq!(pending["proposal_count"], 0);
+    assert_eq!(pending["proposals"], json!([]));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn optimizer_propose_pre_write_refusals_never_create_a_proposal_queue() {
+    // Edge triad, pre-write half: an absent deficit store (empty input) and an invalid one
+    // (invalid format) must both refuse without ever writing a queue row.
+    let proposals_key = metadata_key("demo", "optimizer_proposals_json");
+    let deficits_key = metadata_key("demo", "optimizer_deficits_json");
+
+    let empty_dir = temp_dir("optimizer-propose-empty");
+    let refused = optimizer_propose_json_at(&empty_dir, "demo", None).unwrap();
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"], "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_MISSING",
+        "no measured deficits must refuse rather than invent proposals"
+    );
+    assert_eq!(read_config_value(&empty_dir, &proposals_key).unwrap(), None);
+    fs::remove_dir_all(&empty_dir).ok();
+
+    let invalid_dir = temp_dir("optimizer-propose-invalid");
+    write_config_value(&invalid_dir, &deficits_key, "{\"schema\":\"bogus\"}").unwrap();
+    let refused = optimizer_propose_json_at(&invalid_dir, "demo", None).unwrap();
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(refused["code"], "ASTRO_OPTIMIZER_PROPOSE_DEFICITS_INVALID");
+    assert_eq!(
+        read_config_value(&invalid_dir, &proposals_key).unwrap(),
+        None,
+        "a pre-write refusal must not create a proposal-queue row"
+    );
+    fs::remove_dir_all(&invalid_dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------
+// #198 — `skills.discovery.max_symbols` must be operator-settable within registered bounds,
+// fail closed above the cap, and be REJECTED (never clamped) outside the bounds.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn skill_discovery_refuses_over_the_default_node_limit_with_a_coded_remediable_error() {
+    // Just over the shipped 50_000 default, with NO operator override in play.
+    let refused = skill_tree_from_row_sink_rows(&synthetic_skill_rows(50_001));
+
+    assert_eq!(refused["status"], "refused");
+    assert_eq!(
+        refused["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert_eq!(refused["max_symbols"], 50_000);
+    assert_eq!(refused["trust"], "provisional");
+    assert_eq!(refused["freshness"], "not_evaluated");
+    assert!(
+        refused["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("skills.discovery.max_symbols"),
+        "the refusal must tell the operator which knob to raise"
+    );
+
+    // Just under the default admits, so the cap is the only thing refusing above.
+    let admitted = skill_tree_from_row_sink_rows(&synthetic_skill_rows(0));
+    assert_eq!(admitted["status"], "built");
+    assert_eq!(admitted["skill_count"], 0);
+    assert_eq!(admitted["max_symbols"], 50_000);
+}
+
+#[test]
+fn skill_discovery_max_symbols_knob_gates_exactly_at_the_boundary() {
+    let rows = synthetic_skill_rows(6);
+
+    // AT the limit: admitted.
+    let at_limit = skill_tree_from_row_sink_rows_with_config(
+        &rows,
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(6),
+        })),
+    );
+    assert_eq!(at_limit["status"], "built");
+    assert_eq!(at_limit["max_symbols"], 6);
+
+    // ONE OVER the limit: refused, fail-closed.
+    let over_limit = skill_tree_from_row_sink_rows_with_config(
+        &rows,
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(5),
+        })),
+    );
+    assert_eq!(over_limit["status"], "refused");
+    assert_eq!(
+        over_limit["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert_eq!(over_limit["max_symbols"], 5);
+}
+
+#[test]
+fn skill_discovery_max_symbols_out_of_registered_bounds_is_rejected_not_clamped() {
+    // Registered bounds are [2, 1_000_000]. Six inputs would build under EITHER clamped
+    // bound, so a `built` surface here would prove a silent clamp had occurred.
+    let rows = synthetic_skill_rows(6);
+    for out_of_bounds in [1_u64, 1_000_001_u64] {
+        let refused = skill_tree_from_row_sink_rows_with_config(
+            &rows,
+            &skill_discovery_config(Some(&SkillDiscoveryOverride {
+                max_symbols: Some(out_of_bounds),
+            })),
+        );
+        assert_eq!(
+            refused["status"], "refused",
+            "max_symbols={out_of_bounds} is outside the registered bounds and must be refused"
+        );
+        assert_eq!(
+            refused["code"],
+            astrolabe_kernel::ASTRO_SKILL_DISCOVERY_KNOB_RANGE,
+            "max_symbols={out_of_bounds} must fail knob-range validation, not the node limit"
+        );
+        // The surface echoes the REQUESTED value: clamping it into range would be a silent
+        // fallback that left the operator believing a different cap was in force.
+        assert_eq!(refused["max_symbols"], out_of_bounds);
+        assert!(refused["remediation"].is_string());
+    }
+}
+
+#[test]
+fn calyx_skills_override_parses_rejects_bad_input_and_persists_the_coded_refusal() {
+    // Absent -> no override (registry defaults stay in force).
+    assert!(
+        parse_skill_discovery_override(&Map::new())
+            .unwrap()
+            .is_none()
+    );
+
+    let parsed = parse_skill_discovery_override(
+        json!({"calyx_skills": {"max_symbols": 60_000}})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(parsed.max_symbols, Some(60_000));
+    assert_eq!(
+        skill_discovery_config(Some(&parsed)).max_symbols,
+        60_000,
+        "an in-bounds override is applied verbatim"
+    );
+
+    // Invalid format: rejected fail-closed, never coerced.
+    let unknown =
+        parse_skill_discovery_override(json!({"calyx_skills": {"nope": 1}}).as_object().unwrap())
+            .unwrap_err();
+    assert!(unknown.contains("unknown calyx_skills field"));
+
+    let bad_type = parse_skill_discovery_override(
+        json!({"calyx_skills": {"max_symbols": "lots"}})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap_err();
+    assert!(bad_type.contains("unsigned integer"));
+
+    let not_object =
+        parse_skill_discovery_override(json!({"calyx_skills": 5}).as_object().unwrap())
+            .unwrap_err();
+    assert!(not_object.contains("must be a JSON object"));
+
+    // The knob is Astrolabe-side and is never forwarded to the CBM tool.
+    let sanitized: Value = serde_json::from_str(
+        &strip_calyx_arg(
+            json!({"repo_path": "/tmp/x", "calyx_skills": {"max_symbols": 60_000}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(sanitized.get("calyx_skills").is_none());
+    assert_eq!(sanitized["repo_path"], "/tmp/x");
+
+    // FSV: the coded refusal survives persist + independent readback off disk.
+    let dir = temp_dir("skill-discovery-refusal-readback");
+    let refused = skill_tree_from_row_sink_rows_with_config(
+        &synthetic_skill_rows(6),
+        &skill_discovery_config(Some(&SkillDiscoveryOverride {
+            max_symbols: Some(5),
+        })),
+    );
+    let mut outcome = sample_shadow_outcome(
+        &dir,
+        security_screen_from_row_sink_rows(&sample_pipeline_rows()),
+    );
+    outcome.skill_tree = refused.clone();
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let conn = Connection::open(dir.join("_config.db")).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![metadata_key("demo", "skill_tree_json")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    let persisted: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(persisted, refused);
+    assert_eq!(persisted["status"], "refused");
+    assert_eq!(
+        persisted["code"],
+        astrolabe_kernel::ASTRO_SKILL_DISCOVERY_NODE_LIMIT
+    );
+    assert!(
+        persisted["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("skills.discovery.max_symbols")
+    );
+    assert_eq!(read_skill_tree_metadata(&dir, "demo").unwrap(), refused);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Builds a `VerifyChainReport` fixture for the #209 chain-label matrix.
+fn verify_chain_report(
+    status: &str,
+    checked_range_start: u64,
+    checked_range_end: u64,
+    at_seq: Option<u64>,
+    reason: Option<&str>,
+) -> astrolabe_ingest::VerifyChainReport {
+    astrolabe_ingest::VerifyChainReport {
+        status: status.to_string(),
+        ledger_rows: checked_range_end,
+        checked_range_start,
+        checked_range_end,
+        count: checked_range_end.saturating_sub(checked_range_start),
+        at_seq,
+        expected_hash: None,
+        found_hash: None,
+        reason: reason.map(ToOwned::to_owned),
+        quarantine_seq: None,
+        remediation: None,
+    }
+}
+
+/// A minimal measured-deficit store that yields exactly one generated proposal.
+fn sample_optimizer_deficits() -> Value {
+    json!({
+        "schema": OPTIMIZER_DEFICITS_SCHEMA,
+        "status": "measured",
+        "freshness": "fresh",
+        "trust": "verified",
+        "deficits": [{
+            "deficit_id": "deficit:test:1",
+            "axis": "coverage",
+            "scope": "payments",
+            "measured_bits": 0.61,
+            "required_bits": 1.0,
+            "suggested_action": "ProposeLens",
+            "template_family": "hashed_set",
+            "slot": "lock_atomic_usage",
+            "field": "lock_calls",
+            "freshness": "fresh",
+            "trust": "verified",
+            "provenance": ["measure_bits:test:12"],
+        }],
+    })
+}
+
+/// Plants a SQLite trigger that rewrites the proposal-queue row as it is inserted, so the
+/// production write-then-readback verification observes a genuine storage-layer mismatch.
+///
+/// This is fault injection at the real persistence layer, not a mock: the server code is
+/// untouched and unaware, and a value that does not survive its own round-trip is exactly the
+/// condition `ASTRO_OPTIMIZER_PROPOSE_READBACK_MISMATCH` exists to catch. The trigger matches
+/// only the freshly generated queue (`"status":"generated"`), so the compensating rollback's
+/// restore of a prior queue is not re-corrupted.
+fn plant_proposal_queue_corruptor(cache_dir: &Path, proposals_key: &str) {
+    let conn = open_config(cache_dir).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER corrupt_proposal_queue AFTER INSERT ON config \
+         WHEN NEW.key = '{proposals_key}' AND NEW.value LIKE '%\"status\":\"generated\"%' \
+         BEGIN UPDATE config SET value = '{{\"schema\":\"tampered\"}}' WHERE key = NEW.key; END;"
+    ))
+    .unwrap();
+}
+
+/// `symbol_count` discovery symbols with disjoint token sets, so the node-limit guard — not
+/// clustering behavior — is what the test observes.
+fn synthetic_skill_rows(symbol_count: usize) -> CbmPipelineRows {
+    let nodes = (0..symbol_count)
+        .map(|index| astrolabe_bridge::CbmPipelineNodeRow {
+            id: index as i64 + 1,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: format!("symbol{index}"),
+            qualified_name: format!("demo.symbol{index}"),
+            file_path: format!("src/file{index}.rs"),
+            start_line: 1,
+            end_line: 2,
+            properties_json: format!(r#"{{"docstring":"token{index}"}}"#),
+        })
+        .collect();
+    CbmPipelineRows {
+        project: "demo".to_string(),
+        nodes,
+        edges: Vec::new(),
+    }
 }
 
 fn sample_pipeline_rows() -> CbmPipelineRows {

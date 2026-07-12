@@ -117,6 +117,9 @@ pub(crate) fn strip_calyx_arg(args: &Map<String, Value>) -> Result<String, DynEr
     let mut sanitized = args.clone();
     sanitized.remove("calyx");
     sanitized.remove("calyx_search");
+    // #198: an Astrolabe-side knob, never forwarded to the CBM tool, which would reject it as
+    // an unknown argument.
+    sanitized.remove("calyx_skills");
     Ok(serde_json::to_string(&Value::Object(sanitized))?)
 }
 

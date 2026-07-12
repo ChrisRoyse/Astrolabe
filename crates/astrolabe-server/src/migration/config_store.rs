@@ -97,6 +97,16 @@ pub(crate) fn write_config_value(cache_dir: &Path, key: &str, value: &str) -> Re
     Ok(())
 }
 
+/// Removes a config key.
+///
+/// Idempotent: deleting an absent key succeeds and is a no-op, so a compensating rollback of
+/// a failed write-then-readback verification (#122) is safe to retry.
+pub(crate) fn delete_config_value(cache_dir: &Path, key: &str) -> Result<(), DynError> {
+    let conn = open_config(cache_dir)?;
+    conn.execute("DELETE FROM config WHERE key = ?", params![key])?;
+    Ok(())
+}
+
 /// SQLITE_BUSY retry window for the shared config store — an operational
 /// resilience timeout under cross-process access (multiple agent MCP processes
 /// on one repo, #76), not a result-determining threshold.

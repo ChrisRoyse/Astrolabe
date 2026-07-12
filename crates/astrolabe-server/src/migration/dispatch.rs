@@ -125,7 +125,10 @@ pub(crate) fn should_wrap_tool(
 ) -> Result<bool, DynError> {
     match tool_name {
         "index_repository" => {
-            if args.contains_key("calyx") || args.contains_key("calyx_search") {
+            if args.contains_key("calyx")
+                || args.contains_key("calyx_search")
+                || args.contains_key("calyx_skills")
+            {
                 return Ok(true);
             }
             let Some(project) = index_project_from_args(args)? else {
@@ -165,6 +168,10 @@ pub(crate) fn handle_index_repository(
         Ok(value) => value,
         Err(message) => return tool_error_result(message),
     };
+    let skill_discovery_override = match parse_skill_discovery_override(args_obj) {
+        Ok(value) => value,
+        Err(message) => return tool_error_result(message),
+    };
     let project = index_project_from_args(args_obj)?;
     let explicit_dial = args_obj.get("calyx");
     let dial = match explicit_dial {
@@ -185,10 +192,16 @@ pub(crate) fn handle_index_repository(
                 "calyx_search requires calyx=\"shadow\" or a persisted shadow dial for this project",
             );
         }
+        if skill_discovery_override.is_some() {
+            return tool_error_result(
+                "calyx_skills requires calyx=\"shadow\" or a persisted shadow dial for this project",
+            );
+        }
         return Ok(runner.handle_tool_raw("index_repository", args_json)?);
     }
 
     let sanitized_args = strip_calyx_arg(args_obj)?;
+    let skills = skill_discovery_config(skill_discovery_override.as_ref());
     // #123: the row-sink run returns its raw result even when row capture fails,
     // so a sink failure keeps the first (completed) index run and only labels the
     // row-sink candidate unavailable. The full rerun below remains ONLY for
@@ -197,7 +210,7 @@ pub(crate) fn handle_index_repository(
     let (result, row_sink) = match runner.handle_index_repository_with_rows(&sanitized_args) {
         Ok(run) => {
             let candidate = match run.rows {
-                Ok(rows) => row_sink_import_candidate_from_rows(rows),
+                Ok(rows) => row_sink_import_candidate_from_rows_with_skills(rows, &skills),
                 Err(error) => RowSinkImportCandidate::Unavailable(format!(
                     "row-sink capture failed; completed index result kept without a rerun: {error}"
                 )),
