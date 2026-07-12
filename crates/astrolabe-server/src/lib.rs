@@ -647,9 +647,18 @@ impl ParentWatchdog {
                 handle: None,
             };
         };
+        let handle = Self::spawn_watch(initial_parent, Arc::clone(&shutdown));
+        Self { shutdown, handle }
+    }
 
-        let thread_shutdown = Arc::clone(&shutdown);
-        let handle = thread::spawn(move || {
+    /// Unix: a process is reparented to init (pid 1) when its parent dies, so a change in
+    /// `getppid()` away from the parent seen at startup means the parent exited.
+    #[cfg(unix)]
+    fn spawn_watch(
+        initial_parent: u32,
+        thread_shutdown: Arc<AtomicBool>,
+    ) -> Option<thread::JoinHandle<()>> {
+        Some(thread::spawn(move || {
             let poll_interval = Duration::from_millis(500);
             while !thread_shutdown.load(Ordering::Relaxed) {
                 thread::sleep(poll_interval);
@@ -664,12 +673,60 @@ impl ParentWatchdog {
                     process::exit(0);
                 }
             }
-        });
+        }))
+    }
 
-        Self {
-            shutdown,
-            handle: Some(handle),
-        }
+    /// Windows (#253): there is no reparenting to observe, so open a `SYNCHRONIZE` handle to
+    /// the parent and wait on it — the handle signals the instant the parent exits, so this
+    /// is event-driven (no PID polling, no `STILL_ACTIVE` ambiguity). Bounded 500 ms waits
+    /// let the cooperative `Drop` shutdown be observed between them.
+    ///
+    /// If the handle cannot be *opened*, we do NOT terminate a possibly-healthy server: that
+    /// happens when the parent already exited (its EOF closes stdin, which terminates an
+    /// stdio server anyway) or when SYNCHRONIZE is denied on a live higher-privilege parent
+    /// (killing the server would be wrong). We log the labeled degradation and fall back to
+    /// the stdin-EOF path. But a wait failure on an *established* parent handle is a genuine
+    /// fault on a confirmed parent — there we fail closed and exit.
+    #[cfg(windows)]
+    fn spawn_watch(
+        initial_parent: u32,
+        thread_shutdown: Arc<AtomicBool>,
+    ) -> Option<thread::JoinHandle<()>> {
+        let watch = match astrolabe_bridge::ParentDeathWatch::open(initial_parent) {
+            Ok(watch) => watch,
+            Err(error) => {
+                tracing::warn!(
+                    "parent.watchdog reason=open_failed status=degraded_stdin_eof_fallback detail={error}"
+                );
+                return None;
+            }
+        };
+        Some(thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                match watch.wait(500) {
+                    astrolabe_bridge::ParentWaitOutcome::Exited => {
+                        tracing::warn!("parent.exited reason=handle_signaled");
+                        process::exit(0);
+                    }
+                    astrolabe_bridge::ParentWaitOutcome::StillAlive => {}
+                    astrolabe_bridge::ParentWaitOutcome::Failed(detail) => {
+                        tracing::error!("parent.watchdog reason=wait_failed detail={detail}");
+                        process::exit(0);
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Platforms with no parent-death primitive: no watchdog thread. An stdio server still
+    /// terminates on stdin EOF when its client goes away; this is a labeled no-op, not a
+    /// silent one (the absence of a handle is observable in `index_status`/tests).
+    #[cfg(not(any(unix, windows)))]
+    fn spawn_watch(
+        _initial_parent: u32,
+        _thread_shutdown: Arc<AtomicBool>,
+    ) -> Option<thread::JoinHandle<()>> {
+        None
     }
 }
 

@@ -6,13 +6,23 @@ BIN="${1:-$ROOT/target/debug/astrolabe}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    # #253: the parent-death watchdog is unimplemented on Windows
-    # (parent_process_id() -> None on non-unix; ParentWatchdog::start() no-ops),
-    # and this test uses Unix FIFO/kill/ps. This is a real Windows-scope coverage
-    # gap on the SHIPPING platform, not a port-phase deferral — surface it as a
-    # named, counted marker instead of a silent `exit 0` (standing invariant #3).
-    echo "SKIP[ASTRO_WATCHDOG_WINDOWS_UNIMPLEMENTED]: the astrolabe parent-death watchdog is not implemented on Windows and this Unix (FIFO/kill/ps) test cannot exercise it; NOT passing evidence, tracked in #253."
-    exit 0
+    # #253: the parent-death watchdog is now implemented natively on Windows
+    # (astrolabe-bridge ParentDeathWatch: OpenProcess(SYNCHRONIZE) + WaitForSingleObject on
+    # the parent handle). This Unix FIFO/kill/ps harness cannot exercise it, so delegate to
+    # the native PowerShell test, which holds astrolabe's stdin open (a named pipe owned by
+    # the grandparent) while the parent is killed -- isolating the watchdog from the
+    # stdin-EOF shutdown path so a PASS proves the watchdog, not EOF.
+    win_bin="$BIN"
+    [[ -f "$win_bin" ]] || win_bin="${BIN}.exe"
+    if [[ ! -f "$win_bin" ]]; then
+      echo "missing astrolabe binary: $win_bin" >&2
+      exit 2
+    fi
+    if command -v powershell.exe >/dev/null 2>&1; then PS_EXE=powershell.exe; else PS_EXE=pwsh.exe; fi
+    "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+      -File "$(cygpath -w "$ROOT/scripts/check-astrolabe-watchdog-windows.ps1")" \
+      -Astrolabe "$(cygpath -w "$win_bin")"
+    exit $?
     ;;
 esac
 
