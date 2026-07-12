@@ -332,6 +332,7 @@ pub(crate) fn handle_get_architecture(
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
                 "anomalies": read_anomaly_report(&cache_dir, &project)?,
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
+                "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
             },
         }),
     )

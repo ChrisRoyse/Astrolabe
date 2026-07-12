@@ -98,6 +98,9 @@ use kernel_context::*;
 mod anomalies;
 use anomalies::*;
 
+mod agreement_graph;
+use agreement_graph::*;
+
 mod provenance;
 use provenance::*;
 
