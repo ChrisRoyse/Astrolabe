@@ -2349,17 +2349,11 @@ mod tests {
         }
     }
 
-    /// The CBM store the operator actually owns, listed as (name, len) pairs.
-    /// Every store-env edge case must leave it byte-identical.
-    fn home_store_entries() -> Vec<(String, u64)> {
-        let home = std::env::var("HOME")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var("USERPROFILE").ok())
-            .expect("HOME or USERPROFILE is set");
-        let store = std::path::Path::new(&home)
-            .join(".cache")
-            .join("codebase-memory-mcp");
+    /// List the CBM store under `home` as (name, len) pairs, sorted. The source of
+    /// truth for every store-isolation FSV: an override/refusal must leave it
+    /// byte-identical.
+    fn store_entries(home: &std::path::Path) -> Vec<(String, u64)> {
+        let store = home.join(".cache").join("codebase-memory-mcp");
         let Ok(entries) = std::fs::read_dir(&store) else {
             return Vec::new();
         };
@@ -2373,6 +2367,34 @@ mod tests {
             .collect();
         listing.sort();
         listing
+    }
+
+    /// The CBM store under the process's INHERITED `HOME`. Used only inside child
+    /// probes, which receive a per-run sandbox `HOME` from their parent (#248) — so
+    /// this reads that sandbox, never the operator's real store.
+    fn home_store_entries() -> Vec<(String, u64)> {
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .expect("HOME or USERPROFILE is set");
+        store_entries(std::path::Path::new(&home))
+    }
+
+    /// #248: a per-run sandbox `HOME` so the store-isolation FSV never reads or
+    /// asserts against the operator's real `~/.cache/codebase-memory-mcp`. The
+    /// operator actively uses CBM (their real store holds live project dbs), so a
+    /// concurrent index during the run would perturb a real-home byte-identity
+    /// assertion — a false red unrelated to the code under test, and the exact
+    /// coupling that blocked running the CBM-test and Rust gate phases concurrently.
+    /// The store dir is pre-created so a `default`-case `canonicalize()` (which
+    /// requires the path to exist) resolves against the sandbox instead of the
+    /// operator's home. Lives under the (TMP-sandboxed, #246) test temp root.
+    fn sandbox_home(name: &str) -> std::path::PathBuf {
+        let home = temp_dir(name).join("home");
+        std::fs::create_dir_all(home.join(".cache").join("codebase-memory-mcp"))
+            .expect("create sandbox home store dir");
+        home
     }
 
     #[test]
@@ -2531,7 +2553,11 @@ mod tests {
         std::fs::create_dir_all(&scratch).expect("create the probe scratch dir");
         let occupied = scratch.join("occupied-store");
         std::fs::write(&occupied, b"not a directory").expect("write the blocking file");
-        let before = home_store_entries();
+        // #248: the child inherits a per-run sandbox HOME so the `default` case
+        // resolves the sandbox store (not the operator's real ~/.cache) and the
+        // byte-identity FSV below is hermetic.
+        let test_home = sandbox_home("cache-env-home");
+        let before = store_entries(&test_home);
         let exe = std::env::current_exe().expect("test binary path");
 
         let cases = [
@@ -2553,6 +2579,8 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("ASTRO_BRIDGE_PROBE_CASE", case)
+                .env("HOME", &test_home)
+                .env("USERPROFILE", &test_home)
                 .current_dir(&scratch);
             match &cache_dir {
                 Some(value) => command.env("CBM_CACHE_DIR", value),
@@ -2573,7 +2601,7 @@ mod tests {
 
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "the CBM store must be byte-identical after the edge-case triad"
         );
         std::fs::remove_dir_all(&scratch).ok();
@@ -2670,7 +2698,8 @@ mod tests {
     /// to persist; the SQLite file appearing under the configured dir does.
     #[test]
     fn set_cbm_cache_dir_relocates_the_persisted_store_on_disk() {
-        let before = home_store_entries();
+        let test_home = sandbox_home("ffi-store-home");
+        let before = store_entries(&test_home);
         let dir = temp_dir("ffi-store-config");
         let store = dir.join("relocated-store");
         let repo = dir.join("repo");
@@ -2693,7 +2722,9 @@ mod tests {
                 "--test-threads=1",
             ])
             .env("ASTRO_PROBE_STORE", &store)
-            .env("ASTRO_PROBE_REPO", &repo);
+            .env("ASTRO_PROBE_REPO", &repo)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home);
         let output = command.output().expect("spawn the ffi-store probe");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -2716,7 +2747,7 @@ mod tests {
         );
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "configuring a store by FFI parameter must not touch the home store"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2821,7 +2852,8 @@ mod tests {
 
     #[test]
     fn cbm_env_truncation_and_unresolvable_fail_closed() {
-        let before = home_store_entries();
+        let test_home = sandbox_home("env-fault-home");
+        let before = store_entries(&test_home);
         let exe = std::env::current_exe().expect("test binary path");
         // A store path longer than the CBM_SZ_1K result buffer. Absolute so only the
         // length — not the relative-path guard — is what condemns it.
@@ -2842,7 +2874,9 @@ mod tests {
                 "--test-threads=1",
             ])
             .env("ASTRO_BRIDGE_ENV_FAULT_CASE", "truncated")
-            .env("CBM_CACHE_DIR", &over_long);
+            .env("CBM_CACHE_DIR", &over_long)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home);
         let out = truncated.output().expect("spawn truncation probe");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -2891,7 +2925,7 @@ mod tests {
 
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "the fail-closed env probes must leave the home store byte-identical"
         );
     }
@@ -2903,7 +2937,8 @@ mod tests {
     /// test never mutates libcbm's process-global override or fault state.
     #[test]
     fn set_cbm_cache_dir_edge_triad_fails_closed() {
-        let before = home_store_entries();
+        let test_home = sandbox_home("edge-triad-home");
+        let before = store_entries(&test_home);
         cbm_sys::initialize_allocator_bindings_first();
 
         // Empty.
@@ -2939,7 +2974,7 @@ mod tests {
         eprintln!("edge triad after: override null, home store preserved");
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "the edge triad must leave the home store byte-identical"
         );
     }
@@ -3175,7 +3210,8 @@ mod tests {
         // work runs in a spawned child (the `set_cbm_cache_dir_child_probe` pattern) to
         // stay isolated from sibling test threads; the parent then FSV-asserts the
         // operator home store is byte-identical.
-        let before = home_store_entries();
+        let test_home = sandbox_home("tool-runner-row-sink-home");
+        let before = store_entries(&test_home);
         let dir = temp_dir("tool-runner-row-sink");
         let store = dir.join("store");
         let repo = dir.join("repo");
@@ -3198,6 +3234,8 @@ mod tests {
             ])
             .env("ASTRO_PROBE_STORE", &store)
             .env("ASTRO_PROBE_REPO", &repo)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home)
             .output()
             .expect("spawn the tool-runner row-sink probe");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -3212,7 +3250,7 @@ mod tests {
         );
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "a run-scoped tool-runner index must not touch the operator home store"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -3303,7 +3341,8 @@ mod tests {
     /// FSV-asserts the operator home store is byte-identical.
     #[test]
     fn tool_runner_index_repository_leaves_no_store_residue() {
-        let before = home_store_entries();
+        let test_home = sandbox_home("tool-runner-residue-home");
+        let before = store_entries(&test_home);
         let dir = temp_dir("tool-runner-residue");
         let store = dir.join("store");
         let repo = dir.join("repo");
@@ -3326,6 +3365,8 @@ mod tests {
             ])
             .env("ASTRO_PROBE_STORE", &store)
             .env("ASTRO_PROBE_REPO", &repo)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home)
             .output()
             .expect("spawn the tool-runner residue probe");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -3340,7 +3381,7 @@ mod tests {
         );
         assert_eq!(
             before,
-            home_store_entries(),
+            store_entries(&test_home),
             "a run-scoped tool-runner index must not touch the operator home store"
         );
         std::fs::remove_dir_all(&dir).ok();
