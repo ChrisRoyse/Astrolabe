@@ -72,11 +72,18 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py
 "$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
+"$PYTHON_BIN" scripts/test-check-hazard-suite.py
+"$PYTHON_BIN" scripts/test-check-no-escape.py
+"$PYTHON_BIN" scripts/test-cbm-spawn-patch.py
+"$PYTHON_BIN" scripts/test-cbm-spawn-fsv.py
+"$PYTHON_BIN" scripts/test-cbm-env-store-patch.py
+"$PYTHON_BIN" scripts/test-cbm-env-contract.py
+"$PYTHON_BIN" scripts/check-cbm-env-contract.py
 "$PYTHON_BIN" scripts/test-bench-ratios-artifact.py
-"$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-license-notices.py
 "$PYTHON_BIN" scripts/check-redaction-writers.py
 "$PYTHON_BIN" scripts/check-shell-arg-audit.py
-"$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-hazard-suite.py
 "$PYTHON_BIN" scripts/test-cbm-mem-pressure-patch.py
 "$PYTHON_BIN" scripts/check-cbm-native-build-contract.py
 "$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py
@@ -95,6 +102,8 @@ ASTRO_CARGO_METADATA_JSON="$ROOT/target/astro-cargo-metadata.json"
 export ASTRO_CARGO_METADATA_JSON
 "$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
+# #237: snapshot the protected roots BEFORE the build/test phase can touch them.
+"$PYTHON_BIN" scripts/check-no-escape.py snapshot --out "$ROOT/target/no-escape-before.json"
 "$CARGO_BIN" build --workspace
 if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
   if "$PYTHON_BIN" scripts/check-workspace-tests.py \
@@ -125,7 +134,15 @@ else
   "$PYTHON_BIN" scripts/check-lowered-parity.py
 fi
 "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact
+# #88: predicate artifacts are written ONLY after their attested tests have run
+# (cargo build + workspace test above), stamped with commit + UTC timestamp so a
+# run that dies in the build/test phase leaves no fresh 'pass' artifact behind.
+"$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
+"$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact --cargo "$CARGO_BIN"
 "$PYTHON_BIN" scripts/check-cross-process-vault.py
 "$PYTHON_BIN" scripts/check-cross-process-servers.py
 bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"
 "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"
+# #237: re-read the protected roots AFTER the full suite and fail closed if any
+# test escaped its sandbox (added/modified/removed entry outside the run sandbox).
+"$PYTHON_BIN" scripts/check-no-escape.py verify --before "$ROOT/target/no-escape-before.json" --out "$ROOT/target/no-escape-after.json"

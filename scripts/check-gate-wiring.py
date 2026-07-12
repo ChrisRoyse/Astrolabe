@@ -81,6 +81,43 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    # #237: the sandbox-escape gate is only load-bearing if the aggregate both
+    # runs its self-test AND brackets the build/test phase with snapshot->verify.
+    require(check, "scripts/test-check-no-escape.py", "scripts/check.sh", errors)
+    require(check, "scripts/check-no-escape.py snapshot", "scripts/check.sh", errors)
+    require(check, "scripts/check-no-escape.py verify", "scripts/check.sh", errors)
+    require_order(
+        check,
+        (
+            "scripts/check-no-escape.py snapshot",
+            "build --workspace",
+            "scripts/check-no-escape.py verify",
+        ),
+        "scripts/check.sh",
+        errors,
+    )
+    # #88: hazard-suite must execute its tests (self-test wired) and predicate
+    # artifacts must be written AFTER the workspace test, never before it.
+    require(check, "scripts/test-check-hazard-suite.py", "scripts/check.sh", errors)
+    require_order(
+        check,
+        ("test --workspace", "scripts/check-license-notices.py --write-release-artifact"),
+        "scripts/check.sh",
+        errors,
+    )
+    require_order(
+        check,
+        ("test --workspace", "scripts/check-hazard-suite.py --write-release-artifact"),
+        "scripts/check.sh",
+        errors,
+    )
+    # #227/#228: shell-free CBM git spawn + validator mirror self-tests.
+    require(check, "scripts/test-cbm-spawn-patch.py", "scripts/check.sh", errors)
+    require(check, "scripts/test-cbm-spawn-fsv.py", "scripts/check.sh", errors)
+    # #240/#241: env-as-IPC lint gate + resolver-hardening overlay self-tests.
+    require(check, "scripts/check-cbm-env-contract.py", "scripts/check.sh", errors)
+    require(check, "scripts/test-cbm-env-contract.py", "scripts/check.sh", errors)
+    require(check, "scripts/test-cbm-env-store-patch.py", "scripts/check.sh", errors)
     require(
         check,
         "scripts/test-egress-platform.py",
