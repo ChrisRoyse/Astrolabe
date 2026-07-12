@@ -57,4 +57,27 @@ CBM_API int cbm_abi_layout_size(const char *type_name, size_t *size_out, size_t 
 CBM_API int cbm_abi_layout_offset(const char *type_name, const char *field_name,
                                   size_t *offset_out);
 
+/* Store configuration across the FFI boundary (#240) and the fail-closed
+ * environment fault record (#241). Implemented by patches/cbm/env_store_config.c
+ * and consumed by the store-resolution overlay of the pinned CBM sources.
+ *
+ * These exist because the environment is NOT a usable channel between the Rust
+ * host and libcbm on Windows: `std::env::set_var` writes the Win32 environment
+ * block, while `cbm_safe_getenv` walks the C runtime's `environ` array, and the
+ * two are synchronised only for the environment the process inherited. Passing
+ * the store path as a parameter is the durable contract; see
+ * astrolabe_bridge::set_cbm_cache_dir. */
+CBM_API int cbm_astro_set_cache_dir(const char *path);
+CBM_API void cbm_astro_clear_cache_dir(void);
+CBM_API const char *cbm_astro_cache_dir_override(void);
+CBM_API void cbm_astro_env_record_fault(const char *code, const char *var, const char *message,
+                                        const char *remediation);
+CBM_API void cbm_astro_env_record_truncation(const char *name, size_t needed, size_t capacity);
+CBM_API void cbm_astro_env_record_unresolvable_store(void);
+CBM_API int cbm_astro_env_faulted_for(const char *name);
+CBM_API const char *cbm_astro_env_fault_code(void);
+CBM_API const char *cbm_astro_env_fault_message(void);
+CBM_API const char *cbm_astro_env_fault_remediation(void);
+CBM_API void cbm_astro_env_fault_clear(void);
+
 #endif /* ASTROLABE_ASTRO_FFI_H */
