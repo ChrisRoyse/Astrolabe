@@ -787,6 +787,10 @@ where
     }
 }
 
+// Default-skills convenience wrapper used only by tests; every production caller passes
+// explicit skills via *_with_skills below, so this is gated to test builds rather than
+// shipped as dead code (invariant 6).
+#[cfg(test)]
 pub(crate) fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCandidate {
     row_sink_import_candidate_from_rows_with_skills(rows, &SkillDiscoveryConfig::default())
 }

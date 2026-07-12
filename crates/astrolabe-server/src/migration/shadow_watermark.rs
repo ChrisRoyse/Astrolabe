@@ -44,8 +44,6 @@
 //! unprovable domain is refused, not guessed (standing invariant #2). One reindex
 //! re-persists it in the tagged form and the project is permanently self-describing.
 
-use super::*;
-
 /// Registry-declared format identifier for the persisted shadow freshness watermark.
 ///
 /// This is the declared contract for the `vault_fingerprint` config value, surfaced on
