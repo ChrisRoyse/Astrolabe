@@ -74,6 +74,12 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/test-cbm-cache-guards.py",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/test-verify-pins.py",
         "scripts/check.sh",
         errors,
@@ -308,6 +314,37 @@ def validate(root: Path) -> list[str]:
         "scripts/ci-cbm-test.sh",
         errors,
     )
+    # #194/#232: the CBM phase must run against a run-scoped store and prove the
+    # operator's store came out byte-identical. Both halves are load-bearing.
+    require(
+        cbm_test,
+        'export HOME="$CBM_TEST_HOME"',
+        "scripts/ci-cbm-test.sh run-scoped CBM store",
+        errors,
+    )
+    require(
+        cbm_test,
+        'export USERPROFILE="$CBM_TEST_HOME"',
+        "scripts/ci-cbm-test.sh run-scoped CBM store",
+        errors,
+    )
+    require(
+        cbm_test,
+        "INFO[ASTRO_CBM_RUN_SCOPED_STORE]",
+        "scripts/ci-cbm-test.sh run-scoped CBM store",
+        errors,
+    )
+    require_order(
+        cbm_test,
+        (
+            'check-cbm-cache-hermeticity.py" snapshot',
+            "scripts/test.sh",
+            'check-cbm-cache-hermeticity.py" verify',
+            'check-cbm-cache-hermeticity.py" require-writes',
+        ),
+        "scripts/ci-cbm-test.sh store hermeticity order",
+        errors,
+    )
     require(
         cbm_test,
         'CC_BIN="${2//\\\\//}"',
@@ -360,6 +397,12 @@ def validate(root: Path) -> list[str]:
     require(
         cbm_lint,
         'make -f "$ROOT/patches/cbm/Makefile.cbm" lint-format-astrolabe',
+        "scripts/ci-cbm-lint.sh",
+        errors,
+    )
+    require(
+        cbm_lint,
+        "scripts/check-cbm-cache-paths.py",
         "scripts/ci-cbm-lint.sh",
         errors,
     )

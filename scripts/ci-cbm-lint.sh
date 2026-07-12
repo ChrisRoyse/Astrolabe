@@ -24,6 +24,19 @@ cleanup_format_workspace() {
 }
 trap cleanup_format_workspace EXIT
 
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+else
+  echo "ERROR: ASTRO_CBM_PYTHON_MISSING: python is required by the CBM cache-path gate." >&2
+  echo "  remediation: install python (or python3) on PATH before running the CBM lint gate." >&2
+  exit 1
+fi
+
+echo "=== CBM cache-path construction sites ==="
+"$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-paths.py"
+
 cd "$CBM"
 
 echo "=== CBM no-skips policy ==="

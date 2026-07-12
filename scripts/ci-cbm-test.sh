@@ -75,6 +75,86 @@ if [[ -n "$TMP_ROOT" ]]; then
   export GIT_CEILING_DIRECTORIES="${TMP_ROOT//\\//}"
 fi
 
+# ── Hermetic CBM project store (#194/#232) ────────────────────────────────
+#
+# The CBM store has no registry table: a project is "registered" purely by the
+# presence of `<slug>.db` in the resolved cache directory, so every fixture the
+# suite indexes lands permanently in whatever store the library resolves.
+#
+# cbm_resolve_cache_dir() (src/foundation/platform.c:404) honours CBM_CACHE_DIR,
+# but the vendored tests do NOT call it: they hand-build the same path from
+# getenv("HOME") (tests/test_integration.c:116 and 20 sibling files). A
+# CBM_CACHE_DIR redirect therefore moves the library's WRITE path away from the
+# tests' READ path and regresses ~808 tests (reverted in de2fc30) — the env var
+# was never the defect, the duplicated formula is.
+#
+# HOME is the one input BOTH halves read: cbm_get_home_dir()
+# (platform.c:327) reads HOME first, then USERPROFILE. Redirecting HOME moves
+# the library and the tests together, by construction. USERPROFILE follows it so
+# the resolver cannot reach the operator's profile through the second branch, and
+# CBM_CACHE_DIR is cleared so no split can be reintroduced from the environment.
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+else
+  echo "ERROR: ASTRO_CBM_PYTHON_MISSING: python is required by the CBM store hermeticity gate." >&2
+  echo "  remediation: install python (or python3) on PATH before running the CBM gate." >&2
+  exit 1
+fi
+
+# Native path form: the CBM test binaries are native Windows executables and
+# read HOME with getenv(). An MSYS POSIX path (/c/...) would resolve against the
+# current drive root inside them, so every path handed to a native child or to
+# python is converted here, fail-closed.
+to_native() {
+  if [[ -n "${MSYSTEM:-}" ]]; then
+    if ! command -v cygpath >/dev/null 2>&1; then
+      echo "ERROR: ASTRO_CBM_CYGPATH_MISSING: cygpath is required to hand native Windows paths to the CBM test binaries." >&2
+      echo "  remediation: run the CBM gate under Git for Windows bash (which ships cygpath), not a stripped POSIX shell." >&2
+      exit 1
+    fi
+    cygpath -m "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+OPERATOR_HOME="${HOME:-${USERPROFILE:-}}"
+if [[ -z "$OPERATOR_HOME" ]]; then
+  echo "ERROR: ASTRO_CBM_OPERATOR_HOME_UNSET: neither HOME nor USERPROFILE is set, so the protected CBM store cannot be located." >&2
+  echo "  remediation: export HOME (or USERPROFILE) before running the CBM gate." >&2
+  exit 1
+fi
+# Whatever store this run WOULD have written to is the store that must come out
+# byte-identical — including an inherited CBM_CACHE_DIR.
+PROTECTED_CACHE="$(to_native "${CBM_CACHE_DIR:-$OPERATOR_HOME/.cache/codebase-memory-mcp}")"
+NATIVE_ROOT="$(to_native "$ROOT")"
+CBM_TEST_HOME="$NATIVE_ROOT/target/cbm-test-home"
+RUN_SCOPED_CACHE="$CBM_TEST_HOME/.cache/codebase-memory-mcp"
+BEFORE_MANIFEST="$NATIVE_ROOT/target/ci-logs/cbm-store-before-${LABEL}.manifest"
+AFTER_MANIFEST="$NATIVE_ROOT/target/ci-logs/cbm-store-after-${LABEL}.manifest"
+
+echo "=== CBM store hermeticity: protected-store snapshot (before) ==="
+"$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" snapshot \
+  --cache-dir "$PROTECTED_CACHE" --out "$BEFORE_MANIFEST"
+
+rm -rf -- "$CBM_TEST_HOME"
+mkdir -p "$RUN_SCOPED_CACHE"
+# The suite's git fixtures must not depend on operator identity either; give the
+# run-scoped HOME a deterministic global config instead of inheriting one.
+cat > "$CBM_TEST_HOME/.gitconfig" <<'CBM_GITCONFIG'
+[user]
+	name = Astrolabe CBM Gate
+	email = cbm-gate@astrolabe.invalid
+[init]
+	defaultBranch = main
+CBM_GITCONFIG
+export HOME="$CBM_TEST_HOME"
+export USERPROFILE="$CBM_TEST_HOME"
+unset CBM_CACHE_DIR
+echo "INFO[ASTRO_CBM_RUN_SCOPED_STORE]: HOME/USERPROFILE redirected to $CBM_TEST_HOME for this phase; the library resolver and the vendored tests both derive the store from HOME, so they move together (no CBM_CACHE_DIR split)."
+
 case "$LABEL" in
   windows-*-mingw)
     # Source-derived counting overstates native Windows: registrations
@@ -128,6 +208,17 @@ set +e
 scripts/test.sh "CC=$CC_BIN" "CXX=$CXX_BIN" ${SANITIZE_OVERRIDES[@]+"${SANITIZE_OVERRIDES[@]}"} 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
+
+# The suite is only hermetic if BOTH halves hold: the protected store came out
+# byte-identical, AND the run-scoped store actually received the writes. A suite
+# that silently indexed nothing would satisfy the first alone.
+echo "=== CBM store hermeticity: protected-store verification (after) ==="
+"$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" verify \
+  --cache-dir "$PROTECTED_CACHE" --before "$BEFORE_MANIFEST" --out "$AFTER_MANIFEST"
+
+echo "=== CBM store hermeticity: run-scoped store received the writes ==="
+"$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" require-writes \
+  --cache-dir "$RUN_SCOPED_CACHE"
 
 # Anchored: the unit-suite summary starts with its count; later harness
 # steps (security-strings) print prefixed "N passed" lines that must not

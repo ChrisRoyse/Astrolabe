@@ -506,17 +506,23 @@ function Set-WorkspaceTempEnvironment {
     else {
         $env:GIT_CEILING_DIRECTORIES = $tempCeiling
     }
-    # NOTE (#194): a launcher-level CBM_CACHE_DIR redirect was tried here to keep
+    # NOTE (#194/#232): a launcher-level CBM_CACHE_DIR redirect was tried here to keep
     # codebase-memory-mcp project registrations out of the operator's global store,
     # but it splits the vendored C tests' write path from their read path — those
     # tests index via cbm_mcp_server_new(NULL) (which honours CBM_CACHE_DIR) yet open
     # the db at a HARDCODED $HOME/.cache/codebase-memory-mcp/<project>.db (e.g.
     # tests/test_edge_types_probe.c:104, test_integration.c), so a redirect empties
-    # the store they assert on and regresses ~808 CBM C tests. Test-pollution of the
-    # global store is therefore fixed at the source instead: the Rust row-sink test
-    # cleans up via a fail-closed Drop guard, and leaking vendored C tests are patched
-    # to unlink their registration on teardown (patch flow). Do NOT set CBM_CACHE_DIR
-    # globally in the launcher.
+    # the store they assert on and regresses ~808 CBM C tests. Do NOT set CBM_CACHE_DIR
+    # globally here: it would also reach git, cargo and sccache children that have no
+    # business being repointed.
+    #
+    # The store leak is fixed where the store is decided instead. scripts/ci-cbm-test.sh
+    # redirects HOME/USERPROFILE (the one input BOTH halves read: cbm_get_home_dir()
+    # in src/foundation/platform.c) to a run-scoped store under target/ for the CBM
+    # phase only, so the library and the vendored tests move together; the Rust
+    # row-sink test cleans up through a fail-closed Drop guard; and
+    # scripts/check-cbm-cache-hermeticity.py re-reads the operator's real store before
+    # and after the phase and fails closed on a single added registration.
 }
 
 function Test-PinnedToolchain {

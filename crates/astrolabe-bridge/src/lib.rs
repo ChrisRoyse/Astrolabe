@@ -21,7 +21,100 @@ pub fn parent_roots() -> (&'static str, &'static str) {
     )
 }
 
+/// Byte capacity CBM gives every environment value it reads.
+///
+/// `cbm_safe_getenv` (`vendor/codebase-memory-mcp/src/foundation/platform.c:306`)
+/// `snprintf`s the value into the caller's buffer, and both `cbm_resolve_cache_dir`
+/// and `cbm_get_home_dir` pass a `char[CBM_SZ_256]`. A longer value is therefore
+/// **silently truncated** into a different directory — a store path nobody asked
+/// for. This is not a magic number: it is measured from the vendored
+/// `src/foundation/constants.h` enum and asserted against it by
+/// `cbm_env_capacity_matches_vendor_constant`.
+const CBM_ENV_VALUE_CAPACITY: usize = 256;
+
+/// Fail-closed validation of the environment that decides where the CBM project
+/// store lives (#194/#232).
+///
+/// A project is "registered" in CBM purely by the presence of `<slug>.db` in the
+/// resolved cache directory, so a misread of this environment silently relocates
+/// (or truncates) every index the host writes. The vendored resolver degrades
+/// quietly in three ways — an empty `CBM_CACHE_DIR` falls through to `$HOME`, a
+/// relative one resolves against whatever the process cwd happens to be, and an
+/// over-long one is truncated mid-path. Astrolabe refuses all three at its own
+/// door instead, because every server store path resolves through
+/// [`cbm_cache_dir`].
+fn validate_cbm_store_env(
+    cache_dir: Option<&str>,
+    home: Option<&str>,
+    user_profile: Option<&str>,
+) -> Result<(), BridgeError> {
+    if let Some(raw) = cache_dir {
+        if raw.is_empty() {
+            return Err(envelope(
+                "ASTRO_CBM_CACHE_DIR_EMPTY",
+                "CBM_CACHE_DIR is set but empty; CBM would silently fall back to the home store",
+                "Unset CBM_CACHE_DIR to use the default store, or set it to an absolute path.",
+            ));
+        }
+        if raw.len() >= CBM_ENV_VALUE_CAPACITY {
+            return Err(envelope(
+                "ASTRO_CBM_CACHE_DIR_TRUNCATED",
+                format!(
+                    "CBM_CACHE_DIR is {} bytes; CBM reads environment values into a {}-byte \
+                     buffer and would silently truncate it into a different directory",
+                    raw.len(),
+                    CBM_ENV_VALUE_CAPACITY
+                ),
+                format!(
+                    "Point CBM_CACHE_DIR at an absolute path shorter than {CBM_ENV_VALUE_CAPACITY} bytes."
+                ),
+            ));
+        }
+        if !std::path::Path::new(raw).is_absolute() {
+            return Err(envelope(
+                "ASTRO_CBM_CACHE_DIR_RELATIVE",
+                format!(
+                    "CBM_CACHE_DIR must be an absolute path; {raw:?} would resolve against the \
+                     process working directory and scatter the project store"
+                ),
+                "Set CBM_CACHE_DIR to an absolute path (or unset it to use the default store).",
+            ));
+        }
+        return Ok(());
+    }
+
+    // No override: CBM falls back to <home>/.cache/codebase-memory-mcp, reading
+    // HOME first and USERPROFILE second (platform.c:327). Whichever it would use
+    // is subject to the same truncation.
+    let home = home
+        .filter(|value| !value.is_empty())
+        .or(user_profile.filter(|value| !value.is_empty()));
+    if let Some(home) = home
+        && home.len() >= CBM_ENV_VALUE_CAPACITY
+    {
+        return Err(envelope(
+            "ASTRO_CBM_HOME_TRUNCATED",
+            format!(
+                "HOME/USERPROFILE is {} bytes; CBM reads environment values into a {}-byte \
+                 buffer and would silently truncate the home store path",
+                home.len(),
+                CBM_ENV_VALUE_CAPACITY
+            ),
+            format!(
+                "Set CBM_CACHE_DIR to an absolute path shorter than {CBM_ENV_VALUE_CAPACITY} bytes."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
+    validate_cbm_store_env(
+        std::env::var("CBM_CACHE_DIR").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    )?;
+
     cbm_sys::initialize_allocator_bindings_first();
     let ptr = unsafe { cbm_sys::cbm_resolve_cache_dir() };
     if ptr.is_null() {
@@ -31,7 +124,32 @@ pub fn cbm_cache_dir() -> Result<PathBuf, BridgeError> {
             "Set CBM_CACHE_DIR or HOME/LOCALAPPDATA to a writable directory.",
         ));
     }
-    Ok(PathBuf::from(unsafe { CStr::from_ptr(ptr) }.to_str()?))
+    let resolved = PathBuf::from(unsafe { CStr::from_ptr(ptr) }.to_str()?);
+
+    // The store must be a usable directory before anything indexes into it. CBM
+    // creates it on first write; doing it here turns "your db went somewhere
+    // surprising" into a named, actionable failure at the door.
+    if resolved.exists() && !resolved.is_dir() {
+        return Err(envelope(
+            "ASTRO_CBM_CACHE_DIR_NOT_A_DIRECTORY",
+            format!(
+                "the resolved CBM store {} exists but is not a directory",
+                resolved.display()
+            ),
+            "Point CBM_CACHE_DIR at a directory (or remove the conflicting file).",
+        ));
+    }
+    if let Err(error) = std::fs::create_dir_all(&resolved) {
+        return Err(envelope(
+            "ASTRO_CBM_CACHE_DIR_UNUSABLE",
+            format!(
+                "the resolved CBM store {} cannot be created or opened: {error}",
+                resolved.display()
+            ),
+            "Point CBM_CACHE_DIR at a writable absolute path.",
+        ));
+    }
+    Ok(resolved)
 }
 
 pub fn cbm_memory_budget_bytes() -> usize {
@@ -125,6 +243,13 @@ fn initialize_cbm_host_process_with_log_mode(
     binary_path: Option<&str>,
     silent: bool,
 ) -> Result<(), BridgeError> {
+    // Refuse a store-relocating environment at startup rather than discovering it
+    // one indexed project too late (#194/#232).
+    validate_cbm_store_env(
+        std::env::var("CBM_CACHE_DIR").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    )?;
     cbm_sys::initialize_allocator_bindings_first();
     let binary_path = binary_path.map(CString::new).transpose()?;
 
@@ -1825,6 +1950,235 @@ unsafe fn array_slice<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CBM store the operator actually owns, listed as (name, len) pairs.
+    /// Every store-env edge case must leave it byte-identical.
+    fn home_store_entries() -> Vec<(String, u64)> {
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .expect("HOME or USERPROFILE is set");
+        let store = std::path::Path::new(&home)
+            .join(".cache")
+            .join("codebase-memory-mcp");
+        let Ok(entries) = std::fs::read_dir(&store) else {
+            return Vec::new();
+        };
+        let mut listing: Vec<(String, u64)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let len = entry.metadata().ok()?.len();
+                Some((name, len))
+            })
+            .collect();
+        listing.sort();
+        listing
+    }
+
+    #[test]
+    fn cbm_env_capacity_matches_vendor_constant() {
+        // Not a magic number: read the value CBM actually compiles with.
+        let constants = std::path::Path::new(cbm_sys::vendor_root())
+            .join("src")
+            .join("foundation")
+            .join("constants.h");
+        let source = std::fs::read_to_string(&constants).expect("vendored constants.h is readable");
+        let declared = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("CBM_SZ_256 = "))
+            .and_then(|value| value.trim_end_matches(',').parse::<usize>().ok())
+            .expect("constants.h declares CBM_SZ_256");
+        assert_eq!(
+            declared, CBM_ENV_VALUE_CAPACITY,
+            "CBM_ENV_VALUE_CAPACITY must track the vendored CBM_SZ_256 env buffer"
+        );
+    }
+
+    #[test]
+    fn store_env_validation_refuses_every_silent_degradation() {
+        let absolute = if cfg!(windows) {
+            "C:/code/Astrolabe/target/store"
+        } else {
+            "/var/tmp/store"
+        };
+        assert!(validate_cbm_store_env(Some(absolute), Some("/home/op"), None).is_ok());
+        assert!(validate_cbm_store_env(None, Some("/home/op"), None).is_ok());
+        assert!(validate_cbm_store_env(None, None, Some("C:/Users/op")).is_ok());
+
+        let cases: [(Option<&str>, Option<&str>, &str); 4] = [
+            // Empty: CBM copies "" into its buffer and falls back to the home store.
+            (Some(""), Some("/home/op"), "ASTRO_CBM_CACHE_DIR_EMPTY"),
+            // Relative: resolves against whatever cwd the process happens to have.
+            (
+                Some("relative/store"),
+                Some("/home/op"),
+                "ASTRO_CBM_CACHE_DIR_RELATIVE",
+            ),
+            // Over-long: cbm_safe_getenv truncates into a different directory.
+            (
+                Some(Box::leak(
+                    format!(
+                        "{}{}",
+                        if cfg!(windows) { "C:/" } else { "/" },
+                        "x".repeat(300)
+                    )
+                    .into_boxed_str(),
+                )),
+                Some("/home/op"),
+                "ASTRO_CBM_CACHE_DIR_TRUNCATED",
+            ),
+            (
+                None,
+                Some(Box::leak(
+                    format!(
+                        "{}{}",
+                        if cfg!(windows) { "C:/" } else { "/" },
+                        "h".repeat(300)
+                    )
+                    .into_boxed_str(),
+                )),
+                "ASTRO_CBM_HOME_TRUNCATED",
+            ),
+        ];
+        for (cache_dir, home, code) in cases {
+            let error = validate_cbm_store_env(cache_dir, home, None)
+                .expect_err("silent degradation must fail closed");
+            assert_eq!(error.envelope().code, code, "wrong code for {cache_dir:?}");
+            assert!(
+                !error.envelope().remediation.is_empty(),
+                "{code} must carry a remediation"
+            );
+        }
+    }
+
+    /// Child half of `cbm_cache_dir_edge_cases_fail_closed_without_touching_the_home_store`.
+    ///
+    /// The store environment is read by BOTH halves of this process — Rust's
+    /// `std::env` and, inside libcbm, the C runtime's `environ` snapshot. On
+    /// Windows those two views only agree on the environment the process
+    /// *inherited*: `std::env::set_var` goes through `SetEnvironmentVariableW` and
+    /// never reaches the CRT array `cbm_safe_getenv` walks. So each case is run in
+    /// its own child process with the value inherited from the parent — which is
+    /// also exactly how a real host receives it.
+    #[test]
+    #[ignore = "spawned as a subprocess by cbm_cache_dir_edge_cases_fail_closed_without_touching_the_home_store"]
+    fn cbm_cache_dir_env_child_probe() {
+        let case = std::env::var("ASTRO_BRIDGE_PROBE_CASE").expect("parent selects a case");
+        let before = home_store_entries();
+
+        match case.as_str() {
+            // (a) CBM_CACHE_DIR is relative: CBM would resolve it against whatever
+            // cwd the host happens to have and scatter the store.
+            "relative" => {
+                let raw = std::env::var("CBM_CACHE_DIR").expect("parent set the relative store");
+                let error = cbm_cache_dir().expect_err("a relative store must fail closed");
+                assert_eq!(error.envelope().code, "ASTRO_CBM_CACHE_DIR_RELATIVE");
+                assert!(!error.envelope().remediation.is_empty());
+                assert!(
+                    !std::env::current_dir().expect("cwd").join(&raw).exists(),
+                    "a refused resolve must not create a store under the cwd"
+                );
+            }
+            // (b) CBM_CACHE_DIR names something that cannot hold a store.
+            "occupied" => {
+                let raw = std::env::var("CBM_CACHE_DIR").expect("parent set the blocked store");
+                let error = cbm_cache_dir().expect_err("an unusable store must fail closed");
+                assert_eq!(error.envelope().code, "ASTRO_CBM_CACHE_DIR_NOT_A_DIRECTORY");
+                assert!(!error.envelope().remediation.is_empty());
+                assert_eq!(
+                    std::fs::read(&raw).expect("the blocking file survives"),
+                    b"not a directory",
+                    "a refused resolve must not clobber the path it refused"
+                );
+            }
+            // (c) CBM_CACHE_DIR unset: the documented default store, and nothing else.
+            "default" => {
+                assert!(
+                    std::env::var("CBM_CACHE_DIR").is_err(),
+                    "parent cleared the override"
+                );
+                let resolved = cbm_cache_dir().expect("the default store resolves");
+                let home = std::env::var("HOME")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| std::env::var("USERPROFILE").ok())
+                    .expect("HOME or USERPROFILE is set");
+                let expected = std::path::Path::new(&home)
+                    .join(".cache")
+                    .join("codebase-memory-mcp");
+                assert_eq!(
+                    resolved.canonicalize().expect("resolved store exists"),
+                    expected.canonicalize().expect("expected store exists"),
+                    "the default store must stay $HOME/.cache/codebase-memory-mcp"
+                );
+            }
+            other => panic!("unknown probe case {other}"),
+        }
+
+        // FSV: the operator's store is byte-identical after the case ran.
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "the CBM store must be byte-identical after the {case} case"
+        );
+        println!("cbm_cache_dir store-env case passed: {case}");
+    }
+
+    #[test]
+    fn cbm_cache_dir_edge_cases_fail_closed_without_touching_the_home_store() {
+        let scratch = temp_dir("cache-env-probe");
+        std::fs::create_dir_all(&scratch).expect("create the probe scratch dir");
+        let occupied = scratch.join("occupied-store");
+        std::fs::write(&occupied, b"not a directory").expect("write the blocking file");
+        let before = home_store_entries();
+        let exe = std::env::current_exe().expect("test binary path");
+
+        let cases = [
+            ("relative", Some("astro-relative-store".to_string())),
+            (
+                "occupied",
+                Some(occupied.to_str().expect("utf-8 path").to_string()),
+            ),
+            ("default", None),
+        ];
+        for (case, cache_dir) in cases {
+            let mut command = std::process::Command::new(&exe);
+            command
+                .args([
+                    "--exact",
+                    "tests::cbm_cache_dir_env_child_probe",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("ASTRO_BRIDGE_PROBE_CASE", case)
+                .current_dir(&scratch);
+            match &cache_dir {
+                Some(value) => command.env("CBM_CACHE_DIR", value),
+                None => command.env_remove("CBM_CACHE_DIR"),
+            };
+            let output = command.output().expect("spawn the store-env probe");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "store-env probe {case} failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("store-env case passed: {case}")),
+                "probe {case} did not run its assertions:\n{stdout}"
+            );
+        }
+
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "the CBM store must be byte-identical after the edge-case triad"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
 
     struct PanicOnLogEventSubscriber {
         levels: std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>,
