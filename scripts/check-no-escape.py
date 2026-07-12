@@ -182,12 +182,40 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
             "the launcher writes {pid: first_seen_ns}; regenerate the manifest",
             {"error": str(exc)},
         )
+    # #278 attempt 7: pid INSTANCE LIFETIME windows. pid_intervals maps each pid to
+    # a list of [first_seen_ns, last_seen_ns|null] intervals -- one per instance of
+    # that pid inside OUR tree (the Job Object delivers both NEW_PROCESS and
+    # EXIT_PROCESS, and the same pid can genuinely serve two of our short-lived
+    # children). null upper bound = the instance had not exited when the manifest
+    # was written -> OPEN window (never 'assume dead'; fail closed toward policing).
+    # A manifest without pid_intervals (older recorder) degrades to open-ended
+    # windows derived from pid_first_seen -- again the toward-RED direction.
+    pid_intervals: dict[int, list[tuple[int, int | None]]] = {}
+    raw_intervals = data.get("pid_intervals")
+    if raw_intervals is not None:
+        try:
+            for pid, spans in raw_intervals.items():
+                parsed: list[tuple[int, int | None]] = []
+                for span in spans:
+                    first, last = span[0], span[1]
+                    parsed.append((int(first), None if last is None else int(last)))
+                pid_intervals[int(pid)] = parsed
+        except (TypeError, ValueError, IndexError, AttributeError) as exc:
+            fail(
+                "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+                "attribution manifest pid_intervals must map pids to [first_ns, last_ns|null] pairs",
+                "the launcher writes instance lifetime intervals; regenerate the manifest",
+                {"error": str(exc)},
+            )
+    else:
+        pid_intervals = {pid: [(seen, None)] for pid, seen in pid_first_seen.items()}
     return {
         "path": str(path),
         "launcher_pid": data.get("launcher_pid"),
         "run_started_unix_ns": run_started,
         "tree_pids": tree_pids,
         "pid_first_seen": pid_first_seen,
+        "pid_intervals": pid_intervals,
         "owned_paths": owned_paths,
     }
 
@@ -232,6 +260,22 @@ def classify_causal_delta(
                      that pid's first-seen time in OUR tree (the Job Object stamps
                      each pid at creation): a dir created at 12:57 cannot belong
                      to our pid instance first seen at 13:4x. -> PID_INSTANCE.
+
+    Attempt-7 refinement: first-seen alone still false-attributed DEAD instances --
+    four foreign-sweep pids collided with launcher-startup children of ours that
+    were first seen at 14:2x and long dead when the foreign dirs appeared at
+    14:34-14:36. A pid token therefore attributes only an entry whose timestamp
+    falls INSIDE one of that pid's instance LIFETIME intervals in our tree:
+    first_seen - skew <= entry_ts <= last_seen + skew, per instance (the recorder
+    also consumes JOB_OBJECT_MSG_(ABNORMAL_)EXIT_PROCESS and keeps a [first, last]
+    list per pid, so a pid recycled WITHIN our own tree matches on any of its
+    instances). A missing exit stamp means the instance was still alive at
+    manifest-write time -> open upper bound; a tree pid with no interval data at
+    all (older manifest, recorder stopped early) also degrades to an open window.
+    Both degradations point toward POLICING (never 'assume dead'). Identity vs
+    instance for REMOVED entries: a removal has no event timestamp in either
+    manifest, so a tree-pid token polices it unconditionally -- the fail-closed
+    direction; the run-window/stale guards never apply to REMOVED.
     """
     entry_ts: int | None = None
     if change in ("ADDED", "MODIFIED") and post_fp is not None:
@@ -268,7 +312,7 @@ def classify_causal_delta(
             return OURS
 
     tree_pids = attribution["tree_pids"]
-    pid_first_seen = attribution.get("pid_first_seen") or {}
+    pid_intervals = attribution.get("pid_intervals") or {}
     top_name = rel.split("/", 1)[0]
     saw_pid_instance_mismatch = False
     if tree_pids:
@@ -276,17 +320,25 @@ def classify_causal_delta(
             pid = int(token)
             if pid not in tree_pids:
                 continue
-            first_seen_ns = pid_first_seen.get(pid)
-            if (
-                first_seen_ns is not None
-                and entry_ts is not None
-                and entry_ts < first_seen_ns - skew_ns
-            ):
-                # FIRST-SEEN: the entry predates this pid instance in OUR tree --
-                # the token matches a RECYCLED pid, not our process.
-                saw_pid_instance_mismatch = True
-                continue
-            return OURS
+            if entry_ts is None:
+                # REMOVED: no event timestamp exists for a deletion, so instance
+                # windows cannot apply. A tree-pid token polices it (fail closed).
+                return OURS
+            intervals = pid_intervals.get(pid)
+            if not intervals:
+                # In our tree but without lifetime data (older manifest / recorder
+                # stopped early): open window, never 'assume dead'. The upstream
+                # run-window guard has already excluded pre-run entries.
+                return OURS
+            for first_seen_ns, last_seen_ns in intervals:
+                if entry_ts < first_seen_ns - skew_ns:
+                    continue  # entry predates this instance
+                if last_seen_ns is not None and entry_ts > last_seen_ns + skew_ns:
+                    continue  # entry postdates this instance's exit (attempt 7)
+                return OURS
+            # Every instance of this pid in our tree was dead (or unborn) when the
+            # entry was written -- the token matches a RECYCLED pid, not our process.
+            saw_pid_instance_mismatch = True
     if saw_pid_instance_mismatch:
         return PID_INSTANCE
     return FOREIGN
@@ -808,10 +860,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
     skew_ns = skew_margin_ns(config)
     run_started_ns = resolve_run_started_ns(attribution, before)
     if attribution is not None:
+        interval_count = sum(len(spans) for spans in attribution["pid_intervals"].values())
+        open_count = sum(
+            1
+            for spans in attribution["pid_intervals"].values()
+            for _, last in spans
+            if last is None
+        )
         print(
             f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: launcher_pid={attribution['launcher_pid']}, "
             f"{len(attribution['tree_pids'])} tree PID(s), "
-            f"{len(attribution['pid_first_seen'])} first-seen stamp(s), "
+            f"{interval_count} instance interval(s) ({open_count} open), "
             f"{len(attribution['owned_paths'])} owned path(s), "
             f"run_started_ns={run_started_ns}, skew_ns={skew_ns} from {attribution['path']}"
         )
@@ -905,26 +964,43 @@ def sandbox_env(sandbox: Path, args: argparse.Namespace) -> dict[str, str]:
 
 
 def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
-    """Run `command` on Windows inside a Job Object, returning (proc, tree_pids).
+    """Run `command` on Windows inside a Job Object.
 
-    Descendants auto-join the job, so polling its process-id list while the child
-    runs captures the causal process tree (the same primitive the launcher uses for
-    the aggregate). Best-effort: any Win32 failure falls back to the direct child
-    PID rather than crashing the gate.
+    Returns (proc, tree_pids, pid_first_seen, pid_intervals). Descendants
+    auto-join the job, so polling its process-id list while the child runs
+    captures the causal process tree (the same primitive the launcher uses for
+    the aggregate). Instance lifetimes: a pid present in one poll and absent in
+    the next has exited -- its interval closes at that poll's time; a pid that
+    reappears later is a NEW instance and opens a new interval (attempt 7:
+    attribution is per pid INSTANCE, never per pid identity). A pid still
+    present at the last poll keeps an open (null) upper bound -- never 'assume
+    dead'. Best-effort: any Win32 failure falls back to the direct child PID.
     """
     import ctypes
     from ctypes import wintypes
 
     tree_pids: set[int] = set()
     pid_first_seen: dict[int, int] = {}
+    pid_intervals: dict[int, list[list[int | None]]] = {}
+    live: set[int] = set()
 
-    def note_pid(pid: int) -> None:
+    def note_pid(pid: int, now_ns: int) -> None:
         if pid not in tree_pids:
             tree_pids.add(pid)
-            pid_first_seen[pid] = time.time_ns()
+            pid_first_seen[pid] = now_ns
+        if pid not in live:
+            live.add(pid)
+            pid_intervals.setdefault(pid, []).append([now_ns, None])
+
+    def close_absent(current: set[int], now_ns: int) -> None:
+        for pid in list(live - current):
+            live.discard(pid)
+            spans = pid_intervals.get(pid)
+            if spans and spans[-1][1] is None:
+                spans[-1][1] = now_ns
 
     proc = subprocess.Popen(command, cwd=cwd, env=env)
-    note_pid(proc.pid)
+    note_pid(proc.pid, time.time_ns())
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         job = kernel32.CreateJobObjectW(None, None)
@@ -949,8 +1025,13 @@ def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
             if kernel32.QueryInformationJobObject(
                 job, job_basic_process_id_list, ctypes.byref(info), ctypes.sizeof(info), None
             ):
+                now_ns = time.time_ns()
+                current: set[int] = set()
                 for index in range(min(info.NumberOfProcessIdsInList, capacity)):
-                    note_pid(int(info.ProcessIdList[index]))
+                    pid = int(info.ProcessIdList[index])
+                    current.add(pid)
+                    note_pid(pid, now_ns)
+                close_absent(current, now_ns)
 
         while proc.poll() is None:
             poll_pids()
@@ -959,7 +1040,8 @@ def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
         kernel32.CloseHandle(job)
     except OSError:
         proc.wait()
-    return proc, tree_pids, pid_first_seen
+    intervals = {pid: [(span[0], span[1]) for span in spans] for pid, spans in pid_intervals.items()}
+    return proc, tree_pids, pid_first_seen, intervals
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -988,12 +1070,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Capture the WHOLE descendant tree causally via a Job Object so an escape
         # by a grandchild is still attributed to this run (the launcher uses the
         # same primitive for the aggregate). Falls back to the direct child PID.
-        proc, tree_pids, pid_first_seen = run_in_job(args.command, cwd=args.cwd or ROOT, env=env)
+        proc, tree_pids, pid_first_seen, pid_intervals = run_in_job(
+            args.command, cwd=args.cwd or ROOT, env=env
+        )
     else:
         proc = subprocess.Popen(args.command, cwd=args.cwd or ROOT, env=env)
         proc.wait()
         tree_pids = {proc.pid}
         pid_first_seen = {proc.pid: run_started_ns}
+        pid_intervals = {proc.pid: [(run_started_ns, time.time_ns())]}
 
     print("=== protected roots AFTER ===")
     after = snapshot(config)
@@ -1013,6 +1098,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "run_started_unix_ns": run_started_ns,
             "tree_pids": tree_pids,
             "pid_first_seen": pid_first_seen,
+            "pid_intervals": pid_intervals,
             "owned_paths": set(),
         }
     skew_ns = skew_margin_ns(config)
