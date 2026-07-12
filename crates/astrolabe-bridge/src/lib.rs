@@ -3000,6 +3000,21 @@ mod tests {
             s.push_str(&real);
             s
         };
+        // Beyond ~32767 bytes the Windows DLL loader stops resolving directories
+        // that sit past that mark, so the junk-first shape used below for the
+        // 4226/8192 cases kills the child at load time (runtime DLLs live in the
+        // real PATH suffix). Keep the real PATH as the PREFIX for the 33 KB case:
+        // the child stays launchable and libcbm still reads all 33 000 bytes.
+        let make_real_first = |target: usize| -> String {
+            let mut s = real.clone();
+            s.push_str(sep);
+            let mut i = 0usize;
+            while s.len() < target {
+                s.push_str(&format!("{seg}{i:06}{sep}"));
+                i += 1;
+            }
+            s
+        };
         // baseline (real PATH), operator-size (~4226 B), ~8 KB, ~33 KB (beyond the
         // 32767-char SetEnvironmentVariable maximum — the #267 design correction
         // removed the artificial read cap, so a PATH the OS lets a child inherit is
@@ -3009,7 +3024,10 @@ mod tests {
             ("baseline", Some(real.clone())),
             ("oversize_4226", Some(make(4226))),
             ("oversize_8192", Some(make(8192))),
-            ("oversize_33000_beyond_setvar_max", Some(make(33000))),
+            (
+                "oversize_33000_beyond_setvar_max",
+                Some(make_real_first(33000)),
+            ),
             ("unset", None),
         ];
         for (case, path_value) in cases {
@@ -3045,7 +3063,10 @@ mod tests {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             assert!(
                 out.status.success(),
-                "[{case}] probe failed:\n{stdout}\n{stderr}"
+                "[{case}] probe failed (status {:?} — an empty-output instant death \
+                 here usually means the DLL loader could not resolve the runtime \
+                 DLLs from the synthetic PATH):\n{stdout}\n{stderr}",
+                out.status
             );
             assert!(
                 stdout.contains(&format!("path-buffer case passed: {case}")),
