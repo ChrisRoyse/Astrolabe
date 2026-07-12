@@ -133,6 +133,26 @@ if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
 else
   "$CARGO_BIN" test --workspace
 fi
+# #240/#246/#248: the binary-driving checks below run the astrolabe /
+# codebase-memory-mcp binaries and, without an explicit store, resolve
+# CBM_CACHE_DIR->HOME->USERPROFILE to the operator's REAL
+# ~/.cache/codebase-memory-mcp -- opening _config.db (the migration dial) there and
+# churning its WAL sidecars, which the #237 no-escape gate (correctly) flags as an
+# escape of the exclusive cbm_project_store_home_cache root. Point every downstream
+# check at a run-scoped store under target/ so none touches the operator's real store
+# (check-*.py that already set their own CBM_CACHE_DIR override this per-subprocess).
+# Set AFTER the workspace test so the cbm-sys/bridge tests -- which assert real-store
+# behavior and include $HOME-hardcoded CBM cases -- run unaffected.
+CBM_STORE_SANDBOX="$ROOT/target/cbm-store-sandbox"
+mkdir -p "$CBM_STORE_SANDBOX"
+# The native astrolabe/codebase-memory-mcp binaries need a Windows path here. Git
+# Bash auto-mangles TMP/TEMP/TMPDIR for native children but NOT CBM_CACHE_DIR, so an
+# MSYS "/c/..." value would reach the binary verbatim and be rejected/misresolved --
+# convert to the mixed "C:/..." form (as check-astrolabe-verify-chain.sh does).
+if command -v cygpath >/dev/null 2>&1; then
+  CBM_STORE_SANDBOX="$(cygpath -m "$CBM_STORE_SANDBOX")"
+fi
+export CBM_CACHE_DIR="$CBM_STORE_SANDBOX"
 bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
