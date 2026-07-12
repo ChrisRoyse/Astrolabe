@@ -72,6 +72,11 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py
 "$PYTHON_BIN" scripts/test-egress-platform.py
 "$PYTHON_BIN" scripts/test-release-predicate.py
+# #19: pure-Python shadow-parity whitelist/dashboard self-test. Needs no binaries,
+# so it runs on every host: proves the whitelist is load-bearing (empty-whitelist
+# control bites), the dashboard schema golden + history/trend retention hold, and
+# malformed/duplicate whitelist entries fail closed.
+"$PYTHON_BIN" scripts/check-shadow-parity.py --selftest
 "$PYTHON_BIN" scripts/test-check-hazard-suite.py
 "$PYTHON_BIN" scripts/test-check-no-escape.py
 "$PYTHON_BIN" scripts/test-cbm-spawn-patch.py
