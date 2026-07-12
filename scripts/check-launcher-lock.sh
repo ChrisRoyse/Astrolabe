@@ -21,5 +21,5 @@ esac
 
 # The native Windows launcher and its PowerShell lock helper have no meaning off Windows.
 # Per the Windows-only directive this is a deferred port-phase concern, disclosed not silent.
-echo "DEFERRED[ASTRO_PORT_PHASE]: launcher-lock FSV is native-Windows only (scripts/test-launcher-lock.ps1); not run on $(uname -s)"
+echo "DEFERRED[ASTRO_PORT_PHASE]: launcher-lock FSV is native-Windows only (scripts/test-launcher-lock.ps1); not run on $(uname -s). Tracked in #238; not passing evidence."
 exit 0
