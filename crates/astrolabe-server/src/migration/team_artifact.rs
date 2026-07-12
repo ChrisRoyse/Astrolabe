@@ -117,7 +117,7 @@ pub(crate) fn team_artifact_export_refusal(status: ShadowRefreshStatus) -> Optio
             "{ASTRO_TEAM_ARTIFACT_BUSY}: shadow import is owned by another process; remediation: retry export after index_status reports shadow_import.status=current"
         )),
         ShadowRefreshStatus::StaleReindexRequired => Some(format!(
-            "{ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED}: the CBM source changed since the last shadow import, and index_status refused to reconcile it because the only refresh available to the read path has no CBM tool runner and would overwrite the provenance, security screen, skill tree, bridge, kernel context, and anomaly surfaces with \"unavailable\"; those surfaces are preserved. Exporting now would ship a team artifact whose vault no longer matches its CBM source. Remediation: rerun index_repository with calyx=\"shadow\" for this project, then retry the export"
+            "{ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED}: the CBM source changed since the last shadow import, and index_status refused to reconcile it because the only refresh available to the read path has no CBM tool runner and would overwrite the provenance, security screen, skill tree, bridge, kernel context, and anomaly surfaces with \"unavailable\"; those surfaces are preserved. Exporting now would ship a team artifact whose vault no longer matches its CBM source; remediation: rerun index_repository with calyx=\"shadow\" for this project, then retry the export"
         )),
     }
 }
