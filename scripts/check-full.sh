@@ -110,8 +110,14 @@ CC_BIN="${CC:-$DEFAULT_CC}"
 CXX_BIN="${CXX:-$DEFAULT_CXX}"
 
 echo "=== Portable Astrolabe aggregate (workspace test deadline: ${WORKSPACE_TEST_TIMEOUT_SECS}s) ==="
+# #280: the aggregate tier defeats check.sh's Tier-1 self-test change-gate so no
+# gate-tooling coverage is lost. ASTRO_GATE_SELFTESTS=all runs every gate-tooling
+# self-test regardless of the change-gate manifest. The Tier-1 heavy-test tiering
+# needs no override here: ci-rust-gate.sh (which this aggregate runs) runs the
+# FULL workspace nextest (default profile, every test) and the doctests.
 if ASTROLABE_TARGET_CLEANUP_OWNER="$TARGET_CLEANUP_OWNER" \
   ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS="$WORKSPACE_TEST_TIMEOUT_SECS" \
+  ASTRO_GATE_SELFTESTS=all \
   bash scripts/check.sh; then
   :
 else

@@ -89,16 +89,39 @@ def validate(root: Path) -> list[str]:
     require(check, "scripts/test-no-escape-attribution.py", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py snapshot", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py verify", "scripts/check.sh", errors)
+    # #280: the standalone `cargo build --workspace` was dropped (cargo test
+    # --workspace builds a superset); the no-escape bracket now spans the test
+    # phase. The snapshot must still precede the test phase and the verify follow
+    # it, and a fail-closed binary-existence assertion must guard the dropped
+    # build so a missing bin is a hard error, never a silent skip.
     require_order(
         check,
         (
             "scripts/check-no-escape.py snapshot",
-            "build --workspace",
+            "scripts/check-workspace-tests.py",
             "scripts/check-no-escape.py verify",
         ),
         "scripts/check.sh",
         errors,
     )
+    require(check, "ASTRO_DEBUG_BINARY_MISSING", "scripts/check.sh", errors)
+    # #280: the gate-tooling self-tests are change-gated through this driver, and
+    # the fail-closed mechanism itself is proven by an unconditional meta-test.
+    require(check, "scripts/run-gate-selftests.py", "scripts/check.sh", errors)
+    require(check, "scripts/test-run-gate-selftests.py", "scripts/check.sh", errors)
+    # #280 + #264: Tier-1 runs the nextest `fast` profile (heavy tests tiered out
+    # via .config/nextest.toml default-filter; full set + doctests owned by
+    # ci-rust-gate.sh). Both Tier-1 omissions are counted skip lines.
+    require(check, "--nextest-profile fast", "scripts/check.sh", errors)
+    require(check, "SKIP[ASTRO_FAST_TIER_HEAVY_TESTS]", "scripts/check.sh", errors)
+    require(check, "SKIP[ASTRO_FAST_TIER_DOCTESTS]", "scripts/check.sh", errors)
+    # #280: the dropped `cargo build --workspace` is replaced by a targeted bin
+    # build (nextest may not build [[bin]] targets) plus the fail-closed assertion.
+    require(check, "build -p astrolabe-server --bins", "scripts/check.sh", errors)
+    # #264: ci-rust-gate.sh (the tier check-full runs) runs the full workspace
+    # nextest (every test, incl. the heavy pair) and the doctests.
+    require(rust_gate, "cargo nextest run --workspace", "scripts/ci-rust-gate.sh", errors)
+    require(rust_gate, "cargo test --workspace --doc", "scripts/ci-rust-gate.sh", errors)
     # #246: every path that RUNS workspace/Calyx tests must self-contain
     # std::env::temp_dir() to the run-scoped suite-tmp sandbox, so no invocation
     # leaks calyx-* / astrolabe-* scratch into the operator's real %TEMP%. The #237
@@ -217,9 +240,17 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    # #280: check.sh formats only workspace-local crates; vendor/ is byte-pinned
+    # by verify-pins and full-graph-formatted by the Rust gate below.
     require(
         check,
-        "scripts/native-cargo-fmt.py --all -- --check",
+        "scripts/native-cargo-fmt.py --all --workspace-only -- --check",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "INFO[ASTRO_FMT_VENDOR_EXCLUDED]",
         "scripts/check.sh",
         errors,
     )
@@ -344,6 +375,9 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(full, "scripts/clean-target.sh", "scripts/check-full.sh", errors)
+    # #280: the aggregate tier must run the FULL self-test suite, defeating the
+    # Tier-1 change-gate, so no gate-tooling coverage is lost by the check.sh diet.
+    require(full, "ASTRO_GATE_SELFTESTS=all", "scripts/check-full.sh", errors)
     # #193: the C phases run concurrently. That is only safe to keep if a failure
     # in ANY phase still fails the aggregate with its phase named, and if every
     # started phase is waited on before cleanup. Both are load-bearing.

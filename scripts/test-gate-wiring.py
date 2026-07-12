@@ -78,8 +78,10 @@ def main() -> int:
         check = fixture / "scripts/check.sh"
         rewrite(
             check,
-            'bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform',
-            '"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform\nbash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
+            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n'
+            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"',
+            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"\n'
+            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
         )
         require_error(checker.validate(fixture), "portable-before-egress order")
         copy_fixture(fixture)
@@ -92,71 +94,45 @@ def main() -> int:
         require_error(checker.validate(fixture), "allow-unsupported-platform")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-check-libcbm-symbols.py\n',
-            "",
-        )
+        # #280: the gate-tooling self-tests are now listed in a bash array and
+        # dispatched through scripts/run-gate-selftests.py, and several always-run
+        # static gates are grouped through gate_group. The wiring contract still
+        # requires each script's path to appear in check.sh, so renaming the path
+        # (breaking the wiring) must still be caught. Substring swaps are robust
+        # to the exact invocation form.
+        rewrite(check, "scripts/test-check-libcbm-symbols.py", "scripts/removed-1.py")
         require_error(checker.validate(fixture), "test-check-libcbm-symbols.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-cbm-lint-platform.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-cbm-lint-platform.py", "scripts/removed-2.py")
         require_error(checker.validate(fixture), "test-cbm-lint-platform.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-cbm-format-overlay.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-cbm-format-overlay.py", "scripts/removed-3.py")
         require_error(checker.validate(fixture), "test-cbm-format-overlay.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-parity-corpus-contract.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-parity-corpus-contract.py", "scripts/removed-4.py")
         require_error(checker.validate(fixture), "test-parity-corpus-contract.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-native-cargo-fmt.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-native-cargo-fmt.py", "scripts/removed-5.py")
         require_error(checker.validate(fixture), "test-native-cargo-fmt.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-verify-chain-native-path.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-verify-chain-native-path.py", "scripts/removed-6.py")
         require_error(
             checker.validate(fixture), "test-verify-chain-native-path.py"
         )
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-native-binary-resolution.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-native-binary-resolution.py", "scripts/removed-7.py")
         require_error(
             checker.validate(fixture), "test-native-binary-resolution.py"
         )
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-installer-roundtrip-fixture.py", "scripts/removed-8.py")
         require_error(
             checker.validate(fixture), "test-installer-roundtrip-fixture.py"
         )
@@ -164,8 +140,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py\n',
-            "",
+            "scripts/check-windows-gnu-toolchain-contract.py",
+            "scripts/removed-9.py",
         )
         require_error(
             checker.validate(fixture), "check-windows-gnu-toolchain-contract.py"
@@ -174,8 +150,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/test-windows-gnu-toolchain-contract.py\n',
-            "",
+            "scripts/test-windows-gnu-toolchain-contract.py",
+            "scripts/removed-10.py",
         )
         require_error(
             checker.validate(fixture), "test-windows-gnu-toolchain-contract.py"
@@ -184,8 +160,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py\n',
-            "",
+            "scripts/check-native-aggregate-wrapper.py",
+            "scripts/removed-11.py",
         )
         require_error(
             checker.validate(fixture), "check-native-aggregate-wrapper.py"
@@ -194,8 +170,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py\n',
-            "",
+            "scripts/test-native-aggregate-wrapper.py",
+            "scripts/removed-12.py",
         )
         require_error(
             checker.validate(fixture), "test-native-aggregate-wrapper.py"
@@ -204,10 +180,13 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check\n',
-            "",
+            "--all --workspace-only -- --check",
+            "--all -- --check",
         )
-        require_error(checker.validate(fixture), "native-cargo-fmt.py --all -- --check")
+        require_error(
+            checker.validate(fixture),
+            "native-cargo-fmt.py --all --workspace-only -- --check",
+        )
         copy_fixture(fixture)
 
         rust_gate = fixture / "scripts/ci-rust-gate.sh"
