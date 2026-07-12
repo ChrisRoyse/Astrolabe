@@ -89,13 +89,19 @@ def default_ui_binary():
 
 def build_ui_binary():
     exe = ".exe" if os.name == "nt" else ""
+    # #274: build cbm-with-ui through the Astrolabe-owned patched Makefile — the
+    # same drop-in build_upstream() uses for `cbm` — so both binaries resolve the
+    # compiler family (and thus the GCC-only -Wno-* suppression set) through the
+    # single deterministic, fail-closed probe. Using the vendored Makefile here
+    # instead re-opened the exact cbm-vs-cbm-with-ui divergence #229 observed:
+    # two Makefiles, two independent (formerly silent-flipping) IS_GCC probes.
     run(
         [
             "make",
             "-C",
             ROOT / "vendor" / "codebase-memory-mcp",
             "-f",
-            "Makefile.cbm",
+            ROOT / "patches" / "cbm" / "Makefile.cbm",
             "BUILD_DIR=../../target/cbm-ui-smoke",
             "cbm-with-ui",
         ],
