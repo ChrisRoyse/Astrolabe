@@ -83,8 +83,13 @@ def discover_writers() -> set[tuple[str, str, str]]:
         if rust_prod_lines.is_test_only_file(path, test_files, test_dirs):
             continue
         relative = path.relative_to(ROOT).as_posix()
+        # Blank comments and string/char literals before matching so a doc-comment
+        # or string mention of a writer method name is not miscounted as a
+        # production call site. code_view preserves line/column positions, so
+        # enclosing_function still resolves correctly. This mirrors how
+        # verify_writer_methods_cover_api already reads the source (#118 parity).
         lines = rust_prod_lines.strip_test_spans(
-            path.read_text(encoding="utf-8").splitlines()
+            rust_prod_lines.code_view(path.read_text(encoding="utf-8")).splitlines()
         )
         for index, line in enumerate(lines):
             for method in WRITER_METHODS:
