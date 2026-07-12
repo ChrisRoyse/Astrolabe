@@ -2943,6 +2943,26 @@ mod tests {
     #[ignore = "spawned as a subprocess by cbm_install_plan_reads_oversized_path_without_truncation"]
     fn cbm_path_buffer_child_probe() {
         let case = std::env::var("ASTRO_BRIDGE_PATH_CASE").expect("parent selects a case");
+        if case == "unset" {
+            // The child must LAUNCH with a normal PATH (the GNU-linked test binary
+            // resolves its runtime DLLs through it — with no PATH the loader kills
+            // the process with STATUS_DLL_NOT_FOUND before any user code). To probe
+            // the unset branch libcbm actually reads, strip PATH from the C
+            // runtime's environ in-process: libcbm's find_in_path walks _environ,
+            // which SetEnvironmentVariableW-based std::env does NOT touch.
+            #[cfg(windows)]
+            {
+                unsafe extern "C" {
+                    fn _putenv(assignment: *const std::os::raw::c_char) -> std::os::raw::c_int;
+                }
+                let rc = unsafe { _putenv(c"PATH=".as_ptr()) };
+                assert_eq!(rc, 0, "_putenv must remove PATH from the CRT environ");
+            }
+            #[cfg(not(windows))]
+            unsafe {
+                std::env::remove_var("PATH")
+            };
+        }
         let path_len = std::env::var_os("PATH").map(|p| p.len()).unwrap_or(0);
         println!("path-buffer case={case} PATH_bytes_before={path_len}");
         cbm_sys::initialize_allocator_bindings_first();
@@ -3067,13 +3087,11 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("ASTRO_BRIDGE_PATH_CASE", case);
-            match &path_value {
-                Some(value) => {
-                    child.env("PATH", value);
-                }
-                None => {
-                    child.env_remove("PATH");
-                }
+            // `None` (the unset case) keeps the parent's PATH so the child can
+            // LOAD (runtime DLLs resolve through it); the probe then strips PATH
+            // from the CRT environ itself before touching libcbm.
+            if let Some(value) = &path_value {
+                child.env("PATH", value);
             }
             let out = child.output().expect("spawn path-buffer probe");
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
