@@ -166,6 +166,11 @@ DEPENDENCIES: dict[str, list[str]] = {
         "scripts/check-hook-contracts.py",
         "ci/hook-contracts.json",
     ],
+    "test-cbm-worker-diag-patch.py": [
+        "patches/cbm/apply_worker_diag_patch.py",
+        "patches/cbm/env_apply_store_patch.py",
+        "patches/cbm/astro_overlay.py",
+    ],
 }
 
 
