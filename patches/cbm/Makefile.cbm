@@ -711,6 +711,175 @@ LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_SQLITE3_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_DEPFLAGS)
 
+# ── BEGIN Astrolabe #227/#228: shell-free git spawn + validator overlays ──────
+#
+# #227: CBM's git helpers composed a command STRING for cbm_popen, which runs
+# `cmd.exe /c <string>` on Windows (the CRT's _popen "executes a spawned copy of
+# the command processor") and `/bin/sh -c <string>` on POSIX. cmd.exe performs
+# %VAR% substitution and ^ escaping at PARSE time — before quoting applies — so
+# no quoting of an interpolated repo path can make the string inert, and every
+# new metacharacter class becomes another blocklist entry. These overlays route
+# every git shell-out through cbm_spawn_capture (patches/cbm/astro_spawn.c),
+# which spawns git with an explicit argv via CreateProcessW / posix_spawnp: no
+# shell, therefore nothing to escape.
+#
+# #228: the C validator cbm_validate_shell_arg gains the Windows % ^ ! rejection
+# the Rust bridge validator got in #136 (defence in depth, not the only barrier).
+#
+# Overlays are hash-checked and build-local: the generators read the pinned
+# vendor bytes, verify their sha256, and write into $(LIBCBM_DIR). They never
+# write into vendor/codebase-memory-mcp.
+ASTRO_SPAWN_SRC = $(ASTROLABE_PATCH_DIR)/astro_spawn.c
+ASTRO_SPAWN_HDR = $(ASTROLABE_PATCH_DIR)/astro_spawn.h
+ASTRO_SPAWN_OBJ = $(LIBCBM_DIR)/astro_spawn.o
+ASTRO_OVERLAY_LIB = $(ASTROLABE_PATCH_DIR)/astro_overlay.py
+
+ASTRO_SPAWN_GIT_CONTEXT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_git_context_patch.py
+ASTRO_SPAWN_GIT_CONTEXT_SRC = src/git/git_context.c
+ASTRO_SPAWN_GIT_CONTEXT_OVERLAY = $(LIBCBM_DIR)/src/git/git_context.c
+ASTRO_SPAWN_GIT_CONTEXT_OBJ = $(LIBCBM_DIR)/src/git/git_context.o
+
+ASTRO_SPAWN_ARTIFACT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_artifact_patch.py
+ASTRO_SPAWN_ARTIFACT_SRC = src/pipeline/artifact.c
+ASTRO_SPAWN_ARTIFACT_OVERLAY = $(LIBCBM_DIR)/src/pipeline/artifact.c
+ASTRO_SPAWN_ARTIFACT_OBJ = $(LIBCBM_DIR)/src/pipeline/artifact.o
+
+ASTRO_SPAWN_WATCHER_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_watcher_patch.py
+ASTRO_SPAWN_WATCHER_SRC = src/watcher/watcher.c
+ASTRO_SPAWN_WATCHER_OVERLAY = $(LIBCBM_DIR)/src/watcher/watcher.c
+ASTRO_SPAWN_WATCHER_OBJ = $(LIBCBM_DIR)/src/watcher/watcher.o
+
+ASTRO_SPAWN_GITHISTORY_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_githistory_patch.py
+ASTRO_SPAWN_GITHISTORY_SRC = src/pipeline/pass_githistory.c
+ASTRO_SPAWN_GITHISTORY_OVERLAY = $(LIBCBM_DIR)/src/pipeline/pass_githistory.c
+ASTRO_SPAWN_GITHISTORY_OBJ = $(LIBCBM_DIR)/src/pipeline/pass_githistory.o
+
+ASTRO_SHELLARG_STR_UTIL_PATCH = $(ASTROLABE_PATCH_DIR)/apply_shellarg_str_util_patch.py
+ASTRO_SHELLARG_STR_UTIL_SRC = src/foundation/str_util.c
+ASTRO_SHELLARG_STR_UTIL_OVERLAY = $(LIBCBM_DIR)/src/foundation/str_util.c
+ASTRO_SHELLARG_STR_UTIL_OBJ = $(LIBCBM_DIR)/src/foundation/str_util.o
+
+# The spawn helper compiles as an ordinary libcbm object; it exports the single
+# cbm_-prefixed symbol cbm_spawn_capture, so the libcbm export filter keeps it.
+LIBCBM_OBJS += $(ASTRO_SPAWN_OBJ)
+
+$(ASTRO_SPAWN_OBJ): $(ASTRO_SPAWN_SRC) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
+
+$(ASTRO_SPAWN_GIT_CONTEXT_OVERLAY): $(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
+                                    $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $(ASTRO_OVERLAY_LIB)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $< $@
+
+$(ASTRO_SPAWN_GIT_CONTEXT_OBJ): $(ASTRO_SPAWN_GIT_CONTEXT_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
+
+$(ASTRO_SPAWN_ARTIFACT_OVERLAY): $(ASTRO_SPAWN_ARTIFACT_SRC) \
+                                 $(ASTRO_SPAWN_ARTIFACT_PATCH) $(ASTRO_OVERLAY_LIB)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_ARTIFACT_PATCH) $< $@
+
+$(ASTRO_SPAWN_ARTIFACT_OBJ): $(ASTRO_SPAWN_ARTIFACT_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
+
+$(ASTRO_SPAWN_WATCHER_OVERLAY): $(ASTRO_SPAWN_WATCHER_SRC) \
+                                $(ASTRO_SPAWN_WATCHER_PATCH) $(ASTRO_OVERLAY_LIB)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_WATCHER_PATCH) $< $@
+
+$(ASTRO_SPAWN_WATCHER_OBJ): $(ASTRO_SPAWN_WATCHER_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
+
+$(ASTRO_SPAWN_GITHISTORY_OVERLAY): $(ASTRO_SPAWN_GITHISTORY_SRC) \
+                                   $(ASTRO_SPAWN_GITHISTORY_PATCH) $(ASTRO_OVERLAY_LIB)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_GITHISTORY_PATCH) $< $@
+
+$(ASTRO_SPAWN_GITHISTORY_OBJ): $(ASTRO_SPAWN_GITHISTORY_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
+
+$(ASTRO_SHELLARG_STR_UTIL_OVERLAY): $(ASTRO_SHELLARG_STR_UTIL_SRC) \
+                                    $(ASTRO_SHELLARG_STR_UTIL_PATCH) $(ASTRO_OVERLAY_LIB)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SHELLARG_STR_UTIL_PATCH) $< $@
+
+# str_util.c includes its own header by local name, exactly like the mem.c
+# overlay: keep the original local-header search path.
+$(ASTRO_SHELLARG_STR_UTIL_OBJ): $(ASTRO_SHELLARG_STR_UTIL_OVERLAY) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<
+
+# The CBM clang-format gate validates the overlay bytes we actually compile,
+# never a vendored file. `?=` matches the definition further down; ci-cbm-lint.sh
+# overrides it on the command line with a temporary workspace.
+ASTRO_FORMAT_OVERLAY_DIR ?= $(BUILD_DIR)/astrolabe-format-overlay
+ASTRO_SPAWN_FORMAT_OVERLAYS = \
+	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
+	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC) \
+	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC) \
+	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC) \
+	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC)
+
+$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC): $(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
+                                                            $(ASTRO_SPAWN_GIT_CONTEXT_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $< $@
+
+$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC): $(ASTRO_SPAWN_ARTIFACT_SRC) \
+                                                         $(ASTRO_SPAWN_ARTIFACT_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_ARTIFACT_PATCH) $< $@
+
+$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC): $(ASTRO_SPAWN_WATCHER_SRC) \
+                                                        $(ASTRO_SPAWN_WATCHER_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_WATCHER_PATCH) $< $@
+
+$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC): $(ASTRO_SPAWN_GITHISTORY_SRC) \
+                                                           $(ASTRO_SPAWN_GITHISTORY_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SPAWN_GITHISTORY_PATCH) $< $@
+
+$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC): $(ASTRO_SHELLARG_STR_UTIL_SRC) \
+                                                            $(ASTRO_SHELLARG_STR_UTIL_PATCH)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_SHELLARG_STR_UTIL_PATCH) $< $@
+
+# Additional prerequisite on the existing gate target (GNU Make merges
+# prerequisites; only lint-format-astrolabe carries a recipe). ci-cbm-lint.sh
+# therefore format-checks these overlays with no change to the script.
+lint-format-astrolabe: astro-lint-format-spawn
+
+astro-lint-format-spawn: $(ASTRO_SPAWN_FORMAT_OVERLAYS)
+	@echo "=== clang-format (Astrolabe #227/#228 spawn overlays) ==="
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=$(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
+		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=$(ASTRO_SPAWN_ARTIFACT_SRC) \
+		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=$(ASTRO_SPAWN_WATCHER_SRC) \
+		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=$(ASTRO_SPAWN_GITHISTORY_SRC) \
+		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=$(ASTRO_SHELLARG_STR_UTIL_SRC) \
+		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC)
+	@# The reviewed spawn helper lives outside the vendor tree, so feed it via
+	@# stdin with a vendor-relative assume-filename to resolve the CBM .clang-format.
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=src/foundation/astro_spawn.c < $(ASTRO_SPAWN_SRC)
+	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
+		--assume-filename=src/foundation/astro_spawn.h < $(ASTRO_SPAWN_HDR)
+# ── END Astrolabe #227/#228 ───────────────────────────────────────────────────
+
 ifneq ($(strip $(LIBCBM_CONFIG_STAMP)),)
 $(LIBCBM_OBJS): $(LIBCBM_CONFIG_STAMP)
 endif
