@@ -125,6 +125,13 @@
       "args": {
         "project": "cli_parity",
         "mode": "verify_chain"
+      },
+      "expect_error": {
+        "_comment": "#243: the 2-line fixture repo carries no provenance blocks, so the REAL shadow-import surface persisted at astrolabe.calyx.cli_parity.provenance_json is status:unavailable and get_provenance fails closed. handle_get_provenance calls provenance_store_for_project before any mode logic (dispatch.rs), so every mode hits this refusal. Substrings pinned from provenance.rs:56 (reason) and :580 (remediation). A provenance regression (a #221-class clobber changing the reason, or a fabricated success) makes a substring absent / isError=false and this gate fails RED.",
+        "message_contains": [
+          "provenance metadata missing; row-sink nodes must declare provenance_lineage",
+          "remediation: rerun index_repository with explicit provenance metadata"
+        ]
       }
     },
     "optimizer_status": {

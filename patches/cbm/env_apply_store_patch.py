@@ -251,6 +251,126 @@ CLI_CONFIG_CACHE_NEW = """    /* #241: see get_cache_dir(). The resolver can fai
     cbm_config_t *cfg = cbm_config_open(cache_dir);
 """
 
+# #267: find_in_path copied PATH into a fixed 4096-byte stack buffer via
+# cbm_safe_getenv, which fails closed (CBM_E_ENV_VALUE_TRUNCATED) on any PATH
+# longer than 4095 bytes. A developer PATH on Windows routinely exceeds 4 KB (the
+# operator's is 4226 B), so cbm_find_cli wrongly reported every installed agent
+# CLI absent every run. Size the copy to PATH's real length by reading the C
+# runtime's environ array directly — the same store cbm_safe_getenv walks — so the
+# fix stays portable (no GetEnvironmentVariableW) and consistent with how CBM reads
+# every other variable. CLI_BUF_4K stays defined (other sites use it); only this
+# function stops truncating.
+CLI_FIND_IN_PATH_OLD = """/* Search for an executable named `name` in the PATH environment variable.
+ * Returns the full path in `out` (max out_sz) if found, else empty string. */
+static bool find_in_path(const char *name, char *out, size_t out_sz) {
+    char path_copy[CLI_BUF_4K];
+    if (!cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+        return false;
+    }
+    char *saveptr;
+    char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
+    while (dir) {
+        snprintf(out, out_sz, "%s/%s", dir, name);
+        if (is_executable(out)) {
+            return true;
+        }
+#ifdef _WIN32
+        /* On Windows executables carry an extension (PATHEXT). A CLI like
+         * opencode is often installed as a .cmd / .ps1 / .exe shim (e.g. via
+         * mise or npm), so the bare-name probe above misses it (#221). Try the
+         * common executable extensions before moving to the next PATH entry. */
+        static const char *const win_exts[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
+        for (int i = 0; win_exts[i]; i++) {
+            snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
+            if (is_executable(out)) {
+                return true;
+            }
+        }
+#endif
+        dir = strtok_r(NULL, PATH_DELIM, &saveptr);
+    }
+    return false;
+}
+"""
+
+CLI_FIND_IN_PATH_NEW = """/* Search for an executable named `name` in the PATH environment variable.
+ * Returns the full path in `out` (max out_sz) if found, else empty string.
+ *
+ * #267: PATH is copied into a heap buffer sized to its actual length rather than
+ * a fixed 4096-byte stack buffer. A developer PATH routinely exceeds 4 KB on
+ * Windows; the old fixed buffer made cbm_safe_getenv fail closed
+ * (CBM_E_ENV_VALUE_TRUNCATED) so find_in_path — and therefore cbm_find_cli —
+ * wrongly reported every installed agent CLI absent. The value is read from the C
+ * runtime's environ array (the same store cbm_safe_getenv walks), so this stays
+ * portable: no GetEnvironmentVariableW, consistent with how CBM reads every other
+ * variable, and the match is byte-identical (case-sensitive "PATH" + '='). */
+static bool find_in_path(const char *name, char *out, size_t out_sz) {
+#if defined(_WIN32)
+    char **cli_environ = _environ;
+#elif defined(__APPLE__)
+    char **cli_environ = *_NSGetEnviron();
+#else
+    extern char **environ;
+    char **cli_environ = environ;
+#endif
+    const char *path_val = NULL;
+    if (cli_environ) {
+        size_t nlen = strlen("PATH");
+        for (char **e = cli_environ; *e; e++) {
+            if (strncmp(*e, "PATH", nlen) == 0 && (*e)[nlen] == '=') {
+                path_val = *e + nlen + CLI_SKIP_ONE;
+                break;
+            }
+        }
+    }
+    if (!path_val || !path_val[0]) {
+        return false;
+    }
+
+    /* Size the copy to PATH's real length. The only refusal is a genuine
+     * allocation failure, which is unrepresentable rather than a truncated guess:
+     * report absent instead of crashing. Any PATH that fits in memory is searched
+     * in full — there is no artificial length cap left to trip. */
+    size_t path_len = strlen(path_val);
+    char *path_copy = malloc(path_len + CLI_SKIP_ONE);
+    if (!path_copy) {
+        return false;
+    }
+    memcpy(path_copy, path_val, path_len + CLI_SKIP_ONE);
+
+    char *saveptr;
+    char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
+    bool found = false;
+    while (dir) {
+        snprintf(out, out_sz, "%s/%s", dir, name);
+        if (is_executable(out)) {
+            found = true;
+            break;
+        }
+#ifdef _WIN32
+        /* On Windows executables carry an extension (PATHEXT). A CLI like
+         * opencode is often installed as a .cmd / .ps1 / .exe shim (e.g. via
+         * mise or npm), so the bare-name probe above misses it (#221). Try the
+         * common executable extensions before moving to the next PATH entry. */
+        static const char *const win_exts[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
+        for (int i = 0; win_exts[i]; i++) {
+            snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
+            if (is_executable(out)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            break;
+        }
+#endif
+        dir = strtok_r(NULL, PATH_DELIM, &saveptr);
+    }
+    free(path_copy);
+    return found;
+}
+"""
+
 # ── src/mcp/mcp.c ─────────────────────────────────────────────────────
 
 MCP_SESSION_DB_OLD = """    const char *home = cbm_get_home_dir();
@@ -317,6 +437,7 @@ PATCHES: dict[str, dict[str, object]] = {
         "edits": [
             (CLI_GET_CACHE_DIR_OLD, CLI_GET_CACHE_DIR_NEW, 1),
             (CLI_CONFIG_CACHE_OLD, CLI_CONFIG_CACHE_NEW, 1),
+            (CLI_FIND_IN_PATH_OLD, CLI_FIND_IN_PATH_NEW, 1),  # #267
         ],
     },
     "src/mcp/mcp.c": {
