@@ -115,6 +115,22 @@ smoke gate:
   `malloc((size_t)n * sizeof(int))` in `compute_call_depth`, where `n` is fed in
   unchecked (a genuine bug: `n` is a clamped search-result count, but nothing in
   the callee enforces the bound).
+- `src/pipeline/pass_definitions.c` — `-Walloc-size-larger-than` on
+  `calloc((size_t)file_count, ...)` (the `local_cache` and namespace-map `rels`
+  allocations) in `cbm_pipeline_pass_definitions`, where the signed `int
+  file_count` parameter is fed in unchecked (a negative count casts to an enormous
+  `size_t`). A single entry guard refuses a negative `file_count` and fails closed
+  with a `{code, message, remediation}` record (`CBM_E_DEFS_FILE_COUNT_RANGE`,
+  returning the existing `CBM_NOT_FOUND` status), narrowing the value to
+  `[0, INT_MAX]` for both allocations; `file_count == 0` stays a valid no-op. No
+  new constant is introduced.
+
+Why these fire despite `GCC_ONLY_FLAGS` (`-Wno-stringop-truncation
+-Wno-alloc-size-larger-than`): those suppressions are gated on the `IS_GCC` shell
+probe (`$(shell echo | $(CC) -dM -E - | grep …)`), which resolves to `no` in the
+native launcher environment, so the prod binaries compile under bare `-Wall
+-Wextra -Werror`. The overlays are the robust root-cause fix that does not depend
+on that fragile probe.
 
 `apply_ui_werror_patch.py` generates hash-checked, build-local overlays with
 **root-cause fixes, not warning suppression**: the two strncpy sites become
@@ -136,5 +152,34 @@ propagating the genuine fixes into the libcbm build (composing with the #227
 Verify with `python -B scripts/test-cbm-ui-werror-patch.py` (source-hash pins,
 persisted overlay-byte readback of each fix, the removed strncpy/unchecked-malloc
 idioms, and the drift/empty/unknown-selector fail-closed triad) plus a native
-Windows-GNU `make -f Makefile.cbm cbm-with-ui` that must link `-Werror`-clean.
-Temporary integration patch; intended for upstreaming to CBM.
+Windows-GNU `make -f patches/cbm/Makefile.cbm cbm-with-ui` that must link
+`-Werror`-clean. Temporary integration patch; intended for upstreaming to CBM.
+
+### #229 build-path + vendor-write containment (integration)
+
+The overlays only engage when `cbm-with-ui` is built through **this** patched
+`Makefile.cbm` (its `PROD_SRCS_UI` substitution wires the overlays and its
+`cbm-with-ui` prerequisites run the generator). `scripts/check-lowered-parity.py`
+`build_ui_binary()` therefore builds through `patches/cbm/Makefile.cbm` with an
+absolute `BUILD_DIR` (exactly as `build_upstream()` builds `cbm`) — never the
+vendored `Makefile.cbm`, which has no overlay substitution and would silently
+compile the raw vendored sources.
+
+The UI build must leave the pinned vendor subtree byte-clean. Two generated
+outputs otherwise land in `vendor/`:
+
+- `src/ui/embedded_assets.c` — the vendored `scripts/embed-frontend.sh` hard-codes
+  this CWD-relative output path. The patched `embed` target runs it from a
+  build-local staging root (`$(BUILD_DIR)/astrolabe-ui-embed`) so the file lands
+  under `BUILD_DIR`; `PROD_SRCS_WITH_ASSETS_UI` compiles that build-local copy, and
+  the recipe fails closed if anything was still written into the vendor subtree.
+- `graph-ui/tsconfig.tsbuildinfo` — a **tracked** file rewritten by `tsc -b`. The
+  patched `frontend` target runs `npx vite build` instead of `npm run build`
+  (= `tsc -b && vite build`); with `noEmit: true`, `tsc -b`'s only artifact is
+  that build-info file, and vite bundles `graph-ui/dist` (gitignored) via esbuild
+  without consuming tsc output — so the emitted assets are identical and no tracked
+  vendor file is touched. (Trade-off: the runtime smoke no longer runs the TS
+  typecheck, which stays upstream CBM's dev-flow concern.)
+
+`build_ui_binary()` asserts `git status --porcelain vendor/codebase-memory-mcp` is
+empty after the build (`assert_vendor_clean`), failing closed on any drift.

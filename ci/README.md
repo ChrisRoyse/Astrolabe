@@ -50,7 +50,6 @@ classified `DEFERRED[ASTRO_PORT_PHASE]` and tracked in issue #238
 | `cbm-cache-path-offenders.md` | `scripts/check-cbm-cache-paths.py` | Allowlist of CBM cache-path construction sites. |
 | `cbm-test-totals.md` | `scripts/ci-cbm-test.sh` | Measured CBM registered-test baseline per platform label. |
 | `cli-parity-fixtures.json` | `scripts/check-cli-parity.py` | CLI parity corpus. |
-| `cli-parity-provenance-seed.json` | `scripts/check-cli-parity.py` | Deterministic provenance seed. |
 | `compat-shim-fixtures.json` | `scripts/check-compat-shim.py` | Compat-shim parity corpus. |
 | `fixtures/` | several gates | Shared fixture inputs. |
 | `hazard-suite.json` | `scripts/check-hazard-suite.py` | Hazard suite declarations. |

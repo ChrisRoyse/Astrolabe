@@ -23,6 +23,14 @@ suppression:
       `head` fills the 64-byte buffer, leaving s->last_head unterminated. The
       strnlen-bounded memcpy + explicit NUL fixes both.
 
+  src/pipeline/pass_definitions.c — -Walloc-size-larger-than, the same class of
+      GENUINE bug: cbm_pipeline_pass_definitions() feeds a signed `int file_count`
+      straight into two calloc((size_t)file_count, ...) calls (the local_cache and
+      namespace-map `rels` allocations). A negative count casts to an enormous
+      size_t. A single entry guard refuses a negative file_count and fails closed
+      with a {code, message, remediation} record, narrowing the value to
+      [0, INT_MAX] for both allocations; file_count == 0 stays a valid no-op.
+
   src/ui/layout3d.c            — -Walloc-size-larger-than, a GENUINE bug surface:
       compute_call_depth() feeds a bare `int n` straight into
       malloc((size_t)n * sizeof(int)). `n` is a search-result count already
@@ -100,6 +108,38 @@ WATCHER_B_NEW = """        }
         s->last_head[head_len] = '\\0';
 """
 
+# ── src/pipeline/pass_definitions.c ───────────────────────────────────
+
+DEFS_OLD = """    cbm_log_info("pass.start", "pass", "definitions", "files", itoa_log(file_count));
+
+    /* Ensure extraction library is initialized */
+    cbm_init();"""
+
+DEFS_NEW = """    cbm_log_info("pass.start", "pass", "definitions", "files", itoa_log(file_count));
+
+    /* #229: `file_count` is a signed count fed unchecked into
+     * calloc((size_t)file_count, ...) twice below — the local_cache allocation
+     * and the namespace-map `rels` allocation. A negative count (a caller
+     * contract violation or an upstream integer wraparound) casts to an enormous
+     * size_t: GCC 14 sees the (size_t)file_count range include [INT_MIN..-1] and
+     * trips -Walloc-size-larger-than under -Werror on native MinGW, and such a
+     * count really would request an absurd allocation. Refuse a negative count
+     * and fail closed with a {code, message, remediation} log record; an empty
+     * file set (file_count == 0) stays valid and flows through as a no-op. The
+     * early return narrows file_count to [0, INT_MAX] for both allocations. */
+    if (file_count < 0) {
+        cbm_log_error("pass.definitions.file_count",
+                      "code", "CBM_E_DEFS_FILE_COUNT_RANGE",
+                      "message", "definitions pass received a negative file_count",
+                      "remediation",
+                      "pass a non-negative file_count; a negative value indicates a "
+                      "caller contract violation or an integer overflow upstream");
+        return CBM_NOT_FOUND;
+    }
+
+    /* Ensure extraction library is initialized */
+    cbm_init();"""
+
 # ── src/ui/layout3d.c ─────────────────────────────────────────────────
 
 LAYOUT_OLD = """    for (int i = 0; i < n; i++)
@@ -141,6 +181,10 @@ PATCHES: dict[str, dict[str, object]] = {
             (WATCHER_A_OLD, WATCHER_A_NEW, "watcher last_head strncpy (HEAD moved)"),
             (WATCHER_B_OLD, WATCHER_B_NEW, "watcher last_head strncpy (baseline)"),
         ],
+    },
+    "src/pipeline/pass_definitions.c": {
+        "sha256": "5a49f941ffd96879ff8fe2c5832862a6cd8a4c9b497eca1b2eacd27fa53d753f",
+        "edits": [(DEFS_OLD, DEFS_NEW, "pass_definitions file_count alloc-size")],
     },
     "src/ui/layout3d.c": {
         "sha256": "c5fcd801d9d390252e07e768c35bc5aca7e90b084f8eab7be8ccf1937ae08541",

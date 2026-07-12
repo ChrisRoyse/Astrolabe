@@ -7,8 +7,10 @@ Verifies patches/cbm/apply_ui_werror_patch.py against the live pinned CBM source
     vendored source untouched on disk (the generator never writes into vendor/);
   * each root-cause fix is actually present in the persisted overlay bytes read
     back from disk — the strnlen+memcpy bounded copies (pass_envscan / watcher)
-    and the fail-closed range guard before the compute_call_depth allocation
-    (layout3d), with the flagged strncpy / unchecked-malloc idioms removed;
+    the fail-closed range guard before the compute_call_depth allocation
+    (layout3d), and the fail-closed negative-file_count guard before the two
+    calloc((size_t)file_count, ...) sites (pass_definitions), with the flagged
+    strncpy / unchecked-malloc idioms removed;
   * the edge-case triad fails closed with {code, message, remediation}:
       - drifted source (byte mutated)         -> ASTRO_OVERLAY_SOURCE_DRIFT
       - a re-applied (already-patched) source  -> fails closed (double-apply)
@@ -30,6 +32,7 @@ PATCH = ROOT / "patches" / "cbm" / "apply_ui_werror_patch.py"
 ENVSCAN = "src/pipeline/pass_envscan.c"
 WATCHER = "src/watcher/watcher.c"
 LAYOUT = "src/ui/layout3d.c"
+DEFS = "src/pipeline/pass_definitions.c"
 
 
 def load_patch_module():
@@ -143,6 +146,42 @@ def main() -> None:
     expect(
         0 <= lay.index(guard) < lay.index("int *q = malloc((size_t)n * sizeof(int));"),
         "layout3d.c: the range guard precedes the malloc it protects",
+    )
+
+    # ── pass_definitions.c: fail-closed negative-file_count guard before calloc ─
+    defs = patched_by_file[DEFS]
+    defs_guard = "if (file_count < 0) {"
+    expect(defs_guard in defs, "pass_definitions.c: guards file_count against a negative count")
+    expect(
+        "CBM_E_DEFS_FILE_COUNT_RANGE" in defs and "remediation" in defs,
+        "pass_definitions.c: guard fails closed with a {code, message, remediation} log record",
+    )
+    expect(
+        "return CBM_NOT_FOUND;" in defs,
+        "pass_definitions.c: the negative-count guard returns a fail-closed status",
+    )
+    # The guard must physically precede BOTH flagged callocs so neither allocation
+    # is reachable with a negative (huge-when-cast) file_count.
+    guard_at = defs.index(defs_guard)
+    expect(
+        0 <= guard_at < defs.index("calloc((size_t)file_count, sizeof(CBMFileResult *))")
+        and guard_at < defs.index("calloc((size_t)file_count, sizeof(char *))"),
+        "pass_definitions.c: the range guard precedes both file_count callocs it protects",
+    )
+    # The vendored calloc call-sites themselves are unchanged (root-cause guard,
+    # not a rewrite of the allocations).
+    expect(
+        "calloc((size_t)file_count, sizeof(char *))" in defs,
+        "pass_definitions.c: the guarded namespace-map calloc is preserved",
+    )
+
+    # A drifted pass_definitions source fails closed on its own hash pin.
+    defs_good = (CBM_ROOT / DEFS).read_text(encoding="utf-8")
+    defs_drifted = defs_good.replace("int file_count) {", "int file_count) { /* moved */", 1)
+    expect_fail_closed(
+        lambda: mod.patch_source(DEFS, defs_drifted),
+        "pass_definitions.c: a drifted source fails closed on the hash pin",
+        code="ASTRO_OVERLAY_SOURCE_DRIFT",
     )
 
     # ── Edge-case triad: drift / empty / unknown selector all fail closed ──────
