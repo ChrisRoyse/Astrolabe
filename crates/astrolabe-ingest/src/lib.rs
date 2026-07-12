@@ -3,6 +3,7 @@
 mod erasure_scrub;
 pub mod fsv;
 mod graph_projection;
+mod label_propagation;
 mod ledger_verify;
 mod registry;
 mod sqlite_import;
@@ -13,6 +14,15 @@ pub use erasure_scrub::{
     WalScrubParams, WalScrubReport, WalScrubStatus, scrub_erased_wal_history, wal_scrub_status,
 };
 pub use fsv::VaultMutationPlan;
+
+pub use label_propagation::{
+    ASTRO_LABEL_PROP_ROW_CORRUPT, LABEL_EDGE_ROW_PREFIX, LABEL_GRAPH_LEDGER_SCHEMA,
+    LABEL_PROPAGATION_LEDGER_SCHEMA, LABEL_SEED_ROW_PREFIX, LABEL_TOMBSTONE_ROW_PREFIX,
+    LabelGraphPersistReport, LivePropagationReport, PROPAGATED_LABEL_ROW_PREFIX,
+    PersistedPropagatedLabel, PropagatedLabelRow, SCHEMA_LABEL_EDGE_ROW, SCHEMA_LABEL_SEED_ROW,
+    SCHEMA_LABEL_TOMBSTONE_ROW, SCHEMA_PROPAGATED_LABEL_ROW, persist_label_graph,
+    propagate_labels_over_vault, read_propagated_label_rows,
+};
 
 pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
