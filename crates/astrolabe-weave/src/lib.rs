@@ -44,10 +44,12 @@ pub use sim_rows::{
     sim_edge_graph_key,
 };
 pub use xterm_rows::{
-    ASTRO_XTERM_CX_ID_MISSING, ASTRO_XTERM_ROW_CORRUPT, EagerCrossTermPersistReport,
+    AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
+    ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect, EagerCrossTermPersistReport,
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
-    agreement_graph_from_persisted_rows, designed_kind_for_slots, eager_xterm_dump_bytes,
-    eager_xterm_key, lazy_agreement, persist_eager_cross_terms, read_eager_cross_term_rows,
+    agreement_graph_aspect, agreement_graph_from_persisted_rows, designed_kind_for_slots,
+    eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
+    read_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

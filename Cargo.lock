@@ -276,6 +276,7 @@ dependencies = [
 name = "astrolabe-server"
 version = "0.1.0"
 dependencies = [
+ "astrolabe-anchors",
  "astrolabe-bridge",
  "astrolabe-domain",
  "astrolabe-guard",
