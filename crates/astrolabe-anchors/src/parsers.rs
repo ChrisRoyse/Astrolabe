@@ -33,6 +33,15 @@ pub enum TestReportFormat {
 }
 
 impl TestReportFormat {
+    /// Every supported format, in stable order.
+    pub const ALL: [Self; 5] = [
+        Self::JunitXml,
+        Self::CargoTestJson,
+        Self::PytestVerbose,
+        Self::GoTestJson,
+        Self::VitestJson,
+    ];
+
     /// Stable wire name for reports and errors.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -42,6 +51,25 @@ impl TestReportFormat {
             Self::GoTestJson => "go_test_json",
             Self::VitestJson => "vitest_json",
         }
+    }
+
+    /// Resolves a wire format name to its enum, fail-closed.
+    ///
+    /// The `anchor_outcome` MCP tool and its `astrolabe cli` subcommand both
+    /// route their `format` argument through this one helper so an unknown
+    /// format refuses identically on both paths with
+    /// [`ASTRO_ANCHOR_PARSE_MALFORMED`] rather than silently guessing a parser.
+    pub fn from_wire(name: &str) -> Result<Self, DomainError> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.as_str() == name)
+            .ok_or_else(|| {
+                DomainError::new(
+                    ASTRO_ANCHOR_PARSE_MALFORMED,
+                    format!("unknown test-report format {name:?}"),
+                    "pass one of: junit_xml, cargo_test_json, pytest_verbose, go_test_json, vitest_json",
+                )
+            })
     }
 }
 

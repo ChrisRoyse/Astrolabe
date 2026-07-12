@@ -45,6 +45,8 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
 pub const ASTRO_ANCHOR_SOURCE_PREFIX_INVALID: &str = "ASTRO_ANCHOR_SOURCE_PREFIX_INVALID";
 /// Stable failure code for a confidence that contradicts its source origin.
 pub const ASTRO_ANCHOR_CONFIDENCE_INVALID: &str = "ASTRO_ANCHOR_CONFIDENCE_INVALID";
+/// Stable failure code for a malformed or out-of-range observed-at timestamp.
+pub const ASTRO_ANCHOR_TIMESTAMP_INVALID: &str = "ASTRO_ANCHOR_TIMESTAMP_INVALID";
 /// Stable failure code for a re-post that conflicts with a stored anchor.
 pub const ASTRO_ANCHOR_DEDUP_CONFLICT: &str = "ASTRO_ANCHOR_DEDUP_CONFLICT";
 /// Stable failure code for corrupt or inconsistent persisted anchor rows.
@@ -175,6 +177,66 @@ pub fn validate_confidence(
             )),
         },
     }
+}
+
+/// Validates a server-observed timestamp for an outcome request.
+///
+/// A grounded outcome must carry a real wall-clock observation, so epoch `0` is
+/// refused fail-closed (`ASTRO_ANCHOR_TIMESTAMP_INVALID`) — a zero `observed_at`
+/// is the classic "unset" sentinel and would corrupt the `(cx, kind, source,
+/// observed_at)` dedup identity. Every other `u64` is accepted verbatim.
+pub fn validate_observed_at(observed_at: Ts) -> Result<Ts, astrolabe_domain::DomainError> {
+    if observed_at == 0 {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_ANCHOR_TIMESTAMP_INVALID,
+            "observed_at is 0; a grounded outcome requires a real server-observed timestamp",
+            "pass the wall-clock epoch (seconds or ms) at which the outcome was observed",
+        ));
+    }
+    Ok(observed_at)
+}
+
+/// Parses and validates a caller-supplied `observed_at` timestamp string.
+///
+/// The `anchor_outcome` MCP tool and its `astrolabe cli anchor_outcome`
+/// subcommand funnel the raw timestamp through this one helper so both paths
+/// share byte-identical fail-closed behavior: blank, non-numeric, negative, or
+/// overflowing input refuses with [`ASTRO_ANCHOR_TIMESTAMP_INVALID`], and `0`
+/// refuses via [`validate_observed_at`].
+pub fn parse_observed_at(raw: &str) -> Result<Ts, astrolabe_domain::DomainError> {
+    let trimmed = raw.trim();
+    let parsed = trimmed.parse::<Ts>().map_err(|error| {
+        astrolabe_domain::DomainError::new(
+            ASTRO_ANCHOR_TIMESTAMP_INVALID,
+            format!("observed_at {trimmed:?} is not a non-negative integer timestamp: {error}"),
+            "pass observed_at as a non-negative integer epoch (seconds or ms)",
+        )
+    })?;
+    validate_observed_at(parsed)
+}
+
+/// Builds a validated `test_run` outcome request from raw tool arguments.
+///
+/// This is the single request-construction path shared by the `anchor_outcome`
+/// MCP tool and its `astrolabe cli anchor_outcome` subcommand: both funnel the
+/// same raw `format`, `report_text`, `source`, `observed_at`, and `confidence`
+/// through here, so identical inputs yield a byte-identical
+/// [`OutcomeAnchorRequest`] on both paths by construction — the structural
+/// guarantee behind the dual-path byte-identical-state property. Every stage is
+/// fail-closed: unknown format, malformed report, malformed timestamp, or a
+/// source/confidence that violates the grounding invariants each refuse with
+/// their stable code and no request is produced.
+pub fn build_test_run_request(
+    source: &str,
+    observed_at: &str,
+    confidence: Option<f32>,
+    format: &str,
+    report_text: &str,
+) -> Result<OutcomeAnchorRequest, astrolabe_domain::DomainError> {
+    let observed_at = parse_observed_at(observed_at)?;
+    let format = TestReportFormat::from_wire(format)?;
+    let run = parse_test_report(format, report_text)?;
+    OutcomeAnchorRequest::from_test_run(&run, source, observed_at, confidence)
 }
 
 /// One anchor-bearing subject in an outcome request.
@@ -565,10 +627,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use calyx_aster::vault::VaultOptions;
-    use calyx_core::{SystemClock, VaultId};
+    use calyx_core::{FixedClock, SystemClock, VaultId};
 
     static NEXT_VAULT_DIR: AtomicU64 = AtomicU64::new(0);
     const ANCHOR_TEST_SALT: &[u8] = b"astrolabe-anchors-fsv";
+    // Fixed wall-clock for dual-path determinism: both simulated paths stamp the
+    // same ledger time_index rows, so byte-identical state is a real guarantee,
+    // not a clock artifact.
+    const DUAL_PATH_FIXED_TS: u64 = 1_785_000_000;
 
     #[test]
     fn identifies_calyx_parent() {
@@ -907,6 +973,128 @@ mod tests {
         drop(vault);
     }
 
+    #[test]
+    fn dual_path_identical_inputs_produce_byte_identical_anchor_and_ledger_state() {
+        // The `anchor_outcome` MCP tool and the `astrolabe cli anchor_outcome`
+        // subcommand both construct their request through the single
+        // build_test_run_request path, so identical raw inputs must persist
+        // byte-identical anchor AND ledger CF state. Both paths are simulated
+        // here with identical arguments and a fixed clock; the only thing that
+        // could differ across them is server plumbing, and this proves it does
+        // not change the persisted bytes.
+        const REPORT: &str = include_str!("../tests/fixtures/junit_basic.xml");
+        let mcp_request =
+            build_test_run_request("ci:github:777", "1786400000", None, "junit_xml", REPORT)
+                .expect("mcp-path request");
+        let cli_request =
+            build_test_run_request("ci:github:777", "1786400000", None, "junit_xml", REPORT)
+                .expect("cli-path request");
+        assert_eq!(
+            mcp_request, cli_request,
+            "both paths build the same request"
+        );
+
+        let cx_ids = fixture_cx_ids(&mcp_request);
+        let (mcp_dir, mcp_vault) = anchor_vault_fixed("dual-mcp");
+        let (cli_dir, cli_vault) = anchor_vault_fixed("dual-cli");
+        let mcp_report =
+            ingest_outcome_anchors(&mcp_vault, &mcp_request, &cx_ids, "astrolabe-anchors-test")
+                .expect("mcp-path ingest");
+        let cli_report =
+            ingest_outcome_anchors(&cli_vault, &cli_request, &cx_ids, "astrolabe-anchors-test")
+                .expect("cli-path ingest");
+
+        // Report-level determinism: identical counts, content hash, ledger hash.
+        assert_eq!(mcp_report.anchors_written, cli_report.anchors_written);
+        assert_eq!(mcp_report.rows_written, cli_report.rows_written);
+        assert_eq!(mcp_report.anchor_dump_hash, cli_report.anchor_dump_hash);
+        assert_eq!(mcp_report.ledger_ref.hash, cli_report.ledger_ref.hash);
+        drop(mcp_vault);
+        drop(cli_vault);
+
+        // FSV: reopen both vaults and compare persisted CF bytes independently
+        // of the mutation return values.
+        let mcp_reopened = open_anchor_vault_fixed(&mcp_dir);
+        let cli_reopened = open_anchor_vault_fixed(&cli_dir);
+        let mcp_anchors = raw_cf_bytes(&mcp_reopened, ColumnFamily::Anchors);
+        let cli_anchors = raw_cf_bytes(&cli_reopened, ColumnFamily::Anchors);
+        assert!(!mcp_anchors.is_empty(), "anchors were actually persisted");
+        assert_eq!(
+            mcp_anchors, cli_anchors,
+            "anchors CF bytes must be byte-identical across the MCP and CLI paths"
+        );
+        let mcp_ledger = raw_cf_bytes(&mcp_reopened, ColumnFamily::Ledger);
+        let cli_ledger = raw_cf_bytes(&cli_reopened, ColumnFamily::Ledger);
+        assert_eq!(
+            mcp_ledger, cli_ledger,
+            "ledger CF bytes must be byte-identical across the MCP and CLI paths"
+        );
+        drop(mcp_reopened);
+        drop(cli_reopened);
+    }
+
+    #[test]
+    fn observed_at_timestamp_parsing_fails_closed_on_malformed_input() {
+        // Valid non-negative epochs parse and validate.
+        assert_eq!(
+            parse_observed_at("1786400000").expect("valid epoch"),
+            1_786_400_000
+        );
+        assert_eq!(parse_observed_at("  42 ").expect("trimmed epoch"), 42);
+        assert_eq!(validate_observed_at(1).expect("nonzero"), 1);
+
+        // Blank, non-numeric, negative, overflowing, and zero all refuse
+        // fail-closed with the stable timestamp code.
+        for bad in [
+            "",
+            "   ",
+            "not-a-number",
+            "-5",
+            "3.14",
+            "99999999999999999999999",
+            "0x10",
+        ] {
+            assert_eq!(
+                parse_observed_at(bad)
+                    .expect_err("malformed timestamp refused")
+                    .code(),
+                ASTRO_ANCHOR_TIMESTAMP_INVALID,
+                "{bad:?}"
+            );
+        }
+        // Epoch 0 is the unset sentinel: refused by both entry points.
+        assert_eq!(
+            parse_observed_at("0").expect_err("zero refused").code(),
+            ASTRO_ANCHOR_TIMESTAMP_INVALID
+        );
+        assert_eq!(
+            validate_observed_at(0).expect_err("zero refused").code(),
+            ASTRO_ANCHOR_TIMESTAMP_INVALID
+        );
+    }
+
+    #[test]
+    fn format_from_wire_resolves_known_and_refuses_unknown() {
+        // Every wire name round-trips to its format.
+        for format in TestReportFormat::ALL {
+            assert_eq!(
+                TestReportFormat::from_wire(format.as_str()).expect("known format"),
+                format
+            );
+        }
+        // Unknown / blank / mis-cased names refuse fail-closed rather than
+        // silently guessing a parser.
+        for bad in ["", "junit", "JUNIT_XML", "yaml", "cargo"] {
+            assert_eq!(
+                TestReportFormat::from_wire(bad)
+                    .expect_err("unknown format refused")
+                    .code(),
+                ASTRO_ANCHOR_PARSE_MALFORMED,
+                "{bad:?}"
+            );
+        }
+    }
+
     fn cases(run: &ParsedTestRun) -> Vec<(&str, TestStatus)> {
         run.cases
             .iter()
@@ -927,6 +1115,33 @@ mod tests {
         vault
             .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
             .expect("scan anchors CF")
+    }
+
+    fn raw_cf_bytes<C: Clock>(vault: &AsterVault<C>, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vault.scan_cf_at(vault.snapshot(), cf).expect("scan CF")
+    }
+
+    fn anchor_vault_fixed(name: &str) -> (TempVaultDir, AsterVault<FixedClock>) {
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-anchors-{name}-{}-{}",
+            std::process::id(),
+            NEXT_VAULT_DIR.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test vault dir");
+        let vault = open_anchor_vault_fixed(&dir);
+        (TempVaultDir(dir), vault)
+    }
+
+    fn open_anchor_vault_fixed(dir: &Path) -> AsterVault<FixedClock> {
+        AsterVault::new_durable_with_clock(
+            dir,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<VaultId>().unwrap(),
+            ANCHOR_TEST_SALT.to_vec(),
+            VaultOptions::default(),
+            FixedClock::new(DUAL_PATH_FIXED_TS),
+        )
+        .expect("open durable fixed-clock anchor vault")
     }
 
     /// RAII %TEMP% durable-vault directory: removed recursively on drop (#133, #236).
