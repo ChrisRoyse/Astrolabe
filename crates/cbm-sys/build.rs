@@ -41,6 +41,20 @@ fn main() {
     let env_store_patch = repo_root.join("patches/cbm/env_apply_store_patch.py");
     let env_store_config_src = repo_root.join("patches/cbm/env_store_config.c");
     let env_store_config_hdr = repo_root.join("patches/cbm/env_store_config.h");
+    // #227/#228: the shell-free git-spawn helper, its shared overlay primitives,
+    // and every generator that routes a CBM git shell-out through it. Each is a
+    // build input exactly like the env-store overlay: a change to any of them
+    // must invalidate every libcbm object so Cargo rebuilds the archive.
+    let spawn_overlays = [
+        repo_root.join("patches/cbm/astro_spawn.c"),
+        repo_root.join("patches/cbm/astro_spawn.h"),
+        repo_root.join("patches/cbm/astro_overlay.py"),
+        repo_root.join("patches/cbm/apply_spawn_git_context_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_artifact_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_watcher_patch.py"),
+        repo_root.join("patches/cbm/apply_spawn_githistory_patch.py"),
+        repo_root.join("patches/cbm/apply_shellarg_str_util_patch.py"),
+    ];
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
     let build_support = manifest_dir.join("build_support.rs");
@@ -57,6 +71,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", env_store_patch.display());
     println!("cargo:rerun-if-changed={}", env_store_config_src.display());
     println!("cargo:rerun-if-changed={}", env_store_config_hdr.display());
+    for spawn_overlay in &spawn_overlays {
+        println!("cargo:rerun-if-changed={}", spawn_overlay.display());
+    }
     // The vendored CBM tree is deliberately NOT watched file-by-file (#192).
     // It is pinned: every sanctioned change lands through the VENDORED.md pin
     // procedure (which rewrites the binding tree SHA below) or through the
@@ -85,14 +102,16 @@ fn main() {
     }
 
     let build_script = manifest_dir.join("build.rs");
-    let config = libcbm_build_config(&[
+    let mut config_inputs: Vec<&Path> = vec![
         &build_script,
         &patched_makefile,
         &mem_pressure_patch,
         &env_store_patch,
         &env_store_config_src,
         &env_store_config_hdr,
-    ]);
+    ];
+    config_inputs.extend(spawn_overlays.iter().map(|p| p.as_path()));
+    let config = libcbm_build_config(&config_inputs);
     // Preserve mtime on no-op reruns so Make only invalidates objects when the
     // effective native build configuration changes.
     write_if_changed(&config_stamp, &config);
