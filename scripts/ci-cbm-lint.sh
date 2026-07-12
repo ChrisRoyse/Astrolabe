@@ -64,7 +64,7 @@ make -f Makefile.cbm lint-cppcheck CPPCHECK="$CPPCHECK_COMMAND"
 # #250: static-analyze the Astrolabe-owned CBM C (patches/cbm/*.c). The vendored
 # lint-cppcheck above only covers vendored sources; these Astrolabe-authored files
 # are the new-code surface most worth analyzing. Same analyzer + ABI ($CPPCHECK_COMMAND
-# already carries --platform=unix64 on non-Linux) so findings stay comparable.
+# already carries the unix64 platform flag on non-Linux) so findings stay comparable.
 echo "=== CBM cppcheck (Astrolabe-owned C #250) ==="
 make -f "$ROOT/patches/cbm/Makefile.cbm" lint-cppcheck-astrolabe CPPCHECK="$CPPCHECK_COMMAND"
 
