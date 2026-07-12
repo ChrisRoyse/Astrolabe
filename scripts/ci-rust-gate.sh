@@ -38,25 +38,39 @@ if [[ -z "$RUSTC_HOST" ]]; then
   echo "ERROR: ci-rust-gate could not determine rustc host triple" >&2
   exit 1
 fi
-# #189: On the native aggregate path, check-full.sh sets ASTROLABE_UNIFIED_TARGET_DIR=1
-# and passes the rustc host as the target. An explicit --target forks a redundant
-# target/<triple>/debug tree that shares nothing with the implicit target/debug tree
-# built by check.sh, forcing a second from-cold compile of the whole workspace + the
-# calyx path-deps + libcbm within one gate run. When the requested target IS the rustc
-# host, drop the redundant --target so every phase reuses one target/debug tree, and
-# point the calyx sub-gate at the same shared target dir. CI (which does not set the
-# flag) keeps its explicit per-triple trees and separate calyx tree unchanged.
-if [[ "${ASTROLABE_UNIFIED_TARGET_DIR:-0}" == "1" && "$TARGET_TRIPLE" == "$RUSTC_HOST" ]]; then
-  TARGET_ARGS=()
-  TARGET_SUBDIR="debug"
-  PARITY_ENV=()
-  CALYX_TARGET_DIR_ARGS=(--target-dir "$ROOT/target")
-else
-  TARGET_ARGS=("${TARGET_ARGS[@]}")
-  TARGET_SUBDIR="$TARGET_TRIPLE/debug"
-  PARITY_ENV=(ASTROLABE_RUST_TARGET="$TARGET_TRIPLE")
-  CALYX_TARGET_DIR_ARGS=()
+
+# ── #189: one artifact tree, never two ──────────────────────────────────────
+#
+# Cargo places artifacts in target/<triple>/debug when --target is passed and in
+# target/debug when it is not -- EVEN WHEN the triple equals the host. The two
+# trees share nothing (Cargo Book, "Build cache": "The directory layout depends
+# on whether or not you are using the --target flag"). So passing an explicit
+# --target equal to the host, while check.sh builds the implicit tree, forced a
+# second from-cold compile of the whole workspace + the 8 Calyx path-deps +
+# libcbm inside a single aggregate run -- the largest wall-clock cost in the
+# local verification loop.
+#
+# Astrolabe is Windows-only scope and check-full.sh asserts HOST_TARGET ==
+# RUSTC_HOST, so the requested target is ALWAYS the host. Drop --target entirely:
+# every phase then shares one target/debug tree, and the Calyx sub-gate is pointed
+# at that same tree instead of forking a third one under vendor/calyx/target.
+#
+# This is behavior-neutral: there is no .cargo/config.toml in this repository, so
+# there are no [target.<triple>] rustflags that dropping --target could fail to
+# apply. (Were any added, they would begin applying to build scripts and proc
+# macros too -- see the Cargo Book note on build.rustflags.)
+#
+# A cross-target request is refused rather than silently producing non-native
+# evidence: a build for another target exercises different code paths and cannot
+# satisfy a Windows DoD.
+if [[ "$TARGET_TRIPLE" != "$RUSTC_HOST" ]]; then
+  echo "ERROR: ASTRO_RUST_GATE_CROSS_TARGET: requested target $TARGET_TRIPLE is not the rustc host $RUSTC_HOST." >&2
+  echo "  message: this gate produces native evidence only; a cross-target build exercises different code paths." >&2
+  echo "  remediation: run the gate on a host of that platform. Cross-platform evidence is DEFERRED[ASTRO_PORT_PHASE] (tracked in #238); see docs/port-phase-deferrals.md." >&2
+  exit 1
 fi
+TARGET_SUBDIR="debug"
+CALYX_TARGET_DIR_ARGS=(--target-dir "$ROOT/target")
 
 run_logged() {
   local name="$1"
@@ -116,18 +130,8 @@ if expected != "dynamic" and run_count != int(expected):
 if run_count != passed:
     print(f"ERROR: {name}: not all nextest tests passed: {summary}", file=sys.stderr)
     sys.exit(1)
-summary_file = pathlib.Path()
-if "GITHUB_STEP_SUMMARY" in __import__("os").environ:
-    summary_file = pathlib.Path(__import__("os").environ["GITHUB_STEP_SUMMARY"])
-    with summary_file.open("a", encoding="utf-8") as handle:
-        handle.write(f"### {name}\n\n")
-        handle.write("| Metric | Count |\n")
-        handle.write("|---|---:|\n")
-        handle.write(f"| Tests run | {run_count} |\n")
-        handle.write(f"| Tests passed | {passed} |\n")
-        if expected != "dynamic":
-            handle.write(f"| Expected at pin | {expected} |\n")
-        handle.write("\n")
+# Counts go to stdout, which is the evidence stream. There is no hosted CI and
+# therefore no step summary to write (#224).
 print(summary)
 PY
 
@@ -144,7 +148,7 @@ run_cbm_sys_asan() {
   set +e
   {
     env CC=clang CXX=clang++ CBM_SYS_ASAN=1 \
-      cargo test -p cbm-sys --test fixtures "${TARGET_ARGS[@]}" --no-run ||
+      cargo test -p cbm-sys --test fixtures --no-run ||
       exit $?
 
     local test_dir="$ROOT/target/$TARGET_SUBDIR/deps"
@@ -189,7 +193,7 @@ run_astrolabe_bridge_asan() {
   set +e
   {
     env CC=clang CXX=clang++ CBM_SYS_ASAN=1 \
-      cargo test -p astrolabe-bridge --lib "${TARGET_ARGS[@]}" --no-run ||
+      cargo test -p astrolabe-bridge --lib --no-run ||
       exit $?
 
     local test_dir="$ROOT/target/$TARGET_SUBDIR/deps"
@@ -231,13 +235,13 @@ run_astrolabe_bridge_asan() {
 
 cd "$ROOT"
 run_logged "astrolabe-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all -- --check
-run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets "${TARGET_ARGS[@]}" -- -D warnings
-run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}"
-run_logged "astrolabe-verify-chain-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/$TARGET_SUBDIR/astrolabe"
+run_logged "astrolabe-clippy-$LABEL" cargo clippy --workspace --all-targets -- -D warnings
+run_nextest "Astrolabe nextest $LABEL" dynamic cargo nextest run --workspace
+run_logged "astrolabe-verify-chain-$LABEL" bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/$TARGET_SUBDIR/astrolabe"
 run_logged "astrolabe-ingest-lscale-bench-$LABEL" bash scripts/bench-ingest-lscale.sh --ci-smoke
 run_logged "libcbm-symbols-$LABEL" bash scripts/check-libcbm-symbols.sh
-run_logged "single-mimalloc-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-single-mimalloc.sh
-run_logged "mcp-parity-$LABEL" env "${PARITY_ENV[@]}" bash scripts/check-mcp-parity.sh
+run_logged "single-mimalloc-$LABEL" bash scripts/check-single-mimalloc.sh
+run_logged "mcp-parity-$LABEL" bash scripts/check-mcp-parity.sh
 if [[ "$TARGET_TRIPLE" != *windows* ]]; then
   run_logged "astrolabe-watchdog-$LABEL" bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/$TARGET_SUBDIR/astrolabe"
 fi
@@ -245,7 +249,7 @@ if [[ "$TARGET_TRIPLE" == *linux-gnu ]]; then
   run_cbm_sys_asan
   run_astrolabe_bridge_asan
 fi
-run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}"
+run_logged "astrolabe-doctest-$LABEL" cargo test --workspace --doc
 
 cd "$ROOT/vendor/calyx"
 # The vendored scripts/cargo-fmt-workspace.sh mapfile-parses Windows python3
@@ -254,7 +258,7 @@ cd "$ROOT/vendor/calyx"
 # pinned, so run our own Windows-safe batching formatter over the same Calyx
 # workspace members instead (upstream fix tracked in ChrisRoyse/Calyx).
 run_logged "calyx-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all --manifest-path "$ROOT/vendor/calyx/Cargo.toml" -- --check
-run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
+run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${CALYX_TARGET_DIR_ARGS[@]}"
 # Vendored Calyx is pinned and never edited locally; at pin 6e0e344 the pinned
 # 1.95 clippy fails -D warnings inside calyx-poly (newer lints firing on older
 # code). Lint hygiene of the pinned tree is upstream-owned: tracked in
@@ -267,5 +271,5 @@ echo "SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]: vendored Calyx clippy is upstream-
 # makes the dataset unfabricatable). Excluded by name until upstream ships a
 # fixture or a self-skip: tracked in Astrolabe #235, fix in ChrisRoyse/Calyx#825.
 echo "SKIP[ASTRO_CALYX_ISSUE035_DATASET_LOCAL]: calyx-poly issue035 FSV needs the absent local capture; tracked in #235 (upstream ChrisRoyse/Calyx#825)"
-run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}" -E 'not test(issue035_historical_backfill_loader_fsv)'
-run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc "${TARGET_ARGS[@]}" "${CALYX_TARGET_DIR_ARGS[@]}"
+run_nextest "Calyx nextest $LABEL" dynamic cargo nextest run --workspace "${CALYX_TARGET_DIR_ARGS[@]}" -E 'not test(issue035_historical_backfill_loader_fsv)'
+run_logged "calyx-doctest-$LABEL" cargo test --workspace --doc "${CALYX_TARGET_DIR_ARGS[@]}"

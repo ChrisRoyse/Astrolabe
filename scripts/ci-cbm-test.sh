@@ -56,7 +56,12 @@ else
     echo "ERROR: sanitizers are required on Linux CBM gates; $CC_BIN failed to link the sanitizer probe (log: $PROBE_DIR/probe.log)" >&2
     exit 1
   fi
-  echo "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]: $CC_BIN cannot link the sanitizer probe (no toolchain runtime); running the CBM suite with SANITIZE= per the pinned Makefile.cbm Windows override. Sanitizer coverage of the CBM C suite is owned by the required Linux CI jobs cbm tests / linux-x64-gcc and linux-x64-clang."
+  # No CI job owns this (hosted CI is banned, 2026-07-11). MinGW-w64 GCC ships
+  # no ASan/UBSan runtimes, so this run has NO sanitizer coverage of the CBM C
+  # suite. Sanitized runs are port-phase work, not work we are deferring to a
+  # nonexistent CI job. Named, counted, never passing evidence.
+  echo "SKIP[ASTRO_CBM_SANITIZERS_LINUX_REQUIRED]: $CC_BIN cannot link the sanitizer probe (this toolchain ships no sanitizer runtime); running the CBM suite with SANITIZE= per the pinned Makefile.cbm Windows override. This run has NO ASan/UBSan/LSan coverage of the CBM C suite."
+  echo "DEFERRED[ASTRO_PORT_PHASE]: sanitizer coverage of the CBM C suite is deferred to the port phase (Windows-only scope, owner directive 2026-07-11); tracked in #238. Not passing evidence; no CI job owns it."
   # Unsanitized GCC value-range analysis promotes alloc-size-larger-than to
   # a -Werror failure in pinned CBM sources that upstream compiles only
   # sanitized or with clang. The diagnostic is parameterized, so GCC has no
@@ -247,7 +252,8 @@ if [[ "$LABEL" == windows-*-mingw ]] && grep -q 'SETUP FAILED' "$LOG"; then
   # treats that as a graceful suite skip that never registers its tests. The
   # totals baseline already excludes those registrations; this marker names
   # the degradation and its coverage owner.
-  echo "SKIP[ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED]: the upstream incremental suite cannot set up on native Windows (POSIX shell quoting through system()); its registrations are excluded from the ci/cbm-test-totals.md baseline. Incremental coverage is owned by the required Linux CI jobs cbm tests / linux-x64-gcc and linux-x64-clang."
+  echo "SKIP[ASTRO_CBM_INCREMENTAL_LINUX_REQUIRED]: the upstream incremental suite cannot set up on native Windows (POSIX shell quoting through system()); its registrations are excluded from the ci/cbm-test-totals.md baseline. This run has NO incremental-suite coverage."
+  echo "DEFERRED[ASTRO_PORT_PHASE]: CBM incremental-suite coverage is deferred to the port phase (Windows-only scope, owner directive 2026-07-11); tracked in #238. Not passing evidence; no CI job owns it."
 fi
 
 total=$((passed + failed + skipped))
@@ -258,21 +264,8 @@ fi
 
 bash "$ROOT/scripts/check-cbm-skip-count.sh" "$LABEL" "$skipped"
 
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-  {
-    echo "### CBM C test gate: $LABEL"
-    echo
-    echo "| Metric | Count |"
-    echo "|---|---:|"
-    echo "| Expected tests from pinned source | $expected |"
-    echo "| Passed | $passed |"
-    echo "| Failed | $failed |"
-    echo "| Skipped | $skipped |"
-    echo "| Runtime total | $total |"
-    echo
-    echo "Compiler: \`$CC_BIN\` / \`$CXX_BIN\`"
-  } >> "$GITHUB_STEP_SUMMARY"
-fi
+# Counts go to stdout, which is the evidence stream (no hosted CI, no step summary).
+echo "COUNTS[ASTRO_CBM_TESTS] label=$LABEL expected=$expected passed=$passed failed=$failed skipped=$skipped total=$total cc=$CC_BIN cxx=$CXX_BIN"
 
 if [[ "$rc" -ne 0 ]]; then
   exit "$rc"
