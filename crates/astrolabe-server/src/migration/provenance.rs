@@ -358,6 +358,17 @@ pub(crate) fn provenance_surface_with_chain(
     surface["vault_fingerprint"] = Value::String(vault_fingerprint.to_string());
     surface["ledger_head"] = ledger_pointer_json(&ledger_head);
     surface["chain"] = chain_verification_json(&chain);
+    // #209: the chain just swapped in is a *different* verification result from the one the
+    // surface was originally labeled against — this is the surface that gets persisted, so
+    // it is the fail-open path that actually reaches disk. Without re-deriving the labels, a
+    // surface built over the row-sink's `Intact`-but-empty chain would keep riding
+    // `trust: "verified"` even after a `Broken`/`Corrupt` post-import chain replaced it.
+    let metadata_complete = provenance_surface_metadata_complete(&surface);
+    let labels = provenance_surface_labels(&chain, metadata_complete);
+    surface["warnings"] = Value::Array(labels.warnings);
+    surface["remediation"] = labels.remediation;
+    surface["freshness"] = Value::String(labels.freshness.to_string());
+    surface["trust"] = Value::String(labels.trust.to_string());
     if let Some(store) = surface.get("store") {
         surface["artifact_sha256"] = Value::String(hex_lower(&Sha256::digest(
             provenance_store_artifact_bytes(store),
@@ -420,6 +431,108 @@ pub(crate) fn chain_verification_from_report(
     }
 }
 
+/// Envelope labels for a provenance surface, derived jointly from the metadata build and
+/// the ledger chain the surface embeds.
+pub(crate) struct ProvenanceSurfaceLabels {
+    pub(crate) trust: &'static str,
+    pub(crate) freshness: &'static str,
+    pub(crate) warnings: Vec<Value>,
+    pub(crate) remediation: Value,
+}
+
+/// Derives a provenance surface's `trust`/`freshness` from **both** the completeness of the
+/// metadata build and the ledger chain the surface publishes (#209).
+///
+/// This is the build-surface counterpart of the `get_provenance` envelope rule fixed in
+/// #109: an envelope label may never out-rank the weakest verification the envelope carries.
+/// A surface that embeds a `Broken` or `Corrupt` chain — or an `Intact` chain whose attested
+/// range is empty, which verified nothing at all — is therefore never labeled
+/// `trust: "verified"`, no matter how completely its metadata built. Labeling such a surface
+/// `verified` is the fail-open pattern: a consumer gating on the top-level label would treat
+/// a store with a broken embedded chain as trustworthy.
+pub(crate) fn provenance_surface_labels(
+    chain: &ChainVerification,
+    metadata_complete: bool,
+) -> ProvenanceSurfaceLabels {
+    let warnings = provenance_surface_chain_warnings(chain);
+    let chain_verified = warnings.is_empty();
+    ProvenanceSurfaceLabels {
+        // Both conjuncts must hold. A complete metadata build over an unverified chain is
+        // still unverified, and a verified chain under a partial build is still partial.
+        trust: if chain_verified && metadata_complete {
+            "verified"
+        } else {
+            "provisional"
+        },
+        // The surface's currency claim is anchored in the ledger head it reports. When the
+        // chain backing that head is broken, corrupt, or attested nothing, the currency of
+        // the surface was never established, so it is not labeled `fresh`.
+        freshness: if chain_verified {
+            "fresh"
+        } else {
+            "not_evaluated"
+        },
+        remediation: if chain_verified {
+            Value::Null
+        } else {
+            Value::String(
+                "the embedded ledger chain is not intact over a non-empty range; run \
+                 get_provenance mode=\"verify_chain\", then repair or re-import the ledger \
+                 before treating this surface as verified"
+                    .to_string(),
+            )
+        },
+        warnings,
+    }
+}
+
+/// Coded chain-integrity warnings that force a provenance surface off `trust: "verified"`.
+///
+/// Reuses the `astrolabe-provenance` warning vocabulary so the build surface and the
+/// `get_provenance` envelope name the same conditions with the same codes.
+pub(crate) fn provenance_surface_chain_warnings(chain: &ChainVerification) -> Vec<Value> {
+    match &chain.status {
+        ChainStatus::Intact => {
+            if chain.is_empty_range() {
+                // An empty attested range verified nothing. Absence of evidence is not
+                // evidence of integrity, so the envelope must never read `verified`.
+                vec![json!({
+                    "code": PROVENANCE_WARN_CHAIN_EMPTY,
+                    "message": format!(
+                        "the surface embeds an empty attested ledger range [{}, {}); zero \
+                         entries were checked, so chain integrity is unverified",
+                        chain.checked_from, chain.checked_end
+                    ),
+                })]
+            } else {
+                Vec::new()
+            }
+        }
+        ChainStatus::Broken { seq } => vec![json!({
+            "code": PROVENANCE_WARN_CHAIN_BROKEN,
+            "message": format!(
+                "ledger chain broken at seq {seq}; provenance is not trustworthy at or past \
+                 this entry"
+            ),
+        })],
+        ChainStatus::Corrupt { seq, reason } => vec![json!({
+            "code": PROVENANCE_WARN_CHAIN_CORRUPT,
+            "message": format!("ledger chain corrupt at seq {seq}: {reason}"),
+        })],
+    }
+}
+
+/// True only when a surface can *prove* its metadata build skipped nothing.
+///
+/// A surface missing the counter cannot prove completeness, so it is treated as incomplete:
+/// absence of the counter is not evidence of zero skips.
+pub(crate) fn provenance_surface_metadata_complete(surface: &Value) -> bool {
+    surface
+        .get("metadata_skipped_count")
+        .and_then(Value::as_u64)
+        == Some(0)
+}
+
 pub(crate) fn provenance_surface_json(store: &ProvenanceStore, skipped_properties: usize) -> Value {
     let store_json = provenance_store_json(store);
     let artifact_bytes = provenance_store_artifact_bytes(&store_json);
@@ -427,6 +540,9 @@ pub(crate) fn provenance_surface_json(store: &ProvenanceStore, skipped_propertie
         + store.answers.len()
         + store.reproductions.len()
         + store.manifests.len();
+    // #209: the envelope is labeled against the chain it actually embeds, not against the
+    // metadata build alone.
+    let labels = provenance_surface_labels(&store.chain, skipped_properties == 0);
     json!({
         "schema": PROVENANCE_SURFACE_SCHEMA,
         "tool_schema": GET_PROVENANCE_SCHEMA,
@@ -442,8 +558,10 @@ pub(crate) fn provenance_surface_json(store: &ProvenanceStore, skipped_propertie
         "chain": chain_verification_json(&store.chain),
         "artifact_sha256": hex_lower(&Sha256::digest(&artifact_bytes)),
         "store": store_json,
-        "freshness": "fresh",
-        "trust": if skipped_properties == 0 { "verified" } else { "provisional" },
+        "warnings": labels.warnings,
+        "remediation": labels.remediation,
+        "freshness": labels.freshness,
+        "trust": labels.trust,
     })
 }
 

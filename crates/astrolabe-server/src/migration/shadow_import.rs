@@ -788,6 +788,15 @@ where
 }
 
 pub(crate) fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCandidate {
+    row_sink_import_candidate_from_rows_with_skills(rows, &SkillDiscoveryConfig::default())
+}
+
+/// Builds the row-sink import candidate, running skill discovery under `skills` — the
+/// registry defaults unless the caller supplied a `calyx_skills` override (#198).
+pub(crate) fn row_sink_import_candidate_from_rows_with_skills(
+    rows: CbmPipelineRows,
+    skills: &SkillDiscoveryConfig,
+) -> RowSinkImportCandidate {
     if rows.project.trim().is_empty() {
         return RowSinkImportCandidate::Unavailable(
             "single-run row sink produced no project name".to_string(),
@@ -800,7 +809,7 @@ pub(crate) fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowS
     }
     let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
     let security_screen = security_screen_from_row_sink_rows(&rows);
-    let skill_tree = skill_tree_from_row_sink_rows(&rows);
+    let skill_tree = skill_tree_from_row_sink_rows_with_config(&rows, skills);
     let bridges = bridges_from_row_sink_rows(&rows);
     let kernel_context = kernel_context_from_row_sink_rows(&rows);
     let anomalies = anomalies_from_row_sink_rows(&rows);
