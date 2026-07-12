@@ -19,6 +19,7 @@ FILES = (
     "patches/cbm/Makefile.cbm",
     "scripts/check-windows-gnu-toolchain-contract.py",
     "scripts/windows-gnu-toolchain.ps1",
+    "scripts/launcher-lock.ps1",
 )
 
 
@@ -79,6 +80,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="contract-", dir=scratch) as temp:
         fixture = Path(temp)
         runner = fixture / "scripts/windows-gnu-toolchain.ps1"
+        helper = fixture / "scripts/launcher-lock.ps1"
 
         copy_fixture(fixture)
         expect_pass(run_checker(fixture))
@@ -140,7 +142,7 @@ def main() -> int:
 
         copy_fixture(fixture)
         rewrite(
-            runner,
+            helper,
             "ASTRO_LAUNCHER_LOCK_HELD",
             "ASTRO_LAUNCHER_LOCK_DISABLED",
         )
@@ -148,7 +150,7 @@ def main() -> int:
 
         copy_fixture(fixture)
         rewrite(
-            runner,
+            helper,
             "ASTRO_LAUNCHER_LOCK_STALE",
             "ASTRO_LAUNCHER_LOCK_QUIET",
         )
@@ -194,18 +196,18 @@ def main() -> int:
         # #197: pid schema validation must stay a parse, not a bare cast.
         copy_fixture(fixture)
         rewrite(
-            runner,
-            "[int]::TryParse([string]$lockState.pid",
-            "[int]::Parse([string]$lockState.pid",
+            helper,
+            "[int]::TryParse([string]$state.pid",
+            "[int]::Parse([string]$state.pid",
         )
         expect_failure(run_checker(fixture), "pid schema")
 
         # #197: zero/negative pids must stay invalid.
         copy_fixture(fixture)
         rewrite(
-            runner,
-            "$parsedLockPid -gt 0",
-            "$parsedLockPid -ge 0",
+            helper,
+            "$parsed -gt 0",
+            "$parsed -ge 0",
         )
         expect_failure(run_checker(fixture), "pid schema")
 

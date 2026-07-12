@@ -216,6 +216,12 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
+        "scripts/check-launcher-lock.sh",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
         "scripts/check-native-aggregate-wrapper.py",
         "scripts/check.sh",
         errors,

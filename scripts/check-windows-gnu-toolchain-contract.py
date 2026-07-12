@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "windows-gnu-toolchain.ps1"
+LAUNCHER_LOCK = ROOT / "scripts" / "launcher-lock.ps1"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
 GITIGNORE = ROOT / ".gitignore"
 AGENTS = ROOT / "AGENTS.md"
@@ -24,6 +25,8 @@ def appears_before(text: str, first: str, second: str) -> bool:
 def main() -> None:
     require(RUNNER.is_file(), "the native Windows GNU launcher must exist")
     runner = RUNNER.read_text(encoding="utf-8")
+    require(LAUNCHER_LOCK.is_file(), "the shared launcher-lock helper must exist")
+    lock_helper = LAUNCHER_LOCK.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
     gitignore = GITIGNORE.read_text(encoding="utf-8")
     agents = AGENTS.read_text(encoding="utf-8")
@@ -170,17 +173,32 @@ def main() -> None:
     require(
         '$launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"'
         in runner
-        and "ASTRO_LAUNCHER_LOCK_HELD" in runner
-        and "ASTRO_LAUNCHER_LOCK_UNREADABLE" in runner
-        and "ASTRO_LAUNCHER_LOCK_STALE" in runner
+        and '. (Join-Path $PSScriptRoot "launcher-lock.ps1")' in runner
+        and "Assert-AstroLauncherLockClaimable -LockPath $launcherLock" in runner
         and "function Remove-LauncherLockFile" in runner
         and "launcher lock cleanup failed" in runner
         and appears_before(
             runner,
-            "ASTRO_LAUNCHER_LOCK_HELD",
+            "Assert-AstroLauncherLockClaimable -LockPath $launcherLock",
             "target must be absent before toolchain work",
         ),
-        "the launcher must hold a fail-closed session lock: refuse a live holder, remove only dead-pid stale locks, and release the lock on every exit path",
+        "the launcher must route its session lock check through the audited launcher-lock helper before claiming, and release the lock on every exit path",
+    )
+    require(
+        "function Read-AstroLauncherLock" in lock_helper
+        and "function Assert-AstroLauncherLockClaimable" in lock_helper
+        and "ASTRO_LAUNCHER_LOCK_HELD" in lock_helper
+        and "ASTRO_LAUNCHER_LOCK_UNREADABLE" in lock_helper
+        and "ASTRO_LAUNCHER_LOCK_STALE" in lock_helper
+        and "Get-Process -Id $ownerPid" in lock_helper
+        and "Stop-Process" not in lock_helper
+        and "Get-Process -Name" not in lock_helper
+        and appears_before(
+            lock_helper,
+            "ASTRO_LAUNCHER_LOCK_HELD",
+            "Remove-Item -LiteralPath $LockPath",
+        ),
+        "the launcher-lock helper must classify the session lock fail-closed, refuse a live holder, remove only dead-pid stale locks, and never stop a process",
     )
     require(
         '$launcherLockStage = "$launcherLock.$PID.tmp"' in runner
@@ -191,9 +209,9 @@ def main() -> None:
         "the launcher must claim its session lock atomically: stage the full manifest beside the lock, move without clobbering, and refuse a lost claim race with a named boundary (#197)",
     )
     require(
-        "[int]::TryParse([string]$lockState.pid" in runner
-        and "$parsedLockPid -gt 0" in runner,
-        "the launcher must validate the lock pid schema fail-closed: a non-integer or non-positive pid is the named UNREADABLE boundary, never an unnamed cast error (#197)",
+        "[int]::TryParse([string]$state.pid" in lock_helper
+        and "$parsed -gt 0" in lock_helper,
+        "the launcher-lock helper must validate the lock pid schema fail-closed: a non-integer or non-positive pid is the named UNREADABLE boundary, never an unnamed cast error (#197)",
     )
     require(
         '$previousTempEnvironment = @{}' in runner

@@ -769,40 +769,14 @@ $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
 $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
-if (Test-Path -LiteralPath $launcherLock) {
-    $lockRaw = Get-Content -LiteralPath $launcherLock -Raw -ErrorAction SilentlyContinue
-    $lockState = $null
-    if (-not [string]::IsNullOrWhiteSpace($lockRaw)) {
-        try {
-            $lockState = ConvertFrom-Json -InputObject $lockRaw
-        }
-        catch {
-            $lockState = $null
-        }
-    }
-    # #197: schema validation is fail-closed — the pid field must parse as a
-    # positive integer. A malformed pid (for example a clobbered or truncated
-    # manifest) must surface as the named UNREADABLE boundary below, never as
-    # an unnamed cast exception.
-    $lockOwnerPid = $null
-    if ($null -ne $lockState -and $lockState.PSObject.Properties['pid']) {
-        $parsedLockPid = 0
-        if ([int]::TryParse([string]$lockState.pid, [ref]$parsedLockPid) -and $parsedLockPid -gt 0) {
-            $lockOwnerPid = $parsedLockPid
-        }
-    }
-    if ($null -eq $lockOwnerPid) {
-        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock exists but names no readable pid; verify no toolchain session is live, then remove it manually: $launcherLock"
-    }
-    $lockHolder = Get-Process -Id $lockOwnerPid -ErrorAction SilentlyContinue
-    if ($null -ne $lockHolder) {
-        $lockCommand = if ($lockState.PSObject.Properties['command']) { $lockState.command } else { "unknown" }
-        $lockStarted = if ($lockState.PSObject.Properties['started']) { $lockState.started } else { "unknown" }
-        throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_HELD]: another launcher session owns this workspace (pid=$lockOwnerPid, started=$lockStarted, command=$lockCommand); never stop or clean a live session's run - wait for the lock to release: $launcherLock"
-    }
-    Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_LOCK_STALE]: removing lock left by dead pid $lockOwnerPid"
-    Remove-Item -LiteralPath $launcherLock -Force
-}
+# #197/#247: the session-lock semantics live in one audited, dot-sourceable place
+# (scripts/launcher-lock.ps1) that has NO capability to stop any process. A live foreign
+# holder is refused (ASTRO_LAUNCHER_LOCK_HELD), a malformed lock fails closed
+# (ASTRO_LAUNCHER_LOCK_UNREADABLE), and only a dead-pid stale lock is removed -- never a
+# by-name process sweep. The helper is tested in isolation by scripts/test-launcher-lock.ps1
+# (fixture locks, never the live workspace).
+. (Join-Path $PSScriptRoot "launcher-lock.ps1")
+Assert-AstroLauncherLockClaimable -LockPath $launcherLock
 if (Test-Path -LiteralPath $target) {
     throw "target must be absent before toolchain work: $target"
 }
