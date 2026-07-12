@@ -817,6 +817,7 @@ public class AstroTreeRecorder {
 
     void Flush() {
         List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
+        long flushNs;
         lock (gate) {
             foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
                 List<long[]> copy = new List<long[]>();
@@ -825,12 +826,21 @@ public class AstroTreeRecorder {
             }
             dirty = false;
             lastFlushNs = NowUnixNs();
+            flushNs = lastFlushNs;
         }
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v1\",\"launcher_pid\":");
         sb.Append(launcherPid);
         sb.Append(",\"run_started_unix_ns\":");
         sb.Append(runStartedNs);
+        // #278 attempt 8b: THROTTLE-RACE guard. This manifest is rewritten at most
+        // once a second while the run is live, and the no-escape gate reads it
+        // MID-SESSION (before the final Stop() flush). written_at stamps THIS flush
+        // so the gate can tell that a shared-root delta postdates the manifest --
+        // meaning the recorder had not yet observed the writing process -- and fail
+        // toward RED (ASTRO_NO_ESCAPE_STALE_MANIFEST) instead of silently 'foreign'.
+        sb.Append(",\"written_at\":");
+        sb.Append(flushNs);
         sb.Append(",\"tree_pids\":[");
         for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); sb.Append(snap[i].Key); }
         sb.Append("],\"pid_first_seen\":{");
