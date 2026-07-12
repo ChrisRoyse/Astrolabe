@@ -17,6 +17,27 @@ $ErrorActionPreference = "Stop"
 # Windows PowerShell 5.1 ignores the variable; assigning it there is inert.
 $PSNativeCommandUseErrorActionPreference = $false
 
+# #239: module-independent SHA-256 so the launcher's toolchain-bundle verification does
+# not depend on Get-FileHash autoloading Microsoft.PowerShell.Utility. A fresh child
+# PowerShell whose inherited PSModulePath cannot resolve that module raised a raw
+# CommandNotFoundException on Get-FileHash -- the launcher then died with a generic exit
+# 1 instead of the child's real exit code. This uses the same .NET SHA-256 Get-FileHash
+# wraps and returns a .Hash property with byte-identical uppercase hex (verified -ceq),
+# so every pinned-hash comparison below is unchanged.
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($LiteralPath)
+        try {
+            $hex = [System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', ''
+        }
+        finally { $stream.Dispose() }
+    }
+    finally { $sha.Dispose() }
+    return [pscustomobject]@{ Hash = $hex }
+}
+
 # #239: launcher-owned exit codes. These are protocol codes, not measurements. The
 # launcher's exit code is ALWAYS the child command's exit code when the child ran and
 # cleanup succeeded; these two codes are reserved for the cases where there is no child
@@ -209,7 +230,7 @@ function Install-PinnedToolchain {
         & curl.exe --fail --location --retry 3 --output $archive $ArchiveUrl
         Require-Success "download of $ArchiveName"
 
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        $actualHash = (Get-Sha256Hex -LiteralPath $archive).Hash
         if ($actualHash -ne $ArchiveSha256) {
             throw "pinned MinGW archive hash mismatch: expected $ArchiveSha256, got $actualHash"
         }
@@ -247,7 +268,7 @@ function Install-PinnedLlvm {
         & curl.exe --fail --location --retry 3 --output $archive $LlvmArchiveUrl
         Require-Success "download of $LlvmArchiveName"
 
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        $actualHash = (Get-Sha256Hex -LiteralPath $archive).Hash
         if ($actualHash -ne $LlvmArchiveSha256) {
             throw "pinned LLVM archive hash mismatch: expected $LlvmArchiveSha256, got $actualHash"
         }
@@ -387,7 +408,7 @@ function Install-PinnedRipgrep {
         & curl.exe --fail --location --retry 3 --output $archive $RipgrepArchiveUrl
         Require-Success "download of $RipgrepArchiveName"
 
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        $actualHash = (Get-Sha256Hex -LiteralPath $archive).Hash
         if ($actualHash -ne $ExpectedRipgrepSha256) {
             throw "pinned ripgrep archive hash mismatch: expected $ExpectedRipgrepSha256, got $actualHash"
         }
@@ -443,7 +464,7 @@ function Install-PinnedSccache {
         & curl.exe --fail --location --retry 3 --output $archive $SccacheArchiveUrl
         Require-Success "download of $SccacheArchiveName"
 
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+        $actualHash = (Get-Sha256Hex -LiteralPath $archive).Hash
         if ($actualHash -ne $SccacheArchiveSha256) {
             throw "pinned sccache archive hash mismatch: expected $SccacheArchiveSha256, got $actualHash"
         }
@@ -491,7 +512,7 @@ function Ensure-BundledMakeAlias {
     $alias = Join-Path $MingwBin "make.exe"
     Require-Path $source "pinned MinGW GNU Make is missing"
 
-    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+    $sourceHash = (Get-Sha256Hex -LiteralPath $source).Hash
     if ($sourceHash -ne $ExpectedMakeSha256) {
         throw "pinned MinGW GNU Make hash mismatch: expected $ExpectedMakeSha256, got $sourceHash"
     }
@@ -500,7 +521,7 @@ function Ensure-BundledMakeAlias {
         if (-not (Test-Path -LiteralPath $alias -PathType Leaf)) {
             throw "pinned GNU Make alias is not a file: $alias"
         }
-        $aliasHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $alias).Hash
+        $aliasHash = (Get-Sha256Hex -LiteralPath $alias).Hash
         if ($aliasHash -ne $ExpectedMakeSha256) {
             Remove-Item -LiteralPath $alias -Force
         }
@@ -509,7 +530,7 @@ function Ensure-BundledMakeAlias {
         Copy-Item -LiteralPath $source -Destination $alias
     }
 
-    $aliasHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $alias).Hash
+    $aliasHash = (Get-Sha256Hex -LiteralPath $alias).Hash
     if ($aliasHash -ne $ExpectedMakeSha256) {
         throw "pinned GNU Make alias hash mismatch: expected $ExpectedMakeSha256, got $aliasHash"
     }
@@ -664,8 +685,8 @@ function Test-PinnedToolchain {
     Require-Success "Rust toolchain lookup"
     $rustBin = Join-Path $rustSysroot "bin"
     foreach ($dll in $RuntimeDlls) {
-        $mingwHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $MingwBin $dll)).Hash
-        $rustHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $rustBin $dll)).Hash
+        $mingwHash = (Get-Sha256Hex -LiteralPath (Join-Path $MingwBin $dll)).Hash
+        $rustHash = (Get-Sha256Hex -LiteralPath (Join-Path $rustBin $dll)).Hash
         if ($mingwHash -ne $rustHash) {
             throw "runtime DLL mismatch for $dll; refusing a mixed MinGW runtime"
         }
