@@ -171,6 +171,17 @@ export CBM_CACHE_DIR="$CBM_STORE_SANDBOX"
 bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
 bash scripts/check-single-mimalloc.sh
 bash scripts/check-mcp-parity.sh
+# #6 (item 2): CBM's own MCP protocol suite (vendored test_mcp_rapid_init.py) must pass
+# against the astrolabe binary UNMODIFIED -- spawn it, send initialize +
+# notifications/initialized + tools/list with no delays, require the id:1 and id:2
+# responses (tools present) within the timeout. Pass an absolute NATIVE path: Windows
+# CreateProcess cannot resolve a relative/forward-slash binary path even when
+# os.path.isfile accepts it. Inherits the sandboxed CBM_CACHE_DIR set above.
+astro_mcp_bin="$ROOT/target/debug/astrolabe"
+[[ -f "$astro_mcp_bin" ]] || astro_mcp_bin="${astro_mcp_bin}.exe"
+if command -v cygpath >/dev/null 2>&1; then astro_mcp_bin="$(cygpath -w "$astro_mcp_bin")"; fi
+echo "=== CBM MCP protocol suite (test_mcp_rapid_init.py) vs astrolabe (#6) ==="
+"$PYTHON_BIN" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py "$astro_mcp_bin"
 "$PYTHON_BIN" scripts/check-cli-parity.py --astrolabe "$ROOT/target/debug/astrolabe"
 "$PYTHON_BIN" scripts/check-compat-shim.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 "$PYTHON_BIN" scripts/check-installer-roundtrip.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
