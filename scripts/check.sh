@@ -88,6 +88,9 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-cbm-native-build-contract.py
 "$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py
 "$PYTHON_BIN" scripts/test-windows-gnu-toolchain-contract.py
+# #247/#197: native FSV of the shared launcher session-lock helper -- proves a live
+# foreign lock owner is refused and never stopped (fixture locks, not the live workspace).
+bash scripts/check-launcher-lock.sh
 "$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py
 "$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py
 "$PYTHON_BIN" scripts/check-allocator-contract.py

@@ -62,8 +62,8 @@ function Read-AstroLauncherLock {
 function Assert-AstroLauncherLockClaimable {
     # Decide whether the workspace is claimable, fail-closed. Behaviour:
     #   absent     -> return (claimable)
-    #   unreadable -> throw ASTRO_LAUNCHER_LOCK_UNREADABLE (never guess; operator removes it)
-    #   held       -> throw ASTRO_LAUNCHER_LOCK_HELD (a LIVE foreign session; NEVER stop it)
+    #   unreadable -> refuse with the named UNREADABLE boundary (never guess; operator removes it)
+    #   held       -> refuse with the named HELD boundary (a LIVE foreign session; NEVER stop it)
     #   stale      -> remove the dead-pid lock and return (claimable)
     # It never stops a process under any branch.
     param([Parameter(Mandatory)][string]$LockPath)
