@@ -5,8 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from release_artifact import write_artifact  # noqa: E402
 
 
 ARTIFACT_NAME = "bench-ratios.json"
@@ -20,11 +25,9 @@ def main() -> int:
     args = parser.parse_args()
 
     artifact = build_artifact(args.source, args.return_code)
-    args.artifact_dir.mkdir(parents=True, exist_ok=True)
-    (args.artifact_dir / ARTIFACT_NAME).write_text(
-        json.dumps(artifact, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # #88: stamped with the subject commit and generation instant. This producer
+    # publishes both pass and fail verdicts, and both are bound to their run.
+    write_artifact(args.artifact_dir, ARTIFACT_NAME, artifact)
     return 0
 
 
