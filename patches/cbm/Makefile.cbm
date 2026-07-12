@@ -991,9 +991,38 @@ $(ASTRO_ENV_STORE_CONFIG_OBJ): $(ASTRO_ENV_STORE_CONFIG_SRC) $(ASTRO_ENV_STORE_C
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -c -o $@ $<
 
-$(ASTRO_ENV_STORE_OVERLAYS): $(LIBCBM_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH) | $(BUILD_DIR)
+# src/mcp/mcp.c is excluded from the generic env-store rule: it takes a second
+# hash-checked overlay pass (#282 worker-failure diagnostics) chained after the
+# env-store transform. See the dedicated rule below.
+$(filter-out $(LIBCBM_DIR)/src/mcp/mcp.c,$(ASTRO_ENV_STORE_OVERLAYS)): $(LIBCBM_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file $< $< $@
+
+# ── #282: contained index-worker failures carry their own evidence ────────
+# Two overlays: index_supervisor.c slurps the worker's --response-out file on
+# every outcome (not only CLEAN); mcp.c threads the last failed worker's exit
+# code + bounded response text into build_worker_failure_response. mcp.c chains
+# AFTER the env-store overlay (both patch the same pinned source; each pass is
+# hash/anchor-checked and fails closed on drift). libcbm-only: the upstream
+# parity binary keeps the pinned behavior and no parity corpus entry contains a
+# worker-failure response.
+ASTRO_WORKER_DIAG_PATCH = $(ASTROLABE_PATCH_DIR)/apply_worker_diag_patch.py
+ASTRO_WORKER_DIAG_SUPERVISOR_OVERLAY = $(LIBCBM_DIR)/src/mcp/index_supervisor.c
+ASTRO_WORKER_DIAG_SUPERVISOR_OBJ = $(LIBCBM_DIR)/src/mcp/index_supervisor.o
+
+$(LIBCBM_DIR)/src/mcp/mcp.c: src/mcp/mcp.c $(ASTRO_ENV_STORE_PATCH) $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file src/mcp/mcp.c src/mcp/mcp.c $@.envstore
+	$(PYTHON) $(ASTRO_WORKER_DIAG_PATCH) --file src/mcp/mcp.c --chained $@.envstore $@
+	rm -f $@.envstore
+
+$(ASTRO_WORKER_DIAG_SUPERVISOR_OVERLAY): src/mcp/index_supervisor.c $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_WORKER_DIAG_PATCH) --file src/mcp/index_supervisor.c $< $@
+
+$(ASTRO_WORKER_DIAG_SUPERVISOR_OBJ): $(ASTRO_WORKER_DIAG_SUPERVISOR_OVERLAY) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CC) $(LIBCBM_CFLAGS) -Isrc/mcp -c -o $@ $<
 
 # Each overlay object depends on its generated source plus the Astrolabe header
 # the overlay includes. The sub-directory -I mirrors the vendored source's own
