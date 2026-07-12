@@ -118,6 +118,50 @@ pub fn fsv_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     FSV_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the physical erasure-scrub knobs (#61).
+pub const ERASURE_SCRUB_KNOB_REGISTRY_VERSION: &str = "astrolabe-erasure-scrub-knobs-v1";
+
+/// Name of the WAL-scrub fsync-batch knob.
+pub const ERASURE_SCRUB_SEGMENTS_PER_FSYNC_BATCH_KNOB: &str =
+    "erasure_scrub_segments_per_fsync_batch";
+
+/// Default number of WAL segments truncated-and-fsynced per scrub batch.
+///
+/// Seeded from the PH58 WAL recycler's `DEFAULT_FSYNC_BUDGET_PER_TICK` so the
+/// erasure scrub reuses the storage engine's own anti-fsync-storm budget rather
+/// than inventing a second number.
+pub const ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH: u64 = 8;
+/// Smallest legal scrub batch: a batch must truncate at least one segment so the
+/// scrub loop makes forward progress toward a zero-byte WAL.
+pub const ERASURE_SCRUB_MIN_SEGMENTS_PER_FSYNC_BATCH: u64 = 1;
+/// Largest legal scrub batch. An upper bound keeps the batch a bounded fsync
+/// unit even on a pathologically segmented WAL; the scrub still loops until every
+/// checkpointed segment is zeroed, so this caps burst size, never completeness.
+pub const ERASURE_SCRUB_MAX_SEGMENTS_PER_FSYNC_BATCH: u64 = 65_536;
+
+/// The physical erasure-scrub knob registry (#61).
+///
+/// The scrub adopts SQLite's `PRAGMA wal_checkpoint(TRUNCATE)` posture: WAL
+/// content is checkpointed into the durable store, then the WAL is truncated to
+/// zero bytes so erased plaintext cannot survive in the log. The batch knob
+/// mirrors the WAL recycler's fsync budget so the truncation of a large WAL does
+/// not become one unbounded fsync storm.
+pub const ERASURE_SCRUB_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: ERASURE_SCRUB_KNOB_REGISTRY_VERSION,
+    name: ERASURE_SCRUB_SEGMENTS_PER_FSYNC_BATCH_KNOB,
+    default: ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH,
+    min: ERASURE_SCRUB_MIN_SEGMENTS_PER_FSYNC_BATCH,
+    max: ERASURE_SCRUB_MAX_SEGMENTS_PER_FSYNC_BATCH,
+    unit: "segments",
+    source: "https://www.sqlite.org/pragma.html#pragma_wal_checkpoint (TRUNCATE truncates the WAL to zero bytes once content is checkpointed) and calyx-aster gc::wal_recycler::DEFAULT_FSYNC_BUDGET_PER_TICK",
+    rationale: "bounds the WAL segments one scrub batch truncates+fsyncs so zeroing a large WAL interleaves with the disk instead of issuing one unbounded fsync storm; the scrub loops batches until every checkpointed segment is zero bytes, so this seed caps burst size, not completeness; replace with a measured fsync-latency budget once scrub throughput is benchmarked",
+}];
+
+/// Returns the erasure-scrub declaration for `name`, or `None` when undeclared.
+pub fn erasure_scrub_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ERASURE_SCRUB_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +185,30 @@ mod tests {
         assert!(!knob.accepts(0));
         assert!(knob.accepts(FSV_SAMPLE_RATE_FULL_PERMILLE));
         assert_eq!(knob.default, FSV_SAMPLE_RATE_FULL_PERMILLE);
+    }
+
+    #[test]
+    fn every_erasure_scrub_knob_declares_bounds_that_contain_its_default() {
+        assert!(!ERASURE_SCRUB_KNOBS.is_empty());
+        for knob in ERASURE_SCRUB_KNOBS {
+            assert_eq!(
+                knob.registry_version, ERASURE_SCRUB_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+    }
+
+    #[test]
+    fn erasure_scrub_batch_zero_is_not_a_legal_knob_value() {
+        let knob =
+            erasure_scrub_knob(ERASURE_SCRUB_SEGMENTS_PER_FSYNC_BATCH_KNOB).expect("declared");
+        assert!(!knob.accepts(0));
+        assert!(knob.accepts(ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH));
+        assert_eq!(knob.default, ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH);
     }
 }
