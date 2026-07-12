@@ -1,0 +1,35 @@
+# cargo-nextest configuration for the Astrolabe workspace nextest run
+# (scripts/ci-rust-gate.sh: `cargo nextest run --workspace`). It does NOT govern
+# the Calyx run (ci-rust-gate.sh runs that inside vendor/calyx/, which reads
+# vendor/calyx/.config/nextest.toml). See #264.
+
+[profile.default]
+# Full coverage — the Tier-2 profile the native aggregate runs. Saturate the box;
+# this is nextest's default, set explicitly so the intent is visible and stable.
+test-threads = "num-cpus"
+# One gate run surfaces every failure, not just the first.
+fail-fast = false
+# A failing/flaky test must fail loudly, never be masked by a lucky re-run.
+retries = 0
+# #264: mark a test slow at 60s to SURFACE it in gate output (regression radar).
+# MARK ONLY -- no `terminate-after` -- so legitimate heavy FSV/soak/trybuild tests
+# (the trybuild !Send test links libcbm and takes ~168s) are NEVER falsely killed
+# (standing invariant 3: no silent failure, and no false termination of honest work).
+slow-timeout = "60s"
+
+[profile.fast]
+# Tier-0/1 inner loop (#263 check-fast.sh runs `--profile fast`). Excludes the
+# known-heavy Astrolabe-workspace tests so a broad affected-crate run stays fast.
+# FULL coverage is NEVER lost: the default profile (Tier 2) runs these, and any
+# profile can force the complete set with `-E 'all()' --ignore-default-filter`.
+#
+# Excluded set = Astrolabe-workspace tests measured >= 60s in the #248 aggregate
+# (2026-07-12); the >=60s threshold is the registry-declared knob for this tier:
+#   - astrolabe-bridge cbm_tool_runner_is_not_send  (~168s; trybuild compile-fail
+#     !Send assertion -- correct test, slow because trybuild runs a nested cargo
+#     build that links libcbm. Tier it, don't rewrite it.)
+#   - astrolabe-weave  durable_default_queue_soak_over_4096_...  (~75s; real soak)
+# The other 11 tests in the >=60s tail are calyx-* under vendor/calyx's frozen
+# config -- tiering those is an upstream Calyx follow-up, out of scope here.
+# Unspecified keys fall back to [profile.default] (verify: cargo nextest list --profile fast).
+default-filter = 'not (test(cbm_tool_runner_is_not_send) or test(durable_default_queue_soak_over_4096))'
