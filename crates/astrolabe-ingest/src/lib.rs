@@ -4,9 +4,15 @@ pub mod fsv;
 mod graph_projection;
 mod ledger_verify;
 mod registry;
+mod row_sink_stream;
 mod sqlite_import;
 
 pub use fsv::VaultMutationPlan;
+
+pub use row_sink_stream::{
+    ASTRO_ROW_SINK_STREAM_BATCH_INVALID, ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams,
+    RowSinkStreamReport, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+};
 
 pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,

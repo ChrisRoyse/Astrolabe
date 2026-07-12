@@ -5046,6 +5046,269 @@ mod tests {
         );
     }
 
+    // ---- Streaming row-sink vault writer (#59) FSV ----
+
+    fn row_stream(
+        snapshot: &CbmGraphSnapshot,
+    ) -> Vec<IngestResult<crate::row_sink_stream::RowSinkStreamRow>> {
+        use crate::row_sink_stream::RowSinkStreamRow;
+        let mut rows = Vec::new();
+        for node in &snapshot.nodes {
+            rows.push(Ok(RowSinkStreamRow::Node(node.clone())));
+        }
+        for edge in &snapshot.edges {
+            rows.push(Ok(RowSinkStreamRow::Edge(edge.clone())));
+        }
+        rows
+    }
+
+    #[test]
+    fn streaming_row_sink_import_matches_sqlite_import_raw_cfs() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        let path = temp_db("row-sink-stream-edges");
+        edge_fixture(&path);
+        let sqlite_vault = vault();
+        let stream_vault = vault();
+        let fingerprint = sqlite_fingerprint(&path);
+
+        let sqlite = import_sqlite_to_vault(&path, &sqlite_vault, &FixtureSlotRuntime, &options(1))
+            .expect("sqlite import");
+        let snapshot = edge_snapshot();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("streaming row-sink import");
+
+        // The streaming import report is identical to the SQLite import report, and
+        // the persisted Base/Graph/Ledger/slot CF bytes are byte-for-byte identical
+        // (transitively equal to the direct-writer parity proof).
+        assert_eq!(report.import, sqlite);
+        assert_eq!(report.stream_nodes, snapshot.nodes.len());
+        assert_eq!(report.stream_edges, snapshot.edges.len());
+        // Default drain batch (1024 rows) holds the 7-row fixture in one batch.
+        assert_eq!(report.drain_batches, 1);
+        assert_import_cfs_match_raw(&stream_vault, &sqlite_vault);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn streaming_row_sink_batch_knob_does_not_change_persisted_bytes() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        let snapshot = edge_snapshot();
+        let fingerprint = [7_u8; 32];
+
+        // Default single-batch drain.
+        let default_vault = vault();
+        let default_report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &default_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("default-batch streaming import");
+        assert_eq!(default_report.drain_batches, 1);
+
+        // Small drain batch (2 rows) splits the 7-row stream into 4 backpressure
+        // batches, but persistence is still one ledger-paired write.
+        let batched_vault = vault();
+        let batched_report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::with_drain_batch_rows(2).expect("2 is in bounds"),
+            &batched_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("small-batch streaming import");
+        assert_eq!(batched_report.drain_batch_rows, 2);
+        assert_eq!(batched_report.drain_batches, 4);
+
+        // The drain-batch knob is a backpressure window only: the persisted CF bytes
+        // and the import report are identical across batch sizes.
+        assert_eq!(default_report.import, batched_report.import);
+        assert_import_cfs_match_raw(&batched_vault, &default_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_empty_stream_refuses_without_persisting() {
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+        };
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+        let empty: Vec<IngestResult<RowSinkStreamRow>> = Vec::new();
+        let err = import_cbm_row_stream_to_vault(
+            [0; 32],
+            empty,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("empty stream must refuse");
+
+        // Fail-closed with a stable code; nothing is persisted.
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
+    #[test]
+    fn streaming_row_sink_single_row_stream_imports_one_constellation() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        // Single-node stream (no edges).
+        let mut snapshot = edge_snapshot();
+        snapshot.nodes.truncate(1);
+        snapshot.edges.clear();
+        let fingerprint = [3_u8; 32];
+
+        let stream_vault = vault();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("single-row streaming import");
+        assert_eq!(report.stream_nodes, 1);
+        assert_eq!(report.stream_edges, 0);
+        assert_eq!(report.import.constellation_inputs, 1);
+
+        // Byte-identical to the direct writer for the same single-row snapshot.
+        let direct_vault = vault();
+        import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            fingerprint,
+            &direct_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("direct single-row import");
+        assert_import_cfs_match_raw(&stream_vault, &direct_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_out_of_order_stream_matches_ordered_stream() {
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let fingerprint = [5_u8; 32];
+
+        // Ordered: nodes ascending, then edges.
+        let ordered_vault = vault();
+        import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &ordered_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("ordered streaming import");
+
+        // Out-of-order: edges first, then nodes reversed. The importer re-sorts on
+        // stable keys, so the persisted bytes must be identical.
+        let mut shuffled: Vec<IngestResult<RowSinkStreamRow>> = Vec::new();
+        for edge in snapshot.edges.iter().rev() {
+            shuffled.push(Ok(RowSinkStreamRow::Edge(edge.clone())));
+        }
+        for node in snapshot.nodes.iter().rev() {
+            shuffled.push(Ok(RowSinkStreamRow::Node(node.clone())));
+        }
+        let shuffled_vault = vault();
+        import_cbm_row_stream_to_vault(
+            fingerprint,
+            shuffled,
+            &RowSinkStreamParams::from_registry(),
+            &shuffled_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("out-of-order streaming import");
+
+        assert_import_cfs_match_raw(&shuffled_vault, &ordered_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_tampered_row_fails_closed_without_persisting() {
+        use crate::row_sink_stream::{
+            ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams, RowSinkStreamRow,
+            import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+
+        // Tamper the second streamed row (a node) with invalid properties JSON.
+        let mut rows = row_stream(&snapshot);
+        let mut tampered = snapshot.nodes[1].clone();
+        tampered.properties_json = "{not valid json".to_string();
+        rows[1] = Ok(RowSinkStreamRow::Node(tampered));
+
+        let err = import_cbm_row_stream_to_vault(
+            [1; 32],
+            rows,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("tampered row must fail closed");
+
+        assert_eq!(err.code(), Some(ASTRO_ROW_SINK_STREAM_ROW_REFUSED));
+        assert!(
+            err.to_string().contains("nothing persisted"),
+            "refusal must state nothing persisted: {err}"
+        );
+        // FSV: no partial batch persisted — the vault is byte-for-byte untouched.
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
+    #[test]
+    fn streaming_row_sink_error_item_fails_closed_without_persisting() {
+        use crate::row_sink_stream::{
+            ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams, import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+
+        // A mid-stream Err (the #123 independent row-sink failure) refuses the whole
+        // import; the completed rows before it are not persisted.
+        let mut rows = row_stream(&snapshot);
+        rows[2] = Err(invalid_sqlite("simulated mid-stream row-sink failure"));
+
+        let err = import_cbm_row_stream_to_vault(
+            [1; 32],
+            rows,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("mid-stream error must fail closed");
+
+        assert_eq!(err.code(), Some(ASTRO_ROW_SINK_STREAM_ROW_REFUSED));
+        assert!(
+            err.to_string().contains("yielded an error"),
+            "refusal must name the stream error: {err}"
+        );
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
     #[test]
     fn full_edge_vocabulary_imports_with_golden_priors() {
         let path = temp_db("edge-vocabulary");
