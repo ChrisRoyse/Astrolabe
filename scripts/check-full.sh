@@ -207,17 +207,19 @@ run_phase() {
   wait_phases
 }
 
-echo "=== Upstream CBM lint suite || CBM runtime suite (concurrent) ==="
+echo "=== Upstream CBM lint || CBM runtime || Astrolabe+Calyx Rust suites (concurrent) ==="
 GATE_GROUP_START="$(phase_now)"
 start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh
 start_phase "cbm-test" bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"
+# #248: the Rust gate now runs CONCURRENTLY with the CBM C suites -- the larger
+# cbm-test || rust-gate wall-clock win #193 identified. It was blocked because the
+# astrolabe-bridge store-isolation tests asserted the operator's REAL
+# ~/.cache/codebase-memory-mcp byte-identical while ci-cbm-test snapshots the same
+# store, so overlapping the phases could false-red on either snapshot. Those bridge
+# tests now use per-run sandbox HOMEs (crates/astrolabe-bridge/src/lib.rs sandbox_home)
+# and never read or write the operator store, so the phases are disjoint on shared
+# state and overlap safely. ci-rust-gate reuses check.sh's target/debug tree (#189)
+# and uses cargo; the CBM phases are make/C -- no cargo build-lock contention.
+start_phase "rust-gate" bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
 wait_phases
-echo "PHASE_GROUP[cbm-c]: $(($(phase_now) - GATE_GROUP_START))s wall clock for both C phases"
-
-echo "=== Astrolabe and Calyx Rust suites ($HOST_TARGET) ==="
-# #189: check-full asserts HOST_TARGET == RUSTC_HOST above, so ci-rust-gate now
-# refuses a cross-target request and passes no redundant --target: every phase of
-# this aggregate shares the single target/debug tree that check.sh built, instead
-# of forking target/<triple>/debug and vendor/calyx/target and recompiling the
-# workspace + calyx path-deps + libcbm from cold two more times.
-run_phase "rust-gate" bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
+echo "PHASE_GROUP[cbm-c+rust]: $(($(phase_now) - GATE_GROUP_START))s wall clock for all three phases"
