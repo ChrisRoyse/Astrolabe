@@ -206,6 +206,7 @@ name = "astrolabe-ingest"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-kernel",
  "astrolabe-panel",
  "blake3",
  "calyx-aster",
