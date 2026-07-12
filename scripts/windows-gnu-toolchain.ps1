@@ -694,15 +694,25 @@ public class AstroTreeRecorder {
     IntPtr job, port;
     Thread thread;
     volatile bool stop;
-    readonly HashSet<int> pids = new HashSet<int>();
+    // #278 attempt 6: pid alone is ambiguous under PID REUSE (a foreign batch's
+    // creator pid recycled by one of our thousands of short-lived children).
+    // Stamp each pid's FIRST-SEEN time so the gate only attributes an entry
+    // whose timestamp is >= that pid instance's birth in OUR tree.
+    readonly Dictionary<int, long> pidFirstSeenNs = new Dictionary<int, long>();
     readonly object gate = new object();
     string manifestPath;
     int launcherPid;
+    long runStartedNs;
+
+    static long NowUnixNs() {
+        return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).Ticks * 100L;
+    }
 
     public static AstroTreeRecorder Start(string manifestPath, int launcherPid) {
         AstroTreeRecorder r = new AstroTreeRecorder();
         r.manifestPath = manifestPath;
         r.launcherPid = launcherPid;
+        r.runStartedNs = NowUnixNs();
         r.job = CreateJobObjectW(IntPtr.Zero, null);
         if (r.job == IntPtr.Zero) throw new Exception("CreateJobObject failed " + Marshal.GetLastWin32Error());
         r.port = CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 1);
@@ -722,7 +732,7 @@ public class AstroTreeRecorder {
         // binaries) inherits the job, so all descendant PIDs flow to the port.
         if (!AssignProcessToJobObject(r.job, GetCurrentProcess()))
             throw new Exception("AssignProcessToJobObject failed " + Marshal.GetLastWin32Error());
-        lock (r.gate) { r.pids.Add(launcherPid); }
+        lock (r.gate) { r.pidFirstSeenNs[launcherPid] = r.runStartedNs; }
         r.Flush();
         r.thread = new Thread(r.Loop);
         r.thread.IsBackground = true;
@@ -736,8 +746,11 @@ public class AstroTreeRecorder {
             if (GetQueuedCompletionStatus(port, out bytes, out key, out ov, 500)) {
                 if (bytes == JOB_OBJECT_MSG_NEW_PROCESS) {
                     int pid = (int)ov.ToInt64();
-                    bool added;
-                    lock (gate) { added = pids.Add(pid); }
+                    long now = NowUnixNs();
+                    bool added = false;
+                    lock (gate) {
+                        if (!pidFirstSeenNs.ContainsKey(pid)) { pidFirstSeenNs[pid] = now; added = true; }
+                    }
                     if (added) Flush();
                 } else if (bytes == STOP_SENTINEL) {
                     break;
@@ -747,14 +760,21 @@ public class AstroTreeRecorder {
     }
 
     void Flush() {
-        List<int> snap;
-        lock (gate) { snap = new List<int>(pids); }
+        List<KeyValuePair<int, long>> snap;
+        lock (gate) { snap = new List<KeyValuePair<int, long>>(pidFirstSeenNs); }
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v1\",\"launcher_pid\":");
         sb.Append(launcherPid);
+        sb.Append(",\"run_started_unix_ns\":");
+        sb.Append(runStartedNs);
         sb.Append(",\"tree_pids\":[");
-        for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); sb.Append(snap[i]); }
-        sb.Append("],\"owned_paths\":[]}");
+        for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); sb.Append(snap[i].Key); }
+        sb.Append("],\"pid_first_seen\":{");
+        for (int i = 0; i < snap.Count; i++) {
+            if (i > 0) sb.Append(',');
+            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":"); sb.Append(snap[i].Value);
+        }
+        sb.Append("},\"owned_paths\":[]}");
         try {
             string tmp = manifestPath + ".tmp";
             File.WriteAllText(tmp, sb.ToString());

@@ -160,26 +160,136 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
     owned_paths = {
         os.path.normcase(os.path.abspath(str(entry))) for entry in data.get("owned_paths", [])
     }
+    run_started = data.get("run_started_unix_ns")
+    if run_started is not None:
+        try:
+            run_started = int(run_started)
+        except (TypeError, ValueError) as exc:
+            fail(
+                "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+                "attribution manifest run_started_unix_ns must be an integer",
+                "the launcher writes an epoch-ns start time; regenerate the manifest",
+                {"error": str(exc)},
+            )
+    try:
+        pid_first_seen = {
+            int(pid): int(seen_ns) for pid, seen_ns in (data.get("pid_first_seen") or {}).items()
+        }
+    except (TypeError, ValueError) as exc:
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+            "attribution manifest pid_first_seen must map integer pids to epoch-ns integers",
+            "the launcher writes {pid: first_seen_ns}; regenerate the manifest",
+            {"error": str(exc)},
+        )
     return {
         "path": str(path),
         "launcher_pid": data.get("launcher_pid"),
+        "run_started_unix_ns": run_started,
         "tree_pids": tree_pids,
+        "pid_first_seen": pid_first_seen,
         "owned_paths": owned_paths,
     }
 
 
-def attribution_owns(top_name: str, abspath: Path, attribution: dict[str, Any]) -> bool:
-    """True iff this shared-root entry is causally traceable to our process tree."""
+# Verdicts for a delta in a causally-policed (signature/attributed) root.
+OURS = "ours"
+FOREIGN = "foreign"
+PRE_RUN = "pre_run"
+PID_INSTANCE = "pid_instance"
+STALE_DIR_MTIME = "stale_dir_mtime"
+
+
+def classify_causal_delta(
+    change: str,
+    rel: str,
+    abspath: Path,
+    post_fp: list[Any] | None,
+    prior_fp: list[Any] | None,
+    attribution: dict[str, Any],
+    skew_ns: int,
+    run_started_ns: int | None,
+) -> str:
+    """Classify a shared-root delta: OURS (policed) or a counted-not-policed verdict.
+
+    Attempt-6 refinement (#278): PID-token matching alone is defeated by PID REUSE
+    (a foreign batch's creator pid recycled by one of our thousands of short-lived
+    children) and by NTFS STALE DIRECTORY TIMESTAMPS (scandir returns the directory
+    entry's lazily-synced duplicated file info, which can lag a fresh-handle
+    os.stat; both flagged mtimes in attempt 6 PREDATED the run). Three causal
+    guards close both holes:
+
+      RUN-WINDOW  -- a delta whose post-state timestamp predates run_started (minus
+                     the registry-declared skew margin) cannot be our escape:
+                     nothing we ran existed yet. -> PRE_RUN, counted.
+      STALE-MTIME -- a dir-type MODIFIED whose only delta is the timestamp (type
+                     and size unchanged) is re-read with a FRESH os.stat; if the
+                     fresh value matches the baseline or predates the run, the
+                     "change" was a lazily-synced directory timestamp, not a write
+                     in our window. -> STALE_DIR_MTIME, counted. Never applied to
+                     exclusive roots, ADDED/REMOVED, or content (digest) changes.
+      FIRST-SEEN  -- a pid token only attributes an entry whose timestamp is >=
+                     that pid's first-seen time in OUR tree (the Job Object stamps
+                     each pid at creation): a dir created at 12:57 cannot belong
+                     to our pid instance first seen at 13:4x. -> PID_INSTANCE.
+    """
+    entry_ts: int | None = None
+    if change in ("ADDED", "MODIFIED") and post_fp is not None:
+        entry_ts = int(post_fp[2])
+
+    # STALE-MTIME: dir-type MODIFIED, type and size unchanged -> only the
+    # scandir-cached timestamp moved. Confirm with a fresh stat.
+    if (
+        change == "MODIFIED"
+        and post_fp is not None
+        and prior_fp is not None
+        and post_fp[0] == "dir"
+        and prior_fp[0] == "dir"
+        and post_fp[1] == prior_fp[1]
+    ):
+        try:
+            fresh_mtime_ns = os.stat(abspath, follow_symlinks=False).st_mtime_ns
+        except OSError:
+            fresh_mtime_ns = None
+        if fresh_mtime_ns is not None and (
+            fresh_mtime_ns == int(prior_fp[2])
+            or (run_started_ns is not None and fresh_mtime_ns < run_started_ns - skew_ns)
+        ):
+            return STALE_DIR_MTIME
+
+    # RUN-WINDOW: an entry whose post-state timestamp predates the run cannot be
+    # ours, whatever its name says (REMOVED has no post state; not gated).
+    if entry_ts is not None and run_started_ns is not None and entry_ts < run_started_ns - skew_ns:
+        return PRE_RUN
+
     norm = os.path.normcase(os.path.abspath(str(abspath)))
     for owned in attribution["owned_paths"]:
         if norm == owned or norm.startswith(owned + os.sep):
-            return True
+            return OURS
+
     tree_pids = attribution["tree_pids"]
+    pid_first_seen = attribution.get("pid_first_seen") or {}
+    top_name = rel.split("/", 1)[0]
+    saw_pid_instance_mismatch = False
     if tree_pids:
         for token in _PID_TOKEN.findall(top_name):
-            if int(token) in tree_pids:
-                return True
-    return False
+            pid = int(token)
+            if pid not in tree_pids:
+                continue
+            first_seen_ns = pid_first_seen.get(pid)
+            if (
+                first_seen_ns is not None
+                and entry_ts is not None
+                and entry_ts < first_seen_ns - skew_ns
+            ):
+                # FIRST-SEEN: the entry predates this pid instance in OUR tree --
+                # the token matches a RECYCLED pid, not our process.
+                saw_pid_instance_mismatch = True
+                continue
+            return OURS
+    if saw_pid_instance_mismatch:
+        return PID_INSTANCE
+    return FOREIGN
 
 
 def fail(code: str, message: str, remediation: str, details: dict[str, Any] | None = None) -> None:
@@ -486,21 +596,41 @@ def summarize(manifest: dict[str, Any]) -> None:
 
 
 def report_foreign_churn(
-    before: dict[str, Any], after: dict[str, Any], reclassified: int = 0
+    before: dict[str, Any], after: dict[str, Any], counted: dict[str, int] | None = None
 ) -> None:
     """Label and count third-party churn in shared roots. Never a pass/fail signal."""
     foreign_before = sum(root["foreign_count"] for root in before["roots"])
     foreign_after = sum(root["foreign_count"] for root in after["roots"])
+    counted = counted or {}
     extra = ""
-    if reclassified:
+    if counted.get(FOREIGN):
         extra = (
-            f"; plus {reclassified} signature-matching delta(s) NOT attributable to this "
+            f"; plus {counted[FOREIGN]} signature-matching delta(s) NOT attributable to this "
             "run's process tree (concurrent Calyx/CBM work), counted not policed"
         )
     print(
         f"INFO[ASTRO_NO_ESCAPE_FOREIGN_CHURN]: {foreign_before} -> {foreign_after} "
         f"non-project entries in shared roots; counted, not policed{extra}"
     )
+    if counted.get(PRE_RUN):
+        print(
+            f"INFO[ASTRO_NO_ESCAPE_PRE_RUN_DELTA]: {counted[PRE_RUN]} shared-root delta(s) "
+            "whose timestamps predate this run's start (cannot be our escape by causality); "
+            "counted, not policed"
+        )
+    if counted.get(PID_INSTANCE):
+        print(
+            f"INFO[ASTRO_NO_ESCAPE_PID_INSTANCE_MISMATCH]: {counted[PID_INSTANCE]} shared-root "
+            "delta(s) naming a RECYCLED pid (entry predates that pid's first-seen time in our "
+            "tree); counted, not policed"
+        )
+    if counted.get(STALE_DIR_MTIME):
+        print(
+            f"INFO[ASTRO_NO_ESCAPE_STALE_DIR_MTIME]: {counted[STALE_DIR_MTIME]} dir entr"
+            f"{'y' if counted[STALE_DIR_MTIME] == 1 else 'ies'} whose only delta was a "
+            "directory timestamp that a fresh os.stat shows baseline-consistent or pre-run "
+            "(NTFS lazily-synced duplicated file info); counted, not policed"
+        )
 
 
 def requires_attribution(config: dict[str, Any]) -> bool:
@@ -508,19 +638,69 @@ def requires_attribution(config: dict[str, Any]) -> bool:
     return any(root["mode"] in ("signature", "attributed") for root in config["roots"])
 
 
+def skew_margin_ns(config: dict[str, Any]) -> int:
+    """Registry-declared timestamp-skew margin (invariant 4: a knob, not a constant).
+
+    Declared in scripts/no-escape-roots.json under attribution.skew_margin_secs.
+    Bounds every timestamp-granularity/laziness source the run-window and
+    first-seen guards compare across: NTFS duplicated-info lazy sync (attempt 6
+    measured 164-168 ms), FAT-class 2 s metadata granularity ceiling, the ~15.6 ms
+    Windows clock tick, and completion-port delivery latency for first-seen stamps.
+    """
+    declared = (config.get("attribution") or {}).get("skew_margin_secs", 2.0)
+    try:
+        value = float(declared)
+    except (TypeError, ValueError):
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_REGISTRY",
+            f"attribution.skew_margin_secs must be a number, got {declared!r}",
+            "declare a numeric skew margin in scripts/no-escape-roots.json",
+        )
+    if value < 0:
+        fail(
+            "ASTRO_NO_ESCAPE_BAD_REGISTRY",
+            f"attribution.skew_margin_secs must be >= 0, got {value}",
+            "declare a non-negative skew margin in scripts/no-escape-roots.json",
+        )
+    return int(value * 1_000_000_000)
+
+
+def resolve_run_started_ns(
+    attribution: dict[str, Any] | None, before: dict[str, Any]
+) -> int | None:
+    """The run-window guard's start time: launcher start if recorded, else baseline.
+
+    The launcher's run_started_unix_ns (recorder start) precedes the baseline
+    snapshot, so preferring it is the conservative choice -- it attributes MORE
+    deltas to us, never fewer. The baseline's captured_at_unix always exists, so
+    the window guard is always active during verify.
+    """
+    if attribution is not None and attribution.get("run_started_unix_ns") is not None:
+        return int(attribution["run_started_unix_ns"])
+    captured = before.get("captured_at_unix")
+    if captured is not None:
+        return int(captured) * 1_000_000_000
+    return None
+
+
 def diff_roots(
-    before: dict[str, Any], after: dict[str, Any], attribution: dict[str, Any] | None
-) -> tuple[list[dict[str, Any]], int]:
-    """Return (escapes, foreign_reclassified).
+    before: dict[str, Any],
+    after: dict[str, Any],
+    attribution: dict[str, Any] | None,
+    skew_ns: int,
+    run_started_ns: int | None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Return (escapes, counted-not-policed verdict counts).
 
     An escape is a delta CAUSALLY OURS. For `exclusive` roots (truly project-only)
     every delta is ours. For `signature`/`attributed` roots (shared with the OS and
-    concurrent projects) a delta is ours only if the launcher-recorded process tree
-    proves it (attribution_owns); otherwise it is foreign churn -- counted, never
-    used to fail the build.
+    concurrent projects) a delta is ours only if classify_causal_delta traces it to
+    the launcher-recorded process tree WITHIN this run's time window; every other
+    verdict (foreign, pre-run, recycled-pid, stale dir timestamp) is counted and
+    labeled, never used to fail the build.
     """
     escapes: list[dict[str, Any]] = []
-    foreign_reclassified = 0
+    counted: dict[str, int] = {FOREIGN: 0, PRE_RUN: 0, PID_INSTANCE: 0, STALE_DIR_MTIME: 0}
     before_by_name = {root["name"]: root for root in before["roots"]}
     for root in after["roots"]:
         prior = before_by_name.get(root["name"])
@@ -535,34 +715,49 @@ def diff_roots(
         causal = root["mode"] in ("signature", "attributed")
         prior_entries = prior["entries"]
         entries = root["entries"]
-        changes: list[tuple[str, str, list[Any], list[Any] | None]] = []
+        changes: list[tuple[str, str, list[Any] | None, list[Any] | None]] = []
         for rel in sorted(set(entries) - set(prior_entries)):
             changes.append(("ADDED", rel, entries[rel], None))
         for rel in sorted(set(prior_entries) - set(entries)):
-            changes.append(("REMOVED", rel, prior_entries[rel], None))
+            changes.append(("REMOVED", rel, None, prior_entries[rel]))
         for rel in sorted(set(prior_entries) & set(entries)):
             if prior_entries[rel] != entries[rel]:
                 changes.append(("MODIFIED", rel, entries[rel], prior_entries[rel]))
-        for change, rel, fingerprint, was in changes:
+        for change, rel, post_fp, prior_fp in changes:
             abspath = Path(root["path"]) / rel
             if causal:
                 # attribution is guaranteed present for causal roots (the caller
-                # fails closed otherwise); a delta not traceable to our tree is
-                # foreign concurrent churn, not our escape.
-                top_name = rel.split("/", 1)[0]
-                if attribution is None or not attribution_owns(top_name, abspath, attribution):
-                    foreign_reclassified += 1
+                # fails closed otherwise); a delta not traceable to our tree
+                # WITHIN OUR WINDOW is concurrent churn, not our escape.
+                if attribution is None:
+                    verdict = FOREIGN
+                else:
+                    verdict = classify_causal_delta(
+                        change,
+                        rel,
+                        abspath,
+                        post_fp,
+                        prior_fp,
+                        attribution,
+                        skew_ns,
+                        run_started_ns,
+                    )
+                if verdict != OURS:
+                    counted[verdict] += 1
+                    print(
+                        f"  COUNTED[{verdict}] {change:<8} [{root['name']}] {abspath}"
+                    )
                     continue
             record: dict[str, Any] = {
                 "root": root["name"],
                 "change": change,
                 "path": str(abspath),
-                "fingerprint": fingerprint,
+                "fingerprint": post_fp if post_fp is not None else prior_fp,
             }
-            if was is not None:
-                record["was"] = was
+            if change == "MODIFIED" and prior_fp is not None:
+                record["was"] = prior_fp
             escapes.append(record)
-    return escapes, foreign_reclassified
+    return escapes, counted
 
 
 # --------------------------------------------------------------------------
@@ -610,11 +805,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"--attribution <manifest> / set {ATTRIBUTION_ENV}. The gate refuses to fall "
             "back to name-pattern attribution, which false-positives on shared roots (#278).",
         )
+    skew_ns = skew_margin_ns(config)
+    run_started_ns = resolve_run_started_ns(attribution, before)
     if attribution is not None:
         print(
             f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: launcher_pid={attribution['launcher_pid']}, "
             f"{len(attribution['tree_pids'])} tree PID(s), "
-            f"{len(attribution['owned_paths'])} owned path(s) from {attribution['path']}"
+            f"{len(attribution['pid_first_seen'])} first-seen stamp(s), "
+            f"{len(attribution['owned_paths'])} owned path(s), "
+            f"run_started_ns={run_started_ns}, skew_ns={skew_ns} from {attribution['path']}"
         )
 
     after = snapshot(config)
@@ -622,8 +821,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(after, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
-    escapes, foreign_reclassified = diff_roots(before, after, attribution)
-    report_foreign_churn(before, after, foreign_reclassified)
+    escapes, counted = diff_roots(before, after, attribution, skew_ns, run_started_ns)
+    report_foreign_churn(before, after, counted)
 
     if escapes:
         for escape in escapes:
@@ -717,8 +916,15 @@ def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
     from ctypes import wintypes
 
     tree_pids: set[int] = set()
+    pid_first_seen: dict[int, int] = {}
+
+    def note_pid(pid: int) -> None:
+        if pid not in tree_pids:
+            tree_pids.add(pid)
+            pid_first_seen[pid] = time.time_ns()
+
     proc = subprocess.Popen(command, cwd=cwd, env=env)
-    tree_pids.add(proc.pid)
+    note_pid(proc.pid)
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         job = kernel32.CreateJobObjectW(None, None)
@@ -744,7 +950,7 @@ def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
                 job, job_basic_process_id_list, ctypes.byref(info), ctypes.sizeof(info), None
             ):
                 for index in range(min(info.NumberOfProcessIdsInList, capacity)):
-                    tree_pids.add(int(info.ProcessIdList[index]))
+                    note_pid(int(info.ProcessIdList[index]))
 
         while proc.poll() is None:
             poll_pids()
@@ -753,7 +959,7 @@ def run_in_job(command: list[str], *, cwd: Path, env: dict[str, str]):
         kernel32.CloseHandle(job)
     except OSError:
         proc.wait()
-    return proc, tree_pids
+    return proc, tree_pids, pid_first_seen
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -777,15 +983,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     env = sandbox_env(sandbox, args)
     print(f"=== running under sandbox: {' '.join(args.command)} ===")
+    run_started_ns = time.time_ns()
     if os.name == "nt":
         # Capture the WHOLE descendant tree causally via a Job Object so an escape
         # by a grandchild is still attributed to this run (the launcher uses the
         # same primitive for the aggregate). Falls back to the direct child PID.
-        proc, tree_pids = run_in_job(args.command, cwd=args.cwd or ROOT, env=env)
+        proc, tree_pids, pid_first_seen = run_in_job(args.command, cwd=args.cwd or ROOT, env=env)
     else:
         proc = subprocess.Popen(args.command, cwd=args.cwd or ROOT, env=env)
         proc.wait()
         tree_pids = {proc.pid}
+        pid_first_seen = {proc.pid: run_started_ns}
 
     print("=== protected roots AFTER ===")
     after = snapshot(config)
@@ -802,16 +1010,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         attribution = {
             "path": "<run: captured process tree>",
             "launcher_pid": os.getpid(),
+            "run_started_unix_ns": run_started_ns,
             "tree_pids": tree_pids,
+            "pid_first_seen": pid_first_seen,
             "owned_paths": set(),
         }
+    skew_ns = skew_margin_ns(config)
+    effective_run_started = resolve_run_started_ns(attribution, before)
     print(
         f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: {len(attribution['tree_pids'])} tree PID(s), "
-        f"{len(attribution['owned_paths'])} owned path(s)"
+        f"{len(attribution['owned_paths'])} owned path(s), "
+        f"run_started_ns={effective_run_started}, skew_ns={skew_ns}"
     )
 
-    escapes, foreign_reclassified = diff_roots(before, after, attribution)
-    report_foreign_churn(before, after, foreign_reclassified)
+    escapes, counted = diff_roots(before, after, attribution, skew_ns, effective_run_started)
+    report_foreign_churn(before, after, counted)
     if escapes:
         for escape in escapes:
             print(

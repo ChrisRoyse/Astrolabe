@@ -26,8 +26,23 @@
     "",
     "The gate FAILS CLOSED (ASTRO_NO_ESCAPE_NO_ATTRIBUTION) if any signature/attributed root",
     "is declared but no attribution manifest is supplied: it refuses to fall back to the",
-    "unsound name-pattern classification (#278)."
+    "unsound name-pattern classification (#278).",
+    "",
+    "attribution.skew_margin_secs (invariant-4 knob): tolerance for the run-window and",
+    "pid-first-seen timestamp guards (#278 attempt 6). Sources it must bound: NTFS lazily",
+    "syncs the directory-entry duplicated file info that scandir/FindFirstFile reports, so",
+    "a cached dir mtime can lag a fresh-handle os.stat (attempt 6 measured 164-168 ms on",
+    "the two false-policed calyx-leapable-* dirs); FAT-class metadata granularity is 2 s",
+    "(the coarsest timestamp any policed filesystem would report); the Windows clock tick",
+    "is ~15.6 ms; Job-Object completion-port delivery of first-seen stamps adds single-ms",
+    "latency. 2 s covers the worst (FAT granularity) with the measured NTFS skew an order",
+    "of magnitude inside it. A pid-reuse false attribution would need a foreign entry",
+    "written INSIDE this margin of our pid instance's first-seen time -- vanishingly",
+    "narrower than the 20-minute window that produced attempt 6's collisions."
   ],
+  "attribution": {
+    "skew_margin_secs": 2
+  },
   "signature_globs": [
     "astrolabe*",
     ".astrolabe*",

@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,9 @@ SCRATCH = ROOT / ".tmp" / "no-escape-attribution-selftest"
 # set, so no live process is needed -- the control is fully reproducible.
 TREE_PID = 424242
 FOREIGN_PID = 313131
+# Mirrors the live registry's attribution.skew_margin_secs knob (invariant 4).
+SKEW_SECS = 2
+NS = 1_000_000_000
 
 
 def build_fixture() -> dict[str, Path]:
@@ -68,6 +72,9 @@ def build_fixture() -> dict[str, Path]:
         "schema": "astrolabe.no_escape_roots.v1",
         "signature_globs": ["astrolabe*", "calyx*", "cbm*", "codebase-memory*"],
         "limits": {"max_entries_per_root": 20000, "max_hash_bytes_per_root": 536870912},
+        # Invariant-4 knob, same value the live registry declares (see
+        # scripts/no-escape-roots.json attribution._doc for the derivation).
+        "attribution": {"skew_margin_secs": SKEW_SECS},
         "roots": [
             {
                 "name": "fixture_operator_temp",
@@ -91,18 +98,23 @@ def build_fixture() -> dict[str, Path]:
     return paths
 
 
-def write_manifest(path: Path, owned_paths: list[Path]) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "schema": "astrolabe.no_escape_attribution.v1",
-                "launcher_pid": TREE_PID,
-                "tree_pids": [TREE_PID],
-                "owned_paths": [str(entry) for entry in owned_paths],
-            }
-        ),
-        encoding="utf-8",
-    )
+def write_manifest(
+    path: Path,
+    owned_paths: list[Path],
+    run_started_ns: int | None = None,
+    pid_first_seen: dict[int, int] | None = None,
+) -> None:
+    manifest: dict = {
+        "schema": "astrolabe.no_escape_attribution.v1",
+        "launcher_pid": TREE_PID,
+        "tree_pids": [TREE_PID],
+        "owned_paths": [str(entry) for entry in owned_paths],
+    }
+    if run_started_ns is not None:
+        manifest["run_started_unix_ns"] = run_started_ns
+    if pid_first_seen is not None:
+        manifest["pid_first_seen"] = {str(pid): ns for pid, ns in pid_first_seen.items()}
+    path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def gate(paths: dict[str, Path], *args: str) -> subprocess.CompletedProcess:
@@ -186,8 +198,10 @@ def main() -> int:
     expect_clean(result, "foreign temp churn")
     if "ASTRO_NO_ESCAPE_FOREIGN_CHURN" not in result.stdout:
         raise AssertionError(f"foreign churn not labeled:\n{result.stdout}")
-    if foreign.name in (result.stdout + result.stderr).split("ASTRO_NO_ESCAPE_FOREIGN_CHURN")[0]:
-        raise AssertionError("foreign entry was policed as an escape")
+    # Escapes are printed to stderr; a counted entry appears only in the stdout
+    # COUNTED[...] evidence lines. Policing would have put it on stderr + exit 1.
+    if foreign.name in result.stderr:
+        raise AssertionError(f"foreign entry was policed as an escape:\n{result.stderr}")
     print(f"  independent readback: {foreign} exists and was counted, not policed")
     shutil.rmtree(foreign)
 
@@ -231,8 +245,111 @@ def main() -> int:
     snapshot(paths)
     expect_clean(verify(paths, paths["manifest"]), "clean")
 
+    # ---- attempt-6 refinements (#278): run-window, stale dir mtime, pid reuse ----
+    now_ns = time.time_ns()
+
+    print("=== 8. STALE/PRE-RUN: MODIFIED dir, pre-run mtimes, COLLIDING tree pid -> counted ===")
+    # The exact attempt-6 shape: calyx-leapable-*-<pid> whose baseline AND observed
+    # mtimes both predate the run, where <pid> collides with a recycled pid in our
+    # tree. Must be counted + labeled, never policed.
+    stale_dir = paths["temp"] / f"calyx-leapable-stdio-lifecycle-{TREE_PID}"
+    stale_dir.mkdir()
+    old_ns = now_ns - 3600 * NS
+    os.utime(stale_dir, ns=(old_ns, old_ns))
+    snapshot(paths)
+    # NTFS-lagging-duplicated-info analogue: the timestamp moves ~200ms but both
+    # values predate run_started (attempt 6 measured 164-168 ms of skew).
+    os.utime(stale_dir, ns=(old_ns + 200_000_000, old_ns + 200_000_000))
+    window_manifest = paths["fixture"] / "attribution-window.json"
+    write_manifest(
+        window_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns,
+        pid_first_seen={TREE_PID: now_ns},
+    )
+    result = verify(paths, window_manifest)
+    expect_clean(result, "pre-run stale dir mtime")
+    if "ASTRO_NO_ESCAPE_STALE_DIR_MTIME" not in result.stdout:
+        raise AssertionError(f"stale dir mtime was not labeled:\n{result.stdout}")
+    print(f"  independent readback: {stale_dir} exists, mtimes pre-run, counted under STALE_DIR_MTIME")
+    shutil.rmtree(stale_dir)
+
+    print("=== 9. REGRESSION GUARD: in-window MODIFIED + ADDED with tree pid -> still RED ===")
+    mod_dir = paths["temp"] / f"calyx-retention-mixed-{TREE_PID}"
+    mod_dir.mkdir()
+    os.utime(mod_dir, ns=(old_ns, old_ns))
+    snapshot(paths)
+    now_ns = time.time_ns()
+    os.utime(mod_dir, ns=(now_ns, now_ns))  # a real in-window write to an existing dir
+    add_dir = paths["temp"] / f"calyx-retention-retain-{TREE_PID}"
+    add_dir.mkdir()  # a real in-window creation
+    write_manifest(
+        window_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 60 * NS,
+        pid_first_seen={TREE_PID: now_ns - 60 * NS},
+    )
+    result = verify(paths, window_manifest)
+    expect_red(result, mod_dir.name, "in-window modified")
+    if add_dir.name not in (result.stdout + result.stderr):
+        raise AssertionError(f"in-window ADDED was not policed:\n{result.stdout}\n{result.stderr}")
+    print(f"  independent readback: {mod_dir} and {add_dir} in-window, both policed")
+    shutil.rmtree(mod_dir)
+    shutil.rmtree(add_dir)
+
+    print("=== 10. BOUNDARY: skew margin respected on the run-window guard ===")
+    snapshot(paths)
+    now_ns = time.time_ns()
+    in_margin = paths["temp"] / f"calyx-retention-already-{TREE_PID}"
+    in_margin.mkdir()
+    in_margin_ts = now_ns - (SKEW_SECS * NS - NS // 2)  # run_started - skew + 0.5s: inside
+    os.utime(in_margin, ns=(in_margin_ts, in_margin_ts))
+    out_margin = paths["temp"] / f"calyx-retention-failures-{TREE_PID}"
+    out_margin.mkdir()
+    out_margin_ts = now_ns - (SKEW_SECS * NS + 5 * NS)  # run_started - skew - 5s: outside
+    os.utime(out_margin, ns=(out_margin_ts, out_margin_ts))
+    write_manifest(
+        window_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns,
+        pid_first_seen={TREE_PID: now_ns - 60 * NS},
+    )
+    result = verify(paths, window_manifest)
+    expect_red(result, in_margin.name, "inside skew margin")
+    combined = result.stdout + result.stderr
+    if f"COUNTED[pre_run] ADDED" not in combined or out_margin.name not in result.stdout:
+        raise AssertionError(f"outside-margin entry was not counted as pre-run:\n{combined}")
+    escape_section = result.stderr
+    if out_margin.name in escape_section:
+        raise AssertionError(f"outside-margin entry was policed:\n{escape_section}")
+    print(f"  boundary: {in_margin.name} (t-{SKEW_SECS - 0.5:.1f}s) RED; {out_margin.name} (t-{SKEW_SECS + 5}s) counted")
+    shutil.rmtree(in_margin)
+    shutil.rmtree(out_margin)
+
+    print("=== 11. PID REUSE: in-window entry predating our pid instance's first-seen -> counted ===")
+    snapshot(paths)
+    now_ns = time.time_ns()
+    reused = paths["temp"] / f"calyx-retention-rollup-scan-{TREE_PID}"
+    reused.mkdir()
+    entry_ts = now_ns - 30 * NS  # within the run window ...
+    os.utime(reused, ns=(entry_ts, entry_ts))
+    write_manifest(
+        window_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,
+        # ... but our pid instance was first seen AFTER the entry existed: the
+        # token matches a recycled pid, not our process.
+        pid_first_seen={TREE_PID: now_ns},
+    )
+    result = verify(paths, window_manifest)
+    expect_clean(result, "recycled pid")
+    if "ASTRO_NO_ESCAPE_PID_INSTANCE_MISMATCH" not in result.stdout:
+        raise AssertionError(f"pid-instance mismatch was not labeled:\n{result.stdout}")
+    print(f"  independent readback: {reused} predates our pid instance, counted not policed")
+    shutil.rmtree(reused)
+
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print("no-escape attribution control passed: causal, not nominal (#278)")
+    print("no-escape attribution control passed: causal, windowed, pid-instance-aware (#278)")
     return 0
 
 
