@@ -171,6 +171,28 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
                 "the launcher writes an epoch-ns start time; regenerate the manifest",
                 {"error": str(exc)},
             )
+    # #278 attempt 8b: manifest flush timestamp. The launcher's recorder rewrites
+    # this manifest THROTTLED (~1/sec) while the run is live, and `verify` reads it
+    # MID-SESSION -- before the launcher teardown's final flush. So the manifest the
+    # gate sees can lag reality: a process that leaked into a shared root may not yet
+    # be recorded in tree_pids/pid_intervals. Classifying such a delta FOREIGN just
+    # because its pid is not (yet) in a stale manifest would be a SILENT FALLBACK to
+    # green. written_at stamps each flush so the gate can detect that a delta POSTDATES
+    # the manifest and fail toward RED (ASTRO_NO_ESCAPE_STALE_MANIFEST) instead. A
+    # manifest without written_at (older recorder) disables the guard -- but then the
+    # open-interval/first-seen guards still point toward policing; written_at only adds
+    # protection, never removes it.
+    written_at = data.get("written_at")
+    if written_at is not None:
+        try:
+            written_at = int(written_at)
+        except (TypeError, ValueError) as exc:
+            fail(
+                "ASTRO_NO_ESCAPE_BAD_ATTRIBUTION",
+                "attribution manifest written_at must be an integer",
+                "the launcher writes an epoch-ns flush time; regenerate the manifest",
+                {"error": str(exc)},
+            )
     try:
         pid_first_seen = {
             int(pid): int(seen_ns) for pid, seen_ns in (data.get("pid_first_seen") or {}).items()
@@ -213,6 +235,7 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
         "path": str(path),
         "launcher_pid": data.get("launcher_pid"),
         "run_started_unix_ns": run_started,
+        "written_at": written_at,
         "tree_pids": tree_pids,
         "pid_first_seen": pid_first_seen,
         "pid_intervals": pid_intervals,
@@ -226,6 +249,14 @@ FOREIGN = "foreign"
 PRE_RUN = "pre_run"
 PID_INSTANCE = "pid_instance"
 STALE_DIR_MTIME = "stale_dir_mtime"
+# #278 attempt 8b: a delta that POSTDATES the manifest's flush timestamp. The
+# throttled recorder may not have observed the leaking process yet, so a FOREIGN
+# classification cannot be trusted -- policed (RED), never silently counted.
+STALE_MANIFEST = "stale_manifest"
+
+# Verdicts that POLICE the delta (fail the build). Every other verdict is counted
+# and labeled, never used to fail. STALE_MANIFEST joins OURS on the fail-closed side.
+POLICED_VERDICTS = frozenset({OURS, STALE_MANIFEST})
 
 
 def classify_causal_delta(
@@ -339,6 +370,18 @@ def classify_causal_delta(
             # Every instance of this pid in our tree was dead (or unborn) when the
             # entry was written -- the token matches a RECYCLED pid, not our process.
             saw_pid_instance_mismatch = True
+    # STALE-MANIFEST (#278 attempt 8b): the delta did not attribute to our tree, but
+    # the manifest may simply be STALE for it -- the throttled recorder rewrites the
+    # manifest ~1/sec and `verify` reads it mid-session, so a process that leaked
+    # AFTER the last flush is not yet in tree_pids/pid_intervals. If this delta's
+    # timestamp POSTDATES the manifest flush (beyond skew), the FOREIGN verdict is
+    # untrustworthy: the recorder had not observed the leaker at write time. Fail
+    # toward RED rather than silently toward foreign. (PRE_RUN / STALE_DIR_MTIME have
+    # already returned above; a delta predating the run can never postdate a later
+    # flush, so this never re-reddens the pre-run/stale-timestamp cases.)
+    written_at = attribution.get("written_at")
+    if entry_ts is not None and written_at is not None and entry_ts > written_at + skew_ns:
+        return STALE_MANIFEST
     if saw_pid_instance_mismatch:
         return PID_INSTANCE
     return FOREIGN
@@ -753,6 +796,7 @@ def diff_roots(
     """
     escapes: list[dict[str, Any]] = []
     counted: dict[str, int] = {FOREIGN: 0, PRE_RUN: 0, PID_INSTANCE: 0, STALE_DIR_MTIME: 0}
+    stale_manifest_hits = 0
     before_by_name = {root["name"]: root for root in before["roots"]}
     for root in after["roots"]:
         prior = before_by_name.get(root["name"])
@@ -794,12 +838,19 @@ def diff_roots(
                         skew_ns,
                         run_started_ns,
                     )
-                if verdict != OURS:
+                if verdict not in POLICED_VERDICTS:
                     counted[verdict] += 1
                     print(
                         f"  COUNTED[{verdict}] {change:<8} [{root['name']}] {abspath}"
                     )
                     continue
+                if verdict == STALE_MANIFEST:
+                    stale_manifest_hits += 1
+                    print(
+                        f"  POLICED[stale_manifest] {change:<8} [{root['name']}] {abspath} "
+                        "(delta postdates the attribution manifest's flush; the recorder had "
+                        "not observed the writer, so 'foreign' cannot be trusted -- failing RED)"
+                    )
             record: dict[str, Any] = {
                 "root": root["name"],
                 "change": change,
@@ -809,6 +860,16 @@ def diff_roots(
             if change == "MODIFIED" and prior_fp is not None:
                 record["was"] = prior_fp
             escapes.append(record)
+    if stale_manifest_hits:
+        print(
+            f"ERROR[ASTRO_NO_ESCAPE_STALE_MANIFEST]: {stale_manifest_hits} shared-root "
+            "delta(s) postdate the attribution manifest's flush timestamp (written_at); the "
+            "throttled process-tree recorder had not observed the writing process when the "
+            "manifest was read, so they cannot be safely classified foreign and are POLICED. "
+            "remediation: ensure the launcher's tree recorder flushed after the run (a healthy "
+            "recorder rewrites within the skew margin); a persistently stale manifest means the "
+            "recorder died mid-run -- restart the run so attribution is complete."
+        )
     return escapes, counted
 
 
@@ -872,7 +933,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"{len(attribution['tree_pids'])} tree PID(s), "
             f"{interval_count} instance interval(s) ({open_count} open), "
             f"{len(attribution['owned_paths'])} owned path(s), "
-            f"run_started_ns={run_started_ns}, skew_ns={skew_ns} from {attribution['path']}"
+            f"run_started_ns={run_started_ns}, written_at={attribution.get('written_at')}, "
+            f"skew_ns={skew_ns} from {attribution['path']}"
         )
 
     after = snapshot(config)
@@ -1087,15 +1149,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         json.dumps(after, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
 
-    # `run` owns the sandbox it just executed, so it can attribute causally from
-    # the process tree it captured -- unless the caller supplied an explicit
-    # manifest (the aggregate/self-tests do, to drive multi-PID/owned-path cases).
-    attribution = load_attribution(args.attribution)
+    # `run` owns the sandbox it just executed, so it attributes causally from the
+    # process tree IT captured. An EXPLICIT --attribution manifest overrides that
+    # (the aggregate/self-tests pass one to drive multi-PID/owned-path cases), but
+    # the ambient ${ATTRIBUTION_ENV} does NOT: that env var describes an OUTER
+    # launcher run, not the suite this `run` just launched, so honoring it would
+    # judge a fixture leak against the live session's tree and misclassify our own
+    # child's escape as foreign (#278 attempt 8). Precedence: explicit flag >
+    # captured tree > (env var deliberately ignored here).
+    attribution = load_attribution(args.attribution) if args.attribution is not None else None
     if attribution is None:
         attribution = {
             "path": "<run: captured process tree>",
             "launcher_pid": os.getpid(),
             "run_started_unix_ns": run_started_ns,
+            # The captured tree is authoritative and fully current (this process
+            # observed every child live), so there is no stale-manifest window:
+            # written_at=None deliberately disables that guard for `run`.
+            "written_at": None,
             "tree_pids": tree_pids,
             "pid_first_seen": pid_first_seen,
             "pid_intervals": pid_intervals,
@@ -1181,7 +1252,11 @@ def main() -> int:
         default=None,
         help=(
             "causal-attribution manifest (launcher process-tree PIDs). Required when the "
-            f"registry declares shared-by-design roots. Defaults to ${ATTRIBUTION_ENV}."
+            "registry declares shared-by-design roots. PRECEDENCE: an explicit path given "
+            f"here BEATS the ${ATTRIBUTION_ENV} environment variable; the env var is used "
+            "only when this flag is omitted. Self-tests pass the flag so a fixture run is "
+            f"judged against its OWN manifest even when an ambient ${ATTRIBUTION_ENV} from a "
+            "live launcher session is exported (#278 attempt 8)."
         ),
     )
     verify.set_defaults(func=cmd_verify)
@@ -1193,7 +1268,13 @@ def main() -> int:
         "--attribution",
         type=Path,
         default=None,
-        help="optional explicit attribution manifest; otherwise the captured tree is used.",
+        help=(
+            "optional explicit attribution manifest; otherwise the process tree this "
+            "command captures is used. PRECEDENCE: an explicit path here BEATS both the "
+            f"captured tree and the ${ATTRIBUTION_ENV} environment variable. When omitted, "
+            f"the captured tree is preferred over ${ATTRIBUTION_ENV} so a `run` in a live "
+            "launcher session still attributes to the suite it actually launched (#278)."
+        ),
     )
     run.add_argument("--fresh", action="store_true", help="remove an existing sandbox first")
     run.add_argument(
