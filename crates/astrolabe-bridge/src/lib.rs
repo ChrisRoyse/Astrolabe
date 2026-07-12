@@ -2959,9 +2959,17 @@ mod tests {
                 assert_eq!(rc, 0, "_putenv must remove PATH from the CRT environ");
             }
             #[cfg(not(windows))]
-            unsafe {
-                std::env::remove_var("PATH")
-            };
+            {
+                // Direct libc unsetenv for the same reason as _putenv above: the
+                // probe must edit the environ array libcbm walks, and the
+                // env-as-IPC contract bans the std wrappers for libcbm-consumed
+                // variables (check-cbm-env-contract.py, ASTRO_CBM_ENV_AS_IPC).
+                unsafe extern "C" {
+                    fn unsetenv(name: *const std::os::raw::c_char) -> std::os::raw::c_int;
+                }
+                let rc = unsafe { unsetenv(c"PATH".as_ptr()) };
+                assert_eq!(rc, 0, "unsetenv must remove PATH from the libc environ");
+            }
         }
         let path_len = std::env::var_os("PATH").map(|p| p.len()).unwrap_or(0);
         println!("path-buffer case={case} PATH_bytes_before={path_len}");
