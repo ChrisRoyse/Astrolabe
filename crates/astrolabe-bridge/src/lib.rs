@@ -2984,7 +2984,11 @@ mod tests {
     fn cbm_install_plan_reads_oversized_path_without_truncation() {
         let exe = std::env::current_exe().expect("test binary path");
         let real = std::env::var("PATH").unwrap_or_default();
-        let seg = if cfg!(windows) { "C:\\astro267\\seg" } else { "/astro267/seg" };
+        let seg = if cfg!(windows) {
+            "C:\\astro267\\seg"
+        } else {
+            "/astro267/seg"
+        };
         let sep = if cfg!(windows) { ";" } else { ":" };
         let make = |target: usize| -> String {
             let mut s = String::new();
@@ -3024,7 +3028,10 @@ mod tests {
             let out = child.output().expect("spawn path-buffer probe");
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            assert!(out.status.success(), "[{case}] probe failed:\n{stdout}\n{stderr}");
+            assert!(
+                out.status.success(),
+                "[{case}] probe failed:\n{stdout}\n{stderr}"
+            );
             assert!(
                 stdout.contains(&format!("path-buffer case passed: {case}")),
                 "[{case}] probe did not assert:\n{stdout}"
