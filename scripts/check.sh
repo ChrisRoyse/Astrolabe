@@ -79,6 +79,7 @@ bash scripts/check-unsafe-boundary.sh
 "$PYTHON_BIN" scripts/check-shadow-parity.py --selftest
 "$PYTHON_BIN" scripts/test-check-hazard-suite.py
 "$PYTHON_BIN" scripts/test-check-no-escape.py
+"$PYTHON_BIN" scripts/test-no-escape-attribution.py
 "$PYTHON_BIN" scripts/test-cbm-spawn-patch.py
 "$PYTHON_BIN" scripts/test-cbm-spawn-fsv.py
 "$PYTHON_BIN" scripts/test-cbm-env-store-patch.py

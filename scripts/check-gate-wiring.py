@@ -84,6 +84,9 @@ def validate(root: Path) -> list[str]:
     # #237: the sandbox-escape gate is only load-bearing if the aggregate both
     # runs its self-test AND brackets the build/test phase with snapshot->verify.
     require(check, "scripts/test-check-no-escape.py", "scripts/check.sh", errors)
+    # #278: the causal-attribution control proof must run every aggregate -- it is the
+    # standing guard that shared-root policing is by process tree, not name pattern.
+    require(check, "scripts/test-no-escape-attribution.py", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py snapshot", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py verify", "scripts/check.sh", errors)
     require_order(

@@ -648,6 +648,140 @@ function Set-WorkspaceTempEnvironment {
     # and after the phase and fails closed on a single added registration.
 }
 
+# #278: causal attribution source for the no-escape gate. The gate protects roots
+# the operator SHARES with the OS and -- on this machine -- with other Calyx/CBM
+# checkouts and concurrent codebase-memory-mcp MCP servers. Classifying a delta as
+# "ours" by NAME PATTERN (calyx*, cbm*) false-positives there. Instead the launcher
+# records THIS run's process tree so the gate attributes a shared-root delta only to
+# a process that was actually part of our run. A Windows Job Object receives a
+# JOB_OBJECT_MSG_NEW_PROCESS completion for EVERY descendant at creation time (no
+# poll-miss), so short-lived `cargo test` binaries -- whose scratch-dir names embed
+# std::process::id() -- are captured. If this recorder cannot start, the gate fails
+# CLOSED (ASTRO_NO_ESCAPE_NO_ATTRIBUTION) rather than reverting to name matching.
+$AstroTreeRecorderSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public class AstroTreeRecorder {
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateJobObjectW(IntPtr a, string name);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern IntPtr CreateIoCompletionPort(IntPtr handle, IntPtr existing, UIntPtr key, uint threads);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int cls, IntPtr info, uint len);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
+    [DllImport("kernel32")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool GetQueuedCompletionStatus(IntPtr port, out uint bytes, out UIntPtr key, out IntPtr overlapped, uint ms);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool PostQueuedCompletionStatus(IntPtr port, uint bytes, UIntPtr key, IntPtr overlapped);
+    [DllImport("kernel32")]
+    static extern bool CloseHandle(IntPtr h);
+
+    const int JobObjectAssociateCompletionPortInformation = 7;
+    const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
+    const uint STOP_SENTINEL = 0xFFFFFFFF;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT { public IntPtr CompletionKey; public IntPtr CompletionPort; }
+
+    IntPtr job, port;
+    Thread thread;
+    volatile bool stop;
+    readonly HashSet<int> pids = new HashSet<int>();
+    readonly object gate = new object();
+    string manifestPath;
+    int launcherPid;
+
+    public static AstroTreeRecorder Start(string manifestPath, int launcherPid) {
+        AstroTreeRecorder r = new AstroTreeRecorder();
+        r.manifestPath = manifestPath;
+        r.launcherPid = launcherPid;
+        r.job = CreateJobObjectW(IntPtr.Zero, null);
+        if (r.job == IntPtr.Zero) throw new Exception("CreateJobObject failed " + Marshal.GetLastWin32Error());
+        r.port = CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 1);
+        if (r.port == IntPtr.Zero) throw new Exception("CreateIoCompletionPort failed " + Marshal.GetLastWin32Error());
+        JOBOBJECT_ASSOCIATE_COMPLETION_PORT assoc = new JOBOBJECT_ASSOCIATE_COMPLETION_PORT();
+        assoc.CompletionKey = r.job;
+        assoc.CompletionPort = r.port;
+        IntPtr buf = Marshal.AllocHGlobal(Marshal.SizeOf(assoc));
+        try {
+            Marshal.StructureToPtr(assoc, buf, false);
+            if (!SetInformationJobObject(r.job, JobObjectAssociateCompletionPortInformation, buf, (uint)Marshal.SizeOf(assoc)))
+                throw new Exception("SetInformationJobObject failed " + Marshal.GetLastWin32Error());
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+        // Assign the launcher itself: every child (bash -> gates -> cargo -> test
+        // binaries) inherits the job, so all descendant PIDs flow to the port.
+        if (!AssignProcessToJobObject(r.job, GetCurrentProcess()))
+            throw new Exception("AssignProcessToJobObject failed " + Marshal.GetLastWin32Error());
+        lock (r.gate) { r.pids.Add(launcherPid); }
+        r.Flush();
+        r.thread = new Thread(r.Loop);
+        r.thread.IsBackground = true;
+        r.thread.Start();
+        return r;
+    }
+
+    void Loop() {
+        while (!stop) {
+            uint bytes; UIntPtr key; IntPtr ov;
+            if (GetQueuedCompletionStatus(port, out bytes, out key, out ov, 500)) {
+                if (bytes == JOB_OBJECT_MSG_NEW_PROCESS) {
+                    int pid = (int)ov.ToInt64();
+                    bool added;
+                    lock (gate) { added = pids.Add(pid); }
+                    if (added) Flush();
+                } else if (bytes == STOP_SENTINEL) {
+                    break;
+                }
+            }
+        }
+    }
+
+    void Flush() {
+        List<int> snap;
+        lock (gate) { snap = new List<int>(pids); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v1\",\"launcher_pid\":");
+        sb.Append(launcherPid);
+        sb.Append(",\"tree_pids\":[");
+        for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); sb.Append(snap[i]); }
+        sb.Append("],\"owned_paths\":[]}");
+        try {
+            string tmp = manifestPath + ".tmp";
+            File.WriteAllText(tmp, sb.ToString());
+            if (File.Exists(manifestPath)) File.Delete(manifestPath);
+            File.Move(tmp, manifestPath);
+        } catch { }
+    }
+
+    public void Stop() {
+        stop = true;
+        PostQueuedCompletionStatus(port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero);
+        if (thread != null) thread.Join(2000);
+        Flush();
+        if (port != IntPtr.Zero) CloseHandle(port);
+        if (job != IntPtr.Zero) CloseHandle(job);
+    }
+}
+'@
+
+function Start-AstroTreeAttribution {
+    param([string]$ManifestPath, [int]$LauncherPid)
+    if (-not ([System.Management.Automation.PSTypeName]'AstroTreeRecorder').Type) {
+        Add-Type -TypeDefinition $AstroTreeRecorderSource -Language CSharp -ErrorAction Stop
+    }
+    return [AstroTreeRecorder]::Start($ManifestPath, $LauncherPid)
+}
+
 function Test-PinnedToolchain {
     param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot, [string]$SccacheExe)
 
@@ -896,8 +1030,10 @@ foreach ($argument in $commandArgs) {
 $commandExit = $null
 $launcherFault = $null
 $cleanupErrors = @()
+$treeRecorder = $null
+$attributionManifest = Join-Path $workspaceTempParent "no-escape-attribution-$PID.json"
 $previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
+foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
@@ -935,6 +1071,19 @@ try {
         throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_SERVER_UNAVAILABLE]: no sccache daemon is answering on 127.0.0.1:$sccacheServerPort ('--start-server' exit=$($sccacheStart.ExitCode), '--zero-stats' exit=$($sccacheZero.ExitCode)). Every rustc invocation would fail through RUSTC_WRAPPER. Remediation: check for a foreign listener on that port (Get-NetTCPConnection -LocalPort $sccacheServerPort) and for stale sccache.exe processes, then retry. Daemon output: $($sccacheStart.Output -join ' | ') $($sccacheZero.Output -join ' | ')"
     }
     Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0; SCCACHE_SERVER_PORT=$sccacheServerPort; SCCACHE_IDLE_TIMEOUT=$SccacheIdleTimeout"
+    # #278: start recording THIS run's process tree so the no-escape gate attributes
+    # shared-root deltas causally (see $AstroTreeRecorderSource). Point the gate at the
+    # manifest via the environment the child inherits. If the recorder cannot start, do
+    # NOT set the variable: the gate then fails closed (ASTRO_NO_ESCAPE_NO_ATTRIBUTION)
+    # instead of silently reverting to the unsound name-pattern classification.
+    try {
+        $treeRecorder = Start-AstroTreeAttribution -ManifestPath $attributionManifest -LauncherPid $PID
+        $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
+        Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: process-tree PIDs -> $attributionManifest"
+    }
+    catch {
+        Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_UNAVAILABLE]: could not start the process-tree recorder ($($_.Exception.Message)); the no-escape gate will fail closed rather than fall back to name-pattern attribution"
+    }
     # #239: the child's exit code is the ONLY thing that decides this launcher's exit code.
     # $ErrorActionPreference drops to 'Continue' for the call because Windows PowerShell 5.1
     # turns a native command's stderr into a TERMINATING ErrorRecord under 'Stop' — a child
@@ -959,6 +1108,11 @@ catch {
     $launcherFault = $_
 }
 finally {
+    # #278: stop the process-tree recorder FIRST (flush the final PID manifest) before any
+    # teardown removes .tmp. Stopping never changes the launcher's exit code.
+    if ($null -ne $treeRecorder) {
+        try { $treeRecorder.Stop() } catch { $cleanupErrors += "tree-attribution recorder stop failed: $($_.Exception.Message)" }
+    }
     # #190: surface this run's sccache stats to the evidence stream, then stop the daemon
     # (flushes stats, releases handles) BEFORE the target/temp cleanup below. The on-disk
     # cache in $sccacheDir is intentionally kept.
@@ -1025,7 +1179,7 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
-    foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
+    foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
             Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue

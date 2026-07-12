@@ -51,8 +51,12 @@ elif mode == "leak-exclusive":
     target = Path(sys.argv[2]) / "leaked-project.db"
     target.write_text("registered a fixture project in the operator store\\n", encoding="utf-8")
 elif mode == "leak-signature-dir":
-    # The exact shape of #236 / #133: a vault dir left in the operator's temp.
-    target = Path(sys.argv[2]) / "astrolabe-anchors-7f3c1a"
+    # The exact shape of #236 / #133: a vault dir left in the operator's temp. The
+    # dir name embeds THIS process's id (the vendored scratch-dir convention), which
+    # is how causal attribution (#278) recognises it as ours: the launcher/run tree
+    # contains this pid, so the leak is policed and RED -- while an identical name
+    # carrying a foreign pid would be counted, not policed.
+    target = Path(sys.argv[2]) / f"astrolabe-anchors-{os.getpid()}"
     target.mkdir(parents=True, exist_ok=True)
     (target / "vault.calyx").write_text("leaked vault\\n", encoding="utf-8")
 elif mode == "leak-foreign":
@@ -228,12 +232,17 @@ def main() -> int:
 
     print("=== 3. CONTROL: the #236 / #133 shape -- a vault dir in the operator's temp ===")
     result = run_gate(paths, "leak-signature-dir", paths["shared"])
-    expect_escape(result, "astrolabe-anchors-7f3c1a", "signature dir add")
-    leaked_dir = paths["shared"] / "astrolabe-anchors-7f3c1a"
-    if not leaked_dir.is_dir():
+    expect_escape(result, "astrolabe-anchors-", "signature dir add")
+    leaked_dirs = [
+        child
+        for child in paths["shared"].iterdir()
+        if child.is_dir() and child.name.startswith("astrolabe-anchors-")
+    ]
+    if not leaked_dirs:
         raise AssertionError("the leaker did not create the vault dir; control proof is vacuous")
-    print(f"  independent readback: {leaked_dir} exists on disk")
-    shutil.rmtree(leaked_dir)
+    print(f"  independent readback: {leaked_dirs[0]} exists on disk")
+    for leaked_dir in leaked_dirs:
+        shutil.rmtree(leaked_dir)
 
     print("=== 4. CONTROL: modifying operator state in an exclusive root ===")
     original = (paths["exclusive"] / "operator-project.db").read_bytes()
