@@ -30,6 +30,17 @@ esac
 WORKSPACE_TEST_TIMEOUT_SECS="${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS:-480}"
 WORKSPACE_TEST_DEFERRED_EXIT=125
 
+# #246: contain every phase's std::env::temp_dir() scratch to a run-scoped sandbox
+# under target/ (cleaned with it) so no suite -- the portable workspace tests in
+# check.sh, and the Calyx nextest in ci-rust-gate.sh -- leaks calyx-leapable-* dirs
+# into the operator's real %TEMP%. The #237 no-escape gate resolves operator_temp via
+# the OS known-folder (REAL_TEMP), not the env, so this contains honest writes WITHOUT
+# blinding the gate to a test that bypasses the redirect. check.sh also sets this for
+# its own standalone bracket; setting it here makes every child phase inherit it.
+AGG_SUITE_TMP="$ROOT/target/suite-tmp"
+mkdir -p "$AGG_SUITE_TMP"
+export TMP="$AGG_SUITE_TMP" TEMP="$AGG_SUITE_TMP" TMPDIR="$AGG_SUITE_TMP"
+
 if ! command -v rustc >/dev/null 2>&1; then
   echo "ERROR: rustc not found on PATH" >&2
   exit 1

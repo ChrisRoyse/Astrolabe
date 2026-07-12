@@ -104,6 +104,19 @@ export ASTRO_CARGO_METADATA_JSON
 CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 # #237: snapshot the protected roots BEFORE the build/test phase can touch them.
 "$PYTHON_BIN" scripts/check-no-escape.py snapshot --out "$ROOT/target/no-escape-before.json"
+# #246: give the suite a run-scoped scratch sandbox. The workspace tests (notably
+# the Calyx integration tests) create scratch dirs via std::env::temp_dir(), which
+# honors TMP/TEMP/TMPDIR on Windows; without an explicit sandbox they land in the
+# operator's real %TEMP% and (correctly) trip the #237 no-escape gate. The gate that
+# brackets this phase only *catches* escapes -- it never established a sandbox to
+# escape from, so containment cannot depend on the launcher having redirected TMP
+# (it demonstrably did not reach the cargo-test child processes). Point env::temp_dir
+# at a dir under target/ (cleaned with it). The gate resolves operator_temp via the
+# OS known-folder (REAL_TEMP), not the env, so this contains honest writes WITHOUT
+# blinding the gate to any test that bypasses the redirect via an absolute path.
+SUITE_TMP="$ROOT/target/suite-tmp"
+mkdir -p "$SUITE_TMP"
+export TMP="$SUITE_TMP" TEMP="$SUITE_TMP" TMPDIR="$SUITE_TMP"
 "$CARGO_BIN" build --workspace
 if [[ -n "${ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS+x}" ]]; then
   if "$PYTHON_BIN" scripts/check-workspace-tests.py \
