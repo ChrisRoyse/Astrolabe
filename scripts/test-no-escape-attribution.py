@@ -105,6 +105,7 @@ def write_manifest(
     pid_first_seen: dict[int, int] | None = None,
     pid_intervals: dict[int, list[tuple[int, int | None]]] | None = None,
     tree_pids: list[int] | None = None,
+    written_at: int | None = None,
 ) -> None:
     manifest: dict = {
         "schema": "astrolabe.no_escape_attribution.v1",
@@ -114,6 +115,8 @@ def write_manifest(
     }
     if run_started_ns is not None:
         manifest["run_started_unix_ns"] = run_started_ns
+    if written_at is not None:
+        manifest["written_at"] = written_at
     if pid_first_seen is not None:
         manifest["pid_first_seen"] = {str(pid): ns for pid, ns in pid_first_seen.items()}
     if pid_intervals is not None:
@@ -449,6 +452,75 @@ def main() -> int:
     print(f"  {in_second.name} inside instance 2 -> RED; {between.name} between instances -> counted")
     shutil.rmtree(in_second)
     shutil.rmtree(between)
+
+    # ---- attempt-8 refinement (#278): throttle-race stale-manifest guard ----
+
+    print("=== 16. STALE MANIFEST ('Control 17'): delta POSTDATES written_at -> RED, not foreign ===")
+    # THROTTLE RACE: the launcher's recorder rewrites the manifest ~1/sec while the
+    # run is live, and `verify` reads it MID-SESSION, before the teardown's final
+    # flush. So a process that leaked AFTER the last flush is not yet in tree_pids.
+    # Here a delta with a pid NOT in the tree lands AFTER the manifest's written_at:
+    # without the guard its pid-mismatch classifies FOREIGN (counted, PASS); with the
+    # guard the gate sees the delta postdates the flush and CANNOT trust 'foreign', so
+    # it POLICES it (ASTRO_NO_ESCAPE_STALE_MANIFEST -> RED). Fail-closed, never silent.
+    snapshot(paths)
+    now_ns = time.time_ns()
+    post_flush = paths["temp"] / f"calyx-retention-post-flush-{FOREIGN_PID}"
+    post_flush.mkdir()
+    os.utime(post_flush, ns=(now_ns, now_ns))  # entry timestamp = "now"
+    stale_manifest = paths["fixture"] / "attribution-stale.json"
+    write_manifest(
+        stale_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,  # in-window (not pre-run)
+        written_at=now_ns - 60 * NS,  # flushed 60s BEFORE the delta: stale for it
+        tree_pids=[TREE_PID],  # FOREIGN_PID is NOT in the tree
+        pid_intervals={TREE_PID: [(now_ns - 120 * NS, None)]},
+    )
+    manifest_bytes = stale_manifest.read_bytes()
+    print(f"  FSV manifest byte-readback: {manifest_bytes.decode('utf-8')}")
+    result = verify(paths, stale_manifest)
+    expect_red(result, post_flush.name, "stale-manifest post-flush delta")
+    if "ASTRO_NO_ESCAPE_STALE_MANIFEST" not in (result.stdout + result.stderr):
+        raise AssertionError(f"stale-manifest delta was not labeled:\n{result.stdout}\n{result.stderr}")
+    print("  FSV gate output (stale-manifest label + RED):")
+    for line in (result.stdout + result.stderr).splitlines():
+        if "STALE_MANIFEST" in line or "stale_manifest" in line or "ASTRO_TEST_SANDBOX_ESCAPE" in line:
+            print(f"    {line}")
+    print(f"  gate exit code: {result.returncode}")
+    if not post_flush.is_dir():
+        raise AssertionError("control vacuous: post-flush dir absent on disk")
+    print(f"  independent readback: {post_flush} postdates written_at, POLICED not foreign")
+    shutil.rmtree(post_flush)
+
+    print("=== 17. GUARD BOUND: delta at/inside written_at + skew stays counted (foreign) ===")
+    # The dual of control 16: a foreign delta whose timestamp is WITHIN the skew
+    # margin of written_at is NOT stale (a healthy recorder flushes within skew), so
+    # it must remain counted -- proving the guard reddens only genuinely-late deltas,
+    # not normal in-window foreign churn, and does not re-redden the whole shared root.
+    snapshot(paths)
+    now_ns = time.time_ns()
+    within = paths["temp"] / f"calyx-retention-within-skew-{FOREIGN_PID}"
+    within.mkdir()
+    within_ts = now_ns  # entry "now"
+    os.utime(within, ns=(within_ts, within_ts))
+    fresh_manifest = paths["fixture"] / "attribution-fresh.json"
+    write_manifest(
+        fresh_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,
+        written_at=now_ns,  # flushed at the delta time: within skew, NOT stale
+        tree_pids=[TREE_PID],
+        pid_intervals={TREE_PID: [(now_ns - 120 * NS, None)]},
+    )
+    result = verify(paths, fresh_manifest)
+    expect_clean(result, "within-skew foreign churn")
+    if "ASTRO_NO_ESCAPE_STALE_MANIFEST" in (result.stdout + result.stderr):
+        raise AssertionError(f"within-skew delta was wrongly flagged stale:\n{result.stdout}")
+    if within.name in result.stderr:
+        raise AssertionError(f"within-skew foreign delta was policed:\n{result.stderr}")
+    print(f"  independent readback: {within} within skew of written_at, counted not policed")
+    shutil.rmtree(within)
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
     print("no-escape attribution control passed: causal, windowed, instance-lifetime-aware (#278)")
