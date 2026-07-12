@@ -559,10 +559,11 @@ def validate(root: Path) -> list[str]:
         errors,
     )
 
-    # No hosted CI exists to validate (banned; #224). The row-sink overhead
-    # benchmark lost its scheduled CI caller with the workflow's removal;
-    # scripts/bench-row-sink-overhead.sh remains locally runnable and its
-    # coverage gap is tracked on #224.
+    # No hosted CI exists to validate (banned; the CI-ownership retirement landed
+    # with #224, now closed). The row-sink overhead benchmark lost its scheduled
+    # caller with that removal; scripts/bench-row-sink-overhead.sh remains locally
+    # runnable, but its lack of a scheduled cadence caller post-CI-ban is an
+    # evidence-owner gap recorded on #238 (the live register), not on a closed issue.
 
     return errors
 

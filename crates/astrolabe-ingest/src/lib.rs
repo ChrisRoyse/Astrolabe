@@ -1,11 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod erasure_scrub;
 pub mod fsv;
 mod graph_projection;
 mod ledger_verify;
 mod registry;
 mod sqlite_import;
 
+pub use erasure_scrub::{
+    ASTRO_ERASURE_SCRUB_BATCH_INVALID, ASTRO_ERASURE_SCRUB_IO, ASTRO_ERASURE_SCRUB_NOT_DURABLE,
+    ASTRO_ERASURE_SCRUB_TORN_WAL, ASTRO_ERASURE_SCRUB_WAL_UNCOVERED, WAL_SCRUB_LEDGER_SCHEMA,
+    WalScrubParams, WalScrubReport, WalScrubStatus, scrub_erased_wal_history, wal_scrub_status,
+};
 pub use fsv::VaultMutationPlan;
 
 pub use graph_projection::{

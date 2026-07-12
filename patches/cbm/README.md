@@ -96,3 +96,45 @@ barrier, but the C mirror must not disagree with the Rust validator about which
 byte classes are shell-unsafe. Covered by `scripts/test-cbm-spawn-patch.py`
 (asserts the `_WIN32` case block gains `%`/`^`/`!` and the POSIX branch is
 unchanged) and the CBM clang-format overlay gate. Intended for upstreaming.
+
+## #229: cbm-with-ui -Werror overlays (native MinGW GCC 14.1)
+
+The `cbm` and `cbm-with-ui` production binaries compile the vendored sources
+**directly** (via `PROD_SRCS`), unlike `libcbm.a`, whose overlays live under
+`$(LIBCBM_DIR)` — so the libcbm store/spawn overlays above do **not** reach the
+production binaries. Three vendored sources trip GCC 14.1 `-Werror` on the native
+Windows toolchain, blocking `cbm-with-ui` and therefore the #17 unmodified-UI
+smoke gate:
+
+- `src/pipeline/pass_envscan.c` — `-Wstringop-truncation` on the
+  `strncpy(dst, src, sizeof-1)` + explicit-NUL idiom.
+- `src/watcher/watcher.c` — `-Wstringop-truncation` on two
+  `strncpy(s->last_head, head, sizeof-1)` calls that, additionally, do **not**
+  terminate when `head` fills the 64-byte buffer (a genuine latent bug).
+- `src/ui/layout3d.c` — `-Walloc-size-larger-than` on
+  `malloc((size_t)n * sizeof(int))` in `compute_call_depth`, where `n` is fed in
+  unchecked (a genuine bug: `n` is a clamped search-result count, but nothing in
+  the callee enforces the bound).
+
+`apply_ui_werror_patch.py` generates hash-checked, build-local overlays with
+**root-cause fixes, not warning suppression**: the two strncpy sites become
+`strnlen`-bounded `memcpy` copies with an explicit terminator (identical
+truncate-to-buffer semantics, always NUL-terminated), and `compute_call_depth`
+gains a `0 < n <= HARD_MAX_NODES` range guard that fails closed with a
+`{code, message, remediation}` log record (`CBM_E_LAYOUT_NODE_COUNT_RANGE`) and
+leaves the caller's zero-initialized `depth[]` untouched. `HARD_MAX_NODES` is the
+file's existing hard node ceiling — no new constant is introduced. `Makefile.cbm`
+substitutes the overlays (`PROD_SRCS_UI` / `PROD_SRCS_WITH_ASSETS_UI`) into the
+`cbm` / `cbm-with-ui` links; nothing under `vendor/` is written.
+
+Scope note: these overlays reach the **production binaries only**. The same
+`layout3d.c` / `watcher.c` sources are also compiled into `libcbm.a`, where the
+pre-existing broad `-Wno-*` suppressions (`GCC_ONLY_FLAGS`) mask the diagnostics;
+propagating the genuine fixes into the libcbm build (composing with the #227
+`watcher.c` spawn overlay) is tracked separately, not done here.
+
+Verify with `python -B scripts/test-cbm-ui-werror-patch.py` (source-hash pins,
+persisted overlay-byte readback of each fix, the removed strncpy/unchecked-malloc
+idioms, and the drift/empty/unknown-selector fail-closed triad) plus a native
+Windows-GNU `make -f Makefile.cbm cbm-with-ui` that must link `-Werror`-clean.
+Temporary integration patch; intended for upstreaming to CBM.
