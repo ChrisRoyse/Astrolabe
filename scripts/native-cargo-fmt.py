@@ -106,8 +106,19 @@ def load_metadata(manifest_path: Path | None = None) -> dict:
 def collect_all_targets(
     manifest_path: Path | None = None,
     metadata_loader: MetadataLoader = load_metadata,
+    *,
+    workspace_only: bool = False,
 ) -> list[Target]:
-    """Match cargo-fmt's recursive collection of local path dependencies."""
+    """Match cargo-fmt's recursive collection of local path dependencies.
+
+    With ``workspace_only=True`` the recursion into local path dependencies of
+    OTHER workspaces (notably the vendored ``vendor/calyx`` crates) is skipped,
+    so only the top workspace's own members are formatted. Vendored bytes are
+    byte-pinned by ``scripts/verify-pins.sh`` and full-graph-formatted by the
+    Rust gate (``scripts/ci-rust-gate.sh`` runs ``--all``), so excluding them
+    from the Tier-1 ``check.sh`` fmt is redundant work removed, not coverage
+    lost (#280).
+    """
 
     targets: dict[Path, Target] = {}
     visited_dependency_names: set[str] = set()
@@ -140,6 +151,10 @@ def collect_all_targets(
                 edition = str(target.get("edition") or package.get("edition") or "2015")
                 kinds = target.get("kind") or ["unknown"]
                 targets.setdefault(source, (source, edition, str(kinds[0])))
+
+        if workspace_only:
+            # Do not descend into path dependencies of other workspaces.
+            return
 
         for package in packages:
             for dependency in package.get("dependencies", []):
@@ -222,6 +237,7 @@ def parse_all_options(cargo_args: list[str]) -> argparse.Namespace:
     parser.add_argument("--manifest-path")
     parser.add_argument("--message-format")
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--workspace-only", dest="workspace_only", action="store_true")
     parser.add_argument("--check", action="store_true")
     return parser.parse_args(cargo_args)
 
@@ -345,7 +361,7 @@ def main(arguments: list[str] | None = None) -> int:
     apply_message_format(rustfmt_args, options.message_format)
     manifest_path = Path(options.manifest_path) if options.manifest_path is not None else None
     return run_batched_rustfmt(
-        collect_all_targets(manifest_path),
+        collect_all_targets(manifest_path, workspace_only=options.workspace_only),
         rustfmt_args,
         quiet=options.quiet,
         verbose=options.verbose,

@@ -53,18 +53,17 @@ def default_upstream():
 
 
 def build_upstream():
+    # #280: build via the shared cache helper. Its cache is keyed on the
+    # byte-pinned inputs (not the BUILD_DIR), so when check-mcp-parity.sh already
+    # built+cached the CBM prod binary this run, this call is a byte-identical
+    # cache restore instead of a second ~5-minute make. Fail-closed: an ambiguous
+    # key runs the same full make. (default_upstream() still short-circuits to
+    # check-mcp-parity.sh's target/cbm-parity output when present, so in the
+    # default aggregate order this path is only reached standalone.)
     build_dir = ROOT / "target" / "cbm-lowered-parity"
     exe = ".exe" if os.name == "nt" else ""
     run(
-        [
-            "make",
-            "-C",
-            ROOT / "vendor" / "codebase-memory-mcp",
-            "-f",
-            ROOT / "patches" / "cbm" / "Makefile.cbm",
-            f"BUILD_DIR={build_dir}",
-            "cbm",
-        ],
+        ["bash", str(ROOT / "scripts" / "cbm-prod-build.sh"), str(build_dir)],
         timeout=900,
     )
     built = build_dir / f"codebase-memory-mcp{exe}"

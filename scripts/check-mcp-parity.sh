@@ -29,11 +29,15 @@ esac
 
 cargo build -p astrolabe-server --bin astrolabe
 
+# #280: the CBM prod binary is the dominant cost of this gate. Build it through
+# the shared cache helper, which restores a byte-identical binary from a
+# gitignored cache keyed on (byte-pinned vendor subtree + patches/cbm overlay +
+# toolchain identity) when nothing changed, and otherwise runs the same `make`
+# and populates the cache. check-lowered-parity.py reuses this same BUILD_DIR
+# (target/cbm-parity) via its default_upstream() resolution, so one build serves
+# both parity gates within a run. Fail-closed: an ambiguous key => full build.
 CBM_BUILD_DIR="$ROOT/target/cbm-parity"
-make -C "$ROOT/vendor/codebase-memory-mcp" \
-  -f "$ROOT/patches/cbm/Makefile.cbm" \
-  "BUILD_DIR=$CBM_BUILD_DIR" \
-  cbm
+bash "$ROOT/scripts/cbm-prod-build.sh" "$CBM_BUILD_DIR"
 
 UPSTREAM_BIN="$CBM_BUILD_DIR/codebase-memory-mcp$EXE"
 if [[ ! -x "$UPSTREAM_BIN" && -x "$CBM_BUILD_DIR/codebase-memory-mcp" ]]; then
