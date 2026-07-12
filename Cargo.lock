@@ -271,6 +271,8 @@ version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
  "blake3",
+ "calyx-core",
+ "calyx-ledger",
 ]
 
 [[package]]
