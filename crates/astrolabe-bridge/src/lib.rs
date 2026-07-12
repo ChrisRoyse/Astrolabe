@@ -485,9 +485,174 @@ pub fn parent_process_id() -> Option<u32> {
     Some(unsafe { libc::getppid() as u32 })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn parent_process_id() -> Option<u32> {
+    windows_watchdog::parent_process_id()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn parent_process_id() -> Option<u32> {
     None
+}
+
+/// Outcome of a bounded wait for the parent process to exit (#253).
+///
+/// Windows has no `getppid` reparenting signal (it never reparents an orphan), so the
+/// Unix ppid-change watchdog cannot work here. Instead the watchdog opens a `SYNCHRONIZE`
+/// handle to the parent and waits on it: a process handle becomes signaled when the
+/// process exits. A wait that cannot be performed is [`ParentWaitOutcome::Failed`], never
+/// silently treated as "still alive" — a watchdog that cannot watch must fail closed.
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum ParentWaitOutcome {
+    /// The parent process has exited (its handle signaled); the child should self-terminate.
+    Exited,
+    /// The parent is still alive; the bounded wait elapsed without the handle signaling.
+    StillAlive,
+    /// The wait itself failed; the caller must fail closed rather than assume liveness.
+    Failed(String),
+}
+
+#[cfg(windows)]
+pub use windows_watchdog::ParentDeathWatch;
+
+#[cfg(windows)]
+mod windows_watchdog {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    type Ntstatus = i32;
+
+    // Fixed, stable layout (documented in winternl.h); Rust's own std test suite declares
+    // it identically. Only `inherited_from_unique_process_id` (the parent PID) is read.
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: Ntstatus,
+        peb_base_address: *mut c_void,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    const PROCESS_BASIC_INFORMATION_CLASS: i32 = 0;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+
+    // NtQueryInformationProcess is the documented route to a process's parent PID
+    // (PROCESS_BASIC_INFORMATION.InheritedFromUniqueProcessId); Windows exposes no getppid.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            handle: Handle,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> Ntstatus;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub(crate) fn parent_process_id() -> Option<u32> {
+        let mut info = ProcessBasicInformation {
+            exit_status: 0,
+            peb_base_address: std::ptr::null_mut(),
+            affinity_mask: 0,
+            base_priority: 0,
+            unique_process_id: 0,
+            inherited_from_unique_process_id: 0,
+        };
+        let mut ret_len: u32 = 0;
+        // SAFETY: GetCurrentProcess returns the current-process pseudo-handle (no lifetime
+        // to manage). We pass a correctly sized, fully initialized PROCESS_BASIC_INFORMATION
+        // and its exact size; the call writes only within that buffer.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                GetCurrentProcess(),
+                PROCESS_BASIC_INFORMATION_CLASS,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut ret_len,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let ppid = info.inherited_from_unique_process_id as u32;
+        if ppid == 0 { None } else { Some(ppid) }
+    }
+
+    /// A `SYNCHRONIZE` handle to the parent process. Its wait state becomes signaled when
+    /// the parent exits, so a bounded [`ParentDeathWatch::wait`] on it detects parent death
+    /// near-instantly without polling.
+    pub struct ParentDeathWatch {
+        handle: Handle,
+    }
+
+    // SAFETY: a Windows HANDLE is an opaque kernel-object reference that may be used from
+    // any thread; this value is only ever waited on / closed from the single watchdog
+    // thread that owns it.
+    unsafe impl Send for ParentDeathWatch {}
+
+    impl ParentDeathWatch {
+        /// Opens a `SYNCHRONIZE` handle to `parent_pid`. Fails closed with a coded message
+        /// if the process cannot be opened (typically because the parent is already gone).
+        pub fn open(parent_pid: u32) -> Result<Self, String> {
+            // SAFETY: OpenProcess writes through no caller pointers; a null return is the
+            // documented failure signal, which we check before constructing the wrapper.
+            let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+            if handle.is_null() {
+                // SAFETY: GetLastError has no preconditions.
+                let code = unsafe { GetLastError() };
+                return Err(format!(
+                    "ASTRO_WATCHDOG_PARENT_OPEN: OpenProcess(SYNCHRONIZE) for parent pid \
+                     {parent_pid} failed (GetLastError={code}); the parent may already have exited"
+                ));
+            }
+            Ok(Self { handle })
+        }
+
+        /// Waits up to `timeout_ms` for the parent to exit. Returns immediately with
+        /// [`ParentWaitOutcome::Exited`] once the handle signals.
+        pub fn wait(&self, timeout_ms: u32) -> super::ParentWaitOutcome {
+            // SAFETY: self.handle is a live SYNCHRONIZE handle owned by this value.
+            let rc = unsafe { WaitForSingleObject(self.handle, timeout_ms) };
+            match rc {
+                WAIT_OBJECT_0 => super::ParentWaitOutcome::Exited,
+                WAIT_TIMEOUT => super::ParentWaitOutcome::StillAlive,
+                WAIT_FAILED => {
+                    // SAFETY: GetLastError has no preconditions.
+                    let code = unsafe { GetLastError() };
+                    super::ParentWaitOutcome::Failed(format!(
+                        "ASTRO_WATCHDOG_WAIT: WaitForSingleObject on the parent handle failed \
+                         (GetLastError={code})"
+                    ))
+                }
+                other => super::ParentWaitOutcome::Failed(format!(
+                    "ASTRO_WATCHDOG_WAIT: WaitForSingleObject returned unexpected code {other:#010x}"
+                )),
+            }
+        }
+    }
+
+    impl Drop for ParentDeathWatch {
+        fn drop(&mut self) {
+            // SAFETY: self.handle came from OpenProcess and is closed exactly once, here.
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2096,6 +2261,93 @@ unsafe fn array_slice<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #253 FSV: a SYNCHRONIZE process handle becomes signaled the instant the process
+    // exits, so ParentDeathWatch::wait must report StillAlive while a controlled child runs
+    // and Exited once it is killed. Source of truth = the real OS process state; we read the
+    // wait outcome back before and after the kill.
+    #[cfg(windows)]
+    #[test]
+    fn parent_death_watch_reports_still_alive_then_exited() {
+        use std::process::{Command, Stdio};
+        // A child we fully own: ping loopback stays alive ~30s; killing it is the synthetic
+        // "parent death" trigger. Spawned directly so child.id() is the process we watch.
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a controllable child process");
+        let pid = child.id();
+        let watch =
+            ParentDeathWatch::open(pid).expect("open a SYNCHRONIZE handle to the live child");
+
+        // BEFORE: the child is alive -> a zero-timeout wait must observe StillAlive.
+        let before = watch.wait(0);
+        eprintln!("[FSV #253] pid={pid} before-kill wait(0)  = {before:?}");
+        assert!(
+            matches!(before, ParentWaitOutcome::StillAlive),
+            "expected StillAlive while the child runs, got {before:?}"
+        );
+
+        // Trigger the death and reap it: the OS process is now gone.
+        child.kill().expect("kill the controlled child");
+        let _ = child.wait();
+
+        // AFTER: the handle must signal -> Exited within a bounded wait.
+        let after = watch.wait(5_000);
+        eprintln!("[FSV #253] pid={pid} after-kill  wait(5000)= {after:?}");
+        assert!(
+            matches!(after, ParentWaitOutcome::Exited),
+            "expected Exited after the child was killed, got {after:?}"
+        );
+    }
+
+    // #253: the parent-PID acquisition path (NtQueryInformationProcess) resolves on Windows
+    // -- the test runner has a live parent -- and that PID is openable for a SYNCHRONIZE wait.
+    #[cfg(windows)]
+    #[test]
+    fn parent_process_id_resolves_and_parent_is_watchable() {
+        let ppid = parent_process_id();
+        eprintln!("[FSV #253] parent_process_id() = {ppid:?}");
+        let ppid = ppid.expect("the test runner has a parent; expected Some");
+        assert_ne!(ppid, 0, "parent pid must be non-zero");
+        let watch = ParentDeathWatch::open(ppid).expect("open a handle to our live parent");
+        assert!(
+            matches!(watch.wait(0), ParentWaitOutcome::StillAlive),
+            "our parent is alive right now; wait(0) must be StillAlive"
+        );
+    }
+
+    // #253 edge: opening a watch on a reaped PID must never silently claim liveness -- it
+    // fails closed with the coded message, or (rare PID reuse) yields a real, honest handle.
+    #[cfg(windows)]
+    #[test]
+    fn parent_death_watch_open_on_reaped_pid_never_lies() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child
+            .wait()
+            .expect("reap the child so its PID is no longer a live process");
+        match ParentDeathWatch::open(pid) {
+            Err(message) => {
+                eprintln!("[FSV #253] open(reaped pid {pid}) failed closed: {message}");
+                assert!(
+                    message.contains("ASTRO_WATCHDOG_PARENT_OPEN"),
+                    "fail-closed error must carry the code, got {message}"
+                );
+            }
+            Ok(watch) => {
+                eprintln!(
+                    "[FSV #253] open(reaped pid {pid}) succeeded (PID reuse); wait(0) = {:?}",
+                    watch.wait(0)
+                );
+            }
+        }
+    }
 
     /// The CBM store the operator actually owns, listed as (name, len) pairs.
     /// Every store-env edge case must leave it byte-identical.
