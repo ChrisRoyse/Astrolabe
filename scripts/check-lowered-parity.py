@@ -87,7 +87,44 @@ def default_ui_binary():
     return None
 
 
+def assert_vendor_clean(label):
+    # FSV / #229 contract: a UI build must leave the pinned vendor subtree
+    # byte-clean. `git status --porcelain` reports both modified tracked files
+    # (e.g. graph-ui/tsconfig.tsbuildinfo) and untracked, non-ignored paths (e.g.
+    # a stray src/ui/embedded_assets.c) — exactly what verify-pins.sh would reject.
+    proc = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain", "--", "vendor/codebase-memory-mcp"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"git status failed while checking vendor cleanliness after {label}:\n{proc.stderr}"
+        )
+    dirty = proc.stdout.strip()
+    if dirty:
+        raise SystemExit(
+            f"vendor/ subtree was modified during {label} — verify-pins.sh would fail. "
+            "Every generated build artifact must stay under BUILD_DIR, never in vendor/.\n"
+            f"--- git status --porcelain vendor/codebase-memory-mcp ---\n{dirty}"
+        )
+
+
 def build_ui_binary():
+    # Build cbm-with-ui through the PATCHED Makefile (patches/cbm/Makefile.cbm),
+    # exactly as build_upstream() builds `cbm`. The vendored Makefile.cbm has no
+    # PROD_SRCS_UI substitution, so building through it would compile the raw
+    # vendored sources and re-trip the GCC 14 -Werror diagnostics the #229 overlays
+    # exist to fix (and would silently fall back to un-patched vendored code). The
+    # patched Makefile lists $(ASTRO_UI_WERROR_OVERLAYS) as prerequisites of
+    # cbm-with-ui; its pattern rule runs apply_ui_werror_patch.py to generate each
+    # hash-checked overlay, which fails closed on source drift — a missing or failed
+    # overlay aborts the build rather than reverting to the vendored source.
+    build_dir = ROOT / "target" / "cbm-ui-smoke"
     exe = ".exe" if os.name == "nt" else ""
     run(
         [
@@ -95,15 +132,18 @@ def build_ui_binary():
             "-C",
             ROOT / "vendor" / "codebase-memory-mcp",
             "-f",
-            "Makefile.cbm",
-            "BUILD_DIR=../../target/cbm-ui-smoke",
+            ROOT / "patches" / "cbm" / "Makefile.cbm",
+            f"BUILD_DIR={build_dir}",
             "cbm-with-ui",
         ],
         timeout=900,
     )
-    built = ROOT / "target" / "cbm-ui-smoke" / f"codebase-memory-mcp{exe}"
+    # The UI build runs the frontend/embed toolchain (npm/vite/embed); assert it
+    # left the pinned vendor subtree byte-clean before returning the binary.
+    assert_vendor_clean("cbm-with-ui build")
+    built = build_dir / f"codebase-memory-mcp{exe}"
     if not built.exists():
-        built = ROOT / "target" / "cbm-ui-smoke" / "codebase-memory-mcp"
+        built = build_dir / "codebase-memory-mcp"
     if not built.exists():
         raise SystemExit(f"UI build did not produce {built}")
     return built
