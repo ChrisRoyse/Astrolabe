@@ -3015,22 +3015,39 @@ mod tests {
             }
             s
         };
+        // Case expectations: `Inherits` = the child launches and libcbm must read
+        // the full value without a truncation fault (the #267 design correction —
+        // no artificial cap). `OsBoundary` = Windows itself refuses the value at
+        // process creation (a single environment variable cannot exceed 32 767
+        // chars; RTL init dies with STATUS_NO_MEMORY before any user code), so the
+        // refusal at the real boundary is OS-owned and fail-closed — libcbm can
+        // never observe such a PATH — proven empirically on 2026-07-12 with both
+        // junk-first and real-path-first constructions.
+        #[derive(PartialEq)]
+        enum Expect {
+            Inherits,
+            OsBoundary,
+        }
+        let beyond_max_expect = if cfg!(windows) {
+            Expect::OsBoundary
+        } else {
+            Expect::Inherits
+        };
         // baseline (real PATH), operator-size (~4226 B), ~8 KB, ~33 KB (beyond the
-        // 32767-char SetEnvironmentVariable maximum — the #267 design correction
-        // removed the artificial read cap, so a PATH the OS lets a child inherit is
-        // searched in full; the only remaining refusal is genuine allocation
-        // failure), and unset (no spurious truncation fault on a missing PATH).
+        // 32767-char per-variable maximum), and unset (no spurious truncation
+        // fault on a missing PATH).
         let cases = [
-            ("baseline", Some(real.clone())),
-            ("oversize_4226", Some(make(4226))),
-            ("oversize_8192", Some(make(8192))),
+            ("baseline", Some(real.clone()), Expect::Inherits),
+            ("oversize_4226", Some(make(4226)), Expect::Inherits),
+            ("oversize_8192", Some(make(8192)), Expect::Inherits),
             (
                 "oversize_33000_beyond_setvar_max",
                 Some(make_real_first(33000)),
+                beyond_max_expect,
             ),
-            ("unset", None),
+            ("unset", None, Expect::Inherits),
         ];
-        for (case, path_value) in cases {
+        for (case, path_value, expect) in cases {
             if let Some(value) = &path_value {
                 if case.starts_with("oversize") {
                     assert!(
@@ -3061,6 +3078,32 @@ mod tests {
             let out = child.output().expect("spawn path-buffer probe");
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if expect == Expect::OsBoundary {
+                // The refusal at the genuine boundary is preserved — by the OS.
+                // The child must die at process initialization, before any user
+                // code runs (empty output), so libcbm's cap-free read is
+                // unreachable for values Windows cannot represent.
+                println!(
+                    "path-buffer case={case} os-boundary status={:?} \
+                     stdout_bytes={} stderr_bytes={}",
+                    out.status,
+                    out.stdout.len(),
+                    out.stderr.len()
+                );
+                assert!(
+                    !out.status.success(),
+                    "[{case}] a >32767-char PATH unexpectedly launched; if a \
+                     future Windows lifts the per-variable cap this case must \
+                     move to Expect::Inherits:\n{stdout}\n{stderr}"
+                );
+                assert!(
+                    out.stdout.is_empty() && out.stderr.is_empty(),
+                    "[{case}] expected an RTL-init death before user code, got \
+                     output (status {:?}):\n{stdout}\n{stderr}",
+                    out.status
+                );
+                continue;
+            }
             assert!(
                 out.status.success(),
                 "[{case}] probe failed (status {:?} — an empty-output instant death \
