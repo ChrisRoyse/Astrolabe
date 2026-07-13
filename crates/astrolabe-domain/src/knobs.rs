@@ -54,6 +54,8 @@ pub const FSV_READBACK_SAMPLE_RATE_PERMILLE_KNOB: &str = "fsv_readback_sample_ra
 pub const FSV_JANITOR_ROWS_PER_SLICE_KNOB: &str = "fsv_janitor_rows_per_slice";
 /// Name of the janitor ledger-entry budget knob.
 pub const FSV_JANITOR_LEDGER_ENTRIES_PER_SLICE_KNOB: &str = "fsv_janitor_ledger_entries_per_slice";
+/// Name of the always-on janitor scrub-cadence knob.
+pub const FSV_JANITOR_SCRUB_INTERVAL_MS_KNOB: &str = "fsv_janitor_scrub_interval_ms";
 
 /// Full readback: every mutated row is re-read and content-hash compared.
 pub const FSV_SAMPLE_RATE_FULL_PERMILLE: u64 = 1_000;
@@ -73,6 +75,14 @@ pub const FSV_DEFAULT_JANITOR_LEDGER_ENTRIES_PER_SLICE: u64 = 4_096;
 pub const FSV_MIN_JANITOR_LEDGER_ENTRIES_PER_SLICE: u64 = 1;
 /// Largest legal janitor ledger-entry budget per slice.
 pub const FSV_MAX_JANITOR_LEDGER_ENTRIES_PER_SLICE: u64 = 1_000_000;
+/// Default cadence between bounded background scrub slices, in milliseconds.
+pub const FSV_DEFAULT_JANITOR_SCRUB_INTERVAL_MS: u64 = 250;
+/// Smallest legal scrub cadence: the lane may run back-to-back slices (1 ms) so a
+/// high-throughput store or a test can drain the tail promptly.
+pub const FSV_MIN_JANITOR_SCRUB_INTERVAL_MS: u64 = 1;
+/// Largest legal scrub cadence: a full day, so an operator can throttle the lane
+/// to a once-daily background sweep on a quiet store.
+pub const FSV_MAX_JANITOR_SCRUB_INTERVAL_MS: u64 = 86_400_000;
 
 /// The engine-native FSV knob registry (#178).
 ///
@@ -110,6 +120,16 @@ pub const FSV_KNOBS: &[U64KnobDeclaration] = &[
         unit: "entries",
         source: "https://research.swtch.com/tlog.pdf (a client caches the verified prefix and only verifies the suffix, rather than rewalking the whole log)",
         rationale: "bounds the hash-chain entries one slice re-hashes past the persisted checkpoint, so #96 (no full-ledger rewalk per status call) stays respected as the ledger grows",
+    },
+    U64KnobDeclaration {
+        registry_version: FSV_KNOB_REGISTRY_VERSION,
+        name: FSV_JANITOR_SCRUB_INTERVAL_MS_KNOB,
+        default: FSV_DEFAULT_JANITOR_SCRUB_INTERVAL_MS,
+        min: FSV_MIN_JANITOR_SCRUB_INTERVAL_MS,
+        max: FSV_MAX_JANITOR_SCRUB_INTERVAL_MS,
+        unit: "milliseconds",
+        source: "https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Module%20Parameters.html (zfs_scan_vdev_limit / zfs_scrub_min_time_ms throttle scrub so it interleaves with live I/O rather than running as one stop-the-world pass)",
+        rationale: "seed cadence between bounded background scrub slices so the always-on janitor interleaves with live I/O; a slice is already bounded by the entries-per-slice knob, so this caps how often those bounded slices fire, never their size; replace with a measured IO-budget policy once scrub throughput is benchmarked (#178 non-goal: measured, not theater)",
     },
 ];
 
