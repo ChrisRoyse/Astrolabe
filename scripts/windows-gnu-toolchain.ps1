@@ -1342,6 +1342,11 @@ $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 # exit removal) lives in one audited, dot-sourceable helper that -- like the lock helper --
 # NEVER stops a process and treats a live-PID manifest as inviolable.
 . (Join-Path $PSScriptRoot "attribution-manifest.ps1")
+# #320: liveness-gated reaper for per-run TEMP child dirs left behind when a run's owner
+# pwsh died while a detached child was still executing (that run's finally deferred its own
+# cleanup). Like the lock/manifest helpers it NEVER stops a process and reaps a dir only when
+# the whole owning process tree is dead.
+. (Join-Path $PSScriptRoot "launcher-temp-guard.ps1")
 Assert-AstroLauncherLockClaimable -LockPath $launcherLock
 # #280: ASTROLABE_CONTIGUOUS_BATCH=1 (the CLAUDE.md contiguous-verification-
 # batch carve-out) keeps target/ warm between consecutive runs of one session,
@@ -1363,6 +1368,17 @@ New-Item -ItemType Directory -Path $workspaceTempParent -Force | Out-Null
 $attributionSweep = Clear-DeadAttributionManifests -Directory $workspaceTempParent -SelfPid $PID
 if ($attributionSweep.Removed.Count -gt 0 -or $attributionSweep.Kept.Count -gt 0) {
     Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_SWEEP]: removed $($attributionSweep.Removed.Count) stale dead-PID attribution manifest(s); left $($attributionSweep.Kept.Count) live-PID manifest(s) untouched (#197/#301)"
+}
+# #320: reap per-run TEMP child dirs (.tmp/windows-gnu-toolchain-<pid>) left by prior runs
+# whose owner pwsh died while a detached child kept executing -- those runs' finally blocks
+# deliberately DEFERRED their own cleanup so the live child kept its working tree. This is
+# where that deferred cleanup is finally collected, but ONLY for dirs whose whole process
+# tree is dead: a dir owned by a live concurrent session, or one whose detached child is
+# still alive, is left untouched (#197/#320). Runs after the attribution sweep so a dir's
+# sibling manifest is still on disk to probe its recorded child pids.
+$tempSweep = Clear-DeadLauncherTempDirs -Directory $workspaceTempParent -SelfPid $PID
+if ($tempSweep.Removed.Count -gt 0 -or $tempSweep.Kept.Count -gt 0) {
+    Write-Output "CLEANUP[ASTRO_LAUNCHER_TEMP_SWEEP]: reaped $($tempSweep.Removed.Count) dead-owner TEMP child dir(s); left $($tempSweep.Kept.Count) still-live-owner dir(s) untouched (#197/#320)"
 }
 # #197: atomic lock claim — write the full manifest to a PID-named staging
 # sibling, then move it onto the lock name WITHOUT clobbering. No reader can
@@ -1588,6 +1604,31 @@ finally {
     if ($null -ne $treeRecorder) {
         try { $treeRecorder.Stop() } catch { $cleanupErrors += "tree-attribution recorder stop failed: $($_.Exception.Message)" }
     }
+    # #320: LIVENESS GATE. The recorder's final flush (above) leaves any DETACHED child of
+    # this run -- a cargo/rustc/test grandchild that outlived the owner pwsh -- as an OPEN
+    # interval in $attributionManifest. Probe those recorded pids against the OS; if ANY is
+    # still alive, tearing down target/ or the per-run TEMP child ($workspaceTemp) would rip a
+    # live process's working tree out from under it (the #23 M-scale hazard: a running test's
+    # fixture path resolved into a removed .tmp tree). In that case SKIP ALL cleanup atomically
+    # -- attribution manifest, sccache daemon, target/, TEMP child, session lock, and temp
+    # parent all stay in place, never a PARTIAL teardown -- and emit one fail-closed boundary
+    # line. The next launcher start reaps this run's leftovers (Clear-DeadLauncherTempDirs /
+    # Clear-DeadAttributionManifests) once the whole tree is dead. Env restore below still runs
+    # (restoring the launcher's own process env is not a hazard to the children).
+    $deferCleanupForLiveChildren = $false
+    $liveAttributedPids = @()
+    try {
+        $liveAttributedPids = @((Get-AstroLiveAttributedPids -ManifestPath $attributionManifest -SelfPid $PID).LivePids)
+    }
+    catch {
+        $liveAttributedPids = @()
+    }
+    if ($liveAttributedPids.Count -gt 0) {
+        $deferCleanupForLiveChildren = $true
+        [Console]::Error.WriteLine("LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_CLEANUP_DEFERRED_LIVE_CHILD]: {code=ASTRO_LAUNCHER_CLEANUP_DEFERRED_LIVE_CHILD; message=`"$($liveAttributedPids.Count) attributed child process(es) of this run are still alive (pids: $($liveAttributedPids -join ', ')); ALL exit cleanup is skipped so their working tree is not torn out mid-execution -- target/, the TEMP child $workspaceTemp, the session lock, and the attribution manifest are left in place, never partially removed`"; remediation=`"do not remove .tmp or target/ by hand while those PIDs live; the next 'scripts\\windows-gnu-toolchain.ps1' start reaps this run's leftovers automatically once the whole process tree is dead (Clear-DeadLauncherTempDirs / Clear-DeadAttributionManifests)`"}")
+        Write-Output "CLEANUP[ASTRO_CLEANUP_DEFERRED]: deferred all exit cleanup; $($liveAttributedPids.Count) attributed child pid(s) still alive: $($liveAttributedPids -join ', ') (#320)"
+    }
+  if (-not $deferCleanupForLiveChildren) {
     # #301: remove THIS run's attribution manifest (and its atomic-rename sibling) on
     # EVERY exit path -- success, child failure, and launcher fault all reach this finally.
     # The manifest lives in $workspaceTempParent (.tmp), NOT the per-session $workspaceTemp
@@ -1683,6 +1724,11 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
+  }
+  # #320: env restore ALWAYS runs, even when cleanup was deferred for live children --
+  # restoring the launcher's own process environment cannot affect the detached children
+  # (they already inherited their env at spawn) and leaving TEMP/TMP pointed at a now-kept
+  # child dir would poison this pwsh's remaining lifetime.
     foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
@@ -1696,7 +1742,7 @@ finally {
     # decision below and PowerShell reports a generic terminating error (exit 1),
     # destroying the child's real exit code — a red-for-green AND a green-for-red hazard.
     # Cleanup failures are recorded in $cleanupErrors and adjudicated below, loudly.
-    if ($cleanupErrors.Count -eq 0) {
+    if (-not $deferCleanupForLiveChildren -and $cleanupErrors.Count -eq 0) {
         if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
             Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
         }
