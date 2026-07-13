@@ -2855,6 +2855,311 @@ fn periodic_verify_tick_persists_and_surfaces_chain_status() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// #277 FSV: the periodic tick runs a *bounded* FSV-janitor scrub step and
+/// persists a checkpoint watermark that resumes across ticks (and restarts)
+/// instead of re-walking the whole ledger every tick. Independent config
+/// readback of `verified_through` across two ticks proves the second tick
+/// resumed from the persisted checkpoint and did no re-walk (idle catch-up).
+#[test]
+fn periodic_verify_scrub_advances_and_resumes_from_persisted_checkpoint() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("periodic-scrub-resume");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+    let vdir = vault_dir(&dir, "demo");
+
+    // Tick 1: the janitor drains the real seeded ledger tail in a bounded scrub
+    // and persists an advanced checkpoint.
+    let r1 = periodic_verify_project_at(&dir, "demo", &vdir, 1_000).unwrap();
+    assert_eq!(r1["status"], "intact", "tick1: {r1}");
+    assert_eq!(r1["mode"], "scrub");
+    assert_eq!(
+        r1["scrubbed"], true,
+        "tick1 must have scrubbed real tail: {r1}"
+    );
+    // #178: the scrub committed a witnessed mutation, so the tick relays a real
+    // FsvAck envelope minted by verify_committed (readback + ledger pairing). The
+    // server cannot forge this label — it can only relay one the ack produced.
+    assert_eq!(
+        r1["fsv"]["label"],
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED,
+        "tick1 must carry fsv:verified: {r1}"
+    );
+    assert_eq!(r1["fsv"]["scope"], "fsv_janitor_scrub");
+    assert_eq!(r1["fsv"]["full_readback"], true);
+    assert!(
+        r1["fsv"]["rows_read_back"].as_u64().unwrap() >= 1,
+        "fsv ack must have read back the persisted checkpoint row: {r1}"
+    );
+    assert!(!r1["fsv"]["ledger_entry_hash"].as_str().unwrap().is_empty());
+    // Independent readback of the persisted checkpoint watermark (not the echo).
+    let vt1 = read_config_u64(&dir, "demo", "periodic_verify_verified_through")
+        .unwrap()
+        .expect("tick1 persisted verified_through");
+    assert!(vt1 > 0, "checkpoint must advance past genesis: {vt1}");
+    // #178: the FsvAck envelope is persisted and surfaced through index_status's
+    // readback path (periodic_verify_status_at), not just the live tick echo.
+    let after_scrub = periodic_verify_status_at(&dir, "demo").unwrap();
+    assert_eq!(
+        after_scrub["fsv"]["label"],
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED,
+        "index_status readback must surface the persisted fsv ack: {after_scrub}"
+    );
+    assert_eq!(
+        after_scrub["fsv"]["ledger_seq"], r1["fsv"]["ledger_seq"],
+        "readback ack ledger_seq must match the tick's ack (persisted, not echoed)"
+    );
+
+    // Tick 2: resumes from the persisted checkpoint; nothing new to verify, so it
+    // is an idle catch-up (no re-walk, no further scrub) and the watermark holds.
+    let r2 = periodic_verify_project_at(&dir, "demo", &vdir, 2_000).unwrap();
+    assert_eq!(r2["status"], "intact", "tick2: {r2}");
+    assert_eq!(
+        r2["scrubbed"], false,
+        "tick2 must resume idle from checkpoint, not re-scrub: {r2}"
+    );
+    let vt2 = read_config_u64(&dir, "demo", "periodic_verify_verified_through")
+        .unwrap()
+        .expect("tick2 persisted verified_through");
+    assert_eq!(vt2, vt1, "idle tick must not move the persisted checkpoint");
+
+    // #178: the idle tick performed no witnessed mutation, so the live result and
+    // the persisted readback both carry no fsv envelope — labeled absence, never a
+    // fabricated fsv:verified carried over from the earlier scrub.
+    assert!(
+        r2["fsv"].is_null(),
+        "idle tick must not carry an fsv ack: {r2}"
+    );
+
+    // The surfaced status reads the persisted watermark back, not an API echo.
+    let observed = periodic_verify_status_at(&dir, "demo").unwrap();
+    assert_eq!(observed["status"], "intact");
+    assert_eq!(observed["verified_through"].as_u64().unwrap(), vt2);
+    assert_eq!(observed["scrubbed"], false);
+    assert!(
+        observed["fsv"].is_null(),
+        "readback after an idle tick must show labeled fsv absence: {observed}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Flips one byte in the first on-disk ledger SST record's value and rewrites the
+/// record + body CRCs so the store still opens, leaving the ledger hash chain
+/// broken for the janitor's re-hash to catch. Mirrors the ingest crate's durable
+/// tamper-negative harness (ledger_verify.rs `tamper_ledger_sst_value`).
+fn tamper_first_ledger_sst_value(vault_dir: &Path) {
+    const HEADER_LEN: usize = 32;
+    const RECORD_HEADER_LEN: usize = 12;
+    let ledger_dir = vault_dir.join("cf").join(ColumnFamily::Ledger.name());
+    for entry in fs::read_dir(&ledger_dir).expect("read ledger dir") {
+        let path = entry.expect("ledger dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+            continue;
+        }
+        let mut bytes = fs::read(&path).expect("read ledger sst");
+        if bytes.len() < HEADER_LEN + RECORD_HEADER_LEN {
+            continue;
+        }
+        let record = &bytes[HEADER_LEN..HEADER_LEN + RECORD_HEADER_LEN];
+        let key_len = u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as usize;
+        let key_start = HEADER_LEN + RECORD_HEADER_LEN;
+        let value_start = key_start + key_len;
+        let value_end = value_start + value_len;
+        if value_end > bytes.len() || value_len <= 17 {
+            continue;
+        }
+        // Flip a payload byte, then repair both CRCs so open() succeeds.
+        bytes[value_start + 16] ^= 0xff;
+        let mut record_hasher = crc32fast::Hasher::new();
+        record_hasher.update(&bytes[key_start..value_start]);
+        record_hasher.update(&bytes[value_start..value_end]);
+        bytes[HEADER_LEN + 8..HEADER_LEN + 12]
+            .copy_from_slice(&record_hasher.finalize().to_le_bytes());
+        let mut body_hasher = crc32fast::Hasher::new();
+        body_hasher.update(&bytes[HEADER_LEN..]);
+        bytes[28..32].copy_from_slice(&body_hasher.finalize().to_le_bytes());
+        fs::write(&path, bytes).expect("write tampered ledger sst");
+        return;
+    }
+    panic!("no ledger SST record found in {}", ledger_dir.display());
+}
+
+/// #225 box 3 (concurrent-process safety): two **real** OS processes each drive a
+/// lowered-SQLite regeneration through `regenerate_lowered_under_lock`, which
+/// opens the writable vault and appends the Admin manifest entry inside the
+/// `.astrolabe-lowered.lock` critical section. The lock serializes the two
+/// durable-mutating regens so neither observes a torn artifact; the final
+/// serialized regen's on-disk bytes are read back and re-verified.
+///
+/// The second process is spawned by re-invoking this same test binary filtered to
+/// this test with `ASTRO_CP_CHILD_CACHE` set — the child branch performs one
+/// locked regen against the shared cache dir and exits, a genuine cross-process
+/// contender on the OS file lock.
+#[test]
+fn lowered_regen_serializes_across_two_real_processes_under_lock() {
+    // Child branch: one locked regen against the shared cache, print the artifact
+    // digest, exit before the harness runs anything else.
+    if let Ok(cache) = std::env::var("ASTRO_CP_CHILD_CACHE") {
+        let report =
+            regenerate_lowered_under_lock(Path::new(&cache), "demo").expect("child locked regen");
+        println!("CHILD_OK sha={}", report.artifact_sha256);
+        // process::exit skips destructors and does not flush stdout — flush the
+        // ack line explicitly so the parent can read it.
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("lowered-cross-process");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    // Spawn the real second process contending on the same `.astrolabe-lowered.lock`.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "migration::tests::lowered_regen_serializes_across_two_real_processes_under_lock",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_CP_CHILD_CACHE", &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process regen child");
+
+    // Parent regenerates concurrently; the lock forces one of the two to wait for
+    // the other rather than opening a second durable writer or tearing the file.
+    let parent_report = regenerate_lowered_under_lock(&dir, "demo").expect("parent locked regen");
+
+    let out = child.wait_with_output().expect("join child");
+    assert!(
+        out.status.success(),
+        "child process failed: status={:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The child's ack shares a line with libtest's `test <name> ... ` prefix, so
+    // match the marker as a substring and take the 64-hex digest that follows.
+    let child_stdout = String::from_utf8_lossy(&out.stdout);
+    let marker = "CHILD_OK sha=";
+    let after = child_stdout
+        .find(marker)
+        .map(|idx| &child_stdout[idx + marker.len()..]);
+    let child_sha: String = after
+        .unwrap_or_else(|| {
+            panic!(
+                "child reported no artifact sha\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
+                child_stdout,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    assert_eq!(
+        child_sha.len(),
+        64,
+        "child artifact sha must be a sha256 hex"
+    );
+    assert_eq!(parent_report.artifact_sha256.len(), 64);
+
+    // Final serialized regen reflects the latest (twice-advanced) vault head, so a
+    // fresh readback is authoritative and non-stale.
+    let final_report = regenerate_lowered_under_lock(&dir, "demo").expect("final locked regen");
+    let lowered_path = dir.join("demo.astrolabe-lowered.db");
+    // FSV: verify_lowered_artifact re-reads the on-disk artifact bytes, hashes them,
+    // and matches that digest against the ledgered manifest AND the post-contention
+    // vault fingerprint — proving no torn write survived the two-process contention
+    // and the second observer sees a complete, non-stale artifact.
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![
+            ColumnFamily::Kv,
+            ColumnFamily::Kernel,
+            ColumnFamily::Base,
+            ColumnFamily::Graph,
+            ColumnFamily::Ledger,
+        ],
+    )
+    .unwrap();
+    let verification = astrolabe_lower::verify_lowered_artifact(&vault, &lowered_path, "demo")
+        .expect("lowered artifact verifies after concurrent regen");
+    assert_eq!(
+        verification.artifact_sha256, final_report.artifact_sha256,
+        "disk-byte readback digest must equal the final regen's reported manifest digest"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #277 FSV (tamper-negative): the one-time startup boot gate re-hashes the whole
+/// persisted chain and fails closed on a tampered ledger row — recording
+/// `status: "error"` with the exact janitor refusal code, never a silent pass.
+#[test]
+fn janitor_startup_verify_fails_closed_on_tampered_ledger() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("periodic-scrub-tamper");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+    let vdir = vault_dir(&dir, "demo");
+    // The startup gate discovers projects via the persisted vault_dir config key.
+    write_config_value(
+        &dir,
+        &metadata_key("demo", "vault_dir"),
+        &vdir.display().to_string(),
+    )
+    .unwrap();
+
+    // Force the WAL-resident ledger entry down to an on-disk SST so the tamper
+    // targets the durable artifact the janitor re-hashes on a fresh open.
+    {
+        let vault =
+            open_shadow_vault_writable(&vdir, SHADOW_VAULT_ID, &vault_salt("demo"), Vec::new())
+                .unwrap();
+        vault.flush().unwrap();
+    }
+
+    // Clean chain: the boot gate passes and records intact.
+    assert_eq!(janitor_startup_verify_projects_at(&dir).unwrap(), 0);
+    let clean = periodic_verify_status_at(&dir, "demo").unwrap();
+    assert_eq!(clean["status"], "intact", "clean boot gate: {clean}");
+
+    // Independent readback + one-byte flip of a persisted ledger row, committed
+    // durably so a fresh boot-gate open re-reads the tampered bytes.
+    {
+        // The writable vault's ledger hook refuses to persist a corrupt entry (a
+        // fail-closed write guard), so the tamper must go straight to the on-disk
+        // ledger SST bytes — an artifact an external attacker could edit — with
+        // CRCs rewritten so the store opens and the janitor's from-genesis re-hash
+        // is what catches the hash-chain break.
+        tamper_first_ledger_sst_value(&vdir);
+    }
+
+    // Boot gate now fails closed for the tampered project.
+    let damaged = janitor_startup_verify_projects_at(&dir).unwrap();
+    assert_eq!(damaged, 1, "tampered chain must fail closed at startup");
+    let observed = periodic_verify_status_at(&dir, "demo").unwrap();
+    assert_eq!(
+        observed["status"], "error",
+        "tamper must surface error: {observed}"
+    );
+    assert_eq!(observed["trust"], "provisional");
+    let error = observed["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(astrolabe_ingest::ASTRO_FSV_JANITOR_CHAIN_DAMAGE),
+        "error must name the janitor chain-damage refusal: {error}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn team_artifact_export_import_roundtrip_from_shadow_state() {
     let dir = temp_dir("team-artifact-roundtrip");

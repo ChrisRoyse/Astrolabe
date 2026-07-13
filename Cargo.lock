@@ -293,6 +293,7 @@ dependencies = [
  "calyx-core",
  "calyx-ledger",
  "calyx-loom",
+ "crc32fast",
  "rusqlite",
  "serde_json",
  "sha2",

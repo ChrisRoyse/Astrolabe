@@ -1072,6 +1072,45 @@ where
     })
 }
 
+/// Regenerates the lowered SQLite sidecar for a project, opening the writable
+/// vault **inside** the `.astrolabe-lowered.lock` critical section (#225 box 3).
+///
+/// This is the standalone regen entrypoint a debounced post-weave lowering lane
+/// (`astrolabe_lower::LowerDebouncer::run_due`) drives: because lowering appends
+/// an Admin manifest ledger entry (a durable vault mutation), the writable handle
+/// must be opened under the same OS file lock that serializes the artifact write.
+/// Two processes both calling this therefore never hold two durable writers at
+/// once — the second blocks on the lock, then opens, regenerates, and observes a
+/// complete (never torn) artifact.
+///
+/// Exercised end-to-end by the two-process FSV test
+/// `lowered_regen_serializes_across_two_real_processes_under_lock`. The production
+/// caller — the debounced post-weave lowering lane driving this on
+/// `LowerDebouncer::run_due` — lands with the remaining server weave-production
+/// path (#225 Scope), so this seam is `dead_code` in non-test builds until then.
+#[allow(dead_code)]
+pub(crate) fn regenerate_lowered_under_lock(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<astrolabe_lower::LoweredSqliteReport, DynError> {
+    let vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
+    let vault_id = read_config_value(cache_dir, &metadata_key(project, "vault_id"))?
+        .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
+    let salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
+        .unwrap_or_else(|| vault_salt(project));
+    with_lowered_sqlite_lock(cache_dir, project, || {
+        let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &salt, Vec::new())?;
+        lower_cbm_sqlite(
+            &vault,
+            lowered_sqlite_path(cache_dir, project),
+            &LowerSqliteOptions::new(project),
+        )
+        .map_err(Into::into)
+    })
+}
+
 pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
     json!({
         "status": "imported",
