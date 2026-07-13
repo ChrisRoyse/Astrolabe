@@ -15,6 +15,7 @@ pub fn handle_tool_raw(
         "get_readiness" => handle_get_readiness(args_json),
         "impute_fields" => handle_impute_fields(args_json),
         "anchor_outcome" => handle_anchor_outcome(args_json),
+        "coverage_ingest" => handle_coverage_ingest(args_json),
         "guard_calibrate" => handle_guard_calibrate(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),

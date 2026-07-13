@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 8] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 9] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -8,9 +8,77 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 8] {
         get_readiness_tool_definition(),
         impute_fields_tool_definition(),
         anchor_outcome_tool_definition(),
+        coverage_ingest_tool_definition(),
         team_artifact_tool_definition(),
         guard_calibrate_tool_definition(),
     ]
+}
+
+pub(crate) fn coverage_ingest_tool_definition() -> Value {
+    json!({
+        "name": "coverage_ingest",
+        "title": "Coverage Ingest",
+        "description": "Ground outcome anchors for a shadow-indexed project from a direct coverage report plus a suite run. Assembles propagation inputs from the live CBM graph (symbol line ranges + TESTS/TESTS_FILE edges), maps executed lines to the containing symbols line-exact (resolved, confidence 1.0), and — bounded to the changed-files impact set — propagates passing tests one hop along TESTS edges to covered symbols (proxy, confidence 0.6). Coverage supersedes propagation for any symbol it covers. Reports anchored / excluded_by_fanout / unmatched counts. Malformed reports, a non-resolved coverage_source, or an empty graph refuse fail-closed with no partial anchor.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "coverage_format": {
+                    "type": "string",
+                    "enum": ["lcov", "coverage_py_json", "cobertura_xml"],
+                    "description": "Direct-coverage report format."
+                },
+                "coverage_report": {
+                    "type": "string",
+                    "description": "Full coverage report text in the declared format. Partial or malformed reports refuse fail-closed."
+                },
+                "test_format": {
+                    "type": "string",
+                    "enum": ["junit_xml", "cargo_test_json", "pytest_verbose", "go_test_json", "vitest_json"],
+                    "description": "Suite-run report format, used to determine which tests passed for propagation."
+                },
+                "test_report": {
+                    "type": "string",
+                    "description": "Full suite-run report text in the declared test_format."
+                },
+                "coverage_source": {
+                    "type": "string",
+                    "description": "Resolved catalog source for coverage anchors: ci:/trace:/review:/git:revert: (Trusted, confidence 1.0). A proxy source refuses fail-closed."
+                },
+                "run_id": {
+                    "type": "string",
+                    "description": "Opaque run identifier; propagation anchors are sourced propagation:<run_id>."
+                },
+                "impact_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Changed files' impact set (repo-relative). Propagation anchors are confined to symbols in these files. Empty (default) means no diff: only direct coverage grounds."
+                },
+                "observed_at": {
+                    "type": "integer",
+                    "description": "Server-observed epoch (seconds or ms). Defaults to the server wall clock; pass an explicit value for reproducible anchoring. 0 refuses."
+                }
+            },
+            "required": ["project", "coverage_format", "coverage_report", "test_format", "test_report", "coverage_source", "run_id"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn guard_calibrate_tool_definition() -> Value {
