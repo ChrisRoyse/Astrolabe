@@ -119,6 +119,20 @@
       "method": "write_cf_batch_with_ledger_entry",
       "payload_contract": "janitor scrub group commit (Measure); payload carries schema tag astrolabe-fsv-janitor-scrub (counts and sequence bounds only: status, slice_start, slice_end, entries_verified, verified_through, caught_up) plus the persisted JanitorCheckpoint row; never any verified-entry payload bytes, so a scrub record cannot re-embed a secret from the entries it verified; RedactionPolicy::check_payload enforced by the Calyx writer before commit",
       "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::janitor::tests::scrub_persists_checkpoint_and_ledgers_measure_entry byte-verifies the persisted checkpoint row and its paired Measure ledger entry; startup_verify_fails_closed_on_tampered_ledger_at_exact_seq proves the tamper-negative path"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/label_propagation.rs",
+      "function": "commit_reconciliation",
+      "method": "append_ledger_entry",
+      "payload_contract": "label-propagation no-op reconciliation record (Grounding); payload carries the ledger schema tag and counts only (desired_rows, rows_written=0, rows_tombstoned=0) when the desired and existing row sets already match; no label text, symbol ids, or row bytes; RedactionPolicy::check_payload enforced before append",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the append API rejects secret-shaped payload bytes before ledger rows land; astrolabe-ingest::label_propagation::tests::determinism_order_invariant_across_two_runs drives the unchanged-set no-op arm on its second run"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/label_propagation.rs",
+      "function": "commit_reconciliation",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "label-propagation reconciliation group commit (Grounding); payload carries the ledger schema tag and counts only (desired_rows, rows_written, rows_tombstoned); propagated-label row bytes live in the Kernel CF batch under versioned row schemas, never in the ledger payload, so a propagation record cannot re-embed label or symbol text; RedactionPolicy::check_payload enforced before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::label_propagation::tests::live_propagation_over_persisted_rows_is_readback_verified byte-verifies the persisted propagated-label rows and the FsvAck ledger pairing; erasing_seed_recomputes_over_persisted_rows proves the tombstone reconciliation path"
     }
   ]
 }
