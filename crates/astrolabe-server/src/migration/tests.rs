@@ -2883,6 +2883,166 @@ fn health_surface_metrics_and_ndjson_match_source_state() {
     );
 }
 
+/// #62 metrics truthfulness: the exported chain gauge is cross-checked against its
+/// real source. A physically intact shadow vault reports
+/// `astrolabe_verify_chain_intact = 1`; after one byte of the persisted ledger SST
+/// is corrupted out of band, the SAME real status path must flip the gauge to 0
+/// (and readiness to 0), proving the gauge tracks the live verify_chain over the
+/// on-disk ledger rather than a cached boolean.
+#[test]
+fn health_chain_gauge_flips_on_injected_vault_corruption() {
+    let dir = temp_dir("health-chain-gauge-corruption");
+    fs::create_dir_all(&dir).unwrap();
+    seed_team_shadow_state(&dir);
+    let vault_dir = dir.join("demo.astrolabe-vault");
+
+    // Baseline: an intact real vault reports gauge=1 through the real status path.
+    let before = shadow_status_summary_at(&dir, "demo").unwrap();
+    assert_eq!(before["health"]["chain_verify"]["status"], "intact");
+    assert_eq!(before["health"]["chain_verify"]["intact"], true);
+    assert_eq!(before["health"]["chain_verify"]["gauge"], 1);
+    assert_eq!(before["health"]["status"], "ready");
+    assert!(
+        before["health"]["metrics_text"]
+            .as_str()
+            .unwrap()
+            .contains("astrolabe_verify_chain_intact{project=\"demo\"} 1")
+    );
+
+    // Inject real corruption into the persisted ledger bytes: one payload byte
+    // flipped, CRCs repaired so the store still opens but the hash chain is broken.
+    tamper_first_ledger_sst_value(&vault_dir);
+
+    // The exported chain gauge must now read 0, matching the live verify_chain over
+    // the tampered on-disk ledger.
+    let after = shadow_status_summary_at(&dir, "demo").unwrap();
+    assert_eq!(after["health"]["chain_verify"]["intact"], false);
+    assert_eq!(after["health"]["chain_verify"]["gauge"], 0);
+    assert_eq!(after["health"]["status"], "degraded");
+    let metrics = after["health"]["metrics_text"].as_str().unwrap();
+    assert!(
+        metrics.contains("astrolabe_verify_chain_intact{project=\"demo\"} 0"),
+        "chain gauge must flip to 0 after corruption: {metrics}"
+    );
+    assert!(
+        metrics.contains("astrolabe_readiness{project=\"demo\"} 0"),
+        "readiness gauge must flip to 0 after corruption: {metrics}"
+    );
+
+    // Independent readback: verify_chain over the tampered vault is itself
+    // non-intact, confirming the gauge tracks that exact source.
+    let independent = astrolabe_ingest::verify_chain_vault_path(&vault_dir).unwrap();
+    assert!(
+        !independent.is_intact(),
+        "independent verify_chain must report the tampered vault as non-intact: {}",
+        independent.status
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #62 health-surface schema golden: the `astrolabe.health.v1` surface has a stable
+/// key contract at every level, and its NDJSON trajectory is a complete, parseable
+/// event sequence. Freezing the key sets here catches an accidental field
+/// add/rename/drop that would silently break downstream health scrapers.
+#[test]
+fn health_surface_schema_is_golden() {
+    let lane = json!({"status": "owner", "trust": "verified"});
+    let periodic = json!({
+        "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+        "project": "demo",
+        "status": "intact",
+        "checked_at_unix_ms": 1234,
+        "trust": "verified",
+    });
+    let health = health_surface_json("demo", "intact", true, Some(7), Some(3), Some(&lane), Some(&periodic));
+
+    let top_keys: BTreeSet<&str> = health
+        .as_object()
+        .expect("health object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        top_keys,
+        BTreeSet::from([
+            "schema",
+            "status",
+            "freshness",
+            "trust",
+            "readiness",
+            "chain_verify",
+            "lowered_sqlite",
+            "periodic_verify",
+            "metrics_format",
+            "metrics_text",
+            "trajectory_format",
+            "trajectory_ndjson",
+        ]),
+        "astrolabe.health.v1 top-level key set drifted"
+    );
+    assert_eq!(health["schema"], HEALTH_SURFACE_SCHEMA);
+    assert_eq!(health["metrics_format"], "prometheus_text_v0");
+    assert_eq!(health["trajectory_format"], "ndjson");
+
+    let readiness_keys: BTreeSet<&str> = health["readiness"]
+        .as_object()
+        .expect("readiness object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        readiness_keys,
+        BTreeSet::from(["ready", "blocking_checks", "remediation"]),
+        "readiness key set drifted"
+    );
+    let chain_keys: BTreeSet<&str> = health["chain_verify"]
+        .as_object()
+        .expect("chain_verify object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        chain_keys,
+        BTreeSet::from(["status", "intact", "gauge", "ledger_head", "ledger_rows"]),
+        "chain_verify key set drifted"
+    );
+    let lowered_keys: BTreeSet<&str> = health["lowered_sqlite"]
+        .as_object()
+        .expect("lowered_sqlite object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        lowered_keys,
+        BTreeSet::from(["exists", "gauge"]),
+        "lowered_sqlite key set drifted"
+    );
+
+    // NDJSON trajectory is a complete, ordered, fully-parseable event stream.
+    let events: Vec<Value> = health["trajectory_ndjson"]
+        .as_str()
+        .expect("trajectory ndjson")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson line parses"))
+        .collect();
+    let event_names: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().expect("event name"))
+        .collect();
+    assert_eq!(
+        event_names,
+        ["shadow_health", "background_lane", "periodic_verify_chain"],
+        "health trajectory event sequence drifted"
+    );
+    for event in &events {
+        assert_eq!(
+            event["schema"], HEALTH_SURFACE_SCHEMA,
+            "every trajectory event carries the health schema"
+        );
+    }
+}
+
 #[test]
 fn shadow_status_health_reads_physical_vault_and_lowered_sidecar() {
     let dir = temp_dir("health-status-readback");
@@ -3338,8 +3498,9 @@ fn team_artifact_export_import_roundtrip_from_shadow_state() {
     assert_eq!(exported["artifact_sha256"].as_str().unwrap().len(), 64);
 
     let adopted = dir.join("adopted.db");
-    let imported_raw = team_artifact_import_result(&artifact_dir, &adopted, None, Some("demo"))
-        .expect("import team artifact");
+    let imported_raw =
+        team_artifact_import_result(&artifact_dir, &adopted, None, Some("demo"), None)
+            .expect("import team artifact");
     let imported: Value = serde_json::from_str(&imported_raw).unwrap();
     assert_eq!(imported["isError"], false);
     let structured = &imported["structuredContent"];
@@ -3456,6 +3617,139 @@ fn team_artifact_import_tamper_matrix_refuses_without_adopting() {
         ASTRO_TEAM_ARTIFACT_SIGNATURE,
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// #62: a refused import degrades to the REAL CBM local-reindex fallback when the
+/// operator supplies a local `repo_path`. Because `astrolabe_bridge::set_cbm_cache_dir`
+/// is a process-global override, the real `index_repository` reindex runs in a
+/// spawned child (mirroring the bridge crate's run-scoped-store pattern) with HOME
+/// redirected to a sandbox, so it lands in a run-scoped store and never touches the
+/// operator's `~/.cache`. The child asserts the full contract:
+///   - the tampered artifact is refused with its component code and is NOT adopted;
+///   - `fallback.local_reindex == "reindexed"` (the fallback actually ran); and
+///   - the reindexed project's SQLite graph is read back from the run-scoped store,
+///     proving the fallback produced a real local graph from trusted source.
+#[test]
+fn team_artifact_refused_import_runs_local_reindex_fallback() {
+    // Child branch: run the real reindex under an isolated, run-scoped CBM store.
+    if std::env::var("ASTRO_TA_FALLBACK_CHILD").is_ok() {
+        let store = PathBuf::from(std::env::var("ASTRO_TA_STORE").expect("parent sets store"));
+        let root = PathBuf::from(std::env::var("ASTRO_TA_ROOT").expect("parent sets root"));
+        fs::create_dir_all(&store).expect("create run-scoped store");
+        astrolabe_bridge::set_cbm_cache_dir(&store).expect("configure run-scoped store");
+
+        // A real, indexable source repo for the fallback to reindex.
+        let repo = root.join("repo");
+        let src = repo.join("src");
+        fs::create_dir_all(&src).expect("create fixture repo");
+        fs::write(
+            src.join("main.c"),
+            "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
+        )
+        .expect("write C fixture");
+
+        // A real exported team artifact, then tamper the vault bytes so import refuses.
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).expect("create artifact cache root");
+        seed_team_shadow_state(&cache);
+        let artifact_dir = root.join("artifact");
+        team_artifact_export_json_at(
+            &cache,
+            "demo",
+            &artifact_dir,
+            None,
+            ShadowRefreshStatus::Current,
+        )
+        .expect("export team artifact");
+        flip_first_byte(&artifact_dir.join(VAULT_EXPORT_ZST_NAME));
+
+        let adopted = root.join("adopted.db");
+        let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+        let args = json!({
+            "mode": "import",
+            "artifact_dir": artifact_dir,
+            "adopted_graph_path": adopted,
+            "repo_path": repo,
+        })
+        .to_string();
+        let raw = handle_team_artifact(&runner, &args).expect("import returns an envelope");
+        let value: Value = serde_json::from_str(&raw).expect("import envelope is JSON");
+
+        assert_eq!(value["isError"], true, "tampered import must be refused: {raw}");
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["status"], "refused");
+        assert_eq!(structured["code"], ASTRO_TEAM_ARTIFACT_VAULT_BYTES);
+        // The refused import degraded to a REAL local reindex, not the placeholder label.
+        assert_eq!(
+            structured["fallback"]["local_reindex"], "reindexed",
+            "refused import with repo_path must invoke the local reindex fallback: {structured}"
+        );
+        let reindexed_project = structured["fallback"]["project"]
+            .as_str()
+            .expect("fallback carries the reindexed project");
+        // The untrusted artifact was NOT adopted.
+        assert!(
+            !adopted.exists(),
+            "a refused import must never adopt the untrusted graph"
+        );
+        // Independent readback: the fallback reindex wrote a real CBM graph DB to the
+        // run-scoped store for the reindexed project.
+        let reindexed_db = store.join(format!("{reindexed_project}.db"));
+        assert!(
+            reindexed_db.is_file(),
+            "fallback reindex must persist {reindexed_project}.db under {}; found {:?}",
+            store.display(),
+            fs::read_dir(&store)
+                .map(|entries| entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+        // artifact_sha256 commits to the real fallback outcome (computed pre-hash).
+        assert_eq!(structured["artifact_sha256"].as_str().unwrap().len(), 64);
+
+        astrolabe_bridge::clear_cbm_cache_dir();
+        println!("CHILD_OK reindexed_project={reindexed_project}");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    let root = temp_dir("team-artifact-fallback");
+    fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    let child_root = root.join("child");
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "migration::tests::team_artifact_refused_import_runs_local_reindex_fallback",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_TA_FALLBACK_CHILD", "1")
+        .env("ASTRO_TA_STORE", &store)
+        .env("ASTRO_TA_ROOT", &child_root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("spawn local-reindex fallback child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "fallback child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("CHILD_OK reindexed_project="),
+        "child did not complete the fallback assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -6308,7 +6602,7 @@ fn exported_team_artifact_fixture(name: &str, signing_key: Option<[u8; 32]>) -> 
 }
 
 fn assert_team_artifact_refusal(artifact_dir: &Path, adopted: &Path, expected_code: &str) {
-    let raw = team_artifact_import_result(artifact_dir, adopted, None, Some("demo"))
+    let raw = team_artifact_import_result(artifact_dir, adopted, None, Some("demo"), None)
         .expect("tampered import returns structured refusal");
     let value: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(value["isError"], true);
