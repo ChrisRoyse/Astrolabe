@@ -4,6 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astrolabe_domain::fsv::FsvAck;
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
     ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, EdgeKind,
@@ -27,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
-    SERIES_ID_V1_REBUILD_REMEDIATION,
+    SERIES_ID_V1_REBUILD_REMEDIATION, VaultMutationPlan,
 };
 
 /// Dangling edge refusal/skip code from blueprint `04_DATA_MODEL.md` section 7.
@@ -355,6 +356,10 @@ pub struct SqliteImportReport {
     pub quantization: SqliteImportQuantizationReport,
     /// Post-write CF readback verification counts.
     pub readback: SqliteImportReadback,
+    /// Unforgeable full-readback witness when this import changed vault rows.
+    /// An idempotent ledger-only replay carries labeled absence (`None`).
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
     /// Imported constellation ids in deterministic node-id order.
     pub cx_ids: Vec<CxId>,
 }
@@ -380,6 +385,9 @@ pub struct CxGraphErasureReport {
     pub edge_rows_tombstoned: usize,
     pub raw_edge_rows_tombstoned: usize,
     pub seq: Seq,
+    /// Unforgeable tombstone-readback witness, absent for a no-op erasure.
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
 }
 
 #[derive(Debug, Clone)]
@@ -833,7 +841,7 @@ where
             edge_rows_written: planned_edge_rows_written,
         },
     )?;
-    let (ledger_ref, graph_rows_written, edge_rows_written) = write_import_rows(
+    let (ledger_ref, fsv, graph_rows_written, edge_rows_written) = write_import_rows(
         vault,
         &prepared,
         input.sqlite_fingerprint,
@@ -862,6 +870,7 @@ where
         edge_skips: prepared.edge_skips,
         quantization,
         readback,
+        fsv,
         cx_ids,
     })
 }
@@ -2609,7 +2618,7 @@ fn write_import_rows<C>(
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
-) -> IngestResult<(LedgerRef, usize, usize)>
+) -> IngestResult<(LedgerRef, Option<FsvAck>, usize, usize)>
 where
     C: Clock,
 {
@@ -2681,8 +2690,17 @@ where
             payload,
             ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
         )?;
-        return Ok((ledger_ref, graph_rows_written, edge_rows_written));
+        return Ok((ledger_ref, None, graph_rows_written, edge_rows_written));
     }
+
+    let subject = SubjectId::Query(sqlite_fingerprint.to_vec());
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    // Calyx's group-commit path deterministically binds the staged ledger ref
+    // into Base and provenance-bearing Graph rows before persistence. Preserve
+    // the caller's write set so we can derive those exact post-bind bytes after
+    // recovering this commit's ledger ref; hashing the pre-bind input would be a
+    // false mismatch, while hashing store readback would be circular.
+    let planned_rows = rows.clone();
 
     // Deriving the ledger seq from a pre-commit `ledger_row_count` is a TOCTOU under the
     // supported cross-process concurrency: an interleaved append from another process
@@ -2693,12 +2711,47 @@ where
     let commit_seq = vault.write_cf_batch_with_ledger_entry(
         rows,
         EntryKind::Ingest,
-        SubjectId::Query(sqlite_fingerprint.to_vec()),
+        subject.clone(),
         payload,
-        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+        actor.clone(),
     )?;
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
-    Ok((ledger_ref, graph_rows_written, edge_rows_written))
+    let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
+    for (cf, key, value) in planned_rows {
+        let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
+        fsv_plan.push_content(cf, key, &expected);
+    }
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+    Ok((ledger_ref, Some(fsv), graph_rows_written, edge_rows_written))
+}
+
+/// Mirrors Calyx Aster's deterministic ledger-ref attachment for FSV
+/// expectations. Expected bytes come only from the intended write plus the
+/// independently recovered paired ledger ref, never from the data-row readback
+/// that the resulting plan verifies.
+fn expected_group_commit_bytes(
+    cf: ColumnFamily,
+    value: Vec<u8>,
+    ledger_ref: &LedgerRef,
+) -> IngestResult<Vec<u8>> {
+    if cf == ColumnFamily::Base {
+        let mut constellation = encode::decode_constellation_base(&value)?;
+        constellation.provenance = ledger_ref.clone();
+        return Ok(encode::encode_constellation_base(&constellation)?);
+    }
+    if cf == ColumnFamily::Graph {
+        let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {
+            return Ok(value);
+        };
+        let Some(object) = json.as_object_mut() else {
+            return Ok(value);
+        };
+        if object.contains_key("provenance") {
+            object.insert("provenance".to_string(), serde_json::to_value(ledger_ref)?);
+            return Ok(serde_json::to_vec(&json)?);
+        }
+    }
+    Ok(value)
 }
 
 /// Recovers the ledger reference for the group commit that produced `commit_seq`.
@@ -3291,6 +3344,7 @@ where
             edge_rows_tombstoned,
             raw_edge_rows_tombstoned,
             seq: vault.latest_seq(),
+            fsv: None,
         });
     }
 
@@ -3302,13 +3356,20 @@ where
         "edge_rows_tombstoned": edge_rows_tombstoned,
         "raw_edge_rows_tombstoned": raw_edge_rows_tombstoned,
     }))?;
-    vault.write_cf_batch_with_ledger_entry(
-        rows,
+    let subject = SubjectId::Cx(cx_id);
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    let mut fsv_plan = VaultMutationPlan::new(
+        "erase_imported_cx_graph_rows",
         EntryKind::Admin,
-        SubjectId::Cx(cx_id),
-        payload,
-        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
-    )?;
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &rows {
+        fsv_plan.push_tombstoned(*cf, key.clone(), value);
+    }
+    let commit_seq =
+        vault.write_cf_batch_with_ledger_entry(rows, EntryKind::Admin, subject, payload, actor)?;
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
     vault.purge_tombstoned_cfs(&[ColumnFamily::Graph])?;
 
     Ok(CxGraphErasureReport {
@@ -3318,6 +3379,7 @@ where
         edge_rows_tombstoned,
         raw_edge_rows_tombstoned,
         seq: vault.latest_seq(),
+        fsv: Some(fsv),
     })
 }
 
@@ -5371,6 +5433,13 @@ mod tests {
         assert_eq!(report.edge_skips.dangling, 0);
         assert_eq!(report.edge_rows_written, EdgeKind::ALL.len());
         assert_eq!(report.readback.edge_rows_verified, EdgeKind::ALL.len());
+        let fsv = report
+            .fsv
+            .as_ref()
+            .expect("changed import earns FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.ledger_seq(), report.ledger_seq);
+        assert!(fsv.rows_read_back() >= report.edge_rows_written as u64);
 
         let edges = vault
             .scan_cf_range_at(
@@ -5591,6 +5660,10 @@ mod tests {
         assert_eq!(report.new_cx_ids, 0);
         assert_eq!(report.reused_cx_ids, 1);
         assert_eq!(report.graph_rows_written, 0);
+        assert!(
+            report.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         assert_eq!(
             vault
                 .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
@@ -5876,7 +5949,19 @@ mod tests {
             .expect("erase marker cx");
         assert_eq!(erase.records_deleted, 1);
         assert!(context.is_key_shredded_for_erasure());
-        crate::erase_imported_cx_graph_rows(&vault, "demo", erased_cx).expect("erase graph rows");
+        let graph_erase = crate::erase_imported_cx_graph_rows(&vault, "demo", erased_cx)
+            .expect("erase graph rows");
+        let graph_fsv = graph_erase
+            .fsv
+            .as_ref()
+            .expect("graph tombstones earn FSV witness");
+        assert_eq!(graph_fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(
+            graph_fsv.rows_read_back(),
+            (graph_erase.node_map_rows_tombstoned
+                + graph_erase.edge_rows_tombstoned
+                + graph_erase.raw_edge_rows_tombstoned) as u64
+        );
         vault.flush().expect("flush post-erasure");
 
         // Precondition (the gap this scrub closes): after full erasure the ONLY
@@ -6033,6 +6118,7 @@ mod tests {
         assert_eq!(graph.node_map_rows_tombstoned, 0);
         assert_eq!(graph.edge_rows_tombstoned, 0);
         assert_eq!(graph.raw_edge_rows_tombstoned, 0);
+        assert!(graph.fsv.is_none(), "no-op erasure labels FSV absence");
 
         fs::remove_file(path).ok();
         fs::remove_dir_all(vault_dir).ok();

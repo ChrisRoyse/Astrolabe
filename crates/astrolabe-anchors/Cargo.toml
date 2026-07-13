@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+astrolabe-ingest.workspace = true
 blake3 = "1"
 calyx-aster.workspace = true
 calyx-core.workspace = true

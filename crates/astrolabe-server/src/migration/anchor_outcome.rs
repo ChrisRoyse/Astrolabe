@@ -142,6 +142,7 @@ pub(crate) fn anchor_outcome_json_at(
         "unmapped_subject_count": unmapped_count,
         "anchor_dump_hash": report.anchor_dump_hash,
         "ledger_ref": ledger_ref_json(&report.ledger_ref),
+        "fsv": report.fsv.as_ref().map(fsv_ack_envelope),
         "grounding_delta": {
             "anchors_written": report.anchors_written,
             "rows_written": report.rows_written,

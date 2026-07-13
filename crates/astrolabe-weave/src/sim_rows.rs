@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use astrolabe_domain::fsv::FsvAck;
+use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, ledger_key, prefix_range};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
@@ -125,6 +127,9 @@ pub struct SimilarityPersistReport {
     pub edge_dump_hash: String,
     /// Ledger entry paired with this mutation batch.
     pub ledger_ref: LedgerRef,
+    /// Unforgeable full-readback witness when Graph rows changed.
+    /// A ledger-only no-delta replay carries labeled absence (`None`).
+    pub fsv: Option<FsvAck>,
 }
 
 /// Builds the canonical Graph CF key for one SIM_* edge.
@@ -219,8 +224,24 @@ where
 
     let subject = SubjectId::Query(format!("astrolabe-sim-edges:{edge_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor.into());
-    let ledger_ref = if batch.is_empty() {
-        vault.append_ledger_entry(EntryKind::Ingest, subject, payload, actor)?
+    let mut fsv_plan = VaultMutationPlan::new(
+        "persist_similarity_edges",
+        EntryKind::Ingest,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &batch {
+        if *value == tombstone {
+            fsv_plan.push_tombstoned(*cf, key.clone(), &tombstone);
+        } else {
+            fsv_plan.push_content(*cf, key.clone(), value);
+        }
+    }
+    let (ledger_ref, commit_seq) = if batch.is_empty() {
+        (
+            vault.append_ledger_entry(EntryKind::Ingest, subject, payload, actor)?,
+            None,
+        )
     } else {
         let commit_seq = vault.write_cf_batch_with_ledger_entry(
             batch,
@@ -229,9 +250,12 @@ where
             payload,
             actor,
         )?;
-        ledger_ref_at_commit(vault, commit_seq)?
+        (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
     };
     vault.flush()?;
+    let fsv = commit_seq
+        .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
+        .transpose()?;
 
     Ok(SimilarityPersistReport {
         edge_count: plan.edges.len(),
@@ -240,6 +264,7 @@ where
         rows_tombstoned,
         edge_dump_hash,
         ledger_ref,
+        fsv,
     })
 }
 

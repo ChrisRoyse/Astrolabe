@@ -4111,6 +4111,10 @@ mod tests {
         assert_eq!(report.edge_count, plan.edges.len());
         assert_eq!(report.rows_written, plan.edges.len());
         assert_eq!(report.rows_tombstoned, 0);
+        let fsv = report.fsv.as_ref().expect("SIM edge mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), report.rows_written as u64);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         drop(vault);
 
         // Reopen: everything below reads persisted bytes, not API echoes.
@@ -4171,6 +4175,10 @@ mod tests {
         assert_eq!(second.rows_written, 0);
         assert_eq!(second.rows_unchanged, plan.edges.len());
         assert_eq!(second.rows_tombstoned, 0);
+        assert!(
+            second.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         assert!(second.ledger_ref.seq > report.ledger_ref.seq);
 
         // Reconciliation: a tighter plan tombstones stale rows and readback
@@ -4182,6 +4190,14 @@ mod tests {
         let third = persist_similarity_edges(&reopened, &tighter, "astrolabe-weave-test")
             .expect("reconciling persist");
         assert!(third.rows_tombstoned > 0);
+        assert_eq!(
+            third
+                .fsv
+                .as_ref()
+                .expect("tombstones earn FSV witness")
+                .rows_read_back(),
+            (third.rows_written + third.rows_tombstoned) as u64
+        );
         let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
         assert_eq!(after.len(), tighter.edges.len());
         drop(reopened);
@@ -4733,6 +4749,10 @@ mod tests {
             .expect("persist eager cross terms");
         assert_eq!(report.symbol_count, 3);
         assert_eq!(report.rows_written, 18);
+        let fsv = report.fsv.as_ref().expect("XTerm mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), 18);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         assert_eq!(report.rows_tombstoned, 0);
         assert!(report.absent_by_kind.is_empty());
 

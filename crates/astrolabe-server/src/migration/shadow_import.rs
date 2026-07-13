@@ -74,6 +74,8 @@ pub(crate) struct ShadowImportOutcome {
     pub(crate) reused_cx_ids: usize,
     pub(crate) graph_rows_written: usize,
     pub(crate) edge_rows_written: usize,
+    /// Unforgeable readback witness for the SQLite/row-sink import mutation.
+    pub(crate) import_fsv: Option<astrolabe_domain::fsv::FsvAck>,
     pub(crate) cx_id_set_sha256: String,
     pub(crate) ledger_seq: u64,
     pub(crate) ledger_rows_after: u64,
@@ -794,6 +796,7 @@ pub(crate) fn import_shadow_vault(
         reused_cx_ids: report.reused_cx_ids,
         graph_rows_written: report.graph_rows_written,
         edge_rows_written: report.edge_rows_written,
+        import_fsv: report.fsv.clone(),
         cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
         ledger_seq: lower_report.manifest_seq,
         ledger_rows_after: verify.ledger_rows,
@@ -1141,6 +1144,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "ledger_seq": outcome.ledger_seq,
         "ledger_rows_after": outcome.ledger_rows_after,
         "verify_chain": outcome.verify_chain_status,
+        "fsv": outcome.import_fsv.as_ref().map(fsv_ack_envelope),
         "panel_version": DEFAULT_PANEL_VERSION,
         "panel_runtime": "lens_unavailable",
         "vault_import": vault_import_summary(

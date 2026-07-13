@@ -18,6 +18,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use astrolabe_domain::fsv::FsvAck;
+use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, anchor_key};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
@@ -344,6 +346,9 @@ pub struct AnchorIngestReport {
     pub anchor_dump_hash: String,
     /// Grounding ledger entry paired with this mutation batch.
     pub ledger_ref: LedgerRef,
+    /// Unforgeable full-readback witness when this call changed anchor rows.
+    /// An idempotent ledger-only replay carries labeled absence (`None`).
+    pub fsv: Option<FsvAck>,
 }
 
 /// Ingests a validated outcome request into the `anchors` CF.
@@ -458,8 +463,20 @@ where
     let subject =
         SubjectId::Query(format!("astrolabe-anchor-outcome:{anchor_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor.into());
-    let ledger_ref = if batch.is_empty() {
-        vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?
+    let mut fsv_plan = VaultMutationPlan::new(
+        "ingest_outcome_anchors",
+        EntryKind::Grounding,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &batch {
+        fsv_plan.push_content(*cf, key.clone(), value);
+    }
+    let (ledger_ref, commit_seq) = if batch.is_empty() {
+        (
+            vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?,
+            None,
+        )
     } else {
         let commit_seq = vault.write_cf_batch_with_ledger_entry(
             batch,
@@ -468,9 +485,12 @@ where
             payload,
             actor,
         )?;
-        ledger_ref_at_commit(vault, commit_seq)?
+        (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
     };
     vault.flush()?;
+    let fsv = commit_seq
+        .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
+        .transpose()?;
 
     Ok(AnchorIngestReport {
         anchors_written,
@@ -479,6 +499,7 @@ where
         rows_written,
         anchor_dump_hash,
         ledger_ref,
+        fsv,
     })
 }
 
@@ -816,6 +837,9 @@ mod tests {
             .expect("first ingest");
         assert_eq!(first.anchors_written, 4); // skipped case grounds nothing
         assert_eq!(first.anchors_deduplicated, 0);
+        let first_fsv = first.fsv.as_ref().expect("changed rows earn FSV witness");
+        assert_eq!(first_fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(first_fsv.rows_read_back(), 4);
         let before = raw_anchor_bytes(&vault);
         assert_eq!(before.len(), 4);
 
@@ -824,6 +848,10 @@ mod tests {
         assert_eq!(second.anchors_written, 0);
         assert_eq!(second.anchors_deduplicated, 4);
         assert_eq!(second.rows_written, 0);
+        assert!(
+            second.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         let after = raw_anchor_bytes(&vault);
         assert_eq!(
             before, after,
@@ -858,6 +886,10 @@ mod tests {
         let report = ingest_outcome_anchors(&vault, &request, &cx_ids, "astrolabe-anchors-test")
             .expect("ingest");
         assert_eq!(report.anchors_written, 2);
+        let fsv = report.fsv.as_ref().expect("anchor mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), report.rows_written as u64);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         drop(vault);
 
         // Reopen: everything below reads persisted bytes.

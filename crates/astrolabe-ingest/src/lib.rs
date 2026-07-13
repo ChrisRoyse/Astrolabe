@@ -43,8 +43,8 @@ pub use graph_projection::{
     ASTRO_GRAPH_PROJECTION_CORRUPT, GRAPH_PROJECTION_CSR_PREFIX, GraphProjectionBuildOptions,
     GraphProjectionCsr, GraphProjectionCsrEdge, GraphProjectionKind,
     GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
-    ensure_graph_projection_csr, graph_projection_csr_rows, materialize_graph_projection,
-    materialize_graph_projections, read_graph_projection_csr,
+    ensure_graph_projection_csr, materialize_graph_projection, materialize_graph_projections,
+    read_graph_projection_csr,
 };
 pub use ledger_scan::{
     ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT, ASTRO_LEDGER_SCAN_ROW_CORRUPT,

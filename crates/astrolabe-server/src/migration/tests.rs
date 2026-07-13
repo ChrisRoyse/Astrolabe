@@ -1590,6 +1590,15 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
         Some(candidate),
     )
     .unwrap();
+    let import_fsv = imported
+        .report
+        .fsv
+        .as_ref()
+        .expect("row-sink import earns FSV witness");
+    assert_eq!(
+        import_fsv.label(),
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED
+    );
     let verify = verify_chain(&vault).unwrap();
     let provenance =
         provenance_surface_with_chain(imported.provenance, &"44".repeat(32), 1, &verify);
@@ -1599,10 +1608,14 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
     let mut outcome = sample_shadow_outcome(&dir, security);
     outcome.vault_dir = vault_dir;
     outcome.provenance = provenance;
+    outcome.import_fsv = imported.report.fsv.clone();
     outcome.ledger_seq = 1;
     outcome.lowered_vault_fingerprint_sha256 = "44".repeat(32);
     outcome.verify_chain_status = verify.status.clone();
     persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+    let summary = grounding_summary(&outcome);
+    assert_eq!(summary["fsv"]["label"], "fsv:verified");
+    assert_eq!(summary["fsv"]["scope"], "sqlite_import");
 
     let store = provenance_store_for_project(&dir, "demo").unwrap();
     let response = get_provenance(&store, &ProvenanceQuery::new("verify_chain", None))
@@ -3181,6 +3194,14 @@ fn team_artifact_export_import_roundtrip_from_shadow_state() {
     assert_eq!(exported["status"], "exported");
     assert_eq!(exported["signature_status"], "signed");
     assert_eq!(exported["source_state"]["verify_chain"], "intact");
+    assert_eq!(
+        exported["source_state"]["lowered_artifact"]["status"],
+        "verified"
+    );
+    assert_eq!(
+        exported["source_state"]["lowered_artifact"]["artifact_sha256"],
+        exported["manifest"]["graph_db_sha256"]
+    );
     assert_eq!(exported["files"]["graph_db_zst"]["name"], GRAPH_DB_ZST_NAME);
     assert_eq!(
         exported["files"]["vault_export_zst"]["name"],
@@ -3207,6 +3228,43 @@ fn team_artifact_export_import_roundtrip_from_shadow_state() {
     assert_eq!(structured["serving"]["vault_restored"], false);
     assert_eq!(structured["artifact_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(fs::read(&adopted).unwrap(), fs::read(&lowered).unwrap());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_artifact_export_refuses_tampered_lowered_bytes_before_consuming_them() {
+    use std::io::Write;
+
+    let dir = temp_dir("team-artifact-lowered-tamper");
+    fs::create_dir_all(&dir).unwrap();
+    let lowered = seed_team_shadow_state(&dir);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&lowered)
+        .expect("open lowered artifact for tamper")
+        .write_all(b"tamper")
+        .expect("append tamper bytes");
+
+    let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
+    let error = team_artifact_export_json_at(
+        &dir,
+        "demo",
+        &artifact_dir,
+        None,
+        ShadowRefreshStatus::Current,
+    )
+    .expect_err("tampered lowered bytes must refuse export");
+    assert!(
+        error
+            .to_string()
+            .contains(astrolabe_lower::ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH),
+        "refusal must name the lowered fingerprint mismatch: {error}"
+    );
+    assert!(
+        !artifact_dir.exists(),
+        "refused export must not create a partial team artifact"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -5597,6 +5655,9 @@ fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
     assert_eq!(mcp["status"], "grounded", "mcp envelope: {mcp}");
     assert_eq!(mcp["anchors_written"], 1);
     assert_eq!(mcp["unmapped_subject_count"], 0);
+    assert_eq!(mcp["fsv"]["label"], "fsv:verified");
+    assert_eq!(mcp["fsv"]["scope"], "ingest_outcome_anchors");
+    assert_eq!(mcp["fsv"]["rows_read_back"], 1);
     // Report-level determinism across the two surfaces.
     assert_eq!(mcp["anchor_dump_hash"], cli["anchor_dump_hash"]);
     assert_eq!(mcp["ledger_ref"], cli["ledger_ref"]);
@@ -5681,6 +5742,7 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         reused_cx_ids: 0,
         graph_rows_written: 2,
         edge_rows_written: 1,
+        import_fsv: None,
         cx_id_set_sha256: "33".repeat(32),
         ledger_seq: 1,
         ledger_rows_after: 1,

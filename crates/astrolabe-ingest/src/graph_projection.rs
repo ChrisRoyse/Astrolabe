@@ -361,7 +361,9 @@ where
     materialize_graph_projection_from_source(vault, kind, options, &source)
 }
 
-/// Reads a persisted projection CSR without rebuilding stale or missing rows.
+/// Reads and verifies a persisted projection CSR without rebuilding stale or
+/// missing rows. Both the manifest/segment hashes and the current Graph CF
+/// source fingerprint must match before the artifact is returned.
 pub fn read_graph_projection_csr<C>(
     vault: &AsterVault<C>,
     kind: GraphProjectionKind,
@@ -375,7 +377,18 @@ where
             "{} CSR segment set is incomplete; call ensure_graph_projection_csr to rebuild",
             kind.name()
         ))),
-        PersistedProjectionState::Complete(csr) => Ok(Some(csr)),
+        PersistedProjectionState::Complete(csr) => {
+            let source = read_source_edges(vault)?;
+            if csr.source_fingerprint_blake3 != source.fingerprint {
+                return Err(projection_corrupt(format!(
+                    "{} CSR source fingerprint {} is stale against current Graph CF fingerprint {}; call ensure_graph_projection_csr to rebuild",
+                    kind.name(),
+                    hex_lower(&csr.source_fingerprint_blake3),
+                    hex_lower(&source.fingerprint),
+                )));
+            }
+            Ok(Some(csr))
+        }
     }
 }
 
@@ -407,7 +420,8 @@ where
 }
 
 /// Returns visible Kernel CF rows for one persisted projection namespace.
-pub fn graph_projection_csr_rows<C>(
+#[cfg(test)]
+pub(crate) fn graph_projection_csr_rows<C>(
     vault: &AsterVault<C>,
     kind: GraphProjectionKind,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>>
@@ -2036,6 +2050,37 @@ mod tests {
         let after = graph_projection_csr_rows(&vault, GraphProjectionKind::KernelGraph)
             .expect("after rows");
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn read_projection_refuses_when_graph_source_fingerprint_moved() {
+        let vault = vault();
+        write_sources(&vault, fixture_rows());
+        materialize_graph_projection(
+            &vault,
+            GraphProjectionKind::CallGraph,
+            &GraphProjectionBuildOptions::new(),
+        )
+        .expect("materialize call graph");
+
+        // Mutate the real Graph CF after materialization. The persisted CSR and
+        // its own segment hashes remain internally consistent, but its reproduce
+        // fingerprint is now stale and must refuse on the public load boundary.
+        write_sources(
+            &vault,
+            vec![source_row(
+                99,
+                cx(8),
+                cx(9),
+                EdgeKind::Calls,
+                0.42,
+                json!({}),
+            )],
+        );
+        let error = read_graph_projection_csr(&vault, GraphProjectionKind::CallGraph)
+            .expect_err("stale projection must not load");
+        assert_eq!(error.code(), Some(ASTRO_GRAPH_PROJECTION_CORRUPT));
+        assert!(error.to_string().contains("stale against current Graph CF"));
     }
 
     fn all_projection_rows(vault: &AsterVault) -> Vec<(Vec<u8>, Vec<u8>)> {
