@@ -994,6 +994,36 @@ pub(crate) fn pack_manifest_from_json(value: &Value) -> Result<PackManifest, Dyn
     })
 }
 
+/// Renders the labeled inter-agent trust envelope a verifying agent (agent B)
+/// receives for a `get_provenance(mode="inter_agent_trust")` call (blueprint 9.5).
+///
+/// Every field is derived from [`verify_pack_manifest_claim`] against the serving
+/// vault's persisted manifest — the report is only produced when the claim's
+/// pack_id, ledger_ref, vault_fingerprint, and member_hash all match, so `trust`
+/// is `verified` and `verified_checks` names exactly the confirmed checks. A
+/// tampered claim never reaches this renderer: it fails closed with a coded
+/// `ASTRO_PROVENANCE_MANIFEST_TAMPERED` (or attestation-corrupt) error naming the
+/// failing check, surfaced by the handler as a tool error.
+pub(crate) fn inter_agent_trust_report_json(
+    project: &str,
+    report: &InterAgentTrustReport,
+) -> Value {
+    json!({
+        "schema": report.schema,
+        "project": project,
+        "status": "verified",
+        "mode": "inter_agent_trust",
+        "pack_id": report.pack_id,
+        "ledger_ref": ledger_pointer_json(&report.ledger_ref),
+        "vault_fingerprint": report.vault_fingerprint,
+        "member_hash": report.member_hash,
+        "verified_checks": report.verified_checks,
+        "trust": report.trust,
+        "freshness": freshness_json(&report.freshness),
+        "provenance": ledger_pointer_json(&report.provenance),
+    })
+}
+
 pub(crate) fn ledger_pointer_json(pointer: &LedgerPointer) -> Value {
     json!({
         "seq": pointer.seq,

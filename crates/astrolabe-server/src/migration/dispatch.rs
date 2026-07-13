@@ -395,7 +395,7 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
     }
     let Some(mode) = string_arg(args_obj, "mode") else {
         return tool_error_result(
-            "get_provenance requires mode: lineage, answer_trace, verify_chain, or reproduce",
+            "get_provenance requires mode: lineage, answer_trace, verify_chain, reproduce, or inter_agent_trust",
         );
     };
     let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
@@ -404,6 +404,13 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
         Ok(store) => store,
         Err(error) => return tool_error_result(error.to_string()),
     };
+    // #67 (blueprint 9.5): inter-agent trust is the one-call verification a second
+    // agent runs against a context pack claimed by a first agent. The claimed
+    // manifest is verified against this serving vault's persisted manifest; a
+    // tampered claim fails closed with a coded error naming the failing check.
+    if mode == "inter_agent_trust" {
+        return handle_inter_agent_trust(&project, &store, args_obj);
+    }
     // #284: `mode="lineage"` for a ledger subject key is served from the real
     // persisted ledger, not row-sink symbol metadata. The scan verifies the whole
     // hash-chain first and fails closed on a broken chain or undecodable row, so
@@ -426,6 +433,63 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
         }
     };
     tool_json_result(provenance_response_json(&project, &response))
+}
+
+/// Serves `get_provenance(mode="inter_agent_trust")`: the one-call verification a
+/// second agent runs against a context pack claimed by a first agent (blueprint
+/// 9.5, #67).
+///
+/// The claimed manifest is supplied either as a `manifest` object
+/// (`pack_id`/`ledger_ref`/`vault_fingerprint`/`member_hash`) or as an
+/// `attestation` string — the self-describing artifact the serving agent handed
+/// over, which is parsed and self-checked before it is trusted as a claim. The
+/// claim is verified against this serving vault's persisted manifest via
+/// [`verify_pack_manifest_claim`]; all four fields must match. A tampered claim
+/// fails closed with the coded `{code, message, remediation}` error naming the
+/// failing check rather than returning a verified-looking envelope, and a
+/// self-inconsistent attestation fails closed as attestation-corrupt.
+pub(crate) fn handle_inter_agent_trust(
+    project: &str,
+    store: &ProvenanceStore,
+    args_obj: &Map<String, Value>,
+) -> Result<String, DynError> {
+    let claimed = match args_obj.get("manifest") {
+        Some(manifest_value) => match pack_manifest_from_json(manifest_value) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return tool_error_result(format!(
+                    "get_provenance mode=\"inter_agent_trust\" manifest is malformed: {error}; remediation: pass a manifest object with pack_id, ledger_ref{{seq,chain_hash}}, vault_fingerprint, and member_hash, or an attestation artifact string"
+                ));
+            }
+        },
+        None => match string_arg(args_obj, "attestation") {
+            Some(attestation) => match parse_pack_manifest_attestation(attestation.as_bytes()) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return tool_error_result(format!(
+                        "{}: {}; remediation: {}",
+                        error.code(),
+                        error.message(),
+                        error.remediation()
+                    ));
+                }
+            },
+            None => {
+                return tool_error_result(
+                    "get_provenance mode=\"inter_agent_trust\" requires the claimed context pack: pass a manifest object or an attestation artifact string",
+                );
+            }
+        },
+    };
+    match verify_pack_manifest_claim(store, &claimed) {
+        Ok(report) => tool_json_result(inter_agent_trust_report_json(project, &report)),
+        Err(error) => tool_error_result(format!(
+            "{}: {}; remediation: {}",
+            error.code(),
+            error.message(),
+            error.remediation()
+        )),
+    }
 }
 
 pub(crate) fn handle_optimizer_status(args_json: &str) -> Result<String, DynError> {
