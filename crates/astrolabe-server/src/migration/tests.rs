@@ -1,5 +1,12 @@
 use super::*;
 
+const M_SCALE_PROJECT: &str = "mscale";
+const M_SCALE_SYMBOL_COUNT: usize = astrolabe_weave::DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT;
+const M_SCALE_EDGES_PER_SYMBOL: usize = 10;
+const M_SCALE_EDGE_COUNT: usize = M_SCALE_SYMBOL_COUNT * M_SCALE_EDGES_PER_SYMBOL;
+const M_SCALE_DELTA_BUDGET: Duration = Duration::from_secs(5);
+const M_SCALE_CHANGED_SYMBOL_INDEX: usize = 12_345;
+
 fn fixture_git(repo: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -5172,6 +5179,80 @@ fn synthetic_skill_rows(symbol_count: usize) -> CbmPipelineRows {
     }
 }
 
+fn mscale_pipeline_rows(changed: bool) -> CbmPipelineRows {
+    let nodes = (0..M_SCALE_SYMBOL_COUNT)
+        .map(|index| {
+            let generation = if changed && index == M_SCALE_CHANGED_SYMBOL_INDEX {
+                2
+            } else {
+                1
+            };
+            astrolabe_bridge::CbmPipelineNodeRow {
+                id: index as i64 + 1,
+                project: M_SCALE_PROJECT.to_string(),
+                label: "Function".to_string(),
+                name: format!("symbol_{index:05}"),
+                qualified_name: mscale_qualified_name(index),
+                file_path: format!("src/module_{:03}.rs", index / 100),
+                start_line: (index % 100) as i64 + 1,
+                end_line: (index % 100) as i64 + 1,
+                properties_json: mscale_properties(index, generation),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut edges = Vec::with_capacity(M_SCALE_EDGE_COUNT);
+    let mut edge_id = 1_i64;
+    for source in 0..M_SCALE_SYMBOL_COUNT {
+        for offset in 1..=M_SCALE_EDGES_PER_SYMBOL {
+            let target = (source + offset * 997) % M_SCALE_SYMBOL_COUNT;
+            edges.push(astrolabe_bridge::CbmPipelineEdgeRow {
+                id: edge_id,
+                project: M_SCALE_PROJECT.to_string(),
+                source_id: source as i64 + 1,
+                target_id: target as i64 + 1,
+                edge_type: "IMPORTS".to_string(),
+                properties_json: format!(r#"{{"ordinal":{offset}}}"#),
+                url_path_gen: String::new(),
+                local_name_gen: format!("dep_{target:05}"),
+            });
+            edge_id += 1;
+        }
+    }
+    CbmPipelineRows {
+        project: M_SCALE_PROJECT.to_string(),
+        nodes,
+        edges,
+    }
+}
+
+fn mscale_qualified_name(index: usize) -> String {
+    format!("{M_SCALE_PROJECT}.symbol_{index:05}")
+}
+
+fn mscale_properties(index: usize, generation: u8) -> String {
+    format!(
+        r#"{{"language":"rust","source_snippet":"fn symbol_{index:05}(input: i32) -> i32 {{ input + {generation} }}","signature":"fn symbol_{index:05}(input: i32) -> i32","bt":"symbol {index} generation {generation} route stable branch return","docstring":"M scale symbol {index} generation {generation}","complexity":2.0,"cognitive":1.0,"param_count":1.0,"lines":1.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+    )
+}
+
+fn mscale_row_sink_candidate(rows: CbmPipelineRows) -> RowSinkImportCandidate {
+    let reason = "M-scale latency harness supplies deterministic synthetic row-sink rows; derived non-latency surfaces are intentionally unavailable";
+    let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
+    RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
+        snapshot: pipeline_rows_to_graph_snapshot(rows),
+        source_fingerprint_sha256,
+        security_screen: security_screen_unavailable(
+            security_screen_subject(M_SCALE_PROJECT),
+            reason,
+        ),
+        skill_tree: skill_tree_unavailable_json(reason),
+        bridges: bridges_unavailable_json(reason),
+        kernel_context: kernel_context_unavailable_json(reason),
+        anomalies: anomaly_report_unavailable_json(reason),
+        provenance: provenance_unavailable_json(reason),
+    }))
+}
+
 fn sample_pipeline_rows() -> CbmPipelineRows {
     CbmPipelineRows {
         project: "demo".to_string(),
@@ -6238,6 +6319,180 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
     let noop = run_live_weave(&vault, "demo", false, None).unwrap();
     assert_eq!(noop["status"], "unchanged");
     assert_eq!(vault.latest_seq(), before_noop);
+    drop(vault);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+#[ignore = "M-scale native release FSV; run explicitly for #23 latency evidence"]
+fn mscale_single_file_delta_converges_under_five_seconds() {
+    let root = temp_dir("mscale-delta-latency-fsv");
+    let vault_dir = root.join(format!("{M_SCALE_PROJECT}.astrolabe-vault"));
+    fs::create_dir_all(&root).unwrap();
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"mscale-delta-latency-fsv".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+
+    let import_options = |commit: &str| {
+        SqliteImportOptions::new(M_SCALE_PROJECT, commit, DEFAULT_PANEL_VERSION)
+            .with_available_slots(shadow_available_slots())
+            .with_series_registry(true)
+    };
+
+    let initial = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &import_options("mscale-commit-1"),
+        Some(mscale_row_sink_candidate(mscale_pipeline_rows(false))),
+    )
+    .unwrap();
+    assert_eq!(initial.report.sqlite_nodes, M_SCALE_SYMBOL_COUNT);
+    assert_eq!(initial.report.sqlite_edges, M_SCALE_EDGE_COUNT);
+    assert_eq!(initial.report.new_cx_ids, M_SCALE_SYMBOL_COUNT);
+    let before_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT)
+        .unwrap()
+        .nodes
+        .into_iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .collect::<BTreeMap<_, _>>();
+    let changed_qn = mscale_qualified_name(M_SCALE_CHANGED_SYMBOL_INDEX);
+    let old_changed_cx = before_cx_by_qn[&changed_qn];
+    let changed_rows = mscale_pipeline_rows(true);
+
+    let started = Instant::now();
+    let changed = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &import_options("mscale-commit-2"),
+        Some(mscale_row_sink_candidate(changed_rows)),
+    )
+    .unwrap();
+    let after_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT)
+        .unwrap()
+        .nodes
+        .into_iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .collect::<BTreeMap<_, _>>();
+    let new_cx_ids = changed
+        .report
+        .new_cx_id_values
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let delta = WeaveDelta {
+        dirty_qualified_names: after_cx_by_qn
+            .iter()
+            .filter(|(_, cx_id)| new_cx_ids.contains(cx_id))
+            .map(|(qualified_name, _)| qualified_name.clone())
+            .collect(),
+        removed_qualified_names: before_cx_by_qn
+            .iter()
+            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
+            .map(|(qualified_name, _)| qualified_name.clone())
+            .collect(),
+        removed_cx_ids: before_cx_by_qn
+            .iter()
+            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
+            .map(|(_, cx_id)| *cx_id)
+            .collect(),
+    };
+    assert_eq!(changed.report.new_cx_ids, 1);
+    assert_eq!(changed.report.reused_cx_ids, M_SCALE_SYMBOL_COUNT - 1);
+    assert_eq!(
+        delta.dirty_qualified_names,
+        BTreeSet::from([changed_qn.clone()])
+    );
+    assert_eq!(
+        delta.removed_qualified_names,
+        BTreeSet::from([changed_qn.clone()])
+    );
+    assert!(delta.removed_cx_ids.contains(&old_changed_cx));
+
+    let weave = run_live_weave(&vault, M_SCALE_PROJECT, true, Some(&delta)).unwrap();
+    assert_eq!(weave["status"], "reconciled");
+    assert!(weave["eager_cross_terms"]["rows_written"].as_u64().unwrap() > 0);
+    let invalidations =
+        persist_delta_invalidations(&vault, M_SCALE_PROJECT, true, Some(&delta), &weave).unwrap();
+    assert_eq!(invalidations["status"], "dirty");
+    let scheduled =
+        schedule_lowering_after_convergence(&root, M_SCALE_PROJECT, true, &weave).unwrap();
+    assert_eq!(
+        scheduled
+            .as_ref()
+            .and_then(|value| value["status"].as_str()),
+        Some("waiting")
+    );
+    let elapsed = started.elapsed();
+
+    let live = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT).unwrap();
+    assert_eq!(live.nodes.len(), M_SCALE_SYMBOL_COUNT);
+    assert_eq!(live.edges.len(), M_SCALE_EDGE_COUNT);
+    assert_ne!(after_cx_by_qn[&changed_qn], old_changed_cx);
+    let xterms = astrolabe_weave::read_eager_cross_term_rows(&vault).unwrap();
+    assert!(!xterms.is_empty(), "delta must persist eager xterms");
+    let assay_invalidations = scan_invalidation_rows(
+        &vault,
+        vault.latest_seq(),
+        ColumnFamily::Assay,
+        M_SCALE_PROJECT,
+        "assay",
+    )
+    .unwrap();
+    let kernel_invalidations = scan_invalidation_rows(
+        &vault,
+        vault.latest_seq(),
+        ColumnFamily::Kernel,
+        M_SCALE_PROJECT,
+        "kernel",
+    )
+    .unwrap();
+    let guard_invalidations = scan_invalidation_rows(
+        &vault,
+        vault.latest_seq(),
+        ColumnFamily::Guard,
+        M_SCALE_PROJECT,
+        "guard",
+    )
+    .unwrap();
+    assert_eq!(assay_invalidations.len(), 1);
+    assert_eq!(kernel_invalidations.len(), 1);
+    assert_eq!(guard_invalidations.len(), 1);
+    assert_eq!(verify_chain(&vault).unwrap().status, "intact");
+    let elapsed_ms = elapsed.as_millis() as u64;
+    println!(
+        "MSCALE_DELTA_FSV {}",
+        json!({
+            "schema": "astrolabe.mscale_delta_latency_fsv.v1",
+            "symbols": M_SCALE_SYMBOL_COUNT,
+            "edges": M_SCALE_EDGE_COUNT,
+            "changed_symbol": changed_qn,
+            "elapsed_ms": elapsed_ms,
+            "budget_ms": M_SCALE_DELTA_BUDGET.as_millis() as u64,
+            "new_cx_ids": changed.report.new_cx_ids,
+            "reused_cx_ids": changed.report.reused_cx_ids,
+            "graph_rows_written": changed.report.graph_rows_written,
+            "edge_rows_written": changed.report.edge_rows_written,
+            "xterm_rows_current": xterms.len(),
+            "assay_invalidations": assay_invalidations.len(),
+            "kernel_invalidations": kernel_invalidations.len(),
+            "guard_invalidations": guard_invalidations.len(),
+            "lowering_debounce": scheduled,
+            "verify_chain": "intact",
+        })
+    );
+    assert!(
+        elapsed < M_SCALE_DELTA_BUDGET,
+        "M-scale delta convergence took {:?}, budget {:?}",
+        elapsed,
+        M_SCALE_DELTA_BUDGET
+    );
+
     drop(vault);
     fs::remove_dir_all(root).ok();
 }
