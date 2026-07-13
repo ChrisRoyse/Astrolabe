@@ -1,24 +1,40 @@
+#[cfg(feature = "ml-runtime")]
 use std::fs::{self, File};
+#[cfg(feature = "ml-runtime")]
 use std::io::Read;
+#[cfg(feature = "ml-runtime")]
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CalyxError, Modality, Result, SlotShape};
+#[cfg(feature = "ml-runtime")]
+use calyx_core::Modality;
+use calyx_core::{CalyxError, Result, SlotShape};
+#[cfg(feature = "ml-runtime")]
 use serde_json::Value;
 
+#[cfg(feature = "ml-runtime")]
 mod fastembed_contract;
 
+#[cfg(feature = "ml-runtime")]
 use fastembed_contract::{
     fastembed_bgem3_contract, fastembed_reranker_contract, fastembed_sparse_contract,
 };
 
+#[cfg(feature = "ml-runtime")]
+use crate::Qwen3ModelFiles;
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+#[cfg(feature = "ml-runtime")]
 use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision};
+#[cfg(feature = "ml-runtime")]
 use crate::runtime::common::DEFAULT_MAX_TOKENS;
-use crate::{AlgorithmicEncoder, LensRuntime, LensSpec, Qwen3ModelFiles};
+use crate::{AlgorithmicEncoder, LensRuntime, LensSpec};
 
+#[cfg(feature = "ml-runtime")]
 const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
+#[cfg(feature = "ml-runtime")]
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
+#[cfg(feature = "ml-runtime")]
 const STATIC_LOOKUP_MAGIC: &[u8; 8] = b"CXLKUP1\0";
+#[cfg(feature = "ml-runtime")]
 const STATIC_LOOKUP_HEADER_LEN: usize = 24;
 
 pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensContract> {
@@ -26,37 +42,54 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         LensRuntime::Algorithmic { kind } => algorithmic_contract(spec, kind),
         LensRuntime::TeiHttp { endpoint } => tei_contract(spec, endpoint),
         LensRuntime::ExternalCmd { cmd, args } => external_contract(spec, cmd, args),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::CandleLocal {
             model_id,
             files,
             dtype,
             pooling,
         } => candle_contract(spec, model_id, files, dtype, pooling),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::Onnx { model_id, files } => onnx_contract(spec, model_id, files),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::OnnxColbert { model_id, files } => {
             onnx_colbert_contract(spec, model_id, files)
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedSparse { model_id, files } => {
             fastembed_sparse_contract(spec, model_id, files)
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedBgem3 {
             model_id,
             files,
             output,
         } => fastembed_bgem3_contract(spec, model_id, files, *output),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedReranker { model_id, files } => {
             fastembed_reranker_contract(spec, model_id, files)
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedQwen3 {
             model_id,
             files,
             dtype,
         } => qwen3_contract(spec, model_id, files, dtype),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::StaticLookup {
             embeddings_file,
             tokenizer,
             dim,
         } => static_lookup_contract(spec, embeddings_file, tokenizer, *dim),
+        #[cfg(not(feature = "ml-runtime"))]
+        LensRuntime::CandleLocal { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedQwen3 { .. }
+        | LensRuntime::StaticLookup { .. } => Err(ml_runtime_disabled(spec)),
         LensRuntime::MultimodalAdapter { .. } => Ok(spec.declared_contract()),
     }
 }
@@ -188,6 +221,7 @@ fn external_contract(spec: &LensSpec, cmd: &str, args: &[String]) -> Result<Froz
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn candle_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -232,6 +266,7 @@ fn candle_contract(
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<FrozenLensContract> {
     let [_model, _tokenizer, config, ..] = files else {
         return Err(lens_config_invalid(
@@ -259,6 +294,7 @@ fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<F
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn onnx_colbert_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -288,6 +324,7 @@ fn onnx_colbert_contract(
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn qwen3_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -319,6 +356,7 @@ fn qwen3_contract(
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn static_lookup_contract(
     spec: &LensSpec,
     embeddings_file: &Path,
@@ -347,6 +385,7 @@ fn static_lookup_contract(
     ))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn static_lookup_header(path: &Path) -> Result<(u32, &'static str)> {
     let mut file = File::open(path).map_err(|err| {
         lens_config_invalid(format!(
@@ -399,6 +438,7 @@ fn static_lookup_header(path: &Path) -> Result<(u32, &'static str)> {
     Ok((dim, dtype))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn dense_hidden_size(path: &Path, label: &str) -> Result<u32> {
     let value = read_json(path, label)?;
     let hidden = value
@@ -408,6 +448,7 @@ fn dense_hidden_size(path: &Path, label: &str) -> Result<u32> {
     u32::try_from(hidden).map_err(|_| CalyxError::lens_dim_mismatch("hidden_size exceeds u32"))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn onnx_pooling_from_config(path: &Path) -> Result<&'static str> {
     let value = read_json(path, "ONNX")?;
     let Some(raw) = value
@@ -427,6 +468,7 @@ fn onnx_pooling_from_config(path: &Path) -> Result<&'static str> {
     }
 }
 
+#[cfg(feature = "ml-runtime")]
 fn read_json(path: &Path, label: &str) -> Result<Value> {
     let bytes = fs::read(path).map_err(|err| {
         lens_config_invalid(format!(
@@ -438,6 +480,7 @@ fn read_json(path: &Path, label: &str) -> Result<Value> {
         .map_err(|err| lens_config_invalid(format!("parse {label} config failed: {err}")))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn qwen3_model_id(raw: &str) -> Result<String> {
     match normalized(raw).as_str() {
         "qwen/qwen3-embedding-0.6b" | "qwen3-embedding-0.6b" | "qwen3-0.6b" => {
@@ -470,6 +513,7 @@ fn token_dim(shape: SlotShape) -> Option<u32> {
     }
 }
 
+#[cfg(feature = "ml-runtime")]
 pub(super) fn ensure_file(label: &str, path: &Path) -> Result<()> {
     if path.is_file() {
         return Ok(());
@@ -480,6 +524,7 @@ pub(super) fn ensure_file(label: &str, path: &Path) -> Result<()> {
     )))
 }
 
+#[cfg(feature = "ml-runtime")]
 fn normalized(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -489,5 +534,22 @@ pub(super) fn lens_config_invalid(message: impl Into<String>) -> CalyxError {
         code: "CALYX_LENS_CONFIG_INVALID",
         message: message.into(),
         remediation: "fix persisted LensSpec runtime fields or re-register the lens",
+    }
+}
+
+/// Fail-closed error for neural-runtime contract derivation when the crate was
+/// built without the `ml-runtime` feature (#297).
+#[cfg(not(feature = "ml-runtime"))]
+fn ml_runtime_disabled(spec: &LensSpec) -> CalyxError {
+    CalyxError {
+        code: "CALYX_REGISTRY_ML_RUNTIME_DISABLED",
+        message: format!(
+            "lens {} uses neural runtime {} but calyx-registry was built without the \
+             `ml-runtime` feature (ort/fastembed/candle/tokenizers are compiled out)",
+            spec.name,
+            crate::spec::ml_runtime_kind(&spec.runtime)
+        ),
+        remediation: "rebuild the consuming crate with calyx-registry's `ml-runtime` feature \
+                      enabled to derive neural embedding lens contracts",
     }
 }

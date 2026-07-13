@@ -28,7 +28,6 @@ mod special;
 mod windows_cuda_dlls;
 
 pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
-pub(crate) use batch_scope::with_runtime_batch_limit;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
 

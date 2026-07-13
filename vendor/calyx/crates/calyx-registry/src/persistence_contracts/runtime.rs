@@ -4,9 +4,12 @@ use calyx_core::{CalyxError, Lens, Result, SlotShape};
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::{
-    AlgorithmicLens, CandleLens, ExternalCmdLens, FastembedBgem3Lens, FastembedQwen3Lens,
-    FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec, MultimodalAdapterLens,
-    OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
+    AlgorithmicLens, ExternalCmdLens, LensRuntime, LensSpec, MultimodalAdapterLens, TeiHttpLens,
+};
+#[cfg(feature = "ml-runtime")]
+use crate::{
+    CandleLens, FastembedBgem3Lens, FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens,
+    OnnxColbertLens, OnnxLens, StaticLookupLens,
 };
 
 pub(crate) fn load_runtime_lens_from_spec(
@@ -54,46 +57,63 @@ pub(crate) fn load_runtime_lens_from_spec(
             );
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::CandleLocal { .. } => {
             let lens = CandleLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::Onnx { .. } => {
             let lens = OnnxLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::OnnxColbert { .. } => {
             let lens = OnnxColbertLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedSparse { .. } => {
             let lens = FastembedSparseLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedBgem3 { .. } => {
             let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedReranker { .. } => {
             let lens = FastembedRerankerLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedQwen3 { .. } => {
             let lens = FastembedQwen3Lens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::StaticLookup { .. } => {
             let lens = StaticLookupLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(not(feature = "ml-runtime"))]
+        LensRuntime::CandleLocal { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedQwen3 { .. }
+        | LensRuntime::StaticLookup { .. } => Err(ml_runtime_disabled(&spec.name, &spec.runtime)),
         LensRuntime::MultimodalAdapter { .. } => {
             let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
             let contract = lens.contract();
@@ -218,5 +238,21 @@ fn lens_config_invalid(message: impl Into<String>) -> CalyxError {
         code: "CALYX_LENS_CONFIG_INVALID",
         message: message.into(),
         remediation: "fix persisted LensSpec runtime fields or re-register the lens",
+    }
+}
+
+/// Fail-closed error for neural-runtime lens instantiation when the crate was
+/// built without the `ml-runtime` feature (#297).
+#[cfg(not(feature = "ml-runtime"))]
+fn ml_runtime_disabled(name: &str, runtime: &LensRuntime) -> CalyxError {
+    CalyxError {
+        code: "CALYX_REGISTRY_ML_RUNTIME_DISABLED",
+        message: format!(
+            "lens {name} uses neural runtime {} but calyx-registry was built without the \
+             `ml-runtime` feature (ort/fastembed/candle/tokenizers are compiled out)",
+            crate::spec::ml_runtime_kind(runtime)
+        ),
+        remediation: "rebuild the consuming crate with calyx-registry's `ml-runtime` feature \
+                      enabled to load neural embedding lenses",
     }
 }

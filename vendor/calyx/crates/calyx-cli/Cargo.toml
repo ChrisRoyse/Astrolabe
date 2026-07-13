@@ -38,7 +38,11 @@ calyx-loom = { path = "../calyx-loom" }
 calyx-oracle = { path = "../calyx-oracle" }
 calyx-paths = { path = "../calyx-paths" }
 calyx-search = { path = "../calyx-search" }
-calyx-registry = { path = "../calyx-registry" }
+# calyx-cli drives the neural lens commissioning/explain/scale commands, so it
+# opts into calyx-registry's `ml-runtime` feature (ort/fastembed/candle/
+# tokenizers). Default-off in the registry (#297) keeps that ML payload out of
+# the Astrolabe server graph, which reaches the registry only via SwapController.
+calyx-registry = { path = "../calyx-registry", features = ["ml-runtime"] }
 calyx-sextant = { path = "../calyx-sextant" }
 calyx-ward = { path = "../calyx-ward" }
 calyxd = { path = "../calyxd" }
