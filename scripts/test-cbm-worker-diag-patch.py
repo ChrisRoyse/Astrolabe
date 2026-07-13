@@ -169,6 +169,22 @@ def main() -> int:
             "vendored mcp source untouched on disk",
         )
 
+    # Build plumbing: the prod overlay dir must receive the vendored
+    # index_supervisor.h (bare quote-include resolves includer-relative; the
+    # prod binary has no per-TU -Isrc/mcp). Regression guard for aggregate
+    # attempt 12's "index_supervisor.h: No such file or directory".
+    makefile = (ROOT / "patches" / "cbm" / "Makefile.cbm").read_text(encoding="utf-8")
+    expect(
+        "ASTRO_WORKER_DIAG_PROD_SUPERVISOR_HDR = $(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/index_supervisor.h"
+        in makefile,
+        "Makefile.cbm copies index_supervisor.h beside the prod overlay",
+    )
+    expect(
+        "$(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/index_supervisor.c: $(ASTRO_WORKER_DIAG_PROD_SUPERVISOR_HDR)"
+        in makefile,
+        "the prod supervisor overlay depends on the copied header",
+    )
+
     # Edge-case triad (fail closed).
     expect_fail_closed(
         lambda: module.patch_mcp(mcp_patched),
