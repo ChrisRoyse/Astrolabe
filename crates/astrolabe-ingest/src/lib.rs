@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod erasure_scrub;
 pub mod fsv;
 mod graph_projection;
 mod ledger_scan;
@@ -7,6 +8,11 @@ mod ledger_verify;
 mod registry;
 mod sqlite_import;
 
+pub use erasure_scrub::{
+    ASTRO_ERASURE_SCRUB_BATCH_INVALID, ASTRO_ERASURE_SCRUB_IO, ASTRO_ERASURE_SCRUB_NOT_DURABLE,
+    ASTRO_ERASURE_SCRUB_TORN_WAL, ASTRO_ERASURE_SCRUB_WAL_UNCOVERED, WAL_SCRUB_LEDGER_SCHEMA,
+    WalScrubParams, WalScrubReport, WalScrubStatus, scrub_erased_wal_history, wal_scrub_status,
+};
 pub use fsv::VaultMutationPlan;
 
 pub use graph_projection::{
@@ -44,7 +50,7 @@ pub use sqlite_import::{
     SqliteImportOptions, SqliteImportQuantizationReport, SqliteImportReadback, SqliteImportReport,
     erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, inject_node_property_fault,
-    read_cbm_graph_snapshot,
+    read_cbm_graph_snapshot, read_node_map_cx_ids,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

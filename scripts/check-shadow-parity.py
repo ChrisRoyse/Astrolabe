@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,6 +22,15 @@ WHITELIST = ROOT / "ci" / "shadow-parity-whitelist.json"
 SHADOW_VAULT_ID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 DEFAULT_ARTIFACT_DIR = ROOT / "target" / "astrolabe-release-predicate"
 PARITY_DASHBOARD_ARTIFACT = "parity-dashboard.json"
+PARITY_HISTORY_ARTIFACT = "parity-history.json"
+PARITY_TREND_ARTIFACT = "parity-trend.json"
+DASHBOARD_SCHEMA_GOLDEN = ROOT / "ci" / "shadow-parity-dashboard-schema.json"
+DASHBOARD_SCHEMA = "astrolabe-shadow-parity-dashboard-v1"
+HISTORY_SCHEMA = "astrolabe-shadow-parity-history-v1"
+TREND_SCHEMA = "astrolabe-shadow-parity-trend-v1"
+# How many most-recent dashboard runs the trend history retains. A knob, not a
+# magic constant: raise it for longer trend windows (#19 dashboard history).
+DEFAULT_HISTORY_RETAIN = 50
 
 
 def run(argv, *, env=None, cwd=ROOT, timeout=240):
@@ -248,6 +258,23 @@ def validate_whitelist_entries(entries, source):
                 f"({', '.join(MATCHER_KEYS)}) so the entry targets a specific "
                 "divergence class",
             )
+    # Two entries with an identical matcher set suppress exactly the same
+    # divergence class: the duplicate can only be a copy-paste slip that bloats
+    # the load-bearing whitelist and masks its true size. Reject fail-closed so
+    # the whitelist stays a minimal, auditable set of deliberate suppressions.
+    seen: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        matcher_map = {key: value for key, value in entry.items() if key in MATCHER_KEYS}
+        signature = json.dumps(matcher_map, sort_keys=True)
+        if signature in seen:
+            raise _whitelist_error(
+                "shadow_parity_whitelist_entry_duplicate",
+                f"shadow-parity whitelist entry #{index} in {source} duplicates the "
+                f"matchers of entry #{seen[signature]} ({signature})",
+                "remove the duplicate entry; each suppression must appear once so the "
+                "whitelist's true size stays auditable",
+            )
+        seen[signature] = index
     return entries
 
 
@@ -482,6 +509,225 @@ def deep_verify(astrolabe, vault_dir, project):
     return json.loads(proc.stdout)
 
 
+def utc_now_iso():
+    return datetime.now(tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def compute_status(unwhitelisted):
+    """The single source of truth for pass/fail: any unwhitelisted divergence bites.
+
+    Used by both the live harness and the empty-whitelist control demonstration so
+    the control proves the *real* gate verdict, not a re-implementation of it.
+    """
+    return "verified" if not unwhitelisted else "failed"
+
+
+# JSON type tokens the dashboard golden may require -> acceptance predicates.
+# bool is excluded from the numeric/int classes on purpose (it is a Python int
+# subclass but never a legitimate count or overlap value).
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+_TYPE_PREDICATES = {
+    "str": lambda v: isinstance(v, str),
+    "int": _is_int,
+    "number": _is_number,
+    "list": lambda v: isinstance(v, list),
+    "dict": lambda v: isinstance(v, dict),
+    "str_or_null": lambda v: v is None or isinstance(v, str),
+    "dict_or_null": lambda v: v is None or isinstance(v, dict),
+}
+
+
+def load_dashboard_schema(path=DASHBOARD_SCHEMA_GOLDEN):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") != "astrolabe-shadow-parity-dashboard-schema-v1":
+        raise _whitelist_error(
+            "shadow_parity_dashboard_schema_unrecognized",
+            f"dashboard schema golden {path} has an unexpected schema tag",
+            "restore ci/shadow-parity-dashboard-schema.json to schema "
+            "'astrolabe-shadow-parity-dashboard-schema-v1'",
+        )
+    return payload
+
+
+def validate_dashboard_schema(dashboard, golden=DASHBOARD_SCHEMA_GOLDEN):
+    """Fail closed unless the produced dashboard matches the checked-in golden.
+
+    Guards against silent drift in the dashboard contract: a renamed/removed key,
+    a type change, or an out-of-vocabulary status all fail with a structured
+    {code, message, remediation} error instead of shipping a malformed artifact.
+    """
+    golden_payload = golden if isinstance(golden, dict) else load_dashboard_schema(golden)
+    required = golden_payload["required_keys"]
+    allowed_status = golden_payload["allowed_status"]
+
+    if dashboard.get("schema") != golden_payload["dashboard_schema"]:
+        raise _whitelist_error(
+            "shadow_parity_dashboard_schema_tag_drift",
+            f"dashboard schema tag is {dashboard.get('schema')!r}, golden requires "
+            f"{golden_payload['dashboard_schema']!r}",
+            "align the dashboard 'schema' field with ci/shadow-parity-dashboard-schema.json",
+        )
+
+    missing = sorted(set(required) - set(dashboard))
+    if missing:
+        raise _whitelist_error(
+            "shadow_parity_dashboard_missing_keys",
+            f"dashboard is missing required key(s): {', '.join(missing)}",
+            "add the missing key(s) or update ci/shadow-parity-dashboard-schema.json "
+            "if the contract legitimately changed",
+        )
+    extra = sorted(set(dashboard) - set(required))
+    if extra:
+        raise _whitelist_error(
+            "shadow_parity_dashboard_unexpected_keys",
+            f"dashboard has unexpected key(s): {', '.join(extra)}",
+            "remove the key(s) or declare them in ci/shadow-parity-dashboard-schema.json",
+        )
+    for key, type_token in required.items():
+        predicate = _TYPE_PREDICATES.get(type_token)
+        if predicate is None:
+            raise _whitelist_error(
+                "shadow_parity_dashboard_schema_bad_type",
+                f"dashboard golden declares unknown type {type_token!r} for key {key!r}",
+                f"use one of {', '.join(sorted(_TYPE_PREDICATES))} in the golden",
+            )
+        if not predicate(dashboard[key]):
+            raise _whitelist_error(
+                "shadow_parity_dashboard_type_mismatch",
+                f"dashboard key {key!r} must be {type_token} but is "
+                f"{type(dashboard[key]).__name__}",
+                "fix the value type or update the golden's declared type",
+            )
+    if dashboard["status"] not in allowed_status:
+        raise _whitelist_error(
+            "shadow_parity_dashboard_status_out_of_vocab",
+            f"dashboard status {dashboard['status']!r} is not one of {allowed_status}",
+            "the harness must set status via compute_status(); update the golden's "
+            "allowed_status only for a deliberate contract change",
+        )
+    return dashboard
+
+
+def history_record(dashboard, recorded_at, commit):
+    """Compact, deterministic trend row distilled from one dashboard run."""
+    return {
+        "recorded_at": recorded_at,
+        "commit": commit,
+        "status": dashboard["status"],
+        "nodes": dashboard["nodes"],
+        "edges": dashboard["edges"],
+        "search_overlap_at_10": dashboard["search_overlap_at_10"],
+        "divergence_count": len(dashboard["divergences"]),
+        "unwhitelisted_count": len(dashboard["unwhitelisted"]),
+    }
+
+
+def append_history(history_path, record, retain=DEFAULT_HISTORY_RETAIN):
+    """Append one run to the retained JSON history, keeping the most-recent `retain`.
+
+    Reads back and re-validates the persisted history before appending, so a
+    corrupt or foreign-schema history file fails closed instead of being silently
+    overwritten. Returns the retained record list actually persisted.
+    """
+    history_path = Path(history_path)
+    records: list = []
+    if history_path.exists():
+        try:
+            payload = json.loads(history_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise _whitelist_error(
+                "shadow_parity_history_corrupt",
+                f"parity history {history_path} is not valid JSON: {exc}",
+                "delete the corrupt history file so a fresh trend series can start, or "
+                "restore it from version control",
+            )
+        if not isinstance(payload, dict) or payload.get("schema") != HISTORY_SCHEMA:
+            raise _whitelist_error(
+                "shadow_parity_history_schema_drift",
+                f"parity history {history_path} is not a {HISTORY_SCHEMA} object",
+                "delete the file or restore a valid history object",
+            )
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            raise _whitelist_error(
+                "shadow_parity_history_records_not_list",
+                f"parity history {history_path} 'records' must be a JSON array",
+                "delete the file so a fresh trend series can start",
+            )
+    records = list(records) + [record]
+    if retain > 0:
+        records = records[-retain:]
+    payload = {"schema": HISTORY_SCHEMA, "retain": retain, "records": records}
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return records
+
+
+def compute_trend(records):
+    """Summarize a retained history series into a trend artifact payload."""
+    if not records:
+        return {"schema": TREND_SCHEMA, "count": 0}
+    latest = records[-1]
+    previous = records[-2] if len(records) > 1 else None
+    streak = 0
+    for row in reversed(records):
+        if row.get("status") == "verified":
+            streak += 1
+        else:
+            break
+
+    def delta(key):
+        if previous is None:
+            return None
+        return latest.get(key) - previous.get(key)
+
+    return {
+        "schema": TREND_SCHEMA,
+        "count": len(records),
+        "latest_status": latest.get("status"),
+        "consecutive_verified": streak,
+        "first_recorded_at": records[0].get("recorded_at"),
+        "latest_recorded_at": latest.get("recorded_at"),
+        "latest_unwhitelisted_count": latest.get("unwhitelisted_count"),
+        "unwhitelisted_delta": delta("unwhitelisted_count"),
+        "divergence_delta": delta("divergence_count"),
+        "nodes_delta": delta("nodes"),
+        "edges_delta": delta("edges"),
+    }
+
+
+def write_trend(trend_path, trend):
+    trend_path = Path(trend_path)
+    trend_path.parent.mkdir(parents=True, exist_ok=True)
+    trend_path.write_text(json.dumps(trend, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_history_and_trend(history_dir, dashboard, recorded_at, retain=DEFAULT_HISTORY_RETAIN):
+    """Append this run to the retained history and (re)write the trend artifact.
+
+    Returns (history_path, trend_path, retained_records, trend). The commit binding
+    reuses release_artifact.git_commit so a row names the tree that produced it.
+    """
+    from release_artifact import git_commit
+
+    history_dir = Path(history_dir)
+    commit, _dirty = git_commit(ROOT)
+    record = history_record(dashboard, recorded_at, commit)
+    history_path = history_dir / PARITY_HISTORY_ARTIFACT
+    records = append_history(history_path, record, retain)
+    trend = compute_trend(records)
+    trend_path = history_dir / PARITY_TREND_ARTIFACT
+    write_trend(trend_path, trend)
+    return history_path, trend_path, records, trend
+
+
 def write_dashboard(path, dashboard):
     if path is None:
         return
@@ -685,6 +931,199 @@ def run_selftest():
         # The shipped whitelist (entries: []) must still load cleanly.
         shipped = load_whitelist(WHITELIST)
         check("shipped_whitelist_loads", shipped == [], f"{len(shipped)} entries")
+
+        # Duplicate matcher entries are rejected fail-closed so the whitelist's
+        # true size stays auditable (#19 edge triad: duplicate entries).
+        dup_path = tmp / "duplicate.json"
+        dup_path.write_text(
+            json.dumps(
+                {
+                    "schema": "astrolabe-shadow-parity-whitelist-v1",
+                    "entries": [
+                        {"kind": "fts", "field": "f23", "justification": "first"},
+                        {"kind": "fts", "field": "f23", "justification": "copy-paste"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_whitelist(dup_path)
+            check("duplicate_entry_rejected", False, "load_whitelist did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "duplicate_entry_rejected",
+                payload.get("code") == "shadow_parity_whitelist_entry_duplicate"
+                and "#1" in payload.get("message", "")
+                and bool(payload.get("remediation")),
+                json.dumps(payload, sort_keys=True),
+            )
+
+        # ---- Empty-whitelist-must-bite control demonstration (#19 box 2) ----
+        # A known-benign divergence class we would legitimately whitelist. This is
+        # the control proof that the whitelist is *load-bearing*: with an entry that
+        # names it the gate PASSES; with the shipped empty whitelist the very same
+        # divergence is unsuppressed and the gate FAILS. Uses the real is_whitelisted
+        # + compute_status the live harness uses, not a re-implementation.
+        benign = {"kind": "fts", "field": "f23"}
+        suppressing = [{"kind": "fts", "field": "f23", "justification": "known benign drift"}]
+        empty = []
+        with_wl = [benign] if not is_whitelisted(benign, suppressing) else []
+        without_wl = [benign] if not is_whitelisted(benign, empty) else []
+        check(
+            "control_whitelist_suppresses",
+            compute_status(with_wl) == "verified" and with_wl == [],
+            f"status={compute_status(with_wl)}",
+        )
+        check(
+            "control_empty_whitelist_bites",
+            compute_status(without_wl) == "failed" and without_wl == [benign],
+            f"status={compute_status(without_wl)} unwhitelisted={without_wl}",
+        )
+        # The whitelist is load-bearing iff the two verdicts differ on identical input.
+        check(
+            "control_whitelist_is_load_bearing",
+            compute_status(with_wl) != compute_status(without_wl),
+        )
+        print(
+            "[selftest] control "
+            + json.dumps(
+                {
+                    "divergence": benign,
+                    "with_whitelist_status": compute_status(with_wl),
+                    "empty_whitelist_status": compute_status(without_wl),
+                },
+                sort_keys=True,
+            )
+        )
+
+        # ---- Dashboard schema golden (#19 box 3) ----
+        golden = load_dashboard_schema()
+        check(
+            "dashboard_golden_tag",
+            golden["dashboard_schema"] == DASHBOARD_SCHEMA,
+            golden["dashboard_schema"],
+        )
+        synthetic = {
+            "schema": DASHBOARD_SCHEMA,
+            "status": "verified",
+            "project": PROJECT,
+            "nodes": 30,
+            "edges": 53,
+            "search_overlap_at_10": 1.0,
+            "divergences": [],
+            "unwhitelisted": [],
+            "injected_fault_qn": None,
+            "injected_vault_fault": None,
+            "idempotency": {"first": {}, "second": {}},
+            "lowered_sqlite": {"first": {}, "second": {}, "status": {}},
+            "deep_verify": {},
+            "upstream": "upstream",
+            "astrolabe": "astrolabe",
+        }
+        try:
+            validate_dashboard_schema(synthetic, golden)
+            check("dashboard_golden_accepts_valid", True)
+        except SystemExit as exc:
+            check("dashboard_golden_accepts_valid", False, str(exc.code))
+        # A missing key must fail closed with a structured error.
+        drift = dict(synthetic)
+        drift.pop("deep_verify")
+        try:
+            validate_dashboard_schema(drift, golden)
+            check("dashboard_golden_rejects_drift", False, "accepted a missing key")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "dashboard_golden_rejects_drift",
+                payload.get("code") == "shadow_parity_dashboard_missing_keys"
+                and "deep_verify" in payload.get("message", ""),
+                json.dumps(payload, sort_keys=True),
+            )
+        # A type mismatch must also fail closed.
+        bad_type = dict(synthetic)
+        bad_type["nodes"] = "30"
+        try:
+            validate_dashboard_schema(bad_type, golden)
+            check("dashboard_golden_rejects_bad_type", False, "accepted a string count")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "dashboard_golden_rejects_bad_type",
+                payload.get("code") == "shadow_parity_dashboard_type_mismatch",
+                json.dumps(payload, sort_keys=True),
+            )
+
+        # ---- History / trend retention FSV (#19 box 3) ----
+        # Append several runs to a real on-disk history, read the persisted bytes
+        # back, and prove retention truncates oldest-first and the trend reflects
+        # the series. This is FSV: the assertions read the file, not return values.
+        hist_dir = tmp / "history"
+        hist_path = hist_dir / PARITY_HISTORY_ARTIFACT
+        retain = 3
+        for i in range(5):
+            run_status = "failed" if i == 2 else "verified"
+            rec = history_record(
+                {
+                    "status": run_status,
+                    "nodes": 30,
+                    "edges": 53 + i,
+                    "search_overlap_at_10": 1.0,
+                    "divergences": [],
+                    "unwhitelisted": ([{"kind": "fts"}] if run_status == "failed" else []),
+                },
+                recorded_at=f"2026-07-12T00:0{i}:00Z",
+                commit=f"deadbeef{i}",
+            )
+            append_history(hist_path, rec, retain=retain)
+        persisted = json.loads(hist_path.read_text(encoding="utf-8"))
+        check("history_schema", persisted.get("schema") == HISTORY_SCHEMA)
+        check(
+            "history_retains_last_n",
+            len(persisted["records"]) == retain,
+            f"{len(persisted['records'])} records",
+        )
+        check(
+            "history_drops_oldest",
+            [r["edges"] for r in persisted["records"]] == [55, 56, 57],
+            str([r["edges"] for r in persisted["records"]]),
+        )
+        trend = compute_trend(persisted["records"])
+        check("trend_schema", trend.get("schema") == TREND_SCHEMA)
+        check("trend_count", trend.get("count") == retain, str(trend.get("count")))
+        # records[-1] is verified (i=4); i=3 verified too -> streak counts trailing verified.
+        check(
+            "trend_consecutive_verified",
+            trend.get("consecutive_verified") == 2,
+            str(trend.get("consecutive_verified")),
+        )
+        check("trend_edges_delta", trend.get("edges_delta") == 1, str(trend.get("edges_delta")))
+        # Corrupt history must fail closed, never silently overwrite a series.
+        hist_path.write_text("{ not json", encoding="utf-8")
+        try:
+            append_history(hist_path, rec, retain=retain)
+            check("history_corrupt_rejected", False, "append_history did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "history_corrupt_rejected",
+                payload.get("code") == "shadow_parity_history_corrupt"
+                and bool(payload.get("remediation")),
+                json.dumps(payload, sort_keys=True),
+            )
+        # Foreign-schema history is likewise rejected.
+        hist_path.write_text(json.dumps({"schema": "other", "records": []}), encoding="utf-8")
+        try:
+            append_history(hist_path, rec, retain=retain)
+            check("history_schema_drift_rejected", False, "append_history did not raise")
+        except SystemExit as exc:
+            payload = json.loads(str(exc.code))
+            check(
+                "history_schema_drift_rejected",
+                payload.get("code") == "shadow_parity_history_schema_drift",
+                json.dumps(payload, sort_keys=True),
+            )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -707,6 +1146,22 @@ def main():
     parser.add_argument("--summary-out", type=Path)
     parser.add_argument("--write-release-artifact", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument(
+        "--history-dir",
+        type=Path,
+        help="directory the retained parity history/trend artifacts are written to "
+        "(defaults to --artifact-dir when --write-release-artifact is set)",
+    )
+    parser.add_argument(
+        "--history-retain",
+        type=int,
+        default=DEFAULT_HISTORY_RETAIN,
+        help="how many most-recent runs the trend history keeps",
+    )
+    parser.add_argument(
+        "--recorded-at",
+        help="override the history record timestamp (ISO-8601; for deterministic tests)",
+    )
     parser.add_argument("--inject-fault", action="store_true")
     parser.add_argument(
         "--inject-vault-fault",
@@ -858,7 +1313,7 @@ def main():
                 }
             )
 
-        status = "verified" if not unwhitelisted else "failed"
+        status = compute_status(unwhitelisted)
         dashboard = {
             "schema": "astrolabe-shadow-parity-dashboard-v1",
             "status": status,
@@ -880,8 +1335,37 @@ def main():
             "upstream": str(upstream),
             "astrolabe": str(astrolabe),
         }
+        # Fail closed on any drift from the checked-in dashboard contract before
+        # the artifact escapes this process (#19 dashboard schema golden).
+        validate_dashboard_schema(dashboard)
         write_dashboard(args.dashboard_out, dashboard)
         write_summary(args.summary_out, dashboard)
+
+        # Append this run to the retained trend history (#19). Both verified and
+        # failed runs are recorded so the trend series is honest. History persists
+        # only where its directory outlives target/ cleanup; see the coverage note
+        # on #238 for the cross-run cadence gap.
+        history_dir = args.history_dir
+        if history_dir is None and args.write_release_artifact:
+            history_dir = args.artifact_dir
+        if history_dir is not None:
+            recorded_at = args.recorded_at or utc_now_iso()
+            history_path, trend_path, retained, trend = record_history_and_trend(
+                history_dir, dashboard, recorded_at, args.history_retain
+            )
+            print(
+                "parity history: "
+                + json.dumps(
+                    {
+                        "history": str(history_path),
+                        "trend": str(trend_path),
+                        "retained": len(retained),
+                        "consecutive_verified": trend.get("consecutive_verified"),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
 
         if args.expect_failure:
             if not unwhitelisted:

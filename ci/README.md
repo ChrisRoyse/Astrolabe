@@ -50,7 +50,6 @@ classified `DEFERRED[ASTRO_PORT_PHASE]` and tracked in issue #238
 | `cbm-cache-path-offenders.md` | `scripts/check-cbm-cache-paths.py` | Allowlist of CBM cache-path construction sites. |
 | `cbm-test-totals.md` | `scripts/ci-cbm-test.sh` | Measured CBM registered-test baseline per platform label. |
 | `cli-parity-fixtures.json` | `scripts/check-cli-parity.py` | CLI parity corpus. |
-| `cli-parity-provenance-seed.json` | `scripts/check-cli-parity.py` | Deterministic provenance seed. |
 | `compat-shim-fixtures.json` | `scripts/check-compat-shim.py` | Compat-shim parity corpus. |
 | `fixtures/` | several gates | Shared fixture inputs. |
 | `hazard-suite.json` | `scripts/check-hazard-suite.py` | Hazard suite declarations. |
@@ -62,4 +61,5 @@ classified `DEFERRED[ASTRO_PORT_PHASE]` and tracked in issue #238
 | `mcp-parity-normalizers.json` | `scripts/check-mcp-parity.py` | Parity normalizers. |
 | `redaction-writers.json` | `scripts/check-redaction-writers.py` | Redaction writer allowlist. |
 | `shadow-parity-whitelist.json` | `scripts/check-shadow-parity.py` | Shadow parity whitelist. |
+| `shadow-parity-dashboard-schema.json` | `scripts/check-shadow-parity.py` | Golden schema for the parity dashboard artifact (`--selftest` validates conformance). |
 | `shell-arg-audit.json` | `scripts/check-shell-arg-audit.py` | Shell argument audit allowlist. |

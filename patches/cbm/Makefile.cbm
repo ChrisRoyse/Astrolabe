@@ -302,6 +302,21 @@ PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOV
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
+# ── Astrolabe-owned overlays are compile-time features of the CBM sources ─────
+# The former patches/cbm appliers were absorbed into the CBM sources as plain
+# edits, guarded by ASTRO_* macros so each artifact selects the exact behavior
+# it had before the overlay machinery was dissolved (issue #286). Which flag
+# reaches which artifact:
+#   libcbm.a          : ASTRO_ENV_STORE, ASTRO_SPAWN, ASTRO_SHELLARG,
+#                       ASTRO_MEM_PRESSURE, ASTRO_WORKER_DIAG  (see LIBCBM_CFLAGS)
+#   cbm / cbm-with-ui : ASTRO_UI_WERROR, ASTRO_WORKER_DIAG     (ASTRO_PROD_DEFS)
+#   test-runner       : none — the vendored behavior, unpatched
+# The production binaries compile the owned sources directly (no path
+# substitution); the flags below turn on the two features that historically
+# reached them. #229 (-Werror root-cause fixes) and #282 (worker-failure
+# diagnostics, live parity with the astrolabe/libcbm side).
+ASTRO_PROD_DEFS = -DASTRO_UI_WERROR -DASTRO_WORKER_DIAG
+
 # ── Test sources ─────────────────────────────────────────────────
 
 TEST_FOUNDATION_SRCS = \
@@ -652,8 +667,10 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
+# The production binary compiles the owned sources directly; ASTRO_PROD_DEFS
+# turns on the #229 -Werror root-cause fixes and the #282 worker diagnostics.
 $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
+	$(CC) $(CFLAGS_PROD) $(ASTRO_PROD_DEFS) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
@@ -671,26 +688,15 @@ ASTRO_LAYOUT_PROBE_SRC = $(ASTROLABE_PATCH_DIR)/astro_layout_probe.c
 ASTRO_LAYOUT_PROBE_OBJ = $(LIBCBM_DIR)/astro_layout_probe.o
 ASTRO_FFI_INCLUDE_DIR = $(ASTROLABE_PATCH_DIR)/../../crates/cbm-sys/include
 ASTRO_FFI_HEADER = $(ASTRO_FFI_INCLUDE_DIR)/astro_ffi.h
-ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py
-ASTRO_MEM_PRESSURE_SRC = src/foundation/mem.c
-ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c
-ASTRO_MEM_PRESSURE_OBJ = $(LIBCBM_DIR)/src/foundation/mem.o
-
-# ── #240/#241: store-resolution overlay ──────────────────────────
+# ── #240/#241: store-resolution facilities (now compiled unconditionally) ─────
 # Astrolabe-owned store configuration (explicit FFI parameter instead of
-# env-as-IPC) plus the fail-closed environment fault record, and the hash-checked
-# overlay that teaches the pinned CBM resolvers to use them. Nothing under
-# vendor/ is written: every patched source is regenerated into $(LIBCBM_DIR) and
-# compiled from there, and the explicit object rules below take precedence over
-# the generic $(LIBCBM_DIR)/%.o pattern rule.
-ASTRO_ENV_STORE_PATCH = $(ASTROLABE_PATCH_DIR)/env_apply_store_patch.py
+# env-as-IPC) plus the fail-closed environment fault record. The CBM resolvers
+# that consume them are edited in place under ASTRO_ENV_STORE; libcbm defines
+# that flag (LIBCBM_CFLAGS), so this translation unit is always linked into the
+# archive. ASTRO_ENV_STORE_INC puts its header on the include path.
 ASTRO_ENV_STORE_CONFIG_SRC = $(ASTROLABE_PATCH_DIR)/env_store_config.c
 ASTRO_ENV_STORE_CONFIG_HDR = $(ASTROLABE_PATCH_DIR)/env_store_config.h
 ASTRO_ENV_STORE_CONFIG_OBJ = $(LIBCBM_DIR)/env_store_config.o
-ASTRO_ENV_STORE_SRCS = src/foundation/platform.c src/pipeline/pipeline.c src/cli/cli.c \
-                       src/mcp/mcp.c src/ui/http_server.c
-ASTRO_ENV_STORE_OVERLAYS = $(patsubst %.c,$(LIBCBM_DIR)/%.c,$(ASTRO_ENV_STORE_SRCS))
-ASTRO_ENV_STORE_OBJS = $(patsubst %.c,$(LIBCBM_DIR)/%.o,$(ASTRO_ENV_STORE_SRCS))
 ASTRO_ENV_STORE_INC = -I$(ASTROLABE_PATCH_DIR)
 
 PYTHON ?= python
@@ -729,7 +735,18 @@ LIBCBM_GRAMMAR_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_SQLITE3_CFLAGS += $(LIBCBM_DEPFLAGS)
 LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_DEPFLAGS)
 
-# ── BEGIN Astrolabe #227/#228: shell-free git spawn + validator overlays ──────
+# ── Astrolabe overlay features absorbed into the CBM sources (#286) ───────────
+# Every overlay that historically reached libcbm is now a plain edit in the
+# owned CBM source, guarded by an ASTRO_* macro. libcbm defines them all here;
+# the production binaries define only ASTRO_PROD_DEFS, the test-runner none —
+# reproducing the pre-#286 per-artifact behavior matrix exactly.
+# -I$(ASTROLABE_PATCH_DIR) resolves the two Astrolabe-owned headers those guarded
+# regions include: env_store_config.h (ASTRO_ENV_STORE), astro_spawn.h (ASTRO_SPAWN).
+LIBCBM_ASTRO_DEFS = -DASTRO_ENV_STORE -DASTRO_SPAWN -DASTRO_SHELLARG \
+                    -DASTRO_MEM_PRESSURE -DASTRO_WORKER_DIAG
+LIBCBM_CFLAGS += $(LIBCBM_ASTRO_DEFS) -I$(ASTROLABE_PATCH_DIR)
+
+# ── BEGIN Astrolabe #227/#228: shell-free git spawn helper ────────────────────
 #
 # #227: CBM's git helpers composed a command STRING for cbm_popen, which runs
 # `cmd.exe /c <string>` on Windows (the CRT's _popen "executes a spawned copy of
@@ -750,148 +767,25 @@ LIBCBM_MIMALLOC_CFLAGS += $(LIBCBM_DEPFLAGS)
 ASTRO_SPAWN_SRC = $(ASTROLABE_PATCH_DIR)/astro_spawn.c
 ASTRO_SPAWN_HDR = $(ASTROLABE_PATCH_DIR)/astro_spawn.h
 ASTRO_SPAWN_OBJ = $(LIBCBM_DIR)/astro_spawn.o
-ASTRO_OVERLAY_LIB = $(ASTROLABE_PATCH_DIR)/astro_overlay.py
-
-ASTRO_SPAWN_GIT_CONTEXT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_git_context_patch.py
-ASTRO_SPAWN_GIT_CONTEXT_SRC = src/git/git_context.c
-ASTRO_SPAWN_GIT_CONTEXT_OVERLAY = $(LIBCBM_DIR)/src/git/git_context.c
-ASTRO_SPAWN_GIT_CONTEXT_OBJ = $(LIBCBM_DIR)/src/git/git_context.o
-
-ASTRO_SPAWN_ARTIFACT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_artifact_patch.py
-ASTRO_SPAWN_ARTIFACT_SRC = src/pipeline/artifact.c
-ASTRO_SPAWN_ARTIFACT_OVERLAY = $(LIBCBM_DIR)/src/pipeline/artifact.c
-ASTRO_SPAWN_ARTIFACT_OBJ = $(LIBCBM_DIR)/src/pipeline/artifact.o
-
-ASTRO_SPAWN_WATCHER_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_watcher_patch.py
-ASTRO_SPAWN_WATCHER_SRC = src/watcher/watcher.c
-ASTRO_SPAWN_WATCHER_OVERLAY = $(LIBCBM_DIR)/src/watcher/watcher.c
-ASTRO_SPAWN_WATCHER_OBJ = $(LIBCBM_DIR)/src/watcher/watcher.o
-
-ASTRO_SPAWN_GITHISTORY_PATCH = $(ASTROLABE_PATCH_DIR)/apply_spawn_githistory_patch.py
-ASTRO_SPAWN_GITHISTORY_SRC = src/pipeline/pass_githistory.c
-ASTRO_SPAWN_GITHISTORY_OVERLAY = $(LIBCBM_DIR)/src/pipeline/pass_githistory.c
-ASTRO_SPAWN_GITHISTORY_OBJ = $(LIBCBM_DIR)/src/pipeline/pass_githistory.o
-
-ASTRO_SHELLARG_STR_UTIL_PATCH = $(ASTROLABE_PATCH_DIR)/apply_shellarg_str_util_patch.py
-ASTRO_SHELLARG_STR_UTIL_SRC = src/foundation/str_util.c
-ASTRO_SHELLARG_STR_UTIL_OVERLAY = $(LIBCBM_DIR)/src/foundation/str_util.c
-ASTRO_SHELLARG_STR_UTIL_OBJ = $(LIBCBM_DIR)/src/foundation/str_util.o
 
 # The spawn helper compiles as an ordinary libcbm object; it exports the single
 # cbm_-prefixed symbol cbm_spawn_capture, so the libcbm export filter keeps it.
+# The git shell-out sites in git_context.c / artifact.c / watcher.c /
+# pass_githistory.c call into it under ASTRO_SPAWN, which libcbm defines.
 LIBCBM_OBJS += $(ASTRO_SPAWN_OBJ)
 
 $(ASTRO_SPAWN_OBJ): $(ASTRO_SPAWN_SRC) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
 
-$(ASTRO_SPAWN_GIT_CONTEXT_OVERLAY): $(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
-                                    $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $(ASTRO_OVERLAY_LIB)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $< $@
-
-$(ASTRO_SPAWN_GIT_CONTEXT_OBJ): $(ASTRO_SPAWN_GIT_CONTEXT_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
-
-$(ASTRO_SPAWN_ARTIFACT_OVERLAY): $(ASTRO_SPAWN_ARTIFACT_SRC) \
-                                 $(ASTRO_SPAWN_ARTIFACT_PATCH) $(ASTRO_OVERLAY_LIB)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_ARTIFACT_PATCH) $< $@
-
-$(ASTRO_SPAWN_ARTIFACT_OBJ): $(ASTRO_SPAWN_ARTIFACT_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
-
-$(ASTRO_SPAWN_WATCHER_OVERLAY): $(ASTRO_SPAWN_WATCHER_SRC) \
-                                $(ASTRO_SPAWN_WATCHER_PATCH) $(ASTRO_OVERLAY_LIB)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_WATCHER_PATCH) $< $@
-
-$(ASTRO_SPAWN_WATCHER_OBJ): $(ASTRO_SPAWN_WATCHER_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
-
-$(ASTRO_SPAWN_GITHISTORY_OVERLAY): $(ASTRO_SPAWN_GITHISTORY_SRC) \
-                                   $(ASTRO_SPAWN_GITHISTORY_PATCH) $(ASTRO_OVERLAY_LIB)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_GITHISTORY_PATCH) $< $@
-
-$(ASTRO_SPAWN_GITHISTORY_OBJ): $(ASTRO_SPAWN_GITHISTORY_OVERLAY) $(ASTRO_SPAWN_HDR) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -I$(ASTROLABE_PATCH_DIR) -c -o $@ $<
-
-$(ASTRO_SHELLARG_STR_UTIL_OVERLAY): $(ASTRO_SHELLARG_STR_UTIL_SRC) \
-                                    $(ASTRO_SHELLARG_STR_UTIL_PATCH) $(ASTRO_OVERLAY_LIB)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SHELLARG_STR_UTIL_PATCH) $< $@
-
-# str_util.c includes its own header by local name, exactly like the mem.c
-# overlay: keep the original local-header search path.
-$(ASTRO_SHELLARG_STR_UTIL_OBJ): $(ASTRO_SHELLARG_STR_UTIL_OVERLAY) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<
-
-# The CBM clang-format gate validates the overlay bytes we actually compile,
-# never a vendored file. `?=` matches the definition further down; ci-cbm-lint.sh
-# overrides it on the command line with a temporary workspace.
-ASTRO_FORMAT_OVERLAY_DIR ?= $(BUILD_DIR)/astrolabe-format-overlay
-ASTRO_SPAWN_FORMAT_OVERLAYS = \
-	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
-	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC) \
-	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC) \
-	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC) \
-	$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC)
-
-$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC): $(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
-                                                            $(ASTRO_SPAWN_GIT_CONTEXT_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_GIT_CONTEXT_PATCH) $< $@
-
-$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC): $(ASTRO_SPAWN_ARTIFACT_SRC) \
-                                                         $(ASTRO_SPAWN_ARTIFACT_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_ARTIFACT_PATCH) $< $@
-
-$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC): $(ASTRO_SPAWN_WATCHER_SRC) \
-                                                        $(ASTRO_SPAWN_WATCHER_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_WATCHER_PATCH) $< $@
-
-$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC): $(ASTRO_SPAWN_GITHISTORY_SRC) \
-                                                           $(ASTRO_SPAWN_GITHISTORY_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SPAWN_GITHISTORY_PATCH) $< $@
-
-$(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC): $(ASTRO_SHELLARG_STR_UTIL_SRC) \
-                                                            $(ASTRO_SHELLARG_STR_UTIL_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_SHELLARG_STR_UTIL_PATCH) $< $@
-
-# Additional prerequisite on the existing gate target (GNU Make merges
-# prerequisites; only lint-format-astrolabe carries a recipe). ci-cbm-lint.sh
-# therefore format-checks these overlays with no change to the script.
+# Format-check the two Astrolabe-owned spawn TUs (they live outside the CBM
+# source dirs, so feed via stdin with a vendor-relative assumed name to resolve
+# the CBM .clang-format). The edited CBM sources are format-checked in place by
+# the ordinary ASTRO_LINT_FORMAT_SRCS pass.
 lint-format-astrolabe: astro-lint-format-spawn
 
-astro-lint-format-spawn: $(ASTRO_SPAWN_FORMAT_OVERLAYS)
-	@echo "=== clang-format (Astrolabe #227/#228 spawn overlays) ==="
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
-		--assume-filename=$(ASTRO_SPAWN_GIT_CONTEXT_SRC) \
-		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GIT_CONTEXT_SRC)
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
-		--assume-filename=$(ASTRO_SPAWN_ARTIFACT_SRC) \
-		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_ARTIFACT_SRC)
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
-		--assume-filename=$(ASTRO_SPAWN_WATCHER_SRC) \
-		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_WATCHER_SRC)
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
-		--assume-filename=$(ASTRO_SPAWN_GITHISTORY_SRC) \
-		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SPAWN_GITHISTORY_SRC)
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
-		--assume-filename=$(ASTRO_SHELLARG_STR_UTIL_SRC) \
-		< $(ASTRO_FORMAT_OVERLAY_DIR)/$(ASTRO_SHELLARG_STR_UTIL_SRC)
-	@# The reviewed spawn helper lives outside the vendor tree, so feed it via
-	@# stdin with a vendor-relative assume-filename to resolve the CBM .clang-format.
+astro-lint-format-spawn:
+	@echo "=== clang-format (Astrolabe spawn helper) ==="
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
 		--assume-filename=src/foundation/astro_spawn.c < $(ASTRO_SPAWN_SRC)
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror \
@@ -937,47 +831,18 @@ $(ASTRO_LAYOUT_PROBE_OBJ): $(ASTRO_LAYOUT_PROBE_SRC) $(ASTRO_FFI_HEADER) | $(BUI
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) -I$(ASTRO_FFI_INCLUDE_DIR) -c -o $@ $<
 
-$(ASTRO_MEM_PRESSURE_OVERLAY): $(ASTRO_MEM_PRESSURE_SRC) $(ASTRO_MEM_PRESSURE_PATCH) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_MEM_PRESSURE_PATCH) $< $@
-
-$(ASTRO_MEM_PRESSURE_OBJ): $(ASTRO_MEM_PRESSURE_OVERLAY) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<
-
-# ── #240/#241: store-resolution overlay build rules ──────────────
-# One generator, one hash-checked overlay per pinned source. The overlay is
-# written under $(LIBCBM_DIR); vendor/codebase-memory-mcp is never touched.
+# ── #240/#241: Astrolabe-owned store-configuration TU ─────────────
+# env_store_config.c is a first-class Astrolabe object always linked into
+# libcbm; the CBM resolvers call into it under ASTRO_ENV_STORE (defined for
+# libcbm in LIBCBM_CFLAGS). The overlaid CBM sources (platform.c, pipeline.c,
+# cli.c, mcp.c, http_server.c, index_supervisor.c, str_util.c, mem.c, watcher.c,
+# git_context.c, artifact.c, pass_githistory.c) are edited in place and compile
+# via the generic $(LIBCBM_DIR)/%.o rule below, which carries LIBCBM_CFLAGS
+# (the ASTRO_* defines + -I$(ASTROLABE_PATCH_DIR) for env_store_config.h /
+# astro_spawn.h). Their quote-includes resolve from the source's own directory.
 $(ASTRO_ENV_STORE_CONFIG_OBJ): $(ASTRO_ENV_STORE_CONFIG_SRC) $(ASTRO_ENV_STORE_CONFIG_HDR) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -c -o $@ $<
-
-$(ASTRO_ENV_STORE_OVERLAYS): $(LIBCBM_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file $< $< $@
-
-# Each overlay object depends on its generated source plus the Astrolabe header
-# the overlay includes. The sub-directory -I mirrors the vendored source's own
-# directory so its quote-includes keep resolving from the generated location.
-$(LIBCBM_DIR)/src/foundation/platform.o: $(LIBCBM_DIR)/src/foundation/platform.c $(ASTRO_ENV_STORE_CONFIG_HDR) | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/foundation -c -o $@ $<
-
-$(LIBCBM_DIR)/src/pipeline/pipeline.o: $(LIBCBM_DIR)/src/pipeline/pipeline.c | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/pipeline -c -o $@ $<
-
-$(LIBCBM_DIR)/src/cli/cli.o: $(LIBCBM_DIR)/src/cli/cli.c | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/cli -c -o $@ $<
-
-$(LIBCBM_DIR)/src/mcp/mcp.o: $(LIBCBM_DIR)/src/mcp/mcp.c | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/mcp -c -o $@ $<
-
-$(LIBCBM_DIR)/src/ui/http_server.o: $(LIBCBM_DIR)/src/ui/http_server.c | $(BUILD_DIR)
-	mkdir -p $(dir $@)
-	$(CC) $(LIBCBM_CFLAGS) $(ASTRO_ENV_STORE_INC) -Isrc/ui -c -o $@ $<
 
 $(LIBCBM_DIR)/$(SQLITE3_SRC:.c=.o): $(SQLITE3_SRC) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -1034,7 +899,6 @@ libcbm: $(LIBCBM_A)
 # Swap embedded_stub.c for the generated embedded_assets.c
 UI_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(UI_SRCS))
 PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(PROD_SRCS))
-
 # Embedded asset object files (generated by embed script)
 EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
 
@@ -1044,8 +908,10 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
+# ASTRO_PROD_DEFS turns on the #229 -Werror root-cause fixes and #282 worker
+# diagnostics in the owned sources (compiled directly, no substitution).
 cbm-with-ui: embed $(OBJS_VENDORED_PROD)
-	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
+	$(CC) $(CFLAGS_PROD) $(ASTRO_PROD_DEFS) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
@@ -1077,21 +943,13 @@ LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
-ASTRO_GRAPH_BUFFER_FORMAT_PATCH = $(ASTROLABE_PATCH_DIR)/apply_graph_buffer_format_patch.py
-ASTRO_GRAPH_BUFFER_FORMAT_SRC = src/graph_buffer/graph_buffer.c
-ASTRO_FORMAT_OVERLAY_DIR ?= $(BUILD_DIR)/astrolabe-format-overlay
-ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY = $(ASTRO_FORMAT_OVERLAY_DIR)/src/graph_buffer/graph_buffer.c
-ASTRO_LINT_FORMAT_SRCS = $(filter-out $(ASTRO_GRAPH_BUFFER_FORMAT_SRC),$(LINT_SRCS))
-# #240/#241: format-check the generated store overlays too. The pinned vendor
-# sources stay in ASTRO_LINT_FORMAT_SRCS above (they are format-clean and must
-# remain so); these additional copies prove the OVERLAY Astrolabe actually
-# compiles into libcbm.a is format-clean as well, so a patched region can never
-# become the one unformatted corner of the C tree.
-ASTRO_ENV_STORE_FORMAT_OVERLAYS = $(patsubst %.c,$(ASTRO_FORMAT_OVERLAY_DIR)/%.c,$(ASTRO_ENV_STORE_SRCS))
+# The CBM sources are owned and edited in place (issue #286), so they are
+# format-checked directly as part of LINT_SRCS — no generated overlays.
+ASTRO_LINT_FORMAT_SRCS = $(LINT_SRCS)
 # clang-format resolves its style file by walking up from the assumed filename,
 # and this Makefile always runs with the CBM root as the working directory, so an
 # in-tree assumed name is what makes ./.clang-format the effective config for the
-# Astrolabe-owned sources that live outside the CBM tree.
+# two Astrolabe-owned TUs that still live outside the CBM src tree.
 ASTRO_ENV_STORE_CONFIG_ASSUMED_C = src/foundation/env_store_config.c
 ASTRO_ENV_STORE_CONFIG_ASSUMED_H = src/foundation/env_store_config.h
 
@@ -1157,25 +1015,13 @@ lint-format:
 	@echo "=== clang-format ==="
 	@$(CLANG_FORMAT) --dry-run --Werror $(LINT_SRCS) $(LINT_HDRS)
 
-# Astrolabe keeps the imported tree pristine. This target validates the exact
-# reviewed format-only overlay alongside every remaining upstream lint source.
-$(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY): $(ASTRO_GRAPH_BUFFER_FORMAT_SRC) $(ASTRO_GRAPH_BUFFER_FORMAT_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_GRAPH_BUFFER_FORMAT_PATCH) $< $@
-
-$(ASTRO_ENV_STORE_FORMAT_OVERLAYS): $(ASTRO_FORMAT_OVERLAY_DIR)/%.c: %.c $(ASTRO_ENV_STORE_PATCH)
-	mkdir -p $(dir $@)
-	$(PYTHON) $(ASTRO_ENV_STORE_PATCH) --file $< $< $@
-
-lint-format-astrolabe: $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY) $(ASTRO_ENV_STORE_FORMAT_OVERLAYS)
-	@echo "=== clang-format (Astrolabe overlay) ==="
+# The CBM sources are owned and edited in place (#286), so they format-check
+# directly. Only the two Astrolabe-owned TUs that still live outside the CBM src
+# tree (env_store_config.{c,h}) need the assume-filename stdin form so
+# ./.clang-format applies. The spawn helper is handled by astro-lint-format-spawn.
+lint-format-astrolabe:
+	@echo "=== clang-format (Astrolabe-owned CBM sources) ==="
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror $(ASTRO_LINT_FORMAT_SRCS) $(LINT_HDRS)
-	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_GRAPH_BUFFER_FORMAT_SRC) < $(ASTRO_GRAPH_BUFFER_FORMAT_OVERLAY)
-	@echo "=== clang-format (Astrolabe store overlay #240/#241) ==="
-	@for src in $(ASTRO_ENV_STORE_SRCS); do \
-		$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$$src \
-			< $(ASTRO_FORMAT_OVERLAY_DIR)/$$src || exit 1; \
-	done
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_ENV_STORE_CONFIG_ASSUMED_C) < $(ASTRO_ENV_STORE_CONFIG_SRC)
 	@$(CLANG_FORMAT_FOR_SHELL) --dry-run --Werror --assume-filename=$(ASTRO_ENV_STORE_CONFIG_ASSUMED_H) < $(ASTRO_ENV_STORE_CONFIG_HDR)
 

@@ -145,6 +145,16 @@ def main() -> int:
             f"SKIP[{PLATFORM_SKIP}]: {entry['id']} declares target_os="
             f"{entry['target_os']} and did not run on {host_os()}"
         )
+    if skipped:
+        # A target_os-gated hazard test is non-Windows coverage: deferred to the
+        # port phase (Windows-only scope, owner directive 2026-07-11), never a CI
+        # job and never passing evidence. Tracked in #238 so the deferral is
+        # labeled and counted, not silently absorbed into a Windows-green run.
+        print(
+            "DEFERRED[ASTRO_PORT_PHASE]: the platform-skipped hazard test(s) above are "
+            "deferred to the port phase; tracked in #238. Not passing evidence; "
+            "no CI job owns it."
+        )
     print(
         f"hazard suite executed: {len(executed)} tests passed, "
         f"{len(skipped)} skipped (platform), {len(checked)} in manifest"

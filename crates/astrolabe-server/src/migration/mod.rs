@@ -98,6 +98,9 @@ use kernel_context::*;
 mod anomalies;
 use anomalies::*;
 
+mod agreement_graph;
+use agreement_graph::*;
+
 mod provenance;
 use provenance::*;
 
@@ -119,6 +122,9 @@ use impute::*;
 
 mod readiness;
 use readiness::*;
+
+mod anchor_outcome;
+use anchor_outcome::*;
 
 mod dispatch;
 // Non-test code reaches dispatch only through the two public entry points; the

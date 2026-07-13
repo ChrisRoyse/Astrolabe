@@ -21,8 +21,13 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#ifdef ASTRO_SPAWN
+#include "astro_spawn.h"
+#endif
 #include "foundation/compat.h"
+#ifndef ASTRO_SPAWN
 #include "foundation/compat_fs.h"
+#endif
 #include "foundation/str_util.h"
 
 /* Minimum coupling score to create an edge */
@@ -105,16 +110,49 @@ static void commit_free(commit_t *c) {
     free(c->files);
 }
 
+#ifdef ASTRO_SPAWN
+/* ── git log parsing (shell-free `git log` spawn, #227) ───────────── */
+#else
 /* ── git log parsing (popen "git log") ────────────────────────────── */
+#endif
 
 static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
     *out = NULL;
     *out_count = 0;
 
+#ifdef ASTRO_SPAWN
+    /* Defence in depth (#227/#228): the spawn below never reaches a shell, but a
+     * repo path carrying shell metacharacters is still refused. */
+#endif
     if (!cbm_validate_shell_arg(repo_path)) {
         return CBM_NOT_FOUND;
     }
 
+#ifdef ASTRO_SPAWN
+    /* Shell-free spawn: git receives every element verbatim. `--since=1 year ago`
+     * needs no quotes because there is no word splitting, and the pretty format
+     * keeps its single `%` because no cmd.exe substitutes %VAR% at parse time. */
+    const char *const argv[] = {"git",
+                                "-C",
+                                repo_path,
+                                "log",
+                                "--name-only",
+                                "--pretty=format:COMMIT:%H:%ct",
+                                "--since=1 year ago",
+                                "--max-count=10000",
+                                NULL};
+    char *data = NULL;
+    size_t data_len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &data_len, &err) != 0) {
+        /* A non-zero git status means "no history here"; anything else is a real
+         * degradation and is labelled rather than swallowed. */
+        if (err.code != CBM_SPAWN_E_EXIT) {
+            cbm_log_warn("githistory.git_log.spawn_failed", "code", err.code_name, "message",
+                         err.message, "remediation", err.remediation);
+        }
+        free(data);
+#else
     char cmd[CBM_SZ_1K];
 #ifdef _WIN32
     /* cmd.exe does not recognize single quotes, and '/dev/null' is a POSIX path. */
@@ -132,6 +170,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
 
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return CBM_NOT_FOUND;
     }
 
@@ -140,10 +179,28 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     int count = 0;
     commit_t current = {0};
 
+#ifdef ASTRO_SPAWN
+    char *cursor = data;
+    char *end = data + data_len;
+    while (cursor < end) {
+        char *line = cursor;
+        char *newline = (char *)memchr(cursor, '\n', (size_t)(end - cursor));
+        if (newline) {
+            *newline = '\0';
+            cursor = newline + SKIP_ONE;
+        } else {
+            cursor = end;
+        }
+#else
     char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
+#endif
         size_t len = strlen(line);
+#ifdef ASTRO_SPAWN
+        while (len > 0 && line[len - SKIP_ONE] == '\r') {
+#else
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+#endif
             line[--len] = '\0';
         }
         if (len == 0) {
@@ -182,7 +239,11 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
         commit_free(&current);
     }
 
+#ifdef ASTRO_SPAWN
+    free(data);
+#else
     cbm_pclose(fp);
+#endif
     *out = commits;
     *out_count = count;
     return 0;

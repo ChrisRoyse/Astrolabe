@@ -37,6 +37,13 @@
       "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the batch API rejects secret-shaped payload bytes before rows land; astrolabe-lower::tests::erasure_regenerates_lowered_sqlite_without_erased_bytes exercises erase_imported_cx_graph_rows and verifies the ledger chain remains intact"
     },
     {
+      "file": "crates/astrolabe-ingest/src/erasure_scrub.rs",
+      "function": "scrub_erased_wal_history",
+      "method": "append_ledger_entry",
+      "payload_contract": "physical WAL-scrub audit entry (schema astrolabe-erasure-wal-scrub-v1) carries only the durable seq, WAL segment/byte counts, and the policy tag wal_checkpoint_truncate; never plaintext or row values",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::sqlite_import::tests::erasure_scrub_removes_erased_plaintext_from_wal raw-byte-greps every physical vault file post-scrub for the erased marker (zero occurrences) and reads back the surviving scrub-audit ledger row; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the append API rejects secret-shaped payload bytes before ledger rows land"
+    },
+    {
       "file": "crates/astrolabe-lower/src/lib.rs",
       "function": "write_lower_manifest",
       "method": "append_ledger_entry",

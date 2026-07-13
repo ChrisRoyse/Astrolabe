@@ -43,6 +43,17 @@
         "project": "cli_parity"
       }
     },
+    "anchor_outcome": {
+      "_comment": "#233: exercises the REAL anchor_outcome path end-to-end on the shadow-indexed fixture project (dial check, vault open, node-map resolution, ingest, Grounding ledger append). The 2-line fixture repo maps no test subjects, so the deterministic result is status=noop with the subject counted in unmapped_subjects - an honest counted skip, never a fake anchor.",
+      "args": {
+        "project": "cli_parity",
+        "kind": "test_run",
+        "source": "local:cli-parity-fixture",
+        "format": "cargo_test_json",
+        "report": "{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n{ \"type\": \"test\", \"event\": \"started\", \"name\": \"cli_parity::fixture_probe\" }\n{ \"type\": \"test\", \"name\": \"cli_parity::fixture_probe\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.01 }",
+        "observed_at": 1767225600
+      }
+    },
     "search_graph": {
       "args": {
         "project": "cli_parity",
@@ -86,7 +97,9 @@
     "get_architecture": {
       "args": {
         "project": "cli_parity",
-        "aspects": ["overview"]
+        "aspects": [
+          "overview"
+        ]
       }
     },
     "search_code": {
@@ -101,7 +114,9 @@
       "args": {
         "project": "cli_parity",
         "mode": "sections",
-        "sections": ["Context"]
+        "sections": [
+          "Context"
+        ]
       }
     },
     "ingest_traces": {

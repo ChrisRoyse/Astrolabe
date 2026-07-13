@@ -14,6 +14,7 @@ pub fn handle_tool_raw(
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
         "impute_fields" => handle_impute_fields(args_json),
+        "anchor_outcome" => handle_anchor_outcome(args_json),
         "team_artifact" => handle_team_artifact(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
@@ -332,6 +333,7 @@ pub(crate) fn handle_get_architecture(
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
                 "anomalies": read_anomaly_report(&cache_dir, &project)?,
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
+                "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
             },
         }),
     )

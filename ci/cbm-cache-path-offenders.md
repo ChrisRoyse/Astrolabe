@@ -16,10 +16,10 @@ redirected. Astrolabe's fix is to redirect `HOME` — the one input **both** hal
 read — for the CBM test phase (`scripts/ci-cbm-test.sh`), so the two halves move
 together.
 
-`vendor/codebase-memory-mcp` is a byte-pinned subtree (`VENDORED.md`), so the
-duplication cannot be deleted here; removing it is an upstream change (single
-`th_cache_dir()` accessor in `tests/test_helpers.h` delegating to
-`cbm_resolve_cache_dir()`). What this manifest enforces is that it never **grows**:
+`vendor/codebase-memory-mcp` is now owned first-class source (#286). Collapsing
+the duplication (a single `th_cache_dir()` accessor in `tests/test_helpers.h`
+delegating to `cbm_resolve_cache_dir()`) is a normal code change tracked
+separately; what this manifest enforces is that it never **grows**:
 `scripts/check-cbm-cache-paths.py` recomputes every construction site under the
 pinned tree and requires an exact match. A new hand-built cache path or a new
 `getenv("HOME")` fixture site fails the CBM lint gate closed. Astrolabe-owned C
@@ -44,7 +44,7 @@ out untouched.
 | `scripts/setup.sh` | 1 | 0 | Installer message naming the default store. |
 | `scripts/smoke-test.sh` | 1 | 0 | Smoke harness; sets `CBM_CACHE_DIR` for its dry run. |
 | `src/cli/cli.h` | 1 | 0 | Doc comment on the cache-listing API. |
-| `src/foundation/platform.c` | 1 | 0 | **Sanctioned definition site**: `cbm_resolve_cache_dir()`. |
+| `src/foundation/platform.c` | 2 | 0 | **Sanctioned definition site**: `cbm_resolve_cache_dir()`. Two textual sites since #286 Phase A, but they are the SAME formula in the same resolver: the `#ifdef ASTRO_ENV_STORE` truncation-checked variant (platform.c:498) and its `#else` original (platform.c:504). Still exactly one resolver; no split write/read path. |
 | `src/foundation/platform.h` | 1 | 0 | Doc comment on the resolver contract. |
 | `src/ui/config.c` | 1 | 0 | Doc comment; the code calls the resolver. |
 | `src/ui/config.h` | 1 | 0 | Doc comment; the code calls the resolver. |
