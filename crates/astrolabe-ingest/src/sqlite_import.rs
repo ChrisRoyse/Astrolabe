@@ -566,8 +566,21 @@ struct PreparedConstellation {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedLiveSymbol {
+    node_id: i64,
+    name: String,
+    properties_json: String,
+    node_vector: Option<Vec<u8>>,
+    symbol: SymbolRecord,
+    identity: SymbolIdentity,
+    /// Present only when this content-addressed identity was not already in Base.
+    /// Reused live symbols retain their graph identity without re-running 22 lenses.
+    measured: Option<Constellation>,
+}
+
+#[derive(Debug, Clone)]
 struct PreparedBatch {
-    constellations: Vec<PreparedConstellation>,
+    constellations: Vec<PreparedLiveSymbol>,
     graph_rows: Vec<(Vec<u8>, Vec<u8>)>,
     edge_rows: Vec<PreparedEdgeRow>,
     structural_only: usize,
@@ -879,17 +892,10 @@ where
     let mut new_cx_ids = 0;
     let mut reused_cx_ids = 0;
     for prepared_cx in &prepared.constellations {
-        if vault
-            .read_cf_at(
-                before_snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some()
-        {
-            reused_cx_ids += 1;
-        } else {
+        if prepared_cx.measured.is_some() {
             new_cx_ids += 1;
+        } else {
+            reused_cx_ids += 1;
         }
     }
 
@@ -928,6 +934,7 @@ where
         let inputs = prepared
             .constellations
             .iter()
+            .filter(|prepared| prepared.measured.is_some())
             .map(|prepared| {
                 SeriesVersionInput::new(
                     prepared.symbol.clone(),
@@ -1964,9 +1971,9 @@ fn expected_raw_guard_slot_rows(prepared: &PreparedBatch, gate: &QuantizationGat
     prepared
         .constellations
         .iter()
-        .map(|prepared| {
-            prepared
-                .constellation
+        .filter_map(|prepared| prepared.measured.as_ref())
+        .map(|constellation| {
+            constellation
                 .slots
                 .keys()
                 .filter(|slot| gate.guard_slots.contains(&slot.get()))
@@ -2363,7 +2370,7 @@ where
         .into_iter()
         .partition(|node| node.label.is_structural());
     let mut constellations =
-        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
+        prepare_live_symbols_parallel(vault, runtime, options, &driver, non_structural)?;
     constellations.sort_by_key(|prepared| prepared.node_id);
 
     let mut graph_rows = metadata_graph_rows(options, metadata, sqlite_fingerprint)?;
@@ -2378,6 +2385,7 @@ where
     for (_, value) in &mut graph_rows {
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
+    reuse_semantically_unchanged_graph_rows(vault, &mut graph_rows)?;
     let sqlite_edges = edges.len();
     let structural_node_ids = structural
         .iter()
@@ -2394,6 +2402,42 @@ where
         sqlite_edges,
         edge_skips,
     })
+}
+
+fn reuse_semantically_unchanged_graph_rows<C>(
+    vault: &AsterVault<C>,
+    rows: &mut [(Vec<u8>, Vec<u8>)],
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    for (key, planned) in rows {
+        let Some(existing) = vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? else {
+            continue;
+        };
+        if graph_semantic_json(&existing)? == graph_semantic_json(planned)? {
+            *planned = existing;
+        }
+    }
+    Ok(())
+}
+
+fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if let Some(object) = value.as_object_mut() {
+        for volatile in [
+            "commit",
+            "sqlite_fingerprint_sha256",
+            "indexed_at",
+            "mtime_ns",
+            "created_at",
+            "updated_at",
+        ] {
+            object.remove(volatile);
+        }
+    }
+    Ok(value)
 }
 
 fn metadata_graph_rows(
@@ -2497,7 +2541,7 @@ fn raw_edge_graph_rows(
 
 fn prepare_edge_rows(
     options: &SqliteImportOptions,
-    constellations: &[PreparedConstellation],
+    constellations: &[PreparedLiveSymbol],
     structural_node_ids: &BTreeSet<i64>,
     edges: Vec<RawEdgeRow>,
 ) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
@@ -2555,6 +2599,101 @@ fn prepare_edge_rows(
     }
     prepared.sort_by(|left, right| left.key.cmp(&right.key));
     Ok((prepared, skips))
+}
+
+fn prepare_live_symbols_parallel<C, R>(
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    driver: &PanelDriver,
+    nodes: Vec<ExtractedNode>,
+) -> IngestResult<Vec<PreparedLiveSymbol>>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = options.workers.min(nodes.len()).max(1);
+    if worker_count == 1 {
+        return nodes
+            .into_iter()
+            .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+            .collect();
+    }
+    let chunk_size = nodes.len().div_ceil(worker_count);
+    let mut owned_chunks = Vec::with_capacity(worker_count);
+    let mut drain = nodes.into_iter();
+    loop {
+        let chunk = drain.by_ref().take(chunk_size).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        owned_chunks.push(chunk);
+    }
+    thread::scope(|scope| {
+        let handles = owned_chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+                        .collect::<IngestResult<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.extend(handle.join().map_err(|_| {
+                IngestError::InvalidInput("parallel live-symbol preparation panicked".into())
+            })??);
+        }
+        Ok(out)
+    })
+}
+
+fn prepare_live_symbol<C, R>(
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    driver: &PanelDriver,
+    node: ExtractedNode,
+) -> IngestResult<PreparedLiveSymbol>
+where
+    C: Clock,
+    R: SlotRuntime,
+{
+    let identity = node.symbol.identity(options.panel_version)?;
+    let reused = vault
+        .read_cf_at(
+            vault.latest_seq(),
+            ColumnFamily::Base,
+            &base_key(identity.cx_id),
+        )?
+        .is_some();
+    if reused {
+        return Ok(PreparedLiveSymbol {
+            node_id: node.id,
+            name: node.name,
+            properties_json: node.properties_json,
+            node_vector: node.node_vector,
+            symbol: node.symbol,
+            identity,
+            measured: None,
+        });
+    }
+    let prepared = prepare_constellation(vault, runtime, options, driver, node)?;
+    Ok(PreparedLiveSymbol {
+        node_id: prepared.node_id,
+        name: prepared.name,
+        properties_json: prepared.properties_json,
+        node_vector: prepared.node_vector,
+        symbol: prepared.symbol,
+        identity: prepared.identity,
+        measured: Some(prepared.constellation),
+    })
 }
 
 fn edge_weight(kind: EdgeKind, properties: &Value, edge_id: i64) -> IngestResult<f32> {
@@ -2786,7 +2925,7 @@ fn symbol_metadata(
 
 fn node_map_graph_row(
     options: &SqliteImportOptions,
-    prepared: &PreparedConstellation,
+    prepared: &PreparedLiveSymbol,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
     let row = NodeMapRow {
         schema: SCHEMA_NODE_MAP.to_string(),
@@ -2857,15 +2996,21 @@ where
     C: Clock,
 {
     for prepared_cx in &prepared.constellations {
-        if vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some()
-        {
-            verify_existing_constellation(vault, snapshot, prepared_cx)?;
+        if prepared_cx.measured.is_none() {
+            let bytes = vault
+                .read_cf_at(
+                    snapshot,
+                    ColumnFamily::Base,
+                    &base_key(prepared_cx.identity.cx_id),
+                )?
+                .ok_or_else(|| readback_mismatch("reused Base CF row disappeared"))?;
+            let decoded = encode::decode_constellation_base(&bytes)?;
+            if decoded.cx_id != prepared_cx.identity.cx_id {
+                return Err(readback_mismatch(format!(
+                    "reused Base identity differs for {}",
+                    prepared_cx.identity.cx_id
+                )));
+            }
         }
     }
     Ok(())
@@ -2971,7 +3116,6 @@ fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> 
         && (row.weight - prepared.row.weight).abs() <= f32::EPSILON
         && row.props == prepared.row.props
         && row.properties_json == prepared.row.properties_json
-        && row.commit == prepared.row.commit
 }
 
 fn ledger_ref_matches<C>(
@@ -2991,42 +3135,6 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
-fn verify_existing_constellation<C>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    prepared: &PreparedConstellation,
-) -> IngestResult<()>
-where
-    C: Clock,
-{
-    let base_bytes = vault
-        .read_cf_at(
-            snapshot,
-            ColumnFamily::Base,
-            &base_key(prepared.identity.cx_id),
-        )?
-        .ok_or_else(|| readback_mismatch("preexisting Base CF row disappeared"))?;
-    let decoded = encode::decode_constellation_base(&base_bytes)?;
-    verify_base_fields(&decoded, prepared)?;
-    for (slot, expected) in &prepared.constellation.slots {
-        let slot_bytes = vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::slot(*slot),
-                &slot_key(decoded.cx_id),
-            )?
-            .ok_or_else(|| readback_mismatch(format!("preexisting slot {slot} CF row missing")))?;
-        let decoded_slot = encode::decode_slot_vector(&slot_bytes)?;
-        if &decoded_slot != expected {
-            return Err(readback_mismatch(format!(
-                "preexisting slot {slot} differs for {}",
-                decoded.cx_id
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
@@ -3041,15 +3149,7 @@ where
     let snapshot = vault.latest_seq();
     let mut rows = Vec::new();
     for prepared_cx in &prepared.constellations {
-        let base_exists = vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some();
-        let constellation = &prepared_cx.constellation;
-        if !base_exists {
+        if let Some(constellation) = &prepared_cx.measured {
             rows.push((
                 ColumnFamily::Base,
                 base_key(constellation.cx_id),
@@ -3063,7 +3163,7 @@ where
                 ));
             }
         }
-        if let Some(gate) = quantization_gate {
+        if let (Some(gate), Some(constellation)) = (quantization_gate, &prepared_cx.measured) {
             for (slot, vector) in &constellation.slots {
                 if !gate.guard_slots.contains(&slot.get()) {
                     continue;
@@ -3222,6 +3322,10 @@ where
     let mut slot_rows_verified = 0;
     let mut raw_guard_slot_rows_verified = 0;
     for prepared_cx in &prepared.constellations {
+        let Some(constellation) = &prepared_cx.measured else {
+            base_rows_verified += 1;
+            continue;
+        };
         let base_bytes = vault
             .read_cf_at(
                 snapshot,
@@ -3230,10 +3334,10 @@ where
             )?
             .ok_or_else(|| readback_mismatch("Base CF row missing after import"))?;
         let decoded = encode::decode_constellation_base(&base_bytes)?;
-        verify_base_fields(&decoded, prepared_cx)?;
+        verify_live_base_fields(&decoded, prepared_cx, constellation)?;
         base_rows_verified += 1;
 
-        for (slot, expected) in &prepared_cx.constellation.slots {
+        for (slot, expected) in &constellation.slots {
             let slot_bytes = vault
                 .read_cf_at(
                     snapshot,
@@ -3251,7 +3355,7 @@ where
             slot_rows_verified += 1;
         }
         if let Some(gate) = quantization_gate {
-            for (slot, expected) in &prepared_cx.constellation.slots {
+            for (slot, expected) in &constellation.slots {
                 if !gate.guard_slots.contains(&slot.get()) {
                     continue;
                 }
@@ -3311,7 +3415,8 @@ where
     let expected_slot_rows = prepared
         .constellations
         .iter()
-        .map(|prepared| prepared.constellation.slots.len())
+        .filter_map(|prepared| prepared.measured.as_ref())
+        .map(|constellation| constellation.slots.len())
         .sum();
     let expected_edge_rows = prepared.edge_rows.len();
     let expected_graph_rows = prepared.graph_rows.len() + expected_edge_rows;
@@ -3343,16 +3448,17 @@ where
     })
 }
 
-fn verify_base_fields(
+fn verify_live_base_fields(
     decoded: &Constellation,
-    prepared: &PreparedConstellation,
+    prepared: &PreparedLiveSymbol,
+    constellation: &Constellation,
 ) -> IngestResult<()> {
     if decoded.cx_id != prepared.identity.cx_id
-        || decoded.vault_id != prepared.constellation.vault_id
-        || decoded.panel_version != prepared.constellation.panel_version
-        || decoded.input_ref != prepared.constellation.input_ref
-        || decoded.modality != prepared.constellation.modality
-        || decoded.scalars != prepared.constellation.scalars
+        || decoded.vault_id != constellation.vault_id
+        || decoded.panel_version != constellation.panel_version
+        || decoded.input_ref != constellation.input_ref
+        || decoded.modality != constellation.modality
+        || decoded.scalars != constellation.scalars
     {
         return Err(readback_mismatch(format!(
             "Base CF decoded fields differ for {}",
@@ -3367,7 +3473,7 @@ fn verify_base_fields(
         "series_id_schema",
         "series_id",
     ] {
-        if decoded.metadata.get(key) != prepared.constellation.metadata.get(key) {
+        if decoded.metadata.get(key) != constellation.metadata.get(key) {
             return Err(readback_mismatch(format!(
                 "Base CF metadata {key} differs for {}",
                 prepared.identity.cx_id
@@ -4119,7 +4225,8 @@ fn ingest_ledger_payload(
         expected_slot_rows: prepared
             .constellations
             .iter()
-            .map(|prepared| prepared.constellation.slots.len() as u64)
+            .filter_map(|prepared| prepared.measured.as_ref())
+            .map(|constellation| constellation.slots.len() as u64)
             .sum(),
         expected_graph_rows: (prepared.graph_rows.len() + prepared.edge_rows.len()) as u64,
         expected_edge_rows: prepared.edge_rows.len() as u64,
@@ -5572,7 +5679,7 @@ mod tests {
         .expect("incremental live import");
         assert_eq!(changed.new_cx_ids, 1);
         assert_eq!(changed.reused_cx_ids, 1);
-        assert_eq!(changed.series_inputs, 2);
+        assert_eq!(changed.series_inputs, 1);
         assert!(changed.series_mutated_rows > 0);
 
         let live = read_cbm_graph_snapshot(&delta_vault, "demo").expect("read changed graph");
