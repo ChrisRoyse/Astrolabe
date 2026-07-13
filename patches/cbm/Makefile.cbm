@@ -857,7 +857,7 @@ LIBCBM_CFLAGS += $(LIBCBM_ASTRO_DEFS) -I$(ASTROLABE_PATCH_DIR)
 #
 # Overlays are hash-checked and build-local: the generators read the pinned
 # vendor bytes, verify their sha256, and write into $(LIBCBM_DIR). They never
-# write into vendor/codebase-memory-mcp.
+# write into the cbm/ source tree.
 ASTRO_SPAWN_SRC = $(ASTROLABE_PATCH_DIR)/astro_spawn.c
 ASTRO_SPAWN_HDR = $(ASTROLABE_PATCH_DIR)/astro_spawn.h
 ASTRO_SPAWN_OBJ = $(LIBCBM_DIR)/astro_spawn.o
@@ -991,7 +991,7 @@ libcbm: $(LIBCBM_A)
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
 # #229 vendor-write containment: the UI build must leave the owned CBM source
-# subtree byte-clean (`git status --porcelain vendor/codebase-memory-mcp`).
+# tree byte-clean (`git status --porcelain cbm`).
 # graph-ui/dist and node_modules are gitignored, but two generated outputs
 # otherwise land in the source tree: (a) the embed step's src/ui/embedded_assets.c
 # (untracked, non-ignored), and (b) `tsc -b`'s TRACKED graph-ui/tsconfig.tsbuildinfo.

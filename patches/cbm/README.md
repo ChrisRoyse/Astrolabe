@@ -1,7 +1,7 @@
 # CBM build integration (`patches/cbm`)
 
 This directory holds the Astrolabe build glue for the owned CBM subsystem
-(`vendor/codebase-memory-mcp`). The historical "patch overlay" machinery is
+(`cbm/`). The historical "patch overlay" machinery is
 **gone** (issue #286): the two parent codebases are now this project's own
 first-class source, edited in place, not vendored-and-overlaid.
 
@@ -48,7 +48,7 @@ its flag, plus that the Makefile wires the flags to the right artifacts.
 ## Changing CBM code
 
 It is normal owned source: edit the `.c`/`.h` under
-`vendor/codebase-memory-mcp` directly, add or adjust an `ASTRO_*` guard only
+`cbm/` directly, add or adjust an `ASTRO_*` guard only
 when a change must NOT reach every artifact, and update
 `scripts/test-cbm-overlay-sources.py` if you add a guarded behavior. There is no
 pin file, no applier, and no hash-checked overlay to regenerate.

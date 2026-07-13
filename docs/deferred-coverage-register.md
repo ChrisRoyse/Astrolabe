@@ -79,7 +79,7 @@ specific fix issue, not the port milestone.
 
 | Token | Emitted by | Owner issue | What is unproven | Closes when |
 |---|---|---|---|---|
-| `SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]` | `scripts/ci-rust-gate.sh` | #234 | clippy over the Calyx sources (`too_many_arguments` / `manual_repeat_n` etc.) | the lints are fixed **directly in the now-owned Calyx source** (per EPIC #286 `vendor/calyx` is owned first-class source — the token's "vendored/upstream-pinned" wording is stale and #234 is pending re-scope) and the skip is removed, restoring the stage to blocking |
+| `SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]` | `scripts/ci-rust-gate.sh` | #234 | clippy over the Calyx sources (`too_many_arguments` / `manual_repeat_n` etc.) | the lints are fixed **directly in the now-owned Calyx source** (per EPIC #286 `calyx/` is owned first-class source — the token's "vendored/upstream-pinned" wording is stale and #234 is pending re-scope) and the skip is removed, restoring the stage to blocking |
 
 ---
 

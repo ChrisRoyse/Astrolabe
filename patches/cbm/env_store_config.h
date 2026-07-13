@@ -42,7 +42,7 @@
  *
  * Not a magic number: it is the size of the `static char buf[CBM_SZ_1K]` result
  * buffer that `cbm_resolve_cache_dir()` and `cbm_get_home_dir()` publish in
- * `vendor/codebase-memory-mcp/src/foundation/platform.c`. A store path that does
+ * `cbm/src/foundation/platform.c`. A store path that does
  * not fit in that buffer cannot be represented by the library at all, so the only
  * honest answer is a coded refusal — never a truncated path to a different
  * directory. `scripts/test-cbm-env-store-patch.py` asserts this equals the

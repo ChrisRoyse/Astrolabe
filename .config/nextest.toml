@@ -1,7 +1,7 @@
 # cargo-nextest configuration for the Astrolabe workspace nextest run
 # (scripts/ci-rust-gate.sh: `cargo nextest run --workspace`). It does NOT govern
-# the Calyx run (ci-rust-gate.sh runs that inside vendor/calyx/, which reads
-# vendor/calyx/.config/nextest.toml). See #264.
+# the Calyx run (that runs inside calyx/, which reads
+# calyx/.config/nextest.toml). See #264.
 
 [profile.default]
 # Full coverage. Saturate the box; this is nextest's default, set explicitly so

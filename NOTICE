@@ -8,92 +8,92 @@ Astrolabe integration code
 - License/grant: see LICENSE in this repository.
 
 Calyx
-- Path: vendor/calyx
-- Source license: vendor/calyx/LICENSE
+- Path: calyx
+- Source license: calyx/LICENSE
 - License: Business Source License 1.1 for standalone Calyx, with an
   Astrolabe-specific owner-granted combined-distribution grant recorded in the
   root LICENSE file.
 
 codebase-memory-mcp
-- Path: vendor/codebase-memory-mcp
-- Source license: vendor/codebase-memory-mcp/LICENSE
+- Path: cbm
+- Source license: cbm/LICENSE
 - License: MIT License.
 - Copyright notice in source license: Copyright (c) 2025 DeusData.
 
 tree-sitter common/runtime
 - Paths:
-  - vendor/codebase-memory-mcp/internal/cbm/vendored/common/LICENSE
-  - vendor/codebase-memory-mcp/internal/cbm/vendored/common/tree_sitter/LICENSE
+  - cbm/internal/cbm/vendored/common/LICENSE
+  - cbm/internal/cbm/vendored/common/tree_sitter/LICENSE
 - License: MIT License.
 
 tree-sitter runtime library
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/ts_runtime
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/ts_runtime/LICENSE
+- Path: cbm/internal/cbm/vendored/ts_runtime
+- Source license: cbm/internal/cbm/vendored/ts_runtime/LICENSE
 - License: MIT License.
 
 tree-sitter grammars
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/grammars
+- Path: cbm/internal/cbm/vendored/grammars
 - License: each grammar carries its own LICENSE file in its grammar directory.
   Distribution packaging must preserve those files.
 
 SQLite
-- Path: vendor/codebase-memory-mcp/vendored/sqlite3
-- Source license: vendor/codebase-memory-mcp/vendored/sqlite3/LICENSE.md
+- Path: cbm/vendored/sqlite3
+- Source license: cbm/vendored/sqlite3/LICENSE.md
 - License/notice: public domain blessing as published by SQLite.
 
 mimalloc
-- Path: vendor/codebase-memory-mcp/vendored/mimalloc
-- Source license: vendor/codebase-memory-mcp/vendored/mimalloc/LICENSE
+- Path: cbm/vendored/mimalloc
+- Source license: cbm/vendored/mimalloc/LICENSE
 - License: MIT License.
 
 zstd
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/zstd
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/zstd/LICENSE
+- Path: cbm/internal/cbm/vendored/zstd
+- Source license: cbm/internal/cbm/vendored/zstd/LICENSE
 - License: BSD License.
 
 lz4
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/lz4/LICENSE
+- Path: cbm/internal/cbm/vendored/lz4
+- Source license: cbm/internal/cbm/vendored/lz4/LICENSE
 - License: BSD-style license.
 
 wyhash
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/wyhash
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/wyhash/LICENSE
+- Path: cbm/internal/cbm/vendored/wyhash
+- Source license: cbm/internal/cbm/vendored/wyhash/LICENSE
 - License: Unlicense / public domain dedication.
 
 simplecpp
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/simplecpp
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/simplecpp/LICENSE
+- Path: cbm/internal/cbm/vendored/simplecpp
+- Source license: cbm/internal/cbm/vendored/simplecpp/LICENSE
 - License: BSD Zero Clause License.
 
 verstable
-- Path: vendor/codebase-memory-mcp/internal/cbm/vendored/verstable
-- Source license: vendor/codebase-memory-mcp/internal/cbm/vendored/verstable/LICENSE
+- Path: cbm/internal/cbm/vendored/verstable
+- Source license: cbm/internal/cbm/vendored/verstable/LICENSE
 - License: MIT License.
 
 xxHash
-- Path: vendor/codebase-memory-mcp/vendored/xxhash
-- Source license: vendor/codebase-memory-mcp/vendored/xxhash/LICENSE
+- Path: cbm/vendored/xxhash
+- Source license: cbm/vendored/xxhash/LICENSE
 - License: BSD 2-Clause License.
 
 yyjson
-- Path: vendor/codebase-memory-mcp/vendored/yyjson
-- Source license: vendor/codebase-memory-mcp/vendored/yyjson/LICENSE
+- Path: cbm/vendored/yyjson
+- Source license: cbm/vendored/yyjson/LICENSE
 - License: MIT License.
 
 TRE
-- Path: vendor/codebase-memory-mcp/vendored/tre
-- Source license: vendor/codebase-memory-mcp/vendored/tre/LICENSE
+- Path: cbm/vendored/tre
+- Source license: cbm/vendored/tre/LICENSE
 - License: BSD-style license.
 
 nomic embedding assets
-- Path: vendor/codebase-memory-mcp/vendored/nomic
-- Source license: vendor/codebase-memory-mcp/vendored/nomic/LICENSE
-- Source notice: vendor/codebase-memory-mcp/vendored/nomic/NOTICE
+- Path: cbm/vendored/nomic
+- Source license: cbm/vendored/nomic/LICENSE
+- Source notice: cbm/vendored/nomic/NOTICE
 - License: Apache License 2.0.
 
 Node graph UI dependencies
-- Path: vendor/codebase-memory-mcp/graph-ui/node_modules
+- Path: cbm/graph-ui/node_modules
 - Notice status: package-manager generated dependency notices remain a release
   packaging task. This root NOTICE does not replace per-package notices under
   node_modules.

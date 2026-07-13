@@ -1774,17 +1774,16 @@ Making one binary from ~201K lines of C11 (+157 grammar TUs + vendored tree-sitt
 astrolabe/
   Cargo.toml                  # Rust workspace
   rust-toolchain.toml         # pinned (Calyx needs recent stable, edition 2024)
-  vendor/
-    codebase-memory-mcp/      # git subtree (pinned SHA) â€” unmodified upstream + patches/
-    calyx/                    # git subtree (pinned SHA) â€” the engine crates
+  cbm/                        # owned first-class C source (the code-graph engine)
+  calyx/                      # owned first-class Rust source (the engine crates)
   crates/
     cbm-sys/                  # bindgen + build.rs driving the C build
     astrolabe-bridge/         # safe wrappers over cbm-sys
     astrolabe-{domain,panel,ingest,anchors,weave,assay,kernel,guard,oracle,lower,server}/
-  patches/cbm/                # minimal upstream diffs (see Â§3) â€” upstreamable
-  scripts/ â€¦                  # build/test/bench/release
+  patches/cbm/                # Astrolabe-owned libcbm build glue (Makefile.cbm + ASTRO_* TUs)
+  scripts/ â€¦                  # build/toolchain launcher + native formatter
 ```
-Pin both upstreams by SHA (pre-1.0 interfaces, per both projects' own warnings). Subtree over submodule for hermetic builds.
+Both parent trees were pulled in once and are now this project's own first-class source, edited in place (EPIC #286) — no pins, no subtree refresh, no upstream tracking.
 
 ## 2. Building `libcbm.a`
 

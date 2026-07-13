@@ -1797,7 +1797,7 @@ mod tests {
         inputs.alien_symbols.push(AlienSymbol {
             language: CalibrationLanguage::Rust,
             code: "fn v() {}".to_string(),
-            repo_id: "vendor/calyx".to_string(),
+            repo_id: "calyx".to_string(),
             is_vendored: true,
         });
         let err = build_corpus(domain(), &inputs, MixPolicy::default_policy(), 5)

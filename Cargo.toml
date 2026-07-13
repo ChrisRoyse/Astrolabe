@@ -1,27 +1,22 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# vendor/calyx and vendor/codebase-memory-mcp are deliberately EXCLUDED from the
-# root workspace (they carry their own `[workspace]` + profiles; see the
-# profile note below and #286). The Astrolabe crates reach the calyx crates only
-# as path-dependencies, so the calyx crates' *dev-dependencies* (proptest,
-# blake3, …) are pruned from the root resolution graph.
+# calyx/ and cbm/ are deliberately EXCLUDED from the root workspace (they carry
+# their own `[workspace]` + profiles; see the profile note below and #286). The
+# Astrolabe crates reach the calyx crates only as path-dependencies, so the
+# calyx crates' *dev-dependencies* (proptest, blake3, …) are pruned from the
+# root resolution graph.
 #
 # Dual-workspace dev-dep boundary (#298): a targeted `--all-targets` check of a
-# vendored calyx crate CANNOT run from the root workspace — e.g.
+# calyx crate CANNOT run from the root workspace — e.g.
 # `cargo check -p calyx-ward --all-targets` fails with `unresolved module or
 # unlinked crate proptest`, because building that crate's test targets needs its
-# dev-deps and those live only in the vendor/calyx workspace. Run such targeted
-# checks against the owning workspace via `--manifest-path`, or use the
-# `scripts/check-vendor-crate.sh` helper from the canonical root:
-#     cargo check -p calyx-ward --all-targets --manifest-path vendor/calyx/Cargo.toml
-#     scripts/check-vendor-crate.sh calyx-ward
-# The full gate already covers these crates: `scripts/ci-rust-gate.sh` runs
-# `cargo check/clippy/nextest --workspace --all-targets` from inside
-# vendor/calyx, where the dev-deps resolve.
+# dev-deps and those live only in the calyx/ workspace. Run such targeted
+# checks against the owning workspace via `--manifest-path`:
+#     cargo check -p calyx-ward --all-targets --manifest-path calyx/Cargo.toml
 exclude = [
-    "vendor/calyx",
-    "vendor/codebase-memory-mcp",
+    "calyx",
+    "cbm",
 ]
 
 [workspace.package]
@@ -41,13 +36,13 @@ astrolabe-panel = { path = "crates/astrolabe-panel" }
 astrolabe-provenance = { path = "crates/astrolabe-provenance" }
 astrolabe-weave = { path = "crates/astrolabe-weave" }
 cbm-sys = { path = "crates/cbm-sys" }
-calyx-aster = { path = "vendor/calyx/crates/calyx-aster" }
-calyx-assay = { path = "vendor/calyx/crates/calyx-assay" }
-calyx-core = { path = "vendor/calyx/crates/calyx-core" }
-calyx-ledger = { path = "vendor/calyx/crates/calyx-ledger" }
-calyx-loom = { path = "vendor/calyx/crates/calyx-loom" }
-calyx-paths = { path = "vendor/calyx/crates/calyx-paths" }
-calyx-sextant = { path = "vendor/calyx/crates/calyx-sextant" }
+calyx-aster = { path = "calyx/crates/calyx-aster" }
+calyx-assay = { path = "calyx/crates/calyx-assay" }
+calyx-core = { path = "calyx/crates/calyx-core" }
+calyx-ledger = { path = "calyx/crates/calyx-ledger" }
+calyx-loom = { path = "calyx/crates/calyx-loom" }
+calyx-paths = { path = "calyx/crates/calyx-paths" }
+calyx-sextant = { path = "calyx/crates/calyx-sextant" }
 
 [profile.release]
 codegen-units = 1
@@ -56,8 +51,8 @@ panic = "abort"
 strip = "symbols"
 
 # ── Dev/test profile: debuginfo tuning (issue #188) ─────────────────────────
-# Mirrors vendor/calyx/Cargo.toml, which is silently ignored here: Cargo reads
-# profiles only from the workspace root being built, and vendor/calyx is an
+# Mirrors calyx/Cargo.toml, which is silently ignored here: Cargo reads
+# profiles only from the workspace root being built, and calyx/ is an
 # excluded path-dep tree. Upstream Calyx measured the cargo default (debug = 2,
 # full DWARF) at ~280 MB per dev/test executable and a ~190 GB shared target/;
 # this workspace re-creates target/ from cold every gate run, so full DWARF
