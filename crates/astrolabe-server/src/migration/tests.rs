@@ -5912,6 +5912,8 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         reused_cx_ids: 0,
         graph_rows_written: 2,
         edge_rows_written: 1,
+        series_inputs: 2,
+        series_mutated_rows: 8,
         import_fsv: None,
         cx_id_set_sha256: "33".repeat(32),
         ledger_seq: 1,

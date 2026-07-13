@@ -27,6 +27,7 @@ struct Evidence {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GitArchaeologyImportReport {
     pub(crate) head: String,
+    pub(crate) mode: &'static str,
     pub(crate) evidence: usize,
     pub(crate) historical_constellations_written: usize,
     pub(crate) historical_constellations_reused: usize,
@@ -36,13 +37,28 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) skipped_merge_fixes: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn run_full_git_archaeology<C: Clock>(
     repo: &Path,
     project: &str,
     cache_dir: &Path,
     vault: &AsterVault<C>,
 ) -> Result<GitArchaeologyImportReport, DynError> {
-    let mined = mine_git_archaeology(repo, &GitArchaeologyConfig::default(), &GitMineMode::Full)?;
+    run_git_archaeology(repo, project, cache_dir, vault, GitMineMode::Full)
+}
+
+pub(crate) fn run_git_archaeology<C: Clock>(
+    repo: &Path,
+    project: &str,
+    cache_dir: &Path,
+    vault: &AsterVault<C>,
+    mode: GitMineMode,
+) -> Result<GitArchaeologyImportReport, DynError> {
+    let mode_name = match &mode {
+        GitMineMode::Full => "full",
+        GitMineMode::Since { .. } => "incremental",
+    };
+    let mined = mine_git_archaeology(repo, &GitArchaeologyConfig::default(), &mode)?;
     let mut evidence = Vec::new();
     for finding in &mined.szz_findings {
         evidence.push(Evidence {
@@ -68,6 +84,19 @@ pub(crate) fn run_full_git_archaeology<C: Clock>(
             label: "reverted",
         });
     }
+    let force_observed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    for removed in &mined.force_removed_commits {
+        for range in astrolabe_anchors::archaeology::changed_new_ranges(repo, removed)? {
+            evidence.push(Evidence {
+                commit: removed.clone(),
+                range,
+                source: format!("git:revert:{}", mined.head),
+                observed_at: force_observed_at,
+                confidence: 1.0,
+                label: "reverted",
+            });
+        }
+    }
     evidence.sort_by(|left, right| {
         left.commit
             .cmp(&right.commit)
@@ -78,6 +107,7 @@ pub(crate) fn run_full_git_archaeology<C: Clock>(
 
     let mut report = GitArchaeologyImportReport {
         head: mined.head,
+        mode: mode_name,
         evidence: evidence.len(),
         skipped_merge_fixes: mined.skipped_merge_fixes,
         ..GitArchaeologyImportReport::default()
@@ -269,7 +299,7 @@ fn historical_subject_id(location: &HistoricalSymbolLocation) -> String {
 pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Value {
     json!({
         "status": "imported",
-        "mode": "full",
+        "mode": report.mode,
         "head": report.head,
         "evidence": report.evidence,
         "historical_constellations_written": report.historical_constellations_written,

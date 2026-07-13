@@ -74,6 +74,8 @@ pub(crate) struct ShadowImportOutcome {
     pub(crate) reused_cx_ids: usize,
     pub(crate) graph_rows_written: usize,
     pub(crate) edge_rows_written: usize,
+    pub(crate) series_inputs: usize,
+    pub(crate) series_mutated_rows: usize,
     /// Unforgeable readback witness for the SQLite/row-sink import mutation.
     pub(crate) import_fsv: Option<astrolabe_domain::fsv::FsvAck>,
     pub(crate) cx_id_set_sha256: String,
@@ -487,6 +489,7 @@ pub(crate) fn ensure_shadow_import_current_at(
 /// tool result) records nothing here, and reconciliation then falls back to the
 /// #222 fail-closed floor rather than guessing a path.
 pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
+pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
 /// Persists the calyx-stripped `index_repository` args so a later runner-driven
 /// refresh can replay them for true reconciliation (#244).
@@ -756,19 +759,31 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         vault_salt.as_bytes().to_vec(),
         VaultOptions::default(),
     )?;
-    let options = SqliteImportOptions::new(
-        project,
-        format!("shadow-import-v1:{project}"),
-        DEFAULT_PANEL_VERSION,
-    )
-    .with_available_slots(std::iter::empty());
+    let commit = match repo {
+        Some(repo) => astrolabe_anchors::archaeology::git_head(repo)?,
+        None => format!("shadow-import-v1:{project}"),
+    };
+    let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty())
+        .with_series_registry(repo.is_some());
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
     let git_archaeology = match repo {
-        Some(repo) => git_archaeology_summary(&run_full_git_archaeology(
-            repo, project, &cache_dir, &vault,
-        )?),
+        Some(repo) => {
+            let mode = match read_config_value(
+                &cache_dir,
+                &metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY),
+            )? {
+                Some(previous_head) => {
+                    astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
+                }
+                None => astrolabe_anchors::archaeology::GitMineMode::Full,
+            };
+            git_archaeology_summary(&run_git_archaeology(
+                repo, project, &cache_dir, &vault, mode,
+            )?)
+        }
         None => json!({
             "status": "unavailable",
             "reason": "repository path is unavailable on this recovery import",
@@ -817,6 +832,8 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         reused_cx_ids: report.reused_cx_ids,
         graph_rows_written: report.graph_rows_written,
         edge_rows_written: report.edge_rows_written,
+        series_inputs: report.series_inputs,
+        series_mutated_rows: report.series_mutated_rows,
         import_fsv: report.fsv.clone(),
         cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
         ledger_seq: lower_report.manifest_seq,
@@ -1148,6 +1165,8 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
             "reused_cx_ids": outcome.reused_cx_ids,
             "graph_rows_written": outcome.graph_rows_written,
             "edge_rows_written": outcome.edge_rows_written,
+            "series_inputs": outcome.series_inputs,
+            "series_mutated_rows": outcome.series_mutated_rows,
             "cx_id_set_sha256": outcome.cx_id_set_sha256,
         },
         "sqlite_path": outcome.sqlite_path,
@@ -1343,6 +1362,7 @@ pub(crate) fn persist_shadow_outcome_at(
     let kernel_context_json = serde_json::to_string(&outcome.kernel_context)?;
     let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
+    let git_archaeology_json = serde_json::to_string(&outcome.git_archaeology)?;
     // Atomic multi-key persist: a crash or error mid-write must not leave a torn
     // mix of new and old metadata that a reader would serve as fresh/verified
     // (e.g. a new vault_fingerprint beside a stale kernel_context_json) — #95.
@@ -1415,10 +1435,17 @@ pub(crate) fn persist_shadow_outcome_at(
         ("kernel_context_json", kernel_context_json),
         ("anomaly_report_json", anomaly_report_json),
         ("provenance_json", provenance_json),
+        ("git_archaeology_json", git_archaeology_json),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             params![metadata_key(project, key), value],
+        )?;
+    }
+    if let Some(head) = outcome.git_archaeology.get("head").and_then(Value::as_str) {
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY), head],
         )?;
     }
     tx.commit()?;

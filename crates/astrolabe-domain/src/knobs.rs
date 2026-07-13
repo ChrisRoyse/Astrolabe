@@ -278,6 +278,37 @@ pub fn lower_debounce_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     LOWER_DEBOUNCE_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version for the shipping incremental watcher cadence (#23).
+pub const WATCHER_KNOB_REGISTRY_VERSION: &str = "astrolabe-watcher-knobs-v1";
+/// Name of the server-owned Git watcher poll-cadence knob.
+pub const WATCHER_POLL_INTERVAL_MS_KNOB: &str = "watcher_poll_interval_ms";
+/// Default watcher cadence. This reserves 95% of the five-second convergence
+/// budget for extraction, ingest, weave, and lowering instead of spending the
+/// entire budget waiting to notice the change.
+pub const WATCHER_DEFAULT_POLL_INTERVAL_MS: u64 = 250;
+/// Smallest legal cadence; lower values create an unbounded Git-process storm.
+pub const WATCHER_MIN_POLL_INTERVAL_MS: u64 = 50;
+/// Largest legal cadence. One second leaves four seconds of the hard five-second
+/// product budget for the actual incremental work.
+pub const WATCHER_MAX_POLL_INTERVAL_MS: u64 = 1_000;
+
+/// The server-owned incremental watcher knob registry (#23).
+pub const WATCHER_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: WATCHER_KNOB_REGISTRY_VERSION,
+    name: WATCHER_POLL_INTERVAL_MS_KNOB,
+    default: WATCHER_DEFAULT_POLL_INTERVAL_MS,
+    min: WATCHER_MIN_POLL_INTERVAL_MS,
+    max: WATCHER_MAX_POLL_INTERVAL_MS,
+    unit: "milliseconds",
+    source: "ASTROLABE #23 five-second M-scale convergence budget",
+    rationale: "server-owned detection cadence: 250ms spends 5% of the hard five-second convergence budget on detection and leaves 95% for changed-file extraction, vault convergence, derived projections, and lowered-SQLite readback; bounds prevent both process storms and budget exhaustion",
+}];
+
+/// Returns the watcher declaration for `name`, or `None` when undeclared.
+pub fn watcher_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    WATCHER_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +410,17 @@ mod tests {
         assert!(knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS));
         assert!(!knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS + 1));
         assert_eq!(knob.default, LOWER_DEBOUNCE_DEFAULT_WINDOW_MS);
+    }
+
+    #[test]
+    fn watcher_cadence_is_declared_inside_the_convergence_budget() {
+        let knob = watcher_knob(WATCHER_POLL_INTERVAL_MS_KNOB).expect("declared");
+        assert_eq!(knob.registry_version, WATCHER_KNOB_REGISTRY_VERSION);
+        assert!(knob.accepts(WATCHER_DEFAULT_POLL_INTERVAL_MS));
+        assert!(knob.accepts(WATCHER_MIN_POLL_INTERVAL_MS));
+        assert!(knob.accepts(WATCHER_MAX_POLL_INTERVAL_MS));
+        assert!(!knob.accepts(0));
+        assert!(!knob.accepts(WATCHER_MAX_POLL_INTERVAL_MS + 1));
+        assert!(WATCHER_MAX_POLL_INTERVAL_MS < 5_000);
     }
 }

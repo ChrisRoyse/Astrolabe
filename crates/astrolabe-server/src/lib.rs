@@ -131,6 +131,7 @@ fn print_usage() {
 fn run_server() -> Result<i32, DynError> {
     let _watchdog = ParentWatchdog::start();
     let _verify_chain_loop = VerifyChainLoop::start();
+    let _incremental_watcher_loop = IncrementalWatcherLoop::start();
     tracing::info!("server.start version={}", env!("CARGO_PKG_VERSION"));
     let runner = CbmToolRunner::new_default()?;
     let stdin = io::stdin();
@@ -565,6 +566,36 @@ struct ParentWatchdog {
 struct VerifyChainLoop {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+struct IncrementalWatcherLoop {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl IncrementalWatcherLoop {
+    fn start() -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            if let Err(error) = migration::run_incremental_watcher_loop(thread_shutdown) {
+                tracing::warn!("incremental_watcher.stopped error={error}");
+            }
+        });
+        Self {
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for IncrementalWatcherLoop {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl VerifyChainLoop {

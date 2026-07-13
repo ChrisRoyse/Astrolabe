@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
-    SERIES_ID_V1_REBUILD_REMEDIATION, VaultMutationPlan,
+    SERIES_ID_V1_REBUILD_REMEDIATION, SeriesVersionInput, VaultMutationPlan, ingest_series_batch,
 };
 
 /// Dangling edge refusal/skip code from blueprint `04_DATA_MODEL.md` section 7.
@@ -106,6 +106,8 @@ pub struct SqliteImportOptions {
     pub available_slots: BTreeSet<SlotId>,
     /// Optional measured quantization gate for candidate compressed slots.
     pub quantization_gate: Option<QuantizationGateConfig>,
+    /// Whether this live import also advances the durable symbol-series registry.
+    pub update_series_registry: bool,
 }
 
 impl SqliteImportOptions {
@@ -121,6 +123,7 @@ impl SqliteImportOptions {
                 .map(|slot| slot.slot_id())
                 .collect(),
             quantization_gate: None,
+            update_series_registry: false,
         }
     }
 
@@ -142,6 +145,12 @@ impl SqliteImportOptions {
     /// Attaches a measured quantization gate to this import.
     pub fn with_quantization_gate(mut self, gate: QuantizationGateConfig) -> Self {
         self.quantization_gate = Some(gate);
+        self
+    }
+
+    /// Advances series and recurrence rows for every imported non-structural symbol.
+    pub fn with_series_registry(mut self, enabled: bool) -> Self {
+        self.update_series_registry = enabled;
         self
     }
 }
@@ -345,6 +354,10 @@ pub struct SqliteImportReport {
     pub graph_rows_written: usize,
     /// Typed edge Graph CF rows whose bytes changed in this run.
     pub edge_rows_written: usize,
+    /// Symbol versions presented to the durable series registry.
+    pub series_inputs: usize,
+    /// Registry/reverse/QN/recurrence rows changed by this run.
+    pub series_mutated_rows: usize,
     /// Latest vault sequence after the run ledger append.
     pub seq: Seq,
     /// Ledger sequence of the real `EntryKind::Ingest` run record.
@@ -888,7 +901,7 @@ where
     let mut quantization = quantization_gate_report(options, &prepared);
     verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
     let (planned_graph_rows_written, planned_edge_rows_written) =
-        count_changed_graph_rows(vault, before_snapshot, &prepared)?;
+        count_changed_graph_rows(vault, before_snapshot, &prepared, &options.project)?;
     let payload = ingest_ledger_payload(
         input.sqlite_fingerprint,
         options,
@@ -908,8 +921,26 @@ where
         input.sqlite_fingerprint,
         payload,
         options.quantization_gate.as_ref(),
+        &options.project,
     )?;
     let readback = verify_import_readback(vault, &prepared, options.quantization_gate.as_ref())?;
+    let (series_inputs, series_mutated_rows) = if options.update_series_registry {
+        let inputs = prepared
+            .constellations
+            .iter()
+            .map(|prepared| {
+                SeriesVersionInput::new(
+                    prepared.symbol.clone(),
+                    options.panel_version,
+                    options.commit.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = ingest_series_batch(vault, &inputs)?;
+        (report.inputs, report.mutated_rows)
+    } else {
+        (0, 0)
+    };
     quantization.raw_guard_slot_rows_verified = readback.raw_guard_slot_rows_verified;
     let ledger_rows_after = ledger_row_count(vault)?;
 
@@ -924,6 +955,8 @@ where
         reused_cx_ids,
         graph_rows_written,
         edge_rows_written,
+        series_inputs,
+        series_mutated_rows,
         seq: vault.latest_seq(),
         ledger_seq: ledger_ref.seq,
         ledger_rows_before: input.ledger_rows_before,
@@ -2836,6 +2869,7 @@ fn count_changed_graph_rows<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     prepared: &PreparedBatch,
+    project: &str,
 ) -> IngestResult<(usize, usize)>
 where
     C: Clock,
@@ -2852,7 +2886,51 @@ where
             edge_changed += 1;
         }
     }
-    Ok((changed + edge_changed, edge_changed))
+    let stale = stale_live_graph_keys(vault, snapshot, prepared, project)?;
+    let stale_edges = stale
+        .iter()
+        .filter(|key| key.starts_with(EDGE_ROW_PREFIX))
+        .count();
+    Ok((
+        changed + edge_changed + stale.len(),
+        edge_changed + stale_edges,
+    ))
+}
+
+fn stale_live_graph_keys<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prepared: &PreparedBatch,
+    project: &str,
+) -> IngestResult<Vec<Vec<u8>>>
+where
+    C: Clock,
+{
+    let current = prepared
+        .graph_rows
+        .iter()
+        .map(|(key, _)| key.clone())
+        .chain(prepared.edge_rows.iter().map(|edge| edge.key.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut stale = Vec::new();
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Graph)? {
+        if current.contains(&key) {
+            continue;
+        }
+        let belongs_to_project = serde_json::from_slice::<Value>(&value)
+            .ok()
+            .and_then(|row| {
+                row.get("project")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|row_project| row_project == project);
+        if belongs_to_project {
+            stale.push(key);
+        }
+    }
+    stale.sort();
+    Ok(stale)
 }
 
 fn edge_row_matches_existing<C>(
@@ -2949,6 +3027,7 @@ fn write_import_rows<C>(
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
+    project: &str,
 ) -> IngestResult<(LedgerRef, Option<FsvAck>, usize, usize)>
 where
     C: Clock,
@@ -3013,6 +3092,13 @@ where
             edge_rows_written += 1;
         }
     }
+    for key in stale_live_graph_keys(vault, snapshot, prepared, project)? {
+        if key.starts_with(EDGE_ROW_PREFIX) {
+            edge_rows_written += 1;
+        }
+        rows.push((ColumnFamily::Graph, key, tombstone_value().to_vec()));
+        graph_rows_written += 1;
+    }
 
     if rows.is_empty() {
         let ledger_ref = vault.append_ledger_entry(
@@ -3049,8 +3135,12 @@ where
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
     let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
     for (cf, key, value) in planned_rows {
-        let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
-        fsv_plan.push_content(cf, key, &expected);
+        if value == tombstone_value() {
+            fsv_plan.push_tombstoned(cf, key, &tombstone_value());
+        } else {
+            let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
+            fsv_plan.push_content(cf, key, &expected);
+        }
     }
     let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
     Ok((ledger_ref, Some(fsv), graph_rows_written, edge_rows_written))
@@ -4436,7 +4526,8 @@ mod tests {
 
     use crate::{
         ASTRO_ERASURE_SCRUB_BATCH_INVALID, ASTRO_ERASURE_SCRUB_NOT_DURABLE,
-        WAL_SCRUB_LEDGER_SCHEMA, WalScrubParams, scrub_erased_wal_history, wal_scrub_status,
+        StoredSeriesRegistryRow, WAL_SCRUB_LEDGER_SCHEMA, WalScrubParams, read_registry_snapshot,
+        scrub_erased_wal_history, verify_chain, wal_scrub_status,
     };
     use astrolabe_domain::{
         ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
@@ -4874,6 +4965,15 @@ mod tests {
             ))
         });
         edges
+    }
+
+    fn graph_rows<C>(vault: &AsterVault<C>, snapshot: Seq) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        C: Clock,
+    {
+        vault
+            .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(b"astrolabe:"))
+            .expect("scan graph rows")
     }
 
     fn sqlite_fingerprint(path: &Path) -> [u8; 32] {
@@ -5408,6 +5508,191 @@ mod tests {
         assert_eq!(
             ledger_row_count(&vault).expect("ledger count after reimport"),
             before_ledger + 1
+        );
+    }
+
+    #[test]
+    fn incremental_import_repoints_live_edges_preserves_mvcc_and_matches_clean_final_state() {
+        let initial = edge_snapshot();
+        let delta_vault = vault();
+        let first_options = options(1).with_series_registry(true);
+        let first = import_cbm_graph_snapshot_to_vault_direct(
+            &initial,
+            [1; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &first_options,
+        )
+        .expect("initial live import");
+        assert_eq!(first.series_inputs, 3);
+        assert!(first.series_mutated_rows > 0);
+        let first_seq = delta_vault.latest_seq();
+        let first_graph = graph_rows(&delta_vault, first_seq);
+        let old_edge = first_graph
+            .iter()
+            .find(|(key, _)| key.starts_with(EDGE_ROW_PREFIX))
+            .cloned()
+            .expect("old live edge row");
+        let old_helper_cx = read_cbm_graph_snapshot(&delta_vault, "demo")
+            .expect("read initial graph")
+            .nodes
+            .into_iter()
+            .find(|node| node.qualified_name == "demo.http.helper")
+            .and_then(|node| node.cx_id)
+            .expect("initial helper CxId");
+        let old_helper_base = delta_vault
+            .read_cf_at(first_seq, ColumnFamily::Base, &base_key(old_helper_cx))
+            .expect("read old helper Base")
+            .expect("old helper Base exists");
+
+        let mut final_snapshot = initial.clone();
+        final_snapshot.nodes[1].properties_json =
+            r#"{"language":"rust","source_snippet":"fn helper() { changed(); }","signature":"fn helper()"}"#
+                .to_string();
+        final_snapshot
+            .nodes
+            .retain(|node| node.qualified_name != "demo.net");
+        final_snapshot.edges.retain(|edge| edge.sqlite_edge_id == 1);
+        let final_options = SqliteImportOptions::new("demo", "commit-2", 7)
+            .with_workers(1)
+            .with_series_registry(true);
+        let changed = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("incremental live import");
+        assert_eq!(changed.new_cx_ids, 1);
+        assert_eq!(changed.reused_cx_ids, 1);
+        assert_eq!(changed.series_inputs, 2);
+        assert!(changed.series_mutated_rows > 0);
+
+        let live = read_cbm_graph_snapshot(&delta_vault, "demo").expect("read changed graph");
+        assert_eq!(
+            live.nodes.len(),
+            2,
+            "removed module is absent from live Graph"
+        );
+        assert_eq!(live.edges.len(), 1, "removed import edges are absent");
+        let new_helper_cx = live
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == "demo.http.helper")
+            .and_then(|node| node.cx_id)
+            .expect("new helper CxId");
+        assert_ne!(new_helper_cx, old_helper_cx);
+        let live_edges = edge_multiset(&delta_vault);
+        assert_eq!(live_edges.len(), 1);
+        assert_eq!(live_edges[0].1, new_helper_cx);
+        assert_ne!(live_edges[0].1, old_helper_cx);
+
+        // MVCC readback: the live projection tombstones the old edge, while the
+        // first snapshot still exposes its exact bytes. Immutable Base history
+        // remains readable at both snapshots under the default keep-everything policy.
+        assert_eq!(
+            delta_vault
+                .read_cf_at(first_seq, ColumnFamily::Graph, &old_edge.0)
+                .expect("read old edge at first snapshot"),
+            Some(old_edge.1.clone())
+        );
+        assert_eq!(
+            delta_vault
+                .read_cf_at(delta_vault.latest_seq(), ColumnFamily::Graph, &old_edge.0)
+                .expect("read old edge at live snapshot"),
+            None
+        );
+        for snapshot in [first_seq, delta_vault.latest_seq()] {
+            assert_eq!(
+                delta_vault
+                    .read_cf_at(snapshot, ColumnFamily::Base, &base_key(old_helper_cx))
+                    .expect("read historical Base"),
+                Some(old_helper_base.clone())
+            );
+        }
+
+        let registry = read_registry_snapshot(&delta_vault).expect("read registry state");
+        let helper_series = registry
+            .kv_rows
+            .iter()
+            .filter_map(|(_, value)| serde_json::from_slice::<StoredSeriesRegistryRow>(value).ok())
+            .find(|row| row.qualified_name == "demo.http.helper")
+            .expect("helper series row");
+        assert_eq!(helper_series.version_count, 2);
+        assert_eq!(helper_series.current_cx_id, new_helper_cx);
+        assert_eq!(registry.recurrence_rows.len(), 4);
+        assert_eq!(
+            verify_chain(&delta_vault)
+                .expect("verify delta chain")
+                .status,
+            "intact"
+        );
+
+        // A clean import of the final tree produces the same current CxId set,
+        // node projection, and typed-edge multiset. Historical Base/MVCC rows are
+        // the intentional and required divergence of the incremental vault.
+        let clean_vault = vault();
+        let clean = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &clean_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("clean final import");
+        assert_eq!(changed.cx_ids, clean.cx_ids);
+        assert_eq!(edge_multiset(&delta_vault), edge_multiset(&clean_vault));
+        let delta_nodes = read_cbm_graph_snapshot(&delta_vault, "demo")
+            .expect("delta nodes")
+            .nodes
+            .into_iter()
+            .map(|node| (node.qualified_name, node.cx_id))
+            .collect::<BTreeSet<_>>();
+        let clean_nodes = read_cbm_graph_snapshot(&clean_vault, "demo")
+            .expect("clean nodes")
+            .nodes
+            .into_iter()
+            .map(|node| (node.qualified_name, node.cx_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(delta_nodes, clean_nodes);
+
+        // Re-presenting identical content (the state reached by an mtime-only
+        // watcher event) mutates no content-addressed, Graph, edge, or registry row.
+        let ledger_before_noop = ledger_row_count(&delta_vault).expect("ledger before no-op");
+        let graph_before_noop = graph_rows(&delta_vault, delta_vault.latest_seq());
+        let registry_before_noop =
+            read_registry_snapshot(&delta_vault).expect("registry before no-op");
+        let noop = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("mtime-only equivalent import");
+        assert_eq!(noop.new_cx_ids, 0);
+        assert_eq!(noop.graph_rows_written, 0);
+        assert_eq!(noop.edge_rows_written, 0);
+        assert_eq!(noop.series_mutated_rows, 0);
+        assert_eq!(
+            graph_rows(&delta_vault, delta_vault.latest_seq()),
+            graph_before_noop
+        );
+        assert_eq!(
+            read_registry_snapshot(&delta_vault).expect("registry after no-op"),
+            registry_before_noop
+        );
+        assert_eq!(
+            ledger_row_count(&delta_vault).expect("ledger after no-op"),
+            ledger_before_noop + 1,
+            "only the import run record is appended"
+        );
+        assert_eq!(
+            verify_chain(&delta_vault)
+                .expect("verify no-op chain")
+                .status,
+            "intact"
         );
     }
 

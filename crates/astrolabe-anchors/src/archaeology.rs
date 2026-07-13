@@ -258,6 +258,15 @@ pub fn mine_git_archaeology(
     })
 }
 
+/// Resolves and validates the repository's current immutable object id.
+pub fn git_head(repo: &Path) -> Result<String, ArchaeologyError> {
+    let head = git_text(repo, &["rev-parse", "--verify", "HEAD"])?
+        .trim()
+        .to_string();
+    validate_oid(&head)?;
+    Ok(head)
+}
+
 /// Returns the new-side ranges introduced by `commit` for exact version lookup.
 pub fn changed_new_ranges(
     repo: &Path,
