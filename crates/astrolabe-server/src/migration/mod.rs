@@ -122,6 +122,9 @@ pub(crate) use watcher_lane::run_incremental_watcher_loop;
 mod lowering_lane;
 use lowering_lane::*;
 
+mod invalidation_lane;
+use invalidation_lane::*;
+
 mod status_surface;
 use status_surface::*;
 pub(crate) use status_surface::{janitor_startup_verify_projects, periodic_verify_chain_tick};

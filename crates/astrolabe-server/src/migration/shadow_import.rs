@@ -1103,7 +1103,12 @@ pub(crate) fn import_shadow_vault_with_archaeology(
             .map(|(_, cx_id)| *cx_id)
             .collect(),
     });
-    let weave = run_live_weave(&vault, project, import_changed, delta.as_ref())?;
+    let mut weave = run_live_weave(&vault, project, import_changed, delta.as_ref())?;
+    let invalidations =
+        persist_delta_invalidations(&vault, project, import_changed, delta.as_ref(), &weave)?;
+    if let Some(object) = weave.as_object_mut() {
+        object.insert("invalidations".to_string(), invalidations);
+    }
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
     let prior_lower = if delta.is_some() {
         read_persisted_lower_state(&cache_dir, project)?
@@ -1919,6 +1924,12 @@ pub(crate) fn persist_shadow_outcome_at(
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
     let git_archaeology_json = serde_json::to_string(&outcome.git_archaeology)?;
     let weave_json = serde_json::to_string(&outcome.weave)?;
+    let invalidations_json =
+        serde_json::to_string(outcome.weave.get("invalidations").unwrap_or(&json!({
+            "schema": "astrolabe.delta_invalidation.v1",
+            "status": "unavailable",
+            "reason": "outcome predates delta invalidation metadata",
+        })))?;
     // Atomic multi-key persist: a crash or error mid-write must not leave a torn
     // mix of new and old metadata that a reader would serve as fresh/verified
     // (e.g. a new vault_fingerprint beside a stale kernel_context_json) — #95.
@@ -1993,6 +2004,7 @@ pub(crate) fn persist_shadow_outcome_at(
         ("provenance_json", provenance_json),
         ("git_archaeology_json", git_archaeology_json),
         ("weave_json", weave_json),
+        ("invalidations_json", invalidations_json),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",

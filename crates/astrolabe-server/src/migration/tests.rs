@@ -6076,20 +6076,15 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
     )
     .unwrap();
     assert!(second.report.graph_rows_written > 0);
-    let second_weave = run_live_weave(
-        &vault,
-        "demo",
-        true,
-        Some(&WeaveDelta {
-            dirty_qualified_names: BTreeSet::from(["demo.alpha".to_string()]),
-            removed_qualified_names: BTreeSet::from([
-                "demo.alpha".to_string(),
-                "demo.beta".to_string(),
-            ]),
-            removed_cx_ids: BTreeSet::from([alpha_cx, beta_cx]),
-        }),
-    )
-    .unwrap();
+    let delta = WeaveDelta {
+        dirty_qualified_names: BTreeSet::from(["demo.alpha".to_string()]),
+        removed_qualified_names: BTreeSet::from([
+            "demo.alpha".to_string(),
+            "demo.beta".to_string(),
+        ]),
+        removed_cx_ids: BTreeSet::from([alpha_cx, beta_cx]),
+    };
+    let second_weave = run_live_weave(&vault, "demo", true, Some(&delta)).unwrap();
     assert!(second_weave["similarity"]["rows_tombstoned"] != 0);
     assert_eq!(second_weave["eager_cross_terms"]["symbol_count"], 1);
     assert!(second_weave["eager_cross_terms"]["rows_written"] != 0);
@@ -6123,6 +6118,68 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
             .unwrap()
             .is_some()
     );
+    let invalidations =
+        persist_delta_invalidations(&vault, "demo", true, Some(&delta), &second_weave).unwrap();
+    assert_eq!(invalidations["status"], "dirty");
+    assert_eq!(invalidations["assay"]["rows_written"], 2);
+    assert_eq!(invalidations["kernel"]["dirty_scc_count"], 2);
+    assert_eq!(invalidations["guard"]["counter_count"], 2);
+    assert_eq!(
+        invalidations["fsv"]["readback_verified_rows"],
+        invalidations["rows_written"]
+    );
+    let invalidation_seq = vault.latest_seq();
+    let assay_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Assay,
+        "demo",
+        "assay",
+    )
+    .unwrap();
+    let kernel_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Kernel,
+        "demo",
+        "kernel",
+    )
+    .unwrap();
+    let guard_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Guard,
+        "demo",
+        "guard",
+    )
+    .unwrap();
+    assert_eq!(assay_invalidations.len(), 2);
+    assert_eq!(kernel_invalidations.len(), 2);
+    assert_eq!(guard_invalidations.len(), 2);
+    let guard_alpha = guard_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| value["qualified_name"] == "demo.alpha")
+        .expect("alpha guard drift counter");
+    assert_eq!(guard_alpha["drift_count"], 1);
+    let assay_alpha = assay_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| value["qualified_name"] == "demo.alpha")
+        .expect("alpha assay dirty stratum");
+    assert_eq!(assay_alpha["dirty"], true);
+    assert_eq!(assay_alpha["kind"], "assay_stratum_dirty");
+    let kernel_removed_beta = kernel_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| {
+            value["removed_members"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("demo.beta"))
+        })
+        .expect("removed beta kernel dirty SCC");
+    assert_eq!(kernel_removed_beta["dirty"], true);
     let scheduled = schedule_lowering_after_convergence(&root, "demo", true, &second_weave)
         .unwrap()
         .expect("mutating production convergence schedules lowering");

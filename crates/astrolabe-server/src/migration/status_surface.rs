@@ -105,6 +105,7 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
         "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
         "anomalies": read_anomaly_report(cache_dir, project)?,
         "provenance": read_provenance_metadata(cache_dir, project)?,
+        "invalidations": read_invalidation_metadata(cache_dir, project)?,
         "lowering_debounce": lowering_debounce,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
