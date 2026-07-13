@@ -55,7 +55,7 @@ pub const RESOLVED_SOURCE_CONFIDENCE: f32 = 1.0;
 /// Default confidence for provisional proxy evidence.
 pub const DEFAULT_PROVISIONAL_CONFIDENCE: f32 = 0.8;
 
-const GROUNDING_SOURCE_REMEDIATION: &str = "use a catalog source: ci:/trace:/review:/git:revert: for resolved evidence, or git:fix:/agent:/survival: for proxy evidence";
+const GROUNDING_SOURCE_REMEDIATION: &str = "use a catalog source: ci:/trace:/review:/git:revert: for resolved evidence, or git:fix:/agent:/survival:/propagation: for proxy evidence";
 
 const ID_BYTES: usize = 16;
 
@@ -164,6 +164,7 @@ pub fn classify_grounding_source(source: &str) -> Result<SourceClassification> {
         ("review:", GroundingKind::Resolved, TrustTag::Trusted),
         ("agent:", GroundingKind::Proxy, TrustTag::Provisional),
         ("survival:", GroundingKind::Proxy, TrustTag::Provisional),
+        ("propagation:", GroundingKind::Proxy, TrustTag::Provisional),
     ];
     for &(prefix, grounding_kind, trust) in CATALOG {
         if let Some(rest) = source.strip_prefix(prefix) {

@@ -31,11 +31,18 @@ use serde::{Deserialize, Serialize};
 
 pub mod archaeology;
 mod parsers;
+pub mod propagation;
 
 pub use parsers::{
     ASTRO_ANCHOR_PARSE_MALFORMED, ParsedTestCase, ParsedTestRun, TestReportFormat, TestStatus,
     parse_cargo_test_json, parse_go_test_json, parse_junit_xml, parse_pytest_verbose,
     parse_test_report, parse_vitest_json,
+};
+pub use propagation::{
+    ASTRO_COVERAGE_PARSE_MALFORMED, ASTRO_PROPAGATION_INPUT_INVALID, CoverageFormat,
+    CoverageReport, PROPAGATION_ANCHOR_CONFIDENCE, PROPAGATION_SOURCE_PREFIX, PlannedRequest,
+    PropagationInputs, PropagationPlan, PropagationReport, SymbolNode, TestsEdge, TestsFileEdge,
+    parse_cobertura_xml, parse_coverage, parse_coverage_py_json, parse_lcov, plan_propagation,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
