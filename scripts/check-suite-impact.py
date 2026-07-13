@@ -179,6 +179,30 @@ SUITES: dict[str, dict[str, list]] = {
             ["make", "--version"],
         ],
     },
+    # #291: the astrolabe-ingest crash-FSV cluster
+    # (kill_after_* + crash_*_child in crates/astrolabe-ingest/src/ledger_verify.rs),
+    # built with `--features crash-fsv-tests` so calyx-aster's crash-injection
+    # failpoints compile in (opt-in, never in a shipped/default build). The
+    # default workspace nextest runs WITHOUT the feature, so this named suite is
+    # the durable caller that restores the cluster's coverage. Its input set is
+    # the ingest crate (the gated tests + the feature declaration) and the whole
+    # owned Calyx tree — the crash-recovery path genuinely exercises calyx-aster's
+    # failpoints/vault plus calyx-core WAL replay and calyx-ledger decode, so a
+    # source change in any of them can change this suite's result. Cargo.lock and
+    # the toolchain pin round out the identity.
+    "crash-fsv": {
+        "paths": [
+            "crates/astrolabe-ingest/src/ledger_verify.rs",
+            "crates/astrolabe-ingest/Cargo.toml",
+            "vendor/calyx",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+        ],
+        "tools": [
+            ["rustc", "-V"],
+            ["cargo", "--version"],
+        ],
+    },
     # The CBM C static-analysis tier (ci-cbm-lint.sh), owned by
     # check-release.sh after the #280 tier restructure.
     "cbm-lint": {

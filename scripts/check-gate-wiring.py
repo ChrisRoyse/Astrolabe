@@ -137,6 +137,28 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(check, "scripts/test-check-suite-impact.py", "scripts/check.sh", errors)
+    # #291: the crash-FSV cluster is opt-in (calyx-aster failpoints must never
+    # ship), so the default workspace nextest does not run it; the named,
+    # impact-gated `crash-fsv` suite stage is its durable caller. Both halves
+    # (should-run + record-green) are load-bearing, same as workspace-block.
+    require(
+        check,
+        "scripts/check-suite-impact.py should-run crash-fsv",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/check-suite-impact.py record-green crash-fsv",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "--features crash-fsv-tests -- kill_ crash_",
+        "scripts/check.sh",
+        errors,
+    )
     # #280: the dropped `cargo build --workspace` is replaced by a targeted bin
     # build (nextest may not build [[bin]] targets) plus the fail-closed assertion.
     require(check, "build -p astrolabe-server --bins", "scripts/check.sh", errors)

@@ -142,6 +142,41 @@ gate attribution-owned-probe -- bash scripts/check-attribution-owned-probe.sh
 # run removes its own manifest + .tmp sibling on exit (fixture dirs, not the live .tmp).
 gate attribution-manifest -- bash scripts/check-attribution-manifest.sh
 
+# ── #291 suite impact gate: the astrolabe-ingest crash-FSV cluster ───────────
+#
+# #291: the child-process crash-recovery FSV tests in
+# crates/astrolabe-ingest/src/ledger_verify.rs (kill_after_wal_append /
+# kill_after_mvcc_commit / kill_after_checkpoint + their crash_*_child helpers)
+# arm calyx-aster's `crash-fsv` failpoints. That failpoint must never reach a
+# shipped binary, so it is an OPT-IN feature (astrolabe-ingest/crash-fsv-tests,
+# NOT default) rather than a [dev-dependencies] feature Cargo would unify into
+# every dev-target build — including the optimized `--example` builds the lscale
+# bench compiles, where the #276 build-time guard correctly refuses
+# feature+release (that unification was the release-gate RED this fixes). The
+# default `nextest --workspace` above runs WITHOUT the feature, so it no longer
+# covers this cluster; this named suite restores its coverage, built in the
+# DEBUG profile so the #276 release guard stays silent. Impact-gated on the same
+# fail-closed contract as every suite: byte-identical inputs vs the last green =>
+# SKIP (the gate prints the counted label); ANY other state (including gate
+# ambiguity) => RUN. check-release.sh sets ASTRO_SUITE_GATE=all so the release
+# tier always runs it. The tests spawn child processes that create scratch under
+# std::env::temp_dir(); point that at the run-scoped suite sandbox under target/
+# (cleaned with the run) so nothing lands in the operator's real %TEMP%
+# (workspace-block re-exports the same path when it runs).
+CRASH_FSV_IMPACT_RC=0
+"$PYTHON_BIN" scripts/check-suite-impact.py should-run crash-fsv || CRASH_FSV_IMPACT_RC=$?
+if [[ "$CRASH_FSV_IMPACT_RC" -eq 3 ]]; then
+  echo "  skipped suite: astrolabe-ingest crash-FSV cluster (kill_after_* / crash_*_child)"
+else
+  CRASH_FSV_CEIL="$ROOT/target/suite-tmp"
+  CRASH_FSV_TMP="$CRASH_FSV_CEIL/tmp"
+  mkdir -p "$CRASH_FSV_TMP"
+  export TMP="$CRASH_FSV_TMP" TEMP="$CRASH_FSV_TMP" TMPDIR="$CRASH_FSV_TMP"
+  gate crash-fsv -- "$CARGO_BIN" test -p astrolabe-ingest --features crash-fsv-tests -- kill_ crash_
+  # Suite passed -> record its green so an unchanged input set skips next run.
+  "$PYTHON_BIN" scripts/check-suite-impact.py record-green crash-fsv --note "check.sh crash-fsv cluster"
+fi
+
 # ── #280 suite impact gate: the workspace block ──────────────────────────────
 #
 # Doctrine (owner directive 2026-07-12): no test suite runs when no code change
