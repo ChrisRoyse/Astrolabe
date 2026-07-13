@@ -289,27 +289,17 @@ if command -v cygpath >/dev/null 2>&1; then
   CBM_STORE_SANDBOX="$(cygpath -m "$CBM_STORE_SANDBOX")"
 fi
 export CBM_CACHE_DIR="$CBM_STORE_SANDBOX"
-gate verify-chain -- bash scripts/check-astrolabe-verify-chain.sh "$ROOT/target/debug/astrolabe"
-gate single-mimalloc -- bash scripts/check-single-mimalloc.sh
-gate mcp-parity -- bash scripts/check-mcp-parity.sh
-# #6 (item 2): CBM's own MCP protocol suite (vendored test_mcp_rapid_init.py) must pass
-# against the astrolabe binary UNMODIFIED -- spawn it, send initialize +
-# notifications/initialized + tools/list with no delays, require the id:1 and id:2
-# responses (tools present) within the timeout. Pass an absolute NATIVE path: Windows
-# CreateProcess cannot resolve a relative/forward-slash binary path even when
-# os.path.isfile accepts it. Inherits the sandboxed CBM_CACHE_DIR set above.
-astro_mcp_bin="$ROOT/target/debug/astrolabe"
-[[ -f "$astro_mcp_bin" ]] || astro_mcp_bin="${astro_mcp_bin}.exe"
-if command -v cygpath >/dev/null 2>&1; then astro_mcp_bin="$(cygpath -w "$astro_mcp_bin")"; fi
-echo "=== CBM MCP protocol suite (test_mcp_rapid_init.py) vs astrolabe (#6) ==="
-gate mcp-rapid-init -- "$PYTHON_BIN" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py "$astro_mcp_bin"
+# #280: prefetch the CBM parity prod binary ONCE (content-keyed cache; warm
+# hit is a copy). mcp-parity and the backgrounded lowered-parity both consume
+# target/cbm-parity, so neither pays the build and they can overlap safely.
+gate cbm-prod-binary -- bash scripts/cbm-prod-build.sh "$ROOT/target/cbm-parity"
 # #280: the lowered-parity harness (~98s, self-contained: its own mkdtemp
 # fixture/caches, per-subprocess CBM_CACHE_DIR, no writes to this run's shared
-# CBM_STORE_SANDBOX) overlaps the serial binary-gate chain below instead of
-# extending it. Launched here — after mcp-parity populated target/cbm-parity,
-# so the prod binary resolve is a cache hit — and collected at its original
-# slot before shadow-parity (gate lowered-parity), where a failure still
-# aborts the aggregate with the harness output attached.
+# CBM_STORE_SANDBOX) overlaps the whole binary-gate phase instead of
+# extending it. Launched right after the cbm-prod-binary prefetch (its
+# upstream binary resolve is a cache hit) and collected before
+# shadow-parity (gate lowered-parity), where a failure still aborts the
+# aggregate with the harness output attached.
 LOWERED_PARITY_LOG="$ROOT/target/gate-logs/lowered-parity.log"
 mkdir -p "$ROOT/target/gate-logs"
 LOWERED_PARITY_ARGS=(scripts/check-lowered-parity.py)
@@ -352,11 +342,24 @@ lowered_parity_wait() {
   fi
   return "$rc"
 }
-gate cli-parity -- "$PYTHON_BIN" scripts/check-cli-parity.py --astrolabe "$ROOT/target/debug/astrolabe"
-gate compat-shim -- "$PYTHON_BIN" scripts/check-compat-shim.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
-gate installer-roundtrip -- "$PYTHON_BIN" scripts/check-installer-roundtrip.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
-gate hook-contracts -- "$PYTHON_BIN" scripts/check-hook-contracts.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
-gate server-manifest -- "$PYTHON_BIN" scripts/check-server-manifest.py
+# #6 (item 2): CBM's own MCP protocol suite (vendored test_mcp_rapid_init.py) must pass
+# against the astrolabe binary UNMODIFIED -- spawn it, send initialize +
+# notifications/initialized + tools/list with no delays, require the id:1 and id:2
+# responses (tools present) within the timeout. Pass an absolute NATIVE path: Windows
+# CreateProcess cannot resolve a relative/forward-slash binary path even when
+# os.path.isfile accepts it. Inherits the sandboxed CBM_CACHE_DIR set above.
+astro_mcp_bin="$ROOT/target/debug/astrolabe"
+[[ -f "$astro_mcp_bin" ]] || astro_mcp_bin="${astro_mcp_bin}.exe"
+if command -v cygpath >/dev/null 2>&1; then astro_mcp_bin="$(cygpath -w "$astro_mcp_bin")"; fi
+echo "=== CBM MCP protocol suite (test_mcp_rapid_init.py) vs astrolabe (#6) ==="
+# #280: every gate below is a SELF-ISOLATED consumer of the built binaries —
+# each sets its own CBM_CACHE_DIR and its own temp fixture root (audited
+# 2026-07-13), so none can perturb another through shared state. gate_group
+# runs them concurrently (wall clock = the slowest member, not the sum) with
+# grouped, serialized output and fail-closed first-failure semantics. The two
+# cargo-invoking members (single-mimalloc, mcp-parity) serialize on cargo's
+# own build lock, which only costs them a wait.
+gate_group   verify-chain          "bash scripts/check-astrolabe-verify-chain.sh \"$ROOT/target/debug/astrolabe\""   single-mimalloc       "bash scripts/check-single-mimalloc.sh"   mcp-parity            "bash scripts/check-mcp-parity.sh"   mcp-rapid-init        "\"$PYTHON_BIN\" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py \"$astro_mcp_bin\""   cli-parity            "\"$PYTHON_BIN\" scripts/check-cli-parity.py --astrolabe \"$ROOT/target/debug/astrolabe\""   compat-shim           "\"$PYTHON_BIN\" scripts/check-compat-shim.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   installer-roundtrip   "\"$PYTHON_BIN\" scripts/check-installer-roundtrip.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   hook-contracts        "\"$PYTHON_BIN\" scripts/check-hook-contracts.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   server-manifest       "\"$PYTHON_BIN\" scripts/check-server-manifest.py"   cross-process-vault   "\"$PYTHON_BIN\" scripts/check-cross-process-vault.py"   cross-process-servers "\"$PYTHON_BIN\" scripts/check-cross-process-servers.py"   watchdog              "bash scripts/check-astrolabe-watchdog.sh \"$ROOT/target/debug/astrolabe\""
 # Collect the backgrounded lowered-parity harness (launched above, after
 # mcp-rapid-init). GATE_TIME here is the RESIDUAL wait — the harness ran
 # concurrently under the gates in between.
@@ -367,9 +370,6 @@ gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-relea
 # run that dies in the build/test phase leaves no fresh 'pass' artifact behind.
 gate license-notices-artifact -- "$PYTHON_BIN" scripts/check-license-notices.py --write-release-artifact
 gate hazard-suite-artifact -- "$PYTHON_BIN" scripts/check-hazard-suite.py --write-release-artifact --cargo "$CARGO_BIN"
-gate cross-process-vault -- "$PYTHON_BIN" scripts/check-cross-process-vault.py
-gate cross-process-servers -- "$PYTHON_BIN" scripts/check-cross-process-servers.py
-gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"
 gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"
 # #237: re-read the protected roots AFTER the full suite and fail closed if any
 # test escaped its sandbox (added/modified/removed entry outside the run sandbox).

@@ -77,12 +77,14 @@ def main() -> int:
         assert checker.validate(fixture) == []
 
         check = fixture / "scripts/check.sh"
+        # #280: the lowered-parity collect must precede shadow-parity; swapping
+        # them must trip the order contract.
         rewrite(
             check,
-            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n'
-            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"',
-            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"\n'
-            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
+            'gate lowered-parity -- lowered_parity_wait\n'
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact',
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact\n'
+            'gate lowered-parity -- lowered_parity_wait',
         )
         require_error(checker.validate(fixture), "portable-before-egress order")
         copy_fixture(fixture)

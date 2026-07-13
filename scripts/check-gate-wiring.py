@@ -338,15 +338,31 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(check, "scripts/clean-target.sh", "scripts/check.sh", errors)
+    # #280: the self-isolated binary gates run concurrently in one gate_group
+    # (each must stay wired), while the ordering contract that remains is:
+    # lowered-parity collected before shadow-parity, egress after both, and
+    # the no-escape verify bracket last (checked separately above).
+    for member in (
+        "scripts/check-astrolabe-verify-chain.sh",
+        "scripts/check-single-mimalloc.sh",
+        "scripts/check-mcp-parity.sh",
+        "scripts/check-cli-parity.py",
+        "scripts/check-compat-shim.py",
+        "scripts/check-installer-roundtrip.py",
+        "scripts/check-hook-contracts.py",
+        "scripts/check-server-manifest.py",
+        "scripts/check-cross-process-vault.py",
+        "scripts/check-cross-process-servers.py",
+        "scripts/check-astrolabe-watchdog.sh",
+    ):
+        require(check, member, "scripts/check.sh", errors)
     require_order(
         check,
         (
             "scripts/check-lowered-parity.py",
-            "scripts/check-shadow-parity.py",
-            "scripts/check-cross-process-vault.py",
-            "scripts/check-cross-process-servers.py",
-            "scripts/check-astrolabe-watchdog.sh",
-            "scripts/check-egress-deny.py",
+            "gate lowered-parity -- lowered_parity_wait",
+            "scripts/check-shadow-parity.py --write-release-artifact",
+            "scripts/check-egress-deny.py --allow-unsupported-platform",
         ),
         "scripts/check.sh portable-before-egress order",
         errors,
