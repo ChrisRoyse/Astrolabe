@@ -184,8 +184,46 @@ LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
 
-# All 64 grammar shim files
-GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
+# ── Grammar set selection (#283) ─────────────────────────────────
+# CBM_GRAMMAR_SET is a declared build knob choosing which tree-sitter grammars
+# are compiled into the archive/binary. Default = full: every grammar_*.c shim
+# (157 today), byte-identical to prior behavior — nothing changes silently.
+#
+# `core` compiles only the declared core-language set below and links a
+# grammar-subset build: every non-core grammar_<lang>.c parser.c drops out of
+# GRAMMAR_SRCS (the ~1.19 GiB of static parse tables is the dominant release
+# binary-size payload, #63), and grammar_stubs.c supplies each dropped
+# tree_sitter_<lang>() symbol as a NULL-returning stub so the link stays intact.
+# Indexing a stubbed language then fails closed with a labeled
+# CBM_GRAMMAR_STUBBED error (see cbm.c) — never a silent parse miss.
+CBM_GRAMMAR_SET ?= full
+
+# Declared core-language registry (a knob, not a constant buried in a rule).
+# Each token is a grammar_<token>.c shim whose parser.c defines exactly
+# tree_sitter_<token>. Edit THIS list to change the core set. Keep it in sync
+# with grammar_stubs.c: a core token here MUST have a `#ifndef CBM_CORE_<token>`
+# stub guard there (the core build fails closed on any unresolved symbol).
+CBM_GRAMMAR_CORE_LANGS = go python javascript typescript tsx rust java c cpp \
+    c_sharp ruby bash json yaml html css markdown toml sql
+
+# grammar_stubs.c is never part of the full-set wildcard: in a full build every
+# real parser.c supplies these symbols and the stub file must not be compiled
+# (it would redefine them). It is added explicitly only in the core build.
+GRAMMAR_STUBS_SRC = $(CBM_DIR)/grammar_stubs.c
+
+ifeq ($(CBM_GRAMMAR_SET),full)
+  # All 157 grammar shim files (grammar_stubs.c excluded — full build defines
+  # every real factory).
+  GRAMMAR_SRCS = $(filter-out $(GRAMMAR_STUBS_SRC),$(wildcard $(CBM_DIR)/grammar_*.c))
+  GRAMMAR_SUBSET_DEFS =
+else ifeq ($(CBM_GRAMMAR_SET),core)
+  GRAMMAR_CORE_SRCS = $(addsuffix .c,$(addprefix $(CBM_DIR)/grammar_,$(CBM_GRAMMAR_CORE_LANGS)))
+  GRAMMAR_SRCS = $(GRAMMAR_CORE_SRCS) $(GRAMMAR_STUBS_SRC)
+  GRAMMAR_SUBSET_DEFS = -DCBM_GRAMMAR_SET_CORE \
+                        $(addprefix -DCBM_CORE_,$(CBM_GRAMMAR_CORE_LANGS))
+else
+  $(error CBM_GRAMMAR_SET must be 'full' or 'core', got '$(CBM_GRAMMAR_SET)')
+endif
 
 # LZ4 + Aho-Corasick
 AC_LZ4_SRCS = $(CBM_DIR)/ac.c $(CBM_DIR)/lz4_store.c
@@ -533,11 +571,15 @@ endif
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+# $(GRAMMAR_SUBSET_DEFS) carries the #283 grammar-subset selectors
+# (-DCBM_GRAMMAR_SET_CORE + -DCBM_CORE_<lang> ...) into grammar_stubs.c; empty in
+# a full build, so those compiles are byte-identical to prior behavior.
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                 $(GRAMMAR_SUBSET_DEFS)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZE)
+                      $(GRAMMAR_SUBSET_DEFS) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      -fsanitize=thread -fno-omit-frame-pointer
+                      $(GRAMMAR_SUBSET_DEFS) -fsanitize=thread -fno-omit-frame-pointer
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))

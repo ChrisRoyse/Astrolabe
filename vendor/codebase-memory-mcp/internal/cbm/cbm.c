@@ -742,7 +742,25 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     const TSLanguage *ts_lang = cbm_ts_language(language);
     if (!ts_lang) {
         result->has_error = true;
-        result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+        // #283 grammar-subset build: distinguish a grammar STUBBED OUT of this
+        // build from a language with genuinely no grammar. In a full build every
+        // real tree_sitter_*() factory returns a non-NULL pointer, so a non-NULL
+        // ts_factory that yields NULL can only be the NULL-returning stub linked
+        // in place of a dropped grammar (grammar_stubs.c). Fail closed with a
+        // labeled {code, message, remediation} error naming the build knob —
+        // never a silent parse miss. This branch is dormant (never taken) in a
+        // full build, so default behavior is unchanged.
+        if (spec->ts_factory != NULL) {
+            result->error_msg = cbm_arena_strdup(
+                a,
+                "[CBM_GRAMMAR_STUBBED] tree-sitter grammar for this language was "
+                "stubbed out of the current libcbm build by the grammar-subset knob "
+                "(CBM_GRAMMAR_SET=core); remediation: rebuild libcbm with "
+                "CBM_GRAMMAR_SET=full, or add the language to CBM_GRAMMAR_CORE_LANGS "
+                "in patches/cbm/Makefile.cbm, to index files of this language");
+        } else {
+            result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+        }
         return result;
     }
 
