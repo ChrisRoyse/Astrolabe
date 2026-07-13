@@ -321,7 +321,26 @@ ASTRO_UI_WERROR_OVERLAYS = $(patsubst %.c,$(ASTRO_UI_WERROR_OVERLAY_DIR)/%.c,$(A
 PROD_SRCS_UI = $(subst src/ui/layout3d.c,$(ASTRO_UI_WERROR_OVERLAY_DIR)/src/ui/layout3d.c,\
                $(subst src/watcher/watcher.c,$(ASTRO_UI_WERROR_OVERLAY_DIR)/src/watcher/watcher.c,\
                $(subst src/pipeline/pass_envscan.c,$(ASTRO_UI_WERROR_OVERLAY_DIR)/src/pipeline/pass_envscan.c,\
-               $(PROD_SRCS))))
+               $(PROD_SRCS_DIAG))))
+
+# ── #282: worker-failure diagnostics reach the production binaries too ────────
+# The parity gates compare astrolabe (libcbm, overlaid) against the production
+# binary LIVE, so both sides must carry identical behavior: early repo_path
+# validation before supervision, and the evidence-carrying failure response.
+# Aggregate attempt 11 proved the divergence — the shared
+# tool/index_repository/empty case produced the enriched payload on the
+# astrolabe side only. Non-chained apply from the pinned vendored sources (the
+# env-store overlay is astrolabe-specific and must NOT reach the production
+# binary).
+ASTRO_WORKER_DIAG_PROD_DIR = $(BUILD_DIR)/astrolabe-worker-diag
+ASTRO_WORKER_DIAG_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
+ASTRO_WORKER_DIAG_PROD_OVERLAYS = $(patsubst %.c,$(ASTRO_WORKER_DIAG_PROD_DIR)/%.c,$(ASTRO_WORKER_DIAG_SRCS))
+PROD_SRCS_DIAG = $(subst src/mcp/mcp.c,$(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/mcp.c,\
+                 $(subst src/mcp/index_supervisor.c,$(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/index_supervisor.c,\
+                 $(PROD_SRCS)))
+# (The overlay-generation rule lives below ASTROLABE_PATCH_DIR's definition:
+# make expands PREREQUISITE lists at read time, so a rule here would see an
+# empty patch-dir path.)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -1009,6 +1028,13 @@ $(filter-out $(LIBCBM_DIR)/src/mcp/mcp.c,$(ASTRO_ENV_STORE_OVERLAYS)): $(LIBCBM_
 ASTRO_WORKER_DIAG_PATCH = $(ASTROLABE_PATCH_DIR)/apply_worker_diag_patch.py
 ASTRO_WORKER_DIAG_SUPERVISOR_OVERLAY = $(LIBCBM_DIR)/src/mcp/index_supervisor.c
 ASTRO_WORKER_DIAG_SUPERVISOR_OBJ = $(LIBCBM_DIR)/src/mcp/index_supervisor.o
+
+# #282: production-binary overlays (declared next to PROD_SRCS_DIAG above; the
+# rule lives here because prerequisite lists expand at read time and need
+# ASTROLABE_PATCH_DIR).
+$(ASTRO_WORKER_DIAG_PROD_OVERLAYS): $(ASTRO_WORKER_DIAG_PROD_DIR)/%.c: %.c $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(PYTHON) $(ASTRO_WORKER_DIAG_PATCH) --file $< $< $@
 
 $(LIBCBM_DIR)/src/mcp/mcp.c: src/mcp/mcp.c $(ASTRO_ENV_STORE_PATCH) $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
 	mkdir -p $(dir $@)

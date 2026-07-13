@@ -13,17 +13,24 @@ shadow-parity with exactly that unattributable payload. These overlays:
       nonzero, so on failure the file usually holds the worker's true error;
       deleting it unread made contained failures unattributable.
 
-  src/mcp/mcp.c — thread the last failed worker's exit code and response text
-      through the recovery loop into ``build_worker_failure_response``, which
-      now emits ``worker_exit_code`` and a bounded ``worker_response_tail``
-      alongside the generic hint. Containment behavior is unchanged; the
-      failure artifact simply carries its own evidence.
+  src/mcp/mcp.c — (a) validate ``repo_path`` BEFORE the supervision wrap, so a
+      trivially-invalid call answers with the plain validation error instead of
+      spawning a worker that exits nonzero and gets reported as an anonymous
+      contained crash (aggregate attempt 11 caught exactly this on the
+      ``tool/index_repository/empty`` parity case); (b) thread the last failed
+      worker's exit code and response text through the recovery loop into
+      ``build_worker_failure_response``, which now emits ``worker_exit_code``
+      and a bounded ``worker_response_tail`` alongside the generic hint.
+      Containment behavior is unchanged; the failure artifact simply carries
+      its own evidence.
 
 ``vendor/codebase-memory-mcp`` is byte-pinned and never edited: this script
 verifies the reviewed source hash, applies exact textual edits, and writes a
-build-local overlay compiled in place of the vendored object (libcbm only —
-the upstream parity binary keeps the pinned behavior, and no parity corpus
-entry contains a worker-failure response).
+build-local overlay compiled in place of the vendored object. The overlays
+reach BOTH libcbm.a and the ``cbm``/``cbm-with-ui`` production binaries (the
+#229 ``PROD_SRCS`` substitution precedent): the parity gates compare astrolabe
+against the production binary live, so both sides must carry the identical
+behavior or every shared failure case diverges — attempt 11 proved that.
 
 ``src/mcp/mcp.c`` is already overlaid by ``env_apply_store_patch.py``; this
 script therefore supports ``--chained``: the input is the env-store overlay
@@ -80,6 +87,27 @@ SUPERVISOR_SLURP_NEW = """    result->outcome = r.outcome;
      * defect. */
     result->response = slurp_file(resp_path);
     (void)remove(resp_path);
+"""
+
+MCP_EARLY_VALIDATION_OLD = """     * is set. On spawn failure, fall through to the in-process path (degrade). */
+    if (cbm_index_supervisor_should_wrap()) {
+"""
+
+MCP_EARLY_VALIDATION_NEW = """     * is set. On spawn failure, fall through to the in-process path (degrade). */
+    /* #282: validate arguments BEFORE supervision. Spawning a worker for
+     * trivially-invalid args converts a clean validation error into an
+     * anonymous contained-crash report (the worker exits nonzero carrying the
+     * real message, which the supervisor used to discard) — and it costs a
+     * whole process spawn to say "missing argument". Argument validation is
+     * the caller's answer, not a worker's job. */
+    {
+        char *early_repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+        if (!early_repo_path) {
+            return cbm_mcp_text_result("repo_path is required", true);
+        }
+        free(early_repo_path);
+    }
+    if (cbm_index_supervisor_should_wrap()) {
 """
 
 MCP_SIGNATURE_OLD = (
@@ -202,6 +230,12 @@ def patch_index_supervisor(source: str) -> str:
 
 
 def patch_mcp(source: str) -> str:
+    source = replace_once(
+        source,
+        MCP_EARLY_VALIDATION_OLD,
+        MCP_EARLY_VALIDATION_NEW,
+        "early argument validation (#282)",
+    )
     source = replace_once(source, MCP_SIGNATURE_OLD, MCP_SIGNATURE_NEW, "failure-response signature (#282)")
     source = replace_once(source, MCP_FIELDS_OLD, MCP_FIELDS_NEW, "failure-response fields (#282)")
     source = replace_once(source, MCP_INITIAL_CAPTURE_OLD, MCP_INITIAL_CAPTURE_NEW, "initial capture (#282)")
