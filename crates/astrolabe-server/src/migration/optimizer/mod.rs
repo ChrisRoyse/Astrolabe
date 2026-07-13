@@ -3,7 +3,6 @@ use super::*;
 mod propose;
 pub(crate) use propose::*;
 mod deficits_producer;
-pub(crate) use deficits_producer::*;
 mod triggers;
 pub(crate) use triggers::*;
 mod janitor;

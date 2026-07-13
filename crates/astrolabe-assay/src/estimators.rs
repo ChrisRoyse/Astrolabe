@@ -168,13 +168,12 @@ pub fn mi_mixed_ross(cont: &[Vec<f64>], labels: &[i64], k: usize) -> f64 {
         same.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let d = same[k_i - 1];
         // m = number of points of any class within distance d (excluding self).
-        let mut m = 0usize;
-        for j in 0..n {
-            if j != i && dist[j] <= d {
-                m += 1;
-            }
-        }
-        let m = m.max(1);
+        let m = dist
+            .iter()
+            .enumerate()
+            .filter(|&(j, &dj)| j != i && dj <= d)
+            .count()
+            .max(1);
         acc += digamma(n as f64) - digamma(nx as f64) + digamma(k_i as f64) - digamma(m as f64);
     }
     let mi_nats = acc / n as f64;

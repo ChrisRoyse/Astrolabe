@@ -1485,10 +1485,10 @@ fn encode_layer_role(input: &EncoderLensInput) -> PanelResult<SlotVector> {
         }
     }
 
-    if let Some(routes) = input.route_surface.as_ref() {
-        if !routes.routes.is_empty() || !routes.channels.is_empty() {
-            evidence[LayerRole::TransportApi.index()] += LR_W_ROUTE_SURFACE;
-        }
+    if let Some(routes) = input.route_surface.as_ref()
+        && (!routes.routes.is_empty() || !routes.channels.is_empty())
+    {
+        evidence[LayerRole::TransportApi.index()] += LR_W_ROUTE_SURFACE;
     }
 
     if let Some(calls) = input.api_calls.as_ref() {

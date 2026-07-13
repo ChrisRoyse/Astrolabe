@@ -188,7 +188,7 @@ pub fn serving_p99_micros(samples: &[u64]) -> Option<u64> {
     sorted.sort_unstable();
     // ceil(0.99 * n) with integer math, clamped to a valid 1-based rank.
     let n = sorted.len() as u128;
-    let rank = ((99 * n) + 99) / 100; // ceil(99n/100)
+    let rank = (99 * n).div_ceil(100); // ceil(99n/100)
     let index = (rank.max(1) as usize - 1).min(sorted.len() - 1);
     Some(sorted[index])
 }

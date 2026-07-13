@@ -1624,7 +1624,7 @@ impl CalibrationError {
         }
     }
 
-    pub fn code(&self) -> &str {
+    pub fn code(&self) -> &'static str {
         self.code
     }
 
@@ -1632,7 +1632,7 @@ impl CalibrationError {
         &self.message
     }
 
-    pub fn remediation(&self) -> &str {
+    pub fn remediation(&self) -> &'static str {
         self.remediation
     }
 }

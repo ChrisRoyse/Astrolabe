@@ -147,9 +147,7 @@ impl DeterministicRng {
             // Degenerate underflow: fall back to the uniform simplex point so the
             // result is always a valid probability vector rather than NaNs.
             let uniform = 1.0 / draws.len() as f64;
-            for value in &mut draws {
-                *value = uniform;
-            }
+            draws.fill(uniform);
         }
         draws
     }
