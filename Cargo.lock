@@ -720,11 +720,9 @@ dependencies = [
  "calyx-core",
  "calyx-forge",
  "calyx-ledger",
- "ort",
  "serde",
  "serde_json",
  "sha2",
- "tokenizers",
  "uuid",
 ]
 

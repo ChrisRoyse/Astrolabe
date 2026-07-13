@@ -14,9 +14,20 @@ calyx-ledger = { path = "../calyx-ledger" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"] }
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 uuid.workspace = true
+
+[features]
+# The ONNX ML-lens backends (style/speaker/injection) pull in `ort` (ONNX
+# Runtime bindings, load-dynamic + CUDA) and `tokenizers` (Oniguruma C build).
+# They are OFF by default: Astrolabe reaches calyx-ward only through the pure
+# per-slot cosine guard path (guard/novelty/profile) via calyx-loom, so the
+# ML stack is dead weight in that graph. Enable `onnx-lens` in a consumer that
+# actually runs the ONNX lenses; without it, the lens constructors fail closed
+# with CALYX_WARD_LENS_FEATURE_DISABLED.
+default = []
+onnx-lens = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 blake3.workspace = true
