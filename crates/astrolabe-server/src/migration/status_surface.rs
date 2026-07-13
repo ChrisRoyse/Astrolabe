@@ -208,6 +208,28 @@ pub(crate) struct PeriodicScrubOutcome {
     pub(crate) slice_start: Option<u64>,
     pub(crate) slice_end: Option<u64>,
     pub(crate) error_text: Option<String>,
+    /// #178: the unforgeable [`astrolabe_domain::fsv::FsvAck`] envelope this tick
+    /// earned, present only when the scrub committed a witnessed mutation (its
+    /// checkpoint row + Measure entry were read back byte-identical and the paired
+    /// ledger entry exists). `None` on an idle catch-up — labeled absence, never a
+    /// fabricated `fsv:verified`.
+    pub(crate) fsv: Option<Value>,
+}
+
+/// Serializes an [`astrolabe_domain::fsv::FsvAck`] into the server response
+/// envelope's `fsv` block (#178). The `label` is minted by the ack itself
+/// (`fsv:verified` for a full readback, `fsv:verified-sampled` for a sample) — the
+/// server can only relay it, never assert it.
+pub(crate) fn fsv_ack_envelope(ack: &astrolabe_domain::fsv::FsvAck) -> Value {
+    json!({
+        "label": ack.label(),
+        "scope": ack.scope(),
+        "full_readback": ack.is_full_readback(),
+        "rows_read_back": ack.rows_read_back(),
+        "bytes_read_back": ack.bytes_read_back(),
+        "ledger_seq": ack.ledger_seq(),
+        "ledger_entry_hash": ack.ledger_entry_hash(),
+    })
 }
 
 /// Runs one bounded [`astrolabe_ingest::run_janitor_scrub_step`] against the
@@ -239,11 +261,16 @@ pub(crate) fn periodic_verify_scrub_project(
     match astrolabe_ingest::run_janitor_scrub_step(&vault, None) {
         Ok(report) => {
             let checkpoint = report.checkpoint();
-            let (slice_start, slice_end) = match &report {
-                astrolabe_ingest::JanitorStepReport::Scrubbed { slice, .. } => {
-                    (Some(slice.slice_start), Some(slice.slice_end))
-                }
-                astrolabe_ingest::JanitorStepReport::CaughtUp { .. } => (None, None),
+            let (slice_start, slice_end, fsv) = match &report {
+                astrolabe_ingest::JanitorStepReport::Scrubbed { slice, ack, .. } => (
+                    Some(slice.slice_start),
+                    Some(slice.slice_end),
+                    // #178: relay the scrub's real FsvAck envelope. The ack was
+                    // minted by verify_committed (readback + ledger pairing), so
+                    // this is a witnessed `fsv:verified`, not a server claim.
+                    Some(fsv_ack_envelope(ack)),
+                ),
+                astrolabe_ingest::JanitorStepReport::CaughtUp { .. } => (None, None, None),
             };
             Ok(Some(PeriodicScrubOutcome {
                 status: "intact".to_string(),
@@ -252,6 +279,7 @@ pub(crate) fn periodic_verify_scrub_project(
                 slice_start,
                 slice_end,
                 error_text: None,
+                fsv,
             }))
         }
         Err(error) => Ok(Some(PeriodicScrubOutcome {
@@ -263,6 +291,7 @@ pub(crate) fn periodic_verify_scrub_project(
             slice_start: None,
             slice_end: None,
             error_text: Some(error.to_string()),
+            fsv: None,
         })),
     }
 }
@@ -287,6 +316,7 @@ pub(crate) fn periodic_verify_project_at(
             None,
             None,
             false,
+            None,
         )?;
         return Ok(periodic_verify_result_json(
             project,
@@ -300,6 +330,7 @@ pub(crate) fn periodic_verify_project_at(
             None,
             false,
             "scrub",
+            None,
         ));
     }
 
@@ -322,6 +353,7 @@ pub(crate) fn periodic_verify_project_at(
                 outcome.error_text.as_deref(),
                 verified_through,
                 outcome.scrubbed,
+                outcome.fsv.as_ref(),
             )?;
             Ok(periodic_verify_result_json(
                 project,
@@ -335,6 +367,7 @@ pub(crate) fn periodic_verify_project_at(
                 verified_through,
                 outcome.scrubbed,
                 "scrub",
+                outcome.fsv.as_ref(),
             ))
         }
         None => {
@@ -368,6 +401,7 @@ pub(crate) fn periodic_verify_result_json(
     verified_through: Option<u64>,
     scrubbed: bool,
     mode: &str,
+    fsv: Option<&Value>,
 ) -> Value {
     json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
@@ -381,6 +415,7 @@ pub(crate) fn periodic_verify_result_json(
         "verified_through": verified_through,
         "scrubbed": scrubbed,
         "mode": mode,
+        "fsv": fsv,
         "error": error_text,
         "freshness": "fresh",
         "trust": if status == "intact" { "verified" } else { "provisional" },
@@ -401,12 +436,20 @@ pub(crate) fn persist_periodic_verify_status_at(
     error_text: Option<&str>,
     verified_through: Option<u64>,
     scrubbed: bool,
+    fsv: Option<&Value>,
 ) -> Result<(), DynError> {
     let mut conn = open_config(cache_dir)?;
+    // #178: the last tick's FsvAck envelope, or empty when the tick performed no
+    // witnessed mutation (idle / error / missing) — labeled absence on readback.
+    let fsv_serialized = fsv
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
     // Atomic multi-key persist — a crash mid-write must not leave torn
     // periodic-verify metadata that a status reader would treat as current (#95).
     let tx = conn.transaction()?;
     for (key, value) in [
+        ("periodic_verify_fsv", fsv_serialized),
         ("periodic_verify_status", status.to_string()),
         (
             "periodic_verify_checked_unix_ms",
@@ -488,6 +531,11 @@ pub(crate) fn periodic_verify_status_at(
     .filter(|value| !value.trim().is_empty());
     let error = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_error"))?
         .filter(|value| !value.trim().is_empty());
+    // #178: the last tick's FsvAck envelope (labeled absence when the tick made no
+    // witnessed mutation). Parsed back from the persisted JSON, never fabricated.
+    let fsv = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_fsv"))?
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
     Ok(json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
         "project": project,
@@ -499,6 +547,7 @@ pub(crate) fn periodic_verify_status_at(
         "checked_range_end": checked_range_end,
         "verified_through": verified_through,
         "scrubbed": scrubbed,
+        "fsv": fsv,
         "error": error,
         "freshness": "last_observed",
         "trust": if status == "intact" { "verified" } else { "provisional" },
@@ -518,6 +567,7 @@ pub(crate) fn periodic_verify_unobserved_json(project: &str) -> Value {
         "checked_range_end": Value::Null,
         "verified_through": Value::Null,
         "scrubbed": false,
+        "fsv": Value::Null,
         "error": Value::Null,
         "freshness": "unknown",
         "trust": "provisional",
@@ -776,6 +826,7 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     Some(&error.to_string()),
                     None,
                     false,
+                    None,
                 )?;
                 continue;
             }
@@ -796,6 +847,7 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     None,
                     verified_through,
                     false,
+                    None,
                 )?;
             }
             Err(error) => {
@@ -813,6 +865,7 @@ pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64
                     Some(&error.to_string()),
                     None,
                     false,
+                    None,
                 )?;
             }
         }

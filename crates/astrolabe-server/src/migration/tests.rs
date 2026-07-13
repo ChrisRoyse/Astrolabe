@@ -2877,11 +2877,38 @@ fn periodic_verify_scrub_advances_and_resumes_from_persisted_checkpoint() {
         r1["scrubbed"], true,
         "tick1 must have scrubbed real tail: {r1}"
     );
+    // #178: the scrub committed a witnessed mutation, so the tick relays a real
+    // FsvAck envelope minted by verify_committed (readback + ledger pairing). The
+    // server cannot forge this label — it can only relay one the ack produced.
+    assert_eq!(
+        r1["fsv"]["label"],
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED,
+        "tick1 must carry fsv:verified: {r1}"
+    );
+    assert_eq!(r1["fsv"]["scope"], "fsv_janitor_scrub");
+    assert_eq!(r1["fsv"]["full_readback"], true);
+    assert!(
+        r1["fsv"]["rows_read_back"].as_u64().unwrap() >= 1,
+        "fsv ack must have read back the persisted checkpoint row: {r1}"
+    );
+    assert!(!r1["fsv"]["ledger_entry_hash"].as_str().unwrap().is_empty());
     // Independent readback of the persisted checkpoint watermark (not the echo).
     let vt1 = read_config_u64(&dir, "demo", "periodic_verify_verified_through")
         .unwrap()
         .expect("tick1 persisted verified_through");
     assert!(vt1 > 0, "checkpoint must advance past genesis: {vt1}");
+    // #178: the FsvAck envelope is persisted and surfaced through index_status's
+    // readback path (periodic_verify_status_at), not just the live tick echo.
+    let after_scrub = periodic_verify_status_at(&dir, "demo").unwrap();
+    assert_eq!(
+        after_scrub["fsv"]["label"],
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED,
+        "index_status readback must surface the persisted fsv ack: {after_scrub}"
+    );
+    assert_eq!(
+        after_scrub["fsv"]["ledger_seq"], r1["fsv"]["ledger_seq"],
+        "readback ack ledger_seq must match the tick's ack (persisted, not echoed)"
+    );
 
     // Tick 2: resumes from the persisted checkpoint; nothing new to verify, so it
     // is an idle catch-up (no re-walk, no further scrub) and the watermark holds.
@@ -2896,11 +2923,23 @@ fn periodic_verify_scrub_advances_and_resumes_from_persisted_checkpoint() {
         .expect("tick2 persisted verified_through");
     assert_eq!(vt2, vt1, "idle tick must not move the persisted checkpoint");
 
+    // #178: the idle tick performed no witnessed mutation, so the live result and
+    // the persisted readback both carry no fsv envelope — labeled absence, never a
+    // fabricated fsv:verified carried over from the earlier scrub.
+    assert!(
+        r2["fsv"].is_null(),
+        "idle tick must not carry an fsv ack: {r2}"
+    );
+
     // The surfaced status reads the persisted watermark back, not an API echo.
     let observed = periodic_verify_status_at(&dir, "demo").unwrap();
     assert_eq!(observed["status"], "intact");
     assert_eq!(observed["verified_through"].as_u64().unwrap(), vt2);
     assert_eq!(observed["scrubbed"], false);
+    assert!(
+        observed["fsv"].is_null(),
+        "readback after an idle tick must show labeled fsv absence: {observed}"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
