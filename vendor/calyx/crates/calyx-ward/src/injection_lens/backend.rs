@@ -1,22 +1,34 @@
+#[cfg(feature = "onnx-lens")]
 use std::fmt;
+#[cfg(feature = "onnx-lens")]
 use std::fs::File;
+#[cfg(feature = "onnx-lens")]
 use std::io::Read;
+#[cfg(feature = "onnx-lens")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "onnx-lens")]
 use std::sync::Mutex;
 
+#[cfg(feature = "onnx-lens")]
 use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
+#[cfg(feature = "onnx-lens")]
 use ort::session::{Session, builder::GraphOptimizationLevel};
+#[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "onnx-lens")]
 use tokenizers::Tokenizer;
 
+#[cfg(any(feature = "onnx-lens", test))]
 use crate::error::WardError;
 
+#[cfg(feature = "onnx-lens")]
 use super::{
     BENIGN_LABEL, INJECTION_LABEL, INJECTION_LABELS, INJECTION_MAX_TOKENS, InjectionProviderPolicy,
     InjectionScoreBackend,
 };
 
+#[cfg(feature = "onnx-lens")]
 pub(super) struct OnnxInjectionBackend {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
@@ -28,6 +40,7 @@ pub(super) struct OnnxInjectionBackend {
     policy: InjectionProviderPolicy,
 }
 
+#[cfg(feature = "onnx-lens")]
 impl OnnxInjectionBackend {
     pub(super) fn new(
         model_path: &Path,
@@ -89,6 +102,7 @@ impl OnnxInjectionBackend {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 impl InjectionScoreBackend for OnnxInjectionBackend {
     fn benign_score(&self, text: &str) -> Result<f32, WardError> {
         let (ids, attention) = self.tokenize(text)?;
@@ -134,6 +148,7 @@ impl InjectionScoreBackend for OnnxInjectionBackend {
 }
 
 /// Numerically-stable 2-class softmax, returning `P(benign)`.
+#[cfg(any(feature = "onnx-lens", test))]
 pub(super) fn softmax_benign(benign_logit: f32, injection_logit: f32) -> Result<f32, WardError> {
     if !benign_logit.is_finite() || !injection_logit.is_finite() {
         return Err(WardError::InvalidInput {
@@ -152,6 +167,7 @@ pub(super) fn softmax_benign(benign_logit: f32, injection_logit: f32) -> Result<
     Ok(benign_exp / denom)
 }
 
+#[cfg(feature = "onnx-lens")]
 fn build_session(model_path: &Path, policy: InjectionProviderPolicy) -> Result<Session, WardError> {
     if !model_path.exists() {
         return Err(WardError::ModelNotFound {
@@ -169,6 +185,7 @@ fn build_session(model_path: &Path, policy: InjectionProviderPolicy) -> Result<S
     builder.commit_from_file(model_path).map_err(runtime_error)
 }
 
+#[cfg(feature = "onnx-lens")]
 fn execution_providers(policy: InjectionProviderPolicy) -> Vec<ExecutionProviderDispatch> {
     match policy {
         InjectionProviderPolicy::CudaFailLoud => vec![
@@ -184,6 +201,7 @@ fn execution_providers(policy: InjectionProviderPolicy) -> Vec<ExecutionProvider
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
     names
         .iter()
@@ -195,6 +213,7 @@ fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, 
 }
 
 /// The injection head must be an f32 tensor whose last static dim is 2.
+#[cfg(feature = "onnx-lens")]
 fn assert_logits_shape(session: &Session, output_name: &str) -> Result<(), WardError> {
     let outlet = session
         .outputs()
@@ -223,12 +242,14 @@ fn assert_logits_shape(session: &Session, output_name: &str) -> Result<(), WardE
 }
 
 /// ONNX external-data sidecar path for `model.onnx` -> `model.onnx.data`.
+#[cfg(feature = "onnx-lens")]
 pub(super) fn external_data_path(model_path: &Path) -> PathBuf {
     let mut name = model_path.file_name().unwrap_or_default().to_os_string();
     name.push(".data");
     model_path.with_file_name(name)
 }
 
+#[cfg(feature = "onnx-lens")]
 pub(super) fn sha256_files(paths: &[&Path]) -> Result<[u8; 32], WardError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -255,6 +276,7 @@ pub(super) fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(feature = "onnx-lens")]
 fn runtime_error(error: impl fmt::Display) -> WardError {
     WardError::Runtime {
         reason: error.to_string(),

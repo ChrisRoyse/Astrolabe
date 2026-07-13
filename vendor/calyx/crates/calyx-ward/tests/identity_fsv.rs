@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx-lens")] // #191: ONNX ml-lens tests only build with the feature
 #[path = "identity_fsv/speaker_similarity.rs"]
 mod speaker_similarity;
 
