@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_core::{CxId, FixedClock};
 use calyx_ledger::{
@@ -178,7 +178,8 @@ fn ph35_ledger_appender_manual_fsv() {
 #[test]
 #[ignore = "manual FSV for PH35 ledger redaction policy disk rows"]
 fn ph35_ledger_redaction_manual_fsv() {
-    let root = fsv_root().join("redaction-policy");
+    let scratch = fsv_root();
+    let root = scratch.join("redaction-policy");
     fs::create_dir_all(&root).expect("create fsv root");
     let ledger_dir = root.join("ledger-cf");
     reset_child_dir(&root, &ledger_dir);
@@ -390,10 +391,10 @@ fn range_text(rows: &[LedgerRow]) -> String {
     out
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-ph35-ledger-appender-fsv")
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop (incl. panic unwind);
+// an operator `CALYX_FSV_ROOT` is kept for inspection.
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-ph35-ledger-appender-fsv")
 }
 
 fn reset_child_dir(root: &Path, child: &Path) {

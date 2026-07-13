@@ -140,15 +140,15 @@ fn append_only_violation(message: impl Into<String>) -> CalyxError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use calyx_core::{CxId, FixedClock};
+    use calyx_fsv::scratch::ScratchDir;
 
     use super::*;
     use crate::{ActorId, EntryKind, LedgerAppender, SubjectId, verify_chain};
 
     #[test]
     fn missing_anchor_on_truncated_directory_ledger_fails_closed() {
+        // RAII scratch (#260): self-cleans on normal return and on panic unwind.
         let root = temp_root("missing-anchor-truncated");
         let mut appender = LedgerAppender::open(
             DirectoryLedgerStore::open(&root).expect("open directory store"),
@@ -173,17 +173,11 @@ mod tests {
 
         assert_eq!(error.code, "CALYX_LEDGER_CHAIN_BROKEN");
         assert!(error.message.contains("head anchor missing"));
-        fs::remove_dir_all(root).ok();
+        // `root` (ScratchDir) removes the tree on drop at end of scope.
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "calyx-directory-ledger-{name}-{}-{unique}",
-            std::process::id()
-        ))
+    fn temp_root(name: &str) -> ScratchDir {
+        ScratchDir::new_temp(&format!("calyx-directory-ledger-{name}"))
+            .expect("create directory-ledger scratch dir")
     }
 }
