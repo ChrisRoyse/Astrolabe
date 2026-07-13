@@ -3030,7 +3030,7 @@ fn health_chain_gauge_flips_on_injected_vault_corruption() {
 
     // Inject real corruption into the persisted ledger bytes: one payload byte
     // flipped, CRCs repaired so the store still opens but the hash chain is broken.
-    tamper_first_ledger_sst_value(&vault_dir);
+    tamper_genesis_ledger_sst_value(&vault_dir);
 
     // The exported chain gauge must now read 0, matching the live verify_chain over
     // the tampered on-disk ledger.
@@ -3365,10 +3365,35 @@ fn periodic_verify_scrub_advances_and_resumes_from_persisted_checkpoint() {
 /// record + body CRCs so the store still opens, leaving the ledger hash chain
 /// broken for the janitor's re-hash to catch. Mirrors the ingest crate's durable
 /// tamper-negative harness (ledger_verify.rs `tamper_ledger_sst_value`).
-fn tamper_first_ledger_sst_value(vault_dir: &Path) {
+/// Tamper the persisted genesis ledger entry on disk: flip one payload byte and
+/// repair both CRCs so the store still opens but the hash chain is broken from
+/// genesis.
+///
+/// The ledger chain begins at **seq 0** (the appender's first `next_seq` is 0;
+/// `calyx_ledger::verify` breaks a corrupt genesis `at_seq: 0`). Its Ledger CF
+/// key is `0u64.to_be_bytes()` — the global-minimum big-endian key — so genesis
+/// is the *first* (smallest-key) record of every SST that physically contains it,
+/// in every seed regardless of how many commits/flushes ran.
+///
+/// Why target genesis in *every* such SST rather than "the first record of the
+/// first `.sst` in directory order": seeds that drive several ledger commits
+/// (import + lower) flush more than once, so `cf/ledger` can hold multiple `.sst`
+/// files — including files a background compaction has superseded but not yet
+/// unlinked. The physical ledger reader (`AsterLedgerCfStore`/`CfRouter`) reads
+/// only the *live*, manifest-referenced SSTs and merges them into one
+/// row-per-seq view that fails closed on divergent bytes for a seq. So tampering
+/// an arbitrary first-in-directory `.sst` can hit a compacted-away orphan the
+/// verifier never reads, leaving the chain reported intact (the exact defect
+/// that made this FSV pass vacuously). Tampering genesis *identically* across
+/// every SST that carries it guarantees the live copy the reader verifies is
+/// corrupted, while keeping any duplicate physical copies byte-identical so no
+/// spurious divergent-bytes error masks the intended hash-chain break.
+fn tamper_genesis_ledger_sst_value(vault_dir: &Path) {
     const HEADER_LEN: usize = 32;
     const RECORD_HEADER_LEN: usize = 12;
+    let genesis_key = 0u64.to_be_bytes();
     let ledger_dir = vault_dir.join("cf").join(ColumnFamily::Ledger.name());
+    let mut tampered = 0usize;
     for entry in fs::read_dir(&ledger_dir).expect("read ledger dir") {
         let path = entry.expect("ledger dir entry").path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
@@ -3384,10 +3409,20 @@ fn tamper_first_ledger_sst_value(vault_dir: &Path) {
         let key_start = HEADER_LEN + RECORD_HEADER_LEN;
         let value_start = key_start + key_len;
         let value_end = value_start + value_len;
-        if value_end > bytes.len() || value_len <= 17 {
+        if value_end > bytes.len() {
             continue;
         }
-        // Flip a payload byte, then repair both CRCs so open() succeeds.
+        // Only the SST(s) whose first (smallest-key) record is the genesis entry.
+        if bytes[key_start..value_start] != genesis_key {
+            continue;
+        }
+        assert!(
+            value_len > 17,
+            "genesis (seq 0) ledger value too short to tamper in {}",
+            path.display()
+        );
+        // Flip a payload byte, then repair both CRCs so open() succeeds and the
+        // hash-chain break — not a CRC failure — is what verify catches.
         bytes[value_start + 16] ^= 0xff;
         let mut record_hasher = crc32fast::Hasher::new();
         record_hasher.update(&bytes[key_start..value_start]);
@@ -3398,9 +3433,13 @@ fn tamper_first_ledger_sst_value(vault_dir: &Path) {
         body_hasher.update(&bytes[HEADER_LEN..]);
         bytes[28..32].copy_from_slice(&body_hasher.finalize().to_le_bytes());
         fs::write(&path, bytes).expect("write tampered ledger sst");
-        return;
+        tampered += 1;
     }
-    panic!("no ledger SST record found in {}", ledger_dir.display());
+    assert!(
+        tampered > 0,
+        "no genesis (seq 0) ledger SST record found in {}",
+        ledger_dir.display()
+    );
 }
 
 /// #225 box 3 (concurrent-process safety): two **real** OS processes each drive a
@@ -3556,7 +3595,7 @@ fn janitor_startup_verify_fails_closed_on_tampered_ledger() {
         // ledger SST bytes — an artifact an external attacker could edit — with
         // CRCs rewritten so the store opens and the janitor's from-genesis re-hash
         // is what catches the hash-chain break.
-        tamper_first_ledger_sst_value(&vdir);
+        tamper_genesis_ledger_sst_value(&vdir);
     }
 
     // Boot gate now fails closed for the tampered project.
