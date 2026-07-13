@@ -2603,6 +2603,35 @@ mod tests {
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
 
+    // #60 reactive churn coverage, decomposed into two per-test-budget-compliant
+    // slices (#280: no single test may exceed 60s). The prior monolithic 10K soak
+    // (`durable_reactive_churn_soak_10k_...`, ~227s, deleted in PR #300) is
+    // restored here as (1) a bounded-N slice that FSV-reads the persisted reactive
+    // CF to prove exact accounting under sustained overflow, and (2) an RSS-bound
+    // slice run at the largest event count that stays under the 60s budget.
+    //
+    // The reactive queue is a bounded evict-oldest ring; the churn property does
+    // not depend on the ring being at its production 4096 cap — driving well past
+    // a small cap exercises the overflow / evict-oldest path far more times per
+    // durable evaluation (the per-event vault write dominates wall clock), so the
+    // slices use a small declared cap to soak the ring cheaply. These are declared,
+    // annealable knobs, not measurements.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const REACTIVE_CHURN_SLICE_QUEUE_CAP: usize = 8;
+    /// Bounded-N exact-accounting slice size: enough evaluations to evict the ring
+    /// hundreds of times while staying well under the per-test budget.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const REACTIVE_CHURN_ACCOUNTING_EVENTS: u64 = 256;
+    /// RSS-bound slice size: the largest event count that keeps the durable soak
+    /// under the #280 60s per-test budget on the native Windows host (measured;
+    /// see the #302 evidence comment).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const REACTIVE_CHURN_RSS_EVENTS: u64 = 2_000;
+    /// Resident-set growth bound for the churn soak. The ring never exceeds its
+    /// cap, so sustained churn far beyond the cap must not grow resident memory.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
+
     #[test]
     fn identifies_calyx_parent() {
         assert_eq!(parent_system(), astrolabe_domain::ParentSystem::Calyx);
@@ -3232,6 +3261,140 @@ mod tests {
             .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1);
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Drives `total_evals` durable NewRegion evaluations through `engine`/`vault`,
+    /// asserting the queue accepts exactly `cap` events and every subsequent
+    /// evaluation fails closed with [`CALYX_REACTIVE_QUEUE_FULL`] (the ring is
+    /// never drained here, so once full it stays full). Shared by the two #60
+    /// churn slices.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn drive_reactive_churn(
+        vault: &AsterVault<SystemClock>,
+        engine: &mut ReactiveEngine,
+        total_evals: u64,
+        cap: u64,
+    ) {
+        let signals =
+            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
+        let mut ok_count = 0u64;
+        let mut overflow_count = 0u64;
+        for seq in 1..=total_evals {
+            let result = engine.evaluate_post_ingest_durable(vault, cx(12), lref(seq), &signals);
+            if seq <= cap {
+                assert_eq!(result.expect("queue has capacity below cap"), 1);
+                ok_count += 1;
+            } else {
+                let err = result.expect_err("evaluation beyond queue cap overflows");
+                assert_eq!(err.code, CALYX_REACTIVE_QUEUE_FULL);
+                overflow_count += 1;
+            }
+        }
+        assert_eq!(ok_count, cap);
+        assert_eq!(overflow_count, total_evals - cap);
+    }
+
+    /// #60 churn slice 1 of 2 — bounded-N exact accounting. Drives
+    /// `REACTIVE_CHURN_ACCOUNTING_EVENTS` durable evaluations past a small ring
+    /// cap so the overflow / evict-oldest path runs hundreds of times, then does
+    /// an independent readback of the persisted reactive CF and asserts the
+    /// accounting is exact: every evaluation matched and was audited, exactly one
+    /// QUEUE_FULL warning per overflow, and the in-memory ring holds precisely the
+    /// most-recent `cap` events (FIFO evict-oldest). Bounded N keeps it well under
+    /// the #280 60s per-test budget; the RSS property is proven by slice 2.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn durable_reactive_churn_slice_bounded_n_keeps_exact_accounting() {
+        let (dir, vault) = reactive_vault("churn-accounting");
+        let cap = REACTIVE_CHURN_SLICE_QUEUE_CAP as u64;
+        let mut engine = ReactiveEngine::with_caps(
+            Arc::new(FixedClock::new(1_786_321_000)),
+            4,
+            REACTIVE_CHURN_SLICE_QUEUE_CAP,
+            1 << 20,
+        );
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .expect("register churn accounting trigger");
+
+        let total_evals = REACTIVE_CHURN_ACCOUNTING_EVENTS;
+        assert!(
+            total_evals > cap,
+            "churn slice must drive past the ring cap: total_evals={total_evals} cap={cap}"
+        );
+        drive_reactive_churn(&vault, &mut engine, total_evals, cap);
+
+        // The ring stays capped and holds exactly the most-recent `cap` events
+        // (FIFO evict-oldest): first is total_evals-cap+1, last is total_evals.
+        assert_eq!(engine.queue().len(), REACTIVE_CHURN_SLICE_QUEUE_CAP);
+        let queued_seqs = engine
+            .queue()
+            .iter()
+            .map(|event| event.ledger_ref.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(queued_seqs.first().copied(), Some(total_evals - cap + 1));
+        assert_eq!(queued_seqs.last().copied(), Some(total_evals));
+
+        // FSV: independent readback of the persisted reactive CF. Every evaluation
+        // fired and was audited; exactly one QUEUE_FULL warning per overflow.
+        let audits = all_audit_entries(&vault);
+        assert_eq!(
+            audits.iter().filter(|entry| entry.code.is_none()).count(),
+            total_evals as usize
+        );
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
+                .count(),
+            (total_evals - cap) as usize
+        );
+        assert_eq!(fired_events(&vault).len(), total_evals as usize);
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #60 churn slice 2 of 2 — bounded resident memory under sustained churn.
+    /// Drives `REACTIVE_CHURN_RSS_EVENTS` durable evaluations (the largest count
+    /// that stays under the #280 60s per-test budget on the native host) against a
+    /// full ring, so the overflow / evict-oldest path runs thousands of times, and
+    /// asserts resident-set growth stays under the declared bound. Because the ring
+    /// never exceeds its cap, sustained churn far beyond the cap must not grow
+    /// resident memory. Exact accounting is proven by slice 1.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn durable_reactive_churn_slice_bounds_rss_under_sustained_churn() {
+        let (dir, vault) = reactive_vault("churn-rss");
+        let cap = REACTIVE_CHURN_SLICE_QUEUE_CAP as u64;
+        let mut engine = ReactiveEngine::with_caps(
+            Arc::new(FixedClock::new(1_786_322_000)),
+            4,
+            REACTIVE_CHURN_SLICE_QUEUE_CAP,
+            1 << 20,
+        );
+        engine
+            .register(TriggerCondition::NewRegion { tau_override: None }, None)
+            .expect("register churn rss trigger");
+
+        let total_evals = REACTIVE_CHURN_RSS_EVENTS;
+        assert!(
+            total_evals > cap,
+            "churn slice must drive past the ring cap: total_evals={total_evals} cap={cap}"
+        );
+        let rss_before = resident_set_bytes();
+        drive_reactive_churn(&vault, &mut engine, total_evals, cap);
+        let rss_after = resident_set_bytes();
+
+        let rss_delta = rss_after.saturating_sub(rss_before);
+        assert!(
+            rss_delta <= MAX_REACTIVE_SOAK_RSS_DELTA_BYTES,
+            "reactive churn soak RSS delta {rss_delta} exceeded cap {MAX_REACTIVE_SOAK_RSS_DELTA_BYTES}"
+        );
+
+        // The ring stays capped: bounded footprint under sustained churn.
+        assert_eq!(engine.queue().len(), REACTIVE_CHURN_SLICE_QUEUE_CAP);
         drop(vault);
         let _ = fs::remove_dir_all(dir);
     }
@@ -5292,6 +5455,51 @@ mod tests {
                 .then_some(payload)
             })
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resident_set_bytes() -> u64 {
+        let smaps = fs::read_to_string("/proc/self/smaps_rollup").expect("read smaps_rollup");
+        smaps
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some("Rss:"), Some(kib), Some("kB")) => {
+                        Some(kib.parse::<u64>().expect("parse Rss kB") * 1024)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("Rss line in smaps_rollup")
+    }
+
+    /// Native Windows resident-set probe for the churn soak slice.
+    ///
+    /// `astrolabe-weave` forbids `unsafe`, so instead of a direct
+    /// `GetProcessMemoryInfo` FFI call this shells out to PowerShell for the
+    /// process's working set — the Windows analogue of Linux `Rss` — which is
+    /// exact enough for the 512 MiB soak delta bound.
+    #[cfg(target_os = "windows")]
+    fn resident_set_bytes() -> u64 {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
+            ])
+            .output()
+            .expect("query working set via powershell");
+        assert!(
+            output.status.success(),
+            "powershell working-set query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 working set")
+            .trim()
+            .parse::<u64>()
+            .expect("parse working set bytes")
     }
 
     fn cx(byte: u8) -> CxId {
