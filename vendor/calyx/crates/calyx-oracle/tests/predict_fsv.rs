@@ -461,13 +461,10 @@ fn durable_vault(path: &Path) -> AsterVault<SystemClock> {
     .expect("open durable vault")
 }
 
-fn prepare_fsv_root() -> PathBuf {
-    let root = calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join(format!("calyx-issue434-{}", std::process::id()))
-    });
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("create fsv root");
-    root
+// RAII scratch (#260): armed fallback self-cleans on drop incl. panic unwind;
+// an operator `CALYX_FSV_ROOT` is kept for inspection. Bind for test lifetime.
+fn prepare_fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-issue434")
 }
 
 fn write_summary(root: &Path) {

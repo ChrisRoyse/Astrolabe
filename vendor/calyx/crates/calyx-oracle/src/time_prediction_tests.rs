@@ -175,10 +175,12 @@ fn rolled_frequency_without_active_cadence_fails_closed_explicitly() {
 #[test]
 #[ignore = "manual FSV writes #657 interval-bound readback artifact"]
 fn time_prediction_interval_bounds_manual_fsv() {
-    let root = std::env::var("CALYX_ISSUE657_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("calyx-issue657-time-bounds-fsv"));
-    std::fs::create_dir_all(&root).expect("create root");
+    // RAII scratch (#260): armed fallback self-cleans on drop incl. panic
+    // unwind; an operator `CALYX_ISSUE657_ROOT` is kept for inspection.
+    let root = calyx_fsv::scratch::scratch_or_temp(
+        "CALYX_ISSUE657_ROOT",
+        "calyx-issue657-time-bounds-fsv",
+    );
 
     let high_series = series_with_times([i64::MAX - 30, i64::MAX - 20, i64::MAX - 10]);
     let (high_t_hat, high_half_width) = interval_inputs(&high_series, 1.0).expect("high inputs");
