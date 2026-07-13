@@ -93,6 +93,12 @@ impl CalibrationLanguage {
         }
     }
 
+    /// Frozen ordinal used in canonical serialization (public accessor for the
+    /// guard-profile serializer in `profile.rs`).
+    pub const fn ordinal_public(self) -> u8 {
+        self.ordinal()
+    }
+
     /// Frozen ordinal used in canonical serialization.
     const fn ordinal(self) -> u8 {
         match self {
@@ -1495,11 +1501,29 @@ pub fn run_ablation<S: BadCaseScorer>(
 }
 
 fn far_at(bad_scores: &[f32], tau: f32) -> f32 {
+    false_accept_rate(bad_scores, tau)
+}
+
+/// Empirical false-accept rate: the fraction of bad-case scores that meet or
+/// exceed `tau` (i.e. would be wrongly accepted as in-distribution). An empty
+/// population has no measured false accepts.
+pub fn false_accept_rate(bad_scores: &[f32], tau: f32) -> f32 {
     if bad_scores.is_empty() {
         return 0.0;
     }
     let accepts = bad_scores.iter().filter(|score| **score >= tau).count();
     accepts as f32 / bad_scores.len() as f32
+}
+
+/// Empirical false-reject rate: the fraction of good-case scores that fall below
+/// `tau` (i.e. would be wrongly rejected as out-of-distribution). An empty
+/// population has no measured false rejects.
+pub fn false_reject_rate(good_scores: &[f32], tau: f32) -> f32 {
+    if good_scores.is_empty() {
+        return 0.0;
+    }
+    let rejects = good_scores.iter().filter(|score| **score < tau).count();
+    rejects as f32 / good_scores.len() as f32
 }
 
 /// Conformal tau: the smallest threshold whose bad-accept rate is `<= target_far`
@@ -1588,7 +1612,11 @@ pub struct CalibrationError {
 }
 
 impl CalibrationError {
-    fn new(code: &'static str, message: impl Into<String>, remediation: &'static str) -> Self {
+    pub(crate) fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        remediation: &'static str,
+    ) -> Self {
         Self {
             code,
             message: message.into(),
