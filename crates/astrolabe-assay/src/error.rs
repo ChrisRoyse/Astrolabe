@@ -1,0 +1,77 @@
+//! Fail-closed error type for the assay job scheduler.
+//!
+//! Every failure path in this crate surfaces a stable machine-readable `code`,
+//! a human `message`, and a `remediation` string (standing invariant 6). There
+//! is no `From<io::Error>` blanket that would let an I/O fault leak as an opaque
+//! string: each fallible boundary maps its cause into one of the declared codes
+//! so a caller can branch on the code rather than parse prose.
+
+use std::fmt;
+
+/// A stable fail-closed assay error carrying a machine-readable code.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AssayError {
+    code: &'static str,
+    message: String,
+    remediation: &'static str,
+}
+
+impl AssayError {
+    /// Builds an error from a declared code, a dynamic message, and a static remediation.
+    pub fn new(code: &'static str, message: impl Into<String>, remediation: &'static str) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            remediation,
+        }
+    }
+
+    /// The stable machine-readable error code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The human-readable message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The operator remediation string.
+    pub fn remediation(&self) -> &'static str {
+        self.remediation
+    }
+}
+
+impl fmt::Display for AssayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} (remediation: {})",
+            self.code, self.message, self.remediation
+        )
+    }
+}
+
+impl std::error::Error for AssayError {}
+
+/// Crate result alias.
+pub type Result<T> = std::result::Result<T, AssayError>;
+
+/// The requested sample size was zero, which cannot produce a verifiable sample.
+pub const ASTRO_ASSAY_SAMPLE_SIZE_ZERO: &str = "ASTRO_ASSAY_SAMPLE_SIZE_ZERO";
+/// A subject carried an empty stratum label, so it could not be partitioned.
+pub const ASTRO_ASSAY_EMPTY_STRATUM: &str = "ASTRO_ASSAY_EMPTY_STRATUM";
+/// The population contained a duplicate `SeriesId`, so identity is ambiguous.
+pub const ASTRO_ASSAY_DUPLICATE_SUBJECT: &str = "ASTRO_ASSAY_DUPLICATE_SUBJECT";
+/// A knob value fell outside its registry-declared closed interval.
+pub const ASTRO_ASSAY_KNOB_OUT_OF_BOUNDS: &str = "ASTRO_ASSAY_KNOB_OUT_OF_BOUNDS";
+/// A store I/O operation failed.
+pub const ASTRO_ASSAY_STORE_IO: &str = "ASTRO_ASSAY_STORE_IO";
+/// Persisted bytes did not read back as the value that was written (FSV failure).
+pub const ASTRO_ASSAY_READBACK_MISMATCH: &str = "ASTRO_ASSAY_READBACK_MISMATCH";
+/// Persisted JSON could not be parsed back into a typed value.
+pub const ASTRO_ASSAY_STORE_CORRUPT: &str = "ASTRO_ASSAY_STORE_CORRUPT";
+/// The background lane refused a tick because the serving p99 tripwire was tripped.
+pub const ASTRO_ASSAY_SERVING_TRIPWIRE: &str = "ASTRO_ASSAY_SERVING_TRIPWIRE";
+/// A deficit measurement was structurally invalid for the optimizer contract.
+pub const ASTRO_ASSAY_DEFICIT_INVALID: &str = "ASTRO_ASSAY_DEFICIT_INVALID";
