@@ -28,18 +28,30 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod bits;
 pub mod deficits;
 pub mod error;
+pub mod estimators;
 pub mod fingerprint;
 pub mod knobs;
+pub mod ledger;
 pub mod population;
+pub mod projection;
+pub mod rng;
 pub mod scheduler;
 pub mod store;
 pub mod strata;
 
+pub use bits::{
+    AxisValues, BitsConfig, BitsInterval, DeficitSuggestedAction, SignalBits, SignalRankingCard,
+    SlotDeficit, SlotObservations, SlotSummary, SlotValues, SufficiencyCard, build_signal_ranking,
+    build_sufficiency_card, enforce_dpi_ceiling, measure_slot_bits,
+};
 pub use deficits::{DeficitMeasurement, OPTIMIZER_DEFICITS_SCHEMA, optimizer_deficits_document};
 pub use error::{AssayError, Result};
+pub use estimators::{entropy_bits, mi_continuous_ksg, mi_discrete, mi_mixed_ross};
 pub use fingerprint::InputFingerprint;
+pub use ledger::{AssayCardEntry, CardLedger, input_fingerprint};
 pub use population::{AssaySubject, Population};
 pub use scheduler::{
     AssayScheduler, CooperativeScorer, IsolationDecision, SampleRequest, ScheduleOutcome,
