@@ -752,12 +752,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         // full build, so default behavior is unchanged.
         if (spec->ts_factory != NULL) {
             result->error_msg = cbm_arena_strdup(
-                a,
-                "[CBM_GRAMMAR_STUBBED] tree-sitter grammar for this language was "
-                "stubbed out of the current libcbm build by the grammar-subset knob "
-                "(CBM_GRAMMAR_SET=core); remediation: rebuild libcbm with "
-                "CBM_GRAMMAR_SET=full, or add the language to CBM_GRAMMAR_CORE_LANGS "
-                "in patches/cbm/Makefile.cbm, to index files of this language");
+                a, "[CBM_GRAMMAR_STUBBED] tree-sitter grammar for this language was "
+                   "stubbed out of the current libcbm build by the grammar-subset knob "
+                   "(CBM_GRAMMAR_SET=core); remediation: rebuild libcbm with "
+                   "CBM_GRAMMAR_SET=full, or add the language to CBM_GRAMMAR_CORE_LANGS "
+                   "in patches/cbm/Makefile.cbm, to index files of this language");
         } else {
             result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
         }
