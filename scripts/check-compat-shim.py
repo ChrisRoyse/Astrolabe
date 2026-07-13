@@ -37,7 +37,9 @@ def base_env(cache_dir):
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache_dir)
     env["CBM_LOG_FORMAT"] = "text"
-    env["CBM_LOG_LEVEL"] = "none"
+    # #292: "error", never "none" — a fatal startup/index failure must print its
+    # {code, message, remediation} instead of dying as a bare silent rc=1.
+    env["CBM_LOG_LEVEL"] = "error"
     env["NO_COLOR"] = "1"
     return env
 

@@ -60,7 +60,9 @@ def default_astrolabe():
 def base_env(cache):
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache)
-    env["CBM_LOG_LEVEL"] = "none"
+    # #292: "error", never "none" — a fatal startup/index failure must print its
+    # {code, message, remediation} instead of dying as a bare silent rc=1.
+    env["CBM_LOG_LEVEL"] = "error"
     env["NO_COLOR"] = "1"
     env["ASTROLABE_VERIFY_CHAIN_LOOP"] = "0"
     return env
