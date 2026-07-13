@@ -1116,11 +1116,24 @@ TEST(watcher_watch_after_unwatch) {
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
     index_call_count = 0;
 
-    /* Baseline again (first poll after re-watch) */
+    /* Baseline again (first poll after re-watch) captures the CURRENT dirty
+     * state, exactly like watcher_baseline_dirty_repo: a fresh baseline never
+     * triggers, and pre-existing dirty bytes are not re-indexed (the initial
+     * index already covered them). This is the #23 fingerprint contract —
+     * reindex fires on a fingerprint CHANGE since baseline, not on mere
+     * dirtiness. (Before #23's git_worktree_fingerprint, the old git_is_dirty
+     * probe reindexed any dirty tree, so this second poll used to trigger on the
+     * pre-existing dirt; that path is gone.) */
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0); /* baseline never triggers */
 
-    /* Second poll — detects dirty */
+    /* A NEW edit after the fresh baseline is a distinct porcelain fingerprint
+     * and is detected. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "post-rewatch edit\n");
+    }
     cbm_watcher_touch(w, "rewatch-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);

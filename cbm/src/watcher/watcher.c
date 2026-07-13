@@ -306,6 +306,26 @@ static bool git_worktree_fingerprint(const char *root_path,
     if (rc != 0) {
         return false;
     }
+    /* Porcelain status carries names/status only: it is byte-identical across
+     * successive edits to an already-modified tracked file (` M file` stays
+     * ` M file`). Fold the complete tracked patch in — parity with the
+     * ASTRO_SPAWN path's `git diff --binary HEAD` fold above — so each distinct
+     * edit to the same dirty path yields a new fingerprint and is reindexed
+     * once, instead of the watcher going blind after the first edit. */
+    char diff_cmd[CBM_SZ_1K];
+    snprintf(diff_cmd, sizeof(diff_cmd),
+             "git --no-optional-locks -C \"%s\" diff --binary HEAD 2>%s", root_path,
+             WATCHER_NULDEV);
+    FILE *dfp = cbm_popen(diff_cmd, "r");
+    if (!dfp) {
+        return false;
+    }
+    while ((chunk_len = fread(chunk, 1, sizeof(chunk), dfp)) > 0) {
+        cbm_sha256_update(&hash, chunk, chunk_len);
+    }
+    if (cbm_pclose(dfp) != 0) {
+        return false;
+    }
 #endif
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&hash, digest);
