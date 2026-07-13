@@ -596,6 +596,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "ulid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
