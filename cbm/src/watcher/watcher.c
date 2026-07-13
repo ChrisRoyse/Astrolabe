@@ -656,27 +656,21 @@ static bool check_changes(project_state_t *s) {
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* HEAD moved — commit, checkout, pull */
-#ifdef ASTRO_UI_WERROR
-            /* #229: bounded copy with a guaranteed NUL terminator. The vendored
+            /* #229/#273: bounded copy with a guaranteed NUL terminator. The vendored
              * strncpy(dst, src, sizeof-1) does not terminate when `head` fills the
-             * buffer (a genuine latent bug) and trips GCC 14 -Wstringop-truncation
-             * under -Werror on native MinGW. */
+             * buffer (a genuine latent bug) and trips GCC 14 -Wstringop-truncation.
+             * strnlen caps the length, memcpy copies exactly that many bytes, and the
+             * explicit NUL terminates. Unconditional (#273): the fix ships in libcbm.a
+             * too, instead of being masked by a blanket -Wno-stringop-truncation. */
             size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
             memcpy(s->last_head, head, head_len);
             s->last_head[head_len] = '\0';
-#else
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-#endif
             return true;
         }
-#ifdef ASTRO_UI_WERROR
-        /* #229: bounded copy with a guaranteed NUL terminator (see above). */
+        /* #229/#273: bounded copy with a guaranteed NUL terminator (see above). */
         size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
         memcpy(s->last_head, head, head_len);
         s->last_head[head_len] = '\0';
-#else
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-#endif
     }
 
     /* Check whether the porcelain state changed since the last successful
