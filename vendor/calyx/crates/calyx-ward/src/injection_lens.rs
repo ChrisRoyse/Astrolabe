@@ -23,9 +23,9 @@ use crate::error::WardError;
 
 mod backend;
 
+use backend::hash_parts;
 #[cfg(test)]
 use backend::softmax_benign;
-use backend::hash_parts;
 #[cfg(feature = "onnx-lens")]
 use backend::{OnnxInjectionBackend, external_data_path, sha256_files};
 
@@ -357,7 +357,10 @@ mod tests {
         let err = InjectionLens::new(Path::new("/nonexistent/injection.onnx")).unwrap_err();
         assert_eq!(err.code(), "CALYX_WARD_LENS_FEATURE_DISABLED");
         let msg = err.to_string();
-        assert!(msg.contains("onnx-lens"), "remediation names feature: {msg}");
+        assert!(
+            msg.contains("onnx-lens"),
+            "remediation names feature: {msg}"
+        );
         assert!(msg.contains("injection"), "message names lens: {msg}");
     }
 }

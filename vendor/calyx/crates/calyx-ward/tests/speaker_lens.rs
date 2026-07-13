@@ -157,7 +157,10 @@ fn onnx_lens_disabled_fails_closed() {
     let err = SpeakerLens::new(Path::new("/nonexistent/wavlm.onnx")).unwrap_err();
     assert_eq!(err.code(), "CALYX_WARD_LENS_FEATURE_DISABLED");
     let msg = err.to_string();
-    assert!(msg.contains("onnx-lens"), "remediation names feature: {msg}");
+    assert!(
+        msg.contains("onnx-lens"),
+        "remediation names feature: {msg}"
+    );
     assert!(msg.contains("speaker"), "message names lens: {msg}");
     assert_eq!(
         SpeakerLens::new_cpu_explicit(Path::new("/nonexistent/wavlm.onnx"))

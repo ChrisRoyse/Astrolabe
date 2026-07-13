@@ -175,7 +175,10 @@ fn onnx_lens_disabled_fails_closed() {
     let err = StyleLens::new(Path::new("/nonexistent/style.onnx")).unwrap_err();
     assert_eq!(err.code(), "CALYX_WARD_LENS_FEATURE_DISABLED");
     let msg = err.to_string();
-    assert!(msg.contains("onnx-lens"), "remediation names feature: {msg}");
+    assert!(
+        msg.contains("onnx-lens"),
+        "remediation names feature: {msg}"
+    );
     assert!(msg.contains("style"), "message names lens: {msg}");
     // Every provider entry point fails closed identically.
     assert_eq!(
