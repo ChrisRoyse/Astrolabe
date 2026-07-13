@@ -8,15 +8,17 @@ the ``CALYX_ASTER_CRASH_FSV_AFTER_WAL_APPEND_MARKER`` environment variable and,
 when set, writes a marker file and then parks the process forever. That must
 never exist in a shipped Astrolabe binary.
 
-The feature is wired ONLY through ``astrolabe-ingest``'s ``[dev-dependencies]``
-and is not in any crate's ``default`` feature set, so with resolver = "2" the
-normal/bin feature resolution of ``astrolabe`` never activates ``crash-fsv`` and
-the failpoint's string literals are cfg'd out of the release binary. This gate
-is the standing, byte-level proof of that exclusion: it reads the actual bytes
-of every release binary named in the binary-size manifest and asserts none of
-them contain a failpoint marker. It regresses loudly if anyone ever promotes
-``crash-fsv`` to a normal dependency, adds it to a default feature set, or the
-cargo feature-unification behaviour changes so a dev-dependency feature leaks
+The feature is reachable ONLY through ``astrolabe-ingest``'s opt-in,
+non-default ``crash-fsv-tests`` feature (``crash-fsv-tests =
+["calyx-aster/crash-fsv"]``), enabled explicitly by the ``crash-fsv`` test
+suite stage and never in any crate's ``default`` feature set. So the normal/bin
+feature resolution of ``astrolabe`` never activates ``crash-fsv`` and the
+failpoint's string literals are cfg'd out of the release binary. This gate is
+the standing, byte-level proof of that exclusion: it reads the actual bytes of
+every release binary named in the binary-size manifest and asserts none of them
+contain a failpoint marker. It regresses loudly if anyone ever promotes
+``crash-fsv`` to a normal dependency, adds ``crash-fsv-tests`` (or
+``crash-fsv``) to a default feature set, or otherwise lets the failpoint leak
 onto the shipped bin.
 
 Fail-closed contract:
@@ -51,9 +53,9 @@ FORBIDDEN_MARKERS: tuple[bytes, ...] = (
 def fail(message: str) -> None:
     print(f"ERROR[ASTRO_RELEASE_FAILPOINT_STRING]: {message}", file=sys.stderr)
     print(
-        "  remediation: keep the crash-fsv feature in astrolabe-ingest's "
-        "[dev-dependencies] only (never a normal dep or a default feature); see "
-        "issue #291.",
+        "  remediation: keep calyx-aster/crash-fsv reachable only via "
+        "astrolabe-ingest's opt-in, non-default crash-fsv-tests feature (never a "
+        "normal dep or a default feature); see issue #291.",
         file=sys.stderr,
     )
     raise SystemExit(1)

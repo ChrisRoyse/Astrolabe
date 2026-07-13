@@ -502,6 +502,10 @@ mod tests {
 
     use super::*;
 
+    // #291: the crash-FSV data-row key is used only by the failpoint-armed
+    // cluster (kill_after_* + crash_*_child), so it is gated with them to keep
+    // the module warning-clean when `crash-fsv-tests` is off.
+    #[cfg(feature = "crash-fsv-tests")]
     const CRASH_FSV_KEY: &[u8] = b"astrolabe:crash-fsv:v1";
     const CONCURRENT_PARENT_WRITES: usize = 16;
     const CONCURRENT_CHILD_WRITES: usize = 16;
@@ -718,6 +722,11 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // #291: this crash-recovery cluster arms calyx-aster's `crash-fsv`
+    // failpoints, which compile only under the opt-in `crash-fsv-tests` feature
+    // (never a shipped/default build). The impact-gated `crash-fsv` suite stage
+    // in scripts/check.sh runs it with `--features crash-fsv-tests`.
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     fn kill_after_wal_append_reopens_with_both_data_and_ledger() {
         let root = test_dir("kill-after-wal");
@@ -913,6 +922,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     fn kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay() {
         // Ingest-stage crash matrix (#276): kill the writer at the
@@ -983,6 +993,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     fn kill_after_checkpoint_reopens_intact_chain_via_manifest() {
         // Ingest-stage crash matrix (#276): kill the writer at the
@@ -1086,8 +1097,12 @@ mod tests {
         //  - unarmed + optimized (a normal shipped build without the feature).
         crash_fsv_guard_decision(false, true, false).expect("unarmed production permitted");
 
-        // The live wrapper, reading this build's real cfg (debug + crash-fsv
-        // feature via dev-deps), must permit and never block a durable-vault open.
+        // The live wrapper, reading this build's real cfg, must permit and never
+        // block a durable-vault open. This test is ungated (it needs no
+        // failpoints, only the always-compiled guard), so it runs in both the
+        // default suite (crash-fsv OFF: unarmed debug => permit) and the
+        // `crash-fsv-tests` suite (feature ON: armed debug => permit) — the
+        // guard blocks only armed + optimized + non-test, never this build.
         guard_against_production_failpoints().expect("current debug/test build permitted");
     }
 
@@ -1174,6 +1189,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     #[ignore = "child process helper for kill_after_wal_append_reopens_with_both_data_and_ledger"]
     fn crash_after_wal_append_child() {
@@ -1205,6 +1221,7 @@ mod tests {
         panic!("crash FSV failpoint did not pause");
     }
 
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     #[ignore = "child process helper for kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay"]
     fn crash_after_mvcc_commit_child() {
@@ -1238,6 +1255,7 @@ mod tests {
         panic!("crash FSV failpoint did not pause");
     }
 
+    #[cfg(feature = "crash-fsv-tests")]
     #[test]
     #[ignore = "child process helper for kill_after_checkpoint_reopens_intact_chain_via_manifest"]
     fn crash_after_checkpoint_child() {

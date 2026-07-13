@@ -24,14 +24,31 @@ sha2 = "0.10"
 path = "src/lib.rs"
 
 [dev-dependencies]
-# #291: `crash-fsv` compiles calyx-aster's `crash_fsv_after_wal_append`
-# failpoint (parks the process after a WAL append) for the child-process
-# crash-recovery test in `src/ledger_verify.rs`. It MUST stay here in
-# [dev-dependencies] and MUST NOT be a normal dependency or a default feature:
-# the failpoint must never reach a shipped binary. With resolver = "2" the
-# normal/bin feature resolution of the `astrolabe` bin does not activate a
-# dev-only feature, so the release binary is failpoint-free. The standing
-# byte-level proof is `scripts/check-release-failpoint-strings.py`
-# (wired into check-release.sh), which fails closed if the marker ever ships.
-calyx-aster = { workspace = true, features = ["crash-fsv"] }
 crc32fast = "1"
+
+[features]
+# #291: opt-in compilation of calyx-aster's crash-injection failpoints
+# (`crash_fsv_after_wal_append` / `_after_mvcc_commit` / `_after_checkpoint`,
+# each of which parks the process at a durable-commit boundary) for the
+# child-process crash-recovery FSV cluster in `src/ledger_verify.rs`
+# (the `kill_after_*` tests + their `crash_*_child` helpers, gated behind
+# `cfg(feature = "crash-fsv-tests")`).
+#
+# This is deliberately NOT a default feature and NOT a [dev-dependencies]
+# feature line. A `[dev-dependencies] calyx-aster = { features = ["crash-fsv"] }`
+# unifies that feature into EVERY dev-target build of this crate — including the
+# optimized `--example` builds the lscale bench compiles
+# (`cargo run --release --example ...`), where calyx-aster's #276 build-time
+# guard correctly refuses `crash-fsv` + `not(debug_assertions)` with a
+# `compile_error!`. That unification was the release-gate RED this fixes.
+#
+# As a named, non-default feature the failpoints are compiled only when a caller
+# opts in explicitly (`cargo test -p astrolabe-ingest --features crash-fsv-tests`,
+# always in the debug profile so the #276 guard stays silent). The normal/bin
+# feature resolution of the shipped `astrolabe` binary never activates it, so the
+# release binary is failpoint-free. The standing byte-level proof is
+# `scripts/check-release-failpoint-strings.py` (wired into check-release.sh),
+# which fails closed if the marker ever ships. The default suite no longer runs
+# this cluster, so its coverage is restored by the impact-gated `crash-fsv` suite
+# stage in scripts/check.sh (registered in scripts/check-suite-impact.py).
+crash-fsv-tests = ["calyx-aster/crash-fsv"]
