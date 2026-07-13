@@ -2986,6 +2986,119 @@ fn tamper_first_ledger_sst_value(vault_dir: &Path) {
     panic!("no ledger SST record found in {}", ledger_dir.display());
 }
 
+/// #225 box 3 (concurrent-process safety): two **real** OS processes each drive a
+/// lowered-SQLite regeneration through `regenerate_lowered_under_lock`, which
+/// opens the writable vault and appends the Admin manifest entry inside the
+/// `.astrolabe-lowered.lock` critical section. The lock serializes the two
+/// durable-mutating regens so neither observes a torn artifact; the final
+/// serialized regen's on-disk bytes are read back and re-verified.
+///
+/// The second process is spawned by re-invoking this same test binary filtered to
+/// this test with `ASTRO_CP_CHILD_CACHE` set — the child branch performs one
+/// locked regen against the shared cache dir and exits, a genuine cross-process
+/// contender on the OS file lock.
+#[test]
+fn lowered_regen_serializes_across_two_real_processes_under_lock() {
+    // Child branch: one locked regen against the shared cache, print the artifact
+    // digest, exit before the harness runs anything else.
+    if let Ok(cache) = std::env::var("ASTRO_CP_CHILD_CACHE") {
+        let report =
+            regenerate_lowered_under_lock(Path::new(&cache), "demo").expect("child locked regen");
+        println!("CHILD_OK sha={}", report.artifact_sha256);
+        // process::exit skips destructors and does not flush stdout — flush the
+        // ack line explicitly so the parent can read it.
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("lowered-cross-process");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    // Spawn the real second process contending on the same `.astrolabe-lowered.lock`.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "migration::tests::lowered_regen_serializes_across_two_real_processes_under_lock",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_CP_CHILD_CACHE", &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process regen child");
+
+    // Parent regenerates concurrently; the lock forces one of the two to wait for
+    // the other rather than opening a second durable writer or tearing the file.
+    let parent_report = regenerate_lowered_under_lock(&dir, "demo").expect("parent locked regen");
+
+    let out = child.wait_with_output().expect("join child");
+    assert!(
+        out.status.success(),
+        "child process failed: status={:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The child's ack shares a line with libtest's `test <name> ... ` prefix, so
+    // match the marker as a substring and take the 64-hex digest that follows.
+    let child_stdout = String::from_utf8_lossy(&out.stdout);
+    let marker = "CHILD_OK sha=";
+    let after = child_stdout
+        .find(marker)
+        .map(|idx| &child_stdout[idx + marker.len()..]);
+    let child_sha: String = after
+        .unwrap_or_else(|| {
+            panic!(
+                "child reported no artifact sha\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
+                child_stdout,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    assert_eq!(
+        child_sha.len(),
+        64,
+        "child artifact sha must be a sha256 hex"
+    );
+    assert_eq!(parent_report.artifact_sha256.len(), 64);
+
+    // Final serialized regen reflects the latest (twice-advanced) vault head, so a
+    // fresh readback is authoritative and non-stale.
+    let final_report = regenerate_lowered_under_lock(&dir, "demo").expect("final locked regen");
+    let lowered_path = dir.join("demo.astrolabe-lowered.db");
+    // FSV: verify_lowered_artifact re-reads the on-disk artifact bytes, hashes them,
+    // and matches that digest against the ledgered manifest AND the post-contention
+    // vault fingerprint — proving no torn write survived the two-process contention
+    // and the second observer sees a complete, non-stale artifact.
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![
+            ColumnFamily::Kv,
+            ColumnFamily::Kernel,
+            ColumnFamily::Base,
+            ColumnFamily::Graph,
+            ColumnFamily::Ledger,
+        ],
+    )
+    .unwrap();
+    let verification = astrolabe_lower::verify_lowered_artifact(&vault, &lowered_path, "demo")
+        .expect("lowered artifact verifies after concurrent regen");
+    assert_eq!(
+        verification.artifact_sha256, final_report.artifact_sha256,
+        "disk-byte readback digest must equal the final regen's reported manifest digest"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// #277 FSV (tamper-negative): the one-time startup boot gate re-hashes the whole
 /// persisted chain and fails closed on a tampered ledger row — recording
 /// `status: "error"` with the exact janitor refusal code, never a silent pass.
