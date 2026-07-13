@@ -34,6 +34,8 @@ mod snapshot_lease;
 mod store;
 mod temporal_xterm;
 #[cfg(test)]
+mod wal_group_commit_tests;
+#[cfg(test)]
 use crate::cf::ledger_key;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange, anchor_key, base_key, slot_key};
 use crate::dedup::DedupPolicy;

@@ -182,29 +182,91 @@ impl Wal {
         self.refresh_after_external_appends_locked()?;
         let mut acks = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let seq = self.next_seq;
-            let bytes = record::encode(seq, payload)
-                .map_err(|error| storage_error("encode WAL record", error))?;
-            self.rotate_if_needed(bytes.len() as u64)?;
-            let start_offset = self.seek_end()?;
-            self.file
-                .write_all(&bytes)
-                .map_err(|error| storage_error("append WAL record", error))?;
-            let end_offset = start_offset + bytes.len() as u64;
-            acks.push(AppendAck {
-                seq,
-                segment_path: self.active_path(),
-                start_offset,
-                end_offset,
-            });
-            self.next_seq += 1;
-            self.active_len = end_offset;
+            // A commit that fits in one record keeps the original single-record
+            // (`CXW1`) layout byte-for-byte. A larger commit is framed as an
+            // atomic multi-record group (`CXW2`) that replays all-or-nothing.
+            let ack = if payload.len() <= record::CHUNK_TARGET_BYTES as usize {
+                self.append_single_record(payload)?
+            } else {
+                self.append_group(payload)?
+            };
+            acks.push(ack);
         }
 
         self.file
             .sync_data()
             .map_err(|error| storage_error("fsync WAL batch", error))?;
         Ok(acks)
+    }
+
+    /// Appends one whole commit as a single `CXW1` record.
+    fn append_single_record(&mut self, payload: &[u8]) -> Result<AppendAck> {
+        let seq = self.next_seq;
+        let bytes = record::encode(seq, payload)
+            .map_err(|error| storage_error("encode WAL record", error))?;
+        self.rotate_if_needed(bytes.len() as u64)?;
+        let start_offset = self.seek_end()?;
+        self.file
+            .write_all(&bytes)
+            .map_err(|error| storage_error("append WAL record", error))?;
+        let end_offset = start_offset + bytes.len() as u64;
+        self.next_seq += 1;
+        self.active_len = end_offset;
+        Ok(AppendAck {
+            seq,
+            segment_path: self.active_path(),
+            start_offset,
+            end_offset,
+        })
+    }
+
+    /// Appends one commit that exceeds the chunk target as an atomic group of
+    /// `CXW2` records. Every member record carries the *same* commit seq — a
+    /// group is one logical commit that consumes exactly one sequence number, so
+    /// the ack seq stays equal to the MVCC commit seq the caller expects. The
+    /// whole group is written contiguously into a single segment (rotating once
+    /// up front if it will not fit in the active one) so a torn tail always
+    /// leaves the incomplete group at the physical end of the last segment,
+    /// where replay truncates it wholesale.
+    fn append_group(&mut self, payload: &[u8]) -> Result<AppendAck> {
+        let chunk = record::CHUNK_TARGET_BYTES as usize;
+        let member_count = payload.len().div_ceil(chunk);
+        let member_count = u32::try_from(member_count).map_err(|_| {
+            CalyxError::disk_pressure(format!(
+                "WAL commit of {} bytes needs {member_count} records, exceeding the u32 group limit",
+                payload.len()
+            ))
+        })?;
+
+        // Header + chunk bytes for every member, used to decide a single
+        // up-front rotation that keeps the group in one contiguous segment.
+        let group_bytes: u64 = payload
+            .chunks(chunk)
+            .map(|slice| record::GROUP_HEADER_LEN as u64 + slice.len() as u64)
+            .sum();
+        self.rotate_if_needed(group_bytes)?;
+
+        let seq = self.next_seq;
+        let group_start = self.seek_end()?;
+        let mut end_offset = group_start;
+        for (index, slice) in payload.chunks(chunk).enumerate() {
+            let bytes = record::encode_group_member(seq, index as u32, member_count, slice)
+                .map_err(|error| storage_error("encode WAL group record", error))?;
+            let start_offset = self.seek_end()?;
+            self.file
+                .write_all(&bytes)
+                .map_err(|error| storage_error("append WAL group record", error))?;
+            end_offset = start_offset + bytes.len() as u64;
+            self.active_len = end_offset;
+        }
+        self.next_seq += 1;
+
+        Ok(AppendAck {
+            seq,
+            segment_path: self.active_path(),
+            start_offset: group_start,
+            end_offset,
+        })
     }
 
     pub fn durable_tip_seq(&mut self) -> Result<u64> {
@@ -419,5 +481,7 @@ fn storage_error(context: &str, error: io::Error) -> CalyxError {
     CalyxError::disk_pressure(format!("{context}: {error}"))
 }
 
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod tests;
