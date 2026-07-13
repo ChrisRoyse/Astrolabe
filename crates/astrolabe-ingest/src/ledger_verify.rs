@@ -1577,4 +1577,299 @@ mod tests {
         }
         panic!("timed out waiting for {label}: {}", path.display());
     }
+
+    // ---- #23: crash-injection mid-delta recovery FSV ----
+    //
+    // Proves the live incremental delta path is crash-atomic. The delta importer
+    // `import_cbm_graph_snapshot_to_vault_direct` writes every changed
+    // Base/slot/graph/edge row plus its Ingest ledger entry in ONE atomic group
+    // commit (`write_import_rows` -> `write_cf_batch_with_ledger_entry`), so the
+    // only two reachable recovery states are "entirely pre-delta" and "entirely
+    // post-delta". This test kills the process mid-delta -- parked at the
+    // post-WAL-append durable-commit boundary by calyx-aster's
+    // `crash_fsv_after_wal_append` failpoint -- then reopens the vault in the
+    // parent and reads back the persisted graph. It asserts the recovered state
+    // is one of the two fully-consistent states (never a torn one: no half-added
+    // symbol, no re-pointed edge orphaned from its endpoint, no broken chain) and
+    // that the ledger chain verifies intact. Because the failpoint parks AFTER
+    // the commit is durable, recovery here observes the post-delta state via WAL
+    // replay; the assertion also accepts the pre-delta state so it states the
+    // atomicity guarantee directly rather than the timing of one failpoint.
+
+    #[cfg(feature = "crash-fsv-tests")]
+    const CRASH_DELTA_PROJECT: &str = "crashdelta";
+    #[cfg(feature = "crash-fsv-tests")]
+    const CRASH_DELTA_SYMBOLS: usize = 40;
+    #[cfg(feature = "crash-fsv-tests")]
+    const CRASH_DELTA_EDGES_PER_SYMBOL: usize = 2;
+    #[cfg(feature = "crash-fsv-tests")]
+    const CRASH_DELTA_CHANGED_INDEX: usize = 17;
+    #[cfg(feature = "crash-fsv-tests")]
+    const CRASH_DELTA_SALT: &[u8] = b"crash-delta-fsv";
+
+    /// Deterministic delta fixture shared by parent (generation 1) and the crash
+    /// child (generation 2). `changed` bumps exactly one symbol's body so it
+    /// derives a fresh CxId, driving a single-symbol incremental delta. Every
+    /// "IMPORTS" edge carries a `local_name` property matching its
+    /// `local_name_gen`, satisfying the row-sink edge-consistency contract.
+    #[cfg(feature = "crash-fsv-tests")]
+    fn crash_delta_snapshot(changed: bool) -> crate::CbmGraphSnapshot {
+        let nodes = (0..CRASH_DELTA_SYMBOLS)
+            .map(|index| {
+                let generation = if changed && index == CRASH_DELTA_CHANGED_INDEX {
+                    2
+                } else {
+                    1
+                };
+                crate::CbmGraphNode {
+                    source_node_id: index as i64 + 1,
+                    project: CRASH_DELTA_PROJECT.to_string(),
+                    label: "Function".to_string(),
+                    name: format!("symbol_{index:03}"),
+                    qualified_name: format!("{CRASH_DELTA_PROJECT}.symbol_{index:03}"),
+                    file_path: format!("src/module_{:02}.rs", index / 10),
+                    start_line: (index % 50) as i64 + 1,
+                    end_line: (index % 50) as i64 + 1,
+                    properties_json: format!(
+                        r#"{{"language":"rust","source_snippet":"fn symbol_{index:03}(x: i32) -> i32 {{ x + {generation} }}","signature":"fn symbol_{index:03}(x: i32) -> i32","return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+                    ),
+                    node_vector: None,
+                    cx_id: None,
+                    structural: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        let mut edge_id = 1_i64;
+        for source in 0..CRASH_DELTA_SYMBOLS {
+            for offset in 1..=CRASH_DELTA_EDGES_PER_SYMBOL {
+                let target = (source + offset * 7) % CRASH_DELTA_SYMBOLS;
+                let local_name = format!("dep_{target:03}");
+                edges.push(crate::CbmGraphEdge {
+                    sqlite_edge_id: edge_id,
+                    project: CRASH_DELTA_PROJECT.to_string(),
+                    source_node_id: source as i64 + 1,
+                    target_node_id: target as i64 + 1,
+                    src: None,
+                    dst: None,
+                    edge_type: "IMPORTS".to_string(),
+                    local_name_gen: local_name.clone(),
+                    weight: 1.0,
+                    properties_json: format!(
+                        r#"{{"local_name":"{local_name}","ordinal":{offset}}}"#
+                    ),
+                });
+                edge_id += 1;
+            }
+        }
+        crate::CbmGraphSnapshot {
+            project: CRASH_DELTA_PROJECT.to_string(),
+            panel_version: Some(7),
+            projects: Vec::new(),
+            nodes,
+            edges,
+            file_hashes: Vec::new(),
+            project_summaries: Vec::new(),
+            token_vectors: Vec::new(),
+        }
+    }
+
+    /// Series registry OFF so the delta is exactly ONE atomic group commit; a
+    /// series batch would append a second, independent commit and blur the
+    /// pre/post boundary this test asserts.
+    #[cfg(feature = "crash-fsv-tests")]
+    fn crash_delta_options(commit: &str) -> crate::SqliteImportOptions {
+        crate::SqliteImportOptions::new(CRASH_DELTA_PROJECT, commit, 7).with_workers(1)
+    }
+
+    /// Independent readback of persisted state: (qualified_name -> CxId string)
+    /// for every live symbol in the crash-delta project.
+    #[cfg(feature = "crash-fsv-tests")]
+    fn crash_delta_cx_map<C: Clock>(vault: &AsterVault<C>) -> BTreeMap<String, String> {
+        crate::read_cbm_graph_snapshot(vault, CRASH_DELTA_PROJECT)
+            .expect("read crash-delta graph")
+            .nodes
+            .into_iter()
+            .map(|node| {
+                (
+                    node.qualified_name,
+                    node.cx_id.map(|cx| cx.to_string()).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "crash-fsv-tests")]
+    #[test]
+    fn kill_mid_delta_recovers_to_consistent_pre_or_post_state() {
+        let root = test_dir("kill-mid-delta");
+        let vault_dir = root.join("vault");
+        let marker = root.join("after-wal.marker");
+        fs::create_dir_all(&root).expect("create crash-delta FSV root");
+
+        // 1. Parent commits the initial (pre-delta) generation durably, then
+        //    releases the vault so the crash child can open it.
+        {
+            let vault = AsterVault::new_durable(
+                &vault_dir,
+                vault_id(),
+                CRASH_DELTA_SALT,
+                VaultOptions::default(),
+            )
+            .expect("open parent crash-delta vault");
+            let report = crate::import_cbm_graph_snapshot_to_vault_direct(
+                &crash_delta_snapshot(false),
+                [1; 32],
+                &vault,
+                &astrolabe_panel::FixtureSlotRuntime,
+                &crash_delta_options("crash-commit-1"),
+            )
+            .expect("initial crash-delta import");
+            assert_eq!(report.new_cx_ids, CRASH_DELTA_SYMBOLS);
+            vault.flush().expect("flush initial import");
+        }
+
+        // Snapshot the pre-delta state (before the crash) for the recovery
+        // comparison, then drop the handle.
+        let pre_cx_map;
+        let pre_edges;
+        {
+            let vault = AsterVault::new_durable(
+                &vault_dir,
+                vault_id(),
+                CRASH_DELTA_SALT,
+                VaultOptions::default(),
+            )
+            .expect("reopen parent vault for pre-state");
+            pre_cx_map = crash_delta_cx_map(&vault);
+            pre_edges = crate::read_cbm_graph_snapshot(&vault, CRASH_DELTA_PROJECT)
+                .expect("read pre edges")
+                .edges
+                .len();
+            let pre_chain = verify_chain(&vault).expect("verify pre chain");
+            assert_eq!(pre_chain.status, "intact");
+            assert_eq!(pre_chain.ledger_rows, 1);
+        }
+        let changed_qn = format!("{CRASH_DELTA_PROJECT}.symbol_{CRASH_DELTA_CHANGED_INDEX:03}");
+        let old_changed_cx = pre_cx_map[&changed_qn].clone();
+
+        // 2. Spawn the child that performs the delta import and parks at the
+        //    post-WAL-append failpoint; kill it mid-commit.
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("ledger_verify::tests::crash_mid_delta_child")
+            .arg("--nocapture")
+            .env("ASTROLABE_CRASH_FSV_CHILD", "1")
+            .env("ASTROLABE_CRASH_FSV_VAULT", &vault_dir)
+            .env("CALYX_ASTER_CRASH_FSV_AFTER_WAL_APPEND_MARKER", &marker)
+            .spawn()
+            .expect("spawn crash-delta child");
+        wait_for_marker_or_child_exit(&marker, &mut child);
+        child.kill().expect("kill crash-delta child");
+        let status = child.wait().expect("wait for crash-delta child");
+        assert!(!status.success(), "child should be killed mid-delta-commit");
+
+        // 3. Reopen and read back persisted state. The chain must be intact and
+        //    the graph must be one of the two fully-consistent states.
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            CRASH_DELTA_SALT,
+            VaultOptions::default(),
+        )
+        .expect("reopen crashed crash-delta vault");
+        let chain = verify_chain(&reopened).expect("verify recovered chain");
+        assert_eq!(
+            chain.status, "intact",
+            "recovered ledger chain must be intact"
+        );
+
+        let recovered_cx_map = crash_delta_cx_map(&reopened);
+        let recovered_edges = crate::read_cbm_graph_snapshot(&reopened, CRASH_DELTA_PROJECT)
+            .expect("read recovered edges")
+            .edges
+            .len();
+
+        // Never torn: the same symbol set, the same edge count, in either state.
+        assert_eq!(
+            recovered_cx_map.keys().collect::<Vec<_>>(),
+            pre_cx_map.keys().collect::<Vec<_>>(),
+            "recovered symbol set diverged (torn add/remove)"
+        );
+        assert_eq!(recovered_edges, pre_edges, "recovered edge count diverged");
+
+        eprintln!(
+            "CRASH_MID_DELTA_FSV recovered_state={} ledger_rows={} symbols={} edges={}",
+            if recovered_cx_map == pre_cx_map {
+                "pre-delta"
+            } else {
+                "post-delta"
+            },
+            chain.ledger_rows,
+            recovered_cx_map.len(),
+            recovered_edges
+        );
+        if recovered_cx_map == pre_cx_map {
+            // Pre-delta recovery: the delta group commit did not become durable.
+            assert_eq!(
+                chain.ledger_rows, 1,
+                "pre-delta recovery must show 1 ledger row"
+            );
+        } else {
+            // Post-delta recovery: EXACTLY the changed symbol advanced to a new
+            // CxId; every other symbol is byte-identical to the pre-state.
+            assert_eq!(
+                chain.ledger_rows, 2,
+                "post-delta recovery must show 2 ledger rows"
+            );
+            let mut differing = recovered_cx_map
+                .iter()
+                .filter(|(qn, cx)| pre_cx_map.get(*qn) != Some(*cx))
+                .map(|(qn, _)| qn.clone())
+                .collect::<Vec<_>>();
+            differing.sort();
+            assert_eq!(
+                differing,
+                vec![changed_qn.clone()],
+                "post-delta recovery must change exactly the one delta symbol"
+            );
+            assert_ne!(
+                recovered_cx_map[&changed_qn], old_changed_cx,
+                "the delta symbol must carry its new CxId post-recovery"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "crash-fsv-tests")]
+    #[test]
+    #[ignore = "child process helper for kill_mid_delta_recovers_to_consistent_pre_or_post_state"]
+    fn crash_mid_delta_child() {
+        if std::env::var_os("ASTROLABE_CRASH_FSV_CHILD").is_none() {
+            return;
+        }
+        let vault_dir =
+            std::env::var_os("ASTROLABE_CRASH_FSV_VAULT").expect("ASTROLABE_CRASH_FSV_VAULT");
+        let vault = AsterVault::new_durable(
+            PathBuf::from(vault_dir),
+            vault_id(),
+            CRASH_DELTA_SALT,
+            VaultOptions::default(),
+        )
+        .expect("open child crash-delta vault");
+        // The delta import performs its single atomic group commit here; the
+        // post-WAL-append failpoint parks the process inside that write, after
+        // the WAL is durable but before this call returns.
+        crate::import_cbm_graph_snapshot_to_vault_direct(
+            &crash_delta_snapshot(true),
+            [2; 32],
+            &vault,
+            &astrolabe_panel::FixtureSlotRuntime,
+            &crash_delta_options("crash-commit-2"),
+        )
+        .expect("crash failpoint should pause during delta group commit");
+        panic!("crash FSV delta failpoint did not pause");
+    }
 }
