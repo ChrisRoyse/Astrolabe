@@ -2755,6 +2755,221 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ── #252: worker subprocess inherits the FFI store override via CBM_CACHE_DIR ─
+
+    // libcbm-only symbols (ASTRO_ENV_STORE): the spawn-time env propagation the
+    // index supervisor applies before re-exec'ing `<self> cli --index-worker`.
+    // Not in the bindgen surface (bindgen does not define ASTRO_ENV_STORE), so
+    // they are declared here directly; they link out of libcbm.a like the other
+    // cbm_index_supervisor_* symbols the bridge already calls.
+    unsafe extern "C" {
+        fn cbm_index_worker_store_env_push(
+            prior_out: *mut ::std::os::raw::c_char,
+            prior_cap: usize,
+            had_prior: *mut ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int;
+        fn cbm_index_worker_store_env_pop(
+            pushed: ::std::os::raw::c_int,
+            had_prior: ::std::os::raw::c_int,
+            prior: *const ::std::os::raw::c_char,
+        );
+    }
+
+    /// Read `CBM_CACHE_DIR` from the C runtime `environ` the way libcbm's resolver
+    /// (and any spawned worker child, which inherits it) does — NOT via
+    /// `std::env::var`, which reads the Win32 block that #240 proved diverges from
+    /// the CRT `environ` `cbm_safe_getenv` walks.
+    fn crt_cbm_cache_dir() -> Option<String> {
+        let mut buf = [0 as ::std::os::raw::c_char; 4096];
+        // NULL fallback → NULL return when the variable is unset.
+        let p = unsafe {
+            cbm_sys::cbm_safe_getenv(
+                c"CBM_CACHE_DIR".as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                ptr::null(),
+            )
+        };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        }
+    }
+
+    /// Child probe (#252): exercises `cbm_index_worker_store_env_push/_pop` — the
+    /// exact spawn-time round-trip the index supervisor runs before it forks a
+    /// worker — and reads the propagated value back out of the C `environ` a worker
+    /// would inherit. Runs in its own process because the FFI override AND
+    /// `CBM_CACHE_DIR` are process-global; a sibling test in the shared runner must
+    /// never see them (the same isolation the #240/#241 probes use).
+    #[test]
+    #[ignore = "spawned as a subprocess by worker_subprocess_inherits_ffi_store_override"]
+    fn worker_store_env_child_probe() {
+        let store_a = PathBuf::from(std::env::var("ASTRO_WORKER_STORE_A").expect("parent sets A"));
+        let store_b = PathBuf::from(std::env::var("ASTRO_WORKER_STORE_B").expect("parent sets B"));
+        let a = store_a.to_string_lossy().into_owned();
+        let b = store_b.to_string_lossy().into_owned();
+        assert_ne!(a, b, "the two sandbox stores must differ");
+        cbm_sys::initialize_allocator_bindings_first();
+
+        let mut prior = [0 as ::std::os::raw::c_char; 4096];
+        let mut had_prior: ::std::os::raw::c_int = -1;
+
+        // (empty-input edge) No override configured: propagation is a no-op and the
+        // child's store resolution is byte-identical to before — CBM_CACHE_DIR stays
+        // absent, so a worker would fall through to $HOME exactly as it does today.
+        unsafe { cbm_sys::cbm_astro_clear_cache_dir() };
+        assert!(
+            crt_cbm_cache_dir().is_none(),
+            "fixture precondition: CBM_CACHE_DIR must start unset"
+        );
+        let pushed = unsafe {
+            cbm_index_worker_store_env_push(prior.as_mut_ptr(), prior.len(), &mut had_prior)
+        };
+        assert_eq!(
+            pushed, 0,
+            "no override → push must report nothing propagated"
+        );
+        assert_eq!(had_prior, 0, "no override → no prior captured");
+        assert!(
+            crt_cbm_cache_dir().is_none(),
+            "no override must leave CBM_CACHE_DIR untouched"
+        );
+        unsafe { cbm_index_worker_store_env_pop(pushed, had_prior, prior.as_ptr()) };
+        assert!(
+            crt_cbm_cache_dir().is_none(),
+            "pop of a no-op must stay a no-op"
+        );
+
+        // (normal case) Override active, no prior CBM_CACHE_DIR: push writes the
+        // override into the CRT environ a worker inherits, and pop clears it back to
+        // absent. This is the exact byte a spawned worker resolves its store from.
+        let store_a_c = CString::new(a.clone()).expect("store A cstring");
+        assert_eq!(
+            unsafe { cbm_sys::cbm_astro_set_cache_dir(store_a_c.as_ptr()) },
+            0,
+            "libcbm accepts sandbox store A as the FFI override"
+        );
+        let pushed = unsafe {
+            cbm_index_worker_store_env_push(prior.as_mut_ptr(), prior.len(), &mut had_prior)
+        };
+        assert_eq!(pushed, 1, "an active override must be propagated");
+        assert_eq!(had_prior, 0, "no pre-existing CBM_CACHE_DIR → no prior");
+        assert_eq!(
+            crt_cbm_cache_dir().as_deref(),
+            Some(a.as_str()),
+            "the worker-inherited CBM_CACHE_DIR must be the configured override, \
+             never the operator's $HOME/.cache"
+        );
+        unsafe { cbm_index_worker_store_env_pop(pushed, had_prior, prior.as_ptr()) };
+        assert!(
+            crt_cbm_cache_dir().is_none(),
+            "pop with no prior must restore CBM_CACHE_DIR to absent (never leave a global)"
+        );
+
+        // (boundary case) A pre-existing CBM_CACHE_DIR must be captured and restored
+        // byte-exact: the propagation window is strictly this one spawn. Seed the
+        // CRT prior by pushing override A and leaving it set, then push override B
+        // over it and prove the pop puts A back.
+        let pushed_seed = unsafe {
+            cbm_index_worker_store_env_push(prior.as_mut_ptr(), prior.len(), &mut had_prior)
+        };
+        assert_eq!(pushed_seed, 1, "seed push propagates override A");
+        assert_eq!(
+            crt_cbm_cache_dir().as_deref(),
+            Some(a.as_str()),
+            "CRT prior is now A"
+        );
+
+        let store_b_c = CString::new(b.clone()).expect("store B cstring");
+        assert_eq!(
+            unsafe { cbm_sys::cbm_astro_set_cache_dir(store_b_c.as_ptr()) },
+            0,
+            "libcbm accepts sandbox store B as the FFI override"
+        );
+        let mut prior_b = [0 as ::std::os::raw::c_char; 4096];
+        let mut had_prior_b: ::std::os::raw::c_int = -1;
+        let pushed_b = unsafe {
+            cbm_index_worker_store_env_push(prior_b.as_mut_ptr(), prior_b.len(), &mut had_prior_b)
+        };
+        assert_eq!(pushed_b, 1, "override B must be propagated over the prior");
+        assert_eq!(
+            had_prior_b, 1,
+            "the pre-existing A must be captured as prior"
+        );
+        let captured = unsafe { CStr::from_ptr(prior_b.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(captured, a, "captured prior must be exactly store A");
+        assert_eq!(
+            crt_cbm_cache_dir().as_deref(),
+            Some(b.as_str()),
+            "during the B spawn the worker inherits B, not A"
+        );
+        unsafe { cbm_index_worker_store_env_pop(pushed_b, had_prior_b, prior_b.as_ptr()) };
+        assert_eq!(
+            crt_cbm_cache_dir().as_deref(),
+            Some(a.as_str()),
+            "pop must restore the pre-existing CBM_CACHE_DIR (A) byte-exact"
+        );
+
+        // Leave the process clean-ish (it exits immediately anyway).
+        unsafe { cbm_index_worker_store_env_pop(pushed_seed, 0, ptr::null()) };
+        unsafe { cbm_sys::cbm_astro_clear_cache_dir() };
+        println!("worker-store env round-trip passed: A={a} B={b}");
+    }
+
+    /// FSV for #252: a spawned index worker inherits its store from the host's
+    /// in-process FFI override (`cbm_astro_set_cache_dir`) — which is process-local
+    /// and invisible to the child — because the supervisor propagates it through the
+    /// #240-sanctioned `CBM_CACHE_DIR` env channel around the spawn, then restores
+    /// the parent's environment exactly. Without this a worker would resolve its own
+    /// store from `$HOME` and leak its DB/scratch into `~/.cache`.
+    ///
+    /// Source of truth: the value `cbm_safe_getenv` (the C `environ` accessor the
+    /// worker child inherits) returns for `CBM_CACHE_DIR` at each phase of the
+    /// push/pop the supervisor runs — read back independently in a child process.
+    #[test]
+    fn worker_subprocess_inherits_ffi_store_override() {
+        let dir = temp_dir("worker-store-override");
+        let store_a = dir.join("store-a");
+        let store_b = dir.join("store-b");
+        std::fs::create_dir_all(&store_a).expect("create sandbox store A");
+        std::fs::create_dir_all(&store_b).expect("create sandbox store B");
+        let test_home = sandbox_home("worker-store-home");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args([
+                "--exact",
+                "tests::worker_store_env_child_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRO_WORKER_STORE_A", &store_a)
+            .env("ASTRO_WORKER_STORE_B", &store_b)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home);
+        // The parent must not carry a CBM_CACHE_DIR into the child: the first
+        // sub-case asserts the child starts with it unset.
+        command.env_remove("CBM_CACHE_DIR");
+        let output = command.output().expect("spawn the worker-store probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "worker-store override probe failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("worker-store env round-trip passed"),
+            "probe did not run its assertions:\n{stdout}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── #241: fail-closed environment truncation + unresolvable store ───────
 
     /// Child probe (#241): a real inherited env var longer than the store buffer

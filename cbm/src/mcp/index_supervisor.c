@@ -10,6 +10,17 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
+#ifdef ASTRO_ENV_STORE
+/* #252: the in-process FFI store override (cbm_astro_set_cache_dir) that
+ * cbm_resolve_cache_dir() consults is process-local — it is NOT inherited across
+ * the boundary to a spawned index worker, which resolves its own store fresh. We
+ * propagate the configured store to the child through the #240-sanctioned
+ * CBM_CACHE_DIR env channel. Only compiled into libcbm (where ASTRO_ENV_STORE is
+ * defined and -I$(ASTROLABE_PATCH_DIR) is on the include path); the CRT test build
+ * does not define ASTRO_ENV_STORE, exactly like platform.c's guarded include. */
+#include "env_store_config.h" /* cbm_astro_cache_dir_override, cbm_astro_env_record_fault */
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -182,6 +193,84 @@ static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffi
     }
 }
 
+#ifdef ASTRO_ENV_STORE
+/* #252: propagate any active in-process FFI store override
+ * (cbm_astro_set_cache_dir) into the environment a spawned index worker will
+ * inherit. The override is process-local and is NOT visible to the child, which
+ * resolves its own store fresh (cbm_resolve_cache_dir consults CBM_CACHE_DIR
+ * after the in-process override — and the child has no in-process override).
+ * Without this the child would fall through to $HOME and leak its DB/scratch
+ * into $HOME/.cache whenever the host has redirected the store.
+ *
+ * Extracted from cbm_index_spawn_worker so the round-trip is directly verifiable:
+ * the value it writes is the real CRT `environ` state the child inherits,
+ * readable through cbm_safe_getenv — the exact accessor libcbm's resolver uses.
+ * The parent's own resolution is unperturbed: cbm_resolve_cache_dir consults the
+ * higher-precedence in-process override first, so this transient CBM_CACHE_DIR
+ * write is invisible to the parent and is restored by the matching pop.
+ *
+ * Return  1: override active → CBM_CACHE_DIR set to it; caller MUST pop.
+ *         0: no override active → environment untouched; nothing to pop.
+ *        -1: override active but the env write failed → FAIL CLOSED (a labeled
+ *            fault is recorded); the caller must refuse to spawn, because the
+ *            worker would resolve a DIFFERENT store than the host configured.
+ * On a return of 1, *had_prior / prior_out capture any pre-existing CBM_CACHE_DIR
+ * so the matching pop restores it exactly (never a persistent global mutation). */
+int cbm_index_worker_store_env_push(char *prior_out, size_t prior_cap, int *had_prior) {
+    if (had_prior) {
+        *had_prior = 0;
+    }
+    if (prior_out && prior_cap) {
+        prior_out[0] = '\0';
+    }
+    const char *store_override = cbm_astro_cache_dir_override();
+    if (!store_override) {
+        return 0; /* production default today: no override, nothing to propagate */
+    }
+    /* Capture any pre-existing CBM_CACHE_DIR before we overwrite it: cbm_setenv
+     * (_putenv_s/setenv) below may invalidate the pointer getenv would return. */
+    char probe[CBM_ASTRO_STORE_PATH_CAP] = {0};
+    const char *prior = cbm_safe_getenv("CBM_CACHE_DIR", probe, sizeof(probe), NULL);
+    if (prior && prior[0]) {
+        if (prior_out && prior_cap) {
+            snprintf(prior_out, prior_cap, "%s", prior);
+        }
+        if (had_prior) {
+            *had_prior = 1;
+        }
+    }
+    if (cbm_setenv("CBM_CACHE_DIR", store_override, 1) != 0) {
+        /* Fail closed: do not spawn a worker that would resolve a DIFFERENT store
+         * than the one the host configured. The caller degrades in-process, where
+         * the resolver honors the in-process override directly. */
+        cbm_astro_env_record_fault(
+            "CBM_E_WORKER_STORE_PROPAGATION", "CBM_CACHE_DIR",
+            "failed to propagate the configured CBM store override to the index-worker "
+            "subprocess environment; refusing to spawn a worker that would resolve a "
+            "different store (its DB/scratch would leak into the default $HOME/.cache)",
+            "Ensure the process environment is writable (setenv/_putenv_s must succeed), "
+            "or index in-process without a spawned worker; the in-process path honors the "
+            "cbm_astro_set_cache_dir override directly.");
+        return -1;
+    }
+    return 1;
+}
+
+/* Reverse cbm_index_worker_store_env_push: restore CBM_CACHE_DIR to exactly the
+ * state found before the spawn. `pushed` is that function's return; a value other
+ * than 1 means nothing was propagated and this is a no-op. */
+void cbm_index_worker_store_env_pop(int pushed, int had_prior, const char *prior) {
+    if (pushed != 1) {
+        return; /* no override was propagated → nothing to restore */
+    }
+    if (had_prior && prior) {
+        cbm_setenv("CBM_CACHE_DIR", prior, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+}
+#endif /* ASTRO_ENV_STORE */
+
 int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
                            const char *quarantine_file, cbm_index_worker_result_t *result) {
     g_spawn_count++; /* test hook (#845) — see cbm_index_supervisor_spawn_count */
@@ -226,6 +315,21 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     argv[n++] = resp_path;
     argv[n] = NULL;
 
+#ifdef ASTRO_ENV_STORE
+    /* #252: propagate an active in-process FFI store override into the worker's
+     * inherited environment (see cbm_index_worker_store_env_push above). Fail
+     * closed on a propagation failure rather than spawning a worker that would
+     * resolve a different store and leak its DB/scratch into $HOME/.cache. */
+    int had_prior_cache_dir = 0;
+    char prior_cache_dir[CBM_ASTRO_STORE_PATH_CAP] = {0};
+    int store_pushed = cbm_index_worker_store_env_push(prior_cache_dir, sizeof(prior_cache_dir),
+                                                       &had_prior_cache_dir);
+    if (store_pushed < 0) {
+        cbm_log_warn("index.supervisor.store_propagation_failed", "action", "degrade_in_process");
+        return -1;
+    }
+#endif
+
     /* Recovery-run probe knobs → inherited env for the child. Spawns are
      * sequential, so mutating the parent's environment around a single spawn is
      * safe. Set only the requested knobs; unset them all again after reaping so
@@ -262,6 +366,12 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     if (quarantine_file && quarantine_file[0]) {
         cbm_unsetenv("CBM_INDEX_QUARANTINE_FILE");
     }
+#ifdef ASTRO_ENV_STORE
+    /* #252: restore the parent's CBM_CACHE_DIR exactly as found — the propagation
+     * above is scoped strictly to this one spawn window (never a persistent global
+     * mutation). */
+    cbm_index_worker_store_env_pop(store_pushed, had_prior_cache_dir, prior_cache_dir);
+#endif
 
     if (run_rc != 0) {
         (void)remove(resp_path);
