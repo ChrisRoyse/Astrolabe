@@ -106,12 +106,16 @@ def write_manifest(
     pid_intervals: dict[int, list[tuple[int, int | None]]] | None = None,
     tree_pids: list[int] | None = None,
     written_at: int | None = None,
+    owned_paths_null: bool = False,
 ) -> None:
+    # #279: owned_paths_null emits an EXPLICIT JSON null (the launcher's fail-closed
+    # 'owned-path probe could not run' signal), distinct from an empty list (probe ran,
+    # found no our-tree store write). The gate must treat the two differently.
     manifest: dict = {
         "schema": "astrolabe.no_escape_attribution.v1",
         "launcher_pid": TREE_PID,
         "tree_pids": tree_pids if tree_pids is not None else [TREE_PID],
-        "owned_paths": [str(entry) for entry in owned_paths],
+        "owned_paths": None if owned_paths_null else [str(entry) for entry in owned_paths],
     }
     if run_started_ns is not None:
         manifest["run_started_unix_ns"] = run_started_ns
@@ -522,8 +526,84 @@ def main() -> int:
     print(f"  independent readback: {within} within skew of written_at, counted not policed")
     shutil.rmtree(within)
 
+    # ---- #279: owned-path probe fail-closed (owned_paths null -> unevaluable) ----
+
+    print("=== 18. PROBE FAILED (owned_paths=null): our-tree-class store delta -> RED unevaluable ===")
+    # The #279 residual made explicit. The CBM store files are not pid-named, so a
+    # non-pid store delta is attributed only by the launcher's owned-path probe. When
+    # that probe COULD NOT RUN the launcher records owned_paths as JSON null (not an
+    # empty list). A store delta then has no pid attribution AND no owned-path match,
+    # and the gate CANNOT prove it foreign -- calling it foreign would silently pass a
+    # #246-class store leak. It must POLICE it (ASTRO_NO_ESCAPE_OWNED_PATHS_UNEVALUABLE).
+    snapshot(paths)
+    now_ns = time.time_ns()
+    store_leak = paths["store"] / "leaked-project.db"
+    store_leak.write_text("our test registered a project, but the probe could not run\n", encoding="utf-8")
+    os.utime(store_leak, ns=(now_ns, now_ns))
+    null_manifest = paths["fixture"] / "attribution-owned-null.json"
+    write_manifest(
+        null_manifest,
+        owned_paths=[],
+        run_started_ns=now_ns - 120 * NS,  # in-window (not pre-run)
+        tree_pids=[TREE_PID],
+        pid_intervals={TREE_PID: [(now_ns - 120 * NS, None)]},
+        owned_paths_null=True,  # the probe FAILED
+    )
+    manifest_bytes = null_manifest.read_bytes()
+    print(f"  FSV manifest byte-readback: {manifest_bytes.decode('utf-8')}")
+    if b'"owned_paths": null' not in manifest_bytes and b'"owned_paths":null' not in manifest_bytes:
+        raise AssertionError(f"manifest did not encode owned_paths as JSON null:\n{manifest_bytes!r}")
+    result = verify(paths, null_manifest)
+    expect_red(result, store_leak.name, "owned_paths-null store delta")
+    if "ASTRO_NO_ESCAPE_OWNED_PATHS_UNEVALUABLE" not in (result.stdout + result.stderr):
+        raise AssertionError(f"unevaluable delta was not labeled:\n{result.stdout}\n{result.stderr}")
+    print("  FSV gate output (unevaluable label + RED):")
+    for line in (result.stdout + result.stderr).splitlines():
+        if "OWNED_PATHS_UNEVALUABLE" in line or "owned_paths_unevaluable" in line or "ASTRO_TEST_SANDBOX_ESCAPE" in line:
+            print(f"    {line}")
+    print(f"  gate exit code: {result.returncode}")
+    if not store_leak.is_file():
+        raise AssertionError("control vacuous: store leak absent on disk")
+    print(f"  independent readback: {store_leak} present, POLICED because the probe could not run")
+    store_leak.unlink()
+
+    print("=== 19. GUARD BOUND (probe RAN, empty): the SAME store delta is foreign -> counted ===")
+    # The dual of control 18: an IDENTICAL foreign store write, but the manifest now
+    # carries owned_paths as an empty LIST (probe ran, observed no our-tree store
+    # write). That is a positive 'not ours', so the delta stays counted -- proving it
+    # is the null specifically (probe could not run), not the store delta itself, that
+    # flips the gate to fail-closed. This is the #278 foreign-store-churn tolerance
+    # (DoD box 3: foreign store write with the probe active stays counted-not-policed).
+    snapshot(paths)
+    now_ns = time.time_ns()
+    foreign_store = paths["store"] / "another-mcp-server.db"
+    foreign_store.write_text("a concurrent MCP server's registration\n", encoding="utf-8")
+    os.utime(foreign_store, ns=(now_ns, now_ns))
+    ran_manifest = paths["fixture"] / "attribution-owned-empty.json"
+    write_manifest(
+        ran_manifest,
+        owned_paths=[],  # probe RAN, found no our-tree store write
+        run_started_ns=now_ns - 120 * NS,
+        tree_pids=[TREE_PID],
+        pid_intervals={TREE_PID: [(now_ns - 120 * NS, None)]},
+    )
+    manifest_bytes = ran_manifest.read_bytes()
+    if b'"owned_paths": []' not in manifest_bytes and b'"owned_paths":[]' not in manifest_bytes:
+        raise AssertionError(f"manifest did not encode owned_paths as an empty list:\n{manifest_bytes!r}")
+    result = verify(paths, ran_manifest)
+    expect_clean(result, "probe-active foreign store churn")
+    if "ASTRO_NO_ESCAPE_OWNED_PATHS_UNEVALUABLE" in (result.stdout + result.stderr):
+        raise AssertionError(f"probe-active empty owned_paths wrongly flagged unevaluable:\n{result.stdout}")
+    if foreign_store.name in result.stderr:
+        raise AssertionError(f"probe-active foreign store delta was policed:\n{result.stderr}")
+    print(f"  independent readback: {foreign_store} counted (probe ran, empty owned_paths), not policed")
+    foreign_store.unlink()
+
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print("no-escape attribution control passed: causal, windowed, instance-lifetime-aware (#278)")
+    print(
+        "no-escape attribution control passed: causal, windowed, instance-lifetime-aware (#278), "
+        "owned-path probe fail-closed (#279)"
+    )
     return 0
 
 

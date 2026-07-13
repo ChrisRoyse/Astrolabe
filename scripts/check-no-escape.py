@@ -157,9 +157,24 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
             "the launcher writes integer PIDs; regenerate the manifest",
             {"error": str(exc)},
         )
-    owned_paths = {
-        os.path.normcase(os.path.abspath(str(entry))) for entry in data.get("owned_paths", [])
-    }
+    # #279: the launcher's owned-path probe distinguishes THREE states, and the
+    # difference is load-bearing (it decides fail-open vs fail-closed on the CBM
+    # store). A JSON list (possibly empty) means the probe RAN: the store paths a
+    # tree process was observed holding open, so an empty list is a positive "our
+    # tree touched no store path". Explicit JSON null means the probe COULD NOT RUN
+    # (Restart-Manager/handle enumeration unavailable): the gate then cannot prove a
+    # store delta foreign and must fail closed (OWNED_PATHS_UNEVALUABLE), never treat
+    # an unknown as an empty clean set. A MISSING key (older recorder / the `run`
+    # subcommand's captured-tree attribution, which sets owned_paths to a real set)
+    # degrades to the empty-evaluated set -- backward compatible, and never null,
+    # because those producers are authoritative about their own writes.
+    raw_owned = data.get("owned_paths", [])
+    owned_paths_probe_failed = raw_owned is None
+    owned_paths = (
+        set()
+        if raw_owned is None
+        else {os.path.normcase(os.path.abspath(str(entry))) for entry in raw_owned}
+    )
     run_started = data.get("run_started_unix_ns")
     if run_started is not None:
         try:
@@ -240,6 +255,7 @@ def load_attribution(path: Path | None) -> dict[str, Any] | None:
         "pid_first_seen": pid_first_seen,
         "pid_intervals": pid_intervals,
         "owned_paths": owned_paths,
+        "owned_paths_probe_failed": owned_paths_probe_failed,
     }
 
 
@@ -253,10 +269,19 @@ STALE_DIR_MTIME = "stale_dir_mtime"
 # throttled recorder may not have observed the leaking process yet, so a FOREIGN
 # classification cannot be trusted -- policed (RED), never silently counted.
 STALE_MANIFEST = "stale_manifest"
+# #279: an ATTRIBUTED-root (CBM store) delta the launcher's owned-path probe could
+# not evaluate. The store files are not pid-named, so a non-pid-attributable store
+# delta is classified OURS-or-FOREIGN only by the launcher's causal probe over the
+# recorded tree (open-handle enumeration written into owned_paths). When that probe
+# FAILED (owned_paths recorded as JSON null, not an empty list), the gate cannot tell
+# an our-tree #246-class store write from a concurrent MCP server's write, so calling
+# it FOREIGN would be a SILENT FALLBACK to green. It is POLICED (RED), fail-closed.
+OWNED_PATHS_UNEVALUABLE = "owned_paths_unevaluable"
 
 # Verdicts that POLICE the delta (fail the build). Every other verdict is counted
-# and labeled, never used to fail. STALE_MANIFEST joins OURS on the fail-closed side.
-POLICED_VERDICTS = frozenset({OURS, STALE_MANIFEST})
+# and labeled, never used to fail. STALE_MANIFEST and OWNED_PATHS_UNEVALUABLE join
+# OURS on the fail-closed side.
+POLICED_VERDICTS = frozenset({OURS, STALE_MANIFEST, OWNED_PATHS_UNEVALUABLE})
 
 
 def classify_causal_delta(
@@ -268,6 +293,7 @@ def classify_causal_delta(
     attribution: dict[str, Any],
     skew_ns: int,
     run_started_ns: int | None,
+    is_attributed: bool = False,
 ) -> str:
     """Classify a shared-root delta: OURS (policed) or a counted-not-policed verdict.
 
@@ -382,6 +408,17 @@ def classify_causal_delta(
     written_at = attribution.get("written_at")
     if entry_ts is not None and written_at is not None and entry_ts > written_at + skew_ns:
         return STALE_MANIFEST
+    # #279 OWNED-PATHS UNEVALUABLE: an ATTRIBUTED root (the CBM store) whose files are
+    # not pid-named relies on the launcher's owned-path probe to attribute a non-pid
+    # store delta. When that probe could not run (owned_paths=null), we reach this
+    # tail with no pid attribution and no owned-path match -- and we CANNOT trust
+    # 'foreign', because the probe that would have caught an our-tree store write did
+    # not execute. Fail closed: POLICE it. This never fires for `signature` roots
+    # (pid-named dir convention makes attribution self-describing) nor when the probe
+    # ran (owned_paths is a list, even if empty), and PRE_RUN / STALE_DIR_MTIME above
+    # already excused deltas that causality proves are not ours regardless of the probe.
+    if is_attributed and attribution.get("owned_paths_probe_failed"):
+        return OWNED_PATHS_UNEVALUABLE
     if saw_pid_instance_mismatch:
         return PID_INSTANCE
     return FOREIGN
@@ -797,6 +834,7 @@ def diff_roots(
     escapes: list[dict[str, Any]] = []
     counted: dict[str, int] = {FOREIGN: 0, PRE_RUN: 0, PID_INSTANCE: 0, STALE_DIR_MTIME: 0}
     stale_manifest_hits = 0
+    owned_paths_unevaluable_hits = 0
     before_by_name = {root["name"]: root for root in before["roots"]}
     for root in after["roots"]:
         prior = before_by_name.get(root["name"])
@@ -809,6 +847,7 @@ def diff_roots(
         if not root["resolved"]:
             continue
         causal = root["mode"] in ("signature", "attributed")
+        is_attributed = root["mode"] == "attributed"
         prior_entries = prior["entries"]
         entries = root["entries"]
         changes: list[tuple[str, str, list[Any] | None, list[Any] | None]] = []
@@ -837,6 +876,7 @@ def diff_roots(
                         attribution,
                         skew_ns,
                         run_started_ns,
+                        is_attributed,
                     )
                 if verdict not in POLICED_VERDICTS:
                     counted[verdict] += 1
@@ -850,6 +890,13 @@ def diff_roots(
                         f"  POLICED[stale_manifest] {change:<8} [{root['name']}] {abspath} "
                         "(delta postdates the attribution manifest's flush; the recorder had "
                         "not observed the writer, so 'foreign' cannot be trusted -- failing RED)"
+                    )
+                elif verdict == OWNED_PATHS_UNEVALUABLE:
+                    owned_paths_unevaluable_hits += 1
+                    print(
+                        f"  POLICED[owned_paths_unevaluable] {change:<8} [{root['name']}] {abspath} "
+                        "(attributed CBM-store delta with no pid attribution and a FAILED owned-path "
+                        "probe; the gate cannot prove it foreign, so it fails closed -- RED)"
                     )
             record: dict[str, Any] = {
                 "root": root["name"],
@@ -869,6 +916,18 @@ def diff_roots(
             "remediation: ensure the launcher's tree recorder flushed after the run (a healthy "
             "recorder rewrites within the skew margin); a persistently stale manifest means the "
             "recorder died mid-run -- restart the run so attribution is complete."
+        )
+    if owned_paths_unevaluable_hits:
+        print(
+            f"ERROR[ASTRO_NO_ESCAPE_OWNED_PATHS_UNEVALUABLE]: {owned_paths_unevaluable_hits} "
+            "attributed CBM-store delta(s) could not be attributed because the launcher's "
+            "owned-path probe did not run (owned_paths recorded as null). The store files are "
+            "not pid-named, so the gate cannot tell an our-tree #246-class registration from a "
+            "concurrent MCP server's write and refuses to classify them foreign. They are "
+            "POLICED (fail-closed). remediation: run under the launcher on a host where the "
+            "owned-path probe (Restart-Manager/handle enumeration over the recorded tree) can "
+            "run so owned_paths is a real list; a persistent null means the probe is "
+            "unavailable in this environment and attributed roots cannot be proven this run."
         )
     return escapes, counted
 
@@ -928,11 +987,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
             for _, last in spans
             if last is None
         )
+        owned_state = (
+            "PROBE FAILED (owned_paths=null -> attributed roots unevaluable, fail-closed)"
+            if attribution.get("owned_paths_probe_failed")
+            else f"{len(attribution['owned_paths'])} owned path(s)"
+        )
         print(
             f"INFO[ASTRO_NO_ESCAPE_ATTRIBUTION]: launcher_pid={attribution['launcher_pid']}, "
             f"{len(attribution['tree_pids'])} tree PID(s), "
             f"{interval_count} instance interval(s) ({open_count} open), "
-            f"{len(attribution['owned_paths'])} owned path(s), "
+            f"{owned_state}, "
             f"run_started_ns={run_started_ns}, written_at={attribution.get('written_at')}, "
             f"skew_ns={skew_ns} from {attribution['path']}"
         )
@@ -1171,6 +1235,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             "pid_first_seen": pid_first_seen,
             "pid_intervals": pid_intervals,
             "owned_paths": set(),
+            # #279: `run` captured the whole tree live and is authoritative about its
+            # own writes, so its empty owned_paths is a positive "no store write",
+            # never the fail-closed 'probe could not run' state.
+            "owned_paths_probe_failed": False,
         }
     skew_ns = skew_margin_ns(config)
     effective_run_started = resolve_run_started_ns(attribution, before)

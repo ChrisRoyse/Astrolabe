@@ -133,6 +133,14 @@ gate hazard-suite -- "$PYTHON_BIN" scripts/check-hazard-suite.py
 # #247/#197: native FSV of the shared launcher session-lock helper -- proves a live
 # foreign lock owner is refused and never stopped (fixture locks, not the live workspace).
 gate launcher-lock -- bash scripts/check-launcher-lock.sh
+# #279: native FSV of the no-escape attribution recorder's causal owned-path probe --
+# proves owned_paths is populated by attributing a held-open store file to its holder pid
+# (Restart-Manager backed, real handles), so an our-tree store write REDs the run-wide verify.
+gate attribution-owned-probe -- bash scripts/check-attribution-owned-probe.sh
+# #301: native FSV of the attribution manifest lifecycle -- proves dead-PID manifests are
+# swept at startup, a live-PID (concurrent session) manifest is inviolable (#197), and a
+# run removes its own manifest + .tmp sibling on exit (fixture dirs, not the live .tmp).
+gate attribution-manifest -- bash scripts/check-attribution-manifest.sh
 
 # ── #280 suite impact gate: the workspace block ──────────────────────────────
 #

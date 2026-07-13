@@ -146,6 +146,8 @@ DEPENDENCIES: dict[str, list[str]] = {
     "test-windows-gnu-toolchain-contract.py": [
         "scripts/check-windows-gnu-toolchain-contract.py",
         "scripts/windows-gnu-toolchain.ps1",
+        "scripts/launcher-lock.ps1",
+        "scripts/attribution-manifest.ps1",
     ],
     "test-native-aggregate-wrapper.py": [
         "scripts/check-native-aggregate-wrapper.py",
