@@ -251,8 +251,8 @@ static bool is_executable(const char *path) {
 #endif
 }
 
-/* Search for an executable named `name` in the PATH environment variable.
 #ifdef ASTRO_ENV_STORE
+/* Search for an executable named `name` in the PATH environment variable.
  * Returns the full path in `out` (max out_sz) if found, else empty string.
  *
  * #267: PATH is copied into a heap buffer sized to its actual length rather than
@@ -264,6 +264,7 @@ static bool is_executable(const char *path) {
  * portable: no GetEnvironmentVariableW, consistent with how CBM reads every other
  * variable, and the match is byte-identical (case-sensitive "PATH" + '='). */
 #else
+/* Search for an executable named `name` in the PATH environment variable.
  * Returns the full path in `out` (max out_sz) if found, else empty string. */
 #endif
 static bool find_in_path(const char *name, char *out, size_t out_sz) {

@@ -274,8 +274,8 @@ static bool git_is_dirty(const char *root_path) {
     }
 
 #if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
 #ifdef ASTRO_SPAWN
+    /* Check submodules: uncommitted changes inside a submodule are invisible
      * to the parent's git status. `git submodule foreach` runs its argument in
      * git's OWN shell inside each submodule; that argument is a compile-time
      * constant with no interpolation, so nothing from the environment reaches a
@@ -292,6 +292,7 @@ static bool git_is_dirty(const char *root_path) {
         watcher_log_spawn_failure("watcher.git_submodule_status.spawn_failed", &err);
         free(sub_data);
 #else
+    /* Check submodules: uncommitted changes inside a submodule are invisible
      * to the parent's git status. Use `git submodule foreach` as a portable
      * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
      * an inner shell command that cmd.exe cannot pass intact; the parent-repo
