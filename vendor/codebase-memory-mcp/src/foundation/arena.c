@@ -156,3 +156,4 @@ void cbm_arena_destroy(CBMArena *a) {
 size_t cbm_arena_total(const CBMArena *a) {
     return a->total_alloc;
 }
+// #280 warm-impacted proof probe (2026-07-13)
