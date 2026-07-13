@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+astrolabe-panel.workspace = true
+calyx-core.workspace = true
 sha2 = "0.10"
 
 [lib]

@@ -1,10 +1,36 @@
 use super::*;
 
+use astrolabe_guard::auto::{MeasuredSymbol, calibrate_auto, guard_slot_panel_sources};
 use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
 use astrolabe_guard::profile::{
     CONFORMAL_ALPHA, GUARD_PROFILE_SCHEMA, GuardProfile, GuardSlot, SlotCalibration,
     calibrate_slot, calibration_meta_payload_bytes, default_content_policy,
 };
+use astrolabe_panel::PanelDriver;
+
+/// Which population-source mode `guard_calibrate` runs in.
+///
+/// The mode is **declared**, never silently inferred into a fallback: `auto` derives
+/// per-slot cosine populations by scoring `sources` through the real panel, while
+/// `supplied` consumes operator-supplied `slots` cosine arrays. A panel failure in
+/// `auto` fails closed — it never reverts to the supplied path (standing invariant #3).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CalibrationMode {
+    Supplied,
+    Auto,
+}
+
+impl CalibrationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Supplied => "supplied",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// A fail-closed refusal carried out of a profile builder: `(code, message, remediation)`.
+type GuardRefusal = (String, String, String);
 
 /// Actor recorded on the guard calibration ledger entry.
 pub(crate) const GUARD_CALIBRATE_ACTOR: &str = "astrolabe-server-guard-calibrate";
@@ -79,62 +105,125 @@ pub(crate) fn guard_calibrate_at(
         .map(|value| value as f32)
         .unwrap_or(CONFORMAL_ALPHA);
 
-    let Some(slot_specs) = args_obj.get("slots").and_then(Value::as_array) else {
-        return guard_calibrate_refused(
-            "ASTRO_GUARD_CALIBRATE_INVALID",
-            "guard_calibrate requires a slots array",
-            "Provide one slot object per fixed guard slot with good_scores and bad_scores.",
-        );
+    // Declared mode selection: `auto` (score sources through the panel) vs
+    // `supplied` (operator cosine arrays). Ambiguity is refused, never guessed.
+    let mode = match resolve_calibration_mode(args_obj) {
+        Ok(mode) => mode,
+        Err((code, message, remediation)) => {
+            return guard_calibrate_refused_owned(&code, message, remediation);
+        }
     };
 
-    // Calibrate every fixed guard slot from its supplied score populations. A
-    // missing slot or a calibration failure refuses the whole run.
+    let profile = match mode {
+        CalibrationMode::Supplied => build_supplied_profile(args_obj, &domain, alpha),
+        CalibrationMode::Auto => build_auto_profile(args_obj, &domain, alpha),
+    };
+    let profile = match profile {
+        Ok(profile) => profile,
+        Err((code, message, remediation)) => {
+            return guard_calibrate_refused_owned(&code, message, remediation);
+        }
+    };
+
+    finalize_guard_calibration(cache_dir, project, &domain, profile, alpha, mode)
+}
+
+/// Resolve the declared calibration mode. An explicit `mode` field wins; otherwise
+/// the mode is inferred from exactly one of `slots`/`sources` being present. Both or
+/// neither present is a fail-closed ambiguity (never a silent default).
+fn resolve_calibration_mode(args_obj: &Map<String, Value>) -> Result<CalibrationMode, GuardRefusal> {
+    let has_slots = args_obj.get("slots").and_then(Value::as_array).is_some();
+    let has_sources = args_obj.get("sources").and_then(Value::as_array).is_some();
+    match args_obj.get("mode").and_then(Value::as_str) {
+        Some("supplied") => Ok(CalibrationMode::Supplied),
+        Some("auto") => Ok(CalibrationMode::Auto),
+        Some(other) => Err((
+            "ASTRO_GUARD_CALIBRATE_MODE_INVALID".to_string(),
+            format!("guard_calibrate mode `{other}` is not recognized"),
+            "Pass mode \"auto\" (score sources through the panel) or \"supplied\" (operator cosine arrays).".to_string(),
+        )),
+        None => match (has_slots, has_sources) {
+            (true, false) => Ok(CalibrationMode::Supplied),
+            (false, true) => Ok(CalibrationMode::Auto),
+            (true, true) => Err((
+                "ASTRO_GUARD_CALIBRATE_MODE_AMBIGUOUS".to_string(),
+                "guard_calibrate received both slots and sources; the mode is ambiguous".to_string(),
+                "Declare mode \"auto\" or \"supplied\", or pass only sources (auto) or only slots (supplied).".to_string(),
+            )),
+            (false, false) => Err((
+                "ASTRO_GUARD_CALIBRATE_MODE_MISSING".to_string(),
+                "guard_calibrate requires either sources (auto) or slots (supplied)".to_string(),
+                "Pass sources with mode \"auto\", or slots with mode \"supplied\".".to_string(),
+            )),
+        },
+    }
+}
+
+/// Build a guard profile from operator-supplied per-slot cosine arrays (the wave-9
+/// path). A missing slot or a per-slot calibration failure refuses the whole run.
+fn build_supplied_profile(
+    args_obj: &Map<String, Value>,
+    domain: &CalibrationDomain,
+    alpha: f32,
+) -> Result<GuardProfile, GuardRefusal> {
+    let Some(slot_specs) = args_obj.get("slots").and_then(Value::as_array) else {
+        return Err((
+            "ASTRO_GUARD_CALIBRATE_INVALID".to_string(),
+            "guard_calibrate (supplied mode) requires a slots array".to_string(),
+            "Provide one slot object per fixed guard slot with good_scores and bad_scores.".to_string(),
+        ));
+    };
+
     let mut calibrations: Vec<SlotCalibration> = Vec::with_capacity(GuardSlot::ALL.len());
     for slot in GuardSlot::ALL {
         let Some(spec) = slot_specs.iter().find(|spec| {
             spec.get("slot").and_then(Value::as_str) == Some(slot.as_str())
         }) else {
-            return guard_calibrate_refused_owned(
-                "ASTRO_GUARD_CALIBRATE_SLOT_MISSING",
+            return Err((
+                "ASTRO_GUARD_CALIBRATE_SLOT_MISSING".to_string(),
                 format!("slots is missing required guard slot `{}`", slot.as_str()),
                 "Supply a slot object for every fixed guard slot before calibrating.".to_string(),
-            );
+            ));
         };
-        let good_scores = match parse_scores(spec, "good_scores", slot) {
-            Ok(scores) => scores,
-            Err((code, message, remediation)) => {
-                return guard_calibrate_refused_owned(code, message, remediation);
-            }
-        };
-        let bad_scores = match parse_scores(spec, "bad_scores", slot) {
-            Ok(scores) => scores,
-            Err((code, message, remediation)) => {
-                return guard_calibrate_refused_owned(code, message, remediation);
-            }
-        };
+        let good_scores = parse_scores(spec, "good_scores", slot)
+            .map_err(|(c, m, r)| (c.to_string(), m, r))?;
+        let bad_scores = parse_scores(spec, "bad_scores", slot)
+            .map_err(|(c, m, r)| (c.to_string(), m, r))?;
         match calibrate_slot(slot, &good_scores, &bad_scores, slot.default_target_far(), alpha) {
             Ok(calibration) => calibrations.push(calibration),
             Err(error) => {
                 // Surface the guard-crate error code verbatim (e.g.
                 // ASTRO_GUARD_SLOT_UNSPLITTABLE, ASTRO_GUARD_FAR_BOUND_EXCEEDED).
-                return guard_calibrate_refused_str(
-                    error.code(),
-                    &format!("slot `{}`: {}", slot.as_str(), error.message()),
-                    error.remediation(),
-                );
+                return Err((
+                    error.code().to_string(),
+                    format!("slot `{}`: {}", slot.as_str(), error.message()),
+                    error.remediation().to_string(),
+                ));
             }
         }
     }
 
-    let profile = GuardProfile {
+    Ok(GuardProfile {
         domain: domain.clone(),
         slots: calibrations,
         content_policy: default_content_policy(),
         provisional: false,
         corpus_hash: [0u8; 32],
         calibrated_ledger_seq: None,
-    };
+    })
+}
 
+/// Ledger + persist the calibrated profile and return the tool JSON. Shared by both
+/// the supplied and auto modes so a calibration produced by either path is paired
+/// with its ledger entry and read back from the persisted config row (FSV).
+fn finalize_guard_calibration(
+    cache_dir: &Path,
+    project: &str,
+    domain: &CalibrationDomain,
+    profile: GuardProfile,
+    alpha: f32,
+    mode: CalibrationMode,
+) -> Result<String, DynError> {
     // Ledger the calibration (subject = Guard(profile_hash)), then persist the
     // consumer-contract guard-health profile referencing that ledger seq.
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
@@ -174,6 +263,7 @@ pub(crate) fn guard_calibrate_at(
     tool_json_result(json!({
         "schema": GUARD_PROFILE_SCHEMA,
         "status": "calibrated",
+        "mode": mode.as_str(),
         "project": project,
         "domain": domain.label(),
         "profile_hash": profile.profile_hash_hex(),
@@ -196,6 +286,204 @@ pub(crate) fn guard_calibrate_at(
         "trust": "verified",
         "source": format!("AsterVault:ColumnFamily::Ledger + config:{key}"),
     }))
+}
+
+/// Build a guard profile by scoring `sources` through the **real panel** over the
+/// shadow-indexed corpus (the auto path, blueprint 10_GUARD.md §1/§3).
+///
+/// Each source carries its panel-encoder inputs (symbol name, path, language, parsed
+/// CBM `properties`) plus a `class` of `good` (in-distribution / trusted) or `bad`
+/// (out-of-distribution). Every source is measured through [`ShadowSlotRuntime`] — the
+/// same real encoders the live import uses — and the resulting per-slot vectors feed
+/// [`calibrate_auto`], which builds a trusted-region centroid from the good set and
+/// scores each case as its cosine to that centroid. A panel measurement failure fails
+/// closed here; it never reverts to the supplied path (standing invariant #3).
+fn build_auto_profile(
+    args_obj: &Map<String, Value>,
+    domain: &CalibrationDomain,
+    alpha: f32,
+) -> Result<GuardProfile, GuardRefusal> {
+    let Some(sources) = args_obj.get("sources").and_then(Value::as_array) else {
+        return Err((
+            "ASTRO_GUARD_CALIBRATE_INVALID".to_string(),
+            "guard_calibrate (auto mode) requires a sources array".to_string(),
+            "Provide sources: each an object with panel inputs and class \"good\"|\"bad\"."
+                .to_string(),
+        ));
+    };
+
+    let panel_version = args_obj
+        .get("panel_version")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+        .unwrap_or(DEFAULT_PANEL_VERSION);
+    let driver = PanelDriver::new(panel_version).map_err(|err| {
+        (
+            "ASTRO_GUARD_CALIBRATE_PANEL_VERSION".to_string(),
+            format!("panel version {panel_version} is invalid: {}", err.message()),
+            "Calibrate with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
+        )
+    })?;
+    let runtime = ShadowSlotRuntime;
+
+    let mut good: Vec<MeasuredSymbol> = Vec::new();
+    let mut bad: Vec<MeasuredSymbol> = Vec::new();
+    // (class, qualified_name) identities hashed into the auto corpus provenance.
+    let mut identities: Vec<String> = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        let Some(obj) = source.as_object() else {
+            return Err((
+                "ASTRO_GUARD_CALIBRATE_INVALID".to_string(),
+                format!("source #{index} is not a JSON object"),
+                "Each source must be an object with panel inputs and a class.".to_string(),
+            ));
+        };
+        let class = obj.get("class").and_then(Value::as_str);
+        let qualified_name = obj
+            .get("qualified_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let measured = measure_source_through_panel(&driver, &runtime, obj, index)?;
+        match class {
+            Some("good") => {
+                identities.push(format!("good|{qualified_name}"));
+                good.push(measured);
+            }
+            Some("bad") => {
+                identities.push(format!("bad|{qualified_name}"));
+                bad.push(measured);
+            }
+            _ => {
+                return Err((
+                    "ASTRO_GUARD_CALIBRATE_SOURCE_CLASS".to_string(),
+                    format!("source #{index} has no recognized class (expected \"good\" or \"bad\")"),
+                    "Tag every source good (in-distribution) or bad (out-of-distribution)."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    let corpus_hash = auto_corpus_hash(&identities);
+    calibrate_auto(domain.clone(), panel_version, &good, &bad, corpus_hash, alpha).map_err(|err| {
+        (
+            err.code().to_string(),
+            err.message().to_string(),
+            err.remediation().to_string(),
+        )
+    })
+}
+
+/// Measure one source object through the real panel and extract its guard panel
+/// source slot vectors into a [`MeasuredSymbol`]. A panel error is a fail-closed
+/// refusal (never a silent skip).
+fn measure_source_through_panel(
+    driver: &PanelDriver,
+    runtime: &ShadowSlotRuntime,
+    obj: &Map<String, Value>,
+    index: usize,
+) -> Result<MeasuredSymbol, GuardRefusal> {
+    let string_field = |key: &str| -> String {
+        obj.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    let label = source_symbol_label(obj, index)?;
+    let source_bytes = obj
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|text| text.as_bytes().to_vec())
+        .unwrap_or_default();
+    let properties = obj
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let input = PanelInput {
+        label,
+        available_slots: shadow_available_slots().into_iter().collect(),
+        source_bytes,
+        symbol_name: string_field("symbol_name"),
+        qualified_name: string_field("qualified_name"),
+        rel_file_path: string_field("rel_file_path"),
+        language: string_field("language"),
+        signature: string_field("signature"),
+        properties,
+        scalars: BTreeMap::new(),
+    };
+    let readout = driver.measure(&input, runtime).map_err(|err| {
+        (
+            "ASTRO_GUARD_CALIBRATE_PANEL_FAILED".to_string(),
+            format!("source #{index} panel measurement failed: {}", err.message()),
+            "Fix the source's panel inputs or re-index the project; the auto path never falls \
+             back to supplied cosines on a panel failure."
+                .to_string(),
+        )
+    })?;
+
+    let mut slots: BTreeMap<u16, SlotVector> = BTreeMap::new();
+    for guard_slot in GuardSlot::ALL {
+        for panel_slot in guard_slot_panel_sources(guard_slot) {
+            if let Some(vector) = readout.slots.get(&SlotId::new(*panel_slot)) {
+                slots.insert(*panel_slot, vector.clone());
+            }
+        }
+    }
+    Ok(MeasuredSymbol { slots })
+}
+
+/// Parse a source's `label` into a [`SymbolLabel`] governing panel applicability.
+/// Absent label defaults to `Function` (a callable, where every guard slot applies);
+/// a present-but-unrecognized label is a fail-closed refusal.
+fn source_symbol_label(
+    obj: &Map<String, Value>,
+    index: usize,
+) -> Result<astrolabe_domain::SymbolLabel, GuardRefusal> {
+    use astrolabe_domain::SymbolLabel;
+    let Some(raw) = obj.get("label").and_then(Value::as_str) else {
+        return Ok(SymbolLabel::Function);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(SymbolLabel::Function);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "function" => Ok(SymbolLabel::Function),
+        "method" => Ok(SymbolLabel::Method),
+        "macro" => Ok(SymbolLabel::Macro),
+        "class" => Ok(SymbolLabel::Class),
+        "struct" => Ok(SymbolLabel::Struct),
+        "interface" => Ok(SymbolLabel::Interface),
+        "enum" => Ok(SymbolLabel::Enum),
+        "trait" => Ok(SymbolLabel::Trait),
+        "type" => Ok(SymbolLabel::Type),
+        "typealias" => Ok(SymbolLabel::TypeAlias),
+        "module" => Ok(SymbolLabel::Module),
+        "file" => Ok(SymbolLabel::File),
+        "namespace" => Ok(SymbolLabel::Namespace),
+        "impl" => Ok(SymbolLabel::Impl),
+        other => Err((
+            "ASTRO_GUARD_CALIBRATE_SOURCE_LABEL".to_string(),
+            format!("source #{index} label `{other}` is not a recognized symbol label"),
+            "Use a callable/type/module label such as function, method, class, or module."
+                .to_string(),
+        )),
+    }
+}
+
+/// SHA-256 over the sorted, newline-framed `(class|qualified_name)` identities — the
+/// auto corpus provenance pinned into the guard profile's `corpus_hash`.
+fn auto_corpus_hash(identities: &[String]) -> [u8; 32] {
+    let mut sorted: Vec<&String> = identities.iter().collect();
+    sorted.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"astro.guard.auto_corpus.v1\0");
+    for identity in sorted {
+        hasher.update(identity.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 /// Build the `astrolabe.optimizer_guard_health.v1` config value the optimizer

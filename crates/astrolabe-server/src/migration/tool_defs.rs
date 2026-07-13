@@ -106,13 +106,42 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
     json!({
         "name": "guard_calibrate",
         "title": "Guard Calibrate",
-        "description": "Build/refresh a per-domain guard profile by split (inductive) conformal calibration. Each fixed guard slot's per-slot tau is set on a calibration half of its measured bad-cosine population (binomial-bounded), the achieved FAR is measured on a held-out validation half and checked against a finite-sample ceiling, and the FRR is measured on the good population. The calibration is ledgered (kind=Guard, subject=Guard(profile_hash)) and the astrolabe.optimizer_guard_health.v1 profile is persisted. Fails closed on a missing slot, a thin (<2) or single-source population, or a slot whose held-out FAR breaches its bound.",
+        "description": "Build/refresh a per-domain guard profile by split (inductive) conformal calibration. Two declared modes: auto (score sources through the real panel/lens stack S18/S1/S4/S20/S2/S15/S5+S17 to derive the per-slot good/bad cosine populations itself) and supplied (operator-supplied per-slot cosine arrays). Each fixed guard slot's per-slot tau is set on a calibration half of its measured bad-cosine population (binomial-bounded), the achieved FAR is measured on a held-out validation half and checked against a finite-sample ceiling, and the FRR is measured on the good population. The calibration is ledgered (kind=Guard, subject=Guard(profile_hash)) and the astrolabe.optimizer_guard_health.v1 profile is persisted. Fails closed on an unknown/ambiguous mode, a missing slot, a panel that lacks a required slot, a thin (<2) or single-source population, or a slot whose held-out FAR breaches its bound; an auto panel failure never falls back to supplied cosines.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {
                     "type": "string",
                     "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "supplied"],
+                    "description": "Population-source mode. auto scores sources through the real panel; supplied consumes operator cosine arrays. Inferred from sources/slots when omitted; ambiguous (both) or absent (neither) is refused."
+                },
+                "panel_version": {
+                    "type": "integer",
+                    "description": "Frozen panel roster version used to measure sources in auto mode (1=S0-S22, 2=S0-S23; default 1)."
+                },
+                "sources": {
+                    "type": "array",
+                    "description": "auto mode: source symbols scored through the panel. Each object carries panel-encoder inputs (symbol_name, qualified_name, rel_file_path, language, signature, source, parsed CBM properties, optional label) and a class of \"good\" (in-distribution) or \"bad\" (out-of-distribution).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "class": {"type": "string", "enum": ["good", "bad"]},
+                            "symbol_name": {"type": "string"},
+                            "qualified_name": {"type": "string"},
+                            "rel_file_path": {"type": "string"},
+                            "language": {"type": "string"},
+                            "signature": {"type": "string"},
+                            "label": {"type": "string"},
+                            "source": {"type": "string"},
+                            "properties": {"type": "object"}
+                        },
+                        "required": ["class"],
+                        "additionalProperties": true
+                    }
                 },
                 "domain": {
                     "type": "object",
@@ -136,7 +165,7 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
                 },
                 "slots": {
                     "type": "array",
-                    "description": "One object per fixed guard slot with measured good_scores and bad_scores cosine arrays.",
+                    "description": "supplied mode: one object per fixed guard slot with measured good_scores and bad_scores cosine arrays.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -152,7 +181,7 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
                     }
                 }
             },
-            "required": ["project", "domain", "slots"],
+            "required": ["project", "domain"],
             "additionalProperties": false
         },
         "outputSchema": {
