@@ -1547,7 +1547,10 @@ try {
     try {
         # #279: resolve the attributed CBM-store roots from the gate's own registry so
         # the recorder's owned-path probe scans exactly the roots the gate polices.
-        $attributedStoreRoots = Get-AstroAttributedStoreRoots -RegistryPath (Join-Path $PSScriptRoot "no-escape-roots.json")
+        # #318: PowerShell unwraps function output: zero rows become $null and one row
+        # becomes a scalar. Keep the native zero/one/many shapes normalized so strict
+        # mode can safely read .Count and the recorder always receives string[].
+        [string[]]$attributedStoreRoots = @(Get-AstroAttributedStoreRoots -RegistryPath (Join-Path $PSScriptRoot "no-escape-roots.json"))
         $treeRecorder = Start-AstroTreeAttribution -ManifestPath $attributionManifest -LauncherPid $PID -StoreRoots $attributedStoreRoots
         $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: process-tree PIDs -> $attributionManifest"
