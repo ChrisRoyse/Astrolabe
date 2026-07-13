@@ -253,6 +253,15 @@ mod tests {
     }
 
     proptest! {
+        // #295: bound case count to the crate-wide proptest convention
+        // (see stream/quantize_online.rs) so this fsync-heavy WAL round-trip
+        // property stays well under the 60s per-test budget under full-suite
+        // parallel load; the default 256 cases pushed it past budget. Assertion
+        // set unchanged; deterministic edges are covered by
+        // concurrent_submitters_replay_byte_exact_payloads and
+        // oversized_window_fails_closed.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
         #[test]
         fn submitted_payloads_are_replayed(payloads in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..32), 1..20)) {
             let dir = test_dir("batcher-proptest");

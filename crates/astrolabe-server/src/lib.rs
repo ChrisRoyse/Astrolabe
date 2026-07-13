@@ -578,6 +578,22 @@ impl VerifyChainLoop {
             };
         }
 
+        // #277: one-time deep boot gate before the steady-state bounded scrub lane
+        // begins — re-hashes each project's whole persisted ledger from genesis and
+        // fails closed (records status=error) on a tampered/damaged store, so the
+        // per-tick scrub never runs atop already-corrupt state.
+        match migration::janitor_startup_verify_projects() {
+            Ok(0) => {}
+            Ok(damaged) => {
+                tracing::warn!(
+                    "verify_chain_loop.startup_verify_failed_closed damaged_projects={damaged}"
+                );
+            }
+            Err(error) => {
+                tracing::warn!("verify_chain_loop.startup_verify_error error={error}");
+            }
+        }
+
         let interval = verify_chain_loop_interval();
         let thread_shutdown = Arc::clone(&shutdown);
         let handle = thread::spawn(move || {

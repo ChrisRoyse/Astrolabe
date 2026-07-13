@@ -197,57 +197,230 @@ pub(crate) fn project_from_metadata_key(key: &str, field: &str) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+/// The bounded per-tick outcome of one FSV janitor scrub step (#277). Carries the
+/// persisted checkpoint watermark and the (bounded) slice this tick re-hashed —
+/// never a whole-ledger count, so the cost is O(budget knob) regardless of ledger
+/// length.
+pub(crate) struct PeriodicScrubOutcome {
+    pub(crate) status: String,
+    pub(crate) verified_through: u64,
+    pub(crate) scrubbed: bool,
+    pub(crate) slice_start: Option<u64>,
+    pub(crate) slice_end: Option<u64>,
+    pub(crate) error_text: Option<String>,
+    /// #178: the unforgeable [`astrolabe_domain::fsv::FsvAck`] envelope this tick
+    /// earned, present only when the scrub committed a witnessed mutation (its
+    /// checkpoint row + Measure entry were read back byte-identical and the paired
+    /// ledger entry exists). `None` on an idle catch-up — labeled absence, never a
+    /// fabricated `fsv:verified`.
+    pub(crate) fsv: Option<Value>,
+}
+
+/// Serializes an [`astrolabe_domain::fsv::FsvAck`] into the server response
+/// envelope's `fsv` block (#178). The `label` is minted by the ack itself
+/// (`fsv:verified` for a full readback, `fsv:verified-sampled` for a sample) — the
+/// server can only relay it, never assert it.
+pub(crate) fn fsv_ack_envelope(ack: &astrolabe_domain::fsv::FsvAck) -> Value {
+    json!({
+        "label": ack.label(),
+        "scope": ack.scope(),
+        "full_readback": ack.is_full_readback(),
+        "rows_read_back": ack.rows_read_back(),
+        "bytes_read_back": ack.bytes_read_back(),
+        "ledger_seq": ack.ledger_seq(),
+        "ledger_entry_hash": ack.ledger_entry_hash(),
+    })
+}
+
+/// Runs one bounded [`astrolabe_ingest::run_janitor_scrub_step`] against the
+/// project's shadow vault, under the shadow-import lock so a concurrent
+/// index_repository never races the scrub write (#277).
+///
+/// Returns `Ok(None)` when the shadow-import lock is held (an import is in
+/// flight): the tick is skipped, labeled, and leaves the last persisted status
+/// intact rather than blocking or re-walking. A fail-closed chain-damage refusal
+/// surfaces as `status: "error"` with the refusal code, never a silent pass.
+pub(crate) fn periodic_verify_scrub_project(
+    cache_dir: &Path,
+    project: &str,
+    vault_dir: &Path,
+) -> Result<Option<PeriodicScrubOutcome>, DynError> {
+    // Serialize against the importer: the scrub commits a checkpoint row + Measure
+    // ledger entry, so it must not run concurrently with a shadow import that is
+    // itself appending to the same ledger.
+    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
+        return Ok(None);
+    };
+    let vault_id = read_config_value(cache_dir, &metadata_key(project, "vault_id"))?
+        .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
+    let vault_salt = read_config_value(cache_dir, &metadata_key(project, "vault_salt"))?
+        .unwrap_or_else(|| vault_salt(project));
+    // Writable handle: the scrub advances the persisted JanitorCheckpoint and
+    // appends the witnessed Measure scrub record. selected_cfs=None (all CFs).
+    let vault = open_shadow_vault_writable(vault_dir, &vault_id, &vault_salt, Vec::new())?;
+    match astrolabe_ingest::run_janitor_scrub_step(&vault, None) {
+        Ok(report) => {
+            let checkpoint = report.checkpoint();
+            let (slice_start, slice_end, fsv) = match &report {
+                astrolabe_ingest::JanitorStepReport::Scrubbed { slice, ack, .. } => (
+                    Some(slice.slice_start),
+                    Some(slice.slice_end),
+                    // #178: relay the scrub's real FsvAck envelope. The ack was
+                    // minted by verify_committed (readback + ledger pairing), so
+                    // this is a witnessed `fsv:verified`, not a server claim.
+                    Some(fsv_ack_envelope(ack)),
+                ),
+                astrolabe_ingest::JanitorStepReport::CaughtUp { .. } => (None, None, None),
+            };
+            Ok(Some(PeriodicScrubOutcome {
+                status: "intact".to_string(),
+                verified_through: checkpoint.verified_through,
+                scrubbed: report.scrubbed(),
+                slice_start,
+                slice_end,
+                error_text: None,
+                fsv,
+            }))
+        }
+        Err(error) => Ok(Some(PeriodicScrubOutcome {
+            // Fail closed: the janitor detected chain damage (or a corrupt
+            // checkpoint) and made no mutation. Surface the exact refusal.
+            status: "error".to_string(),
+            verified_through: 0,
+            scrubbed: false,
+            slice_start: None,
+            slice_end: None,
+            error_text: Some(error.to_string()),
+            fsv: None,
+        })),
+    }
+}
+
 pub(crate) fn periodic_verify_project_at(
     cache_dir: &Path,
     project: &str,
     vault_dir: &Path,
     checked_at_unix_ms: u64,
 ) -> Result<Value, DynError> {
-    let mut ledger_rows = None;
-    let mut checked_range_start = None;
-    let mut checked_range_end = None;
-    let mut error_text = None;
-    let status = if !vault_dir.exists() {
-        "missing".to_string()
-    } else {
-        match astrolabe_ingest::verify_chain_vault_path(vault_dir) {
-            Ok(report) => {
-                ledger_rows = Some(report.ledger_rows);
-                checked_range_start = Some(report.checked_range_start);
-                checked_range_end = Some(report.checked_range_end);
-                report.status
-            }
-            Err(error) => {
-                error_text = Some(error.to_string());
-                "error".to_string()
-            }
+    if !vault_dir.exists() {
+        let status = "missing".to_string();
+        persist_periodic_verify_status_at(
+            cache_dir,
+            project,
+            &status,
+            vault_dir,
+            checked_at_unix_ms,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )?;
+        return Ok(periodic_verify_result_json(
+            project,
+            &status,
+            vault_dir,
+            checked_at_unix_ms,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            "scrub",
+            None,
+        ));
+    }
+
+    // #277: bounded janitor scrub step instead of a full verify_chain re-walk on
+    // every tick (the #96 anti-pattern). Cost is O(FSV janitor budget knob),
+    // independent of ledger length. The one-time deep full-chain sweep now lives
+    // in the named startup gate (`janitor_startup_verify_projects_at`).
+    match periodic_verify_scrub_project(cache_dir, project, vault_dir)? {
+        Some(outcome) => {
+            let verified_through = Some(outcome.verified_through);
+            persist_periodic_verify_status_at(
+                cache_dir,
+                project,
+                &outcome.status,
+                vault_dir,
+                checked_at_unix_ms,
+                verified_through,
+                outcome.slice_start,
+                outcome.slice_end,
+                outcome.error_text.as_deref(),
+                verified_through,
+                outcome.scrubbed,
+                outcome.fsv.as_ref(),
+            )?;
+            Ok(periodic_verify_result_json(
+                project,
+                &outcome.status,
+                vault_dir,
+                checked_at_unix_ms,
+                verified_through,
+                outcome.slice_start,
+                outcome.slice_end,
+                outcome.error_text.as_deref(),
+                verified_through,
+                outcome.scrubbed,
+                "scrub",
+                outcome.fsv.as_ref(),
+            ))
         }
-    };
-    persist_periodic_verify_status_at(
-        cache_dir,
-        project,
-        &status,
-        vault_dir,
-        checked_at_unix_ms,
-        ledger_rows,
-        checked_range_start,
-        checked_range_end,
-        error_text.as_deref(),
-    )?;
-    Ok(json!({
+        None => {
+            // Import in flight: the shadow-import lock is held. Skip this tick,
+            // labeled, without overwriting the last persisted verify status.
+            Ok(json!({
+                "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
+                "project": project,
+                "status": "skipped_import_in_progress",
+                "vault_dir": vault_dir,
+                "checked_at_unix_ms": checked_at_unix_ms,
+                "freshness": "fresh",
+                "trust": "provisional",
+                "mode": "skipped_import_in_progress",
+                "remediation": "the shadow-import lock is held; the FSV janitor scrub tick was skipped and will resume from its persisted checkpoint on the next tick after the import releases the lock",
+            }))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn periodic_verify_result_json(
+    project: &str,
+    status: &str,
+    vault_dir: &Path,
+    checked_at_unix_ms: u64,
+    ledger_rows: Option<u64>,
+    checked_range_start: Option<u64>,
+    checked_range_end: Option<u64>,
+    error_text: Option<&str>,
+    verified_through: Option<u64>,
+    scrubbed: bool,
+    mode: &str,
+    fsv: Option<&Value>,
+) -> Value {
+    json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
         "project": project,
-        "status": status.clone(),
+        "status": status,
         "vault_dir": vault_dir,
         "checked_at_unix_ms": checked_at_unix_ms,
         "ledger_rows": ledger_rows,
         "checked_range_start": checked_range_start,
         "checked_range_end": checked_range_end,
+        "verified_through": verified_through,
+        "scrubbed": scrubbed,
+        "mode": mode,
+        "fsv": fsv,
         "error": error_text,
         "freshness": "fresh",
         "trust": if status == "intact" { "verified" } else { "provisional" },
-        "remediation": periodic_verify_remediation(&status),
-    }))
+        "remediation": periodic_verify_remediation(status),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,12 +434,22 @@ pub(crate) fn persist_periodic_verify_status_at(
     checked_range_start: Option<u64>,
     checked_range_end: Option<u64>,
     error_text: Option<&str>,
+    verified_through: Option<u64>,
+    scrubbed: bool,
+    fsv: Option<&Value>,
 ) -> Result<(), DynError> {
     let mut conn = open_config(cache_dir)?;
+    // #178: the last tick's FsvAck envelope, or empty when the tick performed no
+    // witnessed mutation (idle / error / missing) — labeled absence on readback.
+    let fsv_serialized = fsv
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
     // Atomic multi-key persist — a crash mid-write must not leave torn
     // periodic-verify metadata that a status reader would treat as current (#95).
     let tx = conn.transaction()?;
     for (key, value) in [
+        ("periodic_verify_fsv", fsv_serialized),
         ("periodic_verify_status", status.to_string()),
         (
             "periodic_verify_checked_unix_ms",
@@ -290,6 +473,19 @@ pub(crate) fn persist_periodic_verify_status_at(
             checked_range_end
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+        ),
+        (
+            // #277: the persisted FSV-janitor checkpoint watermark this tick
+            // resumed from / advanced to. Independent readback across ticks and
+            // restarts proves the janitor never re-walks from genesis.
+            "periodic_verify_verified_through",
+            verified_through
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "periodic_verify_scrubbed",
+            if scrubbed { "1" } else { "0" }.to_string(),
         ),
         (
             "periodic_verify_error",
@@ -321,6 +517,13 @@ pub(crate) fn periodic_verify_status_at(
         read_config_u64(cache_dir, project, "periodic_verify_checked_range_start")?;
     let checked_range_end =
         read_config_u64(cache_dir, project, "periodic_verify_checked_range_end")?;
+    let verified_through = read_config_u64(cache_dir, project, "periodic_verify_verified_through")?;
+    let scrubbed = read_config_value(
+        cache_dir,
+        &metadata_key(project, "periodic_verify_scrubbed"),
+    )?
+    .map(|value| value.trim() == "1")
+    .unwrap_or(false);
     let vault_dir = read_config_value(
         cache_dir,
         &metadata_key(project, "periodic_verify_vault_dir"),
@@ -328,6 +531,11 @@ pub(crate) fn periodic_verify_status_at(
     .filter(|value| !value.trim().is_empty());
     let error = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_error"))?
         .filter(|value| !value.trim().is_empty());
+    // #178: the last tick's FsvAck envelope (labeled absence when the tick made no
+    // witnessed mutation). Parsed back from the persisted JSON, never fabricated.
+    let fsv = read_config_value(cache_dir, &metadata_key(project, "periodic_verify_fsv"))?
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
     Ok(json!({
         "schema": PERIODIC_VERIFY_CHAIN_SCHEMA,
         "project": project,
@@ -337,6 +545,9 @@ pub(crate) fn periodic_verify_status_at(
         "ledger_rows": ledger_rows,
         "checked_range_start": checked_range_start,
         "checked_range_end": checked_range_end,
+        "verified_through": verified_through,
+        "scrubbed": scrubbed,
+        "fsv": fsv,
         "error": error,
         "freshness": "last_observed",
         "trust": if status == "intact" { "verified" } else { "provisional" },
@@ -354,6 +565,9 @@ pub(crate) fn periodic_verify_unobserved_json(project: &str) -> Value {
         "ledger_rows": Value::Null,
         "checked_range_start": Value::Null,
         "checked_range_end": Value::Null,
+        "verified_through": Value::Null,
+        "scrubbed": false,
+        "fsv": Value::Null,
         "error": Value::Null,
         "freshness": "unknown",
         "trust": "provisional",
@@ -560,6 +774,103 @@ pub(crate) fn health_trajectory_ndjson(
         .map(|event| serde_json::to_string(&event).expect("health event serializes"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// One-time boot integrity gate (#277): re-hashes each discovered project's whole
+/// persisted ledger chain from genesis in bounded slices via
+/// [`astrolabe_ingest::janitor_startup_verify`] — the deliberate deep full sweep
+/// the steady-state per-tick scrub never performs (#96) — and persists the
+/// outcome so `index_status` surfaces a tampered store as `status: "error"` with
+/// the exact refusal code.
+///
+/// Fails **closed** per project: a damaged chain is recorded as
+/// `periodic_verify_status = "error"` with the janitor refusal, never a silent
+/// pass. Returns the number of projects whose boot sweep failed closed.
+/// Resolves the CBM cache dir and runs the one-time [`janitor_startup_verify_projects_at`]
+/// boot gate over every discovered shadow project. Called once at server startup.
+pub(crate) fn janitor_startup_verify_projects() -> Result<u64, DynError> {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    janitor_startup_verify_projects_at(&cache_dir)
+}
+
+pub(crate) fn janitor_startup_verify_projects_at(cache_dir: &Path) -> Result<u64, DynError> {
+    let checked_at_unix_ms = unix_epoch_millis();
+    let projects = discover_periodic_verify_projects_at(cache_dir)?;
+    let mut damaged = 0u64;
+    for project in projects {
+        if !project.vault_dir.exists() {
+            continue;
+        }
+        let vault_id = read_config_value(cache_dir, &metadata_key(&project.project, "vault_id"))?
+            .unwrap_or_else(|| SHADOW_VAULT_ID.to_string());
+        let salt = read_config_value(cache_dir, &metadata_key(&project.project, "vault_salt"))?
+            .unwrap_or_else(|| vault_salt(&project.project));
+        let vault = match open_shadow_vault_read_only(
+            &project.vault_dir,
+            &vault_id,
+            &salt,
+            vec![ColumnFamily::Kv, ColumnFamily::Ledger],
+        ) {
+            Ok(vault) => vault,
+            Err(error) => {
+                damaged += 1;
+                persist_periodic_verify_status_at(
+                    cache_dir,
+                    &project.project,
+                    "error",
+                    &project.vault_dir,
+                    checked_at_unix_ms,
+                    None,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                    None,
+                    false,
+                    None,
+                )?;
+                continue;
+            }
+        };
+        match astrolabe_ingest::janitor_startup_verify(&vault, None) {
+            Ok(slice) => {
+                // Clean boot sweep: the persisted chain re-hashes end to end.
+                let verified_through = Some(slice.checkpoint.verified_through);
+                persist_periodic_verify_status_at(
+                    cache_dir,
+                    &project.project,
+                    "intact",
+                    &project.vault_dir,
+                    checked_at_unix_ms,
+                    verified_through,
+                    Some(slice.slice_start),
+                    Some(slice.slice_end),
+                    None,
+                    verified_through,
+                    false,
+                    None,
+                )?;
+            }
+            Err(error) => {
+                // Fail closed: a tampered/damaged chain is surfaced, never a pass.
+                damaged += 1;
+                persist_periodic_verify_status_at(
+                    cache_dir,
+                    &project.project,
+                    "error",
+                    &project.vault_dir,
+                    checked_at_unix_ms,
+                    None,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                    None,
+                    false,
+                    None,
+                )?;
+            }
+        }
+    }
+    Ok(damaged)
 }
 
 pub(crate) fn prom_label_value(value: &str) -> String {

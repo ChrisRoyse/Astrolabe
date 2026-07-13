@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_core::{
     Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector, SparseEntry,
@@ -105,19 +105,17 @@ pub(super) fn cx(seed: u8) -> CxId {
     CxId::from_bytes([seed; 16])
 }
 
-pub(super) fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "calyx-cli-persisted-search-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("scratch");
-    dir
+// RAII scratch (#260): self-cleans on drop incl. panic unwind.
+pub(super) fn scratch(tag: &str) -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-cli-persisted-search-{tag}"))
+        .expect("scratch")
 }
 
-pub(super) fn cleanup(root: PathBuf) {
-    if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_none() {
-        fs::remove_dir_all(root).ok();
+pub(super) fn cleanup(root: calyx_fsv::scratch::ScratchDir) {
+    // #260 RAII: keep artifacts for operator inspection when CALYX_FSV_ROOT is
+    // set (disarm), otherwise let `root` drop and remove the tree.
+    if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_some() {
+        let _ = root.into_kept();
     }
 }
 

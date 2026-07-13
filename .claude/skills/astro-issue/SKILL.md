@@ -1,6 +1,6 @@
 ---
 name: astro-issue
-description: Drives one ASTROLABE GitHub issue through the mandatory lifecycle — pick, claim, verify prior progress, scoped work, FSV proof, gates, evidence, close. Use when starting, resuming, or closing work on a GitHub issue, choosing the next issue, checking a DoD box, or swapping status labels. Not for filing new issues (use astro-new-issue), running gates alone (use astro-gate), or pausing mid-issue (use astro-handoff).
+description: Drives one ASTROLABE GitHub issue through the mandatory lifecycle — pick, claim, verify prior progress, scoped work, FSV proof, evidence, close. Use when starting, resuming, or closing work on a GitHub issue, choosing the next issue, checking a DoD box, or swapping status labels. Not for filing new issues (use astro-new-issue) or pausing mid-issue (use astro-handoff).
 argument-hint: [issue-number | pick]
 allowed-tools: Bash(gh issue *), Bash(gh api *), Bash(git status *), Bash(git log *), Bash(git diff *)
 ---
@@ -31,8 +31,8 @@ GitHub issues are the single source of truth. If it isn't recorded on an issue, 
 ## 4. Work in scope
 
 - Implement ONLY the issue's Scope section. Discovered adjacent work → file via astro-new-issue and link it; never expand scope in place.
-- Every verification follows astro-fsv (source-of-truth readback, never API echoes). Any work that writes, edits, runs, or removes tests follows astro-test (suite <180s, no test >60s, impact-gated suites, real data only).
-- Every commit body references the issue (`Refs #N`; `Closes #N` only on the final commit **after** gates pass — never on server-pending work, see astro-fanout).
+- Every verification follows astro-fsv (source-of-truth readback, never API echoes; real data only, no mocks). FSV-only doctrine (owner directive 2026-07-13): no aggregate/gate suite exists or is required.
+- Every commit body references the issue (`Refs #N`; `Closes #N` only on the final commit **after** FSV evidence exists — never on server-pending work, see astro-fanout).
 - Never write progress prose into `docs/astrolabe-blueprint.md` (design corrections only).
 - No `todo!()`/stubs on shipped paths; fail-closed `{code, message, remediation}` errors; no silent fallback — every degradation labeled, every skip counted.
 
@@ -40,9 +40,9 @@ GitHub issues are the single source of truth. If it isn't recorded on an issue, 
 
 A DoD checkbox may be checked only in the same session that ran its verification, with the test name + result pasted in a comment (kind `evidence`).
 
-## 6. Gate
+## 6. Verify (FSV)
 
-Run the issue's named gates + the required aggregate via astro-gate from `C:/code/Astrolabe`. Exit 125 / `DEFERRED[...]` / `SKIP[...]` are **not** passing evidence. One exception in kind (#280): `SKIP[ASTRO_SUITE_UNCHANGED]` is the impact gate proving your change did **not** touch that suite's input set - the suite's recorded green (`.astro-gate-cache/suite-green.json`) is the standing evidence, and any change inside the input set re-runs the suite by construction. It is lawful for closure only when the skipped suite is genuinely outside your change's blast radius. A gate that fails for a pre-existing reason: attribute it (astro-gate §attribution), file/link an issue — never skip silently.
+Build the real artifact natively and FSV the changed behavior per astro-fsv: real execution, independent persisted-state readback, edge-case triad. `DEFERRED[...]` / `SKIP[...]` labels are **not** passing evidence. A verification that fails for a pre-existing reason: attribute it (`git log -S`), file/link an issue — never skip silently.
 
 ## 7. Close
 
@@ -50,7 +50,7 @@ Run the issue's named gates + the required aggregate via astro-gate from `C:/cod
 2. Every DoD box checked with evidence → `gh issue close N`.
 3. Tick the issue's checkbox in EPIC #65; remove the `status:*` label.
 4. Commit and push the verified state immediately.
-5. Verify `target/` is absent (astro-gate §cleanup).
+5. Verify `target/` is absent.
 
 ## Stopping early
 

@@ -111,8 +111,8 @@ mod shadow_import;
 use shadow_import::*;
 
 mod status_surface;
-pub(crate) use status_surface::periodic_verify_chain_tick;
 use status_surface::*;
+pub(crate) use status_surface::{janitor_startup_verify_projects, periodic_verify_chain_tick};
 
 mod optimizer;
 use optimizer::*;

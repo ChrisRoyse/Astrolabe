@@ -109,6 +109,27 @@ pub struct LensSpec {
     pub excluded_from_dedup: bool,
 }
 
+/// Human-readable neural-runtime variant name for fail-closed diagnostics when
+/// the `ml-runtime` feature is disabled (#297). Only the neural variants are
+/// reachable on the fail-closed path.
+#[cfg(not(feature = "ml-runtime"))]
+pub(crate) fn ml_runtime_kind(runtime: &LensRuntime) -> &'static str {
+    match runtime {
+        LensRuntime::CandleLocal { .. } => "candle-local",
+        LensRuntime::Onnx { .. } => "onnx",
+        LensRuntime::OnnxColbert { .. } => "onnx-colbert",
+        LensRuntime::FastembedSparse { .. } => "fastembed-sparse",
+        LensRuntime::FastembedBgem3 { .. } => "fastembed-bgem3",
+        LensRuntime::FastembedReranker { .. } => "fastembed-reranker",
+        LensRuntime::FastembedQwen3 { .. } => "fastembed-qwen3",
+        LensRuntime::StaticLookup { .. } => "static-lookup",
+        LensRuntime::Algorithmic { .. }
+        | LensRuntime::TeiHttp { .. }
+        | LensRuntime::MultimodalAdapter { .. }
+        | LensRuntime::ExternalCmd { .. } => "non-neural",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LensHealth {

@@ -1,8 +1,0 @@
-{
-  "scope": "fixture-only",
-  "reason": "release predicate self-test waiver fixture; not an active release waiver",
-  "published_numbers": {
-    "baseline": "fixture",
-    "measured": "fixture"
-  }
-}

@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::PathBuf;
 
 use calyx_core::{CxId, FixedClock, Input, LensId, Modality, SlotId, SlotVector};
 use calyx_ledger::{
@@ -339,8 +338,7 @@ fn answer_id() -> QueryId {
     b"answer-reproduce-test".to_vec()
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-ph36-reproduce-fsv")
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop (incl. panic unwind).
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-ph36-reproduce-fsv")
 }

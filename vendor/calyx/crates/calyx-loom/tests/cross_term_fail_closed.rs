@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_core::{CxId, SlotId, content_address};
@@ -143,10 +142,9 @@ fn expected_gpu_readback() -> &'static str {
     }
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-loom-cross-term-fsv")
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop incl. panic unwind.
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-loom-cross-term-fsv")
 }
 
 fn digest_hex(bytes: &[u8]) -> String {

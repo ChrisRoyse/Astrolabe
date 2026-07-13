@@ -26,7 +26,7 @@ A result is real only after direct verification against the real artifact, proce
 - **Trigger→X→Y:** every process has an observable trigger and an intended persisted outcome. If Y can be physically checked, checking it is mandatory.
 - **Smallest sufficient data:** before running the big dataset, ask what the smallest input is that would 100% prove the behavior — run that. Scale only when scale itself is the claim.
 - **No mocks, no cover-ups:** tests use real data and real stores. Never write a test that passes while the project is broken. Determinism is seeded and worker-count-invariant.
-- **Test timing budgets are doctrine (astro-test):** full suite <180s, no single test >60s (decompose or delete, never merely tier), suites run only when impacted (#280). Writing or changing any test loads astro-test alongside this skill.
+- **FSV-only (owner directive 2026-07-13):** the aggregate gate/check-script suite is retired and deleted; do not rebuild it. FSV against real artifacts and persisted state is the only verification doctrine. In-crate tests may be run ad hoc when they are the cheapest FSV instrument, but no suite is required for closure.
 - **Pre-existing vs mine:** before attributing a failure to your change, check `git log --oneline -S "<string>" -- <path>` and `git merge-base --is-ancestor <sha> HEAD`. File pre-existing failures as issues (astro-new-issue); never absorb them silently.
 - **Exit codes:** in bash, `cmd | tail` masks failure — capture `${PIPESTATUS[0]}`.
-- Native Windows execution from `C:/code/Astrolabe` only (astro-gate owns the mechanics).
+- Native Windows execution from `C:/code/Astrolabe` only, via the `scripts/windows-gnu-toolchain.ps1` launcher for builds.

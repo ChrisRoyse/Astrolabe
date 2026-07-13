@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::dedup::EpochSecs;
@@ -21,7 +21,8 @@ const WEEK_SECS: i64 = 604_800;
 #[test]
 #[ignore = "FSV: writes durable rolled recurrence support evidence under CALYX_FSV_ROOT"]
 fn issue634_rolled_recurrence_summary_manual_fsv() {
-    let root = fsv_root().join("issue634-rolled-recurrence-summary");
+    let scratch = fsv_root();
+    let root = scratch.join("issue634-rolled-recurrence-summary");
     fs::create_dir_all(&root).expect("create fsv root");
     let vault_dir = root.join("vault");
     let vault = AsterVault::new_durable(
@@ -198,10 +199,9 @@ fn put_base<C: Clock>(vault: &AsterVault<C>, input: &[u8]) -> CxId {
     cx_id
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join(format!("calyx-issue634-fsv-{}", std::process::id()))
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop incl. panic unwind.
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-issue634-fsv")
 }
 
 fn vault_id() -> VaultId {

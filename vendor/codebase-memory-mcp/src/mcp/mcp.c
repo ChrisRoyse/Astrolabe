@@ -3898,8 +3898,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
 #ifdef ASTRO_WORKER_DIAG
-    char *failure = build_worker_failure_response(args, last_outcome, last_exit_code,
-                                                  last_response, last_log);
+    char *failure =
+        build_worker_failure_response(args, last_outcome, last_exit_code, last_response, last_log);
     free(last_response);
     free(last_log);
     return failure;

@@ -8,7 +8,28 @@ publish.workspace = true
 
 [features]
 default = []
-cuda = ["candle-cuda", "calyx-forge/cuda"]
+# The neural embedding runtimes (candle-local BERT, ONNX/fastembed, qwen3,
+# static-lookup) pull in the heavy ML stack — `ort` (ONNX Runtime bindings),
+# `fastembed` (which drags `candle`), `candle-{core,nn,transformers}`, and
+# `tokenizers[onig]` (Oniguruma C build) — plus the `hf-hub` downloader and
+# `memmap2`. They are OFF by default (#297): Astrolabe reaches calyx-registry
+# only through `SwapController` (no embedding runtime), so this ML payload is
+# dead weight in the default `astrolabe-server` graph. Enable `ml-runtime` in a
+# consumer that actually instantiates neural lenses; without it, the runtime
+# constructors and contract derivations for those variants fail closed with
+# CALYX_REGISTRY_ML_RUNTIME_DISABLED. Mirrors the #191 calyx-ward `onnx-lens`
+# pattern.
+ml-runtime = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:fastembed",
+    "dep:hf-hub",
+    "dep:memmap2",
+    "dep:ort",
+    "dep:tokenizers",
+]
+cuda = ["ml-runtime", "candle-cuda", "calyx-forge/cuda"]
 candle-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "fastembed/cuda"]
 
 [dependencies]
@@ -18,17 +39,17 @@ calyx-core = { path = "../calyx-core" }
 calyx-forge = { path = "../calyx-forge" }
 calyx-ledger = { path = "../calyx-ledger" }
 blake3.workspace = true
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
-fastembed = { version = "5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic", "qwen3"] }
-hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
-memmap2.workspace = true
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"] }
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", optional = true }
+fastembed = { version = "5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic", "qwen3"], optional = true }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+memmap2 = { workspace = true, optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

@@ -489,10 +489,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * file set (file_count == 0) stays valid and flows through as a no-op. The
      * early return narrows file_count to [0, INT_MAX] for both allocations. */
     if (file_count < 0) {
-        cbm_log_error("pass.definitions.file_count",
-                      "code", "CBM_E_DEFS_FILE_COUNT_RANGE",
-                      "message", "definitions pass received a negative file_count",
-                      "remediation",
+        cbm_log_error("pass.definitions.file_count", "code", "CBM_E_DEFS_FILE_COUNT_RANGE",
+                      "message", "definitions pass received a negative file_count", "remediation",
                       "pass a non-negative file_count; a negative value indicates a "
                       "caller contract violation or an integer overflow upstream");
         return CBM_NOT_FOUND;

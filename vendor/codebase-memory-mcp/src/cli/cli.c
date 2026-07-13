@@ -8,8 +8,12 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+#ifdef _WIN32
+#include <tlhelp32.h> /* CreateToolhelp32Snapshot — attributed instance kill (#292) */
+#endif
 
 /* CLI buffer size constants. */
 enum {
@@ -34,6 +38,12 @@ enum {
     CLI_IDX_2 = 2,        /* array index 2 */
     CLI_STRTOL_BASE = 10, /* decimal base for strtol */
     CLI_STRTOL_HEX = 16,  /* hex base for strtol */
+    /* Bounded wait for a terminated instance's teardown so its image section
+     * is released before install overwrites the binary (kill-then-copy would
+     * otherwise race a Windows sharing violation). Declared bound, not a
+     * measurement: teardown is normally <10ms; the bound only caps a
+     * pathological hang, after which the copy proceeds and fails loudly. */
+    CLI_KILL_WAIT_MS = 5000,
     CLI_BUF_2K = 2048,
     CLI_BUF_8K = 8192,
     CLI_BUF_32 = 32,
@@ -3128,16 +3138,110 @@ static int cbm_macos_adhoc_sign(const char *binary_path) {
 
 /* ── Kill other MCP server instances ──────────────────────────── */
 
-static int cbm_kill_other_instances(void) {
+/* True on-disk identity comparison for kill attribution: volume serial +
+ * file index on Windows (immune to case, separator, 8.3 and hardlink
+ * spellings), dev+inode on POSIX. cbm_same_file's normalized string compare
+ * is fine for self-copy avoidance but too weak to authorize terminating a
+ * process. Any attribution failure returns false — fail closed: no kill
+ * without positive identity. */
+static bool cbm_kill_identity_equal(const char *a, const char *b) {
 #ifdef _WIN32
-    /* taskkill /IM kills ALL matching processes INCLUDING self.
-     * Use /FI filter to exclude our own PID. */
-    char pid_filter[CBM_SZ_64];
-    snprintf(pid_filter, sizeof(pid_filter), "PID ne %lu", (unsigned long)GetCurrentProcessId());
-    const char *argv[] = {"taskkill", "/F",       "/FI", "IMAGENAME eq codebase-memory-mcp.exe",
-                          "/FI",      pid_filter, NULL};
-    (void)cbm_exec_no_shell(argv);
-    return 0;
+    HANDLE ha =
+        CreateFileA(a, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (ha == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    HANDLE hb =
+        CreateFileA(b, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hb == INVALID_HANDLE_VALUE) {
+        CloseHandle(ha);
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION ia;
+    BY_HANDLE_FILE_INFORMATION ib;
+    bool equal = GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib) &&
+                 ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+                 ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+    CloseHandle(ha);
+    CloseHandle(hb);
+    return equal;
+#else
+    struct stat sa;
+    struct stat sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+        return false;
+    }
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+#endif
+}
+
+/* #292 (Astrolabe): stop ONLY server instances running the exact binary this
+ * install/update is replacing (install_target). The former implementation
+ * killed by IMAGE NAME host-wide (Windows: `taskkill /F /FI "IMAGENAME eq
+ * codebase-memory-mcp.exe"`; POSIX: `pgrep -x` + SIGTERM), force-terminating
+ * every process that merely shared the name — concurrent gate harness
+ * binaries, other checkouts' builds, other sessions' live MCP servers — with
+ * exit code 1 and no output (the #292 silent-rc=1 family). A kill now
+ * requires positive identity attribution of the candidate's executable to
+ * install_target; anything unattributable is skipped and logged, never
+ * killed. */
+static int cbm_kill_other_instances(const char *install_target) {
+    if (!install_target || !install_target[0]) {
+        return 0;
+    }
+#ifdef _WIN32
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        cbm_log_warn("install.kill_instances", "err", "process_snapshot_failed");
+        return 0;
+    }
+    PROCESSENTRY32 pe;
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    DWORD self = GetCurrentProcessId();
+    int killed = 0;
+    for (BOOL ok = Process32First(snap, &pe); ok; ok = Process32Next(snap, &pe)) {
+        if (pe.th32ProcessID == self || _stricmp(pe.szExeFile, "codebase-memory-mcp.exe") != 0) {
+            continue;
+        }
+        char pid_buf[CBM_SZ_64];
+        snprintf(pid_buf, sizeof(pid_buf), "%lu", (unsigned long)pe.th32ProcessID);
+        HANDLE proc =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                        pe.th32ProcessID);
+        if (!proc) {
+            cbm_log_debug("install.kill_instances.skip", "pid", pid_buf, "reason", "open_failed");
+            continue;
+        }
+        char image[CLI_BUF_1K];
+        DWORD image_len = (DWORD)sizeof(image);
+        if (!QueryFullProcessImageNameA(proc, 0, image, &image_len)) {
+            cbm_log_debug("install.kill_instances.skip", "pid", pid_buf, "reason",
+                          "image_path_unreadable");
+            CloseHandle(proc);
+            continue;
+        }
+        if (!cbm_kill_identity_equal(image, install_target)) {
+            cbm_log_debug("install.kill_instances.skip", "pid", pid_buf, "reason",
+                          "different_binary", "path", image);
+            CloseHandle(proc);
+            continue;
+        }
+        if (TerminateProcess(proc, 1)) {
+            /* Wait for teardown so the image section is released before the
+             * caller overwrites install_target (kill-then-copy race). */
+            (void)WaitForSingleObject(proc, CLI_KILL_WAIT_MS);
+            killed++;
+            cbm_log_info("install.kill_instances.stopped", "pid", pid_buf, "path", image);
+        } else {
+            cbm_log_warn("install.kill_instances.terminate_failed", "pid", pid_buf);
+        }
+        CloseHandle(proc);
+    }
+    CloseHandle(snap);
+    return killed;
 #else
     int killed = 0;
     pid_t self = getpid();
@@ -3148,10 +3252,32 @@ static int cbm_kill_other_instances(void) {
     char line[CLI_BUF_32];
     while (fgets(line, sizeof(line), fp)) {
         pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
-        if (pid > 0 && pid != self) {
-            if (kill(pid, SIGTERM) == 0) {
-                killed++;
-            }
+        if (pid <= 0 || pid == self) {
+            continue;
+        }
+        char pid_buf[CLI_BUF_32];
+        snprintf(pid_buf, sizeof(pid_buf), "%ld", (long)pid);
+        /* Attribute the candidate's executable via /proc (Linux). An
+         * unreadable exe link (non-Linux POSIX, permissions) means no
+         * attribution and therefore no kill (fail closed). */
+        char exe_link[CLI_BUF_128];
+        char exe_path[CLI_BUF_1K];
+        snprintf(exe_link, sizeof(exe_link), "/proc/%ld/exe", (long)pid);
+        ssize_t exe_len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (exe_len <= 0) {
+            cbm_log_debug("install.kill_instances.skip", "pid", pid_buf, "reason",
+                          "exe_path_unreadable");
+            continue;
+        }
+        exe_path[exe_len] = '\0';
+        if (!cbm_kill_identity_equal(exe_path, install_target)) {
+            cbm_log_debug("install.kill_instances.skip", "pid", pid_buf, "reason",
+                          "different_binary", "path", exe_path);
+            continue;
+        }
+        if (kill(pid, SIGTERM) == 0) {
+            killed++;
+            cbm_log_info("install.kill_instances.stopped", "pid", pid_buf, "path", exe_path);
         }
     }
     cbm_pclose(fp);
@@ -3894,9 +4020,19 @@ int cbm_cmd_install(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    /* Step 1b: Kill running MCP server instances so agents pick up new config */
+    /* Canonical install target — computed before Step 1b so the instance kill
+     * can attribute candidates to exactly this binary (#292). */
+    char bin_target[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+
+    /* Step 1b: Kill running instances OF THE TARGET BINARY so agents pick up
+     * new config. Never name-wide (#292). */
     if (!dry_run) {
-        int killed = cbm_kill_other_instances();
+        int killed = cbm_kill_other_instances(bin_target);
         if (killed > 0) {
             printf("Stopped %d running MCP server instance(s).\n\n", killed);
         }
@@ -3909,13 +4045,6 @@ int cbm_cmd_install(int argc, char **argv) {
      * running binary to ~/.local/bin (unless we ARE that file), then sign it. */
     char self_path[CLI_BUF_1K] = {0};
     cbm_detect_self_path(self_path, sizeof(self_path), home);
-
-    char bin_target[CLI_BUF_1K];
-#ifdef _WIN32
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
-#else
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
-#endif
 
     if (!cbm_same_file(self_path, bin_target)) {
         struct stat tgt_st;
@@ -4361,7 +4490,7 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
 
-    int killed = cbm_kill_other_instances();
+    int killed = cbm_kill_other_instances(bin_dest);
     if (killed > 0) {
         printf("Stopped %d running MCP server instance(s).\n", killed);
     }

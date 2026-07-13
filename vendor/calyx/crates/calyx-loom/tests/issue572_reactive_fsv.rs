@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use calyx_aster::dedup::EpochSecs;
@@ -29,10 +28,11 @@ fn salt() -> Vec<u8> {
     b"issue572-reactive-fsv-salt".to_vec()
 }
 
-fn root() -> PathBuf {
-    std::env::var_os("CALYX_ISSUE572_FSV_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("calyx-issue572-reactive-fsv"))
+// RAII scratch (#260): an operator `CALYX_ISSUE572_FSV_ROOT` is kept for
+// inspection; unset arms a self-cleaning temp fallback (incl. panic unwind).
+// Bind the returned guard for the test's lifetime, then `.join(..)` children.
+fn root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_ISSUE572_FSV_ROOT", "calyx-issue572-reactive-fsv")
 }
 
 fn open_durable(dir: &std::path::Path) -> AsterVault<SystemClock> {
@@ -82,7 +82,8 @@ fn lref(seq: u64) -> LedgerRef {
 /// exactly once, on the third ingest — proven against the on-disk count.
 #[test]
 fn event_recurs_fires_on_real_third_occurrence() {
-    let dir = root().join("vault");
+    let scratch = root();
+    let dir = scratch.join("vault");
     fs::remove_dir_all(&dir).ok();
     let vault = open_durable(&dir);
     let series = put_base(&vault, b"reactive-series-alpha");
@@ -166,7 +167,7 @@ fn event_recurs_fires_on_real_third_occurrence() {
         "fired_event_ledger_seq": fired_events[0].ledger_ref.seq,
         "audit_matched_sequence": matched,
     });
-    let out = root().join("issue572-reactive-fsv-artifact.json");
+    let out = scratch.join("issue572-reactive-fsv-artifact.json");
     fs::write(&out, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     println!("{}", serde_json::to_string_pretty(&artifact).unwrap());
 }
@@ -174,7 +175,8 @@ fn event_recurs_fires_on_real_third_occurrence() {
 /// Edge 1 (empty): a series with zero appended occurrences never fires.
 #[test]
 fn edge_empty_series_never_fires() {
-    let dir = root().join("vault-empty");
+    let scratch = root();
+    let dir = scratch.join("vault-empty");
     fs::remove_dir_all(&dir).ok();
     let vault = open_durable(&dir);
     let series = put_base(&vault, b"reactive-series-empty");
@@ -229,7 +231,8 @@ fn edge_registry_full_fails_closed() {
 /// oldest, returns `CALYX_REACTIVE_QUEUE_FULL`, and records the warning.
 #[test]
 fn edge_queue_overflow_warns() {
-    let dir = root().join("vault-overflow");
+    let scratch = root();
+    let dir = scratch.join("vault-overflow");
     fs::remove_dir_all(&dir).ok();
     let vault = open_durable(&dir);
     let series = put_base(&vault, b"reactive-series-overflow");
@@ -280,7 +283,8 @@ fn edge_queue_overflow_warns() {
 /// the engine propagates `CALYX_REACTIVE_SIGNAL_UNAVAILABLE` and fires nothing.
 #[test]
 fn edge_novelty_on_recurrence_source_fails_closed() {
-    let dir = root().join("vault-novelty");
+    let scratch = root();
+    let dir = scratch.join("vault-novelty");
     fs::remove_dir_all(&dir).ok();
     let vault = open_durable(&dir);
 

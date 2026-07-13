@@ -7,6 +7,13 @@
 #   make -f Makefile.cbm cbm            # Production binary
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
 
+# Captured BEFORE any -include adds generated .d files to MAKEFILE_LIST:
+# $(lastword MAKEFILE_LIST) after the #280 per-TU `-include build/.../*.d`
+# lines silently re-points to the last dep file's directory (bit the release
+# gate: lint-cppcheck-astrolabe scanned build/c/tuprod/... instead of this
+# directory once a prod build had populated dep files).
+ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
 # Linux: gcc/g++ — system default with full sanitizer support
@@ -768,7 +775,7 @@ cbm: $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Static library for Astrolabe FFI ─────────────────────────────
 
-ASTROLABE_PATCH_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+# ASTROLABE_PATCH_DIR is captured at the top of this file (before any -include).
 ASTRO_ALLOC_SHIM_SRC = $(ASTROLABE_PATCH_DIR)/astro_alloc_shim.c
 ASTRO_ALLOC_SHIM_OBJ = $(LIBCBM_DIR)/astro_alloc_shim.o
 ASTRO_LAYOUT_PROBE_SRC = $(ASTROLABE_PATCH_DIR)/astro_layout_probe.c

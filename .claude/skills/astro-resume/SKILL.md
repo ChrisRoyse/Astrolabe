@@ -30,8 +30,8 @@ In-progress issues:
 
 ## Rules
 
-- Never redo a checked DoD item — verify it (run the named test/gate) and note the result.
+- Never redo a checked DoD item — verify it (re-run its named FSV) and note the result.
 - Sole-agent repo: a prior `status:in-progress` claim never prevents continuation, **unless** the claim comment is newer than 48h and evidently from another live session.
-- Run the astro-gate preflight before any build; obey its verdict (a live lock or owned toolchain means read-only work).
+- Before any build, check `.tmp/astrolabe-launcher.lock` and live toolchain processes; a live lock or owned toolchain means read-only work.
 - If the toolchain is occupied, pick non-colliding work: issue analysis, specs, docs, portable Python checks — never a competing build.
 - Then continue via astro-issue.
