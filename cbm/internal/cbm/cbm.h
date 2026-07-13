@@ -515,6 +515,15 @@ typedef struct {
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
 void cbm_alloc_init(void);
 
+// Init-order probe (#5). Returns non-zero once cbm_alloc_init() has bound the
+// tree-sitter/sqlite allocators to mimalloc in a build that enables the binding
+// (CBM_BIND_TS_ALLOCATOR — libcbm.a and the production binary). Always 0 in the
+// test build (the binding is a no-op there) and before the first
+// cbm_alloc_init() call. Lets Rust FFI tests read back the binding state as
+// deterministic evidence of allocator initialization ordering rather than
+// inferring it from heap-accounting deltas.
+int cbm_alloc_bindings_active(void);
+
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
 

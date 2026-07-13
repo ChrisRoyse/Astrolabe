@@ -24,6 +24,8 @@ memory is released by Rust. CBM-owned strings and buffers crossing FFI are
 released through their CBM deallocator; callers never substitute libc or Rust
 deallocation based on an assumed shared heap.
 
+## Initialization order
+
 Startup code that can call libcbm must call
 `cbm_sys::initialize_allocator_bindings_first()` before other libcbm entry
 points. Bridge constructors do this before `cbm_init`, extraction, or MCP server
@@ -31,13 +33,59 @@ creation. The function calls `cbm_alloc_init()` and asserts that the runtime
 mimalloc version matches the vendored header version captured by
 `cbm-sys/build.rs`.
 
+`cbm_alloc_init()` binds SQLite via `SQLITE_CONFIG_MALLOC`, which SQLite ignores
+with `SQLITE_MISUSE` once it has initialized. Calling any store entry point
+before the binding would therefore leave SQLite on its own allocator, so the
+ordering is a correctness contract, not an optimization. Two mechanisms enforce
+it: the C-side `assert(sqlite_rc == SQLITE_OK)` inside `cbm_alloc_init()` aborts
+fail-closed if SQLite initialized first, and `cbm_alloc_bindings_active()`
+(Rust: `cbm_sys::allocator_bindings_active()`) reads the binding flag back so a
+test can prove the binding is live *before* it opens a store.
+
+## MinGW-only global override
+
+The static-CRT `malloc`/`free` override (`-DMI_MALLOC_OVERRIDE=1`, mimalloc
+3.3.0's `_MSC_VER` / `_ACRTIMP` / `_CRT_HYBRIDPATCHABLE` entry points) is enabled
+**only** when `patches/cbm/Makefile.cbm` detects a MinGW target
+(`IS_MINGW = yes`, from the compiler's own `_WIN32` predefine). Unix builds never
+receive the define — overriding process `malloc`/`free` there caused invalid
+cross-library frees on macOS (see the Unix routing note above). This is a
+build-time platform gate: the same `MIMALLOC_OVERRIDE_DEFINE` value flows into
+`libcbm.a`, `cbm`, and `cbm-with-ui`, so no artifact can diverge from it.
+
+## Sanitizer strategy
+
 ASan builds set `CBM_SYS_ASAN=1`. In that profile, `cbm-sys` does not install the
 Rust mimalloc global allocator, and the libcbm overlay compiles mimalloc without
-allocator override or tree-sitter/SQLite allocator binding. Mimalloc remains
-linked only for process APIs and shim/version checks, so ASan owns ordinary Rust
-and C allocation interception.
+allocator override or tree-sitter/SQLite allocator binding (`LIBCBM_ASAN=1` drops
+`CBM_BIND_TS_ALLOCATOR`, so `cbm_alloc_bindings_active()` stays `0` by design).
+Mimalloc remains linked only for process APIs and shim/version checks, so ASan
+owns ordinary Rust and C allocation interception. The allocator-topology tests
+that assume the mimalloc global allocator are `#[cfg(not(cbm_sys_asan))]`.
 
-`scripts/check-single-mimalloc.sh` verifies that a final Astrolabe test binary
-contains exactly one raw mimalloc implementation and one `cbm_mimalloc_*` shim
-surface. `scripts/check-allocator-contract.py` verifies the platform routing,
-Rust shim, initialization binding, dependency, documentation, and gate contract.
+ASan is a sanitizer-on-Linux facility; **executing** an ASan build is
+`DEFERRED[ASTRO_PORT_PHASE]` (tracked on #238) under the Windows-only directive.
+The wiring above is present and compiled so the deferral is a scheduling choice,
+not a missing capability.
+
+## Topology verification (FSV)
+
+The former `scripts/check-single-mimalloc.sh` and
+`scripts/check-allocator-contract.py` gate scripts were removed with the rest of
+the aggregate gate suite under the 2026-07-13 FSV-only directive; they are not
+rebuilt. The single-implementation invariant is verified instead by reading the
+symbol table of the built artifact directly. On the native Windows-GNU archive:
+
+```sh
+# Exactly one mimalloc implementation is linked (one defining `mi_malloc`):
+nm target/**/build/*/out/cbm-build/libcbm.a | grep -E ' T _?mi_malloc$' | wc -l   # => 1
+# Exactly one cbm_mimalloc_* shim surface (the Rust global allocator's C seam):
+nm target/**/build/*/out/cbm-build/libcbm.a | grep -E ' T _?cbm_mimalloc_free$' | wc -l  # => 1
+```
+
+The behavioral half of the topology invariant — Rust and C allocations sharing
+one heap, cross-heap alloc/free across the FFI seam, and SQLite/tree-sitter
+riding the same heap — is proven by the native `cbm-sys` tests
+`rust_and_c_allocations_share_mimalloc_accounting`,
+`cross_heap_alloc_and_free_through_ffi_seam`, and
+`cbm_alloc_init_binds_before_sqlite_use`.

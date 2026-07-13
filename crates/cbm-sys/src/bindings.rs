@@ -1035,6 +1035,9 @@ unsafe extern "C" {
     pub fn cbm_alloc_init();
 }
 unsafe extern "C" {
+    pub fn cbm_alloc_bindings_active() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_init() -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
