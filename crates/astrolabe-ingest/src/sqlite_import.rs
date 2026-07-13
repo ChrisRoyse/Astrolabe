@@ -7479,4 +7479,154 @@ mod tests {
         assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
         fs::remove_file(path).ok();
     }
+
+    // ---- #23: reduced-scale reproduction of the M-scale direct-import failure ----
+    //
+    // The M-scale latency harness (mscale_pipeline_rows) drove
+    // import_cbm_graph_snapshot_to_vault_direct through the row-sink candidate
+    // path and failed. The failure was masked by import_shadow_vault_report's
+    // sqlite fallback (which then errored trying to open a non-existent
+    // `unused.db`). These two tests reproduce the ROOT CAUSE directly in the
+    // pure-Rust ingest crate, without the server layer:
+    //
+    //   1. `direct_import_rejects_import_edge_with_local_name_mismatch` pins the
+    //      fail-closed contract that fired: an "IMPORTS" edge whose
+    //      `local_name_gen` does not equal the `local_name` carried in its
+    //      properties JSON is refused (snapshot_edge_rows). The harness fixture
+    //      violated exactly this — it set local_name_gen = "dep_XXXXX" but never
+    //      wrote a matching "local_name" property.
+    //
+    //   2. `direct_import_scales_with_consistent_import_edges` proves the direct
+    //      import path itself scales (2_000 symbols / 20_000 edges) once the
+    //      edges are internally consistent — i.e. there is NO scale-dependent
+    //      production defect; the M-scale break was a fixture inconsistency the
+    //      importer correctly rejected.
+
+    fn scale_node(index: usize, generation: u8) -> CbmGraphNode {
+        CbmGraphNode {
+            source_node_id: index as i64 + 1,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: format!("symbol_{index:05}"),
+            qualified_name: format!("demo.symbol_{index:05}"),
+            file_path: format!("src/module_{:03}.rs", index / 100),
+            start_line: (index % 100) as i64 + 1,
+            end_line: (index % 100) as i64 + 1,
+            properties_json: format!(
+                r#"{{"language":"rust","source_snippet":"fn symbol_{index:05}(input: i32) -> i32 {{ input + {generation} }}","signature":"fn symbol_{index:05}(input: i32) -> i32","docstring":"scale symbol {index} generation {generation}","return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+            ),
+            node_vector: None,
+            cx_id: None,
+            structural: false,
+        }
+    }
+
+    /// Builds a consistent reduced-scale snapshot: every "IMPORTS" edge carries a
+    /// `local_name` property that matches its `local_name_gen` (the invariant the
+    /// M-scale harness fixture violated).
+    fn scale_snapshot(symbol_count: usize, edges_per_symbol: usize) -> CbmGraphSnapshot {
+        let nodes = (0..symbol_count)
+            .map(|index| scale_node(index, 1))
+            .collect::<Vec<_>>();
+        let mut edges = Vec::with_capacity(symbol_count * edges_per_symbol);
+        let mut edge_id = 1_i64;
+        for source in 0..symbol_count {
+            for offset in 1..=edges_per_symbol {
+                let target = (source + offset * 997) % symbol_count;
+                let local_name = format!("dep_{target:05}");
+                edges.push(CbmGraphEdge {
+                    sqlite_edge_id: edge_id,
+                    project: "demo".to_string(),
+                    source_node_id: source as i64 + 1,
+                    target_node_id: target as i64 + 1,
+                    src: None,
+                    dst: None,
+                    edge_type: "IMPORTS".to_string(),
+                    local_name_gen: local_name.clone(),
+                    weight: 1.0,
+                    properties_json: format!(
+                        r#"{{"local_name":"{local_name}","ordinal":{offset}}}"#
+                    ),
+                });
+                edge_id += 1;
+            }
+        }
+        CbmGraphSnapshot {
+            project: "demo".to_string(),
+            panel_version: Some(7),
+            projects: Vec::new(),
+            nodes,
+            edges,
+            file_hashes: Vec::new(),
+            project_summaries: Vec::new(),
+            token_vectors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn direct_import_rejects_import_edge_with_local_name_mismatch() {
+        // Mirror the M-scale harness bug exactly: an IMPORTS edge with a
+        // non-empty local_name_gen but NO "local_name" property.
+        let mut snapshot = scale_snapshot(2, 0);
+        snapshot.edges.push(CbmGraphEdge {
+            sqlite_edge_id: 1,
+            project: "demo".to_string(),
+            source_node_id: 1,
+            target_node_id: 2,
+            src: None,
+            dst: None,
+            edge_type: "IMPORTS".to_string(),
+            local_name_gen: "dep_00001".to_string(),
+            weight: 1.0,
+            properties_json: r#"{"ordinal":1}"#.to_string(),
+        });
+        let (_dir, vault) = durable_vault("direct-import-mismatch");
+        let before = vault.latest_seq();
+        let err = import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            [7; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("inconsistent IMPORTS edge must be refused");
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        let message = err.to_string();
+        assert!(message.contains("local_name_gen"), "{message}");
+        assert!(message.contains("does not match"), "{message}");
+        // Fail-closed: no partial mutation, no ledger append.
+        assert_eq!(vault.latest_seq(), before);
+        assert_eq!(ledger_row_count(&vault).expect("ledger count"), 0);
+    }
+
+    #[test]
+    fn direct_import_scales_with_consistent_import_edges() {
+        // 2_000 symbols x 10 edges = 20_000 edges: large enough to exercise the
+        // node-map / edge-projection / FSV readback at scale, small enough to run
+        // in the pure-Rust suite. Proves the direct path has no scale-dependent
+        // defect once edges satisfy the local_name invariant.
+        const SYMBOLS: usize = 2_000;
+        const EDGES_PER_SYMBOL: usize = 10;
+        let snapshot = scale_snapshot(SYMBOLS, EDGES_PER_SYMBOL);
+        let (_dir, vault) = durable_vault("direct-import-scale");
+        let report = import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            [9; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(4).with_series_registry(true),
+        )
+        .expect("consistent scale import succeeds");
+        assert_eq!(report.sqlite_nodes, SYMBOLS);
+        assert_eq!(report.sqlite_edges, SYMBOLS * EDGES_PER_SYMBOL);
+        assert_eq!(report.new_cx_ids, SYMBOLS);
+        assert_eq!(report.edge_rows_written, SYMBOLS * EDGES_PER_SYMBOL);
+
+        // Independent readback of persisted state (FSV): the live graph reports
+        // exactly the imported node and edge counts.
+        let live = read_cbm_graph_snapshot(&vault, "demo").expect("read persisted graph");
+        assert_eq!(live.nodes.len(), SYMBOLS);
+        assert_eq!(live.edges.len(), SYMBOLS * EDGES_PER_SYMBOL);
+        assert_eq!(verify_chain(&vault).expect("verify chain").status, "intact");
+    }
 }

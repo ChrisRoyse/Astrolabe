@@ -12,6 +12,16 @@ pub(crate) const ASTRO_SHADOW_VERIFY_NOT_INTACT: &str = "ASTRO_SHADOW_VERIFY_NOT
 /// Genuine source staleness that the read path refuses to reconcile on its own, because
 /// the refresh available to it cannot rebuild the row-sink-derived surfaces (#222).
 pub(crate) const ASTRO_SHADOW_STALE_REINDEX_REQUIRED: &str = "ASTRO_SHADOW_STALE_REINDEX_REQUIRED";
+/// The row-sink direct import failed and there is no CBM SQLite artifact to fall back to
+/// (the sqlite path is intentionally absent). Falling back would only mask the real
+/// row-sink error behind a misleading "cannot open SQLite" error, so the direct-import
+/// error is surfaced verbatim and fail-closed (#23).
+pub(crate) const ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED: &str = "ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED";
+/// The row-sink direct import failed AND the CBM SQLite fallback import also failed. Both
+/// underlying errors are chained verbatim so neither cause is masked (#23).
+pub(crate) const ASTRO_SHADOW_IMPORT_BOTH_FAILED: &str = "ASTRO_SHADOW_IMPORT_BOTH_FAILED";
+pub(crate) const SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION: &str = "the CBM row-sink snapshot could not be imported directly and no CBM SQLite artifact exists to recover from; fix the row-sink rows (the chained error names the exact offending row/field) and rerun index_repository with calyx=\"shadow\"";
+pub(crate) const SHADOW_IMPORT_BOTH_FAILED_REMEDIATION: &str = "both the CBM row-sink direct import and the CBM SQLite fallback import failed; the chained errors name each root cause — resolve the row-sink error first (it is the primary source), then rerun index_repository with calyx=\"shadow\"";
 pub(crate) const SHADOW_SOURCE_MISSING_REMEDIATION: &str = "run index_repository with calyx=\"shadow\" to build the CBM SQLite source and shadow vault before reading shadow freshness";
 pub(crate) const SHADOW_FINGERPRINT_MISSING_REMEDIATION: &str = "no shadow import watermark is recorded; run index_repository with calyx=\"shadow\" so the vault_fingerprint content watermark is persisted";
 /// #222: `index_status` deliberately no longer promises a background refresh here. The
@@ -1382,20 +1392,53 @@ where
                     anomalies,
                     provenance,
                 }),
-                Err(error) => {
-                    let reason = format!("row-sink direct import failed: {error}");
-                    let report = import_sqlite_to_vault(sqlite_path, vault, runtime, options)?;
-                    Ok(ShadowVaultImport {
-                        report,
-                        source: "sqlite_fallback".to_string(),
-                        fallback_reason: Some(reason),
-                        security_screen,
-                        skill_tree,
-                        bridges,
-                        kernel_context,
-                        anomalies,
-                        provenance,
-                    })
+                Err(row_sink_error) => {
+                    // Fail-closed error chaining (#23): the row-sink direct import is the
+                    // primary source of truth. The SQLite fallback is a *recovery* path
+                    // that only exists when a real CBM SQLite artifact is present (the
+                    // production caller guarantees this — `import_shadow_vault_with_archaeology`
+                    // refuses when the sqlite source is missing). If the sqlite path is
+                    // intentionally absent, attempting the fallback would open a missing
+                    // file and return a misleading "cannot open SQLite" error that *masks*
+                    // the real row-sink cause. So skip the fallback entirely and surface the
+                    // row-sink error verbatim, fail-closed.
+                    if !sqlite_path.exists() {
+                        return Err(astrolabe_domain::DomainError::new(
+                            ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED,
+                            format!(
+                                "{ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED}: row-sink direct import failed and no CBM SQLite artifact exists at {} to recover from. Row-sink error: {row_sink_error}",
+                                sqlite_path.display()
+                            ),
+                            SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION,
+                        )
+                        .into());
+                    }
+                    // A real sqlite artifact is present: attempt recovery. On success this is
+                    // a *labeled* degradation (`fallback_reason` carries the row-sink error
+                    // verbatim). On failure, chain BOTH errors so neither cause is masked.
+                    let reason = format!("row-sink direct import failed: {row_sink_error}");
+                    match import_sqlite_to_vault(sqlite_path, vault, runtime, options) {
+                        Ok(report) => Ok(ShadowVaultImport {
+                            report,
+                            source: "sqlite_fallback".to_string(),
+                            fallback_reason: Some(reason),
+                            security_screen,
+                            skill_tree,
+                            bridges,
+                            kernel_context,
+                            anomalies,
+                            provenance,
+                        }),
+                        Err(fallback_error) => Err(astrolabe_domain::DomainError::new(
+                            ASTRO_SHADOW_IMPORT_BOTH_FAILED,
+                            format!(
+                                "{ASTRO_SHADOW_IMPORT_BOTH_FAILED}: row-sink direct import failed AND CBM SQLite fallback import from {} failed. Row-sink error: {row_sink_error}. SQLite fallback error: {fallback_error}",
+                                sqlite_path.display()
+                            ),
+                            SHADOW_IMPORT_BOTH_FAILED_REMEDIATION,
+                        )
+                        .into()),
+                    }
                 }
             }
         }
