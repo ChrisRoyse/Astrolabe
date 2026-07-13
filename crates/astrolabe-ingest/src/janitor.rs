@@ -40,6 +40,11 @@
 //! prefix). A subsequent idle step then verifies nothing and writes nothing,
 //! reaching a fixed point instead of emitting an unbounded stream of self-records.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::Clock;
@@ -58,6 +63,11 @@ use astrolabe_domain::fsv::FsvAck;
 pub const ASTRO_FSV_JANITOR_CHAIN_DAMAGE: &str = "ASTRO_FSV_JANITOR_CHAIN_DAMAGE";
 /// Fail-closed refusal: the persisted janitor checkpoint row does not decode.
 pub const ASTRO_FSV_JANITOR_CHECKPOINT_CORRUPT: &str = "ASTRO_FSV_JANITOR_CHECKPOINT_CORRUPT";
+/// Fail-closed refusal: the requested always-on scrub cadence is outside the
+/// declared knob bounds.
+pub const ASTRO_FSV_JANITOR_INTERVAL_INVALID: &str = "ASTRO_FSV_JANITOR_INTERVAL_INVALID";
+/// Fail-closed refusal: the OS refused to spawn the background janitor thread.
+pub const ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED: &str = "ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED";
 
 const CHAIN_DAMAGE_REMEDIATION: &str = "Quarantine the reported ledger sequence, restore or rebuild the vault from source bytes, then restart so the janitor re-verifies from a clean chain.";
 const CHECKPOINT_CORRUPT_REMEDIATION: &str = "The persisted FSV janitor checkpoint row is unreadable; delete it (or rebuild the vault) so the janitor resumes from genesis, then restart.";
@@ -303,6 +313,321 @@ fn scrub_ledger_payload(
     }))?)
 }
 
+const INTERVAL_INVALID_REMEDIATION: &str = "Set the janitor scrub interval inside the declared FSV knob bounds, or use JanitorLaneConfig::from_registry_defaults() for the declared default cadence.";
+const LANE_SPAWN_REMEDIATION: &str = "The OS refused a new thread for the always-on FSV janitor; free thread resources or lower concurrency, then restart the lane.";
+
+/// Registry-declared configuration for the always-on [`JanitorLane`].
+///
+/// Both tunables are declared FSV knobs (standing invariant 4): the scrub cadence
+/// is [`astrolabe_domain::knobs::FSV_JANITOR_SCRUB_INTERVAL_MS_KNOB`] and the
+/// per-slice ledger-entry budget is
+/// [`astrolabe_domain::knobs::FSV_JANITOR_LEDGER_ENTRIES_PER_SLICE_KNOB`].
+#[derive(Debug, Clone)]
+pub struct JanitorLaneConfig {
+    /// Sleep between bounded scrub slices.
+    scrub_interval: Duration,
+    /// Per-slice ledger-entry budget override; `None` uses the registry default.
+    budget_override: Option<u64>,
+    /// Run a one-time [`janitor_startup_verify`] boot sweep before the lane
+    /// starts; a damaged chain refuses the spawn (fail closed at boot).
+    startup_verify: bool,
+}
+
+impl JanitorLaneConfig {
+    /// The declared-default configuration: default cadence, default per-slice
+    /// budget, and the startup boot-verify hook enabled.
+    #[must_use]
+    pub fn from_registry_defaults() -> Self {
+        Self {
+            scrub_interval: Duration::from_millis(
+                astrolabe_domain::knobs::FSV_DEFAULT_JANITOR_SCRUB_INTERVAL_MS,
+            ),
+            budget_override: None,
+            startup_verify: true,
+        }
+    }
+
+    /// Sets the scrub cadence from a millisecond value validated against the
+    /// declared knob bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`ASTRO_FSV_JANITOR_INTERVAL_INVALID`] when `interval_ms` is outside the
+    /// declared bounds.
+    pub fn with_interval_ms(mut self, interval_ms: u64) -> IngestResult<Self> {
+        let knob = astrolabe_domain::knobs::fsv_knob(
+            astrolabe_domain::knobs::FSV_JANITOR_SCRUB_INTERVAL_MS_KNOB,
+        )
+        .expect("janitor scrub-interval knob is declared in the FSV knob registry");
+        if !knob.accepts(interval_ms) {
+            return Err(IngestError::refused(
+                ASTRO_FSV_JANITOR_INTERVAL_INVALID,
+                format!(
+                    "janitor scrub interval {interval_ms}ms is outside the declared knob bounds [{}, {}]",
+                    knob.min, knob.max
+                ),
+                INTERVAL_INVALID_REMEDIATION,
+            ));
+        }
+        self.scrub_interval = Duration::from_millis(interval_ms);
+        Ok(self)
+    }
+
+    /// Narrows or widens the per-slice ledger-entry budget; `run_janitor_scrub_step`
+    /// validates it against the declared knob bounds on every step.
+    #[must_use]
+    pub fn with_budget_override(mut self, budget: Option<u64>) -> Self {
+        self.budget_override = budget;
+        self
+    }
+
+    /// Enables or disables the one-time startup boot-verify hook.
+    #[must_use]
+    pub fn with_startup_verify(mut self, enabled: bool) -> Self {
+        self.startup_verify = enabled;
+        self
+    }
+}
+
+/// A snapshot of the always-on lane's runtime state, suitable for surfacing in a
+/// server status envelope (e.g. `index_status`).
+///
+/// Every field is a labeled fact, never a bare green flag: a halted lane names the
+/// exact refusal that stopped it, so the server surface can report *why*
+/// self-verification stopped rather than a silent "not running".
+#[derive(Debug, Clone)]
+pub struct JanitorLaneState {
+    /// Total scrub steps the lane has completed (idle or scrubbing).
+    pub steps_run: u64,
+    /// Steps that verified a non-empty slice and ledgered a witnessed scrub.
+    pub scrubs_committed: u64,
+    /// The persisted checkpoint watermark after the most recent step.
+    pub last_checkpoint: JanitorCheckpoint,
+    /// True once the lane stopped itself because a step failed closed; it makes
+    /// no further mutations until restarted against a repaired store.
+    pub halted: bool,
+    /// The refusal code that halted the lane, if any (e.g.
+    /// [`ASTRO_FSV_JANITOR_CHAIN_DAMAGE`]).
+    pub halt_code: Option<String>,
+    /// The human-readable message of the halting refusal, if any.
+    pub halt_message: Option<String>,
+}
+
+impl JanitorLaneState {
+    fn genesis() -> Self {
+        Self {
+            steps_run: 0,
+            scrubs_committed: 0,
+            last_checkpoint: JanitorCheckpoint::GENESIS,
+            halted: false,
+            halt_code: None,
+            halt_message: None,
+        }
+    }
+
+    /// True while the lane is running and has not failed closed.
+    #[must_use]
+    pub fn healthy(&self) -> bool {
+        !self.halted
+    }
+}
+
+/// The always-on FSV janitor lane: a background thread that repeatedly runs a
+/// bounded [`run_janitor_scrub_step`] on the registry-declared cadence, so the
+/// store continuously re-verifies its own persisted ledger without any external
+/// harness (#178 DoD item 2, runtime half).
+///
+/// The lane is **fail-closed**: the first step that returns a structured refusal
+/// (chain damage, corrupt checkpoint, ...) stops the lane, records the exact
+/// code/message in [`JanitorLaneState`], and makes no further mutation — it never
+/// spins on a persistent fault and never silently continues past damage.
+///
+/// Dropping the lane (or calling [`JanitorLane::stop`]) signals the thread and
+/// joins it, so no scrub thread outlives its handle.
+#[derive(Debug)]
+pub struct JanitorLane {
+    stop: Arc<AtomicBool>,
+    steps: Arc<AtomicU64>,
+    state: Arc<Mutex<JanitorLaneState>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl JanitorLane {
+    /// Spawns the background scrub lane against a shared vault.
+    ///
+    /// When `config.startup_verify` is set, a one-time [`janitor_startup_verify`]
+    /// boot sweep runs synchronously first; a damaged chain refuses the spawn
+    /// (returns the refusal and spawns no thread) so the lane never begins
+    /// serving atop an already-corrupt store.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a startup boot-verify refusal (e.g.
+    /// [`ASTRO_FSV_JANITOR_CHAIN_DAMAGE`]) when the hook is enabled and the
+    /// persisted chain is damaged, or [`ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED`] if
+    /// the OS refuses the thread.
+    pub fn spawn<C>(vault: Arc<AsterVault<C>>, config: JanitorLaneConfig) -> IngestResult<Self>
+    where
+        C: Clock + Send + Sync + 'static,
+    {
+        if config.startup_verify {
+            // Fail closed at boot: a corrupt persisted chain refuses the spawn.
+            janitor_startup_verify(vault.as_ref(), config.budget_override)?;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let steps = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(Mutex::new(JanitorLaneState::genesis()));
+
+        let thread_stop = Arc::clone(&stop);
+        let thread_steps = Arc::clone(&steps);
+        let thread_state = Arc::clone(&state);
+        let interval = config.scrub_interval;
+        let budget = config.budget_override;
+
+        let handle = std::thread::Builder::new()
+            .name("astrolabe-fsv-janitor".to_string())
+            .spawn(move || {
+                lane_loop(
+                    &vault,
+                    &thread_stop,
+                    &thread_steps,
+                    &thread_state,
+                    interval,
+                    budget,
+                );
+            })
+            .map_err(|error| {
+                IngestError::refused(
+                    ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED,
+                    format!("could not spawn the FSV janitor lane thread: {error}"),
+                    LANE_SPAWN_REMEDIATION,
+                )
+            })?;
+
+        Ok(Self {
+            stop,
+            steps,
+            state,
+            handle: Some(handle),
+        })
+    }
+
+    /// Returns a snapshot of the lane's current runtime state.
+    #[must_use]
+    pub fn state(&self) -> JanitorLaneState {
+        self.state.lock().expect("janitor lane state mutex").clone()
+    }
+
+    /// Returns the total number of scrub steps completed so far (idle or
+    /// scrubbing). Monotonic; usable to wait for the lane to make progress.
+    #[must_use]
+    pub fn steps_completed(&self) -> u64 {
+        self.steps.load(Ordering::Acquire)
+    }
+
+    /// Blocks until the lane has completed at least `target` steps or `timeout`
+    /// elapses. Returns true if the step count was reached.
+    pub fn wait_for_steps(&self, target: u64, timeout: Duration) -> bool {
+        wait_until(timeout, || self.steps_completed() >= target)
+    }
+
+    /// Blocks until the lane has committed at least `target` witnessed scrubs or
+    /// `timeout` elapses. Returns true if the scrub count was reached.
+    pub fn wait_for_scrubs(&self, target: u64, timeout: Duration) -> bool {
+        wait_until(timeout, || self.state().scrubs_committed >= target)
+    }
+
+    /// Blocks until the lane has halted fail-closed or `timeout` elapses. Returns
+    /// true if the lane halted.
+    pub fn wait_for_halt(&self, timeout: Duration) -> bool {
+        wait_until(timeout, || self.state().halted)
+    }
+
+    /// Signals the background thread to stop and joins it. Idempotent.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for JanitorLane {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn lane_loop<C>(
+    vault: &AsterVault<C>,
+    stop: &AtomicBool,
+    steps: &AtomicU64,
+    state: &Mutex<JanitorLaneState>,
+    interval: Duration,
+    budget: Option<u64>,
+) where
+    C: Clock,
+{
+    while !stop.load(Ordering::Acquire) {
+        match run_janitor_scrub_step(vault, budget) {
+            Ok(report) => {
+                {
+                    let mut guard = state.lock().expect("janitor lane state mutex");
+                    guard.steps_run += 1;
+                    if report.scrubbed() {
+                        guard.scrubs_committed += 1;
+                    }
+                    guard.last_checkpoint = report.checkpoint();
+                }
+                steps.fetch_add(1, Ordering::Release);
+            }
+            Err(error) => {
+                // Fail closed: record the exact refusal and stop the lane. It
+                // makes no further mutation until restarted against a repaired
+                // store — never a spin on a persistent fault.
+                {
+                    let mut guard = state.lock().expect("janitor lane state mutex");
+                    guard.steps_run += 1;
+                    guard.halted = true;
+                    guard.halt_code = error.code().map(str::to_string);
+                    guard.halt_message = Some(error.to_string());
+                }
+                steps.fetch_add(1, Ordering::Release);
+                return;
+            }
+        }
+        sleep_interruptible(stop, interval);
+    }
+}
+
+/// Sleeps up to `interval`, waking early to observe a stop signal so shutdown
+/// stays responsive regardless of the configured cadence.
+fn sleep_interruptible(stop: &AtomicBool, interval: Duration) {
+    const SLICE: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + interval;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(SLICE));
+    }
+}
+
+fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +846,197 @@ mod tests {
         let step = run_janitor_scrub_step(&vault, Some(4)).expect("step on empty ledger");
         assert!(!step.scrubbed());
         assert_eq!(step.checkpoint(), JanitorCheckpoint::GENESIS);
+    }
+
+    /// The always-on background lane runs real scrub ticks, and the checkpoint it
+    /// advanced survives a durable drop+reopen — read back from disk bytes, not
+    /// from the running lane's in-memory state (#178 DoD item 2, runtime half).
+    #[test]
+    fn background_lane_persists_checkpoint_after_scrub_tick() {
+        let dir = test_dir("lane-persist");
+        fs::create_dir_all(&dir).expect("create durable vault dir");
+
+        {
+            let vault = AsterVault::new_durable(
+                &dir,
+                vault_id(),
+                b"fsv-janitor-lane",
+                VaultOptions::default(),
+            )
+            .expect("open durable vault");
+            for index in 0..4 {
+                append_entry(&vault, format!("entry-{index}").as_bytes());
+            }
+            let vault = Arc::new(vault);
+
+            let config = JanitorLaneConfig::from_registry_defaults()
+                .with_budget_override(Some(16))
+                .with_interval_ms(1)
+                .expect("1ms cadence is inside the declared knob bounds");
+            let mut lane = JanitorLane::spawn(Arc::clone(&vault), config).expect("spawn lane");
+
+            assert!(
+                lane.wait_for_scrubs(1, Duration::from_secs(5)),
+                "lane must commit at least one witnessed scrub"
+            );
+            let observed = lane.state();
+            assert!(observed.scrubs_committed >= 1);
+            // Four real entries [0,4); the Measure entry lands at seq 4, so the
+            // checkpoint advances past it to 5 and the lane then goes idle.
+            assert_eq!(observed.last_checkpoint.verified_through, 5);
+            assert!(observed.healthy(), "clean chain must not halt the lane");
+
+            lane.stop();
+            vault.flush().expect("flush durable vault");
+        } // lane joined, all vault handles dropped: simulates process exit.
+
+        // Reopen the same directory and read the checkpoint back from disk.
+        let reopened = AsterVault::new_durable(
+            &dir,
+            vault_id(),
+            b"fsv-janitor-lane",
+            VaultOptions::default(),
+        )
+        .expect("reopen durable vault");
+        let persisted =
+            read_janitor_checkpoint(&reopened).expect("read persisted checkpoint after lane run");
+        assert_eq!(
+            persisted.verified_through, 5,
+            "the background lane's checkpoint must survive restart byte-identical"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A running lane that meets on-disk chain damage halts fail-closed: it names
+    /// the exact refusal, stops mutating, and never advances its checkpoint past
+    /// the damage (#178 DoD item 2, fail-closed runtime).
+    #[test]
+    fn background_lane_halts_fail_closed_on_chain_damage() {
+        let vault = mem_vault();
+        for index in 0..6 {
+            append_entry(&vault, format!("entry-{index}").as_bytes());
+        }
+        // One-byte flip of a persisted ledger row (independent readback + rewrite).
+        let mut tampered = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(3))
+            .expect("read persisted ledger row")
+            .expect("ledger row 3 exists");
+        tampered[18] ^= 0xff;
+        vault
+            .write_cf(ColumnFamily::Ledger, ledger_key(3), tampered)
+            .expect("persist tampered ledger row");
+
+        let vault = Arc::new(vault);
+        // startup_verify disabled so the lane starts and meets the damage inside a
+        // running step, proving the runtime loop (not just the boot hook) halts.
+        let config = JanitorLaneConfig::from_registry_defaults()
+            .with_startup_verify(false)
+            .with_budget_override(Some(4))
+            .with_interval_ms(1)
+            .expect("1ms cadence inside bounds");
+        let lane = JanitorLane::spawn(Arc::clone(&vault), config).expect("spawn lane");
+
+        assert!(
+            lane.wait_for_halt(Duration::from_secs(5)),
+            "lane must halt on chain damage"
+        );
+        let state = lane.state();
+        assert!(!state.healthy());
+        assert_eq!(
+            state.halt_code.as_deref(),
+            Some(ASTRO_FSV_JANITOR_CHAIN_DAMAGE)
+        );
+        assert!(
+            state
+                .halt_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("seq 3"),
+            "halt message must name the damaged seq: {:?}",
+            state.halt_message
+        );
+
+        // Fail-closed: the checkpoint never advanced past the damage.
+        let checkpoint = read_janitor_checkpoint(&vault).expect("read checkpoint");
+        assert_eq!(checkpoint, JanitorCheckpoint::GENESIS);
+    }
+
+    /// The startup boot-verify hook detects a byte-corrupted persisted ledger and
+    /// refuses to start the lane (fail closed at boot; no thread spawned, no
+    /// mutation).
+    #[test]
+    fn startup_verify_hook_refuses_boot_on_tampered_artifact() {
+        let vault = mem_vault();
+        for index in 0..6 {
+            append_entry(&vault, format!("entry-{index}").as_bytes());
+        }
+        let mut tampered = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Ledger, &ledger_key(2))
+            .expect("read persisted ledger row")
+            .expect("ledger row 2 exists");
+        tampered[18] ^= 0xff;
+        vault
+            .write_cf(ColumnFamily::Ledger, ledger_key(2), tampered)
+            .expect("persist tampered ledger row");
+
+        let vault = Arc::new(vault);
+        // startup_verify defaults to true.
+        let config = JanitorLaneConfig::from_registry_defaults().with_budget_override(Some(4));
+        let err = JanitorLane::spawn(Arc::clone(&vault), config)
+            .expect_err("boot hook must refuse a corrupt chain");
+        assert_eq!(err.code(), Some(ASTRO_FSV_JANITOR_CHAIN_DAMAGE));
+        assert!(err.to_string().contains("seq 2"), "{err}");
+        // No lane started, so no mutation occurred: checkpoint stays at genesis.
+        assert_eq!(
+            read_janitor_checkpoint(&vault).expect("read checkpoint"),
+            JanitorCheckpoint::GENESIS
+        );
+    }
+
+    /// A lane over a clean chain runs multiple steps, stays healthy, and stops+
+    /// joins cleanly (idempotent stop, no leaked thread).
+    #[test]
+    fn background_lane_runs_and_stops_cleanly() {
+        let vault = mem_vault();
+        for index in 0..3 {
+            append_entry(&vault, format!("entry-{index}").as_bytes());
+        }
+        let vault = Arc::new(vault);
+        let config = JanitorLaneConfig::from_registry_defaults()
+            .with_budget_override(Some(8))
+            .with_interval_ms(1)
+            .expect("1ms cadence inside bounds");
+        let mut lane = JanitorLane::spawn(Arc::clone(&vault), config).expect("spawn lane");
+
+        assert!(
+            lane.wait_for_steps(2, Duration::from_secs(5)),
+            "lane must complete multiple steps"
+        );
+        assert!(lane.state().healthy());
+        assert!(lane.steps_completed() >= 2);
+        lane.stop();
+        // Idempotent: a second stop is a no-op.
+        lane.stop();
+    }
+
+    /// The scrub cadence is a registry-declared knob: an out-of-bounds interval is
+    /// refused, and the declared default is accepted (standing invariant 4).
+    #[test]
+    fn janitor_scrub_interval_outside_knob_bounds_is_refused() {
+        let err = JanitorLaneConfig::from_registry_defaults()
+            .with_interval_ms(0)
+            .expect_err("zero cadence must refuse");
+        assert_eq!(err.code(), Some(ASTRO_FSV_JANITOR_INTERVAL_INVALID));
+
+        let too_big = JanitorLaneConfig::from_registry_defaults()
+            .with_interval_ms(astrolabe_domain::knobs::FSV_MAX_JANITOR_SCRUB_INTERVAL_MS + 1)
+            .expect_err("above-max cadence must refuse");
+        assert_eq!(too_big.code(), Some(ASTRO_FSV_JANITOR_INTERVAL_INVALID));
+
+        JanitorLaneConfig::from_registry_defaults()
+            .with_interval_ms(astrolabe_domain::knobs::FSV_DEFAULT_JANITOR_SCRUB_INTERVAL_MS)
+            .expect("the declared default cadence is accepted");
     }
 
     fn newest_measure_scrub<C: Clock>(vault: &AsterVault<C>) -> serde_json::Value {

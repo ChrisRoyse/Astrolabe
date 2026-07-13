@@ -19,8 +19,10 @@ pub use erasure_scrub::{
 pub use fsv::VaultMutationPlan;
 pub use janitor::{
     ASTRO_FSV_JANITOR_CHAIN_DAMAGE, ASTRO_FSV_JANITOR_CHECKPOINT_CORRUPT,
+    ASTRO_FSV_JANITOR_INTERVAL_INVALID, ASTRO_FSV_JANITOR_LANE_SPAWN_FAILED,
     ASTROLABE_FSV_JANITOR_ACTOR, FSV_JANITOR_SCRUB_LEDGER_SCHEMA, JANITOR_CHECKPOINT_KEY,
-    JanitorStepReport, janitor_startup_verify, read_janitor_checkpoint, run_janitor_scrub_step,
+    JanitorLane, JanitorLaneConfig, JanitorLaneState, JanitorStepReport, janitor_startup_verify,
+    read_janitor_checkpoint, run_janitor_scrub_step,
 };
 
 pub use row_sink_stream::{
