@@ -27,12 +27,10 @@ FAIL-CLOSED CONTRACT (unknown state => run, never skip)
 FINGERPRINT
     For a change-gated test, the fingerprint is SHA-256 over the sorted
     ``(relpath, sha256(bytes))`` pairs of its dependency set: the test file
-    itself plus the specific gate scripts / patch appliers / manifests it
-    drives (see DEPENDENCIES). Vendored source trees are NOT hashed here: their
-    bytes are byte-pinned by ``scripts/verify-pins.sh`` (unconditional, fail
-    closed) earlier in the same run, so a vendor change cannot silently alter a
-    self-test's premise without a deliberate pin bump -- and the aggregate tier
-    re-runs every self-test regardless.
+    itself plus the specific gate scripts / owned sources / manifests it drives
+    (see DEPENDENCIES). A source-guard test that reads owned CBM sources lists
+    those sources in its dependency set, so an edit to a guarded region re-runs
+    the test; the aggregate tier re-runs every self-test regardless.
 
 RECORDED-GREEN LOCATION
     ``.astro-gate-cache/gate-selftests-green.json`` at the repo root. It must be
@@ -86,15 +84,11 @@ UNCONDITIONAL = {
 # script-change coverage then relies on the aggregate tier (which runs all),
 # and that fallback is logged, never silent.
 DEPENDENCIES: dict[str, list[str]] = {
-    "test-verify-pins.py": ["scripts/verify-pins.sh"],
     "test-cbm-skip-count.py": [
         "scripts/check-cbm-skip-count.sh",
         "ci/known-skips.md",
     ],
     "test-cbm-lint-platform.py": ["scripts/ci-cbm-lint.sh"],
-    "test-cbm-format-overlay.py": [
-        "patches/cbm/apply_graph_buffer_format_patch.py",
-    ],
     "test-cbm-cache-guards.py": [
         "scripts/check-cbm-cache-paths.py",
         "scripts/check-cbm-cache-hermeticity.py",
@@ -134,25 +128,20 @@ DEPENDENCIES: dict[str, list[str]] = {
     "test-egress-platform.py": ["scripts/check-egress-deny.py"],
     "test-release-predicate.py": ["scripts/release-predicate.py"],
     "test-check-no-escape.py": ["scripts/check-no-escape.py"],
-    "test-cbm-spawn-patch.py": [
-        "patches/cbm/apply_spawn_artifact_patch.py",
-        "patches/cbm/apply_spawn_git_context_patch.py",
-        "patches/cbm/apply_spawn_githistory_patch.py",
-        "patches/cbm/apply_spawn_watcher_patch.py",
-        "patches/cbm/astro_spawn.c",
-        "patches/cbm/astro_spawn.h",
-    ],
-    "test-cbm-env-store-patch.py": [
-        "patches/cbm/env_apply_store_patch.py",
-        "patches/cbm/env_store_config.c",
-        "patches/cbm/env_store_config.h",
-        "crates/astrolabe-bridge/src/lib.rs",
-    ],
     "test-cbm-env-contract.py": ["scripts/check-cbm-env-contract.py"],
     "test-bench-ratios-artifact.py": ["scripts/write-bench-ratios-artifact.py"],
-    "test-cbm-mem-pressure-patch.py": [
-        "patches/cbm/apply_mem_pressure_patch.py",
+    # #286: the overlays are absorbed into the owned CBM sources as ASTRO_*-guarded
+    # edits. This source-guard test reads those sources (and the Makefile flag
+    # wiring) directly, so its premise is the source + build-recipe bytes.
+    "test-cbm-overlay-sources.py": [
+        "vendor/codebase-memory-mcp/src/mcp/mcp.c",
+        "vendor/codebase-memory-mcp/src/mcp/index_supervisor.c",
+        "vendor/codebase-memory-mcp/src/foundation/str_util.c",
         "vendor/codebase-memory-mcp/src/foundation/mem.c",
+        "vendor/codebase-memory-mcp/src/foundation/platform.c",
+        "vendor/codebase-memory-mcp/src/git/git_context.c",
+        "vendor/codebase-memory-mcp/src/ui/layout3d.c",
+        "patches/cbm/Makefile.cbm",
     ],
     "test-windows-gnu-toolchain-contract.py": [
         "scripts/check-windows-gnu-toolchain-contract.py",
@@ -165,11 +154,6 @@ DEPENDENCIES: dict[str, list[str]] = {
     "test-check-hook-contracts.py": [
         "scripts/check-hook-contracts.py",
         "ci/hook-contracts.json",
-    ],
-    "test-cbm-worker-diag-patch.py": [
-        "patches/cbm/apply_worker_diag_patch.py",
-        "patches/cbm/env_apply_store_patch.py",
-        "patches/cbm/astro_overlay.py",
     ],
 }
 

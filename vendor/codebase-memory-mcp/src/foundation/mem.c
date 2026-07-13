@@ -85,7 +85,11 @@ static void check_pressure(size_t rss) {
         atomic_store(&g_was_over, 1);
         char rss_mb[CBM_SZ_32];
         char budget_mb[CBM_SZ_32];
+#ifdef ASTRO_MEM_PRESSURE
+        char pct_str[CBM_SZ_32];
+#else
         char pct_str[CBM_SZ_16];
+#endif
         snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
         snprintf(pct_str, sizeof(pct_str), "%zu",
@@ -95,7 +99,11 @@ static void check_pressure(size_t rss) {
         atomic_store(&g_was_over, 0);
         char rss_mb[CBM_SZ_32];
         char budget_mb[CBM_SZ_32];
+#ifdef ASTRO_MEM_PRESSURE
+        char pct_str[CBM_SZ_32];
+#else
         char pct_str[CBM_SZ_16];
+#endif
         snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
         snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
         snprintf(pct_str, sizeof(pct_str), "%zu",

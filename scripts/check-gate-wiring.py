@@ -170,13 +170,14 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
-    # #227/#228: shell-free CBM git spawn + validator mirror self-tests.
-    require(check, "scripts/test-cbm-spawn-patch.py", "scripts/check.sh", errors)
+    # #227/#228: shell-free CBM git spawn behavior FSV self-test.
     require(check, "scripts/test-cbm-spawn-fsv.py", "scripts/check.sh", errors)
-    # #240/#241: env-as-IPC lint gate + resolver-hardening overlay self-tests.
+    # #286: the absorbed-overlay source-guard test (worker-diag/env-store/spawn/
+    # shellarg/mem/ui-werror behaviors + the per-artifact ASTRO_* flag matrix).
+    require(check, "scripts/test-cbm-overlay-sources.py", "scripts/check.sh", errors)
+    # #240/#241: env-as-IPC lint gate + its self-test (real ban-list behavior).
     require(check, "scripts/check-cbm-env-contract.py", "scripts/check.sh", errors)
     require(check, "scripts/test-cbm-env-contract.py", "scripts/check.sh", errors)
-    require(check, "scripts/test-cbm-env-store-patch.py", "scripts/check.sh", errors)
     require(
         check,
         "scripts/test-egress-platform.py",
@@ -191,12 +192,6 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
-        "scripts/test-verify-pins.py",
-        "scripts/check.sh",
-        errors,
-    )
-    require(
-        check,
         "scripts/test-cbm-skip-count.py",
         "scripts/check.sh",
         errors,
@@ -204,12 +199,6 @@ def validate(root: Path) -> list[str]:
     require(
         check,
         "scripts/test-cbm-lint-platform.py",
-        "scripts/check.sh",
-        errors,
-    )
-    require(
-        check,
-        "scripts/test-cbm-format-overlay.py",
         "scripts/check.sh",
         errors,
     )
@@ -243,8 +232,8 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
-    # #280: check.sh formats only workspace-local crates; vendor/ is byte-pinned
-    # by verify-pins and full-graph-formatted by the Rust gate below.
+    # #280: check.sh formats only workspace-local crates; the owned vendor/ tree
+    # is full-graph-formatted by the Rust gate below.
     require(
         check,
         "scripts/native-cargo-fmt.py --all --workspace-only -- --check",
@@ -539,7 +528,7 @@ def validate(root: Path) -> list[str]:
     )
     require(
         cbm_lint,
-        "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+        "INFO[ASTRO_CBM_FORMAT]",
         "scripts/ci-cbm-lint.sh",
         errors,
     )

@@ -1,29 +1,33 @@
 ---
 name: astro-vendor-patch
-description: The only lawful way to change vendored code in ASTROLABE (vendor/calyx, vendor/codebase-memory-mcp) — subtree pins in VENDORED.md, the documented patches/ flow, the hash-checked CBM format overlay, and scripts/verify-pins.sh. Use when a fix appears to require edits under vendor/, when patching or building CBM C sources, when pins or VENDORED.md drift, or when a gate reports vendor tree modifications.
+description: RETIRED (#286). The vendoring doctrine is dissolved — vendor/calyx and vendor/codebase-memory-mcp are owned first-class source, edited in place. There is no pin, no patch applier, and no hash-checked overlay. Use when tempted to reach for pins/overlays/verify-pins for a CBM or Calyx change.
 ---
 
-# Vendored code discipline
+# Vendor-patch skill — RETIRED (#286)
 
-`vendor/calyx` and `vendor/codebase-memory-mcp` are pinned Git subtrees. The binding pin is the **exact tree SHA** recorded in `VENDORED.md`. Never edit files under `vendor/` in place — a dirty vendor tree fails `scripts/verify-pins.sh` and the aggregate.
+The vendoring doctrine this skill described is **gone** (owner directive
+2026-07-12, EPIC #286). `vendor/calyx` and `vendor/codebase-memory-mcp` are now
+this project's own first-class source: edited directly, evolved in place, on a
+stable base this project fully controls. External churn in the origin repos is
+irrelevant.
 
-## Decide first
+There is **no** pin file (`VENDORED.md` deleted), **no** `scripts/verify-pins.sh`
+(deleted), and **no** `patches/cbm` applier / `astro_overlay.py` / hash-checked
+overlay (deleted). Do not reach for any of them.
 
-1. **Can the change live on the Astrolabe side?** (wrapper in `crates/astrolabe-bridge`, shim in `patches/cbm/*.c`, build flag in `crates/cbm-sys/build.rs`). Prefer this always.
-2. **Is it genuinely an upstream defect?** Then it goes through the patch flow below AND gets an issue tracking upstreaming (pattern: #228 — C mirror of a Rust-side fix).
+## What to do instead
 
-## The patches/ flow (CBM)
+- **Changing CBM C** (`vendor/codebase-memory-mcp`): edit the `.c`/`.h`
+  directly. If a change must NOT reach every build artifact, guard it with an
+  `ASTRO_*` macro and wire the flag in `patches/cbm/Makefile.cbm`
+  (`LIBCBM_ASTRO_DEFS` for libcbm, `ASTRO_PROD_DEFS` for the production
+  binaries). Update `scripts/test-cbm-overlay-sources.py` to guard the new
+  behavior. See `patches/cbm/README.md`.
+- **Changing Calyx** (`vendor/calyx`): edit it as normal owned Rust source with
+  normal review and tests.
+- **Astrolabe glue** still lives in `patches/cbm/` (`Makefile.cbm`,
+  `astro_spawn.{c,h}`, `env_store_config.{c,h}`, `astro_alloc_shim.c`,
+  `astro_layout_probe.c`) and `crates/cbm-sys/build.rs`.
 
-`patches/cbm/` holds the only sanctioned vendor modifications:
-- `apply_*.py` scripts materialize a **temporary, hash-checked overlay** — they verify the vendored source bytes against a recorded hash before patching a copy; they never write into `vendor/`. Read `patches/cbm/README.md` before touching anything.
-- `astro_alloc_shim.c`, `astro_layout_probe.c`, `Makefile.cbm` are Astrolabe-side build inputs, not vendor edits.
-- The CBM clang-format gate validates the overlay the same way — an in-place format run against either vendor tree is a defect.
-- Adding a patch: new `apply_<name>_patch.py` with the source hash pinned, wired where the existing ones are consumed; document it in `patches/cbm/README.md`; add its hash-mismatch failure mode (must fail closed with the expected vs found hash).
-
-## Updating a pin (rare, deliberate)
-
-Follow `VENDORED.md` §Update Procedure verbatim: subtree pull/replace → `git add vendor/<name>` → read staged tree SHA via `git rev-parse "$(git write-tree):vendor/<name>"` → update the VENDORED.md table → `bash scripts/verify-pins.sh`. Submodules are forbidden; verify-pins also rejects `.gitmodules`, gitlinks, index-differing tracked vendor files, and non-ignored untracked vendor paths.
-
-## FSV
-
-After any patch/pin work: `bash scripts/verify-pins.sh` (native Git bash) must pass; `git status --porcelain vendor/` must be empty; the consuming build/gate must be re-run. Record all three on the issue (telemetry kind `evidence`).
+Doctrine of record: EPIC #286. `patches/cbm` relocation to a top-level `cbm/`
+subsystem is Phase B.

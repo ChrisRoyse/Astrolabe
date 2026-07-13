@@ -14,6 +14,9 @@
  * Matches the Go watcher's `pollInterval()` logic.
  */
 #include <stdint.h>
+#ifdef ASTRO_SPAWN
+#include "astro_spawn.h"
+#endif
 #include "watcher/watcher.h"
 #include "store/store.h"
 #include "foundation/constants.h"
@@ -105,6 +108,33 @@ int cbm_watcher_poll_interval_ms(int file_count) {
 
 /* ── Git helpers ────────────────────────────────────────────────── */
 
+#ifdef ASTRO_SPAWN
+/* Shell-free git helpers (#227): every git call below hands an explicit argv to
+ * cbm_spawn_capture (CreateProcessW / posix_spawnp). No cmd.exe and no /bin/sh
+ * parse the watched root path, so quoting rules, %VAR% expansion and the
+ * platform null-device redirection (`2>NUL` / `2>/dev/null`) are gone — the
+ * spawner binds the child's stderr to the null device itself. */
+
+/* A non-zero git status is an ordinary answer (not a repo, no HEAD, ...). Every
+ * other failure is a real degradation and gets labelled rather than swallowed. */
+static void watcher_log_spawn_failure(const char *event, const cbm_spawn_error_t *err) {
+    if (err->code == CBM_SPAWN_E_EXIT) {
+        return;
+    }
+    cbm_log_warn(event, "code", err->code_name, "message", err->message, "remediation",
+                 err->remediation);
+}
+
+/* True when the child's first output line carries content — the upstream
+ * "one porcelain line means dirty" semantics, without a line buffer. */
+static bool git_first_line_nonempty(const char *data, size_t len) {
+    size_t line = 0;
+    while (line < len && data[line] != '\n' && data[line] != '\r') {
+        line++;
+    }
+    return line > 0;
+}
+#else
 /* Portable command pieces: cbm_popen runs through cmd.exe on Windows, which does
  * NOT strip single quotes (git would receive a literal-quoted path → "cannot find
  * the path") and has no /dev/null. Use double quotes (stripped by both cmd.exe and
@@ -114,30 +144,63 @@ int cbm_watcher_poll_interval_ms(int file_count) {
 #else
 #define WATCHER_NULDEV "/dev/null"
 #endif
+#endif
 
 static bool is_git_repo(const char *root_path) {
+#ifdef ASTRO_SPAWN
+    const char *const argv[] = {"git", "-C", root_path, "rev-parse", "--git-dir", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    int rc = cbm_spawn_capture(argv, &data, &len, &err);
+    if (rc != 0) {
+        watcher_log_spawn_failure("watcher.is_git_repo.spawn_failed", &err);
+#else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return false;
+#endif
     }
+#ifdef ASTRO_SPAWN
+    free(data);
+#else
     /* Drain output so pclose gets a clean exit status. */
     char drain[CBM_SZ_128];
     while (fgets(drain, (int)sizeof(drain), fp)) { /* discard */
     }
     int rc = cbm_pclose(fp);
+#endif
     return rc == 0;
 }
 
 static int git_head(const char *root_path, char *out, size_t out_size) {
+#ifdef ASTRO_SPAWN
+    if (!out || out_size == 0) {
+        return CBM_NOT_FOUND;
+    }
+    const char *const argv[] = {"git", "-C", root_path, "rev-parse", "HEAD", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
+        watcher_log_spawn_failure("watcher.git_head.spawn_failed", &err);
+        free(data);
+#else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return CBM_NOT_FOUND;
     }
 
+#ifdef ASTRO_SPAWN
+    size_t line = 0;
+    while (line < len && data[line] != '\n' && data[line] != '\r') {
+        line++;
+#else
     if (fgets(out, (int)out_size, fp)) {
         size_t len = strlen(out);
         while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
@@ -145,15 +208,38 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
         }
         cbm_pclose(fp);
         return 0;
+#endif
     }
+#ifdef ASTRO_SPAWN
+    if (line >= out_size) {
+        line = out_size - SKIP_ONE;
+    }
+    memcpy(out, data, line);
+    out[line] = '\0';
+    bool captured = len > 0;
+    free(data);
+    return captured ? 0 : CBM_NOT_FOUND;
+#else
     cbm_pclose(fp);
     return CBM_NOT_FOUND;
+#endif
 }
 
 /* Returns true if working tree has changes (modified, untracked, etc.).
  * Also checks submodules via `git submodule foreach` to detect uncommitted
  * changes inside submodules that `git status` alone would not report. */
 static bool git_is_dirty(const char *root_path) {
+#ifdef ASTRO_SPAWN
+    const char *const argv[] = {
+        "git",         "--no-optional-locks",      "-C", root_path, "status",
+        "--porcelain", "--untracked-files=normal", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
+        watcher_log_spawn_failure("watcher.git_status.spawn_failed", &err);
+        free(data);
+#else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C \"%s\" status --porcelain "
@@ -161,8 +247,13 @@ static bool git_is_dirty(const char *root_path) {
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return false;
     }
+#ifdef ASTRO_SPAWN
+    bool dirty = git_first_line_nonempty(data, len);
+    free(data);
+#else
 
     char line[CBM_SZ_256];
     bool dirty = false;
@@ -176,12 +267,31 @@ static bool git_is_dirty(const char *root_path) {
         }
     }
     cbm_pclose(fp);
+#endif
 
     if (dirty) {
         return true;
     }
 
 #if !defined(_WIN32)
+#ifdef ASTRO_SPAWN
+    /* Check submodules: uncommitted changes inside a submodule are invisible
+     * to the parent's git status. `git submodule foreach` runs its argument in
+     * git's OWN shell inside each submodule; that argument is a compile-time
+     * constant with no interpolation, so nothing from the environment reaches a
+     * shell. POSIX-only for parity with upstream (Apple Git lacks
+     * --recurse-submodules, and the inner command is POSIX shell syntax). */
+    const char *const sub_argv[] = {
+        "git",     "--no-optional-locks", "-C",
+        root_path, "submodule",           "foreach",
+        "--quiet", "--recursive",         "git status --porcelain --untracked-files=normal",
+        NULL};
+    char *sub_data = NULL;
+    size_t sub_len = 0;
+    if (cbm_spawn_capture(sub_argv, &sub_data, &sub_len, &err) != 0) {
+        watcher_log_spawn_failure("watcher.git_submodule_status.spawn_failed", &err);
+        free(sub_data);
+#else
     /* Check submodules: uncommitted changes inside a submodule are invisible
      * to the parent's git status. Use `git submodule foreach` as a portable
      * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
@@ -194,8 +304,13 @@ static bool git_is_dirty(const char *root_path) {
              root_path);
     fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return false;
     }
+#ifdef ASTRO_SPAWN
+    dirty = git_first_line_nonempty(sub_data, sub_len);
+    free(sub_data);
+#else
     if (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
@@ -207,21 +322,41 @@ static bool git_is_dirty(const char *root_path) {
     }
     cbm_pclose(fp);
 #endif
+#endif
     return dirty;
 }
 
 /* Count tracked files via git ls-files */
 static int git_file_count(const char *root_path) {
+#ifdef ASTRO_SPAWN
+    const char *const argv[] = {"git", "-C", root_path, "ls-files", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
+        watcher_log_spawn_failure("watcher.git_file_count.spawn_failed", &err);
+        free(data);
+#else
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return 0;
     }
 
+#ifdef ASTRO_SPAWN
+    /* One tracked file per line. */
+#else
     /* Count newlines (one tracked file per line). `wc -l` is unavailable on
      * Windows, so count in C, robust to paths longer than the read buffer. */
+#endif
     int count = 0;
+#ifdef ASTRO_SPAWN
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\n') {
+            count++;
+#else
     char buf[CBM_SZ_1K];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
@@ -229,9 +364,14 @@ static int git_file_count(const char *root_path) {
             if (buf[i] == '\n') {
                 count++;
             }
+#endif
         }
     }
+#ifdef ASTRO_SPAWN
+    free(data);
+#else
     cbm_pclose(fp);
+#endif
     return count;
 }
 
@@ -412,7 +552,13 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
+#ifdef ASTRO_SPAWN
+    /* Defence in depth (#227/#228): the git helpers no longer use a shell at all,
+     * so this is no longer the only barrier — but a path carrying shell
+     * metacharacters is still refused rather than silently watched. */
+#else
     /* Reject paths with shell metacharacters — all git helpers use popen/system */
+#endif
     if (!cbm_validate_shell_arg(root_path)) {
         cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
                      "path contains shell metacharacters");
@@ -519,10 +665,27 @@ static bool check_changes(project_state_t *s) {
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* HEAD moved — commit, checkout, pull */
+#ifdef ASTRO_UI_WERROR
+            /* #229: bounded copy with a guaranteed NUL terminator. The vendored
+             * strncpy(dst, src, sizeof-1) does not terminate when `head` fills the
+             * buffer (a genuine latent bug) and trips GCC 14 -Wstringop-truncation
+             * under -Werror on native MinGW. */
+            size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
+            memcpy(s->last_head, head, head_len);
+            s->last_head[head_len] = '\0';
+#else
             strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+#endif
             return true;
         }
+#ifdef ASTRO_UI_WERROR
+        /* #229: bounded copy with a guaranteed NUL terminator (see above). */
+        size_t head_len = strnlen(head, sizeof(s->last_head) - 1);
+        memcpy(s->last_head, head, head_len);
+        s->last_head[head_len] = '\0';
+#else
         strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+#endif
     }
 
     /* Check working tree */

@@ -26,14 +26,16 @@ pub fn parent_roots() -> (&'static str, &'static str) {
 /// `cbm_resolve_cache_dir` and `cbm_get_home_dir`
 /// (`vendor/codebase-memory-mcp/src/foundation/platform.c`) publish their result
 /// from a `static char[CBM_SZ_1K]`, so a store path longer than this cannot be
-/// represented by the library at all. Astrolabe's store overlay
-/// (`patches/cbm/env_apply_store_patch.py`, #241) widens the *environment* scratch
-/// buffers those resolvers used — a `char[CBM_SZ_256]`, an artificial cut with no
-/// relation to what the library can hold, and one that silently relocated the store
-/// for any Windows path over 255 bytes — up to the same `CBM_SZ_1K`, and refuses
-/// anything longer with a named fault instead of truncating it.
+/// represented by the library at all. Astrolabe's store-resolution edits
+/// (`ASTRO_ENV_STORE`-guarded, in the owned
+/// `vendor/codebase-memory-mcp/src/foundation/platform.c`, #241) widen the
+/// *environment* scratch buffers those resolvers used — a `char[CBM_SZ_256]`, an
+/// artificial cut with no relation to what the library can hold, and one that
+/// silently relocated the store for any Windows path over 255 bytes — up to the
+/// same `CBM_SZ_1K`, and refuse anything longer with a named fault instead of
+/// truncating it.
 ///
-/// This is not a magic number: it is measured from the vendored
+/// This is not a magic number: it is measured from the owned
 /// `src/foundation/constants.h` enum and asserted against it by
 /// `cbm_store_path_capacity_matches_vendor_constant`, and the C half asserts the
 /// same equality at compile time in `patches/cbm/env_store_config.c`.

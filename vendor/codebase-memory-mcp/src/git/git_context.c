@@ -1,7 +1,14 @@
 #include "git/git_context.h"
 
+#ifdef ASTRO_SPAWN
+#include "astro_spawn.h"
+#else
 #include "foundation/compat_fs.h"
+#endif
 #include "foundation/constants.h"
+#ifdef ASTRO_SPAWN
+#include "foundation/log.h"
+#endif
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -12,8 +19,13 @@
 #include <sys/stat.h>
 
 enum {
+#ifdef ASTRO_SPAWN
+    /* git + -C + <repo path> + the longest argument tail below, with headroom. */
+    GIT_ARGV_MAX = 16,
+#else
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,
+#endif
 };
 
 static char *git_strdup(const char *s) {
@@ -53,7 +65,11 @@ static bool git_validate_repo_path(const char *repo_path) {
     return true;
 }
 
+#ifdef ASTRO_SPAWN
+static int git_capture(const char *repo_path, const char *const *git_args, char **out) {
+#else
 static int git_capture(const char *repo_path, const char *git_args, char **out) {
+#endif
     if (!out) {
         return CBM_NOT_FOUND;
     }
@@ -62,6 +78,37 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
+#ifdef ASTRO_SPAWN
+    /* Shell-free spawn (#227): git receives this argv verbatim through
+     * CreateProcessW / posix_spawnp. No cmd.exe or /bin/sh re-parses the repo
+     * path, so there is no quoting to get right, no %VAR% substitution, and no
+     * redirection metacharacter to escape — cbm_spawn_capture binds the child's
+     * stderr to the null device itself. */
+    const char *argv[GIT_ARGV_MAX];
+    size_t argc = 0;
+    argv[argc++] = "git";
+    argv[argc++] = "-C";
+    argv[argc++] = repo_path;
+    for (size_t i = 0; git_args[i]; i++) {
+        if (argc + 1 >= (size_t)GIT_ARGV_MAX) {
+            return CBM_NOT_FOUND;
+        }
+        argv[argc++] = git_args[i];
+    }
+    argv[argc] = NULL;
+
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture((const char *const *)argv, &data, &len, &err) != 0) {
+        /* A non-zero git exit is an ordinary answer here (no upstream, not a
+         * repo, ...). Anything else is a real degradation and is labelled. */
+        if (err.code != CBM_SPAWN_E_EXIT) {
+            cbm_log_warn("git.spawn_failed", "code", err.code_name, "message", err.message,
+                         "remediation", err.remediation);
+        }
+        free(data);
+#else
     char cmd[GIT_CMD_MAX];
 #ifdef _WIN32
     const char *null_dev = "NUL";
@@ -72,14 +119,29 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
      * rejects quote/backslash/substitution metacharacters before interpolation. */
     int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", repo_path, git_args, null_dev);
     if (n < 0 || n >= (int)sizeof(cmd)) {
+#endif
         return CBM_NOT_FOUND;
     }
 
+#ifdef ASTRO_SPAWN
+    char *newline = (char *)memchr(data, '\n', len);
+    if (newline) {
+        *newline = '\0';
+    }
+    trim_newlines(data);
+    if (data[0] == '\0') {
+        free(data);
+#else
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
+#endif
         return CBM_NOT_FOUND;
     }
 
+#ifdef ASTRO_SPAWN
+    *out = data;
+    return 0;
+#else
     char buf[GIT_OUTPUT_MAX];
     if (!fgets(buf, sizeof(buf), fp)) {
         cbm_pclose(fp);
@@ -94,6 +156,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
 
     *out = git_strdup(buf);
     return *out ? 0 : CBM_NOT_FOUND;
+#endif
 }
 
 static bool path_is_absolute(const char *path) {
@@ -270,23 +333,48 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return 0;
     }
 
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"rev-parse", "--show-toplevel", NULL},
+                    &out->worktree_root) != 0) {
+#else
     if (git_capture(path, "rev-parse --show-toplevel", &out->worktree_root) != 0) {
+#endif
         out->is_git = false;
         return 0;
     }
     out->is_git = true;
 
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"rev-parse", "--git-dir", NULL}, &out->git_dir) !=
+        0) {
+#else
     if (git_capture(path, "rev-parse --git-dir", &out->git_dir) != 0) {
+#endif
         out->git_dir = git_strdup("");
     }
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"rev-parse", "--git-common-dir", NULL},
+                    &out->git_common_dir) != 0) {
+#else
     if (git_capture(path, "rev-parse --git-common-dir", &out->git_common_dir) != 0) {
+#endif
         out->git_common_dir = git_strdup("");
     }
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"rev-parse", "--verify", "HEAD", NULL},
+                    &out->head_sha) != 0) {
+#else
     if (git_capture(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
+#endif
         out->head_sha = git_strdup("");
     }
 
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"symbolic-ref", "--quiet", "--short", "HEAD", NULL},
+                    &out->branch) != 0) {
+#else
     if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
+#endif
         out->branch = git_strdup("DETACHED");
         out->is_detached = true;
     }
@@ -296,12 +384,24 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     /* git 2.31+ canonical absolute common-dir (best-effort; NULL on older git,
      * where derive_canonical_root falls back to the relative common-dir). */
     char *abs_common_dir = NULL;
+#ifdef ASTRO_SPAWN
+    (void)git_capture(
+        path,
+        (const char *const[]){"rev-parse", "--path-format=absolute", "--git-common-dir", NULL},
+        &abs_common_dir);
+#else
     (void)git_capture(path, "rev-parse --path-format=absolute --git-common-dir", &abs_common_dir);
+#endif
     out->canonical_root =
         derive_canonical_root(path, out->worktree_root, out->git_common_dir, abs_common_dir);
     free(abs_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
+#ifdef ASTRO_SPAWN
+    if (git_capture(path, (const char *const[]){"merge-base", "HEAD", "@{upstream}", NULL},
+                    &out->base_sha) != 0) {
+#else
     if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
+#endif
         out->base_sha = git_strdup("");
     }
 

@@ -54,7 +54,7 @@ def default_upstream():
 
 def build_upstream():
     # #280: build via the shared cache helper. Its cache is keyed on the
-    # byte-pinned inputs (not the BUILD_DIR), so when check-mcp-parity.sh already
+    # committed source inputs (not the BUILD_DIR), so when check-mcp-parity.sh already
     # built+cached the CBM prod binary this run, this call is a byte-identical
     # cache restore instead of a second ~5-minute make. Fail-closed: an ambiguous
     # key runs the same full make. (default_upstream() still short-circuits to
