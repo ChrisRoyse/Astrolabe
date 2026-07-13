@@ -344,7 +344,7 @@ fn janitor_report_from_result(
     }
 }
 
-fn verify_store_chain(store: &dyn LedgerCfStore) -> IngestResult<VerifyChainReport> {
+pub(crate) fn verify_store_chain(store: &dyn LedgerCfStore) -> IngestResult<VerifyChainReport> {
     let rows = store.scan()?;
     let row_end = rows
         .iter()
@@ -429,8 +429,8 @@ fn empty_report() -> VerifyChainReport {
     }
 }
 
-struct AsterVaultLedgerStore<'a, C> {
-    vault: &'a AsterVault<C>,
+pub(crate) struct AsterVaultLedgerStore<'a, C> {
+    pub(crate) vault: &'a AsterVault<C>,
 }
 
 impl<C> LedgerCfStore for AsterVaultLedgerStore<'_, C>
@@ -475,7 +475,7 @@ where
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
