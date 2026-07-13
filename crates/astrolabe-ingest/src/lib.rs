@@ -5,6 +5,7 @@ pub mod fsv;
 mod graph_projection;
 mod janitor;
 mod label_propagation;
+mod ledger_scan;
 mod ledger_verify;
 mod registry;
 mod row_sink_stream;
@@ -42,6 +43,11 @@ pub use graph_projection::{
     GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
     ensure_graph_projection_csr, graph_projection_csr_rows, materialize_graph_projection,
     materialize_graph_projections, read_graph_projection_csr,
+};
+pub use ledger_scan::{
+    ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT, ASTRO_LEDGER_SCAN_ROW_CORRUPT,
+    ASTRO_LEDGER_SCAN_SUBJECT_EMPTY, LedgerScanRow, ledger_subject_key, scan_subject_ledger_rows,
+    scan_subject_ledger_rows_vault_path,
 };
 pub use ledger_verify::{
     ASTRO_FSV_JANITOR_BUDGET_INVALID, JanitorCheckpoint, JanitorSliceReport, VerifyChainReport,
