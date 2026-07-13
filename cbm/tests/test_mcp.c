@@ -2493,30 +2493,88 @@ TEST(tool_detect_changes_not_found_rich_error) {
 }
 
 TEST(tool_ingest_traces_basic) {
+    /* #27 contract: ingest_traces resolves a store, promotes matching edges, and
+     * returns a structured accounting response (status/format/received/promoted/
+     * unmatched) — NOT the pre-#27 "accepted" stub. Exercise the full MCP path
+     * against the server's real in-memory store and read the promotion back. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "trace-basic", "/tmp/trace-basic");
+    cbm_mcp_server_set_project(srv, "trace-basic");
+
+    /* Seed a caller->callee CALLS edge the simple trace can promote. */
+    cbm_node_t a = {.project = "trace-basic",
+                    .label = "Function",
+                    .name = "a",
+                    .qualified_name = "a",
+                    .file_path = "a.c"};
+    int64_t aid = cbm_store_upsert_node(st, &a);
+    cbm_node_t b = {.project = "trace-basic",
+                    .label = "Function",
+                    .name = "b",
+                    .qualified_name = "b",
+                    .file_path = "b.c"};
+    int64_t bid = cbm_store_upsert_node(st, &b);
+    cbm_edge_t calls = {.project = "trace-basic",
+                        .source_id = aid,
+                        .target_id = bid,
+                        .type = "CALLS",
+                        .properties_json = "{\"trust\":\"Provisional\"}"};
+    cbm_store_insert_edge(st, &calls);
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":37,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"ingest_traces\","
-             "\"arguments\":{\"traces\":[{\"caller\":\"a\",\"callee\":\"b\"}]}}}");
+             "\"arguments\":{\"project\":\"trace-basic\","
+             "\"traces\":[{\"caller\":\"a\",\"callee\":\"b\",\"count\":3}]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
-    ASSERT_NOT_NULL(strstr(resp, "traces_received"));
+    /* New structured contract: success status, format, explicit accounting. The
+     * old contract's received count survives as `traces_received`. The tool JSON
+     * is embedded (quote-escaped) in the JSON-RPC envelope, so match fragments
+     * through the escaping-aware helper. */
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"ok\""));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"format\":\"simple\""));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"traces_received\":1"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"simple_records\":1"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"simple_unmatched\":0"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"edges_promoted\":1"));
     free(resp);
+
+    /* FSV: read the CALLS edge back from the store — it is now persisted with
+     * the runtime-trace promotion markers (validated/Trusted + measured count). */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(st, aid, "CALLS", &edges, &ec), CBM_STORE_OK);
+    ASSERT_EQ(ec, 1);
+    ASSERT_NOT_NULL(edges[0].properties_json);
+    ASSERT_NOT_NULL(strstr(edges[0].properties_json, "\"validated\":true"));
+    ASSERT_NOT_NULL(strstr(edges[0].properties_json, "\"trust\":\"Trusted\""));
+    ASSERT_NOT_NULL(strstr(edges[0].properties_json, "\"runtime_count\":3"));
+    cbm_store_free_edges(edges, ec);
 
     cbm_mcp_server_free(srv);
     PASS();
 }
 
 TEST(tool_ingest_traces_empty) {
+    /* Empty edge case: no trace items → success with a fully-zeroed accounting
+     * (nothing received, nothing promoted), never a silent drop or an error. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "trace-empty", "/tmp/trace-empty");
+    cbm_mcp_server_set_project(srv, "trace-empty");
 
-    char *resp =
-        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"ingest_traces\","
-                                   "\"arguments\":{\"traces\":[]}}}");
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"ingest_traces\","
+             "\"arguments\":{\"project\":\"trace-empty\",\"traces\":[]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"ok\""));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"traces_received\":0"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"simple_records\":0"));
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"edges_promoted\":0"));
     free(resp);
 
     cbm_mcp_server_free(srv);

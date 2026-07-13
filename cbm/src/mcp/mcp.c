@@ -502,7 +502,9 @@ static const tool_def_t TOOLS[] = {
      "Ingest runtime traces (OTLP protobuf/JSON or simple {caller,callee,count}) to promote "
      "matching graph edges to Trusted, attach runtime anchors, and flag 5xx incidents",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"object\"}},\"resourceSpans\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
+     "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":"
+     "\"string\"},\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},"
+     "\"resourceSpans\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
      "\"otlp_protobuf_base64\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"}},"
      "\"required\":[\"project\"]}"},
 };
@@ -5974,6 +5976,13 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+
+    /* Preserve the pre-#27 contract's input accounting: report how many trace
+     * items the request carried in `traces[]` (0 for OTLP-only requests, whose
+     * span counts are surfaced separately below). Emitted on both the ok and
+     * error responses so callers can always reconcile received vs. accounted. */
+    int traces_received = (traces && yyjson_is_arr(traces)) ? (int)yyjson_arr_size(traces) : 0;
+    yyjson_mut_obj_add_int(doc, root, "traces_received", traces_received);
 
     if (is_error) {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
