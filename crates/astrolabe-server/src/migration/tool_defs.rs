@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 8] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 9] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -10,7 +10,96 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 8] {
         anchor_outcome_tool_definition(),
         team_artifact_tool_definition(),
         guard_calibrate_tool_definition(),
+        guard_check_tool_definition(),
     ]
+}
+
+pub(crate) fn guard_check_tool_definition() -> Value {
+    json!({
+        "name": "guard_check",
+        "title": "Guard Check",
+        "description": "Route a candidate symbol/diff through the guard: measure it via the SAME instruments as indexing, resolve its comparison region (kernel-near trusted exemplars first, peripheral fallback), score every fixed guard slot's cosine against the persisted calibrated tau, and combine the per-slot outcomes into accept / new_region / quarantine / refuse (never a flattened average). The verdict is ledgered (kind=Guard, subject=Cx(target)) with the full per-slot cos/tau/pass detail; a new_region verdict records an AwaitingGrounding lifecycle entry. The guard measures distributional conformance to trusted exemplars, not correctness. Fails closed on an uncalibrated profile, an unparseable target CxId, a candidate/exemplar missing a guard slot or carrying a degenerate vector, or an empty comparison region.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\" and guard_calibrate'd."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Candidate symbol CxId hex; the verdict ledger entry's subject."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Alias for target."
+                },
+                "candidate": {
+                    "type": "object",
+                    "description": "The candidate's measured per-slot lens vectors.",
+                    "properties": {
+                        "slots": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "slot": {
+                                        "type": "string",
+                                        "enum": ["code_semantic", "struct_trigrams", "api_callees", "name_semantic", "complexity_profile", "error_surface", "public_api_signature"]
+                                    },
+                                    "vector": {"type": "array", "items": {"type": "number"}}
+                                },
+                                "required": ["slot", "vector"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["slots"],
+                    "additionalProperties": false
+                },
+                "exemplars": {
+                    "type": "array",
+                    "description": "The enclosing scope's trusted exemplars, each measured on every guard slot. kernel_near exemplars form the primary comparison region.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cx": {"type": "string"},
+                            "kernel_near": {"type": "boolean"},
+                            "slots": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "slot": {"type": "string"},
+                                        "vector": {"type": "array", "items": {"type": "number"}}
+                                    },
+                                    "required": ["slot", "vector"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["slots"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["project", "target", "candidate", "exemplars"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn guard_calibrate_tool_definition() -> Value {
