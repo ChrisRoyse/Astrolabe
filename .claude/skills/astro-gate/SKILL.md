@@ -1,6 +1,6 @@
 ---
 name: astro-gate
-description: Runs ASTROLABE native verification correctly — preflight (launcher lock, toolchain occupancy, target/ state → verdict), launcher and aggregate invocation forms, gate-code semantics (SKIP/DEFERRED/INFO/exit 125), pre-existing-failure attribution, and mandatory target/ cleanup. Use before any cargo build/test/check or aggregate gate run, when interpreting gate output or a red gate, when a lock or another session's build is present, or when deciding build-vs-stage.
+description: Runs ASTROLABE native verification correctly — preflight (launcher lock, toolchain occupancy, target/ state → verdict), launcher and aggregate invocation forms, gate-code semantics (SKIP/DEFERRED/INFO/exit 125, the #280 suite-impact gate, GATE_TIME timing surface), pre-existing-failure attribution, and mandatory target/ cleanup. Use before any cargo build/test/check or aggregate gate run, when interpreting gate output or a red gate, when a lock or another session's build is present, or when deciding build-vs-stage. Test-authoring and timing-budget rules live in astro-test.
 allowed-tools: Bash(git log *), Bash(git merge-base *), Bash(tasklist *), Bash(ls *)
 ---
 
@@ -33,15 +33,16 @@ Tracker-comment **before** acquiring or removing any lock, and re-read the drivi
 - **Aggregate:** only through `scripts/invoke-native-aggregate.ps1`, consuming its **stdout directly**. Never wrap in `Tee-Object`, a transcript, or redirection to any file — the invoking process is the evidence stream.
 - **Tier costs (#280 restructure, 2026-07-12):** `check-full.sh` is the FULL TEST SUITE with a **<180s budget** — impact-gated suites (`SKIP[ASTRO_SUITE_UNCHANGED]` when inputs are byte-identical to the last green), warm-cached CBM builds, sharded C-suite execution, `check.sh ∥ cbm-test` concurrency. `check-release.sh` is the unabridged tier (forces every suite/self-test and owns the tiered-out lint/doc/Calyx phases) and is the only multi-ten-minute gate left.
 - **Long runs (#197 rule 4):** anything expected >10 min (check-release, cold toolchain bootstraps) must not live inside a foreground tool call that can time out. Launch it detached, post the launcher PID to the driving issue at start, and let other sessions verify liveness instead of guessing.
-- **Fast paths:** pure-Rust crates: `cargo check -p <crate> --all-targets` / `cargo test -p <crate>` (no C toolchain needed). Server changes: targeted `cargo test -p astrolabe-server` through the launcher bypasses the portable pre-check phase when that phase is red for tracked reasons. Formatter: `python scripts/native-cargo-fmt.py --all -- --check` (never bare `cargo fmt --all`).
+- **Fast paths:** pure-Rust crates: `cargo check -p <crate> --all-targets` / `cargo nextest run -p <crate>` (no C toolchain needed). Server changes: targeted `cargo test -p astrolabe-server` through the launcher bypasses the portable pre-check phase when that phase is red for tracked reasons. Formatter: `python scripts/native-cargo-fmt.py --all -- --check` (never bare `cargo fmt --all`).
 - **Exit codes:** `cmd | tail` masks failure — capture `${PIPESTATUS[0]}`.
-- Never set `CBM_CACHE_DIR` globally (vendored CBM C tests hardcode `$HOME/.cache`; redirecting regresses ~808 tests).
+- Never set `CBM_CACHE_DIR` globally (the CBM C tests hardcode `$HOME/.cache`; redirecting regresses ~808 tests).
 
 ## 3. Reading results
 
 Verdict vocabulary and every known code: [references/gate-codes.md](references/gate-codes.md). Non-negotiables:
 - Exit `125` / `DEFERRED[...]` = downstream suites did not run — **not** passing evidence. Use the printed `ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0` continuation only for an intentional full run.
-- `SKIP[...]` = recorded coverage gap (tracked, e.g. #224), never a pass. `INFO[...]` = context, not a verdict.
+- `SKIP[...]` = recorded coverage gap (tracked, e.g. #224), never a pass. `INFO[...]` = context, not a verdict. One deliberate exception: `SKIP[ASTRO_SUITE_UNCHANGED]` (the #280 impact gate) means the suite's input set is byte-identical to its last recorded GREEN — it re-certifies existing evidence rather than recording a gap; force with `ASTRO_SUITE_GATE=all` (check-release always runs all).
+- `GATE_TIME[<gate>]` / `GATE_TIME_TOTAL` lines are the timing surface (#280): compare against the sub-180s budget; a materially grown gate time is a regression to file.
 - Never fake a gate result. A gate unavailable or red for pre-existing reasons gets an issue filed/linked (astro-new-issue).
 
 ## 4. Attributing a red gate

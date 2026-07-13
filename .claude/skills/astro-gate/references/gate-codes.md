@@ -26,6 +26,8 @@
 | `SKIP[ASTRO_FAST_TIER_DOCTESTS]` | `scripts/check.sh` | Doctests are the one remaining fast-tier omission; check-release runs them via ci-rust-gate.sh. |
 | `INFO[CBM_INCREMENTAL_BUILD]` / `STEP_TIME[cbm:*]` / `SUITE_TIME[*]` / `SLOW_SUITE[CBM]` | `vendor/codebase-memory-mcp/scripts/test.sh` + `test-shards.sh` | CBM build premise unchanged ⇒ persistent object tree reused; per-phase and per-suite wall clocks; a suite >60s flags the #280 per-test-budget radar. |
 | `INFO[ASTRO_CBM_PARITY_BINARY_CACHED]` | `scripts/cbm-prod-build.sh` | Parity prod binary restored from the content-keyed cache (working-tree-exact fingerprint incl. dirty files). A hit never weakens parity — the harness still runs against the binary. |
+| `INFO[ASTRO_FMT_VENDOR_EXCLUDED]` | `scripts/check.sh` (#280) | Fast-path fmt is workspace-scoped; the full graph (vendor/) runs in `ci-rust-gate.sh` (release tier). |
+| `GATE_TIME[<gate>]` / `GATE_TIME_TOTAL` | aggregate scripts (#280) | Per-gate and total wall-clock surface for the sub-180s budget. Not a verdict; a materially grown time is a regression to file. |
 
 ## Standing rules
 
