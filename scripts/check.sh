@@ -423,22 +423,18 @@ for member_store in verify-chain single-mimalloc mcp-parity mcp-rapid-init   cli
   mkdir -p "$ROOT/target/cbm-store-sandbox/$member_store"
 done
 GSTORE="$CBM_STORE_SANDBOX"
-gate_group   verify-chain          "CBM_CACHE_DIR=\"$GSTORE/verify-chain\" bash scripts/check-astrolabe-verify-chain.sh \"$ROOT/target/debug/astrolabe\""   single-mimalloc       "CBM_CACHE_DIR=\"$GSTORE/single-mimalloc\" bash scripts/check-single-mimalloc.sh"   mcp-rapid-init        "CBM_CACHE_DIR=\"$GSTORE/mcp-rapid-init\" \"$PYTHON_BIN\" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py \"$astro_mcp_bin\""   cli-parity            "CBM_CACHE_DIR=\"$GSTORE/cli-parity\" \"$PYTHON_BIN\" scripts/check-cli-parity.py --astrolabe \"$ROOT/target/debug/astrolabe\""   installer-roundtrip   "CBM_CACHE_DIR=\"$GSTORE/installer-roundtrip\" \"$PYTHON_BIN\" scripts/check-installer-roundtrip.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   hook-contracts        "CBM_CACHE_DIR=\"$GSTORE/hook-contracts\" \"$PYTHON_BIN\" scripts/check-hook-contracts.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   server-manifest       "CBM_CACHE_DIR=\"$GSTORE/server-manifest\" \"$PYTHON_BIN\" scripts/check-server-manifest.py"   watchdog              "CBM_CACHE_DIR=\"$GSTORE/watchdog\" bash scripts/check-astrolabe-watchdog.sh \"$ROOT/target/debug/astrolabe\""
-# mcp-parity and compat-shim are deliberately OUTSIDE the concurrent group:
-# under full group concurrency their one-shot stdio server processes exit rc=1
-# after an apparently clean session (mcp-parity 3/4 group runs, compat-shim
-# 2/2; BOTH green in every serial/solo run, including against the identical
-# freshly-built binary — so the load sensitivity, not the binary, is the
-# variable). Serial here until root-caused — tracked in #292; the fix's DoD
-# returns both to the group.
-gate mcp-parity -- bash scripts/check-mcp-parity.sh
-# cross-process vault/servers deliberately race multiple astrolabe processes
-# on shared locks; under the wide concurrent group their internal timing
-# assertions flake (#292 family: index_repository rc=1 with empty output).
-# Serial until the family is root-caused.
-gate cross-process-vault -- "$PYTHON_BIN" scripts/check-cross-process-vault.py
-gate cross-process-servers -- "$PYTHON_BIN" scripts/check-cross-process-servers.py
-gate compat-shim -- "$PYTHON_BIN" scripts/check-compat-shim.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
+# #292 RESOLVED (root cause, 2026-07-13): the "rc=1 under concurrent load /
+# clean-log silent exit" family was installer-roundtrip's `install -y --force`
+# executing CBM's cbm_kill_other_instances(), which force-killed EVERY process
+# named codebase-memory-mcp.exe host-wide (taskkill /F /FI IMAGENAME) — the
+# shim, the parity prod binary, and the backgrounded lowered-parity harness's
+# one-shot CLI all died with exit 1 and no output whenever they overlapped the
+# installer's kill window. The kill is now identity-attributed to the exact
+# install-target binary (vendor/codebase-memory-mcp/src/cli/cli.c), the
+# installer gate carries both-ways kill-scope controls, and the formerly
+# serialized members (mcp-parity, compat-shim, cross-process-*) return to the
+# concurrent group below.
+gate_group   verify-chain          "CBM_CACHE_DIR=\"$GSTORE/verify-chain\" bash scripts/check-astrolabe-verify-chain.sh \"$ROOT/target/debug/astrolabe\""   single-mimalloc       "CBM_CACHE_DIR=\"$GSTORE/single-mimalloc\" bash scripts/check-single-mimalloc.sh"   mcp-rapid-init        "CBM_CACHE_DIR=\"$GSTORE/mcp-rapid-init\" \"$PYTHON_BIN\" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py \"$astro_mcp_bin\""   cli-parity            "CBM_CACHE_DIR=\"$GSTORE/cli-parity\" \"$PYTHON_BIN\" scripts/check-cli-parity.py --astrolabe \"$ROOT/target/debug/astrolabe\""   installer-roundtrip   "CBM_CACHE_DIR=\"$GSTORE/installer-roundtrip\" \"$PYTHON_BIN\" scripts/check-installer-roundtrip.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   hook-contracts        "CBM_CACHE_DIR=\"$GSTORE/hook-contracts\" \"$PYTHON_BIN\" scripts/check-hook-contracts.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""   server-manifest       "CBM_CACHE_DIR=\"$GSTORE/server-manifest\" \"$PYTHON_BIN\" scripts/check-server-manifest.py"   watchdog              "CBM_CACHE_DIR=\"$GSTORE/watchdog\" bash scripts/check-astrolabe-watchdog.sh \"$ROOT/target/debug/astrolabe\""   mcp-parity            "CBM_CACHE_DIR=\"$GSTORE/mcp-parity\" bash scripts/check-mcp-parity.sh"   cross-process-vault   "CBM_CACHE_DIR=\"$GSTORE/cross-process-vault\" \"$PYTHON_BIN\" scripts/check-cross-process-vault.py"   cross-process-servers "CBM_CACHE_DIR=\"$GSTORE/cross-process-servers\" \"$PYTHON_BIN\" scripts/check-cross-process-servers.py"   compat-shim           "CBM_CACHE_DIR=\"$GSTORE/compat-shim\" \"$PYTHON_BIN\" scripts/check-compat-shim.py --astrolabe \"$ROOT/target/debug/astrolabe\" --shim \"$ROOT/target/debug/codebase-memory-mcp\""
 # Collect the backgrounded lowered-parity harness (launched above, after
 # mcp-rapid-init). GATE_TIME here is the RESIDUAL wait — the harness ran
 # concurrently under the gates in between.

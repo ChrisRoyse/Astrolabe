@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -164,13 +165,58 @@ def assert_plan(binary, env, expected_agents):
         fail(f"{binary.name} install plan did not declare hooks")
 
 
-def run_roundtrip(binary, fixture):
+def spawn_server(binary, env, cache_dir):
+    # A real MCP stdio server held open on stdin: the canonical long-lived
+    # instance shape the install kill targets. Its store points OUTSIDE the
+    # snapshot home so the residue check stays byte-exact.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    server_env = dict(env)
+    server_env["CBM_CACHE_DIR"] = str(cache_dir)
+    return subprocess.Popen(
+        [str(binary)],
+        env=server_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_server(proc):
+    if proc.poll() is None:
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def wait_for_exit(proc, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.1)
+    return proc.poll() is not None
+
+
+def run_roundtrip(binary, fixture, decoy_binary):
     target = ROOT / "target"
     target_existed = target.exists()
     target.mkdir(parents=True, exist_ok=True)
     home = Path(
         tempfile.mkdtemp(prefix=f"astrolabe-installer-{binary.name}-", dir=target)
     )
+    scratch = Path(
+        tempfile.mkdtemp(prefix=f"astrolabe-installer-decoy-{binary.name}-", dir=target)
+    )
+    decoy = None
+    victim = None
     try:
         fakebin = setup_fake_home(home, fixture)
         env = fixture_environment(home, fakebin)
@@ -181,7 +227,18 @@ def run_roundtrip(binary, fixture):
         if snapshot_files(home) != baseline:
             fail(f"{binary.name} install --plan mutated the filesystem")
 
+        # #292 negative control: a live server that merely SHARES THE IMAGE
+        # NAME (spawned from a different on-disk binary) must survive install.
+        # The retired name-wide taskkill murdered exactly this process.
+        decoy = spawn_server(decoy_binary, env, scratch / "decoy-cache")
+
         run([binary, "install", "-y", "--force"], env=env, timeout=120)
+        if decoy.poll() is not None:
+            fail(
+                f"{binary.name} install killed an UNRELATED process that only shares "
+                f"the image name (decoy {decoy_binary} exited rc={decoy.returncode}) — "
+                "#292 kill-scope regression"
+            )
         installed = snapshot_files(home)
         installed_binary = installed_binary_relative_path()
         if installed_binary not in installed:
@@ -191,15 +248,41 @@ def run_roundtrip(binary, fixture):
         if snapshot_files(home) != installed:
             fail(f"{binary.name} update dry-run mutated the filesystem")
 
+        # #292 positive control: a server running FROM the install target is
+        # exactly what the kill exists for — reinstall must stop it (and the
+        # decoy from a different binary must still survive).
+        victim = spawn_server(home / installed_binary, env, scratch / "victim-cache")
+        run([binary, "install", "-y", "--force"], env=env, timeout=120)
+        if not wait_for_exit(victim, timeout=10):
+            fail(
+                f"{binary.name} reinstall did not stop the server running from the "
+                f"install target (pid {victim.pid} still alive) — #292 kill scope "
+                "lost its intended positive case"
+            )
+        if decoy.poll() is not None:
+            fail(
+                f"{binary.name} reinstall killed the unrelated same-name decoy "
+                f"(rc={decoy.returncode}) — #292 kill-scope regression"
+            )
+
         run([binary, "uninstall", "-y"], env=env, timeout=120)
         assert_no_residue(home, baseline)
         return {
             "agents_detected": len(expected_agents),
             "files_after_install": len(installed),
             "baseline_files": len(baseline),
+            "kill_scope": {
+                "same_name_foreign_binary": "survived",
+                "install_target_instance": "stopped",
+            },
         }
     finally:
+        if victim is not None:
+            stop_server(victim)
+        if decoy is not None:
+            stop_server(decoy)
         shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
         if not target_existed:
             try:
                 target.rmdir()
@@ -218,9 +301,11 @@ def main():
     fixture = load_fixture()
     astrolabe = resolve_binary(args.astrolabe)
     shim = resolve_binary(args.shim)
+    # The shim IS named codebase-memory-mcp[.exe] — the exact image name the
+    # #292 name-wide kill matched — making it the canonical same-name decoy.
     result = {
-        "astrolabe": run_roundtrip(astrolabe, fixture),
-        "codebase-memory-mcp": run_roundtrip(shim, fixture),
+        "astrolabe": run_roundtrip(astrolabe, fixture, decoy_binary=shim),
+        "codebase-memory-mcp": run_roundtrip(shim, fixture, decoy_binary=shim),
     }
     print(
         "installer roundtrip verified: "
