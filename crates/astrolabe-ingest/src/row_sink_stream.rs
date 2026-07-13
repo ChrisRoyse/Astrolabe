@@ -236,6 +236,43 @@ where
     })
 }
 
+/// Lazily adapts a materialized [`CbmGraphSnapshot`] into the
+/// [`RowSinkStreamRow`] sequence [`import_cbm_row_stream_to_vault`] consumes.
+///
+/// Nodes are yielded first (in stored order), then edges. Every item is `Ok`
+/// because a snapshot handed to this adapter has already cleared FFI row-sink
+/// validation — the per-item [`IngestResult`] failure channel is reserved for a
+/// live producer whose sink can fail mid-stream (the #123 contract). The adapter
+/// is *lazy*: it never clones the row vectors and yields one row at a time as the
+/// importer pulls it, so a bounded channel placed between a producer and this
+/// stream backpressures the producer instead of forcing a full second copy.
+///
+/// This is the production bridge between the shadow-import row-sink snapshot
+/// ([`pipeline_rows_to_graph_snapshot`] materializes CBM `CbmPipelineRows` into a
+/// [`CbmGraphSnapshot`] to derive the security-screen / skill-tree / bridge /
+/// kernel-context / anomaly / provenance surfaces) and the streaming vault
+/// writer: the same materialized rows are streamed row-by-row into the single
+/// ledger-paired write instead of being handed over as one snapshot argument.
+/// The `projects` / `file_hashes` / `project_summaries` / `token_vectors` fields
+/// are always empty on a row-sink snapshot, so streaming only nodes and edges
+/// preserves byte-for-byte parity with the direct snapshot writer.
+///
+/// [`pipeline_rows_to_graph_snapshot`]: crate::sqlite_import::CbmGraphSnapshot
+pub fn snapshot_into_row_stream(
+    snapshot: CbmGraphSnapshot,
+) -> impl Iterator<Item = IngestResult<RowSinkStreamRow>> {
+    snapshot
+        .nodes
+        .into_iter()
+        .map(|node| Ok(RowSinkStreamRow::Node(node)))
+        .chain(
+            snapshot
+                .edges
+                .into_iter()
+                .map(|edge| Ok(RowSinkStreamRow::Edge(edge))),
+        )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct StreamCounts {
     nodes: usize,
