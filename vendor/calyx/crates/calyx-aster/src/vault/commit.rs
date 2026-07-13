@@ -153,6 +153,12 @@ where
             )));
         }
         durable.stage_checkpoint_batch(durable_seq, rows)?;
+        // Crash boundary (#276): the batch is now in the WAL and the MVCC
+        // memtable and staged for checkpoint, but its checkpoint SST + manifest
+        // advance have not happened. A crash here recovers via WAL replay with a
+        // manifest still behind the committed seq.
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crate::vault::failpoints::crash_fsv_after_mvcc_commit(mvcc_seq)?;
         Ok(mvcc_seq)
     }
 

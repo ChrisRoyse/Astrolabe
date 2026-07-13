@@ -100,6 +100,11 @@ impl DurableVault {
         }
         let last_seq = batches.last().map_or(0, |(seq, _)| *seq);
         self.write_manifest(last_seq)?;
+        // Crash boundary (#276): durable-batch SSTs are written and the manifest
+        // has advanced to cover them. A crash here recovers by reconciling the
+        // advanced manifest + durable-batch SSTs (checkpoint replay), not the WAL.
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crate::vault::failpoints::crash_fsv_after_checkpoint(last_seq)?;
         let mut pending = self
             .pending_checkpoint
             .lock()
