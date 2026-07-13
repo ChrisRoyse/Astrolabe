@@ -5205,15 +5205,20 @@ fn mscale_pipeline_rows(changed: bool) -> CbmPipelineRows {
     for source in 0..M_SCALE_SYMBOL_COUNT {
         for offset in 1..=M_SCALE_EDGES_PER_SYMBOL {
             let target = (source + offset * 997) % M_SCALE_SYMBOL_COUNT;
+            // An "IMPORTS" edge's `local_name_gen` MUST equal the `local_name`
+            // carried in its properties JSON — `snapshot_edge_rows` fails closed
+            // otherwise (astrolabe-ingest row-sink edge validation). Emit both from
+            // one value so the fixture stays internally consistent (#23).
+            let local_name = format!("dep_{target:05}");
             edges.push(astrolabe_bridge::CbmPipelineEdgeRow {
                 id: edge_id,
                 project: M_SCALE_PROJECT.to_string(),
                 source_id: source as i64 + 1,
                 target_id: target as i64 + 1,
                 edge_type: "IMPORTS".to_string(),
-                properties_json: format!(r#"{{"ordinal":{offset}}}"#),
+                properties_json: format!(r#"{{"local_name":"{local_name}","ordinal":{offset}}}"#),
                 url_path_gen: String::new(),
-                local_name_gen: format!("dep_{target:05}"),
+                local_name_gen: local_name,
             });
             edge_id += 1;
         }
@@ -6492,6 +6497,161 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
         elapsed,
         M_SCALE_DELTA_BUDGET
     );
+
+    drop(vault);
+    fs::remove_dir_all(root).ok();
+}
+
+// ---- #23: error-masking regression FSV for import_shadow_vault_report ----
+//
+// Before #23, when the row-sink direct import failed, `import_shadow_vault_report`
+// unconditionally fell back to `import_sqlite_to_vault(sqlite_path, ..)?`. In the
+// row-sink path the sqlite artifact is often intentionally absent, so the `?`
+// propagated a misleading "open SQLite input" error that MASKED the real row-sink
+// cause. These tests exercise the real function with a deliberately-inconsistent
+// row-sink snapshot (an "IMPORTS" edge whose local_name_gen has no matching
+// "local_name" property — the exact shape that broke the M-scale harness) and read
+// back the returned fail-closed structured error.
+
+/// Two Function symbols joined by one "IMPORTS" edge whose `local_name_gen`
+/// ("dep_missing") has no matching `local_name` property, so the direct import's
+/// `snapshot_edge_rows` fails closed. This is the internally-inconsistent shape
+/// the pre-#23 M-scale fixture emitted.
+fn inconsistent_import_edge_rows() -> CbmPipelineRows {
+    let nodes = (0..2)
+        .map(|index| astrolabe_bridge::CbmPipelineNodeRow {
+            id: index as i64 + 1,
+            project: "maskcheck".to_string(),
+            label: "Function".to_string(),
+            name: format!("symbol_{index}"),
+            qualified_name: format!("maskcheck.symbol_{index}"),
+            file_path: "src/lib.rs".to_string(),
+            start_line: index as i64 + 1,
+            end_line: index as i64 + 1,
+            properties_json: format!(
+                r#"{{"language":"rust","source_snippet":"fn symbol_{index}() {{}}","signature":"fn symbol_{index}()"}}"#
+            ),
+        })
+        .collect::<Vec<_>>();
+    let edges = vec![astrolabe_bridge::CbmPipelineEdgeRow {
+        id: 1,
+        project: "maskcheck".to_string(),
+        source_id: 1,
+        target_id: 2,
+        edge_type: "IMPORTS".to_string(),
+        properties_json: r#"{"ordinal":1}"#.to_string(),
+        url_path_gen: String::new(),
+        local_name_gen: "dep_missing".to_string(),
+    }];
+    CbmPipelineRows {
+        project: "maskcheck".to_string(),
+        nodes,
+        edges,
+    }
+}
+
+fn masking_row_sink_candidate(rows: CbmPipelineRows) -> RowSinkImportCandidate {
+    let reason = "error-masking FSV supplies intentionally-inconsistent row-sink rows";
+    let project = rows.project.clone();
+    let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
+    RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
+        snapshot: pipeline_rows_to_graph_snapshot(rows),
+        source_fingerprint_sha256,
+        security_screen: security_screen_unavailable(security_screen_subject(&project), reason),
+        skill_tree: skill_tree_unavailable_json(reason),
+        bridges: bridges_unavailable_json(reason),
+        kernel_context: kernel_context_unavailable_json(reason),
+        anomalies: anomaly_report_unavailable_json(reason),
+        provenance: provenance_unavailable_json(reason),
+    }))
+}
+
+fn masking_import_options() -> SqliteImportOptions {
+    SqliteImportOptions::new("maskcheck", "mask-commit", DEFAULT_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots())
+}
+
+#[test]
+fn direct_import_failure_surfaces_row_sink_error_when_sqlite_absent() {
+    let root = temp_dir("mask-absent");
+    let vault_dir = root.join("maskcheck.astrolabe-vault");
+    fs::create_dir_all(&root).unwrap();
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"mask-absent".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    // Intentionally-absent sqlite path: the fallback cannot recover, so masking it
+    // behind a "cannot open SQLite" error would be a silent fallback.
+    let sqlite_path = root.join("unused.db");
+    assert!(!sqlite_path.exists());
+
+    let err = import_shadow_vault_report(
+        &sqlite_path,
+        &vault,
+        &ShadowSlotRuntime,
+        &masking_import_options(),
+        Some(masking_row_sink_candidate(inconsistent_import_edge_rows())),
+    )
+    .expect_err("inconsistent row-sink snapshot must fail closed, not mask");
+    let message = err.to_string();
+    // Fail-closed structured error carrying the ROW-SINK cause verbatim...
+    assert!(
+        message.contains("ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED"),
+        "{message}"
+    );
+    assert!(message.contains("local_name_gen"), "{message}");
+    assert!(message.contains("does not match"), "{message}");
+    // ...and NOT the masked SQLite-open error the old code returned.
+    assert!(
+        !message.contains("open SQLite input"),
+        "row-sink error was masked by the sqlite fallback: {message}"
+    );
+    // No mutation: the vault ledger is still empty.
+    assert_eq!(verify_chain(&vault).unwrap().ledger_rows, 0);
+
+    drop(vault);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn direct_import_and_sqlite_fallback_both_failing_chains_both_errors() {
+    let root = temp_dir("mask-both");
+    let vault_dir = root.join("maskcheck.astrolabe-vault");
+    fs::create_dir_all(&root).unwrap();
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"mask-both".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    // A present-but-invalid sqlite artifact: the fallback import also fails, so the
+    // returned error must chain BOTH causes rather than masking either one.
+    let sqlite_path = root.join("present-but-invalid.db");
+    fs::write(&sqlite_path, b"not a sqlite database at all").unwrap();
+    assert!(sqlite_path.exists());
+
+    let err = import_shadow_vault_report(
+        &sqlite_path,
+        &vault,
+        &ShadowSlotRuntime,
+        &masking_import_options(),
+        Some(masking_row_sink_candidate(inconsistent_import_edge_rows())),
+    )
+    .expect_err("both the direct import and the sqlite fallback must fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("ASTRO_SHADOW_IMPORT_BOTH_FAILED"),
+        "{message}"
+    );
+    // Both underlying causes are chained verbatim.
+    assert!(message.contains("Row-sink error:"), "{message}");
+    assert!(message.contains("local_name_gen"), "{message}");
+    assert!(message.contains("SQLite fallback error:"), "{message}");
+    assert_eq!(verify_chain(&vault).unwrap().ledger_rows, 0);
 
     drop(vault);
     fs::remove_dir_all(root).ok();
