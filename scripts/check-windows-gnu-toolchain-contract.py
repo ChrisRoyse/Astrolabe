@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "windows-gnu-toolchain.ps1"
 LAUNCHER_LOCK = ROOT / "scripts" / "launcher-lock.ps1"
+ATTRIBUTION_MANIFEST = ROOT / "scripts" / "attribution-manifest.ps1"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
 GITIGNORE = ROOT / ".gitignore"
 AGENTS = ROOT / "AGENTS.md"
@@ -27,6 +28,8 @@ def main() -> None:
     runner = RUNNER.read_text(encoding="utf-8")
     require(LAUNCHER_LOCK.is_file(), "the shared launcher-lock helper must exist")
     lock_helper = LAUNCHER_LOCK.read_text(encoding="utf-8")
+    require(ATTRIBUTION_MANIFEST.is_file(), "the attribution-manifest lifecycle helper must exist")
+    attribution_helper = ATTRIBUTION_MANIFEST.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
     gitignore = GITIGNORE.read_text(encoding="utf-8")
     agents = AGENTS.read_text(encoding="utf-8")
@@ -289,6 +292,64 @@ def main() -> None:
         in makefile
         and 'ifeq ($(filter gcc clang,$(CC_FAMILY)),)' in makefile,
         "the CBM overlay must fail closed when the compiler family cannot be classified (#274)",
+    )
+
+    # #279: the launcher must record the process tree AND populate owned_paths from a
+    # causal owned-path probe over the recorded tree's open handles on the protected CBM
+    # store roots, failing closed (owned_paths=null) when the probe mechanism cannot run.
+    require(
+        "class AstroTreeRecorder" in runner
+        and "public static List<string> ProbeOwnedStorePaths(int[] treePids, string[] roots)" in runner
+        and "rstrtmgr.dll" in runner
+        and "RmStartSession" in runner
+        and "RmGetList" in runner
+        and "RunOwnedProbe" in runner
+        # fail-closed: probe mechanism failure latches ownedProbeFailed -> owned_paths null,
+        # never a silent empty. The '[]' path is only reached when the probe RAN.
+        and "ownedProbeFailed" in runner
+        and '\\"owned_paths\\":' in runner
+        # fail-closed: owned_paths serializes as JSON null when the probe latched failed.
+        and "if (probeFailedSnap) {" in runner
+        and 'sb.Append("null");' in runner,
+        "the launcher's attribution recorder must populate owned_paths via a causal Restart-Manager "
+        "probe over the recorded tree and fail closed (owned_paths=null) when the probe cannot run (#279)",
+    )
+    require(
+        "function Get-AstroAttributedStoreRoots" in runner
+        and "no-escape-roots.json" in runner
+        and "$root.mode -ne 'attributed'" in runner
+        and "-StoreRoots $attributedStoreRoots" in runner
+        and "ASTRO_OWNED_PATH_PROBE" in runner,
+        "the launcher must resolve the attributed CBM-store roots from the gate registry and pass "
+        "them to the owned-path probe (single source of truth, no drift) (#279)",
+    )
+    # #301: the launcher must dot-source the audited attribution-manifest helper, sweep dead-PID
+    # manifests at startup, and remove its OWN manifest on every exit path (finally).
+    require(
+        '. (Join-Path $PSScriptRoot "attribution-manifest.ps1")' in runner
+        and "Clear-DeadAttributionManifests -Directory $workspaceTempParent -SelfPid $PID" in runner
+        and "Remove-AstroAttributionManifest -Path $attributionManifest" in runner
+        and "ASTRO_ATTRIBUTION_SWEEP" in runner
+        and "CLEANUP[ASTRO_ATTRIBUTION_MANIFEST]" in runner
+        and appears_before(
+            runner,
+            "Clear-DeadAttributionManifests -Directory $workspaceTempParent -SelfPid $PID",
+            "Remove-AstroAttributionManifest -Path $attributionManifest",
+        ),
+        "the launcher must sweep dead-PID attribution manifests at startup and remove its own "
+        "manifest on every exit path via the audited helper (#301)",
+    )
+    require(
+        "function Clear-DeadAttributionManifests" in attribution_helper
+        and "function Remove-AstroAttributionManifest" in attribution_helper
+        and "Get-Process -Id $OwnerPid" in attribution_helper
+        # #197: the sweep must never stop a process nor sweep by name; a live-PID manifest is
+        # inviolable (kept), only dead-PID ones are removed.
+        and "Stop-Process" not in attribution_helper
+        and "Get-Process -Name" not in attribution_helper
+        and "$SelfPid" in attribution_helper,
+        "the attribution-manifest helper must classify by exact-PID liveness, keep live-PID "
+        "manifests inviolable, skip the self PID, and never stop a process (#301/#197)",
     )
 
     print("Windows GNU toolchain contract verified")

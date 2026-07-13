@@ -20,6 +20,7 @@ FILES = (
     "scripts/check-windows-gnu-toolchain-contract.py",
     "scripts/windows-gnu-toolchain.ps1",
     "scripts/launcher-lock.ps1",
+    "scripts/attribution-manifest.ps1",
 )
 
 
@@ -218,6 +219,63 @@ def main() -> int:
             "ASTRO_BASH_COMMAND_UNGUARDED",
         )
         expect_failure(run_checker(fixture), "allowlist bash commands")
+
+        # #279: dropping the owned_paths fail-closed serialization (null on probe
+        # failure) must be caught -- a silent empty would let a #246 store leak pass.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "if (probeFailedSnap) {",
+            "if (false) {",
+        )
+        expect_failure(run_checker(fixture), "#279")
+
+        # #279: removing the owned-path probe method (RM enumeration over the tree) must
+        # be caught by the contract.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "public static List<string> ProbeOwnedStorePaths(int[] treePids, string[] roots)",
+            "static List<string> DisabledProbe(int[] treePids, string[] roots)",
+        )
+        expect_failure(run_checker(fixture), "#279")
+
+        # #279: dropping the store-root resolution passed to the recorder must be caught.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "-StoreRoots $attributedStoreRoots",
+            "",
+        )
+        expect_failure(run_checker(fixture), "#279")
+
+        # #301: dropping the dead-PID startup sweep must be caught.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "Clear-DeadAttributionManifests -Directory $workspaceTempParent -SelfPid $PID",
+            "# startup sweep removed",
+        )
+        expect_failure(run_checker(fixture), "#301")
+
+        # #301: dropping the own-manifest exit removal must be caught.
+        copy_fixture(fixture)
+        rewrite(
+            runner,
+            "Remove-AstroAttributionManifest -Path $attributionManifest",
+            "# exit removal removed",
+        )
+        expect_failure(run_checker(fixture), "#301")
+
+        # #301/#197: reintroducing a process-stop into the manifest helper (which must
+        # never stop a process) must be caught.
+        copy_fixture(fixture)
+        rewrite(
+            fixture / "scripts/attribution-manifest.ps1",
+            "function Remove-AstroAttributionManifest {",
+            "Stop-Process -Id 1 -ErrorAction SilentlyContinue\n\nfunction Remove-AstroAttributionManifest {",
+        )
+        expect_failure(run_checker(fixture), "#301/#197")
 
         # Reintroducing ambient bash.exe resolution policing (removed in 70866c7 because
         # it crashes when WSL coexists) must be caught by the contract's `not in runner`

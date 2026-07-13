@@ -295,6 +295,21 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    # #279/#301: the attribution owned-path probe and manifest-lifecycle FSV gates must
+    # stay wired into the aggregate (they are the durable callers proving the launcher
+    # populates owned_paths causally and never leaks stale attribution manifests).
+    require(
+        check,
+        "scripts/check-attribution-owned-probe.sh",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/check-attribution-manifest.sh",
+        "scripts/check.sh",
+        errors,
+    )
     require(
         check,
         "scripts/check-native-aggregate-wrapper.py",
