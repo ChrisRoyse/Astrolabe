@@ -142,6 +142,13 @@ where
             }
         }
     }
+    // Reconcile the entire designed-pair ownership domain, not only CxIds in
+    // the fresh plan. A removed live symbol is absent from `cx_ids`; retaining
+    // its old XTerm row would make the live agreement/anomaly projection stale.
+    // MVCC still preserves the tombstoned row at prior snapshots.
+    for persisted in read_eager_cross_term_rows(vault)? {
+        owned_keys.insert(persisted.key);
+    }
 
     let dump = eager_xterm_dump_bytes(plan, cx_ids)?;
     let xterm_dump_hash = hex_lower_bytes(blake3::hash(&dump).as_bytes());

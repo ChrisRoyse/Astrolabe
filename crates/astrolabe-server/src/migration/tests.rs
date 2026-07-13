@@ -5929,7 +5929,176 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         anomalies: sample_anomalies(),
         provenance: sample_provenance(),
         git_archaeology: json!({"status": "fixture"}),
+        weave: json!({"status": "fixture"}),
     }
+}
+
+#[test]
+fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
+    let root = temp_dir("shadow-panel-weave-fsv");
+    let vault_dir = root.join("demo.astrolabe-vault");
+    fs::create_dir_all(&root).unwrap();
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"shadow-panel-weave-fsv".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let properties = |name: &str| {
+        format!(
+            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ input + 1 }}","signature":"fn {name}(input: i32) -> i32","bt":"input addition return","docstring":"increment an input value","complexity":2.0,"cognitive":1.0,"param_count":1.0,"lines":1.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+        )
+    };
+    let rows = |include_beta: bool| {
+        let mut nodes = vec![astrolabe_bridge::CbmPipelineNodeRow {
+            id: 1,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: "alpha".to_string(),
+            qualified_name: "demo.alpha".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            properties_json: properties("alpha"),
+        }];
+        if include_beta {
+            nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
+                id: 2,
+                project: "demo".to_string(),
+                label: "Function".to_string(),
+                name: "beta".to_string(),
+                qualified_name: "demo.beta".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 3,
+                end_line: 3,
+                properties_json: properties("beta"),
+            });
+        }
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes,
+            edges: Vec::new(),
+        }
+    };
+
+    let first_options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots());
+    let first = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &first_options,
+        Some(row_sink_import_candidate_from_rows(rows(true))),
+    )
+    .unwrap();
+    assert_eq!(first.report.constellation_inputs, 2);
+    let live = astrolabe_ingest::read_cbm_graph_snapshot(&vault, "demo").unwrap();
+    let cx_by_qn = live
+        .nodes
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name.clone(), cx_id)))
+        .collect::<BTreeMap<_, _>>();
+    let alpha_cx = cx_by_qn["demo.alpha"];
+    let beta_cx = cx_by_qn["demo.beta"];
+    let body_slot = vault
+        .read_cf_at(
+            vault.snapshot(),
+            ColumnFamily::slot(SlotId::new(18)),
+            &slot_key(alpha_cx),
+        )
+        .unwrap()
+        .expect("persisted semantic body slot");
+    assert!(matches!(
+        calyx_aster::vault::encode::decode_slot_vector(&body_slot).unwrap(),
+        SlotVector::Dense { .. }
+    ));
+    let unavailable_slot = vault
+        .read_cf_at(
+            vault.snapshot(),
+            ColumnFamily::slot(SlotId::new(1)),
+            &slot_key(alpha_cx),
+        )
+        .unwrap()
+        .expect("persisted explicit unavailable slot");
+    assert!(matches!(
+        calyx_aster::vault::encode::decode_slot_vector(&unavailable_slot).unwrap(),
+        SlotVector::Absent { .. }
+    ));
+
+    let first_weave = run_live_weave(&vault, "demo", true).unwrap();
+    assert_eq!(first_weave["status"], "reconciled");
+    let first_sim = astrolabe_weave::read_similarity_edge_rows(&vault).unwrap();
+    let first_xterms = astrolabe_weave::read_eager_cross_term_rows(&vault).unwrap();
+    assert!(!first_sim.is_empty(), "identical semantic slots must weave");
+    assert!(!first_xterms.is_empty(), "designed pairs must materialize");
+    let old_seq = vault.snapshot();
+    let old_sim_key = first_sim[0].key.clone();
+    let removed_xterm_key = first_xterms
+        .iter()
+        .find(|row| row.row.key.cx_id == beta_cx)
+        .expect("beta eager xterm")
+        .key
+        .clone();
+    let first_lower = lower_shadow_sqlite(&root, "demo", &vault).unwrap();
+    assert!(first_lower.edge_count > 0);
+
+    let second_options = SqliteImportOptions::new("demo", "commit-2", DEFAULT_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots());
+    let second = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &second_options,
+        Some(row_sink_import_candidate_from_rows(rows(false))),
+    )
+    .unwrap();
+    assert!(second.report.graph_rows_written > 0);
+    let second_weave = run_live_weave(&vault, "demo", true).unwrap();
+    assert!(second_weave["similarity"]["rows_tombstoned"] != 0);
+    assert!(second_weave["eager_cross_terms"]["rows_tombstoned"] != 0);
+    assert!(
+        astrolabe_weave::read_similarity_edge_rows(&vault)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &old_sim_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::XTerm, &removed_xterm_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        vault
+            .read_cf_at(old_seq, ColumnFamily::Graph, &old_sim_key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .read_cf_at(old_seq, ColumnFamily::XTerm, &removed_xterm_key)
+            .unwrap()
+            .is_some()
+    );
+    let second_lower = lower_shadow_sqlite(&root, "demo", &vault).unwrap();
+    assert_eq!(second_lower.edge_count, 0);
+    assert_ne!(
+        first_lower.vault_fingerprint_sha256,
+        second_lower.vault_fingerprint_sha256
+    );
+
+    let before_noop = vault.latest_seq();
+    let noop = run_live_weave(&vault, "demo", false).unwrap();
+    assert_eq!(noop["status"], "unchanged");
+    assert_eq!(vault.latest_seq(), before_noop);
+    drop(vault);
+    fs::remove_dir_all(root).ok();
 }
 
 fn sample_search_scale() -> Value {

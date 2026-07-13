@@ -357,7 +357,7 @@ impl Lens for StaticEmbeddingLens {
                     self.slot_id
                 ))
             })?;
-        encode_embedding_slot(self.slot_id, &decoded, &self.table).map_err(|err| {
+        encode_static_embedding_slot(self.slot_id, &decoded, &self.table).map_err(|err| {
             CalyxError::lens_numerical_invariant(format!("{}: {}", err.code(), err.message()))
         })
     }
@@ -389,7 +389,8 @@ pub fn fixture_static_embedding_input() -> StaticEmbeddingInput {
     }
 }
 
-fn encode_embedding_slot(
+/// Encodes one production static-embedding slot from a content-verified table.
+pub fn encode_static_embedding_slot(
     slot_id: SlotId,
     input: &StaticEmbeddingInput,
     table: &StaticEmbeddingTable,
@@ -700,7 +701,7 @@ mod tests {
                  (crates/astrolabe-panel/src/embeddings.rs) is empty; \
                  regenerate the S18-S20 embedding golden for this slot."
             );
-            let vector = encode_embedding_slot(SlotId::new(*slot), &input, table.as_ref())
+            let vector = encode_static_embedding_slot(SlotId::new(*slot), &input, table.as_ref())
                 .expect("embedding vector");
             let actual = hex_lower(&sha256_digest_bytes(&slot_vector_bytes(&vector)));
             assert_eq!(actual, *expected, "slot {slot} embedding drifted");
@@ -722,9 +723,9 @@ mod tests {
             body_tokens: vec!["astrolabe_oov_fixture".to_string()],
             ..StaticEmbeddingInput::default()
         };
-        let first = encode_embedding_slot(SlotId::new(18), &input, table.as_ref())
+        let first = encode_static_embedding_slot(SlotId::new(18), &input, table.as_ref())
             .expect("first OOV vector");
-        let second = encode_embedding_slot(SlotId::new(18), &input, table.as_ref())
+        let second = encode_static_embedding_slot(SlotId::new(18), &input, table.as_ref())
             .expect("second OOV vector");
         assert_eq!(slot_vector_bytes(&first), slot_vector_bytes(&second));
         let actual = hex_lower(&sha256_digest_bytes(&slot_vector_bytes(&first)));
@@ -747,7 +748,8 @@ mod tests {
             qualified_name: "crate::loadUser".to_string(),
         };
         assert_eq!(
-            encode_embedding_slot(SlotId::new(19), &input, table.as_ref()).expect("S19 absent"),
+            encode_static_embedding_slot(SlotId::new(19), &input, table.as_ref())
+                .expect("S19 absent"),
             absent()
         );
     }
@@ -768,7 +770,7 @@ mod tests {
     #[test]
     fn multi_vector_feature_emits_s22_goldens() {
         let table = test_table();
-        let vector = encode_embedding_slot(
+        let vector = encode_static_embedding_slot(
             SlotId::new(22),
             &fixture_static_embedding_input(),
             table.as_ref(),

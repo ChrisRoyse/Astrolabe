@@ -92,6 +92,7 @@ pub(crate) struct ShadowImportOutcome {
     pub(crate) anomalies: Value,
     pub(crate) provenance: Value,
     pub(crate) git_archaeology: Value,
+    pub(crate) weave: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +129,9 @@ pub(crate) struct ShadowVaultImport {
 #[derive(Debug)]
 pub(crate) struct ShadowSlotRuntime;
 
+static SHADOW_EMBEDDING_TABLE: OnceLock<PanelResult<astrolabe_panel::StaticEmbeddingTable>> =
+    OnceLock::new();
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ShadowRefreshStatus {
     Current,
@@ -150,11 +154,253 @@ pub(crate) enum ShadowRefreshStatus {
 }
 
 impl SlotRuntime for ShadowSlotRuntime {
-    fn measure_slot(&self, _slot: &PanelSlotSpec, _input: &PanelInput) -> PanelResult<SlotVector> {
-        Ok(SlotVector::Absent {
-            reason: AbsentReason::LensUnavailable,
-        })
+    fn measure_slot(&self, slot: &PanelSlotSpec, input: &PanelInput) -> PanelResult<SlotVector> {
+        if matches!(slot.slot, 18..=20) {
+            let table = SHADOW_EMBEDDING_TABLE
+                .get_or_init(astrolabe_panel::StaticEmbeddingTable::load_default)
+                .as_ref()
+                .map_err(Clone::clone)?;
+            return astrolabe_panel::encode_static_embedding_slot(
+                slot.slot_id(),
+                &shadow_embedding_input(input),
+                table,
+            );
+        }
+        astrolabe_panel::encode_slot(slot.slot_id(), &shadow_encoder_input(input))
     }
+}
+
+fn shadow_embedding_input(input: &PanelInput) -> astrolabe_panel::StaticEmbeddingInput {
+    astrolabe_panel::StaticEmbeddingInput {
+        body_tokens: property_string(&input.properties, "bt")
+            .map(text_tokens)
+            .unwrap_or_else(|| text_tokens(&String::from_utf8_lossy(&input.source_bytes))),
+        doc_tokens: property_string(&input.properties, "docstring")
+            .map(text_tokens)
+            .unwrap_or_default(),
+        name: input.symbol_name.clone(),
+        qualified_name: input.qualified_name.clone(),
+    }
+}
+
+fn shadow_encoder_input(input: &PanelInput) -> astrolabe_panel::EncoderLensInput {
+    use astrolabe_panel::{
+        ComplexityMetrics, ConfigEnvSurfaceInput, EncoderLensInput, ErrorSurfaceInput,
+        IdentifierLexicalInput, LangLabelInput, PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS,
+        RecordVectorInput, RoleFlagsInput, RouteObservation, RouteSurfaceInput, TypeSurfaceInput,
+    };
+
+    let properties = &input.properties;
+    let body_identifiers = property_string(properties, "bt")
+        .map(text_tokens)
+        .unwrap_or_else(|| text_tokens(&String::from_utf8_lossy(&input.source_bytes)));
+    let complexity = numeric_property(properties, "complexity");
+    let cognitive = numeric_property(properties, "cognitive");
+    let loop_count = numeric_property(properties, "loop_count");
+    let loop_depth = numeric_property(properties, "loop_depth");
+    let max_access_depth = numeric_property(properties, "max_access_depth");
+    let param_count = numeric_property(properties, "param_count");
+    let body_lines = numeric_property(properties, "lines").or_else(|| {
+        Some(
+            input
+                .source_bytes
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as f32,
+        )
+    });
+    let body_tokens = property_string(properties, "bt")
+        .map(|tokens| text_tokens(tokens).len() as f32)
+        .or_else(|| Some(body_identifiers.len() as f32));
+    let complexity_input = Some(ComplexityMetrics {
+        cyclomatic: complexity.unwrap_or(0.0),
+        cognitive: cognitive.unwrap_or(0.0),
+        loop_count: loop_count.unwrap_or(0.0),
+        loop_depth: loop_depth.unwrap_or(0.0),
+        max_access_depth: max_access_depth.unwrap_or(0.0),
+        param_count: param_count.unwrap_or(0.0),
+        body_lines: body_lines.unwrap_or(0.0),
+        body_tokens: body_tokens.unwrap_or(0.0),
+    });
+
+    let mut record_scalars = RECORD_VECTOR_SCALAR_KEYS
+        .iter()
+        .map(|key| ((*key).to_string(), 0.0_f32))
+        .collect::<BTreeMap<_, _>>();
+    for (key, value) in [
+        ("complexity.cyclomatic", complexity),
+        ("complexity.cognitive", cognitive),
+        ("complexity.loop_count", loop_count),
+        ("complexity.loop_depth", loop_depth),
+        ("complexity.max_access_depth", max_access_depth),
+        ("complexity.param_count", param_count),
+        ("complexity.body_lines", body_lines),
+        ("complexity.body_tokens", body_tokens),
+    ] {
+        if let Some(value) = value {
+            record_scalars.insert(key.to_string(), value);
+        }
+    }
+
+    let route_path = property_string(properties, "route_path").unwrap_or_default();
+    let route_surface = (!route_path.trim().is_empty()).then(|| RouteSurfaceInput {
+        routes: vec![RouteObservation {
+            method: property_string(properties, "route_method")
+                .unwrap_or_default()
+                .to_string(),
+            path: route_path.to_string(),
+        }],
+        channels: Vec::new(),
+    });
+    let docstring = property_string(properties, "docstring").unwrap_or_default();
+
+    EncoderLensInput {
+        ast_profile: property_string(properties, "sp").and_then(parse_ast_profile),
+        struct_trigrams: None,
+        complexity: complexity_input,
+        api_calls: None,
+        type_surface: Some(TypeSurfaceInput {
+            param_types: property_strings(properties, "param_types"),
+            return_types: property_string(properties, "return_type")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            uses_types: property_strings(properties, "base_classes"),
+            instantiates: Vec::new(),
+        }),
+        decorators: Some(property_strings(properties, "decorators")),
+        identifiers: Some(IdentifierLexicalInput {
+            name: input.symbol_name.clone(),
+            qualified_name: input.qualified_name.clone(),
+            body_identifiers,
+        }),
+        graph_position: None,
+        path_hierarchy: Some(PathHierarchyInput {
+            path: input.rel_file_path.clone(),
+        }),
+        churn_profile: None,
+        recency: None,
+        role_flags: Some(RoleFlagsInput {
+            is_test: bool_property(properties, "is_test"),
+            is_entry: bool_property(properties, "is_entry_point"),
+            is_exported: bool_property(properties, "is_exported"),
+            is_abstract: bool_property(properties, "is_abstract"),
+            is_async: bool_property(properties, "is_async"),
+            is_generator: bool_property(properties, "is_generator"),
+            is_route: route_surface.is_some(),
+            is_handler: route_surface.is_some(),
+            is_dead: bool_property(properties, "is_dead"),
+            is_recursive: bool_property(properties, "self_recursive"),
+            is_generated: input.rel_file_path.contains("generated")
+                || input.rel_file_path.contains("vendor"),
+            is_documented: !docstring.trim().is_empty(),
+        }),
+        lang_label: Some(LangLabelInput {
+            language: input.language.clone(),
+            label: input.label.as_str().to_string(),
+        }),
+        test_topology: None,
+        error_surface: Some(ErrorSurfaceInput {
+            thrown: property_strings(properties, "throws"),
+            raised: property_strings(properties, "raises"),
+            caught: property_strings(properties, "catches"),
+        }),
+        config_env_surface: Some(ConfigEnvSurfaceInput {
+            env_keys: property_strings(properties, "env_keys"),
+            config_keys: property_strings(properties, "config_keys"),
+        }),
+        route_surface,
+        record_vec: Some(RecordVectorInput {
+            scalars: record_scalars,
+        }),
+    }
+}
+
+fn property_string<'a>(properties: &'a Value, key: &str) -> Option<&'a str> {
+    properties.get(key).and_then(Value::as_str)
+}
+
+fn property_strings(properties: &Value, key: &str) -> Vec<String> {
+    properties
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn numeric_property(properties: &Value, key: &str) -> Option<f32> {
+    properties
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+}
+
+fn bool_property(properties: &Value, key: &str) -> bool {
+    properties
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn text_tokens(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|part| !part.is_empty())
+        .flat_map(astrolabe_panel::cbm_camel_split_tokens)
+        .collect()
+}
+
+fn parse_ast_profile(encoded: &str) -> Option<astrolabe_panel::AstProfile> {
+    let values = encoded
+        .split(',')
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() != 25 || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(astrolabe_panel::AstProfile {
+        if_count: values[0],
+        for_count: values[1],
+        while_count: values[2],
+        switch_count: values[3],
+        try_count: values[4],
+        return_count: values[5],
+        max_nesting_depth: values[6],
+        avg_nesting_depth_x10: values[7],
+        comparison_ops: values[8],
+        arithmetic_ops: values[9],
+        logical_ops: values[10],
+        assignment_count: values[11],
+        string_literals: values[12],
+        number_literals: values[13],
+        bool_literals: values[14],
+        param_count: values[15],
+        params_in_returns: values[16],
+        params_in_conditions: values[17],
+        variable_reassigns: values[18],
+        unique_operators: values[19],
+        unique_operands: values[20],
+        total_operators: values[21],
+        total_operands: values[22],
+        body_lines: values[23],
+        body_tokens: values[24],
+    })
+}
+
+pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
+    astrolabe_panel::PANEL_V1_SLOTS
+        .iter()
+        .filter(|slot| slot.slot <= 21)
+        .map(|slot| (*slot).slot_id())
+        .collect()
 }
 
 pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
@@ -764,7 +1010,7 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         None => format!("shadow-import-v1:{project}"),
     };
     let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
-        .with_available_slots(std::iter::empty())
+        .with_available_slots(shadow_available_slots())
         .with_series_registry(repo.is_some());
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
@@ -791,6 +1037,11 @@ pub(crate) fn import_shadow_vault_with_archaeology(
             "provenance": "unavailable",
         }),
     };
+    let import_changed = report.new_cx_ids > 0
+        || report.graph_rows_written > 0
+        || report.edge_rows_written > 0
+        || report.series_mutated_rows > 0;
+    let weave = run_live_weave(&vault, project, import_changed)?;
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
     let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
     let verify = verify_chain(&vault)?;
@@ -849,7 +1100,109 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         anomalies: shadow_import.anomalies,
         provenance,
         git_archaeology,
+        weave,
     })
+}
+
+pub(crate) fn run_live_weave<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    import_changed: bool,
+) -> Result<Value, DynError>
+where
+    C: Clock,
+{
+    if !import_changed {
+        return Ok(json!({
+            "status": "unchanged",
+            "trust": "verified",
+            "freshness": "current",
+            "provenance": "content-addressed import reported no graph, edge, slot, or series mutation",
+            "writes_skipped": true,
+        }));
+    }
+
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let at_seq = vault.snapshot();
+    let slots = shadow_available_slots();
+    let mut nodes = Vec::new();
+    let mut cx_ids = BTreeMap::new();
+    let mut absent_slot_rows = 0usize;
+    let mut missing_slot_rows = 0usize;
+    for node in snapshot.nodes.into_iter().filter(|node| !node.structural) {
+        let cx_id = node.cx_id.ok_or_else(|| {
+            format!(
+                "live non-structural graph node {:?} has no CxId",
+                node.qualified_name
+            )
+        })?;
+        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
+        for slot in &slots {
+            let Some(bytes) =
+                vault.read_cf_at(at_seq, ColumnFamily::slot(*slot), &slot_key(cx_id))?
+            else {
+                missing_slot_rows += 1;
+                continue;
+            };
+            let vector = calyx_aster::vault::encode::decode_slot_vector(&bytes)?;
+            if matches!(vector, SlotVector::Absent { .. }) {
+                absent_slot_rows += 1;
+            }
+            similarity_node.slots.insert(*slot, vector);
+        }
+        if cx_ids.insert(node.qualified_name.clone(), cx_id).is_some() {
+            return Err(format!(
+                "duplicate live qualified name {:?} while planning weave",
+                node.qualified_name
+            )
+            .into());
+        }
+        nodes.push(similarity_node);
+    }
+
+    let similarity_plan = plan_similarity_edges(&nodes, &SimilarityPlannerConfig::default())?;
+    let vector_skip_count = similarity_plan.skips.vector_skips.len();
+    let family_opt_out_count = similarity_plan.skips.family_opt_outs.len();
+    let similarity = persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?;
+    let xterm_plan = plan_eager_cross_terms(&nodes);
+    let xterm = persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?;
+    let absent_by_kind = xterm
+        .absent_by_kind
+        .iter()
+        .map(|(kind, count)| (kind.wire_name(), *count))
+        .collect::<BTreeMap<_, _>>();
+
+    Ok(json!({
+        "status": "reconciled",
+        "trust": "verified",
+        "freshness": "current",
+        "provenance": "AsterVault Graph + persisted Slot CF readback",
+        "input": {
+            "symbols": nodes.len(),
+            "slot_rows_expected": nodes.len().saturating_mul(slots.len()),
+            "slot_rows_absent": absent_slot_rows,
+            "slot_rows_missing": missing_slot_rows,
+        },
+        "similarity": {
+            "edge_count": similarity.edge_count,
+            "rows_written": similarity.rows_written,
+            "rows_unchanged": similarity.rows_unchanged,
+            "rows_tombstoned": similarity.rows_tombstoned,
+            "edge_dump_hash": similarity.edge_dump_hash,
+            "vector_skips": vector_skip_count,
+            "family_opt_outs": family_opt_out_count,
+            "fsv": similarity.fsv.as_ref().map(fsv_ack_envelope),
+        },
+        "eager_cross_terms": {
+            "symbol_count": xterm.symbol_count,
+            "rows_written": xterm.rows_written,
+            "rows_unchanged": xterm.rows_unchanged,
+            "rows_tombstoned": xterm.rows_tombstoned,
+            "absent_by_kind": absent_by_kind,
+            "xterm_dump_hash": xterm.xterm_dump_hash,
+            "fsv": xterm.fsv.as_ref().map(fsv_ack_envelope),
+        },
+    }))
 }
 
 pub(crate) fn import_shadow_vault_report<C, R>(
@@ -1187,7 +1540,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "verify_chain": outcome.verify_chain_status,
         "fsv": outcome.import_fsv.as_ref().map(fsv_ack_envelope),
         "panel_version": DEFAULT_PANEL_VERSION,
-        "panel_runtime": "lens_unavailable",
+        "panel_runtime": "cbm_frozen_v1",
         "vault_import": vault_import_summary(
             &outcome.vault_import_source,
             outcome.vault_import_fallback_reason.as_deref(),
@@ -1200,6 +1553,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "anomalies": outcome.anomalies.clone(),
         "provenance": outcome.provenance.clone(),
         "git_archaeology": outcome.git_archaeology.clone(),
+        "weave": outcome.weave.clone(),
         "health": health_surface_json(
             outcome_project_label(outcome),
             &outcome.verify_chain_status,
@@ -1363,6 +1717,7 @@ pub(crate) fn persist_shadow_outcome_at(
     let anomaly_report_json = serde_json::to_string(&outcome.anomalies)?;
     let provenance_json = serde_json::to_string(&outcome.provenance)?;
     let git_archaeology_json = serde_json::to_string(&outcome.git_archaeology)?;
+    let weave_json = serde_json::to_string(&outcome.weave)?;
     // Atomic multi-key persist: a crash or error mid-write must not leave a torn
     // mix of new and old metadata that a reader would serve as fresh/verified
     // (e.g. a new vault_fingerprint beside a stale kernel_context_json) — #95.
@@ -1436,6 +1791,7 @@ pub(crate) fn persist_shadow_outcome_at(
         ("anomaly_report_json", anomaly_report_json),
         ("provenance_json", provenance_json),
         ("git_archaeology_json", git_archaeology_json),
+        ("weave_json", weave_json),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",

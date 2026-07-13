@@ -121,7 +121,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         }
         let snapshot = pipeline_rows_to_graph_snapshot(selected);
         let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
-            .with_available_slots(std::iter::empty());
+            .with_available_slots(shadow_available_slots());
         let admission =
             admit_historical_symbol_snapshot(&snapshot, vault, &ShadowSlotRuntime, &options)?;
         report.historical_constellations_written += admission.constellations_written;

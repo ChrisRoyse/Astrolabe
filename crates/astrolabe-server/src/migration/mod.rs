@@ -50,14 +50,15 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
-    LiveAnomalyInputs, SubscriptionId, acknowledge_reactive_subscription,
-    anomaly_report_artifact_bytes, detect_anomalies, live_anomaly_inputs_from_vault,
-    recover_reactive_state,
+    LiveAnomalyInputs, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
+    acknowledge_reactive_subscription, anomaly_report_artifact_bytes, detect_anomalies,
+    live_anomaly_inputs_from_vault, persist_eager_cross_terms, persist_similarity_edges,
+    plan_eager_cross_terms, plan_similarity_edges, recover_reactive_state,
 };
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AbsentReason, Clock, LedgerRef, SlotVector, VaultId, VaultStore};
+use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};

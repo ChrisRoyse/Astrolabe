@@ -2688,6 +2688,12 @@ where
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
         .with_scalars(node.symbol.scalars.clone());
     input.source_bytes = node.symbol.source_snippet_bytes.clone();
+    input.symbol_name = node.name.clone();
+    input.qualified_name = node.symbol.qualified_name.clone();
+    input.rel_file_path = node.symbol.rel_file_path.clone();
+    input.language = node.symbol.language.clone();
+    input.signature = node.symbol.signature.clone();
+    input.properties = serde_json::from_str(&node.properties_json)?;
     let readout = driver.measure(&input, runtime)?;
     let mut metadata = symbol_metadata(options, &node, &identity);
     metadata.insert(
