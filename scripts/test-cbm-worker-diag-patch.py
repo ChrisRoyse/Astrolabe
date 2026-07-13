@@ -90,7 +90,7 @@ def main() -> int:
         "the CLEAN-only slurp gate is removed",
     )
 
-    # MCP overlay: all seven fragments applied; evidence fields present.
+    # MCP overlay: all eight fragments applied; evidence fields present.
     mcp_patched = module.patch_mcp(mcp_vendored)
     for marker in [
         '"worker_exit_code", exit_code',
@@ -98,8 +98,15 @@ def main() -> int:
         "CBM_WORKER_RESPONSE_TAIL_MAX = 2048",
         "int last_exit_code = wr.exit_code;",
         "build_worker_failure_response(args, last_outcome, last_exit_code, last_response)",
+        "char *early_repo_path = cbm_mcp_get_string_arg(args, \"repo_path\");",
     ]:
         expect(marker in mcp_patched, f"mcp overlay carries {marker!r}")
+    expect(
+        mcp_patched.index("early_repo_path")
+        < mcp_patched.index("cbm_index_supervisor_should_wrap()"),
+        "argument validation precedes the supervision wrap (#282: no worker "
+        "spawn for trivially-invalid args)",
+    )
     expect(
         mcp_patched.count("last_response = wr2.response; /* #282 */") == 3,
         "all three recovery-loop failure branches capture the worker evidence",
