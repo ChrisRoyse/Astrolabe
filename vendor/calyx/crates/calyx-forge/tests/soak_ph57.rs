@@ -126,15 +126,32 @@ impl BlockDeallocator for NoopDealloc {
 
 #[test]
 fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
+    // The PH57 soak requires the full local TEI trio (embed :8088, rerank
+    // :8089, embed :8090), each POSITIVELY identified as a live
+    // text-embeddings-inference server via GET /info (200 + model_id).
+    // Environment detection must never assert: an unrelated local service —
+    // or an operator `ssh -L` tunnel forwarding a single remote TEI embed
+    // instance to :8088 (release-gate RED, 2026-07-13) — must produce the
+    // named skip, not a panic about ports it was never part of.
     let health = check_tei_health(&[8088, 8089, 8090]);
-    if !health
+    let identified: Vec<bool> = health
         .iter()
-        .any(|item| item.port == 8088 && item.status == 200)
-    {
-        println!("SKIP_PH57_SOAK: TEI :8088 /health not responsive");
+        .map(|item| item.status == 200 && tei_identifies(item.port))
+        .collect();
+    if !identified.iter().all(|ok| *ok) {
+        let summary: Vec<String> = health
+            .iter()
+            .zip(&identified)
+            .map(|(item, ok)| {
+                format!(":{} health={} tei_identified={}", item.port, item.status, ok)
+            })
+            .collect();
+        println!(
+            "SKIP_PH57_SOAK: no positively-identified local TEI trio ({})",
+            summary.join(", ")
+        );
         return Ok(());
     }
-    assert!(health.iter().all(|item| item.status == 200));
 
     let tei_baseline = background_tei_load(100, &TEI_ENDPOINTS);
     assert_eq!(tei_baseline.failures, 0);
@@ -364,7 +381,26 @@ fn http_post(endpoint: TeiEndpoint) -> std::io::Result<u16> {
     http_request(endpoint.port, "POST", endpoint.path, endpoint.body)
 }
 
+/// Positive TEI identification: a real text-embeddings-inference server
+/// answers GET /info with 200 and a JSON body carrying `model_id`. A bare
+/// 200 on /health is NOT identification — any local service or forwarded
+/// port can answer that.
+fn tei_identifies(port: u16) -> bool {
+    http_request_raw(port, "GET", "/info", "")
+        .map(|(status, response)| status == 200 && response.contains("\"model_id\""))
+        .unwrap_or(false)
+}
+
 fn http_request(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<u16> {
+    Ok(http_request_raw(port, method, path, body)?.0)
+}
+
+fn http_request_raw(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<(u16, String)> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -376,7 +412,8 @@ fn http_request(port: u16, method: &str, path: &str, body: &str) -> std::io::Res
     stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    Ok(response_status(&response).unwrap_or(0))
+    let status = response_status(&response).unwrap_or(0);
+    Ok((status, response))
 }
 
 fn response_status(response: &str) -> Option<u16> {
