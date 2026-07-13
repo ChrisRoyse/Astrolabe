@@ -574,6 +574,18 @@ TEST(cli_skill_files_content) {
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
 
+    /* Astrolabe diagnostic surface + honesty-gate etiquette (#63). */
+    ASSERT(strstr(sk[0].content, "Astrolabe Diagnostic Surface") != NULL);
+    ASSERT(strstr(sk[0].content, "get_provenance") != NULL);
+    ASSERT(strstr(sk[0].content, "detect_anomalies") != NULL);
+    ASSERT(strstr(sk[0].content, "guard_calibrate") != NULL);
+    ASSERT(strstr(sk[0].content, "team_artifact") != NULL);
+    ASSERT(strstr(sk[0].content, "trust") != NULL);
+    ASSERT(strstr(sk[0].content, "freshness") != NULL);
+    ASSERT(strstr(sk[0].content, "provenance") != NULL);
+    ASSERT(strstr(sk[0].content, "decompose -> ground -> measure -> distill -> compose") != NULL);
+    ASSERT(strstr(sk[0].content, "codebase-memory-mcp") != NULL);
+
     PASS();
 }
 
@@ -583,6 +595,9 @@ TEST(cli_codex_instructions) {
     ASSERT_NOT_NULL(instr);
     ASSERT(strstr(instr, "Codebase Knowledge Graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
+    /* Astrolabe surface note (#63). */
+    ASSERT(strstr(instr, "get_provenance") != NULL);
+    ASSERT(strstr(instr, "detect_anomalies") != NULL);
     PASS();
 }
 
@@ -2403,6 +2418,10 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "search_graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
     ASSERT(strstr(instr, "get_code_snippet") != NULL);
+    /* Astrolabe surface note (#63). */
+    ASSERT(strstr(instr, "Astrolabe surface") != NULL);
+    ASSERT(strstr(instr, "get_provenance") != NULL);
+    ASSERT(strstr(instr, "codebase-memory-mcp") != NULL);
     PASS();
 }
 

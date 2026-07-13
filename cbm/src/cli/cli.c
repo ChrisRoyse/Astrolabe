@@ -608,7 +608,47 @@ static const char skill_content[] =
     "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
     "4. `direction=\"outbound\"` misses cross-service callers — use "
     "`direction=\"both\"`.\n"
-    "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
+    "5. Results default to 10 per page — check `has_more` and use `offset`.\n"
+    "\n"
+    "## Astrolabe Diagnostic Surface (8 tools)\n"
+    "When a project is indexed with `calyx=\"shadow\"`, Astrolabe advertises eight\n"
+    "labeled diagnostic tools on top of the 14 core graph tools. Each fails closed\n"
+    "with a `{code, message, remediation}` error until its measured source state\n"
+    "exists — they never guess:\n"
+    "- `get_provenance` — lineage / answer_trace / verify_chain / reproduce for a\n"
+    "  shadow-indexed subject.\n"
+    "- `detect_anomalies` — calibrated findings (doc_drift, name_truth, drift, "
+    "ood_commit, prompt_injection).\n"
+    "- `get_readiness` — six-tier readiness predicate; tiers fail closed without "
+    "their measured source.\n"
+    "- `optimizer_status` — labeled optimizer readiness, trigger ack, or proposals.\n"
+    "- `impute_fields` — provisional field proposals (never written as trusted).\n"
+    "- `anchor_outcome` — ground real-world outcome anchors (e.g. test_run).\n"
+    "- `guard_calibrate` — split-conformal per-domain guard profiles.\n"
+    "- `team_artifact` — export/import the chain-verified team artifact.\n"
+    "\n"
+    "## Honesty-gate etiquette\n"
+    "- Grounded results carry `trust`, `freshness`, and `provenance` labels — read\n"
+    "them and relay them; never restate a provisional result as established fact.\n"
+    "- A tool that lacks sufficient measured state refuses with a labeled deficit\n"
+    "rather than a confident guess. Follow the `remediation`, do not retry blindly.\n"
+    "- Imputed or inferred values are provisional; never merge them as trusted data.\n"
+    "\n"
+    "## Workflow doctrine: decompose -> ground -> measure -> distill -> compose\n"
+    "- decompose: `search_graph` / `trace_path` break the question into structural "
+    "atoms.\n"
+    "- ground: `get_code_snippet` / `get_provenance` attach real source and lineage.\n"
+    "- measure: `detect_anomalies` / `get_readiness` / `optimizer_status` report "
+    "calibrated, labeled state.\n"
+    "- distill: `guard_calibrate` / `impute_fields` turn measurements into profiles "
+    "and provisional proposals.\n"
+    "- compose: `anchor_outcome` / `team_artifact` anchor outcomes and export the "
+    "chain-verified artifact.\n"
+    "\n"
+    "## Command compatibility\n"
+    "The server ships as `astrolabe`; the legacy `codebase-memory-mcp` command is a\n"
+    "compatibility shim for the identical surface, so existing agent configs keep\n"
+    "working unchanged.\n";
 
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
@@ -622,7 +662,14 @@ static const char codex_instructions_content[] =
     "- `query_graph` — run Cypher queries for complex patterns\n"
     "- `get_architecture` — high-level project summary\n"
     "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
+    "Always prefer graph tools over grep for code discovery.\n"
+    "\n"
+    "When indexed with calyx=\"shadow\", the server also exposes labeled Astrolabe\n"
+    "diagnostic tools (get_provenance, detect_anomalies, get_readiness,\n"
+    "optimizer_status, impute_fields, anchor_outcome, guard_calibrate,\n"
+    "team_artifact). Each carries trust/freshness/provenance labels and fails closed\n"
+    "with {code, message, remediation} rather than guessing. codebase-memory-mcp is\n"
+    "a compatibility shim for the astrolabe command.\n";
 
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
@@ -1349,7 +1396,15 @@ static const char agent_instructions_content[] =
     "## Examples\n"
     "- Find a handler: `search_graph(name_pattern=\".*OrderHandler.*\")`\n"
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
-    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n";
+    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n"
+    "\n"
+    "## Astrolabe surface\n"
+    "When indexed with `calyx=\"shadow\"`, the server also exposes labeled diagnostic\n"
+    "tools: `get_provenance`, `detect_anomalies`, `get_readiness`,\n"
+    "`optimizer_status`, `impute_fields`, `anchor_outcome`, `guard_calibrate`,\n"
+    "`team_artifact`. Each carries `trust`/`freshness`/`provenance` labels and fails\n"
+    "closed with `{code, message, remediation}` rather than guessing. The legacy\n"
+    "`codebase-memory-mcp` command is a shim for the same `astrolabe` surface.\n";
 
 const char *cbm_get_agent_instructions(void) {
     return agent_instructions_content;
