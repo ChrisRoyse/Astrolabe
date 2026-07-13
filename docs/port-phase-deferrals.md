@@ -3,6 +3,11 @@
 **Owner issue: #238.** This file is the single register of coverage that
 Astrolabe deliberately does not have yet, and why.
 
+> For a complete index of *every* named `SKIP[...]` / `DEFERRED[...]` token the
+> gates emit — its owner issue, whether it is a real coverage gap, and its exact
+> closure condition — see **`docs/deferred-coverage-register.md`**. This file
+> owns the `DEFERRED[ASTRO_PORT_PHASE]` doctrine that register indexes.
+
 > **Read this before interpreting a green aggregate.**
 > A green Astrolabe gate means **the system is proven on native Windows
 > (`x86_64-pc-windows-gnu`)**. It does **not** mean the system is proven on
