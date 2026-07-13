@@ -1,8 +1,6 @@
 use std::cell::Cell;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
@@ -15,7 +13,6 @@ use calyx_loom::{
 };
 
 const SALT: &[u8] = b"issue573-reactive-subscription";
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct ScriptedSignals {
     occ: Cell<u64>,
@@ -42,7 +39,6 @@ impl ReactiveSignals for ScriptedSignals {
 #[test]
 fn durable_subscription_lifecycle_writes_ledger_and_observes_delta() {
     let dir = test_dir("lifecycle");
-    clean(&dir);
     let vault = open_vault(&dir);
     let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_400_000)));
     let cx = CxId::from_bytes([0x57; 16]);
@@ -226,12 +222,8 @@ fn vault_id() -> VaultId {
     "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
 }
 
-fn test_dir(name: &str) -> PathBuf {
-    let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("calyx-issue573-{name}-{}-{id}", std::process::id()))
-}
-
-fn clean(dir: &Path) {
-    let _ = fs::remove_dir_all(dir);
-    fs::create_dir_all(dir).unwrap();
+// RAII scratch (#260): created fresh and self-cleans on drop incl. panic unwind.
+fn test_dir(name: &str) -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-issue573-{name}"))
+        .expect("create issue573 scratch dir")
 }

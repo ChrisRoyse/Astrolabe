@@ -6,9 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use calyx_fsv::scratch::ScratchDir;
 
 use calyx_aster::cf::{ColumnFamily, ledger_key};
 use calyx_aster::dedup::{
@@ -38,11 +39,10 @@ const SLOT_TIME: SlotId = SlotId::new(20);
 const SLOT_DRIFT: SlotId = SlotId::new(7);
 const SALT: &[u8] = b"issue755-reactive-durable-salt";
 
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
 #[test]
 fn stream_event_recurs_persists_trigger_rows_and_ledger_ref() {
-    let dir = root().join("stream-event-recurs");
+    let scratch = root();
+    let dir = scratch.join("stream-event-recurs");
     clean(&dir);
     let vault = Arc::new(open_stream_vault(&dir));
     let series = vault.cx_id_for_input(SERIES_RAW, PANEL_VERSION);
@@ -141,7 +141,6 @@ fn stream_event_recurs_persists_trigger_rows_and_ledger_ref() {
 #[test]
 fn queue_overflow_persists_warning_audit_row() {
     let dir = test_dir("queue-overflow");
-    clean(&dir);
     let vault = open_stream_vault(&dir);
     let series = put_base(&vault, b"issue755-overflow-series");
     calyx_loom::recurrence::SeriesStore::new(&vault)
@@ -192,7 +191,6 @@ fn queue_overflow_persists_warning_audit_row() {
 #[test]
 fn ward_adapter_fires_new_region_from_real_slot_rows() {
     let dir = test_dir("ward-new-region");
-    clean(&dir);
     let vault = open_stream_vault(&dir);
     let matched = put_slot_cx(&vault, b"matched", SLOT_CONTENT, [1.0, 0.0]);
     let produced = put_slot_cx(&vault, b"produced", SLOT_CONTENT, [0.0, 1.0]);
@@ -214,7 +212,6 @@ fn ward_adapter_fires_new_region_from_real_slot_rows() {
 #[test]
 fn drift_adapter_tracks_previous_slot_snapshot() {
     let dir = test_dir("drift");
-    clean(&dir);
     let vault = open_stream_vault(&dir);
     let first = put_slot_cx(&vault, b"drift-a", SLOT_DRIFT, [1.0, 0.0]);
     let second = put_slot_cx(&vault, b"drift-b", SLOT_DRIFT, [0.0, 1.0]);
@@ -446,15 +443,15 @@ fn vault_id() -> VaultId {
     "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
 }
 
-fn test_dir(name: &str) -> PathBuf {
-    let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("calyx-issue755-{name}-{}-{id}", std::process::id()))
+// RAII scratch (#260): created fresh and self-cleans on drop incl. panic unwind.
+fn test_dir(name: &str) -> ScratchDir {
+    ScratchDir::new_temp(&format!("calyx-issue755-{name}")).expect("create issue755 scratch dir")
 }
 
-fn root() -> PathBuf {
-    std::env::var_os("CALYX_ISSUE755_FSV_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("calyx-issue755-reactive-fsv"))
+// An operator `CALYX_ISSUE755_FSV_ROOT` is kept for inspection; unset arms a
+// self-cleaning temp fallback. Bind the guard for the caller's lifetime.
+fn root() -> ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_ISSUE755_FSV_ROOT", "calyx-issue755-reactive-fsv")
 }
 
 fn clean(dir: &Path) {

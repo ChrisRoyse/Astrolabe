@@ -272,11 +272,7 @@ fn compute_cross_term(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+    use calyx_fsv::scratch::ScratchDir;
 
     #[test]
     fn xterms_roundtrip_through_aster_cf() {
@@ -296,7 +292,7 @@ mod tests {
 
         assert_eq!(loaded.xterm_count(), 1);
         assert_eq!(loaded.agreement_graph()[0].n, 1);
-        cleanup(dir);
+        // `dir` (ScratchDir) removes the tree on drop, incl. panic unwind.
     }
 
     #[test]
@@ -326,19 +322,12 @@ mod tests {
         let loaded = LoomStore::load_xterms_from_aster(&reopened, 8).unwrap();
         assert_eq!(loaded.xterm_count(), store.xterm_count());
         assert_eq!(loaded.xterm_rows(), store.xterm_rows());
-        cleanup(dir);
+        // `dir` (ScratchDir) removes the tree on drop, incl. panic unwind.
     }
 
-    fn test_dir(name: &str) -> PathBuf {
-        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("calyx-loom-{name}-{}-{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn cleanup(dir: PathBuf) {
-        fs::remove_dir_all(dir).unwrap();
+    // RAII scratch (#260): self-cleans on drop (normal return, early return, and
+    // panic unwind); `ScratchDir` carries its own process-wide unique suffix.
+    fn test_dir(name: &str) -> ScratchDir {
+        ScratchDir::new_temp(&format!("calyx-loom-{name}")).expect("create loom scratch dir")
     }
 }

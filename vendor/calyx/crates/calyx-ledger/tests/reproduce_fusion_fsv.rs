@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_core::{FixedClock, Input, LensId, Modality, SlotId, SlotVector};
 use calyx_ledger::{
@@ -379,8 +379,7 @@ fn row_files(rows: &[LedgerRow]) -> Vec<String> {
         .collect()
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-ph36-reproduce-fusion-fsv")
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop (incl. panic unwind).
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-ph36-reproduce-fusion-fsv")
 }

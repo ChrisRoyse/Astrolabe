@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use calyx_core::{FixedClock, Result};
 use calyx_ledger::{
@@ -109,7 +109,8 @@ fn merkle_export_bundle_is_canonical_json_serializable() {
 #[test]
 #[ignore = "manual FSV writes PH36 Merkle readback artifacts"]
 fn ph36_merkle_root_ed25519_manual_fsv() {
-    let root = fsv_root().join("merkle-root-ed25519");
+    let scratch = fsv_root();
+    let root = scratch.join("merkle-root-ed25519");
     let ledger_dir = root.join("ledger-cf");
     reset_child_dir(&root, &ledger_dir);
 
@@ -224,10 +225,9 @@ fn pattern_hash(value: u16) -> [u8; 32] {
     hash
 }
 
-fn fsv_root() -> PathBuf {
-    calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-ph36-merkle-fsv")
-    })
+// RAII scratch (#260): armed fallback self-cleans on drop (incl. panic unwind).
+fn fsv_root() -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::scratch_or_temp("CALYX_FSV_ROOT", "calyx-ph36-merkle-fsv")
 }
 
 fn reset_child_dir(root: &Path, child: &Path) {

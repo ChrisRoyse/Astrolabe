@@ -140,8 +140,10 @@ fn maybe_write_fsv_json(name: &str, value: &serde_json::Value) {
     .expect("write FSV");
 }
 
-fn cleanup(root: std::path::PathBuf) {
-    if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_none() {
-        fs::remove_dir_all(root).ok();
+fn cleanup(root: calyx_fsv::scratch::ScratchDir) {
+    // #260 RAII: keep artifacts for operator inspection when CALYX_FSV_ROOT is
+    // set (disarm), otherwise let `root` drop and remove the tree.
+    if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_some() {
+        let _ = root.into_kept();
     }
 }

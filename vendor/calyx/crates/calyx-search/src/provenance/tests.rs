@@ -32,7 +32,8 @@ mod edge_cases;
 mod guard_profile;
 
 struct Fixture {
-    root: PathBuf,
+    // #260 RAII: removes the whole scratch tree on drop, incl. panic unwind.
+    root: calyx_fsv::scratch::ScratchDir,
     vault_dir: PathBuf,
     vault_id: VaultId,
     cx_id: calyx_core::CxId,
@@ -191,8 +192,10 @@ impl Fixture {
     }
 
     fn cleanup(self) {
-        if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_none() {
-            let _ = fs::remove_dir_all(self.root);
+        // Keep artifacts for operator inspection when CALYX_FSV_ROOT is set
+        // (disarm), otherwise let `self.root` drop and remove the tree (#260).
+        if calyx_fsv::fsv_root("CALYX_FSV_ROOT").is_some() {
+            let _ = self.root.into_kept();
         }
     }
 }
@@ -355,14 +358,10 @@ fn maybe_write_fsv_json(name: &str, value: &Value) {
     .expect("write FSV");
 }
 
-fn temp_root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "calyx-search-issue918-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("create temp root");
-    root
+// RAII scratch (#260): self-cleans on drop incl. panic unwind.
+fn temp_root(name: &str) -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-search-issue918-{name}"))
+        .expect("create temp root")
 }
 
 fn salt() -> Vec<u8> {

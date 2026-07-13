@@ -440,7 +440,6 @@ pub(super) fn validate_entry(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -476,16 +475,9 @@ mod tests {
         assert_eq!(calyx.remediation, UNBOUNDED_MULTI_SIDECAR_REMEDIATION);
     }
 
-    fn temp_root(tag: &str) -> std::path::PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("calyx-search-{tag}-{stamp}"));
-        if root.exists() {
-            fs::remove_dir_all(&root).unwrap();
-        }
-        fs::create_dir_all(&root).unwrap();
-        root
+    // RAII scratch (#260): self-cleans on drop incl. panic unwind.
+    fn temp_root(tag: &str) -> calyx_fsv::scratch::ScratchDir {
+        calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-search-{tag}"))
+            .expect("create temp root")
     }
 }
