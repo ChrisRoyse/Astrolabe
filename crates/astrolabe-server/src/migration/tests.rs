@@ -132,6 +132,178 @@ fn git_archaeology_full_pass_persists_exact_historical_anchors_idempotently() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// DoD #3 (incremental equivalence, byte-compare anchor CF): a staged incremental
+/// mining sequence — a full pass at index time through the fix commit, then a `Since`
+/// watcher tick after the feature+revert land — converges to exactly the anchor set a
+/// single full pass yields. The closing full pass over the complete history writes
+/// zero new anchors and leaves the Anchors CF byte-identical, proving the
+/// incrementally-built persisted state already equals the full-pass persisted state.
+/// The `head` returned by each tick is the value the shadow-import path persists to
+/// `GIT_ARCHAEOLOGY_HEAD_KEY`, so asserting it verifies the checkpoint that drives the
+/// next `Since` tick. Exercises the shipping `run_git_archaeology` with real CBM
+/// historical indexing — no test-only reimplementation.
+#[test]
+fn git_archaeology_incremental_ticks_converge_to_full_pass_anchor_bytes() {
+    use astrolabe_anchors::archaeology::GitMineMode;
+
+    let root = temp_dir("git-archaeology-incremental");
+    let repo = root.join("repo");
+    let cache = root.join("cache");
+    let vault_dir = root.join("vault");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fixture_git(&repo, &["init", "--initial-branch=main"]);
+    fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+    fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+
+    // Stage 1: plant the bug, then fix it. HEAD stops at the fix commit so the first
+    // pass mines a strict prefix of the history (initial..fix).
+    fs::write(repo.join("src/main.c"), "int stable(void) { return 1; }\n").unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "initial"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 7; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "introduce calculation"]);
+    let bug_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "Fix bug Closes #26"]);
+    let fix_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"git-archaeology-incremental".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+
+    // Tick 1: full pass at index time (no checkpoint yet). Blames the fix's changed
+    // line onto the planted bug commit and anchors it as Provisional `bug_touch`.
+    let tick1 =
+        run_git_archaeology(&repo, "archaeology-incr", &cache, &vault, GitMineMode::Full).unwrap();
+    assert_eq!(tick1.mode, "full");
+    assert_eq!(tick1.head, fix_sha, "tick1 checkpoint is the fix commit");
+    assert_eq!(tick1.evidence_without_symbol, 0, "{tick1:#?}");
+    assert!(
+        tick1.anchors_written >= 1,
+        "tick1 must anchor the blamed bug: {tick1:#?}"
+    );
+    vault.flush().unwrap();
+
+    // Stage 2: add a doomed feature, then revert it. HEAD advances past the checkpoint.
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\nint doomed(void) { return 9; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "add doomed feature"]);
+    fixture_git(&repo, &["revert", "--no-edit", "HEAD"]);
+    let revert_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+
+    // Tick 2: incremental watcher tick from the persisted checkpoint, mining only
+    // fix..revert. Anchors the revert as Trusted; must NOT re-write the bug_touch.
+    let tick2 = run_git_archaeology(
+        &repo,
+        "archaeology-incr",
+        &cache,
+        &vault,
+        GitMineMode::Since {
+            previous_head: fix_sha.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(tick2.mode, "incremental");
+    assert_eq!(tick2.head, revert_sha, "tick2 checkpoint advances to the revert");
+    assert!(
+        tick2.anchors_written >= 1,
+        "tick2 must anchor the revert: {tick2:#?}"
+    );
+    vault.flush().unwrap();
+
+    // The incrementally-built set carries the Provisional bug_touch (git:fix, 0.9)
+    // and the Trusted revert (git:revert, 1.0).
+    let incr_rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    let incr_sources = incr_rows
+        .iter()
+        .flat_map(|row| row.row.anchors.iter().map(|anchor| anchor.source.as_str()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        incr_sources.contains(format!("git:fix:{fix_sha}").as_str()),
+        "{incr_sources:?}"
+    );
+    assert!(
+        incr_sources.contains(format!("git:revert:{revert_sha}").as_str()),
+        "{incr_sources:?}"
+    );
+    assert!(incr_rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:fix:{fix_sha}")
+                && anchor.confidence.to_bits() == 0.9f32.to_bits()
+        })
+    }));
+    assert!(incr_rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:revert:{revert_sha}")
+                && anchor.confidence.to_bits() == 1.0f32.to_bits()
+        })
+    }));
+
+    let incremental_bytes = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+    assert!(!incremental_bytes.is_empty());
+
+    // A full pass over the complete history finds the incrementally-built set already
+    // present: zero new anchors and a byte-identical Anchors CF. Incremental mining
+    // therefore converges to exactly the full-pass anchor state. Had the incremental
+    // ticks missed any planted finding, this pass would write it (anchors_written > 0)
+    // and the byte compare would diverge.
+    let full = run_full_git_archaeology(&repo, "archaeology-incr", &cache, &vault).unwrap();
+    assert_eq!(full.head, revert_sha);
+    assert_eq!(
+        full.anchors_written, 0,
+        "full pass over the same history writes nothing new: {full:#?}"
+    );
+    assert!(full.anchors_deduplicated >= tick1.anchors_written + tick2.anchors_written);
+    assert_eq!(
+        incremental_bytes,
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+            .unwrap(),
+        "incremental anchor CF must byte-match the full-pass anchor CF"
+    );
+
+    // Live graph untouched; ledger chain intact; no scratch remnants.
+    assert!(
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Graph)
+            .unwrap()
+            .is_empty(),
+        "historical admission must not alter the live graph"
+    );
+    assert!(verify_chain(&vault).unwrap().is_intact());
+    assert!(cache.read_dir().unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".astrolabe-archaeology-")
+    }));
+    assert_eq!(bug_sha.len(), 40);
+    drop(vault);
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn calyx_arg_is_stripped_before_legacy_caller() {
     let args = serde_json::json!({
