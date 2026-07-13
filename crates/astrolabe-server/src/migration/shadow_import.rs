@@ -1368,19 +1368,38 @@ where
 {
     match row_sink {
         Some(RowSinkImportCandidate::Available(snapshot)) => {
-            let security_screen = snapshot.security_screen.clone();
-            let skill_tree = snapshot.skill_tree.clone();
-            let bridges = snapshot.bridges.clone();
-            let kernel_context = snapshot.kernel_context.clone();
-            let anomalies = snapshot.anomalies.clone();
-            let provenance = snapshot.provenance.clone();
-            match import_cbm_graph_snapshot_to_vault_direct(
-                &snapshot.snapshot,
-                snapshot.source_fingerprint_sha256,
+            // #59 dial flip: the streaming FFI row-sink writer is now the PRIMARY
+            // single-parse persistence path for the shadow import. The materialized
+            // row-sink snapshot is streamed row-by-row through
+            // `import_cbm_row_stream_to_vault` (registry-bounded drain/backpressure
+            // window) instead of being handed to the whole-snapshot direct writer.
+            // Both paths persist byte-identical CFs (one ledger-paired batch), proven
+            // by `astrolabe-ingest`'s raw-CF parity suite and the shadow-level parity
+            // test below; routing the primary write through the streaming writer makes
+            // the single-parse pipeline the shipped path rather than a capability held
+            // behind the dial. The #23 fail-closed error chaining (labeled
+            // `sqlite_fallback` recovery only when a real CBM SQLite artifact exists,
+            // otherwise the row-sink error is surfaced verbatim) is preserved verbatim.
+            let RowSinkSnapshot {
+                snapshot: graph_snapshot,
+                source_fingerprint_sha256,
+                security_screen,
+                skill_tree,
+                bridges,
+                kernel_context,
+                anomalies,
+                provenance,
+            } = *snapshot;
+            match import_cbm_row_stream_to_vault(
+                source_fingerprint_sha256,
+                snapshot_into_row_stream(graph_snapshot),
+                &RowSinkStreamParams::from_registry(),
                 vault,
                 runtime,
                 options,
-            ) {
+            )
+            .map(|stream_report| stream_report.import)
+            {
                 Ok(report) => Ok(ShadowVaultImport {
                     report,
                     source: "row_sink_direct".to_string(),
