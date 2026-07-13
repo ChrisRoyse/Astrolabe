@@ -13,7 +13,14 @@
  *      traffic/latency/error evidence, plus OBSERVED_TRAFFIC edges from the
  *      handler symbols (Recurrence occurrences).
  *   4. Detects incidents: when the 5xx rate over a route spikes past the
- *      declared threshold, an Incident node is labeled onto the route.
+ *      declared threshold, an Incident node (status "active") is labeled onto
+ *      the route. Incident lifecycle is fail-closed: a later batch whose window
+ *      for that route is a valid healthy sample (>= INCIDENT_MIN_REQUESTS with
+ *      error rate below INCIDENT_ERROR_RATE_HIGH) transitions the latched
+ *      Incident to status "resolved" — a ledgered state change on the node and
+ *      its LABELED edge, never a silent deletion. A route absent from a later
+ *      batch keeps its Incident latched (no evidence == no transition), and a
+ *      re-incident re-activates the same node (flapping is idempotent by QN).
  *
  * Ingestion is idempotent: aggregates are written as absolute measured values
  * keyed by deterministic QN, and edge promotion is a json_patch, so ingesting
@@ -47,7 +54,8 @@ typedef struct {
     int routes_matched;   /* distinct Route nodes that received promotions */
     int edges_promoted;   /* edge upserts carrying validated/Trusted/weight */
     int anchors_written;  /* RuntimeAnchor nodes + occurrence edges written */
-    int incidents_detected; /* Incident nodes labeled */
+    int incidents_detected; /* Incident nodes labeled (status active) */
+    int incidents_resolved; /* latched Incident nodes transitioned to resolved */
     int simple_records;   /* {caller,callee,count} records applied */
     int simple_unmatched; /* simple records with no matching edge */
 } cbm_trace_ingest_stats_t;

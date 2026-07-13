@@ -247,8 +247,70 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
 
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
-             "{\"kind\":\"incident\",\"severity\":\"%s\",\"error_rate\":%.4f,"
-             "\"error_count\":%lld,\"traffic\":%lld,\"trigger\":\"5xx_spike\","
+             "{\"kind\":\"incident\",\"severity\":\"%s\",\"status\":\"active\","
+             "\"error_rate\":%.4f,\"error_count\":%lld,\"traffic\":%lld,"
+             "\"trigger\":\"5xx_spike\",\"provenance\":\"runtime_trace\"}",
+             severity, error_rate, (long long)error_count, (long long)count);
+
+    cbm_node_t incident = {
+        .project = project,
+        .label = "Incident",
+        .name = route->name ? route->name : "incident",
+        .qualified_name = incident_qn,
+        .file_path = "",
+        .start_line = 0,
+        .end_line = 0,
+        .properties_json = props,
+    };
+    int64_t incident_id = cbm_store_upsert_node(store, &incident);
+    if (incident_id <= 0) {
+        return 0;
+    }
+    /* Upsert-by-QN re-activates a previously resolved node (flapping): the props
+     * above carry status "active" and overwrite any prior resolved record. */
+    char edge_props[CBM_SZ_128];
+    snprintf(edge_props, sizeof(edge_props),
+             "{\"label\":\"incident\",\"severity\":\"%s\",\"resolved\":false}", severity);
+    promote_edge(store, project, route->id, incident_id, "LABELED", edge_props);
+    return 1;
+}
+
+/* Resolve a latched Incident when a later batch's window shows the route
+ * healthy again. Fail-closed lifecycle (issue #323): never a silent deletion —
+ * the Incident node is flipped active -> resolved with recovery provenance and
+ * the route->incident LABELED edge is patched resolved=true, so the transition
+ * is an independently readable ledger entry. Returns 1 iff a transition
+ * occurred (an active Incident existed); 0 when there is no incident to clear
+ * or it is already resolved (idempotent). Only the caller's healthy-window gate
+ * (>= INCIDENT_MIN_REQUESTS, error rate below INCIDENT_ERROR_RATE_HIGH) reaches
+ * here, so a below-sample or empty window can never clear a real incident. */
+static int resolve_incident(cbm_store_t *store, const char *project, const char *route_qn,
+                            const cbm_node_t *route, int64_t count, int64_t error_count,
+                            double error_rate) {
+    char incident_qn[TI_ROUTE_QN_SIZE];
+    snprintf(incident_qn, sizeof(incident_qn), "__incident__%s", route_qn);
+
+    cbm_node_t existing = {0};
+    if (cbm_store_find_node_by_qn(store, project, incident_qn, &existing) != CBM_STORE_OK) {
+        return 0; /* nothing latched */
+    }
+    if (existing.properties_json &&
+        strstr(existing.properties_json, "\"status\":\"resolved\"") != NULL) {
+        cbm_node_free_fields(&existing); /* already resolved -> idempotent no-op */
+        return 0;
+    }
+    /* Preserve the incident's original severity band in the resolution record. */
+    const char *severity = (existing.properties_json &&
+                            strstr(existing.properties_json, "\"severity\":\"critical\"") != NULL)
+                               ? "critical"
+                               : "high";
+    cbm_node_free_fields(&existing);
+
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props),
+             "{\"kind\":\"incident\",\"severity\":\"%s\",\"status\":\"resolved\","
+             "\"error_rate\":%.4f,\"error_count\":%lld,\"traffic\":%lld,"
+             "\"trigger\":\"5xx_spike\",\"resolution\":\"recovery\","
              "\"provenance\":\"runtime_trace\"}",
              severity, error_rate, (long long)error_count, (long long)count);
 
@@ -267,8 +329,7 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
         return 0;
     }
     char edge_props[CBM_SZ_128];
-    snprintf(edge_props, sizeof(edge_props), "{\"label\":\"incident\",\"severity\":\"%s\"}",
-             severity);
+    snprintf(edge_props, sizeof(edge_props), "{\"resolved\":true,\"resolution\":\"recovery\"}");
     promote_edge(store, project, route->id, incident_id, "LABELED", edge_props);
     return 1;
 }
@@ -294,8 +355,14 @@ static int process_group(cbm_store_t *store, const char *project, trace_group_t 
 
     int64_t p99_ns = cbm_calculate_p99(g->durations, g->dur_n);
     double error_rate = g->count > 0 ? (double)g->error_count / (double)g->count : 0.0;
+    /* Incident detection is over the BATCH WINDOW (not cumulative traffic), so a
+     * later healthy window can recover a route regardless of its lifetime total.
+     * Both bands require a valid sample (>= MIN_REQUESTS) so a 1-request blip can
+     * neither raise nor clear an incident. */
     bool incident = (g->count >= CBM_INCIDENT_MIN_REQUESTS &&
                      error_rate >= CBM_INCIDENT_ERROR_RATE_HIGH);
+    bool window_healthy = (g->count >= CBM_INCIDENT_MIN_REQUESTS &&
+                           error_rate < CBM_INCIDENT_ERROR_RATE_HIGH);
 
     /* Promotion patch: numbers + fixed tokens only (no escaping needed). */
     char patch[CBM_SZ_512];
@@ -333,6 +400,9 @@ static int process_group(cbm_store_t *store, const char *project, trace_group_t 
     if (incident) {
         stats->incidents_detected +=
             write_incident(store, project, route_qn, &route, g->count, g->error_count, error_rate);
+    } else if (window_healthy) {
+        stats->incidents_resolved += resolve_incident(store, project, route_qn, &route, g->count,
+                                                       g->error_count, error_rate);
     }
 
     cbm_node_free_fields(&route);
