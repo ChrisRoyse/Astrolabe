@@ -20,6 +20,12 @@ use std::fs;
 
 impl DurableVault {
     pub(in crate::vault) fn checkpoint_batch(&self, seq: u64, rows: &[WriteRow]) -> Result<()> {
+        #[cfg(test)]
+        if self.take_checkpoint_failure() {
+            return Err(CalyxError::disk_pressure(
+                "injected durable checkpoint failure",
+            ));
+        }
         self.write_rows(seq, rows)?;
         self.advance_checkpointed_derived_content(seq, rows);
         self.write_manifest(seq)
@@ -100,6 +106,11 @@ impl DurableVault {
         }
         let last_seq = batches.last().map_or(0, |(seq, _)| *seq);
         self.write_manifest(last_seq)?;
+        // Crash boundary (#276): durable-batch SSTs are written and the manifest
+        // has advanced to cover them. A crash here recovers by reconciling the
+        // advanced manifest + durable-batch SSTs (checkpoint replay), not the WAL.
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crate::vault::failpoints::crash_fsv_after_checkpoint(last_seq)?;
         let mut pending = self
             .pending_checkpoint
             .lock()

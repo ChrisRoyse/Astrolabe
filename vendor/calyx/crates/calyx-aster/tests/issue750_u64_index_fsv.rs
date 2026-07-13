@@ -4,7 +4,6 @@
 //! reopen. The test decodes physical index keys and checks their field bytes.
 
 use std::fs;
-use std::path::PathBuf;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::collection::{
@@ -23,10 +22,12 @@ fn vault_id() -> VaultId {
     "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
 }
 
-fn root() -> PathBuf {
-    std::env::var_os("CALYX_ISSUE750_U64_FSV_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("calyx-issue750-u64-index-fsv"))
+fn root() -> calyx_fsv::ScratchDir {
+    // RAII scratch: unset CALYX_ISSUE750_U64_FSV_ROOT self-cleans on drop/panic (#260).
+    calyx_fsv::scratch_or_temp(
+        "CALYX_ISSUE750_U64_FSV_ROOT",
+        "calyx-issue750-u64-index-fsv",
+    )
 }
 
 fn index(field: &str) -> SecondaryIndexSpec {
@@ -114,7 +115,8 @@ fn decode_u64_order<C: calyx_core::Clock>(
 
 #[test]
 fn u64_indexes_survive_flush_reopen_and_sort_unsigned() {
-    let dir = root().join("vault");
+    let scratch = root();
+    let dir = scratch.join("vault");
     fs::remove_dir_all(&dir).ok();
     let write_order = [u64::MAX, 0, (i64::MAX as u64) + 1, i64::MAX as u64, 1];
     let mut expected = write_order;
@@ -192,7 +194,7 @@ fn u64_indexes_survive_flush_reopen_and_sort_unsigned() {
         "kv_max_ns_pk_hex": hex(max_ns_pks[0].as_bytes()),
         "rel_max_score_pk_hex": hex(max_score_pks[0].as_bytes()),
     });
-    let out = root().join("issue750-u64-index-fsv-artifact.json");
+    let out = scratch.join("issue750-u64-index-fsv-artifact.json");
     fs::write(&out, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     println!("{}", serde_json::to_string_pretty(&artifact).unwrap());
 }

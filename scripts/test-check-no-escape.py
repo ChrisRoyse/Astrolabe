@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,8 +52,12 @@ elif mode == "leak-exclusive":
     target = Path(sys.argv[2]) / "leaked-project.db"
     target.write_text("registered a fixture project in the operator store\\n", encoding="utf-8")
 elif mode == "leak-signature-dir":
-    # The exact shape of #236 / #133: a vault dir left in the operator's temp.
-    target = Path(sys.argv[2]) / "astrolabe-anchors-7f3c1a"
+    # The exact shape of #236 / #133: a vault dir left in the operator's temp. The
+    # dir name embeds THIS process's id (the vendored scratch-dir convention), which
+    # is how causal attribution (#278) recognises it as ours: the launcher/run tree
+    # contains this pid, so the leak is policed and RED -- while an identical name
+    # carrying a foreign pid would be counted, not policed.
+    target = Path(sys.argv[2]) / f"astrolabe-anchors-{os.getpid()}"
     target.mkdir(parents=True, exist_ok=True)
     (target / "vault.calyx").write_text("leaked vault\\n", encoding="utf-8")
 elif mode == "leak-foreign":
@@ -147,10 +152,28 @@ def build_fixture() -> dict[str, Path]:
     return paths
 
 
-def run_gate(paths: dict[str, Path], mode: str, target: Path | None) -> subprocess.CompletedProcess:
+def clean_env(paths: dict[str, Path]) -> dict[str, str]:
+    """Child env for an inner gate invocation, with attribution EXPLICITLY controlled.
+
+    HERMETICITY (#278 attempt 8): when the aggregate launcher runs this suite it
+    exports ASTRO_NO_ESCAPE_ATTRIBUTION describing the LIVE session's process tree.
+    An inner `run`/`verify` here builds its OWN fixture world; if it inherited that
+    ambient manifest it would judge a fixture leak against the live tree -- the
+    fixture leaker's pid is not in the live tree, so its escape would misclassify as
+    foreign and the escape controls would spuriously PASS (that is exactly the
+    attempt-8 red). So every inner invocation SCRUBS the ambient var; controls that
+    need attribution pass a fixture manifest explicitly (the `run` path attributes
+    from its captured tree). The scrub makes the suite independent of the caller.
+    """
     env = dict(os.environ)
     env["ASTRO_NO_ESCAPE_FIXTURE"] = str(paths["fixture"])
     env.pop("ASTRO_NO_ESCAPE_NO_SUCH_VAR", None)
+    env.pop("ASTRO_NO_ESCAPE_ATTRIBUTION", None)
+    return env
+
+
+def run_gate(paths: dict[str, Path], mode: str, target: Path | None) -> subprocess.CompletedProcess:
+    env = clean_env(paths)
     command = [
         sys.executable,
         str(GATE),
@@ -228,12 +251,17 @@ def main() -> int:
 
     print("=== 3. CONTROL: the #236 / #133 shape -- a vault dir in the operator's temp ===")
     result = run_gate(paths, "leak-signature-dir", paths["shared"])
-    expect_escape(result, "astrolabe-anchors-7f3c1a", "signature dir add")
-    leaked_dir = paths["shared"] / "astrolabe-anchors-7f3c1a"
-    if not leaked_dir.is_dir():
+    expect_escape(result, "astrolabe-anchors-", "signature dir add")
+    leaked_dirs = [
+        child
+        for child in paths["shared"].iterdir()
+        if child.is_dir() and child.name.startswith("astrolabe-anchors-")
+    ]
+    if not leaked_dirs:
         raise AssertionError("the leaker did not create the vault dir; control proof is vacuous")
-    print(f"  independent readback: {leaked_dir} exists on disk")
-    shutil.rmtree(leaked_dir)
+    print(f"  independent readback: {leaked_dirs[0]} exists on disk")
+    for leaked_dir in leaked_dirs:
+        shutil.rmtree(leaked_dir)
 
     print("=== 4. CONTROL: modifying operator state in an exclusive root ===")
     original = (paths["exclusive"] / "operator-project.db").read_bytes()
@@ -264,8 +292,7 @@ def main() -> int:
     print(f"  independent readback: {sandbox_work[0]} ({sandbox_work[0].read_text().strip()!r})")
 
     print("=== 8. a missing baseline fails closed -- containment is never assumed ===")
-    env = dict(os.environ)
-    env["ASTRO_NO_ESCAPE_FIXTURE"] = str(paths["fixture"])
+    env = clean_env(paths)
     result = subprocess.run(
         [
             sys.executable,
@@ -285,6 +312,55 @@ def main() -> int:
     if result.returncode == 0 or "ASTRO_NO_ESCAPE_NO_BASELINE" not in result.stderr:
         raise AssertionError(f"verify without a baseline did not fail closed:\n{result.stderr}")
     print("  verify without a baseline: ASTRO_NO_ESCAPE_NO_BASELINE, exit 1")
+
+    print("=== 9. HERMETICITY (#278 attempt 8, 'Control 16'): POISONED ambient attribution var ===")
+    # The exact attempt-8 repro. When the launcher runs this suite it exports
+    # ASTRO_NO_ESCAPE_ATTRIBUTION pointing at the LIVE session's process-tree
+    # manifest. Rerun the key escape control (the #236/#133 signature-dir leak) with
+    # that variable POISONED -- pointing at a synthetic live-like manifest whose tree
+    # does NOT contain the fixture leaker's pid. Before the fix, the inner `run`
+    # inherited the poison, judged the fixture leak against the live tree, classified
+    # our own child's escape 'foreign', and PASSED an escaping run. The suite must
+    # still RED it: the scrub (clean_env) plus `run` ignoring the ambient var means
+    # attribution comes from the captured tree, not the poison.
+    poison = paths["fixture"] / "poison-live-attribution.json"
+    now_ns = time.time_ns()
+    poison.write_text(
+        json.dumps(
+            {
+                "schema": "astrolabe.no_escape_attribution.v1",
+                "launcher_pid": 999001,
+                "run_started_unix_ns": now_ns - 3600 * 1_000_000_000,
+                "written_at": now_ns,
+                # Deliberately NONE of the fixture leaker's pids: a foreign live tree.
+                "tree_pids": [999001, 999002, 999003],
+                "pid_first_seen": {"999001": now_ns - 3600 * 1_000_000_000},
+                "pid_intervals": {"999001": [[now_ns - 3600 * 1_000_000_000, None]]},
+                "owned_paths": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    saved = os.environ.get("ASTRO_NO_ESCAPE_ATTRIBUTION")
+    os.environ["ASTRO_NO_ESCAPE_ATTRIBUTION"] = str(poison)
+    try:
+        result = run_gate(paths, "leak-signature-dir", paths["shared"])
+        expect_escape(result, "astrolabe-anchors-", "poisoned-ambient signature dir add")
+    finally:
+        if saved is None:
+            os.environ.pop("ASTRO_NO_ESCAPE_ATTRIBUTION", None)
+        else:
+            os.environ["ASTRO_NO_ESCAPE_ATTRIBUTION"] = saved
+    leaked_dirs = [
+        child
+        for child in paths["shared"].iterdir()
+        if child.is_dir() and child.name.startswith("astrolabe-anchors-")
+    ]
+    if not leaked_dirs:
+        raise AssertionError("the leaker did not create the vault dir; control 16 is vacuous")
+    print(f"  independent readback: {leaked_dirs[0]} policed despite the poisoned ambient var")
+    for leaked_dir in leaked_dirs:
+        shutil.rmtree(leaked_dir)
 
     shutil.rmtree(SCRATCH, ignore_errors=True)
     print("no-escape self-test passed: the gate catches escapes and passes clean runs")

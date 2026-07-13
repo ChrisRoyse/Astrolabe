@@ -5,8 +5,7 @@
 
 #[path = "daily_ops_scheduler_fixture.rs"]
 mod fixture;
-#[path = "fsv_support.rs"]
-mod support;
+use fixture::support;
 
 use calyx_core::FixedClock;
 use calyx_poly::daily_ops_scheduler::{DailyOpsSchedulerConfig, DailyOpsSchedulerDecision};

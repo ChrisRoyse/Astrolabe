@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx-lens")] // #191: ONNX ml-lens tests only build with the feature
 //! PH70/#697 — runtime prompt-injection guard FSV.
 //!
 //! Replaces the retired `ph38_injection_fsv.rs`, whose cosine-to-benign-centroid

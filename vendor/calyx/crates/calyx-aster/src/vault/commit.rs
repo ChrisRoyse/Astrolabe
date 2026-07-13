@@ -1,6 +1,11 @@
 use super::{AsterVault, encode, ledger_hook};
 use calyx_core::{CalyxError, Clock, Result, Seq};
 
+/// The WAL append is durable, but the live MVCC/router apply failed and the
+/// caller must reconcile the reported sequence before retrying.
+pub const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
+    "CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED";
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -127,24 +132,33 @@ where
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
         let durable_seq = durable.append_batch(rows)?;
-        #[cfg(any(test, feature = "crash-fsv"))]
-        crash_fsv_after_wal_append(durable_seq)?;
+        // Persist the durable ledger head anchor (the external witness) as part
+        // of completing the WAL-backed ledger commit, BEFORE the crash-fsv
+        // failpoint. #287 candidate 4 (fail closed when a non-empty durable
+        // ledger has no head anchor) makes the anchor mandatory for reopen; the
+        // owned crash-fsv failpoint (Cluster B) simulates a crash right after a
+        // *completed* durable ledger commit, so the anchor must already be
+        // durable at that point or a killed-mid-commit vault could never reopen
+        // (regressing the crash-fsv recovery guarantee). A genuine crash in the
+        // narrow window between the WAL fsync and this anchor fsync still fails
+        // closed on reopen — exactly candidate 4's intended no-silent-truncation
+        // behavior.
         if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crash_fsv_after_wal_append(durable_seq)?;
         let mvcc_seq = match self.commit_rows_to_mvcc(rows) {
             Ok(seq) => seq,
-            Err(error) => {
-                self.restore_committed_rows(durable_seq, rows)?;
-                eprintln!(
-                    "calyx durable commit restored WAL seq {durable_seq} after MVCC/router error: {error}"
-                );
-                if let Err(checkpoint_error) = durable.checkpoint_batch(durable_seq, rows) {
-                    eprintln!(
-                        "calyx durable checkpoint failed after WAL seq {durable_seq}: {checkpoint_error}"
-                    );
-                }
-                return Ok(durable_seq);
+            Err(mvcc_error) => {
+                let restore = self.restore_committed_rows(durable_seq, rows);
+                let checkpoint = durable.checkpoint_batch(durable_seq, rows);
+                return Err(post_wal_commit_error(
+                    durable_seq,
+                    &mvcc_error,
+                    &restore,
+                    &checkpoint,
+                ));
             }
         };
         if mvcc_seq != durable_seq {
@@ -153,10 +167,26 @@ where
             )));
         }
         durable.stage_checkpoint_batch(durable_seq, rows)?;
+        // Crash boundary (#276): the batch is now in the WAL and the MVCC
+        // memtable and staged for checkpoint, but its checkpoint SST + manifest
+        // advance have not happened. A crash here recovers via WAL replay with a
+        // manifest still behind the committed seq.
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crate::vault::failpoints::crash_fsv_after_mvcc_commit(mvcc_seq)?;
         Ok(mvcc_seq)
     }
 
     fn commit_rows_to_mvcc(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        #[cfg(test)]
+        if self
+            .durable
+            .as_ref()
+            .is_some_and(|durable| durable.take_mvcc_commit_failure())
+        {
+            return Err(CalyxError::aster_corrupt_shard(
+                "injected post-WAL MVCC/router commit failure",
+            ));
+        }
         self.rows.commit_batch(
             rows.iter()
                 .map(|row| (row.cf, row.key.clone(), row.value.clone())),
@@ -164,6 +194,16 @@ where
     }
 
     fn restore_committed_rows(&self, seq: Seq, rows: &[encode::WriteRow]) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .durable
+            .as_ref()
+            .is_some_and(|durable| durable.take_mvcc_restore_failure())
+        {
+            return Err(CalyxError::aster_corrupt_shard(
+                "injected post-WAL MVCC restore failure",
+            ));
+        }
         self.rows.restore_batch(
             seq,
             rows.iter()
@@ -173,6 +213,37 @@ where
         Ok(())
     }
 }
+
+fn post_wal_commit_error(
+    durable_seq: Seq,
+    mvcc_error: &CalyxError,
+    restore: &Result<()>,
+    checkpoint: &Result<()>,
+) -> CalyxError {
+    CalyxError {
+        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+        message: format!(
+            "WAL commit is durable but live MVCC/router application failed; wal_seq={durable_seq} \
+             mvcc=error[{}]: {} restore={} checkpoint={}",
+            mvcc_error.code,
+            mvcc_error.message,
+            reconciliation_outcome(restore),
+            reconciliation_outcome(checkpoint),
+        ),
+        remediation: "treat wal_seq as durably committed; reconcile by idempotency/readback or reopen the vault before retrying",
+    }
+}
+
+fn reconciliation_outcome(result: &Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("error[{}]: {}", error.code, error.message),
+    }
+}
+
+#[cfg(test)]
+#[path = "commit_failure_tests.rs"]
+mod failure_tests;
 
 #[cfg(any(test, feature = "crash-fsv"))]
 fn crash_fsv_after_wal_append(seq: Seq) -> Result<()> {

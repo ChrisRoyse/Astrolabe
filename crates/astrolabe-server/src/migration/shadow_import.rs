@@ -477,6 +477,125 @@ pub(crate) fn ensure_shadow_import_current_at(
     Ok(ShadowRefreshStatus::Refreshed)
 }
 
+/// #244: metadata key holding the exact calyx-stripped CBM `index_repository` args
+/// last used for this project, so a freshness-triggered refresh can replay the CBM
+/// pipeline verbatim through a runner and regenerate real row-sink-derived surfaces.
+/// A shadow index without a filesystem path in its args (project resolved from the
+/// tool result) records nothing here, and reconciliation then falls back to the
+/// #222 fail-closed floor rather than guessing a path.
+pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
+
+/// Persists the calyx-stripped `index_repository` args so a later runner-driven
+/// refresh can replay them for true reconciliation (#244).
+pub(crate) fn persist_shadow_index_args(
+    cache_dir: &Path,
+    project: &str,
+    sanitized_index_args: &str,
+) -> Result<(), DynError> {
+    write_config_value(
+        cache_dir,
+        &metadata_key(project, SHADOW_INDEX_ARGS_KEY),
+        sanitized_index_args,
+    )
+}
+
+/// [`ensure_shadow_import_current`] with a `CbmToolRunner`, so genuine staleness is
+/// *repaired* instead of merely refused (#244).
+///
+/// # Reconciliation policy (#244, superseding #222's runner-less deferral)
+///
+/// [`ensure_shadow_import_current`] has no runner, so it can never rebuild the
+/// row-sink-derived surfaces and must fail closed to avoid clobbering them (#222).
+/// This path *does* have a runner: on genuine staleness it replays the persisted
+/// CBM index args through it, captures the row sink, and re-imports with a real
+/// [`RowSinkImportCandidate::Available`] — regenerating provenance, security screen,
+/// skill tree, bridges, kernel context, and anomalies from current source and
+/// returning [`ShadowRefreshStatus::Refreshed`].
+///
+/// The #222 guard remains the fail-closed floor. Reconciliation persists a real
+/// import **only** when the runner produces an `Available` candidate; if there are
+/// no persisted index args to replay, or the runner cannot produce an `Available`
+/// candidate (the pipeline errored or captured no rows), it defers to
+/// [`ensure_shadow_import_current_at`], which preserves last-known-good surfaces
+/// and returns [`ShadowRefreshStatus::StaleReindexRequired`] rather than
+/// overwriting them with "unavailable".
+pub(crate) fn reconcile_shadow_import_current(
+    runner: &CbmToolRunner,
+    project: &str,
+) -> Result<ShadowRefreshStatus, DynError> {
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    reconcile_shadow_import_current_at(runner, &cache_dir, project)
+}
+
+/// [`reconcile_shadow_import_current`] against an explicit CBM cache dir.
+///
+/// `cache_dir` is used for the freshness evaluation and the persisted index-args
+/// lookup; the actual re-import resolves the process cache dir itself (via
+/// [`import_shadow_vault`]), exactly as [`ensure_shadow_import_current_at`] does.
+pub(crate) fn reconcile_shadow_import_current_at(
+    runner: &CbmToolRunner,
+    cache_dir: &Path,
+    project: &str,
+) -> Result<ShadowRefreshStatus, DynError> {
+    match evaluate_shadow_content_freshness(cache_dir, project)? {
+        // Live source fingerprint matches the persisted watermark: nothing to do.
+        ShadowContentVerdict::Fresh => return Ok(ShadowRefreshStatus::Current),
+        // No CBM source present, so no re-import is possible; the refresh trigger
+        // has nothing to act on. Not a freshness claim.
+        ShadowContentVerdict::Unverifiable {
+            source_missing: true,
+            ..
+        } => return Ok(ShadowRefreshStatus::Current),
+        // Genuine staleness, an unusable watermark domain, or a missing/broken
+        // derived artifact while the source is live: all need reconciliation.
+        ShadowContentVerdict::Stale { .. }
+        | ShadowContentVerdict::WatermarkDomainMismatch { .. }
+        | ShadowContentVerdict::Unverifiable {
+            source_missing: false,
+            ..
+        } => {}
+    }
+
+    // True reconciliation requires the CBM index args to replay. Without them we
+    // cannot reconstruct the source path, so we fall back to the #222 fail-closed
+    // floor rather than guessing.
+    let Some(index_args) =
+        read_config_value(cache_dir, &metadata_key(project, SHADOW_INDEX_ARGS_KEY))?
+    else {
+        return ensure_shadow_import_current_at(cache_dir, project);
+    };
+
+    // Replay the CBM pipeline verbatim and capture the row sink, mirroring
+    // handle_index_repository's row-sink path. The lock is taken only for the
+    // import+persist below (like index_repository), never around the pipeline run.
+    let skills = SkillDiscoveryConfig::default();
+    let candidate = match runner.handle_index_repository_with_rows(&index_args) {
+        Ok(run) => match run.rows {
+            Ok(rows) => Some(row_sink_import_candidate_from_rows_with_skills(
+                rows, &skills,
+            )),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    // Persist a real import ONLY for a genuine Available candidate. An absent or
+    // Unavailable candidate must not clobber good surfaces with "unavailable" — the
+    // #222 floor preserves them and returns StaleReindexRequired instead.
+    let row_sink = match candidate {
+        Some(available @ RowSinkImportCandidate::Available(_)) => available,
+        _ => return ensure_shadow_import_current_at(cache_dir, project),
+    };
+
+    let Some(_shadow_import_lock) = try_shadow_import_lock(cache_dir, project)? else {
+        return Ok(ShadowRefreshStatus::Busy);
+    };
+    let search_scale_settings = search_scale_settings_for_import(project, None)?;
+    let outcome = import_shadow_vault(project, Some(row_sink), &search_scale_settings)?;
+    persist_shadow_outcome(project, &outcome)?;
+    Ok(ShadowRefreshStatus::Refreshed)
+}
+
 pub(crate) fn try_shadow_import_lock(
     cache_dir: &Path,
     project: &str,

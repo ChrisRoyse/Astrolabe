@@ -255,6 +255,7 @@ fn write_forecast_json(
     path
 }
 
+#[allow(clippy::too_many_arguments)] // test ledger-append helper threads the full admission artifact set
 fn append_admission_ledger(
     fixture: &Fixture,
     manifest: &AgentForecastManifest,

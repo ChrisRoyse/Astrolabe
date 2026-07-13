@@ -42,7 +42,7 @@ A DoD checkbox may be checked only in the same session that ran its verification
 
 ## 6. Gate
 
-Run the issue's named gates + the required aggregate via astro-gate from `C:/code/Astrolabe`. Exit 125 / `DEFERRED[...]` / `SKIP[...]` are **not** passing evidence. A gate that fails for a pre-existing reason: attribute it (astro-gate §attribution), file/link an issue — never skip silently.
+Run the issue's named gates + the required aggregate via astro-gate from `C:/code/Astrolabe`. Exit 125 / `DEFERRED[...]` / `SKIP[...]` are **not** passing evidence. One exception in kind (#280): `SKIP[ASTRO_SUITE_UNCHANGED]` is the impact gate proving your change did **not** touch that suite's input set - the suite's recorded green (`.astro-gate-cache/suite-green.json`) is the standing evidence, and any change inside the input set re-runs the suite by construction. It is lawful for closure only when the skipped suite is genuinely outside your change's blast radius. A gate that fails for a pre-existing reason: attribute it (astro-gate §attribution), file/link an issue — never skip silently.
 
 ## 7. Close
 

@@ -1,3 +1,8 @@
+// When `onnx-lens` is disabled the ONNX-backed tests (and their FSV-only
+// helpers/imports) are compiled out; silence the resulting unused warnings for
+// that config only (#191).
+#![cfg_attr(not(feature = "onnx-lens"), allow(dead_code, unused_imports))]
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -76,6 +81,7 @@ fn nonfinite_audio_fails_closed() {
     assert!(matches!(error, WardError::InvalidInput { .. }));
 }
 
+#[cfg(feature = "onnx-lens")]
 #[test]
 fn absent_model_reports_model_not_found_code() {
     let missing = temp_path("missing-wavlm-model.onnx");
@@ -142,6 +148,29 @@ proptest! {
     }
 }
 
+/// With `onnx-lens` disabled (Astrolabe's default), the ONNX constructors must
+/// fail closed with the labeled `CALYX_WARD_LENS_FEATURE_DISABLED` deficit
+/// rather than silently degrade (#191).
+#[cfg(not(feature = "onnx-lens"))]
+#[test]
+fn onnx_lens_disabled_fails_closed() {
+    let err = SpeakerLens::new(Path::new("/nonexistent/wavlm.onnx")).unwrap_err();
+    assert_eq!(err.code(), "CALYX_WARD_LENS_FEATURE_DISABLED");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("onnx-lens"),
+        "remediation names feature: {msg}"
+    );
+    assert!(msg.contains("speaker"), "message names lens: {msg}");
+    assert_eq!(
+        SpeakerLens::new_cpu_explicit(Path::new("/nonexistent/wavlm.onnx"))
+            .unwrap_err()
+            .code(),
+        "CALYX_WARD_LENS_FEATURE_DISABLED"
+    );
+}
+
+#[cfg(feature = "onnx-lens")]
 #[test]
 #[ignore = "manual FSV fixture; set CALYX_WARD_SPEAKER_LENS_FSV_DIR"]
 fn issue270_speaker_lens_fsv_writes_readbacks() {

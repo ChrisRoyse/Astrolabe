@@ -1,16 +1,22 @@
 //! WavLM speaker lens adapter for PH39 identity slots.
 
 use std::fmt;
+#[cfg(feature = "onnx-lens")]
 use std::fs::File;
+#[cfg(feature = "onnx-lens")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "onnx-lens")]
 use std::sync::Mutex;
 
 use calyx_core::{
     CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, SlotShape, SlotVector,
 };
+#[cfg(feature = "onnx-lens")]
 use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
+#[cfg(feature = "onnx-lens")]
 use ort::session::{Session, builder::GraphOptimizationLevel};
+#[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
 
@@ -86,6 +92,7 @@ impl SpeakerLens {
         Self::new_with_provider_policy(model_path, SpeakerProviderPolicy::CpuExplicit)
     }
 
+    #[cfg(feature = "onnx-lens")]
     pub fn new_with_provider_policy(
         model_path: &Path,
         policy: SpeakerProviderPolicy,
@@ -93,6 +100,18 @@ impl SpeakerLens {
         let model_hash = sha256_file(model_path)?;
         let backend = OnnxSpeakerBackend::new(model_path, policy)?;
         Self::from_backend(model_path.to_path_buf(), model_hash, backend)
+    }
+
+    /// Fail-closed stub: the ONNX WavLM backend is compiled out when the
+    /// `onnx-lens` feature is disabled (#191). Callers needing real ONNX
+    /// inference must rebuild with `--features onnx-lens`; tests can still
+    /// inject a mock backend through [`SpeakerLens::from_backend`].
+    #[cfg(not(feature = "onnx-lens"))]
+    pub fn new_with_provider_policy(
+        _model_path: &Path,
+        _policy: SpeakerProviderPolicy,
+    ) -> Result<Self, WardError> {
+        Err(WardError::LensFeatureDisabled { lens: "speaker" })
     }
 
     pub fn from_backend<B>(
@@ -189,6 +208,7 @@ impl Lens for SpeakerLens {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 struct OnnxSpeakerBackend {
     session: Mutex<Session>,
     input_name: String,
@@ -199,6 +219,7 @@ struct OnnxSpeakerBackend {
     policy: SpeakerProviderPolicy,
 }
 
+#[cfg(feature = "onnx-lens")]
 impl OnnxSpeakerBackend {
     fn new(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Self, WardError> {
         let session = build_session(model_path, policy)?;
@@ -228,6 +249,7 @@ impl OnnxSpeakerBackend {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 impl SpeakerEmbeddingBackend for OnnxSpeakerBackend {
     fn embed_16khz(&self, audio_pcm: &[f32]) -> Result<Vec<f32>, WardError> {
         let tensor = Tensor::from_array(([1usize, audio_pcm.len()], audio_pcm.to_vec()))
@@ -264,6 +286,7 @@ impl SpeakerEmbeddingBackend for OnnxSpeakerBackend {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn build_session(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Session, WardError> {
     if !model_path.exists() {
         return Err(WardError::ModelNotFound {
@@ -281,6 +304,7 @@ fn build_session(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Ses
     builder.commit_from_file(model_path).map_err(runtime_error)
 }
 
+#[cfg(feature = "onnx-lens")]
 fn execution_providers(policy: SpeakerProviderPolicy) -> Vec<ExecutionProviderDispatch> {
     match policy {
         SpeakerProviderPolicy::CudaFailLoud => vec![
@@ -296,6 +320,7 @@ fn execution_providers(policy: SpeakerProviderPolicy) -> Vec<ExecutionProviderDi
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
     names
         .iter()
@@ -307,6 +332,7 @@ fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, 
         })
 }
 
+#[cfg(feature = "onnx-lens")]
 fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> {
     let outlet = session
         .outputs()
@@ -417,6 +443,7 @@ fn pcm_f32_le(bytes: &[u8]) -> Result<Vec<f32>, WardError> {
         .collect())
 }
 
+#[cfg(feature = "onnx-lens")]
 fn sha256_file(path: &Path) -> Result<[u8; 32], WardError> {
     let mut file = File::open(path).map_err(|_| WardError::ModelNotFound {
         path: path.to_path_buf(),
@@ -441,6 +468,7 @@ fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(feature = "onnx-lens")]
 fn runtime_error(error: impl fmt::Display) -> WardError {
     WardError::Runtime {
         reason: error.to_string(),

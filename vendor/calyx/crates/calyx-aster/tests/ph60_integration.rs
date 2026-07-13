@@ -13,13 +13,12 @@ use calyx_aster::vault::quota::QuotaConfig;
 use calyx_aster::vault::{GrantEntry, VaultContext};
 use calyx_core::VaultId;
 use calyx_ledger::ActorId;
-use std::path::PathBuf;
 use ulid::Ulid;
 
 mod fsv_support;
 use fsv_support::prepared_temp_root;
 
-fn test_dir(name: &str) -> PathBuf {
+fn test_dir(name: &str) -> calyx_fsv::ScratchDir {
     prepared_temp_root("calyx-aster-ph60", name)
 }
 

@@ -34,26 +34,17 @@ fn main() {
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
     let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");
-    let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");
-    // #240/#241: the store-resolution overlay. Its generator and the Astrolabe-owned
-    // translation unit it calls into are build inputs exactly like the mem-pressure
-    // patch: a change to either must invalidate every libcbm object.
-    let env_store_patch = repo_root.join("patches/cbm/env_apply_store_patch.py");
+    // #240/#241: the Astrolabe-owned store-configuration translation unit that the
+    // (now in-place, ASTRO_ENV_STORE-guarded) CBM resolvers call into. A change to
+    // it must invalidate every libcbm object.
     let env_store_config_src = repo_root.join("patches/cbm/env_store_config.c");
     let env_store_config_hdr = repo_root.join("patches/cbm/env_store_config.h");
-    // #227/#228: the shell-free git-spawn helper, its shared overlay primitives,
-    // and every generator that routes a CBM git shell-out through it. Each is a
-    // build input exactly like the env-store overlay: a change to any of them
-    // must invalidate every libcbm object so Cargo rebuilds the archive.
+    // #227/#228: the shell-free git-spawn helper the (in-place, ASTRO_SPAWN-guarded)
+    // git shell-out sites call into. Its source and header are build inputs: a change
+    // to either must invalidate every libcbm object so Cargo rebuilds the archive.
     let spawn_overlays = [
         repo_root.join("patches/cbm/astro_spawn.c"),
         repo_root.join("patches/cbm/astro_spawn.h"),
-        repo_root.join("patches/cbm/astro_overlay.py"),
-        repo_root.join("patches/cbm/apply_spawn_git_context_patch.py"),
-        repo_root.join("patches/cbm/apply_spawn_artifact_patch.py"),
-        repo_root.join("patches/cbm/apply_spawn_watcher_patch.py"),
-        repo_root.join("patches/cbm/apply_spawn_githistory_patch.py"),
-        repo_root.join("patches/cbm/apply_shellarg_str_util_patch.py"),
     ];
     let mimalloc_header = cbm_root.join("vendored/mimalloc/include/mimalloc.h");
     let header = manifest_dir.join("include/astro_ffi.h");
@@ -67,26 +58,20 @@ fn main() {
     println!("cargo:rerun-if-changed={}", patched_makefile.display());
     println!("cargo:rerun-if-changed={}", alloc_shim.display());
     println!("cargo:rerun-if-changed={}", layout_probe.display());
-    println!("cargo:rerun-if-changed={}", mem_pressure_patch.display());
-    println!("cargo:rerun-if-changed={}", env_store_patch.display());
     println!("cargo:rerun-if-changed={}", env_store_config_src.display());
     println!("cargo:rerun-if-changed={}", env_store_config_hdr.display());
     for spawn_overlay in &spawn_overlays {
         println!("cargo:rerun-if-changed={}", spawn_overlay.display());
     }
-    // The vendored CBM tree is deliberately NOT watched file-by-file (#192).
-    // It is pinned: every sanctioned change lands through the VENDORED.md pin
-    // procedure (which rewrites the binding tree SHA below) or through the
-    // watched patches/cbm inputs above, and scripts/verify-pins.sh rejects
-    // direct vendor edits. Watching the whole src/, internal/cbm, and
-    // vendored/ trees made any mtime churn re-run this script — paying the
-    // make walk plus a full libclang bindgen parse — without any input Cargo
-    // could not already see via VENDORED.md. Within one build, Make depfiles
-    // (-MMD -MP) plus the config stamp own C-level incremental correctness.
-    println!(
-        "cargo:rerun-if-changed={}",
-        repo_root.join("VENDORED.md").display()
-    );
+    // The CBM tree under vendor/codebase-memory-mcp is owned first-class source
+    // (#286), but it is deliberately NOT watched file-by-file here (#192): the
+    // whole src/, internal/cbm, and vendored/ trees are large, and watching them
+    // made any mtime churn re-run this script — paying the make walk plus a full
+    // libclang bindgen parse. Within one build, Make depfiles (-MMD -MP) plus the
+    // config stamp own C-level incremental correctness; the Makefile itself and
+    // the Astrolabe-owned TUs above are watched, so a change to the build recipe
+    // or the glue code still forces a rebuild. A source-only edit to a CBM .c that
+    // does not touch those inputs is picked up on the next `cargo clean`/rebuild.
     println!("cargo:rustc-check-cfg=cfg(cbm_sys_asan)");
     println!(
         "cargo:rustc-env=CBM_MIMALLOC_VERSION={}",
@@ -105,8 +90,6 @@ fn main() {
     let mut config_inputs: Vec<&Path> = vec![
         &build_script,
         &patched_makefile,
-        &mem_pressure_patch,
-        &env_store_patch,
         &env_store_config_src,
         &env_store_config_hdr,
     ];

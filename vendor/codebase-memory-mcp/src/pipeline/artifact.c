@@ -22,6 +22,9 @@ enum {
  * capacity from the destination buffer. */
 #define ART_MAX_DECOMPRESSED_BYTES ((size_t)64 * 1024 * ART_BYTES_PER_MB)
 
+#ifdef ASTRO_SPAWN
+#include "astro_spawn.h"
+#endif
 #include "pipeline/artifact.h"
 #include "store/store.h"
 #include "foundation/platform.h"
@@ -209,6 +212,14 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
     return 0;
 }
 
+#ifdef ASTRO_SPAWN
+/* See artifact.h. Defence in depth (#227): the git callers below no longer use a
+ * shell at all — git is spawned with an explicit argv — so this validator is not
+ * what makes interpolation safe; there is no interpolation left to make safe. It
+ * still refuses a repo path carrying shell metacharacters (cbm_validate_shell_arg,
+ * plus the cmd.exe expansion characters % ! ^ on Windows) instead of silently
+ * accepting one. A path may legitimately contain spaces: argv needs no quoting. */
+#else
 #ifdef _WIN32
 #define ARTIFACT_NULL_DEV "NUL"
 #else
@@ -220,6 +231,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
  * metacharacters, and on Windows we also reject the cmd.exe expansion metacharacters
  * % ! ^. Callers then use DOUBLE quotes (honored by both POSIX sh and cmd.exe, unlike
  * single quotes on cmd.exe), so a repo path may legitimately contain spaces. */
+#endif
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
     if (!cbm_validate_shell_arg(repo_path)) {
         return false;
@@ -236,6 +248,9 @@ bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
 
 /* Get current git HEAD hash. buf must be >= CBM_SZ_64. Returns false on error. */
 static bool git_head_hash(const char *repo_path, char *buf, size_t bufsz) {
+#ifdef ASTRO_SPAWN
+    if (bufsz == 0) {
+#else
     char cmd[CBM_SZ_1K];
     if (!cbm_artifact_repo_path_is_shell_safe(repo_path)) {
         buf[0] = '\0';
@@ -251,17 +266,57 @@ static bool git_head_hash(const char *repo_path, char *buf, size_t bufsz) {
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         buf[0] = '\0';
+#endif
         return false;
     }
     buf[0] = '\0';
+#ifdef ASTRO_SPAWN
+    if (!cbm_artifact_repo_path_is_shell_safe(repo_path)) {
+        return false;
+    }
+
+    /* Shell-free spawn (#227): git receives this argv verbatim. There is no
+     * command string to compose (so nothing can be truncated into a malformed
+     * shell line), no quoting to get right, and no `2>NUL` / `2>/dev/null`
+     * suffix — cbm_spawn_capture binds the child's stderr to the null device. */
+    const char *const argv[] = {"git", "-C", repo_path, "rev-parse", "HEAD", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &len, &err) != 0) {
+        /* A non-zero git status just means "no HEAD here"; anything else is a
+         * real degradation and is labelled rather than swallowed. */
+        if (err.code != CBM_SPAWN_E_EXIT) {
+            cbm_log_warn("artifact.git_head.spawn_failed", "code", err.code_name, "message",
+                         err.message, "remediation", err.remediation);
+#else
     if (fgets(buf, (int)bufsz, fp)) {
         /* Strip trailing newline */
         size_t len = strlen(buf);
         while (len > 0 && (buf[len - ART_NUL] == '\n' || buf[len - ART_NUL] == '\r')) {
             buf[--len] = '\0';
+#endif
         }
+#ifdef ASTRO_SPAWN
+        free(data);
+        return false;
+#endif
     }
+#ifdef ASTRO_SPAWN
+
+    size_t line = 0;
+    while (line < len && data[line] != '\n' && data[line] != '\r') {
+        line++;
+    }
+    if (line >= bufsz) {
+        line = bufsz - ART_NUL;
+    }
+    memcpy(buf, data, line);
+    buf[line] = '\0';
+    free(data);
+#else
     (void)cbm_pclose(fp);
+#endif
     return buf[0] != '\0';
 }
 
@@ -403,16 +458,33 @@ static void ensure_gitattributes(const char *repo_path) {
     if (!cbm_artifact_repo_path_is_shell_safe(repo_path)) {
         return;
     }
+#ifdef ASTRO_SPAWN
+
+    /* Shell-free spawn (#227). */
+    const char *const argv[] = {"git",  "-C", repo_path, "config", "merge.ours.driver",
+                                "true", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_spawn_error_t err;
+    if (cbm_spawn_capture(argv, &data, &len, &err) != 0 && err.code != CBM_SPAWN_E_EXIT) {
+        cbm_log_warn("artifact.merge_driver.spawn_failed", "code", err.code_name, "message",
+                     err.message, "remediation", err.remediation);
+#else
     char cmd[CBM_SZ_1K];
     int n = snprintf(cmd, sizeof(cmd),
                      "git -C \"%s\" config merge.ours.driver true 2>" ARTIFACT_NULL_DEV, repo_path);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         return; /* truncated command → skip (parity with git_context.c) */
+#endif
     }
+#ifdef ASTRO_SPAWN
+    free(data);
+#else
     FILE *p = cbm_popen(cmd, "r");
     if (p) {
         (void)cbm_pclose(p);
     }
+#endif
 }
 
 /* ── Index stripping ─────────────────────────────────────────────── */

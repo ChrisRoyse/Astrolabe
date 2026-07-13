@@ -14,6 +14,7 @@ pub fn handle_tool_raw(
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
         "impute_fields" => handle_impute_fields(args_json),
+        "anchor_outcome" => handle_anchor_outcome(args_json),
         "team_artifact" => handle_team_artifact(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
@@ -250,6 +251,9 @@ pub(crate) fn handle_index_repository(
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
     };
     persist_shadow_outcome(&project, &outcome)?;
+    // #244: record the exact CBM index args so a later runner-driven refresh can
+    // replay the pipeline and reconcile genuine staleness with real surfaces.
+    persist_shadow_index_args(&cache_dir, &project, &sanitized_args)?;
     augment_tool_result(
         &result,
         json!({
@@ -281,7 +285,11 @@ pub(crate) fn handle_index_status(
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
-    let refresh_status = match ensure_shadow_import_current(&project) {
+    // #244: reconcile with the runner so genuine staleness is *repaired* (real
+    // row-sink-derived surfaces regenerated from current source) rather than merely
+    // refused. The #222 guard remains the fail-closed floor inside this call when
+    // reconciliation cannot run.
+    let refresh_status = match reconcile_shadow_import_current(runner, &project) {
         Ok(status) => status,
         Err(error) => {
             return tool_error_result(format!("shadow import recovery failed: {error}"));
@@ -332,6 +340,7 @@ pub(crate) fn handle_get_architecture(
                 "kernel_context": read_kernel_context_metadata(&cache_dir, &project)?,
                 "anomalies": read_anomaly_report(&cache_dir, &project)?,
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
+                "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
             },
         }),
     )
@@ -382,10 +391,20 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
     };
     let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let store = match provenance_store_for_project(&cache_dir, &project) {
+    let mut store = match provenance_store_for_project(&cache_dir, &project) {
         Ok(store) => store,
         Err(error) => return tool_error_result(error.to_string()),
     };
+    // #284: `mode="lineage"` for a ledger subject key is served from the real
+    // persisted ledger, not row-sink symbol metadata. The scan verifies the whole
+    // hash-chain first and fails closed on a broken chain or undecodable row, so
+    // its coded refusal is surfaced here rather than degrading into a row-sink
+    // answer.
+    if let Err(error) =
+        apply_ledger_backed_lineage(&mut store, &cache_dir, &project, mode, subject_id)
+    {
+        return tool_error_result(error.to_string());
+    }
     let response = match get_provenance(&store, &ProvenanceQuery::new(mode, subject_id)) {
         Ok(response) => response,
         Err(error) => {

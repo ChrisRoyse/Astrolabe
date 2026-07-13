@@ -26,14 +26,16 @@ pub fn parent_roots() -> (&'static str, &'static str) {
 /// `cbm_resolve_cache_dir` and `cbm_get_home_dir`
 /// (`vendor/codebase-memory-mcp/src/foundation/platform.c`) publish their result
 /// from a `static char[CBM_SZ_1K]`, so a store path longer than this cannot be
-/// represented by the library at all. Astrolabe's store overlay
-/// (`patches/cbm/env_apply_store_patch.py`, #241) widens the *environment* scratch
-/// buffers those resolvers used — a `char[CBM_SZ_256]`, an artificial cut with no
-/// relation to what the library can hold, and one that silently relocated the store
-/// for any Windows path over 255 bytes — up to the same `CBM_SZ_1K`, and refuses
-/// anything longer with a named fault instead of truncating it.
+/// represented by the library at all. Astrolabe's store-resolution edits
+/// (`ASTRO_ENV_STORE`-guarded, in the owned
+/// `vendor/codebase-memory-mcp/src/foundation/platform.c`, #241) widen the
+/// *environment* scratch buffers those resolvers used — a `char[CBM_SZ_256]`, an
+/// artificial cut with no relation to what the library can hold, and one that
+/// silently relocated the store for any Windows path over 255 bytes — up to the
+/// same `CBM_SZ_1K`, and refuse anything longer with a named fault instead of
+/// truncating it.
 ///
-/// This is not a magic number: it is measured from the vendored
+/// This is not a magic number: it is measured from the owned
 /// `src/foundation/constants.h` enum and asserted against it by
 /// `cbm_store_path_capacity_matches_vendor_constant`, and the C half asserts the
 /// same equality at compile time in `patches/cbm/env_store_config.c`.
@@ -2943,6 +2945,34 @@ mod tests {
     #[ignore = "spawned as a subprocess by cbm_install_plan_reads_oversized_path_without_truncation"]
     fn cbm_path_buffer_child_probe() {
         let case = std::env::var("ASTRO_BRIDGE_PATH_CASE").expect("parent selects a case");
+        if case == "unset" {
+            // The child must LAUNCH with a normal PATH (the GNU-linked test binary
+            // resolves its runtime DLLs through it — with no PATH the loader kills
+            // the process with STATUS_DLL_NOT_FOUND before any user code). To probe
+            // the unset branch libcbm actually reads, strip PATH from the C
+            // runtime's environ in-process: libcbm's find_in_path walks _environ,
+            // which SetEnvironmentVariableW-based std::env does NOT touch.
+            #[cfg(windows)]
+            {
+                unsafe extern "C" {
+                    fn _putenv(assignment: *const std::os::raw::c_char) -> std::os::raw::c_int;
+                }
+                let rc = unsafe { _putenv(c"PATH=".as_ptr()) };
+                assert_eq!(rc, 0, "_putenv must remove PATH from the CRT environ");
+            }
+            #[cfg(not(windows))]
+            {
+                // Direct libc unsetenv for the same reason as _putenv above: the
+                // probe must edit the environ array libcbm walks, and the
+                // env-as-IPC contract bans the std wrappers for libcbm-consumed
+                // variables (check-cbm-env-contract.py, ASTRO_CBM_ENV_AS_IPC).
+                unsafe extern "C" {
+                    fn unsetenv(name: *const std::os::raw::c_char) -> std::os::raw::c_int;
+                }
+                let rc = unsafe { unsetenv(c"PATH".as_ptr()) };
+                assert_eq!(rc, 0, "unsetenv must remove PATH from the libc environ");
+            }
+        }
         let path_len = std::env::var_os("PATH").map(|p| p.len()).unwrap_or(0);
         println!("path-buffer case={case} PATH_bytes_before={path_len}");
         cbm_sys::initialize_allocator_bindings_first();
@@ -3000,19 +3030,62 @@ mod tests {
             s.push_str(&real);
             s
         };
-        // baseline (real PATH), operator-size (~4226 B), and ~8 KB.
+        // Beyond ~32767 bytes the Windows DLL loader stops resolving directories
+        // that sit past that mark, so the junk-first shape used below for the
+        // 4226/8192 cases kills the child at load time (runtime DLLs live in the
+        // real PATH suffix). Keep the real PATH as the PREFIX for the 33 KB case:
+        // the child stays launchable and libcbm still reads all 33 000 bytes.
+        let make_real_first = |target: usize| -> String {
+            let mut s = real.clone();
+            s.push_str(sep);
+            let mut i = 0usize;
+            while s.len() < target {
+                s.push_str(&format!("{seg}{i:06}{sep}"));
+                i += 1;
+            }
+            s
+        };
+        // Case expectations: `Inherits` = the child launches and libcbm must read
+        // the full value without a truncation fault (the #267 design correction —
+        // no artificial cap). `OsBoundary` = Windows itself refuses the value at
+        // process creation (a single environment variable cannot exceed 32 767
+        // chars; RTL init dies with STATUS_NO_MEMORY before any user code), so the
+        // refusal at the real boundary is OS-owned and fail-closed — libcbm can
+        // never observe such a PATH — proven empirically on 2026-07-12 with both
+        // junk-first and real-path-first constructions.
+        #[derive(PartialEq)]
+        enum Expect {
+            Inherits,
+            OsBoundary,
+        }
+        let beyond_max_expect = if cfg!(windows) {
+            Expect::OsBoundary
+        } else {
+            Expect::Inherits
+        };
+        // baseline (real PATH), operator-size (~4226 B), ~8 KB, ~33 KB (beyond the
+        // 32767-char per-variable maximum), and unset (no spurious truncation
+        // fault on a missing PATH).
         let cases = [
-            ("baseline", real.clone()),
-            ("oversize_4226", make(4226)),
-            ("oversize_8192", make(8192)),
+            ("baseline", Some(real.clone()), Expect::Inherits),
+            ("oversize_4226", Some(make(4226)), Expect::Inherits),
+            ("oversize_8192", Some(make(8192)), Expect::Inherits),
+            (
+                "oversize_33000_beyond_setvar_max",
+                Some(make_real_first(33000)),
+                beyond_max_expect,
+            ),
+            ("unset", None, Expect::Inherits),
         ];
-        for (case, path_value) in cases {
-            if case != "baseline" {
-                assert!(
-                    path_value.len() > 4096,
-                    "[{case}] PATH must exceed the retired 4096 buffer: {}",
-                    path_value.len()
-                );
+        for (case, path_value, expect) in cases {
+            if let Some(value) = &path_value {
+                if case.starts_with("oversize") {
+                    assert!(
+                        value.len() > 4096,
+                        "[{case}] PATH must exceed the retired 4096 buffer: {}",
+                        value.len()
+                    );
+                }
             }
             let mut child = std::process::Command::new(&exe);
             child
@@ -3023,14 +3096,48 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("ASTRO_BRIDGE_PATH_CASE", case)
-                .env("PATH", &path_value);
+                .env("ASTRO_BRIDGE_PATH_CASE", case);
+            // `None` (the unset case) keeps the parent's PATH so the child can
+            // LOAD (runtime DLLs resolve through it); the probe then strips PATH
+            // from the CRT environ itself before touching libcbm.
+            if let Some(value) = &path_value {
+                child.env("PATH", value);
+            }
             let out = child.output().expect("spawn path-buffer probe");
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if expect == Expect::OsBoundary {
+                // The refusal at the genuine boundary is preserved — by the OS.
+                // The child must die at process initialization, before any user
+                // code runs (empty output), so libcbm's cap-free read is
+                // unreachable for values Windows cannot represent.
+                println!(
+                    "path-buffer case={case} os-boundary status={:?} \
+                     stdout_bytes={} stderr_bytes={}",
+                    out.status,
+                    out.stdout.len(),
+                    out.stderr.len()
+                );
+                assert!(
+                    !out.status.success(),
+                    "[{case}] a >32767-char PATH unexpectedly launched; if a \
+                     future Windows lifts the per-variable cap this case must \
+                     move to Expect::Inherits:\n{stdout}\n{stderr}"
+                );
+                assert!(
+                    out.stdout.is_empty() && out.stderr.is_empty(),
+                    "[{case}] expected an RTL-init death before user code, got \
+                     output (status {:?}):\n{stdout}\n{stderr}",
+                    out.status
+                );
+                continue;
+            }
             assert!(
                 out.status.success(),
-                "[{case}] probe failed:\n{stdout}\n{stderr}"
+                "[{case}] probe failed (status {:?} — an empty-output instant death \
+                 here usually means the DLL loader could not resolve the runtime \
+                 DLLs from the synthetic PATH):\n{stdout}\n{stderr}",
+                out.status
             );
             assert!(
                 stdout.contains(&format!("path-buffer case passed: {case}")),

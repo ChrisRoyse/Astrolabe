@@ -12,6 +12,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+pub mod scratch;
+pub use scratch::{ScratchDir, scratch_or_temp};
+
 /// The workspace-wide FSV evidence root variable.
 pub const FSV_ROOT_ENV: &str = "CALYX_FSV_ROOT";
 

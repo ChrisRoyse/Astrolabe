@@ -58,6 +58,7 @@ pub fn known_healthy_wash_trade() -> calyx_poly::wash::WashTradeScreen {
     }
 }
 
+#[allow(dead_code)]
 pub fn write_json(path: &Path, value: &Value) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create JSON parent directory");
@@ -118,6 +119,7 @@ fn collect_path_list(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn named_fsv_root(env: &str, fallback_name: &str) -> (PathBuf, bool) {
     if let Some(value) = std::env::var_os(env) {
         return (PathBuf::from(value), true);
@@ -128,6 +130,7 @@ pub fn named_fsv_root(env: &str, fallback_name: &str) -> (PathBuf, bool) {
     )
 }
 
+#[allow(dead_code)]
 pub fn reset_dir(path: &Path) {
     if path.exists() {
         fs::remove_dir_all(path).expect("remove previous FSV root");

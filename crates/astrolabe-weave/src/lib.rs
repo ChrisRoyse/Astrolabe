@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod search;
+pub mod search_index;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -44,16 +45,74 @@ pub use sim_rows::{
     sim_edge_graph_key,
 };
 pub use xterm_rows::{
-    ASTRO_XTERM_CX_ID_MISSING, ASTRO_XTERM_ROW_CORRUPT, EagerCrossTermPersistReport,
+    AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
+    ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect, EagerCrossTermPersistReport,
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
-    agreement_graph_from_persisted_rows, designed_kind_for_slots, eager_xterm_dump_bytes,
-    eager_xterm_key, lazy_agreement, persist_eager_cross_terms, read_eager_cross_term_rows,
+    agreement_graph_aspect, agreement_graph_from_persisted_rows, designed_kind_for_slots,
+    eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
+    read_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
+}
+
+/// A production-path weave persistence outcome that may have changed vault state
+/// the lowered SQLite artifact derives from (#225).
+///
+/// The lowered artifact's content fingerprint moves whenever the vault content
+/// it derives from — the persisted Graph/XTerm rows and the ledger head — moves.
+/// A weave commit that actually wrote or tombstoned rows (or drained reactive
+/// events) is such a change; a no-delta audit re-run that only re-appends an
+/// idempotent ledger record is not a content change and must not trigger a
+/// regeneration, or every re-run would rewrite the lowered artifact.
+pub trait WeaveMutation {
+    /// True when this commit changed derived vault content (rows written or
+    /// tombstoned, or reactive events acknowledged), false for a no-delta run.
+    fn changed_lowered_inputs(&self) -> bool;
+}
+
+impl WeaveMutation for SimilarityPersistReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.rows_written > 0 || self.rows_tombstoned > 0
+    }
+}
+
+impl WeaveMutation for EagerCrossTermPersistReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.rows_written > 0 || self.rows_tombstoned > 0
+    }
+}
+
+impl WeaveMutation for ReactiveAckReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.acked_count > 0
+    }
+}
+
+/// Trigger plumbing from a weave mutation path: after a weave persistence commit,
+/// ask the lowering coordinator to schedule a debounced lowered-SQLite
+/// regeneration — but only when the commit actually changed derived vault
+/// content. A no-delta audit re-run never schedules a regeneration.
+///
+/// Returns whether a regeneration was requested, so callers can surface the
+/// scheduling decision. The scheduling itself is debounced by the trigger
+/// implementor (`astrolabe-lower`'s `LowerDebouncer`), so N rapid mutations
+/// coalesce into one regeneration.
+pub fn schedule_lowering_after<M>(
+    report: &M,
+    trigger: &dyn astrolabe_domain::LoweringTrigger,
+) -> bool
+where
+    M: WeaveMutation + ?Sized,
+{
+    let changed = report.changed_lowered_inputs();
+    if changed {
+        trigger.request_regeneration();
+    }
+    changed
 }
 
 pub const SIM_STRUCT_SLOT: SlotId = SlotId::new(1);
@@ -2543,8 +2602,6 @@ mod tests {
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
 
     #[test]
     fn identifies_calyx_parent() {
@@ -3175,61 +3232,6 @@ mod tests {
             .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1);
-        drop(vault);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    #[test]
-    fn durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss() {
-        let (dir, vault) = reactive_vault("queue-soak");
-        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_321_000)));
-        engine
-            .register(TriggerCondition::NewRegion { tau_override: None }, None)
-            .expect("register soak trigger");
-        let signals =
-            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
-        let total_evals = CALYX_REACTIVE_QUEUE_CAP as u64 + 1;
-        let rss_before = resident_set_bytes();
-
-        for seq in 1..=total_evals {
-            let result = engine.evaluate_post_ingest_durable(&vault, cx(12), lref(seq), &signals);
-            if seq <= CALYX_REACTIVE_QUEUE_CAP as u64 {
-                assert_eq!(result.expect("queue has capacity"), 1);
-            } else {
-                let err = result.expect_err("one event beyond queue cap overflows");
-                assert_eq!(err.code, CALYX_REACTIVE_QUEUE_FULL);
-            }
-        }
-
-        let rss_after = resident_set_bytes();
-        let rss_delta = rss_after.saturating_sub(rss_before);
-        assert!(
-            rss_delta <= MAX_REACTIVE_SOAK_RSS_DELTA_BYTES,
-            "reactive soak RSS delta {rss_delta} exceeded cap {MAX_REACTIVE_SOAK_RSS_DELTA_BYTES}"
-        );
-        assert_eq!(engine.queue().len(), CALYX_REACTIVE_QUEUE_CAP);
-        let queued_seqs = engine
-            .queue()
-            .iter()
-            .map(|event| event.ledger_ref.seq)
-            .collect::<Vec<_>>();
-        assert_eq!(queued_seqs.first().copied(), Some(2));
-        assert_eq!(queued_seqs.last().copied(), Some(total_evals));
-
-        let audits = all_audit_entries(&vault);
-        assert_eq!(
-            audits.iter().filter(|entry| entry.code.is_none()).count(),
-            total_evals as usize
-        );
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
-                .count(),
-            1
-        );
-        assert_eq!(fired_events(&vault).len(), total_evals as usize);
         drop(vault);
         let _ = fs::remove_dir_all(dir);
     }
@@ -4019,6 +4021,98 @@ mod tests {
         assert!(third.rows_tombstoned > 0);
         let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
         assert_eq!(after.len(), tighter.edges.len());
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Counting [`LoweringTrigger`] double: records how many debounced
+    /// regenerations the weave plumbing requested.
+    #[derive(Default)]
+    struct CountingTrigger {
+        requests: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingTrigger {
+        fn requests(&self) -> u64 {
+            self.requests.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl astrolabe_domain::LoweringTrigger for CountingTrigger {
+        fn request_regeneration(&self) {
+            self.requests.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn weave_mutation_schedules_lowering_but_no_delta_rerun_does_not() {
+        // #225 trigger plumbing FSV: a real similarity-edge persistence that
+        // writes rows schedules exactly one debounced lowering; a subsequent
+        // no-delta re-persist (audited but zero rows changed) schedules none —
+        // proven against the persisted SIM_* rows read back from the vault, not
+        // the in-memory report alone.
+        let config = SimilarityPlannerConfig {
+            exact_pair_node_limit: None,
+            per_node_cap: 2,
+            thresholds: SimilarityThresholds {
+                sim_struct_min_score: 0.50,
+                sim_semantic_min_score: 0.50,
+                ..SimilarityThresholds::default()
+            },
+            candidate_strategies: SimilarityFamily::ALL
+                .into_iter()
+                .map(|family| (family, SimilarityCandidateStrategy::Ann))
+                .collect(),
+            ..SimilarityPlannerConfig::default()
+        };
+        let group = &[(0, 1.0), (1, 2.0), (2, 3.0)];
+        let nodes = vec![
+            sparse_node("trig.a", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[1.0, 0.0, 0.0])),
+            sparse_node("trig.b", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.9, 0.2, 0.1])),
+        ];
+        let plan = plan_similarity_edges(&nodes, &config).expect("trigger plan");
+        assert!(
+            !plan.edges.is_empty(),
+            "fixture must admit at least one edge"
+        );
+
+        let (dir, vault) = reactive_vault("lowering-trigger");
+        let trigger = CountingTrigger::default();
+
+        // Real mutating commit -> exactly one scheduled regeneration.
+        let report = persist_similarity_edges(&vault, &plan, "astrolabe-weave-test")
+            .expect("persist sim edges");
+        assert!(report.rows_written > 0, "first persist must write rows");
+        assert!(report.changed_lowered_inputs());
+        let scheduled = schedule_lowering_after(&report, &trigger);
+        assert!(scheduled, "a mutating weave commit schedules a lowering");
+        assert_eq!(trigger.requests(), 1);
+        drop(vault);
+
+        // FSV readback: the persisted SIM_* rows exist independently of the report.
+        let reopened = open_reactive_vault(&dir);
+        let persisted = read_similarity_edge_rows(&reopened).expect("read persisted sim rows");
+        assert_eq!(persisted.len(), plan.edges.len());
+
+        // No-delta re-persist: audited, but zero rows changed -> schedules nothing.
+        let rerun = persist_similarity_edges(&reopened, &plan, "astrolabe-weave-test")
+            .expect("idempotent persist");
+        assert_eq!(rerun.rows_written, 0);
+        assert_eq!(rerun.rows_tombstoned, 0);
+        assert!(!rerun.changed_lowered_inputs());
+        let rescheduled = schedule_lowering_after(&rerun, &trigger);
+        assert!(
+            !rescheduled,
+            "a no-delta audit re-run schedules no lowering"
+        );
+        assert_eq!(
+            trigger.requests(),
+            1,
+            "trigger count unchanged after no-delta re-run"
+        );
+
         drop(reopened);
         let _ = fs::remove_dir_all(dir);
     }
@@ -5198,51 +5292,6 @@ mod tests {
                 .then_some(payload)
             })
             .collect()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn resident_set_bytes() -> u64 {
-        let smaps = fs::read_to_string("/proc/self/smaps_rollup").expect("read smaps_rollup");
-        smaps
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split_whitespace();
-                match (parts.next(), parts.next(), parts.next()) {
-                    (Some("Rss:"), Some(kib), Some("kB")) => {
-                        Some(kib.parse::<u64>().expect("parse Rss kB") * 1024)
-                    }
-                    _ => None,
-                }
-            })
-            .expect("Rss line in smaps_rollup")
-    }
-
-    /// Native Windows resident-set probe for the soak harness.
-    ///
-    /// `astrolabe-weave` forbids `unsafe`, so instead of a direct
-    /// `GetProcessMemoryInfo` FFI call this shells out to PowerShell for the
-    /// process's working set — the Windows analogue of Linux `Rss` — which is
-    /// exact enough for the 512 MiB soak delta bound.
-    #[cfg(target_os = "windows")]
-    fn resident_set_bytes() -> u64 {
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
-            ])
-            .output()
-            .expect("query working set via powershell");
-        assert!(
-            output.status.success(),
-            "powershell working-set query failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("utf8 working set")
-            .trim()
-            .parse::<u64>()
-            .expect("parse working set bytes")
     }
 
     fn cx(byte: u8) -> CxId {

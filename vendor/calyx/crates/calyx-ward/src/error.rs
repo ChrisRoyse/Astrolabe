@@ -28,6 +28,7 @@ pub const CALYX_WARD_RUNTIME_ERROR: &str = "CALYX_WARD_RUNTIME_ERROR";
 pub const CALYX_WARD_MISSING_FREQUENCY: &str = "CALYX_WARD_MISSING_FREQUENCY";
 pub const CALYX_WARD_INVALID_FREQUENCY: &str = "CALYX_WARD_INVALID_FREQUENCY";
 pub const CALYX_WARD_INVALID_DOMAIN: &str = "CALYX_WARD_INVALID_DOMAIN";
+pub const CALYX_WARD_LENS_FEATURE_DISABLED: &str = "CALYX_WARD_LENS_FEATURE_DISABLED";
 
 /// Fail-closed errors emitted by Ward guard policy checks.
 #[derive(Clone, Debug, PartialEq)]
@@ -119,6 +120,12 @@ pub enum WardError {
     InvalidDomain {
         reason: String,
     },
+    /// An ONNX ML-lens constructor was invoked in a build compiled without the
+    /// `onnx-lens` cargo feature, so the `ort` + `tokenizers` backend is absent.
+    /// Fail closed rather than silently degrade (#191).
+    LensFeatureDisabled {
+        lens: &'static str,
+    },
 }
 
 impl WardError {
@@ -149,6 +156,7 @@ impl WardError {
             Self::MissingFrequency { .. } => CALYX_WARD_MISSING_FREQUENCY,
             Self::InvalidFrequency { .. } => CALYX_WARD_INVALID_FREQUENCY,
             Self::InvalidDomain { .. } => CALYX_WARD_INVALID_DOMAIN,
+            Self::LensFeatureDisabled { .. } => CALYX_WARD_LENS_FEATURE_DISABLED,
         }
     }
 }
@@ -256,6 +264,13 @@ impl fmt::Display for WardError {
             Self::InvalidDomain { reason } => {
                 write!(f, "{CALYX_WARD_INVALID_DOMAIN}: {reason}")
             }
+            Self::LensFeatureDisabled { lens } => write!(
+                f,
+                "{CALYX_WARD_LENS_FEATURE_DISABLED}: the {lens} ONNX lens requires the `onnx-lens` \
+                 cargo feature (ort + tokenizers), which is disabled in this build; \
+                 rebuild calyx-ward (and the consuming crate) with `--features onnx-lens` to run \
+                 ONNX inference, or use a mock backend via `from_backend` for tests"
+            ),
         }
     }
 }

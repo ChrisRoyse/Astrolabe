@@ -648,6 +648,249 @@ function Set-WorkspaceTempEnvironment {
     # and after the phase and fails closed on a single added registration.
 }
 
+# #278: causal attribution source for the no-escape gate. The gate protects roots
+# the operator SHARES with the OS and -- on this machine -- with other Calyx/CBM
+# checkouts and concurrent codebase-memory-mcp MCP servers. Classifying a delta as
+# "ours" by NAME PATTERN (calyx*, cbm*) false-positives there. Instead the launcher
+# records THIS run's process tree so the gate attributes a shared-root delta only to
+# a process that was actually part of our run. A Windows Job Object receives a
+# JOB_OBJECT_MSG_NEW_PROCESS completion for EVERY descendant at creation time (no
+# poll-miss), so short-lived `cargo test` binaries -- whose scratch-dir names embed
+# std::process::id() -- are captured. If this recorder cannot start, the gate fails
+# CLOSED (ASTRO_NO_ESCAPE_NO_ATTRIBUTION) rather than reverting to name matching.
+$AstroTreeRecorderSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public class AstroTreeRecorder {
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateJobObjectW(IntPtr a, string name);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern IntPtr CreateIoCompletionPort(IntPtr handle, IntPtr existing, UIntPtr key, uint threads);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int cls, IntPtr info, uint len);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
+    [DllImport("kernel32")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool GetQueuedCompletionStatus(IntPtr port, out uint bytes, out UIntPtr key, out IntPtr overlapped, uint ms);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern bool PostQueuedCompletionStatus(IntPtr port, uint bytes, UIntPtr key, IntPtr overlapped);
+    [DllImport("kernel32")]
+    static extern bool CloseHandle(IntPtr h);
+
+    const int JobObjectAssociateCompletionPortInformation = 7;
+    const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
+    const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
+    const uint JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8;
+    const uint STOP_SENTINEL = 0xFFFFFFFF;
+    const long OPEN = -1L;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT { public IntPtr CompletionKey; public IntPtr CompletionPort; }
+
+    IntPtr job, port;
+    Thread thread;
+    volatile bool stop;
+    // #278 attempts 6+7: pid alone is ambiguous under PID REUSE, and first-seen
+    // alone still false-attributes DEAD instances (attempt 7: four foreign-sweep
+    // pids collided with startup children of ours first seen at 14:2x and long
+    // dead when the foreign dirs appeared at 14:34+). Record each pid's INSTANCE
+    // LIFETIME intervals [first_seen, last_seen] -- the port delivers both
+    // NEW_PROCESS and (ABNORMAL_)EXIT_PROCESS -- a list per pid, because the OS
+    // can recycle a pid WITHIN our own tree. last = OPEN(-1) means the instance
+    // had not exited when the manifest was written (serialized as null; the gate
+    // treats it as an open window -- never 'assume dead').
+    readonly Dictionary<int, List<long[]>> pidIntervals = new Dictionary<int, List<long[]>>();
+    readonly object gate = new object();
+    string manifestPath;
+    int launcherPid;
+    long runStartedNs;
+    bool dirty;
+    long lastFlushNs;
+
+    static long NowUnixNs() {
+        return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).Ticks * 100L;
+    }
+
+    public static AstroTreeRecorder Start(string manifestPath, int launcherPid) {
+        AstroTreeRecorder r = new AstroTreeRecorder();
+        r.manifestPath = manifestPath;
+        r.launcherPid = launcherPid;
+        r.runStartedNs = NowUnixNs();
+        r.job = CreateJobObjectW(IntPtr.Zero, null);
+        if (r.job == IntPtr.Zero) throw new Exception("CreateJobObject failed " + Marshal.GetLastWin32Error());
+        r.port = CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 1);
+        if (r.port == IntPtr.Zero) throw new Exception("CreateIoCompletionPort failed " + Marshal.GetLastWin32Error());
+        JOBOBJECT_ASSOCIATE_COMPLETION_PORT assoc = new JOBOBJECT_ASSOCIATE_COMPLETION_PORT();
+        assoc.CompletionKey = r.job;
+        assoc.CompletionPort = r.port;
+        IntPtr buf = Marshal.AllocHGlobal(Marshal.SizeOf(assoc));
+        try {
+            Marshal.StructureToPtr(assoc, buf, false);
+            if (!SetInformationJobObject(r.job, JobObjectAssociateCompletionPortInformation, buf, (uint)Marshal.SizeOf(assoc)))
+                throw new Exception("SetInformationJobObject failed " + Marshal.GetLastWin32Error());
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+        // Assign the launcher itself: every child (bash -> gates -> cargo -> test
+        // binaries) inherits the job, so all descendant PIDs flow to the port.
+        if (!AssignProcessToJobObject(r.job, GetCurrentProcess()))
+            throw new Exception("AssignProcessToJobObject failed " + Marshal.GetLastWin32Error());
+        lock (r.gate) {
+            List<long[]> spans = new List<long[]>();
+            spans.Add(new long[] { r.runStartedNs, OPEN });
+            r.pidIntervals[launcherPid] = spans;
+        }
+        r.Flush();
+        r.thread = new Thread(r.Loop);
+        r.thread.IsBackground = true;
+        r.thread.Start();
+        return r;
+    }
+
+    void OnNewProcess(int pid, long now) {
+        lock (gate) {
+            List<long[]> spans;
+            if (!pidIntervals.TryGetValue(pid, out spans)) {
+                spans = new List<long[]>();
+                pidIntervals[pid] = spans;
+            }
+            // A NEW message for a pid whose last interval is still open is a
+            // duplicate; otherwise this is a fresh instance (possibly the OS
+            // recycling the pid WITHIN our tree) -> open a new interval.
+            if (spans.Count == 0 || spans[spans.Count - 1][1] != OPEN) {
+                spans.Add(new long[] { now, OPEN });
+                dirty = true;
+            }
+        }
+    }
+
+    void OnExitProcess(int pid, long now) {
+        lock (gate) {
+            List<long[]> spans;
+            if (pidIntervals.TryGetValue(pid, out spans)) {
+                if (spans.Count > 0 && spans[spans.Count - 1][1] == OPEN) {
+                    spans[spans.Count - 1][1] = now;
+                    dirty = true;
+                }
+            } else {
+                // Exit for a pid we never saw born (port-association edge case):
+                // fail closed toward attribution -- treat it as alive since run
+                // start, dead now.
+                spans = new List<long[]>();
+                spans.Add(new long[] { runStartedNs, now });
+                pidIntervals[pid] = spans;
+                dirty = true;
+            }
+        }
+    }
+
+    void Loop() {
+        while (!stop) {
+            uint bytes; UIntPtr key; IntPtr ov;
+            bool got = GetQueuedCompletionStatus(port, out bytes, out key, out ov, 500);
+            if (got) {
+                long now = NowUnixNs();
+                if (bytes == JOB_OBJECT_MSG_NEW_PROCESS) {
+                    OnNewProcess((int)ov.ToInt64(), now);
+                } else if (bytes == JOB_OBJECT_MSG_EXIT_PROCESS || bytes == JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS) {
+                    OnExitProcess((int)ov.ToInt64(), now);
+                } else if (bytes == STOP_SENTINEL) {
+                    break;
+                }
+            }
+            // Throttled persistence: thousands of short-lived children generate
+            // ~2 messages each; rewrite the manifest at most once a second and
+            // always once more at Stop().
+            long tick = NowUnixNs();
+            bool doFlush;
+            lock (gate) { doFlush = dirty && (tick - lastFlushNs > 1000000000L); }
+            if (doFlush) Flush();
+        }
+    }
+
+    void Flush() {
+        List<KeyValuePair<int, List<long[]>>> snap = new List<KeyValuePair<int, List<long[]>>>();
+        long flushNs;
+        lock (gate) {
+            foreach (KeyValuePair<int, List<long[]>> entry in pidIntervals) {
+                List<long[]> copy = new List<long[]>();
+                foreach (long[] span in entry.Value) copy.Add(new long[] { span[0], span[1] });
+                snap.Add(new KeyValuePair<int, List<long[]>>(entry.Key, copy));
+            }
+            dirty = false;
+            lastFlushNs = NowUnixNs();
+            flushNs = lastFlushNs;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"schema\":\"astrolabe.no_escape_attribution.v1\",\"launcher_pid\":");
+        sb.Append(launcherPid);
+        sb.Append(",\"run_started_unix_ns\":");
+        sb.Append(runStartedNs);
+        // #278 attempt 8b: THROTTLE-RACE guard. This manifest is rewritten at most
+        // once a second while the run is live, and the no-escape gate reads it
+        // MID-SESSION (before the final Stop() flush). written_at stamps THIS flush
+        // so the gate can tell that a shared-root delta postdates the manifest --
+        // meaning the recorder had not yet observed the writing process -- and fail
+        // toward RED (ASTRO_NO_ESCAPE_STALE_MANIFEST) instead of silently 'foreign'.
+        sb.Append(",\"written_at\":");
+        sb.Append(flushNs);
+        sb.Append(",\"tree_pids\":[");
+        for (int i = 0; i < snap.Count; i++) { if (i > 0) sb.Append(','); sb.Append(snap[i].Key); }
+        sb.Append("],\"pid_first_seen\":{");
+        for (int i = 0; i < snap.Count; i++) {
+            if (i > 0) sb.Append(',');
+            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":"); sb.Append(snap[i].Value[0][0]);
+        }
+        sb.Append("},\"pid_intervals\":{");
+        for (int i = 0; i < snap.Count; i++) {
+            if (i > 0) sb.Append(',');
+            sb.Append('"'); sb.Append(snap[i].Key); sb.Append("\":[");
+            List<long[]> spans = snap[i].Value;
+            for (int j = 0; j < spans.Count; j++) {
+                if (j > 0) sb.Append(',');
+                sb.Append('['); sb.Append(spans[j][0]); sb.Append(',');
+                if (spans[j][1] == OPEN) sb.Append("null"); else sb.Append(spans[j][1]);
+                sb.Append(']');
+            }
+            sb.Append(']');
+        }
+        sb.Append("},\"owned_paths\":[]}");
+        try {
+            string tmp = manifestPath + ".tmp";
+            File.WriteAllText(tmp, sb.ToString());
+            if (File.Exists(manifestPath)) File.Delete(manifestPath);
+            File.Move(tmp, manifestPath);
+        } catch { }
+    }
+
+    public void Stop() {
+        stop = true;
+        PostQueuedCompletionStatus(port, STOP_SENTINEL, UIntPtr.Zero, IntPtr.Zero);
+        if (thread != null) thread.Join(2000);
+        // Final write happens AFTER the tree is done, so nearly every instance
+        // carries a real exit stamp; anything still open stays an open window.
+        Flush();
+        if (port != IntPtr.Zero) CloseHandle(port);
+        if (job != IntPtr.Zero) CloseHandle(job);
+    }
+}
+'@
+
+function Start-AstroTreeAttribution {
+    param([string]$ManifestPath, [int]$LauncherPid)
+    if (-not ([System.Management.Automation.PSTypeName]'AstroTreeRecorder').Type) {
+        Add-Type -TypeDefinition $AstroTreeRecorderSource -Language CSharp -ErrorAction Stop
+    }
+    return [AstroTreeRecorder]::Start($ManifestPath, $LauncherPid)
+}
+
 function Test-PinnedToolchain {
     param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot, [string]$SccacheExe)
 
@@ -777,8 +1020,14 @@ $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 # (fixture locks, never the live workspace).
 . (Join-Path $PSScriptRoot "launcher-lock.ps1")
 Assert-AstroLauncherLockClaimable -LockPath $launcherLock
-if (Test-Path -LiteralPath $target) {
+# #280: ASTROLABE_CONTIGUOUS_BATCH=1 (the CLAUDE.md contiguous-verification-
+# batch carve-out) keeps target/ warm between consecutive runs of one session,
+# so a present target/ is the expected state there, not a hygiene fault.
+if ((Test-Path -LiteralPath $target) -and ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
     throw "target must be absent before toolchain work: $target"
+}
+if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and (Test-Path -LiteralPath $target)) {
+    Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
 }
 if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
@@ -896,8 +1145,10 @@ foreach ($argument in $commandArgs) {
 $commandExit = $null
 $launcherFault = $null
 $cleanupErrors = @()
+$treeRecorder = $null
+$attributionManifest = Join-Path $workspaceTempParent "no-escape-attribution-$PID.json"
 $previousTempEnvironment = @{}
-foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
+foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
 try {
@@ -935,6 +1186,19 @@ try {
         throw "LAUNCHER_BOUNDARY[ASTRO_SCCACHE_SERVER_UNAVAILABLE]: no sccache daemon is answering on 127.0.0.1:$sccacheServerPort ('--start-server' exit=$($sccacheStart.ExitCode), '--zero-stats' exit=$($sccacheZero.ExitCode)). Every rustc invocation would fail through RUSTC_WRAPPER. Remediation: check for a foreign listener on that port (Get-NetTCPConnection -LocalPort $sccacheServerPort) and for stale sccache.exe processes, then retry. Daemon output: $($sccacheStart.Output -join ' | ') $($sccacheZero.Output -join ' | ')"
     }
     Write-Output "SCCACHE[ASTRO_CACHE_ENABLED]: dir=$sccacheDir; size=$SccacheCacheSize; wrapper=$sccacheExe; CARGO_INCREMENTAL=0; SCCACHE_SERVER_PORT=$sccacheServerPort; SCCACHE_IDLE_TIMEOUT=$SccacheIdleTimeout"
+    # #278: start recording THIS run's process tree so the no-escape gate attributes
+    # shared-root deltas causally (see $AstroTreeRecorderSource). Point the gate at the
+    # manifest via the environment the child inherits. If the recorder cannot start, do
+    # NOT set the variable: the gate then fails closed (ASTRO_NO_ESCAPE_NO_ATTRIBUTION)
+    # instead of silently reverting to the unsound name-pattern classification.
+    try {
+        $treeRecorder = Start-AstroTreeAttribution -ManifestPath $attributionManifest -LauncherPid $PID
+        $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
+        Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: process-tree PIDs -> $attributionManifest"
+    }
+    catch {
+        Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_UNAVAILABLE]: could not start the process-tree recorder ($($_.Exception.Message)); the no-escape gate will fail closed rather than fall back to name-pattern attribution"
+    }
     # #239: the child's exit code is the ONLY thing that decides this launcher's exit code.
     # $ErrorActionPreference drops to 'Continue' for the call because Windows PowerShell 5.1
     # turns a native command's stderr into a TERMINATING ErrorRecord under 'Stop' — a child
@@ -959,6 +1223,11 @@ catch {
     $launcherFault = $_
 }
 finally {
+    # #278: stop the process-tree recorder FIRST (flush the final PID manifest) before any
+    # teardown removes .tmp. Stopping never changes the launcher's exit code.
+    if ($null -ne $treeRecorder) {
+        try { $treeRecorder.Stop() } catch { $cleanupErrors += "tree-attribution recorder stop failed: $($_.Exception.Message)" }
+    }
     # #190: surface this run's sccache stats to the evidence stream, then stop the daemon
     # (flushes stats, releases handles) BEFORE the target/temp cleanup below. The on-disk
     # cache in $sccacheDir is intentionally kept.
@@ -989,16 +1258,29 @@ finally {
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
     }
-    if (Test-Path -LiteralPath $target) {
-        try {
-            Remove-Item -LiteralPath $target -Recurse -Force
-        }
-        catch {
-            $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
-        }
+    # #280: ASTROLABE_CONTIGUOUS_BATCH=1 invokes the CLAUDE.md "contiguous
+    # verification batch" carve-out — consecutive gate runs within one session
+    # keep target/ warm (the workspace-test phase is ~95% rebuild cost from a
+    # cold target/; measured 143s rebuild vs 6.6s of actual test execution).
+    # The invoking session REMAINS obligated to wipe target/ at every batch
+    # boundary (turn end, pause, issue close, handoff) — this flag never
+    # weakens that rule, it only moves the wipe from per-invocation to
+    # per-batch, and the default (unset) behavior is unchanged.
+    if ($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") {
+        Write-Output "CLEANUP[ASTRO_TARGET_BATCH_DEFERRED]: ASTROLABE_CONTIGUOUS_BATCH=1 -> target/ kept warm; the batch owner wipes it at the batch boundary"
     }
-    if (Test-Path -LiteralPath $target) {
-        $cleanupErrors += "target cleanup failed: $target remains"
+    else {
+        if (Test-Path -LiteralPath $target) {
+            try {
+                Remove-Item -LiteralPath $target -Recurse -Force
+            }
+            catch {
+                $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $target) {
+            $cleanupErrors += "target cleanup failed: $target remains"
+        }
     }
     if (Test-Path -LiteralPath $workspaceTemp) {
         try {
@@ -1025,7 +1307,7 @@ finally {
             $cleanupErrors += "workspace temporary parent cleanup failed: $($_.Exception.Message)"
         }
     }
-    foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES")) {
+    foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
         $previous = $previousTempEnvironment[$name]
         if ($null -eq $previous) {
             Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -1039,7 +1321,9 @@ finally {
     # destroying the child's real exit code — a red-for-green AND a green-for-red hazard.
     # Cleanup failures are recorded in $cleanupErrors and adjudicated below, loudly.
     if ($cleanupErrors.Count -eq 0) {
-        Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+        if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
+            Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+        }
         Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
     }
 }

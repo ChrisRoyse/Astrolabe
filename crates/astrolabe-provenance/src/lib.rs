@@ -9,6 +9,22 @@ pub const ASTRO_PROVENANCE_UNKNOWN_MODE: &str = "ASTRO_PROVENANCE_UNKNOWN_MODE";
 pub const ASTRO_PROVENANCE_NOT_FOUND: &str = "ASTRO_PROVENANCE_NOT_FOUND";
 pub const ASTRO_PROVENANCE_MANIFEST_TAMPERED: &str = "ASTRO_PROVENANCE_MANIFEST_TAMPERED";
 pub const REPRODUCE_DRIFT_EXCEEDED: &str = "REPRODUCE_DRIFT_EXCEEDED";
+/// Error code: a lineage was requested for a subject that no persisted ledger
+/// row references. Fail closed rather than returning an empty lineage that would
+/// read as a verified, complete history of a symbol that was never ledgered.
+pub const ASTRO_PROVENANCE_LINEAGE_EMPTY: &str = "ASTRO_PROVENANCE_LINEAGE_EMPTY";
+/// Error code: a scanned ledger row that would become a lineage node is missing
+/// its provenance pointer (empty entry hash) or names a different subject than
+/// the one requested. A node with no ledger pointer is an invented edge, so the
+/// whole lineage is refused rather than served with a fabricated link.
+pub const ASTRO_PROVENANCE_LINEAGE_GAP: &str = "ASTRO_PROVENANCE_LINEAGE_GAP";
+/// Schema tag for the self-describing inter-agent pack-manifest attestation
+/// envelope: the byte artifact a serving agent hands a verifying agent.
+pub const PACK_MANIFEST_ATTESTATION_SCHEMA: &str = "astrolabe.pack_manifest_attestation.v1";
+/// Error code: an attestation envelope failed to parse or its recomputed
+/// attestation digest did not match the digest recorded in the envelope — the
+/// exact signature of a tampered manifest artifact. Fail closed.
+pub const ASTRO_PROVENANCE_ATTESTATION_CORRUPT: &str = "ASTRO_PROVENANCE_ATTESTATION_CORRUPT";
 pub const ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT: &str = "ASTRO_PROVENANCE_REPRODUCE_INCONSISTENT";
 /// Error code: a verify-relevant provenance metadatum required to evaluate freshness or
 /// verification was absent from persisted metadata. Fail closed rather than fabricate a
@@ -218,6 +234,111 @@ pub struct LineageEvent {
     pub kind: String,
     pub ledger: LedgerPointer,
     pub summary: String,
+}
+
+/// A decoded ledger row as read back from persisted storage, projected to the
+/// fields lineage construction needs.
+///
+/// The caller (the server's live vault-scan adapter) decodes real persisted
+/// `ledger` column-family bytes into these rows — sequence, lower-hex entry hash
+/// (the chain pointer), stable kind label, resolved subject, and a summary. This
+/// crate never fabricates rows: it turns real scanned rows into a labeled
+/// lineage graph or refuses fail-closed when they are absent or incomplete.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LedgerScanRow {
+    /// Ledger sequence of the persisted row.
+    pub seq: u64,
+    /// Lower-hex of the persisted entry hash; the node's provenance pointer.
+    pub entry_hash: String,
+    /// Stable ledger entry kind label (e.g. `ingest`, `measure`, `guard`).
+    pub kind: String,
+    /// Subject the row is scoped to — the resolved symbol/series identity.
+    pub subject: String,
+    /// Human-readable summary of the event.
+    pub summary: String,
+}
+
+impl LedgerScanRow {
+    pub fn new(
+        seq: u64,
+        entry_hash: impl Into<String>,
+        kind: impl Into<String>,
+        subject: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            seq,
+            entry_hash: entry_hash.into(),
+            kind: kind.into(),
+            subject: subject.into(),
+            summary: summary.into(),
+        }
+    }
+}
+
+/// Builds a symbol's lineage from real persisted ledger rows scanned for that
+/// subject, ordering nodes by ledger sequence and stamping every node with its
+/// real ledger pointer (`seq` + persisted entry hash).
+///
+/// This is the honest core of `get_provenance(mode="lineage")`: the server's
+/// vault-scan adapter decodes the physical `ledger` CF and passes the rows here;
+/// the lineage graph is derived only from what was actually ledgered.
+///
+/// Fails **closed**, never fabricating an edge:
+/// - [`ASTRO_PROVENANCE_LINEAGE_EMPTY`] when no scanned row references `symbol_id`
+///   (an empty history would otherwise read as a verified, complete lineage of a
+///   symbol that was never ledgered);
+/// - [`ASTRO_PROVENANCE_LINEAGE_GAP`] when a scanned row is missing its entry
+///   hash (a node with no provenance pointer) or names a different subject than
+///   requested (a mis-scoped, invented edge).
+pub fn build_symbol_lineage(
+    symbol_id: &str,
+    rows: &[LedgerScanRow],
+) -> astrolabe_domain::Result<SymbolLineage> {
+    let mut scoped: Vec<&LedgerScanRow> = Vec::new();
+    for row in rows {
+        if row.subject != symbol_id {
+            return Err(astrolabe_domain::DomainError::new(
+                ASTRO_PROVENANCE_LINEAGE_GAP,
+                format!(
+                    "lineage scan for {symbol_id} contains a row scoped to a different subject {}",
+                    row.subject
+                ),
+                "scan and pass only the ledger rows whose subject resolves to the requested symbol; refusing rather than attaching a mis-scoped node",
+            ));
+        }
+        if row.entry_hash.trim().is_empty() {
+            return Err(astrolabe_domain::DomainError::new(
+                ASTRO_PROVENANCE_LINEAGE_GAP,
+                format!(
+                    "lineage row at seq {} for {symbol_id} is missing its entry-hash provenance pointer",
+                    row.seq
+                ),
+                "re-scan the ledger so every lineage node carries its persisted entry hash; refusing rather than inventing a hash-less edge",
+            ));
+        }
+        scoped.push(row);
+    }
+    if scoped.is_empty() {
+        return Err(astrolabe_domain::DomainError::new(
+            ASTRO_PROVENANCE_LINEAGE_EMPTY,
+            format!("no persisted ledger row references subject {symbol_id}"),
+            "index or import the symbol so its history is ledgered; refusing rather than returning an empty lineage that reads as verified",
+        ));
+    }
+    scoped.sort_by_key(|row| row.seq);
+    let versions = scoped
+        .into_iter()
+        .map(|row| LineageEvent {
+            kind: row.kind.clone(),
+            ledger: LedgerPointer::new(row.seq, row.entry_hash.clone()),
+            summary: row.summary.clone(),
+        })
+        .collect();
+    Ok(SymbolLineage {
+        symbol_id: symbol_id.to_string(),
+        versions,
+    })
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -516,6 +637,130 @@ pub fn verify_pack_manifest_claim(
         trust: "verified",
         provenance: store.ledger_head.clone(),
     })
+}
+
+/// Domain-separation tag mixed into the pack-manifest attestation digest so it
+/// can never collide with any other blake3 use in this crate.
+const ATTESTATION_DIGEST_DOMAIN: &[u8] = b"astrolabe:pack-manifest-attestation:v1";
+
+/// Canonical attestation digest binding every field of a pack manifest.
+///
+/// This is the content-address the blueprint's inter-agent trust model rests on
+/// (`pack_id = blake3(members ∪ hashes)`): a serving agent computes it over the
+/// manifest it hands out, and any change to `pack_id`, `ledger_ref`,
+/// `vault_fingerprint`, or `member_hash` flips the digest. Fields are length-
+/// prefixed so no two distinct manifests share a preimage.
+pub fn pack_manifest_attestation_digest(manifest: &PackManifest) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ATTESTATION_DIGEST_DOMAIN);
+    for field in [
+        manifest.pack_id.as_bytes(),
+        manifest.ledger_ref.chain_hash.as_bytes(),
+        manifest.vault_fingerprint.as_bytes(),
+        manifest.member_hash.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.update(&manifest.ledger_ref.seq.to_le_bytes());
+    hex_lower(hasher.finalize().as_bytes())
+}
+
+/// Serializes a pack manifest into a canonical, self-describing attestation
+/// envelope carrying its attestation digest.
+///
+/// This is the exact byte artifact a serving agent (agent A) hands to a
+/// verifying agent (agent B). It is line-oriented and deterministic so it round-
+/// trips byte-for-byte through persisted storage; the trailing `digest` line
+/// binds the four verified fields.
+pub fn pack_manifest_attestation_bytes(manifest: &PackManifest) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("schema=");
+    out.push_str(PACK_MANIFEST_ATTESTATION_SCHEMA);
+    out.push('\n');
+    out.push_str("pack_id=");
+    out.push_str(&manifest.pack_id);
+    out.push('\n');
+    out.push_str("ledger_seq=");
+    out.push_str(&manifest.ledger_ref.seq.to_string());
+    out.push('\n');
+    out.push_str("ledger_hash=");
+    out.push_str(&manifest.ledger_ref.chain_hash);
+    out.push('\n');
+    out.push_str("vault_fingerprint=");
+    out.push_str(&manifest.vault_fingerprint);
+    out.push('\n');
+    out.push_str("member_hash=");
+    out.push_str(&manifest.member_hash);
+    out.push('\n');
+    out.push_str("digest=");
+    out.push_str(&pack_manifest_attestation_digest(manifest));
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// Parses an attestation envelope and re-verifies its digest against the parsed
+/// fields, failing closed on any tamper.
+///
+/// A verifying agent reads back the persisted envelope bytes and calls this. A
+/// missing/duplicated field, an unparseable sequence, a wrong schema, or a
+/// digest that does not match the recomputed digest of the parsed fields all
+/// yield [`ASTRO_PROVENANCE_ATTESTATION_CORRUPT`]: the attested manifest is only
+/// returned when the bytes are internally self-consistent. Cross-checking the
+/// returned manifest against the serving vault is [`verify_pack_manifest_claim`].
+pub fn parse_pack_manifest_attestation(bytes: &[u8]) -> astrolabe_domain::Result<PackManifest> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| attestation_corrupt("envelope is not UTF-8"))?;
+    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            attestation_corrupt(format!("envelope line has no key=value: {line:?}"))
+        })?;
+        if fields.insert(key, value).is_some() {
+            return Err(attestation_corrupt(format!(
+                "duplicate envelope field {key}"
+            )));
+        }
+    }
+    let get = |key: &str| -> astrolabe_domain::Result<String> {
+        fields
+            .get(key)
+            .map(|value| (*value).to_string())
+            .ok_or_else(|| attestation_corrupt(format!("envelope is missing field {key}")))
+    };
+    if get("schema")? != PACK_MANIFEST_ATTESTATION_SCHEMA {
+        return Err(attestation_corrupt(
+            "envelope schema is not the attestation schema",
+        ));
+    }
+    let seq = get("ledger_seq")?
+        .parse::<u64>()
+        .map_err(|_| attestation_corrupt("envelope ledger_seq is not a valid sequence"))?;
+    let manifest = PackManifest {
+        pack_id: get("pack_id")?,
+        ledger_ref: LedgerPointer::new(seq, get("ledger_hash")?),
+        vault_fingerprint: get("vault_fingerprint")?,
+        member_hash: get("member_hash")?,
+    };
+    let recorded_digest = get("digest")?;
+    let recomputed = pack_manifest_attestation_digest(&manifest);
+    if recorded_digest != recomputed {
+        return Err(attestation_corrupt(format!(
+            "envelope attestation digest {recorded_digest} does not match recomputed digest {recomputed}"
+        )));
+    }
+    Ok(manifest)
+}
+
+fn attestation_corrupt(message: impl Into<String>) -> astrolabe_domain::DomainError {
+    astrolabe_domain::DomainError::new(
+        ASTRO_PROVENANCE_ATTESTATION_CORRUPT,
+        message.into(),
+        "discard the attestation artifact and re-fetch the manifest from the serving vault; refusing rather than trusting a self-inconsistent envelope",
+    )
 }
 
 /// The genesis chain hash that precedes the first ledger link.
@@ -1308,6 +1553,120 @@ mod tests {
         let text = String::from_utf8(readback).expect("utf8 provenance artifact");
         assert!(text.contains("warning\tunprovenanced"));
         assert!(text.contains("answer_trace\tanswer:incomplete"));
+    }
+
+    #[test]
+    fn build_symbol_lineage_orders_and_labels_nodes_then_refuses_gaps() {
+        // Rows arrive unsorted; the builder orders by seq and stamps each node
+        // with its real ledger pointer.
+        let rows = vec![
+            LedgerScanRow::new(
+                21,
+                "hash-21",
+                "measure",
+                "symbol:auth.login",
+                "metrics measured",
+            ),
+            LedgerScanRow::new(7, "hash-7", "ingest", "symbol:auth.login", "initial import"),
+            LedgerScanRow::new(14, "hash-14", "guard", "symbol:auth.login", "guard verdict"),
+        ];
+        let lineage = build_symbol_lineage("symbol:auth.login", &rows).expect("lineage");
+        assert_eq!(lineage.symbol_id, "symbol:auth.login");
+        let seqs: Vec<u64> = lineage
+            .versions
+            .iter()
+            .map(|event| event.ledger.seq)
+            .collect();
+        assert_eq!(seqs, vec![7, 14, 21], "nodes ordered by ledger seq");
+        for event in &lineage.versions {
+            assert!(
+                !event.ledger.chain_hash.is_empty(),
+                "every node carries its provenance pointer"
+            );
+        }
+
+        // Empty scan refuses rather than returning a verified-looking empty history.
+        let empty = build_symbol_lineage("symbol:missing", &[]).expect_err("empty refused");
+        assert_eq!(empty.code(), ASTRO_PROVENANCE_LINEAGE_EMPTY);
+        assert!(!empty.remediation().is_empty());
+
+        // A hash-less row is an invented edge: refuse.
+        let gap_rows = vec![LedgerScanRow::new(
+            7,
+            "",
+            "ingest",
+            "symbol:auth.login",
+            "import",
+        )];
+        let gap = build_symbol_lineage("symbol:auth.login", &gap_rows).expect_err("gap refused");
+        assert_eq!(gap.code(), ASTRO_PROVENANCE_LINEAGE_GAP);
+
+        // A mis-scoped row (different subject) is also refused.
+        let misscoped = vec![LedgerScanRow::new(
+            7,
+            "hash-7",
+            "ingest",
+            "symbol:other",
+            "import",
+        )];
+        let err = build_symbol_lineage("symbol:auth.login", &misscoped).expect_err("misscoped");
+        assert_eq!(err.code(), ASTRO_PROVENANCE_LINEAGE_GAP);
+    }
+
+    #[test]
+    fn pack_manifest_attestation_round_trips_byte_for_byte_and_tamper_fails_closed() {
+        let store = provenance_fixture();
+        let manifest = store.manifests.get("pack:auth").expect("manifest").clone();
+
+        // Agent A serializes the attestation envelope and persists it to disk.
+        let bytes = pack_manifest_attestation_bytes(&manifest);
+        let path =
+            std::env::temp_dir().join(format!("astrolabe-attestation-{}.txt", std::process::id()));
+        std::fs::write(&path, &bytes).expect("persist attestation");
+
+        // Agent B reads the persisted bytes back and parses+verifies the digest.
+        let readback = std::fs::read(&path).expect("read attestation");
+        assert_eq!(readback, bytes, "attestation round-trips byte-for-byte");
+        let parsed = parse_pack_manifest_attestation(&readback).expect("parse attestation");
+        assert_eq!(
+            parsed, manifest,
+            "parsed manifest equals the served manifest"
+        );
+
+        // Cross-check against the serving vault: verified.
+        let report = verify_pack_manifest_claim(&store, &parsed).expect("verify parsed manifest");
+        assert_eq!(report.trust, "verified");
+        assert_eq!(
+            report.verified_checks,
+            vec!["pack_id", "ledger_ref", "vault_fingerprint", "member_hash"]
+        );
+
+        // Byte-level tamper of the persisted envelope: flip a byte in the
+        // member_hash value; the recomputed digest no longer matches, so parse
+        // refuses fail-closed before any vault comparison.
+        let mut corrupt = readback.clone();
+        let member_pos = String::from_utf8(readback.clone())
+            .unwrap()
+            .find("members-auth")
+            .expect("member hash in envelope");
+        corrupt[member_pos] ^= 0x01;
+        let err = parse_pack_manifest_attestation(&corrupt).expect_err("tamper refused");
+        assert_eq!(err.code(), ASTRO_PROVENANCE_ATTESTATION_CORRUPT);
+        assert!(err.message().contains("digest"));
+
+        // A digest-consistent envelope whose fields simply do not match the
+        // serving vault is caught by the vault cross-check, naming the field.
+        let mut foreign = manifest.clone();
+        foreign.member_hash = "members-forged".to_string();
+        let foreign_bytes = pack_manifest_attestation_bytes(&foreign);
+        let foreign_parsed = parse_pack_manifest_attestation(&foreign_bytes)
+            .expect("self-consistent forgery parses");
+        let vault_err =
+            verify_pack_manifest_claim(&store, &foreign_parsed).expect_err("vault refuses forgery");
+        assert_eq!(vault_err.code(), ASTRO_PROVENANCE_MANIFEST_TAMPERED);
+        assert!(vault_err.message().contains("member_hash"));
+
+        std::fs::remove_file(&path).ok();
     }
 
     fn provenance_fixture() -> ProvenanceStore {

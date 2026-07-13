@@ -84,18 +84,66 @@ def validate(root: Path) -> list[str]:
     # #237: the sandbox-escape gate is only load-bearing if the aggregate both
     # runs its self-test AND brackets the build/test phase with snapshot->verify.
     require(check, "scripts/test-check-no-escape.py", "scripts/check.sh", errors)
+    # #278: the causal-attribution control proof must run every aggregate -- it is the
+    # standing guard that shared-root policing is by process tree, not name pattern.
+    require(check, "scripts/test-no-escape-attribution.py", "scripts/check.sh", errors)
+    # #281: the hook-budget measurement is min-of-N with per-trial correctness;
+    # its self-test must stay wired so a single-sample regression cannot return.
+    require(check, "scripts/test-check-hook-contracts.py", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py snapshot", "scripts/check.sh", errors)
     require(check, "scripts/check-no-escape.py verify", "scripts/check.sh", errors)
+    # #280: the standalone `cargo build --workspace` was dropped (cargo test
+    # --workspace builds a superset); the no-escape bracket now spans the test
+    # phase. The snapshot must still precede the test phase and the verify follow
+    # it, and a fail-closed binary-existence assertion must guard the dropped
+    # build so a missing bin is a hard error, never a silent skip.
     require_order(
         check,
         (
             "scripts/check-no-escape.py snapshot",
-            "build --workspace",
+            "scripts/check-workspace-tests.py",
             "scripts/check-no-escape.py verify",
         ),
         "scripts/check.sh",
         errors,
     )
+    require(check, "ASTRO_DEBUG_BINARY_MISSING", "scripts/check.sh", errors)
+    # #280: the gate-tooling self-tests are change-gated through this driver, and
+    # the fail-closed mechanism itself is proven by an unconditional meta-test.
+    require(check, "scripts/run-gate-selftests.py", "scripts/check.sh", errors)
+    require(check, "scripts/test-run-gate-selftests.py", "scripts/check.sh", errors)
+    # #280 + #264: the workspace-test phase runs the nextest `fast` profile.
+    # The >60s tests were DELETED (owner directive 2026-07-12: no individual
+    # test may exceed 60s), so fast == full workspace coverage; the doctests
+    # remain the one tiered omission, which check-release runs via
+    # ci-rust-gate.sh.
+    require(check, "--nextest-profile fast", "scripts/check.sh", errors)
+    require(check, "INFO[ASTRO_FAST_TIER_FULL_COVERAGE]", "scripts/check.sh", errors)
+    require(check, "SKIP[ASTRO_FAST_TIER_DOCTESTS]", "scripts/check.sh", errors)
+    # #280: the suite impact gate — no suite runs when no code change impacts
+    # it, and a green run must record its fingerprint. Both halves are
+    # load-bearing: should-run without record-green never skips; record-green
+    # without should-run skips nothing. The gate's own self-test must be wired.
+    require(
+        check,
+        "scripts/check-suite-impact.py should-run workspace-block",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "scripts/check-suite-impact.py record-green workspace-block",
+        "scripts/check.sh",
+        errors,
+    )
+    require(check, "scripts/test-check-suite-impact.py", "scripts/check.sh", errors)
+    # #280: the dropped `cargo build --workspace` is replaced by a targeted bin
+    # build (nextest may not build [[bin]] targets) plus the fail-closed assertion.
+    require(check, "build -p astrolabe-server --bins", "scripts/check.sh", errors)
+    # #264: ci-rust-gate.sh (the tier check-full runs) runs the full workspace
+    # nextest (every test, incl. the heavy pair) and the doctests.
+    require(rust_gate, "cargo nextest run --workspace", "scripts/ci-rust-gate.sh", errors)
+    require(rust_gate, "cargo test --workspace --doc", "scripts/ci-rust-gate.sh", errors)
     # #246: every path that RUNS workspace/Calyx tests must self-contain
     # std::env::temp_dir() to the run-scoped suite-tmp sandbox, so no invocation
     # leaks calyx-* / astrolabe-* scratch into the operator's real %TEMP%. The #237
@@ -141,13 +189,14 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
-    # #227/#228: shell-free CBM git spawn + validator mirror self-tests.
-    require(check, "scripts/test-cbm-spawn-patch.py", "scripts/check.sh", errors)
+    # #227/#228: shell-free CBM git spawn behavior FSV self-test.
     require(check, "scripts/test-cbm-spawn-fsv.py", "scripts/check.sh", errors)
-    # #240/#241: env-as-IPC lint gate + resolver-hardening overlay self-tests.
+    # #286: the absorbed-overlay source-guard test (worker-diag/env-store/spawn/
+    # shellarg/mem/ui-werror behaviors + the per-artifact ASTRO_* flag matrix).
+    require(check, "scripts/test-cbm-overlay-sources.py", "scripts/check.sh", errors)
+    # #240/#241: env-as-IPC lint gate + its self-test (real ban-list behavior).
     require(check, "scripts/check-cbm-env-contract.py", "scripts/check.sh", errors)
     require(check, "scripts/test-cbm-env-contract.py", "scripts/check.sh", errors)
-    require(check, "scripts/test-cbm-env-store-patch.py", "scripts/check.sh", errors)
     require(
         check,
         "scripts/test-egress-platform.py",
@@ -162,12 +211,6 @@ def validate(root: Path) -> list[str]:
     )
     require(
         check,
-        "scripts/test-verify-pins.py",
-        "scripts/check.sh",
-        errors,
-    )
-    require(
-        check,
         "scripts/test-cbm-skip-count.py",
         "scripts/check.sh",
         errors,
@@ -175,12 +218,6 @@ def validate(root: Path) -> list[str]:
     require(
         check,
         "scripts/test-cbm-lint-platform.py",
-        "scripts/check.sh",
-        errors,
-    )
-    require(
-        check,
-        "scripts/test-cbm-format-overlay.py",
         "scripts/check.sh",
         errors,
     )
@@ -214,9 +251,17 @@ def validate(root: Path) -> list[str]:
         "scripts/check.sh",
         errors,
     )
+    # #280: check.sh formats only workspace-local crates; the owned vendor/ tree
+    # is full-graph-formatted by the Rust gate below.
     require(
         check,
-        "scripts/native-cargo-fmt.py --all -- --check",
+        "scripts/native-cargo-fmt.py --all --workspace-only -- --check",
+        "scripts/check.sh",
+        errors,
+    )
+    require(
+        check,
+        "INFO[ASTRO_FMT_VENDOR_EXCLUDED]",
         "scripts/check.sh",
         errors,
     )
@@ -293,15 +338,31 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(check, "scripts/clean-target.sh", "scripts/check.sh", errors)
+    # #280: the self-isolated binary gates run concurrently in one gate_group
+    # (each must stay wired), while the ordering contract that remains is:
+    # lowered-parity collected before shadow-parity, egress after both, and
+    # the no-escape verify bracket last (checked separately above).
+    for member in (
+        "scripts/check-astrolabe-verify-chain.sh",
+        "scripts/check-single-mimalloc.sh",
+        "scripts/check-mcp-parity.sh",
+        "scripts/check-cli-parity.py",
+        "scripts/check-compat-shim.py",
+        "scripts/check-installer-roundtrip.py",
+        "scripts/check-hook-contracts.py",
+        "scripts/check-server-manifest.py",
+        "scripts/check-cross-process-vault.py",
+        "scripts/check-cross-process-servers.py",
+        "scripts/check-astrolabe-watchdog.sh",
+    ):
+        require(check, member, "scripts/check.sh", errors)
     require_order(
         check,
         (
             "scripts/check-lowered-parity.py",
-            "scripts/check-shadow-parity.py",
-            "scripts/check-cross-process-vault.py",
-            "scripts/check-cross-process-servers.py",
-            "scripts/check-astrolabe-watchdog.sh",
-            "scripts/check-egress-deny.py",
+            "gate lowered-parity -- lowered_parity_wait",
+            "scripts/check-shadow-parity.py --write-release-artifact",
+            "scripts/check-egress-deny.py --allow-unsupported-platform",
         ),
         "scripts/check.sh portable-before-egress order",
         errors,
@@ -313,17 +374,20 @@ def validate(root: Path) -> list[str]:
         errors,
     )
 
+    # #280: check-full is the sub-3-minute FULL TEST SUITE — the portable
+    # check.sh aggregate and the CBM C runtime suite, concurrent. The
+    # lint/doc/Calyx phases are tiered to check-release with counted labels.
     require_order(
         full,
         (
             "bash scripts/check.sh",
-            "bash scripts/ci-cbm-lint.sh",
             "bash scripts/ci-cbm-test.sh",
-            "bash scripts/ci-rust-gate.sh",
         ),
         "scripts/check-full.sh",
         errors,
     )
+    require(full, "SKIP[ASTRO_RELEASE_TIER_RUST_GATE]", "scripts/check-full.sh", errors)
+    require(full, "SKIP[ASTRO_RELEASE_TIER_CBM_LINT]", "scripts/check-full.sh", errors)
     require(full, "rustc -vV", "scripts/check-full.sh", errors)
     require(full, "ASTROLABE_RUST_TARGET", "scripts/check-full.sh", errors)
     require(full, 'HOST_TARGET" != "$RUSTC_HOST', "scripts/check-full.sh", errors)
@@ -341,6 +405,12 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(full, "scripts/clean-target.sh", "scripts/check-full.sh", errors)
+    # #280: check-release is the tier that defeats BOTH fail-closed fast-path
+    # gates — the suite impact gate and the self-test change-gate — so nothing
+    # is permanently skippable: every suite and every self-test has a durable
+    # forced caller.
+    require(release, "export ASTRO_GATE_SELFTESTS=all", "scripts/check-release.sh", errors)
+    require(release, "export ASTRO_SUITE_GATE=all", "scripts/check-release.sh", errors)
     # #193: the C phases run concurrently. That is only safe to keep if a failure
     # in ANY phase still fails the aggregate with its phase named, and if every
     # started phase is waited on before cleanup. Both are load-bearing.
@@ -376,9 +446,9 @@ def validate(root: Path) -> list[str]:
         errors,
     )
     require(
-        full,
+        release,
         'bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"',
-        "scripts/check-full.sh",
+        "scripts/check-release.sh",
         errors,
     )
     require(
@@ -454,6 +524,34 @@ def validate(root: Path) -> list[str]:
         "scripts/ci-cbm-test.sh store hermeticity order",
         errors,
     )
+    # #280: the CBM suite is impact-gated (fail-closed) and records its green
+    # fingerprint only after every count/hermeticity check passed; the runtime
+    # itself is the sharded runner with the incremental (premise-stamped) build.
+    require(
+        cbm_test,
+        "scripts/check-suite-impact.py\" should-run cbm-c-suite",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    require(
+        cbm_test,
+        "scripts/check-suite-impact.py\" record-green cbm-c-suite",
+        "scripts/ci-cbm-test.sh",
+        errors,
+    )
+    cbm_test_sh = read(root, "vendor/codebase-memory-mcp/scripts/test.sh", errors)
+    require(
+        cbm_test_sh,
+        "scripts/test-shards.sh",
+        "vendor/codebase-memory-mcp/scripts/test.sh",
+        errors,
+    )
+    require(
+        cbm_test_sh,
+        "INFO[CBM_INCREMENTAL_BUILD]",
+        "vendor/codebase-memory-mcp/scripts/test.sh",
+        errors,
+    )
     require(
         cbm_test,
         'CC_BIN="${2//\\\\//}"',
@@ -499,7 +597,7 @@ def validate(root: Path) -> list[str]:
     )
     require(
         cbm_lint,
-        "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+        "INFO[ASTRO_CBM_FORMAT]",
         "scripts/ci-cbm-lint.sh",
         errors,
     )
@@ -520,11 +618,24 @@ def validate(root: Path) -> list[str]:
         release,
         (
             "bash scripts/check-full.sh",
+            "bash scripts/ci-cbm-lint.sh",
+            "bash scripts/ci-rust-gate.sh",
             "cargo build --workspace --release",
             "scripts/check-binary-size.py",
+            # #291: failpoint-string scan runs on the freshly built release
+            # binaries, after the size gate and before the release predicate.
+            "scripts/check-release-failpoint-strings.py",
             "scripts/release-predicate.sh",
         ),
         "scripts/check-release.sh",
+        errors,
+    )
+    # #291: the failpoint-string gate's self-test must stay wired into the
+    # change-gated Tier-1 self-test block so the gate itself is proven fail-closed.
+    require(
+        check,
+        "scripts/test-check-release-failpoint-strings.py",
+        "scripts/check.sh",
         errors,
     )
     require(release, "scripts/clean-target.sh", "scripts/check-release.sh", errors)
@@ -559,10 +670,11 @@ def validate(root: Path) -> list[str]:
         errors,
     )
 
-    # No hosted CI exists to validate (banned; #224). The row-sink overhead
-    # benchmark lost its scheduled CI caller with the workflow's removal;
-    # scripts/bench-row-sink-overhead.sh remains locally runnable and its
-    # coverage gap is tracked on #224.
+    # No hosted CI exists to validate (banned; the CI-ownership retirement landed
+    # with #224, now closed). The row-sink overhead benchmark lost its scheduled
+    # caller with that removal; scripts/bench-row-sink-overhead.sh remains locally
+    # runnable, but its lack of a scheduled cadence caller post-CI-ban is an
+    # evidence-owner gap recorded on #238 (the live register), not on a closed issue.
 
     return errors
 

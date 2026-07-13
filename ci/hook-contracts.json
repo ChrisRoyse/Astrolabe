@@ -1,6 +1,7 @@
 {
   "schema": "astrolabe.hook_contracts.v1",
   "budget_ms": 300,
+  "budget_trials": 5,
   "timeout_exit_ceiling_ms": 900,
   "hooks": [
     {

@@ -5,6 +5,9 @@
  */
 #include "platform.h"
 
+#ifdef ASTRO_ENV_STORE
+#include "env_store_config.h"
+#endif
 #include "foundation/constants.h"
 #include <fcntl.h>
 #include <stdint.h>
@@ -303,20 +306,55 @@ extern char **environ;
 #define CBM_ENVIRON environ
 #endif
 
+#ifdef ASTRO_ENV_STORE
+/* Copy an environment value into the caller's buffer, refusing to truncate.
+ *
+ * #241: the vendored implementation discarded snprintf's return value, so a value
+ * longer than the caller's buffer was silently cut and the library then resolved a
+ * DIFFERENT path than the one configured — a store nobody asked for, with no error.
+ * A truncated value is never a usable answer here, so truncation is detected
+ * (snprintf returns the length it WOULD have written), the buffer is emptied so no
+ * partial value can escape, a {code, message, remediation} fault is published, and
+ * the read fails closed. */
+static const char *cbm_astro_copy_env_value(const char *name, const char *value, char *buf,
+                                            size_t buf_sz) {
+    int written = snprintf(buf, buf_sz, "%s", value);
+    if (written < 0 || (size_t)written >= buf_sz) {
+        buf[0] = '\0';
+        cbm_astro_env_record_truncation(name, strlen(value), buf_sz);
+        return NULL;
+    }
+    return buf;
+}
+
+#endif
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+#ifdef ASTRO_ENV_STORE
+    if (!name || !buf || buf_sz == 0) {
+        return NULL;
+    }
+#endif
     char **env = CBM_ENVIRON;
     if (env) {
         size_t nlen = strlen(name);
         for (; *env; env++) {
             if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
+#ifdef ASTRO_ENV_STORE
+                return cbm_astro_copy_env_value(name, *env + nlen + SKIP_ONE, buf, buf_sz);
+#else
                 snprintf(buf, buf_sz, "%s", *env + nlen + SKIP_ONE);
                 return buf;
+#endif
             }
         }
     }
     if (fallback) {
+#ifdef ASTRO_ENV_STORE
+        return cbm_astro_copy_env_value(name, fallback, buf, buf_sz);
+#else
         snprintf(buf, buf_sz, "%s", fallback);
         return buf;
+#endif
     }
     buf[0] = '\0';
     return NULL;
@@ -326,7 +364,11 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
 
 const char *cbm_get_home_dir(void) {
     static char buf[CBM_SZ_1K];
+#ifdef ASTRO_ENV_STORE
+    char tmp[CBM_SZ_1K] = "";
+#else
     char tmp[CBM_SZ_256] = "";
+#endif
 
     cbm_safe_getenv("HOME", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
@@ -348,7 +390,11 @@ const char *cbm_get_home_dir(void) {
 
 const char *cbm_app_config_dir(void) {
     static char buf[CBM_SZ_1K];
+#ifdef ASTRO_ENV_STORE
+    char tmp[CBM_SZ_1K] = "";
+#else
     char tmp[CBM_SZ_256] = "";
+#endif
 #ifdef _WIN32
     cbm_safe_getenv("APPDATA", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
@@ -381,7 +427,11 @@ const char *cbm_app_config_dir(void) {
 const char *cbm_app_local_dir(void) {
 #ifdef _WIN32
     static char buf[CBM_SZ_1K];
+#ifdef ASTRO_ENV_STORE
+    char tmp[CBM_SZ_1K] = "";
+#else
     char tmp[CBM_SZ_256] = "";
+#endif
     cbm_safe_getenv("LOCALAPPDATA", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
         snprintf(buf, sizeof(buf), "%s", tmp);
@@ -403,8 +453,35 @@ const char *cbm_app_local_dir(void) {
 
 const char *cbm_resolve_cache_dir(void) {
     static char buf[CBM_SZ_1K];
+#ifdef ASTRO_ENV_STORE
+    char tmp[CBM_SZ_1K] = "";
+
+    /* #240: explicit configuration wins, and it is the only mechanism that works
+     * from the Rust host. `std::env::set_var` writes the Win32 environment block;
+     * CBM_ENVIRON above is the C runtime's array. Windows keeps those two stores
+     * in sync only for the environment the process INHERITED, so a runtime env
+     * mutation is invisible here and CBM would resolve the home store instead —
+     * silently. The host therefore passes the store across the FFI boundary as a
+     * parameter (cbm_astro_set_cache_dir), not as an environment variable. */
+    const char *override_dir = cbm_astro_cache_dir_override();
+    if (override_dir) {
+        snprintf(buf, sizeof(buf), "%s", override_dir);
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+
+#else
     char tmp[CBM_SZ_256] = "";
+#endif
     cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
+#ifdef ASTRO_ENV_STORE
+    /* #241: an unreadable CBM_CACHE_DIR must NOT fall through to the home store.
+     * Falling through is exactly how a configured store silently relocates into
+     * the operator's profile (#194). Refuse; the fault is already published. */
+    if (cbm_astro_env_faulted_for("CBM_CACHE_DIR")) {
+        return NULL;
+    }
+#endif
     if (tmp[0]) {
         snprintf(buf, sizeof(buf), "%s", tmp);
         cbm_normalize_path_sep(buf);
@@ -412,8 +489,19 @@ const char *cbm_resolve_cache_dir(void) {
     }
     const char *home = cbm_get_home_dir();
     if (!home) {
+#ifdef ASTRO_ENV_STORE
+        cbm_astro_env_record_unresolvable_store();
+#endif
         return NULL;
     }
+#ifdef ASTRO_ENV_STORE
+    int written = snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
+    if (written < 0 || (size_t)written >= sizeof(buf)) {
+        cbm_astro_env_record_truncation("HOME", (size_t)(written < 0 ? 0 : written), sizeof(buf));
+        return NULL;
+    }
+#else
     snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
+#endif
     return buf;
 }

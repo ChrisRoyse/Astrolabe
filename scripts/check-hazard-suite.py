@@ -112,6 +112,25 @@ def main() -> int:
         print(f"hazard suite manifest verified: {len(checked)} tests (no execution requested)")
         return 0
 
+    artifact_dir = Path(args.artifact_dir)
+    release_name = manifest["release_artifact"]
+
+    # #60/#88 fail-closed sentinel. Before executing a single test, atomically
+    # replace whatever artifact a prior run left with an explicit non-"pass"
+    # status. Two false-green paths close here:
+    #   * A run that begins and then dies mid-suite -- process kill, power loss,
+    #     or a test that hangs and never returns -- would otherwise leave the
+    #     PREVIOUS run's "pass" on disk. The predicate binds artifacts to HEAD
+    #     and a freshness window, so a same-commit re-run inside that window
+    #     could replay that stale green. After this write, an interrupted run
+    #     leaves "incomplete", never "pass".
+    #   * A definitively failed/ambiguous test aborts via fail() below without
+    #     overwriting this sentinel, so the artifact still reads non-"pass".
+    # release-predicate.py treats any non-pass/non-waived status as a failed
+    # conjunct, so neither path can be mistaken for a proven suite.
+    write_incomplete_sentinel(artifact_dir, release_name, manifest, checked, root)
+    _selftest_pause_after_sentinel()
+
     executed, skipped = execute_suite(root, args, manifest["tests"])
     if not executed:
         fail(
@@ -138,18 +157,83 @@ def main() -> int:
             "cargo test and required exactly one passing, non-ignored test per entry"
         ),
     }
-    write_artifact(Path(args.artifact_dir), manifest["release_artifact"], artifact, root)
+    write_artifact(artifact_dir, release_name, artifact, root)
 
     for entry in skipped:
         print(
             f"SKIP[{PLATFORM_SKIP}]: {entry['id']} declares target_os="
             f"{entry['target_os']} and did not run on {host_os()}"
         )
+    if skipped:
+        # A target_os-gated hazard test is non-Windows coverage: deferred to the
+        # port phase (Windows-only scope, owner directive 2026-07-11), never a CI
+        # job and never passing evidence. Tracked in #238 so the deferral is
+        # labeled and counted, not silently absorbed into a Windows-green run.
+        print(
+            "DEFERRED[ASTRO_PORT_PHASE]: the platform-skipped hazard test(s) above are "
+            "deferred to the port phase; tracked in #238. Not passing evidence; "
+            "no CI job owns it."
+        )
     print(
         f"hazard suite executed: {len(executed)} tests passed, "
         f"{len(skipped)} skipped (platform), {len(checked)} in manifest"
     )
     return 0
+
+
+def write_incomplete_sentinel(
+    artifact_dir: Path,
+    filename: str,
+    manifest: dict[str, Any],
+    checked: list[dict[str, Any]],
+    root: Path,
+) -> None:
+    """Stamp an explicit non-"pass" artifact before any test executes (#60/#88).
+
+    This is deliberately written *up front* -- the one case where writing before
+    the work is correct, because its status is the opposite of a false-green: it
+    fails the release predicate closed. It is overwritten with the "pass" artifact
+    only after every host-eligible test has actually passed.
+    """
+    write_artifact(
+        artifact_dir,
+        filename,
+        {
+            "schema": "astrolabe.verify_chain_soak.v1",
+            "status": "incomplete",
+            "reason": (
+                "hazard suite execution started but has not completed; a persisting "
+                "'incomplete' status means the run died mid-suite (crash, kill, hang) "
+                "or a test failed, and the suite proved nothing"
+            ),
+            "source": "scripts/check-hazard-suite.py",
+            "release_predicate_key": manifest["release_predicate_key"],
+            "cadence": manifest["cadence"],
+            "checked_tests": checked,
+            "host_os": host_os(),
+        },
+        root,
+    )
+
+
+def _selftest_pause_after_sentinel() -> None:
+    """Deterministic mid-run-death hook for scripts/test-check-hazard-suite.py.
+
+    Inert in production: without ASTROLABE_HAZARD_SELFTEST_PAUSE_AFTER_SENTINEL the
+    gate returns immediately. When that variable names a path, the gate has just
+    written its "incomplete" sentinel; it touches that path (so the self-test knows
+    the sentinel is on disk) and then blocks forever, with no cargo child yet
+    spawned. The self-test kills it here to reproduce a process that dies AFTER the
+    sentinel is written but BEFORE the suite completes, and proves the artifact left
+    behind is "incomplete", never a stale "pass". This mirrors the env-gated crash
+    failpoints the Calyx vault uses for its own crash-FSV tests.
+    """
+    ready = os.environ.get("ASTROLABE_HAZARD_SELFTEST_PAUSE_AFTER_SENTINEL")
+    if not ready:
+        return
+    Path(ready).write_text("paused\n", encoding="utf-8")
+    while True:
+        time.sleep(3600)
 
 
 def load_manifest(manifest_path: Path) -> dict[str, Any]:

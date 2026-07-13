@@ -72,7 +72,7 @@ fn issue815_nonce_envelope_fsv() {
         "wrong_aad_code": wrong_aad.code,
         "truncated_code": truncated.code,
         "paths": {
-            "root": root,
+            "root": root.display().to_string(),
             "first": first_path,
             "second": second_path,
             "empty": empty_path,
@@ -84,9 +84,9 @@ fn issue815_nonce_envelope_fsv() {
     )
     .unwrap();
 
-    if !preserve {
-        fs::remove_dir_all(&root).unwrap();
-    }
+    // #260: `root` is an RAII ScratchDir — an unset CALYX_FSV_ROOT self-cleans on
+    // drop (incl. panic); a configured root (`preserve`) is kept for inspection.
+    let _ = preserve;
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

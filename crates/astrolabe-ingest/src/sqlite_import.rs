@@ -3341,6 +3341,51 @@ pub struct InjectedNodeFault {
     pub properties_json: String,
 }
 
+/// Resolves outcome subjects to current constellation ids from the node map.
+///
+/// Reads every `astrolabe:node-map:v2` row of `project` from the vault Graph CF
+/// and returns a `qualified_name -> cx_id` map, so the `anchor_outcome` tool can
+/// bind an outcome subject id (a symbol / test-case qualified name) to the
+/// constellation id to anchor. A qualified name carried by more than one node
+/// with differing `cx_id`s is ambiguous and is left out of the map, so the
+/// caller accounts it as an unresolved subject (counted, never a silent guess)
+/// rather than anchoring to a guessed constellation.
+pub fn read_node_map_cx_ids<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> IngestResult<BTreeMap<String, CxId>>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    let mut resolved: BTreeMap<String, CxId> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
+        if row.project != project {
+            continue;
+        }
+        if row.schema != SCHEMA_NODE_MAP {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} has wrong schema {}",
+                row.node_id, row.schema
+            )));
+        }
+        match resolved.get(&row.qualified_name) {
+            Some(existing) if *existing == row.cx_id => {}
+            Some(_) => {
+                ambiguous.insert(row.qualified_name.clone());
+            }
+            None => {
+                resolved.insert(row.qualified_name.clone(), row.cx_id);
+            }
+        }
+    }
+    for name in &ambiguous {
+        resolved.remove(name);
+    }
+    Ok(resolved)
+}
+
 /// Deliberately perturbs one persisted node-map row's properties in the vault.
 ///
 /// Exists solely for the L2 shadow-parity harness (#19): it proves the parity
@@ -3996,6 +4041,10 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::{
+        ASTRO_ERASURE_SCRUB_BATCH_INVALID, ASTRO_ERASURE_SCRUB_NOT_DURABLE,
+        WAL_SCRUB_LEDGER_SCHEMA, WalScrubParams, scrub_erased_wal_history, wal_scrub_status,
+    };
     use astrolabe_domain::{
         ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
         ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE,
@@ -5046,6 +5095,269 @@ mod tests {
         );
     }
 
+    // ---- Streaming row-sink vault writer (#59) FSV ----
+
+    fn row_stream(
+        snapshot: &CbmGraphSnapshot,
+    ) -> Vec<IngestResult<crate::row_sink_stream::RowSinkStreamRow>> {
+        use crate::row_sink_stream::RowSinkStreamRow;
+        let mut rows = Vec::new();
+        for node in &snapshot.nodes {
+            rows.push(Ok(RowSinkStreamRow::Node(node.clone())));
+        }
+        for edge in &snapshot.edges {
+            rows.push(Ok(RowSinkStreamRow::Edge(edge.clone())));
+        }
+        rows
+    }
+
+    #[test]
+    fn streaming_row_sink_import_matches_sqlite_import_raw_cfs() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        let path = temp_db("row-sink-stream-edges");
+        edge_fixture(&path);
+        let sqlite_vault = vault();
+        let stream_vault = vault();
+        let fingerprint = sqlite_fingerprint(&path);
+
+        let sqlite = import_sqlite_to_vault(&path, &sqlite_vault, &FixtureSlotRuntime, &options(1))
+            .expect("sqlite import");
+        let snapshot = edge_snapshot();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("streaming row-sink import");
+
+        // The streaming import report is identical to the SQLite import report, and
+        // the persisted Base/Graph/Ledger/slot CF bytes are byte-for-byte identical
+        // (transitively equal to the direct-writer parity proof).
+        assert_eq!(report.import, sqlite);
+        assert_eq!(report.stream_nodes, snapshot.nodes.len());
+        assert_eq!(report.stream_edges, snapshot.edges.len());
+        // Default drain batch (1024 rows) holds the 7-row fixture in one batch.
+        assert_eq!(report.drain_batches, 1);
+        assert_import_cfs_match_raw(&stream_vault, &sqlite_vault);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn streaming_row_sink_batch_knob_does_not_change_persisted_bytes() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        let snapshot = edge_snapshot();
+        let fingerprint = [7_u8; 32];
+
+        // Default single-batch drain.
+        let default_vault = vault();
+        let default_report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &default_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("default-batch streaming import");
+        assert_eq!(default_report.drain_batches, 1);
+
+        // Small drain batch (2 rows) splits the 7-row stream into 4 backpressure
+        // batches, but persistence is still one ledger-paired write.
+        let batched_vault = vault();
+        let batched_report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::with_drain_batch_rows(2).expect("2 is in bounds"),
+            &batched_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("small-batch streaming import");
+        assert_eq!(batched_report.drain_batch_rows, 2);
+        assert_eq!(batched_report.drain_batches, 4);
+
+        // The drain-batch knob is a backpressure window only: the persisted CF bytes
+        // and the import report are identical across batch sizes.
+        assert_eq!(default_report.import, batched_report.import);
+        assert_import_cfs_match_raw(&batched_vault, &default_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_empty_stream_refuses_without_persisting() {
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+        };
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+        let empty: Vec<IngestResult<RowSinkStreamRow>> = Vec::new();
+        let err = import_cbm_row_stream_to_vault(
+            [0; 32],
+            empty,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("empty stream must refuse");
+
+        // Fail-closed with a stable code; nothing is persisted.
+        assert_eq!(err.code(), Some(ASTRO_INGEST_SQLITE_INVALID));
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
+    #[test]
+    fn streaming_row_sink_single_row_stream_imports_one_constellation() {
+        use crate::row_sink_stream::{RowSinkStreamParams, import_cbm_row_stream_to_vault};
+        // Single-node stream (no edges).
+        let mut snapshot = edge_snapshot();
+        snapshot.nodes.truncate(1);
+        snapshot.edges.clear();
+        let fingerprint = [3_u8; 32];
+
+        let stream_vault = vault();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("single-row streaming import");
+        assert_eq!(report.stream_nodes, 1);
+        assert_eq!(report.stream_edges, 0);
+        assert_eq!(report.import.constellation_inputs, 1);
+
+        // Byte-identical to the direct writer for the same single-row snapshot.
+        let direct_vault = vault();
+        import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            fingerprint,
+            &direct_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("direct single-row import");
+        assert_import_cfs_match_raw(&stream_vault, &direct_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_out_of_order_stream_matches_ordered_stream() {
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let fingerprint = [5_u8; 32];
+
+        // Ordered: nodes ascending, then edges.
+        let ordered_vault = vault();
+        import_cbm_row_stream_to_vault(
+            fingerprint,
+            row_stream(&snapshot),
+            &RowSinkStreamParams::from_registry(),
+            &ordered_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("ordered streaming import");
+
+        // Out-of-order: edges first, then nodes reversed. The importer re-sorts on
+        // stable keys, so the persisted bytes must be identical.
+        let mut shuffled: Vec<IngestResult<RowSinkStreamRow>> = Vec::new();
+        for edge in snapshot.edges.iter().rev() {
+            shuffled.push(Ok(RowSinkStreamRow::Edge(edge.clone())));
+        }
+        for node in snapshot.nodes.iter().rev() {
+            shuffled.push(Ok(RowSinkStreamRow::Node(node.clone())));
+        }
+        let shuffled_vault = vault();
+        import_cbm_row_stream_to_vault(
+            fingerprint,
+            shuffled,
+            &RowSinkStreamParams::from_registry(),
+            &shuffled_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("out-of-order streaming import");
+
+        assert_import_cfs_match_raw(&shuffled_vault, &ordered_vault);
+    }
+
+    #[test]
+    fn streaming_row_sink_tampered_row_fails_closed_without_persisting() {
+        use crate::row_sink_stream::{
+            ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams, RowSinkStreamRow,
+            import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+
+        // Tamper the second streamed row (a node) with invalid properties JSON.
+        let mut rows = row_stream(&snapshot);
+        let mut tampered = snapshot.nodes[1].clone();
+        tampered.properties_json = "{not valid json".to_string();
+        rows[1] = Ok(RowSinkStreamRow::Node(tampered));
+
+        let err = import_cbm_row_stream_to_vault(
+            [1; 32],
+            rows,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("tampered row must fail closed");
+
+        assert_eq!(err.code(), Some(ASTRO_ROW_SINK_STREAM_ROW_REFUSED));
+        assert!(
+            err.to_string().contains("nothing persisted"),
+            "refusal must state nothing persisted: {err}"
+        );
+        // FSV: no partial batch persisted — the vault is byte-for-byte untouched.
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
+    #[test]
+    fn streaming_row_sink_error_item_fails_closed_without_persisting() {
+        use crate::row_sink_stream::{
+            ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams, import_cbm_row_stream_to_vault,
+        };
+        let snapshot = edge_snapshot();
+        let stream_vault = vault();
+        let before_seq = stream_vault.latest_seq();
+
+        // A mid-stream Err (the #123 independent row-sink failure) refuses the whole
+        // import; the completed rows before it are not persisted.
+        let mut rows = row_stream(&snapshot);
+        rows[2] = Err(invalid_sqlite("simulated mid-stream row-sink failure"));
+
+        let err = import_cbm_row_stream_to_vault(
+            [1; 32],
+            rows,
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect_err("mid-stream error must fail closed");
+
+        assert_eq!(err.code(), Some(ASTRO_ROW_SINK_STREAM_ROW_REFUSED));
+        assert!(
+            err.to_string().contains("yielded an error"),
+            "refusal must name the stream error: {err}"
+        );
+        assert_eq!(stream_vault.latest_seq(), before_seq);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 0);
+    }
+
     #[test]
     fn full_edge_vocabulary_imports_with_golden_priors() {
         let path = temp_db("edge-vocabulary");
@@ -5393,6 +5705,362 @@ mod tests {
 
         fs::remove_file(path).ok();
         fs::remove_dir_all(vault_dir).ok();
+    }
+
+    /// Distinctive ASCII marker embedded in an erased symbol's source content.
+    ///
+    /// It is plain ASCII (never a long hex token) so the ledger secret hook does
+    /// not false-positive on the scrub-audit payload, and it is long/unique
+    /// enough that a raw byte-grep of the vault cannot hit it by coincidence.
+    const WAL_SCRUB_MARKER: &str = "wal_scrub_ph61_marker_zeta_unique";
+
+    /// Fixture with one marker-bearing symbol and one benign neighbour.
+    fn marker_fixture(path: &Path, marker: &str) {
+        let connection = create_db(path);
+        let erased = insert_node(
+            &connection,
+            "Function",
+            "alpha",
+            "demo.mod.alpha",
+            "src/mod.rs",
+            10,
+            14,
+            &format!(
+                r#"{{"language":"rust","source_snippet":"fn alpha() {{ let s = \"{marker}\"; }}","signature":"fn alpha()"}}"#
+            ),
+        );
+        let neighbour = insert_node(
+            &connection,
+            "Function",
+            "beta",
+            "demo.mod.beta",
+            "src/mod.rs",
+            20,
+            24,
+            r#"{"language":"rust","source_snippet":"fn beta() { 1 }","signature":"fn beta()"}"#,
+        );
+        insert_node(
+            &connection,
+            "Project",
+            "demo",
+            "demo",
+            "",
+            0,
+            0,
+            r#"{"source_snippet":"demo project"}"#,
+        );
+        insert_edge(&connection, erased, neighbour, "CALLS", "{}");
+    }
+
+    /// The single imported Cx whose persisted node-map row carries `marker`.
+    ///
+    /// The marker lives in the symbol's `source_snippet`, which the importer
+    /// persists verbatim in the Graph CF node-map row's `properties_json`; this
+    /// scans those rows so the erased Cx is identified from real persisted bytes.
+    fn find_marker_cx<C>(vault: &AsterVault<C>, marker: &str) -> CxId
+    where
+        C: Clock,
+    {
+        let snapshot = vault.latest_seq();
+        let mut found = None;
+        for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)
+            .expect("read node-map rows for marker check")
+        {
+            let carries = row
+                .properties_json
+                .as_deref()
+                .is_some_and(|json| json.contains(marker))
+                || row.qualified_name.contains(marker);
+            if carries {
+                assert!(
+                    found.replace(row.cx_id).is_none(),
+                    "marker must map to exactly one imported Cx"
+                );
+            }
+        }
+        found.expect("one imported node-map row must carry the marker")
+    }
+
+    fn bytes_window_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    /// Every physical file under `root` whose bytes contain `needle`.
+    fn path_tree_marker_hits(root: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+        if needle.is_empty() || !root.exists() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let metadata = fs::metadata(&path).expect("metadata during byte sweep");
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path).expect("read dir during byte sweep") {
+                    stack.push(entry.expect("dir entry").path());
+                }
+            } else if metadata.is_file() {
+                let bytes = fs::read(&path).expect("read file during byte sweep");
+                if bytes_window_contains(&bytes, needle) {
+                    hits.push(path);
+                }
+            }
+        }
+        hits.sort();
+        hits
+    }
+
+    fn hit_is_under_wal(root: &Path, path: &Path) -> bool {
+        path.strip_prefix(root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| component.as_os_str() == "wal")
+    }
+
+    fn erasure_context<C>(vault: &AsterVault<C>) -> VaultContext
+    where
+        C: Clock,
+    {
+        VaultContext::new(
+            vault.vault_id(),
+            b"astrolabe-ingest-wal-scrub-fsv",
+            QuotaConfig::default(),
+            "astrolabe-ingest-test",
+        )
+        .expect("create erasure context")
+    }
+
+    // FSV for #61 (P9.3): the WAL-recycler / full-physical-history erasure
+    // policy. Tombstoning + compaction removes erased plaintext from the SST
+    // tier, but the write-ahead log physically retains the original append
+    // records. This proves the checkpoint-then-truncate scrub drives the erased
+    // marker out of EVERY physical file of the store, keeps the tombstone and the
+    // paired scrub-audit ledger rows, and leaves the non-erased neighbour intact.
+    #[test]
+    fn erasure_scrub_removes_erased_plaintext_from_wal() {
+        let path = temp_db("wal-scrub");
+        marker_fixture(&path, WAL_SCRUB_MARKER);
+        let (vault_dir, vault) = durable_vault("wal-scrub");
+        let vault_path: std::path::PathBuf = vault_dir.to_path_buf();
+
+        import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import marker fixture");
+        vault.flush().expect("flush import");
+
+        // Predict: exactly one imported Cx physically carries the marker bytes.
+        let erased_cx = find_marker_cx(&vault, WAL_SCRUB_MARKER);
+        let neighbour_cx =
+            read_graph_rows::<_, NodeMapRow>(&vault, vault.latest_seq(), NODE_MAP_PREFIX)
+                .expect("read node-map rows for neighbour")
+                .into_iter()
+                .map(|row| row.cx_id)
+                .find(|cx| *cx != erased_cx)
+                .expect("a non-erased neighbour Cx must exist");
+
+        // The marker is physically present on disk before erasure.
+        assert!(
+            !path_tree_marker_hits(&vault_path, WAL_SCRUB_MARKER.as_bytes()).is_empty(),
+            "marker must be present in the durable vault before erasure"
+        );
+
+        // Lawful erasure: tombstone + compaction removes it from the SST tier.
+        let mut context = erasure_context(&vault);
+        let erase = vault
+            .erase(
+                EraseScope::Cx(erased_cx),
+                &mut context,
+                &EraseRegistry::new(),
+            )
+            .expect("erase marker cx");
+        assert_eq!(erase.records_deleted, 1);
+        assert!(context.is_key_shredded_for_erasure());
+        crate::erase_imported_cx_graph_rows(&vault, "demo", erased_cx).expect("erase graph rows");
+        vault.flush().expect("flush post-erasure");
+
+        // Precondition (the gap this scrub closes): after full erasure the ONLY
+        // physical files still holding the marker are WAL segments — the exact
+        // "old content may remain in the WAL file" hazard from SQLite.
+        let pre_scrub_hits = path_tree_marker_hits(&vault_path, WAL_SCRUB_MARKER.as_bytes());
+        assert!(
+            !pre_scrub_hits.is_empty(),
+            "expected the WAL to still retain the marker before the scrub"
+        );
+        assert!(
+            pre_scrub_hits
+                .iter()
+                .all(|hit| hit_is_under_wal(&vault_path, hit)),
+            "non-WAL files retained the erased marker after tombstone+compaction: {pre_scrub_hits:?}"
+        );
+
+        // Crash-before-scrub honesty: status must REPORT the WAL as non-quiescent
+        // (marker may persist) — never a silent "erased" claim.
+        let status = wal_scrub_status(&vault_path).expect("wal status before scrub");
+        assert!(
+            !status.is_wal_quiescent(),
+            "pre-scrub WAL must be reported non-quiescent, not silently clean"
+        );
+        assert!(status.wal_bytes > 0);
+
+        // Run the scrub. It consumes the vault and drops it before touching WAL.
+        let params = WalScrubParams::from_registry();
+        let scrub = scrub_erased_wal_history(
+            vault,
+            &vault_path,
+            &params,
+            SubjectId::Cx(erased_cx),
+            ActorId::Service("astrolabe-ingest-test".to_string()),
+        )
+        .expect("scrub erased wal history");
+        assert!(scrub.wal_segments_scrubbed >= 1);
+        assert!(scrub.wal_bytes_reclaimed > 0);
+        assert!(
+            scrub.wal_is_quiescent(),
+            "scrub must leave the WAL at zero bytes"
+        );
+
+        // CORE DELIVERABLE: raw byte-grep of every physical file — zero marker.
+        let post_scrub_hits = path_tree_marker_hits(&vault_path, WAL_SCRUB_MARKER.as_bytes());
+        assert!(
+            post_scrub_hits.is_empty(),
+            "erased marker still present on disk after scrub: {post_scrub_hits:?}"
+        );
+        assert!(
+            wal_scrub_status(&vault_path)
+                .expect("wal status after scrub")
+                .is_wal_quiescent()
+        );
+
+        // Reopen cold and read back persisted state from the SST tier.
+        let reopened = AsterVault::new_durable_with_clock(
+            &vault_path,
+            TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+            b"astrolabe-ingest-test".to_vec(),
+            VaultOptions::default(),
+            FixedClock::new(1_785_400_000),
+        )
+        .expect("reopen scrubbed vault");
+        let snapshot = reopened.latest_seq();
+        assert!(
+            reopened
+                .read_cf_at(snapshot, ColumnFamily::Base, &base_key(erased_cx))
+                .expect("read erased base after reopen")
+                .is_none(),
+            "erased Cx base row must stay gone after scrub+reopen"
+        );
+        assert!(
+            reopened
+                .read_cf_at(snapshot, ColumnFamily::Base, &base_key(neighbour_cx))
+                .expect("read neighbour base after reopen")
+                .is_some(),
+            "non-erased neighbour Cx must survive the scrub"
+        );
+
+        // Tombstone and the paired scrub-audit ledger rows both survive.
+        let ledger_rows = cf_rows(&reopened, ColumnFamily::Ledger);
+        let mut saw_erase = false;
+        let mut saw_scrub = false;
+        for (_, bytes) in &ledger_rows {
+            let entry = decode(bytes).expect("decode ledger row");
+            if entry.kind == EntryKind::Erase {
+                saw_erase = true;
+            }
+            if entry.kind == EntryKind::Admin
+                && bytes_window_contains(&entry.payload, WAL_SCRUB_LEDGER_SCHEMA.as_bytes())
+            {
+                saw_scrub = true;
+                assert!(
+                    !bytes_window_contains(&entry.payload, WAL_SCRUB_MARKER.as_bytes()),
+                    "scrub-audit ledger payload must never carry the erased marker"
+                );
+            }
+        }
+        assert!(
+            saw_erase,
+            "erase tombstone ledger entry must survive the scrub"
+        );
+        assert!(
+            saw_scrub,
+            "scrub-audit ledger entry must be present after the scrub"
+        );
+        assert!(reopened.latest_seq() >= scrub.ledger_seq);
+        let chain = crate::verify_chain(&reopened).expect("verify chain after scrub");
+        assert_eq!(chain.status, "intact");
+
+        // Double-scrub is idempotent: it succeeds and the WAL stays marker-free.
+        let second = scrub_erased_wal_history(
+            reopened,
+            &vault_path,
+            &params,
+            SubjectId::Cx(erased_cx),
+            ActorId::Service("astrolabe-ingest-test".to_string()),
+        )
+        .expect("second scrub is idempotent");
+        assert!(second.wal_is_quiescent());
+        assert!(
+            path_tree_marker_hits(&vault_path, WAL_SCRUB_MARKER.as_bytes()).is_empty(),
+            "double scrub must keep the marker absent"
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_dir_all(&vault_path).ok();
+    }
+
+    // Edge: erasing a Cx that was never imported is an explicit no-op per the
+    // existing contract (records_deleted == 0), not a silent success that
+    // pretends to have removed rows.
+    #[test]
+    fn erasing_nonexistent_cx_is_explicit_noop() {
+        let path = temp_db("wal-scrub-noop");
+        marker_fixture(&path, WAL_SCRUB_MARKER);
+        let (vault_dir, vault) = durable_vault("wal-scrub-noop");
+        import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("import marker fixture");
+        vault.flush().expect("flush import");
+
+        let absent = CxId::from_input(b"never-imported-symbol", 7, b"astrolabe-ingest-test");
+        let mut context = erasure_context(&vault);
+        let erase = vault
+            .erase(EraseScope::Cx(absent), &mut context, &EraseRegistry::new())
+            .expect("erase nonexistent cx");
+        assert_eq!(
+            erase.records_deleted, 0,
+            "no rows should be reported deleted"
+        );
+        let graph = crate::erase_imported_cx_graph_rows(&vault, "demo", absent)
+            .expect("graph erase nonexistent cx");
+        assert_eq!(graph.node_map_rows_tombstoned, 0);
+        assert_eq!(graph.edge_rows_tombstoned, 0);
+        assert_eq!(graph.raw_edge_rows_tombstoned, 0);
+
+        fs::remove_file(path).ok();
+        fs::remove_dir_all(vault_dir).ok();
+    }
+
+    // Edge: the fsync-batch knob is registry-bounded; zero is refused fail-closed.
+    #[test]
+    fn wal_scrub_batch_zero_is_refused() {
+        let err = WalScrubParams::with_segments_per_fsync_batch(0)
+            .expect_err("zero batch must be refused");
+        assert_eq!(err.code(), Some(ASTRO_ERASURE_SCRUB_BATCH_INVALID));
+        assert!(err.remediation().is_some());
+        assert!(WalScrubParams::with_segments_per_fsync_batch(1).is_ok());
+    }
+
+    // Edge: scrubbing a path with no WAL tree fails closed, never a false pass.
+    #[test]
+    fn wal_scrub_status_refuses_non_durable_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "astrolabe-ingest-wal-scrub-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let err = wal_scrub_status(&dir).expect_err("missing wal tree must be refused");
+        assert_eq!(err.code(), Some(ASTRO_ERASURE_SCRUB_NOT_DURABLE));
     }
 
     #[test]

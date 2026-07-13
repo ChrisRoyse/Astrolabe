@@ -110,18 +110,24 @@ CC_BIN="${CC:-$DEFAULT_CC}"
 CXX_BIN="${CXX:-$DEFAULT_CXX}"
 
 echo "=== Portable Astrolabe aggregate (workspace test deadline: ${WORKSPACE_TEST_TIMEOUT_SECS}s) ==="
-if ASTROLABE_TARGET_CLEANUP_OWNER="$TARGET_CLEANUP_OWNER" \
-  ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS="$WORKSPACE_TEST_TIMEOUT_SECS" \
-  bash scripts/check.sh; then
-  :
-else
-  status=$?
-  if [[ "$status" -eq "$WORKSPACE_TEST_DEFERRED_EXIT" ]]; then
-    echo "DEFERRED[ASTRO_NATIVE_AGGREGATE]: workspace test deadline reached; downstream suites were not started"
-    echo "CONTINUATION[ASTRO_NATIVE_AGGREGATE]: ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0 bash scripts/check-full.sh"
-  fi
-  exit "$status"
-fi
+# #280 (owner directive 2026-07-12): check-full is the FULL TEST SUITE with a
+# sub-3-minute (<180s) wall-clock benchmark. Suites are impact-gated — a suite
+# runs only when its declared input set changed vs its last recorded green
+# (scripts/check-suite-impact.py, fail-closed) — and the gate-tooling
+# self-tests keep their change-gate. check-release.sh is the unabridged tier:
+# it forces every suite and self-test (ASTRO_SUITE_GATE=all +
+# ASTRO_GATE_SELFTESTS=all) and owns the lint/doc/Calyx phases tiered out of
+# this gate (see the labels below).
+CHECK_SH_STATUS_FILE="$ROOT/target/gate-logs/portable.exit"
+run_portable_check() {
+  local rc=0
+  ASTROLABE_TARGET_CLEANUP_OWNER="$TARGET_CLEANUP_OWNER" \
+    ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS="$WORKSPACE_TEST_TIMEOUT_SECS" \
+    bash scripts/check.sh || rc=$?
+  mkdir -p "$(dirname "$CHECK_SH_STATUS_FILE")"
+  echo "$rc" > "$CHECK_SH_STATUS_FILE"
+  return "$rc"
+}
 
 # ── #193: concurrent gate phases ────────────────────────────────────────────
 #
@@ -207,19 +213,33 @@ run_phase() {
   wait_phases
 }
 
-echo "=== Upstream CBM lint || CBM runtime || Astrolabe+Calyx Rust suites (concurrent) ==="
+# #280 (owner directive 2026-07-12): the full TEST suite is two concurrent
+# phases — the portable check.sh aggregate (workspace tests + binary-driving
+# gates, impact-gated as workspace-block) and the CBM C suite (impact-gated as
+# cbm-c-suite, incremental build + sharded run). They are store-disjoint: the
+# #248 fix moved the astrolabe-bridge store-isolation tests onto per-run
+# sandbox HOMEs, and every binary-driving check in check.sh runs against a
+# run-scoped CBM_CACHE_DIR, so neither phase can perturb the operator store
+# ci-cbm-test.sh snapshots. Rust is cargo into target/; CBM is make into
+# vendor build dirs — no build-tree contention.
+#
+# The lint/doc/Calyx phases are NOT tests and are tiered to check-release
+# (named, counted — never silent):
+echo "SKIP[ASTRO_RELEASE_TIER_RUST_GATE]: owner=check-release (full-graph fmt, workspace clippy, full nextest re-run, doctests, Calyx nextest+doctests via scripts/ci-rust-gate.sh)"
+echo "SKIP[ASTRO_RELEASE_TIER_CBM_LINT]: owner=check-release (cppcheck, clang-format, NOLINT whitelist, cache-path lint via scripts/ci-cbm-lint.sh)"
+
+echo "=== Portable aggregate || CBM C runtime suite (concurrent) ==="
 GATE_GROUP_START="$(phase_now)"
-start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh
+start_phase "portable" run_portable_check
 start_phase "cbm-test" bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"
-# #248: the Rust gate now runs CONCURRENTLY with the CBM C suites -- the larger
-# cbm-test || rust-gate wall-clock win #193 identified. It was blocked because the
-# astrolabe-bridge store-isolation tests asserted the operator's REAL
-# ~/.cache/codebase-memory-mcp byte-identical while ci-cbm-test snapshots the same
-# store, so overlapping the phases could false-red on either snapshot. Those bridge
-# tests now use per-run sandbox HOMEs (crates/astrolabe-bridge/src/lib.rs sandbox_home)
-# and never read or write the operator store, so the phases are disjoint on shared
-# state and overlap safely. ci-rust-gate reuses check.sh's target/debug tree (#189)
-# and uses cargo; the CBM phases are make/C -- no cargo build-lock contention.
-start_phase "rust-gate" bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
-wait_phases
-echo "PHASE_GROUP[cbm-c+rust]: $(($(phase_now) - GATE_GROUP_START))s wall clock for all three phases"
+if ! wait_phases; then
+  status=1
+  if [[ -f "$CHECK_SH_STATUS_FILE" ]] && \
+     [[ "$(cat "$CHECK_SH_STATUS_FILE" 2>/dev/null)" == "$WORKSPACE_TEST_DEFERRED_EXIT" ]]; then
+    echo "DEFERRED[ASTRO_NATIVE_AGGREGATE]: workspace test deadline reached; downstream suites were not started"
+    echo "CONTINUATION[ASTRO_NATIVE_AGGREGATE]: ASTROLABE_WORKSPACE_TEST_TIMEOUT_SECS=0 bash scripts/check-full.sh"
+    status="$WORKSPACE_TEST_DEFERRED_EXIT"
+  fi
+  exit "$status"
+fi
+echo "PHASE_GROUP[portable+cbm-c]: $(($(phase_now) - GATE_GROUP_START))s wall clock for both phases"

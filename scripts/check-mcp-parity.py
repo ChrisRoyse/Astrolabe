@@ -112,7 +112,9 @@ def filtered_stderr(text):
 def assert_equal(label, left, right):
     if left != right:
         print(f"ERROR: parity mismatch for {label}", file=sys.stderr)
-        print("--- upstream ---", file=sys.stderr)
+        # Dual-path consistency: the "left" side is the standalone C production
+        # binary built from the SAME owned CBM sources as the astrolabe host.
+        print("--- production binary (same owned sources) ---", file=sys.stderr)
         print(left, file=sys.stderr)
         print("--- astrolabe ---", file=sys.stderr)
         print(right, file=sys.stderr)

@@ -63,6 +63,10 @@ typedef struct {
     int exit_code;              /* worker exit code (-1 if signalled) */
     int term_signal;            /* POSIX terminating signal, else 0 */
     char *response;             /* worker's result string on CLEAN exit (caller frees); else NULL */
+    char *log_tail;             /* #282: bounded tail of the worker's own log (stderr/panic text)
+                                 * on a non-CLEAN outcome (caller frees); else NULL. Present in
+                                 * every build for a single struct layout; only the
+                                 * ASTRO_WORKER_DIAG supervisor fills it. */
 } cbm_index_worker_result_t;
 
 /* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,

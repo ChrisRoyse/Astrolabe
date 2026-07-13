@@ -411,6 +411,23 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
 
 static void compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
                                int *depth) {
+#ifdef ASTRO_UI_WERROR
+    /* #229: `n` is a search-result count, already clamped to <= HARD_MAX_NODES by
+     * clamp_max_nodes() before the query that produced it — but the compiler cannot
+     * see that bound. A bare int spans up to INT_MAX, so (size_t)n * sizeof(int)
+     * trips GCC 14 -Walloc-size-larger-than under -Werror, and an out-of-range n
+     * really would request an absurd allocation. Refuse a non-positive or over-cap
+     * count and fail closed: log a {code, message, remediation} record and leave
+     * the caller's zero-initialized depth[] untouched. */
+    if (n <= 0 || n > HARD_MAX_NODES) {
+        cbm_log_error("layout3d.call_depth", "code", "CBM_E_LAYOUT_NODE_COUNT_RANGE",
+                      "message", "call-depth node count is out of the representable range",
+                      "remediation",
+                      "lower the layout node ceiling (CBM_UI_MAX_RENDER_NODES) or the "
+                      "requested max_nodes so the result set stays within HARD_MAX_NODES");
+        return;
+    }
+#endif
     for (int i = 0; i < n; i++)
         depth[i] = -1;
     int *q = malloc((size_t)n * sizeof(int));

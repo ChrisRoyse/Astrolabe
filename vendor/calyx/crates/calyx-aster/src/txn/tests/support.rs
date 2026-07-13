@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use calyx_core::{
@@ -174,11 +174,9 @@ pub(super) fn durable_vault(root: &Path) -> AsterVault<FixedClock> {
     .unwrap()
 }
 
-pub(super) fn temp_root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("calyx-{name}"));
-    fs::remove_dir_all(&root).ok();
-    fs::create_dir_all(&root).unwrap();
-    root
+pub(super) fn temp_root(name: &str) -> calyx_fsv::ScratchDir {
+    // RAII scratch: removed on drop, including panic unwind (#260).
+    calyx_fsv::ScratchDir::new_temp(&format!("calyx-{name}")).unwrap()
 }
 
 fn orders(name: &str) -> Collection {

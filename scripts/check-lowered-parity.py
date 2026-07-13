@@ -53,18 +53,17 @@ def default_upstream():
 
 
 def build_upstream():
+    # #280: build via the shared cache helper. Its cache is keyed on the
+    # committed source inputs (not the BUILD_DIR), so when check-mcp-parity.sh already
+    # built+cached the CBM prod binary this run, this call is a byte-identical
+    # cache restore instead of a second ~5-minute make. Fail-closed: an ambiguous
+    # key runs the same full make. (default_upstream() still short-circuits to
+    # check-mcp-parity.sh's target/cbm-parity output when present, so in the
+    # default aggregate order this path is only reached standalone.)
     build_dir = ROOT / "target" / "cbm-lowered-parity"
     exe = ".exe" if os.name == "nt" else ""
     run(
-        [
-            "make",
-            "-C",
-            ROOT / "vendor" / "codebase-memory-mcp",
-            "-f",
-            ROOT / "patches" / "cbm" / "Makefile.cbm",
-            f"BUILD_DIR={build_dir}",
-            "cbm",
-        ],
+        ["bash", str(ROOT / "scripts" / "cbm-prod-build.sh"), str(build_dir)],
         timeout=900,
     )
     built = build_dir / f"codebase-memory-mcp{exe}"
@@ -87,23 +86,69 @@ def default_ui_binary():
     return None
 
 
+def assert_vendor_clean(label):
+    # FSV / #229 contract: a UI build must leave the owned CBM source subtree
+    # byte-clean. `git status --porcelain` reports both modified tracked files
+    # (e.g. graph-ui/tsconfig.tsbuildinfo) and untracked, non-ignored paths (e.g.
+    # a stray src/ui/embedded_assets.c) — any such build-time write into the owned
+    # source tree is a hygiene violation (#286: build artifacts belong under BUILD_DIR).
+    proc = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain", "--", "vendor/codebase-memory-mcp"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"git status failed while checking vendor cleanliness after {label}:\n{proc.stderr}"
+        )
+    dirty = proc.stdout.strip()
+    if dirty:
+        raise SystemExit(
+            f"vendor/ subtree was modified during {label} — owned source must stay byte-clean. "
+            "Every generated build artifact must stay under BUILD_DIR, never in vendor/.\n"
+            f"--- git status --porcelain vendor/codebase-memory-mcp ---\n{dirty}"
+        )
+
+
 def build_ui_binary():
+    # Build cbm-with-ui through the PATCHED Makefile (patches/cbm/Makefile.cbm),
+    # exactly as build_upstream() builds `cbm`. Only the patched Makefile defines
+    # ASTRO_PROD_DEFS (-DASTRO_UI_WERROR -DASTRO_WORKER_DIAG); the plain vendored
+    # Makefile.cbm does not, so building through it would compile the owned sources
+    # with the #229 -Werror root-cause guards (#ifdef ASTRO_UI_WERROR) disabled and
+    # re-trip the GCC 14 -Werror diagnostics those guards exist to fix (#286 absorbed
+    # the former apply_ui_werror_patch.py overlays into the owned sources as plain
+    # ASTRO_UI_WERROR-guarded edits — see patches/cbm/README.md).
+    build_dir = ROOT / "target" / "cbm-ui-smoke"
     exe = ".exe" if os.name == "nt" else ""
+    # #274: build cbm-with-ui through the Astrolabe-owned patched Makefile — the
+    # same drop-in build_upstream() uses for `cbm` — so both binaries resolve the
+    # compiler family (and thus the GCC-only -Wno-* suppression set) through the
+    # single deterministic, fail-closed probe. Using the vendored Makefile here
+    # instead re-opened the exact cbm-vs-cbm-with-ui divergence #229 observed:
+    # two Makefiles, two independent (formerly silent-flipping) IS_GCC probes.
     run(
         [
             "make",
             "-C",
             ROOT / "vendor" / "codebase-memory-mcp",
             "-f",
-            "Makefile.cbm",
-            "BUILD_DIR=../../target/cbm-ui-smoke",
+            ROOT / "patches" / "cbm" / "Makefile.cbm",
+            f"BUILD_DIR={build_dir}",
             "cbm-with-ui",
         ],
         timeout=900,
     )
-    built = ROOT / "target" / "cbm-ui-smoke" / f"codebase-memory-mcp{exe}"
+    # The UI build runs the frontend/embed toolchain (npm/vite/embed); assert it
+    # left the pinned vendor subtree byte-clean before returning the binary.
+    assert_vendor_clean("cbm-with-ui build")
+    built = build_dir / f"codebase-memory-mcp{exe}"
     if not built.exists():
-        built = ROOT / "target" / "cbm-ui-smoke" / "codebase-memory-mcp"
+        built = build_dir / "codebase-memory-mcp"
     if not built.exists():
         raise SystemExit(f"UI build did not produce {built}")
     return built

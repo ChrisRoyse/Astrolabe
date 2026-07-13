@@ -3492,7 +3492,18 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
  * result. The crash is already contained (this process survived); we report it
  * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
  * rest) is layered on in the probe stage. */
+#ifdef ASTRO_WORKER_DIAG
+/* #282: bound on the worker-response excerpt embedded in the failure JSON. A
+ * response is normally a short error result; the tail keeps the terminal error
+ * text if something ever writes more. */
+enum { CBM_WORKER_RESPONSE_TAIL_MAX = 2048 };
+
+static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome,
+                                           int exit_code, const char *worker_response,
+                                           const char *worker_log) {
+#else
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
+#endif
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -3506,6 +3517,23 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
               "terminated and the server survived. Re-run to retry."
             : "Indexing worker crashed on a file. The crash was contained (the server "
               "survived). Re-run to retry; a future release isolates the culprit file.");
+#ifdef ASTRO_WORKER_DIAG
+    /* #282: carry the worker's own evidence so a contained failure is
+     * attributable from this artifact alone. */
+    yyjson_mut_obj_add_int(doc, root, "worker_exit_code", exit_code);
+    if (worker_response && worker_response[0]) {
+        size_t wr_len = strlen(worker_response);
+        const char *wr_tail = wr_len > CBM_WORKER_RESPONSE_TAIL_MAX
+                                  ? worker_response + (wr_len - CBM_WORKER_RESPONSE_TAIL_MAX)
+                                  : worker_response;
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_response_tail", wr_tail);
+    }
+    if (worker_log && worker_log[0]) {
+        /* #282 (attempt 15): the worker's own log tail — panic/abort text —
+         * already bounded by the supervisor (CBM_WORKER_LOG_TAIL_MAX). */
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_log_tail", worker_log);
+    }
+#endif
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
@@ -3704,6 +3732,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * innocent ms-typescript fixtures quarantined one 15-minute retry at a
      * time. */
     cbm_proc_outcome_t last_outcome = wr.outcome;
+#ifdef ASTRO_WORKER_DIAG
+    int last_exit_code = wr.exit_code;
+    char *last_response = wr.response; /* #282: keep the worker's evidence */
+    wr.response = NULL;
+    char *last_log = wr.log_tail; /* #282: keep the worker's panic/log text */
+    wr.log_tail = NULL;
+#endif
     cbm_index_worker_result_free(&wr);
 
     char marker_path[CBM_SZ_1K];
@@ -3736,6 +3771,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
                                          quarantine_path, &wr2);
         if (rc2 != 0) {
             last_outcome = wr2.outcome;
+#ifdef ASTRO_WORKER_DIAG
+            last_exit_code = wr2.exit_code;
+            free(last_response);
+            last_response = wr2.response; /* #282 */
+            wr2.response = NULL;
+            free(last_log);
+            last_log = wr2.log_tail; /* #282 */
+            wr2.log_tail = NULL;
+#endif
             cbm_index_worker_result_free(&wr2);
             break; /* spawn failed mid-recovery — give up */
         }
@@ -3747,6 +3791,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         }
         if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
             last_outcome = wr2.outcome;
+#ifdef ASTRO_WORKER_DIAG
+            last_exit_code = wr2.exit_code;
+            free(last_response);
+            last_response = wr2.response; /* #282 */
+            wr2.response = NULL;
+            free(last_log);
+            last_log = wr2.log_tail; /* #282 */
+            wr2.log_tail = NULL;
+#endif
             cbm_index_worker_result_free(&wr2);
             /* crash vs hang: the phase this file is quarantined under and
              * reported as in skipped[]. A fault signal → "crash"; a
@@ -3796,6 +3849,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
          * attribute; stop and report a contained failure. */
         last_outcome = wr2.outcome;
+#ifdef ASTRO_WORKER_DIAG
+        last_exit_code = wr2.exit_code;
+        free(last_response);
+        last_response = wr2.response; /* #282 */
+        wr2.response = NULL;
+        free(last_log);
+        last_log = wr2.log_tail; /* #282 */
+        wr2.log_tail = NULL;
+#endif
         cbm_index_worker_result_free(&wr2);
         break;
     }
@@ -3829,9 +3891,21 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
 
     if (resp) {
+#ifdef ASTRO_WORKER_DIAG
+        free(last_response);
+        free(last_log);
+#endif
         return resp;
     }
+#ifdef ASTRO_WORKER_DIAG
+    char *failure = build_worker_failure_response(args, last_outcome, last_exit_code,
+                                                  last_response, last_log);
+    free(last_response);
+    free(last_log);
+    return failure;
+#else
     return build_worker_failure_response(args, last_outcome);
+#endif
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
@@ -3868,6 +3942,21 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
      * is set. On spawn failure, fall through to the in-process path (degrade). */
+#ifdef ASTRO_WORKER_DIAG
+    /* #282: validate arguments BEFORE supervision. Spawning a worker for
+     * trivially-invalid args converts a clean validation error into an
+     * anonymous contained-crash report (the worker exits nonzero carrying the
+     * real message, which the supervisor used to discard) — and it costs a
+     * whole process spawn to say "missing argument". Argument validation is
+     * the caller's answer, not a worker's job. */
+    {
+        char *early_repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+        if (!early_repo_path) {
+            return cbm_mcp_text_result("repo_path is required", true);
+        }
+        free(early_repo_path);
+    }
+#endif
     if (cbm_index_supervisor_should_wrap()) {
         char *supervised = index_run_supervised(srv, args);
         if (supervised) {
@@ -5948,10 +6037,21 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     /* Check if project already has a DB */
     const char *home = cbm_get_home_dir();
+#ifdef ASTRO_ENV_STORE
+    /* #241: a resolvable home no longer implies a resolvable store, and "%s" on a
+     * NULL cache directory is undefined behaviour. Resolve first, then check. */
+    const char *session_cache = cbm_resolve_cache_dir();
+    if (home && session_cache) {
+#else
     if (home) {
+#endif
         char db_check[CBM_SZ_1K];
+#ifdef ASTRO_ENV_STORE
+        snprintf(db_check, sizeof(db_check), "%s/%s.db", session_cache, srv->session_project);
+#else
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
+#endif
         if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",

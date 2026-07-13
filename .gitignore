@@ -61,6 +61,10 @@ tmp/
 .cache/
 /.toolchains/
 /.sccache/
+# #280: durable gate caches that MUST survive the per-run target/ wipe and are
+# NOT launcher-owned (unlike .tmp/): the change-gated self-test recorded-green
+# manifest and the CBM prod-binary build cache (keyed on byte-pinned inputs).
+/.astro-gate-cache/
 *.log
 *.tmp
 *.sqlite

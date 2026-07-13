@@ -1631,6 +1631,138 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
 }
 
 #[test]
+fn get_provenance_lineage_dual_path_server_and_crate_agree_from_persisted_ledger() {
+    // #284 dual-path FSV: `get_provenance(mode="lineage")` for a ledger subject key
+    // must be served from the *real persisted ledger*, not row-sink symbol
+    // metadata. Prove the server adapter path
+    // (apply_ledger_backed_lineage -> get_provenance -> provenance_response_json)
+    // yields lineage rows byte-identical to the direct crate API
+    // (astrolabe_ingest::scan_subject_ledger_rows_vault_path), and that each row's
+    // ledger pointer matches an independent decode of the persisted ledger bytes.
+    let dir = temp_dir("provenance-lineage-dual-path");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let salt = b"provenance-lineage-dual-path".to_vec();
+
+    // Real durable vault seeded with a known subject A interleaved with noise for a
+    // second subject B, so the subject-scoping is exercised, not assumed.
+    let subject_a_cx = calyx_core::CxId::from_bytes([0x9A; 16]);
+    let subject_b_cx = calyx_core::CxId::from_bytes([0xB7; 16]);
+    {
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            salt.clone(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let append = |cx: calyx_core::CxId, marker: &str| {
+            vault
+                .append_ledger_entry(
+                    calyx_ledger::EntryKind::Ingest,
+                    SubjectId::Cx(cx),
+                    format!(r#"{{"marker":"{marker}"}}"#).into_bytes(),
+                    ActorId::Service("astrolabe-lineage-test".to_string()),
+                )
+                .unwrap();
+        };
+        append(subject_a_cx, "a0"); // seq 0
+        append(subject_b_cx, "b0"); // seq 1 (noise)
+        append(subject_a_cx, "a1"); // seq 2
+        append(subject_a_cx, "a2"); // seq 3
+        vault.flush().unwrap();
+    }
+
+    // Persist a valid shadow outcome so provenance_store_for_project succeeds; it
+    // re-verifies the chain against this same physical vault dir.
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(&dir, security);
+    outcome.vault_dir = vault_dir.clone();
+    outcome.vault_salt = "provenance-lineage-dual-path".to_string();
+    outcome.ledger_seq = 3;
+    outcome.ledger_rows_after = 4;
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let subject = astrolabe_ingest::ledger_subject_key(&SubjectId::Cx(subject_a_cx));
+    // A ledger subject key routes to the ledger; a bare qualified name does not.
+    assert!(is_ledger_subject_key(&subject));
+    assert!(!is_ledger_subject_key("auth.login"));
+
+    // Direct crate API: the honest persisted-ledger scan for subject A.
+    let direct_rows =
+        astrolabe_ingest::scan_subject_ledger_rows_vault_path(&vault_dir, &subject).unwrap();
+    assert_eq!(
+        direct_rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![0, 2, 3],
+        "only subject A's seqs, ascending"
+    );
+
+    // Server adapter path: exactly what handle_get_provenance runs before serving.
+    let mut store = provenance_store_for_project(&dir, "demo").unwrap();
+    apply_ledger_backed_lineage(&mut store, &dir, "demo", "lineage", Some(&subject)).unwrap();
+    let response = get_provenance(&store, &ProvenanceQuery::new("lineage", Some(&subject)))
+        .expect("ledger-backed lineage response");
+    let payload = provenance_response_json("demo", &response);
+    assert_eq!(payload["mode"], "lineage");
+    let versions = payload["payload"]["lineage"]["versions"]
+        .as_array()
+        .expect("lineage versions array");
+    assert_eq!(
+        payload["payload"]["lineage"]["symbol_id"], subject,
+        "served lineage is scoped to the requested ledger subject"
+    );
+
+    // Dual-path identity: the server-served lineage rows equal the direct scan
+    // rows, field for field (seq, entry-hash chain pointer, kind, summary).
+    assert_eq!(
+        versions.len(),
+        direct_rows.len(),
+        "server lineage row count equals direct scan"
+    );
+    for (version, row) in versions.iter().zip(&direct_rows) {
+        assert_eq!(version["ledger"]["seq"].as_u64(), Some(row.seq));
+        assert_eq!(
+            version["ledger"]["chain_hash"].as_str(),
+            Some(row.entry_hash.as_str())
+        );
+        assert_eq!(version["kind"].as_str(), Some(row.kind.as_str()));
+        assert_eq!(version["summary"].as_str(), Some(row.summary.as_str()));
+    }
+
+    // FSV: independently reopen the durable vault and decode each persisted ledger
+    // row; its real entry hash and subject key must equal what the server served.
+    let reopened = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        salt,
+        VaultOptions::default(),
+    )
+    .unwrap();
+    for row in &direct_rows {
+        let bytes = reopened
+            .read_cf_at(
+                reopened.latest_seq(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(row.seq),
+            )
+            .unwrap()
+            .expect("persisted ledger row exists");
+        let entry = decode_ledger(&bytes).unwrap();
+        assert_eq!(
+            hex_lower(&entry.entry_hash),
+            row.entry_hash,
+            "served entry_hash equals independently decoded persisted bytes at seq {}",
+            row.seq
+        );
+        assert_eq!(
+            astrolabe_ingest::ledger_subject_key(&entry.subject),
+            row.subject
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn vault_import_summary_labels_fallback_trust() {
     let fallback = vault_import_summary(
         "sqlite_fallback",
@@ -3800,6 +3932,16 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
             "impute_fields requires calyx shadow indexing",
         ),
         (
+            "anchor_outcome",
+            json!({
+                "project": project.clone(),
+                "source": "ci:github:1",
+                "format": "cargo_test_json",
+                "report": "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n"
+            }),
+            "anchor_outcome requires calyx shadow indexing",
+        ),
+        (
             "team_artifact",
             json!({"mode": "export", "project": project}),
             "team_artifact export requires calyx shadow indexing",
@@ -5056,6 +5198,156 @@ fn seed_minimal_cbm_sqlite(path: &Path) {
             [],
         )
         .unwrap();
+}
+
+/// Seeds a deterministic shadow vault for `demo` at the default cache location
+/// with a single node (`demo.main`) in the node map, so anchor_outcome subjects
+/// resolve to a real CxId. The far-future `seed_ts` FixedClock makes every seed
+/// ledger timestamp deterministic and, because the real wall clock used by the
+/// later writable anchor append is far behind it, forces that append's timestamp
+/// to `last_ts + 1` — making the grounding ledger entry byte-deterministic too.
+fn seed_anchor_subject_vault(cache_dir: &Path, seed_ts: u64) {
+    let sqlite = cache_dir.join("source.db");
+    seed_minimal_cbm_sqlite(&sqlite);
+    let vault = AsterVault::new_durable_with_clock(
+        vault_dir(cache_dir, "demo"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        vault_salt("demo").as_bytes().to_vec(),
+        VaultOptions::default(),
+        calyx_core::FixedClock::new(seed_ts),
+    )
+    .unwrap();
+    let options = SqliteImportOptions::new("demo", "commit-anchor", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+    import_shadow_vault_report(
+        &sqlite,
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(RowSinkImportCandidate::Unavailable(
+            "forced sqlite import for deterministic anchor seed".to_string(),
+        )),
+    )
+    .unwrap();
+    drop(vault);
+    persist_dial_at(cache_dir, "demo", MigrationDial::Shadow).unwrap();
+}
+
+#[test]
+fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
+    // Server-surface mirror of the #24 contract-level dual-path byte-identity
+    // proof: the anchor_outcome MCP tool and the `astrolabe cli anchor_outcome`
+    // subcommand both route through migration::handle_tool_raw into the single
+    // anchor_outcome_json_at core, so identical inputs must persist byte-identical
+    // anchor AND ledger CF state. Both surfaces are driven here through that one
+    // shared core against two independently seeded shadow vaults; the far-future
+    // seed clock makes the grounding ledger timestamp deterministic (the append
+    // clamps to last_ts+1 because SystemClock's real millisecond now is far behind
+    // the seed), so byte-identity is a real guarantee, not a clock artifact.
+    const SEED_TS: u64 = 10_000_000_000_000; // far future in SystemClock milliseconds
+    const SUBJECT_QN: &str = "demo.main"; // seed_minimal_cbm_sqlite node qualified name
+    const OBSERVED_AT: &str = "1786400000";
+    const SOURCE: &str = "ci:github:777";
+    // cargo libtest JSON whose test name equals the seeded node qualified name, so
+    // the outcome subject resolves to that node's CxId in the vault node map.
+    let report = format!(
+        "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}}\n\
+         {{\"type\":\"test\",\"name\":\"{SUBJECT_QN}\",\"event\":\"started\"}}\n\
+         {{\"type\":\"test\",\"name\":\"{SUBJECT_QN}\",\"event\":\"ok\"}}\n\
+         {{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\
+         \"measured\":0,\"filtered_out\":0}}\n"
+    );
+
+    let mcp_dir = temp_dir("anchor-outcome-mcp");
+    let cli_dir = temp_dir("anchor-outcome-cli");
+    fs::create_dir_all(&mcp_dir).unwrap();
+    fs::create_dir_all(&cli_dir).unwrap();
+    seed_anchor_subject_vault(&mcp_dir, SEED_TS);
+    seed_anchor_subject_vault(&cli_dir, SEED_TS);
+
+    let mcp = anchor_outcome_json_at(
+        &mcp_dir,
+        "demo",
+        "test_run",
+        SOURCE,
+        None,
+        "cargo_test_json",
+        &report,
+        OBSERVED_AT,
+    )
+    .unwrap();
+    let cli = anchor_outcome_json_at(
+        &cli_dir,
+        "demo",
+        "test_run",
+        SOURCE,
+        None,
+        "cargo_test_json",
+        &report,
+        OBSERVED_AT,
+    )
+    .unwrap();
+
+    // Both surfaces actually grounded the resolved subject (no silent unmapped).
+    assert_eq!(mcp["status"], "grounded", "mcp envelope: {mcp}");
+    assert_eq!(mcp["anchors_written"], 1);
+    assert_eq!(mcp["unmapped_subject_count"], 0);
+    // Report-level determinism across the two surfaces.
+    assert_eq!(mcp["anchor_dump_hash"], cli["anchor_dump_hash"]);
+    assert_eq!(mcp["ledger_ref"], cli["ledger_ref"]);
+
+    // FSV: reopen both vaults and compare persisted CF bytes independently of the
+    // envelope return values.
+    let mcp_vault = open_shadow_vault_read_only(
+        &vault_dir(&mcp_dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    let cli_vault = open_shadow_vault_read_only(
+        &vault_dir(&cli_dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    let mcp_anchors = mcp_vault
+        .scan_cf_at(mcp_vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+    let cli_anchors = cli_vault
+        .scan_cf_at(cli_vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+    assert!(!mcp_anchors.is_empty(), "anchors were actually persisted");
+    assert_eq!(
+        mcp_anchors, cli_anchors,
+        "anchors CF bytes must be byte-identical across the MCP and CLI paths"
+    );
+    let mcp_ledger = mcp_vault
+        .scan_cf_at(mcp_vault.snapshot(), ColumnFamily::Ledger)
+        .unwrap();
+    let cli_ledger = cli_vault
+        .scan_cf_at(cli_vault.snapshot(), ColumnFamily::Ledger)
+        .unwrap();
+    assert_eq!(
+        mcp_ledger, cli_ledger,
+        "ledger CF bytes must be byte-identical across the MCP and CLI paths"
+    );
+
+    // FSV of the persisted anchor content: exactly one grounded TestPass anchor
+    // for the resolved subject, carrying the request's source/observed_at/value.
+    let rows = astrolabe_anchors::read_anchor_rows(&mcp_vault).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row.anchors.len(), 1);
+    let anchor = &rows[0].row.anchors[0];
+    assert_eq!(anchor.source, SOURCE);
+    assert_eq!(anchor.observed_at, 1_786_400_000);
+    assert_eq!(anchor.value, calyx_core::AnchorValue::Bool(true));
+    assert_eq!(anchor.confidence.to_bits(), 1.0f32.to_bits());
+    drop(mcp_vault);
+    drop(cli_vault);
+    fs::remove_dir_all(&mcp_dir).ok();
+    fs::remove_dir_all(&cli_dir).ok();
 }
 
 fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOutcome {

@@ -1,18 +1,25 @@
 //! RoBERTa style lens adapter for PH39 identity slots.
 
 use std::fmt;
+#[cfg(feature = "onnx-lens")]
 use std::fs::File;
+#[cfg(feature = "onnx-lens")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "onnx-lens")]
 use std::sync::Mutex;
 
 use calyx_core::{
     CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, SlotShape, SlotVector,
 };
+#[cfg(feature = "onnx-lens")]
 use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
+#[cfg(feature = "onnx-lens")]
 use ort::session::{Session, builder::GraphOptimizationLevel};
+#[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "onnx-lens")]
 use tokenizers::Tokenizer;
 
 use crate::error::WardError;
@@ -101,6 +108,7 @@ impl StyleLens {
         Self::new_with_tokenizer_and_provider_policy(model_path, &tokenizer_path, policy)
     }
 
+    #[cfg(feature = "onnx-lens")]
     pub fn new_with_tokenizer_and_provider_policy(
         model_path: &Path,
         tokenizer_path: &Path,
@@ -114,6 +122,19 @@ impl StyleLens {
             weights_hash,
             backend,
         )
+    }
+
+    /// Fail-closed stub: the ONNX style backend is compiled out when the
+    /// `onnx-lens` feature is disabled (#191). Callers that need real ONNX
+    /// inference must rebuild with `--features onnx-lens`; tests can still
+    /// inject a mock backend through [`StyleLens::from_backend`].
+    #[cfg(not(feature = "onnx-lens"))]
+    pub fn new_with_tokenizer_and_provider_policy(
+        _model_path: &Path,
+        _tokenizer_path: &Path,
+        _policy: StyleProviderPolicy,
+    ) -> Result<Self, WardError> {
+        Err(WardError::LensFeatureDisabled { lens: "style" })
     }
 
     pub fn from_backend<B>(
@@ -223,6 +244,7 @@ impl Lens for StyleLens {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 struct OnnxStyleBackend {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
@@ -235,6 +257,7 @@ struct OnnxStyleBackend {
     policy: StyleProviderPolicy,
 }
 
+#[cfg(feature = "onnx-lens")]
 impl OnnxStyleBackend {
     fn new(
         model_path: &Path,
@@ -298,6 +321,7 @@ impl OnnxStyleBackend {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 impl StyleEmbeddingBackend for OnnxStyleBackend {
     fn embed(&self, text: &str) -> Result<Vec<f32>, WardError> {
         let (ids, attention) = self.tokenize(text)?;
@@ -341,6 +365,7 @@ impl StyleEmbeddingBackend for OnnxStyleBackend {
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn build_session(model_path: &Path, policy: StyleProviderPolicy) -> Result<Session, WardError> {
     if !model_path.exists() {
         return Err(WardError::ModelNotFound {
@@ -358,6 +383,7 @@ fn build_session(model_path: &Path, policy: StyleProviderPolicy) -> Result<Sessi
     builder.commit_from_file(model_path).map_err(runtime_error)
 }
 
+#[cfg(feature = "onnx-lens")]
 fn execution_providers(policy: StyleProviderPolicy) -> Vec<ExecutionProviderDispatch> {
     match policy {
         StyleProviderPolicy::CudaFailLoud => vec![
@@ -372,6 +398,7 @@ fn execution_providers(policy: StyleProviderPolicy) -> Vec<ExecutionProviderDisp
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
     names
         .iter()
@@ -382,6 +409,7 @@ fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, 
         })
 }
 
+#[cfg(feature = "onnx-lens")]
 fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> {
     let outlet = session
         .outputs()
@@ -406,6 +434,7 @@ fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> 
     }
 }
 
+#[cfg(feature = "onnx-lens")]
 fn mean_pool(
     token_embeddings: &[f32],
     attention: &[i64],
@@ -459,6 +488,7 @@ fn normalize_unit(mut data: Vec<f32>, expected_dim: usize) -> Result<Vec<f32>, W
     Ok(data)
 }
 
+#[cfg(feature = "onnx-lens")]
 fn sha256_files(paths: &[&Path]) -> Result<[u8; 32], WardError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -485,6 +515,7 @@ fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(feature = "onnx-lens")]
 fn runtime_error(error: impl fmt::Display) -> WardError {
     WardError::Runtime {
         reason: error.to_string(),

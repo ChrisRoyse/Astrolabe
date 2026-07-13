@@ -7,14 +7,42 @@
     "NOT from the environment -- a sandbox that redirects HOME/TEMP must not be able to",
     "blind the gate that polices it. ${VAR} also expands from the environment.",
     "",
-    "mode=exclusive: the project owns this root outright. ANY added, removed, or modified",
-    "  entry is a leak and fails the build. Full recursive sha256 manifest.",
+    "mode=exclusive: the project owns this root outright and no third party writes it.",
+    "  ANY added, removed, or modified entry is a leak and fails the build. Full recursive",
+    "  sha256 manifest. No attribution needed -- every delta is ours by definition.",
     "mode=signature: the operator and the OS also write here (%TEMP%, $HOME), so a strict",
     "  whole-root assertion would fail on unrelated third-party churn and get switched off.",
-    "  The assertion is scoped to entries whose top-level name matches signature_globs --",
-    "  precisely the escape shape of #133 (astrolabe-ingest-*) and #236 (astrolabe-anchors-*).",
-    "  Foreign entries are counted and reported, never used to pass or fail the gate."
+    "  A signature-matching delta is a leak ONLY when CAUSALLY attributable to this run's",
+    "  launcher process tree (#278: a `cargo test` in the operator's own Calyx checkout drops",
+    "  calyx-* dirs here too -- name matching alone false-positives). Attribution comes from",
+    "  the launcher's Job-Object process-tree manifest; a delta not traceable to our tree is",
+    "  counted as foreign churn, never used to pass or fail. This still catches #133/#236: a",
+    "  vault dir our test leaks carries our PID (std::process::id() in the name) and is owned.",
+    "mode=attributed: shared-by-design AND worth a full byte manifest (the CBM store: this",
+    "  machine runs several codebase-memory-mcp MCP servers that all write _config.db here by",
+    "  design -- #278). Hashed like exclusive, but a delta is a leak only when attributable to",
+    "  our process tree (PID-stamped name, or a launcher-recorded owned path). Foreign MCP",
+    "  churn is counted, not policed; our own #246-class write is still RED.",
+    "",
+    "The gate FAILS CLOSED (ASTRO_NO_ESCAPE_NO_ATTRIBUTION) if any signature/attributed root",
+    "is declared but no attribution manifest is supplied: it refuses to fall back to the",
+    "unsound name-pattern classification (#278).",
+    "",
+    "attribution.skew_margin_secs (invariant-4 knob): tolerance for the run-window and",
+    "pid-first-seen timestamp guards (#278 attempt 6). Sources it must bound: NTFS lazily",
+    "syncs the directory-entry duplicated file info that scandir/FindFirstFile reports, so",
+    "a cached dir mtime can lag a fresh-handle os.stat (attempt 6 measured 164-168 ms on",
+    "the two false-policed calyx-leapable-* dirs); FAT-class metadata granularity is 2 s",
+    "(the coarsest timestamp any policed filesystem would report); the Windows clock tick",
+    "is ~15.6 ms; Job-Object completion-port delivery of first-seen stamps adds single-ms",
+    "latency. 2 s covers the worst (FAT granularity) with the measured NTFS skew an order",
+    "of magnitude inside it. A pid-reuse false attribution would need a foreign entry",
+    "written INSIDE this margin of our pid instance's first-seen time -- vanishingly",
+    "narrower than the 20-minute window that produced attempt 6's collisions."
   ],
+  "attribution": {
+    "skew_margin_secs": 2
+  },
   "signature_globs": [
     "astrolabe*",
     ".astrolabe*",
@@ -26,20 +54,21 @@
   ],
   "limits": {
     "max_entries_per_root": 20000,
-    "max_hash_bytes_per_root": 536870912
+    "_max_hash_bytes_note": "#280 (2026-07-13): raised 512MiB -> 2GiB after confirming legitimate operator growth, not a leak — the operator's own MCP server indexed C-code-leapablememory.db (320MB) into the real store between gate runs; the CBM-phase hermeticity manifest verified the store byte-identical across our runs. The limit bounds snapshot hashing cost only.",
+    "max_hash_bytes_per_root": 2147483648
   },
   "roots": [
     {
       "name": "cbm_project_store_home_cache",
       "path": "${REAL_HOME}/.cache/codebase-memory-mcp",
-      "mode": "exclusive",
-      "note": "#194/#232: the CBM C suite registered 25 fixture projects here."
+      "mode": "attributed",
+      "note": "#194/#232: the CBM C suite registered 25 fixture projects here. #278: shared-by-design -- concurrent codebase-memory-mcp MCP servers on this machine write _config.db here too, so policing is causal (our tree only), not any-delta."
     },
     {
       "name": "cbm_project_store_localappdata",
       "path": "${REAL_LOCALAPPDATA}/codebase-memory-mcp",
-      "mode": "exclusive",
-      "note": "Windows cache resolution for the same store."
+      "mode": "attributed",
+      "note": "Windows cache resolution for the same store (#278: causal attribution, shared-by-design)."
     },
     {
       "name": "astrolabe_home_state",

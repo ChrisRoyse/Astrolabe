@@ -54,11 +54,55 @@ print_env "test.sh"
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean
-scripts/clean.sh
+# #280: per-step wall-clock so the aggregate's timing surface can attribute
+# the phase cost (clean/build/run/prod/watchdog) instead of one opaque total.
+step_epoch() { date +%s; }
+tstep_start="$(step_epoch)"
+tstep() {
+    local now
+    now="$(step_epoch)"
+    echo "STEP_TIME[cbm:$1]: $((now - tstep_start))s"
+    tstep_start="$now"
+}
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
-make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 1: Clean — ONLY when the build premise changed (#280). The per-TU
+# object tree in build/c is mtime+depfile-correct (-MMD/-MP in Makefile.cbm),
+# so an unchanged toolchain + flags premise makes a persistent build dir
+# sound and a full clean pure waste (~230s of recompiles). The premise stamp
+# is (compiler identities + Makefile.cbm bytes + the make args of this run);
+# any mismatch or ambiguity cleans, fail closed. CBM_FORCE_CLEAN=1 forces it.
+STAMP_FILE="build/c/.build-premise-stamp"
+premise="$(
+  {
+    "$CC" --version 2>/dev/null | head -n 1 || echo cc-unknown
+    "$CXX" --version 2>/dev/null | head -n 1 || echo cxx-unknown
+    echo "args:$MAKE_ARGS $*"
+    sha256sum Makefile.cbm 2>/dev/null || echo makefile-unknown
+  } | sha256sum | cut -d' ' -f1
+)"
+if [ "${CBM_FORCE_CLEAN:-0}" = "1" ] || [ ! -f "$STAMP_FILE" ] \
+  || [ "$(cat "$STAMP_FILE" 2>/dev/null)" != "$premise" ] \
+  || printf '%s' "$premise" | grep -q "unknown"; then
+    scripts/clean.sh
+    mkdir -p build/c
+    printf '%s' "$premise" > "$STAMP_FILE"
+else
+    echo "INFO[CBM_INCREMENTAL_BUILD]: build premise unchanged (stamp ${premise:0:12}) — reusing build/c object tree; make + depfiles own correctness"
+    # Keep the fixture hygiene part of clean.sh even on incremental runs.
+    find "$ROOT" -maxdepth 1 -type d \( -name 'cbm_*' -o -name 'cli-*' \) -exec rm -rf {} + 2>/dev/null || true
+fi
+tstep clean
+
+# Step 2: Build the test runner (per-TU objects, parallel; Makefile applies
+# $ARCHFLAGS on macOS).
+make -j"$NPROC" -f Makefile.cbm build/c/test-runner $MAKE_ARGS
+tstep build-test-runner
+
+# Step 3: Run the suites in parallel shards (#280). The shard driver replays
+# every suite's output, prints per-suite times, and emits the combined
+# summary line last (the anchored count ci-cbm-test.sh parses).
+bash scripts/test-shards.sh build/c/test-runner
+tstep run-test-runner
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
@@ -73,18 +117,22 @@ fi
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+tstep build-prod-cbm
 bash "$ROOT/tests/test_parent_watchdog.sh"
+tstep parent-watchdog
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 bash "$ROOT/tests/test_worker_watchdog.sh"
+tstep worker-watchdog
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
 echo "=== Step 6: security-strings allow-list regression ==="
 bash "$ROOT/tests/test_security_strings_allowlist.sh"
+tstep security-strings
 
 echo "=== All tests passed ==="

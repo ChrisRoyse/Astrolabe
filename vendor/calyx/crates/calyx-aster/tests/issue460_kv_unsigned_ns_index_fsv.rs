@@ -12,7 +12,6 @@
 //! flush + reopen (not return values).
 
 use std::fs;
-use std::path::PathBuf;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::collection::{
@@ -68,10 +67,9 @@ fn ns_spec() -> IndexSpec {
     )
 }
 
-fn root() -> PathBuf {
-    std::env::var_os("CALYX_ISSUE460_NS_FSV_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("calyx-issue460-ns-index-fsv"))
+fn root() -> calyx_fsv::ScratchDir {
+    // RAII scratch: unset CALYX_ISSUE460_NS_FSV_ROOT self-cleans on drop/panic (#260).
+    calyx_fsv::scratch_or_temp("CALYX_ISSUE460_NS_FSV_ROOT", "calyx-issue460-ns-index-fsv")
 }
 
 #[test]
@@ -110,7 +108,8 @@ fn unindexed_kv_accepts_full_u64_namespace() {
 
 #[test]
 fn ns_index_orders_namespaces_unsigned_on_disk() {
-    let dir = root().join("vault");
+    let scratch = root();
+    let dir = scratch.join("vault");
     fs::remove_dir_all(&dir).ok();
 
     // Synthetic namespaces written OUT of order on purpose. Sorted unsigned they
@@ -190,7 +189,7 @@ fn ns_index_orders_namespaces_unsigned_on_disk() {
             "note": "u64::MAX and i64::MAX+1 reinterpret as negative i64 and would sort first",
         },
     });
-    let out = root().join("issue460-ns-index-fsv-artifact.json");
+    let out = scratch.join("issue460-ns-index-fsv-artifact.json");
     fs::write(&out, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     println!("{}", serde_json::to_string_pretty(&artifact).unwrap());
 }

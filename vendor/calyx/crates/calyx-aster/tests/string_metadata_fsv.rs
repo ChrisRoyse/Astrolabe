@@ -58,8 +58,10 @@ fn string_metadata_survives_base_row_codec_and_durable_readback() {
 #[test]
 #[ignore = "manual FSV for issue #601 string metadata SoT readback"]
 fn issue601_string_metadata_manual_fsv() {
-    let root =
-        fsv_root_os("CALYX_FSV_ROOT", "calyx-issue601-string-metadata-manual").join("issue601");
+    // Bind the RAII guard so the scratch tree self-cleans on drop/panic (#260);
+    // a configured CALYX_FSV_ROOT is kept for inspection.
+    let scratch = fsv_root_os("CALYX_FSV_ROOT", "calyx-issue601-string-metadata-manual");
+    let root = scratch.join("issue601");
     reset_dir(&root);
     let vault_dir = root.join("vault");
     let vault = open_vault(&vault_dir);

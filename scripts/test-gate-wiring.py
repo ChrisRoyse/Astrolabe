@@ -21,6 +21,7 @@ FILES = (
     "scripts/ci-rust-gate.sh",
     "scripts/check-workspace-tests.py",
     "scripts/clean-target.sh",
+    "vendor/codebase-memory-mcp/scripts/test.sh",
 )
 
 
@@ -76,10 +77,14 @@ def main() -> int:
         assert checker.validate(fixture) == []
 
         check = fixture / "scripts/check.sh"
+        # #280: the lowered-parity collect must precede shadow-parity; swapping
+        # them must trip the order contract.
         rewrite(
             check,
-            'bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform',
-            '"$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform\nbash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
+            'gate lowered-parity -- lowered_parity_wait\n'
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact',
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact\n'
+            'gate lowered-parity -- lowered_parity_wait',
         )
         require_error(checker.validate(fixture), "portable-before-egress order")
         copy_fixture(fixture)
@@ -92,71 +97,45 @@ def main() -> int:
         require_error(checker.validate(fixture), "allow-unsupported-platform")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-check-libcbm-symbols.py\n',
-            "",
-        )
+        # #280: the gate-tooling self-tests are now listed in a bash array and
+        # dispatched through scripts/run-gate-selftests.py, and several always-run
+        # static gates are grouped through gate_group. The wiring contract still
+        # requires each script's path to appear in check.sh, so renaming the path
+        # (breaking the wiring) must still be caught. Substring swaps are robust
+        # to the exact invocation form.
+        rewrite(check, "scripts/test-check-libcbm-symbols.py", "scripts/removed-1.py")
         require_error(checker.validate(fixture), "test-check-libcbm-symbols.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-cbm-lint-platform.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-cbm-lint-platform.py", "scripts/removed-2.py")
         require_error(checker.validate(fixture), "test-cbm-lint-platform.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-cbm-format-overlay.py\n',
-            "",
-        )
-        require_error(checker.validate(fixture), "test-cbm-format-overlay.py")
+        rewrite(check, "scripts/test-cbm-overlay-sources.py", "scripts/removed-3.py")
+        require_error(checker.validate(fixture), "test-cbm-overlay-sources.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-parity-corpus-contract.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-parity-corpus-contract.py", "scripts/removed-4.py")
         require_error(checker.validate(fixture), "test-parity-corpus-contract.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-native-cargo-fmt.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-native-cargo-fmt.py", "scripts/removed-5.py")
         require_error(checker.validate(fixture), "test-native-cargo-fmt.py")
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-verify-chain-native-path.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-verify-chain-native-path.py", "scripts/removed-6.py")
         require_error(
             checker.validate(fixture), "test-verify-chain-native-path.py"
         )
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-native-binary-resolution.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-native-binary-resolution.py", "scripts/removed-7.py")
         require_error(
             checker.validate(fixture), "test-native-binary-resolution.py"
         )
         copy_fixture(fixture)
 
-        rewrite(
-            check,
-            '"$PYTHON_BIN" scripts/test-installer-roundtrip-fixture.py\n',
-            "",
-        )
+        rewrite(check, "scripts/test-installer-roundtrip-fixture.py", "scripts/removed-8.py")
         require_error(
             checker.validate(fixture), "test-installer-roundtrip-fixture.py"
         )
@@ -164,8 +143,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/check-windows-gnu-toolchain-contract.py\n',
-            "",
+            "scripts/check-windows-gnu-toolchain-contract.py",
+            "scripts/removed-9.py",
         )
         require_error(
             checker.validate(fixture), "check-windows-gnu-toolchain-contract.py"
@@ -174,8 +153,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/test-windows-gnu-toolchain-contract.py\n',
-            "",
+            "scripts/test-windows-gnu-toolchain-contract.py",
+            "scripts/removed-10.py",
         )
         require_error(
             checker.validate(fixture), "test-windows-gnu-toolchain-contract.py"
@@ -184,8 +163,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/check-native-aggregate-wrapper.py\n',
-            "",
+            "scripts/check-native-aggregate-wrapper.py",
+            "scripts/removed-11.py",
         )
         require_error(
             checker.validate(fixture), "check-native-aggregate-wrapper.py"
@@ -194,8 +173,8 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/test-native-aggregate-wrapper.py\n',
-            "",
+            "scripts/test-native-aggregate-wrapper.py",
+            "scripts/removed-12.py",
         )
         require_error(
             checker.validate(fixture), "test-native-aggregate-wrapper.py"
@@ -204,10 +183,13 @@ def main() -> int:
 
         rewrite(
             check,
-            '"$PYTHON_BIN" scripts/native-cargo-fmt.py --all -- --check\n',
-            "",
+            "--all --workspace-only -- --check",
+            "--all -- --check",
         )
-        require_error(checker.validate(fixture), "native-cargo-fmt.py --all -- --check")
+        require_error(
+            checker.validate(fixture),
+            "native-cargo-fmt.py --all --workspace-only -- --check",
+        )
         copy_fixture(fixture)
 
         rust_gate = fixture / "scripts/ci-rust-gate.sh"
@@ -220,16 +202,58 @@ def main() -> int:
         copy_fixture(fixture)
 
         full = fixture / "scripts/check-full.sh"
-        # #193: the C phases now start concurrently, but their declaration order
-        # is still contractual -- swapping them must still trip the order check.
+        # #280: unwiring the concurrent CBM phase from check-full must be caught.
         rewrite(
             full,
-            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh\n'
-            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh',
-            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh\n'
-            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh',
+            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"',
+            'start_phase "cbm-test" true',
         )
-        require_error(checker.validate(fixture), "required order")
+        require_error(checker.validate(fixture), "ci-cbm-test.sh")
+        copy_fixture(fixture)
+
+        # #280: the tiered-out phases must stay COUNTED omissions in check-full.
+        rewrite(
+            full,
+            "SKIP[ASTRO_RELEASE_TIER_RUST_GATE]",
+            "INFO[ASTRO_RELEASE_TIER_RUST_GATE]",
+        )
+        require_error(checker.validate(fixture), "ASTRO_RELEASE_TIER_RUST_GATE")
+        copy_fixture(fixture)
+
+        # #280: the suite impact gate is load-bearing in both directions.
+        rewrite(
+            check,
+            "scripts/check-suite-impact.py should-run workspace-block",
+            "scripts/check-suite-impact.py always-run workspace-block",
+        )
+        require_error(
+            checker.validate(fixture),
+            "check-suite-impact.py should-run workspace-block",
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            "scripts/check-suite-impact.py record-green workspace-block",
+            "scripts/check-suite-impact.py forget-green workspace-block",
+        )
+        require_error(
+            checker.validate(fixture),
+            "check-suite-impact.py record-green workspace-block",
+        )
+        copy_fixture(fixture)
+
+        # #280: check-release must defeat both fail-closed fast-path gates.
+        release_pre = fixture / "scripts/check-release.sh"
+        rewrite(release_pre, "export ASTRO_SUITE_GATE=all", "export ASTRO_SUITE_GATE=auto2")
+        require_error(checker.validate(fixture), "ASTRO_SUITE_GATE=all")
+        copy_fixture(fixture)
+
+        # #280: the sharded CBM runner and the premise-stamped incremental build
+        # must stay wired inside the owned test.sh.
+        cbm_test_sh = fixture / "vendor/codebase-memory-mcp/scripts/test.sh"
+        rewrite(cbm_test_sh, "scripts/test-shards.sh", "scripts/test-serial.sh")
+        require_error(checker.validate(fixture), "test-shards.sh")
         copy_fixture(fixture)
 
         # #193: a failure in ANY concurrent phase must fail the aggregate with the
@@ -274,10 +298,10 @@ def main() -> int:
 
         rewrite(
             cbm_lint,
-            "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+            "INFO[ASTRO_CBM_FORMAT]",
             "INFO[ASTRO_CBM_FORMAT_REMOVED]",
         )
-        require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT_OVERLAY")
+        require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT")
         copy_fixture(fixture)
 
         cbm_test = fixture / "scripts/ci-cbm-test.sh"

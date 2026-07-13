@@ -107,11 +107,33 @@ def main() -> int:
         required=True,
         help="Workspace-test deadline; zero runs without a deadline.",
     )
+    parser.add_argument(
+        "--nextest-profile",
+        default=None,
+        help=(
+            "When set, run `cargo nextest run --profile <name> --workspace` "
+            "instead of `cargo test --workspace`. #280 Tier-1 uses the #264 "
+            "`fast` profile, whose .config/nextest.toml default-filter tiers out "
+            "the heavy tests; ci-rust-gate.sh runs the full set + doctests."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.nextest_profile:
+        argv = [
+            args.cargo,
+            "nextest",
+            "run",
+            "--profile",
+            args.nextest_profile,
+            "--workspace",
+        ]
+    else:
+        argv = [args.cargo, "test", "--workspace"]
 
     try:
         return run_command(
-            [args.cargo, "test", "--workspace"],
+            argv,
             cwd=ROOT,
             timeout_secs=args.timeout_secs,
         )

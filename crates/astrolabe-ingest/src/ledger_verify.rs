@@ -344,7 +344,7 @@ fn janitor_report_from_result(
     }
 }
 
-fn verify_store_chain(store: &dyn LedgerCfStore) -> IngestResult<VerifyChainReport> {
+pub(crate) fn verify_store_chain(store: &dyn LedgerCfStore) -> IngestResult<VerifyChainReport> {
     let rows = store.scan()?;
     let row_end = rows
         .iter()
@@ -429,8 +429,8 @@ fn empty_report() -> VerifyChainReport {
     }
 }
 
-struct AsterVaultLedgerStore<'a, C> {
-    vault: &'a AsterVault<C>,
+pub(crate) struct AsterVaultLedgerStore<'a, C> {
+    pub(crate) vault: &'a AsterVault<C>,
 }
 
 impl<C> LedgerCfStore for AsterVaultLedgerStore<'_, C>
@@ -475,7 +475,7 @@ where
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -488,6 +488,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use calyx_aster::cf::ledger_key;
+    use calyx_aster::pressure::{DiskPressureGuard, DiskSample, DiskSpaceProbe};
     use calyx_aster::vault::{AsterVault, VaultOptions};
     use calyx_core::{FixedClock, VaultId};
     use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -495,6 +496,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -776,6 +779,318 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Toggleable disk-space probe for the disk-full recovery FSV (#60). The test
+    /// flips `available` blocks between "all free" and "none free" to drive
+    /// Calyx's disk-pressure guard across its high-water mark without a real
+    /// filesystem quota -- no VHD and no admin rights, so it runs natively on
+    /// Windows in a worktree.
+    #[derive(Clone)]
+    struct ToggleDiskProbe {
+        blocks: u64,
+        available: Arc<AtomicU64>,
+    }
+
+    impl DiskSpaceProbe for ToggleDiskProbe {
+        fn sample(&self, _path: &Path) -> CalyxResult<DiskSample> {
+            Ok(DiskSample {
+                blocks: self.blocks,
+                blocks_available: self.available.load(Ordering::SeqCst),
+            })
+        }
+    }
+
+    #[test]
+    fn disk_full_write_fails_closed_and_vault_recovers_with_exact_ledger() {
+        let root = test_dir("disk-full-recovery");
+        let vault_dir = root.join("vault");
+        fs::create_dir_all(&root).expect("create disk-full FSV root");
+
+        // 100 blocks total; `available` starts full (all free). The guard rejects a
+        // write once used_ratio (= 1 - available/total) reaches the high-water mark.
+        let available = Arc::new(AtomicU64::new(100));
+        let probe = ToggleDiskProbe {
+            blocks: 100,
+            available: Arc::clone(&available),
+        };
+        // high_water_ratio 0.85: available=0 -> used_ratio 1.0 >= 0.85 -> disk full;
+        // available=100 -> used_ratio 0.0 -> writes admitted.
+        let guard = DiskPressureGuard::with_probe(
+            vault_dir.clone(),
+            0.85,
+            Arc::new(FixedClock::new(42)),
+            Arc::new(probe),
+        );
+        let options = VaultOptions {
+            disk_pressure_guard: Some(guard),
+            ..VaultOptions::default()
+        };
+
+        let vault = AsterVault::new_durable(&vault_dir, vault_id(), b"ledger-disk-full", options)
+            .expect("open durable vault with disk guard");
+
+        // 1. Space free: a durable batch+ledger write commits.
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    b"row-before".to_vec(),
+                    b"v-before".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"before-full".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("write before disk-full commits");
+
+        // 2. Disk full: the next write must fail closed BEFORE any WAL append, so it
+        // leaves neither a data row nor a ledger entry (no torn write).
+        available.store(0, Ordering::SeqCst);
+        let err = vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    b"row-during".to_vec(),
+                    b"v-during".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"during-full".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect_err("write under disk pressure must fail closed");
+        assert_eq!(err.code, "CALYX_DISK_PRESSURE");
+
+        // 3. Recovery: space returns and a durable write commits again.
+        available.store(100, Ordering::SeqCst);
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(ColumnFamily::Kv, b"row-after".to_vec(), b"v-after".to_vec())],
+                EntryKind::Ingest,
+                SubjectId::Query(b"after-recovery".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("write after recovery commits");
+        vault.flush().expect("flush recovered vault");
+        drop(vault);
+
+        // 4. Independent readback: reopen with a plain handle (no guard) and prove
+        // the ledger chain is intact with EXACTLY the two committed entries -- the
+        // disk-full-rejected write left no ledger gap and no orphaned data row.
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-disk-full",
+            VaultOptions::default(),
+        )
+        .expect("reopen vault after disk-full episode");
+        let chain = verify_chain(&reopened).expect("verify recovered chain");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows, 2);
+        assert_eq!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-before")
+                .expect("read row-before")
+                .expect("row-before present"),
+            b"v-before"
+        );
+        assert_eq!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-after")
+                .expect("read row-after")
+                .expect("row-after present"),
+            b"v-after"
+        );
+        assert!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, b"row-during")
+                .expect("read row-during")
+                .is_none(),
+            "the disk-full-rejected write must have persisted nothing"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay() {
+        // Ingest-stage crash matrix (#276): kill the writer at the
+        // post-MVCC-commit / pre-checkpoint boundary. The batch is in the WAL
+        // and MVCC memtable but the checkpoint manifest never advanced, so
+        // recovery must WAL-replay it. FSV proves the reopened vault has the
+        // data row and exactly one ledger entry with an intact chain.
+        let root = test_dir("kill-after-mvcc");
+        let vault_dir = root.join("vault");
+        let marker = root.join("after-mvcc.marker");
+        fs::create_dir_all(&root).expect("create crash FSV root");
+
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("ledger_verify::tests::crash_after_mvcc_commit_child")
+            .arg("--nocapture")
+            .env("ASTROLABE_CRASH_FSV_CHILD", "1")
+            .env("ASTROLABE_CRASH_FSV_VAULT", &vault_dir)
+            .env("CALYX_ASTER_CRASH_FSV_AFTER_MVCC_COMMIT_MARKER", &marker)
+            .spawn()
+            .expect("spawn crash FSV child");
+
+        wait_for_marker_or_child_exit(&marker, &mut child);
+        child.kill().expect("kill crash FSV child");
+        let status = child.wait().expect("wait for crash FSV child");
+        assert!(!status.success(), "child should be killed mid-commit");
+
+        let marker_seq = fs::read_to_string(&marker)
+            .expect("read crash marker")
+            .trim()
+            .parse::<u64>()
+            .expect("marker seq");
+        assert_eq!(marker_seq, 1);
+
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-crash-fsv",
+            VaultOptions::default(),
+        )
+        .expect("reopen crashed vault");
+        let data = reopened
+            .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, CRASH_FSV_KEY)
+            .expect("read recovered data row")
+            .expect("data row recovered from WAL replay");
+        assert_eq!(data, b"durable-before-process-kill");
+
+        let chain = verify_chain(&reopened).expect("verify recovered ledger chain");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows, 1);
+
+        let ledger = reopened
+            .read_cf_at(reopened.latest_seq(), ColumnFamily::Ledger, &ledger_key(0))
+            .expect("read recovered ledger row")
+            .expect("ledger row recovered from WAL replay");
+        let entry = decode(&ledger).expect("decode recovered ledger row");
+        assert_eq!(entry.kind, EntryKind::Ingest);
+        // No partial state: exactly one ledger seq, no phantom second entry.
+        assert!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Ledger, &ledger_key(1))
+                .expect("read absent ledger seq 1")
+                .is_none(),
+            "recovery must not invent a second ledger entry"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kill_after_checkpoint_reopens_intact_chain_via_manifest() {
+        // Ingest-stage crash matrix (#276): kill the writer at the
+        // post-checkpoint / post-manifest-advance boundary. The batch's
+        // durable-batch SSTs are written and the manifest has advanced, so
+        // recovery reconciles the manifest + SSTs (checkpoint replay), a
+        // distinct path from the WAL-replay case above. FSV proves the reopened
+        // vault has the data row and exactly one ledger entry, chain intact.
+        let root = test_dir("kill-after-checkpoint");
+        let vault_dir = root.join("vault");
+        let marker = root.join("after-checkpoint.marker");
+        fs::create_dir_all(&root).expect("create crash FSV root");
+
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("ledger_verify::tests::crash_after_checkpoint_child")
+            .arg("--nocapture")
+            .env("ASTROLABE_CRASH_FSV_CHILD", "1")
+            .env("ASTROLABE_CRASH_FSV_VAULT", &vault_dir)
+            .env("CALYX_ASTER_CRASH_FSV_AFTER_CHECKPOINT_MARKER", &marker)
+            .spawn()
+            .expect("spawn crash FSV child");
+
+        wait_for_marker_or_child_exit(&marker, &mut child);
+        child.kill().expect("kill crash FSV child");
+        let status = child.wait().expect("wait for crash FSV child");
+        assert!(!status.success(), "child should be killed post-checkpoint");
+
+        let marker_seq = fs::read_to_string(&marker)
+            .expect("read crash marker")
+            .trim()
+            .parse::<u64>()
+            .expect("marker seq");
+        assert_eq!(marker_seq, 1);
+
+        let reopened = AsterVault::new_durable(
+            &vault_dir,
+            vault_id(),
+            b"ledger-crash-fsv",
+            VaultOptions::default(),
+        )
+        .expect("reopen crashed vault");
+        let data = reopened
+            .read_cf_at(reopened.latest_seq(), ColumnFamily::Kv, CRASH_FSV_KEY)
+            .expect("read recovered data row")
+            .expect("data row recovered from checkpoint");
+        assert_eq!(data, b"durable-before-process-kill");
+
+        let chain = verify_chain(&reopened).expect("verify recovered ledger chain");
+        assert_eq!(chain.status, "intact");
+        assert_eq!(chain.ledger_rows, 1);
+
+        let ledger = reopened
+            .read_cf_at(reopened.latest_seq(), ColumnFamily::Ledger, &ledger_key(0))
+            .expect("read recovered ledger row")
+            .expect("ledger row recovered from checkpoint");
+        let entry = decode(&ledger).expect("decode recovered ledger row");
+        assert_eq!(entry.kind, EntryKind::Ingest);
+        // No partial state: exactly one ledger seq survives the checkpoint crash.
+        assert!(
+            reopened
+                .read_cf_at(reopened.latest_seq(), ColumnFamily::Ledger, &ledger_key(1))
+                .expect("read absent ledger seq 1")
+                .is_none(),
+            "recovery must not invent a second ledger entry"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Production-build guard control (#276). Crash failpoints must be
+    /// impossible to arm in a shipped build. The build-time `compile_error!` in
+    /// `calyx-aster` refuses to compile `--features crash-fsv` into a release
+    /// build; this control proves the paired startup guard's decision fires on
+    /// exactly the armed-and-optimized combination and permits every legitimate
+    /// one, and that the live guard permits this debug/test build.
+    #[test]
+    fn crash_fsv_production_guard_refuses_armed_optimized_build() {
+        use calyx_aster::vault::{
+            CRASH_FSV_ARMED_IN_PRODUCTION, crash_fsv_guard_decision,
+            guard_against_production_failpoints,
+        };
+
+        // Armed failpoints + optimized (release) + non-test => refuse, fail closed.
+        let err = crash_fsv_guard_decision(true, true, false)
+            .expect_err("an armed optimized production build must be refused");
+        // The refusal carries the exact fail-closed wire code.
+        assert_eq!(err.code, "CALYX_CRASH_FSV_ARMED_IN_PRODUCTION");
+        assert_eq!(err.code, CRASH_FSV_ARMED_IN_PRODUCTION);
+        assert!(
+            !err.remediation.is_empty(),
+            "guard error carries remediation"
+        );
+
+        // Every legitimate combination is permitted:
+        //  - armed + debug build (the crash-FSV suite itself),
+        crash_fsv_guard_decision(true, false, false).expect("armed debug build permitted");
+        //  - armed + optimized + `cfg(test)` build (`cargo test --release`),
+        crash_fsv_guard_decision(true, true, true).expect("armed test build permitted");
+        //  - unarmed + optimized (a normal shipped build without the feature).
+        crash_fsv_guard_decision(false, true, false).expect("unarmed production permitted");
+
+        // The live wrapper, reading this build's real cfg (debug + crash-fsv
+        // feature via dev-deps), must permit and never block a durable-vault open.
+        guard_against_production_failpoints().expect("current debug/test build permitted");
+    }
+
     #[test]
     fn durable_vault_concurrent_open_serializes_cross_process_writes() {
         let root = test_dir("concurrent-open");
@@ -888,6 +1203,76 @@ mod tests {
             )
             .expect("crash failpoint should pause after WAL append");
         panic!("crash FSV failpoint did not pause");
+    }
+
+    #[test]
+    #[ignore = "child process helper for kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay"]
+    fn crash_after_mvcc_commit_child() {
+        if std::env::var_os("ASTROLABE_CRASH_FSV_CHILD").is_none() {
+            return;
+        }
+        let vault_dir =
+            std::env::var_os("ASTROLABE_CRASH_FSV_VAULT").expect("ASTROLABE_CRASH_FSV_VAULT");
+        let vault = AsterVault::new_durable(
+            PathBuf::from(vault_dir),
+            vault_id(),
+            b"ledger-crash-fsv",
+            VaultOptions::default(),
+        )
+        .expect("open child crash FSV vault");
+        // The post-MVCC-commit failpoint parks inside this write, after the WAL
+        // append and MVCC commit but before the checkpoint manifest advances.
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    CRASH_FSV_KEY.to_vec(),
+                    b"durable-before-process-kill".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"crash-fsv".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("crash failpoint should pause after MVCC commit");
+        panic!("crash FSV failpoint did not pause");
+    }
+
+    #[test]
+    #[ignore = "child process helper for kill_after_checkpoint_reopens_intact_chain_via_manifest"]
+    fn crash_after_checkpoint_child() {
+        if std::env::var_os("ASTROLABE_CRASH_FSV_CHILD").is_none() {
+            return;
+        }
+        let vault_dir =
+            std::env::var_os("ASTROLABE_CRASH_FSV_VAULT").expect("ASTROLABE_CRASH_FSV_VAULT");
+        let vault = AsterVault::new_durable(
+            PathBuf::from(vault_dir),
+            vault_id(),
+            b"ledger-crash-fsv",
+            VaultOptions::default(),
+        )
+        .expect("open child crash FSV vault");
+        // The write commits and stages the checkpoint; flush() writes the
+        // durable-batch SSTs and advances the manifest, then the post-checkpoint
+        // failpoint parks the process AFTER the manifest advance.
+        vault
+            .write_cf_batch_with_ledger_entry(
+                [(
+                    ColumnFamily::Kv,
+                    CRASH_FSV_KEY.to_vec(),
+                    b"durable-before-process-kill".to_vec(),
+                )],
+                EntryKind::Ingest,
+                SubjectId::Query(b"crash-fsv".to_vec()),
+                br#"{"schema":"test-ledger-v1"}"#.to_vec(),
+                ActorId::Service("astrolabe-test".to_string()),
+            )
+            .expect("write commits before checkpoint flush");
+        vault
+            .flush()
+            .expect("crash failpoint should pause after checkpoint manifest advance");
+        panic!("crash FSV checkpoint failpoint did not pause");
     }
 
     #[test]

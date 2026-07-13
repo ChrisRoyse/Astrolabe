@@ -23,9 +23,11 @@ use crate::error::WardError;
 
 mod backend;
 
+use backend::hash_parts;
 #[cfg(test)]
 use backend::softmax_benign;
-use backend::{OnnxInjectionBackend, external_data_path, hash_parts, sha256_files};
+#[cfg(feature = "onnx-lens")]
+use backend::{OnnxInjectionBackend, external_data_path, sha256_files};
 
 pub const DEFAULT_INJECTION_MODEL_PATH: &str = "/var/lib/calyx/models/injection-guard/model.onnx";
 pub const DEFAULT_INJECTION_TOKENIZER_PATH: &str =
@@ -34,7 +36,9 @@ pub const DEFAULT_INJECTION_TOKENIZER_PATH: &str =
 pub const INJECTION_MAX_TOKENS: usize = 512;
 /// `RobertaForSequenceClassification` injection head: 2 logits.
 pub const INJECTION_LABELS: usize = 2;
+#[cfg(feature = "onnx-lens")]
 const BENIGN_LABEL: usize = 0;
+#[cfg(feature = "onnx-lens")]
 const INJECTION_LABEL: usize = 1;
 const INJECTION_LENS_NAME: &str = "injection-guard-v1";
 const INJECTION_SOURCE_REPO: &str = "calyx/injection_guard#562-model_comb";
@@ -114,6 +118,7 @@ impl InjectionLens {
         Self::new_with_tokenizer_and_provider_policy(model_path, &tokenizer_path, policy)
     }
 
+    #[cfg(feature = "onnx-lens")]
     pub fn new_with_tokenizer_and_provider_policy(
         model_path: &Path,
         tokenizer_path: &Path,
@@ -135,6 +140,19 @@ impl InjectionLens {
             weights_hash,
             backend,
         )
+    }
+
+    /// Fail-closed stub: the ONNX injection backend is compiled out when the
+    /// `onnx-lens` feature is disabled (#191). Callers needing real ONNX
+    /// inference must rebuild with `--features onnx-lens`; tests can still
+    /// inject a mock backend through [`InjectionLens::from_backend`].
+    #[cfg(not(feature = "onnx-lens"))]
+    pub fn new_with_tokenizer_and_provider_policy(
+        _model_path: &Path,
+        _tokenizer_path: &Path,
+        _policy: InjectionProviderPolicy,
+    ) -> Result<Self, WardError> {
+        Err(WardError::LensFeatureDisabled { lens: "injection" })
     }
 
     pub fn from_backend<B>(
@@ -327,5 +345,22 @@ mod tests {
             }
             other => panic!("expected dense, got {other:?}"),
         }
+    }
+
+    /// With `onnx-lens` disabled (Astrolabe's default), the ONNX constructors
+    /// fail closed with the labeled `CALYX_WARD_LENS_FEATURE_DISABLED` deficit
+    /// rather than silently degrade (#191). The mock `from_backend` seam above
+    /// still works, proving only the ONNX backend is gated.
+    #[cfg(not(feature = "onnx-lens"))]
+    #[test]
+    fn onnx_lens_disabled_fails_closed() {
+        let err = InjectionLens::new(Path::new("/nonexistent/injection.onnx")).unwrap_err();
+        assert_eq!(err.code(), "CALYX_WARD_LENS_FEATURE_DISABLED");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("onnx-lens"),
+            "remediation names feature: {msg}"
+        );
+        assert!(msg.contains("injection"), "message names lens: {msg}");
     }
 }

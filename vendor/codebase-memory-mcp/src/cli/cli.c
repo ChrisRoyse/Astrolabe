@@ -251,19 +251,77 @@ static bool is_executable(const char *path) {
 #endif
 }
 
+#ifdef ASTRO_ENV_STORE
+/* Search for an executable named `name` in the PATH environment variable.
+ * Returns the full path in `out` (max out_sz) if found, else empty string.
+ *
+ * #267: PATH is copied into a heap buffer sized to its actual length rather than
+ * a fixed 4096-byte stack buffer. A developer PATH routinely exceeds 4 KB on
+ * Windows; the old fixed buffer made cbm_safe_getenv fail closed
+ * (CBM_E_ENV_VALUE_TRUNCATED) so find_in_path — and therefore cbm_find_cli —
+ * wrongly reported every installed agent CLI absent. The value is read from the C
+ * runtime's environ array (the same store cbm_safe_getenv walks), so this stays
+ * portable: no GetEnvironmentVariableW, consistent with how CBM reads every other
+ * variable, and the match is byte-identical (case-sensitive "PATH" + '='). */
+#else
 /* Search for an executable named `name` in the PATH environment variable.
  * Returns the full path in `out` (max out_sz) if found, else empty string. */
+#endif
 static bool find_in_path(const char *name, char *out, size_t out_sz) {
+#ifdef ASTRO_ENV_STORE
+#if defined(_WIN32)
+    char **cli_environ = _environ;
+#elif defined(__APPLE__)
+    char **cli_environ = *_NSGetEnviron();
+#else
+    extern char **environ;
+    char **cli_environ = environ;
+#endif
+    const char *path_val = NULL;
+    if (cli_environ) {
+        size_t nlen = strlen("PATH");
+        for (char **e = cli_environ; *e; e++) {
+            if (strncmp(*e, "PATH", nlen) == 0 && (*e)[nlen] == '=') {
+                path_val = *e + nlen + CLI_SKIP_ONE;
+                break;
+            }
+        }
+    }
+    if (!path_val || !path_val[0]) {
+#else
     char path_copy[CLI_BUF_4K];
     if (!cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+#endif
         return false;
     }
+#ifdef ASTRO_ENV_STORE
+
+    /* Size the copy to PATH's real length. The only refusal is a genuine
+     * allocation failure, which is unrepresentable rather than a truncated guess:
+     * report absent instead of crashing. Any PATH that fits in memory is searched
+     * in full — there is no artificial length cap left to trip. */
+    size_t path_len = strlen(path_val);
+    char *path_copy = malloc(path_len + CLI_SKIP_ONE);
+    if (!path_copy) {
+        return false;
+    }
+    memcpy(path_copy, path_val, path_len + CLI_SKIP_ONE);
+
+#endif
     char *saveptr;
     char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
+#ifdef ASTRO_ENV_STORE
+    bool found = false;
+#endif
     while (dir) {
         snprintf(out, out_sz, "%s/%s", dir, name);
         if (is_executable(out)) {
+#ifdef ASTRO_ENV_STORE
+            found = true;
+            break;
+#else
             return true;
+#endif
         }
 #ifdef _WIN32
         /* On Windows executables carry an extension (PATHEXT). A CLI like
@@ -274,13 +332,28 @@ static bool find_in_path(const char *name, char *out, size_t out_sz) {
         for (int i = 0; win_exts[i]; i++) {
             snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
             if (is_executable(out)) {
+#ifdef ASTRO_ENV_STORE
+                found = true;
+                break;
+#else
                 return true;
+#endif
             }
+#ifdef ASTRO_ENV_STORE
+        }
+        if (found) {
+            break;
+#endif
         }
 #endif
         dir = strtok_r(NULL, PATH_DELIM, &saveptr);
     }
+#ifdef ASTRO_ENV_STORE
+    free(path_copy);
+    return found;
+#else
     return false;
+#endif
 }
 
 const char *cbm_find_cli(const char *name, const char *home_dir) {
@@ -2622,7 +2695,18 @@ static const char *get_cache_dir(const char *home_dir) {
     if (!home_dir) {
         return NULL;
     }
+#ifdef ASTRO_ENV_STORE
+    /* #241: a non-NULL home no longer implies a resolvable store — an unreadable
+     * CBM_CACHE_DIR now fails closed instead of relocating the store. NULL here is
+     * a real outcome, and "%s" on NULL is undefined behaviour. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s", cache_dir);
+#else
     snprintf(buf, sizeof(buf), "%s", cbm_resolve_cache_dir());
+#endif
     return buf;
 }
 
@@ -2851,8 +2935,20 @@ int cbm_cmd_config(int argc, char **argv) {
         return CLI_TRUE;
     }
 
+#ifdef ASTRO_ENV_STORE
+    /* #241: see get_cache_dir(). The resolver can fail even with a good home. */
+    const char *resolved_cache = cbm_resolve_cache_dir();
+    if (!resolved_cache) {
+        (void)fprintf(stderr, "error: cannot resolve the CBM cache directory\n");
+        return CLI_TRUE;
+    }
+#endif
     char cache_dir[CLI_BUF_1K];
+#ifdef ASTRO_ENV_STORE
+    snprintf(cache_dir, sizeof(cache_dir), "%s", resolved_cache);
+#else
     snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
+#endif
 
     cbm_config_t *cfg = cbm_config_open(cache_dir);
     if (!cfg) {

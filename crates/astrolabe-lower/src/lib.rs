@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+pub mod debounce;
 mod team_artifact;
+
+pub use debounce::{ASTRO_LOWER_DEBOUNCE_WINDOW_OUT_OF_RANGE, LowerDebouncer, RunOutcome};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -1163,6 +1166,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrolabe_domain::LoweringTrigger;
     use astrolabe_ingest::{
         SqliteImportOptions, erase_imported_cx_graph_rows, import_sqlite_to_vault, verify_chain,
     };
@@ -1410,6 +1414,183 @@ mod tests {
         cleanup(&source);
         cleanup(&before_lowered);
         cleanup(&after_lowered);
+        cleanup_dir(&vault_dir);
+    }
+
+    /// Manually advanceable clock so debounce timing is deterministic without
+    /// real sleeps.
+    #[derive(Clone, Debug)]
+    struct AdvancingClock {
+        now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl AdvancingClock {
+        fn new(start: calyx_core::Ts) -> Self {
+            Self {
+                now: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start)),
+            }
+        }
+        fn advance(&self, delta_ms: u64) {
+            self.now
+                .fetch_add(delta_ms, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> calyx_core::Ts {
+            self.now.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Appends a non-lower ledger entry, moving the vault's ledger head exactly
+    /// as a production-path weave commit would, so the lowered artifact's derived
+    /// content fingerprint changes.
+    fn simulate_weave_mutation(vault: &AsterVault<SystemClock>, tag: &str) {
+        vault
+            .append_ledger_entry(
+                EntryKind::Ingest,
+                SubjectId::Query(format!("astrolabe-weave-sim:{tag}").into_bytes()),
+                serde_json::to_vec(&json!({"schema": "astrolabe-weave-mutation-test", "tag": tag}))
+                    .expect("encode weave mutation payload"),
+                ActorId::Service("astrolabe-weave-sim".to_string()),
+            )
+            .expect("append simulated weave ledger entry");
+    }
+
+    /// Counts ledger entries authored by the lowering actor (one per real,
+    /// non-idempotent lowering manifest commit).
+    fn lower_manifest_ledger_entries(vault: &AsterVault<SystemClock>) -> usize {
+        vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan ledger cf")
+            .into_iter()
+            .filter(|(_key, bytes)| {
+                let entry = decode(bytes).expect("decode ledger entry");
+                matches!(&entry.actor, ActorId::Service(actor) if actor == ASTRO_LOWER_ACTOR)
+            })
+            .count()
+    }
+
+    /// Reads `astro_meta.vault_fingerprint` straight out of the on-disk lowered
+    /// SQLite file — independent of any in-memory report.
+    fn read_astro_meta_fingerprint(path: &Path) -> String {
+        let connection = Connection::open(path).expect("open lowered artifact for readback");
+        connection
+            .query_row("SELECT vault_fingerprint FROM astro_meta", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("read astro_meta.vault_fingerprint")
+    }
+
+    #[test]
+    fn debounced_regeneration_coalesces_weave_mutations_and_refreshes_lowered_on_disk() {
+        // #225 end-to-end FSV: a real vault is lowered once, then a burst of
+        // production-path weave mutations arrives. The debounce coordinator
+        // coalesces the burst into ONE regeneration once the window elapses. The
+        // regenerated lowered SQLite on disk is opened independently and its
+        // astro_meta.vault_fingerprint is proven to match the post-mutation vault
+        // (via verify_lowered_artifact, which recomputes the current vault
+        // fingerprint), and the lowering manifest ledger grew by exactly one.
+        let source = temp_path("debounce-source.db");
+        let baseline_lowered = temp_path("debounce-baseline.db");
+        let lowered = temp_path("debounce-lowered.db");
+        let (vault_dir, vault) = durable_vault("debounce-regeneration");
+        fixture_sqlite(&source);
+        import_sqlite_to_vault(
+            &source,
+            &vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-debounce", 1),
+        )
+        .expect("import source sqlite");
+        vault.flush().expect("flush imported vault");
+
+        let options = LowerSqliteOptions::new("demo");
+
+        // Baseline lowering before any weave mutation: capture its fingerprint.
+        let baseline =
+            lower_cbm_sqlite(&vault, &baseline_lowered, &options).expect("baseline lower");
+        let manifests_after_baseline = lower_manifest_ledger_entries(&vault);
+        assert_eq!(
+            manifests_after_baseline, 1,
+            "baseline lowering writes one manifest ledger entry"
+        );
+
+        // Coordinator with a real registry-declared window and a controllable clock.
+        let clock = AdvancingClock::new(1_000);
+        let debouncer = LowerDebouncer::new(clock.clone(), 500).expect("valid window");
+
+        // A burst of 5 weave mutations, each signalling the coordinator, all
+        // inside the debounce window of the previous one.
+        const BURST: usize = 5;
+        for i in 0..BURST {
+            simulate_weave_mutation(&vault, &format!("burst-{i}"));
+            debouncer.request_regeneration();
+            clock.advance(50); // < 500ms window: keeps the burst coalescing
+        }
+        assert!(debouncer.pending(), "the burst leaves a regeneration owed");
+
+        // Before the window elapses: no regeneration yet — the lowered target for
+        // this coordinator does not exist on disk.
+        let waiting = debouncer
+            .run_due(|| lower_cbm_sqlite(&vault, &lowered, &options))
+            .expect("waiting run_due");
+        assert!(matches!(waiting, RunOutcome::Waiting));
+        assert!(
+            !lowered.exists(),
+            "no regeneration must occur before the debounce window elapses"
+        );
+        assert_eq!(
+            lower_manifest_ledger_entries(&vault),
+            manifests_after_baseline,
+            "no manifest ledger entry before the window elapses"
+        );
+
+        // Quiet for the full window since the last mutation: exactly one regen.
+        clock.advance(500);
+        let fired = debouncer
+            .run_due(|| lower_cbm_sqlite(&vault, &lowered, &options))
+            .expect("debounced regeneration");
+        let report = match fired {
+            RunOutcome::Regenerated(report) => report,
+            other => panic!("expected a regeneration, got {other:?}"),
+        };
+        assert!(!debouncer.pending(), "the coalesced burst is fully covered");
+
+        // Coalescing DoD: the manifest ledger grew by exactly ONE for the whole
+        // 5-mutation burst, not five.
+        assert_eq!(
+            lower_manifest_ledger_entries(&vault),
+            manifests_after_baseline + 1,
+            "the coalesced burst produces exactly one regeneration (ledger delta = 1)"
+        );
+
+        // FSV DoD: read the regenerated artifact's astro_meta straight off disk.
+        assert!(
+            lowered.exists(),
+            "regenerated lowered artifact exists on disk"
+        );
+        let disk_fingerprint = read_astro_meta_fingerprint(&lowered);
+        assert_eq!(
+            disk_fingerprint, report.vault_fingerprint_sha256,
+            "on-disk astro_meta fingerprint matches the reported regeneration"
+        );
+        assert_ne!(
+            disk_fingerprint, baseline.vault_fingerprint_sha256,
+            "post-weave lowered fingerprint differs from the pre-mutation baseline"
+        );
+
+        // Independent verifier: recomputes the CURRENT vault fingerprint and
+        // proves the on-disk artifact reflects the post-mutation vault (not stale,
+        // disk bytes hash to the ledgered manifest digest).
+        let verification =
+            verify_lowered_artifact(&vault, &lowered, "demo").expect("verify regenerated artifact");
+        assert_eq!(verification.vault_fingerprint_sha256, disk_fingerprint);
+        assert_eq!(verification.artifact_sha256, report.artifact_sha256);
+
+        cleanup(&source);
+        cleanup(&baseline_lowered);
+        cleanup(&lowered);
         cleanup_dir(&vault_dir);
     }
 
