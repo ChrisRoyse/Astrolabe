@@ -6004,6 +6004,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "edges_promoted", stats.edges_promoted);
         yyjson_mut_obj_add_int(doc, root, "anchors_written", stats.anchors_written);
         yyjson_mut_obj_add_int(doc, root, "incidents_detected", stats.incidents_detected);
+        yyjson_mut_obj_add_int(doc, root, "incidents_resolved", stats.incidents_resolved);
         yyjson_mut_obj_add_int(doc, root, "simple_records", stats.simple_records);
         yyjson_mut_obj_add_int(doc, root, "simple_unmatched", stats.simple_unmatched);
         /* Label the degradation: unmatched observations are surfaced, not dropped. */
