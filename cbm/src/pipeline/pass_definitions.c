@@ -477,17 +477,17 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                   int file_count) {
     cbm_log_info("pass.start", "pass", "definitions", "files", itoa_log(file_count));
 
-#ifdef ASTRO_UI_WERROR
-    /* #229: `file_count` is a signed count fed unchecked into
+    /* #229/#273: `file_count` is a signed count fed unchecked into
      * calloc((size_t)file_count, ...) twice below — the local_cache allocation
      * and the namespace-map `rels` allocation. A negative count (a caller
      * contract violation or an upstream integer wraparound) casts to an enormous
      * size_t: GCC 14 sees the (size_t)file_count range include [INT_MIN..-1] and
-     * trips -Walloc-size-larger-than under -Werror on native MinGW, and such a
-     * count really would request an absurd allocation. Refuse a negative count
-     * and fail closed with a {code, message, remediation} log record; an empty
-     * file set (file_count == 0) stays valid and flows through as a no-op. The
-     * early return narrows file_count to [0, INT_MAX] for both allocations. */
+     * trips -Walloc-size-larger-than on native MinGW, and such a count really would
+     * request an absurd allocation. Refuse a negative count and fail closed with a
+     * {code, message, remediation} log record; an empty file set (file_count == 0)
+     * stays valid and flows through as a no-op. The early return narrows file_count
+     * to [0, INT_MAX] for both allocations. Unconditional (#273): the fix ships in
+     * libcbm.a too, instead of being masked by a blanket -Wno-alloc-size-larger-than. */
     if (file_count < 0) {
         cbm_log_error("pass.definitions.file_count", "code", "CBM_E_DEFS_FILE_COUNT_RANGE",
                       "message", "definitions pass received a negative file_count", "remediation",
@@ -495,7 +495,6 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                       "caller contract violation or an integer overflow upstream");
         return CBM_NOT_FOUND;
     }
-#endif
 
     /* Ensure extraction library is initialized */
     cbm_init();

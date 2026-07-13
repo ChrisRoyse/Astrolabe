@@ -379,19 +379,16 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
         if (!is_ignored_dir(ent->name) &&
             !cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count) &&
             *stack_top < CBM_SZ_256) {
-#ifdef ASTRO_UI_WERROR
-            /* #229: bounded copy with a guaranteed terminator. The vendored
+            /* #229/#273: bounded copy with a guaranteed terminator. The vendored
              * strncpy(dst, src, sizeof-1) truncation idiom trips GCC 14
-             * -Wstringop-truncation under -Werror on the native MinGW toolchain.
-             * strnlen caps the length, memcpy copies exactly that many bytes, and
-             * the explicit NUL terminates — identical semantics, no diagnostic. */
+             * -Wstringop-truncation on the native MinGW toolchain. strnlen caps the
+             * length, memcpy copies exactly that many bytes, and the explicit NUL
+             * terminates — identical semantics, no diagnostic. Unconditional (#273):
+             * the fix ships in libcbm.a too, instead of being masked by a blanket
+             * -Wno-stringop-truncation. */
             size_t entry_len = strnlen(full_path, sizeof(path_stack[0]) - SKIP_ONE);
             memcpy(path_stack[*stack_top], full_path, entry_len);
             path_stack[*stack_top][entry_len] = '\0';
-#else
-            strncpy(path_stack[*stack_top], full_path, sizeof(path_stack[0]) - 1);
-            path_stack[*stack_top][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
-#endif
             (*stack_top)++;
         }
         return 0;
