@@ -176,12 +176,89 @@ def write_fixture(repo):
     (src / "main.c").write_text("".join(lines), encoding="utf-8")
 
 
-def cli_tool(binary, cache, tool, args):
-    proc = run(
-        [binary, "cli", "--json", tool, json.dumps(args, separators=(",", ":"))],
-        env=base_env(cache),
-        timeout=240,
+def diagnose_binary_failure(argv, cache, tool, first_rc):
+    # #292 forensics: the family signature is rc=1 with EMPTY stdout+stderr —
+    # the process dies before its unconditional pre-work fprintf reaches the
+    # pipe, indistinguishable from TerminateProcess(h, 1). Gather evidence,
+    # then STILL fail closed (a retry that passes must never green the gate:
+    # the silent kill is the defect #292 tracks, not this harness's luck).
+    report = {
+        "code": "ASTRO_LOWERED_PARITY_BINARY_SILENT_EXIT",
+        "tool": tool,
+        "first_rc": first_rc,
+        "first_rc_hex": f"0x{first_rc & 0xFFFFFFFF:08X}",
+        "binary": str(argv[0]),
+        "pid": os.getpid(),
+        "retries": [],
+    }
+    for attempt, delay in ((1, 0.0), (2, 2.0)):
+        time.sleep(delay)
+        stderr_file = Path(str(cache)) / f"diag-stderr-{attempt}.log"
+        env = base_env(cache)
+        env["CBM_LOG_LEVEL"] = "debug"
+        with open(stderr_file, "w", encoding="utf-8") as sink:
+            proc = subprocess.run(
+                [str(a) for a in argv],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=sink,  # a FILE, not a pipe: survives handle races
+                timeout=240,
+                check=False,
+            )
+        stderr_text = stderr_file.read_text(encoding="utf-8", errors="replace")
+        report["retries"].append(
+            {
+                "attempt": attempt,
+                "after_delay_s": delay,
+                "rc": proc.returncode,
+                "rc_hex": f"0x{proc.returncode & 0xFFFFFFFF:08X}",
+                "stdout_bytes": len(proc.stdout or ""),
+                "stderr_to_file_tail": stderr_text[-2000:],
+            }
+        )
+        if proc.returncode == 0:
+            break
+    db = Path(str(cache)) / f"{PROJECT}.db"
+    report["fsv_native_db_exists_after"] = db.exists()
+    report["fsv_native_db_bytes"] = db.stat().st_size if db.exists() else 0
+    report["message"] = (
+        "CBM binary exited silently; diagnostics above (retry rc / stderr-to-file / "
+        "persisted-db FSV) attribute the exit. See issue #292."
     )
+    report["remediation"] = (
+        "If retries pass and no stderr was produced on the first run, the process "
+        "was killed externally (TerminateProcess/taskkill signature) — audit "
+        "concurrent gate/test process-kill machinery. If retries also fail, the "
+        "stderr file names the real error."
+    )
+    print(json.dumps(report, indent=2, sort_keys=True), file=sys.stderr)
+
+
+def cli_tool(binary, cache, tool, args):
+    argv = [binary, "cli", "--json", tool, json.dumps(args, separators=(",", ":"))]
+    proc = subprocess.run(
+        [str(arg) for arg in argv],
+        cwd=ROOT,
+        env=base_env(cache),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=240,
+        check=False,
+    )
+    if proc.returncode != 0:
+        if not (proc.stdout or "").strip() and not (proc.stderr or "").strip():
+            diagnose_binary_failure(argv, cache, tool, proc.returncode)
+        raise SystemExit(
+            f"command failed ({proc.returncode}): {' '.join(map(str, argv))}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
     payload = json.loads(proc.stdout)
     if payload.get("isError") is True:
         raise SystemExit(f"{tool} returned isError=true: {payload}")
