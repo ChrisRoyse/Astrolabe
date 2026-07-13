@@ -10,7 +10,10 @@ pub(crate) const ASTRO_TEAM_ARTIFACT_BUSY: &str = "ASTRO_TEAM_ARTIFACT_BUSY";
 pub(crate) const ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED: &str =
     "ASTRO_TEAM_ARTIFACT_STALE_REINDEX_REQUIRED";
 
-pub(crate) fn handle_team_artifact(args_json: &str) -> Result<String, DynError> {
+pub(crate) fn handle_team_artifact(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
     let args = serde_json::from_str::<Value>(args_json)?;
     let Some(args_obj) = args.as_object() else {
         return tool_error_result("team_artifact arguments must be a JSON object");
@@ -20,11 +23,117 @@ pub(crate) fn handle_team_artifact(args_json: &str) -> Result<String, DynError> 
     };
     match mode {
         "export" => handle_team_artifact_export(args_obj),
-        "import" => handle_team_artifact_import(args_obj),
+        "import" => handle_team_artifact_import(runner, args_obj),
         other => tool_error_result(format!(
             "ASTRO_TEAM_ARTIFACT_MODE_UNSUPPORTED: team_artifact mode {other:?} is not available; remediation: use mode=\"export\" or mode=\"import\""
         )),
     }
+}
+
+/// The outcome of the #62 local-reindex fallback that a refused team-artifact
+/// import degrades to. A refused import must NEVER adopt the untrusted shared
+/// artifact; CBM's existing fallback path is a local reindex of the operator's
+/// own repository, which rebuilds the CBM graph from trusted local source. The
+/// variant is chosen only after import refusal and is recorded verbatim in the
+/// refusal envelope's `fallback` block, hashed into `artifact_sha256`.
+pub(crate) enum LocalReindexOutcome {
+    /// No fallback runner was in play (the pure import API called directly, e.g.
+    /// from a test): the refusal is terminal and the operator acts on the
+    /// remediation manually. Serializes as `local_reindex: "not_run"`.
+    NotRun,
+    /// A runner was available but no local `repo_path` was supplied, so there was
+    /// nothing to reindex. Serializes as `local_reindex: "not_applicable"`.
+    NotApplicable,
+    /// The local `index_repository` fallback ran and rebuilt the CBM graph from
+    /// the operator's own source. Serializes as `local_reindex: "reindexed"`.
+    Reindexed { project: Option<String> },
+    /// The local `index_repository` fallback was attempted but the CBM call
+    /// failed. Serializes as `local_reindex: "failed"` with the CBM error text.
+    Failed { error: String },
+}
+
+const LOCAL_REINDEX_REMEDIATION: &str = "run index_repository with this repo_path to rebuild the local CBM graph; run it with calyx=\"shadow\" before trusting vault-backed surfaces";
+
+impl LocalReindexOutcome {
+    /// Renders the `fallback` block of a refused team-artifact import. Built
+    /// before `artifact_sha256` is computed so the hash commits to the real
+    /// fallback outcome, never a stale placeholder.
+    pub(crate) fn to_fallback_json(&self) -> Value {
+        match self {
+            LocalReindexOutcome::NotRun => json!({
+                "local_reindex": "not_run",
+                "remediation": LOCAL_REINDEX_REMEDIATION,
+            }),
+            LocalReindexOutcome::NotApplicable => json!({
+                "local_reindex": "not_applicable",
+                "remediation": "supply repo_path so the refused import can fall back to a local CBM reindex, then rerun index_repository with calyx=\"shadow\" before trusting vault-backed surfaces",
+            }),
+            LocalReindexOutcome::Reindexed { project } => json!({
+                "local_reindex": "reindexed",
+                "project": project,
+                "remediation": "the untrusted artifact was NOT adopted; a fresh local CBM graph was rebuilt from repo_path. Rerun index_repository with calyx=\"shadow\" before trusting vault-backed surfaces",
+            }),
+            LocalReindexOutcome::Failed { error } => json!({
+                "local_reindex": "failed",
+                "error": error,
+                "remediation": LOCAL_REINDEX_REMEDIATION,
+            }),
+        }
+    }
+}
+
+/// Runs the #62 local-reindex fallback for a refused import. Returns
+/// [`LocalReindexOutcome::NotApplicable`] when no local `repo_path` is available,
+/// otherwise invokes CBM's own `index_repository` fallback path directly (never
+/// the shadow-wrapping path — the point is a trusted local rebuild) and reports
+/// the real result.
+pub(crate) fn run_local_reindex_fallback(
+    runner: &CbmToolRunner,
+    repo_path: Option<&str>,
+) -> LocalReindexOutcome {
+    let Some(repo_path) = repo_path else {
+        return LocalReindexOutcome::NotApplicable;
+    };
+    let args_json = match serde_json::to_string(&json!({ "repo_path": repo_path })) {
+        Ok(value) => value,
+        Err(error) => {
+            return LocalReindexOutcome::Failed {
+                error: format!("encode index_repository fallback arguments: {error}"),
+            };
+        }
+    };
+    match runner.handle_tool_raw("index_repository", &args_json) {
+        Ok(raw) => match tool_result_is_error(&raw) {
+            Ok(false) => LocalReindexOutcome::Reindexed {
+                project: project_from_tool_result(&raw),
+            },
+            Ok(true) => LocalReindexOutcome::Failed {
+                error: tool_result_error_text(&raw),
+            },
+            Err(error) => LocalReindexOutcome::Failed {
+                error: format!("inspect index_repository fallback result: {error}"),
+            },
+        },
+        Err(error) => LocalReindexOutcome::Failed {
+            error: format!("index_repository fallback: {error}"),
+        },
+    }
+}
+
+/// Extracts the human-readable error text from a CBM/Astrolabe tool-result
+/// envelope so the fallback can report *why* the local reindex failed.
+fn tool_result_error_text(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| raw.to_string())
 }
 
 pub(crate) fn handle_team_artifact_export(args: &Map<String, Value>) -> Result<String, DynError> {
@@ -68,11 +177,23 @@ pub(crate) fn handle_team_artifact_export(args: &Map<String, Value>) -> Result<S
         refresh_status,
     ) {
         Ok(value) => tool_json_result(value),
-        Err(error) => team_artifact_error_result("export", &project, &artifact_dir, None, error),
+        Err(error) => team_artifact_error_result(
+            "export",
+            &project,
+            &artifact_dir,
+            None,
+            error,
+            // Export refusals mean the local shadow SOURCE is unusable; there is
+            // no untrusted artifact to fall back away from, so no reindex is run.
+            LocalReindexOutcome::NotRun,
+        ),
     }
 }
 
-pub(crate) fn handle_team_artifact_import(args: &Map<String, Value>) -> Result<String, DynError> {
+pub(crate) fn handle_team_artifact_import(
+    runner: &CbmToolRunner,
+    args: &Map<String, Value>,
+) -> Result<String, DynError> {
     let project = team_project_from_args(args)?;
     let artifact_dir = match team_artifact_dir_from_args(args, "import") {
         Ok(path) => path,
@@ -90,11 +211,19 @@ pub(crate) fn handle_team_artifact_import(args: &Map<String, Value>) -> Result<S
         Ok(value) => value,
         Err(message) => return tool_error_result(message),
     };
+    // #62: a refused import degrades to a real local reindex of the operator's own
+    // repository (CBM's existing fallback path), invoked only when a local
+    // repo_path is supplied. The closure is called by `team_artifact_import_result`
+    // ONLY on refusal, so an adopted (verified) import never triggers a reindex.
+    let repo_path = string_arg(args, "repo_path").map(ToOwned::to_owned);
+    let reindex = || run_local_reindex_fallback(runner, repo_path.as_deref());
+    let reindex_ref: &dyn Fn() -> LocalReindexOutcome = &reindex;
     team_artifact_import_result(
         &artifact_dir,
         &adopted_graph_path,
         expected_signer,
         project.as_deref(),
+        Some(reindex_ref),
     )
 }
 
@@ -194,6 +323,7 @@ pub(crate) fn team_artifact_import_result(
     adopted_graph_path: &Path,
     expected_signer: Option<[u8; 32]>,
     project: Option<&str>,
+    reindex: Option<&dyn Fn() -> LocalReindexOutcome>,
 ) -> Result<String, DynError> {
     let options = match expected_signer {
         Some(pubkey) => TeamArtifactImportOptions::with_expected_signer(pubkey),
@@ -205,13 +335,24 @@ pub(crate) fn team_artifact_import_result(
             artifact_dir,
             &report,
         )?),
-        Err(error) => team_artifact_error_result(
-            "import",
-            project.unwrap_or("unknown"),
-            artifact_dir,
-            Some(adopted_graph_path),
-            error,
-        ),
+        Err(error) => {
+            // #62: the untrusted artifact was refused and NOT adopted. Compute the
+            // local-reindex fallback outcome BEFORE building the envelope so it is
+            // hashed into `artifact_sha256`. `None` (direct API callers/tests)
+            // keeps the historical `local_reindex: "not_run"` label.
+            let fallback = match reindex {
+                Some(reindex) => reindex(),
+                None => LocalReindexOutcome::NotRun,
+            };
+            team_artifact_error_result(
+                "import",
+                project.unwrap_or("unknown"),
+                artifact_dir,
+                Some(adopted_graph_path),
+                error,
+                fallback,
+            )
+        }
     }
 }
 
@@ -324,6 +465,7 @@ pub(crate) fn team_artifact_error_result<E>(
     artifact_dir: &Path,
     adopted_graph_path: Option<&Path>,
     error: E,
+    fallback: LocalReindexOutcome,
 ) -> Result<String, DynError>
 where
     E: std::fmt::Display,
@@ -338,13 +480,10 @@ where
         "artifact_dir": artifact_dir,
         "code": code,
         "message": message,
-        "remediation": "run index_repository with this repo_path to rebuild the local CBM graph; run it with calyx=\"shadow\" before trusting vault-backed surfaces",
+        "remediation": LOCAL_REINDEX_REMEDIATION,
         "freshness": "fresh",
         "trust": "verified",
-        "fallback": {
-            "local_reindex": "not_run",
-            "remediation": "run index_repository with this repo_path to rebuild the local CBM graph; run it with calyx=\"shadow\" before trusting vault-backed surfaces",
-        },
+        "fallback": fallback.to_fallback_json(),
     });
     if let Some(path) = adopted_graph_path
         && let Some(object) = value.as_object_mut()
