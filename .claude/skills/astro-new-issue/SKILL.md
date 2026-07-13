@@ -15,7 +15,7 @@ Title seed: `$ARGUMENTS`
 
 ## 2. Compose
 
-**Title prefix conventions:** `[bug]` `[build]` `[test]` `[gate]` `[lint]` `[vendor]` `[process]` `[hardening]` `[spec]` `[audit-followup]`, plus `[Windows]`/`[Windows GNU]` qualifiers, or `P<phase>.<n>:` for spine work.
+**Title prefix conventions:** `[bug]` `[build]` `[test]` `[gate]` `[lint]` `[process]` `[hardening]` `[spec]` `[audit-followup]`, plus `[Windows]`/`[Windows GNU]` qualifiers, or `P<phase>.<n>:` for spine work. (`[vendor]` is retired with the vendoring doctrine, #286 — CBM/Calyx changes are ordinary source changes.)
 
 **Body skeleton:**
 ```markdown

@@ -31,7 +31,7 @@ GitHub issues are the single source of truth. If it isn't recorded on an issue, 
 ## 4. Work in scope
 
 - Implement ONLY the issue's Scope section. Discovered adjacent work → file via astro-new-issue and link it; never expand scope in place.
-- Every verification follows astro-fsv (source-of-truth readback, never API echoes).
+- Every verification follows astro-fsv (source-of-truth readback, never API echoes). Any work that writes, edits, runs, or removes tests follows astro-test (suite <180s, no test >60s, impact-gated suites, real data only).
 - Every commit body references the issue (`Refs #N`; `Closes #N` only on the final commit **after** gates pass — never on server-pending work, see astro-fanout).
 - Never write progress prose into `docs/astrolabe-blueprint.md` (design corrections only).
 - No `todo!()`/stubs on shipped paths; fail-closed `{code, message, remediation}` errors; no silent fallback — every degradation labeled, every skip counted.

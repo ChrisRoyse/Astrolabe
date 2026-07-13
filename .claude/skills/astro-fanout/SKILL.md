@@ -17,6 +17,7 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 - Work in your assigned worktree on branch `sweep/<crate>`; touch ONLY your crate's files.
 - Never push, never touch GitHub (no comments/labels/closes) — return structured results instead.
 - Verify honestly per astro-fsv; report `partial`/`blocked` rather than fake green. If the issue is already fixed in your base commit, say so with evidence — do not redo it.
+- Any test you write, edit, or run obeys the astro-test doctrine: full suite <180s, no single test >60s (decompose or delete — never tier, never raise a timeout), real data only (no mocks), FSV byte readback. Load the astro-test skill before touching test surface.
 - Server-side edits you cannot build: stage them, commit with `Refs #N` (NEVER `Closes #N`), and flag `server_pending: true`.
 - Record out-of-scope discoveries in `new_problems` (title + evidence); the orchestrator files them.
 - Return: `{issue, status: done|partial|blocked|already-fixed, evidence[], commits[], server_pending, new_problems[]}`.
