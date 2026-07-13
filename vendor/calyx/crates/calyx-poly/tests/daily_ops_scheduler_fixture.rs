@@ -28,7 +28,7 @@ use calyx_ward::{MIN_BAD_SCORES, SlotKind};
 use serde_json::{Value, json};
 
 #[path = "fsv_support.rs"]
-mod support;
+pub mod support;
 
 use support::{
     known_healthy_market_integrity, known_healthy_oracle_risk, known_healthy_wash_trade,

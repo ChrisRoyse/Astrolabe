@@ -228,6 +228,7 @@ fn rows(prefix: &str) -> Vec<MistakeClosureScoreRow> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)] // test data-row builder mirrors MistakeClosureScoreRow fields
 fn row(
     prefix: &str,
     suffix: &str,
