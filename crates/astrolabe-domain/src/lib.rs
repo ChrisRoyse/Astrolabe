@@ -16,9 +16,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod fsv;
 pub mod knobs;
+pub mod lowering_trigger;
 
 /// Re-export of the Calyx core crate used for vault identities and content addressing.
 pub use calyx_core as calyx;
+
+/// Cross-crate hook a weave mutation path calls to schedule a debounced
+/// lowered-SQLite regeneration (#225).
+pub use lowering_trigger::LoweringTrigger;
 
 /// The Cargo package name for this crate.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

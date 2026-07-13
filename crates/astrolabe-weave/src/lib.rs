@@ -59,6 +59,62 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
 }
 
+/// A production-path weave persistence outcome that may have changed vault state
+/// the lowered SQLite artifact derives from (#225).
+///
+/// The lowered artifact's content fingerprint moves whenever the vault content
+/// it derives from — the persisted Graph/XTerm rows and the ledger head — moves.
+/// A weave commit that actually wrote or tombstoned rows (or drained reactive
+/// events) is such a change; a no-delta audit re-run that only re-appends an
+/// idempotent ledger record is not a content change and must not trigger a
+/// regeneration, or every re-run would rewrite the lowered artifact.
+pub trait WeaveMutation {
+    /// True when this commit changed derived vault content (rows written or
+    /// tombstoned, or reactive events acknowledged), false for a no-delta run.
+    fn changed_lowered_inputs(&self) -> bool;
+}
+
+impl WeaveMutation for SimilarityPersistReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.rows_written > 0 || self.rows_tombstoned > 0
+    }
+}
+
+impl WeaveMutation for EagerCrossTermPersistReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.rows_written > 0 || self.rows_tombstoned > 0
+    }
+}
+
+impl WeaveMutation for ReactiveAckReport {
+    fn changed_lowered_inputs(&self) -> bool {
+        self.acked_count > 0
+    }
+}
+
+/// Trigger plumbing from a weave mutation path: after a weave persistence commit,
+/// ask the lowering coordinator to schedule a debounced lowered-SQLite
+/// regeneration — but only when the commit actually changed derived vault
+/// content. A no-delta audit re-run never schedules a regeneration.
+///
+/// Returns whether a regeneration was requested, so callers can surface the
+/// scheduling decision. The scheduling itself is debounced by the trigger
+/// implementor (`astrolabe-lower`'s `LowerDebouncer`), so N rapid mutations
+/// coalesce into one regeneration.
+pub fn schedule_lowering_after<M>(
+    report: &M,
+    trigger: &dyn astrolabe_domain::LoweringTrigger,
+) -> bool
+where
+    M: WeaveMutation + ?Sized,
+{
+    let changed = report.changed_lowered_inputs();
+    if changed {
+        trigger.request_regeneration();
+    }
+    changed
+}
+
 pub const SIM_STRUCT_SLOT: SlotId = SlotId::new(1);
 pub const SIM_API_SLOT: SlotId = SlotId::new(4);
 pub const SIM_SEMANTIC_SLOT: SlotId = SlotId::new(18);
@@ -3965,6 +4021,98 @@ mod tests {
         assert!(third.rows_tombstoned > 0);
         let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
         assert_eq!(after.len(), tighter.edges.len());
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Counting [`LoweringTrigger`] double: records how many debounced
+    /// regenerations the weave plumbing requested.
+    #[derive(Default)]
+    struct CountingTrigger {
+        requests: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingTrigger {
+        fn requests(&self) -> u64 {
+            self.requests.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl astrolabe_domain::LoweringTrigger for CountingTrigger {
+        fn request_regeneration(&self) {
+            self.requests.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn weave_mutation_schedules_lowering_but_no_delta_rerun_does_not() {
+        // #225 trigger plumbing FSV: a real similarity-edge persistence that
+        // writes rows schedules exactly one debounced lowering; a subsequent
+        // no-delta re-persist (audited but zero rows changed) schedules none —
+        // proven against the persisted SIM_* rows read back from the vault, not
+        // the in-memory report alone.
+        let config = SimilarityPlannerConfig {
+            exact_pair_node_limit: None,
+            per_node_cap: 2,
+            thresholds: SimilarityThresholds {
+                sim_struct_min_score: 0.50,
+                sim_semantic_min_score: 0.50,
+                ..SimilarityThresholds::default()
+            },
+            candidate_strategies: SimilarityFamily::ALL
+                .into_iter()
+                .map(|family| (family, SimilarityCandidateStrategy::Ann))
+                .collect(),
+            ..SimilarityPlannerConfig::default()
+        };
+        let group = &[(0, 1.0), (1, 2.0), (2, 3.0)];
+        let nodes = vec![
+            sparse_node("trig.a", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[1.0, 0.0, 0.0])),
+            sparse_node("trig.b", SimilarityFamily::Struct, 8, group)
+                .with_slot(SIM_SEMANTIC_SLOT, dense(&[0.9, 0.2, 0.1])),
+        ];
+        let plan = plan_similarity_edges(&nodes, &config).expect("trigger plan");
+        assert!(
+            !plan.edges.is_empty(),
+            "fixture must admit at least one edge"
+        );
+
+        let (dir, vault) = reactive_vault("lowering-trigger");
+        let trigger = CountingTrigger::default();
+
+        // Real mutating commit -> exactly one scheduled regeneration.
+        let report = persist_similarity_edges(&vault, &plan, "astrolabe-weave-test")
+            .expect("persist sim edges");
+        assert!(report.rows_written > 0, "first persist must write rows");
+        assert!(report.changed_lowered_inputs());
+        let scheduled = schedule_lowering_after(&report, &trigger);
+        assert!(scheduled, "a mutating weave commit schedules a lowering");
+        assert_eq!(trigger.requests(), 1);
+        drop(vault);
+
+        // FSV readback: the persisted SIM_* rows exist independently of the report.
+        let reopened = open_reactive_vault(&dir);
+        let persisted = read_similarity_edge_rows(&reopened).expect("read persisted sim rows");
+        assert_eq!(persisted.len(), plan.edges.len());
+
+        // No-delta re-persist: audited, but zero rows changed -> schedules nothing.
+        let rerun = persist_similarity_edges(&reopened, &plan, "astrolabe-weave-test")
+            .expect("idempotent persist");
+        assert_eq!(rerun.rows_written, 0);
+        assert_eq!(rerun.rows_tombstoned, 0);
+        assert!(!rerun.changed_lowered_inputs());
+        let rescheduled = schedule_lowering_after(&rerun, &trigger);
+        assert!(
+            !rescheduled,
+            "a no-delta audit re-run schedules no lowering"
+        );
+        assert_eq!(
+            trigger.requests(),
+            1,
+            "trigger count unchanged after no-delta re-run"
+        );
+
         drop(reopened);
         let _ = fs::remove_dir_all(dir);
     }

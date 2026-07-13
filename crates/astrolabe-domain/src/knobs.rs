@@ -232,6 +232,52 @@ pub fn row_sink_stream_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ROW_SINK_STREAM_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the debounced lowered-SQLite regeneration knobs (#225).
+pub const LOWER_DEBOUNCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-lower-debounce-knobs-v1";
+
+/// Name of the lowered-SQLite regeneration debounce-window knob.
+pub const LOWER_DEBOUNCE_WINDOW_MS_KNOB: &str = "lower_debounce_window_ms";
+
+/// Default debounce window, in milliseconds, before a burst of weave mutations
+/// coalesces into one lowered-SQLite regeneration.
+///
+/// Seeded from `cargo-watch`/`watchexec`, whose file-change rebuild debounce
+/// `--delay` defaults to 0.5s: a trailing-edge settle window that lets a burst of
+/// changes land before it triggers one rebuild, rather than rebuilding per event.
+pub const LOWER_DEBOUNCE_DEFAULT_WINDOW_MS: u64 = 500;
+/// Smallest legal debounce window. Zero is illegal: a zero-width window fires a
+/// full regeneration on every single weave mutation, which is exactly the
+/// burst-amplification this knob exists to coalesce away — the same "a zero value
+/// disables the protection this knob exists for" failure the FSV sampling knob
+/// forbids.
+pub const LOWER_DEBOUNCE_MIN_WINDOW_MS: u64 = 1;
+/// Largest legal debounce window. An upper bound keeps a burst from starving the
+/// lowered artifact indefinitely: after at most this long of quiet, the pending
+/// regeneration must be allowed to fire.
+pub const LOWER_DEBOUNCE_MAX_WINDOW_MS: u64 = 300_000;
+
+/// The debounced lowered-SQLite regeneration knob registry (#225).
+///
+/// Coalescing bursts of weave mutations into one regeneration mirrors the
+/// file-watch rebuild debouncers (`cargo-watch`/`watchexec`): a mutation arms a
+/// trailing-edge timer, further mutations inside the window reset it, and one
+/// regeneration fires once the window elapses quietly.
+pub const LOWER_DEBOUNCE_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: LOWER_DEBOUNCE_KNOB_REGISTRY_VERSION,
+    name: LOWER_DEBOUNCE_WINDOW_MS_KNOB,
+    default: LOWER_DEBOUNCE_DEFAULT_WINDOW_MS,
+    min: LOWER_DEBOUNCE_MIN_WINDOW_MS,
+    max: LOWER_DEBOUNCE_MAX_WINDOW_MS,
+    unit: "milliseconds",
+    source: "https://github.com/watchexec/cargo-watch (the rebuild debounce --delay defaults to 0.5s) over watchexec's trailing-edge coalescing debounce",
+    rationale: "trailing-edge debounce window that coalesces a burst of production-path weave mutations into one lowered-SQLite regeneration; 500ms mirrors cargo-watch's default file-change settle delay; zero is illegal because a zero window regenerates on every single mutation (no coalescing at all); replace with a measured value once weave mutation burst timing is benchmarked",
+}];
+
+/// Returns the lower-debounce declaration for `name`, or `None` when undeclared.
+pub fn lower_debounce_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    LOWER_DEBOUNCE_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +353,31 @@ mod tests {
         assert!(knob.accepts(ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS));
         assert!(!knob.accepts(ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS + 1));
         assert_eq!(knob.default, ROW_SINK_STREAM_DEFAULT_DRAIN_BATCH_ROWS);
+    }
+
+    #[test]
+    fn every_lower_debounce_knob_declares_bounds_that_contain_its_default() {
+        assert!(!LOWER_DEBOUNCE_KNOBS.is_empty());
+        for knob in LOWER_DEBOUNCE_KNOBS {
+            assert_eq!(
+                knob.registry_version, LOWER_DEBOUNCE_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+    }
+
+    #[test]
+    fn lower_debounce_window_zero_is_not_a_legal_knob_value() {
+        let knob = lower_debounce_knob(LOWER_DEBOUNCE_WINDOW_MS_KNOB).expect("declared");
+        assert!(!knob.accepts(0));
+        assert!(knob.accepts(LOWER_DEBOUNCE_DEFAULT_WINDOW_MS));
+        assert!(knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS));
+        assert!(!knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS + 1));
+        assert_eq!(knob.default, LOWER_DEBOUNCE_DEFAULT_WINDOW_MS);
     }
 }
