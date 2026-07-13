@@ -28,6 +28,7 @@ pub use janitor::{
 pub use row_sink_stream::{
     ASTRO_ROW_SINK_STREAM_BATCH_INVALID, ASTRO_ROW_SINK_STREAM_ROW_REFUSED, RowSinkStreamParams,
     RowSinkStreamReport, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+    snapshot_into_row_stream,
 };
 
 pub use label_propagation::{

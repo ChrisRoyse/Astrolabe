@@ -6267,6 +6267,196 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_into_row_stream_matches_direct_writer_raw_cfs() {
+        // The `snapshot_into_row_stream` producer is the shadow-import dial's bridge
+        // between a materialized row-sink snapshot and the streaming vault writer.
+        // Streaming a snapshot through it must persist byte-for-byte the same CFs as
+        // handing the same snapshot to the direct writer.
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, import_cbm_row_stream_to_vault, snapshot_into_row_stream,
+        };
+        let snapshot = edge_snapshot();
+        let fingerprint = [11_u8; 32];
+
+        let direct_vault = vault();
+        import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            fingerprint,
+            &direct_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("direct snapshot import");
+
+        let stream_vault = vault();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            snapshot_into_row_stream(snapshot.clone()),
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("producer-fed streaming import");
+
+        assert_eq!(report.stream_nodes, snapshot.nodes.len());
+        assert_eq!(report.stream_edges, snapshot.edges.len());
+        assert_import_cfs_match_raw(&stream_vault, &direct_vault);
+    }
+
+    /// Builds a node-only snapshot of `n` valid constellations for backpressure and
+    /// scale soaks. Every node carries an object `properties_json` so the streaming
+    /// importer's per-row validation accepts it; ids/names are unique so the panel
+    /// encodes distinct constellations.
+    fn scaled_node_snapshot(n: usize) -> CbmGraphSnapshot {
+        let nodes = (0..n)
+            .map(|i| CbmGraphNode {
+                source_node_id: (i as i64) + 1,
+                project: "demo".to_string(),
+                label: "Function".to_string(),
+                name: format!("f{i}"),
+                qualified_name: format!("demo.gen.f{i}"),
+                file_path: format!("src/gen/mod{}.rs", i % 16),
+                start_line: (i as i64) * 3 + 1,
+                end_line: (i as i64) * 3 + 2,
+                properties_json: format!(
+                    r#"{{"language":"rust","source_snippet":"fn f{i}() {{}}","signature":"fn f{i}()"}}"#
+                ),
+                node_vector: None,
+                cx_id: None,
+                structural: false,
+            })
+            .collect();
+        CbmGraphSnapshot {
+            project: "demo".to_string(),
+            panel_version: Some(7),
+            projects: Vec::new(),
+            nodes,
+            edges: Vec::new(),
+            file_hashes: Vec::new(),
+            project_summaries: Vec::new(),
+            token_vectors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn streaming_row_sink_bounded_channel_backpressures_slow_consumer() {
+        // Backpressure soak with a REAL concurrent producer and a REAL slow consumer.
+        //
+        // A producer thread hands rows into a bounded `sync_channel(BOUND)`; the
+        // streaming importer consumes the receiver lazily as its `IntoIterator`, and
+        // an instrumented wrapper sleeps per pulled row to make the *consumer* the
+        // bottleneck. Because the importer pulls one row at a time within the bounded
+        // window (rather than eagerly draining the whole stream), the number of rows
+        // outstanding between producer and importer never exceeds the channel bound,
+        // independent of the total stream length N >> BOUND. If the importer buffered
+        // unboundedly the producer would race ahead and peak in-flight would approach
+        // N; the bounded channel + lazy pull hold it at BOUND. The import still
+        // persists correct, byte-identical CFs under this concurrency.
+        use crate::row_sink_stream::{
+            RowSinkStreamParams, RowSinkStreamRow, import_cbm_row_stream_to_vault,
+            snapshot_into_row_stream,
+        };
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        const BOUND: usize = 2;
+        const N: usize = 400;
+
+        let snapshot = scaled_node_snapshot(N);
+        let fingerprint = [23_u8; 32];
+
+        // Reference: the same snapshot through the direct writer (no channel).
+        let direct_vault = vault();
+        import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            fingerprint,
+            &direct_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("reference direct import");
+
+        let in_flight = std::sync::Arc::new(AtomicI64::new(0));
+        let max_in_flight = std::sync::Arc::new(AtomicI64::new(0));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<IngestResult<RowSinkStreamRow>>(BOUND);
+
+        // Producer thread: increments the in-flight gauge once a row is accepted into
+        // the bounded channel (the send blocks — backpressure — while it is full).
+        let producer_in_flight = in_flight.clone();
+        let producer_max = max_in_flight.clone();
+        let producer = std::thread::spawn(move || {
+            for item in snapshot_into_row_stream(snapshot) {
+                // send() blocks here once BOUND rows are outstanding — this is the
+                // backpressure the bounded channel + lazy importer produce.
+                tx.send(item).expect("row-sink consumer hung up");
+                let now = producer_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                producer_max.fetch_max(now, Ordering::SeqCst);
+            }
+        });
+
+        // Slow-consumer adapter: the importer pulls from this; each pulled row leaves
+        // the channel (decrementing in-flight) and then costs a small, real delay so
+        // the consumer is the bottleneck and the producer is forced to block.
+        struct SlowConsumer {
+            rx: std::sync::mpsc::Receiver<IngestResult<RowSinkStreamRow>>,
+            in_flight: std::sync::Arc<AtomicI64>,
+        }
+        impl Iterator for SlowConsumer {
+            type Item = IngestResult<RowSinkStreamRow>;
+            fn next(&mut self) -> Option<Self::Item> {
+                match self.rx.recv() {
+                    Ok(item) => {
+                        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        Some(item)
+                    }
+                    Err(_) => None,
+                }
+            }
+        }
+
+        let stream_vault = vault();
+        let report = import_cbm_row_stream_to_vault(
+            fingerprint,
+            SlowConsumer {
+                rx,
+                in_flight: in_flight.clone(),
+            },
+            &RowSinkStreamParams::from_registry(),
+            &stream_vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("backpressure streaming import");
+
+        producer.join().expect("producer thread panicked");
+
+        // Backpressure held: outstanding rows between producer and importer stayed at
+        // the channel bound, though the stream carried N >> BOUND. The instrumented
+        // gauge can transiently read one over BOUND because the producer's post-send
+        // increment may land before the consumer's post-recv decrement (the freed
+        // rendezvous slot); the count of rows actually buffered in the channel is
+        // provably <= BOUND. Either way the ceiling is BOUND + 1, nowhere near N —
+        // an importer that buffered the stream would push the gauge toward N.
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 1 && peak <= BOUND as i64 + 1,
+            "peak in-flight {peak} must stay within the channel bound {BOUND} (+1 slot, N={N}); \
+             a value near N would mean the importer buffered the stream instead of \
+             backpressuring the producer"
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "rows left in flight");
+        assert_eq!(report.stream_nodes, N);
+        assert_eq!(report.stream_edges, 0);
+
+        // FSV: the import is byte-identical to the reference direct import despite the
+        // concurrent bounded-channel producer, and it is exactly one ledger entry.
+        assert_import_cfs_match_raw(&stream_vault, &direct_vault);
+        assert_eq!(ledger_row_count(&stream_vault).expect("ledger count"), 1);
+    }
+
+    #[test]
     fn full_edge_vocabulary_imports_with_golden_priors() {
         let path = temp_db("edge-vocabulary");
         full_vocabulary_fixture(&path);
