@@ -3769,6 +3769,186 @@ mod tests {
         println!("tool-runner collect-rows probe passed: {}", db.display());
     }
 
+    /// #283 grammar-subset FSV: a `CBM_GRAMMAR_SET=core` libcbm drops non-core
+    /// tree-sitter grammars and links `grammar_stubs.c` NULL-returning factories in
+    /// their place. Indexing a file of a stubbed language MUST fail closed with the
+    /// labeled `[CBM_GRAMMAR_STUBBED]` error and count the file as a labeled skip
+    /// (`skipped_count >= 1`) — never a silent parse miss — while a core-language
+    /// file in the same run still indexes cleanly.
+    ///
+    /// This is meaningful ONLY against a core libcbm; in the default full build every
+    /// grammar is present, so there is no stub to observe. The test is COMPILE-GATED
+    /// on `option_env!("CBM_GRAMMAR_SET")`: under a full build it labels itself skipped
+    /// and returns rather than fake-passing in the wrong configuration. (The launcher
+    /// wipes `target/` before every run, so each run is a fresh compile and the
+    /// captured build-time env matches the linked libcbm.) The core-build contract is
+    /// additionally re-verified at runtime by the child probe, so a mismatched libcbm
+    /// fails closed instead of passing.
+    #[test]
+    fn index_repository_stubbed_grammar_is_a_labeled_skip_not_silent_miss() {
+        if option_env!("CBM_GRAMMAR_SET") != Some("core") {
+            println!(
+                "[SKIP] #283 grammar-stubbed FSV requires a CBM_GRAMMAR_SET=core libcbm build; \
+                 this binary was compiled with CBM_GRAMMAR_SET={:?} (full grammar set has no \
+                 stub to observe)",
+                option_env!("CBM_GRAMMAR_SET")
+            );
+            return;
+        }
+
+        let test_home = sandbox_home("grammar-stub-home");
+        let before = store_entries(&test_home);
+        let dir = temp_dir("grammar-stub");
+        let store = dir.join("store");
+        let repo = dir.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).expect("create fixture repo");
+        // Core language (python is in CBM_GRAMMAR_CORE_LANGS): must index cleanly.
+        std::fs::write(src.join("mod_core.py"), "def py_core_fn():\n    return 41\n")
+            .expect("write python fixture");
+        // Stubbed language (zig is NOT core): must be a labeled CBM_GRAMMAR_STUBBED skip.
+        std::fs::write(
+            src.join("thing.zig"),
+            "pub fn zig_stub_fn() i32 {\n    return 4;\n}\n",
+        )
+        .expect("write zig fixture");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "tests::grammar_stubbed_skip_child_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRO_PROBE_STORE", &store)
+            .env("ASTRO_PROBE_REPO", &repo)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home)
+            .output()
+            .expect("spawn the grammar-stub probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "grammar-stub probe failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("GRAMMAR_STUB_CORE_CONTRACT_OK"),
+            "probe did not verify the core-build stub contract:\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            before,
+            store_entries(&test_home),
+            "a run-scoped grammar-stub index must not touch the operator home store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by index_repository_stubbed_grammar_is_a_labeled_skip_not_silent_miss"]
+    fn grammar_stubbed_skip_child_probe() {
+        let store = PathBuf::from(std::env::var("ASTRO_PROBE_STORE").expect("parent sets store"));
+        let repo = std::env::var("ASTRO_PROBE_REPO").expect("parent sets repo");
+        std::fs::create_dir_all(&store).expect("create run-scoped store");
+        let before = home_store_entries();
+        set_cbm_cache_dir(&store).expect("configure run-scoped store");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let project = format!("grammar-stub-{}-{nanos}", std::process::id());
+        let args = serde_json::json!({
+            "repo_path": repo,
+            "mode": "full",
+            "name": project,
+        })
+        .to_string();
+        {
+            let _db_guard = CbmProjectDbGuard {
+                project: project.clone(),
+            };
+            let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+            let run = runner
+                .handle_index_repository_with_rows(&args)
+                .expect("single MCP index_repository run with row sink");
+            let value: serde_json::Value =
+                serde_json::from_str(&run.raw_json).expect("valid MCP tool result JSON");
+            println!("GRAMMAR_STUB_RAW: {}", run.raw_json);
+
+            // The run itself succeeds — a stubbed grammar is a HANDLED skip, not a run error.
+            assert_eq!(
+                value.get("isError").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "a stubbed-language file must be a handled skip, not a failed run: {}",
+                run.raw_json
+            );
+
+            // skipped_count and the skipped-file list live under structuredContent
+            // (fall back to the root object for robustness).
+            let structured = value.get("structuredContent").unwrap_or(&value);
+            let skipped_count = structured
+                .get("skipped_count")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| value.get("skipped_count").and_then(serde_json::Value::as_i64))
+                .unwrap_or(0);
+            let files = structured
+                .get("skipped")
+                .and_then(|s| s.get("files"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut zig_stub_labeled = false;
+            let mut py_skipped = false;
+            for fe in &files {
+                let path = fe.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+                let reason = fe.get("reason").and_then(serde_json::Value::as_str).unwrap_or("");
+                if path.ends_with(".zig") && reason.contains("[CBM_GRAMMAR_STUBBED]") {
+                    zig_stub_labeled = true;
+                }
+                if path.ends_with(".py") {
+                    py_skipped = true;
+                }
+            }
+
+            // Contract 1: the stubbed .zig file is a LABELED skip, never a silent miss.
+            assert!(
+                zig_stub_labeled,
+                "core build must skip thing.zig with a [CBM_GRAMMAR_STUBBED] reason; \
+                 skipped files were: {files:?}"
+            );
+            assert!(
+                skipped_count >= 1,
+                "a stubbed-language file must be counted (skipped_count>=1); got {skipped_count}: {}",
+                run.raw_json
+            );
+            // Contract 2: the core-language .py file still indexes (never skipped) and
+            // produces real graph rows.
+            assert!(
+                !py_skipped,
+                "core-language mod_core.py must index, not be skipped: {files:?}"
+            );
+            let rows = run.rows.expect("row sink capture for the completed run");
+            assert!(
+                !rows.nodes.is_empty(),
+                "the core-language file must yield at least one indexed node: {rows:?}"
+            );
+            println!(
+                "GRAMMAR_STUB_CORE_CONTRACT_OK zig_stub_labeled={zig_stub_labeled} \
+                 skipped_count={skipped_count} py_skipped={py_skipped} nodes={}",
+                rows.nodes.len()
+            );
+        }
+        clear_cbm_cache_dir();
+        assert_eq!(
+            before,
+            home_store_entries(),
+            "a run-scoped grammar-stub index must not touch the operator home store"
+        );
+    }
+
     /// Regression for #194: prove — by reading the persisted `.db` file on disk
     /// (full state verification, not a return value) — that a tool-runner
     /// `index_repository` run registers exactly one project db and that teardown
