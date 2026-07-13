@@ -338,6 +338,14 @@ mod tests {
     }
 
     proptest! {
+        // #295: bound case count to the crate-wide proptest convention
+        // (see stream/quantize_online.rs) so this SST-writing property stays
+        // well under the 60s per-test budget under full-suite parallel load;
+        // the default 256 cases pushed it past budget. Assertion set unchanged;
+        // deterministic edges are covered by empty_and_oldest_only_edges,
+        // metadata_bounds_point_lookup_to_candidate_sst, and the tombstone tests.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
         #[test]
         fn level_returns_latest_values(pairs in proptest::collection::vec((proptest::collection::vec(any::<u8>(), 1..8), proptest::collection::vec(any::<u8>(), 0..8)), 1..32)) {
             let dir = test_dir("proptest");
