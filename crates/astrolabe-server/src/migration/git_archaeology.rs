@@ -1,0 +1,284 @@
+use super::*;
+
+use std::process::Command;
+
+use astrolabe_anchors::archaeology::{
+    GitArchaeologyConfig, GitLineRange, GitMineMode, mine_git_archaeology,
+};
+use astrolabe_anchors::{
+    OutcomeAnchorRequest, OutcomeKind, OutcomeSubject, ingest_outcome_anchors,
+};
+use astrolabe_bridge::{CbmIndexMode, CbmPipeline, CbmPipelineNodeRow, CbmPipelineRows};
+use astrolabe_ingest::{HistoricalSymbolLocation, admit_historical_symbol_snapshot};
+use calyx_core::{AnchorKind, AnchorValue};
+
+const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
+
+#[derive(Debug, Clone)]
+struct Evidence {
+    commit: String,
+    range: GitLineRange,
+    source: String,
+    observed_at: u64,
+    confidence: f32,
+    label: &'static str,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GitArchaeologyImportReport {
+    pub(crate) head: String,
+    pub(crate) evidence: usize,
+    pub(crate) historical_constellations_written: usize,
+    pub(crate) historical_constellations_reused: usize,
+    pub(crate) anchors_written: usize,
+    pub(crate) anchors_deduplicated: usize,
+    pub(crate) evidence_without_symbol: usize,
+    pub(crate) skipped_merge_fixes: usize,
+}
+
+pub(crate) fn run_full_git_archaeology<C: Clock>(
+    repo: &Path,
+    project: &str,
+    cache_dir: &Path,
+    vault: &AsterVault<C>,
+) -> Result<GitArchaeologyImportReport, DynError> {
+    let mined = mine_git_archaeology(repo, &GitArchaeologyConfig::default(), &GitMineMode::Full)?;
+    let mut evidence = Vec::new();
+    for finding in &mined.szz_findings {
+        evidence.push(Evidence {
+            commit: finding.blamed_commit.clone(),
+            range: GitLineRange {
+                path: finding.path.clone(),
+                start_line: finding.line,
+                line_count: 1,
+            },
+            source: format!("git:fix:{}", finding.fix_commit),
+            observed_at: finding.observed_at,
+            confidence: finding.confidence,
+            label: "bug_touch",
+        });
+    }
+    for finding in &mined.revert_findings {
+        evidence.push(Evidence {
+            commit: finding.target_commit.clone(),
+            range: finding.target_range.clone(),
+            source: format!("git:revert:{}", finding.revert_commit),
+            observed_at: finding.observed_at,
+            confidence: 1.0,
+            label: "reverted",
+        });
+    }
+    evidence.sort_by(|left, right| {
+        left.commit
+            .cmp(&right.commit)
+            .then_with(|| left.range.cmp(&right.range))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.label.cmp(right.label))
+    });
+
+    let mut report = GitArchaeologyImportReport {
+        head: mined.head,
+        evidence: evidence.len(),
+        skipped_merge_fixes: mined.skipped_merge_fixes,
+        ..GitArchaeologyImportReport::default()
+    };
+    for (commit, group) in group_evidence_by_commit(&evidence) {
+        let rows = index_historical_commit(repo, cache_dir, project, commit)?;
+        let selected = select_implicated_rows(rows, group);
+        if selected.nodes.is_empty() {
+            report.evidence_without_symbol += group.len();
+            continue;
+        }
+        let snapshot = pipeline_rows_to_graph_snapshot(selected);
+        let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
+            .with_available_slots(std::iter::empty());
+        let admission =
+            admit_historical_symbol_snapshot(&snapshot, vault, &ShadowSlotRuntime, &options)?;
+        report.historical_constellations_written += admission.constellations_written;
+        report.historical_constellations_reused += admission.constellations_reused;
+
+        for item in group {
+            let locations = admission
+                .locations
+                .iter()
+                .filter(|location| location_overlaps(location, &item.range))
+                .collect::<Vec<_>>();
+            if locations.is_empty() {
+                report.evidence_without_symbol += 1;
+                continue;
+            }
+            let mut cx_ids = BTreeMap::new();
+            let mut subjects = Vec::new();
+            for location in locations {
+                let subject_id = historical_subject_id(location);
+                if cx_ids.insert(subject_id.clone(), location.cx_id).is_none() {
+                    subjects.push(OutcomeSubject {
+                        subject_id,
+                        anchor_kind: AnchorKind::Label(item.label.to_string()),
+                        value: AnchorValue::Bool(true),
+                    });
+                }
+            }
+            let request = OutcomeAnchorRequest::new(
+                OutcomeKind::GitArchaeology,
+                item.source.clone(),
+                item.observed_at,
+                Some(item.confidence),
+                subjects,
+            )?;
+            let anchored = ingest_outcome_anchors(vault, &request, &cx_ids, ARCHAEOLOGY_ACTOR)?;
+            report.anchors_written += anchored.anchors_written;
+            report.anchors_deduplicated += anchored.anchors_deduplicated;
+        }
+    }
+    Ok(report)
+}
+
+fn group_evidence_by_commit(evidence: &[Evidence]) -> Vec<(&str, &[Evidence])> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < evidence.len() {
+        let mut end = start + 1;
+        while end < evidence.len() && evidence[end].commit == evidence[start].commit {
+            end += 1;
+        }
+        groups.push((evidence[start].commit.as_str(), &evidence[start..end]));
+        start = end;
+    }
+    groups
+}
+
+fn index_historical_commit(
+    repo: &Path,
+    cache_dir: &Path,
+    project: &str,
+    commit: &str,
+) -> Result<CbmPipelineRows, DynError> {
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let worktree = cache_dir.join(format!(".astrolabe-archaeology-worktree-{nonce}"));
+    let database = cache_dir.join(format!(".astrolabe-archaeology-{nonce}.db"));
+    git_checked(
+        repo,
+        &["worktree", "add", "--detach", path_str(&worktree)?, commit],
+    )?;
+    let indexed = (|| -> Result<CbmPipelineRows, DynError> {
+        let mut pipeline = CbmPipeline::new(
+            path_str(&worktree)?,
+            path_str(&database)?,
+            CbmIndexMode::Fast,
+        )?;
+        pipeline.set_project_name(project)?;
+        Ok(pipeline.collect_rows()?)
+    })();
+    let cleanup = git_checked(
+        repo,
+        &["worktree", "remove", "--force", path_str(&worktree)?],
+    );
+    cleanup_archaeology_database(&database);
+    if worktree.exists() {
+        fs::remove_dir_all(&worktree)?;
+    }
+    match (indexed, cleanup) {
+        (Ok(rows), Ok(())) => Ok(rows),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn cleanup_archaeology_database(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+}
+
+fn path_str(path: &Path) -> Result<&str, DynError> {
+    path.to_str()
+        .ok_or_else(|| format!("archaeology path is not valid UTF-8: {}", path.display()).into())
+}
+
+fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Git archaeology command {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into())
+    }
+}
+
+fn select_implicated_rows(mut rows: CbmPipelineRows, evidence: &[Evidence]) -> CbmPipelineRows {
+    rows.nodes.retain(|node| {
+        !matches!(node.label.as_str(), "Project" | "Branch" | "Folder")
+            && evidence.iter().any(|item| node_overlaps(node, &item.range))
+    });
+    rows.nodes.sort_by_key(|node| node.id);
+    rows.nodes.dedup_by(|left, right| left.id == right.id);
+    rows.edges.clear();
+    rows
+}
+
+fn node_overlaps(node: &CbmPipelineNodeRow, range: &GitLineRange) -> bool {
+    normalized_path(&node.file_path) == normalized_path(&range.path)
+        && node.start_line > 0
+        && node.end_line >= node.start_line
+        && (node.start_line as u64) <= range_end(range)
+        && (node.end_line as u64) >= u64::from(range.start_line)
+}
+
+fn location_overlaps(location: &HistoricalSymbolLocation, range: &GitLineRange) -> bool {
+    normalized_path(&location.file_path) == normalized_path(&range.path)
+        && u64::from(location.start_line) <= range_end(range)
+        && u64::from(location.end_line) >= u64::from(range.start_line)
+}
+
+fn range_end(range: &GitLineRange) -> u64 {
+    u64::from(range.start_line)
+        .saturating_add(u64::from(range.line_count))
+        .saturating_sub(1)
+}
+
+fn normalized_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn historical_subject_id(location: &HistoricalSymbolLocation) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        normalized_path(&location.file_path),
+        location.start_line,
+        location.end_line,
+        location.qualified_name
+    )
+}
+
+pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Value {
+    json!({
+        "status": "imported",
+        "mode": "full",
+        "head": report.head,
+        "evidence": report.evidence,
+        "historical_constellations_written": report.historical_constellations_written,
+        "historical_constellations_reused": report.historical_constellations_reused,
+        "anchors_written": report.anchors_written,
+        "anchors_deduplicated": report.anchors_deduplicated,
+        "evidence_without_symbol": report.evidence_without_symbol,
+        "skipped_merge_fixes": report.skipped_merge_fixes,
+        "trust": "mixed",
+        "provenance": "git_history",
+    })
+}

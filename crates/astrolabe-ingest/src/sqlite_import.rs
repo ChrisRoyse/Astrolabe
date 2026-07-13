@@ -75,6 +75,9 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
+/// Ledger payload schema for admitting historical symbol versions without
+/// mutating the live graph projection.
+pub const HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA: &str = "astrolabe.historical_symbol_ingest.v1";
 const SCHEMA_QUANTIZATION_GATE: &str = "astrolabe.quantization_gate.v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
@@ -362,6 +365,64 @@ pub struct SqliteImportReport {
     pub fsv: Option<FsvAck>,
     /// Imported constellation ids in deterministic node-id order.
     pub cx_ids: Vec<CxId>,
+}
+
+/// Deterministic location and identity of one admitted historical symbol.
+///
+/// The record is derived from the same CBM row parsing and Astrolabe canonical
+/// identity path as a live shadow import. It deliberately contains no source
+/// bytes; callers use it to bind Git archaeology outcomes to the exact
+/// historical `CxId`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalSymbolLocation {
+    /// Git commit supplied through [`SqliteImportOptions::commit`].
+    pub commit: String,
+    /// Repository-relative source path at that commit.
+    pub file_path: String,
+    /// One-based inclusive symbol start line.
+    pub start_line: u32,
+    /// One-based inclusive symbol end line.
+    pub end_line: u32,
+    /// Historical qualified name emitted by CBM.
+    pub qualified_name: String,
+    /// Historical CBM symbol label.
+    pub label: String,
+    /// Exact immutable constellation id for this historical version.
+    pub cx_id: CxId,
+}
+
+/// Result of admitting implicated historical symbol versions.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalSymbolAdmissionReport {
+    /// Deterministically sorted admitted locations.
+    pub locations: Vec<HistoricalSymbolLocation>,
+    /// Non-structural symbol versions presented to the panel driver.
+    pub constellation_inputs: usize,
+    /// Constellations whose Base row did not previously exist.
+    pub constellations_written: usize,
+    /// Exact Base plus slot rows written by this call.
+    pub rows_written: usize,
+    /// Constellations already present and independently verified.
+    pub constellations_reused: usize,
+    /// Commit snapshot after this call; unchanged on an idempotent replay.
+    pub seq: Seq,
+    /// Paired Ingest ledger entry, present exactly when rows were written.
+    pub ledger_ref: Option<LedgerRef>,
+    /// Full persisted-row and paired-ledger readback witness for a mutation.
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct HistoricalSymbolIngestLedgerPayload {
+    schema: String,
+    project_hash_sha256: String,
+    commit_hash_sha256: String,
+    location_digest: String,
+    constellation_inputs: u64,
+    constellations_written: u64,
+    rows_written: u64,
+    constellations_reused: u64,
 }
 
 /// Deep verification counts for SQLite-imported graph mapping rows.
@@ -947,6 +1008,276 @@ where
             ledger_rows_before,
         },
     )
+}
+
+/// Admits implicated historical CBM symbols as exact constellations without
+/// changing the live node map, Graph CF, or edge projection.
+///
+/// `snapshot` is expected to contain the filtered nodes implicated by Git
+/// archaeology at the real commit named by [`SqliteImportOptions::commit`].
+/// Nodes pass through the canonical snapshot parser, [`SymbolRecord`] builder,
+/// panel driver, and identity derivation used by live SQLite imports. Structural
+/// nodes are ignored because they do not have constellations. New Base and slot
+/// rows are written in one atomic `Ingest` group commit and verified with a
+/// [`VaultMutationPlan`]. Replaying an unchanged snapshot verifies existing rows
+/// and performs no mutation or ledger append.
+pub fn admit_historical_symbol_snapshot<C, R>(
+    snapshot: &CbmGraphSnapshot,
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+) -> IngestResult<HistoricalSymbolAdmissionReport>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    validate_options(options)?;
+    ensure_no_legacy_series_state(vault)?;
+    if options.commit.trim().is_empty() {
+        return Err(invalid_sqlite(
+            "historical symbol admission requires a non-empty real Git commit",
+        ));
+    }
+    if snapshot.project != options.project {
+        return Err(invalid_sqlite(format!(
+            "historical snapshot project {:?} does not match import project {:?}",
+            snapshot.project, options.project
+        )));
+    }
+
+    let extracted = extract_nodes(snapshot_node_rows(snapshot, &options.project)?)?;
+    let non_structural = extracted
+        .into_iter()
+        .filter(|node| !node.label.is_structural())
+        .collect::<Vec<_>>();
+    if non_structural.is_empty() {
+        return Err(invalid_sqlite(
+            "historical symbol snapshot contains no non-structural symbols to admit",
+        ));
+    }
+
+    let driver = PanelDriver::new(options.panel_version)?;
+    let mut prepared =
+        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
+    prepared.sort_by(|left, right| {
+        left.symbol
+            .rel_file_path
+            .cmp(&right.symbol.rel_file_path)
+            .then_with(|| left.symbol.start_line.cmp(&right.symbol.start_line))
+            .then_with(|| left.symbol.end_line.cmp(&right.symbol.end_line))
+            .then_with(|| left.symbol.qualified_name.cmp(&right.symbol.qualified_name))
+            .then_with(|| left.symbol.label.cmp(&right.symbol.label))
+            .then_with(|| left.identity.cx_id.cmp(&right.identity.cx_id))
+    });
+    for symbol in &mut prepared {
+        symbol.constellation.metadata.insert(
+            "start_line".to_string(),
+            symbol.symbol.start_line.to_string(),
+        );
+        symbol
+            .constellation
+            .metadata
+            .insert("end_line".to_string(), symbol.symbol.end_line.to_string());
+        symbol
+            .constellation
+            .metadata
+            .insert("historical_commit".to_string(), options.commit.clone());
+    }
+    let mut seen_cx_ids = BTreeSet::new();
+    for symbol in &prepared {
+        if !seen_cx_ids.insert(symbol.identity.cx_id) {
+            return Err(invalid_sqlite(format!(
+                "historical snapshot maps more than one node to CxId {}; filter duplicate symbol rows before admission",
+                symbol.identity.cx_id
+            )));
+        }
+    }
+
+    let locations = prepared
+        .iter()
+        .map(|symbol| HistoricalSymbolLocation {
+            commit: options.commit.clone(),
+            file_path: symbol.symbol.rel_file_path.clone(),
+            start_line: symbol.symbol.start_line,
+            end_line: symbol.symbol.end_line,
+            qualified_name: symbol.symbol.qualified_name.clone(),
+            label: symbol.symbol.label.clone(),
+            cx_id: symbol.identity.cx_id,
+        })
+        .collect::<Vec<_>>();
+    let snapshot_seq = vault.latest_seq();
+    let mut rows = Vec::new();
+    let mut constellations_written = 0usize;
+    let mut constellations_reused = 0usize;
+    for symbol in &prepared {
+        let key = base_key(symbol.identity.cx_id);
+        if vault
+            .read_cf_at(snapshot_seq, ColumnFamily::Base, &key)?
+            .is_some()
+        {
+            verify_existing_historical_constellation(vault, snapshot_seq, symbol)?;
+            constellations_reused += 1;
+            continue;
+        }
+        rows.push((
+            ColumnFamily::Base,
+            key,
+            encode::encode_constellation_base(&symbol.constellation)?,
+        ));
+        for (slot, vector) in &symbol.constellation.slots {
+            rows.push((
+                ColumnFamily::slot(*slot),
+                slot_key(symbol.identity.cx_id),
+                encode::encode_slot_vector(vector)?,
+            ));
+        }
+        constellations_written += 1;
+    }
+    let rows_written = rows.len();
+    if rows.is_empty() {
+        return Ok(HistoricalSymbolAdmissionReport {
+            locations,
+            constellation_inputs: prepared.len(),
+            constellations_written,
+            rows_written,
+            constellations_reused,
+            seq: snapshot_seq,
+            ledger_ref: None,
+            fsv: None,
+        });
+    }
+
+    let location_digest = historical_location_digest(&locations);
+    let payload = serde_json::to_vec(&HistoricalSymbolIngestLedgerPayload {
+        schema: HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA.to_string(),
+        project_hash_sha256: hex_lower(&sha256_digest(options.project.as_bytes())),
+        commit_hash_sha256: hex_lower(&sha256_digest(options.commit.as_bytes())),
+        location_digest: hex_lower(blake3::hash(&location_digest).as_bytes()),
+        constellation_inputs: prepared.len() as u64,
+        constellations_written: constellations_written as u64,
+        rows_written: rows_written as u64,
+        constellations_reused: constellations_reused as u64,
+    })?;
+    let subject = SubjectId::Query(blake3::hash(&location_digest).as_bytes().to_vec());
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    let planned_rows = rows.clone();
+    let commit_seq = vault.write_cf_batch_with_ledger_entry(
+        rows,
+        EntryKind::Ingest,
+        subject.clone(),
+        payload,
+        actor.clone(),
+    )?;
+    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
+    let mut fsv_plan = VaultMutationPlan::new(
+        "admit_historical_symbol_snapshot",
+        EntryKind::Ingest,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in planned_rows {
+        let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
+        fsv_plan.push_content(cf, key, &expected);
+    }
+    vault.flush()?;
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+
+    Ok(HistoricalSymbolAdmissionReport {
+        locations,
+        constellation_inputs: prepared.len(),
+        constellations_written,
+        rows_written,
+        constellations_reused,
+        seq: commit_seq,
+        ledger_ref: Some(ledger_ref),
+        fsv: Some(fsv),
+    })
+}
+
+fn historical_location_digest(locations: &[HistoricalSymbolLocation]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for location in locations {
+        for field in [
+            location.commit.as_bytes(),
+            location.file_path.as_bytes(),
+            location.qualified_name.as_bytes(),
+            location.label.as_bytes(),
+            location.cx_id.as_bytes(),
+        ] {
+            bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(&location.start_line.to_be_bytes());
+        bytes.extend_from_slice(&location.end_line.to_be_bytes());
+    }
+    bytes
+}
+
+fn verify_existing_historical_constellation<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prepared: &PreparedConstellation,
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let bytes = vault
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Base,
+            &base_key(prepared.identity.cx_id),
+        )?
+        .ok_or_else(|| readback_mismatch("historical Base CF row disappeared"))?;
+    let decoded = encode::decode_constellation_base(&bytes)?;
+    if decoded.cx_id != prepared.identity.cx_id
+        || decoded.vault_id != prepared.constellation.vault_id
+        || decoded.panel_version != prepared.constellation.panel_version
+        || decoded.input_ref.hash != prepared.constellation.input_ref.hash
+        || decoded.input_ref.redacted != prepared.constellation.input_ref.redacted
+        || decoded.modality != prepared.constellation.modality
+        || decoded.scalars != prepared.constellation.scalars
+    {
+        return Err(readback_mismatch(format!(
+            "preexisting historical Base CF fields differ for {}",
+            prepared.identity.cx_id
+        )));
+    }
+    for key in [
+        "astrolabe_schema",
+        "qualified_name",
+        "label",
+        "series_id_schema",
+        "series_id",
+        "input_hash_blake3",
+    ] {
+        if decoded.metadata.get(key) != prepared.constellation.metadata.get(key) {
+            return Err(readback_mismatch(format!(
+                "preexisting historical Base CF metadata {key} differs for {}",
+                prepared.identity.cx_id
+            )));
+        }
+    }
+    for (slot, expected) in &prepared.constellation.slots {
+        let bytes = vault
+            .read_cf_at(
+                snapshot,
+                ColumnFamily::slot(*slot),
+                &slot_key(prepared.identity.cx_id),
+            )?
+            .ok_or_else(|| {
+                readback_mismatch(format!(
+                    "preexisting historical slot {slot} missing for {}",
+                    prepared.identity.cx_id
+                ))
+            })?;
+        if encode::decode_slot_vector(&bytes)? != *expected {
+            return Err(readback_mismatch(format!(
+                "preexisting historical slot {slot} differs for {}",
+                prepared.identity.cx_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
@@ -5135,6 +5466,111 @@ mod tests {
         assert_import_cfs_match_raw(&direct_vault, &sqlite_vault);
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn historical_symbol_admission_reopens_base_and_never_mutates_live_graph() {
+        let mut snapshot = edge_snapshot();
+        snapshot.nodes.retain(|node| node.label == "Function");
+        // Deliberately leave the real captured edges in the filtered snapshot:
+        // historical admission must ignore them rather than project live Graph
+        // rows from a past tree.
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let options = SqliteImportOptions::new("demo", commit, 7);
+        let (dir, vault) = durable_vault("historical-symbol-admission");
+        let graph_before = vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+            .expect("scan initial Graph CF");
+
+        let report =
+            admit_historical_symbol_snapshot(&snapshot, &vault, &FixtureSlotRuntime, &options)
+                .expect("admit historical symbols");
+        assert_eq!(report.constellation_inputs, 2);
+        assert_eq!(report.constellations_written, 2);
+        assert_eq!(report.constellations_reused, 0);
+        assert!(report.rows_written >= 2);
+        assert!(report.ledger_ref.is_some());
+        assert_eq!(
+            report
+                .fsv
+                .as_ref()
+                .expect("historical admission FSV")
+                .scope(),
+            "admit_historical_symbol_snapshot"
+        );
+        assert_eq!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+                .expect("scan Graph CF after admission"),
+            graph_before,
+            "historical admission must not write node-map, Graph, or edge rows"
+        );
+        vault.flush().expect("flush historical admission vault");
+        drop(vault);
+
+        let reopened = AsterVault::new_durable_with_clock(
+            &*dir,
+            TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+            b"astrolabe-ingest-test".to_vec(),
+            VaultOptions::default(),
+            FixedClock::new(1_785_400_000),
+        )
+        .expect("reopen historical admission vault");
+        for location in &report.locations {
+            let bytes = reopened
+                .read_cf_at(
+                    reopened.latest_seq(),
+                    ColumnFamily::Base,
+                    &base_key(location.cx_id),
+                )
+                .expect("read historical Base row")
+                .expect("historical Base row exists");
+            let constellation =
+                encode::decode_constellation_base(&bytes).expect("decode historical Base row");
+            assert_eq!(constellation.cx_id, location.cx_id);
+            assert_eq!(
+                constellation.metadata.get("historical_commit"),
+                Some(&commit.to_string())
+            );
+            assert_eq!(
+                constellation.metadata.get("start_line"),
+                Some(&location.start_line.to_string())
+            );
+            assert_eq!(
+                constellation.metadata.get("end_line"),
+                Some(&location.end_line.to_string())
+            );
+        }
+        let (_, ledger_bytes) = reopened
+            .scan_cf_at(reopened.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan historical admission ledger")
+            .into_iter()
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .expect("paired historical admission ledger row");
+        let ledger = decode(&ledger_bytes).expect("decode historical admission ledger");
+        let payload: Value =
+            serde_json::from_slice(&ledger.payload).expect("decode historical ledger payload");
+        assert_eq!(payload["schema"], HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA);
+        assert_eq!(payload["constellations_written"], 2);
+
+        let before_replay_seq = reopened.latest_seq();
+        let replay =
+            admit_historical_symbol_snapshot(&snapshot, &reopened, &FixtureSlotRuntime, &options)
+                .expect("idempotent historical replay");
+        assert_eq!(replay.locations, report.locations);
+        assert_eq!(replay.constellations_written, 0);
+        assert_eq!(replay.rows_written, 0);
+        assert_eq!(replay.constellations_reused, 2);
+        assert_eq!(replay.seq, before_replay_seq);
+        assert!(replay.ledger_ref.is_none());
+        assert!(replay.fsv.is_none());
+        assert_eq!(reopened.latest_seq(), before_replay_seq);
+        assert_eq!(
+            reopened
+                .scan_cf_at(reopened.latest_seq(), ColumnFamily::Graph)
+                .expect("scan Graph CF after replay"),
+            graph_before
+        );
     }
 
     #[test]

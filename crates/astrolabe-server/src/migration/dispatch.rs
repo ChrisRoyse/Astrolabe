@@ -202,6 +202,9 @@ pub(crate) fn handle_index_repository(
     }
 
     let sanitized_args = strip_calyx_arg(args_obj)?;
+    let repo_path = string_arg(args_obj, "repo_path")
+        .or_else(|| string_arg(args_obj, "name"))
+        .map(PathBuf::from);
     let skills = skill_discovery_config(skill_discovery_override.as_ref());
     // #123: the row-sink run returns its raw result even when row capture fails,
     // so a sink failure keeps the first (completed) index run and only labels the
@@ -246,7 +249,12 @@ pub(crate) fn handle_index_repository(
     let Some(_shadow_import_lock) = try_shadow_import_lock(&cache_dir, &project)? else {
         return augment_tool_result(&result, shadow_import_busy_summary_at(&cache_dir, &project));
     };
-    let outcome = match import_shadow_vault(&project, Some(row_sink), &search_scale_settings) {
+    let outcome = match import_shadow_vault_with_archaeology(
+        &project,
+        Some(row_sink),
+        &search_scale_settings,
+        repo_path.as_deref(),
+    ) {
         Ok(outcome) => outcome,
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
     };

@@ -1,5 +1,130 @@
 use super::*;
 
+fn fixture_git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn git_archaeology_full_pass_persists_exact_historical_anchors_idempotently() {
+    let root = temp_dir("git-archaeology-full");
+    let repo = root.join("repo");
+    let cache = root.join("cache");
+    let vault_dir = root.join("vault");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fixture_git(&repo, &["init", "--initial-branch=main"]);
+    fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+    fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+
+    fs::write(repo.join("src/main.c"), "int stable(void) { return 1; }\n").unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "initial"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 7; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "introduce calculation"]);
+    let bug_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "Fix bug Closes #26"]);
+    let fix_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\nint doomed(void) { return 9; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "add doomed feature"]);
+    let reverted_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fixture_git(&repo, &["revert", "--no-edit", "HEAD"]);
+    let revert_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"git-archaeology-fsv".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let first = run_full_git_archaeology(&repo, "archaeology-fsv", &cache, &vault).unwrap();
+    assert_eq!(first.evidence_without_symbol, 0, "{first:#?}");
+    assert!(first.historical_constellations_written >= 2, "{first:#?}");
+    assert!(first.anchors_written >= 2, "{first:#?}");
+    vault.flush().unwrap();
+
+    let before = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+    assert!(!before.is_empty());
+    assert!(
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Graph)
+            .unwrap()
+            .is_empty(),
+        "historical admission must not alter the live graph"
+    );
+    let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    let sources = rows
+        .iter()
+        .flat_map(|row| row.row.anchors.iter().map(|anchor| anchor.source.as_str()))
+        .collect::<BTreeSet<_>>();
+    assert!(sources.contains(format!("git:fix:{fix_sha}").as_str()));
+    assert!(sources.contains(format!("git:revert:{revert_sha}").as_str()));
+    assert!(rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:fix:{fix_sha}")
+                && anchor.confidence.to_bits() == 0.9f32.to_bits()
+        })
+    }));
+    assert!(rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:revert:{revert_sha}")
+                && anchor.confidence.to_bits() == 1.0f32.to_bits()
+        })
+    }));
+
+    let second = run_full_git_archaeology(&repo, "archaeology-fsv", &cache, &vault).unwrap();
+    assert_eq!(second.anchors_written, 0, "{second:#?}");
+    assert!(second.anchors_deduplicated >= first.anchors_written);
+    assert_eq!(
+        before,
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+            .unwrap(),
+        "idempotent full pass must preserve anchor bytes"
+    );
+    assert!(verify_chain(&vault).unwrap().is_intact());
+    assert!(cache.read_dir().unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".astrolabe-archaeology-")
+    }));
+    assert_eq!(bug_sha.len(), 40);
+    assert_eq!(reverted_sha.len(), 40);
+    drop(vault);
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn calyx_arg_is_stripped_before_legacy_caller() {
     let args = serde_json::json!({
@@ -5801,6 +5926,7 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         kernel_context: sample_kernel_context(),
         anomalies: sample_anomalies(),
         provenance: sample_provenance(),
+        git_archaeology: json!({"status": "fixture"}),
     }
 }
 

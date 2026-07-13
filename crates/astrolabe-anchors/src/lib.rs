@@ -29,6 +29,7 @@ use calyx_ledger::decode as decode_ledger;
 use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
 use serde::{Deserialize, Serialize};
 
+pub mod archaeology;
 mod parsers;
 
 pub use parsers::{
@@ -93,6 +94,8 @@ pub enum OutcomeKind {
     Incident,
     /// A manual label.
     ManualLabel,
+    /// A label derived from validated Git history evidence.
+    GitArchaeology,
 }
 
 impl OutcomeKind {
@@ -104,6 +107,7 @@ impl OutcomeKind {
             Self::Review => "review",
             Self::Incident => "incident",
             Self::ManualLabel => "manual_label",
+            Self::GitArchaeology => "git_archaeology",
         }
     }
 }
@@ -387,6 +391,17 @@ where
             remediation: "use a new catalog source identifying the replacement evidence",
         });
     }
+    // Anchor rows retain their catalog source for provenance. Preserve the
+    // existing fail-closed secret screen before hashing that source in the
+    // ledger payload; full Git object IDs are the one structurally validated
+    // long-token catalog form and are identifiers, not secret material.
+    if !is_full_git_oid_source(&request.source) {
+        let source_probe = serde_json::to_vec(&serde_json::json!({
+            "source": request.source,
+        }))
+        .map_err(|error| anchor_corrupt(format!("encode anchor source probe: {error}")))?;
+        RedactionPolicy::check_payload(&source_probe)?;
+    }
     let snapshot = vault.snapshot();
     let mut rows = BTreeMap::<Vec<u8>, AnchorRowV1>::new();
     let mut dirty_keys = BTreeSet::<Vec<u8>>::new();
@@ -467,7 +482,7 @@ where
     let payload = serde_json::to_vec(&serde_json::json!({
         "schema": ANCHOR_LEDGER_SCHEMA,
         "outcome_kind": request.kind.as_str(),
-        "source": request.source,
+        "source_hash": hex_lower(blake3::hash(request.source.as_bytes()).as_bytes()),
         "observed_at": request.observed_at,
         "anchors_written": anchors_written,
         "anchors_deduplicated": anchors_deduplicated,
@@ -519,6 +534,14 @@ where
         ledger_ref,
         trust: request_trust,
         fsv,
+    })
+}
+
+fn is_full_git_oid_source(source: &str) -> bool {
+    ["git:fix:", "git:revert:"].iter().any(|prefix| {
+        source.strip_prefix(prefix).is_some_and(|oid| {
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     })
 }
 

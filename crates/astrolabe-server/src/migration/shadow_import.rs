@@ -89,6 +89,7 @@ pub(crate) struct ShadowImportOutcome {
     pub(crate) kernel_context: Value,
     pub(crate) anomalies: Value,
     pub(crate) provenance: Value,
+    pub(crate) git_archaeology: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -714,6 +715,15 @@ pub(crate) fn import_shadow_vault(
     row_sink: Option<RowSinkImportCandidate>,
     search_scale_settings: &SearchScaleSettings,
 ) -> Result<ShadowImportOutcome, DynError> {
+    import_shadow_vault_with_archaeology(project, row_sink, search_scale_settings, None)
+}
+
+pub(crate) fn import_shadow_vault_with_archaeology(
+    project: &str,
+    row_sink: Option<RowSinkImportCandidate>,
+    search_scale_settings: &SearchScaleSettings,
+    repo: Option<&Path>,
+) -> Result<ShadowImportOutcome, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     fs::create_dir_all(&cache_dir)?;
     let sqlite_path = sqlite_path(&cache_dir, project);
@@ -755,6 +765,17 @@ pub(crate) fn import_shadow_vault(
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
+    let git_archaeology = match repo {
+        Some(repo) => git_archaeology_summary(&run_full_git_archaeology(
+            repo, project, &cache_dir, &vault,
+        )?),
+        None => json!({
+            "status": "unavailable",
+            "reason": "repository path is unavailable on this recovery import",
+            "trust": "provisional",
+            "provenance": "unavailable",
+        }),
+    };
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
     let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
     let verify = verify_chain(&vault)?;
@@ -810,6 +831,7 @@ pub(crate) fn import_shadow_vault(
         kernel_context: shadow_import.kernel_context,
         anomalies: shadow_import.anomalies,
         provenance,
+        git_archaeology,
     })
 }
 
@@ -1158,6 +1180,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "kernel_context": outcome.kernel_context.clone(),
         "anomalies": outcome.anomalies.clone(),
         "provenance": outcome.provenance.clone(),
+        "git_archaeology": outcome.git_archaeology.clone(),
         "health": health_surface_json(
             outcome_project_label(outcome),
             &outcome.verify_chain_status,
