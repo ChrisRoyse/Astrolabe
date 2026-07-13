@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auto;
 pub mod calibration;
 pub mod profile;
 

@@ -115,6 +115,8 @@ name = "astrolabe-guard"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-panel",
+ "calyx-core",
  "serde_json",
  "sha2",
  "tree-sitter",

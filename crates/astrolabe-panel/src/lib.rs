@@ -6,6 +6,7 @@ pub mod layout_registry;
 mod lenses;
 #[cfg(test)]
 mod s23_layer_role_fsv;
+pub mod similarity;
 mod unicode61;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +37,10 @@ pub use lenses::{
     cbm_camel_split_tokens, cbm_route_canon_path, default_api_family, encode_slot,
     fixture_encoder_input, fixture_scalar_sidecar, layer_role_lens, s0_s9_lenses,
     s10_s17_s21_lenses,
+};
+pub use similarity::{
+    ASTRO_PANEL_COSINE_SHAPE_MISMATCH, ASTRO_PANEL_COSINE_UNSUPPORTED_SHAPE, slot_centroid,
+    slot_vector_cosine,
 };
 
 /// Crate name reported by Cargo metadata.
