@@ -23,5 +23,14 @@ sha2 = "0.10"
 path = "src/lib.rs"
 
 [dev-dependencies]
+# #291: `crash-fsv` compiles calyx-aster's `crash_fsv_after_wal_append`
+# failpoint (parks the process after a WAL append) for the child-process
+# crash-recovery test in `src/ledger_verify.rs`. It MUST stay here in
+# [dev-dependencies] and MUST NOT be a normal dependency or a default feature:
+# the failpoint must never reach a shipped binary. With resolver = "2" the
+# normal/bin feature resolution of the `astrolabe` bin does not activate a
+# dev-only feature, so the release binary is failpoint-free. The standing
+# byte-level proof is `scripts/check-release-failpoint-strings.py`
+# (wired into check-release.sh), which fails closed if the marker ever ships.
 calyx-aster = { workspace = true, features = ["crash-fsv"] }
 crc32fast = "1"
