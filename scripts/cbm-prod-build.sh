@@ -78,9 +78,17 @@ else
 fi
 
 # ── build ───────────────────────────────────────────────────────────────────
+# Mixed native path form (C:/...) for make: the #280 per-TU link writes object
+# paths into a gcc response file, and MSYS path conversion never rewrites file
+# CONTENTS — a /c/... BUILD_DIR inside the .rsp would reach native gcc verbatim.
+MAKE_BUILD_DIR="$BUILD_DIR"
+if command -v cygpath >/dev/null 2>&1; then
+  MAKE_BUILD_DIR="$(cygpath -m "$BUILD_DIR")"
+fi
 make -C "$ROOT/vendor/codebase-memory-mcp" \
   -f "$ROOT/patches/cbm/Makefile.cbm" \
-  "BUILD_DIR=$BUILD_DIR" \
+  -j"$(nproc 2>/dev/null || echo 8)" \
+  "BUILD_DIR=$MAKE_BUILD_DIR" \
   cbm
 
 built="$BUILD_DIR/codebase-memory-mcp$EXE"

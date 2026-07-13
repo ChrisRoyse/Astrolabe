@@ -669,12 +669,22 @@ MAIN_SRC = src/main.c
 
 # The production binary compiles the owned sources directly; ASTRO_PROD_DEFS
 # turns on the #229 -Werror root-cause fixes and the #282 worker diagnostics.
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) $(ASTRO_PROD_DEFS) -o $@ \
-		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_PROD) \
-		$(LDFLAGS)
+# #280: per-TU objects with -MMD dep tracking — the historical single gcc
+# command (~320s serial) dominated the mcp-parity gate on any cache miss;
+# per-TU objects make the cold build -j-parallel and an edit incremental.
+# Same pattern as the owned vendor Makefile.cbm.
+PROD_TU_SRCS = $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+PROD_TU_OBJS = $(patsubst %.c,$(BUILD_DIR)/tuprod/%.o,$(PROD_TU_SRCS))
+
+$(BUILD_DIR)/tuprod/%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_PROD) $(ASTRO_PROD_DEFS) -MMD -MP -c -o $@ $<
+
+-include $(PROD_TU_OBJS:.o=.d)
+
+$(BUILD_DIR)/codebase-memory-mcp: $(PROD_TU_OBJS) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	$(file >$@.rsp,$(PROD_TU_OBJS) $(OBJS_VENDORED_PROD))
+	$(CC) $(CFLAGS_PROD) $(ASTRO_PROD_DEFS) -o $@ @$@.rsp $(LDFLAGS)
 
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
