@@ -12,10 +12,7 @@ use std::path::Path;
 use std::ptr;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
-pub const CBM_VENDOR_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../cbm"
-);
+pub const CBM_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cbm");
 pub const VENDORED_MIMALLOC_VERSION: &str = env!("CBM_MIMALLOC_VERSION");
 
 include!("bindings.rs");
