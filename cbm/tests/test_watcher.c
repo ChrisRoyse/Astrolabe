@@ -932,7 +932,17 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Same dirty bytes — do not reindex forever. */
+    cbm_watcher_touch(w, "cont-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* A second edit while still dirty has a new porcelain fingerprint. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "dirty again\n");
+    }
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2);
@@ -993,11 +1003,21 @@ TEST(watcher_baseline_dirty_repo) {
     cbm_watcher_watch(w, "bld-repo", tmpdir);
     index_call_count = 0;
 
-    /* Baseline — captures HEAD but doesn't check for dirty */
+    /* Baseline captures both HEAD and the current dirty state. */
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0); /* baseline never triggers */
 
-    /* First real poll — should detect the pre-existing dirty state */
+    /* The same pre-existing dirty bytes are not a new change. */
+    cbm_watcher_touch(w, "bld-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* A later edit while still dirty is detected. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "later edit\n");
+    }
     cbm_watcher_touch(w, "bld-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);

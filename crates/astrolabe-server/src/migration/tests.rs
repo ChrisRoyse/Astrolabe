@@ -1,5 +1,130 @@
 use super::*;
 
+fn fixture_git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn git_archaeology_full_pass_persists_exact_historical_anchors_idempotently() {
+    let root = temp_dir("git-archaeology-full");
+    let repo = root.join("repo");
+    let cache = root.join("cache");
+    let vault_dir = root.join("vault");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fixture_git(&repo, &["init", "--initial-branch=main"]);
+    fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+    fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+
+    fs::write(repo.join("src/main.c"), "int stable(void) { return 1; }\n").unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "initial"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 7; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "introduce calculation"]);
+    let bug_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "Fix bug Closes #26"]);
+    let fix_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/main.c"),
+        "int stable(void) { return 1; }\nint buggy(void) { return 8; }\nint doomed(void) { return 9; }\n",
+    )
+    .unwrap();
+    fixture_git(&repo, &["add", "src/main.c"]);
+    fixture_git(&repo, &["commit", "-m", "add doomed feature"]);
+    let reverted_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    fixture_git(&repo, &["revert", "--no-edit", "HEAD"]);
+    let revert_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"git-archaeology-fsv".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let first = run_full_git_archaeology(&repo, "archaeology-fsv", &cache, &vault).unwrap();
+    assert_eq!(first.evidence_without_symbol, 0, "{first:#?}");
+    assert!(first.historical_constellations_written >= 2, "{first:#?}");
+    assert!(first.anchors_written >= 2, "{first:#?}");
+    vault.flush().unwrap();
+
+    let before = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .unwrap();
+    assert!(!before.is_empty());
+    assert!(
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Graph)
+            .unwrap()
+            .is_empty(),
+        "historical admission must not alter the live graph"
+    );
+    let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    let sources = rows
+        .iter()
+        .flat_map(|row| row.row.anchors.iter().map(|anchor| anchor.source.as_str()))
+        .collect::<BTreeSet<_>>();
+    assert!(sources.contains(format!("git:fix:{fix_sha}").as_str()));
+    assert!(sources.contains(format!("git:revert:{revert_sha}").as_str()));
+    assert!(rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:fix:{fix_sha}")
+                && anchor.confidence.to_bits() == 0.9f32.to_bits()
+        })
+    }));
+    assert!(rows.iter().any(|row| {
+        row.row.anchors.iter().any(|anchor| {
+            anchor.source == format!("git:revert:{revert_sha}")
+                && anchor.confidence.to_bits() == 1.0f32.to_bits()
+        })
+    }));
+
+    let second = run_full_git_archaeology(&repo, "archaeology-fsv", &cache, &vault).unwrap();
+    assert_eq!(second.anchors_written, 0, "{second:#?}");
+    assert!(second.anchors_deduplicated >= first.anchors_written);
+    assert_eq!(
+        before,
+        vault
+            .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+            .unwrap(),
+        "idempotent full pass must preserve anchor bytes"
+    );
+    assert!(verify_chain(&vault).unwrap().is_intact());
+    assert!(cache.read_dir().unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".astrolabe-archaeology-")
+    }));
+    assert_eq!(bug_sha.len(), 40);
+    assert_eq!(reverted_sha.len(), 40);
+    drop(vault);
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn calyx_arg_is_stripped_before_legacy_caller() {
     let args = serde_json::json!({
@@ -1590,6 +1715,15 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
         Some(candidate),
     )
     .unwrap();
+    let import_fsv = imported
+        .report
+        .fsv
+        .as_ref()
+        .expect("row-sink import earns FSV witness");
+    assert_eq!(
+        import_fsv.label(),
+        astrolabe_domain::fsv::FSV_LABEL_VERIFIED
+    );
     let verify = verify_chain(&vault).unwrap();
     let provenance =
         provenance_surface_with_chain(imported.provenance, &"44".repeat(32), 1, &verify);
@@ -1599,10 +1733,14 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
     let mut outcome = sample_shadow_outcome(&dir, security);
     outcome.vault_dir = vault_dir;
     outcome.provenance = provenance;
+    outcome.import_fsv = imported.report.fsv.clone();
     outcome.ledger_seq = 1;
     outcome.lowered_vault_fingerprint_sha256 = "44".repeat(32);
     outcome.verify_chain_status = verify.status.clone();
     persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+    let summary = grounding_summary(&outcome);
+    assert_eq!(summary["fsv"]["label"], "fsv:verified");
+    assert_eq!(summary["fsv"]["scope"], "sqlite_import");
 
     let store = provenance_store_for_project(&dir, "demo").unwrap();
     let response = get_provenance(&store, &ProvenanceQuery::new("verify_chain", None))
@@ -3181,6 +3319,14 @@ fn team_artifact_export_import_roundtrip_from_shadow_state() {
     assert_eq!(exported["status"], "exported");
     assert_eq!(exported["signature_status"], "signed");
     assert_eq!(exported["source_state"]["verify_chain"], "intact");
+    assert_eq!(
+        exported["source_state"]["lowered_artifact"]["status"],
+        "verified"
+    );
+    assert_eq!(
+        exported["source_state"]["lowered_artifact"]["artifact_sha256"],
+        exported["manifest"]["graph_db_sha256"]
+    );
     assert_eq!(exported["files"]["graph_db_zst"]["name"], GRAPH_DB_ZST_NAME);
     assert_eq!(
         exported["files"]["vault_export_zst"]["name"],
@@ -3207,6 +3353,43 @@ fn team_artifact_export_import_roundtrip_from_shadow_state() {
     assert_eq!(structured["serving"]["vault_restored"], false);
     assert_eq!(structured["artifact_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(fs::read(&adopted).unwrap(), fs::read(&lowered).unwrap());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn team_artifact_export_refuses_tampered_lowered_bytes_before_consuming_them() {
+    use std::io::Write;
+
+    let dir = temp_dir("team-artifact-lowered-tamper");
+    fs::create_dir_all(&dir).unwrap();
+    let lowered = seed_team_shadow_state(&dir);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&lowered)
+        .expect("open lowered artifact for tamper")
+        .write_all(b"tamper")
+        .expect("append tamper bytes");
+
+    let artifact_dir = dir.join("repo").join(CBM_TEAM_ARTIFACT_DIR);
+    let error = team_artifact_export_json_at(
+        &dir,
+        "demo",
+        &artifact_dir,
+        None,
+        ShadowRefreshStatus::Current,
+    )
+    .expect_err("tampered lowered bytes must refuse export");
+    assert!(
+        error
+            .to_string()
+            .contains(astrolabe_lower::ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH),
+        "refusal must name the lowered fingerprint mismatch: {error}"
+    );
+    assert!(
+        !artifact_dir.exists(),
+        "refused export must not create a partial team artifact"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -5597,6 +5780,10 @@ fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
     assert_eq!(mcp["status"], "grounded", "mcp envelope: {mcp}");
     assert_eq!(mcp["anchors_written"], 1);
     assert_eq!(mcp["unmapped_subject_count"], 0);
+    assert_eq!(mcp["fsv"]["label"], "fsv:verified");
+    assert_eq!(mcp["fsv"]["scope"], "ingest_outcome_anchors");
+    assert_eq!(mcp["fsv"]["rows_read_back"], 1);
+    assert_eq!(mcp["trust"], "trusted");
     // Report-level determinism across the two surfaces.
     assert_eq!(mcp["anchor_dump_hash"], cli["anchor_dump_hash"]);
     assert_eq!(mcp["ledger_ref"], cli["ledger_ref"]);
@@ -5655,6 +5842,50 @@ fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
     fs::remove_dir_all(&cli_dir).ok();
 }
 
+#[test]
+fn anchor_outcome_proxy_source_is_provisional_on_the_shipping_surface() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                  {\"type\":\"test\",\"name\":\"demo.main\",\"event\":\"started\"}\n\
+                  {\"type\":\"test\",\"name\":\"demo.main\",\"event\":\"ok\"}\n\
+                  {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
+    let dir = temp_dir("anchor-outcome-proxy-trust");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    let response = anchor_outcome_json_at(
+        &dir,
+        "demo",
+        "test_run",
+        "agent:codex:session-29",
+        Some(0.6),
+        "cargo_test_json",
+        report,
+        "1786400000",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["trust"], "provisional");
+    assert_eq!(response["fsv"]["label"], "fsv:verified");
+
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row.anchors[0].source, "agent:codex:session-29");
+    assert_eq!(
+        rows[0].row.anchors[0].confidence.to_bits(),
+        0.6f32.to_bits()
+    );
+    drop(vault);
+    fs::remove_dir_all(&dir).ok();
+}
+
 fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOutcome {
     ShadowImportOutcome {
         vault_dir: root.join("demo.astrolabe-vault"),
@@ -5681,6 +5912,9 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         reused_cx_ids: 0,
         graph_rows_written: 2,
         edge_rows_written: 1,
+        series_inputs: 2,
+        series_mutated_rows: 8,
+        import_fsv: None,
         cx_id_set_sha256: "33".repeat(32),
         ledger_seq: 1,
         ledger_rows_after: 1,
@@ -5694,7 +5928,318 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         kernel_context: sample_kernel_context(),
         anomalies: sample_anomalies(),
         provenance: sample_provenance(),
+        git_archaeology: json!({"status": "fixture"}),
+        weave: json!({"status": "fixture"}),
     }
+}
+
+#[test]
+fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
+    let root = temp_dir("shadow-panel-weave-fsv");
+    let vault_dir = root.join("demo.astrolabe-vault");
+    fs::create_dir_all(&root).unwrap();
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"shadow-panel-weave-fsv".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let properties = |name: &str, increment: u8| {
+        format!(
+            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ input + {increment} }}","signature":"fn {name}(input: i32) -> i32","bt":"input addition return {increment}","docstring":"increment an input value","complexity":2.0,"cognitive":1.0,"param_count":1.0,"lines":1.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+        )
+    };
+    let rows = |include_beta: bool, increment: u8| {
+        let mut nodes = vec![astrolabe_bridge::CbmPipelineNodeRow {
+            id: 1,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: "alpha".to_string(),
+            qualified_name: "demo.alpha".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            properties_json: properties("alpha", increment),
+        }];
+        if include_beta {
+            nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
+                id: 2,
+                project: "demo".to_string(),
+                label: "Function".to_string(),
+                name: "beta".to_string(),
+                qualified_name: "demo.beta".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 3,
+                end_line: 3,
+                properties_json: properties("beta", 1),
+            });
+        }
+        CbmPipelineRows {
+            project: "demo".to_string(),
+            nodes,
+            edges: Vec::new(),
+        }
+    };
+
+    let first_options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots());
+    let first = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &first_options,
+        Some(row_sink_import_candidate_from_rows(rows(true, 1))),
+    )
+    .unwrap();
+    assert_eq!(first.report.constellation_inputs, 2);
+    let live = astrolabe_ingest::read_cbm_graph_snapshot(&vault, "demo").unwrap();
+    let cx_by_qn = live
+        .nodes
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name.clone(), cx_id)))
+        .collect::<BTreeMap<_, _>>();
+    let alpha_cx = cx_by_qn["demo.alpha"];
+    let beta_cx = cx_by_qn["demo.beta"];
+    let body_slot = vault
+        .read_cf_at(
+            vault.snapshot(),
+            ColumnFamily::slot(SlotId::new(18)),
+            &slot_key(alpha_cx),
+        )
+        .unwrap()
+        .expect("persisted semantic body slot");
+    assert!(matches!(
+        calyx_aster::vault::encode::decode_slot_vector(&body_slot).unwrap(),
+        SlotVector::Dense { .. }
+    ));
+    let unavailable_slot = vault
+        .read_cf_at(
+            vault.snapshot(),
+            ColumnFamily::slot(SlotId::new(1)),
+            &slot_key(alpha_cx),
+        )
+        .unwrap()
+        .expect("persisted explicit unavailable slot");
+    assert!(matches!(
+        calyx_aster::vault::encode::decode_slot_vector(&unavailable_slot).unwrap(),
+        SlotVector::Absent { .. }
+    ));
+
+    let first_weave = run_live_weave(&vault, "demo", true, None).unwrap();
+    assert_eq!(first_weave["status"], "reconciled");
+    let first_sim = astrolabe_weave::read_similarity_edge_rows(&vault).unwrap();
+    let first_xterms = astrolabe_weave::read_eager_cross_term_rows(&vault).unwrap();
+    assert!(!first_sim.is_empty(), "identical semantic slots must weave");
+    assert!(!first_xterms.is_empty(), "designed pairs must materialize");
+    let old_seq = vault.snapshot();
+    let old_sim_key = first_sim[0].key.clone();
+    let removed_xterm_key = first_xterms
+        .iter()
+        .find(|row| row.row.key.cx_id == beta_cx)
+        .expect("beta eager xterm")
+        .key
+        .clone();
+    let first_lower = lower_shadow_sqlite(&root, "demo", &vault).unwrap();
+    assert!(first_lower.edge_count > 0);
+    for (name, value) in [
+        ("vault_dir", vault_dir.display().to_string()),
+        ("vault_id", SHADOW_VAULT_ID.to_string()),
+        ("vault_salt", "shadow-panel-weave-fsv".to_string()),
+        (
+            "lowered_artifact_sha256",
+            first_lower.artifact_sha256.clone(),
+        ),
+        (
+            "lowered_vault_fingerprint_sha256",
+            first_lower.vault_fingerprint_sha256.clone(),
+        ),
+        ("lowered_manifest_seq", first_lower.manifest_seq.to_string()),
+        ("lowered_nodes", first_lower.node_count.to_string()),
+        ("lowered_edges", first_lower.edge_count.to_string()),
+        (
+            "lowered_skipped_edges",
+            first_lower.skipped_edges.to_string(),
+        ),
+    ] {
+        write_config_value(&root, &metadata_key("demo", name), &value).unwrap();
+    }
+
+    let second_options = SqliteImportOptions::new("demo", "commit-2", DEFAULT_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots());
+    let second = import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &second_options,
+        Some(row_sink_import_candidate_from_rows(rows(false, 2))),
+    )
+    .unwrap();
+    assert!(second.report.graph_rows_written > 0);
+    let delta = WeaveDelta {
+        dirty_qualified_names: BTreeSet::from(["demo.alpha".to_string()]),
+        removed_qualified_names: BTreeSet::from([
+            "demo.alpha".to_string(),
+            "demo.beta".to_string(),
+        ]),
+        removed_cx_ids: BTreeSet::from([alpha_cx, beta_cx]),
+    };
+    let second_weave = run_live_weave(&vault, "demo", true, Some(&delta)).unwrap();
+    assert!(second_weave["similarity"]["rows_tombstoned"] != 0);
+    assert_eq!(second_weave["eager_cross_terms"]["symbol_count"], 1);
+    assert!(second_weave["eager_cross_terms"]["rows_written"] != 0);
+    assert!(second_weave["eager_cross_terms"]["rows_tombstoned"] != 0);
+    assert!(
+        astrolabe_weave::read_similarity_edge_rows(&vault)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &old_sim_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::XTerm, &removed_xterm_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        vault
+            .read_cf_at(old_seq, ColumnFamily::Graph, &old_sim_key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .read_cf_at(old_seq, ColumnFamily::XTerm, &removed_xterm_key)
+            .unwrap()
+            .is_some()
+    );
+    let invalidations =
+        persist_delta_invalidations(&vault, "demo", true, Some(&delta), &second_weave).unwrap();
+    assert_eq!(invalidations["status"], "dirty");
+    assert_eq!(invalidations["assay"]["rows_written"], 2);
+    assert_eq!(invalidations["kernel"]["dirty_scc_count"], 2);
+    assert_eq!(invalidations["guard"]["counter_count"], 2);
+    assert_eq!(
+        invalidations["fsv"]["readback_verified_rows"],
+        invalidations["rows_written"]
+    );
+    let invalidation_seq = vault.latest_seq();
+    let assay_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Assay,
+        "demo",
+        "assay",
+    )
+    .unwrap();
+    let kernel_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Kernel,
+        "demo",
+        "kernel",
+    )
+    .unwrap();
+    let guard_invalidations = scan_invalidation_rows(
+        &vault,
+        invalidation_seq,
+        ColumnFamily::Guard,
+        "demo",
+        "guard",
+    )
+    .unwrap();
+    assert_eq!(assay_invalidations.len(), 2);
+    assert_eq!(kernel_invalidations.len(), 2);
+    assert_eq!(guard_invalidations.len(), 2);
+    let guard_alpha = guard_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| value["qualified_name"] == "demo.alpha")
+        .expect("alpha guard drift counter");
+    assert_eq!(guard_alpha["drift_count"], 1);
+    let assay_alpha = assay_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| value["qualified_name"] == "demo.alpha")
+        .expect("alpha assay dirty stratum");
+    assert_eq!(assay_alpha["dirty"], true);
+    assert_eq!(assay_alpha["kind"], "assay_stratum_dirty");
+    let kernel_removed_beta = kernel_invalidations
+        .iter()
+        .map(|(_, value)| serde_json::from_slice::<Value>(value).unwrap())
+        .find(|value| {
+            value["removed_members"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("demo.beta"))
+        })
+        .expect("removed beta kernel dirty SCC");
+    assert_eq!(kernel_removed_beta["dirty"], true);
+    let scheduled = schedule_lowering_after_convergence(&root, "demo", true, &second_weave)
+        .unwrap()
+        .expect("mutating production convergence schedules lowering");
+    assert_eq!(scheduled["status"], "waiting");
+    assert_eq!(scheduled["pending"], true);
+    assert!(matches!(
+        drive_project_lowering(&root, "demo").unwrap()["status"].as_str(),
+        Some("waiting")
+    ));
+    drop(vault);
+    thread::sleep(Duration::from_millis(
+        astrolabe_domain::knobs::LOWER_DEBOUNCE_DEFAULT_WINDOW_MS + 50,
+    ));
+    let regenerated = drive_project_lowering(&root, "demo").unwrap();
+    assert_eq!(regenerated["status"], "regenerated");
+    assert_eq!(regenerated["pending"], false);
+    assert_eq!(regenerated["edge_count"], 0);
+    let vault = open_shadow_vault_writable(
+        &vault_dir,
+        SHADOW_VAULT_ID,
+        "shadow-panel-weave-fsv",
+        Vec::new(),
+    )
+    .unwrap();
+    let verified_lower = astrolabe_lower::verify_lowered_artifact(
+        &vault,
+        lowered_sqlite_path(&root, "demo"),
+        "demo",
+    )
+    .unwrap();
+    assert_eq!(
+        verified_lower.artifact_sha256,
+        regenerated["artifact_sha256"].as_str().unwrap()
+    );
+    let status = shadow_status_summary_at(&root, "demo").unwrap();
+    assert_eq!(status["lowering_debounce"]["status"], "regenerated");
+    assert_eq!(status["lowering_debounce"]["pending"], false);
+    assert_eq!(
+        status["lowered_sqlite"]["artifact_sha256"].as_str(),
+        Some(verified_lower.artifact_sha256.as_str())
+    );
+    assert_eq!(
+        status["lowered_sqlite"]["vault_fingerprint_sha256"].as_str(),
+        Some(verified_lower.vault_fingerprint_sha256.as_str())
+    );
+    assert_eq!(
+        status["lowered_sqlite"]["manifest_seq"].as_u64(),
+        regenerated["manifest_seq"].as_u64()
+    );
+    assert_ne!(
+        first_lower.vault_fingerprint_sha256,
+        verified_lower.vault_fingerprint_sha256
+    );
+
+    let before_noop = vault.latest_seq();
+    let noop = run_live_weave(&vault, "demo", false, None).unwrap();
+    assert_eq!(noop["status"], "unchanged");
+    assert_eq!(vault.latest_seq(), before_noop);
+    drop(vault);
+    fs::remove_dir_all(root).ok();
 }
 
 fn sample_search_scale() -> Value {

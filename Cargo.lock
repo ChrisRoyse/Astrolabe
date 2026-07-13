@@ -63,10 +63,12 @@ name = "astrolabe-anchors"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-ingest",
  "blake3",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "proptest",
  "quick-xml",
  "serde",
  "serde_json",
@@ -158,6 +160,7 @@ dependencies = [
  "astrolabe-domain",
  "astrolabe-ingest",
  "astrolabe-panel",
+ "astrolabe-weave",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
@@ -230,6 +233,7 @@ name = "astrolabe-weave"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "astrolabe-ingest",
  "astrolabe-panel",
  "blake3",
  "calyx-assay",

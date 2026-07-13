@@ -71,7 +71,7 @@ CC_FAMILY := $(shell dump="$$(echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)"; \
 	elif printf '%s\n' "$$dump" | grep -q '__GNUC__'; then echo gcc; \
 	else echo other; fi)
 ifeq ($(filter gcc clang,$(CC_FAMILY)),)
-$(error [#274] Makefile.cbm could not classify the compiler family for CC="$(CC)" (probe result: '$(CC_FAMILY)'). `echo | $(CC_FOR_SHELL) -dM -E -` must define __GNUC__ (GCC) or __clang__ (Clang) so the GCC-only -Wno-* suppression set is chosen deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Bootstrap`. Refusing to guess a warning-suppression state.)
+$(error [#274] Makefile.cbm could not classify the compiler family for CC="$(CC)" (probe result: '$(CC_FAMILY)'). `echo | $(CC_FOR_SHELL) -dM -E -` must define __GNUC__ (GCC) or __clang__ (Clang) so the GCC-only -Wno-* suppression set is chosen deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap`. Refusing to guess a warning-suppression state.)
 endif
 IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)
 GCC_ONLY_FLAGS :=

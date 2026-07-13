@@ -20,15 +20,15 @@
 
 function Read-AstroLauncherLock {
     # Classify a launcher lock file without mutating anything or stopping any process.
-    # Returns { State = absent|stale|held|unreadable; OwnerPid; Command; Started }.
+    # Returns { State = absent|stale|held|unreadable; OwnerPid; Issue; Command; Started }.
     #   absent     -- no lock file
-    #   unreadable -- present but names no positive-integer pid (fail-closed, #186/#197)
+    #   unreadable -- present but violates the required owner schema (fail-closed, #186/#197/#317)
     #   held       -- names a pid that is a LIVE process (a foreign session owns it)
     #   stale      -- names a pid that is no longer a live process
     param([Parameter(Mandatory)][string]$LockPath)
 
     if (-not (Test-Path -LiteralPath $LockPath)) {
-        return [pscustomobject]@{ State = 'absent'; OwnerPid = $null; Command = $null; Started = $null }
+        return [pscustomobject]@{ State = 'absent'; OwnerPid = $null; Issue = $null; Command = $null; Started = $null }
     }
 
     $raw = Get-Content -LiteralPath $LockPath -Raw -ErrorAction SilentlyContinue
@@ -37,9 +37,9 @@ function Read-AstroLauncherLock {
         try { $state = ConvertFrom-Json -InputObject $raw } catch { $state = $null }
     }
 
-    # Fail-closed schema validation: the pid must parse as a positive integer. A malformed pid
-    # (clobbered or truncated manifest) surfaces as the named UNREADABLE boundary, never as an
-    # unnamed cast exception.
+    # Fail-closed schema validation: PID and driving issue are positive integers,
+    # start time is an ISO timestamp, and command is non-empty. A clobbered,
+    # truncated, or legacy ownerless manifest is unreadable, never guessed.
     $ownerPid = $null
     if ($null -ne $state -and $state.PSObject.Properties['pid']) {
         $parsed = 0
@@ -47,16 +47,26 @@ function Read-AstroLauncherLock {
             $ownerPid = $parsed
         }
     }
-    if ($null -eq $ownerPid) {
-        return [pscustomobject]@{ State = 'unreadable'; OwnerPid = $null; Command = $null; Started = $null }
+    $issue = $null
+    if ($null -ne $state -and $state.PSObject.Properties['issue']) {
+        $parsedIssue = 0
+        if ([int]::TryParse([string]$state.issue, [ref]$parsedIssue) -and $parsedIssue -gt 0) {
+            $issue = $parsedIssue
+        }
     }
-
-    $command = if ($state.PSObject.Properties['command']) { $state.command } else { 'unknown' }
-    $started = if ($state.PSObject.Properties['started']) { $state.started } else { 'unknown' }
+    $command = if ($null -ne $state -and $state.PSObject.Properties['command']) { [string]$state.command } else { $null }
+    $started = if ($null -ne $state -and $state.PSObject.Properties['started']) { [string]$state.started } else { $null }
+    $parsedStarted = [DateTimeOffset]::MinValue
+    $startedIsValid = -not [string]::IsNullOrWhiteSpace($started) -and
+        [DateTimeOffset]::TryParse($started, [ref]$parsedStarted)
+    if ($null -eq $ownerPid -or $null -eq $issue -or
+        [string]::IsNullOrWhiteSpace($command) -or -not $startedIsValid) {
+        return [pscustomobject]@{ State = 'unreadable'; OwnerPid = $ownerPid; Issue = $issue; Command = $command; Started = $started }
+    }
     # Liveness probe of the EXACT recorded pid only -- never a by-name sweep.
     $holder = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
     $liveState = if ($null -ne $holder) { 'held' } else { 'stale' }
-    return [pscustomobject]@{ State = $liveState; OwnerPid = $ownerPid; Command = $command; Started = $started }
+    return [pscustomobject]@{ State = $liveState; OwnerPid = $ownerPid; Issue = $issue; Command = $command; Started = $started }
 }
 
 function Assert-AstroLauncherLockClaimable {
@@ -72,13 +82,13 @@ function Assert-AstroLauncherLockClaimable {
     switch ($lock.State) {
         'absent' { return }
         'unreadable' {
-            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock exists but names no readable pid; verify no toolchain session is live, then remove it manually: $LockPath"
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_UNREADABLE]: launcher lock schema is unreadable (required: positive pid, positive issue, ISO started, non-empty command); verify no toolchain session is live, post PID-probe evidence to the owning issue when identifiable, then remove it manually: $LockPath"
         }
         'held' {
-            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_HELD]: another launcher session owns this workspace (pid=$($lock.OwnerPid), started=$($lock.Started), command=$($lock.Command)); never stop or clean a live session's run - wait for the lock to release: $LockPath"
+            throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_LOCK_HELD]: another launcher session owns this workspace (pid=$($lock.OwnerPid), issue=#$($lock.Issue), started=$($lock.Started), command=$($lock.Command)); never stop or clean a live session's run - wait for the lock to release: $LockPath"
         }
         'stale' {
-            Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_LOCK_STALE]: removing lock left by dead pid $($lock.OwnerPid)"
+            Write-Output "LAUNCHER_LOCK[ASTRO_LAUNCHER_LOCK_STALE]: removing lock for issue #$($lock.Issue) left by dead pid $($lock.OwnerPid)"
             Remove-Item -LiteralPath $LockPath -Force
             return
         }

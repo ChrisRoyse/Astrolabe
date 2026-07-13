@@ -21,10 +21,8 @@ use astrolabe_domain::fsv::{
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, Seq};
+use calyx_core::{CalyxError, Clock, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
-
-use crate::registry::{IngestError, IngestResult};
 
 /// A planned set of column-family rows plus the ledger entry a single vault
 /// mutation is accountable for.
@@ -102,7 +100,7 @@ impl VaultMutationPlan {
     ///
     /// # Errors
     ///
-    /// Propagates the fail-closed domain refusals as [`IngestError::Domain`]:
+    /// Propagates fail-closed refusals as structured [`CalyxError`] values:
     /// `ASTRO_FSV_READBACK_MISMATCH` (a row's persisted bytes diverge),
     /// `ASTRO_FSV_LEDGER_UNPAIRED` (the mutation has no matching ledger entry),
     /// or `ASTRO_FSV_PLAN_INVALID` (the plan named no rows).
@@ -110,11 +108,11 @@ impl VaultMutationPlan {
         &self,
         vault: &AsterVault<C>,
         commit_seq: Seq,
-    ) -> IngestResult<FsvAck>
+    ) -> calyx_core::Result<FsvAck>
     where
         C: Clock,
     {
-        let read_error: std::cell::RefCell<Option<IngestError>> = std::cell::RefCell::new(None);
+        let read_error: std::cell::RefCell<Option<CalyxError>> = std::cell::RefCell::new(None);
         let ack = verify_mutation(
             &self.plan,
             |row| {
@@ -127,15 +125,15 @@ impl VaultMutationPlan {
                         // The plan builder always registers a CF for every row it
                         // pushed; a missing entry is an internal contract break,
                         // surfaced fail-closed rather than skipped.
-                        let err = IngestError::refused(
-                            astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
-                            format!(
+                        let err = CalyxError {
+                            code: astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
+                            message: format!(
                                 "FSV plan row store={} key len={} has no registered column family",
                                 row.store(),
                                 row.key().len()
                             ),
-                            "This is an internal FSV plan construction bug: every planned row must be pushed through VaultMutationPlan so its column family is recorded.",
-                        );
+                            remediation: "This is an internal FSV plan construction bug: every planned row must be pushed through VaultMutationPlan so its column family is recorded.",
+                        };
                         *read_error.borrow_mut() = Some(err);
                         return Err(plan_bug());
                     }
@@ -143,7 +141,6 @@ impl VaultMutationPlan {
                 match vault.read_cf_at(commit_seq, cf, row.key()) {
                     Ok(value) => Ok(value),
                     Err(err) => {
-                        let err = IngestError::from(err);
                         *read_error.borrow_mut() = Some(err);
                         Err(plan_bug())
                     }
@@ -163,27 +160,31 @@ impl VaultMutationPlan {
                 if let Some(err) = read_error.take() {
                     return Err(err);
                 }
-                Err(IngestError::Domain(domain_err))
+                Err(CalyxError {
+                    code: domain_err.code(),
+                    message: domain_err.message().to_string(),
+                    remediation: domain_err.remediation(),
+                })
             }
         }
     }
 }
 
 /// Sentinel domain error used to unwind out of the verification closures when a
-/// vault read itself fails; the real [`IngestError`] is stashed and re-raised by
+/// vault read itself fails; the real [`CalyxError`] is stashed and re-raised by
 /// [`VaultMutationPlan::verify_committed`].
 fn plan_bug() -> astrolabe_domain::DomainError {
     astrolabe_domain::DomainError::new(
         astrolabe_domain::fsv::ASTRO_FSV_PLAN_INVALID,
         "vault readback failed during FSV verification",
-        "internal: the stashed IngestError carries the real cause",
+        "internal: the stashed CalyxError carries the real cause",
     )
 }
 
 fn newest_ledger_readback<C>(
     vault: &AsterVault<C>,
     commit_seq: Seq,
-) -> IngestResult<Option<FsvLedgerReadback>>
+) -> calyx_core::Result<Option<FsvLedgerReadback>>
 where
     C: Clock,
 {

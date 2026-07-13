@@ -115,9 +115,10 @@ impl IngestError {
         match self {
             Self::Domain(err) => Some(err.code()),
             Self::Panel(err) => Some(err.code()),
+            Self::Calyx(err) => Some(err.code),
             Self::Refused { code, .. } => Some(code),
             Self::VerifyFailed(_) => Some(ASTRO_VERIFY_DEEP_FAILED),
-            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) => None,
+            Self::Json(_) | Self::InvalidInput(_) => None,
         }
     }
 
@@ -126,11 +127,12 @@ impl IngestError {
         match self {
             Self::Domain(err) => Some(err.remediation()),
             Self::Panel(err) => Some(err.remediation()),
+            Self::Calyx(err) => Some(err.remediation),
             Self::Refused { remediation, .. } => Some(remediation),
             Self::VerifyFailed(_) => Some(
                 "Quarantine the vault, inspect the named invariant violations, and rebuild from source bytes before serving reads.",
             ),
-            Self::Calyx(_) | Self::Json(_) | Self::InvalidInput(_) => None,
+            Self::Json(_) | Self::InvalidInput(_) => None,
         }
     }
 }
@@ -1491,10 +1493,7 @@ mod tests {
         let err = plan
             .verify_committed(&vault, vault.latest_seq())
             .expect_err("mutation without ledger must refuse");
-        assert_eq!(
-            err.code(),
-            Some(astrolabe_domain::fsv::ASTRO_FSV_LEDGER_UNPAIRED)
-        );
+        assert_eq!(err.code, astrolabe_domain::fsv::ASTRO_FSV_LEDGER_UNPAIRED);
     }
 
     #[test]
@@ -1558,10 +1557,7 @@ mod tests {
         let err = plan
             .verify_committed(&vault, vault.latest_seq())
             .expect_err("tampered persisted bytes must fail closed");
-        assert_eq!(
-            err.code(),
-            Some(astrolabe_domain::fsv::ASTRO_FSV_READBACK_MISMATCH)
-        );
+        assert_eq!(err.code, astrolabe_domain::fsv::ASTRO_FSV_READBACK_MISMATCH);
         assert!(err.to_string().contains("kv"), "names the CF: {err}");
         fs::remove_dir_all(&dir).ok();
     }
