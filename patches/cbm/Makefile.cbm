@@ -493,7 +493,7 @@ TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
 TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c
 
-TEST_TRACES_SRCS = tests/test_traces.c
+TEST_TRACES_SRCS = tests/test_traces.c tests/test_trace_ingest.c
 
 
 TEST_CLI_SRCS = tests/test_cli.c
