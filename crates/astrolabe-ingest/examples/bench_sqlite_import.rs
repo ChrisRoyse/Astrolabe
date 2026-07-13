@@ -10,7 +10,7 @@ use calyx_core::VaultId;
 use serde_json::json;
 
 const DEFAULT_VAULT_ID: &str = "00000000000000000000000000";
-const DEFAULT_PANEL_VERSION: u32 = 7;
+const DEFAULT_PANEL_VERSION: u32 = 1;
 const DEFAULT_TARGET_SECONDS: f64 = 300.0;
 
 fn main() -> Result<(), Box<dyn Error>> {

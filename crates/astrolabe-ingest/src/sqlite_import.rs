@@ -4837,7 +4837,7 @@ mod tests {
     }
 
     fn options(workers: usize) -> SqliteImportOptions {
-        SqliteImportOptions::new("demo", "commit-1", 7).with_workers(workers)
+        SqliteImportOptions::new("demo", "commit-1", 1).with_workers(workers)
     }
 
     fn quantization_measurement(
@@ -4952,7 +4952,7 @@ mod tests {
     fn edge_snapshot() -> CbmGraphSnapshot {
         CbmGraphSnapshot {
             project: "demo".to_string(),
-            panel_version: Some(7),
+            panel_version: Some(1),
             projects: Vec::new(),
             nodes: vec![
                 CbmGraphNode {
@@ -5678,7 +5678,7 @@ mod tests {
             .nodes
             .retain(|node| node.qualified_name != "demo.net");
         final_snapshot.edges.retain(|edge| edge.sqlite_edge_id == 1);
-        let final_options = SqliteImportOptions::new("demo", "commit-2", 7)
+        let final_options = SqliteImportOptions::new("demo", "commit-2", 1)
             .with_workers(1)
             .with_series_registry(true);
         let changed = import_cbm_graph_snapshot_to_vault_direct(
@@ -5886,7 +5886,7 @@ mod tests {
         // historical admission must ignore them rather than project live Graph
         // rows from a past tree.
         let commit = "0123456789abcdef0123456789abcdef01234567";
-        let options = SqliteImportOptions::new("demo", commit, 7);
+        let options = SqliteImportOptions::new("demo", commit, 1);
         let (dir, vault) = durable_vault("historical-symbol-admission");
         let graph_before = vault
             .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
@@ -6329,7 +6329,7 @@ mod tests {
             .collect();
         CbmGraphSnapshot {
             project: "demo".to_string(),
-            panel_version: Some(7),
+            panel_version: Some(1),
             projects: Vec::new(),
             nodes,
             edges: Vec::new(),
@@ -7743,7 +7743,7 @@ mod tests {
         }
         CbmGraphSnapshot {
             project: "demo".to_string(),
-            panel_version: Some(7),
+            panel_version: Some(1),
             projects: Vec::new(),
             nodes,
             edges,
