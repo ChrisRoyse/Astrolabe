@@ -454,6 +454,134 @@ pub(crate) fn kernel_context_unavailable_json(reason: &str) -> Value {
     })
 }
 
+/// #69 box 5 — exact set of symbol ids carrying `label` as a *propagated* label in
+/// the persisted kernel context. Fails closed (coded) when propagation is
+/// unavailable so the search filter never silently degrades into an unfiltered or
+/// spuriously empty result. Same exact-match semantics as the kernel's
+/// [`astrolabe_kernel::filter_symbols_by_propagated_label`].
+pub(crate) fn propagated_label_symbol_ids(
+    kernel_context: &Value,
+    label: &str,
+) -> Result<BTreeSet<String>, String> {
+    let propagation = kernel_context
+        .get("label_propagation")
+        .unwrap_or(&Value::Null);
+    let status = propagation
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if status == "unavailable" {
+        let reason = propagation
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("label propagation metadata unavailable");
+        return Err(format!(
+            "ASTRO_SEARCH_GRAPH_PROPAGATED_LABEL_UNAVAILABLE: cannot apply propagated_label filter {label:?}: {reason}; remediation: rerun index_repository with calyx=\"shadow\" so label seeds and graph edges are propagated before filtering search_graph by a propagated label"
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    if let Some(labels) = propagation.get("labels").and_then(Value::as_array) {
+        for entry in labels {
+            if entry.get("label").and_then(Value::as_str) == Some(label)
+                && let Some(symbol_id) = entry
+                    .get("symbol_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|symbol_id| !symbol_id.is_empty())
+            {
+                ids.insert(symbol_id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// #69 box 5 — rewrite a raw `search_graph` tool result, keeping only hits whose
+/// symbol id is in `labeled_symbols` (exact match, original hit order preserved).
+/// Annotates both the `structuredContent` and the mirrored `content[0].text`
+/// payload with the applied filter, at provisional trust (propagated labels are
+/// inferences, never trusted).
+pub(crate) fn filter_search_graph_result_by_label(
+    raw_result: &str,
+    label: &str,
+    labeled_symbols: &BTreeSet<String>,
+) -> Result<String, DynError> {
+    let mut value: Value = serde_json::from_str(raw_result)?;
+
+    if let Some(structured) = value
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        let (input_count, matched_count) = retain_labeled_results(structured, labeled_symbols);
+        structured.insert(
+            "astrolabe_propagated_label_filter".to_string(),
+            search_graph_filter_meta_json(label, input_count, matched_count),
+        );
+    }
+
+    if let Some(text) = value
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.first_mut())
+        .and_then(|item| item.get_mut("text"))
+        && let Some(raw_text) = text.as_str()
+        && let Ok(mut text_value) = serde_json::from_str::<Value>(raw_text)
+        && let Some(text_obj) = text_value.as_object_mut()
+    {
+        let (input_count, matched_count) = retain_labeled_results(text_obj, labeled_symbols);
+        text_obj.insert(
+            "astrolabe_propagated_label_filter".to_string(),
+            search_graph_filter_meta_json(label, input_count, matched_count),
+        );
+        *text = Value::String(serde_json::to_string(&text_value)?);
+    }
+
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Retain only the `results[]` entries whose symbol id is in `labeled_symbols`.
+/// Returns `(input_count, matched_count)` and rewrites any mirrored count field so
+/// the surfaced total never lies about the post-filter hit count.
+fn retain_labeled_results(
+    obj: &mut Map<String, Value>,
+    labeled_symbols: &BTreeSet<String>,
+) -> (usize, usize) {
+    let Some(results) = obj.get_mut("results").and_then(Value::as_array_mut) else {
+        return (0, 0);
+    };
+    let input_count = results.len();
+    results.retain(|hit| {
+        let candidate = hit
+            .get("qualified_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| hit.get("name").and_then(Value::as_str))
+            .unwrap_or_default();
+        labeled_symbols.contains(candidate)
+    });
+    let matched_count = results.len();
+    for key in ["result_count", "count", "total_results", "returned"] {
+        if let Some(existing) = obj.get_mut(key)
+            && existing.as_u64() == Some(input_count as u64)
+        {
+            *existing = json!(matched_count);
+        }
+    }
+    (input_count, matched_count)
+}
+
+fn search_graph_filter_meta_json(label: &str, input_count: usize, matched_count: usize) -> Value {
+    json!({
+        "schema": "astrolabe.search_graph_propagated_label_filter.v1",
+        "label": label,
+        "input_count": input_count,
+        "matched_count": matched_count,
+        "trust": "provisional",
+        "freshness": "fresh",
+        "provenance": "kernel_context.label_propagation (astrolabe.label_propagation.v1)",
+    })
+}
+
 pub(crate) fn read_kernel_context_metadata(
     cache_dir: &Path,
     project: &str,
