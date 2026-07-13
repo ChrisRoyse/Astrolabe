@@ -7,12 +7,12 @@
 # The CBM prod build (`make ... cbm`, ~200 grammar translation units) is the
 # single largest cost in check.sh (~320s of the 322.8s check-mcp-parity.sh gate,
 # even with warm sccache C-object hits, because link/archive and the make graph
-# dominate). Its output is a PURE FUNCTION of committed inputs:
+# dominate). Its output is a PURE FUNCTION of its inputs:
 #
-#   * vendor/codebase-memory-mcp -- the owned CBM sources; the committed subtree
-#     SHA fully identifies them (the absorbed overlays are in-source edits).
+#   * vendor/codebase-memory-mcp -- the owned CBM sources (WORKING-TREE bytes,
+#     including dirty/untracked edits; #286 made in-place editing normal).
 #   * patches/cbm/**            -- Makefile.cbm (the -D flag wiring) + glue TUs.
-#   * the C toolchain identity  -- CC/CXX version + host triple (ABI).
+#   * the C toolchain identity  -- CC/CXX/make versions.
 #
 # So a rebuild from an unchanged (sources + Makefile + toolchain) is provably
 # identical input->output, and the built binary can be cached across runs (which
@@ -43,27 +43,24 @@ CC_BIN="${CC:-gcc}"
 CXX_BIN="${CXX:-g++}"
 
 # ── fail-closed cache key ───────────────────────────────────────────────────
+# #280: content-exact over the WORKING TREE via the shared fingerprint engine
+# (scripts/check-suite-impact.py, registry entry cbm-parity-binary). The former
+# key used HEAD:vendor/... — sound only on a clean tree; with the parent trees
+# owned first-class source (#286) a dirty vendor tree is normal, and a
+# HEAD-keyed cache could restore a binary built from DIFFERENT bytes. The
+# fingerprint hashes dirty/untracked working-tree bytes, closing that hole.
+# Any fingerprint ambiguity => no key => full build (fail closed).
 key=""
-if command -v git >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
-  vendor_tree="$(git -C "$ROOT" rev-parse "HEAD:vendor/codebase-memory-mcp" 2>/dev/null || true)"
-  if [[ -n "$vendor_tree" && -d "$ROOT/patches/cbm" ]]; then
-    # Hash of every byte under patches/cbm (Makefile.cbm + Astrolabe glue TUs).
-    patches_hash="$(
-      find "$ROOT/patches/cbm" -type f -print0 \
-        | LC_ALL=C sort -z \
-        | xargs -0 sha256sum \
-        | sha256sum \
-        | cut -d' ' -f1
-    )" || patches_hash=""
-    cc_id="$("$CC_BIN" -dumpversion 2>/dev/null || echo unknown)"
-    cxx_id="$("$CXX_BIN" -dumpversion 2>/dev/null || echo unknown)"
-    host_id="$(uname -sm 2>/dev/null || echo unknown)"
-    if [[ -n "$patches_hash" ]]; then
-      key="$(printf '%s|%s|%s|%s|%s' \
-        "$vendor_tree" "$patches_hash" "$cc_id" "$cxx_id" "$host_id" \
-        | sha256sum | cut -d' ' -f1)"
-    fi
-  fi
+if command -v python >/dev/null 2>&1; then
+  PY_BIN=python
+elif command -v python3 >/dev/null 2>&1; then
+  PY_BIN=python3
+else
+  PY_BIN=""
+fi
+if [[ -n "$PY_BIN" ]]; then
+  key="$("$PY_BIN" "$ROOT/scripts/check-suite-impact.py" fingerprint cbm-parity-binary 2>/dev/null || true)"
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || key=""
 fi
 
 CACHE_ROOT="$ROOT/.astro-gate-cache/cbm-parity"

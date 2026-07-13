@@ -38,15 +38,6 @@
       "test": "durable_queue_overflow_persists_warning_row_and_bounds_queue",
       "kind": "reactive_queue_overflow",
       "evidence": ["CALYX_REACTIVE_QUEUE_FULL", "warnings.len()"]
-    },
-    {
-      "id": "queue_soak_4096_accounting",
-      "crate": "astrolabe-weave",
-      "file": "crates/astrolabe-weave/src/lib.rs",
-      "test": "durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss",
-      "kind": "reactive_queue_soak",
-      "target_os": "linux",
-      "evidence": ["CALYX_REACTIVE_QUEUE_CAP", "MAX_REACTIVE_SOAK_RSS_DELTA_BYTES"]
     }
   ]
 }

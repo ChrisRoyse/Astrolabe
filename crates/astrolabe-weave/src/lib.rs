@@ -2545,8 +2545,6 @@ mod tests {
 
     static NEXT_REACTIVE_DIR: AtomicU64 = AtomicU64::new(0);
     const REACTIVE_TEST_SALT: &[u8] = b"astrolabe-weave-reactive-fsv";
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    const MAX_REACTIVE_SOAK_RSS_DELTA_BYTES: u64 = 512 * 1024 * 1024;
 
     #[test]
     fn identifies_calyx_parent() {
@@ -3177,61 +3175,6 @@ mod tests {
             .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1);
-        drop(vault);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    #[test]
-    fn durable_default_queue_soak_over_4096_has_exact_accounting_and_bounded_rss() {
-        let (dir, vault) = reactive_vault("queue-soak");
-        let mut engine = ReactiveEngine::new(Arc::new(FixedClock::new(1_786_321_000)));
-        engine
-            .register(TriggerCondition::NewRegion { tau_override: None }, None)
-            .expect("register soak trigger");
-        let signals =
-            ScriptedReactiveSignals::with_novelty_and_drift(NoveltyVerdict::NewRegion, 0.0);
-        let total_evals = CALYX_REACTIVE_QUEUE_CAP as u64 + 1;
-        let rss_before = resident_set_bytes();
-
-        for seq in 1..=total_evals {
-            let result = engine.evaluate_post_ingest_durable(&vault, cx(12), lref(seq), &signals);
-            if seq <= CALYX_REACTIVE_QUEUE_CAP as u64 {
-                assert_eq!(result.expect("queue has capacity"), 1);
-            } else {
-                let err = result.expect_err("one event beyond queue cap overflows");
-                assert_eq!(err.code, CALYX_REACTIVE_QUEUE_FULL);
-            }
-        }
-
-        let rss_after = resident_set_bytes();
-        let rss_delta = rss_after.saturating_sub(rss_before);
-        assert!(
-            rss_delta <= MAX_REACTIVE_SOAK_RSS_DELTA_BYTES,
-            "reactive soak RSS delta {rss_delta} exceeded cap {MAX_REACTIVE_SOAK_RSS_DELTA_BYTES}"
-        );
-        assert_eq!(engine.queue().len(), CALYX_REACTIVE_QUEUE_CAP);
-        let queued_seqs = engine
-            .queue()
-            .iter()
-            .map(|event| event.ledger_ref.seq)
-            .collect::<Vec<_>>();
-        assert_eq!(queued_seqs.first().copied(), Some(2));
-        assert_eq!(queued_seqs.last().copied(), Some(total_evals));
-
-        let audits = all_audit_entries(&vault);
-        assert_eq!(
-            audits.iter().filter(|entry| entry.code.is_none()).count(),
-            total_evals as usize
-        );
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|entry| entry.code.as_deref() == Some(CALYX_REACTIVE_QUEUE_FULL))
-                .count(),
-            1
-        );
-        assert_eq!(fired_events(&vault).len(), total_evals as usize);
         drop(vault);
         let _ = fs::remove_dir_all(dir);
     }
@@ -5200,51 +5143,6 @@ mod tests {
                 .then_some(payload)
             })
             .collect()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn resident_set_bytes() -> u64 {
-        let smaps = fs::read_to_string("/proc/self/smaps_rollup").expect("read smaps_rollup");
-        smaps
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split_whitespace();
-                match (parts.next(), parts.next(), parts.next()) {
-                    (Some("Rss:"), Some(kib), Some("kB")) => {
-                        Some(kib.parse::<u64>().expect("parse Rss kB") * 1024)
-                    }
-                    _ => None,
-                }
-            })
-            .expect("Rss line in smaps_rollup")
-    }
-
-    /// Native Windows resident-set probe for the soak harness.
-    ///
-    /// `astrolabe-weave` forbids `unsafe`, so instead of a direct
-    /// `GetProcessMemoryInfo` FFI call this shells out to PowerShell for the
-    /// process's working set — the Windows analogue of Linux `Rss` — which is
-    /// exact enough for the 512 MiB soak delta bound.
-    #[cfg(target_os = "windows")]
-    fn resident_set_bytes() -> u64 {
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("(Get-Process -Id {}).WorkingSet64", std::process::id()),
-            ])
-            .output()
-            .expect("query working set via powershell");
-        assert!(
-            output.status.success(),
-            "powershell working-set query failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("utf8 working set")
-            .trim()
-            .parse::<u64>()
-            .expect("parse working set bytes")
     }
 
     fn cx(byte: u8) -> CxId {

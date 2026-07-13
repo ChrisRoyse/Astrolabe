@@ -96,6 +96,7 @@ ASTRO_GATE_SELFTESTS_LIST=(
   scripts/test-native-aggregate-wrapper.py
   scripts/test-check-hook-contracts.py
   scripts/test-cbm-overlay-sources.py
+  scripts/test-check-suite-impact.py
 )
 # The mechanism ITSELF (fail-closed change-gating) is proven by an unconditional
 # meta-meta-test that must always run — never routed through the change-gate.
@@ -131,6 +132,24 @@ gate hazard-suite -- "$PYTHON_BIN" scripts/check-hazard-suite.py
 # #247/#197: native FSV of the shared launcher session-lock helper -- proves a live
 # foreign lock owner is refused and never stopped (fixture locks, not the live workspace).
 gate launcher-lock -- bash scripts/check-launcher-lock.sh
+
+# ── #280 suite impact gate: the workspace block ──────────────────────────────
+#
+# Doctrine (owner directive 2026-07-12): no test suite runs when no code change
+# impacts it. Everything from the cargo-metadata resolve through the no-escape
+# verify — the workspace tests, the binary-driving checks, the parity gates and
+# the release artifacts — is one "workspace-block" suite whose declared input
+# set (crates/, vendor/calyx, vendor/codebase-memory-mcp via libcbm, patches/cbm,
+# cargo manifests, the driving gate scripts, the toolchain identities) is
+# fingerprinted by scripts/check-suite-impact.py. Byte-identical inputs vs the
+# last recorded GREEN run => the whole block skips with the counted label the
+# gate prints; ANY other state (including any gate ambiguity) runs it all.
+# check-release.sh sets ASTRO_SUITE_GATE=all so the release tier always runs.
+WORKSPACE_IMPACT_RC=0
+"$PYTHON_BIN" scripts/check-suite-impact.py should-run workspace-block || WORKSPACE_IMPACT_RC=$?
+if [[ "$WORKSPACE_IMPACT_RC" -eq 3 ]]; then
+  echo "  skipped block: cargo metadata/fmt, workspace tests, server bins, verify-chain, mimalloc, mcp-parity, rapid-init, cli-parity, compat-shim, installer, hooks, manifest, lowered/shadow parity, artifacts, cross-process, watchdog, egress, no-escape bracket"
+else
 
 # Resolve workspace metadata once per aggregate run (#192) and hand the JSON
 # to every downstream consumer via ASTRO_CARGO_METADATA_JSON. Consumers filter
@@ -186,21 +205,19 @@ fi
 # build is replaced by the test phase plus a fail-closed assertion (below) that
 # the binaries the downstream checks consume were actually produced.
 #
-# #280 + #264 fast test tier: the Tier-1 workspace-test phase runs the nextest
-# `fast` profile. Its .config/nextest.toml `default-filter` tiers out the two
-# tests that dominate the wall clock (bridge cbm_tool_runner_is_not_send
-# trybuild ~210s; weave durable_default_queue_soak_over_4096 ~60s), and nextest
-# runs the critical remainder with per-test process parallelism. NO coverage is
-# lost at merge: check-full.sh runs the FULL workspace nextest (default profile,
-# every test) AND the doctests inside scripts/ci-rust-gate.sh, which is where the
-# heavy tests and doctests are owned. Every Tier-1 omission is one counted line.
+# #280 + #264 fast test tier: the workspace-test phase runs the nextest `fast`
+# profile. Since the >60s tests were DELETED under the #280 sub-3-minute owner
+# directive (2026-07-12: no individual test may take >60s), the fast profile
+# carries NO filter and equals full workspace test coverage — per-test process
+# parallelism, every test. The only remaining tier-out is the doctests, owned
+# by check-release (ci-rust-gate.sh runs `cargo test --workspace --doc`).
 # Fail-safe: if cargo-nextest is absent, run the full `cargo test --workspace`
 # (more coverage, no tiering) rather than skipping silently.
 WORKSPACE_TEST_MODE="cargo-test"
 if command -v cargo-nextest >/dev/null 2>&1; then
   WORKSPACE_TEST_MODE="nextest-fast"
-  echo "SKIP[ASTRO_FAST_TIER_HEAVY_TESTS]: n=2 owner=check-full (bridge cbm_tool_runner_is_not_send trybuild; weave durable_default_queue_soak_over_4096) -- .config/nextest.toml [profile.fast] default-filter; ci-rust-gate.sh runs the default profile over every test"
-  echo "SKIP[ASTRO_FAST_TIER_DOCTESTS]: owner=check-full (ci-rust-gate.sh runs cargo test --workspace --doc)"
+  echo "INFO[ASTRO_FAST_TIER_FULL_COVERAGE]: nextest fast profile == full workspace test set (the >60s tests were deleted under #280; .config/nextest.toml [profile.fast] carries no filter)"
+  echo "SKIP[ASTRO_FAST_TIER_DOCTESTS]: owner=check-release (ci-rust-gate.sh runs cargo test --workspace --doc)"
 else
   echo "INFO[ASTRO_FAST_TIER_NO_NEXTEST]: cargo-nextest not found -> running full cargo test --workspace (fail-safe: more coverage, no tiering)"
 fi
@@ -286,16 +303,64 @@ astro_mcp_bin="$ROOT/target/debug/astrolabe"
 if command -v cygpath >/dev/null 2>&1; then astro_mcp_bin="$(cygpath -w "$astro_mcp_bin")"; fi
 echo "=== CBM MCP protocol suite (test_mcp_rapid_init.py) vs astrolabe (#6) ==="
 gate mcp-rapid-init -- "$PYTHON_BIN" vendor/codebase-memory-mcp/scripts/test_mcp_rapid_init.py "$astro_mcp_bin"
+# #280: the lowered-parity harness (~98s, self-contained: its own mkdtemp
+# fixture/caches, per-subprocess CBM_CACHE_DIR, no writes to this run's shared
+# CBM_STORE_SANDBOX) overlaps the serial binary-gate chain below instead of
+# extending it. Launched here — after mcp-parity populated target/cbm-parity,
+# so the prod binary resolve is a cache hit — and collected at its original
+# slot before shadow-parity (gate lowered-parity), where a failure still
+# aborts the aggregate with the harness output attached.
+LOWERED_PARITY_LOG="$ROOT/target/gate-logs/lowered-parity.log"
+mkdir -p "$ROOT/target/gate-logs"
+LOWERED_PARITY_ARGS=(scripts/check-lowered-parity.py)
+if [[ "${ASTROLABE_CHECK_UI_SMOKE:-0}" == "1" ]]; then
+  LOWERED_PARITY_ARGS+=(--ui-smoke)
+fi
+"$PYTHON_BIN" "${LOWERED_PARITY_ARGS[@]}" > "$LOWERED_PARITY_LOG" 2>&1 &
+LOWERED_PARITY_PID=$!
+# A gate failure between launch and collect aborts via set -e; the EXIT trap
+# must reap the background harness so no orphan writes into target/ during
+# cleanup. Composes with (never replaces) the owner=check target cleanup.
+kill_lowered_parity() {
+  kill "$LOWERED_PARITY_PID" 2>/dev/null || true
+  wait "$LOWERED_PARITY_PID" 2>/dev/null || true
+}
+if [[ "$TARGET_CLEANUP_OWNER" == "check" ]]; then
+  cleanup_check_and_bg() {
+    local status=$?
+    kill_lowered_parity
+    if ! bash "$ROOT/scripts/clean-target.sh"; then
+      return 1
+    fi
+    return "$status"
+  }
+  trap cleanup_check_and_bg EXIT
+else
+  cleanup_bg_only() {
+    local status=$?
+    kill_lowered_parity
+    return "$status"
+  }
+  trap cleanup_bg_only EXIT
+fi
+lowered_parity_wait() {
+  local rc=0
+  wait "$LOWERED_PARITY_PID" || rc=$?
+  cat "$LOWERED_PARITY_LOG"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "ERROR[ASTRO_LOWERED_PARITY_FAILED]: check-lowered-parity.py exited $rc (output above)" >&2
+  fi
+  return "$rc"
+}
 gate cli-parity -- "$PYTHON_BIN" scripts/check-cli-parity.py --astrolabe "$ROOT/target/debug/astrolabe"
 gate compat-shim -- "$PYTHON_BIN" scripts/check-compat-shim.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 gate installer-roundtrip -- "$PYTHON_BIN" scripts/check-installer-roundtrip.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 gate hook-contracts -- "$PYTHON_BIN" scripts/check-hook-contracts.py --astrolabe "$ROOT/target/debug/astrolabe" --shim "$ROOT/target/debug/codebase-memory-mcp"
 gate server-manifest -- "$PYTHON_BIN" scripts/check-server-manifest.py
-if [[ "${ASTROLABE_CHECK_UI_SMOKE:-0}" == "1" ]]; then
-  gate lowered-parity -- "$PYTHON_BIN" scripts/check-lowered-parity.py --ui-smoke
-else
-  gate lowered-parity -- "$PYTHON_BIN" scripts/check-lowered-parity.py
-fi
+# Collect the backgrounded lowered-parity harness (launched above, after
+# mcp-rapid-init). GATE_TIME here is the RESIDUAL wait — the harness ran
+# concurrently under the gates in between.
+gate lowered-parity -- lowered_parity_wait
 gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact
 # #88: predicate artifacts are written ONLY after their attested tests have run
 # (cargo test + workspace test above), stamped with commit + UTC timestamp so a
@@ -309,5 +374,11 @@ gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupport
 # #237: re-read the protected roots AFTER the full suite and fail closed if any
 # test escaped its sandbox (added/modified/removed entry outside the run sandbox).
 gate no-escape-verify -- "$PYTHON_BIN" scripts/check-no-escape.py verify --before "$ROOT/target/no-escape-before.json" --out "$ROOT/target/no-escape-after.json"
+
+# #280: every gate in the block passed — record the green fingerprint so an
+# unchanged input set skips the block next run (fail-closed; see the gate).
+"$PYTHON_BIN" scripts/check-suite-impact.py record-green workspace-block --note "check.sh workspace block"
+
+fi  # end #280 workspace-block impact gate
 
 gate_time_total

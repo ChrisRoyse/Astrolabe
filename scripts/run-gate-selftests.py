@@ -155,6 +155,10 @@ DEPENDENCIES: dict[str, list[str]] = {
         "scripts/check-hook-contracts.py",
         "ci/hook-contracts.json",
     ],
+    # #280: the suite impact gate (fixture-repo FSV of its fail-closed contract).
+    "test-check-suite-impact.py": [
+        "scripts/check-suite-impact.py",
+    ],
 }
 
 

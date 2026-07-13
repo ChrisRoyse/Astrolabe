@@ -65,17 +65,43 @@ tstep() {
     tstep_start="$now"
 }
 
-# Step 1: Clean
-scripts/clean.sh
+# Step 1: Clean — ONLY when the build premise changed (#280). The per-TU
+# object tree in build/c is mtime+depfile-correct (-MMD/-MP in Makefile.cbm),
+# so an unchanged toolchain + flags premise makes a persistent build dir
+# sound and a full clean pure waste (~230s of recompiles). The premise stamp
+# is (compiler identities + Makefile.cbm bytes + the make args of this run);
+# any mismatch or ambiguity cleans, fail closed. CBM_FORCE_CLEAN=1 forces it.
+STAMP_FILE="build/c/.build-premise-stamp"
+premise="$(
+  {
+    "$CC" --version 2>/dev/null | head -n 1 || echo cc-unknown
+    "$CXX" --version 2>/dev/null | head -n 1 || echo cxx-unknown
+    echo "args:$MAKE_ARGS $*"
+    sha256sum Makefile.cbm 2>/dev/null || echo makefile-unknown
+  } | sha256sum | cut -d' ' -f1
+)"
+if [ "${CBM_FORCE_CLEAN:-0}" = "1" ] || [ ! -f "$STAMP_FILE" ] \
+  || [ "$(cat "$STAMP_FILE" 2>/dev/null)" != "$premise" ] \
+  || printf '%s' "$premise" | grep -q "unknown"; then
+    scripts/clean.sh
+    mkdir -p build/c
+    printf '%s' "$premise" > "$STAMP_FILE"
+else
+    echo "INFO[CBM_INCREMENTAL_BUILD]: build premise unchanged (stamp ${premise:0:12}) — reusing build/c object tree; make + depfiles own correctness"
+    # Keep the fixture hygiene part of clean.sh even on incremental runs.
+    find "$ROOT" -maxdepth 1 -type d \( -name 'cbm_*' -o -name 'cli-*' \) -exec rm -rf {} + 2>/dev/null || true
+fi
 tstep clean
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS).
-# Split so build cost and test-run cost are separately attributable: the
-# test-runner build first (all its object deps), then `test` (deps already
-# up to date) just executes the runner.
+# Step 2: Build the test runner (per-TU objects, parallel; Makefile applies
+# $ARCHFLAGS on macOS).
 make -j"$NPROC" -f Makefile.cbm build/c/test-runner $MAKE_ARGS
 tstep build-test-runner
-make -f Makefile.cbm test $MAKE_ARGS
+
+# Step 3: Run the suites in parallel shards (#280). The shard driver replays
+# every suite's output, prints per-suite times, and emits the combined
+# summary line last (the anchored count ci-cbm-test.sh parses).
+bash scripts/test-shards.sh build/c/test-runner
 tstep run-test-runner
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
