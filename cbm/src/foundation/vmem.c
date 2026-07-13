@@ -10,6 +10,7 @@
  * near the budget boundary.
  */
 #include "vmem.h"
+#include "constants.h" /* SKIP_ONE, CBM_SZ_* — self-contained TU (issue #325) */
 #include "platform.h"
 #include "log.h"
 

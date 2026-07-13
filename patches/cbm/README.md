@@ -47,14 +47,20 @@ flags per artifact:
   mask them on the unguarded (libcbm.a, test-runner) paths were removed from
   `GCC_ONLY_FLAGS`, keeping both diagnostics on as `-Werror` everywhere.
 
-This per-artifact matrix is guarded by `scripts/test-cbm-overlay-sources.py`,
-which reads the owned sources and asserts each behavior is present only under
-its flag, plus that the Makefile wires the flags to the right artifacts.
+This per-artifact matrix is verified by Full State Verification (FSV), not a gate
+script: build each artifact natively through the launcher
+(`scripts/windows-gnu-toolchain.ps1`) and read back the compiled behavior — for
+example, confirm a guarded symbol is present only in the artifacts whose
+`-DASTRO_*` flag the Makefile passes (`nm`/disassembly of `libcbm.a` vs the
+production binaries). The former `scripts/test-cbm-overlay-sources.py` gate was
+deleted with the rest of the aggregate gate/check suite under the 2026-07-13
+FSV-only directive (d90100d) and is not to be rebuilt.
 
 ## Changing CBM code
 
 It is normal owned source: edit the `.c`/`.h` under
-`cbm/` directly, add or adjust an `ASTRO_*` guard only
-when a change must NOT reach every artifact, and update
-`scripts/test-cbm-overlay-sources.py` if you add a guarded behavior. There is no
-pin file, no applier, and no hash-checked overlay to regenerate.
+`cbm/` directly, and add or adjust an `ASTRO_*` guard only
+when a change must NOT reach every artifact. Verify a new guarded behavior by FSV
+— build the affected artifacts and read back that the behavior appears only under
+its flag — not with any gate script. There is no pin file, no applier, and no
+hash-checked overlay to regenerate.
