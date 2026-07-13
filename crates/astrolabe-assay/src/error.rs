@@ -75,3 +75,12 @@ pub const ASTRO_ASSAY_STORE_CORRUPT: &str = "ASTRO_ASSAY_STORE_CORRUPT";
 pub const ASTRO_ASSAY_SERVING_TRIPWIRE: &str = "ASTRO_ASSAY_SERVING_TRIPWIRE";
 /// A deficit measurement was structurally invalid for the optimizer contract.
 pub const ASTRO_ASSAY_DEFICIT_INVALID: &str = "ASTRO_ASSAY_DEFICIT_INVALID";
+/// A derived-signal claim exceeded the measured `I(panel;outcome)` ceiling, which
+/// the Data Processing Inequality forbids (capability 4.13).
+pub const ASTRO_ASSAY_DPI_VIOLATION: &str = "ASTRO_ASSAY_DPI_VIOLATION";
+/// A measurement input was malformed: row counts disagreed, an axis carried no
+/// variation, or a value was non-finite.
+pub const ASTRO_ASSAY_MEASUREMENT_INPUT_INVALID: &str = "ASTRO_ASSAY_MEASUREMENT_INPUT_INVALID";
+/// A card read back from the ledger did not re-derive to the recorded value
+/// (reproduce/FSV failure).
+pub const ASTRO_ASSAY_REPRODUCE_MISMATCH: &str = "ASTRO_ASSAY_REPRODUCE_MISMATCH";
