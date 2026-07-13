@@ -17,6 +17,7 @@ pub fn handle_tool_raw(
         "anchor_outcome" => handle_anchor_outcome(args_json),
         "guard_calibrate" => handle_guard_calibrate(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
+        "search_graph" => handle_search_graph(runner, args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -353,6 +354,57 @@ pub(crate) fn handle_get_architecture(
             },
         }),
     )
+}
+
+/// #69 box 5 — `search_graph` with an optional `propagated_label` exact filter.
+/// Without the knob this is a byte-identical passthrough to the CBM tool. With it,
+/// the raw hits are intersected against the project's persisted propagated labels
+/// (`kernel_context.label_propagation`) so an inferred label such as
+/// `security-sensitive` is usable as an exact search filter. Fails closed (coded)
+/// when the project is missing, not shadow-indexed, or propagation is unavailable.
+pub(crate) fn handle_search_graph(
+    runner: &CbmToolRunner,
+    args_json: &str,
+) -> Result<String, DynError> {
+    let Ok(args) = serde_json::from_str::<Value>(args_json) else {
+        return Ok(runner.handle_tool_raw("search_graph", args_json)?);
+    };
+    let Some(args_obj) = args.as_object() else {
+        return Ok(runner.handle_tool_raw("search_graph", args_json)?);
+    };
+    let Some(label_filter) = string_arg(args_obj, "propagated_label").map(ToOwned::to_owned) else {
+        // No Astrolabe filter requested — pass the original request through unchanged.
+        return Ok(runner.handle_tool_raw("search_graph", args_json)?);
+    };
+
+    // The Astrolabe-only knob must never reach the CBM tool, which rejects unknown args.
+    let mut sanitized = args_obj.clone();
+    sanitized.remove("propagated_label");
+    let sanitized_json = serde_json::to_string(&Value::Object(sanitized.clone()))?;
+
+    let raw = runner.handle_tool_raw("search_graph", &sanitized_json)?;
+    if tool_result_is_error(&raw)? {
+        return Ok(raw);
+    }
+
+    let Some(project) = status_project_from_args(&sanitized)? else {
+        return tool_error_result(
+            "ASTRO_SEARCH_GRAPH_PROPAGATED_LABEL_PROJECT: propagated_label filter requires project; remediation: pass the project whose propagated labels should filter the search",
+        );
+    };
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "ASTRO_SEARCH_GRAPH_PROPAGATED_LABEL_SHADOW: propagated_label filter requires calyx shadow indexing; rerun index_repository with calyx=\"shadow\"",
+        );
+    }
+
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let kernel_context = read_kernel_context_metadata(&cache_dir, &project)?;
+    let labeled_symbols = match propagated_label_symbol_ids(&kernel_context, &label_filter) {
+        Ok(ids) => ids,
+        Err(message) => return tool_error_result(message),
+    };
+    filter_search_graph_result_by_label(&raw, &label_filter, &labeled_symbols)
 }
 
 pub(crate) fn handle_detect_anomalies(args_json: &str) -> Result<String, DynError> {

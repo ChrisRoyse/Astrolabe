@@ -1483,6 +1483,141 @@ fn kernel_context_persists_reads_back_and_augments_architecture_payload() {
     fs::remove_dir_all(&dir).ok();
 }
 
+fn sample_search_graph_raw(hits: &[(&str, &str)]) -> String {
+    let results = hits
+        .iter()
+        .map(|(qualified_name, file_path)| {
+            json!({
+                "qualified_name": qualified_name,
+                "name": qualified_name,
+                "file_path": file_path,
+                "label": "function",
+            })
+        })
+        .collect::<Vec<_>>();
+    let inner = json!({
+        "project": "demo",
+        "results": results,
+        "result_count": hits.len(),
+    });
+    serde_json::to_string(&json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&inner).unwrap()}],
+        "structuredContent": inner,
+        "isError": false,
+    }))
+    .unwrap()
+}
+
+fn sample_propagation_context(labels: &[(&str, &str, u64)]) -> Value {
+    json!({
+        "schema": KERNEL_CONTEXT_SCHEMA,
+        "status": "built",
+        "label_propagation": {
+            "schema": LABEL_PROPAGATION_SCHEMA,
+            "status": "built",
+            "labels": labels
+                .iter()
+                .map(|(symbol_id, label, confidence)| json!({
+                    "symbol_id": symbol_id,
+                    "label": label,
+                    "confidence_millipoints": confidence,
+                    "trust": "provisional",
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "scope_summaries": {"status": "built"},
+    })
+}
+
+#[test]
+fn search_graph_propagated_label_filter_keeps_only_exact_labeled_hits() {
+    let raw = sample_search_graph_raw(&[
+        ("auth.token", "src/auth.rs"),
+        ("billing.charge", "src/billing.rs"),
+        ("other.thing", "src/other.rs"),
+    ]);
+    let context = sample_propagation_context(&[
+        ("auth.token", "security-sensitive", 500),
+        ("billing.charge", "security-sensitive", 250),
+        ("auth.token", "deprecated", 400),
+    ]);
+
+    let ids = propagated_label_symbol_ids(&context, "security-sensitive").unwrap();
+    assert_eq!(ids.len(), 2);
+
+    let filtered = filter_search_graph_result_by_label(&raw, "security-sensitive", &ids).unwrap();
+    let value: Value = serde_json::from_str(&filtered).unwrap();
+
+    let results = value["structuredContent"]["results"].as_array().unwrap();
+    let names = results
+        .iter()
+        .map(|hit| hit["qualified_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["auth.token", "billing.charge"]);
+    assert_eq!(value["structuredContent"]["result_count"], 2);
+
+    let meta = &value["structuredContent"]["astrolabe_propagated_label_filter"];
+    assert_eq!(meta["label"], "security-sensitive");
+    assert_eq!(meta["input_count"], 3);
+    assert_eq!(meta["matched_count"], 2);
+    assert_eq!(meta["trust"], "provisional");
+
+    let text = value["content"][0]["text"].as_str().unwrap();
+    let text_value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(text_value["results"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        text_value["astrolabe_propagated_label_filter"]["matched_count"],
+        2
+    );
+    assert_eq!(text_value["result_count"], 2);
+}
+
+#[test]
+fn search_graph_propagated_label_filter_is_explicit_empty_when_no_match() {
+    let raw = sample_search_graph_raw(&[("auth.token", "src/auth.rs")]);
+    let context = sample_propagation_context(&[("auth.token", "security-sensitive", 500)]);
+
+    let ids = propagated_label_symbol_ids(&context, "deprecated").unwrap();
+    assert!(ids.is_empty());
+
+    let filtered = filter_search_graph_result_by_label(&raw, "deprecated", &ids).unwrap();
+    let value: Value = serde_json::from_str(&filtered).unwrap();
+
+    assert!(
+        value["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(value["isError"], false);
+    assert_eq!(value["structuredContent"]["result_count"], 0);
+    assert_eq!(
+        value["structuredContent"]["astrolabe_propagated_label_filter"]["matched_count"],
+        0
+    );
+}
+
+#[test]
+fn search_graph_propagated_label_fails_closed_when_propagation_unavailable() {
+    let context = json!({
+        "schema": KERNEL_CONTEXT_SCHEMA,
+        "status": "unavailable",
+        "label_propagation": {
+            "schema": LABEL_PROPAGATION_SCHEMA,
+            "status": "unavailable",
+            "reason": "kernel context metadata missing",
+        },
+        "scope_summaries": {"status": "unavailable"},
+    });
+
+    let error = propagated_label_symbol_ids(&context, "security-sensitive").unwrap_err();
+    assert!(
+        error.contains("ASTRO_SEARCH_GRAPH_PROPAGATED_LABEL_UNAVAILABLE"),
+        "error={error}"
+    );
+    assert!(error.contains("remediation"), "error={error}");
+}
+
 #[test]
 fn row_sink_anomalies_aggregate_and_filter_by_kind() {
     let anomalies = anomalies_from_row_sink_rows(&sample_anomaly_rows());
