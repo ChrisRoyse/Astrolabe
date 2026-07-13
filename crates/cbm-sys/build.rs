@@ -22,6 +22,13 @@ const LIBCBM_BUILD_ENV_VARS: &[&str] = &[
     "CXXFLAGS_EXTRA",
     "CBM_SYS_ASAN",
     "STATIC",
+    // #63/#283: declared grammar-set build knob. Selects which tree-sitter
+    // grammars libcbm.a compiles in (`full` = every shim, the default; `core` =
+    // the curated CBM_GRAMMAR_CORE_LANGS subset with grammar_stubs.c fail-closing
+    // dropped languages via a labeled CBM_GRAMMAR_STUBBED error). Listing it here
+    // makes a change to it (a) re-run this build script and (b) enter the libcbm
+    // config stamp, so switching full<->core invalidates every grammar object.
+    "CBM_GRAMMAR_SET",
 ];
 
 fn main() {
@@ -163,6 +170,14 @@ fn run_make(cbm_root: &Path, patched_makefile: &Path, build_dir: &Path, config_s
     }
     if let Ok(archflags) = env::var("ARCHFLAGS") {
         command.arg(format!("ARCHFLAGS={archflags}"));
+    }
+    // #63/#283: forward the declared grammar-set knob to Make. Only forwarded
+    // when explicitly set so the Makefile default (`full`) governs dev/test and
+    // the CBM C suite; the release gate (check-release.sh) selects `core` for
+    // the size-gated shipped artifact. The Makefile validates the value and
+    // fails closed via `$(error ...)` on anything but `full`/`core`.
+    if let Ok(grammar_set) = env::var("CBM_GRAMMAR_SET") {
+        command.arg(format!("CBM_GRAMMAR_SET={grammar_set}"));
     }
 
     let status = command.status().unwrap_or_else(|err| {
