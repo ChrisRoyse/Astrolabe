@@ -1,6 +1,24 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# vendor/calyx and vendor/codebase-memory-mcp are deliberately EXCLUDED from the
+# root workspace (they carry their own `[workspace]` + profiles; see the
+# profile note below and #286). The Astrolabe crates reach the calyx crates only
+# as path-dependencies, so the calyx crates' *dev-dependencies* (proptest,
+# blake3, …) are pruned from the root resolution graph.
+#
+# Dual-workspace dev-dep boundary (#298): a targeted `--all-targets` check of a
+# vendored calyx crate CANNOT run from the root workspace — e.g.
+# `cargo check -p calyx-ward --all-targets` fails with `unresolved module or
+# unlinked crate proptest`, because building that crate's test targets needs its
+# dev-deps and those live only in the vendor/calyx workspace. Run such targeted
+# checks against the owning workspace via `--manifest-path`, or use the
+# `scripts/check-vendor-crate.sh` helper from the canonical root:
+#     cargo check -p calyx-ward --all-targets --manifest-path vendor/calyx/Cargo.toml
+#     scripts/check-vendor-crate.sh calyx-ward
+# The full gate already covers these crates: `scripts/ci-rust-gate.sh` runs
+# `cargo check/clippy/nextest --workspace --all-targets` from inside
+# vendor/calyx, where the dev-deps resolve.
 exclude = [
     "vendor/calyx",
     "vendor/codebase-memory-mcp",
