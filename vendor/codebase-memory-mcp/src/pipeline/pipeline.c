@@ -368,9 +368,24 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
     }
     if (p->db_path) {
         snprintf(path, 1024, "%s", p->db_path);
+#ifdef ASTRO_ENV_STORE
+        return path;
+#else
     } else {
         snprintf(path, 1024, "%s/%s.db", cbm_resolve_cache_dir(), p->project_name);
+#endif
     }
+#ifdef ASTRO_ENV_STORE
+    /* #241: cbm_resolve_cache_dir() returns NULL when no store can be resolved
+     * (platform.c). Passing that pointer to "%s" is undefined behaviour, and the
+     * one caller of this function already treats NULL as "no database". Refuse. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        free(path);
+        return NULL;
+    }
+    snprintf(path, 1024, "%s/%s.db", cache_dir, p->project_name);
+#endif
     return path;
 }
 

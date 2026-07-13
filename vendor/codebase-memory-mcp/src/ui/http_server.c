@@ -102,8 +102,21 @@ static const char *detect_ui_lang(const char *accept_language) {
 static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     const char *lang = NULL;
     char cache_dir[1024];
+#ifdef ASTRO_ENV_STORE
+    /* #241: this site passed cbm_resolve_cache_dir() straight to "%s" with no NULL
+     * check at all. The resolver returns NULL whenever the store cannot be
+     * resolved, which is undefined behaviour here. Serve the detected language
+     * from the request instead of dereferencing NULL. */
+    const char *resolved = cbm_resolve_cache_dir();
+    cbm_config_t *cfg = NULL;
+    if (resolved) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s", resolved);
+        cfg = cbm_config_open(cache_dir);
+    }
+#else
     snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
     cbm_config_t *cfg = cbm_config_open(cache_dir);
+#endif
     if (cfg) {
         const char *pinned = cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto");
         if (strcmp(pinned, "zh") == 0 || strcmp(pinned, "en") == 0) {

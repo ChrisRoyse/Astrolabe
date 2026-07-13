@@ -234,9 +234,19 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     result->outcome = r.outcome;
     result->exit_code = r.exit_code;
     result->term_signal = r.term_signal;
+#ifdef ASTRO_WORKER_DIAG
+    /* #282: slurp the response file on EVERY outcome, not only CLEAN. The
+     * worker CLI writes --response-out before exiting nonzero, so on failure
+     * this file usually carries the worker's true error (e.g. the exact
+     * isError text). Discarding it unread made contained failures
+     * unattributable — the supervisor deleted the one artifact that named the
+     * defect. */
+    result->response = slurp_file(resp_path);
+#else
     if (r.outcome == CBM_PROC_CLEAN) {
         result->response = slurp_file(resp_path);
     }
+#endif
     (void)remove(resp_path);
 
     char sig[16];

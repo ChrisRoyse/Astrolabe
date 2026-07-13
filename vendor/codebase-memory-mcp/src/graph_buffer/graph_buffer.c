@@ -1716,8 +1716,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     bool has_row_sink = gbuf_has_row_sink(gb);
     if (has_row_sink) {
         CBM_PROF_START(t_build_edges_sink);
-        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths,
-                                      &local_names);
+        dump_edges =
+            build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges_sink, edge_idx);
         release_and_remap_vectors(gb, temp_to_final, max_temp_id);
 
