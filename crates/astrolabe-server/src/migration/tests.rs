@@ -2689,6 +2689,118 @@ fn shadow_refresh_preserves_last_known_good_surfaces_on_genuine_source_staleness
 }
 
 #[test]
+fn reconcile_without_index_args_falls_back_to_preservation_floor() {
+    // #244: `reconcile_shadow_import_current_at` *repairs* genuine staleness by replaying the
+    // persisted CBM index args through the runner. But a shadow index whose args carried no
+    // filesystem path (project resolved from the tool result) persists no index args, so there
+    // is nothing to replay and true reconciliation is impossible. In that case the reconcile
+    // MUST defer to the #222 fail-closed floor: preserve the last-known-good, row-sink-derived
+    // surfaces byte-for-byte and return stale_reindex_required — never clobber them with
+    // "unavailable". Prove it by byte readback, not an API echo. The `:memory:` runner is
+    // constructed but never driven on this path (the early return precedes any replay), so this
+    // test touches no real CBM store and no process-global cache dir.
+    let dir = temp_dir("reconcile-no-args-preserves");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+    let before = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(before.len(), SHADOW_DERIVED_SURFACE_KEYS.len());
+    assert!(
+        read_config_value(&dir, &metadata_key("demo", SHADOW_INDEX_ARGS_KEY))
+            .unwrap()
+            .is_none(),
+        "precondition: reconciliation has no persisted args to replay"
+    );
+
+    // Genuine out-of-band source mutation: the CBM SQLite really did change.
+    fs::write(
+        sqlite_path(&dir, "demo"),
+        b"cbm sqlite content v2 mutated out of band",
+    )
+    .unwrap();
+    assert!(matches!(
+        evaluate_shadow_content_freshness(&dir, "demo").unwrap(),
+        ShadowContentVerdict::Stale { .. }
+    ));
+
+    let runner = CbmToolRunner::new(":memory:").unwrap();
+    let status = reconcile_shadow_import_current_at(&runner, &dir, "demo").unwrap();
+    assert_eq!(
+        status,
+        ShadowRefreshStatus::StaleReindexRequired,
+        "no replayable args => #222 preservation floor, not a surface-clobbering refresh"
+    );
+
+    // FSV: the persisted surfaces read back off disk are byte-identical to the good ones.
+    let after = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(
+        after, before,
+        "reconcile without replayable args must not overwrite any derived surface"
+    );
+    let provenance_after: Value =
+        serde_json::from_str(after.get("provenance_json").unwrap()).unwrap();
+    assert_ne!(
+        provenance_after["status"], "unavailable",
+        "#222: the good provenance surface was silently downgraded to unavailable"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reconcile_with_unreplayable_index_args_preserves_surfaces() {
+    // #244 fail-closed floor with args present: the args replay, but the runner produces no
+    // `Available` candidate (the pipeline errors on a missing repo, or captures zero rows). The
+    // reconcile must NOT persist an "unavailable" import over the good surfaces; it defers to
+    // the #222 floor and returns stale_reindex_required. Because the candidate is not
+    // `Available`, the reconcile returns before `import_shadow_vault`, so this test never
+    // touches the process-global CBM cache dir.
+    let dir = temp_dir("reconcile-unreplayable-args-preserves");
+    seed_shadow_content_fixture(&dir, b"cbm sqlite content v1");
+    let before = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(before.len(), SHADOW_DERIVED_SURFACE_KEYS.len());
+
+    // Persist index args that point at a path that cannot be indexed: the replay yields no
+    // Available candidate.
+    let missing_repo = dir.join("no-such-repo");
+    persist_shadow_index_args(
+        &dir,
+        "demo",
+        &serde_json::json!({ "repo_path": missing_repo.to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+    assert!(
+        read_config_value(&dir, &metadata_key("demo", SHADOW_INDEX_ARGS_KEY))
+            .unwrap()
+            .is_some(),
+        "precondition: index args are persisted so the reconcile attempts a replay"
+    );
+
+    fs::write(
+        sqlite_path(&dir, "demo"),
+        b"cbm sqlite content v2 mutated out of band",
+    )
+    .unwrap();
+    assert!(matches!(
+        evaluate_shadow_content_freshness(&dir, "demo").unwrap(),
+        ShadowContentVerdict::Stale { .. }
+    ));
+
+    let runner = CbmToolRunner::new(":memory:").unwrap();
+    let status = reconcile_shadow_import_current_at(&runner, &dir, "demo").unwrap();
+    assert_eq!(
+        status,
+        ShadowRefreshStatus::StaleReindexRequired,
+        "args that cannot yield an Available candidate must not clobber good surfaces"
+    );
+
+    // FSV: byte-identical surfaces after an attempted-but-impossible reconciliation.
+    let after = read_persisted_derived_surfaces(&dir, "demo");
+    assert_eq!(
+        after, before,
+        "an unusable replay must preserve every persisted derived surface"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn shadow_refresh_refuses_rather_than_clobbering_on_unusable_watermark_domain() {
     // The same #222 preservation invariant on the #223 trigger: a wrong-domain watermark
     // must not drive the surface-destroying refresh either. (Pre-#223 this was the live
