@@ -352,6 +352,15 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     if let Some(path) = response_out.as_ref() {
         fs::write(path, &result)?;
     }
+    if index_worker {
+        // #282 (attempt 15): the response file is a supervised worker's ONLY
+        // result channel — its stdout/stderr are the supervisor's log handle
+        // (or worse, whatever handle state the spawn produced), so printing
+        // the result there at best duplicates the payload into the log and at
+        // worst makes a fully-successful index depend on stdout health for
+        // its exit code. Exit with the tool outcome and write nothing.
+        return Ok(mcp_result_exit_code(&result));
+    }
 
     if raw_json {
         println!("{result}");
@@ -504,6 +513,19 @@ fn resolve_cli_args(args: &[String]) -> Result<String, DynError> {
         }
     }
     Ok("{}".to_string())
+}
+
+/// Exit code for an MCP tool result string: 1 for `isError: true`, else 0
+/// (unparseable results count as success, matching `print_mcp_tool_result`).
+fn mcp_result_exit_code(result: &str) -> i32 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else {
+        return 0;
+    };
+    let is_error = value
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    i32::from(is_error)
 }
 
 fn print_mcp_tool_result(result: &str) -> Result<i32, DynError> {
@@ -742,6 +764,22 @@ impl Drop for ParentWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_exit_code_reflects_tool_outcome_not_stdout_health() {
+        // success result -> 0; isError -> 1; unparseable -> 0 (same contract
+        // print_mcp_tool_result has always had, now stdout-independent).
+        assert_eq!(
+            mcp_result_exit_code(r#"{"content":[{"type":"text","text":"ok"}],"isError":false}"#),
+            0
+        );
+        assert_eq!(
+            mcp_result_exit_code(r#"{"content":[{"type":"text","text":"boom"}],"isError":true}"#),
+            1
+        );
+        assert_eq!(mcp_result_exit_code("not json"), 0);
+        assert_eq!(mcp_result_exit_code(r#"{"content":[]}"#), 0);
+    }
     use std::io::Cursor;
 
     #[test]
