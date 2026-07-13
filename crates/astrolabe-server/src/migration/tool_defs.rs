@@ -16,7 +16,7 @@ pub(crate) fn anchor_outcome_tool_definition() -> Value {
     json!({
         "name": "anchor_outcome",
         "title": "Anchor Outcome",
-        "description": "Ground real-world outcome anchors for a shadow-indexed project. The test_run kind parses a JUnit/cargo/pytest/go/vitest report and writes one grounded TestPass anchor per resolved subject, paired with a Grounding ledger entry. Source must be 'ci:<provider>:<run_id>' (certain, confidence 1.0) or 'local:<context>' (provisional).",
+        "description": "Ground real-world outcome anchors for a shadow-indexed project. The test_run kind parses a JUnit/cargo/pytest/go/vitest report and writes one grounded TestPass anchor per resolved subject, paired with a Grounding ledger entry. Catalog sources are ci:/trace:/review:/git:revert: (Trusted, confidence 1.0) and git:fix:/agent:/survival: (Provisional, confidence in (0,1)).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -31,7 +31,7 @@ pub(crate) fn anchor_outcome_tool_definition() -> Value {
                 },
                 "source": {
                     "type": "string",
-                    "description": "Enforced-prefix outcome source: 'ci:<provider>:<run_id>' for CI-resolved runs or 'local:<context>' for uncommitted local runs."
+                    "description": "Catalog source: ci:/trace:/review:/git:revert: for resolved evidence, or git:fix:/agent:/survival: for proxy evidence. ci: and agent: require owner plus observation components."
                 },
                 "format": {
                     "type": "string",
@@ -48,7 +48,7 @@ pub(crate) fn anchor_outcome_tool_definition() -> Value {
                 },
                 "confidence": {
                     "type": "number",
-                    "description": "Optional confidence. Omit for the source default (ci: exactly 1.0, local: 0.8). A ci: source may only carry exactly 1.0; a local: source must be finite in the open interval (0, 1)."
+                    "description": "Optional confidence. Resolved sources require exactly 1.0; proxy sources require a finite value in (0,1) and default to 0.8."
                 },
                 "observed_at": {
                     "type": "integer",

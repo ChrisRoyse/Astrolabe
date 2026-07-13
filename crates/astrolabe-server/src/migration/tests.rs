@@ -5658,6 +5658,7 @@ fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
     assert_eq!(mcp["fsv"]["label"], "fsv:verified");
     assert_eq!(mcp["fsv"]["scope"], "ingest_outcome_anchors");
     assert_eq!(mcp["fsv"]["rows_read_back"], 1);
+    assert_eq!(mcp["trust"], "trusted");
     // Report-level determinism across the two surfaces.
     assert_eq!(mcp["anchor_dump_hash"], cli["anchor_dump_hash"]);
     assert_eq!(mcp["ledger_ref"], cli["ledger_ref"]);
@@ -5714,6 +5715,50 @@ fn anchor_outcome_dual_path_mcp_and_cli_persist_byte_identical_state() {
     drop(cli_vault);
     fs::remove_dir_all(&mcp_dir).ok();
     fs::remove_dir_all(&cli_dir).ok();
+}
+
+#[test]
+fn anchor_outcome_proxy_source_is_provisional_on_the_shipping_surface() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                  {\"type\":\"test\",\"name\":\"demo.main\",\"event\":\"started\"}\n\
+                  {\"type\":\"test\",\"name\":\"demo.main\",\"event\":\"ok\"}\n\
+                  {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
+    let dir = temp_dir("anchor-outcome-proxy-trust");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    let response = anchor_outcome_json_at(
+        &dir,
+        "demo",
+        "test_run",
+        "agent:codex:session-29",
+        Some(0.6),
+        "cargo_test_json",
+        report,
+        "1786400000",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["trust"], "provisional");
+    assert_eq!(response["fsv"]["label"], "fsv:verified");
+
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "demo"),
+        SHADOW_VAULT_ID,
+        &vault_salt("demo"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row.anchors[0].source, "agent:codex:session-29");
+    assert_eq!(
+        rows[0].row.anchors[0].confidence.to_bits(),
+        0.6f32.to_bits()
+    );
+    drop(vault);
+    fs::remove_dir_all(&dir).ok();
 }
 
 fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOutcome {

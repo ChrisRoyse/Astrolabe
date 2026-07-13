@@ -68,6 +68,7 @@ dependencies = [
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "proptest",
  "quick-xml",
  "serde",
  "serde_json",

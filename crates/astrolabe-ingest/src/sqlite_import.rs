@@ -6248,7 +6248,7 @@ mod tests {
                 "bad-anchor",
                 "Function",
                 "demo.bad.anchor",
-                r#"{"source_snippet":"x","anchors":[{"source":"ci:github","confidence":0.0}]}"#,
+                r#"{"source_snippet":"x","anchors":[{"source":"ci:github:run-1","confidence":0.0}]}"#,
                 7,
                 ASTRO_ANCHOR_CONFIDENCE_RANGE,
                 "Clamp or reject anchor confidence so only values in (0, 1] are admitted.",
