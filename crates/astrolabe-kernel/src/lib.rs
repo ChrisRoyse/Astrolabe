@@ -4,6 +4,12 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+/// Directory-role frame, `placement_truth` cross-term, and `layout_map` aspect
+/// (#180b): the structure-convention reference frame built on the S23
+/// `layer_role` lens.
+pub mod layout;
+pub use layout::*;
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SEARCH_SCALE_SCHEMA: &str = "astrolabe.search_scale_plan.v1";
 pub const SEARCH_SCALE_KNOB_REGISTRY_VERSION: &str = "astro.kernel.search_scale_knobs.v1";
