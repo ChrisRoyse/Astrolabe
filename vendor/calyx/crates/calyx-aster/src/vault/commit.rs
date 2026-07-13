@@ -132,11 +132,22 @@ where
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
         let durable_seq = durable.append_batch(rows)?;
-        #[cfg(any(test, feature = "crash-fsv"))]
-        crash_fsv_after_wal_append(durable_seq)?;
+        // Persist the durable ledger head anchor (the external witness) as part
+        // of completing the WAL-backed ledger commit, BEFORE the crash-fsv
+        // failpoint. #287 candidate 4 (fail closed when a non-empty durable
+        // ledger has no head anchor) makes the anchor mandatory for reopen; the
+        // owned crash-fsv failpoint (Cluster B) simulates a crash right after a
+        // *completed* durable ledger commit, so the anchor must already be
+        // durable at that point or a killed-mid-commit vault could never reopen
+        // (regressing the crash-fsv recovery guarantee). A genuine crash in the
+        // narrow window between the WAL fsync and this anchor fsync still fails
+        // closed on reopen — exactly candidate 4's intended no-silent-truncation
+        // behavior.
         if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
+        #[cfg(any(test, feature = "crash-fsv"))]
+        crash_fsv_after_wal_append(durable_seq)?;
         let mvcc_seq = match self.commit_rows_to_mvcc(rows) {
             Ok(seq) => seq,
             Err(mvcc_error) => {
