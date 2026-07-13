@@ -47,6 +47,7 @@ use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemCloc
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use context::VaultContext;
 pub use durable::VaultOptions;
