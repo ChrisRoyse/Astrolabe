@@ -61,7 +61,20 @@ LABEL="${ASTROLABE_CHECK_LABEL:-$DEFAULT_LABEL}"
 bash scripts/ci-cbm-lint.sh
 bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
 
-cargo build --workspace --release
+# #63/#283: the SHIPPED release artifact is the grammar-subset (`core`) variant.
+# Rationale (recorded decision): the full grammar set (157 tree-sitter shims,
+# ~1.19 GiB of static const parse tables) makes the release binary ~263 MiB,
+# ~113 MiB over the #63 150 MiB gate; the parse tables are const data, immune to
+# LTO/strip/opt-level. `core` compiles only CBM_GRAMMAR_CORE_LANGS and links
+# grammar_stubs.c, which fails CLOSED on any dropped language with a labeled
+# {code,message,remediation} CBM_GRAMMAR_STUBBED error naming the knob (never a
+# silent parse miss) — satisfying the HONEST "no silent fallback" invariant, so
+# core-by-default in the shipped artifact is acceptable. This is scoped to the
+# release build ONLY: the Makefile default stays `full`, so check-full.sh above
+# (workspace tests + the CBM C suite) exercised every grammar with no coverage
+# loss. Switching the knob re-enters the libcbm config stamp (build.rs), forcing
+# a grammar-object rebuild here regardless of any warm objects from check-full.
+CBM_GRAMMAR_SET=core cargo build --workspace --release
 "$PYTHON_BIN" scripts/check-binary-size.py
 # #291: byte-level proof that the shipped release binaries carry no test-only
 # failpoint marker (e.g. the calyx-aster crash-fsv env var). Runs on the real
