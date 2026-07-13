@@ -121,6 +121,8 @@ def guarded(relpath: str, flag: str, marker: str, absent_marker: str | None = No
 # ── #282 worker-failure diagnostics (libcbm + production binaries) ────────────
 guarded("src/mcp/mcp.c", "ASTRO_WORKER_DIAG", '"worker_exit_code"')
 guarded("src/mcp/mcp.c", "ASTRO_WORKER_DIAG", '"worker_response_tail"')
+guarded("src/mcp/mcp.c", "ASTRO_WORKER_DIAG", '"worker_log_tail"')
+guarded("src/mcp/index_supervisor.c", "ASTRO_WORKER_DIAG", "slurp_file_tail(log_path, CBM_WORKER_LOG_TAIL_MAX)")
 # index_supervisor.c slurps the worker response on EVERY outcome (not only CLEAN)
 guarded("src/mcp/index_supervisor.c", "ASTRO_WORKER_DIAG", "on EVERY outcome")
 

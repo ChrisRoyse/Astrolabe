@@ -3499,7 +3499,8 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
 enum { CBM_WORKER_RESPONSE_TAIL_MAX = 2048 };
 
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome,
-                                           int exit_code, const char *worker_response) {
+                                           int exit_code, const char *worker_response,
+                                           const char *worker_log) {
 #else
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
 #endif
@@ -3526,6 +3527,11 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
                                   ? worker_response + (wr_len - CBM_WORKER_RESPONSE_TAIL_MAX)
                                   : worker_response;
         yyjson_mut_obj_add_strcpy(doc, root, "worker_response_tail", wr_tail);
+    }
+    if (worker_log && worker_log[0]) {
+        /* #282 (attempt 15): the worker's own log tail — panic/abort text —
+         * already bounded by the supervisor (CBM_WORKER_LOG_TAIL_MAX). */
+        yyjson_mut_obj_add_strcpy(doc, root, "worker_log_tail", worker_log);
     }
 #endif
     if (repo_path) {
@@ -3730,6 +3736,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     int last_exit_code = wr.exit_code;
     char *last_response = wr.response; /* #282: keep the worker's evidence */
     wr.response = NULL;
+    char *last_log = wr.log_tail; /* #282: keep the worker's panic/log text */
+    wr.log_tail = NULL;
 #endif
     cbm_index_worker_result_free(&wr);
 
@@ -3768,6 +3776,9 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             free(last_response);
             last_response = wr2.response; /* #282 */
             wr2.response = NULL;
+            free(last_log);
+            last_log = wr2.log_tail; /* #282 */
+            wr2.log_tail = NULL;
 #endif
             cbm_index_worker_result_free(&wr2);
             break; /* spawn failed mid-recovery — give up */
@@ -3785,6 +3796,9 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             free(last_response);
             last_response = wr2.response; /* #282 */
             wr2.response = NULL;
+            free(last_log);
+            last_log = wr2.log_tail; /* #282 */
+            wr2.log_tail = NULL;
 #endif
             cbm_index_worker_result_free(&wr2);
             /* crash vs hang: the phase this file is quarantined under and
@@ -3840,6 +3854,9 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         free(last_response);
         last_response = wr2.response; /* #282 */
         wr2.response = NULL;
+        free(last_log);
+        last_log = wr2.log_tail; /* #282 */
+        wr2.log_tail = NULL;
 #endif
         cbm_index_worker_result_free(&wr2);
         break;
@@ -3876,13 +3893,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     if (resp) {
 #ifdef ASTRO_WORKER_DIAG
         free(last_response);
+        free(last_log);
 #endif
         return resp;
     }
 #ifdef ASTRO_WORKER_DIAG
-    char *failure =
-        build_worker_failure_response(args, last_outcome, last_exit_code, last_response);
+    char *failure = build_worker_failure_response(args, last_outcome, last_exit_code,
+                                                  last_response, last_log);
     free(last_response);
+    free(last_log);
     return failure;
 #else
     return build_worker_failure_response(args, last_outcome);

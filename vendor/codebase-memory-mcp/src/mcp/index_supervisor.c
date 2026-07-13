@@ -104,6 +104,44 @@ static int worker_quiet_timeout_ms(void) {
     return DEFAULT_QUIET_TIMEOUT_MS;
 }
 
+#ifdef ASTRO_WORKER_DIAG
+/* #282: bound on the worker-log excerpt carried in the failure result. The
+ * panic/abort text lands at the END of the log, so a tail keeps it. */
+enum { CBM_WORKER_LOG_TAIL_MAX = 2048 };
+
+/* Read the last max_bytes of a file into a heap string (NUL-terminated).
+ * NULL on error or empty file. */
+static char *slurp_file_tail(const char *path, size_t max_bytes) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size <= 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    size_t want = (size_t)size > max_bytes ? max_bytes : (size_t)size;
+    if (fseek(f, (long)((size_t)size - want), SEEK_SET) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
+    char *buf = malloc(want + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+    size_t rd = fread(buf, 1, want, f);
+    (void)fclose(f);
+    buf[rd] = '\0';
+    return buf;
+}
+#endif
+
 /* Read an entire file into a heap string (NUL-terminated). NULL on error. */
 static char *slurp_file(const char *path) {
     FILE *f = cbm_fopen(path, "rb");
@@ -154,6 +192,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     result->exit_code = -1;
     result->term_signal = 0;
     result->response = NULL;
+    result->log_tail = NULL;
 
     char self[1024] = {0};
     if (!cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)) || !self[0]) {
@@ -242,6 +281,13 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * unattributable — the supervisor deleted the one artifact that named the
      * defect. */
     result->response = slurp_file(resp_path);
+    if (r.outcome != CBM_PROC_CLEAN) {
+        /* #282 (attempt 15): the worker's panic/abort text goes only to its
+         * log, which lives under a run-scoped dir the gate wipes — carry a
+         * bounded tail in the result so the failure artifact names the
+         * defect even after cleanup. The on-disk log is still kept below. */
+        result->log_tail = slurp_file_tail(log_path, CBM_WORKER_LOG_TAIL_MAX);
+    }
 #else
     if (r.outcome == CBM_PROC_CLEAN) {
         result->response = slurp_file(resp_path);
@@ -282,5 +328,7 @@ void cbm_index_worker_result_free(cbm_index_worker_result_t *result) {
     if (result) {
         free(result->response);
         result->response = NULL;
+        free(result->log_tail);
+        result->log_tail = NULL;
     }
 }
