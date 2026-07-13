@@ -1,16 +1,56 @@
+use std::cell::Cell;
+#[cfg(feature = "ml-runtime")]
 use std::env;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CalyxError, Input, Lens, Result};
+use calyx_core::{CalyxError, Result};
+#[cfg(feature = "ml-runtime")]
+use calyx_core::{Input, Lens};
 
 use crate::frozen::LengthDelimitedSha256;
+#[cfg(feature = "ml-runtime")]
 use crate::lens::ensure_input_modality;
 
+#[cfg(feature = "ml-runtime")]
 pub const DEFAULT_MAX_TOKENS: usize = 512;
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+thread_local! {
+    static SCOPED_RUNTIME_BATCH_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Run `run` with a process-wide (per-thread) runtime batch-limit override in
+/// scope. Lives here — rather than in the ML-only `onnx` module — so the
+/// registry batch-measurement path (`runtime_limit`, `persistence::runtime`)
+/// stays available when the `ml-runtime` feature is off (#297). Data-oblivious:
+/// pure thread-local swap, no ML dependency.
+pub(crate) fn with_runtime_batch_limit<T>(
+    limit: Option<usize>,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if limit == Some(0) {
+        return Err(CalyxError::lens_unreachable(
+            "runtime batch limit must be > 0 when supplied",
+        ));
+    }
+    SCOPED_RUNTIME_BATCH_LIMIT.with(|slot| {
+        let previous = slot.replace(limit);
+        let result = run();
+        slot.set(previous);
+        result
+    })
+}
+
+/// Current scoped runtime batch limit, if any. Read by the ONNX runtime's
+/// `scoped_max_batch` when the `ml-runtime` feature is enabled.
+#[cfg(feature = "ml-runtime")]
+pub(crate) fn scoped_runtime_batch_limit() -> Option<usize> {
+    SCOPED_RUNTIME_BATCH_LIMIT.with(Cell::get)
+}
+
+#[cfg(feature = "ml-runtime")]
 pub fn default_hf_cache_root() -> PathBuf {
     if let Some(path) = env::var_os("HF_HOME") {
         return PathBuf::from(path);
@@ -21,6 +61,7 @@ pub fn default_hf_cache_root() -> PathBuf {
     PathBuf::from(".hf-cache")
 }
 
+#[cfg(feature = "ml-runtime")]
 pub fn fastembed_cache_root(default_cache: &Path) -> PathBuf {
     env::var_os("HF_HOME")
         .map(PathBuf::from)
@@ -69,6 +110,7 @@ fn hash_file_into(
     }
 }
 
+#[cfg(feature = "ml-runtime")]
 pub fn text_from_input<'a>(lens: &dyn Lens, input: &'a Input) -> Result<&'a str> {
     ensure_input_modality(lens, input)?;
     std::str::from_utf8(&input.bytes).map_err(|err| {

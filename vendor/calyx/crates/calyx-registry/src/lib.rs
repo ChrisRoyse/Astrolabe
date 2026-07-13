@@ -102,20 +102,24 @@ pub use runtime::adapters::{
     is_non_commercial_license, register_multimodal_lens_pack, shutdown_multimodal_gpu_workers,
 };
 pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
+#[cfg(feature = "ml-runtime")]
 pub use runtime::candle::{
     CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,
     CandlePrecision, DEFAULT_CANDLE_MODEL,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
+#[cfg(feature = "ml-runtime")]
 pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
     OnnxProviderPolicy, PoolingPolicy,
 };
+#[cfg(feature = "ml-runtime")]
 pub use runtime::qwen3::{
     DEFAULT_QWEN3_MAX_TOKENS, DEFAULT_QWEN3_MODEL, FastembedQwen3Lens, Qwen3FileSpec,
     Qwen3ModelFiles,
 };
+#[cfg(feature = "ml-runtime")]
 pub use runtime::static_lookup::{
     StaticLookupDType, StaticLookupFileSpec, StaticLookupFiles, StaticLookupLens,
 };
