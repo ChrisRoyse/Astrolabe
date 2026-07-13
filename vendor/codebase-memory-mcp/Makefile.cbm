@@ -509,10 +509,12 @@ test-foundation: $(BUILD_DIR)/test-foundation
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+-include $(GRAMMAR_OBJS_TEST:.o=.d)
 
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
+-include $(BUILD_DIR)/ts_runtime.d
 
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
@@ -575,12 +577,25 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
-		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TEST) \
-		$(LDFLAGS_TEST)
+# ── #280: per-TU objects for the test runner ────────────────────
+# The historical rule compiled every product + test TU in ONE gcc command
+# (~117s serial on 32 threads — a single compiler process that -j cannot
+# parallelize). Per-TU objects make the cold build parallel and an edit
+# incremental (changed TU + link). -MMD/-MP dep files make a header edit
+# rebuild its dependents, so a persistent build dir is mtime-correct without
+# a clean. Objects mirror the source tree under $(BUILD_DIR)/tu/.
+TEST_TU_SRCS = $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+TEST_TU_OBJS = $(patsubst %.c,$(BUILD_DIR)/tu/%.o,$(TEST_TU_SRCS))
+
+$(BUILD_DIR)/tu/%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_TEST) -MMD -MP -Itests -Itests/repro -c -o $@ $<
+
+-include $(TEST_TU_OBJS:.o=.d)
+
+$(BUILD_DIR)/test-runner: $(TEST_TU_OBJS) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+	$(file >$@.rsp,$(TEST_TU_OBJS) $(OBJS_VENDORED_TEST))
+	$(CC) $(CFLAGS_TEST) -o $@ @$@.rsp $(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
@@ -640,12 +655,20 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
-		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_PROD) \
-		$(LDFLAGS)
+# #280: per-TU objects (see the test-runner rule above for the rationale;
+# same -MMD dep tracking, separate object tree because CFLAGS_PROD differ).
+PROD_TU_SRCS = $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+PROD_TU_OBJS = $(patsubst %.c,$(BUILD_DIR)/tuprod/%.o,$(PROD_TU_SRCS))
+
+$(BUILD_DIR)/tuprod/%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_PROD) -MMD -MP -c -o $@ $<
+
+-include $(PROD_TU_OBJS:.o=.d)
+
+$(BUILD_DIR)/codebase-memory-mcp: $(PROD_TU_OBJS) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+	$(file >$@.rsp,$(PROD_TU_OBJS) $(OBJS_VENDORED_PROD))
+	$(CC) $(CFLAGS_PROD) -o $@ @$@.rsp $(LDFLAGS)
 
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"

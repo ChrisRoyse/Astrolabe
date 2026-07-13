@@ -21,6 +21,7 @@ FILES = (
     "scripts/ci-rust-gate.sh",
     "scripts/check-workspace-tests.py",
     "scripts/clean-target.sh",
+    "vendor/codebase-memory-mcp/scripts/test.sh",
 )
 
 
@@ -76,12 +77,14 @@ def main() -> int:
         assert checker.validate(fixture) == []
 
         check = fixture / "scripts/check.sh"
+        # #280: the lowered-parity collect must precede shadow-parity; swapping
+        # them must trip the order contract.
         rewrite(
             check,
-            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"\n'
-            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"',
-            'gate egress-deny -- "$PYTHON_BIN" scripts/check-egress-deny.py --allow-unsupported-platform --astrolabe "$ROOT/target/debug/astrolabe"\n'
-            'gate watchdog -- bash scripts/check-astrolabe-watchdog.sh "$ROOT/target/debug/astrolabe"',
+            'gate lowered-parity -- lowered_parity_wait\n'
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact',
+            'gate shadow-parity -- "$PYTHON_BIN" scripts/check-shadow-parity.py --write-release-artifact\n'
+            'gate lowered-parity -- lowered_parity_wait',
         )
         require_error(checker.validate(fixture), "portable-before-egress order")
         copy_fixture(fixture)
@@ -199,16 +202,58 @@ def main() -> int:
         copy_fixture(fixture)
 
         full = fixture / "scripts/check-full.sh"
-        # #193: the C phases now start concurrently, but their declaration order
-        # is still contractual -- swapping them must still trip the order check.
+        # #280: unwiring the concurrent CBM phase from check-full must be caught.
         rewrite(
             full,
-            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh\n'
-            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh',
-            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh\n'
-            'start_phase "cbm-lint" bash scripts/ci-cbm-lint.sh',
+            'start_phase "cbm-test" bash scripts/ci-cbm-test.sh "$LABEL" "$CC_BIN" "$CXX_BIN"',
+            'start_phase "cbm-test" true',
         )
-        require_error(checker.validate(fixture), "required order")
+        require_error(checker.validate(fixture), "ci-cbm-test.sh")
+        copy_fixture(fixture)
+
+        # #280: the tiered-out phases must stay COUNTED omissions in check-full.
+        rewrite(
+            full,
+            "SKIP[ASTRO_RELEASE_TIER_RUST_GATE]",
+            "INFO[ASTRO_RELEASE_TIER_RUST_GATE]",
+        )
+        require_error(checker.validate(fixture), "ASTRO_RELEASE_TIER_RUST_GATE")
+        copy_fixture(fixture)
+
+        # #280: the suite impact gate is load-bearing in both directions.
+        rewrite(
+            check,
+            "scripts/check-suite-impact.py should-run workspace-block",
+            "scripts/check-suite-impact.py always-run workspace-block",
+        )
+        require_error(
+            checker.validate(fixture),
+            "check-suite-impact.py should-run workspace-block",
+        )
+        copy_fixture(fixture)
+
+        rewrite(
+            check,
+            "scripts/check-suite-impact.py record-green workspace-block",
+            "scripts/check-suite-impact.py forget-green workspace-block",
+        )
+        require_error(
+            checker.validate(fixture),
+            "check-suite-impact.py record-green workspace-block",
+        )
+        copy_fixture(fixture)
+
+        # #280: check-release must defeat both fail-closed fast-path gates.
+        release_pre = fixture / "scripts/check-release.sh"
+        rewrite(release_pre, "export ASTRO_SUITE_GATE=all", "export ASTRO_SUITE_GATE=auto2")
+        require_error(checker.validate(fixture), "ASTRO_SUITE_GATE=all")
+        copy_fixture(fixture)
+
+        # #280: the sharded CBM runner and the premise-stamped incremental build
+        # must stay wired inside the owned test.sh.
+        cbm_test_sh = fixture / "vendor/codebase-memory-mcp/scripts/test.sh"
+        rewrite(cbm_test_sh, "scripts/test-shards.sh", "scripts/test-serial.sh")
+        require_error(checker.validate(fixture), "test-shards.sh")
         copy_fixture(fixture)
 
         # #193: a failure in ANY concurrent phase must fail the aggregate with the

@@ -155,6 +155,10 @@ DEPENDENCIES: dict[str, list[str]] = {
         "scripts/check-hook-contracts.py",
         "ci/hook-contracts.json",
     ],
+    # #280: the suite impact gate (fixture-repo FSV of its fail-closed contract).
+    "test-check-suite-impact.py": [
+        "scripts/check-suite-impact.py",
+    ],
 }
 
 
@@ -263,10 +267,13 @@ def main(argv: list[str] | None = None) -> int:
     python_bin = os.environ.get("ASTRO_GATE_PYTHON", sys.executable or "python")
     mode = os.environ.get("ASTRO_GATE_SELFTESTS", "auto").strip().lower()
     force_all = mode == "all"
+    # #280: default parallelism scales with the box (the self-tests are
+    # subprocess/IO-bound fixture drivers, not CPU-saturating builds).
+    default_jobs = str(max(6, min(12, (os.cpu_count() or 8) // 2)))
     try:
-        jobs = max(1, int(os.environ.get("ASTRO_GATE_SELFTEST_JOBS", "6")))
+        jobs = max(1, int(os.environ.get("ASTRO_GATE_SELFTEST_JOBS", default_jobs)))
     except ValueError:
-        jobs = 6
+        jobs = int(default_jobs)
     cache_dir = Path(
         os.environ.get("ASTRO_GATE_CACHE_DIR", str(root / ".astro-gate-cache"))
     )

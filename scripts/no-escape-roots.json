@@ -54,7 +54,8 @@
   ],
   "limits": {
     "max_entries_per_root": 20000,
-    "max_hash_bytes_per_root": 536870912
+    "_max_hash_bytes_note": "#280 (2026-07-13): raised 512MiB -> 2GiB after confirming legitimate operator growth, not a leak — the operator's own MCP server indexed C-code-leapablememory.db (320MB) into the real store between gate runs; the CBM-phase hermeticity manifest verified the store byte-identical across our runs. The limit bounds snapshot hashing cost only.",
+    "max_hash_bytes_per_root": 2147483648
   },
   "roots": [
     {

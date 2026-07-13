@@ -16,10 +16,36 @@ CXX_BIN="${3//\\//}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CBM="$ROOT/vendor/codebase-memory-mcp"
-LOG_DIR="$ROOT/target/ci-logs"
+# #280: phase evidence (tee'd log, hermeticity manifests, sanitizer probe)
+# lives in a PID-scoped dir under .tmp, NOT under target/ — a concurrent or
+# just-exited session's target/ cleanup must never be able to delete this
+# phase's before-manifest mid-run (observed 2026-07-12: FileNotFoundError at
+# the verify step after a green suite).
+LOG_DIR="$ROOT/.tmp/cbm-phase-$$"
 LOG="$LOG_DIR/cbm-${LABEL}.log"
-
 mkdir -p "$LOG_DIR"
+cleanup_phase_dir() { rm -rf -- "$LOG_DIR"; }
+trap cleanup_phase_dir EXIT
+
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+else
+  echo "ERROR: ASTRO_CBM_PYTHON_MISSING: python is required by the CBM gate." >&2
+  echo "  remediation: install python (or python3) on PATH before running the CBM gate." >&2
+  exit 1
+fi
+
+# ── #280 suite impact gate: no suite runs when no code change impacts it ────
+# Fail closed: only a byte-identical input set vs the last recorded GREEN run
+# skips (exit 3); every other state — including any gate error — runs.
+impact_rc=0
+"$PYTHON_BIN" "$ROOT/scripts/check-suite-impact.py" should-run cbm-c-suite || impact_rc=$?
+if [[ "$impact_rc" -eq 3 ]]; then
+  echo "COUNTS[ASTRO_CBM_TESTS] label=$LABEL suite-skipped-unchanged (see SKIP[ASTRO_SUITE_UNCHANGED] above; recorded-green counts are in .astro-gate-cache/suite-green.json)"
+  exit 0
+fi
 
 cd "$CBM"
 
@@ -98,16 +124,6 @@ fi
 # the library and the tests together, by construction. USERPROFILE follows it so
 # the resolver cannot reach the operator's profile through the second branch, and
 # CBM_CACHE_DIR is cleared so no split can be reintroduced from the environment.
-if command -v python >/dev/null 2>&1; then
-  PYTHON_BIN="python"
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON_BIN="python3"
-else
-  echo "ERROR: ASTRO_CBM_PYTHON_MISSING: python is required by the CBM store hermeticity gate." >&2
-  echo "  remediation: install python (or python3) on PATH before running the CBM gate." >&2
-  exit 1
-fi
-
 # Native path form: the CBM test binaries are native Windows executables and
 # read HOME with getenv(). An MSYS POSIX path (/c/...) would resolve against the
 # current drive root inside them, so every path handed to a native child or to
@@ -137,8 +153,8 @@ PROTECTED_CACHE="$(to_native "${CBM_CACHE_DIR:-$OPERATOR_HOME/.cache/codebase-me
 NATIVE_ROOT="$(to_native "$ROOT")"
 CBM_TEST_HOME="$NATIVE_ROOT/target/cbm-test-home"
 RUN_SCOPED_CACHE="$CBM_TEST_HOME/.cache/codebase-memory-mcp"
-BEFORE_MANIFEST="$NATIVE_ROOT/target/ci-logs/cbm-store-before-${LABEL}.manifest"
-AFTER_MANIFEST="$NATIVE_ROOT/target/ci-logs/cbm-store-after-${LABEL}.manifest"
+BEFORE_MANIFEST="$(to_native "$LOG_DIR")/cbm-store-before-${LABEL}.manifest"
+AFTER_MANIFEST="$(to_native "$LOG_DIR")/cbm-store-after-${LABEL}.manifest"
 
 echo "=== CBM store hermeticity: protected-store snapshot (before) ==="
 "$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" snapshot \
@@ -222,8 +238,27 @@ echo "=== CBM store hermeticity: protected-store verification (after) ==="
   --cache-dir "$PROTECTED_CACHE" --before "$BEFORE_MANIFEST" --out "$AFTER_MANIFEST"
 
 echo "=== CBM store hermeticity: run-scoped store received the writes ==="
-"$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" require-writes \
-  --cache-dir "$RUN_SCOPED_CACHE"
+# #280: the sharded runner gives each shard its own HOME under
+# $CBM_TEST_HOME/shards/home-N, so store writes land in per-shard stores (plus
+# possibly the base store, used by the post-shard watchdog/security steps).
+# The honest requirement is unchanged — the suite must have written SOMEWHERE
+# run-scoped — so require at least one non-empty run-scoped store.
+stores_with_writes=0
+for run_store in "$RUN_SCOPED_CACHE" "$CBM_TEST_HOME"/shards/home-*/.cache/codebase-memory-mcp; do
+  [[ -d "$run_store" ]] || continue
+  if "$PYTHON_BIN" "$ROOT/scripts/check-cbm-cache-hermeticity.py" require-writes \
+    --cache-dir "$run_store" > "$LOG_DIR/require-writes.last" 2>&1; then
+    stores_with_writes=$((stores_with_writes + 1))
+  fi
+done
+if [[ "$stores_with_writes" -lt 1 ]]; then
+  echo "ERROR: ASTRO_CBM_RUN_SCOPED_STORE_EMPTY: no run-scoped store (base or shard) received writes." >&2
+  echo "  The suite indexed nothing into any redirected store, so a clean operator cache proves nothing." >&2
+  echo "  remediation: confirm HOME/USERPROFILE reach the native test binaries (last probe output follows)." >&2
+  cat "$LOG_DIR/require-writes.last" >&2 || true
+  exit 1
+fi
+echo "CBM run-scoped stores with writes: $stores_with_writes"
 
 # Anchored: the unit-suite summary starts with its count; later harness
 # steps (security-strings) print prefixed "N passed" lines that must not
@@ -273,3 +308,9 @@ fi
 if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
+
+# #280: record this GREEN run's input fingerprint so an unchanged input set
+# skips the suite next time (never weakens anything: any byte change, tool
+# bump, or manifest ambiguity re-runs — see check-suite-impact.py).
+"$PYTHON_BIN" "$ROOT/scripts/check-suite-impact.py" record-green cbm-c-suite \
+  --note "label=$LABEL passed=$passed failed=$failed skipped=$skipped"

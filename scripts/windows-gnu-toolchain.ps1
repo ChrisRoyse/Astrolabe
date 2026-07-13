@@ -1020,8 +1020,14 @@ $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 # (fixture locks, never the live workspace).
 . (Join-Path $PSScriptRoot "launcher-lock.ps1")
 Assert-AstroLauncherLockClaimable -LockPath $launcherLock
-if (Test-Path -LiteralPath $target) {
+# #280: ASTROLABE_CONTIGUOUS_BATCH=1 (the CLAUDE.md contiguous-verification-
+# batch carve-out) keeps target/ warm between consecutive runs of one session,
+# so a present target/ is the expected state there, not a hygiene fault.
+if ((Test-Path -LiteralPath $target) -and ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
     throw "target must be absent before toolchain work: $target"
+}
+if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and (Test-Path -LiteralPath $target)) {
+    Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
 }
 if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
@@ -1252,16 +1258,29 @@ finally {
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
     }
-    if (Test-Path -LiteralPath $target) {
-        try {
-            Remove-Item -LiteralPath $target -Recurse -Force
-        }
-        catch {
-            $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
-        }
+    # #280: ASTROLABE_CONTIGUOUS_BATCH=1 invokes the CLAUDE.md "contiguous
+    # verification batch" carve-out — consecutive gate runs within one session
+    # keep target/ warm (the workspace-test phase is ~95% rebuild cost from a
+    # cold target/; measured 143s rebuild vs 6.6s of actual test execution).
+    # The invoking session REMAINS obligated to wipe target/ at every batch
+    # boundary (turn end, pause, issue close, handoff) — this flag never
+    # weakens that rule, it only moves the wipe from per-invocation to
+    # per-batch, and the default (unset) behavior is unchanged.
+    if ($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") {
+        Write-Output "CLEANUP[ASTRO_TARGET_BATCH_DEFERRED]: ASTROLABE_CONTIGUOUS_BATCH=1 -> target/ kept warm; the batch owner wipes it at the batch boundary"
     }
-    if (Test-Path -LiteralPath $target) {
-        $cleanupErrors += "target cleanup failed: $target remains"
+    else {
+        if (Test-Path -LiteralPath $target) {
+            try {
+                Remove-Item -LiteralPath $target -Recurse -Force
+            }
+            catch {
+                $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $target) {
+            $cleanupErrors += "target cleanup failed: $target remains"
+        }
     }
     if (Test-Path -LiteralPath $workspaceTemp) {
         try {
@@ -1302,7 +1321,9 @@ finally {
     # destroying the child's real exit code — a red-for-green AND a green-for-red hazard.
     # Cleanup failures are recorded in $cleanupErrors and adjudicated below, loudly.
     if ($cleanupErrors.Count -eq 0) {
-        Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+        if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
+            Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+        }
         Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
     }
 }
