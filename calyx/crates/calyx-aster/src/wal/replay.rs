@@ -1,4 +1,4 @@
-use super::record::DecodeStatus;
+use super::record::LogicalStatus;
 use super::{ReplayOutcome, ReplayRecord, TornTail, record, segment, storage_error};
 use calyx_core::{CalyxErrorCode, Result};
 use std::fs::{File, OpenOptions};
@@ -54,14 +54,22 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                     );
                 }
             };
+            // The floor is always a whole-commit boundary (a standalone seq or a
+            // group's final-member seq), so every physical record of an
+            // already-checkpointed commit has `seq <= floor` and is skipped here
+            // header-only, without re-reading its (possibly large) payload — for
+            // a group that means walking past each member chunk in turn.
             if header.seq <= replay_floor_seq {
                 offset = header.end_offset;
                 continue;
             }
-            match record::decode_at(&mut file, offset)
+            // Above the floor: reassemble the whole logical commit. A group is
+            // applied only when every member is present; an incomplete trailing
+            // group is a torn tail truncated at the group's start offset.
+            match record::decode_logical_at(&mut file, offset)
                 .map_err(|error| storage_error("decode WAL record", error))?
             {
-                DecodeStatus::Complete(decoded) => {
+                LogicalStatus::Complete(decoded) => {
                     offset = decoded.end_offset;
                     records.push(ReplayRecord {
                         seq: decoded.seq,
@@ -71,8 +79,8 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                         end_offset: decoded.end_offset,
                     });
                 }
-                DecodeStatus::Eof => break,
-                DecodeStatus::Torn { offset, message } => {
+                LogicalStatus::Eof => break,
+                LogicalStatus::Torn { offset, message } => {
                     return resolve_torn_tail(
                         &file,
                         path,
