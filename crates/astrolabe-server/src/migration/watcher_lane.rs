@@ -68,6 +68,15 @@ pub(crate) fn run_incremental_watcher_loop(shutdown: Arc<AtomicBool>) -> Result<
                 "incremental_watcher.poll_failed"
             );
         }
+        for project in registered.keys() {
+            if let Err(error) = drive_project_lowering(&cache_dir, project) {
+                tracing::warn!(
+                    project,
+                    error = %error,
+                    "incremental_watcher.lowering_tick_failed"
+                );
+            }
+        }
         sleep_watcher_slice(&shutdown);
     }
     Ok(())

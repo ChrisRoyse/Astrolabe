@@ -6042,6 +6042,28 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         .clone();
     let first_lower = lower_shadow_sqlite(&root, "demo", &vault).unwrap();
     assert!(first_lower.edge_count > 0);
+    for (name, value) in [
+        ("vault_dir", vault_dir.display().to_string()),
+        ("vault_id", SHADOW_VAULT_ID.to_string()),
+        ("vault_salt", "shadow-panel-weave-fsv".to_string()),
+        (
+            "lowered_artifact_sha256",
+            first_lower.artifact_sha256.clone(),
+        ),
+        (
+            "lowered_vault_fingerprint_sha256",
+            first_lower.vault_fingerprint_sha256.clone(),
+        ),
+        ("lowered_manifest_seq", first_lower.manifest_seq.to_string()),
+        ("lowered_nodes", first_lower.node_count.to_string()),
+        ("lowered_edges", first_lower.edge_count.to_string()),
+        (
+            "lowered_skipped_edges",
+            first_lower.skipped_edges.to_string(),
+        ),
+    ] {
+        write_config_value(&root, &metadata_key("demo", name), &value).unwrap();
+    }
 
     let second_options = SqliteImportOptions::new("demo", "commit-2", DEFAULT_PANEL_VERSION)
         .with_available_slots(shadow_available_slots());
@@ -6101,11 +6123,58 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
             .unwrap()
             .is_some()
     );
-    let second_lower = lower_shadow_sqlite(&root, "demo", &vault).unwrap();
-    assert_eq!(second_lower.edge_count, 0);
+    let scheduled = schedule_lowering_after_convergence(&root, "demo", true, &second_weave)
+        .unwrap()
+        .expect("mutating production convergence schedules lowering");
+    assert_eq!(scheduled["status"], "waiting");
+    assert_eq!(scheduled["pending"], true);
+    assert!(matches!(
+        drive_project_lowering(&root, "demo").unwrap()["status"].as_str(),
+        Some("waiting")
+    ));
+    drop(vault);
+    thread::sleep(Duration::from_millis(
+        astrolabe_domain::knobs::LOWER_DEBOUNCE_DEFAULT_WINDOW_MS + 50,
+    ));
+    let regenerated = drive_project_lowering(&root, "demo").unwrap();
+    assert_eq!(regenerated["status"], "regenerated");
+    assert_eq!(regenerated["pending"], false);
+    assert_eq!(regenerated["edge_count"], 0);
+    let vault = open_shadow_vault_writable(
+        &vault_dir,
+        SHADOW_VAULT_ID,
+        "shadow-panel-weave-fsv",
+        Vec::new(),
+    )
+    .unwrap();
+    let verified_lower = astrolabe_lower::verify_lowered_artifact(
+        &vault,
+        lowered_sqlite_path(&root, "demo"),
+        "demo",
+    )
+    .unwrap();
+    assert_eq!(
+        verified_lower.artifact_sha256,
+        regenerated["artifact_sha256"].as_str().unwrap()
+    );
+    let status = shadow_status_summary_at(&root, "demo").unwrap();
+    assert_eq!(status["lowering_debounce"]["status"], "regenerated");
+    assert_eq!(status["lowering_debounce"]["pending"], false);
+    assert_eq!(
+        status["lowered_sqlite"]["artifact_sha256"].as_str(),
+        Some(verified_lower.artifact_sha256.as_str())
+    );
+    assert_eq!(
+        status["lowered_sqlite"]["vault_fingerprint_sha256"].as_str(),
+        Some(verified_lower.vault_fingerprint_sha256.as_str())
+    );
+    assert_eq!(
+        status["lowered_sqlite"]["manifest_seq"].as_u64(),
+        regenerated["manifest_seq"].as_u64()
+    );
     assert_ne!(
         first_lower.vault_fingerprint_sha256,
-        second_lower.vault_fingerprint_sha256
+        verified_lower.vault_fingerprint_sha256
     );
 
     let before_noop = vault.latest_seq();

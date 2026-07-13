@@ -10,6 +10,7 @@ pub(crate) fn shadow_status_summary(project: &str) -> Result<Value, DynError> {
 }
 
 pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Result<Value, DynError> {
+    let lowering_debounce = drive_project_lowering(cache_dir, project)?;
     let sqlite_path = sqlite_path(cache_dir, project);
     let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
         .map(PathBuf::from)
@@ -104,6 +105,7 @@ pub(crate) fn shadow_status_summary_at(cache_dir: &Path, project: &str) -> Resul
         "kernel_context": read_kernel_context_metadata(cache_dir, project)?,
         "anomalies": read_anomaly_report(cache_dir, project)?,
         "provenance": read_provenance_metadata(cache_dir, project)?,
+        "lowering_debounce": lowering_debounce,
         "lowered_sqlite": lowered_summary(
             &lowered_path,
             read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?.as_ref(),

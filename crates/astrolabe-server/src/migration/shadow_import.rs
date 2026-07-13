@@ -136,6 +136,29 @@ pub(crate) struct WeaveDelta {
     pub(crate) removed_cx_ids: BTreeSet<calyx_core::CxId>,
 }
 
+#[derive(Debug, Clone)]
+struct ShadowLowerState {
+    artifact_sha256: String,
+    vault_fingerprint_sha256: String,
+    manifest_seq: u64,
+    node_count: usize,
+    edge_count: usize,
+    skipped_edges: usize,
+}
+
+impl From<astrolabe_lower::LoweredSqliteReport> for ShadowLowerState {
+    fn from(report: astrolabe_lower::LoweredSqliteReport) -> Self {
+        Self {
+            artifact_sha256: report.artifact_sha256,
+            vault_fingerprint_sha256: report.vault_fingerprint_sha256,
+            manifest_seq: report.manifest_seq,
+            node_count: report.node_count,
+            edge_count: report.edge_count,
+            skipped_edges: report.skipped_edges,
+        }
+    }
+}
+
 static SHADOW_EMBEDDING_TABLE: OnceLock<PanelResult<astrolabe_panel::StaticEmbeddingTable>> =
     OnceLock::new();
 
@@ -1082,7 +1105,18 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     });
     let weave = run_live_weave(&vault, project, import_changed, delta.as_ref())?;
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
-    let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
+    let prior_lower = if delta.is_some() {
+        read_persisted_lower_state(&cache_dir, project)?
+    } else {
+        None
+    };
+    let lower_state = match prior_lower {
+        Some(prior) if lowered_sqlite_path.exists() => {
+            schedule_lowering_after_convergence(&cache_dir, project, import_changed, &weave)?;
+            prior
+        }
+        _ => ShadowLowerState::from(lower_shadow_sqlite(&cache_dir, project, &vault)?),
+    };
     let verify = verify_chain(&vault)?;
     if !verify.is_intact() {
         return Err(format!(
@@ -1095,8 +1129,8 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     let search_scale = search_scale_summary(search_scale_settings, total_records)?;
     let provenance = provenance_surface_with_chain(
         shadow_import.provenance,
-        &lower_report.vault_fingerprint_sha256,
-        lower_report.manifest_seq,
+        &lower_state.vault_fingerprint_sha256,
+        lower_state.manifest_seq,
         &verify,
     );
 
@@ -1108,12 +1142,12 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         sqlite_fingerprint_sha256: hex_lower(&report.sqlite_fingerprint_sha256),
         content_freshness_watermark_sha256,
         lowered_sqlite_path,
-        lowered_artifact_sha256: lower_report.artifact_sha256,
-        lowered_vault_fingerprint_sha256: lower_report.vault_fingerprint_sha256,
-        lowered_manifest_seq: lower_report.manifest_seq,
-        lowered_nodes: lower_report.node_count,
-        lowered_edges: lower_report.edge_count,
-        lowered_skipped_edges: lower_report.skipped_edges,
+        lowered_artifact_sha256: lower_state.artifact_sha256,
+        lowered_vault_fingerprint_sha256: lower_state.vault_fingerprint_sha256,
+        lowered_manifest_seq: lower_state.manifest_seq,
+        lowered_nodes: lower_state.node_count,
+        lowered_edges: lower_state.edge_count,
+        lowered_skipped_edges: lower_state.skipped_edges,
         sqlite_nodes: report.sqlite_nodes,
         sqlite_edges: report.sqlite_edges,
         constellation_inputs: report.constellation_inputs,
@@ -1126,7 +1160,7 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         series_mutated_rows: report.series_mutated_rows,
         import_fsv: report.fsv.clone(),
         cx_id_set_sha256: cx_id_set_sha256(&report.cx_ids),
-        ledger_seq: lower_report.manifest_seq,
+        ledger_seq: vault.latest_seq(),
         ledger_rows_after: verify.ledger_rows,
         verify_chain_status: verify.status,
         vault_import_source: shadow_import.source,
@@ -1581,10 +1615,8 @@ where
 ///
 /// Exercised end-to-end by the two-process FSV test
 /// `lowered_regen_serializes_across_two_real_processes_under_lock`. The production
-/// caller — the debounced post-weave lowering lane driving this on
-/// `LowerDebouncer::run_due` — lands with the remaining server weave-production
-/// path (#225 Scope), so this seam is `dead_code` in non-test builds until then.
-#[allow(dead_code)]
+/// The production lowering lane drives this entrypoint through
+/// `LowerDebouncer::run_due` after a persisted weave mutation.
 pub(crate) fn regenerate_lowered_under_lock(
     cache_dir: &Path,
     project: &str,
@@ -1605,6 +1637,74 @@ pub(crate) fn regenerate_lowered_under_lock(
         )
         .map_err(Into::into)
     })
+}
+
+fn read_persisted_lower_state(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<ShadowLowerState>, DynError> {
+    let Some(artifact_sha256) =
+        read_config_value(cache_dir, &metadata_key(project, "lowered_artifact_sha256"))?
+    else {
+        return Ok(None);
+    };
+    let Some(vault_fingerprint_sha256) = read_config_value(
+        cache_dir,
+        &metadata_key(project, "lowered_vault_fingerprint_sha256"),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(manifest_seq) = read_lower_config_u64(cache_dir, project, "lowered_manifest_seq")?
+    else {
+        return Ok(None);
+    };
+    let Some(node_count) = read_lower_config_usize(cache_dir, project, "lowered_nodes")? else {
+        return Ok(None);
+    };
+    let Some(edge_count) = read_lower_config_usize(cache_dir, project, "lowered_edges")? else {
+        return Ok(None);
+    };
+    let Some(skipped_edges) = read_lower_config_usize(cache_dir, project, "lowered_skipped_edges")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ShadowLowerState {
+        artifact_sha256,
+        vault_fingerprint_sha256,
+        manifest_seq,
+        node_count,
+        edge_count,
+        skipped_edges,
+    }))
+}
+
+fn read_lower_config_u64(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<Option<u64>, DynError> {
+    read_config_value(cache_dir, &metadata_key(project, name))?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("invalid persisted {name}: {error}").into())
+        })
+        .transpose()
+}
+
+fn read_lower_config_usize(
+    cache_dir: &Path,
+    project: &str,
+    name: &str,
+) -> Result<Option<usize>, DynError> {
+    read_config_value(cache_dir, &metadata_key(project, name))?
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("invalid persisted {name}: {error}").into())
+        })
+        .transpose()
 }
 
 pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
