@@ -622,9 +622,20 @@ def validate(root: Path) -> list[str]:
             "bash scripts/ci-rust-gate.sh",
             "cargo build --workspace --release",
             "scripts/check-binary-size.py",
+            # #291: failpoint-string scan runs on the freshly built release
+            # binaries, after the size gate and before the release predicate.
+            "scripts/check-release-failpoint-strings.py",
             "scripts/release-predicate.sh",
         ),
         "scripts/check-release.sh",
+        errors,
+    )
+    # #291: the failpoint-string gate's self-test must stay wired into the
+    # change-gated Tier-1 self-test block so the gate itself is proven fail-closed.
+    require(
+        check,
+        "scripts/test-check-release-failpoint-strings.py",
+        "scripts/check.sh",
         errors,
     )
     require(release, "scripts/clean-target.sh", "scripts/check-release.sh", errors)

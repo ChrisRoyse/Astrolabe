@@ -159,6 +159,12 @@ DEPENDENCIES: dict[str, list[str]] = {
     "test-check-suite-impact.py": [
         "scripts/check-suite-impact.py",
     ],
+    # #291: the release failpoint-string gate scans the binaries named in the
+    # binary-size manifest for test-only failpoint markers.
+    "test-check-release-failpoint-strings.py": [
+        "scripts/check-release-failpoint-strings.py",
+        "ci/binary-size-gate.json",
+    ],
 }
 
 

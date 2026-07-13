@@ -63,4 +63,8 @@ bash scripts/ci-rust-gate.sh "$LABEL" "$HOST_TARGET"
 
 cargo build --workspace --release
 "$PYTHON_BIN" scripts/check-binary-size.py
+# #291: byte-level proof that the shipped release binaries carry no test-only
+# failpoint marker (e.g. the calyx-aster crash-fsv env var). Runs on the real
+# artifacts built just above, before the release predicate.
+"$PYTHON_BIN" scripts/check-release-failpoint-strings.py
 bash "$ROOT/scripts/release-predicate.sh" "$@"
