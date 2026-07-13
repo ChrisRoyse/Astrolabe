@@ -130,6 +130,7 @@ fn issue223_loader_rejects_degenerate_lookahead_and_unresolved_rows_loud() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[allow(clippy::too_many_arguments)] // test JSON fixture builder mirrors the wire schema field-for-field
 fn gamma_market(
     condition_id: &str,
     outcomes: &[&str],

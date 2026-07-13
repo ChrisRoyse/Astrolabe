@@ -301,13 +301,13 @@ cd "$ROOT/vendor/calyx"
 # workspace members instead (upstream fix tracked in ChrisRoyse/Calyx).
 run_logged "calyx-fmt-$LABEL" python3 "$ROOT/scripts/native-cargo-fmt.py" --all --manifest-path "$ROOT/vendor/calyx/Cargo.toml" -- --check
 run_logged "calyx-check-$LABEL" cargo check --workspace --all-targets "${CALYX_TARGET_DIR_ARGS[@]}"
-# Vendored Calyx is pinned and never edited locally; at pin 6e0e344 the pinned
-# 1.95 clippy fails -D warnings inside calyx-poly (newer lints firing on older
-# code). Lint hygiene of the pinned tree is upstream-owned: tracked in
-# Astrolabe #234, fix in ChrisRoyse/Calyx#824, retired by a lint-clean pin
-# bump. Named skip, never pass evidence; the behavioral Calyx gates below
-# (check/nextest/doctest) and all Astrolabe-crate clippy stay blocking.
-echo "SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED]: vendored Calyx clippy is upstream-owned at the pin; tracked in #234 (upstream ChrisRoyse/Calyx#824)"
+# Owned-source doctrine (#286): vendor/calyx is Astrolabe's own first-class
+# source, held to the same lint bar as every other crate. The former
+# SKIP[ASTRO_CALYX_CLIPPY_VENDOR_PINNED] (deferring to a lint-clean upstream pin)
+# is retired — the calyx-poly clippy findings it named were fixed in-tree under
+# #234, so Calyx clippy is a real blocking gate phase, identical in form to the
+# Astrolabe-workspace clippy above.
+run_logged "calyx-clippy-$LABEL" cargo clippy --workspace --all-targets "${CALYX_TARGET_DIR_ARGS[@]}" -- -D warnings
 # calyx-poly's issue035 FSV test needs a resolved-market JSONL capture. The
 # machine-local Polymarket capture is gone, so #235 ships a committed synthetic
 # deterministic fixture (fixtures/calyx-issue035/) that satisfies the same
