@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 7] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 8] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -9,7 +9,77 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 7] {
         impute_fields_tool_definition(),
         anchor_outcome_tool_definition(),
         team_artifact_tool_definition(),
+        guard_calibrate_tool_definition(),
     ]
+}
+
+pub(crate) fn guard_calibrate_tool_definition() -> Value {
+    json!({
+        "name": "guard_calibrate",
+        "title": "Guard Calibrate",
+        "description": "Build/refresh a per-domain guard profile by split (inductive) conformal calibration. Each fixed guard slot's per-slot tau is set on a calibration half of its measured bad-cosine population (binomial-bounded), the achieved FAR is measured on a held-out validation half and checked against a finite-sample ceiling, and the FRR is measured on the good population. The calibration is ledgered (kind=Guard, subject=Guard(profile_hash)) and the astrolabe.optimizer_guard_health.v1 profile is persisted. Fails closed on a missing slot, a thin (<2) or single-source population, or a slot whose held-out FAR breaches its bound.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "domain": {
+                    "type": "object",
+                    "description": "Calibration domain = language x scope-class.",
+                    "properties": {
+                        "language": {
+                            "type": "string",
+                            "enum": ["rust", "python", "javascript", "typescript", "go", "java", "c", "cpp", "csharp", "ruby"]
+                        },
+                        "scope_class": {
+                            "type": "string",
+                            "description": "Non-empty scope class such as core, frontend, or test."
+                        }
+                    },
+                    "required": ["language", "scope_class"],
+                    "additionalProperties": false
+                },
+                "alpha": {
+                    "type": "number",
+                    "description": "Binomial confidence level for the per-slot tau bound (default 0.05)."
+                },
+                "slots": {
+                    "type": "array",
+                    "description": "One object per fixed guard slot with measured good_scores and bad_scores cosine arrays.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "slot": {
+                                "type": "string",
+                                "enum": ["code_semantic", "struct_trigrams", "api_callees", "name_semantic", "complexity_profile", "error_surface", "public_api_signature"]
+                            },
+                            "good_scores": {"type": "array", "items": {"type": "number"}},
+                            "bad_scores": {"type": "array", "items": {"type": "number"}}
+                        },
+                        "required": ["slot", "good_scores", "bad_scores"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["project", "domain", "slots"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn anchor_outcome_tool_definition() -> Value {
