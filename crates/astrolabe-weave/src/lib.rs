@@ -3,6 +3,7 @@
 pub mod search;
 pub mod search_eval;
 pub mod search_index;
+pub mod search_production;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
