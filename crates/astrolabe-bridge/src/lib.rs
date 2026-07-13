@@ -3804,8 +3804,11 @@ mod tests {
         let src = repo.join("src");
         std::fs::create_dir_all(&src).expect("create fixture repo");
         // Core language (python is in CBM_GRAMMAR_CORE_LANGS): must index cleanly.
-        std::fs::write(src.join("mod_core.py"), "def py_core_fn():\n    return 41\n")
-            .expect("write python fixture");
+        std::fs::write(
+            src.join("mod_core.py"),
+            "def py_core_fn():\n    return 41\n",
+        )
+        .expect("write python fixture");
         // Stubbed language (zig is NOT core): must be a labeled CBM_GRAMMAR_STUBBED skip.
         std::fs::write(
             src.join("thing.zig"),
@@ -3891,7 +3894,11 @@ mod tests {
             let skipped_count = structured
                 .get("skipped_count")
                 .and_then(serde_json::Value::as_i64)
-                .or_else(|| value.get("skipped_count").and_then(serde_json::Value::as_i64))
+                .or_else(|| {
+                    value
+                        .get("skipped_count")
+                        .and_then(serde_json::Value::as_i64)
+                })
                 .unwrap_or(0);
             let files = structured
                 .get("skipped")
@@ -3903,8 +3910,14 @@ mod tests {
             let mut zig_stub_labeled = false;
             let mut py_skipped = false;
             for fe in &files {
-                let path = fe.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
-                let reason = fe.get("reason").and_then(serde_json::Value::as_str).unwrap_or("");
+                let path = fe
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let reason = fe
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
                 if path.ends_with(".zig") && reason.contains("[CBM_GRAMMAR_STUBBED]") {
                     zig_stub_labeled = true;
                 }

@@ -175,10 +175,9 @@ impl GuardSlot {
 
     pub const fn kind(self) -> SlotKind {
         match self {
-            Self::CodeSemantic
-            | Self::StructTrigrams
-            | Self::ApiCallees
-            | Self::ErrorSurface => SlotKind::Content,
+            Self::CodeSemantic | Self::StructTrigrams | Self::ApiCallees | Self::ErrorSurface => {
+                SlotKind::Content
+            }
             Self::NameSemantic | Self::ComplexityProfile => SlotKind::Stylistic,
             Self::PublicApiSignature => SlotKind::Identity,
         }
@@ -300,8 +299,10 @@ impl GuardProfile {
     /// A cold-start profile for `domain`: every slot at `tau = 0.7`, provisional.
     /// Verdicts against it are labeled provisional; high-stakes mode refuses.
     pub fn cold_start(domain: CalibrationDomain) -> Self {
-        let slots: Vec<SlotCalibration> =
-            GuardSlot::ALL.iter().map(|slot| SlotCalibration::cold_start(*slot)).collect();
+        let slots: Vec<SlotCalibration> = GuardSlot::ALL
+            .iter()
+            .map(|slot| SlotCalibration::cold_start(*slot))
+            .collect();
         Self {
             domain,
             slots,
@@ -313,18 +314,26 @@ impl GuardProfile {
     }
 
     pub fn slot(&self, slot: GuardSlot) -> Option<&SlotCalibration> {
-        self.slots.iter().find(|calibration| calibration.slot == slot)
+        self.slots
+            .iter()
+            .find(|calibration| calibration.slot == slot)
     }
 
     /// Lowercase hex of the corpus hash.
     pub fn corpus_hash_hex(&self) -> String {
-        self.corpus_hash.iter().map(|byte| format!("{byte:02x}")).collect()
+        self.corpus_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Lowercase hex of the canonical profile hash (`profile_hash`), the value
     /// pinned into the ledger `CalibrationMeta` payload.
     pub fn profile_hash_hex(&self) -> String {
-        self.canonical_profile_hash().iter().map(|byte| format!("{byte:02x}")).collect()
+        self.canonical_profile_hash()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// SHA-256 over the canonical profile bytes.
@@ -402,8 +411,14 @@ impl GuardProfile {
 /// four content slots (allow at most one content dimension to miss before the
 /// candidate is out-of-distribution).
 pub fn default_content_policy() -> CombinationPolicy {
-    let n = GuardSlot::ALL.iter().filter(|slot| slot.kind() == SlotKind::Content).count();
-    CombinationPolicy::KofN { k: n.saturating_sub(1), n }
+    let n = GuardSlot::ALL
+        .iter()
+        .filter(|slot| slot.kind() == SlotKind::Content)
+        .count();
+    CombinationPolicy::KofN {
+        k: n.saturating_sub(1),
+        n,
+    }
 }
 
 /// Reconstruct a [`SlotCalibration`] from its raw byte encoding (the CF
@@ -413,7 +428,10 @@ pub fn slot_calibration_from_raw_bytes(bytes: &[u8]) -> Result<SlotCalibration, 
     if bytes.len() != LEN {
         return Err(CalibrationError::new(
             "ASTRO_GUARD_RAW_SLOT_MALFORMED",
-            format!("raw slot record is {} bytes; expected exactly {LEN}", bytes.len()),
+            format!(
+                "raw slot record is {} bytes; expected exactly {LEN}",
+                bytes.len()
+            ),
             "Re-read the full fixed-width raw slot record before decoding.",
         ));
     }
@@ -463,13 +481,17 @@ pub fn slot_calibration_from_raw_bytes(bytes: &[u8]) -> Result<SlotCalibration, 
 }
 
 fn guard_slot_from_ordinal(ordinal: u8) -> Result<GuardSlot, CalibrationError> {
-    GuardSlot::ALL.iter().copied().find(|slot| slot.ordinal() == ordinal).ok_or_else(|| {
-        CalibrationError::new(
-            "ASTRO_GUARD_RAW_SLOT_MALFORMED",
-            format!("raw slot ordinal {ordinal} is out of range"),
-            "Re-read the raw slot record; the ordinal byte is corrupt.",
-        )
-    })
+    GuardSlot::ALL
+        .iter()
+        .copied()
+        .find(|slot| slot.ordinal() == ordinal)
+        .ok_or_else(|| {
+            CalibrationError::new(
+                "ASTRO_GUARD_RAW_SLOT_MALFORMED",
+                format!("raw slot ordinal {ordinal} is out of range"),
+                "Re-read the raw slot record; the ordinal byte is corrupt.",
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -615,10 +637,16 @@ pub fn calibrate_profile<S: SlotScorer>(
 ) -> Result<GuardProfile, CalibrationError> {
     let mut slots = Vec::with_capacity(GuardSlot::ALL.len());
     for slot in GuardSlot::ALL {
-        let good_scores: Vec<f32> =
-            corpus.good_cases.iter().map(|case| scorer.score_good(slot, case)).collect();
-        let bad_scores: Vec<f32> =
-            corpus.bad_cases.iter().map(|case| scorer.score_bad(slot, case)).collect();
+        let good_scores: Vec<f32> = corpus
+            .good_cases
+            .iter()
+            .map(|case| scorer.score_good(slot, case))
+            .collect();
+        let bad_scores: Vec<f32> = corpus
+            .bad_cases
+            .iter()
+            .map(|case| scorer.score_bad(slot, case))
+            .collect();
         slots.push(calibrate_slot(
             slot,
             &good_scores,
@@ -738,15 +766,19 @@ pub fn combine_verdicts(
     let mut verdict = GuardVerdict::Accept;
     let mut reason = String::from("all slots within their calibrated trusted region");
 
-    let escalate = |candidate: GuardVerdict, why: String, verdict: &mut GuardVerdict, reason: &mut String| {
-        if candidate > *verdict {
-            *verdict = candidate;
-            *reason = why;
-        }
-    };
+    let escalate =
+        |candidate: GuardVerdict, why: String, verdict: &mut GuardVerdict, reason: &mut String| {
+            if candidate > *verdict {
+                *verdict = candidate;
+                *reason = why;
+            }
+        };
 
     // 1. Identity slots (AllRequired). A failing identity slot dominates.
-    for slot_verdict in per_slot.iter().filter(|sv| sv.slot.kind() == SlotKind::Identity) {
+    for slot_verdict in per_slot
+        .iter()
+        .filter(|sv| sv.slot.kind() == SlotKind::Identity)
+    {
         if !slot_verdict.pass() {
             let within_band = slot_verdict.margin() >= -IDENTITY_QUARANTINE_MARGIN;
             if within_band {
@@ -781,8 +813,10 @@ pub fn combine_verdicts(
 
     // 2. Content slots (KofN). Too many content misses => OOD refusal; exactly
     //    the tolerated single miss => novel-but-plausible new-region.
-    let content: Vec<&SlotVerdict> =
-        per_slot.iter().filter(|sv| sv.slot.kind() == SlotKind::Content).collect();
+    let content: Vec<&SlotVerdict> = per_slot
+        .iter()
+        .filter(|sv| sv.slot.kind() == SlotKind::Content)
+        .collect();
     if !content.is_empty() {
         let passes = content.iter().filter(|sv| sv.pass()).count();
         let required_k = match content_policy {
@@ -790,8 +824,11 @@ pub fn combine_verdicts(
             CombinationPolicy::KofN { k, .. } => k.min(content.len()),
         };
         if passes < required_k {
-            let failed: Vec<&str> =
-                content.iter().filter(|sv| !sv.pass()).map(|sv| sv.slot.as_str()).collect();
+            let failed: Vec<&str> = content
+                .iter()
+                .filter(|sv| !sv.pass())
+                .map(|sv| sv.slot.as_str())
+                .collect();
             escalate(
                 GuardVerdict::Refuse,
                 format!(
@@ -803,8 +840,11 @@ pub fn combine_verdicts(
                 &mut reason,
             );
         } else if passes < content.len() {
-            let failed: Vec<&str> =
-                content.iter().filter(|sv| !sv.pass()).map(|sv| sv.slot.as_str()).collect();
+            let failed: Vec<&str> = content
+                .iter()
+                .filter(|sv| !sv.pass())
+                .map(|sv| sv.slot.as_str())
+                .collect();
             escalate(
                 GuardVerdict::NewRegion,
                 format!(
@@ -834,7 +874,12 @@ pub fn combine_verdicts(
         );
     }
 
-    CombinedVerdict { verdict, per_slot: per_slot.to_vec(), provisional, reason }
+    CombinedVerdict {
+        verdict,
+        per_slot: per_slot.to_vec(),
+        provisional,
+        reason,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -857,10 +902,19 @@ pub fn calibration_meta_payload_bytes(profile: &GuardProfile) -> Vec<u8> {
     let mut out = String::new();
     out.push('{');
     out.push_str(&format!("\"schema\":\"{}\",", GUARD_PROFILE_SCHEMA));
-    out.push_str(&format!("\"knob_registry\":\"{}\",", GUARD_PROFILE_KNOB_REGISTRY_VERSION));
+    out.push_str(&format!(
+        "\"knob_registry\":\"{}\",",
+        GUARD_PROFILE_KNOB_REGISTRY_VERSION
+    ));
     out.push_str(&format!("\"domain\":\"{}\",", profile.domain.label()));
-    out.push_str(&format!("\"profile_hash\":\"{}\",", profile.profile_hash_hex()));
-    out.push_str(&format!("\"corpus_hash\":\"{}\",", profile.corpus_hash_hex()));
+    out.push_str(&format!(
+        "\"profile_hash\":\"{}\",",
+        profile.profile_hash_hex()
+    ));
+    out.push_str(&format!(
+        "\"corpus_hash\":\"{}\",",
+        profile.corpus_hash_hex()
+    ));
     out.push_str("\"slots\":[");
     let mut ordered: Vec<&SlotCalibration> = profile.slots.iter().collect();
     ordered.sort_by_key(|calibration| calibration.slot.ordinal());
@@ -892,7 +946,11 @@ fn json_f32(value: f32) -> String {
     if value.is_nan() {
         "0".to_string()
     } else if value.is_infinite() {
-        if value > 0.0 { "1e38".to_string() } else { "-1e38".to_string() }
+        if value > 0.0 {
+            "1e38".to_string()
+        } else {
+            "-1e38".to_string()
+        }
     } else {
         // Use the shortest round-trippable representation.
         let text = format!("{value}");
@@ -907,9 +965,7 @@ fn json_f32(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::{
-        BadCase, BadCaseGenerator, CalibrationLanguage, GoodCase,
-    };
+    use crate::calibration::{BadCase, BadCaseGenerator, CalibrationLanguage, GoodCase};
 
     fn domain() -> CalibrationDomain {
         CalibrationDomain::new(CalibrationLanguage::Rust, "core").expect("valid domain")
@@ -924,7 +980,12 @@ mod tests {
         assert!(profile.calibrated_ledger_seq.is_none());
         assert_eq!(profile.slots.len(), GuardSlot::ALL.len());
         for slot in &profile.slots {
-            assert_eq!(slot.tau, 0.7, "cold-start tau must be 0.7 for {}", slot.slot.as_str());
+            assert_eq!(
+                slot.tau,
+                0.7,
+                "cold-start tau must be 0.7 for {}",
+                slot.slot.as_str()
+            );
             assert!(slot.provisional);
         }
     }
@@ -950,7 +1011,11 @@ mod tests {
     #[test]
     fn conformal_tau_meets_each_far_class_with_binomial_bound() {
         let bad = known_bad_population();
-        for target_far in [IDENTITY_TARGET_FAR, CONTENT_TARGET_FAR, STYLISTIC_TARGET_FAR] {
+        for target_far in [
+            IDENTITY_TARGET_FAR,
+            CONTENT_TARGET_FAR,
+            STYLISTIC_TARGET_FAR,
+        ] {
             let tau = conformal_tau(&bad, target_far, CONFORMAL_ALPHA);
             let achieved = false_accept_rate(&bad, tau);
             // The binomial-bounded estimator never *exceeds* the target on the
@@ -964,7 +1029,10 @@ mod tests {
             // 0.99 are the top three). The binomial bound pushes it strictly
             // higher, so tau > 0.96.
             if (target_far - CONTENT_TARGET_FAR).abs() < 1e-6 {
-                assert!(tau > 0.96, "content tau {tau} must exclude all but the top bad scores");
+                assert!(
+                    tau > 0.96,
+                    "content tau {tau} must exclude all but the top bad scores"
+                );
             }
         }
     }
@@ -976,9 +1044,14 @@ mod tests {
         // held-out FAR within the finite-sample ceiling.
         let good: Vec<f32> = (0..60).map(|i| 0.85 + (i % 10) as f32 * 0.01).collect();
         let bad: Vec<f32> = (0..80).map(|i| 0.10 + (i % 40) as f32 * 0.015).collect();
-        let calibration =
-            calibrate_slot(GuardSlot::CodeSemantic, &good, &bad, CONTENT_TARGET_FAR, CONFORMAL_ALPHA)
-                .expect("calibrates");
+        let calibration = calibrate_slot(
+            GuardSlot::CodeSemantic,
+            &good,
+            &bad,
+            CONTENT_TARGET_FAR,
+            CONFORMAL_ALPHA,
+        )
+        .expect("calibrates");
         let bound = finite_sample_far_bound(
             CONTENT_TARGET_FAR,
             calibration.n_bad_validation,
@@ -990,7 +1063,10 @@ mod tests {
             calibration.achieved_far
         );
         assert!(!calibration.provisional);
-        assert_eq!(calibration.drift_bound, DRIFT_ALARM_MULTIPLIER * calibration.achieved_far);
+        assert_eq!(
+            calibration.drift_bound,
+            DRIFT_ALARM_MULTIPLIER * calibration.achieved_far
+        );
     }
 
     #[test]
@@ -1010,11 +1086,8 @@ mod tests {
         // exceeded (over-accept) — the fail-closed path we require.
         if let Ok(cal) = err {
             // If it did calibrate, the achieved FAR must still respect the bound.
-            let bound = finite_sample_far_bound(
-                IDENTITY_TARGET_FAR,
-                cal.n_bad_validation,
-                CONFORMAL_ALPHA,
-            );
+            let bound =
+                finite_sample_far_bound(IDENTITY_TARGET_FAR, cal.n_bad_validation, CONFORMAL_ALPHA);
             assert!(cal.achieved_far <= bound + f32::EPSILON);
         }
     }
@@ -1041,7 +1114,10 @@ mod tests {
             sv(GuardSlot::PublicApiSignature, 0.10, 0.95),
         ];
         let mean: f32 = per_slot.iter().map(|s| s.cos).sum::<f32>() / per_slot.len() as f32;
-        assert!(mean > 0.80, "mean cosine {mean} would pass a flat threshold");
+        assert!(
+            mean > 0.80,
+            "mean cosine {mean} would pass a flat threshold"
+        );
         let combined = combine_verdicts(&per_slot, default_content_policy(), false);
         assert_eq!(
             combined.verdict,
@@ -1067,15 +1143,28 @@ mod tests {
             sv(GuardSlot::PublicApiSignature, 0.93, 0.95),
         ];
         let combined = combine_verdicts(&per_slot, default_content_policy(), false);
-        assert_eq!(combined.verdict, GuardVerdict::Quarantine, "{}", combined.reason);
+        assert_eq!(
+            combined.verdict,
+            GuardVerdict::Quarantine,
+            "{}",
+            combined.reason
+        );
     }
 
     #[test]
     fn one_content_miss_is_new_region_two_is_refuse() {
         let base = |semantic_pass: bool, struct_pass: bool| {
             vec![
-                sv(GuardSlot::CodeSemantic, if semantic_pass { 0.90 } else { 0.10 }, 0.80),
-                sv(GuardSlot::StructTrigrams, if struct_pass { 0.90 } else { 0.10 }, 0.80),
+                sv(
+                    GuardSlot::CodeSemantic,
+                    if semantic_pass { 0.90 } else { 0.10 },
+                    0.80,
+                ),
+                sv(
+                    GuardSlot::StructTrigrams,
+                    if struct_pass { 0.90 } else { 0.10 },
+                    0.80,
+                ),
                 sv(GuardSlot::ApiCallees, 0.90, 0.80),
                 sv(GuardSlot::ErrorSurface, 0.90, 0.80),
                 sv(GuardSlot::NameSemantic, 0.90, 0.70),
@@ -1104,7 +1193,12 @@ mod tests {
             sv(GuardSlot::PublicApiSignature, 0.99, 0.95),
         ];
         let combined = combine_verdicts(&per_slot, default_content_policy(), false);
-        assert_eq!(combined.verdict, GuardVerdict::NewRegion, "{}", combined.reason);
+        assert_eq!(
+            combined.verdict,
+            GuardVerdict::NewRegion,
+            "{}",
+            combined.reason
+        );
     }
 
     #[test]
@@ -1125,7 +1219,9 @@ mod tests {
     fn combine_verdicts_source_has_no_cosine_flattening() {
         let source = include_str!("profile.rs");
         // Isolate the shipped combine_verdicts function body (up to the tests).
-        let start = source.find("pub fn combine_verdicts").expect("combine_verdicts present");
+        let start = source
+            .find("pub fn combine_verdicts")
+            .expect("combine_verdicts present");
         let tests_at = source.find("#[cfg(test)]").expect("tests module present");
         let body = &source[start..tests_at];
         assert!(
@@ -1153,9 +1249,18 @@ mod tests {
         let decoded = slot_calibration_from_raw_bytes(&bytes).expect("decodes");
         // Bit-exact: raw IEEE-754, no int8 quantization would preserve this.
         assert_eq!(decoded.tau.to_bits(), calibrated.tau.to_bits());
-        assert_eq!(decoded.achieved_far.to_bits(), calibrated.achieved_far.to_bits());
-        assert_eq!(decoded.achieved_frr.to_bits(), calibrated.achieved_frr.to_bits());
-        assert_eq!(decoded.drift_bound.to_bits(), calibrated.drift_bound.to_bits());
+        assert_eq!(
+            decoded.achieved_far.to_bits(),
+            calibrated.achieved_far.to_bits()
+        );
+        assert_eq!(
+            decoded.achieved_frr.to_bits(),
+            calibrated.achieved_frr.to_bits()
+        );
+        assert_eq!(
+            decoded.drift_bound.to_bits(),
+            calibrated.drift_bound.to_bits()
+        );
         assert_eq!(decoded, calibrated);
         // A quantized (int8) store would collapse nearby taus; prove two taus
         // that differ by < 1/255 survive distinctly through the raw round-trip.
@@ -1165,7 +1270,11 @@ mod tests {
         b.tau = 0.900_500_0;
         let da = slot_calibration_from_raw_bytes(&profile.raw_slot_bytes(&a)).unwrap();
         let db = slot_calibration_from_raw_bytes(&profile.raw_slot_bytes(&b)).unwrap();
-        assert_ne!(da.tau.to_bits(), db.tau.to_bits(), "raw store must not quantize taus");
+        assert_ne!(
+            da.tau.to_bits(),
+            db.tau.to_bits(),
+            "raw store must not quantize taus"
+        );
     }
 
     #[test]
@@ -1182,17 +1291,28 @@ mod tests {
     #[test]
     fn empty_bad_population_is_refused() {
         let good: Vec<f32> = (0..10).map(|i| 0.9 + i as f32 * 0.001).collect();
-        let err = calibrate_slot(GuardSlot::CodeSemantic, &good, &[], CONTENT_TARGET_FAR, CONFORMAL_ALPHA)
-            .expect_err("empty bad set refused");
+        let err = calibrate_slot(
+            GuardSlot::CodeSemantic,
+            &good,
+            &[],
+            CONTENT_TARGET_FAR,
+            CONFORMAL_ALPHA,
+        )
+        .expect_err("empty bad set refused");
         assert_eq!(err.code(), "ASTRO_GUARD_SLOT_UNSPLITTABLE");
     }
 
     #[test]
     fn single_element_bad_population_is_refused() {
         let good: Vec<f32> = (0..10).map(|i| 0.9 + i as f32 * 0.001).collect();
-        let err =
-            calibrate_slot(GuardSlot::CodeSemantic, &good, &[0.3], CONTENT_TARGET_FAR, CONFORMAL_ALPHA)
-                .expect_err("single bad case cannot be split");
+        let err = calibrate_slot(
+            GuardSlot::CodeSemantic,
+            &good,
+            &[0.3],
+            CONTENT_TARGET_FAR,
+            CONFORMAL_ALPHA,
+        )
+        .expect_err("single bad case cannot be split");
         assert_eq!(err.code(), "ASTRO_GUARD_SLOT_UNSPLITTABLE");
     }
 
@@ -1203,11 +1323,27 @@ mod tests {
         // holding the held-out FAR at 0.
         let bad: Vec<f32> = vec![0.5; 40];
         let good: Vec<f32> = vec![0.9; 20];
-        let cal = calibrate_slot(GuardSlot::CodeSemantic, &good, &bad, CONTENT_TARGET_FAR, CONFORMAL_ALPHA)
-            .expect("identical scores calibrate");
-        assert!(cal.tau > 0.5, "tau {} must exclude the identical bad mass", cal.tau);
-        assert_eq!(cal.achieved_far, 0.0, "held-out FAR must be 0 when tau excludes all bad");
-        assert_eq!(cal.achieved_frr, 0.0, "good at 0.9 >= tau, no false rejects");
+        let cal = calibrate_slot(
+            GuardSlot::CodeSemantic,
+            &good,
+            &bad,
+            CONTENT_TARGET_FAR,
+            CONFORMAL_ALPHA,
+        )
+        .expect("identical scores calibrate");
+        assert!(
+            cal.tau > 0.5,
+            "tau {} must exclude the identical bad mass",
+            cal.tau
+        );
+        assert_eq!(
+            cal.achieved_far, 0.0,
+            "held-out FAR must be 0 when tau excludes all bad"
+        );
+        assert_eq!(
+            cal.achieved_frr, 0.0,
+            "good at 0.9 >= tau, no false rejects"
+        );
     }
 
     // -- Calibration meta payload / provenance schema ------------------------
@@ -1235,7 +1371,10 @@ mod tests {
         assert_eq!(value["schema"], GUARD_PROFILE_SCHEMA);
         assert_eq!(value["knob_registry"], GUARD_PROFILE_KNOB_REGISTRY_VERSION);
         assert_eq!(value["profile_hash"], profile.profile_hash_hex());
-        assert_eq!(value["slots"].as_array().unwrap().len(), GuardSlot::ALL.len());
+        assert_eq!(
+            value["slots"].as_array().unwrap().len(),
+            GuardSlot::ALL.len()
+        );
         // Determinism: same profile => byte-identical payload.
         assert_eq!(calibration_meta_payload_bytes(&profile), bytes);
         // Provenance schema: each slot carries slot/kind/tau/far/frr/drift.
@@ -1257,7 +1396,10 @@ mod tests {
         // is invariant to in-memory slot order.
         profile.slots.reverse();
         let hash_b = profile.canonical_profile_hash();
-        assert_eq!(hash_a, hash_b, "profile hash must be slot-order-independent");
+        assert_eq!(
+            hash_a, hash_b,
+            "profile hash must be slot-order-independent"
+        );
     }
 
     /// A per-slot fixture scorer for the full-profile calibration proof: good
@@ -1332,7 +1474,11 @@ mod tests {
         assert!(!profile.provisional);
         assert_eq!(profile.corpus_hash, corpus.corpus_hash);
         for slot in &profile.slots {
-            assert!(!slot.provisional, "slot {} still provisional", slot.slot.as_str());
+            assert!(
+                !slot.provisional,
+                "slot {} still provisional",
+                slot.slot.as_str()
+            );
             // tau sits above the bad band (~0.45) and below the good band (0.92):
             // it separates the two populations rather than collapsing into either.
             assert!(
@@ -1342,7 +1488,12 @@ mod tests {
                 slot.tau
             );
             // Good cases at 0.92 are never rejected: FRR is zero.
-            assert_eq!(slot.achieved_frr, 0.0, "slot {} rejects good cases", slot.slot.as_str());
+            assert_eq!(
+                slot.achieved_frr,
+                0.0,
+                "slot {} rejects good cases",
+                slot.slot.as_str()
+            );
             let bound =
                 finite_sample_far_bound(slot.target_far, slot.n_bad_validation, CONFORMAL_ALPHA);
             assert!(slot.achieved_far <= bound + f32::EPSILON);

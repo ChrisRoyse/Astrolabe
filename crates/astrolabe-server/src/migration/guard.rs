@@ -131,7 +131,9 @@ pub(crate) fn guard_calibrate_at(
 /// Resolve the declared calibration mode. An explicit `mode` field wins; otherwise
 /// the mode is inferred from exactly one of `slots`/`sources` being present. Both or
 /// neither present is a fail-closed ambiguity (never a silent default).
-fn resolve_calibration_mode(args_obj: &Map<String, Value>) -> Result<CalibrationMode, GuardRefusal> {
+fn resolve_calibration_mode(
+    args_obj: &Map<String, Value>,
+) -> Result<CalibrationMode, GuardRefusal> {
     let has_slots = args_obj.get("slots").and_then(Value::as_array).is_some();
     let has_sources = args_obj.get("sources").and_then(Value::as_array).is_some();
     match args_obj.get("mode").and_then(Value::as_str) {
@@ -170,26 +172,34 @@ fn build_supplied_profile(
         return Err((
             "ASTRO_GUARD_CALIBRATE_INVALID".to_string(),
             "guard_calibrate (supplied mode) requires a slots array".to_string(),
-            "Provide one slot object per fixed guard slot with good_scores and bad_scores.".to_string(),
+            "Provide one slot object per fixed guard slot with good_scores and bad_scores."
+                .to_string(),
         ));
     };
 
     let mut calibrations: Vec<SlotCalibration> = Vec::with_capacity(GuardSlot::ALL.len());
     for slot in GuardSlot::ALL {
-        let Some(spec) = slot_specs.iter().find(|spec| {
-            spec.get("slot").and_then(Value::as_str) == Some(slot.as_str())
-        }) else {
+        let Some(spec) = slot_specs
+            .iter()
+            .find(|spec| spec.get("slot").and_then(Value::as_str) == Some(slot.as_str()))
+        else {
             return Err((
                 "ASTRO_GUARD_CALIBRATE_SLOT_MISSING".to_string(),
                 format!("slots is missing required guard slot `{}`", slot.as_str()),
                 "Supply a slot object for every fixed guard slot before calibrating.".to_string(),
             ));
         };
-        let good_scores = parse_scores(spec, "good_scores", slot)
-            .map_err(|(c, m, r)| (c.to_string(), m, r))?;
-        let bad_scores = parse_scores(spec, "bad_scores", slot)
-            .map_err(|(c, m, r)| (c.to_string(), m, r))?;
-        match calibrate_slot(slot, &good_scores, &bad_scores, slot.default_target_far(), alpha) {
+        let good_scores =
+            parse_scores(spec, "good_scores", slot).map_err(|(c, m, r)| (c.to_string(), m, r))?;
+        let bad_scores =
+            parse_scores(spec, "bad_scores", slot).map_err(|(c, m, r)| (c.to_string(), m, r))?;
+        match calibrate_slot(
+            slot,
+            &good_scores,
+            &bad_scores,
+            slot.default_target_far(),
+            alpha,
+        ) {
             Ok(calibration) => calibrations.push(calibration),
             Err(error) => {
                 // Surface the guard-crate error code verbatim (e.g.
@@ -320,7 +330,10 @@ fn build_auto_profile(
     let driver = PanelDriver::new(panel_version).map_err(|err| {
         (
             "ASTRO_GUARD_CALIBRATE_PANEL_VERSION".to_string(),
-            format!("panel version {panel_version} is invalid: {}", err.message()),
+            format!(
+                "panel version {panel_version} is invalid: {}",
+                err.message()
+            ),
             "Calibrate with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
         )
     })?;
@@ -357,7 +370,9 @@ fn build_auto_profile(
             _ => {
                 return Err((
                     "ASTRO_GUARD_CALIBRATE_SOURCE_CLASS".to_string(),
-                    format!("source #{index} has no recognized class (expected \"good\" or \"bad\")"),
+                    format!(
+                        "source #{index} has no recognized class (expected \"good\" or \"bad\")"
+                    ),
                     "Tag every source good (in-distribution) or bad (out-of-distribution)."
                         .to_string(),
                 ));
@@ -366,7 +381,15 @@ fn build_auto_profile(
     }
 
     let corpus_hash = auto_corpus_hash(&identities);
-    calibrate_auto(domain.clone(), panel_version, &good, &bad, corpus_hash, alpha).map_err(|err| {
+    calibrate_auto(
+        domain.clone(),
+        panel_version,
+        &good,
+        &bad,
+        corpus_hash,
+        alpha,
+    )
+    .map_err(|err| {
         (
             err.code().to_string(),
             err.message().to_string(),
@@ -385,7 +408,10 @@ fn measure_source_through_panel(
     index: usize,
 ) -> Result<MeasuredSymbol, GuardRefusal> {
     let string_field = |key: &str| -> String {
-        obj.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+        obj.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
     };
     let label = source_symbol_label(obj, index)?;
     let source_bytes = obj
@@ -412,7 +438,10 @@ fn measure_source_through_panel(
     let readout = driver.measure(&input, runtime).map_err(|err| {
         (
             "ASTRO_GUARD_CALIBRATE_PANEL_FAILED".to_string(),
-            format!("source #{index} panel measurement failed: {}", err.message()),
+            format!(
+                "source #{index} panel measurement failed: {}",
+                err.message()
+            ),
             "Fix the source's panel inputs or re-index the project; the auto path never falls \
              back to supplied cosines on a panel failure."
                 .to_string(),
@@ -569,7 +598,10 @@ fn parse_domain(
             "Use one of: rust, python, javascript, typescript, go, java, c, cpp, csharp, ruby.",
         ));
     };
-    let scope_class = domain_obj.get("scope_class").and_then(Value::as_str).unwrap_or("");
+    let scope_class = domain_obj
+        .get("scope_class")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     CalibrationDomain::new(language, scope_class).map_err(|_| {
         (
             "ASTRO_GUARD_CALIBRATE_INVALID",
@@ -580,7 +612,10 @@ fn parse_domain(
 }
 
 fn language_from_str(value: &str) -> Option<CalibrationLanguage> {
-    CalibrationLanguage::ALL.iter().copied().find(|language| language.as_str() == value)
+    CalibrationLanguage::ALL
+        .iter()
+        .copied()
+        .find(|language| language.as_str() == value)
 }
 
 fn parse_scores(
@@ -592,7 +627,10 @@ fn parse_scores(
         return Err((
             "ASTRO_GUARD_CALIBRATE_INVALID",
             format!("slot `{}` requires a numeric {field} array", slot.as_str()),
-            format!("Provide {field} as an array of measured cosine scores for slot {}.", slot.as_str()),
+            format!(
+                "Provide {field} as an array of measured cosine scores for slot {}.",
+                slot.as_str()
+            ),
         ));
     };
     let mut scores = Vec::with_capacity(array.len());
@@ -600,7 +638,10 @@ fn parse_scores(
         let Some(score) = value.as_f64() else {
             return Err((
                 "ASTRO_GUARD_CALIBRATE_INVALID",
-                format!("slot `{}` {field} contains a non-numeric entry", slot.as_str()),
+                format!(
+                    "slot `{}` {field} contains a non-numeric entry",
+                    slot.as_str()
+                ),
                 "All score entries must be JSON numbers.".to_string(),
             ));
         };

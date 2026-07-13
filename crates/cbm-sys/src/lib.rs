@@ -604,7 +604,10 @@ mod tests {
                     properties_json: std::ptr::null(),
                 };
                 let id = cbm_store_upsert_node(store, &node);
-                assert!(id > 0, "cbm_store_upsert_node returned id={id} for node {i}");
+                assert!(
+                    id > 0,
+                    "cbm_store_upsert_node returned id={id} for node {i}"
+                );
             }
 
             // Read the persisted state back from the real store.
@@ -627,7 +630,7 @@ mod tests {
     #[cfg(not(cbm_sys_asan))]
     #[test]
     fn cross_heap_alloc_and_free_through_ffi_seam() {
-        use std::alloc::{alloc, dealloc, Layout};
+        use std::alloc::{Layout, alloc, dealloc};
 
         initialize_allocator_bindings_first();
 
@@ -653,7 +656,10 @@ mod tests {
         // global allocator's dealloc (which routes to cbm_mimalloc_free).
         unsafe {
             let c_ptr = cbm_mimalloc_malloc_aligned(SIZE, 64).cast::<u8>();
-            assert!(!c_ptr.is_null(), "cbm_mimalloc_malloc_aligned returned NULL");
+            assert!(
+                !c_ptr.is_null(),
+                "cbm_mimalloc_malloc_aligned returned NULL"
+            );
             std::ptr::write_bytes(c_ptr, 0x5A, SIZE);
             let usable = cbm_mimalloc_usable_size(c_ptr.cast::<c_void>());
             assert!(

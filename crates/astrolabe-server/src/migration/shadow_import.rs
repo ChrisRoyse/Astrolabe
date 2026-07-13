@@ -1014,7 +1014,13 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     repo: Option<&Path>,
 ) -> Result<ShadowImportOutcome, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    import_shadow_vault_with_archaeology_at(&cache_dir, project, row_sink, search_scale_settings, repo)
+    import_shadow_vault_with_archaeology_at(
+        &cache_dir,
+        project,
+        row_sink,
+        search_scale_settings,
+        repo,
+    )
 }
 
 pub(crate) fn import_shadow_vault_with_archaeology_at(

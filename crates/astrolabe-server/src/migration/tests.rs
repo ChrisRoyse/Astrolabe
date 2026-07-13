@@ -223,7 +223,10 @@ fn git_archaeology_incremental_ticks_converge_to_full_pass_anchor_bytes() {
     )
     .unwrap();
     assert_eq!(tick2.mode, "incremental");
-    assert_eq!(tick2.head, revert_sha, "tick2 checkpoint advances to the revert");
+    assert_eq!(
+        tick2.head, revert_sha,
+        "tick2 checkpoint advances to the revert"
+    );
     assert!(
         tick2.anchors_written >= 1,
         "tick2 must anchor the revert: {tick2:#?}"
@@ -3639,7 +3642,15 @@ fn health_surface_schema_is_golden() {
         "checked_at_unix_ms": 1234,
         "trust": "verified",
     });
-    let health = health_surface_json("demo", "intact", true, Some(7), Some(3), Some(&lane), Some(&periodic));
+    let health = health_surface_json(
+        "demo",
+        "intact",
+        true,
+        Some(7),
+        Some(3),
+        Some(&lane),
+        Some(&periodic),
+    );
 
     let top_keys: BTreeSet<&str> = health
         .as_object()
@@ -4398,7 +4409,10 @@ fn team_artifact_refused_import_runs_local_reindex_fallback() {
         let raw = handle_team_artifact(&runner, &args).expect("import returns an envelope");
         let value: Value = serde_json::from_str(&raw).expect("import envelope is JSON");
 
-        assert_eq!(value["isError"], true, "tampered import must be refused: {raw}");
+        assert_eq!(
+            value["isError"], true,
+            "tampered import must be refused: {raw}"
+        );
         let structured = &value["structuredContent"];
         assert_eq!(structured["status"], "refused");
         assert_eq!(structured["code"], ASTRO_TEAM_ARTIFACT_VAULT_BYTES);
@@ -5015,10 +5029,7 @@ fn guard_calibrate_calibrates_ledgers_and_persists_measured_profile() {
         .unwrap();
     // target_far is stored f32; JSON carries its exact f64 widening, so assert
     // the truthful persisted representation (0.01f32 != 0.01f64).
-    assert_eq!(
-        identity["target_far"].as_f64().unwrap(),
-        f64::from(0.01f32)
-    );
+    assert_eq!(identity["target_far"].as_f64().unwrap(), f64::from(0.01f32));
     // Derivation of the achieved held-out FAR (proves the conformal tau is
     // correctly placed and 0.05 is the honest value, not a defect):
     //   bad scores = 0.10..=0.49, each value appearing twice (i % 40).
@@ -5091,7 +5102,10 @@ fn guard_calibrate_refuses_missing_slot() {
     let envelope = guard_calibrate_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     let text = envelope["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("ASTRO_GUARD_CALIBRATE_SLOT_MISSING"), "{text}");
+    assert!(
+        text.contains("ASTRO_GUARD_CALIBRATE_SLOT_MISSING"),
+        "{text}"
+    );
     assert!(text.contains("public_api_signature"), "{text}");
 
     // FSV: nothing was persisted — no measured guard-health config row exists.
@@ -5185,7 +5199,10 @@ fn setup_guard_check_calibrated(dir: &Path, salt: &str) {
         "slots": guard_calibrate_slots_json(),
     });
     let envelope = guard_calibrate_structured(dir, &args);
-    assert_eq!(envelope["isError"], false, "calibrate must succeed: {envelope}");
+    assert_eq!(
+        envelope["isError"], false,
+        "calibrate must succeed: {envelope}"
+    );
 }
 
 #[test]
@@ -5276,7 +5293,11 @@ fn guard_check_refuses_alien_candidate_with_per_slot_breakdown() {
     let result = &envelope["structuredContent"];
     assert_eq!(result["verdict"], "refuse", "{result}");
     assert!(
-        result["remediation"].as_str().unwrap().to_lowercase().contains("refuse"),
+        result["remediation"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("refuse"),
         "{result}"
     );
     // At least one content slot is below tau (pass=false) in the served breakdown.
@@ -5322,7 +5343,10 @@ fn guard_check_refuses_empty_region_and_invalid_target() {
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_CHECK_NO_REGION"),
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_CHECK_NO_REGION"),
         "{envelope}"
     );
 
@@ -5336,7 +5360,10 @@ fn guard_check_refuses_empty_region_and_invalid_target() {
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_CHECK_INVALID"),
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_CHECK_INVALID"),
         "{envelope}"
     );
     fs::remove_dir_all(&dir).ok();
@@ -5376,11 +5403,16 @@ fn guard_check_new_region_records_awaiting_grounding() {
     // The new-region lifecycle record is persisted AwaitingGrounding and surfaced.
     assert_eq!(result["new_region"]["state"], "awaiting_grounding");
     let seq = result["ledger_ref"]["seq"].as_u64().unwrap();
-    assert_eq!(result["new_region"]["verdict_ledger_seq"].as_u64().unwrap(), seq);
+    assert_eq!(
+        result["new_region"]["verdict_ledger_seq"].as_u64().unwrap(),
+        seq
+    );
 
     // FSV: the persisted new-region config row reads back AwaitingGrounding.
     let key = metadata_key("demo", &format!("guard_new_region:{GUARD_CHECK_TARGET}"));
-    let raw = read_config_value(&dir, &key).unwrap().expect("new-region row persisted");
+    let raw = read_config_value(&dir, &key)
+        .unwrap()
+        .expect("new-region row persisted");
     let persisted: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(persisted["schema"], "astro.guard.new_region.v1");
     assert_eq!(persisted["state"], "awaiting_grounding");
@@ -7537,7 +7569,11 @@ fn read_back_test_pass_anchor(
         &vault_dir(cache_dir, "calc"),
         SHADOW_VAULT_ID,
         &vault_salt("calc"),
-        vec![ColumnFamily::Anchors, ColumnFamily::Ledger, ColumnFamily::Graph],
+        vec![
+            ColumnFamily::Anchors,
+            ColumnFamily::Ledger,
+            ColumnFamily::Graph,
+        ],
     )
     .unwrap();
     let cx_ids = astrolabe_ingest::read_node_map_cx_ids(&vault, "calc").unwrap();
@@ -7545,9 +7581,17 @@ fn read_back_test_pass_anchor(
     let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
     let found = rows.into_iter().find(|persisted| persisted.row.cx_id == cx);
     let result = found.map(|persisted| {
-        assert_eq!(persisted.row.anchors.len(), 1, "{qn} should carry one anchor");
+        assert_eq!(
+            persisted.row.anchors.len(),
+            1,
+            "{qn} should carry one anchor"
+        );
         let anchor = &persisted.row.anchors[0];
-        (anchor.source.clone(), anchor.confidence, anchor.value.clone())
+        (
+            anchor.source.clone(),
+            anchor.confidence,
+            anchor.value.clone(),
+        )
     });
     drop(vault);
     result
@@ -7596,7 +7640,10 @@ fn coverage_ingest_grounds_coverage_and_propagation_with_precedence_and_fanout()
     assert_eq!(response["anchors_written"], 3, "envelope: {response}");
     let report = &response["propagation_report"];
     assert_eq!(report["coverage_symbols"], json!(["calc.add"]));
-    assert_eq!(report["propagation_symbols"], json!(["calc.mul", "calc.sub"]));
+    assert_eq!(
+        report["propagation_symbols"],
+        json!(["calc.mul", "calc.sub"])
+    );
     assert_eq!(report["suppressed_by_precedence"], json!(["calc.add"]));
     assert_eq!(report["excluded_by_fanout"], json!([]));
     assert_eq!(report["anchored"], 3);
@@ -7612,10 +7659,14 @@ fn coverage_ingest_grounds_coverage_and_propagation_with_precedence_and_fanout()
 
     let expected_prop_source = format!("propagation:{RUN_ID}");
     for covered in ["calc.sub", "calc.mul"] {
-        let (src, conf, val) =
-            read_back_test_pass_anchor(&dir, covered).unwrap_or_else(|| panic!("{covered} anchored"));
+        let (src, conf, val) = read_back_test_pass_anchor(&dir, covered)
+            .unwrap_or_else(|| panic!("{covered} anchored"));
         assert_eq!(src, expected_prop_source, "{covered} via propagation");
-        assert_eq!(conf.to_bits(), 0.6f32.to_bits(), "{covered} proxy confidence");
+        assert_eq!(
+            conf.to_bits(),
+            0.6f32.to_bits(),
+            "{covered} proxy confidence"
+        );
         assert_eq!(val, calyx_core::AnchorValue::Bool(true));
     }
     // The test symbol is never anchored (would be circular).
@@ -7642,8 +7693,16 @@ fn coverage_ingest_duplicate_report_is_idempotent() {
     let impact: BTreeSet<String> = ["src/calc.py".to_string()].into_iter().collect();
 
     let first = coverage_ingest_json_at(
-        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report, "ci:github:900",
-        "run-cov-1", &impact, "1786400000",
+        &dir,
+        "calc",
+        "lcov",
+        coverage,
+        "cargo_test_json",
+        test_report,
+        "ci:github:900",
+        "run-cov-1",
+        &impact,
+        "1786400000",
     )
     .unwrap();
     assert_eq!(first["anchors_written"], 3, "first: {first}");
@@ -7662,11 +7721,22 @@ fn coverage_ingest_duplicate_report_is_idempotent() {
     };
 
     let second = coverage_ingest_json_at(
-        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report, "ci:github:900",
-        "run-cov-1", &impact, "1786400000",
+        &dir,
+        "calc",
+        "lcov",
+        coverage,
+        "cargo_test_json",
+        test_report,
+        "ci:github:900",
+        "run-cov-1",
+        &impact,
+        "1786400000",
     )
     .unwrap();
-    assert_eq!(second["anchors_written"], 0, "second must write nothing: {second}");
+    assert_eq!(
+        second["anchors_written"], 0,
+        "second must write nothing: {second}"
+    );
     assert_eq!(second["anchors_deduplicated"], 3, "second: {second}");
 
     let rows_after_second = {
@@ -7699,9 +7769,16 @@ fn coverage_ingest_empty_report_refuses_fail_closed() {
     let impact: BTreeSet<String> = BTreeSet::new();
 
     let response = coverage_ingest_json_at(
-        &dir, "calc", "lcov", "", "cargo_test_json",
+        &dir,
+        "calc",
+        "lcov",
+        "",
+        "cargo_test_json",
         "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n",
-        "ci:github:900", "run-cov-1", &impact, "1786400000",
+        "ci:github:900",
+        "run-cov-1",
+        &impact,
+        "1786400000",
     )
     .unwrap();
     assert_eq!(response["status"], "refused", "envelope: {response}");
@@ -7716,7 +7793,9 @@ fn coverage_ingest_empty_report_refuses_fail_closed() {
     )
     .unwrap();
     assert!(
-        astrolabe_anchors::read_all_anchor_rows(&vault).unwrap().is_empty(),
+        astrolabe_anchors::read_all_anchor_rows(&vault)
+            .unwrap()
+            .is_empty(),
         "refused ingest must persist no anchor rows"
     );
     drop(vault);
@@ -7730,15 +7809,24 @@ fn coverage_ingest_proxy_source_refuses_fail_closed() {
     // any anchor is written.
     const SEED_TS: u64 = 10_000_000_000_000;
     let coverage = "SF:src/calc.py\nDA:2,1\nend_of_record\n";
-    let test_report = "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n";
+    let test_report =
+        "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n";
     let dir = temp_dir("coverage-ingest-proxy");
     fs::create_dir_all(&dir).unwrap();
     seed_coverage_ingest_vault(&dir, SEED_TS);
     let impact: BTreeSet<String> = BTreeSet::new();
 
     let response = coverage_ingest_json_at(
-        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report,
-        "agent:codex:session-7", "run-cov-1", &impact, "1786400000",
+        &dir,
+        "calc",
+        "lcov",
+        coverage,
+        "cargo_test_json",
+        test_report,
+        "agent:codex:session-7",
+        "run-cov-1",
+        &impact,
+        "1786400000",
     )
     .unwrap();
     assert_eq!(response["status"], "refused", "envelope: {response}");
@@ -7753,7 +7841,9 @@ fn coverage_ingest_proxy_source_refuses_fail_closed() {
     )
     .unwrap();
     assert!(
-        astrolabe_anchors::read_all_anchor_rows(&vault).unwrap().is_empty(),
+        astrolabe_anchors::read_all_anchor_rows(&vault)
+            .unwrap()
+            .is_empty(),
         "refused proxy-source ingest must persist no anchor rows"
     );
     drop(vault);
@@ -7777,13 +7867,24 @@ fn coverage_ingest_unknown_files_ground_only_via_propagation() {
     let impact: BTreeSet<String> = ["src/calc.py".to_string()].into_iter().collect();
 
     let response = coverage_ingest_json_at(
-        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report,
-        "ci:github:900", "run-cov-1", &impact, "1786400000",
+        &dir,
+        "calc",
+        "lcov",
+        coverage,
+        "cargo_test_json",
+        test_report,
+        "ci:github:900",
+        "run-cov-1",
+        &impact,
+        "1786400000",
     )
     .unwrap();
     assert_eq!(response["status"], "grounded", "envelope: {response}");
     let report = &response["propagation_report"];
-    assert_eq!(report["coverage_symbol_count"], 0, "no coverage attribution");
+    assert_eq!(
+        report["coverage_symbol_count"], 0,
+        "no coverage attribution"
+    );
     // No coverage precedence, so all three impact symbols ground by propagation.
     assert_eq!(
         report["propagation_symbols"],
@@ -7793,7 +7894,10 @@ fn coverage_ingest_unknown_files_ground_only_via_propagation() {
 
     let expected_prop_source = "propagation:run-cov-1";
     let (src, conf, _) = read_back_test_pass_anchor(&dir, "calc.add").expect("calc.add anchored");
-    assert_eq!(src, expected_prop_source, "calc.add via propagation, not coverage");
+    assert_eq!(
+        src, expected_prop_source,
+        "calc.add via propagation, not coverage"
+    );
     assert_eq!(conf.to_bits(), 0.6f32.to_bits());
     fs::remove_dir_all(&dir).ok();
 }
@@ -8462,7 +8566,11 @@ fn first_shadow_import_on_fresh_vault_succeeds_with_empty_before_map() {
     let cache_dir = temp_dir("fresh-vault-first-import");
     fs::create_dir_all(&cache_dir).unwrap();
     // The row-sink direct path only fingerprints the CBM SQLite source file.
-    fs::write(sqlite_path(&cache_dir, "freshvault"), b"cbm sqlite fixture v1").unwrap();
+    fs::write(
+        sqlite_path(&cache_dir, "freshvault"),
+        b"cbm sqlite fixture v1",
+    )
+    .unwrap();
     let settings = SearchScaleSettings {
         index_backend: SearchIndexBackend::InMemoryHnsw,
         funnel_activation_records: DEFAULT_FUNNEL_ACTIVATION_RECORDS,
@@ -8486,9 +8594,13 @@ fn first_shadow_import_on_fresh_vault_succeeds_with_empty_before_map() {
 
     // FSV read-back: the project row exists and carries both symbols; the pre-#335 failure
     // left only WAL + lock files here.
-    let vault =
-        open_shadow_vault_writable(&vdir, SHADOW_VAULT_ID, &vault_salt("freshvault"), Vec::new())
-            .expect("vault opens after first import");
+    let vault = open_shadow_vault_writable(
+        &vdir,
+        SHADOW_VAULT_ID,
+        &vault_salt("freshvault"),
+        Vec::new(),
+    )
+    .expect("vault opens after first import");
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, "freshvault")
         .expect("project row persisted by first import");
     assert_eq!(snapshot.nodes.len(), 2, "both symbols persisted");

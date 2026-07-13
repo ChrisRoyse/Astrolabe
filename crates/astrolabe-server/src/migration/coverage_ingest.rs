@@ -378,15 +378,16 @@ pub(crate) fn coverage_ingest_json_at(
     }
     drop(vault);
 
-    let status = if anchors_written > 0 { "grounded" } else { "noop" };
+    let status = if anchors_written > 0 {
+        "grounded"
+    } else {
+        "noop"
+    };
     let report = &plan.report;
     let mut provenance: Vec<Value> = ledger_refs
         .iter()
         .map(|(label, ledger_ref)| {
-            Value::String(format!(
-                "ledger:grounding:{label}:seq={}",
-                ledger_ref.seq
-            ))
+            Value::String(format!("ledger:grounding:{label}:seq={}", ledger_ref.seq))
         })
         .collect();
     provenance.push(Value::String(format!("coverage_source:{coverage_source}")));
