@@ -34,12 +34,18 @@ flags per artifact:
 | shell-arg validator (#228)         | `ASTRO_SHELLARG`     |    ✓     |          —          |      —      |
 | pressure-log buffers (#149)        | `ASTRO_MEM_PRESSURE` |    ✓     |          —          |      —      |
 | worker-failure diagnostics (#282)  | `ASTRO_WORKER_DIAG`  |    ✓     |          ✓          |      —      |
-| `-Werror` root-cause fixes (#229)  | `ASTRO_UI_WERROR`    |    —     |          ✓          |      —      |
+| `-Werror` root-cause fixes (#229/#273) | _(unconditional)_ |    ✓     |          ✓          |      ✓      |
 
 - `libcbm` defines the first five via `LIBCBM_ASTRO_DEFS` (in `LIBCBM_CFLAGS`).
-- the production binaries define `ASTRO_PROD_DEFS` (`ASTRO_UI_WERROR` +
-  `ASTRO_WORKER_DIAG`).
+- the production binaries define `ASTRO_PROD_DEFS` (`ASTRO_WORKER_DIAG`).
 - the C test-runner defines none — the plain vendored behavior.
+- the #229 `-Werror` root-cause fixes are **no longer macro-gated** (#273): the
+  unchecked alloc-size guards (`ui/layout3d.c`, `pipeline/pass_definitions.c`) and
+  the non-terminating-`strncpy` fixes (`watcher/watcher.c`, `pipeline/pass_envscan.c`)
+  are unconditional in the owned source, so they ship in every artifact. The
+  blanket `-Wno-stringop-truncation` / `-Wno-alloc-size-larger-than` that used to
+  mask them on the unguarded (libcbm.a, test-runner) paths were removed from
+  `GCC_ONLY_FLAGS`, keeping both diagnostics on as `-Werror` everywhere.
 
 This per-artifact matrix is guarded by `scripts/test-cbm-overlay-sources.py`,
 which reads the owned sources and asserts each behavior is present only under

@@ -74,10 +74,19 @@ ifeq ($(filter gcc clang,$(CC_FAMILY)),)
 $(error [#274] Makefile.cbm could not classify the compiler family for CC="$(CC)" (probe result: '$(CC_FAMILY)'). `echo | $(CC_FOR_SHELL) -dM -E -` must define __GNUC__ (GCC) or __clang__ (Clang) so the GCC-only -Wno-* suppression set is chosen deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap`. Refusing to guess a warning-suppression state.)
 endif
 IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)
+# #273: the two blanket suppressions -Wno-stringop-truncation and
+# -Wno-alloc-size-larger-than were REMOVED. They masked genuine latent C defects
+# in the owned CBM sources (unchecked alloc-size in ui/layout3d.c compute_call_depth
+# and pipeline/pass_definitions.c; non-NUL-terminating strncpy in watcher/watcher.c
+# and pipeline/pass_envscan.c). Those sites are now root-cause-fixed unconditionally
+# (strnlen+memcpy+explicit NUL; fail-closed range guards), so the diagnostics stay
+# ON as -Werror across every artifact — libcbm.a, the production binaries, and the
+# test-runner — and any future truncation / oversized-allocation defect fails the
+# build instead of shipping silently. -Wno-format-truncation and -Wno-unused-result
+# remain: they suppress a different, out-of-scope diagnostic class (see #274 follow-up).
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
-GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
-                  -Wno-stringop-truncation -Wno-alloc-size-larger-than
+GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result
 endif
 
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
@@ -380,14 +389,22 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # reaches which artifact:
 #   libcbm.a          : ASTRO_ENV_STORE, ASTRO_SPAWN, ASTRO_SHELLARG,
 #                       ASTRO_MEM_PRESSURE, ASTRO_WORKER_DIAG  (see LIBCBM_CFLAGS)
-#   cbm / cbm-with-ui : ASTRO_UI_WERROR, ASTRO_WORKER_DIAG     (ASTRO_PROD_DEFS)
+#   cbm / cbm-with-ui : ASTRO_WORKER_DIAG                      (ASTRO_PROD_DEFS)
 #   test-runner       : none — the vendored behavior, unpatched
 # The production binaries compile the owned sources directly (no path
-# substitution); the flags below turn on the two features that historically
-# reached them. #229 (-Werror root-cause fixes: src/ui/layout3d.c and
-# src/pipeline/pass_definitions.c unchecked allocation-size guards) and #282
-# (worker-failure diagnostics, live parity with the astrolabe/libcbm side).
-ASTRO_PROD_DEFS = -DASTRO_UI_WERROR -DASTRO_WORKER_DIAG
+# substitution); the flag below turns on the diagnostics feature that
+# historically reached them. #282 (worker-failure diagnostics, live parity with
+# the astrolabe/libcbm side).
+#
+# #273: the former ASTRO_UI_WERROR macro is gone. Its #229 -Werror root-cause
+# fixes (src/ui/layout3d.c and src/pipeline/pass_definitions.c unchecked
+# allocation-size guards; the strncpy -> strnlen+memcpy+NUL fixes in
+# src/watcher/watcher.c and src/pipeline/pass_envscan.c) are now UNCONDITIONAL in
+# the CBM sources, so they ship identically in libcbm.a, the production binaries,
+# and the test-runner — no per-artifact macro gates them, and the blanket
+# -Wno-stringop-truncation / -Wno-alloc-size-larger-than that used to mask them on
+# the unguarded paths are removed (see GCC_ONLY_FLAGS above).
+ASTRO_PROD_DEFS = -DASTRO_WORKER_DIAG
 
 # ── Test sources ─────────────────────────────────────────────────
 
