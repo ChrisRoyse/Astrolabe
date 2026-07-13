@@ -59,6 +59,8 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "traces/otlp_decode.h"
+#include "traces/trace_ingest.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -496,11 +498,13 @@ static const tool_def_t TOOLS[] = {
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
-    {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
+    {"ingest_traces", "Ingest traces",
+     "Ingest runtime traces (OTLP protobuf/JSON or simple {caller,callee,count}) to promote "
+     "matching graph edges to Trusted, attach runtime anchors, and flag 5xx incidents",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
-     "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
-     "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+     "\"object\"}},\"resourceSpans\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
+     "\"otlp_protobuf_base64\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"}},"
+     "\"required\":[\"project\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -5836,34 +5840,180 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── ingest_traces ────────────────────────────────────────────── */
 
-static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
-    (void)srv;
-    /* Parse traces array from JSON args */
-    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
-    int trace_count = 0;
+/* True when a `traces` array element is a simple {caller, callee, count}
+ * record (as opposed to an OTLP ResourceSpans object). */
+static bool traces_arr_is_simple(yyjson_val *traces) {
+    if (!traces || !yyjson_is_arr(traces) || yyjson_arr_size(traces) == 0) {
+        return false;
+    }
+    yyjson_val *first = yyjson_arr_get_first(traces);
+    return first && yyjson_is_obj(first) && yyjson_obj_get(first, "caller") != NULL &&
+           yyjson_obj_get(first, "callee") != NULL;
+}
 
-    if (adoc) {
-        yyjson_val *aroot = yyjson_doc_get_root(adoc);
-        yyjson_val *traces = yyjson_obj_get(aroot, "traces");
-        if (traces && yyjson_is_arr(traces)) {
-            trace_count = (int)yyjson_arr_size(traces);
+/* Collect {caller, callee, count} records from a JSON array. Caller frees. */
+static cbm_trace_simple_t *collect_simple(yyjson_val *traces, int *out_n) {
+    int n = (int)yyjson_arr_size(traces);
+    *out_n = 0;
+    if (n <= 0) {
+        return NULL;
+    }
+    cbm_trace_simple_t *recs = calloc((size_t)n, sizeof(*recs));
+    if (!recs) {
+        return NULL;
+    }
+    int m = 0;
+    size_t idx = 0;
+    size_t max = 0;
+    yyjson_val *el = NULL;
+    yyjson_arr_foreach(traces, idx, max, el) {
+        yyjson_val *caller = yyjson_obj_get(el, "caller");
+        yyjson_val *callee = yyjson_obj_get(el, "callee");
+        if (!caller || !callee || !yyjson_is_str(caller) || !yyjson_is_str(callee)) {
+            continue;
         }
-        yyjson_doc_free(adoc);
+        snprintf(recs[m].caller, sizeof(recs[m].caller), "%s", yyjson_get_str(caller));
+        snprintf(recs[m].callee, sizeof(recs[m].callee), "%s", yyjson_get_str(callee));
+        yyjson_val *count = yyjson_obj_get(el, "count");
+        recs[m].count = (count && yyjson_is_int(count)) ? yyjson_get_int(count) : 1;
+        m++;
+    }
+    *out_n = m;
+    return recs;
+}
+
+static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+
+    cbm_store_t *resolved = resolve_store(srv, project);
+    if (!resolved) {
+        char *err = build_no_store_error(project);
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
+        free(project);
+        return res;
+    }
+    /* resolve_store opens file-backed projects READ-ONLY; ingestion mutates, so
+     * open a dedicated read-write handle to the same DB (mirrors manage_adr). */
+    cbm_store_t *store = resolved;
+    cbm_store_t *owned_rw = NULL;
+    const char *resolved_db_path = cbm_store_db_path(resolved);
+    if (resolved_db_path) {
+        owned_rw = cbm_store_open_path(resolved_db_path);
+        if (!owned_rw) {
+            char *err = build_no_store_error(project);
+            char *res = cbm_mcp_text_result(err, true);
+            free(err);
+            free(project);
+            return res;
+        }
+        store = owned_rw;
+    }
+    const char *eff_project = project ? project : srv->current_project;
+
+    cbm_otlp_batch_t batch = {0};
+    cbm_trace_ingest_stats_t stats = {0};
+    const char *format = "empty";
+    bool is_error = false;
+    char *err_detail = NULL;
+
+    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
+
+    char *b64 = cbm_mcp_get_string_arg(args, "otlp_protobuf_base64");
+    yyjson_val *rspans = aroot ? yyjson_obj_get(aroot, "resourceSpans") : NULL;
+    if (!rspans && aroot) {
+        rspans = yyjson_obj_get(aroot, "resource_spans");
+    }
+    yyjson_val *traces = aroot ? yyjson_obj_get(aroot, "traces") : NULL;
+
+    if (b64 && b64[0]) {
+        format = "otlp_protobuf";
+        int rc = cbm_otlp_decode_protobuf_base64(b64, &batch);
+        if (rc != CBM_OTLP_OK) {
+            is_error = true;
+            err_detail = heap_strdup("invalid OTLP protobuf (base64 or wire format)");
+        }
+    } else if (rspans && yyjson_is_arr(rspans)) {
+        format = "otlp_json";
+        if (cbm_otlp_decode_json_rspans(rspans, &batch) != CBM_OTLP_OK) {
+            is_error = true;
+            err_detail = heap_strdup("invalid OTLP/JSON resourceSpans");
+        }
+    } else if (traces && traces_arr_is_simple(traces)) {
+        format = "simple";
+        int sn = 0;
+        cbm_trace_simple_t *recs = collect_simple(traces, &sn);
+        if (recs) {
+            cbm_trace_ingest_simple(store, eff_project, recs, sn, &stats);
+            free(recs);
+        }
+    } else if (traces && yyjson_is_arr(traces)) {
+        /* Legacy signature: OTLP ResourceSpans carried in the `traces` array. */
+        format = "otlp_json";
+        if (cbm_otlp_decode_json_rspans(traces, &batch) != CBM_OTLP_OK) {
+            is_error = true;
+            err_detail = heap_strdup("invalid OTLP/JSON spans in traces[]");
+        }
+    }
+
+    /* Ingest OTLP records (protobuf/JSON paths). */
+    if (!is_error && batch.record_count >= 0 &&
+        (strcmp(format, "otlp_protobuf") == 0 || strcmp(format, "otlp_json") == 0)) {
+        stats.spans_total = batch.spans_total;
+        stats.spans_non_http = batch.spans_non_http;
+        cbm_trace_ingest_records(store, eff_project, batch.records, batch.record_count, &stats);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_str(doc, root, "status", "accepted");
-    yyjson_mut_obj_add_int(doc, root, "traces_received", trace_count);
-    yyjson_mut_obj_add_str(doc, root, "note",
-                           "Runtime edge creation from traces not yet implemented");
+    if (is_error) {
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_strcpy(doc, root, "code", "otlp_decode_failed");
+        yyjson_mut_obj_add_strcpy(doc, root, "message",
+                                  err_detail ? err_detail : "trace decode failed");
+        yyjson_mut_obj_add_str(doc, root, "remediation",
+                               "Send a valid OTLP TracesData batch (protobuf base64 in "
+                               "'otlp_protobuf_base64', OTLP/JSON in 'resourceSpans', or "
+                               "simple {caller,callee,count} objects in 'traces').");
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "status", "ok");
+        yyjson_mut_obj_add_strcpy(doc, root, "format", format);
+        yyjson_mut_obj_add_int(doc, root, "spans_total", stats.spans_total);
+        yyjson_mut_obj_add_int(doc, root, "spans_http", stats.spans_http);
+        yyjson_mut_obj_add_int(doc, root, "spans_non_http", stats.spans_non_http);
+        yyjson_mut_obj_add_int(doc, root, "spans_unmatched", stats.spans_unmatched);
+        yyjson_mut_obj_add_int(doc, root, "routes_matched", stats.routes_matched);
+        yyjson_mut_obj_add_int(doc, root, "edges_promoted", stats.edges_promoted);
+        yyjson_mut_obj_add_int(doc, root, "anchors_written", stats.anchors_written);
+        yyjson_mut_obj_add_int(doc, root, "incidents_detected", stats.incidents_detected);
+        yyjson_mut_obj_add_int(doc, root, "simple_records", stats.simple_records);
+        yyjson_mut_obj_add_int(doc, root, "simple_unmatched", stats.simple_unmatched);
+        /* Label the degradation: unmatched observations are surfaced, not dropped. */
+        if (stats.spans_unmatched > 0 || stats.simple_unmatched > 0) {
+            yyjson_mut_obj_add_str(
+                doc, root, "unmatched_note",
+                "Some observations matched no indexed route/edge and were counted "
+                "(spans_unmatched/simple_unmatched), not silently dropped.");
+        }
+    }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_otlp_batch_free(&batch);
+    if (adoc) {
+        yyjson_doc_free(adoc);
+    }
+    free(err_detail);
+    free(b64);
+    if (owned_rw) {
+        cbm_store_close(owned_rw);
+    }
+    free(project);
 
-    char *result = cbm_mcp_text_result(json, false);
+    char *result = cbm_mcp_text_result(json, is_error);
     free(json);
     return result;
 }
