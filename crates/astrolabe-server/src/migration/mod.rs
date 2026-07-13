@@ -52,9 +52,10 @@ use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
     EagerAgreementKind, LiveAnomalyInputs, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
     acknowledge_reactive_subscription, anomaly_report_artifact_bytes, detect_anomalies,
-    live_anomaly_inputs_from_vault, persist_eager_cross_terms, persist_eager_cross_terms_delta,
-    persist_similarity_edges, plan_eager_cross_terms, plan_eager_cross_terms_for_symbols,
-    plan_similarity_edges, recover_reactive_state,
+    expand_similarity_dirty_region, live_anomaly_inputs_from_vault, persist_eager_cross_terms,
+    persist_eager_cross_terms_delta, persist_similarity_edges, persist_similarity_edges_delta,
+    plan_eager_cross_terms, plan_eager_cross_terms_for_symbols, plan_similarity_edges,
+    read_similarity_edge_rows, recover_reactive_state,
 };
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;

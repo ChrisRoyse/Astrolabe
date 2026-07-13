@@ -41,8 +41,8 @@ pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
-    SimilarityPersistReport, persist_similarity_edges, read_similarity_edge_rows,
-    sim_edge_graph_key,
+    SimilarityPersistReport, persist_similarity_edges, persist_similarity_edges_delta,
+    read_similarity_edge_rows, sim_edge_graph_key,
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
@@ -994,6 +994,65 @@ pub fn plan_similarity_edges(
         skips,
         workers_requested: config.worker_count,
     })
+}
+
+/// Expands changed symbols into a bounded L2 similarity repair region.
+///
+/// The region includes two hops of currently persisted SIM neighbors plus the
+/// best exact candidates for every changed symbol in each enabled family. The
+/// candidate budget is the registry-declared ANN headroom
+/// (`per_node_cap * candidate_multiplier`), so work is linear in corpus size
+/// per changed symbol and never an all-pairs rebuild.
+pub fn expand_similarity_dirty_region(
+    nodes: &[SimilarityNode],
+    changed: &BTreeSet<String>,
+    persisted: &[PersistedSimilarityEdgeRow],
+    config: &SimilarityPlannerConfig,
+) -> BTreeSet<String> {
+    let mut region = changed.clone();
+    for _ in 0..2 {
+        let frontier = region.clone();
+        for edge in persisted {
+            if frontier.contains(&edge.row.source_qn) || frontier.contains(&edge.row.target_qn) {
+                region.insert(edge.row.source_qn.clone());
+                region.insert(edge.row.target_qn.clone());
+            }
+        }
+    }
+    let candidate_cap = config
+        .per_node_cap
+        .saturating_mul(config.ann.candidate_multiplier)
+        .max(config.per_node_cap);
+    for family in SimilarityFamily::ALL {
+        if config.disabled_families.contains(&family) {
+            continue;
+        }
+        let mut skips = SimilaritySkipReport::default();
+        let vectors = collect_family_vectors(nodes, family, &mut skips);
+        for source in vectors
+            .iter()
+            .filter(|vector| changed.contains(&vector.qualified_name))
+        {
+            let mut candidates = vectors
+                .iter()
+                .filter(|target| target.qualified_name != source.qualified_name)
+                .filter_map(|target| {
+                    cosine(&source.vector, &target.vector)
+                        .map(|score| (score, target.qualified_name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1))
+            });
+            region.extend(
+                candidates
+                    .into_iter()
+                    .take(candidate_cap)
+                    .map(|(_, qualified_name)| qualified_name.to_string()),
+            );
+        }
+    }
+    region
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4231,6 +4290,72 @@ mod tests {
         let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
         assert_eq!(after.len(), tighter.edges.len());
         drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn similarity_delta_tombstones_owned_rows_and_preserves_clean_rows() {
+        let mut config = family_only_config(SimilarityFamily::Semantic);
+        config.thresholds.sim_semantic_min_score = 0.90;
+        let nodes = vec![
+            dense_node("dirty.a", SimilarityFamily::Semantic, &[1.0, 0.0]),
+            dense_node("dirty.b", SimilarityFamily::Semantic, &[1.0, 0.0]),
+            dense_node("clean.c", SimilarityFamily::Semantic, &[0.0, 1.0]),
+            dense_node("clean.d", SimilarityFamily::Semantic, &[0.0, 1.0]),
+        ];
+        let full = plan_similarity_edges(&nodes, &config).expect("full similarity plan");
+        assert_eq!(
+            edge_qns(&full.edges),
+            vec![("clean.c", "clean.d"), ("dirty.a", "dirty.b")]
+        );
+
+        let (dir, vault) = reactive_vault("similarity-delta-ownership-fsv");
+        persist_similarity_edges(&vault, &full, "astrolabe-weave-test")
+            .expect("persist full similarity state");
+        let clean_key = sim_edge_graph_key(SimilarityFamily::Semantic, "clean.c", "clean.d");
+        let clean_before = vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &clean_key)
+            .expect("read clean row before delta")
+            .expect("clean row before delta");
+
+        let empty_delta = SimilarityPlan {
+            edges: Vec::new(),
+            skips: SimilaritySkipReport::default(),
+            workers_requested: config.worker_count,
+        };
+        let report = persist_similarity_edges_delta(
+            &vault,
+            &empty_delta,
+            &BTreeSet::from(["dirty.a".to_string()]),
+            &BTreeSet::new(),
+            "astrolabe-weave-test",
+        )
+        .expect("persist owned similarity delta");
+        assert_eq!(report.rows_tombstoned, 1);
+        assert_eq!(report.rows_written, 0);
+
+        let persisted = read_similarity_edge_rows(&vault).expect("read similarity delta state");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].key, clean_key);
+        let clean_after = vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &clean_key)
+            .expect("read clean row after delta")
+            .expect("clean row after delta");
+        assert_eq!(
+            clean_after, clean_before,
+            "clean-clean bytes must not change"
+        );
+        assert!(
+            vault
+                .read_cf_at(
+                    vault.snapshot(),
+                    ColumnFamily::Graph,
+                    &sim_edge_graph_key(SimilarityFamily::Semantic, "dirty.a", "dirty.b",),
+                )
+                .expect("read dirty row after delta")
+                .is_none()
+        );
+        drop(vault);
         let _ = fs::remove_dir_all(dir);
     }
 

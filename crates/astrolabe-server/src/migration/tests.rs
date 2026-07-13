@@ -6060,6 +6060,10 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         true,
         Some(&WeaveDelta {
             dirty_qualified_names: BTreeSet::from(["demo.alpha".to_string()]),
+            removed_qualified_names: BTreeSet::from([
+                "demo.alpha".to_string(),
+                "demo.beta".to_string(),
+            ]),
             removed_cx_ids: BTreeSet::from([alpha_cx, beta_cx]),
         }),
     )

@@ -8,7 +8,7 @@
 //! canonical edge dump — pairing the mutation with its ledger record and
 //! making the persisted set byte-verifiable on readback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astrolabe_domain::fsv::FsvAck;
 use astrolabe_ingest::VaultMutationPlan;
@@ -160,6 +160,38 @@ pub fn persist_similarity_edges<C>(
 where
     C: Clock,
 {
+    persist_similarity_edges_owned(vault, plan, None, actor.into())
+}
+
+/// Reconciles only the named dirty-region source ownership plus rows touching
+/// removed qualified names. Clean-clean SIM rows remain byte-identical.
+pub fn persist_similarity_edges_delta<C>(
+    vault: &AsterVault<C>,
+    plan: &SimilarityPlan,
+    owned_sources: &BTreeSet<String>,
+    removed_qualified_names: &BTreeSet<String>,
+    actor: impl Into<String>,
+) -> calyx_core::Result<SimilarityPersistReport>
+where
+    C: Clock,
+{
+    persist_similarity_edges_owned(
+        vault,
+        plan,
+        Some((owned_sources, removed_qualified_names)),
+        actor.into(),
+    )
+}
+
+fn persist_similarity_edges_owned<C>(
+    vault: &AsterVault<C>,
+    plan: &SimilarityPlan,
+    ownership: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
+    actor: String,
+) -> calyx_core::Result<SimilarityPersistReport>
+where
+    C: Clock,
+{
     let dump = similarity_edge_dump_bytes(&plan.edges);
     let edge_dump_hash = hex_lower_bytes(blake3::hash(&dump).as_bytes());
 
@@ -181,7 +213,7 @@ where
     }
 
     let snapshot = vault.snapshot();
-    let existing: BTreeMap<Vec<u8>, Vec<u8>> = vault
+    let mut existing: BTreeMap<Vec<u8>, Vec<u8>> = vault
         .scan_cf_range_at(
             snapshot,
             ColumnFamily::Graph,
@@ -189,6 +221,20 @@ where
         )?
         .into_iter()
         .collect();
+    if let Some((owned_sources, removed)) = ownership {
+        let mut owned_existing = BTreeMap::new();
+        for (key, value) in existing {
+            let row = serde_json::from_slice::<SimEdgeGraphRow>(&value)
+                .map_err(|error| sim_edge_corrupt(format!("decode owned SIM_* row: {error}")))?;
+            if owned_sources.contains(&row.source_qn)
+                || removed.contains(&row.source_qn)
+                || removed.contains(&row.target_qn)
+            {
+                owned_existing.insert(key, value);
+            }
+        }
+        existing = owned_existing;
+    }
 
     let mut batch = Vec::new();
     let mut rows_written = 0usize;
@@ -223,7 +269,7 @@ where
     RedactionPolicy::check_payload(&payload)?;
 
     let subject = SubjectId::Query(format!("astrolabe-sim-edges:{edge_dump_hash}").into_bytes());
-    let actor = ActorId::Service(actor.into());
+    let actor = ActorId::Service(actor);
     let mut fsv_plan = VaultMutationPlan::new(
         "persist_similarity_edges",
         EntryKind::Ingest,

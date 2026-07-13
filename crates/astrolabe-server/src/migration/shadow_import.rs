@@ -132,6 +132,7 @@ pub(crate) struct ShadowSlotRuntime;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WeaveDelta {
     pub(crate) dirty_qualified_names: BTreeSet<String>,
+    pub(crate) removed_qualified_names: BTreeSet<String>,
     pub(crate) removed_cx_ids: BTreeSet<calyx_core::CxId>,
 }
 
@@ -1068,6 +1069,11 @@ pub(crate) fn import_shadow_vault_with_archaeology(
             .filter(|(_, cx_id)| new_cx_ids.contains(cx_id))
             .map(|(qualified_name, _)| qualified_name.clone())
             .collect(),
+        removed_qualified_names: before_cx_by_qn
+            .iter()
+            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
+            .map(|(qualified_name, _)| qualified_name.clone())
+            .collect(),
         removed_cx_ids: before_cx_by_qn
             .iter()
             .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
@@ -1208,10 +1214,38 @@ where
         nodes.push(similarity_node);
     }
 
-    let similarity_plan = plan_similarity_edges(&nodes, &SimilarityPlannerConfig::default())?;
+    let similarity_config = SimilarityPlannerConfig::default();
+    let (similarity_plan, similarity_region) = match delta {
+        Some(delta) => {
+            let persisted = read_similarity_edge_rows(vault)?;
+            let mut changed = delta.dirty_qualified_names.clone();
+            changed.extend(delta.removed_qualified_names.iter().cloned());
+            let region =
+                expand_similarity_dirty_region(&nodes, &changed, &persisted, &similarity_config);
+            let region_nodes = nodes
+                .iter()
+                .filter(|node| region.contains(&node.qualified_name))
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                plan_similarity_edges(&region_nodes, &similarity_config)?,
+                Some(region),
+            )
+        }
+        None => (plan_similarity_edges(&nodes, &similarity_config)?, None),
+    };
     let vector_skip_count = similarity_plan.skips.vector_skips.len();
     let family_opt_out_count = similarity_plan.skips.family_opt_outs.len();
-    let similarity = persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?;
+    let similarity = match (delta, similarity_region.as_ref()) {
+        (Some(delta), Some(region)) => persist_similarity_edges_delta(
+            vault,
+            &similarity_plan,
+            region,
+            &delta.removed_qualified_names,
+            "astrolabe-shadow-weave",
+        )?,
+        _ => persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?,
+    };
     let xterm_plan = match delta {
         Some(delta) => plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names),
         None => plan_eager_cross_terms(&nodes),
