@@ -651,6 +651,112 @@ pub(crate) fn provenance_store_for_project(
     Ok(store)
 }
 
+/// Ledger-subject-key tags emitted by [`astrolabe_ingest::ledger_subject_key`].
+///
+/// A `get_provenance(mode="lineage")` subject that carries one of these tags is a
+/// request for the *real persisted ledger* history of that subject, so it is
+/// served from the physical `ledger` column family (#284) rather than the
+/// row-sink symbol metadata. A subject without one of these tags (for example a
+/// bare qualified name like `auth.login`) is a row-sink symbol query and is left
+/// to the existing `store.symbols` path untouched.
+const LEDGER_SUBJECT_KEY_TAGS: [&str; 5] = ["cx:", "lens:", "kernel:", "guard:", "query:"];
+
+/// True when `subject` is a canonical ledger subject key (see
+/// [`astrolabe_ingest::ledger_subject_key`]), and therefore a request for real
+/// persisted-ledger lineage rather than row-sink symbol metadata.
+pub(crate) fn is_ledger_subject_key(subject: &str) -> bool {
+    LEDGER_SUBJECT_KEY_TAGS
+        .iter()
+        .any(|tag| subject.starts_with(tag))
+}
+
+/// Overrides `store.symbols[subject]` with the honest lineage decoded from the
+/// real persisted ledger when this is a ledger-subject lineage query (#284).
+///
+/// This is the exact wiring `handle_get_provenance` performs before serving a
+/// `mode="lineage"` response: `get_provenance(mode="lineage")` for a ledger
+/// subject key must be built from the persisted `ledger` column family, not from
+/// row-sink JSON metadata. The scan
+/// ([`astrolabe_ingest::scan_subject_ledger_rows_vault_path`]) verifies the whole
+/// hash-chain before serving anything and fails **closed** on a non-intact chain
+/// or an undecodable row; those refusals propagate to the caller as coded errors
+/// rather than degrading into a row-sink answer.
+///
+/// A non-ledger subject (bare qualified name) is left untouched, so existing
+/// row-sink symbol lineage is unaffected. A ledger subject with no persisted rows
+/// is also left untouched, so `get_provenance`'s own fail-closed "not found"
+/// still fires rather than fabricating an empty lineage.
+pub(crate) fn apply_ledger_backed_lineage(
+    store: &mut ProvenanceStore,
+    cache_dir: &Path,
+    project: &str,
+    mode: &str,
+    subject: Option<&str>,
+) -> Result<(), DynError> {
+    if mode != "lineage" {
+        return Ok(());
+    }
+    let Some(subject) = subject.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if !is_ledger_subject_key(subject) {
+        return Ok(());
+    }
+    if let Some(lineage) = subject_lineage_from_ledger(cache_dir, project, subject)? {
+        store.symbols.insert(subject.to_string(), lineage);
+    }
+    Ok(())
+}
+
+/// Scans the project's persisted ledger for `subject` and builds its
+/// [`SymbolLineage`] straight from the decoded ledger rows (#284).
+///
+/// Resolves the same physical vault directory the rest of the provenance surface
+/// verifies against, then delegates to
+/// [`astrolabe_ingest::scan_subject_ledger_rows_vault_path`]. Returns `None` when
+/// the intact ledger holds no row for `subject` (a truthful "no history"), and an
+/// `Err` carrying the scan's coded refusal when the chain is not intact or a row
+/// cannot be decoded — never a fabricated or partial lineage.
+pub(crate) fn subject_lineage_from_ledger(
+    cache_dir: &Path,
+    project: &str,
+    subject: &str,
+) -> Result<Option<SymbolLineage>, DynError> {
+    let configured_vault_dir = read_config_value(cache_dir, &metadata_key(project, "vault_dir"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vault_dir(cache_dir, project));
+    let rows =
+        astrolabe_ingest::scan_subject_ledger_rows_vault_path(&configured_vault_dir, subject)?;
+    Ok(symbol_lineage_from_scan_rows(subject, rows))
+}
+
+/// Maps subject-scoped [`astrolabe_ingest::LedgerScanRow`]s one-to-one onto a
+/// [`SymbolLineage`] whose versions carry the rows' real persisted entry hashes as
+/// their ledger chain pointers, in ascending sequence order.
+///
+/// Returns `None` for an empty row set so callers fall through to the
+/// fail-closed "no lineage" path rather than serving an empty history.
+pub(crate) fn symbol_lineage_from_scan_rows(
+    subject: &str,
+    rows: Vec<astrolabe_ingest::LedgerScanRow>,
+) -> Option<SymbolLineage> {
+    if rows.is_empty() {
+        return None;
+    }
+    let versions = rows
+        .into_iter()
+        .map(|row| LineageEvent {
+            kind: row.kind,
+            ledger: LedgerPointer::new(row.seq, row.entry_hash),
+            summary: row.summary,
+        })
+        .collect();
+    Some(SymbolLineage {
+        symbol_id: subject.to_string(),
+        versions,
+    })
+}
+
 pub(crate) fn provenance_store_json(store: &ProvenanceStore) -> Value {
     json!({
         "vault_fingerprint": store.vault_fingerprint,

@@ -384,10 +384,20 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
     };
     let subject_id = string_arg(args_obj, "subject_id").or_else(|| string_arg(args_obj, "subject"));
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let store = match provenance_store_for_project(&cache_dir, &project) {
+    let mut store = match provenance_store_for_project(&cache_dir, &project) {
         Ok(store) => store,
         Err(error) => return tool_error_result(error.to_string()),
     };
+    // #284: `mode="lineage"` for a ledger subject key is served from the real
+    // persisted ledger, not row-sink symbol metadata. The scan verifies the whole
+    // hash-chain first and fails closed on a broken chain or undecodable row, so
+    // its coded refusal is surfaced here rather than degrading into a row-sink
+    // answer.
+    if let Err(error) =
+        apply_ledger_backed_lineage(&mut store, &cache_dir, &project, mode, subject_id)
+    {
+        return tool_error_result(error.to_string());
+    }
     let response = match get_provenance(&store, &ProvenanceQuery::new(mode, subject_id)) {
         Ok(response) => response,
         Err(error) => {

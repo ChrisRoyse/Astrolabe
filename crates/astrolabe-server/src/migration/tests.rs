@@ -1631,6 +1631,138 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
 }
 
 #[test]
+fn get_provenance_lineage_dual_path_server_and_crate_agree_from_persisted_ledger() {
+    // #284 dual-path FSV: `get_provenance(mode="lineage")` for a ledger subject key
+    // must be served from the *real persisted ledger*, not row-sink symbol
+    // metadata. Prove the server adapter path
+    // (apply_ledger_backed_lineage -> get_provenance -> provenance_response_json)
+    // yields lineage rows byte-identical to the direct crate API
+    // (astrolabe_ingest::scan_subject_ledger_rows_vault_path), and that each row's
+    // ledger pointer matches an independent decode of the persisted ledger bytes.
+    let dir = temp_dir("provenance-lineage-dual-path");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let salt = b"provenance-lineage-dual-path".to_vec();
+
+    // Real durable vault seeded with a known subject A interleaved with noise for a
+    // second subject B, so the subject-scoping is exercised, not assumed.
+    let subject_a_cx = calyx_core::CxId::from_bytes([0x9A; 16]);
+    let subject_b_cx = calyx_core::CxId::from_bytes([0xB7; 16]);
+    {
+        let vault = AsterVault::new_durable(
+            &vault_dir,
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            salt.clone(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        let append = |cx: calyx_core::CxId, marker: &str| {
+            vault
+                .append_ledger_entry(
+                    calyx_ledger::EntryKind::Ingest,
+                    SubjectId::Cx(cx),
+                    format!(r#"{{"marker":"{marker}"}}"#).into_bytes(),
+                    ActorId::Service("astrolabe-lineage-test".to_string()),
+                )
+                .unwrap();
+        };
+        append(subject_a_cx, "a0"); // seq 0
+        append(subject_b_cx, "b0"); // seq 1 (noise)
+        append(subject_a_cx, "a1"); // seq 2
+        append(subject_a_cx, "a2"); // seq 3
+        vault.flush().unwrap();
+    }
+
+    // Persist a valid shadow outcome so provenance_store_for_project succeeds; it
+    // re-verifies the chain against this same physical vault dir.
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(&dir, security);
+    outcome.vault_dir = vault_dir.clone();
+    outcome.vault_salt = "provenance-lineage-dual-path".to_string();
+    outcome.ledger_seq = 3;
+    outcome.ledger_rows_after = 4;
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let subject = astrolabe_ingest::ledger_subject_key(&SubjectId::Cx(subject_a_cx));
+    // A ledger subject key routes to the ledger; a bare qualified name does not.
+    assert!(is_ledger_subject_key(&subject));
+    assert!(!is_ledger_subject_key("auth.login"));
+
+    // Direct crate API: the honest persisted-ledger scan for subject A.
+    let direct_rows =
+        astrolabe_ingest::scan_subject_ledger_rows_vault_path(&vault_dir, &subject).unwrap();
+    assert_eq!(
+        direct_rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![0, 2, 3],
+        "only subject A's seqs, ascending"
+    );
+
+    // Server adapter path: exactly what handle_get_provenance runs before serving.
+    let mut store = provenance_store_for_project(&dir, "demo").unwrap();
+    apply_ledger_backed_lineage(&mut store, &dir, "demo", "lineage", Some(&subject)).unwrap();
+    let response = get_provenance(&store, &ProvenanceQuery::new("lineage", Some(&subject)))
+        .expect("ledger-backed lineage response");
+    let payload = provenance_response_json("demo", &response);
+    assert_eq!(payload["mode"], "lineage");
+    let versions = payload["payload"]["lineage"]["versions"]
+        .as_array()
+        .expect("lineage versions array");
+    assert_eq!(
+        payload["payload"]["lineage"]["symbol_id"], subject,
+        "served lineage is scoped to the requested ledger subject"
+    );
+
+    // Dual-path identity: the server-served lineage rows equal the direct scan
+    // rows, field for field (seq, entry-hash chain pointer, kind, summary).
+    assert_eq!(
+        versions.len(),
+        direct_rows.len(),
+        "server lineage row count equals direct scan"
+    );
+    for (version, row) in versions.iter().zip(&direct_rows) {
+        assert_eq!(version["ledger"]["seq"].as_u64(), Some(row.seq));
+        assert_eq!(
+            version["ledger"]["chain_hash"].as_str(),
+            Some(row.entry_hash.as_str())
+        );
+        assert_eq!(version["kind"].as_str(), Some(row.kind.as_str()));
+        assert_eq!(version["summary"].as_str(), Some(row.summary.as_str()));
+    }
+
+    // FSV: independently reopen the durable vault and decode each persisted ledger
+    // row; its real entry hash and subject key must equal what the server served.
+    let reopened = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        salt,
+        VaultOptions::default(),
+    )
+    .unwrap();
+    for row in &direct_rows {
+        let bytes = reopened
+            .read_cf_at(
+                reopened.latest_seq(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(row.seq),
+            )
+            .unwrap()
+            .expect("persisted ledger row exists");
+        let entry = decode_ledger(&bytes).unwrap();
+        assert_eq!(
+            hex_lower(&entry.entry_hash),
+            row.entry_hash,
+            "served entry_hash equals independently decoded persisted bytes at seq {}",
+            row.seq
+        );
+        assert_eq!(
+            astrolabe_ingest::ledger_subject_key(&entry.subject),
+            row.subject
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn vault_import_summary_labels_fallback_trust() {
     let fallback = vault_import_summary(
         "sqlite_fallback",
