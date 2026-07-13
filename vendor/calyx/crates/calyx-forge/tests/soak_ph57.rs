@@ -143,7 +143,10 @@ fn concurrent_tei_and_forge_soak_writes_readback() -> Result<()> {
             .iter()
             .zip(&identified)
             .map(|(item, ok)| {
-                format!(":{} health={} tei_identified={}", item.port, item.status, ok)
+                format!(
+                    ":{} health={} tei_identified={}",
+                    item.port, item.status, ok
+                )
             })
             .collect();
         println!(
