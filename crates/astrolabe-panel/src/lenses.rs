@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ASTRO_PANEL_CONTRACT_INVALID, ASTRO_PANEL_S21_ZERO_SIGNAL, ASTRO_PANEL_VECTOR_INVALID,
-    FrozenLensContract, PanelError, PanelResult, seed_spec_for_lens, slot_spec,
+    FrozenLensContract, LAYER_ROLE_COUNT, LayerRole, PanelError, PanelResult, seed_spec_for_lens,
+    slot_spec,
 };
 
 const AST_PROFILE_DIM: u32 = 25;
@@ -21,6 +22,22 @@ const RECENCY_DIM: u32 = 1;
 const ROLE_FLAGS_DIM: u32 = 12;
 const TEST_TOPOLOGY_DIM: u32 = 4;
 const RECORD_VEC_DIM: u32 = 24;
+
+// Frozen S23 `layer_role` weighted-evidence weights.
+//
+// These live in the `astro.layout.evidence_weights.v1` registry knob (see
+// [`crate::layout_registry`]) — the single content-addressed source of truth for the
+// combiner spec — and are re-exported here for the encoder. They are the frozen
+// *encoder spec* (like `AST_PROFILE_MAXIMA` / `COMPLEXITY_PLE_THRESHOLDS`), bound
+// into the lens `weights_sha` via the frozen-fixture output, so any change to the
+// knob moves the S23 frozen lens identity. The measured, per-repo part of the model
+// — which callee QNs are persistence vs transport — is the
+// `astro.layout.api_families.v1` knob (default-seeded, learned downstream).
+use crate::layout_registry::{
+    LR_W_API_PERSISTENCE, LR_W_API_TRANSPORT, LR_W_API_UNCLASSIFIED, LR_W_HANDLER_FLAG,
+    LR_W_ROUTE_FLAG, LR_W_ROUTE_SURFACE, LR_W_SERVICE_BETWEENNESS, LR_W_SERVICE_DEGREE,
+    LR_W_TEST_FLAG,
+};
 
 const STRUCT_TRIGRAM_DIM: u32 = 65_536;
 const API_CALLEES_DIM: u32 = 262_144;
@@ -671,10 +688,11 @@ pub fn encode_slot(slot_id: SlotId, input: &EncoderLensInput) -> PanelResult<Slo
             .as_ref()
             .map(encode_record_vec)
             .unwrap_or_else(absent),
+        23 => encode_layer_role(input),
         _ => Err(PanelError::new(
             ASTRO_PANEL_CONTRACT_INVALID,
-            format!("slot {slot_id} is not implemented by deterministic S0-S17/S21 lenses"),
-            "Use slot ids 0 through 17 or 21 for this encoder family.",
+            format!("slot {slot_id} is not implemented by deterministic S0-S17/S21/S23 lenses"),
+            "Use slot ids 0 through 17, 21, or 23 for this encoder family.",
         )),
     }
 }
@@ -1365,6 +1383,185 @@ fn encode_route_surface(input: &RouteSurfaceInput) -> PanelResult<SlotVector> {
     )
 }
 
+/// Default API-family of a resolved callee, for the S23 `layer_role` encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiFamily {
+    /// Database / store / ORM / connection / query surface.
+    Persistence,
+    /// Transport / HTTP / router / handler surface.
+    Transport,
+}
+
+/// Frozen default persistence-family callee substrings — the corpus-independent
+/// default seed of `astro.layout.api_families.v1`.
+pub const DEFAULT_PERSISTENCE_FAMILY_SEEDS: &[&str] = &[
+    "query",
+    "execute",
+    "cursor",
+    "connection",
+    "session",
+    "transaction",
+    "commit",
+    "rollback",
+    "insert",
+    "update",
+    "delete",
+    "select",
+    "upsert",
+    "sqlx",
+    "diesel",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "mongo",
+    "redis",
+    "repository",
+    "datastore",
+    "persist",
+    "fetch_one",
+    "fetch_all",
+];
+
+/// Frozen default transport-family callee substrings — the corpus-independent
+/// default seed of `astro.layout.api_families.v1`.
+pub const DEFAULT_TRANSPORT_FAMILY_SEEDS: &[&str] = &[
+    "route", "router", "handler", "endpoint", "request", "response", "http", "axum", "actix",
+    "warp", "flask", "express", "fastapi", "respond",
+];
+
+/// Classifies a resolved callee QN against the frozen default API-family seeds.
+///
+/// The measured, per-repo refinement of these seeds lives in the
+/// `astro.layout.api_families.v1` registry knob (declared-seeds-learned); this
+/// corpus-independent default keeps the default-seeded S23 lens frozen. Persistence
+/// takes precedence when both families match, because a symbol that touches the
+/// store is a persistence symbol even inside a transport helper.
+pub fn default_api_family(callee: &str) -> Option<ApiFamily> {
+    let lowered = callee.to_ascii_lowercase();
+    if DEFAULT_PERSISTENCE_FAMILY_SEEDS
+        .iter()
+        .any(|seed| lowered.contains(seed))
+    {
+        return Some(ApiFamily::Persistence);
+    }
+    if DEFAULT_TRANSPORT_FAMILY_SEEDS
+        .iter()
+        .any(|seed| lowered.contains(seed))
+    {
+        return Some(ApiFamily::Transport);
+    }
+    None
+}
+
+/// Deterministic weighted-evidence combiner for S23 `layer_role` (#180a).
+///
+/// Combines four already-explicit behavioral signals — S12 `role_flags`, S17
+/// `route_surface` presence, S4 `api_callees` matched against the default API-family
+/// seeds, and S8 `graph_position` between-ness — into a Dense(8) L1 distribution over
+/// the frozen [`CANONICAL_ROLES`] coordinate system. Behavioral surface that maps to
+/// no known role overflows to [`LayerRole::Other`]; a symbol with none of the four
+/// inputs is a labeled absence (non-applicability by label class is enforced upstream
+/// by the panel driver as `Absent{NotApplicable}`).
+fn encode_layer_role(input: &EncoderLensInput) -> PanelResult<SlotVector> {
+    if input.role_flags.is_none()
+        && input.route_surface.is_none()
+        && input.api_calls.is_none()
+        && input.graph_position.is_none()
+    {
+        return absent();
+    }
+
+    let mut evidence = [0.0_f32; LAYER_ROLE_COUNT];
+
+    if let Some(flags) = input.role_flags {
+        if flags.is_test {
+            evidence[LayerRole::Test.index()] += LR_W_TEST_FLAG;
+        }
+        if flags.is_route {
+            evidence[LayerRole::TransportApi.index()] += LR_W_ROUTE_FLAG;
+        }
+        if flags.is_handler {
+            evidence[LayerRole::TransportApi.index()] += LR_W_HANDLER_FLAG;
+        }
+    }
+
+    if let Some(routes) = input.route_surface.as_ref() {
+        if !routes.routes.is_empty() || !routes.channels.is_empty() {
+            evidence[LayerRole::TransportApi.index()] += LR_W_ROUTE_SURFACE;
+        }
+    }
+
+    if let Some(calls) = input.api_calls.as_ref() {
+        for call in calls {
+            ensure_finite_scalar("layer_role.api_call_count", call.call_count)?;
+            ensure_non_negative("layer_role.api_call_count", call.call_count)?;
+            let trimmed = call.callee.trim();
+            if trimmed.is_empty() || !call.resolved {
+                continue;
+            }
+            let weight = 1.0 + crate::detmath::ln_1p(call.call_count);
+            match default_api_family(trimmed) {
+                Some(ApiFamily::Persistence) => {
+                    evidence[LayerRole::Persistence.index()] += LR_W_API_PERSISTENCE * weight;
+                }
+                Some(ApiFamily::Transport) => {
+                    evidence[LayerRole::TransportApi.index()] += LR_W_API_TRANSPORT * weight;
+                }
+                None => {
+                    evidence[LayerRole::Other.index()] += LR_W_API_UNCLASSIFIED * weight;
+                }
+            }
+        }
+    }
+
+    if let Some(graph) = input.graph_position.as_ref() {
+        let signals = [
+            graph.call_in,
+            graph.call_out,
+            graph.dataflow_in,
+            graph.dataflow_out,
+            graph.type_in,
+            graph.type_out,
+            graph.service_in,
+            graph.service_out,
+            graph.sampled_betweenness,
+            graph.pagerank,
+            graph.clustering_coeff,
+            graph.neighbor_label_entropy,
+        ];
+        ensure_finite_values("layer_role.graph_position", &signals)?;
+        for value in signals {
+            ensure_non_negative("layer_role.graph_position", value)?;
+        }
+        // A service symbol sits *between* callers and callees: it carries both
+        // inbound and outbound edges and high sampled betweenness.
+        let in_degree = crate::detmath::ln_1p(graph.call_in + graph.dataflow_in + graph.service_in);
+        let out_degree =
+            crate::detmath::ln_1p(graph.call_out + graph.dataflow_out + graph.service_out);
+        let service_ev = LR_W_SERVICE_BETWEENNESS * graph.sampled_betweenness
+            + LR_W_SERVICE_DEGREE * in_degree.min(out_degree);
+        if service_ev > 0.0 {
+            evidence[LayerRole::ServiceDomain.index()] += service_ev;
+        }
+    }
+
+    let total: f32 = evidence.iter().sum();
+    let mut data = if total <= 0.0 {
+        let mut fallback = vec![0.0_f32; LAYER_ROLE_COUNT];
+        fallback[LayerRole::Other.index()] = 1.0;
+        fallback
+    } else {
+        evidence.to_vec()
+    };
+    l1_normalize(&mut data)?;
+    dense(SlotId::new(23), data)
+}
+
+/// Returns the S23 `layer_role` deterministic encoder lens runtime.
+pub fn layer_role_lens() -> PanelResult<DeterministicEncoderLens> {
+    DeterministicEncoderLens::new(SlotId::new(23))
+}
+
 fn encode_record_vec(input: &RecordVectorInput) -> PanelResult<SlotVector> {
     let mut data = Vec::with_capacity(RECORD_VEC_DIM as usize);
     for key in RECORD_VECTOR_SCALAR_KEYS {
@@ -1557,7 +1754,7 @@ fn insert_prefixed(terms: &mut BTreeSet<String>, prefix: &str, values: &[String]
 }
 
 fn is_deterministic_encoder_slot(slot: u16) -> bool {
-    (0..=17).contains(&slot) || slot == 21
+    (0..=17).contains(&slot) || slot == 21 || slot == 23
 }
 
 fn bool_to_f32(value: bool) -> f32 {
@@ -1585,6 +1782,32 @@ fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
     }
     for value in data {
         *value /= norm;
+    }
+    Ok(())
+}
+
+/// L1-normalizes a non-negative evidence vector into a probability distribution.
+///
+/// Every value must be finite and non-negative (the S23 evidence accumulator only
+/// adds non-negative weighted signals); fails closed if the total mass is zero so a
+/// signal-free vector can never be silently emitted as a uniform or empty posterior
+/// (the encoder routes that case to an explicit `Other`-mass fallback upstream).
+fn l1_normalize(data: &mut [f32]) -> PanelResult<()> {
+    for value in data.iter() {
+        ensure_finite_scalar("l1_norm", *value)?;
+        ensure_non_negative("l1_norm", *value)?;
+    }
+    let mass = data.iter().sum::<f32>();
+    ensure_finite_scalar("l1_mass", mass)?;
+    if mass == 0.0 {
+        return Err(PanelError::new(
+            ASTRO_PANEL_VECTOR_INVALID,
+            "l1-normalized distribution has zero mass",
+            "Emit at least one non-zero evidence coordinate before L1 normalization.",
+        ));
+    }
+    for value in data.iter_mut() {
+        *value /= mass;
     }
     Ok(())
 }

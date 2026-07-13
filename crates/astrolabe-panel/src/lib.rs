@@ -2,12 +2,16 @@
 
 mod detmath;
 mod embeddings;
+pub mod layout_registry;
 mod lenses;
+#[cfg(test)]
+mod s23_layer_role_fsv;
 mod unicode61;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::LazyLock;
 
 use astrolabe_domain::{ASTRO_SYMBOL_NON_FINITE, SymbolLabel};
 use calyx_core::{
@@ -23,21 +27,35 @@ pub use embeddings::{
     fixture_static_embedding_input, nomic_weights_identity, s18_s20_lenses,
 };
 pub use lenses::{
-    ApiCall, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
-    ConfigEnvSurfaceInput, DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput,
-    GraphPositionInput, IdentifierLexicalInput, LangLabelInput, PathHierarchyInput,
-    RECORD_VECTOR_SCALAR_KEYS, RecordVectorInput, RoleFlagsInput, RouteObservation,
-    RouteSurfaceInput, StructuralTrigram, TestTopologyInput, TypeSurfaceInput, canonical_route_qn,
-    cbm_camel_split_text, cbm_camel_split_tokens, cbm_route_canon_path, encode_slot,
-    fixture_encoder_input, fixture_scalar_sidecar, s0_s9_lenses, s10_s17_s21_lenses,
+    ApiCall, ApiFamily, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
+    ConfigEnvSurfaceInput, DEFAULT_PERSISTENCE_FAMILY_SEEDS, DEFAULT_TRANSPORT_FAMILY_SEEDS,
+    DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput, GraphPositionInput,
+    IdentifierLexicalInput, LangLabelInput, PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS,
+    RecordVectorInput, RoleFlagsInput, RouteObservation, RouteSurfaceInput, StructuralTrigram,
+    TestTopologyInput, TypeSurfaceInput, canonical_route_qn, cbm_camel_split_text,
+    cbm_camel_split_tokens, cbm_route_canon_path, default_api_family, encode_slot,
+    fixture_encoder_input, fixture_scalar_sidecar, layer_role_lens, s0_s9_lenses,
+    s10_s17_s21_lenses,
 };
 
 /// Crate name reported by Cargo metadata.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 /// Frozen Astrolabe panel schema identifier.
+///
+/// This string is the panel-*family* content-address salt baked into every slot's
+/// [`FrozenLensContract::lens_id`] and deterministic `weights_sha`. It is stable
+/// across panel *roster* versions: a lens's identity is per-lens (its name, weights,
+/// shape, modality, norm), so a new roster version that only *adds* a slot never
+/// disturbs the frozen identities of the existing S0-S22 lenses. The roster version
+/// itself is carried separately as [`PanelReadout::panel_version`] /
+/// [`PANEL_SCHEMA_ID_V2`].
 pub const PANEL_SCHEMA_ID: &str = "astro.panel.v1";
+/// Panel schema id emitted by readouts from the v2 roster (S0-S23, adds S23 `layer_role`).
+pub const PANEL_SCHEMA_ID_V2: &str = "astro.panel.v2";
 /// First Astrolabe panel version.
 pub const DEFAULT_PANEL_VERSION: u32 = 1;
+/// Second Astrolabe panel version — adds the S23 `layer_role` frozen slot (#180a).
+pub const PANEL_V2_VERSION: u32 = 2;
 /// Frozen seed registry schema identifier.
 pub const ASTRO_SEED_REGISTRY_SCHEMA: &str = "astro.seed_registry.v1";
 /// Frozen seed registry artifact kind.
@@ -57,6 +75,10 @@ pub const ASTRO_PANEL_SEED_REGISTRY_INVALID: &str = "ASTRO_PANEL_SEED_REGISTRY_I
 /// unit-normalized, so the slot degrades to an explicit labeled absence instead of
 /// aborting the whole panel readout for the symbol.
 pub const ASTRO_PANEL_S21_ZERO_SIGNAL: &str = "ASTRO_PANEL_S21_ZERO_SIGNAL";
+/// Error code returned when a panel-version bump is inconsistent (e.g. non-monotonic).
+pub const ASTRO_PANEL_VERSION_BUMP_INVALID: &str = "ASTRO_PANEL_VERSION_BUMP_INVALID";
+/// Frozen schema id of the canonical layer-role taxonomy shared with the layout registry.
+pub const ASTRO_LAYOUT_CANONICAL_ROLES_SCHEMA: &str = "astro.layout.canonical_roles.v1";
 
 /// Result type for panel operations.
 pub type PanelResult<T> = std::result::Result<T, PanelError>;
@@ -131,23 +153,36 @@ impl LensDType {
 pub enum NormPolicy {
     /// Values must be finite; unit length is not required.
     Finite,
-    /// Values must be finite and each vector must be unit length.
+    /// Values must be finite and each vector must be unit (L2) length.
     Unit {
         /// Absolute tolerance for unit-length validation.
+        tolerance: f32,
+    },
+    /// Values must be finite and each vector's L1 mass (sum of absolute values)
+    /// must be one — i.e. the vector is a probability distribution. Used by the
+    /// S23 `layer_role` posterior.
+    L1 {
+        /// Absolute tolerance for L1-mass validation.
         tolerance: f32,
     },
 }
 
 impl NormPolicy {
-    /// Unit norm with the Astrolabe v1 default tolerance.
+    /// Unit (L2) norm with the Astrolabe v1 default tolerance.
     pub const fn unit() -> Self {
         Self::Unit { tolerance: 1.0e-3 }
+    }
+
+    /// L1-mass (probability-distribution) norm with the Astrolabe v1 default tolerance.
+    pub const fn l1() -> Self {
+        Self::L1 { tolerance: 1.0e-3 }
     }
 
     const fn as_str(self) -> &'static str {
         match self {
             Self::Finite => "finite",
             Self::Unit { .. } => "unit",
+            Self::L1 { .. } => "l1",
         }
     }
 }
@@ -388,12 +423,20 @@ pub struct PanelSlotSpec {
     pub retrieval_only: bool,
     /// Slots excluded from dedup do not affect content identity.
     pub excluded_from_dedup: bool,
+    /// Guard-designated slots are persisted **raw** (no quantization) so a guard
+    /// conformal readback is byte-exact against the encoder's real posterior.
+    pub guard_raw: bool,
 }
 
 impl PanelSlotSpec {
     /// Returns the Calyx slot id.
     pub const fn slot_id(self) -> SlotId {
         SlotId::new(self.slot)
+    }
+
+    /// Returns true when this slot is guard-designated (persisted raw).
+    pub const fn is_guard_raw(self) -> bool {
+        self.guard_raw
     }
 }
 
@@ -412,6 +455,7 @@ const fn slot(
         norm,
         retrieval_only: false,
         excluded_from_dedup: false,
+        guard_raw: false,
     }
 }
 
@@ -430,6 +474,27 @@ const fn retrieval_slot(
         norm,
         retrieval_only: true,
         excluded_from_dedup: true,
+        guard_raw: false,
+    }
+}
+
+/// Frozen slot spec for a guard-designated slot persisted raw (no quantization).
+const fn guard_raw_slot(
+    slot: u16,
+    key: &'static str,
+    shape: SlotShape,
+    modality: Modality,
+    norm: NormPolicy,
+) -> PanelSlotSpec {
+    PanelSlotSpec {
+        slot,
+        key,
+        shape,
+        modality,
+        norm,
+        retrieval_only: false,
+        excluded_from_dedup: false,
+        guard_raw: true,
     }
 }
 
@@ -598,14 +663,159 @@ pub const PANEL_V1_SLOTS: &[PanelSlotSpec] = &[
     ),
 ];
 
+/// Frozen canonical layer-role taxonomy for the S23 `layer_role` lens
+/// (`astro.layout.canonical_roles.v1`).
+///
+/// This is a fixed *coordinate system* — a taxonomy/enum, not a measurable
+/// threshold — so it is a permitted literal under standing invariant 4. Repos
+/// declare their own directory *names*; the per-repo directory→role assignment
+/// lives in the `astro.layout.declared_map.v1` registry knob, and any behavioral
+/// surface that does not map to one of these roles overflows to
+/// [`LayerRole::Other`] (the S13 hashed-overflow pattern). The **order** here is
+/// frozen: it is the Dense(8) dimension order of every persisted S23 posterior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerRole {
+    /// Transport / API layer: routes, handlers, request/response surface.
+    TransportApi,
+    /// Service / business-domain layer: orchestration between transport and data.
+    ServiceDomain,
+    /// Persistence layer: database, store, ORM, connection/query surface.
+    Persistence,
+    /// Model / schema layer: data-holding declarations with no behavioral surface.
+    ModelSchema,
+    /// Infrastructure / configuration layer.
+    InfraConfig,
+    /// Test layer.
+    Test,
+    /// Presentation / UI layer.
+    Presentation,
+    /// Overflow role for behavioral surface that maps to no declared layer.
+    Other,
+}
+
+/// Number of canonical layer roles — the frozen S23 `layer_role` Dense dimension.
+pub const LAYER_ROLE_COUNT: usize = 8;
+
+/// Frozen canonical role order (the S23 Dense(8) dimension order).
+pub const CANONICAL_ROLES: [LayerRole; LAYER_ROLE_COUNT] = [
+    LayerRole::TransportApi,
+    LayerRole::ServiceDomain,
+    LayerRole::Persistence,
+    LayerRole::ModelSchema,
+    LayerRole::InfraConfig,
+    LayerRole::Test,
+    LayerRole::Presentation,
+    LayerRole::Other,
+];
+
+impl LayerRole {
+    /// Stable snake_case identifier for this role.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportApi => "transport_api",
+            Self::ServiceDomain => "service_domain",
+            Self::Persistence => "persistence",
+            Self::ModelSchema => "model_schema",
+            Self::InfraConfig => "infra_config",
+            Self::Test => "test",
+            Self::Presentation => "presentation",
+            Self::Other => "other",
+        }
+    }
+
+    /// Fixed Dense(8) dimension index of this role.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::TransportApi => 0,
+            Self::ServiceDomain => 1,
+            Self::Persistence => 2,
+            Self::ModelSchema => 3,
+            Self::InfraConfig => 4,
+            Self::Test => 5,
+            Self::Presentation => 6,
+            Self::Other => 7,
+        }
+    }
+
+    /// Parses a canonical role name, or `None` if it is not in the frozen taxonomy.
+    pub fn from_str_canonical(name: &str) -> Option<Self> {
+        CANONICAL_ROLES
+            .into_iter()
+            .find(|role| role.as_str() == name)
+    }
+}
+
+/// Frozen slot spec for the S23 `layer_role` lens (panel v2 addition, #180a).
+///
+/// Guard-designated (persisted raw), Dense(8) over [`CANONICAL_ROLES`], L1-normalized
+/// (a probability distribution). The calyx input [`Modality::Structured`] carries the
+/// derived behavioral graph/flag evidence the encoder combines; the blueprint "Content"
+/// modality is the guard lens *category* (distinct axis from the calyx input modality).
+pub const S23_LAYER_ROLE_SLOT: PanelSlotSpec = guard_raw_slot(
+    23,
+    "layer_role",
+    SlotShape::Dense(LAYER_ROLE_COUNT as u32),
+    Modality::Structured,
+    NormPolicy::l1(),
+);
+
+/// Frozen v2 slot roster: the v1 slots (S0-S22) plus the S23 `layer_role` slot.
+///
+/// The v1 lenses keep their exact frozen identities (per-lens content addressing);
+/// only S23 is minted. Built lazily to append S23 to [`PANEL_V1_SLOTS`] without
+/// duplicating the 23-entry v1 table.
+pub static PANEL_V2_SLOTS: LazyLock<Vec<PanelSlotSpec>> = LazyLock::new(|| {
+    let mut slots = PANEL_V1_SLOTS.to_vec();
+    slots.push(S23_LAYER_ROLE_SLOT);
+    slots
+});
+
 /// Returns the frozen v1 slot roster.
 pub fn default_panel_slots() -> &'static [PanelSlotSpec] {
     PANEL_V1_SLOTS
 }
 
-/// Returns a slot specification by id.
+/// Returns the frozen v2 slot roster (S0-S23).
+pub fn default_panel_v2_slots() -> &'static [PanelSlotSpec] {
+    &PANEL_V2_SLOTS
+}
+
+/// Returns the frozen slot roster for a panel roster version.
+///
+/// Fails closed for a version that has no frozen roster rather than silently
+/// measuring an empty or wrong panel.
+pub fn slots_for_version(version: u32) -> PanelResult<&'static [PanelSlotSpec]> {
+    match version {
+        DEFAULT_PANEL_VERSION => Ok(PANEL_V1_SLOTS),
+        PANEL_V2_VERSION => Ok(&PANEL_V2_SLOTS),
+        other => Err(PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            format!("panel version {other} has no frozen slot roster"),
+            "Measure with panel version 1 (S0-S22) or 2 (S0-S23).",
+        )),
+    }
+}
+
+/// Returns the frozen panel schema id emitted by a roster version's readouts.
+pub fn schema_id_for_version(version: u32) -> PanelResult<&'static str> {
+    match version {
+        DEFAULT_PANEL_VERSION => Ok(PANEL_SCHEMA_ID),
+        PANEL_V2_VERSION => Ok(PANEL_SCHEMA_ID_V2),
+        other => Err(PanelError::new(
+            ASTRO_PANEL_CONTRACT_INVALID,
+            format!("panel version {other} has no frozen schema id"),
+            "Measure with panel version 1 or 2.",
+        )),
+    }
+}
+
+/// Returns a slot specification by id, searching the v2 superset roster (S0-S23).
+///
+/// The v1 slots are a prefix of the v2 roster with byte-identical specs, so a v1
+/// consumer sees the same answer; S23 additionally resolves.
 pub fn slot_spec(slot_id: SlotId) -> Option<&'static PanelSlotSpec> {
-    PANEL_V1_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
+    PANEL_V2_SLOTS.iter().find(|slot| slot.slot_id() == slot_id)
 }
 
 /// Returns the default frozen contracts for every v1 slot.
@@ -683,14 +893,50 @@ pub const fn label_class(label: SymbolLabel) -> LabelClass {
     }
 }
 
-/// Returns true when a slot applies to a label.
+/// Returns true when a slot applies to a label (v1 roster).
 pub fn slot_applies(label: SymbolLabel, slot_id: SlotId) -> bool {
     applicable_slot_ids_for_class(label_class(label)).contains(&slot_id)
 }
 
-/// Returns the applicable slot ids for a domain label.
+/// Returns the applicable slot ids for a domain label (v1 roster).
 pub fn applicable_slot_ids(label: SymbolLabel) -> BTreeSet<SlotId> {
     applicable_slot_ids_for_class(label_class(label))
+}
+
+/// Returns the applicable slot ids for a domain label under a panel roster version.
+///
+/// For the v2 roster this adds S23 `layer_role` to the classes with a behavioral
+/// surface (Callable, TypeDeclaration, ModuleFile, RouteChannel). Value-class atoms
+/// (Field/Constant/Property) and structural atoms have no behavioral surface, so S23
+/// stays *not applicable* and their readout carries an explicit `Absent{NotApplicable}`.
+pub fn applicable_slot_ids_versioned(label: SymbolLabel, version: u32) -> BTreeSet<SlotId> {
+    applicable_slot_ids_for_class_versioned(label_class(label), version)
+}
+
+/// Returns the applicable slot ids for a label class under a panel roster version.
+pub fn applicable_slot_ids_for_class_versioned(
+    class: LabelClass,
+    version: u32,
+) -> BTreeSet<SlotId> {
+    let mut set = applicable_slot_ids_for_class(class);
+    if version >= PANEL_V2_VERSION && layer_role_applies_to_class(class) {
+        set.insert(S23_LAYER_ROLE_SLOT.slot_id());
+    }
+    set
+}
+
+/// S23 `layer_role` applicability by class (blueprint applicability-matrix rows):
+/// Function/Method/Macro (full); Class/Struct/Interface/Enum/Trait (aggregate over
+/// members); Module/File (directory-role feeder); Route/Channel (`transport_api` by
+/// construction). Field/Constant/Property and structural atoms ⇒ not applicable.
+const fn layer_role_applies_to_class(class: LabelClass) -> bool {
+    matches!(
+        class,
+        LabelClass::Callable
+            | LabelClass::TypeDeclaration
+            | LabelClass::ModuleFile
+            | LabelClass::RouteChannel
+    )
 }
 
 /// Returns the applicable slot ids for a label class.
@@ -900,10 +1146,12 @@ impl PanelDriver {
         R: SlotRuntime,
     {
         validate_scalar_sidecar(&input.scalars)?;
-        let applicable = applicable_slot_ids(input.label);
+        let roster = slots_for_version(self.version)?;
+        let schema_id = schema_id_for_version(self.version)?;
+        let applicable = applicable_slot_ids_versioned(input.label, self.version);
         let mut slots = BTreeMap::new();
         let mut summary = PanelReadoutSummary::default();
-        for slot in PANEL_V1_SLOTS {
+        for slot in roster {
             let slot_id = slot.slot_id();
             let vector = if !applicable.contains(&slot_id) {
                 SlotVector::Absent {
@@ -934,7 +1182,7 @@ impl PanelDriver {
             slots.insert(slot_id, vector);
         }
         Ok(PanelReadout {
-            schema_id: PANEL_SCHEMA_ID.to_string(),
+            schema_id: schema_id.to_string(),
             panel_version: self.version,
             label: input.label,
             slots,
@@ -1393,6 +1641,185 @@ pub fn plan_encoder_change(
     })
 }
 
+/// Re-derivation cost incurred by adding a frozen slot to the panel roster.
+///
+/// Adding S23 to the roster and to dedup identity means every symbol whose label
+/// class receives S23 must be re-deduped and re-assayed. The concrete touched-scope
+/// *count* is repo-specific and is measured by the ingest ledger entry against the
+/// real corpus; this record states the policy (which classes, that re-derivation is
+/// required) so the cost is never silently absorbed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReDerivationCost {
+    /// True when the added slot participates in constellation identity/dedup.
+    pub added_to_identity: bool,
+    /// Whether dedup constellations must be re-indexed for touched scopes.
+    pub dedup_reindex_required: bool,
+    /// Whether assay/quality re-derivation is required for touched scopes.
+    pub assay_recompute_required: bool,
+    /// Stable snake_case names of the label classes that receive the new slot.
+    pub affected_label_classes: Vec<String>,
+}
+
+/// A ledgerable record of a panel roster-version bump (e.g. v1 → v2 adding S23).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PanelVersionBump {
+    /// Previous panel schema id.
+    pub from_schema_id: String,
+    /// New panel schema id.
+    pub to_schema_id: String,
+    /// Previous panel roster version.
+    pub from_version: u32,
+    /// New panel roster version.
+    pub to_version: u32,
+    /// Slot id added by this bump.
+    pub added_slot: SlotId,
+    /// Stable key of the added slot.
+    pub added_slot_key: String,
+    /// Content-addressed frozen lens id of the added slot.
+    pub added_lens_id: LensId,
+    /// Re-derivation cost this bump imposes on touched scopes.
+    pub rederivation: ReDerivationCost,
+}
+
+/// Plans the panel v1 → v2 bump that adds the S23 `layer_role` slot (#180a).
+///
+/// Fails closed if the S23 frozen contract cannot bind its real encoder output.
+pub fn plan_panel_version_bump_v1_to_v2() -> PanelResult<PanelVersionBump> {
+    let contract = FrozenLensContract::for_slot(&S23_LAYER_ROLE_SLOT)?;
+    let added_to_identity =
+        !S23_LAYER_ROLE_SLOT.retrieval_only && !S23_LAYER_ROLE_SLOT.excluded_from_dedup;
+    let affected = [
+        LabelClass::Callable,
+        LabelClass::TypeDeclaration,
+        LabelClass::ModuleFile,
+        LabelClass::RouteChannel,
+    ]
+    .into_iter()
+    .filter(|class| layer_role_applies_to_class(*class))
+    .map(|class| label_class_key(class).to_string())
+    .collect::<Vec<_>>();
+    Ok(PanelVersionBump {
+        from_schema_id: PANEL_SCHEMA_ID.to_string(),
+        to_schema_id: PANEL_SCHEMA_ID_V2.to_string(),
+        from_version: DEFAULT_PANEL_VERSION,
+        to_version: PANEL_V2_VERSION,
+        added_slot: S23_LAYER_ROLE_SLOT.slot_id(),
+        added_slot_key: S23_LAYER_ROLE_SLOT.key.to_string(),
+        added_lens_id: contract.lens_id(),
+        rederivation: ReDerivationCost {
+            added_to_identity,
+            dedup_reindex_required: added_to_identity,
+            assay_recompute_required: added_to_identity,
+            affected_label_classes: affected,
+        },
+    })
+}
+
+/// Stable snake_case key for a panel applicability label class.
+pub const fn label_class_key(class: LabelClass) -> &'static str {
+    match class {
+        LabelClass::Callable => "callable",
+        LabelClass::TypeDeclaration => "type_declaration",
+        LabelClass::Value => "value",
+        LabelClass::ModuleFile => "module_file",
+        LabelClass::RouteChannel => "route_channel",
+        LabelClass::StructuredResource => "structured_resource",
+        LabelClass::Section => "section",
+        LabelClass::Structural => "structural",
+    }
+}
+
+/// Serializes a concrete slot vector to its guard-raw byte form (no quantization):
+/// `b"D" | dim:u32be | dim×f32be` for dense, `b"S" | dim:u32be | len:u32be |
+/// (idx:u32be,val:f32be)×len` for sparse. This is the exact byte-level form a
+/// guard-designated slot (e.g. S23 `layer_role`) is persisted and read back in.
+///
+/// Fails closed on `Multi`/`Absent`: a guard-designated raw sidecar records a
+/// concrete measured vector, never a placeholder.
+pub fn slot_raw_bytes(vector: &SlotVector) -> PanelResult<Vec<u8>> {
+    slot_vector_identity_bytes(vector)
+}
+
+/// Decodes guard-raw bytes produced by [`slot_raw_bytes`] back into a slot vector.
+///
+/// Fails closed with [`ASTRO_PANEL_VECTOR_INVALID`] on a truncated or unrecognized
+/// envelope so a corrupt persisted sidecar can never be read as a valid posterior.
+pub fn decode_slot_raw(bytes: &[u8]) -> PanelResult<SlotVector> {
+    let invalid = |message: String| {
+        PanelError::new(
+            ASTRO_PANEL_VECTOR_INVALID,
+            message,
+            "Re-persist the guard-raw slot sidecar from the encoder's real output.",
+        )
+    };
+    let (tag, rest) = bytes
+        .split_first()
+        .ok_or_else(|| invalid("empty guard-raw slot envelope".to_string()))?;
+    match tag {
+        b'D' => {
+            let dim_bytes: [u8; 4] = rest
+                .get(0..4)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("dense guard-raw envelope missing dim".to_string()))?;
+            let dim = u32::from_be_bytes(dim_bytes);
+            let payload = &rest[4..];
+            if payload.len() != dim as usize * 4 {
+                return Err(invalid(format!(
+                    "dense guard-raw envelope has {} value bytes, expected {}",
+                    payload.len(),
+                    dim as usize * 4
+                )));
+            }
+            let data = payload
+                .chunks_exact(4)
+                .map(|chunk| {
+                    let mut word = [0_u8; 4];
+                    word.copy_from_slice(chunk);
+                    f32::from_bits(u32::from_be_bytes(word))
+                })
+                .collect::<Vec<_>>();
+            Ok(SlotVector::Dense { dim, data })
+        }
+        b'S' => {
+            let dim_bytes: [u8; 4] = rest
+                .get(0..4)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("sparse guard-raw envelope missing dim".to_string()))?;
+            let dim = u32::from_be_bytes(dim_bytes);
+            let len_bytes: [u8; 4] = rest
+                .get(4..8)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("sparse guard-raw envelope missing len".to_string()))?;
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            let payload = &rest[8..];
+            if payload.len() != len * 8 {
+                return Err(invalid(format!(
+                    "sparse guard-raw envelope has {} entry bytes, expected {}",
+                    payload.len(),
+                    len * 8
+                )));
+            }
+            let entries = payload
+                .chunks_exact(8)
+                .map(|chunk| {
+                    let mut idx = [0_u8; 4];
+                    idx.copy_from_slice(&chunk[0..4]);
+                    let mut val = [0_u8; 4];
+                    val.copy_from_slice(&chunk[4..8]);
+                    SparseEntry {
+                        idx: u32::from_be_bytes(idx),
+                        val: f32::from_bits(u32::from_be_bytes(val)),
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(SlotVector::Sparse { dim, entries })
+        }
+        other => Err(invalid(format!(
+            "unrecognized guard-raw envelope tag {other:#x}"
+        ))),
+    }
+}
+
 /// Returns the parent system this crate currently binds against.
 pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::Calyx
@@ -1501,24 +1928,44 @@ fn validate_vector(
             norm: contract.norm,
             retrieval_only: false,
             excluded_from_dedup: false,
+            guard_raw: false,
         },
         vector,
     )?;
-    if let NormPolicy::Unit { tolerance } = contract.norm {
-        let norm = vector_norm(vector).ok_or_else(|| {
-            PanelError::new(
-                ASTRO_PANEL_VECTOR_INVALID,
-                format!("lens {lens_id} emitted absent vector for a unit-norm contract"),
-                "Use explicit Absent only for unavailable runtime paths, not registration probes.",
-            )
-        })?;
-        if (norm - 1.0).abs() > tolerance {
-            return Err(PanelError::new(
-                ASTRO_PANEL_VECTOR_INVALID,
-                format!("lens {lens_id} norm {norm:.6} outside unit tolerance {tolerance}"),
-                "Normalize the emitted vector or change the frozen contract norm policy.",
-            ));
+    match contract.norm {
+        NormPolicy::Unit { tolerance } => {
+            let norm = vector_norm(vector).ok_or_else(|| {
+                PanelError::new(
+                    ASTRO_PANEL_VECTOR_INVALID,
+                    format!("lens {lens_id} emitted absent vector for a unit-norm contract"),
+                    "Use explicit Absent only for unavailable runtime paths, not registration probes.",
+                )
+            })?;
+            if (norm - 1.0).abs() > tolerance {
+                return Err(PanelError::new(
+                    ASTRO_PANEL_VECTOR_INVALID,
+                    format!("lens {lens_id} norm {norm:.6} outside unit tolerance {tolerance}"),
+                    "Normalize the emitted vector or change the frozen contract norm policy.",
+                ));
+            }
         }
+        NormPolicy::L1 { tolerance } => {
+            let mass = vector_l1_mass(vector).ok_or_else(|| {
+                PanelError::new(
+                    ASTRO_PANEL_VECTOR_INVALID,
+                    format!("lens {lens_id} emitted absent vector for an L1-norm contract"),
+                    "Use explicit Absent only for unavailable runtime paths, not registration probes.",
+                )
+            })?;
+            if (mass - 1.0).abs() > tolerance {
+                return Err(PanelError::new(
+                    ASTRO_PANEL_VECTOR_INVALID,
+                    format!("lens {lens_id} L1 mass {mass:.6} outside tolerance {tolerance}"),
+                    "L1-normalize the emitted distribution or change the frozen contract norm policy.",
+                ));
+            }
+        }
+        NormPolicy::Finite => {}
     }
     Ok(())
 }
@@ -1587,6 +2034,24 @@ fn vector_norm(vector: &SlotVector) -> Option<f32> {
         SlotVector::Absent { .. } => return None,
     };
     Some(sum.sqrt())
+}
+
+/// Returns the L1 mass (sum of absolute values) of a concrete vector, or `None` for
+/// an absent slot. Used to validate an [`NormPolicy::L1`] probability-distribution slot.
+fn vector_l1_mass(vector: &SlotVector) -> Option<f32> {
+    let mass = match vector {
+        SlotVector::Dense { data, .. } => data.iter().map(|value| value.abs()).sum::<f32>(),
+        SlotVector::Sparse { entries, .. } => {
+            entries.iter().map(|entry| entry.val.abs()).sum::<f32>()
+        }
+        SlotVector::Multi { tokens, .. } => tokens
+            .iter()
+            .flatten()
+            .map(|value| value.abs())
+            .sum::<f32>(),
+        SlotVector::Absent { .. } => return None,
+    };
+    Some(mass)
 }
 
 fn fixture_vector(shape: SlotShape, slot: u16, salt: usize) -> SlotVector {
