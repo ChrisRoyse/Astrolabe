@@ -71,16 +71,15 @@ make -f "$ROOT/patches/cbm/Makefile.cbm" lint-cppcheck-astrolabe CPPCHECK="$CPPC
 echo "=== CBM clang-format ==="
 mkdir -p "$FORMAT_TMP_PARENT"
 FORMAT_WORKSPACE="$(mktemp -d "$FORMAT_TMP_PARENT/cbm-format.XXXXXX")"
-# Overlay set is declared once, in patches/cbm/Makefile.cbm's lint-format-astrolabe
-# prerequisites. This stage names no overlay file: adding an overlay there extends
-# this gate automatically, with no edit here. Every overlay is hash-checked against
-# the pinned vendor source and materialized under a run-scoped workspace, so the
-# vendor tree is never written.
-echo "INFO[ASTRO_CBM_FORMAT_OVERLAY]: hash-checked overlays validate the pinned vendor sources without mutating them (overlay set declared in patches/cbm/Makefile.cbm: lint-format-astrolabe)"
+# #286: the CBM sources are owned and edited in place, so lint-format-astrolabe
+# format-checks them directly (as LINT_SRCS) plus the two Astrolabe-owned glue
+# TUs (env_store_config.{c,h}) that still live outside the CBM src tree, fed via
+# stdin with a vendor-relative assumed name so ./.clang-format applies. The
+# spawn helper is handled by the same target's astro-lint-format-spawn prereq.
+echo "INFO[ASTRO_CBM_FORMAT]: owned CBM sources format-checked in place (patches/cbm/Makefile.cbm: lint-format-astrolabe)"
 make -f "$ROOT/patches/cbm/Makefile.cbm" lint-format-astrolabe \
   CLANG_FORMAT="${CLANG_FORMAT:-clang-format}" \
-  BUILD_DIR="$FORMAT_WORKSPACE/build" \
-  ASTRO_FORMAT_OVERLAY_DIR="$FORMAT_WORKSPACE/overlay"
+  BUILD_DIR="$FORMAT_WORKSPACE/build"
 
 echo "=== CBM NOLINT whitelist ==="
 make -f Makefile.cbm lint-no-suppress

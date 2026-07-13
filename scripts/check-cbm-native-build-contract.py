@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_RS = ROOT / "crates" / "cbm-sys" / "build.rs"
 MAKEFILE = ROOT / "patches" / "cbm" / "Makefile.cbm"
-MEM_PRESSURE_PATCH = ROOT / "patches" / "cbm" / "apply_mem_pressure_patch.py"
+MEM_C = ROOT / "vendor" / "codebase-memory-mcp" / "src" / "foundation" / "mem.c"
 LAYOUT_PROBE = ROOT / "patches" / "cbm" / "astro_layout_probe.c"
 
 
@@ -19,7 +19,7 @@ def require(condition: bool, message: str) -> None:
 def main() -> None:
     build_rs = BUILD_RS.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
-    mem_pressure_patch = MEM_PRESSURE_PATCH.read_text(encoding="utf-8")
+    mem_c = MEM_C.read_text(encoding="utf-8")
 
     require(LAYOUT_PROBE.is_file(), "the native C ABI layout probe must be present")
 
@@ -56,20 +56,12 @@ def main() -> None:
             f'format!("{variable}={{}}", make_command_path(&{local}))' in build_rs,
             f"{variable} must be normalized before GNU Make receives it",
         )
-    # #192 narrowed the rerun-if surface: the pinned CBM trees are deliberately
-    # NOT watched file-by-file. VENDORED.md (rewritten by every sanctioned pin
-    # bump) and the patches/cbm overlay inputs are the only vendor-change
-    # channels Cargo needs to see; scripts/verify-pins.sh rejects direct vendor
-    # edits. Statements are split on ';' so multi-line println! calls are
-    # evaluated whole.
+    # #192 narrowed the rerun-if surface: the (now owned, #286) CBM trees are
+    # deliberately NOT watched file-by-file. The Makefile and the Astrolabe glue
+    # TUs are watched; within one build the Make depfiles + config stamp own
+    # incremental correctness. Statements are split on ';' so multi-line println!
+    # calls are evaluated whole.
     statements = build_rs.split(";")
-    require(
-        any(
-            "rerun-if-changed" in statement and 'join("VENDORED.md")' in statement
-            for statement in statements
-        ),
-        "Cargo must watch VENDORED.md as the sanctioned vendor-change signal (#192)",
-    )
     stale_tree_watches = [
         statement.strip()
         for statement in statements
@@ -96,42 +88,30 @@ def main() -> None:
         "libcbm_build_config(&config_inputs)" in build_rs
         and "&build_script," in build_rs
         and "&patched_makefile," in build_rs
-        and "&mem_pressure_patch," in build_rs
-        and "&env_store_patch," in build_rs
         and "&env_store_config_src," in build_rs
         and "&env_store_config_hdr," in build_rs
         and "config_inputs.extend(spawn_overlays" in build_rs,
-        "the configuration stamp must cover build.rs, Makefile.cbm, and every "
-        "source overlay (mem-pressure, env-store, and the #227/#228 spawn set)",
+        "the configuration stamp must cover build.rs, Makefile.cbm, and the "
+        "Astrolabe-owned glue TUs (env-store config + the #227/#228 spawn helper)",
     )
-    require(
-        'let mem_pressure_patch = repo_root.join("patches/cbm/apply_mem_pressure_patch.py");'
-        in build_rs
-        and "cargo:rerun-if-changed={}" in build_rs,
-        "Cargo must rebuild when the CBM pressure-log overlay changes",
-    )
-    # #227/#228: every shell-free-spawn overlay input must be watched AND folded
-    # into the config stamp, or a change to the git-spawn helper/generators would
-    # not rebuild libcbm.a. Assert the whole set by path so the gate stays
-    # load-bearing as overlays are added.
-    for overlay in (
+    # #286: the overlays are absorbed into the owned CBM sources; the only
+    # patches/cbm build inputs left are the Astrolabe glue TUs. Each must be
+    # watched AND folded into the config stamp, or a change to the git-spawn
+    # helper / env-store config would not rebuild libcbm.a.
+    for glue in (
         "astro_spawn.c",
         "astro_spawn.h",
-        "astro_overlay.py",
-        "apply_spawn_git_context_patch.py",
-        "apply_spawn_artifact_patch.py",
-        "apply_spawn_watcher_patch.py",
-        "apply_spawn_githistory_patch.py",
-        "apply_shellarg_str_util_patch.py",
+        "env_store_config.c",
+        "env_store_config.h",
     ):
         require(
-            f'repo_root.join("patches/cbm/{overlay}")' in build_rs,
-            f"Cargo must rebuild when the CBM spawn overlay {overlay} changes",
+            f'repo_root.join("patches/cbm/{glue}")' in build_rs,
+            f"Cargo must rebuild when the Astrolabe glue TU {glue} changes",
         )
     require(
         "for spawn_overlay in &spawn_overlays" in build_rs
         and "cargo:rerun-if-changed={}" in build_rs,
-        "every spawn overlay must emit a rerun-if-changed directive",
+        "every spawn helper input must emit a rerun-if-changed directive",
     )
     require(
         'let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");' in build_rs
@@ -244,24 +224,34 @@ def main() -> None:
         'println!("cargo:rustc-link-lib=advapi32");' in build_rs,
         "native Windows links must include the token-privilege system library",
     )
+    # #286: the pressure-log overlay is an in-place edit in the owned mem.c,
+    # guarded by ASTRO_MEM_PRESSURE (libcbm defines it). Both size_t percentage
+    # buffers are widened CBM_SZ_16 -> CBM_SZ_32 under the guard; the #else keeps
+    # the original CBM_SZ_16 for the production/test artifacts.
     require(
-        'PERCENT_BUFFER_DECLARATION = "char pct_str[CBM_SZ_16];"' in mem_pressure_patch
-        and 'PATCHED_PERCENT_BUFFER_DECLARATION = "char pct_str[CBM_SZ_32];"'
-        in mem_pressure_patch
-        and "EXPECTED_PERCENT_BUFFER_COUNT = 2" in mem_pressure_patch,
-        "the pressure-log overlay must expand exactly the two size_t percentage buffers",
+        mem_c.count("char pct_str[CBM_SZ_32];") == 2
+        and mem_c.count("char pct_str[CBM_SZ_16];") == 2
+        and "#ifdef ASTRO_MEM_PRESSURE" in mem_c,
+        "owned mem.c must widen both percentage buffers under ASTRO_MEM_PRESSURE "
+        "with the original preserved in the #else",
+    )
+    # #286: libcbm turns on every absorbed feature it historically carried; the
+    # production binaries get only the -Werror fixes and the worker diagnostics.
+    require(
+        "LIBCBM_ASTRO_DEFS = -DASTRO_ENV_STORE -DASTRO_SPAWN -DASTRO_SHELLARG" in makefile
+        and "-DASTRO_MEM_PRESSURE -DASTRO_WORKER_DIAG" in makefile
+        and "LIBCBM_CFLAGS += $(LIBCBM_ASTRO_DEFS) -I$(ASTROLABE_PATCH_DIR)" in makefile,
+        "libcbm must define the five absorbed-overlay feature flags",
     )
     require(
-        "ASTRO_MEM_PRESSURE_PATCH = $(ASTROLABE_PATCH_DIR)/apply_mem_pressure_patch.py"
-        in makefile
-        and "ASTRO_MEM_PRESSURE_OVERLAY = $(LIBCBM_DIR)/src/foundation/mem.c" in makefile
-        and "$(ASTRO_MEM_PRESSURE_OBJ): $(ASTRO_MEM_PRESSURE_OVERLAY)" in makefile
-        and "$(PYTHON) $(ASTRO_MEM_PRESSURE_PATCH) $< $@" in makefile,
-        "libcbm must compile the generated pressure-log overlay instead of mutating vendor mem.c",
+        "ASTRO_PROD_DEFS = -DASTRO_UI_WERROR -DASTRO_WORKER_DIAG" in makefile
+        and "ASTRO_ENV_STORE" not in makefile.split("ASTRO_PROD_DEFS", 1)[1].split("\n", 1)[0],
+        "the production binaries must define only ASTRO_UI_WERROR + ASTRO_WORKER_DIAG",
     )
     require(
-        "$(CC) $(LIBCBM_CFLAGS) -Isrc/foundation -c -o $@ $<" in makefile,
-        "the generated foundation overlay must retain its original local-header search path",
+        "$(LIBCBM_DIR)/%.o: %.c" in makefile
+        and "$(CC) $(LIBCBM_CFLAGS) -c -o $@ $<" in makefile,
+        "the owned CBM sources must compile via the generic libcbm object rule",
     )
 
     print("native Windows libcbm build contract verified")

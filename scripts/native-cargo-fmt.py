@@ -112,12 +112,11 @@ def collect_all_targets(
     """Match cargo-fmt's recursive collection of local path dependencies.
 
     With ``workspace_only=True`` the recursion into local path dependencies of
-    OTHER workspaces (notably the vendored ``vendor/calyx`` crates) is skipped,
-    so only the top workspace's own members are formatted. Vendored bytes are
-    byte-pinned by ``scripts/verify-pins.sh`` and full-graph-formatted by the
-    Rust gate (``scripts/ci-rust-gate.sh`` runs ``--all``), so excluding them
-    from the Tier-1 ``check.sh`` fmt is redundant work removed, not coverage
-    lost (#280).
+    OTHER workspaces (notably the owned ``vendor/calyx`` crates) is skipped,
+    so only the top workspace's own members are formatted. The owned vendor/
+    trees are full-graph-formatted by the Rust gate (``scripts/ci-rust-gate.sh``
+    runs ``--all``), so excluding them from the Tier-1 ``check.sh`` fmt is
+    redundant work removed, not coverage lost (#280).
     """
 
     targets: dict[Path, Target] = {}

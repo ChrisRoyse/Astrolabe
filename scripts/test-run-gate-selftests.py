@@ -197,18 +197,18 @@ def main() -> int:
         scripts = base / "scripts"
         scripts.mkdir(parents=True)
         # (3) fingerprint changes when a DECLARED dependency changes.
-        write(scripts / "verify-pins.sh", "echo v1\n")
-        write(scripts / "test-verify-pins.py", PASS_TEST)
-        fp1, missing1 = driver.fingerprint(base, "test-verify-pins.py")
+        write(scripts / "ci-cbm-lint.sh", "echo v1\n")
+        write(scripts / "test-cbm-lint-platform.py", PASS_TEST)
+        fp1, missing1 = driver.fingerprint(base, "test-cbm-lint-platform.py")
         expect(missing1 == [], "declared deps resolve", str(missing1))
-        write(scripts / "verify-pins.sh", "echo v2\n")
-        fp2, _ = driver.fingerprint(base, "test-verify-pins.py")
+        write(scripts / "ci-cbm-lint.sh", "echo v2\n")
+        fp2, _ = driver.fingerprint(base, "test-cbm-lint-platform.py")
         expect(fp1 != fp2, "fingerprint changes when a declared dependency changes")
 
         # (3b) missing declared dependency -> fingerprint None (fail closed -> run).
-        (scripts / "verify-pins.sh").unlink()
-        fp3, missing3 = driver.fingerprint(base, "test-verify-pins.py")
-        expect(fp3 is None and "scripts/verify-pins.sh" in missing3, "missing dep -> None")
+        (scripts / "ci-cbm-lint.sh").unlink()
+        fp3, missing3 = driver.fingerprint(base, "test-cbm-lint-platform.py")
+        expect(fp3 is None and "scripts/ci-cbm-lint.sh" in missing3, "missing dep -> None")
 
         # (8) UNCONDITIONAL set is non-empty and names are never fingerprinted for skip.
         expect(

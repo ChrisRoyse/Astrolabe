@@ -55,11 +55,6 @@ else
   exit 1
 fi
 
-# Vendored bytes are byte-pinned here, unconditionally and fail-closed. Every
-# downstream gate that trusts vendor content (the CBM patch/overlay self-tests,
-# the workspace-scoped fmt below) depends on this having run first.
-gate verify-pins -- bash scripts/verify-pins.sh
-
 # ── #280: gate-tooling self-tests (change-gated + parallel) ──────────────────
 #
 # These test-*.py scripts are META-TESTS of the gate tooling: they drive a gate
@@ -76,10 +71,8 @@ gate verify-pins -- bash scripts/verify-pins.sh
 # Every name is listed here (not hidden behind a manifest) so the gate-wiring
 # contract can still see each test-*.py wired into the aggregate.
 ASTRO_GATE_SELFTESTS_LIST=(
-  scripts/test-verify-pins.py
   scripts/test-cbm-skip-count.py
   scripts/test-cbm-lint-platform.py
-  scripts/test-cbm-format-overlay.py
   scripts/test-cbm-cache-guards.py
   scripts/test-check-libcbm-symbols.py
   scripts/test-parity-corpus-contract.py
@@ -96,16 +89,13 @@ ASTRO_GATE_SELFTESTS_LIST=(
   scripts/test-check-hazard-suite.py
   scripts/test-check-no-escape.py
   scripts/test-no-escape-attribution.py
-  scripts/test-cbm-spawn-patch.py
   scripts/test-cbm-spawn-fsv.py
-  scripts/test-cbm-env-store-patch.py
   scripts/test-cbm-env-contract.py
   scripts/test-bench-ratios-artifact.py
-  scripts/test-cbm-mem-pressure-patch.py
   scripts/test-windows-gnu-toolchain-contract.py
   scripts/test-native-aggregate-wrapper.py
   scripts/test-check-hook-contracts.py
-  scripts/test-cbm-worker-diag-patch.py
+  scripts/test-cbm-overlay-sources.py
 )
 # The mechanism ITSELF (fail-closed change-gating) is proven by an unconditional
 # meta-meta-test that must always run — never routed through the change-gate.
@@ -151,12 +141,11 @@ mkdir -p "$ROOT/target"
 ASTRO_CARGO_METADATA_JSON="$ROOT/target/astro-cargo-metadata.json"
 gate cargo-metadata -- bash -c "\"$CARGO_BIN\" metadata --format-version 1 > \"$ASTRO_CARGO_METADATA_JSON\""
 export ASTRO_CARGO_METADATA_JSON
-# #280: fmt only the workspace-local crates. vendor/ is byte-pinned by
-# verify-pins (above) and full-graph-formatted by the Rust gate
-# (scripts/ci-rust-gate.sh runs native-cargo-fmt.py --all in check-full), so
-# re-checking vendor fmt every Tier-1 run is redundant work removed, not
-# coverage lost.
-echo "INFO[ASTRO_FMT_VENDOR_EXCLUDED]: vendor/ covered by verify-pins byte-pinning (full-graph fmt runs in check-full via ci-rust-gate.sh)"
+# #280: fmt only the workspace-local crates. The owned vendor/ tree is
+# full-graph-formatted by the Rust gate (scripts/ci-rust-gate.sh runs
+# native-cargo-fmt.py --all in check-full), so re-checking vendor fmt every
+# Tier-1 run is redundant work removed, not coverage lost.
+echo "INFO[ASTRO_FMT_VENDOR_EXCLUDED]: vendor/ full-graph fmt runs in check-full via ci-rust-gate.sh"
 gate fmt-workspace -- "$PYTHON_BIN" scripts/native-cargo-fmt.py --all --workspace-only -- --check
 gate calyx-path-deps -- env CARGO="$CARGO_BIN" "$PYTHON_BIN" scripts/check-calyx-path-deps.py
 # #237: snapshot the protected roots BEFORE the build/test phase can touch them.

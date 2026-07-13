@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Build (or restore from cache) the upstream CBM production binary used by the
-# byte-parity gates (scripts/check-mcp-parity.sh, scripts/check-lowered-parity.py). #280.
+# Build (or restore from cache) the CBM production binary used by the byte-parity
+# gates (scripts/check-mcp-parity.sh, scripts/check-lowered-parity.py). #280. It
+# is built from the SAME owned CBM sources as libcbm, with ASTRO_PROD_DEFS
+# selecting the production-side features (dual-path consistency check).
 #
 # The CBM prod build (`make ... cbm`, ~200 grammar translation units) is the
 # single largest cost in check.sh (~320s of the 322.8s check-mcp-parity.sh gate,
 # even with warm sccache C-object hits, because link/archive and the make graph
-# dominate). Its output is a PURE FUNCTION of byte-pinned inputs:
+# dominate). Its output is a PURE FUNCTION of committed inputs:
 #
-#   * vendor/codebase-memory-mcp -- byte-pinned by scripts/verify-pins.sh
-#     (unconditional, fail-closed, runs at the top of every aggregate), so the
-#     committed subtree SHA fully identifies the C sources.
-#   * patches/cbm/**            -- the Astrolabe overlay + Makefile.cbm.
+#   * vendor/codebase-memory-mcp -- the owned CBM sources; the committed subtree
+#     SHA fully identifies them (the absorbed overlays are in-source edits).
+#   * patches/cbm/**            -- Makefile.cbm (the -D flag wiring) + glue TUs.
 #   * the C toolchain identity  -- CC/CXX version + host triple (ABI).
 #
-# So a rebuild from an unchanged (pin + overlay + toolchain) is provably
+# So a rebuild from an unchanged (sources + Makefile + toolchain) is provably
 # identical input->output, and the built binary can be cached across runs (which
 # each wipe target/) in a gitignored, non-launcher-owned cache. The parity
 # harness still exercises the (cached or fresh) binary against the full corpus
@@ -46,7 +47,7 @@ key=""
 if command -v git >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
   vendor_tree="$(git -C "$ROOT" rev-parse "HEAD:vendor/codebase-memory-mcp" 2>/dev/null || true)"
   if [[ -n "$vendor_tree" && -d "$ROOT/patches/cbm" ]]; then
-    # Hash of every byte under patches/cbm (the overlay + Makefile.cbm).
+    # Hash of every byte under patches/cbm (Makefile.cbm + Astrolabe glue TUs).
     patches_hash="$(
       find "$ROOT/patches/cbm" -type f -print0 \
         | LC_ALL=C sort -z \
@@ -71,7 +72,7 @@ if [[ -n "$key" ]]; then
   cached_bin="$CACHE_ROOT/$key/codebase-memory-mcp$EXE"
   if [[ -f "$cached_bin" ]]; then
     cp -f "$cached_bin" "$BUILD_DIR/codebase-memory-mcp$EXE"
-    echo "INFO[ASTRO_CBM_PARITY_BINARY_CACHED]: key=${key:0:12} (byte-identical to a build from the pinned vendor subtree + patches/cbm overlay + toolchain)"
+    echo "INFO[ASTRO_CBM_PARITY_BINARY_CACHED]: key=${key:0:12} (byte-identical to a build from the owned CBM sources + patches/cbm Makefile/glue + toolchain)"
     exit 0
   fi
   echo "INFO[ASTRO_CBM_PARITY_CACHE_MISS]: no cached CBM prod binary for key=${key:0:12} -> building"

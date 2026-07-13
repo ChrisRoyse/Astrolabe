@@ -16,10 +16,10 @@ redirected. Astrolabe's fix is to redirect `HOME` — the one input **both** hal
 read — for the CBM test phase (`scripts/ci-cbm-test.sh`), so the two halves move
 together.
 
-`vendor/codebase-memory-mcp` is a byte-pinned subtree (`VENDORED.md`), so the
-duplication cannot be deleted here; removing it is an upstream change (single
-`th_cache_dir()` accessor in `tests/test_helpers.h` delegating to
-`cbm_resolve_cache_dir()`). What this manifest enforces is that it never **grows**:
+`vendor/codebase-memory-mcp` is now owned first-class source (#286). Collapsing
+the duplication (a single `th_cache_dir()` accessor in `tests/test_helpers.h`
+delegating to `cbm_resolve_cache_dir()`) is a normal code change tracked
+separately; what this manifest enforces is that it never **grows**:
 `scripts/check-cbm-cache-paths.py` recomputes every construction site under the
 pinned tree and requires an exact match. A new hand-built cache path or a new
 `getenv("HOME")` fixture site fails the CBM lint gate closed. Astrolabe-owned C

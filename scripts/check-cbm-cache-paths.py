@@ -9,10 +9,10 @@ Two sources of truth for one path is what makes a `CBM_CACHE_DIR` redirect split
 the library's write path from the tests' read path, and it is why the store leaks
 into the operator's profile at all.
 
-`vendor/codebase-memory-mcp` is a byte-pinned subtree, so those duplications
-cannot be deleted here (that is an upstream change). What CAN be enforced is that
-they never grow: this gate recomputes every cache-path construction site under
-the pinned tree and requires an exact match against `ci/cbm-cache-path-offenders.md`.
+`vendor/codebase-memory-mcp` is now owned first-class source (#286); collapsing
+those duplications is a normal code change tracked separately. What this gate
+enforces is that they never grow: it recomputes every cache-path construction
+site under the tree and requires an exact match against `ci/cbm-cache-path-offenders.md`.
 A new hand-built cache path, or a new `getenv("HOME")` fixture site, fails the
 gate closed; Astrolabe-owned C under `patches/cbm/` is banned from the pattern
 outright.

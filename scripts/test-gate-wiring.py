@@ -108,8 +108,8 @@ def main() -> int:
         require_error(checker.validate(fixture), "test-cbm-lint-platform.py")
         copy_fixture(fixture)
 
-        rewrite(check, "scripts/test-cbm-format-overlay.py", "scripts/removed-3.py")
-        require_error(checker.validate(fixture), "test-cbm-format-overlay.py")
+        rewrite(check, "scripts/test-cbm-overlay-sources.py", "scripts/removed-3.py")
+        require_error(checker.validate(fixture), "test-cbm-overlay-sources.py")
         copy_fixture(fixture)
 
         rewrite(check, "scripts/test-parity-corpus-contract.py", "scripts/removed-4.py")
@@ -253,10 +253,10 @@ def main() -> int:
 
         rewrite(
             cbm_lint,
-            "INFO[ASTRO_CBM_FORMAT_OVERLAY]",
+            "INFO[ASTRO_CBM_FORMAT]",
             "INFO[ASTRO_CBM_FORMAT_REMOVED]",
         )
-        require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT_OVERLAY")
+        require_error(checker.validate(fixture), "ASTRO_CBM_FORMAT")
         copy_fixture(fixture)
 
         cbm_test = fixture / "scripts/ci-cbm-test.sh"
