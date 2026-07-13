@@ -4,11 +4,10 @@
 //!
 //! Anchors are never synthetic: every anchor comes from a parsed real-world
 //! outcome (test run, agent task, review, incident, manual label) with an
-//! enforced source-prefix convention and the Poly `grounding.rs` confidence
-//! invariants verbatim — a resolved (`ci:*`) source is certain and must carry
-//! confidence exactly `1.0`; a provisional (`local:*`) source is an estimate
-//! and must carry a finite confidence in the open interval `(0, 1)`. Anything
-//! else refuses fail-closed.
+//! enforced source-prefix catalog and the Poly `grounding.rs` confidence
+//! invariants verbatim — resolved sources are Trusted at confidence exactly
+//! `1.0`; proxy sources are Provisional with finite confidence in `(0, 1)`.
+//! Anything else refuses fail-closed.
 //!
 //! Storage pairs every mutation with its ledger record: anchor rows land in
 //! the `anchors` CF keyed `(CxId, AnchorKind)` and the same atomic group
@@ -18,6 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use astrolabe_domain::fsv::FsvAck;
+pub use astrolabe_domain::{GroundingKind, SourceClassification, TrustTag};
+use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, anchor_key};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
@@ -27,6 +29,7 @@ use calyx_ledger::decode as decode_ledger;
 use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
 use serde::{Deserialize, Serialize};
 
+pub mod archaeology;
 mod parsers;
 
 pub use parsers::{
@@ -42,9 +45,10 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
 }
 
 /// Stable failure code for an unrecognized outcome source prefix.
-pub const ASTRO_ANCHOR_SOURCE_PREFIX_INVALID: &str = "ASTRO_ANCHOR_SOURCE_PREFIX_INVALID";
+pub const ASTRO_ANCHOR_SOURCE_PREFIX_INVALID: &str =
+    astrolabe_domain::ASTRO_ANCHOR_SOURCE_PREFIX_INVALID;
 /// Stable failure code for a confidence that contradicts its source origin.
-pub const ASTRO_ANCHOR_CONFIDENCE_INVALID: &str = "ASTRO_ANCHOR_CONFIDENCE_INVALID";
+pub const ASTRO_ANCHOR_CONFIDENCE_INVALID: &str = astrolabe_domain::ASTRO_ANCHOR_CONFIDENCE_INVALID;
 /// Stable failure code for a malformed or out-of-range observed-at timestamp.
 pub const ASTRO_ANCHOR_TIMESTAMP_INVALID: &str = "ASTRO_ANCHOR_TIMESTAMP_INVALID";
 /// Stable failure code for a re-post that conflicts with a stored anchor.
@@ -53,21 +57,28 @@ pub const ASTRO_ANCHOR_DEDUP_CONFLICT: &str = "ASTRO_ANCHOR_DEDUP_CONFLICT";
 pub const ASTRO_ANCHOR_ROW_CORRUPT: &str = "ASTRO_ANCHOR_ROW_CORRUPT";
 /// Stable failure code when the paired ledger entry cannot be recovered.
 pub const ASTRO_ANCHOR_LEDGER_MISSING: &str = "ASTRO_ANCHOR_LEDGER_MISSING";
+/// Stable failure code when a producer tries to reuse a retracted source.
+pub const ASTRO_ANCHOR_SOURCE_RETRACTED: &str = "ASTRO_ANCHOR_SOURCE_RETRACTED";
 
 /// Row schema tag for persisted anchor rows.
 pub const SCHEMA_ANCHOR_ROW: &str = "astrolabe-anchor-row-v1";
+/// Schema for an append-only source retraction record in the KV CF.
+pub const SCHEMA_ANCHOR_TOMBSTONE: &str = "astrolabe-anchor-tombstone-v1";
 /// Ledger payload schema for one anchor ingest group commit.
 pub const ANCHOR_LEDGER_SCHEMA: &str = "astrolabe.anchor_outcome.v1";
+/// Ledger payload schema for one append-only source retraction.
+pub const ANCHOR_ERASURE_LEDGER_SCHEMA: &str = "astrolabe.anchor_erasure.v1";
+
+const ANCHOR_TOMBSTONE_PREFIX: &[u8] = b"astrolabe:anchor-tombstone:v1:";
 
 /// Confidence carried by every resolved (`ci:*`) anchor — certainty, verbatim
 /// from the Poly grounding invariant.
-pub const RESOLVED_SOURCE_CONFIDENCE: f32 = 1.0;
-/// Default confidence for provisional (`local:*`) anchors (04 §4 convention).
-pub const DEFAULT_PROVISIONAL_CONFIDENCE: f32 = 0.8;
+pub const RESOLVED_SOURCE_CONFIDENCE: f32 = astrolabe_domain::RESOLVED_SOURCE_CONFIDENCE;
+/// Default confidence for provisional proxy anchors (04 §4 convention).
+pub const DEFAULT_PROVISIONAL_CONFIDENCE: f32 = astrolabe_domain::DEFAULT_PROVISIONAL_CONFIDENCE;
 
 const ANCHOR_REMEDIATION: &str =
     "regenerate anchors with astrolabe_anchors::ingest_outcome_anchors from a fresh outcome";
-const SOURCE_REMEDIATION: &str = "use 'ci:<provider>:<run_id>' for CI-resolved outcomes or 'local:<context>' for uncommitted local runs";
 
 /// Outcome kinds accepted by `anchor_outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -83,6 +94,8 @@ pub enum OutcomeKind {
     Incident,
     /// A manual label.
     ManualLabel,
+    /// A label derived from validated Git history evidence.
+    GitArchaeology,
 }
 
 impl OutcomeKind {
@@ -94,53 +107,20 @@ impl OutcomeKind {
             Self::Review => "review",
             Self::Incident => "incident",
             Self::ManualLabel => "manual_label",
+            Self::GitArchaeology => "git_archaeology",
         }
     }
 }
 
-/// Grounding origin classified from the source prefix (04 §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceOrigin {
-    /// `ci:<provider>:<run_id>` — a resolved, certain outcome (Trusted 1.0).
-    Resolved,
-    /// `local:<context>` — an uncommitted local run (Provisional, default 0.8).
-    Provisional,
-}
-
-/// Classifies an outcome source string by its enforced prefix convention.
+/// Classifies an outcome source string by the exhaustive prefix catalog.
 ///
-/// Refuses fail-closed on anything that is not a well-formed `ci:` or
-/// `local:` source — an anchor with an unknown origin would be an unlabeled
-/// claim.
-pub fn classify_source(source: &str) -> Result<SourceOrigin, astrolabe_domain::DomainError> {
-    if let Some(rest) = source.strip_prefix("ci:") {
-        let mut parts = rest.splitn(2, ':');
-        let provider = parts.next().unwrap_or_default();
-        let run_id = parts.next().unwrap_or_default();
-        if provider.is_empty() || run_id.is_empty() {
-            return Err(astrolabe_domain::DomainError::new(
-                ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
-                format!("ci source {source:?} must be 'ci:<provider>:<run_id>'"),
-                SOURCE_REMEDIATION,
-            ));
-        }
-        return Ok(SourceOrigin::Resolved);
-    }
-    if let Some(rest) = source.strip_prefix("local:") {
-        if rest.trim().is_empty() {
-            return Err(astrolabe_domain::DomainError::new(
-                ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
-                format!("local source {source:?} must name its context"),
-                SOURCE_REMEDIATION,
-            ));
-        }
-        return Ok(SourceOrigin::Provisional);
-    }
-    Err(astrolabe_domain::DomainError::new(
-        ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
-        format!("outcome source {source:?} has no recognized origin prefix"),
-        SOURCE_REMEDIATION,
-    ))
+/// Unknown prefixes and empty suffixes refuse: accepting either would create an
+/// unlabeled claim. Prefix order is deliberate (`git:revert:`/`git:fix:` are
+/// catalog entries; a bare `git:` is not).
+pub fn classify_source(
+    source: &str,
+) -> Result<SourceClassification, astrolabe_domain::DomainError> {
+    astrolabe_domain::classify_grounding_source(source)
 }
 
 /// Validates (or defaults) an outcome confidence against its source origin —
@@ -152,31 +132,36 @@ pub fn classify_source(source: &str) -> Result<SourceOrigin, astrolabe_domain::D
 ///   [`DEFAULT_PROVISIONAL_CONFIDENCE`], anything not finite in the open
 ///   interval `(0, 1)` refuses.
 pub fn validate_confidence(
-    origin: SourceOrigin,
+    grounding_kind: GroundingKind,
     confidence: Option<f32>,
 ) -> Result<f32, astrolabe_domain::DomainError> {
-    match origin {
-        SourceOrigin::Resolved => match confidence {
-            None => Ok(RESOLVED_SOURCE_CONFIDENCE),
-            Some(value) if value == RESOLVED_SOURCE_CONFIDENCE => Ok(value),
-            Some(value) => Err(astrolabe_domain::DomainError::new(
-                ASTRO_ANCHOR_CONFIDENCE_INVALID,
-                format!("resolved (ci:) outcome carries confidence {value}, must be exactly 1.0"),
-                "resolved outcomes are certain; omit confidence or pass exactly 1.0",
-            )),
-        },
-        SourceOrigin::Provisional => match confidence {
-            None => Ok(DEFAULT_PROVISIONAL_CONFIDENCE),
-            Some(value) if value.is_finite() && value > 0.0 && value < 1.0 => Ok(value),
-            Some(value) => Err(astrolabe_domain::DomainError::new(
-                ASTRO_ANCHOR_CONFIDENCE_INVALID,
-                format!(
-                    "provisional (local:) outcome carries confidence {value}, must be finite in the open interval (0, 1)"
-                ),
-                "provisional outcomes are estimates; pass a confidence strictly between 0 and 1",
-            )),
-        },
+    astrolabe_domain::validate_grounding_confidence(grounding_kind, confidence)
+}
+
+/// Aggregate trust is Trusted iff at least one contributor exists and every
+/// contributor is Trusted. Empty evidence fails closed to Provisional.
+pub fn rollup_trust(tags: impl IntoIterator<Item = TrustTag>) -> TrustTag {
+    astrolabe_domain::rollup_trust(tags)
+}
+
+/// Returns the catalog trust for one source, refusing unknown prefixes.
+pub fn trust_for_source(source: &str) -> Result<TrustTag, astrolabe_domain::DomainError> {
+    Ok(classify_source(source)?.trust)
+}
+
+/// Rolls up trust across active anchor rows. Empty rows are Provisional.
+pub fn rollup_anchor_trust<'a>(
+    rows: impl IntoIterator<Item = &'a PersistedAnchorRow>,
+) -> Result<TrustTag, astrolabe_domain::DomainError> {
+    let mut tags = Vec::new();
+    for persisted in rows {
+        for anchor in &persisted.row.anchors {
+            let classification = classify_source(&anchor.source)?;
+            validate_confidence(classification.grounding_kind, Some(anchor.confidence))?;
+            tags.push(trust_for_source(&anchor.source)?);
+        }
     }
+    Ok(rollup_trust(tags))
 }
 
 /// Validates a server-observed timestamp for an outcome request.
@@ -256,7 +241,7 @@ pub struct OutcomeSubject {
 pub struct OutcomeAnchorRequest {
     /// Outcome kind.
     pub kind: OutcomeKind,
-    /// Enforced-prefix source (`ci:<provider>:<run_id>` or `local:<context>`).
+    /// Enforced catalog source (resolved or proxy prefix).
     pub source: String,
     /// Server-observed timestamp for every anchor in the request.
     pub observed_at: Ts,
@@ -277,8 +262,8 @@ impl OutcomeAnchorRequest {
         subjects: Vec<OutcomeSubject>,
     ) -> Result<Self, astrolabe_domain::DomainError> {
         let source = source.into();
-        let origin = classify_source(&source)?;
-        let confidence = validate_confidence(origin, confidence)?;
+        let classification = classify_source(&source)?;
+        let confidence = validate_confidence(classification.grounding_kind, confidence)?;
         Ok(Self {
             kind,
             source,
@@ -344,6 +329,28 @@ pub struct AnchorIngestReport {
     pub anchor_dump_hash: String,
     /// Grounding ledger entry paired with this mutation batch.
     pub ledger_ref: LedgerRef,
+    /// All anchors in one request share one catalog source and trust tag.
+    pub trust: TrustTag,
+    /// Unforgeable full-readback witness when this call changed anchor rows.
+    /// An idempotent ledger-only replay carries labeled absence (`None`).
+    pub fsv: Option<FsvAck>,
+}
+
+/// Append-only retraction of every anchor attributed to one source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorTombstoneV1 {
+    pub schema: String,
+    pub source: String,
+    pub retracted_at: Ts,
+}
+
+/// Report for one source-erasure mutation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorErasureReport {
+    pub anchors_retracted: usize,
+    pub tombstone_written: bool,
+    pub ledger_ref: LedgerRef,
+    pub fsv: Option<FsvAck>,
 }
 
 /// Ingests a validated outcome request into the `anchors` CF.
@@ -364,6 +371,37 @@ pub fn ingest_outcome_anchors<C>(
 where
     C: Clock,
 {
+    let request_trust = classify_source(&request.source)
+        .map_err(|error| CalyxError {
+            code: error.code(),
+            message: error.message().to_string(),
+            remediation: error.remediation(),
+        })?
+        .trust;
+    if read_anchor_tombstones(vault)?
+        .iter()
+        .any(|tombstone| tombstone.source == request.source)
+    {
+        return Err(CalyxError {
+            code: ASTRO_ANCHOR_SOURCE_RETRACTED,
+            message: format!(
+                "anchor source {:?} was retracted and cannot be reused",
+                request.source
+            ),
+            remediation: "use a new catalog source identifying the replacement evidence",
+        });
+    }
+    // Anchor rows retain their catalog source for provenance. Preserve the
+    // existing fail-closed secret screen before hashing that source in the
+    // ledger payload; full Git object IDs are the one structurally validated
+    // long-token catalog form and are identifiers, not secret material.
+    if !is_full_git_oid_source(&request.source) {
+        let source_probe = serde_json::to_vec(&serde_json::json!({
+            "source": request.source,
+        }))
+        .map_err(|error| anchor_corrupt(format!("encode anchor source probe: {error}")))?;
+        RedactionPolicy::check_payload(&source_probe)?;
+    }
     let snapshot = vault.snapshot();
     let mut rows = BTreeMap::<Vec<u8>, AnchorRowV1>::new();
     let mut dirty_keys = BTreeSet::<Vec<u8>>::new();
@@ -444,7 +482,7 @@ where
     let payload = serde_json::to_vec(&serde_json::json!({
         "schema": ANCHOR_LEDGER_SCHEMA,
         "outcome_kind": request.kind.as_str(),
-        "source": request.source,
+        "source_hash": hex_lower(blake3::hash(request.source.as_bytes()).as_bytes()),
         "observed_at": request.observed_at,
         "anchors_written": anchors_written,
         "anchors_deduplicated": anchors_deduplicated,
@@ -458,8 +496,20 @@ where
     let subject =
         SubjectId::Query(format!("astrolabe-anchor-outcome:{anchor_dump_hash}").into_bytes());
     let actor = ActorId::Service(actor.into());
-    let ledger_ref = if batch.is_empty() {
-        vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?
+    let mut fsv_plan = VaultMutationPlan::new(
+        "ingest_outcome_anchors",
+        EntryKind::Grounding,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &batch {
+        fsv_plan.push_content(*cf, key.clone(), value);
+    }
+    let (ledger_ref, commit_seq) = if batch.is_empty() {
+        (
+            vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?,
+            None,
+        )
     } else {
         let commit_seq = vault.write_cf_batch_with_ledger_entry(
             batch,
@@ -468,9 +518,12 @@ where
             payload,
             actor,
         )?;
-        ledger_ref_at_commit(vault, commit_seq)?
+        (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
     };
     vault.flush()?;
+    let fsv = commit_seq
+        .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
+        .transpose()?;
 
     Ok(AnchorIngestReport {
         anchors_written,
@@ -479,6 +532,16 @@ where
         rows_written,
         anchor_dump_hash,
         ledger_ref,
+        trust: request_trust,
+        fsv,
+    })
+}
+
+fn is_full_git_oid_source(source: &str) -> bool {
+    ["git:fix:", "git:revert:"].iter().any(|prefix| {
+        source.strip_prefix(prefix).is_some_and(|oid| {
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     })
 }
 
@@ -493,6 +556,27 @@ pub struct PersistedAnchorRow {
 
 /// Reads back and key-verifies every persisted anchor row.
 pub fn read_anchor_rows<C>(vault: &AsterVault<C>) -> calyx_core::Result<Vec<PersistedAnchorRow>>
+where
+    C: Clock,
+{
+    let tombstoned_sources = read_anchor_tombstones(vault)?
+        .into_iter()
+        .map(|tombstone| tombstone.source)
+        .collect::<BTreeSet<_>>();
+    let mut rows = read_all_anchor_rows(vault)?;
+    for persisted in &mut rows {
+        persisted
+            .row
+            .anchors
+            .retain(|anchor| !tombstoned_sources.contains(&anchor.source));
+    }
+    rows.retain(|persisted| !persisted.row.anchors.is_empty());
+    Ok(rows)
+}
+
+/// Reads original anchor rows without applying retractions. This exists for
+/// physical append-only FSV; serving/query paths use [`read_anchor_rows`].
+pub fn read_all_anchor_rows<C>(vault: &AsterVault<C>) -> calyx_core::Result<Vec<PersistedAnchorRow>>
 where
     C: Clock,
 {
@@ -521,9 +605,147 @@ where
                 hex_lower(&key)
             )));
         }
+        for anchor in &row.anchors {
+            let classification = classify_source(&anchor.source).map_err(|error| CalyxError {
+                code: error.code(),
+                message: error.message().to_string(),
+                remediation: error.remediation(),
+            })?;
+            validate_confidence(classification.grounding_kind, Some(anchor.confidence)).map_err(
+                |error| CalyxError {
+                    code: error.code(),
+                    message: error.message().to_string(),
+                    remediation: error.remediation(),
+                },
+            )?;
+        }
         rows.push(PersistedAnchorRow { key, row });
     }
     Ok(rows)
+}
+
+/// Reads and key-verifies every persisted append-only retraction.
+pub fn read_anchor_tombstones<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<Vec<AnchorTombstoneV1>>
+where
+    C: Clock,
+{
+    let snapshot = vault.snapshot();
+    let mut tombstones = Vec::new();
+    for (key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Kv)? {
+        if !key.starts_with(ANCHOR_TOMBSTONE_PREFIX) {
+            continue;
+        }
+        let tombstone: AnchorTombstoneV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            anchor_corrupt(format!(
+                "decode anchor tombstone {}: {error}",
+                hex_lower(&key)
+            ))
+        })?;
+        if tombstone.schema != SCHEMA_ANCHOR_TOMBSTONE
+            || key != anchor_tombstone_key(&tombstone.source)
+        {
+            return Err(anchor_corrupt(format!(
+                "anchor tombstone {} disagrees with its source key",
+                hex_lower(&key)
+            )));
+        }
+        tombstones.push(tombstone);
+    }
+    tombstones.sort_by(|left, right| left.source.cmp(&right.source));
+    Ok(tombstones)
+}
+
+/// Retracts every anchor from `source` by appending a tombstone and paired
+/// Grounding ledger entry. Original anchor rows are never rewritten.
+pub fn erase_anchors_by_source<C>(
+    vault: &AsterVault<C>,
+    source: &str,
+    retracted_at: Ts,
+    actor: impl Into<String>,
+) -> calyx_core::Result<AnchorErasureReport>
+where
+    C: Clock,
+{
+    classify_source(source).map_err(|error| CalyxError {
+        code: error.code(),
+        message: error.message().to_string(),
+        remediation: error.remediation(),
+    })?;
+    validate_observed_at(retracted_at).map_err(|error| CalyxError {
+        code: error.code(),
+        message: error.message().to_string(),
+        remediation: error.remediation(),
+    })?;
+
+    let anchors_retracted = read_all_anchor_rows(vault)?
+        .iter()
+        .flat_map(|persisted| &persisted.row.anchors)
+        .filter(|anchor| anchor.source == source)
+        .count();
+    let key = anchor_tombstone_key(source);
+    let tombstone = AnchorTombstoneV1 {
+        schema: SCHEMA_ANCHOR_TOMBSTONE.to_string(),
+        source: source.to_string(),
+        retracted_at,
+    };
+    let value = serde_json::to_vec(&tombstone)
+        .map_err(|error| anchor_corrupt(format!("encode anchor tombstone: {error}")))?;
+    let already_present = vault
+        .read_cf_at(vault.snapshot(), ColumnFamily::Kv, &key)?
+        .is_some();
+    let tombstone_written = anchors_retracted > 0 && !already_present;
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema": ANCHOR_ERASURE_LEDGER_SCHEMA,
+        "source": source,
+        "retracted_at": retracted_at,
+        "anchors_retracted": anchors_retracted,
+        "tombstone_written": tombstone_written,
+    }))
+    .map_err(|error| anchor_corrupt(format!("encode anchor erasure ledger payload: {error}")))?;
+    RedactionPolicy::check_payload(&payload)?;
+    let subject = SubjectId::Query(format!("astrolabe-anchor-erasure:{source}").into_bytes());
+    let actor = ActorId::Service(actor.into());
+    let mut fsv_plan = VaultMutationPlan::new(
+        "erase_anchors_by_source",
+        EntryKind::Grounding,
+        &actor,
+        &subject,
+    );
+    let (ledger_ref, fsv) = if tombstone_written {
+        fsv_plan.push_content(ColumnFamily::Kv, key.clone(), &value);
+        let commit_seq = vault.write_cf_batch_with_ledger_entry(
+            vec![(ColumnFamily::Kv, key, value)],
+            EntryKind::Grounding,
+            subject,
+            payload,
+            actor,
+        )?;
+        vault.flush()?;
+        (
+            ledger_ref_at_commit(vault, commit_seq)?,
+            Some(fsv_plan.verify_committed(vault, commit_seq)?),
+        )
+    } else {
+        let ledger_ref =
+            vault.append_ledger_entry(EntryKind::Grounding, subject, payload, actor)?;
+        vault.flush()?;
+        (ledger_ref, None)
+    };
+    Ok(AnchorErasureReport {
+        anchors_retracted,
+        tombstone_written,
+        ledger_ref,
+        fsv,
+    })
+}
+
+fn anchor_tombstone_key(source: &str) -> Vec<u8> {
+    let mut key = ANCHOR_TOMBSTONE_PREFIX.to_vec();
+    key.extend_from_slice(blake3::hash(source.as_bytes()).as_bytes());
+    key
 }
 
 /// Canonical byte dump of anchor rows for ledger content hashing (one line
@@ -622,6 +844,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -746,16 +969,64 @@ mod tests {
 
     #[test]
     fn source_prefix_and_confidence_bounds_enforced_verbatim() {
-        // Source-prefix conventions (04 §4).
-        assert_eq!(
-            classify_source("ci:github:12345").expect("ci source"),
-            SourceOrigin::Resolved
-        );
-        assert_eq!(
-            classify_source("local:worktree-run").expect("local source"),
-            SourceOrigin::Provisional
-        );
-        for bad in ["ci:github", "ci::42", "local:", "manual", ""] {
+        let catalog = [
+            (
+                "ci:github:12345",
+                GroundingKind::Resolved,
+                TrustTag::Trusted,
+            ),
+            (
+                "trace:runtime-42",
+                GroundingKind::Resolved,
+                TrustTag::Trusted,
+            ),
+            (
+                "review:change-7",
+                GroundingKind::Resolved,
+                TrustTag::Trusted,
+            ),
+            (
+                "git:revert:abc123",
+                GroundingKind::Resolved,
+                TrustTag::Trusted,
+            ),
+            (
+                "git:fix:def456",
+                GroundingKind::Proxy,
+                TrustTag::Provisional,
+            ),
+            (
+                "agent:codex:session-9",
+                GroundingKind::Proxy,
+                TrustTag::Provisional,
+            ),
+            (
+                "survival:probe-3",
+                GroundingKind::Proxy,
+                TrustTag::Provisional,
+            ),
+        ];
+        for (source, grounding_kind, trust) in catalog {
+            assert_eq!(
+                classify_source(source).expect("catalog source"),
+                SourceClassification {
+                    grounding_kind,
+                    trust
+                },
+                "{source}"
+            );
+        }
+        for bad in [
+            "ci:github",
+            "ci::42",
+            "agent:codex",
+            "agent::session",
+            "trace:",
+            "git:",
+            "local:worktree-run",
+            "manual",
+            "",
+        ] {
             assert_eq!(
                 classify_source(bad).expect_err("refuse").code(),
                 ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
@@ -765,16 +1036,16 @@ mod tests {
 
         // Resolved: confidence must be exactly 1.0.
         assert_eq!(
-            validate_confidence(SourceOrigin::Resolved, None).expect("default"),
+            validate_confidence(GroundingKind::Resolved, None).expect("default"),
             1.0
         );
         assert_eq!(
-            validate_confidence(SourceOrigin::Resolved, Some(1.0)).expect("exact"),
+            validate_confidence(GroundingKind::Resolved, Some(1.0)).expect("exact"),
             1.0
         );
         for bad in [0.99f32, 0.0, 1.01, f32::NAN] {
             assert_eq!(
-                validate_confidence(SourceOrigin::Resolved, Some(bad))
+                validate_confidence(GroundingKind::Resolved, Some(bad))
                     .expect_err("refuse")
                     .code(),
                 ASTRO_ANCHOR_CONFIDENCE_INVALID,
@@ -784,21 +1055,36 @@ mod tests {
 
         // Provisional: finite in the open interval (0, 1).
         assert_eq!(
-            validate_confidence(SourceOrigin::Provisional, None).expect("default"),
+            validate_confidence(GroundingKind::Proxy, None).expect("default"),
             DEFAULT_PROVISIONAL_CONFIDENCE
         );
         assert_eq!(
-            validate_confidence(SourceOrigin::Provisional, Some(0.5)).expect("estimate"),
+            validate_confidence(GroundingKind::Proxy, Some(0.5)).expect("estimate"),
             0.5
         );
         for bad in [0.0f32, 1.0, -0.2, 1.5, f32::NAN, f32::INFINITY] {
             assert_eq!(
-                validate_confidence(SourceOrigin::Provisional, Some(bad))
+                validate_confidence(GroundingKind::Proxy, Some(bad))
                     .expect_err("refuse")
                     .code(),
                 ASTRO_ANCHOR_CONFIDENCE_INVALID,
                 "{bad}"
             );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn rollup_property_any_proxy_is_provisional(contributors in prop::collection::vec(any::<bool>(), 0..128)) {
+            let tags = contributors.iter().map(|trusted| {
+                if *trusted { TrustTag::Trusted } else { TrustTag::Provisional }
+            });
+            let expected = if !contributors.is_empty() && contributors.iter().all(|trusted| *trusted) {
+                TrustTag::Trusted
+            } else {
+                TrustTag::Provisional
+            };
+            prop_assert_eq!(rollup_trust(tags), expected);
         }
     }
 
@@ -816,6 +1102,9 @@ mod tests {
             .expect("first ingest");
         assert_eq!(first.anchors_written, 4); // skipped case grounds nothing
         assert_eq!(first.anchors_deduplicated, 0);
+        let first_fsv = first.fsv.as_ref().expect("changed rows earn FSV witness");
+        assert_eq!(first_fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(first_fsv.rows_read_back(), 4);
         let before = raw_anchor_bytes(&vault);
         assert_eq!(before.len(), 4);
 
@@ -824,6 +1113,10 @@ mod tests {
         assert_eq!(second.anchors_written, 0);
         assert_eq!(second.anchors_deduplicated, 4);
         assert_eq!(second.rows_written, 0);
+        assert!(
+            second.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         let after = raw_anchor_bytes(&vault);
         assert_eq!(
             before, after,
@@ -858,6 +1151,10 @@ mod tests {
         let report = ingest_outcome_anchors(&vault, &request, &cx_ids, "astrolabe-anchors-test")
             .expect("ingest");
         assert_eq!(report.anchors_written, 2);
+        let fsv = report.fsv.as_ref().expect("anchor mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), report.rows_written as u64);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         drop(vault);
 
         // Reopen: everything below reads persisted bytes.
@@ -908,6 +1205,91 @@ mod tests {
     }
 
     #[test]
+    fn source_erasure_is_append_only_and_recomputes_active_trust_after_reopen() {
+        let run = parse_cargo_test_json(include_str!("../tests/fixtures/cargo_test.jsonl"))
+            .expect("cargo golden");
+        let trusted =
+            OutcomeAnchorRequest::from_test_run(&run, "ci:buildkite:erase-42", 1_786_600_000, None)
+                .expect("trusted request");
+        let proxy = OutcomeAnchorRequest::from_test_run(
+            &run,
+            "agent:codex:erase-session",
+            1_786_600_001,
+            Some(0.6),
+        )
+        .expect("proxy request");
+        let cx_ids = fixture_cx_ids(&trusted);
+        let (dir, vault) = anchor_vault("source-erasure");
+        ingest_outcome_anchors(&vault, &trusted, &cx_ids, "astrolabe-anchors-test")
+            .expect("trusted ingest");
+        ingest_outcome_anchors(&vault, &proxy, &cx_ids, "astrolabe-anchors-test")
+            .expect("proxy ingest");
+        let original_anchor_cf = raw_anchor_bytes(&vault);
+        assert_eq!(
+            rollup_anchor_trust(read_anchor_rows(&vault).expect("active before").iter())
+                .expect("rollup before"),
+            TrustTag::Provisional
+        );
+
+        let erased = erase_anchors_by_source(
+            &vault,
+            "ci:buildkite:erase-42",
+            1_786_600_002,
+            "astrolabe-anchors-test",
+        )
+        .expect("erase trusted source");
+        assert_eq!(erased.anchors_retracted, trusted.subjects.len());
+        assert!(erased.tombstone_written);
+        let fsv = erased.fsv.as_ref().expect("tombstone earns FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), 1);
+        assert_eq!(fsv.ledger_seq(), erased.ledger_ref.seq);
+        assert_eq!(raw_anchor_bytes(&vault), original_anchor_cf);
+        drop(vault);
+
+        let reopened = open_anchor_vault(&dir);
+        assert_eq!(raw_anchor_bytes(&reopened), original_anchor_cf);
+        let history = read_all_anchor_rows(&reopened).expect("raw history");
+        assert!(
+            history
+                .iter()
+                .flat_map(|row| &row.row.anchors)
+                .any(|anchor| { anchor.source == "ci:buildkite:erase-42" })
+        );
+        let active = read_anchor_rows(&reopened).expect("active overlay");
+        assert!(
+            active
+                .iter()
+                .flat_map(|row| &row.row.anchors)
+                .all(|anchor| { anchor.source == "agent:codex:erase-session" })
+        );
+        assert_eq!(
+            rollup_anchor_trust(active.iter()).expect("active rollup"),
+            TrustTag::Provisional
+        );
+        let tombstones = read_anchor_tombstones(&reopened).expect("tombstones");
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].source, "ci:buildkite:erase-42");
+
+        let ledger_bytes = reopened
+            .read_cf_at(
+                reopened.snapshot(),
+                ColumnFamily::Ledger,
+                &calyx_aster::cf::ledger_key(erased.ledger_ref.seq),
+            )
+            .expect("ledger read")
+            .expect("ledger row");
+        let ledger = decode_ledger(&ledger_bytes).expect("decode erasure ledger");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&ledger.payload).expect("erasure payload");
+        assert_eq!(payload["schema"], ANCHOR_ERASURE_LEDGER_SCHEMA);
+
+        let reuse = ingest_outcome_anchors(&reopened, &trusted, &cx_ids, "astrolabe-anchors-test")
+            .expect_err("retracted source cannot be reused");
+        assert_eq!(reuse.code, ASTRO_ANCHOR_SOURCE_RETRACTED);
+    }
+
+    #[test]
     fn secret_shaped_source_refused_at_the_ledger_writer_with_no_rows_written() {
         let secret = format!("ci:leaky:{}", "a1b2c3d4".repeat(8));
         let request = OutcomeAnchorRequest::new(
@@ -943,7 +1325,7 @@ mod tests {
     fn unmapped_subjects_are_accounted_never_silent() {
         let request = OutcomeAnchorRequest::new(
             OutcomeKind::ManualLabel,
-            "local:triage-session",
+            "agent:codex:triage-session",
             1_786_700_000,
             Some(0.6),
             vec![

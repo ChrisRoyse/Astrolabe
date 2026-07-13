@@ -4,6 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astrolabe_domain::fsv::FsvAck;
 use astrolabe_domain::{
     ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
     ASTRO_SYMBOL_IDENTITY_EMPTY, ASTRO_SYMBOL_NON_FINITE, AnchorEvidence, DomainError, EdgeKind,
@@ -27,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ASTRO_SERIES_ID_V1_REBUILD_REQUIRED, IngestError, IngestResult,
-    SERIES_ID_V1_REBUILD_REMEDIATION,
+    SERIES_ID_V1_REBUILD_REMEDIATION, SeriesVersionInput, VaultMutationPlan, ingest_series_batch,
 };
 
 /// Dangling edge refusal/skip code from blueprint `04_DATA_MODEL.md` section 7.
@@ -74,6 +75,9 @@ const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
+/// Ledger payload schema for admitting historical symbol versions without
+/// mutating the live graph projection.
+pub const HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA: &str = "astrolabe.historical_symbol_ingest.v1";
 const SCHEMA_QUANTIZATION_GATE: &str = "astrolabe.quantization_gate.v1";
 const ASTROLABE_INGEST_ACTOR: &str = "astrolabe-ingest";
 
@@ -102,6 +106,8 @@ pub struct SqliteImportOptions {
     pub available_slots: BTreeSet<SlotId>,
     /// Optional measured quantization gate for candidate compressed slots.
     pub quantization_gate: Option<QuantizationGateConfig>,
+    /// Whether this live import also advances the durable symbol-series registry.
+    pub update_series_registry: bool,
 }
 
 impl SqliteImportOptions {
@@ -117,6 +123,7 @@ impl SqliteImportOptions {
                 .map(|slot| slot.slot_id())
                 .collect(),
             quantization_gate: None,
+            update_series_registry: false,
         }
     }
 
@@ -138,6 +145,12 @@ impl SqliteImportOptions {
     /// Attaches a measured quantization gate to this import.
     pub fn with_quantization_gate(mut self, gate: QuantizationGateConfig) -> Self {
         self.quantization_gate = Some(gate);
+        self
+    }
+
+    /// Advances series and recurrence rows for every imported non-structural symbol.
+    pub fn with_series_registry(mut self, enabled: bool) -> Self {
+        self.update_series_registry = enabled;
         self
     }
 }
@@ -341,6 +354,10 @@ pub struct SqliteImportReport {
     pub graph_rows_written: usize,
     /// Typed edge Graph CF rows whose bytes changed in this run.
     pub edge_rows_written: usize,
+    /// Symbol versions presented to the durable series registry.
+    pub series_inputs: usize,
+    /// Registry/reverse/QN/recurrence rows changed by this run.
+    pub series_mutated_rows: usize,
     /// Latest vault sequence after the run ledger append.
     pub seq: Seq,
     /// Ledger sequence of the real `EntryKind::Ingest` run record.
@@ -355,8 +372,75 @@ pub struct SqliteImportReport {
     pub quantization: SqliteImportQuantizationReport,
     /// Post-write CF readback verification counts.
     pub readback: SqliteImportReadback,
+    /// Unforgeable full-readback witness when this import changed vault rows.
+    /// An idempotent ledger-only replay carries labeled absence (`None`).
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
     /// Imported constellation ids in deterministic node-id order.
     pub cx_ids: Vec<CxId>,
+    /// Newly measured constellation ids in deterministic node-id order.
+    /// Incremental consumers use this dirty set instead of rescanning/reweaving
+    /// every reused constellation in the full CBM snapshot.
+    #[serde(default)]
+    pub new_cx_id_values: Vec<CxId>,
+}
+
+/// Deterministic location and identity of one admitted historical symbol.
+///
+/// The record is derived from the same CBM row parsing and Astrolabe canonical
+/// identity path as a live shadow import. It deliberately contains no source
+/// bytes; callers use it to bind Git archaeology outcomes to the exact
+/// historical `CxId`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalSymbolLocation {
+    /// Git commit supplied through [`SqliteImportOptions::commit`].
+    pub commit: String,
+    /// Repository-relative source path at that commit.
+    pub file_path: String,
+    /// One-based inclusive symbol start line.
+    pub start_line: u32,
+    /// One-based inclusive symbol end line.
+    pub end_line: u32,
+    /// Historical qualified name emitted by CBM.
+    pub qualified_name: String,
+    /// Historical CBM symbol label.
+    pub label: String,
+    /// Exact immutable constellation id for this historical version.
+    pub cx_id: CxId,
+}
+
+/// Result of admitting implicated historical symbol versions.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalSymbolAdmissionReport {
+    /// Deterministically sorted admitted locations.
+    pub locations: Vec<HistoricalSymbolLocation>,
+    /// Non-structural symbol versions presented to the panel driver.
+    pub constellation_inputs: usize,
+    /// Constellations whose Base row did not previously exist.
+    pub constellations_written: usize,
+    /// Exact Base plus slot rows written by this call.
+    pub rows_written: usize,
+    /// Constellations already present and independently verified.
+    pub constellations_reused: usize,
+    /// Commit snapshot after this call; unchanged on an idempotent replay.
+    pub seq: Seq,
+    /// Paired Ingest ledger entry, present exactly when rows were written.
+    pub ledger_ref: Option<LedgerRef>,
+    /// Full persisted-row and paired-ledger readback witness for a mutation.
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct HistoricalSymbolIngestLedgerPayload {
+    schema: String,
+    project_hash_sha256: String,
+    commit_hash_sha256: String,
+    location_digest: String,
+    constellation_inputs: u64,
+    constellations_written: u64,
+    rows_written: u64,
+    constellations_reused: u64,
 }
 
 /// Deep verification counts for SQLite-imported graph mapping rows.
@@ -380,6 +464,9 @@ pub struct CxGraphErasureReport {
     pub edge_rows_tombstoned: usize,
     pub raw_edge_rows_tombstoned: usize,
     pub seq: Seq,
+    /// Unforgeable tombstone-readback witness, absent for a no-op erasure.
+    #[serde(default, skip_deserializing)]
+    pub fsv: Option<FsvAck>,
 }
 
 #[derive(Debug, Clone)]
@@ -484,8 +571,21 @@ struct PreparedConstellation {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedLiveSymbol {
+    node_id: i64,
+    name: String,
+    properties_json: String,
+    node_vector: Option<Vec<u8>>,
+    symbol: SymbolRecord,
+    identity: SymbolIdentity,
+    /// Present only when this content-addressed identity was not already in Base.
+    /// Reused live symbols retain their graph identity without re-running 22 lenses.
+    measured: Option<Constellation>,
+}
+
+#[derive(Debug, Clone)]
 struct PreparedBatch {
-    constellations: Vec<PreparedConstellation>,
+    constellations: Vec<PreparedLiveSymbol>,
     graph_rows: Vec<(Vec<u8>, Vec<u8>)>,
     edge_rows: Vec<PreparedEdgeRow>,
     structural_only: usize,
@@ -797,17 +897,10 @@ where
     let mut new_cx_ids = 0;
     let mut reused_cx_ids = 0;
     for prepared_cx in &prepared.constellations {
-        if vault
-            .read_cf_at(
-                before_snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some()
-        {
-            reused_cx_ids += 1;
-        } else {
+        if prepared_cx.measured.is_some() {
             new_cx_ids += 1;
+        } else {
+            reused_cx_ids += 1;
         }
     }
 
@@ -816,10 +909,16 @@ where
         .iter()
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
+    let new_cx_id_values = prepared
+        .constellations
+        .iter()
+        .filter(|prepared| prepared.measured.is_some())
+        .map(|prepared| prepared.identity.cx_id)
+        .collect::<Vec<_>>();
     let mut quantization = quantization_gate_report(options, &prepared);
     verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
     let (planned_graph_rows_written, planned_edge_rows_written) =
-        count_changed_graph_rows(vault, before_snapshot, &prepared)?;
+        count_changed_graph_rows(vault, before_snapshot, &prepared, &options.project)?;
     let payload = ingest_ledger_payload(
         input.sqlite_fingerprint,
         options,
@@ -833,14 +932,33 @@ where
             edge_rows_written: planned_edge_rows_written,
         },
     )?;
-    let (ledger_ref, graph_rows_written, edge_rows_written) = write_import_rows(
+    let (ledger_ref, fsv, graph_rows_written, edge_rows_written) = write_import_rows(
         vault,
         &prepared,
         input.sqlite_fingerprint,
         payload,
         options.quantization_gate.as_ref(),
+        &options.project,
     )?;
     let readback = verify_import_readback(vault, &prepared, options.quantization_gate.as_ref())?;
+    let (series_inputs, series_mutated_rows) = if options.update_series_registry {
+        let inputs = prepared
+            .constellations
+            .iter()
+            .filter(|prepared| prepared.measured.is_some())
+            .map(|prepared| {
+                SeriesVersionInput::new(
+                    prepared.symbol.clone(),
+                    options.panel_version,
+                    options.commit.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = ingest_series_batch(vault, &inputs)?;
+        (report.inputs, report.mutated_rows)
+    } else {
+        (0, 0)
+    };
     quantization.raw_guard_slot_rows_verified = readback.raw_guard_slot_rows_verified;
     let ledger_rows_after = ledger_row_count(vault)?;
 
@@ -855,6 +973,8 @@ where
         reused_cx_ids,
         graph_rows_written,
         edge_rows_written,
+        series_inputs,
+        series_mutated_rows,
         seq: vault.latest_seq(),
         ledger_seq: ledger_ref.seq,
         ledger_rows_before: input.ledger_rows_before,
@@ -862,7 +982,9 @@ where
         edge_skips: prepared.edge_skips,
         quantization,
         readback,
+        fsv,
         cx_ids,
+        new_cx_id_values,
     })
 }
 
@@ -938,6 +1060,276 @@ where
             ledger_rows_before,
         },
     )
+}
+
+/// Admits implicated historical CBM symbols as exact constellations without
+/// changing the live node map, Graph CF, or edge projection.
+///
+/// `snapshot` is expected to contain the filtered nodes implicated by Git
+/// archaeology at the real commit named by [`SqliteImportOptions::commit`].
+/// Nodes pass through the canonical snapshot parser, [`SymbolRecord`] builder,
+/// panel driver, and identity derivation used by live SQLite imports. Structural
+/// nodes are ignored because they do not have constellations. New Base and slot
+/// rows are written in one atomic `Ingest` group commit and verified with a
+/// [`VaultMutationPlan`]. Replaying an unchanged snapshot verifies existing rows
+/// and performs no mutation or ledger append.
+pub fn admit_historical_symbol_snapshot<C, R>(
+    snapshot: &CbmGraphSnapshot,
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+) -> IngestResult<HistoricalSymbolAdmissionReport>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    validate_options(options)?;
+    ensure_no_legacy_series_state(vault)?;
+    if options.commit.trim().is_empty() {
+        return Err(invalid_sqlite(
+            "historical symbol admission requires a non-empty real Git commit",
+        ));
+    }
+    if snapshot.project != options.project {
+        return Err(invalid_sqlite(format!(
+            "historical snapshot project {:?} does not match import project {:?}",
+            snapshot.project, options.project
+        )));
+    }
+
+    let extracted = extract_nodes(snapshot_node_rows(snapshot, &options.project)?)?;
+    let non_structural = extracted
+        .into_iter()
+        .filter(|node| !node.label.is_structural())
+        .collect::<Vec<_>>();
+    if non_structural.is_empty() {
+        return Err(invalid_sqlite(
+            "historical symbol snapshot contains no non-structural symbols to admit",
+        ));
+    }
+
+    let driver = PanelDriver::new(options.panel_version)?;
+    let mut prepared =
+        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
+    prepared.sort_by(|left, right| {
+        left.symbol
+            .rel_file_path
+            .cmp(&right.symbol.rel_file_path)
+            .then_with(|| left.symbol.start_line.cmp(&right.symbol.start_line))
+            .then_with(|| left.symbol.end_line.cmp(&right.symbol.end_line))
+            .then_with(|| left.symbol.qualified_name.cmp(&right.symbol.qualified_name))
+            .then_with(|| left.symbol.label.cmp(&right.symbol.label))
+            .then_with(|| left.identity.cx_id.cmp(&right.identity.cx_id))
+    });
+    for symbol in &mut prepared {
+        symbol.constellation.metadata.insert(
+            "start_line".to_string(),
+            symbol.symbol.start_line.to_string(),
+        );
+        symbol
+            .constellation
+            .metadata
+            .insert("end_line".to_string(), symbol.symbol.end_line.to_string());
+        symbol
+            .constellation
+            .metadata
+            .insert("historical_commit".to_string(), options.commit.clone());
+    }
+    let mut seen_cx_ids = BTreeSet::new();
+    for symbol in &prepared {
+        if !seen_cx_ids.insert(symbol.identity.cx_id) {
+            return Err(invalid_sqlite(format!(
+                "historical snapshot maps more than one node to CxId {}; filter duplicate symbol rows before admission",
+                symbol.identity.cx_id
+            )));
+        }
+    }
+
+    let locations = prepared
+        .iter()
+        .map(|symbol| HistoricalSymbolLocation {
+            commit: options.commit.clone(),
+            file_path: symbol.symbol.rel_file_path.clone(),
+            start_line: symbol.symbol.start_line,
+            end_line: symbol.symbol.end_line,
+            qualified_name: symbol.symbol.qualified_name.clone(),
+            label: symbol.symbol.label.clone(),
+            cx_id: symbol.identity.cx_id,
+        })
+        .collect::<Vec<_>>();
+    let snapshot_seq = vault.latest_seq();
+    let mut rows = Vec::new();
+    let mut constellations_written = 0usize;
+    let mut constellations_reused = 0usize;
+    for symbol in &prepared {
+        let key = base_key(symbol.identity.cx_id);
+        if vault
+            .read_cf_at(snapshot_seq, ColumnFamily::Base, &key)?
+            .is_some()
+        {
+            verify_existing_historical_constellation(vault, snapshot_seq, symbol)?;
+            constellations_reused += 1;
+            continue;
+        }
+        rows.push((
+            ColumnFamily::Base,
+            key,
+            encode::encode_constellation_base(&symbol.constellation)?,
+        ));
+        for (slot, vector) in &symbol.constellation.slots {
+            rows.push((
+                ColumnFamily::slot(*slot),
+                slot_key(symbol.identity.cx_id),
+                encode::encode_slot_vector(vector)?,
+            ));
+        }
+        constellations_written += 1;
+    }
+    let rows_written = rows.len();
+    if rows.is_empty() {
+        return Ok(HistoricalSymbolAdmissionReport {
+            locations,
+            constellation_inputs: prepared.len(),
+            constellations_written,
+            rows_written,
+            constellations_reused,
+            seq: snapshot_seq,
+            ledger_ref: None,
+            fsv: None,
+        });
+    }
+
+    let location_digest = historical_location_digest(&locations);
+    let payload = serde_json::to_vec(&HistoricalSymbolIngestLedgerPayload {
+        schema: HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA.to_string(),
+        project_hash_sha256: hex_lower(&sha256_digest(options.project.as_bytes())),
+        commit_hash_sha256: hex_lower(&sha256_digest(options.commit.as_bytes())),
+        location_digest: hex_lower(blake3::hash(&location_digest).as_bytes()),
+        constellation_inputs: prepared.len() as u64,
+        constellations_written: constellations_written as u64,
+        rows_written: rows_written as u64,
+        constellations_reused: constellations_reused as u64,
+    })?;
+    let subject = SubjectId::Query(blake3::hash(&location_digest).as_bytes().to_vec());
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    let planned_rows = rows.clone();
+    let commit_seq = vault.write_cf_batch_with_ledger_entry(
+        rows,
+        EntryKind::Ingest,
+        subject.clone(),
+        payload,
+        actor.clone(),
+    )?;
+    let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
+    let mut fsv_plan = VaultMutationPlan::new(
+        "admit_historical_symbol_snapshot",
+        EntryKind::Ingest,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in planned_rows {
+        let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
+        fsv_plan.push_content(cf, key, &expected);
+    }
+    vault.flush()?;
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+
+    Ok(HistoricalSymbolAdmissionReport {
+        locations,
+        constellation_inputs: prepared.len(),
+        constellations_written,
+        rows_written,
+        constellations_reused,
+        seq: commit_seq,
+        ledger_ref: Some(ledger_ref),
+        fsv: Some(fsv),
+    })
+}
+
+fn historical_location_digest(locations: &[HistoricalSymbolLocation]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for location in locations {
+        for field in [
+            location.commit.as_bytes(),
+            location.file_path.as_bytes(),
+            location.qualified_name.as_bytes(),
+            location.label.as_bytes(),
+            location.cx_id.as_bytes(),
+        ] {
+            bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(&location.start_line.to_be_bytes());
+        bytes.extend_from_slice(&location.end_line.to_be_bytes());
+    }
+    bytes
+}
+
+fn verify_existing_historical_constellation<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prepared: &PreparedConstellation,
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let bytes = vault
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Base,
+            &base_key(prepared.identity.cx_id),
+        )?
+        .ok_or_else(|| readback_mismatch("historical Base CF row disappeared"))?;
+    let decoded = encode::decode_constellation_base(&bytes)?;
+    if decoded.cx_id != prepared.identity.cx_id
+        || decoded.vault_id != prepared.constellation.vault_id
+        || decoded.panel_version != prepared.constellation.panel_version
+        || decoded.input_ref.hash != prepared.constellation.input_ref.hash
+        || decoded.input_ref.redacted != prepared.constellation.input_ref.redacted
+        || decoded.modality != prepared.constellation.modality
+        || decoded.scalars != prepared.constellation.scalars
+    {
+        return Err(readback_mismatch(format!(
+            "preexisting historical Base CF fields differ for {}",
+            prepared.identity.cx_id
+        )));
+    }
+    for key in [
+        "astrolabe_schema",
+        "qualified_name",
+        "label",
+        "series_id_schema",
+        "series_id",
+        "input_hash_blake3",
+    ] {
+        if decoded.metadata.get(key) != prepared.constellation.metadata.get(key) {
+            return Err(readback_mismatch(format!(
+                "preexisting historical Base CF metadata {key} differs for {}",
+                prepared.identity.cx_id
+            )));
+        }
+    }
+    for (slot, expected) in &prepared.constellation.slots {
+        let bytes = vault
+            .read_cf_at(
+                snapshot,
+                ColumnFamily::slot(*slot),
+                &slot_key(prepared.identity.cx_id),
+            )?
+            .ok_or_else(|| {
+                readback_mismatch(format!(
+                    "preexisting historical slot {slot} missing for {}",
+                    prepared.identity.cx_id
+                ))
+            })?;
+        if encode::decode_slot_vector(&bytes)? != *expected {
+            return Err(readback_mismatch(format!(
+                "preexisting historical slot {slot} differs for {}",
+                prepared.identity.cx_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
@@ -1591,9 +1983,9 @@ fn expected_raw_guard_slot_rows(prepared: &PreparedBatch, gate: &QuantizationGat
     prepared
         .constellations
         .iter()
-        .map(|prepared| {
-            prepared
-                .constellation
+        .filter_map(|prepared| prepared.measured.as_ref())
+        .map(|constellation| {
+            constellation
                 .slots
                 .keys()
                 .filter(|slot| gate.guard_slots.contains(&slot.get()))
@@ -1990,7 +2382,7 @@ where
         .into_iter()
         .partition(|node| node.label.is_structural());
     let mut constellations =
-        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
+        prepare_live_symbols_parallel(vault, runtime, options, &driver, non_structural)?;
     constellations.sort_by_key(|prepared| prepared.node_id);
 
     let mut graph_rows = metadata_graph_rows(options, metadata, sqlite_fingerprint)?;
@@ -2005,6 +2397,7 @@ where
     for (_, value) in &mut graph_rows {
         append_import_fingerprint(value, sqlite_fingerprint)?;
     }
+    reuse_semantically_unchanged_graph_rows(vault, &mut graph_rows)?;
     let sqlite_edges = edges.len();
     let structural_node_ids = structural
         .iter()
@@ -2021,6 +2414,42 @@ where
         sqlite_edges,
         edge_skips,
     })
+}
+
+fn reuse_semantically_unchanged_graph_rows<C>(
+    vault: &AsterVault<C>,
+    rows: &mut [(Vec<u8>, Vec<u8>)],
+) -> IngestResult<()>
+where
+    C: Clock,
+{
+    let snapshot = vault.latest_seq();
+    for (key, planned) in rows {
+        let Some(existing) = vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? else {
+            continue;
+        };
+        if graph_semantic_json(&existing)? == graph_semantic_json(planned)? {
+            *planned = existing;
+        }
+    }
+    Ok(())
+}
+
+fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if let Some(object) = value.as_object_mut() {
+        for volatile in [
+            "commit",
+            "sqlite_fingerprint_sha256",
+            "indexed_at",
+            "mtime_ns",
+            "created_at",
+            "updated_at",
+        ] {
+            object.remove(volatile);
+        }
+    }
+    Ok(value)
 }
 
 fn metadata_graph_rows(
@@ -2124,7 +2553,7 @@ fn raw_edge_graph_rows(
 
 fn prepare_edge_rows(
     options: &SqliteImportOptions,
-    constellations: &[PreparedConstellation],
+    constellations: &[PreparedLiveSymbol],
     structural_node_ids: &BTreeSet<i64>,
     edges: Vec<RawEdgeRow>,
 ) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
@@ -2182,6 +2611,101 @@ fn prepare_edge_rows(
     }
     prepared.sort_by(|left, right| left.key.cmp(&right.key));
     Ok((prepared, skips))
+}
+
+fn prepare_live_symbols_parallel<C, R>(
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    driver: &PanelDriver,
+    nodes: Vec<ExtractedNode>,
+) -> IngestResult<Vec<PreparedLiveSymbol>>
+where
+    C: Clock,
+    R: SlotRuntime + Sync,
+{
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = options.workers.min(nodes.len()).max(1);
+    if worker_count == 1 {
+        return nodes
+            .into_iter()
+            .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+            .collect();
+    }
+    let chunk_size = nodes.len().div_ceil(worker_count);
+    let mut owned_chunks = Vec::with_capacity(worker_count);
+    let mut drain = nodes.into_iter();
+    loop {
+        let chunk = drain.by_ref().take(chunk_size).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        owned_chunks.push(chunk);
+    }
+    thread::scope(|scope| {
+        let handles = owned_chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+                        .collect::<IngestResult<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.extend(handle.join().map_err(|_| {
+                IngestError::InvalidInput("parallel live-symbol preparation panicked".into())
+            })??);
+        }
+        Ok(out)
+    })
+}
+
+fn prepare_live_symbol<C, R>(
+    vault: &AsterVault<C>,
+    runtime: &R,
+    options: &SqliteImportOptions,
+    driver: &PanelDriver,
+    node: ExtractedNode,
+) -> IngestResult<PreparedLiveSymbol>
+where
+    C: Clock,
+    R: SlotRuntime,
+{
+    let identity = node.symbol.identity(options.panel_version)?;
+    let reused = vault
+        .read_cf_at(
+            vault.latest_seq(),
+            ColumnFamily::Base,
+            &base_key(identity.cx_id),
+        )?
+        .is_some();
+    if reused {
+        return Ok(PreparedLiveSymbol {
+            node_id: node.id,
+            name: node.name,
+            properties_json: node.properties_json,
+            node_vector: node.node_vector,
+            symbol: node.symbol,
+            identity,
+            measured: None,
+        });
+    }
+    let prepared = prepare_constellation(vault, runtime, options, driver, node)?;
+    Ok(PreparedLiveSymbol {
+        node_id: prepared.node_id,
+        name: prepared.name,
+        properties_json: prepared.properties_json,
+        node_vector: prepared.node_vector,
+        symbol: prepared.symbol,
+        identity: prepared.identity,
+        measured: Some(prepared.constellation),
+    })
 }
 
 fn edge_weight(kind: EdgeKind, properties: &Value, edge_id: i64) -> IngestResult<f32> {
@@ -2315,6 +2839,12 @@ where
     let mut input = PanelInput::with_available_slots(node.label, options.available_slots.clone())
         .with_scalars(node.symbol.scalars.clone());
     input.source_bytes = node.symbol.source_snippet_bytes.clone();
+    input.symbol_name = node.name.clone();
+    input.qualified_name = node.symbol.qualified_name.clone();
+    input.rel_file_path = node.symbol.rel_file_path.clone();
+    input.language = node.symbol.language.clone();
+    input.signature = node.symbol.signature.clone();
+    input.properties = serde_json::from_str(&node.properties_json)?;
     let readout = driver.measure(&input, runtime)?;
     let mut metadata = symbol_metadata(options, &node, &identity);
     metadata.insert(
@@ -2407,7 +2937,7 @@ fn symbol_metadata(
 
 fn node_map_graph_row(
     options: &SqliteImportOptions,
-    prepared: &PreparedConstellation,
+    prepared: &PreparedLiveSymbol,
 ) -> IngestResult<(Vec<u8>, Vec<u8>)> {
     let row = NodeMapRow {
         schema: SCHEMA_NODE_MAP.to_string(),
@@ -2478,15 +3008,21 @@ where
     C: Clock,
 {
     for prepared_cx in &prepared.constellations {
-        if vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some()
-        {
-            verify_existing_constellation(vault, snapshot, prepared_cx)?;
+        if prepared_cx.measured.is_none() {
+            let bytes = vault
+                .read_cf_at(
+                    snapshot,
+                    ColumnFamily::Base,
+                    &base_key(prepared_cx.identity.cx_id),
+                )?
+                .ok_or_else(|| readback_mismatch("reused Base CF row disappeared"))?;
+            let decoded = encode::decode_constellation_base(&bytes)?;
+            if decoded.cx_id != prepared_cx.identity.cx_id {
+                return Err(readback_mismatch(format!(
+                    "reused Base identity differs for {}",
+                    prepared_cx.identity.cx_id
+                )));
+            }
         }
     }
     Ok(())
@@ -2496,6 +3032,7 @@ fn count_changed_graph_rows<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     prepared: &PreparedBatch,
+    project: &str,
 ) -> IngestResult<(usize, usize)>
 where
     C: Clock,
@@ -2512,7 +3049,51 @@ where
             edge_changed += 1;
         }
     }
-    Ok((changed + edge_changed, edge_changed))
+    let stale = stale_live_graph_keys(vault, snapshot, prepared, project)?;
+    let stale_edges = stale
+        .iter()
+        .filter(|key| key.starts_with(EDGE_ROW_PREFIX))
+        .count();
+    Ok((
+        changed + edge_changed + stale.len(),
+        edge_changed + stale_edges,
+    ))
+}
+
+fn stale_live_graph_keys<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+    prepared: &PreparedBatch,
+    project: &str,
+) -> IngestResult<Vec<Vec<u8>>>
+where
+    C: Clock,
+{
+    let current = prepared
+        .graph_rows
+        .iter()
+        .map(|(key, _)| key.clone())
+        .chain(prepared.edge_rows.iter().map(|edge| edge.key.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut stale = Vec::new();
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Graph)? {
+        if current.contains(&key) {
+            continue;
+        }
+        let belongs_to_project = serde_json::from_slice::<Value>(&value)
+            .ok()
+            .and_then(|row| {
+                row.get("project")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|row_project| row_project == project);
+        if belongs_to_project {
+            stale.push(key);
+        }
+    }
+    stale.sort();
+    Ok(stale)
 }
 
 fn edge_row_matches_existing<C>(
@@ -2547,7 +3128,6 @@ fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> 
         && (row.weight - prepared.row.weight).abs() <= f32::EPSILON
         && row.props == prepared.row.props
         && row.properties_json == prepared.row.properties_json
-        && row.commit == prepared.row.commit
 }
 
 fn ledger_ref_matches<C>(
@@ -2567,64 +3147,21 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
-fn verify_existing_constellation<C>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    prepared: &PreparedConstellation,
-) -> IngestResult<()>
-where
-    C: Clock,
-{
-    let base_bytes = vault
-        .read_cf_at(
-            snapshot,
-            ColumnFamily::Base,
-            &base_key(prepared.identity.cx_id),
-        )?
-        .ok_or_else(|| readback_mismatch("preexisting Base CF row disappeared"))?;
-    let decoded = encode::decode_constellation_base(&base_bytes)?;
-    verify_base_fields(&decoded, prepared)?;
-    for (slot, expected) in &prepared.constellation.slots {
-        let slot_bytes = vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::slot(*slot),
-                &slot_key(decoded.cx_id),
-            )?
-            .ok_or_else(|| readback_mismatch(format!("preexisting slot {slot} CF row missing")))?;
-        let decoded_slot = encode::decode_slot_vector(&slot_bytes)?;
-        if &decoded_slot != expected {
-            return Err(readback_mismatch(format!(
-                "preexisting slot {slot} differs for {}",
-                decoded.cx_id
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
-) -> IngestResult<(LedgerRef, usize, usize)>
+    project: &str,
+) -> IngestResult<(LedgerRef, Option<FsvAck>, usize, usize)>
 where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
     let mut rows = Vec::new();
     for prepared_cx in &prepared.constellations {
-        let base_exists = vault
-            .read_cf_at(
-                snapshot,
-                ColumnFamily::Base,
-                &base_key(prepared_cx.identity.cx_id),
-            )?
-            .is_some();
-        let constellation = &prepared_cx.constellation;
-        if !base_exists {
+        if let Some(constellation) = &prepared_cx.measured {
             rows.push((
                 ColumnFamily::Base,
                 base_key(constellation.cx_id),
@@ -2638,7 +3175,7 @@ where
                 ));
             }
         }
-        if let Some(gate) = quantization_gate {
+        if let (Some(gate), Some(constellation)) = (quantization_gate, &prepared_cx.measured) {
             for (slot, vector) in &constellation.slots {
                 if !gate.guard_slots.contains(&slot.get()) {
                     continue;
@@ -2673,6 +3210,13 @@ where
             edge_rows_written += 1;
         }
     }
+    for key in stale_live_graph_keys(vault, snapshot, prepared, project)? {
+        if key.starts_with(EDGE_ROW_PREFIX) {
+            edge_rows_written += 1;
+        }
+        rows.push((ColumnFamily::Graph, key, tombstone_value().to_vec()));
+        graph_rows_written += 1;
+    }
 
     if rows.is_empty() {
         let ledger_ref = vault.append_ledger_entry(
@@ -2681,8 +3225,17 @@ where
             payload,
             ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
         )?;
-        return Ok((ledger_ref, graph_rows_written, edge_rows_written));
+        return Ok((ledger_ref, None, graph_rows_written, edge_rows_written));
     }
+
+    let subject = SubjectId::Query(sqlite_fingerprint.to_vec());
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    // Calyx's group-commit path deterministically binds the staged ledger ref
+    // into Base and provenance-bearing Graph rows before persistence. Preserve
+    // the caller's write set so we can derive those exact post-bind bytes after
+    // recovering this commit's ledger ref; hashing the pre-bind input would be a
+    // false mismatch, while hashing store readback would be circular.
+    let planned_rows = rows.clone();
 
     // Deriving the ledger seq from a pre-commit `ledger_row_count` is a TOCTOU under the
     // supported cross-process concurrency: an interleaved append from another process
@@ -2693,12 +3246,51 @@ where
     let commit_seq = vault.write_cf_batch_with_ledger_entry(
         rows,
         EntryKind::Ingest,
-        SubjectId::Query(sqlite_fingerprint.to_vec()),
+        subject.clone(),
         payload,
-        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
+        actor.clone(),
     )?;
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
-    Ok((ledger_ref, graph_rows_written, edge_rows_written))
+    let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
+    for (cf, key, value) in planned_rows {
+        if value == tombstone_value() {
+            fsv_plan.push_tombstoned(cf, key, &tombstone_value());
+        } else {
+            let expected = expected_group_commit_bytes(cf, value, &ledger_ref)?;
+            fsv_plan.push_content(cf, key, &expected);
+        }
+    }
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
+    Ok((ledger_ref, Some(fsv), graph_rows_written, edge_rows_written))
+}
+
+/// Mirrors Calyx Aster's deterministic ledger-ref attachment for FSV
+/// expectations. Expected bytes come only from the intended write plus the
+/// independently recovered paired ledger ref, never from the data-row readback
+/// that the resulting plan verifies.
+fn expected_group_commit_bytes(
+    cf: ColumnFamily,
+    value: Vec<u8>,
+    ledger_ref: &LedgerRef,
+) -> IngestResult<Vec<u8>> {
+    if cf == ColumnFamily::Base {
+        let mut constellation = encode::decode_constellation_base(&value)?;
+        constellation.provenance = ledger_ref.clone();
+        return Ok(encode::encode_constellation_base(&constellation)?);
+    }
+    if cf == ColumnFamily::Graph {
+        let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {
+            return Ok(value);
+        };
+        let Some(object) = json.as_object_mut() else {
+            return Ok(value);
+        };
+        if object.contains_key("provenance") {
+            object.insert("provenance".to_string(), serde_json::to_value(ledger_ref)?);
+            return Ok(serde_json::to_vec(&json)?);
+        }
+    }
+    Ok(value)
 }
 
 /// Recovers the ledger reference for the group commit that produced `commit_seq`.
@@ -2742,6 +3334,10 @@ where
     let mut slot_rows_verified = 0;
     let mut raw_guard_slot_rows_verified = 0;
     for prepared_cx in &prepared.constellations {
+        let Some(constellation) = &prepared_cx.measured else {
+            base_rows_verified += 1;
+            continue;
+        };
         let base_bytes = vault
             .read_cf_at(
                 snapshot,
@@ -2750,10 +3346,10 @@ where
             )?
             .ok_or_else(|| readback_mismatch("Base CF row missing after import"))?;
         let decoded = encode::decode_constellation_base(&base_bytes)?;
-        verify_base_fields(&decoded, prepared_cx)?;
+        verify_live_base_fields(&decoded, prepared_cx, constellation)?;
         base_rows_verified += 1;
 
-        for (slot, expected) in &prepared_cx.constellation.slots {
+        for (slot, expected) in &constellation.slots {
             let slot_bytes = vault
                 .read_cf_at(
                     snapshot,
@@ -2771,7 +3367,7 @@ where
             slot_rows_verified += 1;
         }
         if let Some(gate) = quantization_gate {
-            for (slot, expected) in &prepared_cx.constellation.slots {
+            for (slot, expected) in &constellation.slots {
                 if !gate.guard_slots.contains(&slot.get()) {
                     continue;
                 }
@@ -2831,7 +3427,8 @@ where
     let expected_slot_rows = prepared
         .constellations
         .iter()
-        .map(|prepared| prepared.constellation.slots.len())
+        .filter_map(|prepared| prepared.measured.as_ref())
+        .map(|constellation| constellation.slots.len())
         .sum();
     let expected_edge_rows = prepared.edge_rows.len();
     let expected_graph_rows = prepared.graph_rows.len() + expected_edge_rows;
@@ -2863,16 +3460,17 @@ where
     })
 }
 
-fn verify_base_fields(
+fn verify_live_base_fields(
     decoded: &Constellation,
-    prepared: &PreparedConstellation,
+    prepared: &PreparedLiveSymbol,
+    constellation: &Constellation,
 ) -> IngestResult<()> {
     if decoded.cx_id != prepared.identity.cx_id
-        || decoded.vault_id != prepared.constellation.vault_id
-        || decoded.panel_version != prepared.constellation.panel_version
-        || decoded.input_ref != prepared.constellation.input_ref
-        || decoded.modality != prepared.constellation.modality
-        || decoded.scalars != prepared.constellation.scalars
+        || decoded.vault_id != constellation.vault_id
+        || decoded.panel_version != constellation.panel_version
+        || decoded.input_ref != constellation.input_ref
+        || decoded.modality != constellation.modality
+        || decoded.scalars != constellation.scalars
     {
         return Err(readback_mismatch(format!(
             "Base CF decoded fields differ for {}",
@@ -2887,7 +3485,7 @@ fn verify_base_fields(
         "series_id_schema",
         "series_id",
     ] {
-        if decoded.metadata.get(key) != prepared.constellation.metadata.get(key) {
+        if decoded.metadata.get(key) != constellation.metadata.get(key) {
             return Err(readback_mismatch(format!(
                 "Base CF metadata {key} differs for {}",
                 prepared.identity.cx_id
@@ -3291,6 +3889,7 @@ where
             edge_rows_tombstoned,
             raw_edge_rows_tombstoned,
             seq: vault.latest_seq(),
+            fsv: None,
         });
     }
 
@@ -3302,13 +3901,20 @@ where
         "edge_rows_tombstoned": edge_rows_tombstoned,
         "raw_edge_rows_tombstoned": raw_edge_rows_tombstoned,
     }))?;
-    vault.write_cf_batch_with_ledger_entry(
-        rows,
+    let subject = SubjectId::Cx(cx_id);
+    let actor = ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string());
+    let mut fsv_plan = VaultMutationPlan::new(
+        "erase_imported_cx_graph_rows",
         EntryKind::Admin,
-        SubjectId::Cx(cx_id),
-        payload,
-        ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
-    )?;
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &rows {
+        fsv_plan.push_tombstoned(*cf, key.clone(), value);
+    }
+    let commit_seq =
+        vault.write_cf_batch_with_ledger_entry(rows, EntryKind::Admin, subject, payload, actor)?;
+    let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
     vault.purge_tombstoned_cfs(&[ColumnFamily::Graph])?;
 
     Ok(CxGraphErasureReport {
@@ -3318,6 +3924,7 @@ where
         edge_rows_tombstoned,
         raw_edge_rows_tombstoned,
         seq: vault.latest_seq(),
+        fsv: Some(fsv),
     })
 }
 
@@ -3630,7 +4237,8 @@ fn ingest_ledger_payload(
         expected_slot_rows: prepared
             .constellations
             .iter()
-            .map(|prepared| prepared.constellation.slots.len() as u64)
+            .filter_map(|prepared| prepared.measured.as_ref())
+            .map(|constellation| constellation.slots.len() as u64)
             .sum(),
         expected_graph_rows: (prepared.graph_rows.len() + prepared.edge_rows.len()) as u64,
         expected_edge_rows: prepared.edge_rows.len() as u64,
@@ -4043,7 +4651,8 @@ mod tests {
 
     use crate::{
         ASTRO_ERASURE_SCRUB_BATCH_INVALID, ASTRO_ERASURE_SCRUB_NOT_DURABLE,
-        WAL_SCRUB_LEDGER_SCHEMA, WalScrubParams, scrub_erased_wal_history, wal_scrub_status,
+        StoredSeriesRegistryRow, WAL_SCRUB_LEDGER_SCHEMA, WalScrubParams, read_registry_snapshot,
+        scrub_erased_wal_history, verify_chain, wal_scrub_status,
     };
     use astrolabe_domain::{
         ASTRO_ANCHOR_CONFIDENCE_RANGE, ASTRO_PANEL_VERSION_ZERO, ASTRO_SOURCE_DRIFT,
@@ -4481,6 +5090,15 @@ mod tests {
             ))
         });
         edges
+    }
+
+    fn graph_rows<C>(vault: &AsterVault<C>, snapshot: Seq) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        C: Clock,
+    {
+        vault
+            .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(b"astrolabe:"))
+            .expect("scan graph rows")
     }
 
     fn sqlite_fingerprint(path: &Path) -> [u8; 32] {
@@ -5019,6 +5637,191 @@ mod tests {
     }
 
     #[test]
+    fn incremental_import_repoints_live_edges_preserves_mvcc_and_matches_clean_final_state() {
+        let initial = edge_snapshot();
+        let delta_vault = vault();
+        let first_options = options(1).with_series_registry(true);
+        let first = import_cbm_graph_snapshot_to_vault_direct(
+            &initial,
+            [1; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &first_options,
+        )
+        .expect("initial live import");
+        assert_eq!(first.series_inputs, 3);
+        assert!(first.series_mutated_rows > 0);
+        let first_seq = delta_vault.latest_seq();
+        let first_graph = graph_rows(&delta_vault, first_seq);
+        let old_edge = first_graph
+            .iter()
+            .find(|(key, _)| key.starts_with(EDGE_ROW_PREFIX))
+            .cloned()
+            .expect("old live edge row");
+        let old_helper_cx = read_cbm_graph_snapshot(&delta_vault, "demo")
+            .expect("read initial graph")
+            .nodes
+            .into_iter()
+            .find(|node| node.qualified_name == "demo.http.helper")
+            .and_then(|node| node.cx_id)
+            .expect("initial helper CxId");
+        let old_helper_base = delta_vault
+            .read_cf_at(first_seq, ColumnFamily::Base, &base_key(old_helper_cx))
+            .expect("read old helper Base")
+            .expect("old helper Base exists");
+
+        let mut final_snapshot = initial.clone();
+        final_snapshot.nodes[1].properties_json =
+            r#"{"language":"rust","source_snippet":"fn helper() { changed(); }","signature":"fn helper()"}"#
+                .to_string();
+        final_snapshot
+            .nodes
+            .retain(|node| node.qualified_name != "demo.net");
+        final_snapshot.edges.retain(|edge| edge.sqlite_edge_id == 1);
+        let final_options = SqliteImportOptions::new("demo", "commit-2", 7)
+            .with_workers(1)
+            .with_series_registry(true);
+        let changed = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("incremental live import");
+        assert_eq!(changed.new_cx_ids, 1);
+        assert_eq!(changed.reused_cx_ids, 1);
+        assert_eq!(changed.series_inputs, 1);
+        assert!(changed.series_mutated_rows > 0);
+
+        let live = read_cbm_graph_snapshot(&delta_vault, "demo").expect("read changed graph");
+        assert_eq!(
+            live.nodes.len(),
+            2,
+            "removed module is absent from live Graph"
+        );
+        assert_eq!(live.edges.len(), 1, "removed import edges are absent");
+        let new_helper_cx = live
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == "demo.http.helper")
+            .and_then(|node| node.cx_id)
+            .expect("new helper CxId");
+        assert_ne!(new_helper_cx, old_helper_cx);
+        let live_edges = edge_multiset(&delta_vault);
+        assert_eq!(live_edges.len(), 1);
+        assert_eq!(live_edges[0].1, new_helper_cx);
+        assert_ne!(live_edges[0].1, old_helper_cx);
+
+        // MVCC readback: the live projection tombstones the old edge, while the
+        // first snapshot still exposes its exact bytes. Immutable Base history
+        // remains readable at both snapshots under the default keep-everything policy.
+        assert_eq!(
+            delta_vault
+                .read_cf_at(first_seq, ColumnFamily::Graph, &old_edge.0)
+                .expect("read old edge at first snapshot"),
+            Some(old_edge.1.clone())
+        );
+        assert_eq!(
+            delta_vault
+                .read_cf_at(delta_vault.latest_seq(), ColumnFamily::Graph, &old_edge.0)
+                .expect("read old edge at live snapshot"),
+            None
+        );
+        for snapshot in [first_seq, delta_vault.latest_seq()] {
+            assert_eq!(
+                delta_vault
+                    .read_cf_at(snapshot, ColumnFamily::Base, &base_key(old_helper_cx))
+                    .expect("read historical Base"),
+                Some(old_helper_base.clone())
+            );
+        }
+
+        let registry = read_registry_snapshot(&delta_vault).expect("read registry state");
+        let helper_series = registry
+            .kv_rows
+            .iter()
+            .filter_map(|(_, value)| serde_json::from_slice::<StoredSeriesRegistryRow>(value).ok())
+            .find(|row| row.qualified_name == "demo.http.helper")
+            .expect("helper series row");
+        assert_eq!(helper_series.version_count, 2);
+        assert_eq!(helper_series.current_cx_id, new_helper_cx);
+        assert_eq!(registry.recurrence_rows.len(), 4);
+        assert_eq!(
+            verify_chain(&delta_vault)
+                .expect("verify delta chain")
+                .status,
+            "intact"
+        );
+
+        // A clean import of the final tree produces the same current CxId set,
+        // node projection, and typed-edge multiset. Historical Base/MVCC rows are
+        // the intentional and required divergence of the incremental vault.
+        let clean_vault = vault();
+        let clean = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &clean_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("clean final import");
+        assert_eq!(changed.cx_ids, clean.cx_ids);
+        assert_eq!(edge_multiset(&delta_vault), edge_multiset(&clean_vault));
+        let delta_nodes = read_cbm_graph_snapshot(&delta_vault, "demo")
+            .expect("delta nodes")
+            .nodes
+            .into_iter()
+            .map(|node| (node.qualified_name, node.cx_id))
+            .collect::<BTreeSet<_>>();
+        let clean_nodes = read_cbm_graph_snapshot(&clean_vault, "demo")
+            .expect("clean nodes")
+            .nodes
+            .into_iter()
+            .map(|node| (node.qualified_name, node.cx_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(delta_nodes, clean_nodes);
+
+        // Re-presenting identical content (the state reached by an mtime-only
+        // watcher event) mutates no content-addressed, Graph, edge, or registry row.
+        let ledger_before_noop = ledger_row_count(&delta_vault).expect("ledger before no-op");
+        let graph_before_noop = graph_rows(&delta_vault, delta_vault.latest_seq());
+        let registry_before_noop =
+            read_registry_snapshot(&delta_vault).expect("registry before no-op");
+        let noop = import_cbm_graph_snapshot_to_vault_direct(
+            &final_snapshot,
+            [2; 32],
+            &delta_vault,
+            &FixtureSlotRuntime,
+            &final_options,
+        )
+        .expect("mtime-only equivalent import");
+        assert_eq!(noop.new_cx_ids, 0);
+        assert_eq!(noop.graph_rows_written, 0);
+        assert_eq!(noop.edge_rows_written, 0);
+        assert_eq!(noop.series_mutated_rows, 0);
+        assert_eq!(
+            graph_rows(&delta_vault, delta_vault.latest_seq()),
+            graph_before_noop
+        );
+        assert_eq!(
+            read_registry_snapshot(&delta_vault).expect("registry after no-op"),
+            registry_before_noop
+        );
+        assert_eq!(
+            ledger_row_count(&delta_vault).expect("ledger after no-op"),
+            ledger_before_noop + 1,
+            "only the import run record is appended"
+        );
+        assert_eq!(
+            verify_chain(&delta_vault)
+                .expect("verify no-op chain")
+                .status,
+            "intact"
+        );
+    }
+
+    #[test]
     fn row_sink_snapshot_import_matches_sqlite_import_for_typed_edges() {
         let path = temp_db("row-sink-edges");
         edge_fixture(&path);
@@ -5073,6 +5876,111 @@ mod tests {
         assert_import_cfs_match_raw(&direct_vault, &sqlite_vault);
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn historical_symbol_admission_reopens_base_and_never_mutates_live_graph() {
+        let mut snapshot = edge_snapshot();
+        snapshot.nodes.retain(|node| node.label == "Function");
+        // Deliberately leave the real captured edges in the filtered snapshot:
+        // historical admission must ignore them rather than project live Graph
+        // rows from a past tree.
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let options = SqliteImportOptions::new("demo", commit, 7);
+        let (dir, vault) = durable_vault("historical-symbol-admission");
+        let graph_before = vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+            .expect("scan initial Graph CF");
+
+        let report =
+            admit_historical_symbol_snapshot(&snapshot, &vault, &FixtureSlotRuntime, &options)
+                .expect("admit historical symbols");
+        assert_eq!(report.constellation_inputs, 2);
+        assert_eq!(report.constellations_written, 2);
+        assert_eq!(report.constellations_reused, 0);
+        assert!(report.rows_written >= 2);
+        assert!(report.ledger_ref.is_some());
+        assert_eq!(
+            report
+                .fsv
+                .as_ref()
+                .expect("historical admission FSV")
+                .scope(),
+            "admit_historical_symbol_snapshot"
+        );
+        assert_eq!(
+            vault
+                .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)
+                .expect("scan Graph CF after admission"),
+            graph_before,
+            "historical admission must not write node-map, Graph, or edge rows"
+        );
+        vault.flush().expect("flush historical admission vault");
+        drop(vault);
+
+        let reopened = AsterVault::new_durable_with_clock(
+            &*dir,
+            TEST_VAULT_ID.parse::<VaultId>().expect("valid vault id"),
+            b"astrolabe-ingest-test".to_vec(),
+            VaultOptions::default(),
+            FixedClock::new(1_785_400_000),
+        )
+        .expect("reopen historical admission vault");
+        for location in &report.locations {
+            let bytes = reopened
+                .read_cf_at(
+                    reopened.latest_seq(),
+                    ColumnFamily::Base,
+                    &base_key(location.cx_id),
+                )
+                .expect("read historical Base row")
+                .expect("historical Base row exists");
+            let constellation =
+                encode::decode_constellation_base(&bytes).expect("decode historical Base row");
+            assert_eq!(constellation.cx_id, location.cx_id);
+            assert_eq!(
+                constellation.metadata.get("historical_commit"),
+                Some(&commit.to_string())
+            );
+            assert_eq!(
+                constellation.metadata.get("start_line"),
+                Some(&location.start_line.to_string())
+            );
+            assert_eq!(
+                constellation.metadata.get("end_line"),
+                Some(&location.end_line.to_string())
+            );
+        }
+        let (_, ledger_bytes) = reopened
+            .scan_cf_at(reopened.latest_seq(), ColumnFamily::Ledger)
+            .expect("scan historical admission ledger")
+            .into_iter()
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .expect("paired historical admission ledger row");
+        let ledger = decode(&ledger_bytes).expect("decode historical admission ledger");
+        let payload: Value =
+            serde_json::from_slice(&ledger.payload).expect("decode historical ledger payload");
+        assert_eq!(payload["schema"], HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA);
+        assert_eq!(payload["constellations_written"], 2);
+
+        let before_replay_seq = reopened.latest_seq();
+        let replay =
+            admit_historical_symbol_snapshot(&snapshot, &reopened, &FixtureSlotRuntime, &options)
+                .expect("idempotent historical replay");
+        assert_eq!(replay.locations, report.locations);
+        assert_eq!(replay.constellations_written, 0);
+        assert_eq!(replay.rows_written, 0);
+        assert_eq!(replay.constellations_reused, 2);
+        assert_eq!(replay.seq, before_replay_seq);
+        assert!(replay.ledger_ref.is_none());
+        assert!(replay.fsv.is_none());
+        assert_eq!(reopened.latest_seq(), before_replay_seq);
+        assert_eq!(
+            reopened
+                .scan_cf_at(reopened.latest_seq(), ColumnFamily::Graph)
+                .expect("scan Graph CF after replay"),
+            graph_before
+        );
     }
 
     #[test]
@@ -5371,6 +6279,13 @@ mod tests {
         assert_eq!(report.edge_skips.dangling, 0);
         assert_eq!(report.edge_rows_written, EdgeKind::ALL.len());
         assert_eq!(report.readback.edge_rows_verified, EdgeKind::ALL.len());
+        let fsv = report
+            .fsv
+            .as_ref()
+            .expect("changed import earns FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.ledger_seq(), report.ledger_seq);
+        assert!(fsv.rows_read_back() >= report.edge_rows_written as u64);
 
         let edges = vault
             .scan_cf_range_at(
@@ -5591,6 +6506,10 @@ mod tests {
         assert_eq!(report.new_cx_ids, 0);
         assert_eq!(report.reused_cx_ids, 1);
         assert_eq!(report.graph_rows_written, 0);
+        assert!(
+            report.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         assert_eq!(
             vault
                 .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)
@@ -5876,7 +6795,19 @@ mod tests {
             .expect("erase marker cx");
         assert_eq!(erase.records_deleted, 1);
         assert!(context.is_key_shredded_for_erasure());
-        crate::erase_imported_cx_graph_rows(&vault, "demo", erased_cx).expect("erase graph rows");
+        let graph_erase = crate::erase_imported_cx_graph_rows(&vault, "demo", erased_cx)
+            .expect("erase graph rows");
+        let graph_fsv = graph_erase
+            .fsv
+            .as_ref()
+            .expect("graph tombstones earn FSV witness");
+        assert_eq!(graph_fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(
+            graph_fsv.rows_read_back(),
+            (graph_erase.node_map_rows_tombstoned
+                + graph_erase.edge_rows_tombstoned
+                + graph_erase.raw_edge_rows_tombstoned) as u64
+        );
         vault.flush().expect("flush post-erasure");
 
         // Precondition (the gap this scrub closes): after full erasure the ONLY
@@ -6033,6 +6964,7 @@ mod tests {
         assert_eq!(graph.node_map_rows_tombstoned, 0);
         assert_eq!(graph.edge_rows_tombstoned, 0);
         assert_eq!(graph.raw_edge_rows_tombstoned, 0);
+        assert!(graph.fsv.is_none(), "no-op erasure labels FSV absence");
 
         fs::remove_file(path).ok();
         fs::remove_dir_all(vault_dir).ok();
@@ -6162,7 +7094,7 @@ mod tests {
                 "bad-anchor",
                 "Function",
                 "demo.bad.anchor",
-                r#"{"source_snippet":"x","anchors":[{"source":"ci:github","confidence":0.0}]}"#,
+                r#"{"source_snippet":"x","anchors":[{"source":"ci:github:run-1","confidence":0.0}]}"#,
                 7,
                 ASTRO_ANCHOR_CONFIDENCE_RANGE,
                 "Clamp or reject anchor confidence so only values in (0, 1] are admitted.",

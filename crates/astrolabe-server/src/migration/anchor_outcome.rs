@@ -142,15 +142,15 @@ pub(crate) fn anchor_outcome_json_at(
         "unmapped_subject_count": unmapped_count,
         "anchor_dump_hash": report.anchor_dump_hash,
         "ledger_ref": ledger_ref_json(&report.ledger_ref),
+        "fsv": report.fsv.as_ref().map(fsv_ack_envelope),
         "grounding_delta": {
             "anchors_written": report.anchors_written,
             "rows_written": report.rows_written,
             "ledger_seq": report.ledger_ref.seq,
         },
-        // HONEST labels: the mutation is persisted and paired with its Grounding
-        // ledger entry (trust=verified). Any subject that did not resolve is
-        // surfaced above as an unmapped, counted skip, never silently dropped.
-        "trust": "verified",
+        // Source trust is a grounding property, distinct from the verified FSV
+        // witness above. Proxy evidence can never ride as Trusted.
+        "trust": report.trust.as_str(),
         "freshness": "fresh",
         "provenance": [
             format!("ledger:grounding:seq={}", report.ledger_ref.seq),
@@ -178,7 +178,7 @@ fn anchor_outcome_refused(
         "message": message.into(),
         "remediation": remediation,
         "anchors_written": 0,
-        "trust": "verified",
+        "trust": "provisional",
         "freshness": "fresh",
         "provenance": ["refusal:pre-commit:no-anchor-written"],
     })
@@ -198,7 +198,7 @@ pub(crate) fn handle_anchor_outcome(args_json: &str) -> Result<String, DynError>
     let kind = string_arg(args_obj, "kind").unwrap_or("test_run");
     let Some(source) = string_arg(args_obj, "source") else {
         return tool_error_result(
-            "anchor_outcome requires source ('ci:<provider>:<run_id>' or 'local:<context>')",
+            "anchor_outcome requires a catalog source prefix (ci:/trace:/review:/git:revert:/git:fix:/agent:/survival:)",
         );
     };
     let Some(format) = string_arg(args_obj, "format") else {

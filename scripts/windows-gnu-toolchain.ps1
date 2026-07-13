@@ -2,7 +2,17 @@
 param(
     [switch]$Bootstrap,
     [string]$Command,
-    [string]$CommandArgsJson = "[]"
+    [string]$CommandArgsJson = "[]",
+    # #317: positive driving GitHub issue recorded in every launcher lock.
+    # String input permits a stable fail-closed refusal for malformed values.
+    [string]$Issue = "",
+    # #303: read-only diagnostic. Resolve the pinned ld.lld and print its path + version,
+    # then exit. Runs before the lock/workspace/toolchain-env machinery so it can prove the
+    # linker-resolution guard in isolation (FSV) without a full native build. -LlvmBinOverride
+    # points the resolver at a sandbox bin (never a real build path) for the missing-binary
+    # edge test; empty means the canonical pinned .toolchains bin.
+    [switch]$ProbeLld,
+    [string]$LlvmBinOverride = ""
 )
 
 Set-StrictMode -Version Latest
@@ -112,6 +122,13 @@ $RequiredTools = @(
 )
 $RuntimeDlls = @("libgcc_s_seh-1.dll", "libwinpthread-1.dll")
 $RequiredLlvmTools = @("clang-tidy.exe", "clang-format.exe")
+# #303: the lld linker ships in the same pinned LLVM 20.1.8 bundle as clang-tidy/clang-format.
+# Its version string is asserted independently of PATH resolution: gcc/collect2 PATH-searches
+# for `ld.lld`, and this host carries an UNPINNED MSVS BuildTools LLD 12.0.0 ahead of the
+# pinned bundle, so any lld-enabled build that does not force the pinned bin silently links
+# with the stale linker (a "no silent fallback" invariant breach surfaced by #270).
+$ExpectedLldVersion = "20.1.8"
+$PinnedLldExeName = "ld.lld.exe"
 
 function Require-Path {
     param([string]$Path, [string]$Message)
@@ -1098,6 +1115,70 @@ function Get-AstroAttributedStoreRoots {
     return $roots
 }
 
+function Resolve-PinnedLld {
+    <#
+      #303: resolve the `ld.lld` used for lld-enabled x86_64-pc-windows-gnu links to the
+      pinned LLVM 20.1.8 bundle ONLY. This computes the linker path DIRECTLY from the pinned
+      .toolchains bin -- it NEVER consults PATH -- so a decoy `ld.lld` earlier on PATH (this
+      host's unpinned MSVS BuildTools LLD 12.0.0) can never be returned. It refuses to hand
+      back the path unless `ld.lld --version` reports the pinned $ExpectedLldVersion. Every
+      refusal is fail-closed and carries {code, message, remediation}. Returns the resolved
+      absolute path on success.
+    #>
+    param([Parameter(Mandatory)][string]$LlvmBin)
+
+    $pinnedLld = Join-Path $LlvmBin $PinnedLldExeName
+    if (-not (Test-Path -LiteralPath $pinnedLld -PathType Leaf)) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_MISSING]: {code=ASTRO_PINNED_LLD_MISSING; message=`"pinned ld.lld ($PinnedLldExeName) is absent from the pinned LLVM $ExpectedLldVersion bundle at $pinnedLld`"; remediation=`"rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to (re)install the pinned LLVM $ExpectedLldVersion bundle`"}"
+    }
+    $probe = Invoke-NativeCapture -Exe $pinnedLld -Arguments @("--version")
+    $versionText = ($probe.Output -join "`n").Trim()
+    if ($probe.ExitCode -ne 0) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_PROBE_FAILED]: {code=ASTRO_PINNED_LLD_PROBE_FAILED; message=`"pinned ld.lld at $pinnedLld failed its '--version' probe (exit $($probe.ExitCode)): $versionText`"; remediation=`"the pinned linker is corrupt or unrunnable; rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
+    }
+    if ($versionText -notmatch [regex]::Escape($ExpectedLldVersion)) {
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_VERSION]: {code=ASTRO_PINNED_LLD_VERSION; message=`"pinned ld.lld at $pinnedLld reported an unexpected version; expected LLD $ExpectedLldVersion, got: $versionText`"; remediation=`"remove the mismatched .toolchains LLVM bundle and rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
+    }
+    return (Resolve-Path -LiteralPath $pinnedLld).Path
+}
+
+function Assert-GccResolvesPinnedLld {
+    <#
+      #303: end-to-end guard run BEFORE any lld-enabled build. gcc/collect2 must resolve
+      `ld.lld` to the pinned LLVM 20.1.8 linker, not the host's unpinned MSVS BuildTools LLD.
+      Passing `-B<pinned-bin>\` pins collect2's ld.lld search to the pinned directory ahead of
+      PATH; `-Wl,--version` makes the resolved linker print its identity so it can be asserted.
+      Fails closed with {code, message, remediation} unless the linker reports LLD
+      $ExpectedLldVersion. Returns the pinned ld.lld path on success.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GccExe,
+        [Parameter(Mandatory)][string]$LlvmBin,
+        [Parameter(Mandatory)][string]$ScratchDir
+    )
+
+    $pinnedLld = Resolve-PinnedLld -LlvmBin $LlvmBin
+    # gcc treats -B as a filename PREFIX, so it must end in a directory separator or the
+    # concatenation becomes "<bin>ld.lld" instead of "<bin>\ld.lld".
+    $lldPrefix = ($LlvmBin.TrimEnd('\', '/')) + '\'
+    New-Item -ItemType Directory -Path $ScratchDir -Force | Out-Null
+    $trivialC = Join-Path $ScratchDir "astro-lld-probe-$PID.c"
+    $trivialExe = Join-Path $ScratchDir "astro-lld-probe-$PID.exe"
+    Set-Content -LiteralPath $trivialC -Value "int main(void){return 0;}" -Encoding ASCII
+    try {
+        $probe = Invoke-NativeCapture -Exe $GccExe -Arguments @("-B$lldPrefix", "-fuse-ld=lld", $trivialC, "-o", $trivialExe, "-Wl,--version")
+        $versionText = ($probe.Output -join "`n").Trim()
+        if ($versionText -notmatch [regex]::Escape("LLD $ExpectedLldVersion")) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_LLD_RESOLUTION_POISONED]: {code=ASTRO_LLD_RESOLUTION_POISONED; message=`"gcc -fuse-ld=lld resolved a linker other than the pinned LLD $ExpectedLldVersion (pinned=$pinnedLld); linker reported: $versionText`"; remediation=`"an unpinned ld.lld (e.g. this host's MSVS BuildTools LLD 12.0.0) is shadowing the pinned bundle; the launcher prepends $LlvmBin to PATH and pins collect2 to it via -B$lldPrefix -- if this still fires the pinned bundle is broken, so rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace`"}"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $trivialC -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $trivialExe -Force -ErrorAction SilentlyContinue
+    }
+    return $pinnedLld
+}
+
 function Test-PinnedToolchain {
     param([string]$MingwBin, [string]$LlvmBin, [string]$CppcheckRoot, [string]$RipgrepRoot, [string]$SccacheExe)
 
@@ -1187,6 +1268,37 @@ if ($env:WSL_DISTRO_NAME -or $env:WSL_INTEROP) {
     throw "EXECUTION_BOUNDARY[ASTRO_NATIVE_CONTEXT_REQUIRED]: run this launcher from native Windows PowerShell"
 }
 
+# #303: read-only linker-resolution diagnostic. Proves Resolve-PinnedLld in isolation --
+# never PATH-searched, fail-closed on missing/wrong-version -- without touching the session
+# lock, target/, or the toolchain environment. Runs before all of that machinery.
+if ($ProbeLld) {
+    if ([string]::IsNullOrWhiteSpace($LlvmBinOverride)) {
+        $probeLlvmBin = Join-Path (Join-Path (Join-Path $ExpectedWorkspace ".toolchains") $LlvmDirectoryName) "bin"
+    }
+    else {
+        $probeLlvmBin = $LlvmBinOverride
+    }
+    try {
+        $resolved = Resolve-PinnedLld -LlvmBin $probeLlvmBin
+    }
+    catch {
+        Write-Output "PROBE_LLD[ASTRO_PINNED_LLD_FAILCLOSED]: $($_.Exception.Message)"
+        exit 3
+    }
+    $probeVersion = (Invoke-NativeCapture -Exe $resolved -Arguments @("--version")).Output -join "`n"
+    Write-Output "PROBE_LLD[ASTRO_PINNED_LLD_RESOLVED]: path=$resolved"
+    Write-Output "PROBE_LLD[ASTRO_PINNED_LLD_VERSION]: $($probeVersion.Trim())"
+    exit 0
+}
+
+# #317: tracker ownership is part of the lock schema, not optional metadata.
+# Validate before resolving/creating any workspace lock path so a malformed or
+# absent issue can never acquire a partially owned session.
+$drivingIssue = 0
+if (-not [int]::TryParse($Issue, [ref]$drivingIssue) -or $drivingIssue -le 0) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_ISSUE_INVALID]: {code=ASTRO_LAUNCHER_ISSUE_INVALID; message=`"the native launcher requires a positive driving GitHub issue number; received '$Issue'`"; remediation=`"re-read the driving issue, post the tracker comment required by #197, then rerun with -Issue <positive-issue-number>`"}"
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 # #226: a registered git worktree of the canonical workspace (a `.git` FILE under
 # .claude\worktrees\) is a valid launcher root for parallel-session verification.
@@ -1258,10 +1370,15 @@ if ($attributionSweep.Removed.Count -gt 0 -or $attributionSweep.Kept.Count -gt 0
 # race), and a concurrent claim between the boundary check above and this move
 # surfaces as a named fail-closed refusal instead of overwriting a live lock.
 $launcherLockStage = "$launcherLock.$PID.tmp"
+$launcherCommand = ("$Command $CommandArgsJson").Trim()
+if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
+    $launcherCommand = if ($Bootstrap) { "bootstrap" } else { "environment-probe" }
+}
 [ordered]@{
     pid = $PID
+    issue = $drivingIssue
     started = (Get-Date).ToString("o")
-    command = ("$Command $CommandArgsJson").Trim()
+    command = $launcherCommand
 } | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLockStage -Encoding UTF8
 try {
     Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop
@@ -1325,8 +1442,25 @@ Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cp
 Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -SccacheExe $sccacheExe
 Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, sccache $ExpectedSccacheVersion, runtime $mingwBin"
 
+# #303: when the operator opts into the #270 lld linker (RUSTFLAGS carries -fuse-ld=lld),
+# guarantee the pinned LLVM 20.1.8 ld.lld -- never the host's unpinned MSVS BuildTools LLD --
+# is the one gcc/collect2 uses. Set-ToolchainEnvironment already prepends the pinned LLVM bin
+# to PATH; here we (1) end-to-end probe gcc and FAIL CLOSED unless it resolves LLD 20.1.8,
+# then (2) pin collect2's ld.lld search to the pinned dir via -B for the actual child build,
+# so a poisoned PATH cannot silently downgrade the linker. This only ADDS a pin when lld is
+# already requested; the default ld.bfd path is untouched.
+if ($env:RUSTFLAGS -and ($env:RUSTFLAGS -match 'fuse-ld=lld')) {
+    $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $llvmBin -ScratchDir $workspaceTempParent
+    $lldPrefix = ($llvmBin.TrimEnd('\', '/')) + '\'
+    $lldPinArg = "-Clink-arg=-B$lldPrefix"
+    if ($env:RUSTFLAGS -notmatch [regex]::Escape($lldPinArg)) {
+        $env:RUSTFLAGS = "$lldPinArg $($env:RUSTFLAGS)"
+    }
+    Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in RUSTFLAGS; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
+}
+
 if ([string]::IsNullOrWhiteSpace($Command)) {
-    Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
+    Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
     Remove-LauncherLockFile -LockPath $launcherLock
     if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
         Remove-Item -LiteralPath $workspaceTempParent -Force -ErrorAction SilentlyContinue
@@ -1413,7 +1547,10 @@ try {
     try {
         # #279: resolve the attributed CBM-store roots from the gate's own registry so
         # the recorder's owned-path probe scans exactly the roots the gate polices.
-        $attributedStoreRoots = Get-AstroAttributedStoreRoots -RegistryPath (Join-Path $PSScriptRoot "no-escape-roots.json")
+        # #318: PowerShell unwraps function output: zero rows become $null and one row
+        # becomes a scalar. Keep the native zero/one/many shapes normalized so strict
+        # mode can safely read .Count and the recorder always receives string[].
+        [string[]]$attributedStoreRoots = @(Get-AstroAttributedStoreRoots -RegistryPath (Join-Path $PSScriptRoot "no-escape-roots.json"))
         $treeRecorder = Start-AstroTreeAttribution -ManifestPath $attributionManifest -LauncherPid $PID -StoreRoots $attributedStoreRoots
         $env:ASTRO_NO_ESCAPE_ATTRIBUTION = $attributionManifest
         Write-Output "NO_ESCAPE[ASTRO_ATTRIBUTION_RECORDING]: process-tree PIDs -> $attributionManifest"

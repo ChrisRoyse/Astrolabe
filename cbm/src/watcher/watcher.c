@@ -26,6 +26,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 
 #include <errno.h>
@@ -42,6 +43,7 @@ typedef struct {
     char *project_name;
     char *root_path;
     char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char worktree_sha256[CBM_SHA256_HEX_LEN + 1]; /* last successfully indexed porcelain state */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -125,15 +127,6 @@ static void watcher_log_spawn_failure(const char *event, const cbm_spawn_error_t
                  err->remediation);
 }
 
-/* True when the child's first output line carries content — the upstream
- * "one porcelain line means dirty" semantics, without a line buffer. */
-static bool git_first_line_nonempty(const char *data, size_t len) {
-    size_t line = 0;
-    while (line < len && data[line] != '\n' && data[line] != '\r') {
-        line++;
-    }
-    return line > 0;
-}
 #else
 /* Portable command pieces: cbm_popen runs through cmd.exe on Windows, which does
  * NOT strip single quotes (git would receive a literal-quoted path → "cannot find
@@ -225,14 +218,18 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
 #endif
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+/* Captures a deterministic fingerprint of the working-tree state. Unlike a
+ * boolean "dirty" probe, this distinguishes successive edits while the tree
+ * remains dirty and prevents the watcher from reindexing the same dirty bytes
+ * forever. The porcelain stream is stable and includes submodule dirtiness. */
+static bool git_worktree_fingerprint(const char *root_path,
+                                     char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
 #ifdef ASTRO_SPAWN
     const char *const argv[] = {
         "git",         "--no-optional-locks",      "-C", root_path, "status",
-        "--porcelain", "--untracked-files=normal", NULL};
+        "--porcelain=v1", "-z", "--untracked-files=normal", NULL};
     char *data = NULL;
     size_t len = 0;
     cbm_spawn_error_t err;
@@ -251,79 +248,72 @@ static bool git_is_dirty(const char *root_path) {
         return false;
     }
 #ifdef ASTRO_SPAWN
-    bool dirty = git_first_line_nonempty(data, len);
+    cbm_sha256_update(&hash, data, len);
+    /* Porcelain names untracked files but does not include their contents.
+     * Fold those bytes in so repeated edits to a still-untracked file are not
+     * mistaken for the already-indexed dirty state. `-z` makes paths literal. */
+    for (size_t offset = 0; offset < len;) {
+        size_t end = offset;
+        while (end < len && data[end] != '\0') {
+            end++;
+        }
+        if (end >= offset + 3 && data[offset] == '?' && data[offset + 1] == '?' &&
+            data[offset + 2] == ' ') {
+            size_t path_len = end - (offset + 3);
+            size_t root_len = strlen(root_path);
+            char *path = malloc(root_len + path_len + 2);
+            if (path) {
+                memcpy(path, root_path, root_len);
+                path[root_len] = '/';
+                memcpy(path + root_len + 1, data + offset + 3, path_len);
+                path[root_len + path_len + 1] = '\0';
+                FILE *untracked = fopen(path, "rb");
+                if (untracked) {
+                    char chunk[CBM_SZ_1K];
+                    size_t chunk_len;
+                    while ((chunk_len = fread(chunk, 1, sizeof(chunk), untracked)) > 0) {
+                        cbm_sha256_update(&hash, chunk, chunk_len);
+                    }
+                    fclose(untracked);
+                }
+                free(path);
+            }
+        }
+        offset = end + 1;
+    }
     free(data);
-#else
 
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-#endif
-
-    if (dirty) {
-        return true;
-    }
-
-#if !defined(_WIN32)
-#ifdef ASTRO_SPAWN
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. `git submodule foreach` runs its argument in
-     * git's OWN shell inside each submodule; that argument is a compile-time
-     * constant with no interpolation, so nothing from the environment reaches a
-     * shell. POSIX-only for parity with upstream (Apple Git lacks
-     * --recurse-submodules, and the inner command is POSIX shell syntax). */
-    const char *const sub_argv[] = {
-        "git",     "--no-optional-locks", "-C",
-        root_path, "submodule",           "foreach",
-        "--quiet", "--recursive",         "git status --porcelain --untracked-files=normal",
-        NULL};
-    char *sub_data = NULL;
-    size_t sub_len = 0;
-    if (cbm_spawn_capture(sub_argv, &sub_data, &sub_len, &err) != 0) {
-        watcher_log_spawn_failure("watcher.git_submodule_status.spawn_failed", &err);
-        free(sub_data);
-#else
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-             "2>/dev/null",
-             root_path);
-    fp = cbm_popen(cmd, "r");
-    if (!fp) {
-#endif
+    /* Porcelain status contains names/status only. Fold the complete tracked
+     * patch in so successive edits to the same dirty path produce new state. */
+    const char *const diff_argv[] = {
+        "git", "--no-optional-locks", "-C", root_path, "diff", "--binary", "HEAD", NULL};
+    data = NULL;
+    len = 0;
+    if (cbm_spawn_capture(diff_argv, &data, &len, &err) != 0) {
+        watcher_log_spawn_failure("watcher.git_diff.spawn_failed", &err);
+        free(data);
         return false;
     }
-#ifdef ASTRO_SPAWN
-    dirty = git_first_line_nonempty(sub_data, sub_len);
-    free(sub_data);
+    cbm_sha256_update(&hash, data, len);
+    free(data);
 #else
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
+    char chunk[CBM_SZ_1K];
+    size_t chunk_len;
+    while ((chunk_len = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        cbm_sha256_update(&hash, chunk, chunk_len);
     }
-    cbm_pclose(fp);
+    int rc = cbm_pclose(fp);
+    if (rc != 0) {
+        return false;
+    }
 #endif
-#endif
-    return dirty;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&hash, digest);
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        snprintf(out + (i * 2), 3, "%02x", digest[i]);
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
 }
 
 /* Count tracked files via git ls-files */
@@ -643,6 +633,7 @@ static void init_baseline(project_state_t *s) {
 
     if (s->is_git) {
         git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        (void)git_worktree_fingerprint(s->root_path, s->worktree_sha256);
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -688,8 +679,11 @@ static bool check_changes(project_state_t *s) {
 #endif
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* Check whether the porcelain state changed since the last successful
+     * indexing tick, including successive edits while the tree remains dirty. */
+    char worktree_sha256[CBM_SHA256_HEX_LEN + 1] = {0};
+    return git_worktree_fingerprint(s->root_path, worktree_sha256) &&
+           strcmp(worktree_sha256, s->worktree_sha256) != 0;
 }
 
 /* Context for poll_once foreach callback */
@@ -802,6 +796,7 @@ static void poll_project(const char *key, void *val, void *ud) {
             ctx->reindexed++;
             /* Update HEAD after successful reindex */
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            (void)git_worktree_fingerprint(s->root_path, s->worktree_sha256);
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);

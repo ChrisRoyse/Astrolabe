@@ -164,14 +164,27 @@ pub(crate) fn team_artifact_export_json_at(
         Some(key) => TeamArtifactExportOptions::with_signing_key(key),
         None => TeamArtifactExportOptions::unsigned(),
     };
-    let report = export_team_artifact(&vault, &lowered_path, artifact_dir, &options)?;
+    // #178: the lowered sidecar is a derived artifact and must never be consumed
+    // on the strength of path existence or cached metadata. Hold the same
+    // cross-process lock used by regeneration across verify + export so a
+    // project-owned writer cannot replace the bytes between the independent
+    // verification read and the export read.
+    let (lowered_verification, report) = with_lowered_sqlite_lock(cache_dir, project, || {
+        let lowered_verification =
+            astrolabe_lower::verify_lowered_artifact(&vault, &lowered_path, project)?;
+        let report = export_team_artifact(&vault, &lowered_path, artifact_dir, &options)?;
+        Ok((lowered_verification, report))
+    })?;
     team_artifact_export_report_json(
         project,
         artifact_dir,
-        &configured_vault_dir,
-        &lowered_path,
-        &verify,
-        refresh_status,
+        VerifiedExportSource {
+            vault_dir: &configured_vault_dir,
+            lowered_sqlite_path: &lowered_path,
+            verify: &verify,
+            lowered: &lowered_verification,
+            refresh_status,
+        },
         &report,
     )
 }
@@ -202,15 +215,22 @@ pub(crate) fn team_artifact_import_result(
     }
 }
 
-pub(crate) fn team_artifact_export_report_json(
+struct VerifiedExportSource<'a> {
+    vault_dir: &'a Path,
+    lowered_sqlite_path: &'a Path,
+    verify: &'a astrolabe_ingest::VerifyChainReport,
+    lowered: &'a astrolabe_lower::LoweredArtifactVerification,
+    refresh_status: ShadowRefreshStatus,
+}
+
+fn team_artifact_export_report_json(
     project: &str,
     artifact_dir: &Path,
-    vault_dir: &Path,
-    lowered_sqlite_path: &Path,
-    verify: &astrolabe_ingest::VerifyChainReport,
-    refresh_status: ShadowRefreshStatus,
+    source: VerifiedExportSource<'_>,
     report: &TeamArtifactExportReport,
 ) -> Result<Value, DynError> {
+    let verify = source.verify;
+    let lowered_verification = source.lowered;
     let mut value = json!({
         "schema": TEAM_ARTIFACT_SCHEMA,
         "mode": "export",
@@ -225,13 +245,21 @@ pub(crate) fn team_artifact_export_report_json(
         "manifest": serde_json::to_value(&report.manifest)?,
         "signature_status": if report.manifest.signature.is_some() { "signed" } else { "unsigned" },
         "source_state": {
-            "shadow_refresh": shadow_refresh_status_str(refresh_status),
-            "vault_dir": vault_dir,
-            "lowered_sqlite_path": lowered_sqlite_path,
+            "shadow_refresh": shadow_refresh_status_str(source.refresh_status),
+            "vault_dir": source.vault_dir,
+            "lowered_sqlite_path": source.lowered_sqlite_path,
             "verify_chain": verify.status,
             "ledger_rows": verify.ledger_rows,
             "checked_range_start": verify.checked_range_start,
             "checked_range_end": verify.checked_range_end,
+            "lowered_artifact": {
+                "status": "verified",
+                "artifact_sha256": lowered_verification.artifact_sha256,
+                "vault_fingerprint_sha256": lowered_verification.vault_fingerprint_sha256,
+                "source_ledger_head_hash": lowered_verification.source_ledger_head_hash,
+                "panel_version": lowered_verification.panel_version,
+                "lowered_at": lowered_verification.lowered_at,
+            },
         },
         "files": {
             "graph_db_zst": {

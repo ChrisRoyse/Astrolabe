@@ -15,6 +15,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use astrolabe_domain::fsv::FsvAck;
+use astrolabe_ingest::VaultMutationPlan;
 use calyx_aster::cf::{ColumnFamily, XTermKind, xterm_key};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::AsterVault;
@@ -63,6 +65,9 @@ pub struct EagerCrossTermPersistReport {
     pub xterm_dump_hash: String,
     /// Ledger entry paired with this mutation batch.
     pub ledger_ref: LedgerRef,
+    /// Unforgeable full-readback witness when XTerm rows changed.
+    /// A ledger-only no-delta replay carries labeled absence (`None`).
+    pub fsv: Option<FsvAck>,
 }
 
 /// One designed-pair agreement edge recomputed from persisted XTerm CF rows
@@ -102,6 +107,38 @@ pub fn persist_eager_cross_terms<C>(
 where
     C: Clock,
 {
+    persist_eager_cross_terms_owned(vault, plan, cx_ids, None, actor.into())
+}
+
+/// Persists a dirty-symbol eager cross-term delta without touching clean symbols.
+///
+/// `plan` and `cx_ids` cover the current changed symbols. `removed_cx_ids`
+/// contributes all six designed ownership keys so stale rows for deleted or
+/// superseded versions are tombstoned. Clean CxIds are neither scanned nor
+/// rewritten; prior MVCC versions remain readable.
+pub fn persist_eager_cross_terms_delta<C>(
+    vault: &AsterVault<C>,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    removed_cx_ids: &BTreeSet<CxId>,
+    actor: impl Into<String>,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
+    persist_eager_cross_terms_owned(vault, plan, cx_ids, Some(removed_cx_ids), actor.into())
+}
+
+fn persist_eager_cross_terms_owned<C>(
+    vault: &AsterVault<C>,
+    plan: &EagerCrossTermPlan,
+    cx_ids: &BTreeMap<String, CxId>,
+    removed_cx_ids: Option<&BTreeSet<CxId>>,
+    actor: String,
+) -> calyx_core::Result<EagerCrossTermPersistReport>
+where
+    C: Clock,
+{
     let mut new_rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     let mut owned_keys = BTreeSet::<Vec<u8>>::new();
     let mut absent_by_kind = BTreeMap::<EagerAgreementKind, usize>::new();
@@ -134,6 +171,24 @@ where
             }
             CrossTermValue::Absent { .. } => {
                 *absent_by_kind.entry(row.kind).or_default() += 1;
+            }
+        }
+    }
+    // Reconcile the entire designed-pair ownership domain, not only CxIds in
+    // the fresh plan. A removed live symbol is absent from `cx_ids`; retaining
+    // its old XTerm row would make the live agreement/anomaly projection stale.
+    // MVCC still preserves the tombstoned row at prior snapshots.
+    match removed_cx_ids {
+        None => {
+            for persisted in read_eager_cross_term_rows(vault)? {
+                owned_keys.insert(persisted.key);
+            }
+        }
+        Some(removed) => {
+            for cx_id in removed {
+                for kind in EagerAgreementKind::ALL {
+                    owned_keys.insert(eager_xterm_key(*cx_id, kind));
+                }
             }
         }
     }
@@ -194,9 +249,25 @@ where
     RedactionPolicy::check_payload(&payload)?;
 
     let subject = SubjectId::Query(format!("astrolabe-eager-xterm:{xterm_dump_hash}").into_bytes());
-    let actor = ActorId::Service(actor.into());
-    let ledger_ref = if batch.is_empty() {
-        vault.append_ledger_entry(EntryKind::Measure, subject, payload, actor)?
+    let actor = ActorId::Service(actor);
+    let mut fsv_plan = VaultMutationPlan::new(
+        "persist_eager_cross_terms",
+        EntryKind::Measure,
+        &actor,
+        &subject,
+    );
+    for (cf, key, value) in &batch {
+        if *value == tombstone {
+            fsv_plan.push_tombstoned(*cf, key.clone(), &tombstone);
+        } else {
+            fsv_plan.push_content(*cf, key.clone(), value);
+        }
+    }
+    let (ledger_ref, commit_seq) = if batch.is_empty() {
+        (
+            vault.append_ledger_entry(EntryKind::Measure, subject, payload, actor)?,
+            None,
+        )
     } else {
         let commit_seq = vault.write_cf_batch_with_ledger_entry(
             batch,
@@ -205,9 +276,12 @@ where
             payload,
             actor,
         )?;
-        ledger_ref_at_commit(vault, commit_seq)?
+        (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
     };
     vault.flush()?;
+    let fsv = commit_seq
+        .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
+        .transpose()?;
 
     Ok(EagerCrossTermPersistReport {
         symbol_count: symbols.len(),
@@ -217,6 +291,7 @@ where
         absent_by_kind,
         xterm_dump_hash,
         ledger_ref,
+        fsv,
     })
 }
 

@@ -41,8 +41,8 @@ pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
-    SimilarityPersistReport, persist_similarity_edges, read_similarity_edge_rows,
-    sim_edge_graph_key,
+    SimilarityPersistReport, persist_similarity_edges, persist_similarity_edges_delta,
+    read_similarity_edge_rows, sim_edge_graph_key,
 };
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
@@ -50,7 +50,7 @@ pub use xterm_rows::{
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows, designed_kind_for_slots,
     eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
-    read_eager_cross_term_rows,
+    persist_eager_cross_terms_delta, read_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -996,6 +996,65 @@ pub fn plan_similarity_edges(
     })
 }
 
+/// Expands changed symbols into a bounded L2 similarity repair region.
+///
+/// The region includes two hops of currently persisted SIM neighbors plus the
+/// best exact candidates for every changed symbol in each enabled family. The
+/// candidate budget is the registry-declared ANN headroom
+/// (`per_node_cap * candidate_multiplier`), so work is linear in corpus size
+/// per changed symbol and never an all-pairs rebuild.
+pub fn expand_similarity_dirty_region(
+    nodes: &[SimilarityNode],
+    changed: &BTreeSet<String>,
+    persisted: &[PersistedSimilarityEdgeRow],
+    config: &SimilarityPlannerConfig,
+) -> BTreeSet<String> {
+    let mut region = changed.clone();
+    for _ in 0..2 {
+        let frontier = region.clone();
+        for edge in persisted {
+            if frontier.contains(&edge.row.source_qn) || frontier.contains(&edge.row.target_qn) {
+                region.insert(edge.row.source_qn.clone());
+                region.insert(edge.row.target_qn.clone());
+            }
+        }
+    }
+    let candidate_cap = config
+        .per_node_cap
+        .saturating_mul(config.ann.candidate_multiplier)
+        .max(config.per_node_cap);
+    for family in SimilarityFamily::ALL {
+        if config.disabled_families.contains(&family) {
+            continue;
+        }
+        let mut skips = SimilaritySkipReport::default();
+        let vectors = collect_family_vectors(nodes, family, &mut skips);
+        for source in vectors
+            .iter()
+            .filter(|vector| changed.contains(&vector.qualified_name))
+        {
+            let mut candidates = vectors
+                .iter()
+                .filter(|target| target.qualified_name != source.qualified_name)
+                .filter_map(|target| {
+                    cosine(&source.vector, &target.vector)
+                        .map(|score| (score, target.qualified_name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1))
+            });
+            region.extend(
+                candidates
+                    .into_iter()
+                    .take(candidate_cap)
+                    .map(|(_, qualified_name)| qualified_name.to_string()),
+            );
+        }
+    }
+    region
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EagerAgreementKind {
     DocDrift,
@@ -1776,11 +1835,36 @@ fn anomaly_finding_order(left: &AnomalyFinding, right: &AnomalyFinding) -> Order
 }
 
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
-    let mut rows = Vec::with_capacity(nodes.len() * EagerAgreementKind::ALL.len());
+    plan_eager_cross_terms_selected(nodes, None)
+}
+
+/// Plans eager agreements only for the named dirty symbols while retaining the
+/// full corpus as neighborhood context.
+pub fn plan_eager_cross_terms_for_symbols(
+    nodes: &[SimilarityNode],
+    qualified_names: &BTreeSet<String>,
+) -> EagerCrossTermPlan {
+    plan_eager_cross_terms_selected(nodes, Some(qualified_names))
+}
+
+fn plan_eager_cross_terms_selected(
+    nodes: &[SimilarityNode],
+    qualified_names: Option<&BTreeSet<String>>,
+) -> EagerCrossTermPlan {
+    let selected_indices = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            qualified_names.is_none_or(|names| names.contains(&node.qualified_name))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
     for kind in EagerAgreementKind::ALL {
         let (left_slot, right_slot) = kind.slots();
-        let values = cross_term_values(nodes, kind);
-        for (node, value) in nodes.iter().zip(values) {
+        let values = cross_term_values(nodes, kind, &selected_indices);
+        for (&node_index, value) in selected_indices.iter().zip(values) {
+            let node = &nodes[node_index];
             rows.push(EagerCrossTermRow {
                 qualified_name: node.qualified_name.clone(),
                 kind,
@@ -1799,7 +1883,7 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
         .filter(|row| matches!(row.value, CrossTermValue::Scalar(_)))
         .count();
     let absent_count = rows.len() - scalar_count;
-    let symbol_count = nodes.len();
+    let symbol_count = selected_indices.len();
     EagerCrossTermPlan {
         rows,
         agreement_graph,
@@ -1819,7 +1903,11 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
     }
 }
 
-fn cross_term_values(nodes: &[SimilarityNode], kind: EagerAgreementKind) -> Vec<CrossTermValue> {
+fn cross_term_values(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    selected_indices: &[usize],
+) -> Vec<CrossTermValue> {
     let (left_slot, right_slot) = kind.slots();
     let operands = nodes
         .iter()
@@ -1832,12 +1920,13 @@ fn cross_term_values(nodes: &[SimilarityNode], kind: EagerAgreementKind) -> Vec<
         .collect::<Vec<_>>();
 
     match kind.comparator() {
-        EagerCrossTermComparator::DirectAgreement => operands
+        EagerCrossTermComparator::DirectAgreement => selected_indices
             .iter()
-            .map(|(left, right)| direct_cross_term_value(left, right))
+            .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
             .collect(),
-        EagerCrossTermComparator::NeighborhoodAgreement => (0..operands.len())
-            .map(|node_index| {
+        EagerCrossTermComparator::NeighborhoodAgreement => selected_indices
+            .iter()
+            .map(|&node_index| {
                 neighborhood_cross_term_value(node_index, left_slot, right_slot, &operands)
             })
             .collect(),
@@ -4111,6 +4200,10 @@ mod tests {
         assert_eq!(report.edge_count, plan.edges.len());
         assert_eq!(report.rows_written, plan.edges.len());
         assert_eq!(report.rows_tombstoned, 0);
+        let fsv = report.fsv.as_ref().expect("SIM edge mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), report.rows_written as u64);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         drop(vault);
 
         // Reopen: everything below reads persisted bytes, not API echoes.
@@ -4171,6 +4264,10 @@ mod tests {
         assert_eq!(second.rows_written, 0);
         assert_eq!(second.rows_unchanged, plan.edges.len());
         assert_eq!(second.rows_tombstoned, 0);
+        assert!(
+            second.fsv.is_none(),
+            "ledger-only replay labels FSV absence"
+        );
         assert!(second.ledger_ref.seq > report.ledger_ref.seq);
 
         // Reconciliation: a tighter plan tombstones stale rows and readback
@@ -4182,9 +4279,83 @@ mod tests {
         let third = persist_similarity_edges(&reopened, &tighter, "astrolabe-weave-test")
             .expect("reconciling persist");
         assert!(third.rows_tombstoned > 0);
+        assert_eq!(
+            third
+                .fsv
+                .as_ref()
+                .expect("tombstones earn FSV witness")
+                .rows_read_back(),
+            (third.rows_written + third.rows_tombstoned) as u64
+        );
         let after = read_similarity_edge_rows(&reopened).expect("read reconciled rows");
         assert_eq!(after.len(), tighter.edges.len());
         drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn similarity_delta_tombstones_owned_rows_and_preserves_clean_rows() {
+        let mut config = family_only_config(SimilarityFamily::Semantic);
+        config.thresholds.sim_semantic_min_score = 0.90;
+        let nodes = vec![
+            dense_node("dirty.a", SimilarityFamily::Semantic, &[1.0, 0.0]),
+            dense_node("dirty.b", SimilarityFamily::Semantic, &[1.0, 0.0]),
+            dense_node("clean.c", SimilarityFamily::Semantic, &[0.0, 1.0]),
+            dense_node("clean.d", SimilarityFamily::Semantic, &[0.0, 1.0]),
+        ];
+        let full = plan_similarity_edges(&nodes, &config).expect("full similarity plan");
+        assert_eq!(
+            edge_qns(&full.edges),
+            vec![("clean.c", "clean.d"), ("dirty.a", "dirty.b")]
+        );
+
+        let (dir, vault) = reactive_vault("similarity-delta-ownership-fsv");
+        persist_similarity_edges(&vault, &full, "astrolabe-weave-test")
+            .expect("persist full similarity state");
+        let clean_key = sim_edge_graph_key(SimilarityFamily::Semantic, "clean.c", "clean.d");
+        let clean_before = vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &clean_key)
+            .expect("read clean row before delta")
+            .expect("clean row before delta");
+
+        let empty_delta = SimilarityPlan {
+            edges: Vec::new(),
+            skips: SimilaritySkipReport::default(),
+            workers_requested: config.worker_count,
+        };
+        let report = persist_similarity_edges_delta(
+            &vault,
+            &empty_delta,
+            &BTreeSet::from(["dirty.a".to_string()]),
+            &BTreeSet::new(),
+            "astrolabe-weave-test",
+        )
+        .expect("persist owned similarity delta");
+        assert_eq!(report.rows_tombstoned, 1);
+        assert_eq!(report.rows_written, 0);
+
+        let persisted = read_similarity_edge_rows(&vault).expect("read similarity delta state");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].key, clean_key);
+        let clean_after = vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Graph, &clean_key)
+            .expect("read clean row after delta")
+            .expect("clean row after delta");
+        assert_eq!(
+            clean_after, clean_before,
+            "clean-clean bytes must not change"
+        );
+        assert!(
+            vault
+                .read_cf_at(
+                    vault.snapshot(),
+                    ColumnFamily::Graph,
+                    &sim_edge_graph_key(SimilarityFamily::Semantic, "dirty.a", "dirty.b",),
+                )
+                .expect("read dirty row after delta")
+                .is_none()
+        );
+        drop(vault);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -4733,6 +4904,10 @@ mod tests {
             .expect("persist eager cross terms");
         assert_eq!(report.symbol_count, 3);
         assert_eq!(report.rows_written, 18);
+        let fsv = report.fsv.as_ref().expect("XTerm mutation FSV witness");
+        assert_eq!(fsv.label(), astrolabe_domain::fsv::FSV_LABEL_VERIFIED);
+        assert_eq!(fsv.rows_read_back(), 18);
+        assert_eq!(fsv.ledger_seq(), report.ledger_ref.seq);
         assert_eq!(report.rows_tombstoned, 0);
         assert!(report.absent_by_kind.is_empty());
 

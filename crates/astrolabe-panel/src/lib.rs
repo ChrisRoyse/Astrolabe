@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 pub use embeddings::{
     NOMIC_EMBED_DIM, NOMIC_TOKEN_COUNT, NOMIC_TOKEN_TABLE_SHA256, NOMIC_VECTOR_BLOB_SHA256,
-    StaticEmbeddingInput, StaticEmbeddingLens, StaticEmbeddingTable,
+    StaticEmbeddingInput, StaticEmbeddingLens, StaticEmbeddingTable, encode_static_embedding_slot,
     fixture_static_embedding_input, nomic_weights_identity, s18_s20_lenses,
 };
 pub use lenses::{
@@ -962,6 +962,19 @@ pub struct PanelInput {
     pub available_slots: BTreeSet<SlotId>,
     /// Stable source bytes for deterministic fixture/runtime probes.
     pub source_bytes: Vec<u8>,
+    /// Local symbol name supplied by the production CBM importer.
+    pub symbol_name: String,
+    /// Fully-qualified symbol name supplied by the production CBM importer.
+    pub qualified_name: String,
+    /// Repository-relative source path supplied by the production CBM importer.
+    pub rel_file_path: String,
+    /// Source-language label supplied by the production CBM importer.
+    pub language: String,
+    /// Signature supplied by the production CBM importer.
+    pub signature: String,
+    /// Parsed CBM node properties. Keeping this parsed avoids reparsing the same
+    /// JSON once for every slot in a panel measurement.
+    pub properties: serde_json::Value,
     /// Exact scalar measurements preserved beside the vector panel.
     pub scalars: BTreeMap<String, f64>,
 }
@@ -973,6 +986,12 @@ impl PanelInput {
             label,
             available_slots: PANEL_V1_SLOTS.iter().map(|slot| slot.slot_id()).collect(),
             source_bytes: label.as_str().as_bytes().to_vec(),
+            symbol_name: String::new(),
+            qualified_name: String::new(),
+            rel_file_path: String::new(),
+            language: String::new(),
+            signature: String::new(),
+            properties: serde_json::Value::Object(serde_json::Map::new()),
             scalars: BTreeMap::new(),
         }
     }
@@ -986,6 +1005,12 @@ impl PanelInput {
             label,
             available_slots: available_slots.into_iter().collect(),
             source_bytes: label.as_str().as_bytes().to_vec(),
+            symbol_name: String::new(),
+            qualified_name: String::new(),
+            rel_file_path: String::new(),
+            language: String::new(),
+            signature: String::new(),
+            properties: serde_json::Value::Object(serde_json::Map::new()),
             scalars: BTreeMap::new(),
         }
     }

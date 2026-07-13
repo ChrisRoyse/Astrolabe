@@ -45,6 +45,17 @@ pub const ASTRO_SOURCE_DRIFT: &str = "ASTRO_SOURCE_DRIFT";
 pub const ASTRO_PANEL_VERSION_ZERO: &str = "ASTRO_PANEL_VERSION_ZERO";
 /// Error code used when an anchor confidence is not in the open-closed range `(0, 1]`.
 pub const ASTRO_ANCHOR_CONFIDENCE_RANGE: &str = "ASTRO_ANCHOR_CONFIDENCE_RANGE";
+/// Error code used when grounded evidence has no catalog source prefix.
+pub const ASTRO_ANCHOR_SOURCE_PREFIX_INVALID: &str = "ASTRO_ANCHOR_SOURCE_PREFIX_INVALID";
+/// Error code used when confidence contradicts the source's grounding kind.
+pub const ASTRO_ANCHOR_CONFIDENCE_INVALID: &str = "ASTRO_ANCHOR_CONFIDENCE_INVALID";
+
+/// Confidence carried by resolved evidence.
+pub const RESOLVED_SOURCE_CONFIDENCE: f32 = 1.0;
+/// Default confidence for provisional proxy evidence.
+pub const DEFAULT_PROVISIONAL_CONFIDENCE: f32 = 0.8;
+
+const GROUNDING_SOURCE_REMEDIATION: &str = "use a catalog source: ci:/trace:/review:/git:revert: for resolved evidence, or git:fix:/agent:/survival: for proxy evidence";
 
 const ID_BYTES: usize = 16;
 
@@ -68,6 +79,45 @@ pub struct DomainError {
     code: &'static str,
     message: String,
     remediation: &'static str,
+}
+
+/// Grounding kind classified from the exhaustive source-prefix catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingKind {
+    /// Direct external evidence, certain at confidence 1.0.
+    Resolved,
+    /// Indirect proxy evidence, always below confidence 1.0.
+    Proxy,
+}
+
+/// Trust carried by grounded evidence and aggregates derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustTag {
+    /// Every contributor is resolved evidence.
+    Trusted,
+    /// At least one contributor is proxy evidence, or no evidence exists.
+    Provisional,
+}
+
+impl TrustTag {
+    /// Stable response-envelope label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Provisional => "provisional",
+        }
+    }
+}
+
+/// Complete classification of one catalog source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceClassification {
+    /// Whether the source is direct resolved evidence or a proxy.
+    pub grounding_kind: GroundingKind,
+    /// Trust implied by that grounding kind.
+    pub trust: TrustTag,
 }
 
 impl DomainError {
@@ -103,6 +153,99 @@ impl fmt::Display for DomainError {
 }
 
 impl std::error::Error for DomainError {}
+
+/// Classifies a grounding source using the exhaustive prefix catalog.
+pub fn classify_grounding_source(source: &str) -> Result<SourceClassification> {
+    const CATALOG: &[(&str, GroundingKind, TrustTag)] = &[
+        ("git:revert:", GroundingKind::Resolved, TrustTag::Trusted),
+        ("git:fix:", GroundingKind::Proxy, TrustTag::Provisional),
+        ("ci:", GroundingKind::Resolved, TrustTag::Trusted),
+        ("trace:", GroundingKind::Resolved, TrustTag::Trusted),
+        ("review:", GroundingKind::Resolved, TrustTag::Trusted),
+        ("agent:", GroundingKind::Proxy, TrustTag::Provisional),
+        ("survival:", GroundingKind::Proxy, TrustTag::Provisional),
+    ];
+    for &(prefix, grounding_kind, trust) in CATALOG {
+        if let Some(rest) = source.strip_prefix(prefix) {
+            if rest.trim().is_empty() {
+                return Err(DomainError::new(
+                    ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
+                    format!("source {source:?} must name evidence after {prefix:?}"),
+                    GROUNDING_SOURCE_REMEDIATION,
+                ));
+            }
+            if matches!(prefix, "ci:" | "agent:") {
+                let Some((owner, observation)) = rest.split_once(':') else {
+                    return Err(DomainError::new(
+                        ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
+                        format!("source {source:?} must be {prefix}<owner>:<observation>"),
+                        GROUNDING_SOURCE_REMEDIATION,
+                    ));
+                };
+                if owner.trim().is_empty() || observation.trim().is_empty() {
+                    return Err(DomainError::new(
+                        ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
+                        format!("source {source:?} has an empty owner or observation"),
+                        GROUNDING_SOURCE_REMEDIATION,
+                    ));
+                }
+            }
+            return Ok(SourceClassification {
+                grounding_kind,
+                trust,
+            });
+        }
+    }
+    Err(DomainError::new(
+        ASTRO_ANCHOR_SOURCE_PREFIX_INVALID,
+        format!("grounding source {source:?} has no recognized catalog prefix"),
+        GROUNDING_SOURCE_REMEDIATION,
+    ))
+}
+
+/// Validates or defaults confidence against a source's grounding kind.
+pub fn validate_grounding_confidence(
+    grounding_kind: GroundingKind,
+    confidence: Option<f32>,
+) -> Result<f32> {
+    match grounding_kind {
+        GroundingKind::Resolved => match confidence {
+            None => Ok(RESOLVED_SOURCE_CONFIDENCE),
+            Some(value) if value == RESOLVED_SOURCE_CONFIDENCE => Ok(value),
+            Some(value) => Err(DomainError::new(
+                ASTRO_ANCHOR_CONFIDENCE_INVALID,
+                format!("resolved evidence confidence {value} must be exactly 1.0"),
+                "resolved evidence is certain; omit confidence or pass exactly 1.0",
+            )),
+        },
+        GroundingKind::Proxy => match confidence {
+            None => Ok(DEFAULT_PROVISIONAL_CONFIDENCE),
+            Some(value) if value.is_finite() && value > 0.0 && value < 1.0 => Ok(value),
+            Some(value) => Err(DomainError::new(
+                ASTRO_ANCHOR_CONFIDENCE_INVALID,
+                format!("proxy evidence confidence {value} must be finite and within (0, 1)"),
+                "proxy evidence is provisional; pass confidence strictly between 0 and 1",
+            )),
+        },
+    }
+}
+
+/// Rolls contributor trust up fail-closed: empty or any Provisional input is
+/// Provisional; only a non-empty all-Trusted input is Trusted.
+pub fn rollup_trust(tags: impl IntoIterator<Item = TrustTag>) -> TrustTag {
+    let mut saw_contributor = false;
+    for tag in tags {
+        saw_contributor = true;
+        if tag == TrustTag::Provisional {
+            return TrustTag::Provisional;
+        }
+    }
+    if saw_contributor {
+        TrustTag::Trusted
+    } else {
+        TrustTag::Provisional
+    }
+}
 
 /// Result type used by Astrolabe domain operations.
 pub type Result<T> = std::result::Result<T, DomainError>;
@@ -768,17 +911,15 @@ impl SymbolRecord {
         }
 
         for anchor in &self.anchors {
-            if !anchor.confidence.is_finite() || anchor.confidence <= 0.0 || anchor.confidence > 1.0
-            {
-                return Err(DomainError::new(
+            let classification = classify_grounding_source(&anchor.source)?;
+            validate_grounding_confidence(classification.grounding_kind, Some(anchor.confidence))
+                .map_err(|error| {
+                DomainError::new(
                     ASTRO_ANCHOR_CONFIDENCE_RANGE,
-                    format!(
-                        "symbol {} anchor {} confidence {} is outside (0, 1]",
-                        self.qualified_name, anchor.source, anchor.confidence
-                    ),
+                    error.message().to_string(),
                     "Clamp or reject anchor confidence so only values in (0, 1] are admitted.",
-                ));
-            }
+                )
+            })?;
         }
 
         if let Some(expected) = self.expected_source_snippet_blake3 {
@@ -1049,7 +1190,9 @@ mod tests {
     #[test]
     fn validation_refuses_anchor_confidence_outside_range() {
         let mut symbol = symbol();
-        symbol.anchors.push(AnchorEvidence::new("ci:github", 0.0));
+        symbol
+            .anchors
+            .push(AnchorEvidence::new("ci:github:run-1", 0.0));
 
         let err = symbol
             .canonical_input_bytes()

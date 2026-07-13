@@ -50,14 +50,17 @@ use astrolabe_provenance::{
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,
-    LiveAnomalyInputs, SubscriptionId, acknowledge_reactive_subscription,
-    anomaly_report_artifact_bytes, detect_anomalies, live_anomaly_inputs_from_vault,
-    recover_reactive_state,
+    EagerAgreementKind, LiveAnomalyInputs, SimilarityNode, SimilarityPlannerConfig, SubscriptionId,
+    acknowledge_reactive_subscription, anomaly_report_artifact_bytes, detect_anomalies,
+    expand_similarity_dirty_region, live_anomaly_inputs_from_vault, persist_eager_cross_terms,
+    persist_eager_cross_terms_delta, persist_similarity_edges, persist_similarity_edges_delta,
+    plan_eager_cross_terms, plan_eager_cross_terms_for_symbols, plan_similarity_edges,
+    read_similarity_edge_rows, recover_reactive_state,
 };
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{AbsentReason, Clock, LedgerRef, SlotVector, VaultId, VaultStore};
+use calyx_core::{Clock, LedgerRef, SlotId, SlotVector, VaultId, VaultStore};
 use calyx_ledger::{ActorId, SubjectId, decode as decode_ledger};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
@@ -109,6 +112,18 @@ use shadow_watermark::*;
 
 mod shadow_import;
 use shadow_import::*;
+
+mod git_archaeology;
+use git_archaeology::*;
+
+mod watcher_lane;
+pub(crate) use watcher_lane::run_incremental_watcher_loop;
+
+mod lowering_lane;
+use lowering_lane::*;
+
+mod invalidation_lane;
+use invalidation_lane::*;
 
 mod status_surface;
 use status_surface::*;

@@ -40,7 +40,7 @@ Prerequisites and toolchain facts:
 - Bootstrap everything pinned (Rust-CI-compatible GCC 14.1 bundle, LLVM 20.1 analysis bundle, Cppcheck 2.20.0 source build) with:
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1 -Bootstrap
+  powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap
   ```
 
 - Run every native Cargo or aggregate command **through the launcher** so it selects the matching runtime and pinned lint tools, confines child `TEMP`/`TMP`/`TMPDIR` to a launcher-owned `.tmp` child inside the workspace, and removes that child and `target/` on exit. Aggregate evidence must stream directly through the repository wrapper, which creates no log file and must not be wrapped in `Tee-Object` or redirected to a host-side file:

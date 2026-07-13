@@ -12,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use astrolabe_ingest::{CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, read_cbm_graph_snapshot};
+use astrolabe_weave::{PersistedSimilarityEdgeRow, read_similarity_edge_rows};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Seq};
@@ -255,9 +256,10 @@ where
     validate_options(options)?;
     let output_path = output_path.as_ref().to_path_buf();
     let snapshot = read_cbm_graph_snapshot(vault, &options.project)?;
+    let similarity_edges = read_similarity_edge_rows(vault)?;
     let source_ledger_head_hash = source_ledger_head_hash(vault)?;
     let vault_fingerprint_sha256 = snapshot_fingerprint(&snapshot, &source_ledger_head_hash);
-    let lowered = LoweredRows::from_snapshot(snapshot)?;
+    let lowered = LoweredRows::from_snapshot(snapshot, similarity_edges)?;
 
     write_sqlite_artifact(
         &output_path,
@@ -574,9 +576,13 @@ struct LoweredEdge {
 }
 
 impl LoweredRows {
-    fn from_snapshot(snapshot: CbmGraphSnapshot) -> LowerResult<Self> {
+    fn from_snapshot(
+        snapshot: CbmGraphSnapshot,
+        similarity_edges: Vec<PersistedSimilarityEdgeRow>,
+    ) -> LowerResult<Self> {
         let mut seen_qn = BTreeSet::new();
         let mut id_by_source = BTreeMap::new();
+        let mut id_by_qn = BTreeMap::new();
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
         for (index, node) in snapshot.nodes.into_iter().enumerate() {
             if !seen_qn.insert((node.project.clone(), node.qualified_name.clone())) {
@@ -594,6 +600,7 @@ impl LoweredRows {
                     node.source_node_id
                 )));
             }
+            id_by_qn.insert(node.qualified_name.clone(), id);
             nodes.push(lower_node(id, node));
         }
 
@@ -612,6 +619,32 @@ impl LoweredRows {
                 LowerError::InvalidInput("too many edges to assign SQLite ids".to_string())
             })?;
             edges.push(lower_edge(id, edge, source_id, target_id));
+        }
+        for persisted in similarity_edges {
+            let row = persisted.row;
+            let source_id = id_by_qn.get(&row.source_qn).copied().ok_or_else(|| {
+                LowerError::InvalidInput(format!(
+                    "persisted {} similarity edge points to missing source {:?}",
+                    row.family, row.source_qn
+                ))
+            })?;
+            let target_id = id_by_qn.get(&row.target_qn).copied().ok_or_else(|| {
+                LowerError::InvalidInput(format!(
+                    "persisted {} similarity edge points to missing target {:?}",
+                    row.family, row.target_qn
+                ))
+            })?;
+            let id = i64::try_from(edges.len() + 1).map_err(|_| {
+                LowerError::InvalidInput("too many edges to assign SQLite ids".to_string())
+            })?;
+            edges.push(LoweredEdge {
+                id,
+                project: snapshot.project.clone(),
+                source_id,
+                target_id,
+                edge_type: row.family,
+                properties_json: serde_json::to_string(&row.props)?,
+            });
         }
 
         Ok(Self {

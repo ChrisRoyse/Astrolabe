@@ -3989,6 +3989,85 @@ mod tests {
     }
 
     #[test]
+    fn watcher_fingerprints_dirty_bytes_without_repeating_the_same_state() {
+        use std::cell::Cell;
+        use std::fs;
+        use std::path::Path;
+        use std::process::Command;
+        use std::rc::Rc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "astrolabe-bridge-watcher-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create watcher repo");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .expect("run native git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Astrolabe FSV"]);
+        git(&["config", "user.email", "astrolabe-fsv@example.invalid"]);
+        fs::write(root.join("tracked.txt"), "baseline\n").expect("write baseline");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-q", "-m", "baseline"]);
+
+        let calls = Rc::new(Cell::new(0_u32));
+        let callback_calls = Rc::clone(&calls);
+        let callback_repo = root.clone();
+        let mut watcher = CbmWatcher::new_for_polling(move |project, callback_root| {
+            assert_eq!(project, "fingerprint-demo");
+            assert_eq!(Path::new(callback_root), callback_repo.as_path());
+            callback_calls.set(callback_calls.get() + 1);
+            Ok(())
+        })
+        .expect("create watcher");
+        watcher
+            .watch(
+                "fingerprint-demo",
+                root.to_str().expect("UTF-8 watcher repo"),
+            )
+            .expect("register watcher");
+        watcher.poll_once().expect("establish baseline");
+
+        fs::write(root.join("tracked.txt"), "first edit\n").expect("first edit");
+        watcher.touch("fingerprint-demo").expect("touch first edit");
+        assert_eq!(watcher.poll_once().expect("poll first edit"), 1);
+        assert_eq!(calls.get(), 1);
+
+        watcher
+            .touch("fingerprint-demo")
+            .expect("touch identical dirty state");
+        assert_eq!(watcher.poll_once().expect("poll identical dirty state"), 0);
+        assert_eq!(calls.get(), 1, "same dirty bytes must not reindex again");
+
+        fs::write(root.join("tracked.txt"), "second edit\n").expect("second edit");
+        watcher
+            .touch("fingerprint-demo")
+            .expect("touch second edit");
+        assert_eq!(watcher.poll_once().expect("poll second edit"), 1);
+        assert_eq!(calls.get(), 2, "successive dirty content must be detected");
+
+        drop(watcher);
+        fs::remove_dir_all(&root).expect("remove watcher repo");
+    }
+
+    #[test]
     fn watcher_rejects_inputs_cbm_would_silently_ignore() {
         let mut watcher = CbmWatcher::new_for_polling(|_, _| Ok(())).unwrap();
         assert_eq!(
