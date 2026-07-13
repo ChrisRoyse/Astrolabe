@@ -7,7 +7,7 @@ use calyx_ledger::{
 };
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use ulid::Ulid;
 
 fn vault_id() -> VaultId {
@@ -24,12 +24,9 @@ fn context() -> VaultContext {
     .unwrap()
 }
 
-fn durable_vault(name: &str) -> (PathBuf, AsterVault) {
-    let dir =
-        std::env::temp_dir().join(format!("calyx-erase-ledger-{name}-{}", std::process::id()));
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
+fn durable_vault(name: &str) -> (calyx_fsv::ScratchDir, AsterVault) {
+    // RAII scratch: removed on drop, including panic unwind (#260).
+    let dir = calyx_fsv::ScratchDir::new_temp(&format!("calyx-erase-ledger-{name}")).unwrap();
     let vault = AsterVault::new_durable(
         &dir,
         vault_id(),
@@ -208,14 +205,12 @@ fn erase_tombstones(entries: &[LedgerEntry]) -> Vec<calyx_ledger::ErasureTombsto
 #[test]
 #[ignore = "manual FSV fixture for issue #503"]
 fn issue503_erasure_ledger_fsv_fixture() {
-    let root = calyx_fsv::fsv_root_or_else("CALYX_FSV_ROOT", || {
-        std::env::temp_dir().join("calyx-issue503-fsv")
-    });
+    // RAII scratch: unset CALYX_FSV_ROOT self-cleans on drop/panic (#260).
+    let root = calyx_fsv::scratch_or_temp("CALYX_FSV_ROOT", "calyx-issue503-fsv");
     let vault_dir = root.join("issue503-ledger-vault");
     if vault_dir.exists() {
         fs::remove_dir_all(&vault_dir).unwrap();
     }
-    fs::create_dir_all(&root).unwrap();
     let vault = AsterVault::new_durable(
         &vault_dir,
         vault_id(),
