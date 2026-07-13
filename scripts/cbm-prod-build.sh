@@ -64,11 +64,22 @@ if [[ -n "$PY_BIN" ]]; then
 fi
 
 CACHE_ROOT="$ROOT/.astro-gate-cache/cbm-parity"
+BUILD_KEY_STAMP="$BUILD_DIR/.cbm-parity-key"
 cached_bin=""
 if [[ -n "$key" ]]; then
+  # If BUILD_DIR already holds a binary installed under THIS key, leave it
+  # untouched: concurrent gates execute that exact file, and re-copying over a
+  # running executable is a WinError-32 race (observed 2026-07-13: lowered-
+  # parity spawning the exe while a sibling gate's cache-hit re-copy held it).
+  if [[ -f "$BUILD_DIR/codebase-memory-mcp$EXE" && -f "$BUILD_KEY_STAMP" ]] \
+    && [[ "$(cat "$BUILD_KEY_STAMP" 2>/dev/null)" == "$key" ]]; then
+    echo "INFO[ASTRO_CBM_PARITY_BINARY_CACHED]: key=${key:0:12} already installed in $BUILD_DIR (left untouched)"
+    exit 0
+  fi
   cached_bin="$CACHE_ROOT/$key/codebase-memory-mcp$EXE"
   if [[ -f "$cached_bin" ]]; then
     cp -f "$cached_bin" "$BUILD_DIR/codebase-memory-mcp$EXE"
+    printf '%s' "$key" > "$BUILD_KEY_STAMP"
     echo "INFO[ASTRO_CBM_PARITY_BINARY_CACHED]: key=${key:0:12} (byte-identical to a build from the owned CBM sources + patches/cbm Makefile/glue + toolchain)"
     exit 0
   fi
@@ -102,6 +113,7 @@ fi
 
 # Populate the cache for future runs (only when we have a sound key).
 if [[ -n "$key" ]]; then
+  printf '%s' "$key" > "$BUILD_KEY_STAMP" 2>/dev/null || true
   mkdir -p "$CACHE_ROOT/$key"
   # Atomic-ish install so a concurrent reader never sees a half-copied binary.
   tmp_bin="$CACHE_ROOT/$key/.codebase-memory-mcp$EXE.tmp.$$"

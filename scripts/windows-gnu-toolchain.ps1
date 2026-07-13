@@ -1020,8 +1020,14 @@ $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
 # (fixture locks, never the live workspace).
 . (Join-Path $PSScriptRoot "launcher-lock.ps1")
 Assert-AstroLauncherLockClaimable -LockPath $launcherLock
-if (Test-Path -LiteralPath $target) {
+# #280: ASTROLABE_CONTIGUOUS_BATCH=1 (the CLAUDE.md contiguous-verification-
+# batch carve-out) keeps target/ warm between consecutive runs of one session,
+# so a present target/ is the expected state there, not a hygiene fault.
+if ((Test-Path -LiteralPath $target) -and ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1")) {
     throw "target must be absent before toolchain work: $target"
+}
+if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and (Test-Path -LiteralPath $target)) {
+    Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
 }
 if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
