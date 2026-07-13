@@ -203,6 +203,7 @@ extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_trace_ingest(void);
+extern void suite_trace_e2e(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
@@ -363,6 +364,9 @@ int main(int argc, char **argv) {
 
     /* Trace ingestion (OTLP -> route match -> edge promotion + anchors) */
     RUN_SELECTED_SUITE(trace_ingest);
+
+    /* Trace ingestion end-to-end over the MCP JSON-RPC surface (#27) */
+    RUN_SELECTED_SUITE(trace_e2e);
 
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
