@@ -17,14 +17,14 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 - Work in your assigned worktree on branch `sweep/<crate>`; touch ONLY your crate's files.
 - Never push, never touch GitHub (no comments/labels/closes) — return structured results instead.
 - Verify honestly per astro-fsv; report `partial`/`blocked` rather than fake green. If the issue is already fixed in your base commit, say so with evidence — do not redo it.
-- Any test you write, edit, or run obeys the astro-test doctrine: full suite <180s, no single test >60s (decompose or delete — never tier, never raise a timeout), real data only (no mocks), FSV byte readback. Load the astro-test skill before touching test surface.
+- FSV-only doctrine (owner directive 2026-07-13): no aggregate/gate suite exists — verify with real data (no mocks) and FSV byte readback per astro-fsv.
 - Server-side edits you cannot build: stage them, commit with `Refs #N` (NEVER `Closes #N`), and flag `server_pending: true`.
 - Record out-of-scope discoveries in `new_problems` (title + evidence); the orchestrator files them.
 - Return: `{issue, status: done|partial|blocked|already-fixed, evidence[], commits[], server_pending, new_problems[]}`.
 
 ## Orchestrator sequence
 
-1. Preflight (astro-gate) — a wave needs `FREE` or `CPU_CONTENDED`; never start under `LOCKED_LIVE`/`OWNED_BUSY`.
+1. Preflight — check `.tmp/astrolabe-launcher.lock` and live toolchain processes; never start a wave while another session's live-locked build owns the toolchain.
 2. Partition ready issues by crate; one worker per crate works its issues sequentially.
 3. On completion: octopus-merge the disjoint `sweep/*` branches; run ONE consolidated `cargo test` + clippy as independent FSV of the merge.
 4. **Server-pending consolidation:** merge all server-pending branches into one local tree, run ONE native `cargo test -p astrolabe-server` through the launcher from `C:/code/Astrolabe`; on green, publish each branch, close the `Refs` issues manually with that shared evidence. Before any `git reset --hard`, save an insurance patch of applied stash/edits (`git diff <file> > <scratchpad>/x.patch`).

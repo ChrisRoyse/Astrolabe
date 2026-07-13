@@ -9,8 +9,8 @@ A handoff exists so a zero-context successor can continue without re-deriving an
 
 ## 1. Hygiene before writing
 
-- Run `pwsh -NoProfile -File ${CLAUDE_PROJECT_DIR}/.claude/skills/astro-gate/scripts/preflight.ps1`.
-- If `target/` exists and this session owns it (no live lock from another session): delete it and verify absent. If another session owns it (`LOCKED_LIVE`/`OWNED_BUSY`): leave it and record the conflict in the handoff.
+- Check `.tmp/astrolabe-launcher.lock`: if it names a live PID, another session owns the toolchain — read-only until it clears.
+- If `target/` exists and this session owns it (no live lock from another session): delete it and verify absent. If another live-locked session owns it: leave it and record the conflict in the handoff.
 - `git status --short` — know every uncommitted/untracked path. Remove stray temp files this session created; keep repo-controlled outputs out of the index.
 - List stray worktrees/branches this session created (`git worktree list`, `git branch --list 'sweep/*'`) — remove finished ones or name them in the handoff.
 
