@@ -2,7 +2,10 @@
 
 mod detmath;
 mod embeddings;
+pub mod layout_registry;
 mod lenses;
+#[cfg(test)]
+mod s23_layer_role_fsv;
 mod unicode61;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,13 +27,15 @@ pub use embeddings::{
     fixture_static_embedding_input, nomic_weights_identity, s18_s20_lenses,
 };
 pub use lenses::{
-    ApiCall, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
-    ConfigEnvSurfaceInput, DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput,
-    GraphPositionInput, IdentifierLexicalInput, LangLabelInput, PathHierarchyInput,
-    RECORD_VECTOR_SCALAR_KEYS, RecordVectorInput, RoleFlagsInput, RouteObservation,
-    RouteSurfaceInput, StructuralTrigram, TestTopologyInput, TypeSurfaceInput, canonical_route_qn,
-    cbm_camel_split_text, cbm_camel_split_tokens, cbm_route_canon_path, encode_slot,
-    fixture_encoder_input, fixture_scalar_sidecar, s0_s9_lenses, s10_s17_s21_lenses,
+    ApiCall, ApiFamily, AstProfile, ChannelObservation, ChurnProfileInput, ComplexityMetrics,
+    ConfigEnvSurfaceInput, DEFAULT_PERSISTENCE_FAMILY_SEEDS, DEFAULT_TRANSPORT_FAMILY_SEEDS,
+    DeterministicEncoderLens, EncoderLensInput, ErrorSurfaceInput, GraphPositionInput,
+    IdentifierLexicalInput, LangLabelInput, PathHierarchyInput, RECORD_VECTOR_SCALAR_KEYS,
+    RecordVectorInput, RoleFlagsInput, RouteObservation, RouteSurfaceInput, StructuralTrigram,
+    TestTopologyInput, TypeSurfaceInput, canonical_route_qn, cbm_camel_split_text,
+    cbm_camel_split_tokens, cbm_route_canon_path, default_api_family, encode_slot,
+    fixture_encoder_input, fixture_scalar_sidecar, layer_role_lens, s0_s9_lenses,
+    s10_s17_s21_lenses,
 };
 
 /// Crate name reported by Cargo metadata.
@@ -735,7 +740,9 @@ impl LayerRole {
 
     /// Parses a canonical role name, or `None` if it is not in the frozen taxonomy.
     pub fn from_str_canonical(name: &str) -> Option<Self> {
-        CANONICAL_ROLES.into_iter().find(|role| role.as_str() == name)
+        CANONICAL_ROLES
+            .into_iter()
+            .find(|role| role.as_str() == name)
     }
 }
 
@@ -2037,9 +2044,11 @@ fn vector_l1_mass(vector: &SlotVector) -> Option<f32> {
         SlotVector::Sparse { entries, .. } => {
             entries.iter().map(|entry| entry.val.abs()).sum::<f32>()
         }
-        SlotVector::Multi { tokens, .. } => {
-            tokens.iter().flatten().map(|value| value.abs()).sum::<f32>()
-        }
+        SlotVector::Multi { tokens, .. } => tokens
+            .iter()
+            .flatten()
+            .map(|value| value.abs())
+            .sum::<f32>(),
         SlotVector::Absent { .. } => return None,
     };
     Some(mass)

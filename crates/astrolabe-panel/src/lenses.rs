@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ASTRO_PANEL_CONTRACT_INVALID, ASTRO_PANEL_S21_ZERO_SIGNAL, ASTRO_PANEL_VECTOR_INVALID,
-    CANONICAL_ROLES, FrozenLensContract, LAYER_ROLE_COUNT, LayerRole, PanelError, PanelResult,
-    seed_spec_for_lens, slot_spec,
+    FrozenLensContract, LAYER_ROLE_COUNT, LayerRole, PanelError, PanelResult, seed_spec_for_lens,
+    slot_spec,
 };
 
 const AST_PROFILE_DIM: u32 = 25;
@@ -22,28 +22,22 @@ const RECENCY_DIM: u32 = 1;
 const ROLE_FLAGS_DIM: u32 = 12;
 const TEST_TOPOLOGY_DIM: u32 = 4;
 const RECORD_VEC_DIM: u32 = 24;
-const LAYER_ROLE_DIM: u32 = LAYER_ROLE_COUNT as u32;
 
 // Frozen S23 `layer_role` weighted-evidence weights.
 //
-// These are the frozen *encoder spec* for the deterministic weighted-evidence
-// combiner: like `AST_PROFILE_MAXIMA` (S0) or `COMPLEXITY_PLE_THRESHOLDS` (S3),
-// they are bound into the lens `weights_sha` via the frozen-fixture output, so any
-// change to them moves the S23 frozen lens identity. They are *not* runtime
-// decision thresholds that gate a measured outcome (invariant 4): the measured,
-// per-repo part of the model — which callee QNs are persistence vs transport — is
-// the `astro.layout.api_families.v1` registry knob (default-seeded here, learned
-// downstream). The weights only fold explicit graph/flag evidence into a
-// distribution over the frozen canonical-role coordinate system.
-const LR_W_ROUTE_FLAG: f32 = 2.0;
-const LR_W_HANDLER_FLAG: f32 = 2.0;
-const LR_W_ROUTE_SURFACE: f32 = 3.0;
-const LR_W_TEST_FLAG: f32 = 4.0;
-const LR_W_API_TRANSPORT: f32 = 1.5;
-const LR_W_API_PERSISTENCE: f32 = 2.0;
-const LR_W_API_UNCLASSIFIED: f32 = 0.5;
-const LR_W_SERVICE_BETWEENNESS: f32 = 2.5;
-const LR_W_SERVICE_DEGREE: f32 = 1.0;
+// These live in the `astro.layout.evidence_weights.v1` registry knob (see
+// [`crate::layout_registry`]) — the single content-addressed source of truth for the
+// combiner spec — and are re-exported here for the encoder. They are the frozen
+// *encoder spec* (like `AST_PROFILE_MAXIMA` / `COMPLEXITY_PLE_THRESHOLDS`), bound
+// into the lens `weights_sha` via the frozen-fixture output, so any change to the
+// knob moves the S23 frozen lens identity. The measured, per-repo part of the model
+// — which callee QNs are persistence vs transport — is the
+// `astro.layout.api_families.v1` knob (default-seeded, learned downstream).
+use crate::layout_registry::{
+    LR_W_API_PERSISTENCE, LR_W_API_TRANSPORT, LR_W_API_UNCLASSIFIED, LR_W_HANDLER_FLAG,
+    LR_W_ROUTE_FLAG, LR_W_ROUTE_SURFACE, LR_W_SERVICE_BETWEENNESS, LR_W_SERVICE_DEGREE,
+    LR_W_TEST_FLAG,
+};
 
 const STRUCT_TRIGRAM_DIM: u32 = 65_536;
 const API_CALLEES_DIM: u32 = 262_144;
@@ -1431,20 +1425,8 @@ pub const DEFAULT_PERSISTENCE_FAMILY_SEEDS: &[&str] = &[
 /// Frozen default transport-family callee substrings — the corpus-independent
 /// default seed of `astro.layout.api_families.v1`.
 pub const DEFAULT_TRANSPORT_FAMILY_SEEDS: &[&str] = &[
-    "route",
-    "router",
-    "handler",
-    "endpoint",
-    "request",
-    "response",
-    "http",
-    "axum",
-    "actix",
-    "warp",
-    "flask",
-    "express",
-    "fastapi",
-    "respond",
+    "route", "router", "handler", "endpoint", "request", "response", "http", "axum", "actix",
+    "warp", "flask", "express", "fastapi", "respond",
 ];
 
 /// Classifies a resolved callee QN against the frozen default API-family seeds.
@@ -1800,6 +1782,32 @@ fn l2_normalize(data: &mut [f32]) -> PanelResult<()> {
     }
     for value in data {
         *value /= norm;
+    }
+    Ok(())
+}
+
+/// L1-normalizes a non-negative evidence vector into a probability distribution.
+///
+/// Every value must be finite and non-negative (the S23 evidence accumulator only
+/// adds non-negative weighted signals); fails closed if the total mass is zero so a
+/// signal-free vector can never be silently emitted as a uniform or empty posterior
+/// (the encoder routes that case to an explicit `Other`-mass fallback upstream).
+fn l1_normalize(data: &mut [f32]) -> PanelResult<()> {
+    for value in data.iter() {
+        ensure_finite_scalar("l1_norm", *value)?;
+        ensure_non_negative("l1_norm", *value)?;
+    }
+    let mass = data.iter().sum::<f32>();
+    ensure_finite_scalar("l1_mass", mass)?;
+    if mass == 0.0 {
+        return Err(PanelError::new(
+            ASTRO_PANEL_VECTOR_INVALID,
+            "l1-normalized distribution has zero mass",
+            "Emit at least one non-zero evidence coordinate before L1 normalization.",
+        ));
+    }
+    for value in data.iter_mut() {
+        *value /= mass;
     }
     Ok(())
 }
