@@ -1,23 +1,40 @@
 use super::*;
 use calyx_core::LensId;
 use serde_json::json;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 const NOW: Timestamp = 1_785_500_000_000;
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
-    let next = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "calyx-supply-chain-{name}-{}-{next}",
-        std::process::id()
-    ));
-    std::fs::write(&path, bytes).unwrap();
-    path
+/// RAII scratch file: the `bytes` are written inside a self-cleaning
+/// [`calyx_fsv::ScratchDir`], so the file (and its dir) are removed on drop,
+/// including panic unwind (#260). Derefs to the file's [`Path`] so existing
+/// `&path` call sites keep compiling.
+struct ScratchFile {
+    _dir: calyx_fsv::ScratchDir,
+    path: PathBuf,
 }
 
-fn lock_file(text: &str) -> PathBuf {
+impl std::ops::Deref for ScratchFile {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for ScratchFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_file(name: &str, bytes: &[u8]) -> ScratchFile {
+    let dir = calyx_fsv::ScratchDir::new_temp("calyx-supply-chain").unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    ScratchFile { _dir: dir, path }
+}
+
+fn lock_file(text: &str) -> ScratchFile {
     temp_file("Cargo.lock", text.as_bytes())
 }
 

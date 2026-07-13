@@ -12,9 +12,8 @@ mod support;
 
 #[test]
 fn ph54_fsv_same_seq_crash_range_rebuild() {
-    let root = std::env::temp_dir().join("calyx-ph54-fsv-test");
-    fs::remove_dir_all(&root).ok();
-    fs::create_dir_all(&root).unwrap();
+    // RAII scratch: removed on drop, including panic unwind (#260).
+    let root = calyx_fsv::ScratchDir::new_temp("calyx-ph54-fsv-test").unwrap();
     let evidence = support::run_fsv(&root);
     support::write_and_assert(&root, &evidence);
 }

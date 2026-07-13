@@ -9,7 +9,6 @@ use calyx_ledger::{EntryKind, LedgerCfStore, decode};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
 
 mod fsv_support;
 use fsv_support::prepared_temp_root;
@@ -18,7 +17,7 @@ fn vault_id() -> VaultId {
     "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("valid ULID")
 }
 
-fn test_dir(name: &str) -> PathBuf {
+fn test_dir(name: &str) -> calyx_fsv::ScratchDir {
     prepared_temp_root("calyx-issue575", name)
 }
 

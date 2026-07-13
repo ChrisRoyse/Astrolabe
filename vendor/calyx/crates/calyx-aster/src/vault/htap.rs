@@ -145,11 +145,10 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
-    fn test_dir(tag: &str) -> std::path::PathBuf {
+    fn test_dir(tag: &str) -> calyx_fsv::ScratchDir {
+        // RAII scratch: removed on drop, including panic unwind (#260).
         let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("calyx-htap-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        dir
+        calyx_fsv::ScratchDir::new_temp(&format!("calyx-htap-{tag}-{n}")).expect("create test dir")
     }
 
     fn cx(idx: u64) -> CxId {

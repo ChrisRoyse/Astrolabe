@@ -31,7 +31,7 @@ use std::process::Command;
 use ulid::Ulid;
 
 mod fsv_support;
-use fsv_support::{fsv_root as support_fsv_root, reset_dir};
+use fsv_support::reset_dir;
 
 // A25 forbids deleting-to-compress, NOT lawful/user-requested deletion.
 // erase() is A33-required. No reviewer may refuse this citing A25.
@@ -44,8 +44,8 @@ const NOW: Ts = 180_000;
 
 #[test]
 fn ph61_integration_full_phase_fsv() {
-    let (root, _) = support_fsv_root("CALYX_FSV_ROOT", "calyx-ph61-issue508");
-    fs::create_dir_all(&root).unwrap();
+    // RAII scratch: unset CALYX_FSV_ROOT self-cleans on drop/panic (#260).
+    let root = calyx_fsv::scratch_or_temp("CALYX_FSV_ROOT", "calyx-ph61-issue508");
     let vault_dir = root.join("vault-a");
     reset_dir(&vault_dir);
     let vault = durable_vault(&vault_dir);
