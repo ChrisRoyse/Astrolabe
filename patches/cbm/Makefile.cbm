@@ -305,7 +305,7 @@ SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 
 # Traces module (new)
-TRACES_SRCS = src/traces/traces.c
+TRACES_SRCS = src/traces/traces.c src/traces/otlp_decode.c src/traces/trace_ingest.c
 
 # Watcher module (new)
 WATCHER_SRCS = src/watcher/watcher.c

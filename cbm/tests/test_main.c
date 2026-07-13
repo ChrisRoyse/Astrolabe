@@ -202,6 +202,7 @@ extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
+extern void suite_trace_ingest(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
@@ -359,6 +360,9 @@ int main(int argc, char **argv) {
 
     /* Traces helpers */
     RUN_SELECTED_SUITE(traces);
+
+    /* Trace ingestion (OTLP -> route match -> edge promotion + anchors) */
+    RUN_SELECTED_SUITE(trace_ingest);
 
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
