@@ -10,6 +10,18 @@
 //! downstream oracle chain reads verified persisted state, never a planner echo.
 
 pub mod corpus;
+pub mod predict;
+
+pub use predict::{
+    ASTRO_ORACLE_GRAPH_INVALID, ASTRO_ORACLE_PREDICT_CONFIG_INVALID,
+    ASTRO_ORACLE_PREDICT_REQUEST_INVALID, BacktestCase, BacktestReport, Consequence,
+    ConsequenceEdge, ConsequenceEdgeKind, ConsequenceGraph, ImpactOutcome, ImpactPrediction,
+    InsufficientReport, NodeEvidence, ORACLE_BACKTEST_TOP_K_SUCCESS_RATE,
+    ORACLE_INSUFFICIENT_REMEDIATION, ORACLE_PREDICT_KNOB_REGISTRY_VERSION, ORACLE_PREDICT_KNOBS,
+    ORACLE_SENSOR_DIRECT_CHANGE_HISTORY, OracleEvidence, PredictConfig, PredictRequest,
+    SensorDeficit, TestSelection, backtest_phase_gate, oracle_predict_knob, predict_impact,
+    run_backtest,
+};
 
 pub use corpus::{
     ASTRO_ORACLE_CONFIG_INVALID, ASTRO_ORACLE_EVENT_INVALID, ASTRO_ORACLE_LEDGER_MISSING,
