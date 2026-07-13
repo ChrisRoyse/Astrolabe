@@ -29,6 +29,7 @@
       "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
       "test": "kill_after_wal_append_reopens_with_both_data_and_ledger",
       "kind": "crash_recovery",
+      "features": ["crash-fsv-tests"],
       "evidence": ["ASTROLABE_CRASH_FSV_CHILD", "verify_chain"]
     },
     {
@@ -70,6 +71,7 @@
       "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
       "test": "kill_after_mvcc_commit_reopens_intact_chain_via_wal_replay",
       "kind": "crash_recovery",
+      "features": ["crash-fsv-tests"],
       "evidence": ["CALYX_ASTER_CRASH_FSV_AFTER_MVCC_COMMIT_MARKER", "verify_chain"]
     },
     {
@@ -78,6 +80,7 @@
       "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
       "test": "kill_after_checkpoint_reopens_intact_chain_via_manifest",
       "kind": "crash_recovery",
+      "features": ["crash-fsv-tests"],
       "evidence": ["CALYX_ASTER_CRASH_FSV_AFTER_CHECKPOINT_MARKER", "verify_chain"]
     },
     {

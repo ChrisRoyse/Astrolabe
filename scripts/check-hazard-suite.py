@@ -369,6 +369,16 @@ def execute_test(root: Path, args: argparse.Namespace, test: dict[str, Any]) -> 
         "-p",
         test["crate"],
         "--lib",
+    ]
+    # #291: opt-in cfg(feature) test clusters (e.g. the astrolabe-ingest
+    # crash-FSV kill_after_* parents behind `crash-fsv-tests`) compile out of
+    # the default lib target; the manifest declares the features an entry
+    # needs so the ambiguous-execution check (passed==1) keeps proving the
+    # test actually ran rather than silently filtering to zero.
+    features = test.get("features", [])
+    if features:
+        command += ["--features", ",".join(features)]
+    command += [
         "--",
         "--nocapture",
         test_name,
