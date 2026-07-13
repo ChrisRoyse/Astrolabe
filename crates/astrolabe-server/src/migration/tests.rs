@@ -8397,6 +8397,117 @@ fn masking_import_options() -> SqliteImportOptions {
         .with_available_slots(shadow_available_slots())
 }
 
+// ---- #335: fresh-vault first shadow import regression FSV ----
+
+/// Two Function symbols joined by one consistent "CALLS" edge — the smallest valid
+/// row-sink snapshot for a first-ever import of a project.
+fn fresh_vault_rows() -> CbmPipelineRows {
+    let nodes = (0..2)
+        .map(|index| astrolabe_bridge::CbmPipelineNodeRow {
+            id: index as i64 + 1,
+            project: "freshvault".to_string(),
+            label: "Function".to_string(),
+            name: format!("symbol_{index}"),
+            qualified_name: format!("freshvault.symbol_{index}"),
+            file_path: "src/lib.rs".to_string(),
+            start_line: index as i64 + 1,
+            end_line: index as i64 + 1,
+            properties_json: format!(
+                r#"{{"language":"rust","source_snippet":"fn symbol_{index}() {{}}","signature":"fn symbol_{index}()"}}"#
+            ),
+        })
+        .collect::<Vec<_>>();
+    let edges = vec![astrolabe_bridge::CbmPipelineEdgeRow {
+        id: 1,
+        project: "freshvault".to_string(),
+        source_id: 1,
+        target_id: 2,
+        edge_type: "CALLS".to_string(),
+        properties_json: r#"{"call_count":1}"#.to_string(),
+        url_path_gen: String::new(),
+        local_name_gen: String::new(),
+    }];
+    CbmPipelineRows {
+        project: "freshvault".to_string(),
+        nodes,
+        edges,
+    }
+}
+
+fn fresh_vault_candidate() -> RowSinkImportCandidate {
+    let reason = "fresh-vault first-import FSV: derived surfaces intentionally unavailable";
+    let rows = fresh_vault_rows();
+    let project = rows.project.clone();
+    let source_fingerprint_sha256 = row_sink_fingerprint(&rows);
+    RowSinkImportCandidate::Available(Box::new(RowSinkSnapshot {
+        snapshot: pipeline_rows_to_graph_snapshot(rows),
+        source_fingerprint_sha256,
+        security_screen: security_screen_unavailable(security_screen_subject(&project), reason),
+        skill_tree: skill_tree_unavailable_json(reason),
+        bridges: bridges_unavailable_json(reason),
+        kernel_context: kernel_context_unavailable_json(reason),
+        anomalies: anomaly_report_unavailable_json(reason),
+        provenance: provenance_unavailable_json(reason),
+    }))
+}
+
+#[test]
+fn first_shadow_import_on_fresh_vault_succeeds_with_empty_before_map() {
+    // #335: 64f3c00a added a before-map pre-read (`read_cbm_graph_snapshot`) that refused
+    // ASTRO_MISSING_CBM_PROJECT_ROW on a fresh vault, so the FIRST
+    // index_repository(calyx=shadow) of any project failed end-to-end. Exercise the real
+    // wrapper (`import_shadow_vault_with_archaeology_at`) — not
+    // `import_shadow_vault_report`, which bypasses the pre-read — on a brand-new cache
+    // dir, then independently read the persisted state back.
+    let cache_dir = temp_dir("fresh-vault-first-import");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // The row-sink direct path only fingerprints the CBM SQLite source file.
+    fs::write(sqlite_path(&cache_dir, "freshvault"), b"cbm sqlite fixture v1").unwrap();
+    let settings = SearchScaleSettings {
+        index_backend: SearchIndexBackend::InMemoryHnsw,
+        funnel_activation_records: DEFAULT_FUNNEL_ACTIVATION_RECORDS,
+        estimated_index_rss_bytes: 0,
+        master_budget_bytes: 2048,
+        source: "fixture".to_string(),
+    };
+
+    // BEFORE: the vault does not exist at all — the exact fresh state #335 broke on.
+    let vdir = vault_dir(&cache_dir, "freshvault");
+    assert!(!vdir.exists(), "precondition: vault must be fresh");
+
+    import_shadow_vault_with_archaeology_at(
+        &cache_dir,
+        "freshvault",
+        Some(fresh_vault_candidate()),
+        &settings,
+        None,
+    )
+    .expect("#335: first shadow import on a fresh vault must succeed");
+
+    // FSV read-back: the project row exists and carries both symbols; the pre-#335 failure
+    // left only WAL + lock files here.
+    let vault =
+        open_shadow_vault_writable(&vdir, SHADOW_VAULT_ID, &vault_salt("freshvault"), Vec::new())
+            .expect("vault opens after first import");
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, "freshvault")
+        .expect("project row persisted by first import");
+    assert_eq!(snapshot.nodes.len(), 2, "both symbols persisted");
+    assert!(verify_chain(&vault).unwrap().is_intact());
+    drop(vault);
+
+    // Second import over existing state: the before-map is now non-empty, so the delta
+    // path (the thing 64f3c00a was actually adding) still runs and succeeds.
+    import_shadow_vault_with_archaeology_at(
+        &cache_dir,
+        "freshvault",
+        Some(fresh_vault_candidate()),
+        &settings,
+        None,
+    )
+    .expect("second import over existing state must succeed");
+    fs::remove_dir_all(&cache_dir).ok();
+}
+
 #[test]
 fn direct_import_failure_surfaces_row_sink_error_when_sqlite_absent() {
     let root = temp_dir("mask-absent");

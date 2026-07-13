@@ -1014,7 +1014,17 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     repo: Option<&Path>,
 ) -> Result<ShadowImportOutcome, DynError> {
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    fs::create_dir_all(&cache_dir)?;
+    import_shadow_vault_with_archaeology_at(&cache_dir, project, row_sink, search_scale_settings, repo)
+}
+
+pub(crate) fn import_shadow_vault_with_archaeology_at(
+    cache_dir: &Path,
+    project: &str,
+    row_sink: Option<RowSinkImportCandidate>,
+    search_scale_settings: &SearchScaleSettings,
+    repo: Option<&Path>,
+) -> Result<ShadowImportOutcome, DynError> {
+    fs::create_dir_all(cache_dir)?;
     let sqlite_path = sqlite_path(&cache_dir, project);
     if !sqlite_path.exists() {
         return Err(format!(
@@ -1052,11 +1062,21 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
         .with_available_slots(shadow_available_slots())
         .with_series_registry(repo.is_some());
-    let before_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?
-        .nodes
-        .into_iter()
-        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
-        .collect::<BTreeMap<_, _>>();
+    // A fresh vault carries no `astrolabe:cbm-project:v1` row yet: the first import of a
+    // project has no prior constellation to diff, so the before-map is legitimately empty
+    // (the delta below is already `None` for an empty map). Only that exact refusal is
+    // absorbed; every other read error still fails closed (#335).
+    let before_cx_by_qn = match astrolabe_ingest::read_cbm_graph_snapshot(&vault, project) {
+        Ok(snapshot) => snapshot
+            .nodes
+            .into_iter()
+            .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+            .collect::<BTreeMap<_, _>>(),
+        Err(err) if err.code() == Some(astrolabe_ingest::ASTRO_MISSING_CBM_PROJECT_ROW) => {
+            BTreeMap::new()
+        }
+        Err(err) => return Err(err.into()),
+    };
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
