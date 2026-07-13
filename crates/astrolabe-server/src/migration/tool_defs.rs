@@ -148,7 +148,7 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
     json!({
         "name": "get_provenance",
         "title": "Get Provenance",
-        "description": "Return labeled Astrolabe provenance for a shadow-indexed project. Modes are lineage, answer_trace, verify_chain, and reproduce.",
+        "description": "Return labeled Astrolabe provenance for a shadow-indexed project. Modes are lineage, answer_trace, verify_chain, reproduce, and inter_agent_trust (one-call verification of a context pack claimed by another agent).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -158,7 +158,7 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["lineage", "answer_trace", "verify_chain", "reproduce"]
+                    "enum": ["lineage", "answer_trace", "verify_chain", "reproduce", "inter_agent_trust"]
                 },
                 "subject_id": {
                     "type": "string",
@@ -167,6 +167,14 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
                 "subject": {
                     "type": "string",
                     "description": "Alias for subject_id."
+                },
+                "manifest": {
+                    "type": "object",
+                    "description": "inter_agent_trust: the claimed context-pack manifest to verify against this serving vault (pack_id, ledger_ref{seq,chain_hash}, vault_fingerprint, member_hash)."
+                },
+                "attestation": {
+                    "type": "string",
+                    "description": "inter_agent_trust: a self-describing pack-manifest attestation artifact string handed over by the serving agent, verified in place of an inline manifest object."
                 }
             },
             "required": ["project", "mode"],

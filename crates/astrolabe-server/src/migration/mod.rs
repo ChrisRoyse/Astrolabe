@@ -44,10 +44,11 @@ use astrolabe_lower::{
 use astrolabe_panel::{DEFAULT_PANEL_VERSION, PanelInput, PanelResult, PanelSlotSpec, SlotRuntime};
 use astrolabe_provenance::{
     AnswerHop, AnswerTrace, ChainStatus, ChainVerification, Freshness, GET_PROVENANCE_SCHEMA,
-    LedgerPointer, LineageEvent, PROVENANCE_WARN_CHAIN_BROKEN, PROVENANCE_WARN_CHAIN_CORRUPT,
-    PROVENANCE_WARN_CHAIN_EMPTY, PackManifest, ProvenancePayload, ProvenanceQuery,
-    ProvenanceResponse, ProvenanceStore, ReproduceRecord, SymbolLineage, get_provenance,
-    provenance_response_artifact_bytes,
+    InterAgentTrustReport, LedgerPointer, LineageEvent, PROVENANCE_WARN_CHAIN_BROKEN,
+    PROVENANCE_WARN_CHAIN_CORRUPT, PROVENANCE_WARN_CHAIN_EMPTY, PackManifest, ProvenancePayload,
+    ProvenanceQuery, ProvenanceResponse, ProvenanceStore, ReproduceRecord, SymbolLineage,
+    get_provenance, parse_pack_manifest_attestation, provenance_response_artifact_bytes,
+    verify_pack_manifest_claim,
 };
 use astrolabe_weave::{
     AnomalyCalibration, AnomalyKind, AnomalyReport, AnomalySubstrateRow, DETECT_ANOMALIES_SCHEMA,

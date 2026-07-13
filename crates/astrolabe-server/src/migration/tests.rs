@@ -2083,6 +2083,155 @@ fn get_provenance_verify_chain_reopens_physical_shadow_vault() {
 }
 
 #[test]
+fn get_provenance_inter_agent_trust_round_trip_and_tamper_fails_closed() {
+    // #67 (blueprint 9.5): the one-call verification a second agent runs against a
+    // context pack claimed by a first agent. The serving vault's persisted manifest
+    // is the source of truth; a matching claim verifies with all four checks, and
+    // any tampered field fails closed naming the failing check. Exercises the exact
+    // server surface (handle_inter_agent_trust) a separate process reaches through
+    // get_provenance(mode="inter_agent_trust").
+    let dir = temp_dir("provenance-inter-agent-trust");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"provenance-inter-agent-trust".to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+    let candidate = row_sink_import_candidate_from_rows(sample_provenance_rows());
+    let imported = import_shadow_vault_report(
+        &dir.join("must-not-exist.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(candidate),
+    )
+    .unwrap();
+    let verify = verify_chain(&vault).unwrap();
+    let provenance =
+        provenance_surface_with_chain(imported.provenance, &"44".repeat(32), 1, &verify);
+    drop(vault);
+
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(&dir, security);
+    outcome.vault_dir = vault_dir;
+    outcome.provenance = provenance;
+    outcome.import_fsv = imported.report.fsv.clone();
+    outcome.ledger_seq = 1;
+    outcome.lowered_vault_fingerprint_sha256 = "44".repeat(32);
+    outcome.verify_chain_status = verify.status.clone();
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    // Independent readback: the persisted provenance store carries the manifest that
+    // agent A published at index time (source of truth for the verification).
+    let store = provenance_store_for_project(&dir, "demo").unwrap();
+    let served = store
+        .manifests
+        .get("pack:auth")
+        .expect("served pack manifest persisted in the provenance store")
+        .clone();
+
+    // 1. Matching claim (inline manifest object): verified, all four checks named.
+    let mut ok_args = serde_json::Map::new();
+    ok_args.insert("manifest".to_string(), pack_manifest_json(&served));
+    let ok_result = handle_inter_agent_trust("demo", &store, &ok_args).unwrap();
+    assert!(
+        !tool_result_is_error(&ok_result).unwrap(),
+        "matching claim verifies: {ok_result}"
+    );
+    let ok_value: Value = serde_json::from_str(&ok_result).unwrap();
+    let body = &ok_value["structuredContent"];
+    assert_eq!(
+        body["schema"],
+        astrolabe_provenance::INTER_AGENT_TRUST_SCHEMA
+    );
+    assert_eq!(body["mode"], "inter_agent_trust");
+    assert_eq!(body["trust"], "verified");
+    assert_eq!(body["pack_id"], "pack:auth");
+    assert_eq!(body["ledger_ref"]["seq"].as_u64().unwrap(), 24);
+    assert_eq!(
+        body["verified_checks"],
+        json!(["pack_id", "ledger_ref", "vault_fingerprint", "member_hash"])
+    );
+
+    // 2. Tampered claim (member_hash forged): fail closed, naming the failing check.
+    let mut tampered = served.clone();
+    tampered.member_hash = "members-forged".to_string();
+    let mut bad_args = serde_json::Map::new();
+    bad_args.insert("manifest".to_string(), pack_manifest_json(&tampered));
+    let bad_result = handle_inter_agent_trust("demo", &store, &bad_args).unwrap();
+    assert!(
+        tool_result_is_error(&bad_result).unwrap(),
+        "tampered claim refused: {bad_result}"
+    );
+    let bad_text = serde_json::from_str::<Value>(&bad_result).unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        bad_text.contains(astrolabe_provenance::ASTRO_PROVENANCE_MANIFEST_TAMPERED),
+        "coded tamper refusal: {bad_text}"
+    );
+    assert!(
+        bad_text.contains("member_hash"),
+        "refusal names the failing check: {bad_text}"
+    );
+
+    // 3. Attestation-artifact form: the serving agent's self-describing artifact
+    //    parses, self-checks, and verifies to the same report.
+    let attestation = String::from_utf8(astrolabe_provenance::pack_manifest_attestation_bytes(
+        &served,
+    ))
+    .unwrap();
+    let mut att_args = serde_json::Map::new();
+    att_args.insert(
+        "attestation".to_string(),
+        Value::String(attestation.clone()),
+    );
+    let att_result = handle_inter_agent_trust("demo", &store, &att_args).unwrap();
+    assert!(
+        !tool_result_is_error(&att_result).unwrap(),
+        "attestation artifact verifies: {att_result}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&att_result).unwrap()["structuredContent"]["trust"],
+        "verified"
+    );
+
+    // 4. Self-inconsistent attestation (member_hash mutated, digest unchanged):
+    //    fail closed as attestation-corrupt before it is trusted as a claim.
+    let corrupt = attestation.replace("members-auth", "members-xxxx");
+    let mut corrupt_args = serde_json::Map::new();
+    corrupt_args.insert("attestation".to_string(), Value::String(corrupt));
+    let corrupt_result = handle_inter_agent_trust("demo", &store, &corrupt_args).unwrap();
+    assert!(
+        tool_result_is_error(&corrupt_result).unwrap(),
+        "corrupt attestation refused: {corrupt_result}"
+    );
+    let corrupt_text =
+        serde_json::from_str::<Value>(&corrupt_result).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(
+        corrupt_text.contains(astrolabe_provenance::ASTRO_PROVENANCE_ATTESTATION_CORRUPT),
+        "coded attestation-corrupt refusal: {corrupt_text}"
+    );
+
+    // 5. Neither manifest nor attestation supplied: fail closed asking for the claim.
+    let missing_result = handle_inter_agent_trust("demo", &store, &serde_json::Map::new()).unwrap();
+    assert!(
+        tool_result_is_error(&missing_result).unwrap(),
+        "missing claim refused: {missing_result}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn get_provenance_lineage_dual_path_server_and_crate_agree_from_persisted_ledger() {
     // #284 dual-path FSV: `get_provenance(mode="lineage")` for a ledger subject key
     // must be served from the *real persisted ledger*, not row-sink symbol
