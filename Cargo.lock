@@ -176,7 +176,16 @@ dependencies = [
 name = "astrolabe-oracle"
 version = "0.1.0"
 dependencies = [
+ "astrolabe-anchors",
  "astrolabe-domain",
+ "astrolabe-ingest",
+ "blake3",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
