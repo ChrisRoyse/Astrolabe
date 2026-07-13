@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calibration;
+pub mod check;
 pub mod profile;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

@@ -5150,6 +5150,244 @@ fn guard_calibrate_refuses_invalid_domain() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// --- guard_check (P7.3, #47) -------------------------------------------------
+
+const GUARD_CHECK_TARGET: &str = "0123456789abcdef0123456789abcdef";
+
+/// A candidate/exemplar body: every fixed guard slot carries `vector`.
+fn guard_check_symbol_body(vector: &[f64]) -> Value {
+    let slots: Vec<Value> = [
+        "code_semantic",
+        "struct_trigrams",
+        "api_callees",
+        "name_semantic",
+        "complexity_profile",
+        "error_surface",
+        "public_api_signature",
+    ]
+    .iter()
+    .map(|slot| json!({"slot": slot, "vector": vector}))
+    .collect();
+    json!({"slots": slots})
+}
+
+fn guard_check_structured(dir: &Path, args: &Value) -> Value {
+    let raw = guard_check_at(dir, "demo", args.as_object().unwrap()).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+/// Calibrate a profile so guard_check has a persisted tau set to consult.
+fn setup_guard_check_calibrated(dir: &Path, salt: &str) {
+    setup_guard_calibrate_shadow(dir, salt);
+    let args = json!({
+        "project": "demo",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "slots": guard_calibrate_slots_json(),
+    });
+    let envelope = guard_calibrate_structured(dir, &args);
+    assert_eq!(envelope["isError"], false, "calibrate must succeed: {envelope}");
+}
+
+#[test]
+fn guard_check_accepts_conforming_candidate_and_ledgers_verdict() {
+    let dir = temp_dir("guard-check-accept");
+    setup_guard_check_calibrated(&dir, "guard-check-accept");
+
+    // Candidate identical to a kernel-near exemplar => cosine 1.0 on every slot
+    // => accept against the calibrated taus (all below 1.0).
+    let vector = vec![1.0, 2.0, 3.0, 4.0];
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": guard_check_symbol_body(&vector),
+        "exemplars": [
+            {"cx": "cx:kernel", "kernel_near": true, "slots": guard_check_symbol_body(&vector)["slots"].clone()},
+            {"cx": "cx:periph", "kernel_near": false, "slots": guard_check_symbol_body(&[9.0, 1.0, 1.0, 1.0])["slots"].clone()},
+        ],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["status"], "checked");
+    assert_eq!(result["verdict"], "accept", "{result}");
+    // Region resolution: kernel-near exemplar chosen over the peripheral one.
+    assert_eq!(result["region_class"], "kernel_near");
+    assert_eq!(result["nearest_exemplar"]["cx"], "cx:kernel");
+    let seq = result["ledger_ref"]["seq"].as_u64().expect("verdict seq");
+    assert_eq!(result["ledger_ref"]["kind"], "guard");
+    assert_eq!(result["slots"].as_array().unwrap().len(), 7);
+
+    // FSV: independently read the verdict ledger entry back; its per-slot detail
+    // (cos/tau/pass) must match the served response byte-for-byte.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)
+        .unwrap()
+        .expect("verdict ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Guard);
+    assert!(matches!(entry.subject, SubjectId::Cx(_)));
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload["schema"], "astro.guard.verdict.v1");
+    assert_eq!(payload["subject_cx"], GUARD_CHECK_TARGET);
+    assert_eq!(payload["verdict"], "accept");
+    let persisted_slots = payload["slots"].as_array().unwrap();
+    assert_eq!(persisted_slots.len(), 7);
+    for served in result["slots"].as_array().unwrap() {
+        let name = served["slot"].as_str().unwrap();
+        let persisted = persisted_slots.iter().find(|s| s["slot"] == name).unwrap();
+        assert_eq!(persisted["cos"], served["cos"], "cos mismatch on {name}");
+        assert_eq!(persisted["tau"], served["tau"], "tau mismatch on {name}");
+        assert_eq!(persisted["pass"], served["pass"], "pass mismatch on {name}");
+    }
+    // Determinism: the same request yields a byte-identical served verdict.
+    let repeat = guard_check_structured(&dir, &args);
+    assert_eq!(repeat["structuredContent"]["verdict"], "accept");
+    for (a, b) in result["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(repeat["structuredContent"]["slots"].as_array().unwrap())
+    {
+        assert_eq!(a["cos"], b["cos"]);
+        assert_eq!(a["tau"], b["tau"]);
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_refuses_alien_candidate_with_per_slot_breakdown() {
+    let dir = temp_dir("guard-check-refuse");
+    setup_guard_check_calibrated(&dir, "guard-check-refuse");
+
+    // Candidate orthogonal to the exemplar => cosine ~0 on every slot => below
+    // tau on the content + identity slots => refuse with the failing slots named.
+    let exemplar_vec = vec![1.0, 0.0, 0.0, 0.0];
+    let candidate_vec = vec![0.0, 0.0, 0.0, 1.0];
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": guard_check_symbol_body(&candidate_vec),
+        "exemplars": [
+            {"cx": "cx:kernel", "kernel_near": true, "slots": guard_check_symbol_body(&exemplar_vec)["slots"].clone()},
+        ],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["verdict"], "refuse", "{result}");
+    assert!(
+        result["remediation"].as_str().unwrap().to_lowercase().contains("refuse"),
+        "{result}"
+    );
+    // At least one content slot is below tau (pass=false) in the served breakdown.
+    let any_fail = result["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["pass"] == json!(false));
+    assert!(any_fail, "refuse must name a failing slot: {result}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_refuses_when_uncalibrated() {
+    let dir = temp_dir("guard-check-uncalibrated");
+    // Shadow indexed but NEVER calibrated => no persisted profile.
+    setup_guard_calibrate_shadow(&dir, "guard-check-uncalibrated");
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": guard_check_symbol_body(&[1.0, 2.0, 3.0]),
+        "exemplars": [{"cx": "cx:k", "kernel_near": true, "slots": guard_check_symbol_body(&[1.0, 2.0, 3.0])["slots"].clone()}],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ASTRO_GUARD_CHECK_UNCALIBRATED"), "{text}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_refuses_empty_region_and_invalid_target() {
+    let dir = temp_dir("guard-check-edge");
+    setup_guard_check_calibrated(&dir, "guard-check-edge");
+
+    // Edge 1: empty exemplars => no comparison region => fail closed.
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": guard_check_symbol_body(&[1.0, 2.0, 3.0]),
+        "exemplars": [],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_CHECK_NO_REGION"),
+        "{envelope}"
+    );
+
+    // Edge 2: an unparseable target CxId => fail closed.
+    let args = json!({
+        "project": "demo",
+        "target": "not-a-cxid",
+        "candidate": guard_check_symbol_body(&[1.0, 2.0, 3.0]),
+        "exemplars": [{"cx": "cx:k", "kernel_near": true, "slots": guard_check_symbol_body(&[1.0, 2.0, 3.0])["slots"].clone()}],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_CHECK_INVALID"),
+        "{envelope}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_new_region_records_awaiting_grounding() {
+    let dir = temp_dir("guard-check-new-region");
+    setup_guard_check_calibrated(&dir, "guard-check-new-region");
+
+    // One content slot orthogonal to the exemplar (cos ~0 < tau), the rest
+    // identical (cos 1.0). With KofN k=n-1 that single content miss routes to
+    // new_region, and identity/stylistic slots pass.
+    let base = vec![1.0, 2.0, 3.0, 4.0];
+    let orthogonal = vec![4.0, -3.0, 0.0, 0.0]; // dot with base = 4-6 = -2 (low/neg cos)
+    let candidate_slots = json!([
+        {"slot": "code_semantic", "vector": orthogonal},
+        {"slot": "struct_trigrams", "vector": base},
+        {"slot": "api_callees", "vector": base},
+        {"slot": "name_semantic", "vector": base},
+        {"slot": "complexity_profile", "vector": base},
+        {"slot": "error_surface", "vector": base},
+        {"slot": "public_api_signature", "vector": base},
+    ]);
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": {"slots": candidate_slots},
+        "exemplars": [
+            {"cx": "cx:kernel", "kernel_near": true, "slots": guard_check_symbol_body(&base)["slots"].clone()},
+        ],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["verdict"], "new_region", "{result}");
+    // The new-region lifecycle record is persisted AwaitingGrounding and surfaced.
+    assert_eq!(result["new_region"]["state"], "awaiting_grounding");
+    let seq = result["ledger_ref"]["seq"].as_u64().unwrap();
+    assert_eq!(result["new_region"]["verdict_ledger_seq"].as_u64().unwrap(), seq);
+
+    // FSV: the persisted new-region config row reads back AwaitingGrounding.
+    let key = metadata_key("demo", &format!("guard_new_region:{GUARD_CHECK_TARGET}"));
+    let raw = read_config_value(&dir, &key).unwrap().expect("new-region row persisted");
+    let persisted: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(persisted["schema"], "astro.guard.new_region.v1");
+    assert_eq!(persisted["state"], "awaiting_grounding");
+    assert_eq!(persisted["subject_cx"], GUARD_CHECK_TARGET);
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn optimizer_status_reads_measured_tripwires_from_config() {
     let dir = temp_dir("optimizer-tripwires-readback");
@@ -5664,8 +5902,13 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
         ),
         (
             "guard_calibrate",
-            json!({"project": project}),
+            json!({"project": project.clone()}),
             "guard_calibrate requires calyx shadow indexing",
+        ),
+        (
+            "guard_check",
+            json!({"project": project}),
+            "guard_check requires calyx shadow indexing",
         ),
     ];
     let advertised = astrolabe_tool_definitions()
