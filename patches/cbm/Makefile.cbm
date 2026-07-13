@@ -74,10 +74,17 @@ ifeq ($(filter gcc clang,$(CC_FAMILY)),)
 $(error [#274] Makefile.cbm could not classify the compiler family for CC="$(CC)" (probe result: '$(CC_FAMILY)'). `echo | $(CC_FOR_SHELL) -dM -E -` must define __GNUC__ (GCC) or __clang__ (Clang) so the GCC-only -Wno-* suppression set is chosen deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap`. Refusing to guess a warning-suppression state.)
 endif
 IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)
+# #179: -Wno-alloc-size-larger-than retired. The two sites that tripped GCC 14's
+# -Walloc-size-larger-than under -Werror (src/pipeline/pass_definitions.c and
+# src/ui/layout3d.c) now carry UNCONDITIONAL fail-closed count clamps (previously
+# gated behind ASTRO_UI_WERROR under #229). The clamps narrow each allocation's
+# value range below the diagnostic threshold in EVERY artifact — libcbm.a and the
+# test-runner, not just the ASTRO_UI_WERROR prod binaries — so the suppression is
+# no longer needed and the genuine -Werror contract is restored across the board.
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
-                  -Wno-stringop-truncation -Wno-alloc-size-larger-than
+                  -Wno-stringop-truncation
 endif
 
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
@@ -384,9 +391,12 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 #   test-runner       : none — the vendored behavior, unpatched
 # The production binaries compile the owned sources directly (no path
 # substitution); the flags below turn on the two features that historically
-# reached them. #229 (-Werror root-cause fixes: src/ui/layout3d.c and
-# src/pipeline/pass_definitions.c unchecked allocation-size guards) and #282
-# (worker-failure diagnostics, live parity with the astrolabe/libcbm side).
+# reached them. ASTRO_UI_WERROR now gates only #229's -Wstringop-truncation
+# root-cause fixes (src/pipeline/pass_envscan.c, src/watcher/watcher.c); #179
+# made #229's allocation-size guards (src/ui/layout3d.c,
+# src/pipeline/pass_definitions.c) UNCONDITIONAL so -Wno-alloc-size-larger-than
+# could be retired from every artifact, not just these prod binaries. #282 adds
+# worker-failure diagnostics (live parity with the astrolabe/libcbm side).
 ASTRO_PROD_DEFS = -DASTRO_UI_WERROR -DASTRO_WORKER_DIAG
 
 # ── Test sources ─────────────────────────────────────────────────

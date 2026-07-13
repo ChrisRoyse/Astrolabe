@@ -34,7 +34,8 @@ flags per artifact:
 | shell-arg validator (#228)         | `ASTRO_SHELLARG`     |    ✓     |          —          |      —      |
 | pressure-log buffers (#149)        | `ASTRO_MEM_PRESSURE` |    ✓     |          —          |      —      |
 | worker-failure diagnostics (#282)  | `ASTRO_WORKER_DIAG`  |    ✓     |          ✓          |      —      |
-| `-Werror` root-cause fixes (#229)  | `ASTRO_UI_WERROR`    |    —     |          ✓          |      —      |
+| `-Werror` stringop fixes (#229)    | `ASTRO_UI_WERROR`    |    —     |          ✓          |      —      |
+| `-Werror` alloc-size fixes (#229/#179) | unconditional    |    ✓     |          ✓          |      ✓      |
 
 - `libcbm` defines the first five via `LIBCBM_ASTRO_DEFS` (in `LIBCBM_CFLAGS`).
 - the production binaries define `ASTRO_PROD_DEFS` (`ASTRO_UI_WERROR` +

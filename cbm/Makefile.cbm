@@ -37,10 +37,15 @@ TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
 IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+# #179: -Wno-alloc-size-larger-than retired. The two sites that tripped GCC 14's
+# -Walloc-size-larger-than under -Werror (src/pipeline/pass_definitions.c and
+# src/ui/layout3d.c) now carry unconditional fail-closed count clamps that narrow
+# the allocation-size value range below the diagnostic threshold, so the
+# suppression is no longer needed and the real -Werror contract is restored.
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
-                  -Wno-stringop-truncation -Wno-alloc-size-larger-than
+                  -Wno-stringop-truncation
 endif
 
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
