@@ -10,6 +10,17 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
+#ifdef ASTRO_ENV_STORE
+/* #252: the in-process FFI store override (cbm_astro_set_cache_dir) that
+ * cbm_resolve_cache_dir() consults is process-local — it is NOT inherited across
+ * the boundary to a spawned index worker, which resolves its own store fresh. We
+ * propagate the configured store to the child through the #240-sanctioned
+ * CBM_CACHE_DIR env channel. Only compiled into libcbm (where ASTRO_ENV_STORE is
+ * defined and -I$(ASTROLABE_PATCH_DIR) is on the include path); the CRT test build
+ * does not define ASTRO_ENV_STORE, exactly like platform.c's guarded include. */
+#include "env_store_config.h" /* cbm_astro_cache_dir_override, cbm_astro_env_record_fault */
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -226,6 +237,51 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     argv[n++] = resp_path;
     argv[n] = NULL;
 
+#ifdef ASTRO_ENV_STORE
+    /* #252: propagate the configured FFI store override to the worker's inherited
+     * environment. The override is process-local (cbm_astro_cache_dir_override);
+     * the child resolves its own store and would otherwise fall through to
+     * CBM_CACHE_DIR/$HOME — leaking its DB/scratch into $HOME/.cache when the host
+     * has redirected the store. Cross the boundary through CBM_CACHE_DIR: the child
+     * has no in-process override, so that env value wins over $HOME for it, while
+     * the parent's own resolution consults the higher-precedence in-process
+     * override and is unperturbed by this transient parent-env write (spawns are
+     * sequential). When no override is configured (production default today) this
+     * sets nothing and the child's store resolution is byte-identical to before.
+     * NEVER a global/persistent CBM_CACHE_DIR: any prior value is captured and
+     * restored below, scoped strictly to this one spawn. */
+    bool store_propagated = false;
+    bool had_prior_cache_dir = false;
+    char prior_cache_dir[1024] = {0};
+    const char *store_override = cbm_astro_cache_dir_override();
+    if (store_override) {
+        char probe[1024] = {0};
+        /* Copy any pre-existing CBM_CACHE_DIR immediately: _putenv_s/setenv below
+         * may invalidate the pointer getenv would return. */
+        const char *prior = cbm_safe_getenv("CBM_CACHE_DIR", probe, sizeof(probe), NULL);
+        if (prior && prior[0]) {
+            snprintf(prior_cache_dir, sizeof(prior_cache_dir), "%s", prior);
+            had_prior_cache_dir = true;
+        }
+        if (cbm_setenv("CBM_CACHE_DIR", store_override, 1) != 0) {
+            /* Fail closed: do not spawn a worker that would resolve a DIFFERENT
+             * store than the one the host configured. Degrade in-process (the
+             * in-process path honors the override correctly). */
+            cbm_astro_env_record_fault(
+                "CBM_E_WORKER_STORE_PROPAGATION", "CBM_CACHE_DIR",
+                "failed to propagate the configured CBM store override to the index-worker "
+                "subprocess environment; refusing to spawn a worker that would resolve a "
+                "different store (its DB/scratch would leak into the default $HOME/.cache)",
+                "Ensure the process environment is writable (setenv/_putenv_s must succeed), "
+                "or index in-process without a spawned worker; the in-process path honors the "
+                "cbm_astro_set_cache_dir override directly.");
+            cbm_log_warn("index.supervisor.store_propagation_failed", "action", "degrade_in_process");
+            return -1;
+        }
+        store_propagated = true;
+    }
+#endif
+
     /* Recovery-run probe knobs → inherited env for the child. Spawns are
      * sequential, so mutating the parent's environment around a single spawn is
      * safe. Set only the requested knobs; unset them all again after reaping so
@@ -262,6 +318,18 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     if (quarantine_file && quarantine_file[0]) {
         cbm_unsetenv("CBM_INDEX_QUARANTINE_FILE");
     }
+#ifdef ASTRO_ENV_STORE
+    /* #252: restore the parent's CBM_CACHE_DIR exactly as found — the propagation
+     * above is scoped strictly to this one spawn window (never a persistent global
+     * mutation). */
+    if (store_propagated) {
+        if (had_prior_cache_dir) {
+            cbm_setenv("CBM_CACHE_DIR", prior_cache_dir, 1);
+        } else {
+            cbm_unsetenv("CBM_CACHE_DIR");
+        }
+    }
+#endif
 
     if (run_rc != 0) {
         (void)remove(resp_path);
