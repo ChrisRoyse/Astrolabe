@@ -39,8 +39,34 @@ TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 CC_FOR_SHELL := $(subst \,/,$(CC))
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
-# Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
-IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+#
+# #274: deterministic, fail-closed compiler-family detection. The former probe
+#   IS_GCC := $(shell ... grep __GNUC__ && ! ... grep __clang__ && echo yes || echo no)
+# ran the compiler TWICE and folded EVERY failure — including a compiler that
+# could not be invoked at all (PATH miss, Windows path mangling, transient spawn
+# failure) — into a plain "no" via the trailing `|| echo no`. "no" then silently
+# drops the -Wno-stringop-truncation / -Wno-alloc-size-larger-than suppressions,
+# so an invocation that merely failed to run the probe compiles the SAME sources
+# under a DIFFERENT -Werror contract than one that ran it: a per-invocation flip
+# of the build contract (observed as cbm vs cbm-with-ui diverging under #229).
+#
+# Deterministic replacement: run the compiler ONCE, capture its predefined-macro
+# dump, and classify into exactly one family. Clang => IS_GCC=no is a real answer
+# (Clang genuinely rejects unknown -Wno-*). A probe that cannot run the compiler
+# ("probe-failed"), or a compiler that is neither GCC nor Clang ("other"), is a
+# HARD ERROR with remediation — never a silent suppression flip. Given the same
+# environment the macro dump is identical, so CC_FAMILY (and thus IS_GCC) is a
+# pure function of CC: the same across the cbm, cbm-with-ui, and libcbm goals,
+# which all read this single parse-time assignment.
+CC_FAMILY := $(shell dump="$$(echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)"; \
+	if [ -z "$$dump" ]; then echo probe-failed; \
+	elif printf '%s\n' "$$dump" | grep -q '__clang__'; then echo clang; \
+	elif printf '%s\n' "$$dump" | grep -q '__GNUC__'; then echo gcc; \
+	else echo other; fi)
+ifeq ($(filter gcc clang,$(CC_FAMILY)),)
+$(error [#274] Makefile.cbm could not classify the compiler family for CC="$(CC)" (probe result: '$(CC_FAMILY)'). `echo | $(CC_FOR_SHELL) -dM -E -` must define __GNUC__ (GCC) or __clang__ (Clang) so the GCC-only -Wno-* suppression set is chosen deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Bootstrap`. Refusing to guess a warning-suppression state.)
+endif
+IS_GCC := $(if $(filter gcc,$(CC_FAMILY)),yes,no)
 GCC_ONLY_FLAGS :=
 ifeq ($(IS_GCC),yes)
 GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
@@ -521,10 +547,18 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan libcbm cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-cppcheck-astrolabe lint-format security
+.PHONY: test test-repro test-foundation test-tsan libcbm cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-cppcheck-astrolabe lint-format security astro-cc-family-probe
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+# #274 regression probe: prints the classified compiler family and the derived
+# IS_GCC without compiling anything. A determinism check invokes this repeatedly
+# (and with each build goal) to assert the values are identical across
+# invocations and across the cbm / cbm-with-ui / libcbm build contexts, which all
+# consume the single parse-time IS_GCC assignment above.
+astro-cc-family-probe:
+	@echo "CC_FAMILY=$(CC_FAMILY) IS_GCC=$(IS_GCC)"
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 

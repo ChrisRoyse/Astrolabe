@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+astrolabe-kernel.workspace = true
 astrolabe-panel.workspace = true
 calyx-aster.workspace = true
 calyx-core.workspace = true

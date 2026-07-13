@@ -504,7 +504,7 @@ pub struct SearchError {
 }
 
 impl SearchError {
-    fn new(code: &'static str, message: String, remediation: &'static str) -> Self {
+    pub(crate) fn new(code: &'static str, message: String, remediation: &'static str) -> Self {
         Self {
             code,
             message,
