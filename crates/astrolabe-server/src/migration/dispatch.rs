@@ -251,6 +251,9 @@ pub(crate) fn handle_index_repository(
         Err(error) => return tool_error_result(format!("shadow import failed: {error}")),
     };
     persist_shadow_outcome(&project, &outcome)?;
+    // #244: record the exact CBM index args so a later runner-driven refresh can
+    // replay the pipeline and reconcile genuine staleness with real surfaces.
+    persist_shadow_index_args(&cache_dir, &project, &sanitized_args)?;
     augment_tool_result(
         &result,
         json!({
@@ -282,7 +285,11 @@ pub(crate) fn handle_index_status(
     if tool_result_is_error(&result)? {
         return Ok(result);
     }
-    let refresh_status = match ensure_shadow_import_current(&project) {
+    // #244: reconcile with the runner so genuine staleness is *repaired* (real
+    // row-sink-derived surfaces regenerated from current source) rather than merely
+    // refused. The #222 guard remains the fail-closed floor inside this call when
+    // reconciliation cannot run.
+    let refresh_status = match reconcile_shadow_import_current(runner, &project) {
         Ok(status) => status,
         Err(error) => {
             return tool_error_result(format!("shadow import recovery failed: {error}"));

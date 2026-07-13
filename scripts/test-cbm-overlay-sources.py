@@ -141,6 +141,7 @@ guarded(
 
 # ── #229 production-binary -Werror root-cause fixes (production binaries only) ─
 guarded("src/ui/layout3d.c", "ASTRO_UI_WERROR", "CBM_E_LAYOUT_NODE_COUNT_RANGE")
+guarded("src/pipeline/pass_definitions.c", "ASTRO_UI_WERROR", "CBM_E_DEFS_FILE_COUNT_RANGE")
 
 # ── Makefile flag wiring: the per-artifact behavior matrix ─────────────────────
 if not MAKEFILE.is_file():

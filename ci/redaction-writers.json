@@ -112,6 +112,13 @@
       "method": "append_ledger_entry",
       "payload_contract": "reactive ack payload carries tag, fixed ack action, subscription id, acknowledged count, and compact acknowledged event refs only; no source text or symbol payloads",
       "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::ledger_verify::tests::redaction_refuses_secret_payload_before_append_or_batch_commit verifies the append API rejects secret-shaped payload bytes before ledger rows land; astrolabe-weave::tests::durable_ack_persists_and_recovery_drains_pending_subscription_after_reopen exercises the reactive ack ledger payload and recovery"
+    },
+    {
+      "file": "crates/astrolabe-ingest/src/janitor.rs",
+      "function": "run_janitor_scrub_step",
+      "method": "write_cf_batch_with_ledger_entry",
+      "payload_contract": "janitor scrub group commit (Measure); payload carries schema tag astrolabe-fsv-janitor-scrub (counts and sequence bounds only: status, slice_start, slice_end, entries_verified, verified_through, caught_up) plus the persisted JanitorCheckpoint row; never any verified-entry payload bytes, so a scrub record cannot re-embed a secret from the entries it verified; RedactionPolicy::check_payload enforced by the Calyx writer before commit",
+      "coverage": "scripts/check-redaction-writers.py enumerates this call site; astrolabe-ingest::janitor::tests::scrub_persists_checkpoint_and_ledgers_measure_entry byte-verifies the persisted checkpoint row and its paired Measure ledger entry; startup_verify_fails_closed_on_tampered_ledger_at_exact_seq proves the tamper-negative path"
     }
   ]
 }

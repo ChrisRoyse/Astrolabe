@@ -162,6 +162,56 @@ pub fn erasure_scrub_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ERASURE_SCRUB_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the streaming CBM row-sink ingest knobs (#59).
+pub const ROW_SINK_STREAM_KNOB_REGISTRY_VERSION: &str = "astrolabe-row-sink-stream-knobs-v1";
+
+/// Name of the streaming row-sink drain-batch knob.
+pub const ROW_SINK_STREAM_DRAIN_BATCH_ROWS_KNOB: &str = "row_sink_stream_drain_batch_rows";
+
+/// Default number of CBM row-sink rows drained and structurally validated per
+/// streaming batch before they are staged for the single ledger-paired write.
+///
+/// Seeded to mirror RocksDB/TiKV micro-batch write guidance (batch incoming
+/// updates into ~100 KB micro-batches of sorted keys rather than one row at a
+/// time). At the typical CBM node/edge JSON row size (a few hundred bytes to
+/// ~1 KB) 1024 rows lands in that ~100 KB-per-batch window, which is also the
+/// bounded-channel backpressure staging unit between the producing row-sink and
+/// the validating consumer.
+pub const ROW_SINK_STREAM_DEFAULT_DRAIN_BATCH_ROWS: u64 = 1_024;
+/// Smallest legal drain batch: a batch must admit at least one row so the drain
+/// loop makes forward progress toward a fully validated stream.
+pub const ROW_SINK_STREAM_MIN_DRAIN_BATCH_ROWS: u64 = 1;
+/// Largest legal drain batch. An upper bound keeps the drain a bounded staging
+/// unit even on a pathologically large stream so the bounded-channel
+/// backpressure window cannot grow without limit; the drain still loops until the
+/// whole stream is validated, so this caps the burst window, never completeness.
+pub const ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS: u64 = 1_048_576;
+
+/// The streaming CBM row-sink ingest knob registry (#59).
+///
+/// The default follows the RocksDB bulk-load posture (larger batches amortize
+/// per-record overhead and cut write amplification) tempered by the
+/// bounded-channel backpressure posture (too small a buffer applies backpressure
+/// too early, too large a buffer wastes memory). The drain batch bounds only the
+/// streaming validation/backpressure window; persistence is always one
+/// ledger-paired write per import, so this knob never changes what is durably
+/// written, only the size of the transient validation staging burst.
+pub const ROW_SINK_STREAM_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: ROW_SINK_STREAM_KNOB_REGISTRY_VERSION,
+    name: ROW_SINK_STREAM_DRAIN_BATCH_ROWS_KNOB,
+    default: ROW_SINK_STREAM_DEFAULT_DRAIN_BATCH_ROWS,
+    min: ROW_SINK_STREAM_MIN_DRAIN_BATCH_ROWS,
+    max: ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS,
+    unit: "rows",
+    source: "https://github.com/facebook/rocksdb/wiki/Basic-Operations (batch updates in a WriteBatch with consecutive sorted keys for higher write throughput), https://medium.com/@siddontang/how-we-optimize-rocksdb-in-tikv-write-batch-optimization-28751a4bdd8b (micro-batch incoming updates before writing), and bounded-channel backpressure guidance (size the ingest buffer for the expected burst; too small backpressures too early, too large wastes memory)",
+    rationale: "bounds the CBM row-sink rows one streaming batch drains and validates before staging, so a large index stream backpressures the producer in bounded windows instead of buffering unboundedly; the drain loops batches until the whole stream is validated and persistence remains one ledger-paired write, so this seed caps the backpressure burst, not correctness; replace with a measured ingest throughput/latency budget once streaming ingest is benchmarked",
+}];
+
+/// Returns the row-sink-stream declaration for `name`, or `None` when undeclared.
+pub fn row_sink_stream_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ROW_SINK_STREAM_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,11 +254,38 @@ mod tests {
     }
 
     #[test]
+    fn every_row_sink_stream_knob_declares_bounds_that_contain_its_default() {
+        assert!(!ROW_SINK_STREAM_KNOBS.is_empty());
+        for knob in ROW_SINK_STREAM_KNOBS {
+            assert_eq!(
+                knob.registry_version, ROW_SINK_STREAM_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+    }
+
+    #[test]
     fn erasure_scrub_batch_zero_is_not_a_legal_knob_value() {
         let knob =
             erasure_scrub_knob(ERASURE_SCRUB_SEGMENTS_PER_FSYNC_BATCH_KNOB).expect("declared");
         assert!(!knob.accepts(0));
         assert!(knob.accepts(ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH));
         assert_eq!(knob.default, ERASURE_SCRUB_DEFAULT_SEGMENTS_PER_FSYNC_BATCH);
+    }
+
+    #[test]
+    fn row_sink_stream_batch_zero_is_not_a_legal_knob_value() {
+        let knob = row_sink_stream_knob(ROW_SINK_STREAM_DRAIN_BATCH_ROWS_KNOB).expect("declared");
+        assert!(!knob.accepts(0));
+        assert!(knob.accepts(ROW_SINK_STREAM_DEFAULT_DRAIN_BATCH_ROWS));
+        assert!(knob.accepts(ROW_SINK_STREAM_MIN_DRAIN_BATCH_ROWS));
+        assert!(knob.accepts(ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS));
+        assert!(!knob.accepts(ROW_SINK_STREAM_MAX_DRAIN_BATCH_ROWS + 1));
+        assert_eq!(knob.default, ROW_SINK_STREAM_DEFAULT_DRAIN_BATCH_ROWS);
     }
 }
