@@ -846,9 +846,12 @@ pub fn combine_verdicts(
 /// The server tool appends this (subject = `SubjectId::Guard`) so every
 /// calibration is auditably paired with its ledger entry (blueprint §5, R16).
 ///
+/// The entry's own ledger seq is not embedded — the ledger position *is* the
+/// seq, and the config projection (`last_calibrated_ledger_seq`) references it.
+///
 /// Returned as canonical UTF-8 JSON bytes so the server can both hash it and
 /// read it back byte-for-byte in the FSV.
-pub fn calibration_meta_payload_bytes(profile: &GuardProfile, ledger_seq: u64) -> Vec<u8> {
+pub fn calibration_meta_payload_bytes(profile: &GuardProfile) -> Vec<u8> {
     // Hand-built canonical JSON (stable key order, no float locale surprises):
     // the server re-parses and re-hashes it, so byte stability matters.
     let mut out = String::new();
@@ -858,7 +861,6 @@ pub fn calibration_meta_payload_bytes(profile: &GuardProfile, ledger_seq: u64) -
     out.push_str(&format!("\"domain\":\"{}\",", profile.domain.label()));
     out.push_str(&format!("\"profile_hash\":\"{}\",", profile.profile_hash_hex()));
     out.push_str(&format!("\"corpus_hash\":\"{}\",", profile.corpus_hash_hex()));
-    out.push_str(&format!("\"ledger_seq\":{ledger_seq},"));
     out.push_str("\"slots\":[");
     let mut ordered: Vec<&SlotCalibration> = profile.slots.iter().collect();
     ordered.sort_by_key(|calibration| calibration.slot.ordinal());
@@ -1227,15 +1229,15 @@ mod tests {
             .expect("calibrates");
         }
         profile.provisional = false;
-        let bytes = calibration_meta_payload_bytes(&profile, 42);
+        let bytes = calibration_meta_payload_bytes(&profile);
         let text = std::str::from_utf8(&bytes).expect("utf-8");
         let value: serde_json::Value = serde_json::from_str(text).expect("valid JSON payload");
         assert_eq!(value["schema"], GUARD_PROFILE_SCHEMA);
         assert_eq!(value["knob_registry"], GUARD_PROFILE_KNOB_REGISTRY_VERSION);
-        assert_eq!(value["ledger_seq"], 42);
+        assert_eq!(value["profile_hash"], profile.profile_hash_hex());
         assert_eq!(value["slots"].as_array().unwrap().len(), GuardSlot::ALL.len());
-        // Determinism: same profile + seq => byte-identical payload.
-        assert_eq!(calibration_meta_payload_bytes(&profile, 42), bytes);
+        // Determinism: same profile => byte-identical payload.
+        assert_eq!(calibration_meta_payload_bytes(&profile), bytes);
         // Provenance schema: each slot carries slot/kind/tau/far/frr/drift.
         for slot in value["slots"].as_array().unwrap() {
             assert!(slot["slot"].is_string());

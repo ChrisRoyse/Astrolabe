@@ -3922,6 +3922,194 @@ fn optimizer_status_reads_measured_guard_health_profile_from_config() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// --- guard_calibrate (P7.2, #46) ---------------------------------------------
+
+fn guard_calibrate_slots_json() -> Value {
+    // Separated populations: good ~0.85-0.94, bad ~0.10-0.49. Every slot
+    // (including identity FAR 0.01) calibrates to a tau in between with FAR 0.
+    let good: Vec<f64> = (0..60).map(|i| 0.85 + (i % 10) as f64 * 0.01).collect();
+    let bad: Vec<f64> = (0..80).map(|i| 0.10 + (i % 40) as f64 * 0.01).collect();
+    let slots: Vec<Value> = [
+        "code_semantic",
+        "struct_trigrams",
+        "api_callees",
+        "name_semantic",
+        "complexity_profile",
+        "error_surface",
+        "public_api_signature",
+    ]
+    .iter()
+    .map(|slot| json!({"slot": slot, "good_scores": good, "bad_scores": bad}))
+    .collect();
+    json!(slots)
+}
+
+fn setup_guard_calibrate_shadow(dir: &Path, salt: &str) {
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        salt.as_bytes().to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    drop(vault);
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let mut outcome = sample_shadow_outcome(dir, security);
+    outcome.vault_dir = vault_dir;
+    outcome.vault_salt = salt.to_string();
+    persist_shadow_outcome_at(dir, "demo", &outcome).unwrap();
+    persist_dial_at(dir, "demo", MigrationDial::Shadow).unwrap();
+}
+
+fn guard_calibrate_structured(dir: &Path, args: &Value) -> Value {
+    let raw = guard_calibrate_at(dir, "demo", args.as_object().unwrap()).unwrap();
+    let envelope: Value = serde_json::from_str(&raw).unwrap();
+    envelope
+}
+
+#[test]
+fn guard_calibrate_calibrates_ledgers_and_persists_measured_profile() {
+    let dir = temp_dir("guard-calibrate-valid");
+    setup_guard_calibrate_shadow(&dir, "guard-calibrate-valid");
+
+    let args = json!({
+        "project": "demo",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "slots": guard_calibrate_slots_json(),
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["status"], "calibrated");
+    assert_eq!(result["domain"], "rust/core");
+    let seq = result["ledger_ref"]["seq"].as_u64().expect("ledger seq");
+    assert_eq!(result["ledger_ref"]["kind"], "guard");
+    let slots = result["slots"].as_array().unwrap();
+    assert_eq!(slots.len(), 7);
+    // Identity slot carries the strict 0.01 target and an achieved FAR of 0 on
+    // the cleanly separated populations.
+    let identity = slots
+        .iter()
+        .find(|slot| slot["slot"] == "public_api_signature")
+        .unwrap();
+    assert_eq!(identity["target_far"], 0.01);
+    assert_eq!(identity["achieved_far"], 0.0);
+    assert!(!identity["provisional"].as_bool().unwrap());
+
+    // FSV #1: the persisted config row (bytes on disk) validates as MEASURED
+    // guard health through the independent optimizer_status validator.
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    let guard = &status["guard_health"];
+    assert_eq!(guard["status"], "measured");
+    assert_eq!(guard["slot_count"], 7);
+    for slot in guard["slots"].as_array().unwrap() {
+        assert_eq!(slot["last_calibrated_ledger_seq"].as_u64().unwrap(), seq);
+        assert!(slot["far"].is_number());
+        assert!(slot["frr"].is_number());
+        assert!(slot["drift"].is_number());
+        assert_eq!(slot["trust"], "verified");
+        assert!(
+            slot["provenance"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("guard_calibrate:rust/core:")
+        );
+    }
+
+    // FSV #2: independently read the ledger entry at `seq` back from the vault
+    // and confirm it is the paired Guard calibration entry.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)
+        .unwrap()
+        .expect("guard calibration ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Guard);
+    assert!(matches!(entry.subject, SubjectId::Guard(_)));
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload["schema"], "astro.guard.profile.v1");
+    assert_eq!(payload["profile_hash"], result["profile_hash"]);
+    assert_eq!(payload["slots"].as_array().unwrap().len(), 7);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_calibrate_refuses_missing_slot() {
+    let dir = temp_dir("guard-calibrate-missing-slot");
+    setup_guard_calibrate_shadow(&dir, "guard-calibrate-missing-slot");
+
+    // Drop the identity slot from an otherwise-complete request.
+    let mut slots = guard_calibrate_slots_json();
+    let array = slots.as_array_mut().unwrap();
+    array.retain(|slot| slot["slot"] != "public_api_signature");
+    let args = json!({
+        "project": "demo",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "slots": slots,
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ASTRO_GUARD_CALIBRATE_SLOT_MISSING"), "{text}");
+    assert!(text.contains("public_api_signature"), "{text}");
+
+    // FSV: nothing was persisted — no measured guard-health config row exists.
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    assert_eq!(status["guard_health"]["status"], "unavailable");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_calibrate_refuses_insufficient_corpus() {
+    let dir = temp_dir("guard-calibrate-insufficient");
+    setup_guard_calibrate_shadow(&dir, "guard-calibrate-insufficient");
+
+    // A single bad score cannot be split into calibration + validation halves.
+    let thin_slots: Vec<Value> = [
+        "code_semantic",
+        "struct_trigrams",
+        "api_callees",
+        "name_semantic",
+        "complexity_profile",
+        "error_surface",
+        "public_api_signature",
+    ]
+    .iter()
+    .map(|slot| json!({"slot": slot, "good_scores": [0.9, 0.9], "bad_scores": [0.3]}))
+    .collect();
+    let args = json!({
+        "project": "demo",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "slots": json!(thin_slots),
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ASTRO_GUARD_SLOT_UNSPLITTABLE"), "{text}");
+
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    assert_eq!(status["guard_health"]["status"], "unavailable");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_calibrate_refuses_invalid_domain() {
+    let dir = temp_dir("guard-calibrate-invalid-domain");
+    setup_guard_calibrate_shadow(&dir, "guard-calibrate-invalid-domain");
+
+    let args = json!({
+        "project": "demo",
+        "domain": {"language": "cobol", "scope_class": "core"},
+        "slots": guard_calibrate_slots_json(),
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ASTRO_GUARD_CALIBRATE_INVALID"), "{text}");
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn optimizer_status_reads_measured_tripwires_from_config() {
     let dir = temp_dir("optimizer-tripwires-readback");
@@ -4431,8 +4619,13 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
         ),
         (
             "team_artifact",
-            json!({"mode": "export", "project": project}),
+            json!({"mode": "export", "project": project.clone()}),
             "team_artifact export requires calyx shadow indexing",
+        ),
+        (
+            "guard_calibrate",
+            json!({"project": project}),
+            "guard_calibrate requires calyx shadow indexing",
         ),
     ];
     let advertised = astrolabe_tool_definitions()
