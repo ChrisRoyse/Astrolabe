@@ -24,11 +24,11 @@ pub fn parent_roots() -> (&'static str, &'static str) {
 /// Byte capacity of a CBM store path.
 ///
 /// `cbm_resolve_cache_dir` and `cbm_get_home_dir`
-/// (`vendor/codebase-memory-mcp/src/foundation/platform.c`) publish their result
+/// (`cbm/src/foundation/platform.c`) publish their result
 /// from a `static char[CBM_SZ_1K]`, so a store path longer than this cannot be
 /// represented by the library at all. Astrolabe's store-resolution edits
 /// (`ASTRO_ENV_STORE`-guarded, in the owned
-/// `vendor/codebase-memory-mcp/src/foundation/platform.c`, #241) widen the
+/// `cbm/src/foundation/platform.c`, #241) widen the
 /// *environment* scratch buffers those resolvers used — a `char[CBM_SZ_256]`, an
 /// artificial cut with no relation to what the library can hold, and one that
 /// silently relocated the store for any Windows path over 255 bytes — up to the
@@ -3239,8 +3239,8 @@ mod tests {
     #[test]
     fn exposes_both_parent_roots() {
         let (calyx, cbm) = parent_roots();
-        assert!(calyx.ends_with("vendor/calyx"));
-        assert!(cbm.ends_with("vendor/codebase-memory-mcp"));
+        assert!(calyx.ends_with("/calyx"));
+        assert!(cbm.ends_with("/cbm"));
     }
 
     #[test]

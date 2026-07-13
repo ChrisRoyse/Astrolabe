@@ -14,7 +14,7 @@ use std::ptr;
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const CBM_VENDOR_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../vendor/codebase-memory-mcp"
+    "/../../cbm"
 );
 pub const VENDORED_MIMALLOC_VERSION: &str = env!("CBM_MIMALLOC_VERSION");
 
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn exposes_cbm_vendor_root() {
-        assert!(vendor_root().ends_with("vendor/codebase-memory-mcp"));
+        assert!(vendor_root().ends_with("cbm"));
     }
 
     #[test]

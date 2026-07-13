@@ -27,8 +27,8 @@ pub use lowering_trigger::LoweringTrigger;
 
 /// The Cargo package name for this crate.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
-/// Absolute path to the vendored Calyx checkout used by this workspace.
-pub const CALYX_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/calyx");
+/// Absolute path to the owned Calyx tree used by this workspace.
+pub const CALYX_VENDOR_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../calyx");
 /// Version tag prepended to every symbol canonical byte sequence.
 pub const SYMBOL_CANONICAL_TAG: &str = "astro-symbol-v1";
 /// Domain tag framed into every stable series identifier preimage.
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn exposes_calyx_vendor_root() {
-        assert!(calyx_vendor_root().ends_with("vendor/calyx"));
+        assert!(calyx_vendor_root().ends_with("/calyx"));
     }
 
     #[test]

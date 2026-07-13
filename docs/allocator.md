@@ -1,7 +1,7 @@
 # Allocator Topology
 
-Astrolabe links exactly one mimalloc implementation: the source vendored by
-`vendor/codebase-memory-mcp`. This is an implementation-identity invariant, not
+Astrolabe links exactly one mimalloc implementation: the source under
+`cbm/`. This is an implementation-identity invariant, not
 a claim that every allocation on every platform belongs to one heap.
 
 Production routing is platform-specific:

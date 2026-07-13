@@ -28,14 +28,14 @@ const NOMIC_VECTOR_HEADER_LEN: usize = 8;
 const NOMIC_OOV_NNZ: usize = 8;
 const INT8_SCALE: f32 = 127.0;
 
-/// SHA-256 of `vendor/codebase-memory-mcp/vendored/nomic/code_vectors.bin`.
+/// SHA-256 of `cbm/vendored/nomic/code_vectors.bin`.
 pub const NOMIC_VECTOR_BLOB_SHA256: [u8; 32] = [
     0xc7, 0x6b, 0xba, 0x4c, 0x50, 0x32, 0x32, 0x3d, 0xed, 0x62, 0x02, 0x05, 0x3a, 0xf5, 0xaf, 0xdb,
     0xba, 0xc1, 0x2f, 0x6d, 0x92, 0x0c, 0x69, 0x1b, 0x3b, 0x3b, 0x4c, 0xd7, 0x08, 0xf9, 0x9e, 0x83,
 ];
 
 /// SHA-256 of the raw bytes of
-/// `vendor/codebase-memory-mcp/vendored/nomic/code_tokens.txt` (LF-normalized by
+/// `cbm/vendored/nomic/code_tokens.txt` (LF-normalized by
 /// `.gitattributes`). The token file assigns each vector row its token identity,
 /// so a reordered/edited table with the same row count would silently change
 /// S18-S20/S22 outputs under the same lens id. Freezing this hash makes any such
@@ -45,8 +45,8 @@ pub const NOMIC_TOKEN_TABLE_SHA256: [u8; 32] = [
     0xbc, 0x95, 0x19, 0x27, 0x27, 0x57, 0x9a, 0xa1, 0x6b, 0x06, 0x2f, 0xf8, 0xef, 0x30, 0x1d, 0x25,
 ];
 
-const CODE_VECTORS_REL: &str = "../../vendor/codebase-memory-mcp/vendored/nomic/code_vectors.bin";
-const CODE_TOKENS_REL: &str = "../../vendor/codebase-memory-mcp/vendored/nomic/code_tokens.txt";
+const CODE_VECTORS_REL: &str = "../../cbm/vendored/nomic/code_vectors.bin";
+const CODE_TOKENS_REL: &str = "../../cbm/vendored/nomic/code_tokens.txt";
 
 /// Input measured by S18-S20/S22 static embedding lenses.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

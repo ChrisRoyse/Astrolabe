@@ -16,10 +16,10 @@ Astrolabe project permission to use, copy, modify, link, embed, and distribute
 Calyx as part of the combined Astrolabe source and binary distributions. This
 self-issued grant is specific to Astrolabe distributions from this repository
 and does not rewrite the standalone Calyx license stored at
-vendor/calyx/LICENSE.
+calyx/LICENSE.
 
 codebase-memory-mcp remains under its MIT license at
-vendor/codebase-memory-mcp/LICENSE. Other vendored third-party components
+cbm/LICENSE. Other vendored third-party components
 remain under their own licenses and notices. See NOTICE and the referenced
 license files for distribution obligations.
 

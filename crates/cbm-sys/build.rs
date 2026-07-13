@@ -37,7 +37,7 @@ fn main() {
         .parent()
         .and_then(Path::parent)
         .expect("cbm-sys crate must live under crates/");
-    let cbm_root = repo_root.join("vendor/codebase-memory-mcp");
+    let cbm_root = repo_root.join("cbm");
     let patched_makefile = repo_root.join("patches/cbm/Makefile.cbm");
     let alloc_shim = repo_root.join("patches/cbm/astro_alloc_shim.c");
     let layout_probe = repo_root.join("patches/cbm/astro_layout_probe.c");
@@ -70,7 +70,7 @@ fn main() {
     for spawn_overlay in &spawn_overlays {
         println!("cargo:rerun-if-changed={}", spawn_overlay.display());
     }
-    // The CBM tree under vendor/codebase-memory-mcp is owned first-class source
+    // The CBM tree under cbm/ is owned first-class source
     // (#286), but it is deliberately NOT watched file-by-file here (#192): the
     // whole src/, internal/cbm, and vendored/ trees are large, and watching them
     // made any mtime churn re-run this script — paying the make walk plus a full

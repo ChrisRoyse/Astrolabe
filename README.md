@@ -1,6 +1,6 @@
 # ASTROLABE
 
-ASTROLABE is a coding MCP server for AI agents that fuses two parents into one native binary: **codebase-memory-mcp** (C; tree-sitter + hybrid-LSP code-graph extraction across 158 languages, vendored at `vendor/codebase-memory-mcp`, linked in as `libcbm.a`) and **Calyx** (Rust; association-native database engine with measured-bits assay, kernel distillation, conformal guard, oracle, hash-chained provenance, and reversible self-optimization, vendored at `vendor/calyx`). CBM turns a repository into atoms and associations; Calyx turns atoms and associations into grounded intelligence — context packs, guard verdicts, impact predictions, and provenance an agent can trust.
+ASTROLABE is a coding MCP server for AI agents that fuses two parents into one native binary: **codebase-memory-mcp** (C; tree-sitter + hybrid-LSP code-graph extraction across 158 languages, owned first-class source at `cbm/`, linked in as `libcbm.a`) and **Calyx** (Rust; association-native database engine with measured-bits assay, kernel distillation, conformal guard, oracle, hash-chained provenance, and reversible self-optimization, owned first-class source at `calyx/`). CBM turns a repository into atoms and associations; Calyx turns atoms and associations into grounded intelligence — context packs, guard verdicts, impact predictions, and provenance an agent can trust.
 
 ## Read these first
 
@@ -26,7 +26,8 @@ The blueprint records *design*; it never records *progress*. All state — done,
 - `crates/astrolabe-guard`, `astrolabe-oracle`, `astrolabe-assay`, `astrolabe-anchors`, `astrolabe-provenance` — contract crates brought live per phase (see EPIC #65 for which are live).
 - `crates/cbm-sys` + `crates/astrolabe-bridge` — FFI to `libcbm.a` (bindgen bindings; safe wrappers, watcher, tool runner).
 - `crates/astrolabe-server` — the MCP surface (wraps the CBM tool runner, adds Astrolabe-native tools).
-- `vendor/` — pinned upstream sources (`VENDORED.md`, `scripts/verify-pins.sh`). **Never edit vendor trees directly**; use the documented patch flow in `patches/`.
+- `calyx/`, `cbm/` — the two parent trees, now owned first-class source (EPIC #286): edit them directly like any other code in this repo. No pins, no patch overlays, no upstream tracking.
+- `patches/cbm/` — Astrolabe-owned libcbm build glue (`Makefile.cbm` + the `ASTRO_*` translation units) compiled directly by `crates/cbm-sys/build.rs`. Not a patch-overlay directory (that machinery was dismantled in #286).
 
 ## Building natively on Windows
 

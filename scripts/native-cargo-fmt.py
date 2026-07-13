@@ -112,17 +112,17 @@ def collect_all_targets(
     """Match cargo-fmt's recursive collection of local path dependencies.
 
     With ``workspace_only=True`` the recursion into local path dependencies of
-    OTHER workspaces (notably the owned ``vendor/calyx`` crates) is skipped,
-    so only the top workspace's own members are formatted. The owned vendor/
-    trees are full-graph-formatted by the Rust gate (``scripts/ci-rust-gate.sh``
-    runs ``--all``), so excluding them from the Tier-1 ``check.sh`` fmt is
-    redundant work removed, not coverage lost (#280).
+    OTHER workspaces (notably the owned ``calyx/`` crates) is skipped,
+    so only the top workspace's own members are formatted. The owned calyx/
+    and cbm/ trees are full-graph-formatted from their own workspaces, so
+    excluding them from the top-workspace fmt is redundant work removed, not
+    coverage lost (#280).
     """
 
     targets: dict[Path, Target] = {}
     visited_dependency_names: set[str] = set()
     # One `cargo metadata` resolve returns every package of its workspace, so
-    # crates sharing a workspace (the 8+ vendor/calyx path deps) must reuse the
+    # crates sharing a workspace (the 8+ calyx/ path deps) must reuse the
     # first resolve instead of re-running cargo per manifest (#192).
     loaded_workspaces: list[tuple[set[Path], dict]] = []
 

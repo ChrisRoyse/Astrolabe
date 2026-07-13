@@ -82,12 +82,12 @@ pub fn golden_path(key: &str, slot: u16) -> PathBuf {
 
 /// Path of the vendored nomic vector blob.
 pub fn blob_path() -> PathBuf {
-    crate_dir().join("../../vendor/codebase-memory-mcp/vendored/nomic/code_vectors.bin")
+    crate_dir().join("../../cbm/vendored/nomic/code_vectors.bin")
 }
 
 /// Path of the vendored nomic token table.
 pub fn tokens_path() -> PathBuf {
-    crate_dir().join("../../vendor/codebase-memory-mcp/vendored/nomic/code_tokens.txt")
+    crate_dir().join("../../cbm/vendored/nomic/code_tokens.txt")
 }
 
 /// The one real, SHA-verified nomic table, shared by every test in the binary.
