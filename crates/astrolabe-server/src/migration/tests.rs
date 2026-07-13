@@ -2012,6 +2012,115 @@ fn shadow_import_report_uses_available_row_sink_snapshot() {
 }
 
 #[test]
+fn shadow_import_streaming_primary_matches_direct_snapshot_raw_cfs() {
+    // #59 dial-flip migration-safety FSV. `import_shadow_vault_report`'s Available
+    // branch now persists through the streaming FFI row-sink writer
+    // (`import_cbm_row_stream_to_vault`) as the PRIMARY single-parse path. Prove that
+    // flip persists byte-identical vault state — same CxIds, same rows, same single
+    // ledger entry — to the pre-flip whole-snapshot direct writer
+    // (`import_cbm_graph_snapshot_to_vault_direct`), which astrolabe-ingest's raw-CF
+    // parity suite (`streaming_row_sink_import_matches_sqlite_import_raw_cfs`) has
+    // already proven byte-identical to the dump-then-import path
+    // (`import_sqlite_to_vault`). Two independent FixedClock vaults at the same far-
+    // future seed make the Ledger CF bytes a real determinism guarantee, not a clock
+    // artifact (the #78 injected-clock fix carries into both write paths).
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("shadow-dial-flip-parity");
+    fs::create_dir_all(&dir).unwrap();
+
+    let rows = sample_pipeline_rows();
+    let options = SqliteImportOptions::new("demo", "commit-flip", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+
+    // Path A: flipped shadow primary (streaming row-sink) via import_shadow_vault_report.
+    // The `must-not-exist.db` path proves the streaming path is genuinely primary — no
+    // SQLite artifact exists to fall back to, so a labeled fallback is impossible.
+    let stream_vault = AsterVault::new_durable_with_clock(
+        dir.join("stream.astrolabe-vault"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"dial-flip-parity".to_vec(),
+        VaultOptions::default(),
+        calyx_core::FixedClock::new(SEED_TS),
+    )
+    .unwrap();
+    let imported = import_shadow_vault_report(
+        &dir.join("must-not-exist.db"),
+        &stream_vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(row_sink_import_candidate_from_rows(rows.clone())),
+    )
+    .unwrap();
+    assert_eq!(imported.source, "row_sink_direct");
+    assert!(imported.fallback_reason.is_none());
+
+    // Path B: reference whole-snapshot direct writer — the exact code the Available
+    // branch called before the #59 flip — on the identical snapshot and fingerprint.
+    let direct_vault = AsterVault::new_durable_with_clock(
+        dir.join("direct.astrolabe-vault"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        b"dial-flip-parity".to_vec(),
+        VaultOptions::default(),
+        calyx_core::FixedClock::new(SEED_TS),
+    )
+    .unwrap();
+    let direct_report = import_cbm_graph_snapshot_to_vault_direct(
+        &pipeline_rows_to_graph_snapshot(rows.clone()),
+        row_sink_fingerprint(&rows),
+        &direct_vault,
+        &ShadowSlotRuntime,
+        &options,
+    )
+    .unwrap();
+
+    // The streaming-primary import report equals the direct writer's report (row
+    // counts, ledger seq, readback witness all agree).
+    assert_eq!(imported.report, direct_report);
+
+    // FSV: independent CF byte readback, comparing the two vaults' persisted bytes
+    // directly rather than trusting the report. Base + Graph carry the CxIds and the
+    // constellation/graph rows; Ledger carries the single paired ledger entry; each
+    // panel slot CF carries its lens rows.
+    for cf in [
+        ColumnFamily::Base,
+        ColumnFamily::Graph,
+        ColumnFamily::Ledger,
+    ] {
+        let stream_rows = stream_vault
+            .scan_cf_at(stream_vault.snapshot(), cf)
+            .unwrap();
+        let direct_rows = direct_vault
+            .scan_cf_at(direct_vault.snapshot(), cf)
+            .unwrap();
+        assert!(
+            !stream_rows.is_empty(),
+            "{cf:?} CF must actually persist rows"
+        );
+        assert_eq!(
+            stream_rows, direct_rows,
+            "{cf:?} CF bytes differ between the streaming-primary and direct writer"
+        );
+    }
+    for slot in astrolabe_panel::default_panel_slots() {
+        let cf = ColumnFamily::slot(slot.slot_id());
+        assert_eq!(
+            stream_vault
+                .scan_cf_at(stream_vault.snapshot(), cf)
+                .unwrap(),
+            direct_vault
+                .scan_cf_at(direct_vault.snapshot(), cf)
+                .unwrap(),
+            "slot {} CF bytes differ between the streaming-primary and direct writer",
+            slot.slot_id()
+        );
+    }
+
+    // Ledger pairing: exactly one ledger entry on both paths (single paired batch).
+    assert_eq!(stream_vault.latest_seq(), direct_vault.latest_seq());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn shadow_import_report_falls_back_to_sqlite_with_reason() {
     let dir = temp_dir("row-sink-fallback-report");
     fs::create_dir_all(&dir).unwrap();
