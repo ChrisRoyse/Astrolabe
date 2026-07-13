@@ -441,14 +441,10 @@ fn cx(seed: u8) -> CxId {
     CxId::from_bytes([seed; 16])
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "calyx-cli-persisted-search-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("scratch");
-    dir
+// RAII scratch (#260): self-cleans on drop incl. panic unwind.
+fn scratch(tag: &str) -> calyx_fsv::scratch::ScratchDir {
+    calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-cli-persisted-search-{tag}"))
+        .expect("scratch")
 }
 
 fn sst_count(path: PathBuf) -> usize {
