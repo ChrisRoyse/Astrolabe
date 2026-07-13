@@ -3078,14 +3078,14 @@ mod tests {
             ("unset", None, Expect::Inherits),
         ];
         for (case, path_value, expect) in cases {
-            if let Some(value) = &path_value {
-                if case.starts_with("oversize") {
-                    assert!(
-                        value.len() > 4096,
-                        "[{case}] PATH must exceed the retired 4096 buffer: {}",
-                        value.len()
-                    );
-                }
+            if let Some(value) = &path_value
+                && case.starts_with("oversize")
+            {
+                assert!(
+                    value.len() > 4096,
+                    "[{case}] PATH must exceed the retired 4096 buffer: {}",
+                    value.len()
+                );
             }
             let mut child = std::process::Command::new(&exe);
             child
