@@ -143,6 +143,9 @@ use readiness::*;
 mod anchor_outcome;
 use anchor_outcome::*;
 
+mod coverage_ingest;
+use coverage_ingest::*;
+
 mod guard;
 use guard::*;
 

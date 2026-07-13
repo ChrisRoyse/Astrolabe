@@ -5896,6 +5896,19 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
             "anchor_outcome requires calyx shadow indexing",
         ),
         (
+            "coverage_ingest",
+            json!({
+                "project": project.clone(),
+                "coverage_format": "lcov",
+                "coverage_report": "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
+                "test_format": "cargo_test_json",
+                "test_report": "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n",
+                "coverage_source": "ci:github:1",
+                "run_id": "run-1"
+            }),
+            "coverage_ingest requires calyx shadow indexing",
+        ),
+        (
             "team_artifact",
             json!({"mode": "export", "project": project.clone()}),
             "team_artifact export requires calyx shadow indexing",
@@ -7438,6 +7451,350 @@ fn anchor_outcome_proxy_source_is_provisional_on_the_shipping_surface() {
         0.6f32.to_bits()
     );
     drop(vault);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Seeds a shadow vault for `calc` with three non-test symbols sharing one
+/// source file (`calc.add` 1-3, `calc.sub` 5-7, `calc.mul` 9-11) plus a test
+/// symbol (`tests.test_arith` 1-5) wired to all three by `TESTS` edges, so
+/// `coverage_ingest` assembles real `PropagationInputs` (symbol line ranges +
+/// TESTS edges) from persisted graph state. The far-future seed clock keeps
+/// the seed ledger timestamps deterministic, mirroring `seed_anchor_subject_vault`.
+fn seed_coverage_ingest_vault(cache_dir: &Path, seed_ts: u64) {
+    let sqlite = cache_dir.join("source.db");
+    let conn = Connection::open(&sqlite).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               label TEXT NOT NULL,
+               name TEXT NOT NULL,
+               qualified_name TEXT NOT NULL,
+               file_path TEXT DEFAULT '',
+               start_line INTEGER DEFAULT 0,
+               end_line INTEGER DEFAULT 0,
+               properties TEXT DEFAULT '{}'
+             );
+             CREATE TABLE edges (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               source_id INTEGER NOT NULL,
+               target_id INTEGER NOT NULL,
+               type TEXT NOT NULL,
+               properties TEXT DEFAULT '{}',
+               url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+               local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                 THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+               UNIQUE(source_id, target_id, type, local_name_gen)
+             );",
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties) VALUES
+           (1,'calc','Function','add','calc.add','src/calc.py',1,3,'{}'),
+           (2,'calc','Function','sub','calc.sub','src/calc.py',5,7,'{}'),
+           (3,'calc','Function','mul','calc.mul','src/calc.py',9,11,'{}'),
+           (4,'calc','Function','test_arith','tests.test_arith','tests/test_calc.py',1,5,'{}');
+         INSERT INTO edges(id, project, source_id, target_id, type, properties) VALUES
+           (1,'calc',4,1,'TESTS','{}'),
+           (2,'calc',4,2,'TESTS','{}'),
+           (3,'calc',4,3,'TESTS','{}');",
+    )
+    .unwrap();
+    drop(conn);
+    let vault = AsterVault::new_durable_with_clock(
+        vault_dir(cache_dir, "calc"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        vault_salt("calc").as_bytes().to_vec(),
+        VaultOptions::default(),
+        calyx_core::FixedClock::new(seed_ts),
+    )
+    .unwrap();
+    let options = SqliteImportOptions::new("calc", "commit-coverage", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+    import_shadow_vault_report(
+        &sqlite,
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(RowSinkImportCandidate::Unavailable(
+            "forced sqlite import for deterministic coverage seed".to_string(),
+        )),
+    )
+    .unwrap();
+    drop(vault);
+    persist_dial_at(cache_dir, "calc", MigrationDial::Shadow).unwrap();
+}
+
+/// Reads back one persisted TestPass anchor for `qn`, or `None` if the symbol
+/// has no anchor row. Independent state readback: reopens the vault read-only,
+/// maps the qualified name to its CxId from the node map, and finds its row.
+fn read_back_test_pass_anchor(
+    cache_dir: &Path,
+    qn: &str,
+) -> Option<(String, f32, calyx_core::AnchorValue)> {
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger, ColumnFamily::Graph],
+    )
+    .unwrap();
+    let cx_ids = astrolabe_ingest::read_node_map_cx_ids(&vault, "calc").unwrap();
+    let cx = *cx_ids.get(qn)?;
+    let rows = astrolabe_anchors::read_anchor_rows(&vault).unwrap();
+    let found = rows.into_iter().find(|persisted| persisted.row.cx_id == cx);
+    let result = found.map(|persisted| {
+        assert_eq!(persisted.row.anchors.len(), 1, "{qn} should carry one anchor");
+        let anchor = &persisted.row.anchors[0];
+        (anchor.source.clone(), anchor.confidence, anchor.value.clone())
+    });
+    drop(vault);
+    result
+}
+
+#[test]
+fn coverage_ingest_grounds_coverage_and_propagation_with_precedence_and_fanout() {
+    // FSV: a real seeded graph + real lcov coverage + real passing suite run.
+    // Line 2 of src/calc.py falls inside calc.add (1-3) => calc.add is grounded
+    // by DIRECT COVERAGE at confidence 1.0 under the resolved ci: source. The
+    // passing test tests.test_arith TESTS all three of add/sub/mul: add is
+    // suppressed by precedence (coverage already grounded it), sub and mul are
+    // grounded by PROPAGATION at 0.6 under propagation:<run_id>. All three are in
+    // the impact set (src/calc.py), so none is excluded by fan-out. The test
+    // symbol itself is never anchored. Every claim is read back from persisted
+    // anchor rows, not the return envelope.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    const COVERAGE_SOURCE: &str = "ci:github:900";
+    const RUN_ID: &str = "run-cov-1";
+    let coverage = "SF:src/calc.py\nDA:2,1\nend_of_record\n";
+    let test_report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"started\"}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"ok\"}\n\
+                       {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
+
+    let dir = temp_dir("coverage-ingest-happy");
+    fs::create_dir_all(&dir).unwrap();
+    seed_coverage_ingest_vault(&dir, SEED_TS);
+
+    let impact: BTreeSet<String> = ["src/calc.py".to_string()].into_iter().collect();
+    let response = coverage_ingest_json_at(
+        &dir,
+        "calc",
+        "lcov",
+        coverage,
+        "cargo_test_json",
+        test_report,
+        COVERAGE_SOURCE,
+        RUN_ID,
+        &impact,
+        "1786400000",
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["anchors_written"], 3, "envelope: {response}");
+    let report = &response["propagation_report"];
+    assert_eq!(report["coverage_symbols"], json!(["calc.add"]));
+    assert_eq!(report["propagation_symbols"], json!(["calc.mul", "calc.sub"]));
+    assert_eq!(report["suppressed_by_precedence"], json!(["calc.add"]));
+    assert_eq!(report["excluded_by_fanout"], json!([]));
+    assert_eq!(report["anchored"], 3);
+    assert_eq!(report["non_test_symbol_count"], 3);
+    assert_eq!(response["trust"], "provisional"); // propagation present => weaker rollup
+
+    // Independent persisted-state readback.
+    let (add_src, add_conf, add_val) =
+        read_back_test_pass_anchor(&dir, "calc.add").expect("calc.add anchored");
+    assert_eq!(add_src, COVERAGE_SOURCE, "calc.add via direct coverage");
+    assert_eq!(add_conf.to_bits(), 1.0f32.to_bits());
+    assert_eq!(add_val, calyx_core::AnchorValue::Bool(true));
+
+    let expected_prop_source = format!("propagation:{RUN_ID}");
+    for covered in ["calc.sub", "calc.mul"] {
+        let (src, conf, val) =
+            read_back_test_pass_anchor(&dir, covered).unwrap_or_else(|| panic!("{covered} anchored"));
+        assert_eq!(src, expected_prop_source, "{covered} via propagation");
+        assert_eq!(conf.to_bits(), 0.6f32.to_bits(), "{covered} proxy confidence");
+        assert_eq!(val, calyx_core::AnchorValue::Bool(true));
+    }
+    // The test symbol is never anchored (would be circular).
+    assert!(
+        read_back_test_pass_anchor(&dir, "tests.test_arith").is_none(),
+        "test symbol must not be anchored"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn coverage_ingest_duplicate_report_is_idempotent() {
+    // Edge case (idempotence): re-posting the identical coverage + run writes no
+    // new anchors and leaves the persisted rows byte-unchanged.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let coverage = "SF:src/calc.py\nDA:2,1\nend_of_record\n";
+    let test_report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"started\"}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"ok\"}\n\
+                       {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
+    let dir = temp_dir("coverage-ingest-idempotent");
+    fs::create_dir_all(&dir).unwrap();
+    seed_coverage_ingest_vault(&dir, SEED_TS);
+    let impact: BTreeSet<String> = ["src/calc.py".to_string()].into_iter().collect();
+
+    let first = coverage_ingest_json_at(
+        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report, "ci:github:900",
+        "run-cov-1", &impact, "1786400000",
+    )
+    .unwrap();
+    assert_eq!(first["anchors_written"], 3, "first: {first}");
+
+    let rows_after_first = {
+        let vault = open_shadow_vault_read_only(
+            &vault_dir(&dir, "calc"),
+            SHADOW_VAULT_ID,
+            &vault_salt("calc"),
+            vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+        )
+        .unwrap();
+        let rows = astrolabe_anchors::read_all_anchor_rows(&vault).unwrap();
+        drop(vault);
+        rows
+    };
+
+    let second = coverage_ingest_json_at(
+        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report, "ci:github:900",
+        "run-cov-1", &impact, "1786400000",
+    )
+    .unwrap();
+    assert_eq!(second["anchors_written"], 0, "second must write nothing: {second}");
+    assert_eq!(second["anchors_deduplicated"], 3, "second: {second}");
+
+    let rows_after_second = {
+        let vault = open_shadow_vault_read_only(
+            &vault_dir(&dir, "calc"),
+            SHADOW_VAULT_ID,
+            &vault_salt("calc"),
+            vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+        )
+        .unwrap();
+        let rows = astrolabe_anchors::read_all_anchor_rows(&vault).unwrap();
+        drop(vault);
+        rows
+    };
+    assert_eq!(
+        rows_after_first, rows_after_second,
+        "idempotent re-post must not mutate persisted anchor rows"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn coverage_ingest_empty_report_refuses_fail_closed() {
+    // Edge case (empty payload): an empty coverage report parses to zero records
+    // and refuses ASTRO_COVERAGE_PARSE_MALFORMED before any mutation.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("coverage-ingest-empty");
+    fs::create_dir_all(&dir).unwrap();
+    seed_coverage_ingest_vault(&dir, SEED_TS);
+    let impact: BTreeSet<String> = BTreeSet::new();
+
+    let response = coverage_ingest_json_at(
+        &dir, "calc", "lcov", "", "cargo_test_json",
+        "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n",
+        "ci:github:900", "run-cov-1", &impact, "1786400000",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "refused", "envelope: {response}");
+    assert_eq!(response["code"], "ASTRO_COVERAGE_PARSE_MALFORMED");
+    assert_eq!(response["anchors_written"], 0);
+
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    assert!(
+        astrolabe_anchors::read_all_anchor_rows(&vault).unwrap().is_empty(),
+        "refused ingest must persist no anchor rows"
+    );
+    drop(vault);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn coverage_ingest_proxy_source_refuses_fail_closed() {
+    // Edge case (invalid schema / policy): coverage anchors are resolved
+    // evidence; a proxy coverage_source is refused by plan_propagation before
+    // any anchor is written.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let coverage = "SF:src/calc.py\nDA:2,1\nend_of_record\n";
+    let test_report = "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n";
+    let dir = temp_dir("coverage-ingest-proxy");
+    fs::create_dir_all(&dir).unwrap();
+    seed_coverage_ingest_vault(&dir, SEED_TS);
+    let impact: BTreeSet<String> = BTreeSet::new();
+
+    let response = coverage_ingest_json_at(
+        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report,
+        "agent:codex:session-7", "run-cov-1", &impact, "1786400000",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "refused", "envelope: {response}");
+    assert_eq!(response["code"], "ASTRO_PROPAGATION_INPUT_INVALID");
+    assert_eq!(response["anchors_written"], 0);
+
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(&dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Anchors, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    assert!(
+        astrolabe_anchors::read_all_anchor_rows(&vault).unwrap().is_empty(),
+        "refused proxy-source ingest must persist no anchor rows"
+    );
+    drop(vault);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn coverage_ingest_unknown_files_ground_only_via_propagation() {
+    // Edge case (report referencing unknown files): coverage lines for a file
+    // absent from the graph attribute to no symbol, so direct coverage grounds
+    // nothing; the passing suite still grounds the impact symbols by propagation.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let coverage = "SF:src/nonexistent.py\nDA:2,1\nend_of_record\n";
+    let test_report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"started\"}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"ok\"}\n\
+                       {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
+    let dir = temp_dir("coverage-ingest-unknown-files");
+    fs::create_dir_all(&dir).unwrap();
+    seed_coverage_ingest_vault(&dir, SEED_TS);
+    let impact: BTreeSet<String> = ["src/calc.py".to_string()].into_iter().collect();
+
+    let response = coverage_ingest_json_at(
+        &dir, "calc", "lcov", coverage, "cargo_test_json", test_report,
+        "ci:github:900", "run-cov-1", &impact, "1786400000",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    let report = &response["propagation_report"];
+    assert_eq!(report["coverage_symbol_count"], 0, "no coverage attribution");
+    // No coverage precedence, so all three impact symbols ground by propagation.
+    assert_eq!(
+        report["propagation_symbols"],
+        json!(["calc.add", "calc.mul", "calc.sub"])
+    );
+    assert_eq!(response["anchors_written"], 3);
+
+    let expected_prop_source = "propagation:run-cov-1";
+    let (src, conf, _) = read_back_test_pass_anchor(&dir, "calc.add").expect("calc.add anchored");
+    assert_eq!(src, expected_prop_source, "calc.add via propagation, not coverage");
+    assert_eq!(conf.to_bits(), 0.6f32.to_bits());
     fs::remove_dir_all(&dir).ok();
 }
 
