@@ -100,8 +100,19 @@ run_shard() {
   # Shard homes live UNDER the run-scoped base HOME so every store write the
   # suite performs stays inside the one directory the hermeticity gate scans.
   local shard_home="$BASE_HOME/shards/home-$idx"
-  local shard_tmp="$WORK/tmp-$idx"
+  # The shard temp sits INSIDE this repo, so a "non-git" fixture created there
+  # would discover the outer .git and flip is_git=true (observed: three
+  # git-context test failures in the first sharded run). Nest the temp one
+  # level UNDER a per-shard ceiling dir and point GIT_CEILING_DIRECTORIES at
+  # the ceiling — the same containment ci-cbm-test.sh establishes for the
+  # launcher TMP, which the per-shard TMP override was silently discarding.
+  local shard_ceil="$WORK/tmp-$idx"
+  local shard_tmp="$shard_ceil/tmp"
   mkdir -p "$shard_home/.cache/codebase-memory-mcp" "$shard_tmp"
+  local shard_ceil_native="$shard_ceil"
+  if command -v cygpath >/dev/null 2>&1; then
+    shard_ceil_native="$(cygpath -m "$shard_ceil")"
+  fi
   if [[ -f "$BASE_HOME/.gitconfig" ]]; then
     cp -f "$BASE_HOME/.gitconfig" "$shard_home/.gitconfig"
   fi
@@ -111,6 +122,7 @@ run_shard() {
     rc=0
     HOME="$shard_home" USERPROFILE="$shard_home" \
       TMP="$shard_tmp" TEMP="$shard_tmp" TMPDIR="$shard_tmp" \
+      GIT_CEILING_DIRECTORIES="$shard_ceil_native" \
       "$RUNNER" "$suite" > "$WORK/log-$suite.txt" 2>&1 || rc=$?
     end="$(date +%s%3N)"
     printf '%s\t%s\t%s\n' "$suite" "$rc" "$((end - start))" >> "$WORK/result-$idx.tsv"
@@ -158,7 +170,9 @@ for suite in "${SUITES[@]}"; do
     hard_fail=1
     continue
   fi
-  p="$(sed -nE 's/.*[^0-9]?([0-9]+) passed.*/\1/p' <<<"$summary")"
+  # Anchored at line start: a greedy `.*[^0-9]?` prefix lets the regex engine
+  # eat leading digits and capture only the final digit (observed: 5764 -> 4).
+  p="$(sed -nE 's/^[[:space:]]*([0-9]+) passed.*/\1/p' <<<"$summary")"
   f="$(sed -nE 's/.*[^0-9]([0-9]+) failed.*/\1/p' <<<"$summary")"
   k="$(sed -nE 's/.*[^0-9]([0-9]+) skipped.*/\1/p' <<<"$summary")"
   # Assignment form: `(( x += 0 ))` evaluates to 0 and aborts under set -e.
