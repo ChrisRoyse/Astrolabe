@@ -40,6 +40,22 @@
       "evidence": ["CALYX_REACTIVE_QUEUE_FULL", "warnings.len()"]
     },
     {
+      "id": "reactive_churn_accounting_slice",
+      "crate": "astrolabe-weave",
+      "file": "crates/astrolabe-weave/src/lib.rs",
+      "test": "durable_reactive_churn_slice_bounded_n_keeps_exact_accounting",
+      "kind": "reactive_churn_exact_accounting",
+      "evidence": ["CALYX_REACTIVE_QUEUE_FULL", "all_audit_entries", "REACTIVE_CHURN_ACCOUNTING_EVENTS"]
+    },
+    {
+      "id": "reactive_churn_rss_bound_slice",
+      "crate": "astrolabe-weave",
+      "file": "crates/astrolabe-weave/src/lib.rs",
+      "test": "durable_reactive_churn_slice_bounds_rss_under_sustained_churn",
+      "kind": "reactive_churn_rss_bound",
+      "evidence": ["MAX_REACTIVE_SOAK_RSS_DELTA_BYTES", "resident_set_bytes", "REACTIVE_CHURN_RSS_EVENTS"]
+    },
+    {
       "id": "disk_full_recovery_fails_closed",
       "crate": "astrolabe-ingest",
       "file": "crates/astrolabe-ingest/src/ledger_verify.rs",
