@@ -204,17 +204,27 @@ static int incremental_setup(void) {
 
     /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
      * Cuts indexing time roughly in half on slow shared runners. */
+    /* #179: quote the interpolated path and the sparse-checkout patterns with
+     * DOUBLE quotes, not POSIX single quotes. system() dispatches through
+     * cmd.exe on native Windows, which does not strip single quotes — git then
+     * received a literal leading/trailing `'` in the destination path and failed
+     * the clone (rc=128), skipping the entire incremental suite. Double quotes are
+     * honored identically by both cmd.exe (via the MSVCRT argv parser) and POSIX
+     * sh, and the interpolated path (a mkdtemp result, forward-slashed on Windows)
+     * plus the fixed sparse patterns carry no shell metacharacters. The sparse
+     * step uses `git -C "<repo>"` instead of `cd '<repo>' &&` so no shell `cd`
+     * (which under cmd.exe would not change drive without /d) is needed. */
     char cmd[1024];
     if (getenv("CI")) {
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
+                 "--sparse https://github.com/fastapi/fastapi.git \"%s\" 2>&1 && "
+                 "git -C \"%s\" sparse-checkout set --no-cone \"/*\" \"!/docs\" \"!/tests\" 2>&1",
                  g_repodir, g_repodir);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet "
-                 "https://github.com/fastapi/fastapi.git '%s' 2>&1",
+                 "https://github.com/fastapi/fastapi.git \"%s\" 2>&1",
                  g_repodir);
     }
     int rc = system(cmd);
