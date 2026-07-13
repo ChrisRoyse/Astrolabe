@@ -43,6 +43,7 @@ out untouched.
 |---|---:|---:|---|
 | `scripts/setup.sh` | 1 | 0 | Installer message naming the default store. |
 | `scripts/smoke-test.sh` | 1 | 0 | Smoke harness; sets `CBM_CACHE_DIR` for its dry run. |
+| `scripts/test-shards.sh` | 1 | 0 | #280 sharded-suite containment: pre-creates the store dir under each shard's already-redirected `$shard_home` sandbox so vendored tests land in the sandbox, not the operator store. Moves with `HOME` exactly like the resolver; the byte-manifest hermeticity guard proves the real store untouched. |
 | `src/cli/cli.h` | 1 | 0 | Doc comment on the cache-listing API. |
 | `src/foundation/platform.c` | 2 | 0 | **Sanctioned definition site**: `cbm_resolve_cache_dir()`. Two textual sites since #286 Phase A, but they are the SAME formula in the same resolver: the `#ifdef ASTRO_ENV_STORE` truncation-checked variant (platform.c:498) and its `#else` original (platform.c:504). Still exactly one resolver; no split write/read path. |
 | `src/foundation/platform.h` | 1 | 0 | Doc comment on the resolver contract. |
