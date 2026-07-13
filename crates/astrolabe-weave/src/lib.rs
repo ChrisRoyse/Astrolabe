@@ -50,7 +50,7 @@ pub use xterm_rows::{
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
     agreement_graph_aspect, agreement_graph_from_persisted_rows, designed_kind_for_slots,
     eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
-    read_eager_cross_term_rows,
+    persist_eager_cross_terms_delta, read_eager_cross_term_rows,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -1776,11 +1776,36 @@ fn anomaly_finding_order(left: &AnomalyFinding, right: &AnomalyFinding) -> Order
 }
 
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
-    let mut rows = Vec::with_capacity(nodes.len() * EagerAgreementKind::ALL.len());
+    plan_eager_cross_terms_selected(nodes, None)
+}
+
+/// Plans eager agreements only for the named dirty symbols while retaining the
+/// full corpus as neighborhood context.
+pub fn plan_eager_cross_terms_for_symbols(
+    nodes: &[SimilarityNode],
+    qualified_names: &BTreeSet<String>,
+) -> EagerCrossTermPlan {
+    plan_eager_cross_terms_selected(nodes, Some(qualified_names))
+}
+
+fn plan_eager_cross_terms_selected(
+    nodes: &[SimilarityNode],
+    qualified_names: Option<&BTreeSet<String>>,
+) -> EagerCrossTermPlan {
+    let selected_indices = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            qualified_names.is_none_or(|names| names.contains(&node.qualified_name))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
     for kind in EagerAgreementKind::ALL {
         let (left_slot, right_slot) = kind.slots();
-        let values = cross_term_values(nodes, kind);
-        for (node, value) in nodes.iter().zip(values) {
+        let values = cross_term_values(nodes, kind, &selected_indices);
+        for (&node_index, value) in selected_indices.iter().zip(values) {
+            let node = &nodes[node_index];
             rows.push(EagerCrossTermRow {
                 qualified_name: node.qualified_name.clone(),
                 kind,
@@ -1799,7 +1824,7 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
         .filter(|row| matches!(row.value, CrossTermValue::Scalar(_)))
         .count();
     let absent_count = rows.len() - scalar_count;
-    let symbol_count = nodes.len();
+    let symbol_count = selected_indices.len();
     EagerCrossTermPlan {
         rows,
         agreement_graph,
@@ -1819,7 +1844,11 @@ pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
     }
 }
 
-fn cross_term_values(nodes: &[SimilarityNode], kind: EagerAgreementKind) -> Vec<CrossTermValue> {
+fn cross_term_values(
+    nodes: &[SimilarityNode],
+    kind: EagerAgreementKind,
+    selected_indices: &[usize],
+) -> Vec<CrossTermValue> {
     let (left_slot, right_slot) = kind.slots();
     let operands = nodes
         .iter()
@@ -1832,12 +1861,13 @@ fn cross_term_values(nodes: &[SimilarityNode], kind: EagerAgreementKind) -> Vec<
         .collect::<Vec<_>>();
 
     match kind.comparator() {
-        EagerCrossTermComparator::DirectAgreement => operands
+        EagerCrossTermComparator::DirectAgreement => selected_indices
             .iter()
-            .map(|(left, right)| direct_cross_term_value(left, right))
+            .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
             .collect(),
-        EagerCrossTermComparator::NeighborhoodAgreement => (0..operands.len())
-            .map(|node_index| {
+        EagerCrossTermComparator::NeighborhoodAgreement => selected_indices
+            .iter()
+            .map(|&node_index| {
                 neighborhood_cross_term_value(node_index, left_slot, right_slot, &operands)
             })
             .collect(),

@@ -5945,12 +5945,12 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         VaultOptions::default(),
     )
     .unwrap();
-    let properties = |name: &str| {
+    let properties = |name: &str, increment: u8| {
         format!(
-            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ input + 1 }}","signature":"fn {name}(input: i32) -> i32","bt":"input addition return","docstring":"increment an input value","complexity":2.0,"cognitive":1.0,"param_count":1.0,"lines":1.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ input + {increment} }}","signature":"fn {name}(input: i32) -> i32","bt":"input addition return {increment}","docstring":"increment an input value","complexity":2.0,"cognitive":1.0,"param_count":1.0,"lines":1.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
         )
     };
-    let rows = |include_beta: bool| {
+    let rows = |include_beta: bool, increment: u8| {
         let mut nodes = vec![astrolabe_bridge::CbmPipelineNodeRow {
             id: 1,
             project: "demo".to_string(),
@@ -5960,7 +5960,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
             file_path: "src/lib.rs".to_string(),
             start_line: 1,
             end_line: 1,
-            properties_json: properties("alpha"),
+            properties_json: properties("alpha", increment),
         }];
         if include_beta {
             nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
@@ -5972,7 +5972,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
                 file_path: "src/lib.rs".to_string(),
                 start_line: 3,
                 end_line: 3,
-                properties_json: properties("beta"),
+                properties_json: properties("beta", 1),
             });
         }
         CbmPipelineRows {
@@ -5989,7 +5989,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         &vault,
         &ShadowSlotRuntime,
         &first_options,
-        Some(row_sink_import_candidate_from_rows(rows(true))),
+        Some(row_sink_import_candidate_from_rows(rows(true, 1))),
     )
     .unwrap();
     assert_eq!(first.report.constellation_inputs, 2);
@@ -6026,7 +6026,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         SlotVector::Absent { .. }
     ));
 
-    let first_weave = run_live_weave(&vault, "demo", true).unwrap();
+    let first_weave = run_live_weave(&vault, "demo", true, None).unwrap();
     assert_eq!(first_weave["status"], "reconciled");
     let first_sim = astrolabe_weave::read_similarity_edge_rows(&vault).unwrap();
     let first_xterms = astrolabe_weave::read_eager_cross_term_rows(&vault).unwrap();
@@ -6050,12 +6050,23 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         &vault,
         &ShadowSlotRuntime,
         &second_options,
-        Some(row_sink_import_candidate_from_rows(rows(false))),
+        Some(row_sink_import_candidate_from_rows(rows(false, 2))),
     )
     .unwrap();
     assert!(second.report.graph_rows_written > 0);
-    let second_weave = run_live_weave(&vault, "demo", true).unwrap();
+    let second_weave = run_live_weave(
+        &vault,
+        "demo",
+        true,
+        Some(&WeaveDelta {
+            dirty_qualified_names: BTreeSet::from(["demo.alpha".to_string()]),
+            removed_cx_ids: BTreeSet::from([alpha_cx, beta_cx]),
+        }),
+    )
+    .unwrap();
     assert!(second_weave["similarity"]["rows_tombstoned"] != 0);
+    assert_eq!(second_weave["eager_cross_terms"]["symbol_count"], 1);
+    assert!(second_weave["eager_cross_terms"]["rows_written"] != 0);
     assert!(second_weave["eager_cross_terms"]["rows_tombstoned"] != 0);
     assert!(
         astrolabe_weave::read_similarity_edge_rows(&vault)
@@ -6094,7 +6105,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
     );
 
     let before_noop = vault.latest_seq();
-    let noop = run_live_weave(&vault, "demo", false).unwrap();
+    let noop = run_live_weave(&vault, "demo", false, None).unwrap();
     assert_eq!(noop["status"], "unchanged");
     assert_eq!(vault.latest_seq(), before_noop);
     drop(vault);

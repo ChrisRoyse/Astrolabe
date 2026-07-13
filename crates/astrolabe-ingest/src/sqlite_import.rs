@@ -378,6 +378,11 @@ pub struct SqliteImportReport {
     pub fsv: Option<FsvAck>,
     /// Imported constellation ids in deterministic node-id order.
     pub cx_ids: Vec<CxId>,
+    /// Newly measured constellation ids in deterministic node-id order.
+    /// Incremental consumers use this dirty set instead of rescanning/reweaving
+    /// every reused constellation in the full CBM snapshot.
+    #[serde(default)]
+    pub new_cx_id_values: Vec<CxId>,
 }
 
 /// Deterministic location and identity of one admitted historical symbol.
@@ -904,6 +909,12 @@ where
         .iter()
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
+    let new_cx_id_values = prepared
+        .constellations
+        .iter()
+        .filter(|prepared| prepared.measured.is_some())
+        .map(|prepared| prepared.identity.cx_id)
+        .collect::<Vec<_>>();
     let mut quantization = quantization_gate_report(options, &prepared);
     verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
     let (planned_graph_rows_written, planned_edge_rows_written) =
@@ -973,6 +984,7 @@ where
         readback,
         fsv,
         cx_ids,
+        new_cx_id_values,
     })
 }
 

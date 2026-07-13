@@ -129,6 +129,12 @@ pub(crate) struct ShadowVaultImport {
 #[derive(Debug)]
 pub(crate) struct ShadowSlotRuntime;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WeaveDelta {
+    pub(crate) dirty_qualified_names: BTreeSet<String>,
+    pub(crate) removed_cx_ids: BTreeSet<calyx_core::CxId>,
+}
+
 static SHADOW_EMBEDDING_TABLE: OnceLock<PanelResult<astrolabe_panel::StaticEmbeddingTable>> =
     OnceLock::new();
 
@@ -1012,6 +1018,11 @@ pub(crate) fn import_shadow_vault_with_archaeology(
     let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
         .with_available_slots(shadow_available_slots())
         .with_series_registry(repo.is_some());
+    let before_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?
+        .nodes
+        .into_iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .collect::<BTreeMap<_, _>>();
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
@@ -1041,7 +1052,29 @@ pub(crate) fn import_shadow_vault_with_archaeology(
         || report.graph_rows_written > 0
         || report.edge_rows_written > 0
         || report.series_mutated_rows > 0;
-    let weave = run_live_weave(&vault, project, import_changed)?;
+    let after_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?
+        .nodes
+        .into_iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .collect::<BTreeMap<_, _>>();
+    let new_cx_ids = report
+        .new_cx_id_values
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let delta = (!before_cx_by_qn.is_empty()).then(|| WeaveDelta {
+        dirty_qualified_names: after_cx_by_qn
+            .iter()
+            .filter(|(_, cx_id)| new_cx_ids.contains(cx_id))
+            .map(|(qualified_name, _)| qualified_name.clone())
+            .collect(),
+        removed_cx_ids: before_cx_by_qn
+            .iter()
+            .filter(|(qualified_name, cx_id)| after_cx_by_qn.get(*qualified_name) != Some(*cx_id))
+            .map(|(_, cx_id)| *cx_id)
+            .collect(),
+    });
+    let weave = run_live_weave(&vault, project, import_changed, delta.as_ref())?;
     let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
     let lower_report = lower_shadow_sqlite(&cache_dir, project, &vault)?;
     let verify = verify_chain(&vault)?;
@@ -1108,6 +1141,7 @@ pub(crate) fn run_live_weave<C>(
     vault: &AsterVault<C>,
     project: &str,
     import_changed: bool,
+    delta: Option<&WeaveDelta>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -1124,7 +1158,21 @@ where
 
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
     let at_seq = vault.snapshot();
-    let slots = shadow_available_slots();
+    let slots = EagerAgreementKind::ALL
+        .into_iter()
+        .flat_map(|kind| {
+            let (left, right) = kind.slots();
+            [left, right]
+        })
+        .chain([
+            SlotId::new(1),
+            SlotId::new(4),
+            SlotId::new(18),
+            SlotId::new(21),
+        ])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut nodes = Vec::new();
     let mut cx_ids = BTreeMap::new();
     let mut absent_slot_rows = 0usize;
@@ -1164,8 +1212,27 @@ where
     let vector_skip_count = similarity_plan.skips.vector_skips.len();
     let family_opt_out_count = similarity_plan.skips.family_opt_outs.len();
     let similarity = persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?;
-    let xterm_plan = plan_eager_cross_terms(&nodes);
-    let xterm = persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?;
+    let xterm_plan = match delta {
+        Some(delta) => plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names),
+        None => plan_eager_cross_terms(&nodes),
+    };
+    let xterm = match delta {
+        Some(delta) => {
+            let dirty_cx_ids = cx_ids
+                .iter()
+                .filter(|(qualified_name, _)| delta.dirty_qualified_names.contains(*qualified_name))
+                .map(|(qualified_name, cx_id)| (qualified_name.clone(), *cx_id))
+                .collect::<BTreeMap<_, _>>();
+            persist_eager_cross_terms_delta(
+                vault,
+                &xterm_plan,
+                &dirty_cx_ids,
+                &delta.removed_cx_ids,
+                "astrolabe-shadow-weave",
+            )?
+        }
+        None => persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?,
+    };
     let absent_by_kind = xterm
         .absent_by_kind
         .iter()
