@@ -402,6 +402,309 @@ TEST(trace_ingest_unmatched_accounted) {
     PASS();
 }
 
+/* ── incident lifecycle FSV (issue #323) + cumulative weights (issue #324) ──
+ *
+ * These tests build HTTP record batches directly (bypassing the OTLP decoder)
+ * so a batch's exact request count / error count / route can be dialed in, then
+ * INDEPENDENTLY read back the persisted Incident status, LABELED edge, promoted
+ * edge weight, RuntimeAnchor traffic and TraceBatch ledger node. Appended after
+ * the original #27 suite; nothing above is modified. */
+
+/* Fill `recs` with `total` POST /api/orders records, the first `errors` of them
+ * returning 500 (the rest 200). Matches the setup_route_graph POST route. */
+static int fill_orders(cbm_trace_record_t *recs, int total, int errors) {
+    for (int i = 0; i < total; i++) {
+        memset(&recs[i], 0, sizeof(recs[i]));
+        snprintf(recs[i].service, sizeof(recs[i].service), "orders-svc");
+        snprintf(recs[i].method, sizeof(recs[i].method), "POST");
+        snprintf(recs[i].path, sizeof(recs[i].path), "/api/orders");
+        recs[i].status_code = (i < errors) ? 500 : 200;
+        recs[i].duration_ns = 10000000 + i;
+        recs[i].span_kind = 3;
+    }
+    return total;
+}
+
+/* Read back the Incident node's status string ("active"/"resolved"), or NULL. */
+static int incident_status_is(cbm_store_t *s, const char *want) {
+    cbm_node_t inc = {0};
+    int ok = 0;
+    if (cbm_store_find_node_by_qn(s, "test", INCIDENT_QN, &inc) == CBM_STORE_OK) {
+        char needle[64];
+        snprintf(needle, sizeof(needle), "\"status\":\"%s\"", want);
+        ok = inc.properties_json && strstr(inc.properties_json, needle) != NULL;
+    }
+    cbm_node_free_fields(&inc);
+    return ok;
+}
+
+/* ── #323: incident resolves when a later batch recovers ─────────────── */
+
+TEST(trace_ingest_incident_resolves_on_recovery) {
+    int64_t route_id = 0;
+    cbm_store_t *s = setup_route_graph(&route_id, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    /* Batch A: 8 requests, 6x 500 => error_rate 0.75 => critical incident. */
+    cbm_trace_record_t a[8];
+    fill_orders(a, 8, 6);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 8, &sa), CBM_STORE_OK);
+    ASSERT_EQ(sa.incidents_detected, 1);
+    ASSERT_EQ(sa.incidents_resolved, 0);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* before: latched active */
+
+    /* Batch B: 6 healthy requests => valid recovery window => resolved. */
+    cbm_trace_record_t b[6];
+    fill_orders(b, 6, 0);
+    cbm_trace_ingest_stats_t sb = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", b, 6, &sb), CBM_STORE_OK);
+    ASSERT_EQ(sb.incidents_detected, 0);
+    ASSERT_EQ(sb.incidents_resolved, 1);
+
+    /* After: the SAME node persists, flipped to resolved (never deleted). */
+    cbm_node_t inc = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "test", INCIDENT_QN, &inc), CBM_STORE_OK);
+    ASSERT_TRUE(strstr(inc.properties_json, "\"status\":\"resolved\"") != NULL);
+    ASSERT_TRUE(strstr(inc.properties_json, "\"resolution\":\"recovery\"") != NULL);
+    ASSERT_TRUE(strstr(inc.properties_json, "\"severity\":\"critical\"") != NULL); /* preserved */
+    cbm_node_free_fields(&inc);
+
+    /* Ledgered on the route->incident LABELED edge as well. */
+    cbm_edge_t *lab = NULL;
+    int labc = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, route_id, "LABELED", &lab, &labc),
+              CBM_STORE_OK);
+    ASSERT_EQ(labc, 1);
+    ASSERT_TRUE(strstr(lab[0].properties_json, "\"resolved\":true") != NULL);
+    cbm_store_free_edges(lab, labc);
+
+    /* Re-applying the recovery batch is idempotent (already resolved => 0). */
+    cbm_trace_ingest_stats_t sc = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", b, 6, &sc), CBM_STORE_OK);
+    ASSERT_EQ(sc.incidents_resolved, 0);
+    ASSERT_TRUE(incident_status_is(s, "resolved"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #323 edge: empty recovery batch keeps the incident latched ──────── */
+
+TEST(trace_ingest_incident_persists_on_empty_recovery) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    cbm_trace_record_t a[8];
+    fill_orders(a, 8, 6);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 8, &sa), CBM_STORE_OK);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* before */
+
+    /* Empty batch: no window to evaluate => no transition. */
+    cbm_trace_ingest_stats_t sb = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", NULL, 0, &sb), CBM_STORE_OK);
+    ASSERT_EQ(sb.incidents_resolved, 0);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* after: still latched */
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #323 edge: route absent from the recovery batch keeps it latched ── */
+
+TEST(trace_ingest_incident_persists_when_route_absent) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    cbm_trace_record_t a[8];
+    fill_orders(a, 8, 6);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 8, &sa), CBM_STORE_OK);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* before */
+
+    /* Recovery batch touches only an UNMATCHED route: the incident route was
+     * never observed healthy, so its incident cannot be cleared. */
+    cbm_trace_record_t b[6];
+    fill_orders(b, 6, 0);
+    for (int i = 0; i < 6; i++) {
+        snprintf(b[i].path, sizeof(b[i].path), "/api/widgets");
+    }
+    cbm_trace_ingest_stats_t sb = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", b, 6, &sb), CBM_STORE_OK);
+    ASSERT_EQ(sb.routes_matched, 0);
+    ASSERT_EQ(sb.incidents_resolved, 0);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* after: still latched */
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #323 edge: exactly-at-threshold window does NOT resolve ─────────── */
+
+TEST(trace_ingest_at_threshold_no_resolve) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    cbm_trace_record_t a[8];
+    fill_orders(a, 8, 6);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 8, &sa), CBM_STORE_OK);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* before */
+
+    /* 8 requests, 4x 500 => error_rate 0.50 == INCIDENT_ERROR_RATE_HIGH: the
+     * band is inclusive, so this is still an incident, never a recovery. */
+    cbm_trace_record_t b[8];
+    fill_orders(b, 8, 4);
+    cbm_trace_ingest_stats_t sb = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", b, 8, &sb), CBM_STORE_OK);
+    ASSERT_EQ(sb.incidents_resolved, 0);
+    ASSERT_EQ(sb.incidents_detected, 1);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* after: still active */
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #323 edge: flapping route active -> resolved -> active ──────────── */
+
+TEST(trace_ingest_incident_flapping) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    cbm_trace_record_t spike[8];
+    fill_orders(spike, 8, 6);
+    cbm_trace_record_t healthy[6];
+    fill_orders(healthy, 6, 0);
+
+    cbm_trace_ingest_stats_t s1 = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", spike, 8, &s1), CBM_STORE_OK);
+    ASSERT_TRUE(incident_status_is(s, "active"));
+
+    cbm_trace_ingest_stats_t s2 = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", healthy, 6, &s2), CBM_STORE_OK);
+    ASSERT_EQ(s2.incidents_resolved, 1);
+    ASSERT_TRUE(incident_status_is(s, "resolved"));
+
+    /* Re-incident must RE-ACTIVATE the same node, not stay resolved. */
+    cbm_trace_ingest_stats_t s3 = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", spike, 8, &s3), CBM_STORE_OK);
+    ASSERT_EQ(s3.incidents_detected, 1);
+    ASSERT_TRUE(incident_status_is(s, "active")); /* flipped back */
+
+    /* Exactly ONE Incident node exists for the route (no duplicate latch). */
+    cbm_node_t *incs = NULL;
+    int nincs = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test", "Incident", &incs, &nincs), CBM_STORE_OK);
+    ASSERT_EQ(nincs, 1);
+    cbm_store_free_nodes(incs, nincs);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #324: edge weights accumulate across distinct batches ───────────── */
+
+TEST(trace_ingest_weights_accumulate_across_batches) {
+    int64_t route_id = 0;
+    cbm_store_t *s = setup_route_graph(&route_id, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    /* Batch A: 4 healthy requests => cumulative traffic 4. */
+    cbm_trace_record_t a[4];
+    fill_orders(a, 4, 0);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 4, &sa), CBM_STORE_OK);
+    ASSERT_TRUE(assert_http_edge_promoted(s, route_id, 4)); /* before: weight 4 */
+
+    /* Batch B: 5 healthy requests (distinct content) => cumulative 4 + 5 = 9. */
+    cbm_trace_record_t b[5];
+    fill_orders(b, 5, 0);
+    cbm_trace_ingest_stats_t sb = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", b, 5, &sb), CBM_STORE_OK);
+    ASSERT_TRUE(assert_http_edge_promoted(s, route_id, 9)); /* after: hand-computed 9 */
+
+    /* RuntimeAnchor traffic reads back the cumulative total, not a per-batch one. */
+    cbm_node_t anchor = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "test", ANCHOR_QN, &anchor), CBM_STORE_OK);
+    ASSERT_TRUE(strstr(anchor.properties_json, "\"traffic\":9") != NULL);
+    cbm_node_free_fields(&anchor);
+
+    /* Two distinct TraceBatch ledger entries recorded. */
+    cbm_node_t *batches = NULL;
+    int nb = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test", "TraceBatch", &batches, &nb), CBM_STORE_OK);
+    ASSERT_EQ(nb, 2);
+    cbm_store_free_nodes(batches, nb);
+
+    /* Re-ingest batch A verbatim: fingerprint already ledgered => NO double
+     * count. Weight stays 9 and no new ledger node is created. */
+    cbm_trace_ingest_stats_t sc = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 4, &sc), CBM_STORE_OK);
+    ASSERT_TRUE(assert_http_edge_promoted(s, route_id, 9));
+    cbm_node_t *batches2 = NULL;
+    int nb2 = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test", "TraceBatch", &batches2, &nb2), CBM_STORE_OK);
+    ASSERT_EQ(nb2, 2);
+    cbm_store_free_nodes(batches2, nb2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #324 edge: overflow-scale counts saturate, never wrap ───────────── */
+
+TEST(trace_ingest_weight_overflow_saturates) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    /* Pre-seed the RuntimeAnchor near INT64_MAX to simulate long-run traffic
+     * (before state: traffic == INT64_MAX - 2). */
+    cbm_node_t seed = {.project = "test",
+                       .label = "RuntimeAnchor",
+                       .name = "/api/orders",
+                       .qualified_name = ANCHOR_QN,
+                       .file_path = "",
+                       .properties_json = "{\"kind\":\"runtime_anchor\","
+                                          "\"traffic\":9223372036854775805,\"error_count\":0}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &seed), 0);
+
+    /* A distinct batch of 6 healthy requests would push traffic past INT64_MAX. */
+    cbm_trace_record_t a[6];
+    fill_orders(a, 6, 0);
+    cbm_trace_ingest_stats_t sa = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", a, 6, &sa), CBM_STORE_OK);
+
+    /* After: clamped at INT64_MAX (never a negative wrap), degradation labeled. */
+    cbm_node_t back = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "test", ANCHOR_QN, &back), CBM_STORE_OK);
+    ASSERT_TRUE(strstr(back.properties_json, "\"traffic\":9223372036854775807") != NULL);
+    ASSERT_TRUE(strstr(back.properties_json, "\"saturated\":true") != NULL);
+    cbm_node_free_fields(&back);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── #324 edge: an empty batch writes no ledger node ─────────────────── */
+
+TEST(trace_ingest_empty_batch_no_ledger) {
+    cbm_store_t *s = setup_route_graph(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(s);
+
+    cbm_trace_ingest_stats_t st = {0};
+    ASSERT_EQ(cbm_trace_ingest_records(s, "test", NULL, 0, &st), CBM_STORE_OK);
+
+    cbm_node_t *batches = NULL;
+    int nb = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test", "TraceBatch", &batches, &nb), CBM_STORE_OK);
+    ASSERT_EQ(nb, 0); /* nothing measured => nothing ledgered */
+    cbm_store_free_nodes(batches, nb);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(trace_ingest) {
     RUN_TEST(trace_ingest_json_promotes);
     RUN_TEST(trace_ingest_protobuf_matches_json);
@@ -412,4 +715,12 @@ SUITE(trace_ingest) {
     RUN_TEST(trace_ingest_empty_input);
     RUN_TEST(trace_ingest_invalid_protobuf);
     RUN_TEST(trace_ingest_unmatched_accounted);
+    RUN_TEST(trace_ingest_incident_resolves_on_recovery);
+    RUN_TEST(trace_ingest_incident_persists_on_empty_recovery);
+    RUN_TEST(trace_ingest_incident_persists_when_route_absent);
+    RUN_TEST(trace_ingest_at_threshold_no_resolve);
+    RUN_TEST(trace_ingest_incident_flapping);
+    RUN_TEST(trace_ingest_weights_accumulate_across_batches);
+    RUN_TEST(trace_ingest_weight_overflow_saturates);
+    RUN_TEST(trace_ingest_empty_batch_no_ledger);
 }

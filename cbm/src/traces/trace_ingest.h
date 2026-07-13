@@ -8,16 +8,31 @@
  *      QN canonicalization (__route__METHOD__/path).
  *   2. Promotes the caller/cross-service edges into that Route (and the
  *      DATA_FLOWS through its handlers): props.validated=true, weight ->
- *      measured request count, trust Provisional -> Trusted, provenance ref.
+ *      CUMULATIVE measured request count, trust Provisional -> Trusted,
+ *      provenance ref.
  *   3. Writes runtime anchors: a RuntimeAnchor node per matched route carrying
- *      traffic/latency/error evidence, plus OBSERVED_TRAFFIC edges from the
- *      handler symbols (Recurrence occurrences).
+ *      cumulative traffic/error evidence (the counter of record) plus
+ *      current-window latency, plus OBSERVED_TRAFFIC edges from the handler
+ *      symbols (Recurrence occurrences).
  *   4. Detects incidents: when the 5xx rate over a route spikes past the
- *      declared threshold, an Incident node is labeled onto the route.
+ *      declared threshold, an Incident node (status "active") is labeled onto
+ *      the route. Incident lifecycle is fail-closed: a later batch whose window
+ *      for that route is a valid healthy sample (>= INCIDENT_MIN_REQUESTS with
+ *      error rate below INCIDENT_ERROR_RATE_HIGH) transitions the latched
+ *      Incident to status "resolved" — a ledgered state change on the node and
+ *      its LABELED edge, never a silent deletion. A route absent from a later
+ *      batch keeps its Incident latched (no evidence == no transition), and a
+ *      re-incident re-activates the same node (flapping is idempotent by QN).
  *
- * Ingestion is idempotent: aggregates are written as absolute measured values
- * keyed by deterministic QN, and edge promotion is a json_patch, so ingesting
- * the same batch twice yields no double-promotion and no duplicate anchors.
+ * Ingestion accumulates across batches yet is idempotent per batch: measured
+ * traffic/error counts add onto the route's RuntimeAnchor (the cumulative
+ * counter of record) and promoted edge weights carry that cumulative value, so
+ * long-run load survives between batches. Each batch is fingerprinted by its
+ * measured content and recorded as a TraceBatch ledger node; a batch already in
+ * the ledger contributes no delta, so ingesting the SAME batch twice yields no
+ * double-count and no duplicate anchors, while a distinct batch accumulates.
+ * Cumulative counters saturate at INT64_MAX with a labeled "saturated" marker
+ * rather than wrapping.
  *
  * Every span is accounted: non-HTTP spans and HTTP spans that match no route
  * are counted and surfaced, never silently dropped (HONEST invariant 3).
@@ -47,7 +62,8 @@ typedef struct {
     int routes_matched;   /* distinct Route nodes that received promotions */
     int edges_promoted;   /* edge upserts carrying validated/Trusted/weight */
     int anchors_written;  /* RuntimeAnchor nodes + occurrence edges written */
-    int incidents_detected; /* Incident nodes labeled */
+    int incidents_detected; /* Incident nodes labeled (status active) */
+    int incidents_resolved; /* latched Incident nodes transitioned to resolved */
     int simple_records;   /* {caller,callee,count} records applied */
     int simple_unmatched; /* simple records with no matching edge */
 } cbm_trace_ingest_stats_t;

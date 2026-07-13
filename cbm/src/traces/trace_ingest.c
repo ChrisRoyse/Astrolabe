@@ -111,6 +111,83 @@ static void group_set_free(trace_group_set_t *gs) {
     gs->cap = 0;
 }
 
+/* ── cumulative accounting (issue #324) ──────────────────────────────
+ *
+ * Runtime weights and traffic figures accumulate across batches: the
+ * RuntimeAnchor node is the single cumulative counter of record, and promoted
+ * edge weights are patched to that cumulative value. Re-ingesting the SAME
+ * batch must not double-count, so each batch is fingerprinted by its measured
+ * content and recorded as a TraceBatch ledger node; a batch already in the
+ * ledger contributes no delta (idempotent) while a distinct batch adds its
+ * measured counts. Counters saturate at INT64_MAX with a labeled marker rather
+ * than wrapping (HONEST invariant 3 — no silent degradation). */
+
+/* FNV-1a 64-bit over a NUL-terminated string, chained from `h`. */
+static uint64_t ti_fnv1a(const char *s, uint64_t h) {
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Saturating int64 add: clamps at INT64_MAX and reports the clamp so the
+ * degradation is labeled, never a silent wrap to a negative counter. */
+static int64_t ti_sat_add(int64_t a, int64_t b, bool *saturated) {
+    if (b > 0 && a > INT64_MAX - b) {
+        *saturated = true;
+        return INT64_MAX;
+    }
+    return a + b;
+}
+
+/* Read a flat integer field from our own controlled anchor/props JSON (no
+ * nested objects), e.g. "traffic":123. Returns false when the key is absent. */
+static bool ti_json_int(const char *json, const char *key, int64_t *out) {
+    if (!json) {
+        return false;
+    }
+    char needle[CBM_SZ_64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(json, needle);
+    if (!p) {
+        return false;
+    }
+    p += strlen(needle);
+    while (*p == ' ') {
+        p++;
+    }
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    if (end == p) {
+        return false;
+    }
+    *out = (int64_t)v;
+    return true;
+}
+
+/* Read the current cumulative traffic/error_count off a route's RuntimeAnchor.
+ * Absent anchor (first observation) reads back zero — a clean accumulation
+ * base. */
+static void ti_read_anchor_cumulative(cbm_store_t *store, const char *project,
+                                      const char *anchor_qn, int64_t *traffic,
+                                      int64_t *error_count) {
+    *traffic = 0;
+    *error_count = 0;
+    cbm_node_t a = {0};
+    if (cbm_store_find_node_by_qn(store, project, anchor_qn, &a) == CBM_STORE_OK) {
+        int64_t t = 0;
+        int64_t e = 0;
+        if (ti_json_int(a.properties_json, "traffic", &t)) {
+            *traffic = t;
+        }
+        if (ti_json_int(a.properties_json, "error_count", &e)) {
+            *error_count = e;
+        }
+    }
+    cbm_node_free_fields(&a);
+}
+
 /* ── promotion ───────────────────────────────────────────────────── */
 
 /* json_patch the promotion evidence onto an existing edge (idempotent: the
@@ -171,11 +248,14 @@ static int promote_handler_data_flows(cbm_store_t *store, const char *project, i
 
 /* ── anchors + incidents ─────────────────────────────────────────── */
 
-/* Write the RuntimeAnchor node for a route (absolute values -> idempotent) and
- * an OBSERVED_TRAFFIC edge from every handler symbol. Returns objects written. */
+/* Write the RuntimeAnchor node for a route (CUMULATIVE traffic/error counts —
+ * issue #324) and an OBSERVED_TRAFFIC edge from every handler symbol. `traffic`
+ * and `error_count` are the route's lifetime totals; `error_rate` is derived
+ * from them; `p99_ns`/`incident` reflect the current batch window; `saturated`
+ * marks a clamped counter. Returns objects written. */
 static int write_runtime_anchor(cbm_store_t *store, const char *project, const char *route_qn,
                                 const cbm_node_t *route, int64_t count, int64_t error_count,
-                                int64_t p99_ns, double error_rate, bool incident,
+                                int64_t p99_ns, double error_rate, bool incident, bool saturated,
                                 const char *service) {
     char anchor_qn[TI_ROUTE_QN_SIZE];
     snprintf(anchor_qn, sizeof(anchor_qn), "__runtime__%s", route_qn);
@@ -189,9 +269,10 @@ static int write_runtime_anchor(cbm_store_t *store, const char *project, const c
     snprintf(props, sizeof(props),
              "{\"kind\":\"runtime_anchor\",\"service\":\"%s\",\"path\":\"%s\","
              "\"traffic\":%lld,\"error_count\":%lld,\"error_rate\":%.4f,"
-             "\"p99_ns\":%lld,\"incident\":%s,\"provenance\":\"runtime_trace\"}",
+             "\"p99_ns\":%lld,\"incident\":%s,\"saturated\":%s,"
+             "\"provenance\":\"runtime_trace\"}",
              esc_svc, esc_path, (long long)count, (long long)error_count, error_rate,
-             (long long)p99_ns, incident ? "true" : "false");
+             (long long)p99_ns, incident ? "true" : "false", saturated ? "true" : "false");
 
     cbm_node_t anchor = {
         .project = project,
@@ -247,8 +328,70 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
 
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
-             "{\"kind\":\"incident\",\"severity\":\"%s\",\"error_rate\":%.4f,"
-             "\"error_count\":%lld,\"traffic\":%lld,\"trigger\":\"5xx_spike\","
+             "{\"kind\":\"incident\",\"severity\":\"%s\",\"status\":\"active\","
+             "\"error_rate\":%.4f,\"error_count\":%lld,\"traffic\":%lld,"
+             "\"trigger\":\"5xx_spike\",\"provenance\":\"runtime_trace\"}",
+             severity, error_rate, (long long)error_count, (long long)count);
+
+    cbm_node_t incident = {
+        .project = project,
+        .label = "Incident",
+        .name = route->name ? route->name : "incident",
+        .qualified_name = incident_qn,
+        .file_path = "",
+        .start_line = 0,
+        .end_line = 0,
+        .properties_json = props,
+    };
+    int64_t incident_id = cbm_store_upsert_node(store, &incident);
+    if (incident_id <= 0) {
+        return 0;
+    }
+    /* Upsert-by-QN re-activates a previously resolved node (flapping): the props
+     * above carry status "active" and overwrite any prior resolved record. */
+    char edge_props[CBM_SZ_128];
+    snprintf(edge_props, sizeof(edge_props),
+             "{\"label\":\"incident\",\"severity\":\"%s\",\"resolved\":false}", severity);
+    promote_edge(store, project, route->id, incident_id, "LABELED", edge_props);
+    return 1;
+}
+
+/* Resolve a latched Incident when a later batch's window shows the route
+ * healthy again. Fail-closed lifecycle (issue #323): never a silent deletion —
+ * the Incident node is flipped active -> resolved with recovery provenance and
+ * the route->incident LABELED edge is patched resolved=true, so the transition
+ * is an independently readable ledger entry. Returns 1 iff a transition
+ * occurred (an active Incident existed); 0 when there is no incident to clear
+ * or it is already resolved (idempotent). Only the caller's healthy-window gate
+ * (>= INCIDENT_MIN_REQUESTS, error rate below INCIDENT_ERROR_RATE_HIGH) reaches
+ * here, so a below-sample or empty window can never clear a real incident. */
+static int resolve_incident(cbm_store_t *store, const char *project, const char *route_qn,
+                            const cbm_node_t *route, int64_t count, int64_t error_count,
+                            double error_rate) {
+    char incident_qn[TI_ROUTE_QN_SIZE];
+    snprintf(incident_qn, sizeof(incident_qn), "__incident__%s", route_qn);
+
+    cbm_node_t existing = {0};
+    if (cbm_store_find_node_by_qn(store, project, incident_qn, &existing) != CBM_STORE_OK) {
+        return 0; /* nothing latched */
+    }
+    if (existing.properties_json &&
+        strstr(existing.properties_json, "\"status\":\"resolved\"") != NULL) {
+        cbm_node_free_fields(&existing); /* already resolved -> idempotent no-op */
+        return 0;
+    }
+    /* Preserve the incident's original severity band in the resolution record. */
+    const char *severity = (existing.properties_json &&
+                            strstr(existing.properties_json, "\"severity\":\"critical\"") != NULL)
+                               ? "critical"
+                               : "high";
+    cbm_node_free_fields(&existing);
+
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props),
+             "{\"kind\":\"incident\",\"severity\":\"%s\",\"status\":\"resolved\","
+             "\"error_rate\":%.4f,\"error_count\":%lld,\"traffic\":%lld,"
+             "\"trigger\":\"5xx_spike\",\"resolution\":\"recovery\","
              "\"provenance\":\"runtime_trace\"}",
              severity, error_rate, (long long)error_count, (long long)count);
 
@@ -267,8 +410,7 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
         return 0;
     }
     char edge_props[CBM_SZ_128];
-    snprintf(edge_props, sizeof(edge_props), "{\"label\":\"incident\",\"severity\":\"%s\"}",
-             severity);
+    snprintf(edge_props, sizeof(edge_props), "{\"resolved\":true,\"resolution\":\"recovery\"}");
     promote_edge(store, project, route->id, incident_id, "LABELED", edge_props);
     return 1;
 }
@@ -276,7 +418,7 @@ static int write_incident(cbm_store_t *store, const char *project, const char *r
 /* ── per-group processing ────────────────────────────────────────── */
 
 static int process_group(cbm_store_t *store, const char *project, trace_group_t *g,
-                         cbm_trace_ingest_stats_t *stats) {
+                         bool batch_already_applied, cbm_trace_ingest_stats_t *stats) {
     char route_qn[TI_ROUTE_QN_SIZE];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", g->method, g->canonpath);
 
@@ -294,16 +436,40 @@ static int process_group(cbm_store_t *store, const char *project, trace_group_t 
 
     int64_t p99_ns = cbm_calculate_p99(g->durations, g->dur_n);
     double error_rate = g->count > 0 ? (double)g->error_count / (double)g->count : 0.0;
+    /* Incident detection is over the BATCH WINDOW (not cumulative traffic), so a
+     * later healthy window can recover a route regardless of its lifetime total.
+     * Both bands require a valid sample (>= MIN_REQUESTS) so a 1-request blip can
+     * neither raise nor clear an incident. */
     bool incident = (g->count >= CBM_INCIDENT_MIN_REQUESTS &&
                      error_rate >= CBM_INCIDENT_ERROR_RATE_HIGH);
+    bool window_healthy = (g->count >= CBM_INCIDENT_MIN_REQUESTS &&
+                           error_rate < CBM_INCIDENT_ERROR_RATE_HIGH);
 
-    /* Promotion patch: numbers + fixed tokens only (no escaping needed). */
+    /* Accumulate this batch's measured counts onto the route's lifetime totals
+     * (issue #324). The RuntimeAnchor is the cumulative counter of record; a
+     * batch already recorded in the TraceBatch ledger contributes no delta so a
+     * verbatim re-ingest is a no-op, while a distinct batch adds its counts. */
+    char anchor_qn[TI_ROUTE_QN_SIZE];
+    snprintf(anchor_qn, sizeof(anchor_qn), "__runtime__%s", route_qn);
+    int64_t cum_traffic = 0;
+    int64_t cum_errors = 0;
+    ti_read_anchor_cumulative(store, project, anchor_qn, &cum_traffic, &cum_errors);
+    bool saturated = false;
+    if (!batch_already_applied) {
+        cum_traffic = ti_sat_add(cum_traffic, g->count, &saturated);
+        cum_errors = ti_sat_add(cum_errors, g->error_count, &saturated);
+    }
+    double cum_error_rate = cum_traffic > 0 ? (double)cum_errors / (double)cum_traffic : 0.0;
+
+    /* Promotion patch: numbers + fixed tokens only (no escaping needed).
+     * weight/runtime_count carry the CUMULATIVE traffic so long-run measured
+     * load survives across batches. */
     char patch[CBM_SZ_512];
     snprintf(patch, sizeof(patch),
              "{\"validated\":true,\"trust\":\"Trusted\",\"provenance\":\"runtime_trace\","
              "\"weight\":%lld,\"runtime_count\":%lld,\"runtime_error_count\":%lld,"
              "\"runtime_p99_ns\":%lld,\"incident\":%s}",
-             (long long)g->count, (long long)g->count, (long long)g->error_count,
+             (long long)cum_traffic, (long long)cum_traffic, (long long)cum_errors,
              (long long)p99_ns, incident ? "true" : "false");
 
     int promoted = 0;
@@ -327,12 +493,15 @@ static int process_group(cbm_store_t *store, const char *project, trace_group_t 
     stats->edges_promoted += promoted;
     stats->spans_http += (int)g->count;
 
-    stats->anchors_written += write_runtime_anchor(store, project, route_qn, &route, g->count,
-                                                   g->error_count, p99_ns, error_rate, incident,
-                                                   g->service);
+    stats->anchors_written +=
+        write_runtime_anchor(store, project, route_qn, &route, cum_traffic, cum_errors, p99_ns,
+                             cum_error_rate, incident, saturated, g->service);
     if (incident) {
         stats->incidents_detected +=
             write_incident(store, project, route_qn, &route, g->count, g->error_count, error_rate);
+    } else if (window_healthy) {
+        stats->incidents_resolved += resolve_incident(store, project, route_qn, &route, g->count,
+                                                       g->error_count, error_rate);
     }
 
     cbm_node_free_fields(&route);
@@ -377,12 +546,57 @@ int cbm_trace_ingest_records(cbm_store_t *store, const char *project,
         }
     }
 
+    /* Fingerprint the batch by its aggregated measured content (issue #324).
+     * Combining per-group hashes additively makes the fingerprint independent of
+     * group iteration order; folding count/error_count/sample size/duration sum
+     * keeps genuinely distinct batches distinct. A verbatim re-ingest reproduces
+     * the same fingerprint and is deduped; different measurements accumulate. */
+    uint64_t fp = 0;
+    for (int i = 0; i < gs.n; i++) {
+        trace_group_t *g = &gs.groups[i];
+        int64_t dur_sum = 0;
+        for (int d = 0; d < g->dur_n; d++) {
+            dur_sum += g->durations[d];
+        }
+        char buf[TI_METHOD_BUF + TI_PATH_BUF + CBM_SZ_128];
+        snprintf(buf, sizeof(buf), "%s|%s|%lld|%lld|%d|%lld", g->method, g->canonpath,
+                 (long long)g->count, (long long)g->error_count, g->dur_n, (long long)dur_sum);
+        fp += ti_fnv1a(buf, 1469598103934665603ULL);
+    }
+
+    char batch_qn[TI_ROUTE_QN_SIZE];
+    snprintf(batch_qn, sizeof(batch_qn), "__trace_batch__%016llx", (unsigned long long)fp);
+    cbm_node_t existing_batch = {0};
+    bool batch_already_applied =
+        cbm_store_find_node_by_qn(store, project, batch_qn, &existing_batch) == CBM_STORE_OK;
+    cbm_node_free_fields(&existing_batch);
+
     int rc = CBM_STORE_OK;
     for (int i = 0; i < gs.n; i++) {
-        rc = process_group(store, project, &gs.groups[i], stats);
+        rc = process_group(store, project, &gs.groups[i], batch_already_applied, stats);
         if (rc != CBM_STORE_OK) {
             break;
         }
+    }
+
+    /* Ledger the applied batch only after every group committed (fail-closed: a
+     * partial failure leaves the batch unrecorded so a retry re-applies it). New
+     * batches only — re-applying an already-ledgered batch changes nothing. */
+    if (rc == CBM_STORE_OK && !batch_already_applied && gs.n > 0) {
+        char bprops[CBM_SZ_256];
+        snprintf(bprops, sizeof(bprops),
+                 "{\"kind\":\"trace_batch\",\"fingerprint\":\"%016llx\",\"groups\":%d,"
+                 "\"provenance\":\"runtime_trace\"}",
+                 (unsigned long long)fp, gs.n);
+        cbm_node_t bnode = {
+            .project = project,
+            .label = "TraceBatch",
+            .name = "trace_batch",
+            .qualified_name = batch_qn,
+            .file_path = "",
+            .properties_json = bprops,
+        };
+        cbm_store_upsert_node(store, &bnode);
     }
 
     char b1[CBM_SZ_16];
