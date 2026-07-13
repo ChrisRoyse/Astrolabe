@@ -1,0 +1,43 @@
+# ASTROLABE cargo configuration.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Opt-in: LLD linker for the x86_64-pc-windows-gnu target (issue #270)
+# ─────────────────────────────────────────────────────────────────────────────
+# Status: OPT-IN, NOT the silent default. ld.bfd (the mingw binutils linker)
+# remains the default so no gate/build silently changes linker without an
+# explicit operator choice (issue #270 DoD: "no silent linker downgrade").
+#
+# Measured on this workspace (2026-07-13), pure final-link of the libcbm-linked
+# `astrolabe` binary (446 MB dev artifact), isolated with a timing linker
+# wrapper, 3 alternating same-session samples each — registry-declared knob
+# values per standing invariant #4 (measurements, not magic constants):
+#
+#   ld.bfd  (mingw 14.1.0 binutils): 2381.8 / 2198.3 / 2412.4 ms  → avg 2330.8 ms
+#   ld.lld  (pinned LLVM 20.1.8):      834.7 /  852.9 /  844.8 ms  → avg  844.1 ms
+#   delta:  -1486.7 ms  (-63.8%,  2.76x faster link)
+#
+# Correctness: the lld-linked binary runs (`astrolabe --version` -> "astrolabe
+# 0.1.0", rc=0); binary size 446.74 MB (lld) vs 446.96 MB (bfd), functionally
+# identical. Cold full build (compile-dominated, not link-bound): bfd 136 s vs
+# lld 156 s — the link win is realized in the aggregate, whose long pole is
+# ~20 concurrent final links, not in a single compile-dominated cold build.
+#
+# ── HARD REQUIREMENT before enabling ─────────────────────────────────────────
+# gcc's collect2 resolves `ld.lld.exe` from the FIRST match on PATH. On this
+# host an UNPINNED "MSVS BuildTools LLD 12.0.0" sits in the system PATH; if it
+# precedes the pinned bundle, enabling lld silently links with an old, unpinned
+# linker. The launcher's pinned LLVM 20.1.8 bin
+#   C:/code/Astrolabe/.toolchains/llvm-20.1.8-x86_64-pc-windows-msvc/bin
+# MUST appear on PATH *ahead* of any other ld.lld. Verify with:
+#   gcc -fuse-ld=lld -Wl,--version <trivial.c> -o x   # must print "LLD 20.1.8"
+# If that prints any other version, DO NOT enable lld — fail closed.
+#
+# ── To enable (opt-in) ───────────────────────────────────────────────────────
+# EITHER set, for the invoking process only, with the pinned LLVM bin on PATH:
+#   RUSTFLAGS="-Clink-arg=-fuse-ld=lld"
+# OR uncomment the block below (makes lld the linker for every gnu build in
+# this workspace — only do this once the pinned-PATH requirement above is
+# guaranteed by the launcher):
+#
+# [target.x86_64-pc-windows-gnu]
+# rustflags = ["-Clink-arg=-fuse-ld=lld"]
