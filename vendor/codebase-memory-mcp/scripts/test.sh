@@ -54,11 +54,29 @@ print_env "test.sh"
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
+# #280: per-step wall-clock so the aggregate's timing surface can attribute
+# the phase cost (clean/build/run/prod/watchdog) instead of one opaque total.
+step_epoch() { date +%s; }
+tstep_start="$(step_epoch)"
+tstep() {
+    local now
+    now="$(step_epoch)"
+    echo "STEP_TIME[cbm:$1]: $((now - tstep_start))s"
+    tstep_start="$now"
+}
+
 # Step 1: Clean
 scripts/clean.sh
+tstep clean
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
-make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS).
+# Split so build cost and test-run cost are separately attributable: the
+# test-runner build first (all its object deps), then `test` (deps already
+# up to date) just executes the runner.
+make -j"$NPROC" -f Makefile.cbm build/c/test-runner $MAKE_ARGS
+tstep build-test-runner
+make -f Makefile.cbm test $MAKE_ARGS
+tstep run-test-runner
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
@@ -73,18 +91,22 @@ fi
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+tstep build-prod-cbm
 bash "$ROOT/tests/test_parent_watchdog.sh"
+tstep parent-watchdog
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 bash "$ROOT/tests/test_worker_watchdog.sh"
+tstep worker-watchdog
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
 echo "=== Step 6: security-strings allow-list regression ==="
 bash "$ROOT/tests/test_security_strings_allowlist.sh"
+tstep security-strings
 
 echo "=== All tests passed ==="
