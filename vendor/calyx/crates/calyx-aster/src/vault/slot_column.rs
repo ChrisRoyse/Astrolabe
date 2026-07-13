@@ -113,11 +113,10 @@ where
     }
 
     fn dense_slot_rows_at(&self, snapshot: Seq, slot: SlotId) -> Result<Vec<SlotColumnRow>> {
-        let rows = self.rows.scan_cf_at(
-            self.snapshot_handle(snapshot),
-            ColumnFamily::slot(slot),
-            &self.clock,
-        )?;
+        let snapshot = self.snapshot_handle(snapshot);
+        let rows =
+            self.rows
+                .scan_cf_at(snapshot.snapshot(), ColumnFamily::slot(slot), &self.clock)?;
         if rows.is_empty() {
             return Err(CalyxError::stale_derived(format!(
                 "slot {slot} has no rows to materialize"
@@ -251,21 +250,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_parent(path)
 }
 
-#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| CalyxError::disk_pressure("slot artifact has no parent"))?;
-    File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| storage_error("fsync slot artifact dir", error))
-}
-
-#[cfg(not(unix))]
-fn sync_parent(path: &Path) -> Result<()> {
-    path.parent()
-        .ok_or_else(|| CalyxError::disk_pressure("slot artifact has no parent"))?;
-    Ok(())
+    crate::fsync::sync_parent(path, "slot artifact")
 }
 
 fn storage_error(context: &str, error: io::Error) -> CalyxError {

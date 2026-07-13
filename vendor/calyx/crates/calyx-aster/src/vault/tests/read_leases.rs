@@ -1,6 +1,19 @@
 use super::*;
 use std::sync::Arc;
 
+// NOTE (#287 Tranche 1, candidate 6): upstream f8fa97d0's second regression,
+// `seq_paged_scan_pins_versions_until_every_page_completes`, exercises the
+// seq-parameterized `AsterVault::scan_cf_pages_at` whole-CF streaming API, which
+// was introduced by upstream #1350 (`Stream Aster CF scans for Oracle`,
+// d7c34d63) — a commit our owned base has NOT adopted (out of Tranche-1 scope).
+// Our base carries only the range-paged variants (`scan_cf_range_page_at` /
+// `_snapshot`). That test is therefore intentionally NOT ported here; adopting
+// #1350 is tracked separately. The lease-scoping conversion candidate 6 makes to
+// every seq read our base *does* have (read_cf_at / scan_cf_at /
+// scan_cf_range_at / scan_cf_range_keys_at / scan_cf_range_page_at /
+// seq_for_key_at) is proven by the no-regression full lib suite plus the
+// explicit-lease bound below.
+
 #[derive(Clone, Debug)]
 struct MutableClock {
     now: Arc<AtomicU64>,

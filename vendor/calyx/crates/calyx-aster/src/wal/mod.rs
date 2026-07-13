@@ -343,29 +343,8 @@ fn open_append_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| CalyxError::disk_pressure("WAL segment path has no parent"))?;
-    File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| storage_error("fsync WAL directory", error))
-}
-
-#[cfg(not(unix))]
-fn sync_parent(path: &Path) -> Result<()> {
-    path.parent()
-        .ok_or_else(|| CalyxError::disk_pressure("WAL segment path has no parent"))?;
-    Ok(())
-}
-
-fn remove_later_segments(segments: &[(u64, PathBuf)]) -> Result<()> {
-    for (_, path) in segments {
-        fs::remove_file(path)
-            .map_err(|error| storage_error("remove discarded WAL segment", error))?;
-    }
-    Ok(())
+    crate::fsync::sync_parent(path, "WAL segment")
 }
 
 fn segment_inventory_locked(dir: &Path, active_index: u64) -> Result<Vec<WalSegmentStatus>> {
