@@ -4406,7 +4406,12 @@ fn guard_calibrate_calibrates_ledgers_and_persists_measured_profile() {
         .iter()
         .find(|slot| slot["slot"] == "public_api_signature")
         .unwrap();
-    assert_eq!(identity["target_far"], 0.01);
+    // target_far is stored f32; JSON carries its exact f64 widening, so assert
+    // the truthful persisted representation (0.01f32 != 0.01f64).
+    assert_eq!(
+        identity["target_far"].as_f64().unwrap(),
+        f64::from(0.01f32)
+    );
     assert_eq!(identity["achieved_far"], 0.0);
     assert!(!identity["provisional"].as_bool().unwrap());
 
@@ -7376,6 +7381,10 @@ fn seed_team_shadow_state(root: &Path) -> PathBuf {
     .unwrap();
     let lower_report = lower_shadow_sqlite(root, "demo", &vault).unwrap();
     let verify = verify_chain(&vault).unwrap();
+    // Flush so every CF (ledger included) reaches on-disk SSTs: the corruption
+    // FSV tampers persisted SST bytes and must find them (mirrors the ingest
+    // tamper harness, which flushes before tampering).
+    vault.flush().unwrap();
     drop(vault);
 
     let mut outcome = sample_shadow_outcome(root, imported.security_screen.clone());
