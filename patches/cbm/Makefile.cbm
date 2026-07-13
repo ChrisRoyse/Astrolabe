@@ -1022,9 +1022,10 @@ $(filter-out $(LIBCBM_DIR)/src/mcp/mcp.c,$(ASTRO_ENV_STORE_OVERLAYS)): $(LIBCBM_
 # every outcome (not only CLEAN); mcp.c threads the last failed worker's exit
 # code + bounded response text into build_worker_failure_response. mcp.c chains
 # AFTER the env-store overlay (both patch the same pinned source; each pass is
-# hash/anchor-checked and fails closed on drift). libcbm-only: the upstream
-# parity binary keeps the pinned behavior and no parity corpus entry contains a
-# worker-failure response.
+# hash/anchor-checked and fails closed on drift). The overlays reach BOTH
+# libcbm.a and the production parity binaries (PROD_SRCS_DIAG): the parity
+# gates compare astrolabe against the production binary live, so both sides
+# must carry identical behavior on shared failure cases (attempt 11, #282).
 ASTRO_WORKER_DIAG_PATCH = $(ASTROLABE_PATCH_DIR)/apply_worker_diag_patch.py
 ASTRO_WORKER_DIAG_SUPERVISOR_OVERLAY = $(LIBCBM_DIR)/src/mcp/index_supervisor.c
 ASTRO_WORKER_DIAG_SUPERVISOR_OBJ = $(LIBCBM_DIR)/src/mcp/index_supervisor.o
@@ -1035,6 +1036,20 @@ ASTRO_WORKER_DIAG_SUPERVISOR_OBJ = $(LIBCBM_DIR)/src/mcp/index_supervisor.o
 $(ASTRO_WORKER_DIAG_PROD_OVERLAYS): $(ASTRO_WORKER_DIAG_PROD_DIR)/%.c: %.c $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(PYTHON) $(ASTRO_WORKER_DIAG_PATCH) --file $< $< $@
+
+# index_supervisor.c quote-includes its own header ("index_supervisor.h"),
+# which resolves relative to the includer's directory. The prod binary compiles
+# every TU in one command with shared -I flags (no per-TU -Isrc/mcp like the
+# libcbm object rule), so the UNMODIFIED vendored header must sit next to the
+# generated overlay or the compile fails: index_supervisor.h: No such file
+# (aggregate attempt 12, 2026-07-12). mcp.c needs no copy — its includes are
+# all -Isrc-relative ("mcp/index_supervisor.h").
+ASTRO_WORKER_DIAG_PROD_SUPERVISOR_HDR = $(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/index_supervisor.h
+$(ASTRO_WORKER_DIAG_PROD_SUPERVISOR_HDR): src/mcp/index_supervisor.h | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	cp -f $< $@
+
+$(ASTRO_WORKER_DIAG_PROD_DIR)/src/mcp/index_supervisor.c: $(ASTRO_WORKER_DIAG_PROD_SUPERVISOR_HDR)
 
 $(LIBCBM_DIR)/src/mcp/mcp.c: src/mcp/mcp.c $(ASTRO_ENV_STORE_PATCH) $(ASTRO_WORKER_DIAG_PATCH) $(ASTRO_OVERLAY_LIB) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
