@@ -5914,6 +5914,10 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     cbm_otlp_batch_t batch = {0};
     cbm_trace_ingest_stats_t stats = {0};
     const char *format = "empty";
+    /* Control flow must not depend on strcmp(format, ...): GCC 14 -Wstring-compare
+     * proves literal-vs-literal branches constant under -O2 jump threading and
+     * -Werror rejects them. `format` is response-payload only. */
+    bool is_otlp = false;
     bool is_error = false;
     char *err_detail = NULL;
 
@@ -5929,6 +5933,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
     if (b64 && b64[0]) {
         format = "otlp_protobuf";
+        is_otlp = true;
         int rc = cbm_otlp_decode_protobuf_base64(b64, &batch);
         if (rc != CBM_OTLP_OK) {
             is_error = true;
@@ -5936,6 +5941,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
         }
     } else if (rspans && yyjson_is_arr(rspans)) {
         format = "otlp_json";
+        is_otlp = true;
         if (cbm_otlp_decode_json_rspans(rspans, &batch) != CBM_OTLP_OK) {
             is_error = true;
             err_detail = heap_strdup("invalid OTLP/JSON resourceSpans");
@@ -5951,6 +5957,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     } else if (traces && yyjson_is_arr(traces)) {
         /* Legacy signature: OTLP ResourceSpans carried in the `traces` array. */
         format = "otlp_json";
+        is_otlp = true;
         if (cbm_otlp_decode_json_rspans(traces, &batch) != CBM_OTLP_OK) {
             is_error = true;
             err_detail = heap_strdup("invalid OTLP/JSON spans in traces[]");
@@ -5958,8 +5965,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Ingest OTLP records (protobuf/JSON paths). */
-    if (!is_error && batch.record_count >= 0 &&
-        (strcmp(format, "otlp_protobuf") == 0 || strcmp(format, "otlp_json") == 0)) {
+    if (!is_error && is_otlp && batch.record_count >= 0) {
         stats.spans_total = batch.spans_total;
         stats.spans_non_http = batch.spans_non_http;
         cbm_trace_ingest_records(store, eff_project, batch.records, batch.record_count, &stats);
