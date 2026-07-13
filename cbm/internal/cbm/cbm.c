@@ -285,13 +285,21 @@ static void cbm_sqlite_memshutdown(void *appdata) {
 }
 #endif /* CBM_BIND_TS_ALLOCATOR */
 
+/* Allocator-binding state (#5). File-scope (was a function-local static) so
+ * cbm_alloc_bindings_active() can read back whether cbm_alloc_init() has already
+ * bound the tree-sitter/sqlite allocators to mimalloc. This gives the Rust FFI
+ * tests a deterministic init-order probe: the flag flips 0 -> 1 exactly once,
+ * the first time cbm_alloc_init() runs in a build that enables the binding.
+ * Single-threaded startup; a plain int is fine. Always 0 in the test build
+ * (CBM_BIND_TS_ALLOCATOR undefined) because the binding is a no-op there. */
+static int cbm_alloc_bound = 0;
+
 void cbm_alloc_init(void) {
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
-    static int alloc_bound = 0; /* single-threaded startup; plain int is fine */
-    if (alloc_bound) {
+    if (cbm_alloc_bound) {
         return;
     }
-    alloc_bound = 1;
+    cbm_alloc_bound = 1;
 
     /* tree-sitter runtime (was previously bound in cbm_init; consolidated here). */
     ts_set_allocator(mi_malloc, mi_calloc, mi_realloc, mi_free);
@@ -314,6 +322,15 @@ void cbm_alloc_init(void) {
     assert(sqlite_rc == SQLITE_OK && "SQLITE_CONFIG_MALLOC must run before sqlite3_initialize");
     (void)sqlite_rc;
 #endif /* CBM_BIND_TS_ALLOCATOR */
+}
+
+int cbm_alloc_bindings_active(void) {
+    /* Reads back the file-scope binding flag cbm_alloc_init() sets. Non-zero
+     * proves cbm_alloc_init() has run and bound tree-sitter/sqlite to mimalloc
+     * (only possible in a CBM_BIND_TS_ALLOCATOR build — libcbm.a and the prod
+     * binary). Used by the Rust init-order FFI test as independent evidence,
+     * not a return-value echo. */
+    return cbm_alloc_bound;
 }
 
 // --- Init/Shutdown ---

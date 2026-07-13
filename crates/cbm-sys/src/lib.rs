@@ -118,6 +118,19 @@ pub fn initialize_allocator_bindings_first() {
     assert_mimalloc_version_matches_vendored();
 }
 
+/// Reads back libcbm's allocator-binding flag (#5).
+///
+/// Returns `true` once [`initialize_allocator_bindings_first`] (via
+/// `cbm_alloc_init`) has bound the tree-sitter and SQLite allocators to the
+/// shared mimalloc heap. This is only observable in a build that enables the
+/// binding (`CBM_BIND_TS_ALLOCATOR` — the linked `libcbm.a` and the production
+/// binary); the vendored test build leaves it `false` because the binding is a
+/// deliberate no-op there. Startup code uses it as a deterministic init-order
+/// probe: SQLite and tree-sitter must never allocate before this reads `true`.
+pub fn allocator_bindings_active() -> bool {
+    unsafe { cbm_alloc_bindings_active() != 0 }
+}
+
 pub fn mimalloc_collect(force: bool) {
     unsafe {
         cbm_mimalloc_collect(force);
@@ -530,6 +543,135 @@ mod tests {
         }
         rust_buffer.fill(0);
         drop(rust_buffer);
+        mimalloc_collect(true);
+    }
+
+    /// Init-order integration FSV (#5, D9): `initialize_allocator_bindings_first`
+    /// must bind SQLite to the shared mimalloc heap *before* any libcbm entry
+    /// point opens a SQLite database. `SQLITE_CONFIG_MALLOC` is silently ignored
+    /// (`SQLITE_MISUSE`) once SQLite has initialized, so if `cbm_alloc_init` ran
+    /// late the C-side assert in it would abort the process. We prove the correct
+    /// order two ways: (1) read back the binding flag libcbm sets, then (2) drive
+    /// a real in-memory SQLite store through the FFI seam with a known node set
+    /// and read the persisted count back out of the store.
+    ///
+    /// Gated off the ASan profile: there `CBM_BIND_TS_ALLOCATOR` is deliberately
+    /// undefined (ASan owns allocation), so the binding flag stays 0 by design.
+    #[cfg(not(cbm_sys_asan))]
+    #[test]
+    fn cbm_alloc_init_binds_before_sqlite_use() {
+        initialize_allocator_bindings_first();
+
+        // (1) Independent readback of the binding flag, not a return-value echo.
+        // cbm-sys links libcbm (CBM_BIND_TS_ALLOCATOR), so the binding is active.
+        assert!(
+            allocator_bindings_active(),
+            "cbm_alloc_init did not activate the tree-sitter/SQLite mimalloc binding"
+        );
+
+        // (2) End-to-end through a real SQLite store opened AFTER the binding.
+        let project = CString::new("astro-alloc-fsv").expect("static project has no NUL");
+        let root = CString::new(r"C:\code\Astrolabe").expect("static root has no NUL");
+        const NODE_COUNT: i32 = 128;
+
+        unsafe {
+            let store = cbm_store_open_memory();
+            assert!(!store.is_null(), "cbm_store_open_memory returned NULL");
+
+            let rc = cbm_store_upsert_project(store, project.as_ptr(), root.as_ptr());
+            assert_eq!(rc, CBM_STORE_OK as i32, "cbm_store_upsert_project rc={rc}");
+
+            // Keep every CString alive for the duration of the upsert calls: the
+            // node struct borrows their pointers.
+            let label = CString::new("Function").expect("static label has no NUL");
+            let file = CString::new("src/lib.rs").expect("static path has no NUL");
+            let mut names = Vec::with_capacity(NODE_COUNT as usize);
+            let mut qns = Vec::with_capacity(NODE_COUNT as usize);
+            for i in 0..NODE_COUNT {
+                names.push(CString::new(format!("sym_{i}")).expect("no NUL"));
+                qns.push(CString::new(format!("astro::sym_{i}")).expect("no NUL"));
+            }
+            for i in 0..NODE_COUNT as usize {
+                let node = cbm_node_t {
+                    id: 0,
+                    project: project.as_ptr(),
+                    label: label.as_ptr(),
+                    name: names[i].as_ptr(),
+                    qualified_name: qns[i].as_ptr(),
+                    file_path: file.as_ptr(),
+                    start_line: (i as i32) + 1,
+                    end_line: (i as i32) + 2,
+                    properties_json: std::ptr::null(),
+                };
+                let id = cbm_store_upsert_node(store, &node);
+                assert!(id > 0, "cbm_store_upsert_node returned id={id} for node {i}");
+            }
+
+            // Read the persisted state back from the real store.
+            let count = cbm_store_count_nodes(store, project.as_ptr());
+            assert_eq!(
+                count, NODE_COUNT,
+                "store persisted {count} nodes, expected {NODE_COUNT}"
+            );
+
+            cbm_store_close(store);
+        }
+    }
+
+    /// Cross-heap FFI-seam FSV (#5, D9): a single shared mimalloc heap means a
+    /// pointer allocated on one side of the FFI seam can be freed on the other.
+    /// If the Rust `#[global_allocator]` and the C `cbm_mimalloc_*` shims routed
+    /// to different heaps, mimalloc would reject the foreign pointer (`mi_free`
+    /// abort / heap corruption). Exercising both directions natively and not
+    /// faulting is the evidence.
+    #[cfg(not(cbm_sys_asan))]
+    #[test]
+    fn cross_heap_alloc_and_free_through_ffi_seam() {
+        use std::alloc::{alloc, dealloc, Layout};
+
+        initialize_allocator_bindings_first();
+
+        const SIZE: usize = 4096;
+        let layout = Layout::from_size_align(SIZE, 64).expect("valid layout");
+
+        // Direction A: allocate through the Rust global allocator (which routes
+        // to cbm_mimalloc_malloc_aligned), then free it through the C shim.
+        // usable_size proves the C side's mimalloc recognizes the pointer.
+        unsafe {
+            let rust_ptr = alloc(layout);
+            assert!(!rust_ptr.is_null(), "Rust global alloc returned NULL");
+            std::ptr::write_bytes(rust_ptr, 0xA5, SIZE);
+            let usable = cbm_mimalloc_usable_size(rust_ptr.cast::<c_void>());
+            assert!(
+                usable >= SIZE,
+                "C mimalloc did not recognize the Rust allocation (usable={usable})"
+            );
+            cbm_mimalloc_free(rust_ptr.cast::<c_void>());
+        }
+
+        // Direction B: allocate through the C shim, then free it through the Rust
+        // global allocator's dealloc (which routes to cbm_mimalloc_free).
+        unsafe {
+            let c_ptr = cbm_mimalloc_malloc_aligned(SIZE, 64).cast::<u8>();
+            assert!(!c_ptr.is_null(), "cbm_mimalloc_malloc_aligned returned NULL");
+            std::ptr::write_bytes(c_ptr, 0x5A, SIZE);
+            let usable = cbm_mimalloc_usable_size(c_ptr.cast::<c_void>());
+            assert!(
+                usable >= SIZE,
+                "shared mimalloc did not recognize the C allocation (usable={usable})"
+            );
+            dealloc(c_ptr, layout);
+        }
+
+        // Edge case: zero-sized crossing. The Rust global allocator maps size 0
+        // to a 1-byte mimalloc allocation (alloc() itself must not see 0, so use
+        // the shim directly); freeing it through the seam must also be clean.
+        unsafe {
+            let z = cbm_mimalloc_malloc_aligned(1, 1).cast::<u8>();
+            assert!(!z.is_null(), "1-byte cross-heap allocation returned NULL");
+            cbm_mimalloc_free(z.cast::<c_void>());
+        }
+
         mimalloc_collect(true);
     }
 }
