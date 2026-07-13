@@ -3,6 +3,9 @@ param(
     [switch]$Bootstrap,
     [string]$Command,
     [string]$CommandArgsJson = "[]",
+    # #317: positive driving GitHub issue recorded in every launcher lock.
+    # String input permits a stable fail-closed refusal for malformed values.
+    [string]$Issue = "",
     # #303: read-only diagnostic. Resolve the pinned ld.lld and print its path + version,
     # then exit. Runs before the lock/workspace/toolchain-env machinery so it can prove the
     # linker-resolution guard in isolation (FSV) without a full native build. -LlvmBinOverride
@@ -1126,15 +1129,15 @@ function Resolve-PinnedLld {
 
     $pinnedLld = Join-Path $LlvmBin $PinnedLldExeName
     if (-not (Test-Path -LiteralPath $pinnedLld -PathType Leaf)) {
-        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_MISSING]: {code=ASTRO_PINNED_LLD_MISSING; message=`"pinned ld.lld ($PinnedLldExeName) is absent from the pinned LLVM $ExpectedLldVersion bundle at $pinnedLld`"; remediation=`"rerun 'scripts\windows-gnu-toolchain.ps1 -Bootstrap' from $ExpectedWorkspace to (re)install the pinned LLVM $ExpectedLldVersion bundle`"}"
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_MISSING]: {code=ASTRO_PINNED_LLD_MISSING; message=`"pinned ld.lld ($PinnedLldExeName) is absent from the pinned LLVM $ExpectedLldVersion bundle at $pinnedLld`"; remediation=`"rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to (re)install the pinned LLVM $ExpectedLldVersion bundle`"}"
     }
     $probe = Invoke-NativeCapture -Exe $pinnedLld -Arguments @("--version")
     $versionText = ($probe.Output -join "`n").Trim()
     if ($probe.ExitCode -ne 0) {
-        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_PROBE_FAILED]: {code=ASTRO_PINNED_LLD_PROBE_FAILED; message=`"pinned ld.lld at $pinnedLld failed its '--version' probe (exit $($probe.ExitCode)): $versionText`"; remediation=`"the pinned linker is corrupt or unrunnable; rerun 'scripts\windows-gnu-toolchain.ps1 -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_PROBE_FAILED]: {code=ASTRO_PINNED_LLD_PROBE_FAILED; message=`"pinned ld.lld at $pinnedLld failed its '--version' probe (exit $($probe.ExitCode)): $versionText`"; remediation=`"the pinned linker is corrupt or unrunnable; rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
     }
     if ($versionText -notmatch [regex]::Escape($ExpectedLldVersion)) {
-        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_VERSION]: {code=ASTRO_PINNED_LLD_VERSION; message=`"pinned ld.lld at $pinnedLld reported an unexpected version; expected LLD $ExpectedLldVersion, got: $versionText`"; remediation=`"remove the mismatched .toolchains LLVM bundle and rerun 'scripts\windows-gnu-toolchain.ps1 -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
+        throw "LAUNCHER_BOUNDARY[ASTRO_PINNED_LLD_VERSION]: {code=ASTRO_PINNED_LLD_VERSION; message=`"pinned ld.lld at $pinnedLld reported an unexpected version; expected LLD $ExpectedLldVersion, got: $versionText`"; remediation=`"remove the mismatched .toolchains LLVM bundle and rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace to reinstall the pinned LLVM $ExpectedLldVersion bundle`"}"
     }
     return (Resolve-Path -LiteralPath $pinnedLld).Path
 }
@@ -1166,7 +1169,7 @@ function Assert-GccResolvesPinnedLld {
         $probe = Invoke-NativeCapture -Exe $GccExe -Arguments @("-B$lldPrefix", "-fuse-ld=lld", $trivialC, "-o", $trivialExe, "-Wl,--version")
         $versionText = ($probe.Output -join "`n").Trim()
         if ($versionText -notmatch [regex]::Escape("LLD $ExpectedLldVersion")) {
-            throw "LAUNCHER_BOUNDARY[ASTRO_LLD_RESOLUTION_POISONED]: {code=ASTRO_LLD_RESOLUTION_POISONED; message=`"gcc -fuse-ld=lld resolved a linker other than the pinned LLD $ExpectedLldVersion (pinned=$pinnedLld); linker reported: $versionText`"; remediation=`"an unpinned ld.lld (e.g. this host's MSVS BuildTools LLD 12.0.0) is shadowing the pinned bundle; the launcher prepends $LlvmBin to PATH and pins collect2 to it via -B$lldPrefix -- if this still fires the pinned bundle is broken, so rerun 'scripts\windows-gnu-toolchain.ps1 -Bootstrap' from $ExpectedWorkspace`"}"
+            throw "LAUNCHER_BOUNDARY[ASTRO_LLD_RESOLUTION_POISONED]: {code=ASTRO_LLD_RESOLUTION_POISONED; message=`"gcc -fuse-ld=lld resolved a linker other than the pinned LLD $ExpectedLldVersion (pinned=$pinnedLld); linker reported: $versionText`"; remediation=`"an unpinned ld.lld (e.g. this host's MSVS BuildTools LLD 12.0.0) is shadowing the pinned bundle; the launcher prepends $LlvmBin to PATH and pins collect2 to it via -B$lldPrefix -- if this still fires the pinned bundle is broken, so rerun 'scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap' from $ExpectedWorkspace`"}"
         }
     }
     finally {
@@ -1288,6 +1291,14 @@ if ($ProbeLld) {
     exit 0
 }
 
+# #317: tracker ownership is part of the lock schema, not optional metadata.
+# Validate before resolving/creating any workspace lock path so a malformed or
+# absent issue can never acquire a partially owned session.
+$drivingIssue = 0
+if (-not [int]::TryParse($Issue, [ref]$drivingIssue) -or $drivingIssue -le 0) {
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_ISSUE_INVALID]: {code=ASTRO_LAUNCHER_ISSUE_INVALID; message=`"the native launcher requires a positive driving GitHub issue number; received '$Issue'`"; remediation=`"re-read the driving issue, post the tracker comment required by #197, then rerun with -Issue <positive-issue-number>`"}"
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 # #226: a registered git worktree of the canonical workspace (a `.git` FILE under
 # .claude\worktrees\) is a valid launcher root for parallel-session verification.
@@ -1359,10 +1370,15 @@ if ($attributionSweep.Removed.Count -gt 0 -or $attributionSweep.Kept.Count -gt 0
 # race), and a concurrent claim between the boundary check above and this move
 # surfaces as a named fail-closed refusal instead of overwriting a live lock.
 $launcherLockStage = "$launcherLock.$PID.tmp"
+$launcherCommand = ("$Command $CommandArgsJson").Trim()
+if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
+    $launcherCommand = if ($Bootstrap) { "bootstrap" } else { "environment-probe" }
+}
 [ordered]@{
     pid = $PID
+    issue = $drivingIssue
     started = (Get-Date).ToString("o")
-    command = ("$Command $CommandArgsJson").Trim()
+    command = $launcherCommand
 } | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLockStage -Encoding UTF8
 try {
     Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop
@@ -1444,7 +1460,7 @@ if ($env:RUSTFLAGS -and ($env:RUSTFLAGS -match 'fuse-ld=lld')) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Command)) {
-    Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
+    Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
     Remove-LauncherLockFile -LockPath $launcherLock
     if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
         Remove-Item -LiteralPath $workspaceTempParent -Force -ErrorAction SilentlyContinue
