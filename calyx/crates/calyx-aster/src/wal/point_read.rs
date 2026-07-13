@@ -3,10 +3,15 @@ use std::path::Path;
 
 use calyx_core::{CalyxError, CalyxErrorCode, Result};
 
-use super::record::DecodeStatus;
+use super::record::LogicalStatus;
 use super::{ReplayRecord, TornTail, record, storage_error};
 
-/// Reads and validates one physical WAL record by exact segment and byte range.
+/// Reads and validates one logical WAL commit by exact segment and byte range.
+///
+/// For a commit framed as a multi-record group, `seq` is the single commit seq
+/// shared by every member and `start_offset`/`end_offset` span the whole group
+/// — exactly the coordinates a group-aware replay recorded — and the
+/// reassembled payload is returned.
 pub(crate) fn read_record_at(
     segment_path: impl AsRef<Path>,
     seq: u64,
@@ -22,10 +27,10 @@ pub(crate) fn read_record_at(
         .read(true)
         .open(path)
         .map_err(|error| storage_error("open WAL segment for point read", error))?;
-    match record::decode_at(&mut file, start_offset)
+    match record::decode_logical_at(&mut file, start_offset)
         .map_err(|error| storage_error("decode WAL record", error))?
     {
-        DecodeStatus::Complete(decoded) => {
+        LogicalStatus::Complete(decoded) => {
             if decoded.seq != seq
                 || decoded.start_offset != start_offset
                 || decoded.end_offset != end_offset
@@ -46,13 +51,13 @@ pub(crate) fn read_record_at(
                 end_offset: decoded.end_offset,
             })
         }
-        DecodeStatus::Eof => Err(CalyxError::aster_corrupt_shard(format!(
+        LogicalStatus::Eof => Err(CalyxError::aster_corrupt_shard(format!(
             "WAL record {seq} at {}:{}..{} is beyond EOF",
             path.display(),
             start_offset,
             end_offset
         ))),
-        DecodeStatus::Torn { offset, message } => Err(TornTail {
+        LogicalStatus::Torn { offset, message } => Err(TornTail {
             segment_path: path.to_path_buf(),
             offset,
             code: CalyxErrorCode::AsterTornWal.code(),

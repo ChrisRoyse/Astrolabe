@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 
 use calyx_core::{CalyxErrorCode, Result};
 
-use super::record::DecodeStatus;
+use super::record::LogicalStatus;
 use super::{ReplayRecord, TornTail, record, segment, storage_error};
 
 pub(crate) fn stream_records(
@@ -20,10 +20,10 @@ pub(crate) fn stream_records(
             .map_err(|error| storage_error("open WAL segment for stream replay", error))?;
         let mut offset = 0;
         loop {
-            match record::decode_at(&mut file, offset)
+            match record::decode_logical_at(&mut file, offset)
                 .map_err(|error| storage_error("decode WAL record", error))?
             {
-                DecodeStatus::Complete(decoded) => {
+                LogicalStatus::Complete(decoded) => {
                     offset = decoded.end_offset;
                     count += 1;
                     visit(ReplayRecord {
@@ -34,8 +34,8 @@ pub(crate) fn stream_records(
                         end_offset: decoded.end_offset,
                     })?;
                 }
-                DecodeStatus::Eof => break,
-                DecodeStatus::Torn { offset, message } => {
+                LogicalStatus::Eof => break,
+                LogicalStatus::Torn { offset, message } => {
                     return Err(TornTail {
                         segment_path: path.clone(),
                         offset,
