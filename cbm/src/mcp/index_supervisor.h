@@ -91,4 +91,19 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 
+#ifdef ASTRO_ENV_STORE
+#include <stddef.h> /* size_t */
+/* #252: propagate an active in-process FFI store override
+ * (cbm_astro_set_cache_dir) into the environment a spawned index worker inherits,
+ * and restore it afterwards. The override is process-local and is not visible to
+ * the child, which resolves its own store fresh; without propagation the child
+ * would leak its DB/scratch into $HOME/.cache when the host has redirected the
+ * store. Compiled only into libcbm (ASTRO_ENV_STORE); exposed here so the env
+ * round-trip is directly verifiable through the same cbm_safe_getenv accessor the
+ * child inherits. See the definitions in index_supervisor.c for the return
+ * contract (1 = propagated/pop required, 0 = no override, -1 = fail-closed). */
+int cbm_index_worker_store_env_push(char *prior_out, size_t prior_cap, int *had_prior);
+void cbm_index_worker_store_env_pop(int pushed, int had_prior, const char *prior);
+#endif /* ASTRO_ENV_STORE */
+
 #endif /* CBM_INDEX_SUPERVISOR_H */
