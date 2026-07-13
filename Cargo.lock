@@ -79,6 +79,9 @@ name = "astrolabe-assay"
 version = "0.1.0"
 dependencies = [
  "astrolabe-domain",
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -206,6 +209,7 @@ name = "astrolabe-server"
 version = "0.1.0"
 dependencies = [
  "astrolabe-anchors",
+ "astrolabe-assay",
  "astrolabe-bridge",
  "astrolabe-domain",
  "astrolabe-guard",

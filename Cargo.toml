@@ -28,6 +28,7 @@ publish = false
 
 [workspace.dependencies]
 astrolabe-anchors = { path = "crates/astrolabe-anchors" }
+astrolabe-assay = { path = "crates/astrolabe-assay" }
 astrolabe-domain = { path = "crates/astrolabe-domain" }
 astrolabe-ingest = { path = "crates/astrolabe-ingest" }
 astrolabe-kernel = { path = "crates/astrolabe-kernel" }
