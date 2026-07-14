@@ -21,15 +21,17 @@ use astrolabe_ingest::{
 };
 use astrolabe_kernel::{
     BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,
-    DEFAULT_FUNNEL_ACTIVATION_RECORDS, LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
-    LABEL_PROPAGATION_SCHEMA, LabelGraphEdge, LabelPropagationConfig, LabelPropagationReport,
-    LabelSeed, LabelTombstone, SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION,
-    SEARCH_SCALE_SCHEMA, SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA,
-    ScopeRecallMeasurement, ScopeSummary, ScopeSummaryInput, ScopeSummaryMember,
-    SearchIndexBackend, SearchScaleConfig, SearchScalePlan, SkillDiscoveryConfig, SkillSymbolInput,
-    SkillTree, bridge_report_artifact_bytes, bridge_symbols, build_skill_tree,
-    label_propagation_artifact_bytes, plan_search_scale, propagate_labels,
-    scope_summary_artifact_bytes, skill_tree_artifact_bytes, summarize_scope_kernel,
+    CALYX_KERNEL_ANSWER_LEDGER_REQUIRED, DEFAULT_FUNNEL_ACTIVATION_RECORDS,
+    KERNEL_ANSWER_KNOB_REGISTRY_VERSION, KERNEL_ANSWER_SCHEMA, KERNEL_GAP_REPORT_SCHEMA,
+    LABEL_PROPAGATION_KNOB_REGISTRY_VERSION, LABEL_PROPAGATION_SCHEMA, LabelGraphEdge,
+    LabelPropagationConfig, LabelPropagationReport, LabelSeed, LabelTombstone,
+    SCOPE_SUMMARY_SCHEMA, SEARCH_SCALE_KNOB_REGISTRY_VERSION, SEARCH_SCALE_SCHEMA,
+    SKILL_DISCOVERY_KNOB_REGISTRY_VERSION, SKILL_TREE_SCHEMA, ScopeRecallMeasurement, ScopeSummary,
+    ScopeSummaryInput, ScopeSummaryMember, SearchIndexBackend, SearchScaleConfig, SearchScalePlan,
+    SkillDiscoveryConfig, SkillSymbolInput, SkillTree, bridge_report_artifact_bytes,
+    bridge_symbols, build_skill_tree, label_propagation_artifact_bytes, plan_search_scale,
+    propagate_labels, scope_summary_artifact_bytes, skill_tree_artifact_bytes,
+    summarize_scope_kernel,
 };
 use astrolabe_lower::{
     ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
@@ -100,6 +102,9 @@ use bridges::*;
 
 mod kernel_context;
 use kernel_context::*;
+
+mod kernel_answer;
+use kernel_answer::*;
 
 mod anomalies;
 use anomalies::*;

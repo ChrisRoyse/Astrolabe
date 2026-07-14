@@ -6347,8 +6347,18 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
         ),
         (
             "guard_check",
-            json!({"project": project}),
+            json!({"project": project.clone()}),
             "guard_check requires calyx shadow indexing",
+        ),
+        (
+            "get_kernel",
+            json!({"project": project.clone(), "mode": "read"}),
+            "get_kernel requires calyx shadow indexing",
+        ),
+        (
+            "kernel_answer",
+            json!({"project": project, "query": "how does main work"}),
+            "kernel_answer requires calyx shadow indexing",
         ),
     ];
     let advertised = astrolabe_tool_definitions()

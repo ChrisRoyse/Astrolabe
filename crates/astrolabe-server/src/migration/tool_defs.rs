@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 19] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -19,7 +19,89 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
         assay_gate_tool_definition(),
         abduce_cause_tool_definition(),
         forecast_tool_definition(),
+        // #40 (lane w13-B) appended at the end to minimize merge conflicts.
+        get_kernel_tool_definition(),
+        kernel_answer_tool_definition(),
     ]
+}
+
+pub(crate) fn get_kernel_tool_definition() -> Value {
+    json!({
+        "name": "get_kernel",
+        "title": "Get Kernel",
+        "description": "Serve the persisted kernel for a shadow-indexed project: the scope-summary kernel members (qualified name, kernel score in permille, grounded flag, provenance) with their recall metrics and grounded fraction. Three modes: read (every kernel member per scope with recall metrics), gaps (only the ungrounded members that still need grounding, with per-scope gap counts), build (recompute the feedback-vertex-set kernel over the vault association graph — pending the GraphProjectionCsr->KernelGraph adapter, #343, and fails closed with that dependency). Optionally scoped by scope id. Every response carries trust/freshness/provenance. Fails closed with {code,message,remediation} on an unknown mode, an absent scope, or a project whose kernel context has not been persisted (rerun index_repository with calyx=\"shadow\").",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["read", "build", "gaps"],
+                    "description": "read (default): kernel members + recall per scope. gaps: the ungrounded members only. build: recompute the FVS kernel (pending vault adapter #343)."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to restrict the kernel to. Omit for every persisted scope. An unknown scope refuses fail-closed."
+                },
+                "budget": {
+                    "type": "integer",
+                    "description": "Optional member budget hint for mode=build (honored once the FVS build is wired to the vault adapter #343)."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn kernel_answer_tool_definition() -> Value {
+    json!({
+        "name": "kernel_answer",
+        "title": "Kernel Answer",
+        "description": "Grounded kernel-first Q&A for a shadow-indexed project: kernel-first search resolves an anchored (Trusted-grounded) entry point, then a hop-attenuated answer path walks association edges outward with hop_score = edge_weight * 0.9^hop, every hop carrying its ledger reference and every node its provenance. The answer is assembled from the path nodes with a total score, ordered provenance, and a rolled-up trust tag; an ungrounded scope or an unanswerable query refuses with a per-lens deficit rather than an empty answer, and a multi-hop answer without complete ledger wiring fails closed with CALYX_KERNEL_ANSWER_LEDGER_REQUIRED (never served unprovenanced). The answer-path algorithm is implemented and FSV-covered in astrolabe_kernel::answer; assembling the association graph over the vault is pending the GraphProjectionCsr->KernelGraph adapter (#343), so this tool currently fails closed with that dependency. Fails closed with {code,message,remediation} on a missing project/query or a non-shadow project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "The question to answer from the kernel. An empty query refuses fail-closed."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to restrict the kernel-first search to."
+                }
+            },
+            "required": ["project", "query"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn assay_gate_tool_definition() -> Value {
