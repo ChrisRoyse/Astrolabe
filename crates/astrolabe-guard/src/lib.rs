@@ -3,6 +3,10 @@
 pub mod auto;
 pub mod calibration;
 pub mod check;
+pub mod commit;
+pub mod drift;
+pub mod hook;
+pub mod lock;
 pub mod profile;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

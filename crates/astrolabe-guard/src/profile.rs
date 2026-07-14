@@ -79,6 +79,19 @@ pub const IDENTITY_QUARANTINE_MARGIN: f32 = 0.05;
 /// recalibration is due. Recorded per slot as its `drift` bound.
 pub const DRIFT_ALARM_MULTIPLIER: f32 = 1.5;
 
+/// Rolling window (number of most-recent per-slot `guard_check` outcomes) over
+/// which a slot's rejection rate is measured for drift monitoring (blueprint
+/// `10_GUARD.md` §4). A rejection rate over the slot's `drift_bound`
+/// (`DRIFT_ALARM_MULTIPLIER × achieved_far`) across this window fires a
+/// recalibration proposal exactly once per crossing (see [`crate::drift`]).
+pub const DRIFT_REJECTION_WINDOW: usize = 500;
+
+/// Advisory `PostToolUse` hook wall-clock budget in milliseconds (blueprint
+/// `10_GUARD.md` §5, CBM `hook_augment` contract). The advisory quick check
+/// must return an advisory or go silent within this budget; it never blocks the
+/// agent flow (see [`crate::hook`]).
+pub const ADVISORY_HOOK_BUDGET_MS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 // Slot taxonomy
 // ---------------------------------------------------------------------------
@@ -758,11 +771,44 @@ pub struct CombinedVerdict {
 /// identity breach refuses even when every other slot passes with a wide
 /// margin (asserted in tests). Precedence: Refuse > Quarantine > NewRegion >
 /// Accept.
+///
+/// Identity-locked semantics: the identity slot ([`GuardSlot::PublicApiSignature`])
+/// is always treated as identity-locked here. Callers that hold a per-target
+/// lock decision use [`combine_verdicts_with_lock`] to downgrade the identity
+/// slot to content-class handling for non-exported (unlocked) symbols.
 pub fn combine_verdicts(
     per_slot: &[SlotVerdict],
     content_policy: CombinationPolicy,
     provisional: bool,
 ) -> CombinedVerdict {
+    combine_verdicts_with_lock(per_slot, content_policy, provisional, true)
+}
+
+/// Combine per-slot verdicts with an explicit **identity-lock** decision for the
+/// candidate's target symbol (P7.4, blueprint `10_GUARD.md` §4). Exported/public
+/// API symbols are identity-locked: their public-API-signature slot is enforced
+/// `AllRequired` at the identity FAR (a breach refuses, a near-miss quarantines).
+///
+/// A **non-exported** symbol (`identity_locked = false`) is not breaking-change
+/// protected: the same public-API-signature drift is folded into the content
+/// `KofN` set and handled as content-class (one tolerated miss routes to
+/// `new_region`, not an identity refuse). Everything else is unchanged, and the
+/// per-slot detail is preserved (never flattened, A3).
+pub fn combine_verdicts_with_lock(
+    per_slot: &[SlotVerdict],
+    content_policy: CombinationPolicy,
+    provisional: bool,
+    identity_locked: bool,
+) -> CombinedVerdict {
+    // Effective kind: an unlocked (non-exported) symbol's identity slot is
+    // handled as content, never as a breaking-change identity lock.
+    let effective_kind = |slot: GuardSlot| -> SlotKind {
+        match slot.kind() {
+            SlotKind::Identity if !identity_locked => SlotKind::Content,
+            other => other,
+        }
+    };
+
     let mut verdict = GuardVerdict::Accept;
     let mut reason = String::from("all slots within their calibrated trusted region");
 
@@ -774,10 +820,11 @@ pub fn combine_verdicts(
             }
         };
 
-    // 1. Identity slots (AllRequired). A failing identity slot dominates.
+    // 1. Identity slots (AllRequired). A failing identity slot dominates. Only
+    //    identity-locked (exported/public) symbols enter this branch.
     for slot_verdict in per_slot
         .iter()
-        .filter(|sv| sv.slot.kind() == SlotKind::Identity)
+        .filter(|sv| effective_kind(sv.slot) == SlotKind::Identity)
     {
         if !slot_verdict.pass() {
             let within_band = slot_verdict.margin() >= -IDENTITY_QUARANTINE_MARGIN;
@@ -812,17 +859,22 @@ pub fn combine_verdicts(
     }
 
     // 2. Content slots (KofN). Too many content misses => OOD refusal; exactly
-    //    the tolerated single miss => novel-but-plausible new-region.
+    //    the tolerated single miss => novel-but-plausible new-region. For an
+    //    unlocked target the identity slot joins this set (content-class).
     let content: Vec<&SlotVerdict> = per_slot
         .iter()
-        .filter(|sv| sv.slot.kind() == SlotKind::Content)
+        .filter(|sv| effective_kind(sv.slot) == SlotKind::Content)
         .collect();
     if !content.is_empty() {
         let passes = content.iter().filter(|sv| sv.pass()).count();
-        let required_k = match content_policy {
-            CombinationPolicy::AllRequired => content.len(),
-            CombinationPolicy::KofN { k, .. } => k.min(content.len()),
+        // Preserve the policy's tolerance (allowed misses) across the effective
+        // content set size, so folding the identity slot in does not change how
+        // many misses are tolerated before OOD refusal.
+        let allowed_misses = match content_policy {
+            CombinationPolicy::AllRequired => 0,
+            CombinationPolicy::KofN { k, n } => n.saturating_sub(k),
         };
+        let required_k = content.len().saturating_sub(allowed_misses);
         if passes < required_k {
             let failed: Vec<&str> = content
                 .iter()
@@ -1198,6 +1250,66 @@ mod tests {
             GuardVerdict::NewRegion,
             "{}",
             combined.reason
+        );
+    }
+
+    #[test]
+    fn identity_lock_downgrades_signature_slot_for_unlocked_target() {
+        // Only the public-API signature slot breaches (hard, outside the band);
+        // every other slot passes wide.
+        let per_slot = vec![
+            sv(GuardSlot::CodeSemantic, 0.99, 0.80),
+            sv(GuardSlot::StructTrigrams, 0.99, 0.80),
+            sv(GuardSlot::ApiCallees, 0.99, 0.80),
+            sv(GuardSlot::ErrorSurface, 0.99, 0.80),
+            sv(GuardSlot::NameSemantic, 0.99, 0.70),
+            sv(GuardSlot::ComplexityProfile, 0.99, 0.70),
+            sv(GuardSlot::PublicApiSignature, 0.10, 0.95),
+        ];
+
+        // Locked (exported/public): identity AllRequired => breaking-change refuse.
+        let locked = combine_verdicts_with_lock(&per_slot, default_content_policy(), false, true);
+        assert_eq!(locked.verdict, GuardVerdict::Refuse, "{}", locked.reason);
+
+        // Unlocked (private): the signature slot folds into content. It is now one
+        // content miss among five, within the KofN tolerance => new_region, not an
+        // identity refuse.
+        let unlocked =
+            combine_verdicts_with_lock(&per_slot, default_content_policy(), false, false);
+        assert_eq!(
+            unlocked.verdict,
+            GuardVerdict::NewRegion,
+            "unlocked signature drift is content-class: {}",
+            unlocked.reason
+        );
+
+        // The convenience `combine_verdicts` is the locked default (unchanged).
+        assert_eq!(
+            combine_verdicts(&per_slot, default_content_policy(), false).verdict,
+            GuardVerdict::Refuse
+        );
+    }
+
+    #[test]
+    fn unlocked_target_still_refuses_on_two_content_misses() {
+        // Signature breach folded into content PLUS a real content miss = two
+        // content misses => below KofN tolerance => refuse even when unlocked.
+        let per_slot = vec![
+            sv(GuardSlot::CodeSemantic, 0.10, 0.80), // real content miss
+            sv(GuardSlot::StructTrigrams, 0.99, 0.80),
+            sv(GuardSlot::ApiCallees, 0.99, 0.80),
+            sv(GuardSlot::ErrorSurface, 0.99, 0.80),
+            sv(GuardSlot::NameSemantic, 0.99, 0.70),
+            sv(GuardSlot::ComplexityProfile, 0.99, 0.70),
+            sv(GuardSlot::PublicApiSignature, 0.10, 0.95), // folded content miss
+        ];
+        let unlocked =
+            combine_verdicts_with_lock(&per_slot, default_content_policy(), false, false);
+        assert_eq!(
+            unlocked.verdict,
+            GuardVerdict::Refuse,
+            "{}",
+            unlocked.reason
         );
     }
 
