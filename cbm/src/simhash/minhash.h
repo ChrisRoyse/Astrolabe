@@ -65,6 +65,27 @@ bool cbm_minhash_compute(TSNode func_body, const char *source, int language, cbm
  * Returns value in [0.0, 1.0]. */
 double cbm_minhash_jaccard(const cbm_minhash_t *a, const cbm_minhash_t *b);
 
+/* Maximum serialized struct-trigram buffer (panel S1 encoder source list).
+ * Bounds the per-symbol structural surface deterministically. */
+enum { CBM_STRUCT_TRIGRAMS_BUF = 16384 };
+
+/* Serialize the weight>0 normalised AST node-type trigrams of a function
+ * body as the panel S1 encoder's structural-trigram source list.
+ *
+ * These are the exact same trigrams the MinHash fingerprint is built from
+ * (collect_ast_tokens leaf-type stream + trigram_structural_weight), surfaced
+ * as text so the Rust panel S1 lens can hash them into a sparse structural
+ * vector. Each weight>0 trigram is emitted in document order as one record
+ *   a '\t' b '\t' c '\t' weight '\n'
+ * where a/b/c are normalised node-type kind strings (never containing a tab
+ * or newline) and weight is 1..3. Weight-0 trigrams (pure I/S/N/T noise) are
+ * skipped, exactly as the MinHash path skips them. Records are written only
+ * whole: if the next record would overflow `bufsize`, serialization stops at
+ * the prior record boundary (deterministic truncation). Writes a NUL
+ * terminator. Returns the number of bytes written (excluding the NUL), or 0
+ * when the body has no structural trigram (buf receives an empty string). */
+int cbm_struct_trigrams_serialize(TSNode func_body, char *buf, int bufsize);
+
 /* Hex encoding: K uint32 values × 8 hex chars each = 512 chars. */
 enum { CBM_MINHASH_HEX_LEN = 512 };
 

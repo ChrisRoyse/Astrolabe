@@ -5450,67 +5450,228 @@ fn guard_check_panel_body(name: &str, source: &str) -> Value {
             "param_types": ["u32"],
             "return_type": "Result<u32, Error>",
             "throws": ["Error"],
+            // A route surface so the public_api_signature guard slot's S17 source is
+            // measurable from the candidate's indexed properties (S5/S15/S17 are
+            // property-derived; only S1/S4 need the #341 reparse). Real route-bearing
+            // symbols carry these fields.
+            "route_path": format!("/{name}"),
+            "route_method": "GET",
             "docstring": "Checked demo function."
         },
     })
 }
 
-#[test]
-fn guard_check_panel_mode_fails_closed_on_unmeasurable_panel_source() {
-    // #331 server contract, current truth: ShadowSlotRuntime never populates the
-    // S1 (struct_trigrams) / S4 (api_calls) encoder inputs (shadow_import.rs
-    // hardcodes them None), so those guard panel sources read back Absent and the
-    // panel path MUST refuse — never partially score, never silently fall back to
-    // supplied vectors (standing invariant #3). The accept path through the panel
-    // lands with the per-snippet libcbm reparse (#341).
-    let dir = temp_dir("guard-check-panel-closed");
-    setup_guard_check_calibrated(&dir, "guard-check-panel-closed");
-
-    // Before-state: guard_calibrate itself ledgers one EntryKind::Guard row, so the
-    // fail-closed proof is a BEFORE == AFTER count, not an absolute zero.
-    let vault_dir = dir.join("demo.astrolabe-vault");
-    let count_guard_entries = |vault_dir: &Path| -> usize {
-        let mut seq = 1u64;
-        let mut guard_entries = 0usize;
-        while let Some(row) = calyx_aster::ledger_view::read_ledger_seq(vault_dir, seq).unwrap() {
-            let entry = decode_ledger(&row.bytes).unwrap();
-            if entry.kind == calyx_ledger::EntryKind::Guard {
-                guard_entries += 1;
-            }
-            seq += 1;
+/// #341: count the persisted `EntryKind::Guard` ledger rows in a vault. The
+/// fail-closed proof for a refused check is a BEFORE == AFTER count (guard_calibrate
+/// itself ledgers one row during setup), not an absolute zero.
+fn count_guard_ledger_entries(vault_dir: &Path) -> usize {
+    let mut seq = 1u64;
+    let mut guard_entries = 0usize;
+    while let Some(row) = calyx_aster::ledger_view::read_ledger_seq(vault_dir, seq).unwrap() {
+        let entry = decode_ledger(&row.bytes).unwrap();
+        if entry.kind == calyx_ledger::EntryKind::Guard {
+            guard_entries += 1;
         }
-        guard_entries
-    };
-    let guard_entries_before = count_guard_entries(&vault_dir);
+        seq += 1;
+    }
+    guard_entries
+}
 
-    let source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    let bumped = input.checked_add(1).ok_or(Error::Overflow)?;\n    Ok(bumped)\n}\n";
+#[test]
+fn guard_check_panel_mode_accepts_reparsed_conforming_candidate() {
+    // #341 server contract: the per-snippet libcbm reparse now measures the S1
+    // (struct_trigrams) and S4 (api_callees) panel sources for a fresh candidate
+    // snippet — the same instruments indexing runs per symbol. A candidate whose
+    // source is byte-identical to a kernel-near exemplar therefore scores cosine 1.0
+    // on every guard slot and ACCEPTS through the panel path (previously this was
+    // pinned refuse-only because S1/S4 read back Absent).
+    let dir = temp_dir("guard-check-panel-accept");
+    setup_guard_check_calibrated(&dir, "guard-check-panel-accept");
+
+    // A real function with control flow (S1 structural trigrams) and calls
+    // (S4 api_callees), so both reparse-measured slots are non-degenerate.
+    let source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    if input > 100 {\n        return Err(Error::TooBig);\n    }\n    let bumped = input.checked_add(1).ok_or(Error::Overflow)?;\n    Ok(bumped)\n}\n";
+    // Candidate and exemplar share byte-identical panel inputs => every guard slot
+    // (reparse-measured S1/S4 included) cosines to 1.0 against the kernel exemplar.
+    let body = guard_check_panel_body("checked_add", source);
+    let mut exemplar = body.clone();
+    let exemplar_obj = exemplar.as_object_mut().unwrap();
+    exemplar_obj.insert("cx".to_string(), json!("cx:kernel"));
+    exemplar_obj.insert("kernel_near".to_string(), json!(true));
+
     let args = json!({
         "project": "demo",
         "target": GUARD_CHECK_TARGET,
         "measurement": "panel",
-        "candidate": guard_check_panel_body("checked_add", source),
-        "exemplars": [
-            {"cx": "cx:kernel", "kernel_near": true, "source": source, "symbol_name": "checked_add",
-             "qualified_name": "demo::checked_add", "rel_file_path": "src/demo.rs", "language": "rust",
-             "properties": {"complexity": 3.0, "throws": ["Error"]}},
-        ],
+        "candidate": body,
+        "exemplars": [exemplar],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["verdict"], "accept", "{result}");
+    assert_eq!(result["slots"].as_array().unwrap().len(), 7);
+    // Every guard slot passed at cosine 1.0 — including the reparse-measured S1/S4.
+    for slot in result["slots"].as_array().unwrap() {
+        let name = slot["slot"].as_str().unwrap();
+        assert_eq!(
+            slot["pass"],
+            json!(true),
+            "slot {name} did not pass: {slot}"
+        );
+        let cos = slot["cos"].as_f64().unwrap();
+        assert!(
+            (cos - 1.0).abs() < 1e-4,
+            "slot {name} cosine {cos} is not ~1.0 for an identical candidate/exemplar"
+        );
+    }
+
+    // FSV: independently read the accept verdict back from the guard ledger.
+    let seq = result["ledger_ref"]["seq"].as_u64().expect("verdict seq");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)
+        .unwrap()
+        .expect("verdict ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Guard);
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload["schema"], "astro.guard.verdict.v1");
+    assert_eq!(payload["verdict"], "accept");
+    assert_eq!(payload["subject_cx"], GUARD_CHECK_TARGET);
+    assert_eq!(payload["slots"].as_array().unwrap().len(), 7);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_panel_mode_refuses_genuinely_unmeasurable_source() {
+    // #341 edge triad: the reparse fails closed with a labeled refusal on a source
+    // it cannot structurally measure, and persists NO verdict. Empty source is the
+    // canonical unmeasurable fixture (unparseable / unsupported-language variants are
+    // exercised by the guard.rs reparse unit paths).
+    let dir = temp_dir("guard-check-panel-unmeasurable");
+    setup_guard_check_calibrated(&dir, "guard-check-panel-unmeasurable");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let before = count_guard_ledger_entries(&vault_dir);
+
+    // Candidate carries the panel-mode field vocabulary but an empty source body:
+    // there is nothing to reparse, so S1/S4 are unmeasurable and the check refuses.
+    let mut candidate = guard_check_panel_body("empty_fn", "   \n  \n");
+    let exemplar_source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    if input > 100 {\n        return Err(Error::TooBig);\n    }\n    let bumped = input.checked_add(1).ok_or(Error::Overflow)?;\n    Ok(bumped)\n}\n";
+    let mut exemplar = guard_check_panel_body("checked_add", exemplar_source);
+    let exemplar_obj = exemplar.as_object_mut().unwrap();
+    exemplar_obj.insert("cx".to_string(), json!("cx:kernel"));
+    exemplar_obj.insert("kernel_near".to_string(), json!(true));
+    candidate["symbol_name"] = json!("empty_fn");
+
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "measurement": "panel",
+        "candidate": candidate,
+        "exemplars": [exemplar],
     });
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     let text = envelope["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING")
+        text.contains("ASTRO_GUARD_REPARSE_EMPTY_SOURCE")
             || text.contains("ASTRO_GUARD_CHECK_PANEL_FAILED"),
-        "panel mode must fail closed on an unmeasurable source, got: {text}"
+        "panel mode must fail closed with a labeled reparse refusal, got: {text}"
     );
 
-    // FSV after-state: a refused panel check persists NO verdict — the Guard-kind
-    // ledger count is byte-for-byte unchanged from before the call.
-    let guard_entries_after = count_guard_entries(&vault_dir);
+    // FSV after-state: a refused panel check persists no new Guard verdict.
+    let after = count_guard_ledger_entries(&vault_dir);
     assert_eq!(
-        guard_entries_after, guard_entries_before,
+        after, before,
         "a refused panel check must persist no verdict"
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_panel_mode_reparse_edge_triad_fails_closed() {
+    // #341 edge triad: the per-snippet reparse fails closed with a distinct labeled
+    // code on (1) an unresolvable language tag, (2) a snippet with no measurable
+    // definition, and (3) an empty body — none of which persists a verdict.
+    let dir = temp_dir("guard-check-reparse-edges");
+    setup_guard_check_calibrated(&dir, "guard-check-reparse-edges");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+
+    // A valid kernel exemplar (never reached: candidate is measured first and fails).
+    let exemplar_source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    if input > 100 {\n        return Err(Error::TooBig);\n    }\n    input.checked_add(1).ok_or(Error::Overflow)\n}\n";
+    let mut exemplar = guard_check_panel_body("checked_add", exemplar_source);
+    let exemplar_obj = exemplar.as_object_mut().unwrap();
+    exemplar_obj.insert("cx".to_string(), json!("cx:kernel"));
+    exemplar_obj.insert("kernel_near".to_string(), json!(true));
+
+    // (candidate, expected-code) triad. Each candidate carries panel properties so
+    // the shadow-runtime slots measure; only the reparse leg fails.
+    let cases: [(Value, &str); 3] = [
+        (
+            // Unsupported language: neither the file extension nor the tag resolves.
+            json!({
+                "source": "fn f(x: u32) -> u32 { if x > 0 { x - 1 } else { x } }",
+                "symbol_name": "f",
+                "qualified_name": "demo::f",
+                "rel_file_path": "src/demo.klingon",
+                "language": "klingon",
+                "properties": {"complexity": 2.0, "route_path": "/f", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN",
+        ),
+        (
+            // No measurable definition: a bare non-definition fragment.
+            json!({
+                "source": "let mut total = 0; total += 1;",
+                "symbol_name": "frag",
+                "qualified_name": "demo::frag",
+                "rel_file_path": "src/demo.rs",
+                "language": "rust",
+                "properties": {"complexity": 2.0, "route_path": "/frag", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_NO_STRUCTURE",
+        ),
+        (
+            // Empty body.
+            json!({
+                "source": "   \n\t\n",
+                "symbol_name": "blank",
+                "qualified_name": "demo::blank",
+                "rel_file_path": "src/demo.rs",
+                "language": "rust",
+                "properties": {"complexity": 2.0, "route_path": "/blank", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_EMPTY_SOURCE",
+        ),
+    ];
+
+    for (candidate, expected_code) in cases {
+        let before = count_guard_ledger_entries(&vault_dir);
+        let args = json!({
+            "project": "demo",
+            "target": GUARD_CHECK_TARGET,
+            "measurement": "panel",
+            "candidate": candidate,
+            "exemplars": [exemplar.clone()],
+        });
+        let envelope = guard_check_structured(&dir, &args);
+        assert_eq!(envelope["isError"], true, "{envelope}");
+        let text = envelope["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(expected_code),
+            "expected labeled refusal {expected_code}, got: {text}"
+        );
+        // FSV: each refused reparse persists no verdict (before == after).
+        let after = count_guard_ledger_entries(&vault_dir);
+        assert_eq!(
+            after, before,
+            "reparse refusal {expected_code} must persist no verdict"
+        );
+        eprintln!("reparse edge OK: {expected_code} refused, ledger before={before} after={after}");
+    }
     fs::remove_dir_all(&dir).ok();
 }
 

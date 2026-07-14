@@ -1,12 +1,23 @@
 use super::*;
 
+use astrolabe_bridge::{ExtractedFile, Language};
 use astrolabe_guard::auto::{MeasuredSymbol, calibrate_auto, guard_slot_panel_sources};
 use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
 use astrolabe_guard::profile::{
     CONFORMAL_ALPHA, GUARD_PROFILE_SCHEMA, GuardProfile, GuardSlot, SlotCalibration,
     calibrate_slot, calibration_meta_payload_bytes, default_content_policy,
 };
-use astrolabe_panel::PanelDriver;
+use astrolabe_panel::{ApiCall, EncoderLensInput, PanelDriver, StructuralTrigram, encode_slot};
+use calyx_core::{SlotId, SlotVector};
+
+/// Panel slot id of the S1 struct-trigram lens (guard `StructTrigrams` source).
+const PANEL_SLOT_STRUCT_TRIGRAMS: u16 = 1;
+/// Panel slot id of the S4 api-callees lens (guard `ApiCallees` source).
+const PANEL_SLOT_API_CALLEES: u16 = 4;
+/// Wall-clock ceiling for a single per-snippet libcbm reparse. A resource bound
+/// (not a scoring threshold): a snippet that will not parse within this budget is
+/// a fail-closed reparse fault, never a silently dropped structural slot.
+const GUARD_REPARSE_TIMEOUT_MICROS: i64 = 2_000_000;
 
 /// Which population-source mode `guard_calibrate` runs in.
 ///
@@ -473,7 +484,248 @@ pub(crate) fn measure_guard_panel_sources(
             }
         }
     }
+
+    // The shadow runtime cannot synthesize the S1 (struct-trigram) and S4
+    // (api-callee) encoder inputs from properties alone, so it returns them
+    // `Absent` (#331/#341). Measure them here from a real per-snippet libcbm
+    // reparse of the candidate source — the same instruments the indexing
+    // pipeline runs per symbol — and override the two panel sources. A reparse
+    // fault is a fail-closed refusal, never a silently-absent structural slot.
+    let (s1, s4) = reparse_structural_panel_sources(
+        &input.source_bytes,
+        &input.rel_file_path,
+        &input.language,
+        &input.symbol_name,
+        index,
+    )?;
+    slots.insert(PANEL_SLOT_STRUCT_TRIGRAMS, s1);
+    slots.insert(PANEL_SLOT_API_CALLEES, s4);
     Ok(slots)
+}
+
+/// Measure the S1 (struct-trigram) and S4 (api-callee) panel sources of one
+/// candidate/exemplar source snippet through a real per-snippet libcbm reparse.
+///
+/// This is the per-snippet reparse subsystem (#341): the shadow runtime hardcodes
+/// these two encoder inputs to `None` because they cannot be reconstructed from the
+/// stored `properties` vocabulary, so a fresh candidate snippet could not be
+/// structurally measured at all. Here the snippet is re-parsed in memory with the
+/// same libcbm tree-sitter grammar the symbol was indexed under, the primary
+/// definition's normalised AST node-type struct trigrams (S1) and attributed callees
+/// (S4) are extracted — the identical instruments indexing uses per symbol — and each
+/// is encoded through the real panel lens. Every failure mode is a labeled fail-closed
+/// refusal: empty source, an unresolvable language tag, a parse fault, no measurable
+/// structure, or an encoder contract violation. It never returns a silently-absent or
+/// fabricated structural slot (standing invariants #2/#3).
+fn reparse_structural_panel_sources(
+    source_bytes: &[u8],
+    rel_file_path: &str,
+    language_hint: &str,
+    symbol_name: &str,
+    index: usize,
+) -> Result<(SlotVector, SlotVector), GuardRefusal> {
+    let refusal = |code: &str, message: String, remediation: &str| -> GuardRefusal {
+        (code.to_string(), message, remediation.to_string())
+    };
+
+    let source = std::str::from_utf8(source_bytes).map_err(|_| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_SOURCE_NOT_UTF8",
+            format!("source #{index} is not valid UTF-8; the guard reparse cannot tree-sit it"),
+            "Provide the candidate's source text as UTF-8; binary blobs are not measurable code.",
+        )
+    })?;
+    if source.trim().is_empty() {
+        return Err(refusal(
+            "ASTRO_GUARD_REPARSE_EMPTY_SOURCE",
+            format!("source #{index} has no source text to reparse for its S1/S4 panel sources"),
+            "Supply the candidate symbol's source body; an empty snippet has no structural surface.",
+        ));
+    }
+
+    let language = resolve_reparse_language(rel_file_path, language_hint).ok_or_else(|| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN",
+            format!(
+                "source #{index} has no resolvable libcbm grammar (rel_file_path `{rel_file_path}`, \
+                 language `{language_hint}`)"
+            ),
+            "Tag the source with a supported language or a file path libcbm recognizes; the reparse \
+             never guesses a grammar.",
+        )
+    })?;
+
+    let extracted = ExtractedFile::extract(
+        source,
+        language,
+        "astro_guard_reparse",
+        if rel_file_path.is_empty() {
+            "snippet"
+        } else {
+            rel_file_path
+        },
+        GUARD_REPARSE_TIMEOUT_MICROS,
+    )
+    .map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_PARSE_FAILED",
+            format!("source #{index} libcbm reparse failed: {err}"),
+            "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
+        )
+    })?;
+
+    let definitions = extracted.definitions().map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_PARSE_FAILED",
+            format!("source #{index} reparse produced no readable definitions: {err}"),
+            "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
+        )
+    })?;
+    // Primary definition: the one whose name matches the declared symbol, else the
+    // widest line span (the enclosing symbol of a single-symbol snippet).
+    let primary = definitions
+        .iter()
+        .find(|def| !symbol_name.is_empty() && def.name == symbol_name)
+        .or_else(|| {
+            definitions
+                .iter()
+                .max_by_key(|def| def.end_line.saturating_sub(def.start_line))
+        })
+        .ok_or_else(|| {
+            refusal(
+                "ASTRO_GUARD_REPARSE_NO_STRUCTURE",
+                format!("source #{index} reparse extracted no definition to measure S1/S4 from"),
+                "Supply a complete symbol definition (function/method/type), not a bare fragment.",
+            )
+        })?;
+
+    // S1: normalised AST node-type struct trigrams from the primary def's body.
+    let trigrams = primary.parsed_struct_trigrams().map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_PARSE_FAILED",
+            format!("source #{index} struct-trigram readback failed: {err}"),
+            "Treat this as libcbm serialization drift and reject the reparse as a fault.",
+        )
+    })?;
+    if trigrams.is_empty() {
+        return Err(refusal(
+            "ASTRO_GUARD_REPARSE_NO_STRUCTURE",
+            format!(
+                "source #{index} (`{}`) has no weighted structural trigram; S1 is unmeasurable",
+                primary.name
+            ),
+            "Measure a symbol with real control/expression structure; a trivial body has no S1 \
+             surface and is refused rather than scored on an empty vector.",
+        ));
+    }
+    let struct_trigrams: Vec<StructuralTrigram> = trigrams
+        .into_iter()
+        .map(|(a, b, c, weight)| StructuralTrigram { a, b, c, weight })
+        .collect();
+    let s1_input = EncoderLensInput {
+        struct_trigrams: Some(struct_trigrams),
+        ..EncoderLensInput::default()
+    };
+    let s1 = encode_slot(SlotId::new(PANEL_SLOT_STRUCT_TRIGRAMS), &s1_input).map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_ENCODE_FAILED",
+            format!(
+                "source #{index} S1 struct-trigram encode failed: {}",
+                err.message()
+            ),
+            "Reject the candidate; its structural trigrams do not encode to a valid S1 vector.",
+        )
+    })?;
+
+    // S4: callees attributed to the primary def, aggregated by callee. A fresh
+    // snippet has no cross-file resolution, so callees are unresolved (the panel
+    // hashes them under the `unresolved:` term) — identical for candidate and
+    // exemplar measured through this same path.
+    let calls = extracted.calls().map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_PARSE_FAILED",
+            format!("source #{index} callee readback failed: {err}"),
+            "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
+        )
+    })?;
+    let mut callee_counts: BTreeMap<String, f32> = BTreeMap::new();
+    for call in &calls {
+        let attributed = call
+            .enclosing_func_qn
+            .as_deref()
+            .is_none_or(|qn| qn == primary.qualified_name);
+        if attributed && !call.callee_name.trim().is_empty() {
+            *callee_counts.entry(call.callee_name.clone()).or_insert(0.0) += 1.0;
+        }
+    }
+    if callee_counts.is_empty() {
+        return Err(refusal(
+            "ASTRO_GUARD_REPARSE_NO_STRUCTURE",
+            format!(
+                "source #{index} (`{}`) makes no calls; S4 (api_callees) is unmeasurable",
+                primary.name
+            ),
+            "Measure a symbol that invokes an API surface; a call-free body has no S4 surface and \
+             is refused rather than scored on an empty vector.",
+        ));
+    }
+    let api_calls: Vec<ApiCall> = callee_counts
+        .into_iter()
+        .map(|(callee, call_count)| ApiCall {
+            callee,
+            call_count,
+            resolved: false,
+        })
+        .collect();
+    let s4_input = EncoderLensInput {
+        api_calls: Some(api_calls),
+        ..EncoderLensInput::default()
+    };
+    let s4 = encode_slot(SlotId::new(PANEL_SLOT_API_CALLEES), &s4_input).map_err(|err| {
+        refusal(
+            "ASTRO_GUARD_REPARSE_ENCODE_FAILED",
+            format!(
+                "source #{index} S4 api-callee encode failed: {}",
+                err.message()
+            ),
+            "Reject the candidate; its callees do not encode to a valid S4 vector.",
+        )
+    })?;
+
+    Ok((s1, s4))
+}
+
+/// Resolve the libcbm grammar for a reparse, preferring the indexed file path (the
+/// authority the indexing pipeline uses) and falling back to a canonical filename
+/// synthesized from the declared language tag. Returns `None` when neither resolves
+/// to a real grammar — the caller refuses rather than guessing.
+fn resolve_reparse_language(rel_file_path: &str, language_hint: &str) -> Option<Language> {
+    if !rel_file_path.trim().is_empty()
+        && let Some(language) = Language::from_filename(rel_file_path)
+    {
+        return Some(language);
+    }
+    let hint = language_hint.trim().to_ascii_lowercase();
+    let filename = match hint.as_str() {
+        "rust" | "rs" => "snippet.rs",
+        "python" | "py" => "snippet.py",
+        "javascript" | "js" => "snippet.js",
+        "typescript" | "ts" => "snippet.ts",
+        "tsx" => "snippet.tsx",
+        "jsx" => "snippet.jsx",
+        "go" | "golang" => "snippet.go",
+        "java" => "snippet.java",
+        "c" => "snippet.c",
+        "cpp" | "c++" | "cxx" => "snippet.cpp",
+        "csharp" | "c#" | "cs" => "snippet.cs",
+        "ruby" | "rb" => "snippet.rb",
+        "php" => "snippet.php",
+        "kotlin" | "kt" => "snippet.kt",
+        "swift" => "snippet.swift",
+        "scala" => "snippet.scala",
+        _ => return None,
+    };
+    Language::from_filename(filename)
 }
 
 /// Parse a source's `label` into a [`SymbolLabel`] governing panel applicability.

@@ -360,8 +360,16 @@ fn measure_candidate_and_exemplars_through_panel(
                    index: usize|
      -> Result<MeasuredSymbol, (&'static str, String, String)> {
         let map = measure_guard_panel_sources(&driver, &runtime, obj, index).map_err(
-            |(_code, message, remediation)| {
-                ("ASTRO_GUARD_CHECK_PANEL_FAILED", message, remediation)
+            |(code, message, remediation)| {
+                // Preserve the specific measurement/reparse code (e.g.
+                // ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN) inside the panel-failed
+                // envelope so the operator sees the labeled root cause, not just the
+                // generic panel-failed wrapper.
+                (
+                    "ASTRO_GUARD_CHECK_PANEL_FAILED",
+                    format!("[{code}] {message}"),
+                    remediation,
+                )
             },
         )?;
         let input = slot_input_from_panel(&map).map_err(|error| {

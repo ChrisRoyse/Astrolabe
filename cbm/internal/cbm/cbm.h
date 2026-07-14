@@ -214,6 +214,8 @@ typedef struct {
     bool is_entry_point;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
+    const char *struct_trigrams; // panel S1 source: newline-delimited "a\tb\tc\tweight"
+                                 // normalised AST node-type trigrams (arena) or NULL
 } CBMDefinition;
 
 /* Argument captured from a call expression */

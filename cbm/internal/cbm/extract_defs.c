@@ -128,6 +128,20 @@ static void compute_fingerprint(CBMExtractCtx *ctx, CBMDefinition *def, TSNode f
     if (ts_node_is_null(body)) {
         body = func_node;
     }
+
+    /* Panel S1 source: the normalised AST node-type struct-trigram list rides
+     * the same body node as the MinHash fingerprint, but is computed
+     * independently of the fingerprint's 30-token floor so that shorter bodies
+     * still expose a structural surface for guard/panel measurement. This is
+     * the shared instrument: per-snippet guard reparse reads this same field
+     * back through cbm_extract_file, so identical body bytes match exactly. */
+    {
+        char st_buf[CBM_STRUCT_TRIGRAMS_BUF];
+        if (cbm_struct_trigrams_serialize(body, st_buf, (int)sizeof(st_buf)) > 0) {
+            def->struct_trigrams = cbm_arena_strdup(ctx->arena, st_buf);
+        }
+    }
+
     cbm_minhash_t result;
     if (!cbm_minhash_compute(body, ctx->source, (int)ctx->language, &result)) {
         return; /* Too short or empty — no fingerprint */
