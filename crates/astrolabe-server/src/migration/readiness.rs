@@ -92,6 +92,10 @@ pub(crate) fn readiness_status_json_at(
         "measured_tier_count": measured_tier_count,
         "tier_count": tiers.len(),
         "tiers": tiers,
+        // P7.4 (#48): guard drift recalibration proposals feed the readiness view —
+        // an elevated rolling rejection rate is a signal the calibrated tier is
+        // drifting and recalibration is due (labeled; empty when no crossing fired).
+        "guard_drift": drift_proposals_section(cache_dir, project),
         "first_failing_tier": first_failing.as_ref().map(|tier| {
             json!({
                 "tier": tier.get("tier").cloned().unwrap_or(Value::Null),

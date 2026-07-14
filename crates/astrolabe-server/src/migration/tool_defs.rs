@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 13] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 15] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -15,7 +15,114 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 13] {
         guard_check_tool_definition(),
         measure_bits_tool_definition(),
         find_similar_tool_definition(),
+        guard_lock_tool_definition(),
+        assay_gate_tool_definition(),
     ]
+}
+
+pub(crate) fn assay_gate_tool_definition() -> Value {
+    json!({
+        "name": "assay_gate",
+        "title": "Assay Lens Capability Gate",
+        "description": "Per-repo lens capability gate (P5.5): Admit/Park/Retire each candidate lens from its measured capability card, ledgered to the real Assay column family and reversible. Three modes: decide (gate one lens from a measured LensCapabilityCard + its max admitted correlation + sole-critical-carrier flag, persisting an Admit/Park/Retire verdict as a hash-chained Ledger row and re-folding the serving state), revert (neutralize a prior decision by its Ledger seq, restoring the prior serving state byte-for-byte), status (serve the current Admit/Park/Retire buckets and the serving_view mask note, optionally reading any journal entry back by Ledger seq via as_of_seq). Parked/retired lenses are masked out of serving paths non-destructively; the frozen roster and historical slot bytes are untouched. Every response carries trust/freshness/provenance and is read-back verified against the persisted CF bytes. Fails closed with {code,message,remediation} on a malformed card, an unknown mode, an invalid/already-reverted seq, or a readback mismatch.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["decide", "revert", "status"],
+                    "description": "decide: gate one lens; revert: reverse a prior decision by Ledger seq; status: serve the current serving state. Defaults to status."
+                },
+                "card": {
+                    "type": "object",
+                    "description": "mode=decide: the measured LensCapabilityCard (lens, axis_bits, signal_bits, coverage, spread, separation, cost_units, n)."
+                },
+                "max_admitted_correlation": {
+                    "type": "number",
+                    "description": "mode=decide: measured max absolute correlation of the candidate with any admitted lens (0.0..=1.0)."
+                },
+                "sole_critical_carrier": {
+                    "type": "boolean",
+                    "description": "mode=decide: whether the candidate is the sole carrier of a rare-but-critical stratum (stratified override)."
+                },
+                "reverts_seq": {
+                    "type": "integer",
+                    "description": "mode=revert: the Ledger seq of the decision to reverse (from mode=status)."
+                },
+                "as_of_seq": {
+                    "type": "integer",
+                    "description": "mode=status: optionally read one journal entry back by its Ledger seq (CF-level as_of)."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn guard_lock_tool_definition() -> Value {
+    json!({
+        "name": "guard_lock",
+        "title": "Guard Identity-Lock Inventory",
+        "description": "Identity-lock inventory for public APIs (P7.4): exported/public symbols are identity-locked so guard_check enforces their public-API signature slot AllRequired at the identity FAR (breaking-change drift on a locked surface refuses). Four modes: lock (identity-lock an exported/public symbol; refuses a non-exported symbol fail-closed), unlock (reversible; returns the inventory byte-for-byte to its pre-lock state), inventory (serve the locked set), rebuild (rebuild the inventory from extraction export flags, the parity source of truth). Lock/unlock mutations are persisted to the config store and ledgered to the real Guard column family, read-back verified. Every response carries trust/freshness/provenance. Fails closed with {code,message,remediation} on a non-exported lock target, an unlocked unlock target, an unknown mode, or a readback mismatch.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["lock", "unlock", "inventory", "rebuild"],
+                    "description": "lock/unlock a symbol, serve the inventory, or rebuild from extraction flags. Defaults to inventory."
+                },
+                "cx": {
+                    "type": "string",
+                    "description": "mode=lock/unlock: the target symbol's CxId hex."
+                },
+                "qualified_name": {
+                    "type": "string",
+                    "description": "mode=lock: the target's fully-qualified name (surfaced in the inventory)."
+                },
+                "exported": {
+                    "type": "boolean",
+                    "description": "mode=lock: whether extraction flagged the symbol exported/public (only exported symbols can be identity-locked)."
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "mode=rebuild: the extraction symbol set, each {cx, qualified_name, exported}."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn measure_bits_tool_definition() -> Value {

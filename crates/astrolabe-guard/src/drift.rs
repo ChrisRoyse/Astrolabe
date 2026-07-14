@@ -205,6 +205,67 @@ impl SlotDriftMonitor {
     }
 }
 
+/// A serializable snapshot of a [`SlotDriftMonitor`] — the persisted image the
+/// server round-trips so the rolling window **and its hysteresis latch** survive
+/// across `guard_check` calls (each check is a separate process/request). The slot
+/// is stored by its stable str key ([`GuardSlot::as_str`]); restoring an unknown
+/// key fails closed (`from_snapshot` returns `None`) rather than inventing a slot.
+///
+/// This is a plain data image (public fields, no `serde` — the crate's non-test
+/// code is serde-free by convention; see [`crate::profile`] / [`crate::lock`]).
+/// The JSON persistence mapping lives in the server layer, which owns `serde_json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotDriftSnapshot {
+    /// Stable slot key.
+    pub slot: String,
+    /// Rolling window size.
+    pub window: usize,
+    /// Calibrated drift bound (`multiplier x calibrated_far`).
+    pub drift_bound: f32,
+    /// The slot's calibrated achieved FAR (the drift bound's basis).
+    pub calibrated_far: f32,
+    /// Most-recent outcomes (true = rejection); front is oldest.
+    pub samples: Vec<bool>,
+    /// Hysteresis latch state (whether currently latched above the bound).
+    pub above: bool,
+}
+
+impl SlotDriftMonitor {
+    /// A serializable snapshot of the monitor's full state (window + latch).
+    pub fn snapshot(&self) -> SlotDriftSnapshot {
+        SlotDriftSnapshot {
+            slot: self.slot.as_str().to_string(),
+            window: self.window,
+            drift_bound: self.drift_bound,
+            calibrated_far: self.calibrated_far,
+            samples: self.samples.iter().copied().collect(),
+            above: self.above,
+        }
+    }
+
+    /// Rebuild a monitor from a snapshot. Returns `None` for an unknown slot key so
+    /// a corrupt/incompatible persisted image fails closed rather than restoring a
+    /// bogus monitor. The rejection count is recomputed from the samples so it is
+    /// always consistent with the restored window.
+    pub fn from_snapshot(snapshot: &SlotDriftSnapshot) -> Option<Self> {
+        let slot = GuardSlot::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == snapshot.slot)?;
+        let window = snapshot.window.max(1);
+        let samples: VecDeque<bool> = snapshot.samples.iter().copied().collect();
+        let rejections = samples.iter().filter(|&&rejected| rejected).count();
+        Some(Self {
+            slot,
+            window,
+            drift_bound: snapshot.drift_bound,
+            calibrated_far: snapshot.calibrated_far,
+            samples,
+            rejections,
+            above: snapshot.above,
+        })
+    }
+}
+
 /// A whole-profile drift monitor: one [`SlotDriftMonitor`] per guard slot for a
 /// domain. Feeds a stream of [`guard_check`](crate::check::check_candidate)
 /// reports and yields the recalibration proposals as slots cross their bounds.
@@ -242,6 +303,21 @@ impl ProfileDriftMonitor {
             .iter_mut()
             .find(|m| m.slot() == slot)
             .and_then(|m| m.observe(rejected))
+    }
+
+    /// Serializable snapshots for every slot monitor (the persisted image).
+    pub fn snapshots(&self) -> Vec<SlotDriftSnapshot> {
+        self.monitors.iter().map(SlotDriftMonitor::snapshot).collect()
+    }
+
+    /// Rebuild a profile monitor from per-slot snapshots. Snapshots with an unknown
+    /// slot key are dropped (fail-closed on that slot); the rest restore exactly.
+    pub fn from_snapshots(snapshots: &[SlotDriftSnapshot]) -> Self {
+        let monitors = snapshots
+            .iter()
+            .filter_map(SlotDriftMonitor::from_snapshot)
+            .collect();
+        Self { monitors }
     }
 
     /// Feed a whole `guard_check` report: each slot's `!pass()` is one outcome.
@@ -387,6 +463,78 @@ mod tests {
         assert!(value["rejection_rate"].as_f64().unwrap() > value["drift_bound"].as_f64().unwrap());
         // Determinism: same monitor state reproduces the same bytes.
         assert_eq!(proposal.canonical_bytes(), proposal.canonical_bytes());
+    }
+
+    // -- Snapshot round-trip preserves the window AND the hysteresis latch -------
+
+    #[test]
+    fn snapshot_round_trip_preserves_latch_no_refire() {
+        // Cross the bound so the latch is set, then serialize -> JSON -> restore and
+        // confirm the restored monitor does NOT re-fire while still latched above:
+        // the persisted image carries the "fires once per crossing" hysteresis.
+        let mut monitor = SlotDriftMonitor::new(GuardSlot::CodeSemantic, 0.02, 10);
+        for _ in 0..10 {
+            assert!(monitor.observe(false).is_none());
+        }
+        assert!(monitor.observe(true).is_some(), "crossing fires once");
+        assert!(monitor.is_above());
+
+        // Map the snapshot through JSON exactly as the server layer persists it
+        // (public fields -> serde_json -> back), proving the field mapping and the
+        // latch survive a serialization round-trip.
+        let snapshot = monitor.snapshot();
+        let value = serde_json::json!({
+            "slot": snapshot.slot,
+            "window": snapshot.window,
+            "drift_bound": snapshot.drift_bound,
+            "calibrated_far": snapshot.calibrated_far,
+            "samples": snapshot.samples,
+            "above": snapshot.above,
+        });
+        let json = serde_json::to_string(&value).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let restored_snapshot = SlotDriftSnapshot {
+            slot: parsed["slot"].as_str().unwrap().to_string(),
+            window: parsed["window"].as_u64().unwrap() as usize,
+            drift_bound: parsed["drift_bound"].as_f64().unwrap() as f32,
+            calibrated_far: parsed["calibrated_far"].as_f64().unwrap() as f32,
+            samples: parsed["samples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.as_bool().unwrap())
+                .collect(),
+            above: parsed["above"].as_bool().unwrap(),
+        };
+        let mut restored =
+            SlotDriftMonitor::from_snapshot(&restored_snapshot).expect("restore snapshot");
+
+        // State survived byte-for-byte.
+        assert!(restored.is_above(), "latch survived the round-trip");
+        assert_eq!(restored.sample_count(), monitor.sample_count());
+        assert!((restored.rejection_rate() - monitor.rejection_rate()).abs() < 1e-6);
+
+        // Still latched above => a further rejection must NOT re-fire.
+        assert!(
+            restored.observe(true).is_none(),
+            "a restored, still-latched monitor must not re-fire (hysteresis preserved)"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_unknown_slot_key() {
+        let bogus = SlotDriftSnapshot {
+            slot: "not_a_guard_slot".to_string(),
+            window: 10,
+            drift_bound: 0.03,
+            calibrated_far: 0.02,
+            samples: vec![false, true],
+            above: false,
+        };
+        assert!(
+            SlotDriftMonitor::from_snapshot(&bogus).is_none(),
+            "an unknown slot key must fail closed, not restore a bogus monitor"
+        );
     }
 
     #[test]

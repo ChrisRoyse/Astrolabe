@@ -162,6 +162,15 @@ use guard::*;
 mod guard_check;
 use guard_check::*;
 
+mod guard_drift;
+use guard_drift::*;
+
+mod assay_gate;
+use assay_gate::*;
+
+mod guard_lock;
+use guard_lock::*;
+
 mod detect_changes_risk;
 use detect_changes_risk::*;
 
