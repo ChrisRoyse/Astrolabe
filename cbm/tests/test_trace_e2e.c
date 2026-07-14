@@ -134,6 +134,32 @@ static char *rpc_trace_observed_traffic(cbm_mcp_server_t *srv) {
              "\"edge_types\":[\"OBSERVED_TRAFFIC\"]}}}");
 }
 
+/* trace_path outbound from `fn` over a single edge type (#333 provenance FSV). */
+static char *rpc_trace_edge(cbm_mcp_server_t *srv, const char *fn, const char *edge_type) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"project\":\"" E2E_PROJECT "\","
+             "\"function_name\":\"%s\",\"direction\":\"outbound\","
+             "\"edge_types\":[\"%s\"]}}}",
+             fn, edge_type);
+    return cbm_mcp_server_handle(srv, req);
+}
+
+/* search_graph(name_pattern=fn, relationship=et, include_connected=true) — surfaces
+ * connected_edges with per-edge promotion provenance (#333). */
+static char *rpc_search_connected(cbm_mcp_server_t *srv, const char *fn, const char *edge_type) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"" E2E_PROJECT "\","
+             "\"name_pattern\":\"%s\",\"relationship\":\"%s\",\"include_connected\":true}}}",
+             fn, edge_type);
+    return cbm_mcp_server_handle(srv, req);
+}
+
 /* Ingest the committed OTLP/JSON golden batch through the real ingest_traces
  * JSON-RPC tool. The golden JSON is a full {"resourceSpans":[...]} document; we
  * splice the project field in front of its resourceSpans and wrap it as the
@@ -249,6 +275,143 @@ TEST(trace_e2e_tools_carry_trusted_service_edges_after_ingest) {
      * — the HTTP_CALLS edge was promoted validated=true / Trusted / measured. */
     ASSERT_TRUE(http_calls_is_promoted(st, caller_id));
 
+    /* ── #333: the SAME promotion is now readable THROUGH the tool JSON ──────
+     * trace_path over the promoted HTTP_CALLS edge surfaces the edge's
+     * validated / Trusted / runtime_trace / measured-weight provenance on the
+     * route hop — no raw-store access required. */
+    char *prov_trace = rpc_trace_edge(srv, "checkout", "HTTP_CALLS");
+    ASSERT_NOT_NULL(prov_trace);
+    ASSERT_TRUE(response_has_fragment(prov_trace, "\"validated\":true"));
+    ASSERT_TRUE(response_has_fragment(prov_trace, "\"trust\":\"Trusted\""));
+    ASSERT_TRUE(response_has_fragment(prov_trace, "\"provenance\":\"runtime_trace\""));
+    ASSERT_TRUE(response_has_fragment(prov_trace, "\"weight\":"));
+    free(prov_trace);
+
+    /* search_graph include_connected surfaces the same provenance on the
+     * connected_edges of the caller node reached over the promoted edge. */
+    char *prov_search = rpc_search_connected(srv, "checkout", "HTTP_CALLS");
+    ASSERT_NOT_NULL(prov_search);
+    ASSERT_TRUE(response_has_fragment(prov_search, "connected_edges"));
+    ASSERT_TRUE(response_has_fragment(prov_search, "\"validated\":true"));
+    ASSERT_TRUE(response_has_fragment(prov_search, "\"trust\":\"Trusted\""));
+    ASSERT_TRUE(response_has_fragment(prov_search, "\"provenance\":\"runtime_trace\""));
+    free(prov_search);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #333 edge-case triad, asserted THROUGH trace_path tool JSON (not raw rows):
+ *   (1) an edge with FULL runtime-trace promotion properties surfaces
+ *       validated / trust / weight / provenance on the hop;
+ *   (2) an edge with NO properties surfaces NONE of those fields (absence is
+ *       honest — no invented defaults);
+ *   (3) an edge with unusable properties_json (a valid JSON value that is not an
+ *       object) surfaces an explicit "provenance_error" marker (invariant 3 —
+ *       never a silent drop). NOTE: a truly *unparseable* properties string cannot
+ *       be seeded through cbm_store_insert_edge — the edges.url_path_gen generated
+ *       column is indexed (idx_edges_url_path), so json_extract() runs at insert and
+ *       aborts on malformed JSON. Such rows only exist in legacy/externally-corrupted
+ *       DBs; emit_edge_provenance() routes them to the SAME provenance_error marker
+ *       this non-object case proves end to end. */
+static void seed_provenance_triad(cbm_store_t *s) {
+    cbm_store_upsert_project(s, E2E_PROJECT, "/tmp/trace-e2e");
+
+    cbm_node_t caller = {.project = E2E_PROJECT,
+                         .label = "Function",
+                         .name = "dispatch",
+                         .qualified_name = "svc.dispatch",
+                         .file_path = "svc/dispatch.go"};
+    int64_t cid = cbm_store_upsert_node(s, &caller);
+
+    cbm_node_t full = {.project = E2E_PROJECT,
+                       .label = "Function",
+                       .name = "promoted_full",
+                       .qualified_name = "svc.promoted_full",
+                       .file_path = "svc/full.go"};
+    int64_t fid = cbm_store_upsert_node(s, &full);
+
+    cbm_node_t bare = {.project = E2E_PROJECT,
+                       .label = "Function",
+                       .name = "bare_edge",
+                       .qualified_name = "svc.bare_edge",
+                       .file_path = "svc/bare.go"};
+    int64_t bare_id = cbm_store_upsert_node(s, &bare);
+
+    cbm_node_t broken = {.project = E2E_PROJECT,
+                         .label = "Function",
+                         .name = "broken_props",
+                         .qualified_name = "svc.broken_props",
+                         .file_path = "svc/broken.go"};
+    int64_t broken_id = cbm_store_upsert_node(s, &broken);
+
+    /* (1) fully promoted edge. */
+    cbm_edge_t e_full = {
+        .project = E2E_PROJECT,
+        .source_id = cid,
+        .target_id = fid,
+        .type = "CALLS",
+        .properties_json = "{\"validated\":true,\"trust\":\"Trusted\","
+                           "\"provenance\":\"runtime_trace\",\"weight\":42,\"runtime_count\":42}"};
+    cbm_store_insert_edge(s, &e_full);
+
+    /* (2) edge with no properties at all (store defaults to "{}"). */
+    cbm_edge_t e_bare = {.project = E2E_PROJECT,
+                         .source_id = cid,
+                         .target_id = bare_id,
+                         .type = "USES",
+                         .properties_json = NULL};
+    cbm_store_insert_edge(s, &e_bare);
+
+    /* (3) edge with unusable properties: valid JSON that is not an object (a JSON
+     * array). Inserts cleanly (json_extract on a non-matching path returns NULL,
+     * so the generated url_path_gen column does not abort) yet cannot yield the
+     * promoted fields, so the tool must emit an explicit provenance_error. */
+    cbm_edge_t e_broken = {.project = E2E_PROJECT,
+                           .source_id = cid,
+                           .target_id = broken_id,
+                           .type = "READS",
+                           .properties_json = "[\"validated\",\"trust\"]"};
+    cbm_store_insert_edge(s, &e_broken);
+}
+
+TEST(trace_e2e_edge_provenance_triad_through_tools) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    seed_provenance_triad(st);
+    cbm_mcp_server_set_project(srv, E2E_PROJECT);
+
+    /* (1) FULL promotion → all four provenance fields on the hop. */
+    char *full = rpc_trace_edge(srv, "dispatch", "CALLS");
+    ASSERT_NOT_NULL(full);
+    ASSERT_TRUE(response_has_fragment(full, "promoted_full"));
+    ASSERT_TRUE(response_has_fragment(full, "\"validated\":true"));
+    ASSERT_TRUE(response_has_fragment(full, "\"trust\":\"Trusted\""));
+    ASSERT_TRUE(response_has_fragment(full, "\"weight\":42"));
+    ASSERT_TRUE(response_has_fragment(full, "\"provenance\":\"runtime_trace\""));
+    ASSERT_NULL(strstr(full, "provenance_error"));
+    free(full);
+
+    /* (2) NO properties → NONE of the provenance fields, and no error marker. */
+    char *bare = rpc_trace_edge(srv, "dispatch", "USES");
+    ASSERT_NOT_NULL(bare);
+    ASSERT_TRUE(response_has_fragment(bare, "bare_edge"));
+    ASSERT_NULL(strstr(bare, "validated"));
+    ASSERT_NULL(strstr(bare, "\\\"trust\\\""));
+    ASSERT_NULL(strstr(bare, "provenance_error"));
+    free(bare);
+
+    /* (3) MALFORMED properties → explicit provenance_error marker, never silent. */
+    char *broken = rpc_trace_edge(srv, "dispatch", "READS");
+    ASSERT_NOT_NULL(broken);
+    ASSERT_TRUE(response_has_fragment(broken, "broken_props"));
+    ASSERT_TRUE(response_has_fragment(broken, "provenance_error"));
+    ASSERT_NULL(strstr(broken, "\\\"validated\\\":true"));
+    free(broken);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -298,4 +461,5 @@ TEST(trace_e2e_no_route_no_service_edge) {
 SUITE(trace_e2e) {
     RUN_TEST(trace_e2e_tools_carry_trusted_service_edges_after_ingest);
     RUN_TEST(trace_e2e_no_route_no_service_edge);
+    RUN_TEST(trace_e2e_edge_provenance_triad_through_tools);
 }

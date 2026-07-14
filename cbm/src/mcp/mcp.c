@@ -1552,6 +1552,82 @@ static bool validate_edge_type(const char *s) {
     return true;
 }
 
+/* Find the raw properties_json of the traversal edge that touches a hop node,
+ * preferring an edge that carries runtime-trace promotion markers so trust is
+ * surfaced when a promoted and an unpromoted edge both touch the same node.
+ * Returns the borrowed properties_json or NULL when no touching edge records
+ * properties. (#333) */
+static const char *bfs_edge_props_for_hop(cbm_traverse_result_t *tr, int64_t hop_node_id) {
+    const char *first = NULL;
+    for (int e = 0; e < tr->edge_count; e++) {
+        /* Match either endpoint: outbound traces reach the hop as target,
+         * inbound traces reach it as source. */
+        if (tr->edges[e].target_id != hop_node_id && tr->edges[e].source_id != hop_node_id) {
+            continue;
+        }
+        const char *pj = tr->edges[e].properties_json;
+        if (!pj || pj[0] == '\0') {
+            continue;
+        }
+        if (!first) {
+            first = pj;
+        }
+        /* Prefer the promoted edge if one exists among the touching edges. */
+        if (strstr(pj, "\"validated\"") != NULL || strstr(pj, "\"provenance\"") != NULL) {
+            return pj;
+        }
+    }
+    return first;
+}
+
+/* Parse an edge's raw properties_json and graft runtime-trace promotion
+ * provenance (validated / trust tier / measured weight / provenance kind) onto
+ * `item`. Returns true iff a provenance field OR an explicit error marker was
+ * added. Contract (HONEST invariants 1 & 3):
+ *   - NULL/empty properties               -> nothing added, false (absence is honest).
+ *   - valid JSON with no promotion marker  -> nothing added, false (an unpromoted
+ *                                             edge honestly carries no trust label).
+ *   - malformed / non-object JSON          -> explicit "provenance_error" marker,
+ *                                             true (never a silent drop).
+ * Never invents defaults for absent fields. (#333) */
+static bool emit_edge_provenance(yyjson_mut_doc *doc, yyjson_mut_val *item, const char *pj) {
+    if (!pj || pj[0] == '\0') {
+        return false;
+    }
+    yyjson_doc *pd = yyjson_read(pj, strlen(pj), 0);
+    if (!pd) {
+        yyjson_mut_obj_add_str(doc, item, "provenance_error", "malformed edge properties_json");
+        return true;
+    }
+    yyjson_val *root = yyjson_doc_get_root(pd);
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(pd);
+        yyjson_mut_obj_add_str(doc, item, "provenance_error",
+                               "edge properties_json is not a JSON object");
+        return true;
+    }
+    bool added = false;
+    yyjson_val *v;
+    if ((v = yyjson_obj_get(root, "validated")) != NULL && yyjson_is_bool(v)) {
+        yyjson_mut_obj_add_bool(doc, item, "validated", yyjson_get_bool(v));
+        added = true;
+    }
+    if ((v = yyjson_obj_get(root, "trust")) != NULL && yyjson_is_str(v)) {
+        yyjson_mut_obj_add_strcpy(doc, item, "trust", yyjson_get_str(v));
+        added = true;
+    }
+    if ((v = yyjson_obj_get(root, "weight")) != NULL && yyjson_is_int(v)) {
+        yyjson_mut_obj_add_int(doc, item, "weight", yyjson_get_int(v));
+        added = true;
+    }
+    if ((v = yyjson_obj_get(root, "provenance")) != NULL && yyjson_is_str(v)) {
+        yyjson_mut_obj_add_strcpy(doc, item, "provenance", yyjson_get_str(v));
+        added = true;
+    }
+    yyjson_doc_free(pd);
+    return added;
+}
+
 /* Enrich search result with 1-hop connected node names. */
 /* Add BFS results to a yyjson array (deduped by name). */
 static void enrich_add_bfs(yyjson_mut_doc *doc, yyjson_mut_val *arr, cbm_traverse_result_t *tr) {
@@ -1562,25 +1638,56 @@ static void enrich_add_bfs(yyjson_mut_doc *doc, yyjson_mut_val *arr, cbm_travers
     }
 }
 
+/* Append one object per connected node whose connecting edge carries runtime-trace
+ * promotion provenance to `arr`, as {name, validated?, trust?, weight?, provenance?}
+ * (or {name, provenance_error} for a malformed edge). Nodes reached over an
+ * unpromoted edge add nothing here — their name is already in connected_names, and
+ * an unpromoted edge honestly carries no trust label. (#333) */
+static void enrich_add_bfs_edges(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                 cbm_traverse_result_t *tr) {
+    for (int j = 0; j < tr->visited_count; j++) {
+        if (!tr->visited[j].node.name) {
+            continue;
+        }
+        const char *pj = bfs_edge_props_for_hop(tr, tr->visited[j].node.id);
+        if (!pj) {
+            continue;
+        }
+        yyjson_mut_val *eo = yyjson_mut_obj(doc);
+        if (emit_edge_provenance(doc, eo, pj)) {
+            yyjson_mut_obj_add_strcpy(doc, eo, "name", tr->visited[j].node.name);
+            yyjson_mut_arr_add_val(arr, eo);
+        }
+    }
+}
+
 /* Enrich search result with 1-hop connected node names (inbound + outbound). */
 static void enrich_connected(yyjson_mut_doc *doc, yyjson_mut_val *item, cbm_store_t *store,
                              int64_t node_id, const char *relationship) {
     const char *et[] = {relationship ? relationship : "CALLS"};
     yyjson_mut_val *conn = yyjson_mut_arr(doc);
+    yyjson_mut_val *conn_edges = yyjson_mut_arr(doc);
 
     /* BFS doesn't support "both" — run inbound + outbound separately. */
     cbm_traverse_result_t tr_in = {0};
     cbm_store_bfs(store, node_id, "inbound", et, SKIP_ONE, SKIP_ONE, MCP_DEFAULT_LIMIT, &tr_in);
     enrich_add_bfs(doc, conn, &tr_in);
+    enrich_add_bfs_edges(doc, conn_edges, &tr_in);
     cbm_store_traverse_free(&tr_in);
 
     cbm_traverse_result_t tr_out = {0};
     cbm_store_bfs(store, node_id, "outbound", et, SKIP_ONE, SKIP_ONE, MCP_DEFAULT_LIMIT, &tr_out);
     enrich_add_bfs(doc, conn, &tr_out);
+    enrich_add_bfs_edges(doc, conn_edges, &tr_out);
     cbm_store_traverse_free(&tr_out);
 
     if (yyjson_mut_arr_size(conn) > 0) {
         yyjson_mut_obj_add_val(doc, item, "connected_names", conn);
+    }
+    /* Only emitted when at least one connecting edge carries promotion provenance;
+     * absent otherwise (invariant 1: grounded trust labels, no invented defaults). */
+    if (yyjson_mut_arr_size(conn_edges) > 0) {
+        yyjson_mut_obj_add_val(doc, item, "connected_edges", conn_edges);
     }
 }
 
@@ -2816,6 +2923,13 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
                     yyjson_mut_obj_add_val(doc, item, "args", av);
                 }
             }
+        }
+        /* Surface runtime-trace promotion provenance (validated / trust / measured
+         * weight / provenance kind) of the edge leading to this hop when present;
+         * an unpromoted hop's edge adds nothing (invariant 1). The root (hop 0) has
+         * no edge leading to it, so it is never labelled from its own outgoing edge. (#333) */
+        if (tr->visited[i].hop > 0) {
+            emit_edge_provenance(doc, item, bfs_edge_props_for_hop(tr, tr->visited[i].node.id));
         }
         yyjson_mut_arr_add_val(arr, item);
     }
