@@ -47,6 +47,30 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
     return NULL;
 }
 
+// --- UTF-8-safe in-place truncation ---
+
+size_t cbm_utf8_truncate(char *s, size_t max_bytes) {
+    if (!s) {
+        return 0;
+    }
+    size_t len = strlen(s);
+    if (len <= max_bytes) {
+        return len;
+    }
+    // s[max_bytes] is the first byte to drop. If it is a UTF-8 continuation
+    // byte (10xxxxxx), it belongs to a character whose lead byte precedes the
+    // cut, so cutting here would leave a partial sequence. Walk back to that
+    // character's lead byte and drop the whole partial character. Lead bytes
+    // (0xxxxxxx ASCII, or 110/1110/11110xxxx) are valid boundaries and stop
+    // the scan immediately.
+    size_t cut = max_bytes;
+    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) {
+        cut--;
+    }
+    s[cut] = '\0';
+    return cut;
+}
+
 // --- Node text extraction ---
 
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source) {

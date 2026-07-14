@@ -12,6 +12,18 @@ void *cbm_memmem(const void *haystack, size_t haystack_len, const void *needle, 
 // Extract text of a node from source. Returns arena-allocated string.
 char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 
+// Truncate a NUL-terminated, valid-UTF-8 string IN PLACE to at most
+// `max_bytes` bytes WITHOUT splitting a multibyte character. If the cut point
+// lands inside a multibyte sequence (the byte at `max_bytes` is a UTF-8
+// continuation byte 0x80-0xBF), it backs up to that character's lead byte and
+// drops the whole partial character, so the retained prefix is always valid
+// UTF-8. A naive `s[max_bytes] = '\0'` can slice a 2-4 byte character in half
+// and emit an invalid sequence that fail-closes the downstream UTF-8-strict
+// row sink (see #362). No-op when strlen(s) <= max_bytes. Precondition: the
+// input up to the cut is itself valid UTF-8 (extraction reads verbatim from
+// UTF-8 source, so this holds). Returns the resulting length in bytes.
+size_t cbm_utf8_truncate(char *s, size_t max_bytes);
+
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 
