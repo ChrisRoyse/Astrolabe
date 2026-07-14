@@ -1606,9 +1606,9 @@ fn next_above(value: f32) -> f32 {
 /// (invariant #6).
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CalibrationError {
-    code: &'static str,
+    code: String,
     message: String,
-    remediation: &'static str,
+    remediation: String,
 }
 
 impl CalibrationError {
@@ -1618,22 +1618,38 @@ impl CalibrationError {
         remediation: &'static str,
     ) -> Self {
         Self {
-            code,
+            code: code.to_string(),
             message: message.into(),
-            remediation,
+            remediation: remediation.to_string(),
         }
     }
 
-    pub fn code(&self) -> &'static str {
-        self.code
+    /// Public owned-string constructor for external [`CorpusPanelMeasurer`]
+    /// implementors (e.g. the server's panel/libcbm measurer, #334), which surface
+    /// fail-closed `{code, message, remediation}` faults whose codes/remediations are
+    /// computed at runtime rather than being `'static` literals.
+    pub fn new_owned(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            remediation: remediation.into(),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
     }
 
     pub fn message(&self) -> &str {
         &self.message
     }
 
-    pub fn remediation(&self) -> &'static str {
-        self.remediation
+    pub fn remediation(&self) -> &str {
+        &self.remediation
     }
 }
 

@@ -67,7 +67,7 @@ pub enum AdvisoryOutcome {
     SilentTimeout { budget_ms: u64, elapsed_ms: u64 },
     /// The quick check faulted (e.g. a degenerate vector): silent, counted skip
     /// carrying the deficit code for observability. Still never blocks.
-    SilentError { code: &'static str },
+    SilentError { code: String },
 }
 
 impl AdvisoryOutcome {
@@ -180,13 +180,15 @@ where
     let start = Instant::now();
     match rx.recv_timeout(Duration::from_millis(budget_ms)) {
         Ok(Ok(signal)) => AdvisoryOutcome::Advisory(signal),
-        Ok(Err(error)) => AdvisoryOutcome::SilentError { code: error.code() },
+        Ok(Err(error)) => AdvisoryOutcome::SilentError {
+            code: error.code().to_string(),
+        },
         Err(mpsc::RecvTimeoutError::Timeout) => AdvisoryOutcome::SilentTimeout {
             budget_ms,
             elapsed_ms: start.elapsed().as_millis() as u64,
         },
         Err(mpsc::RecvTimeoutError::Disconnected) => AdvisoryOutcome::SilentError {
-            code: "ASTRO_GUARD_HOOK_WORKER_LOST",
+            code: "ASTRO_GUARD_HOOK_WORKER_LOST".to_string(),
         },
     }
 }
