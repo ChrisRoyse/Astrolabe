@@ -31,6 +31,7 @@ pub fn handle_tool_raw(
         "kernel_answer" => handle_kernel_answer(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
         "search_graph" => handle_search_graph(runner, args_json),
+        "trace_path" | "trace_call_path" => handle_trace_path(runner, args_json),
         "find_similar" => handle_find_similar(args_json),
         "detect_changes" => handle_detect_changes_grounded_risk(runner, args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
@@ -92,7 +93,12 @@ pub fn handle_jsonrpc_raw(
 pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "index_repository" | "index_status" | "get_architecture" | "detect_changes"
+        "index_repository"
+            | "index_status"
+            | "get_architecture"
+            | "detect_changes"
+            | "trace_path"
+            | "trace_call_path"
     ) || is_advertised_astrolabe_tool(tool_name)
 }
 
@@ -143,8 +149,12 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
     // gating the whole augmentation on the final page served the bare legacy
     // schema (found by the #328 live-binary readback FSV).
     for tool in tools.iter_mut() {
-        if tool.get("name").and_then(Value::as_str) == Some("search_graph") {
-            overlay_search_graph_extensions(tool);
+        match tool.get("name").and_then(Value::as_str) {
+            Some("search_graph") => overlay_search_graph_extensions(tool),
+            // #43: advertise the opt-in `scored` best-first knob on the CBM
+            // trace_path schema so clients can discover it, same overlay pattern.
+            Some("trace_path") | Some("trace_call_path") => overlay_trace_path_extensions(tool),
+            _ => {}
         }
     }
     Ok(serde_json::to_string(&response)?)
@@ -163,6 +173,23 @@ pub(crate) fn overlay_search_graph_extensions(tool: &mut Value) {
         return;
     };
     for (name, spec) in search_graph_astrolabe_property_overlay() {
+        properties.entry(name).or_insert(spec);
+    }
+}
+
+/// #43: merge the Astrolabe `scored` extension property into the CBM `trace_path`
+/// tool's `inputSchema.properties`, leaving CBM-native properties untouched.
+pub(crate) fn overlay_trace_path_extensions(tool: &mut Value) {
+    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let properties = schema
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(properties) = properties.as_object_mut() else {
+        return;
+    };
+    for (name, spec) in trace_path_astrolabe_property_overlay() {
         properties.entry(name).or_insert(spec);
     }
 }
@@ -204,6 +231,12 @@ pub(crate) fn should_wrap_tool(
                 return Ok(false);
             };
             Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        "trace_path" | "trace_call_path" => {
+            // The scored best-first re-rank is the ONLY divergence from CBM's plain
+            // BFS. Without `scored:true` we never intercept, so the legacy traversal
+            // is served byte-for-byte by libcbm (the #43 plain-BFS byte-parity floor).
+            Ok(trace_path_scored_requested(args))
         }
         name if is_advertised_astrolabe_tool(name) => Ok(true),
         _ => Ok(false),
@@ -457,6 +490,10 @@ pub(crate) fn handle_get_architecture(
                 "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
                 "redundancy": read_redundancy_neff_aspect(&cache_dir, &project),
                 "layout_map": read_layout_map_aspect(&cache_dir, &project)?,
+                // #43: the two aspects that were genuinely missing on main
+                // (kernel_context/agreement_graph/n_eff already serve above).
+                "grounding_gaps": read_grounding_gaps_aspect(&cache_dir, &project)?,
+                "signal_ranking": read_signal_ranking_aspect(&cache_dir, &project)?,
             },
         }),
     )
