@@ -613,6 +613,25 @@ pub(crate) fn handle_get_provenance(args_json: &str) -> Result<String, DynError>
     {
         return tool_error_result(error.to_string());
     }
+    // #67 DoD 1: reproduce is live re-execution of the #40 kernel answer engine
+    // against the persisted current vault graph — an unchanged vault reproduces
+    // bit-exact, a perturbed vault fails closed with REPRODUCE_DRIFT_EXCEEDED
+    // naming the drift magnitude. `drift_bound_microunits` may only tighten the
+    // pinned 1e-3 bound. When no reproduce fixture is persisted yet (pre-#343),
+    // this is a no-op and reproduce serves the recorded digest/drift path.
+    let drift_bound_override = args_obj
+        .get("drift_bound_microunits")
+        .and_then(Value::as_u64);
+    if let Err(error) = apply_live_reproduce(
+        &mut store,
+        &cache_dir,
+        &project,
+        mode,
+        subject_id,
+        drift_bound_override,
+    ) {
+        return tool_error_result(error.to_string());
+    }
     let response = match get_provenance(&store, &ProvenanceQuery::new(mode, subject_id)) {
         Ok(response) => response,
         Err(error) => {

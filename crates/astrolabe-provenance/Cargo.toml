@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 astrolabe-domain.workspace = true
+# #67 / #40: reproduce mode re-executes the grounded kernel answer engine
+# (`astrolabe_kernel::answer`) live against the current vault graph and compares
+# the re-derivation to the recorded answer. No cycle: kernel depends on
+# domain + panel, never on provenance.
+astrolabe-kernel.workspace = true
 blake3 = "1"
 
 [dev-dependencies]

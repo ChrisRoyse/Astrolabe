@@ -2,6 +2,16 @@
 
 use std::collections::BTreeMap;
 
+pub mod reproduce;
+pub use reproduce::{
+    ASTRO_PROVENANCE_REPRODUCE_ARTIFACT_CORRUPT, ASTRO_PROVENANCE_REPRODUCE_BOUND_LOOSENED,
+    KNOB_REPRODUCE_DRIFT_BOUND_MICROUNITS, MICROUNITS_PER_PERMILLE, RECORDED_KERNEL_ANSWER_SCHEMA,
+    REPRODUCE_KNOB_REGISTRY_VERSION, REPRODUCE_KNOBS, RecordedKernelAnswer,
+    STRUCTURAL_DRIFT_MICROUNITS, answer_drift_microunits, answer_trace_from_kernel_answer,
+    parse_recorded_kernel_answer, recorded_kernel_answer_bytes, reproduce_drift_bound_default,
+    reproduce_kernel_answer, resolve_drift_bound,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const GET_PROVENANCE_SCHEMA: &str = "astrolabe.get_provenance.v1";
 pub const INTER_AGENT_TRUST_SCHEMA: &str = "astrolabe.inter_agent_trust.v1";

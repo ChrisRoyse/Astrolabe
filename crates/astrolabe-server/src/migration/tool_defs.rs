@@ -881,7 +881,7 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
     json!({
         "name": "get_provenance",
         "title": "Get Provenance",
-        "description": "Return labeled Astrolabe provenance for a shadow-indexed project. Modes are lineage, answer_trace, verify_chain, reproduce, and inter_agent_trust (one-call verification of a context pack claimed by another agent).",
+        "description": "Return labeled Astrolabe provenance for a shadow-indexed project. Modes are lineage, answer_trace (the recorded kernel answer's lineage; legs the answer does not carry — fusion weights, guard verdict — are reported as explicit unprovenanced warnings, never fabricated links), verify_chain, reproduce, and inter_agent_trust (one-call verification of a context pack claimed by another agent). reproduce live-re-executes the recorded kernel answer with its frozen lenses and recorded seeds against the current vault graph: an unchanged vault reproduces bit-for-bit, and a perturbed vault fails closed with REPRODUCE_DRIFT_EXCEEDED naming the drift magnitude when the measured drift exceeds the registry-pinned 1e-3 bound.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -900,6 +900,10 @@ pub(crate) fn get_provenance_tool_definition() -> Value {
                 "subject": {
                     "type": "string",
                     "description": "Alias for subject_id."
+                },
+                "drift_bound_microunits": {
+                    "type": "integer",
+                    "description": "reproduce: optional tightening-only override of the 1e-3 (1000-microunit) drift bound. A value above the pinned default is refused; omit to use 1e-3."
                 },
                 "manifest": {
                     "type": "object",
