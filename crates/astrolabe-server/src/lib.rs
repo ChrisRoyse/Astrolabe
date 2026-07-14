@@ -129,7 +129,7 @@ fn initialize_tracing() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> '<json>' | cli verify_chain '{{\"vault\":\"<dir>\"}}' | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token still works but is deprecated and warns.\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -325,7 +325,7 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
     if args.is_empty() {
-        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [json_args]".into());
+        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin) | '<json>' (deprecated)]".into());
     }
 
     let _worker_watchdog = index_worker.then(ParentWatchdog::start);
@@ -499,26 +499,53 @@ fn strip_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 
-fn resolve_cli_args(args: &[String]) -> Result<String, DynError> {
+/// How the leading `cli` argv supplies the tool JSON. Only [`CliArgSource::RawJsonArgv`]
+/// is deprecated; `--args-file <path>` and piped stdin are the supported forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliArgSource {
+    /// `cli <tool> --args-file <path>` — JSON read from a file.
+    ArgsFile,
+    /// `cli <tool> '{...}'` — raw JSON as an argv token (deprecated; still accepted).
+    RawJsonArgv,
+}
+
+/// Classify how the remaining `cli` arguments (after the tool name) supply the
+/// tool JSON, performing no I/O. Returns `None` when the argv carries no
+/// inline arguments, in which case the caller falls back to piped stdin (or an
+/// empty object). Kept pure so the deprecation-vs-supported split is unit
+/// testable without touching real stdin/stderr.
+fn classify_cli_argv(args: &[String]) -> Option<CliArgSource> {
     if args.len() >= 2 && args[0] == "--args-file" {
-        return Ok(fs::read_to_string(&args[1])?);
+        return Some(CliArgSource::ArgsFile);
     }
     if let Some(first) = args.first()
         && first.trim_start().starts_with('{')
     {
-        eprintln!(
-            "warning: passing raw JSON to 'cli' is deprecated; use --args-file or piped stdin."
-        );
-        return Ok(first.clone());
+        return Some(CliArgSource::RawJsonArgv);
     }
-    if !io::stdin().is_terminal() {
-        let mut text = String::new();
-        io::stdin().read_to_string(&mut text)?;
-        if !text.is_empty() {
-            return Ok(text);
+    None
+}
+
+fn resolve_cli_args(args: &[String]) -> Result<String, DynError> {
+    match classify_cli_argv(args) {
+        Some(CliArgSource::ArgsFile) => Ok(fs::read_to_string(&args[1])?),
+        Some(CliArgSource::RawJsonArgv) => {
+            eprintln!(
+                "warning: passing raw JSON to 'cli' is deprecated; use --args-file <path> or piped stdin."
+            );
+            Ok(args[0].clone())
+        }
+        None => {
+            if !io::stdin().is_terminal() {
+                let mut text = String::new();
+                io::stdin().read_to_string(&mut text)?;
+                if !text.is_empty() {
+                    return Ok(text);
+                }
+            }
+            Ok("{}".to_string())
         }
     }
-    Ok("{}".to_string())
 }
 
 /// Exit code for an MCP tool result string: 1 for `isError: true`, else 0
@@ -843,6 +870,38 @@ mod tests {
         assert_eq!(mcp_result_exit_code("not json"), 0);
         assert_eq!(mcp_result_exit_code(r#"{"content":[]}"#), 0);
     }
+    #[test]
+    fn cli_argv_classifier_only_flags_raw_json_argv_as_deprecated() {
+        // #377: --args-file and stdin are the supported forms; only a raw-JSON
+        // argv token routes through the deprecation branch. classify_cli_argv is
+        // the pure seam that decides this, so we can assert the split without a
+        // real stdin/stderr. Zero deprecation warnings for the supported forms
+        // <=> classify never returns RawJsonArgv for them.
+
+        // --args-file <path>: supported, never warns.
+        assert_eq!(
+            classify_cli_argv(&["--args-file".into(), "args.json".into()]),
+            Some(CliArgSource::ArgsFile)
+        );
+        // --args-file with no value falls through to the stdin path (None), no warn.
+        assert_eq!(classify_cli_argv(&["--args-file".into()]), None);
+        // No inline args -> stdin fallback (None), no warn.
+        assert_eq!(classify_cli_argv(&[]), None);
+        // A non-JSON, non-flag first token (e.g. a bare value) -> stdin path, no warn.
+        assert_eq!(classify_cli_argv(&["not-json".into()]), None);
+
+        // Raw-JSON argv token: the ONLY deprecated form.
+        assert_eq!(
+            classify_cli_argv(&["{\"repo_path\":\".\"}".into()]),
+            Some(CliArgSource::RawJsonArgv)
+        );
+        // Leading whitespace before '{' is still detected as raw JSON.
+        assert_eq!(
+            classify_cli_argv(&["  {\"a\":1}".into()]),
+            Some(CliArgSource::RawJsonArgv)
+        );
+    }
+
     use std::io::Cursor;
 
     #[test]
