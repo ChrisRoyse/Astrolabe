@@ -215,9 +215,25 @@ fn index_historical_commit(
     );
     let worktree = cache_dir.join(format!(".astrolabe-archaeology-worktree-{nonce}"));
     let database = cache_dir.join(format!(".astrolabe-archaeology-{nonce}.db"));
+    // Windows MAX_PATH containment (#376 follow-up): for a monorepo-member
+    // corpus (cbm/ inside the Astrolabe repo) this worktree materializes the
+    // FULL historical toplevel tree, whose deepest repo-relative paths exceed
+    // 260 chars once joined to the store-nested worktree base. Git for
+    // Windows handles those via \\?\-prefixed paths only when
+    // core.longpaths=true, so enable it for exactly the worktree add/remove
+    // pair; for a corpus that IS the toplevel with short paths this is
+    // behavior-neutral.
     git_checked(
         repo,
-        &["worktree", "add", "--detach", path_str(&worktree)?, commit],
+        &[
+            "-c",
+            "core.longpaths=true",
+            "worktree",
+            "add",
+            "--detach",
+            path_str(&worktree)?,
+            commit,
+        ],
     )?;
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
         let mut pipeline = CbmPipeline::new(
@@ -237,7 +253,14 @@ fn index_historical_commit(
     // sweep any file/dir it leaves behind under Windows handle latency.
     let cleanup = git_checked(
         repo,
-        &["worktree", "remove", "--force", path_str(&worktree)?],
+        &[
+            "-c",
+            "core.longpaths=true",
+            "worktree",
+            "remove",
+            "--force",
+            path_str(&worktree)?,
+        ],
     );
     let mut cleanup_remnants = cleanup_archaeology_database(&database);
     if !remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path)) {
