@@ -6,6 +6,7 @@ mod graph_projection;
 mod janitor;
 mod kernel_artifact;
 mod label_propagation;
+mod label_seeds;
 mod ledger_scan;
 mod ledger_verify;
 mod registry;
@@ -39,6 +40,11 @@ pub use label_propagation::{
     PersistedPropagatedLabel, PropagatedLabelRow, SCHEMA_LABEL_EDGE_ROW, SCHEMA_LABEL_SEED_ROW,
     SCHEMA_LABEL_TOMBSTONE_ROW, SCHEMA_PROPAGATED_LABEL_ROW, persist_label_graph,
     propagate_labels_over_vault, read_propagated_label_rows,
+};
+
+pub use label_seeds::{
+    IndexTimeLabelReport, KERNEL_CORE_LABEL, LABEL_SEED_ACTOR, NO_GROUNDED_LABEL_SOURCE,
+    derive_and_propagate_index_time_labels, kernel_member_seeds, label_graph_edges_from_csr,
 };
 
 pub use graph_projection::{
