@@ -158,6 +158,9 @@ use measure_bits::*;
 mod anchor_outcome;
 use anchor_outcome::*;
 
+mod anchor_erase;
+use anchor_erase::*;
+
 mod predict_impact;
 use predict_impact::*;
 

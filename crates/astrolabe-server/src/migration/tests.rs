@@ -1901,6 +1901,272 @@ fn anomaly_report_prefers_live_vault_rows_over_stored_metadata() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// --- #361: server-level Swept-path FSV for live blind_spot findings ----------
+
+/// Seeds a shadow `demo` vault at `cache_dir` with a real graph snapshot whose
+/// non-structural symbols carry the blind-spot lens geometry in slots S1 (struct =
+/// the confident lens) and S18 (semantic = the neighbor lens), so
+/// `read_anomaly_report`'s live path reconstructs the corpus and runs the sweep.
+/// Each `nodes` entry is `(qualified_name, struct_xy, semantic_xy)`. The importer
+/// assigns the CxIds; the S1/S18 lens vectors are then written under `slot_key(cx)`
+/// exactly as the shadow importer's slot load would.
+fn seed_blind_spot_vault(cache_dir: &Path, nodes: &[(&str, [f32; 2], [f32; 2])]) {
+    let mut rows = CbmPipelineRows {
+        project: "demo".to_string(),
+        nodes: vec![astrolabe_bridge::CbmPipelineNodeRow {
+            id: 1,
+            project: "demo".to_string(),
+            label: "Project".to_string(),
+            name: "demo".to_string(),
+            qualified_name: "demo".to_string(),
+            file_path: String::new(),
+            start_line: 0,
+            end_line: 0,
+            properties_json: "{}".to_string(),
+        }],
+        edges: Vec::new(),
+    };
+    for (index, (qn, _, _)) in nodes.iter().enumerate() {
+        let name = qn.rsplit('.').next().unwrap_or(qn);
+        rows.nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
+            id: (index as i64) + 2,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: name.to_string(),
+            qualified_name: (*qn).to_string(),
+            file_path: format!("src/{name}.rs"),
+            start_line: (index as i64) * 10 + 1,
+            end_line: (index as i64) * 10 + 5,
+            properties_json: "{}".to_string(),
+        });
+    }
+
+    let vault = AsterVault::new_durable(
+        vault_dir(cache_dir, "demo"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        vault_salt("demo").as_bytes().to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let options = SqliteImportOptions::new("demo", "commit-blindspot", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+    import_cbm_graph_snapshot_to_vault_direct(
+        &pipeline_rows_to_graph_snapshot(rows.clone()),
+        row_sink_fingerprint(&rows),
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+    )
+    .unwrap();
+
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, "demo").unwrap();
+    let cx_by_qn: std::collections::BTreeMap<String, CxId> = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx| (node.qualified_name.clone(), cx)))
+        .collect();
+    let mut batch: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> = Vec::new();
+    for (qn, struct_xy, semantic_xy) in nodes {
+        let cx = cx_by_qn
+            .get(*qn)
+            .unwrap_or_else(|| panic!("seeded node {qn} was assigned a CxId"));
+        let struct_vec = SlotVector::Dense {
+            dim: 2,
+            data: struct_xy.to_vec(),
+        };
+        let semantic_vec = SlotVector::Dense {
+            dim: 2,
+            data: semantic_xy.to_vec(),
+        };
+        batch.push((
+            ColumnFamily::slot(SlotId::new(1)),
+            slot_key(*cx).as_slice().to_vec(),
+            calyx_aster::vault::encode::encode_slot_vector(&struct_vec).unwrap(),
+        ));
+        batch.push((
+            ColumnFamily::slot(SlotId::new(18)),
+            slot_key(*cx).as_slice().to_vec(),
+            calyx_aster::vault::encode::encode_slot_vector(&semantic_vec).unwrap(),
+        ));
+    }
+    vault.write_cf_batch(batch).unwrap();
+    vault.flush().unwrap();
+    drop(vault);
+    persist_dial_at(cache_dir, "demo", MigrationDial::Shadow).unwrap();
+}
+
+/// The `blind_spot` findings served in an anomaly report (empty when none).
+fn report_blind_spot_findings(report: &Value) -> Vec<Value> {
+    report["findings"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|finding| finding["kind"] == "blind_spot")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The 8-member clean cluster: identical on both the confident (struct) and
+/// neighbor (semantic) lens, so every member's confident-vs-neighbor gap is 0.
+fn clean_cluster_nodes() -> Vec<(&'static str, [f32; 2], [f32; 2])> {
+    [
+        "cluster.c0",
+        "cluster.c1",
+        "cluster.c2",
+        "cluster.c3",
+        "cluster.c4",
+        "cluster.c5",
+        "cluster.c6",
+        "cluster.c7",
+    ]
+    .into_iter()
+    .map(|name| (name, [1.0_f32, 0.0], [1.0_f32, 0.0]))
+    .collect()
+}
+
+/// #361 Swept-path FSV: a temp vault seeded with a real graph snapshot + S1/S18
+/// slot CFs containing a planted alien — struct-similar to the clean cluster
+/// (cosine 0.8) but semantically orthogonal (cosine 0) — makes the live
+/// `detect_anomalies` path reconstruct the corpus, run the sweep, and serve a
+/// single `blind_spot` finding for `planted.alien` (kind, hand-computable gap 800,
+/// calibration provenance) read back from the report. The 8 clean-cluster members
+/// are not flagged (FPR 0 within the served report).
+#[test]
+fn detect_anomalies_serves_live_blind_spot_finding_for_planted_alien() {
+    let dir = temp_dir("blind-spot-planted");
+    fs::create_dir_all(&dir).unwrap();
+    let mut nodes = clean_cluster_nodes();
+    // Planted alien: struct cosine 0.8 with the cluster, semantic orthogonal (0.0).
+    nodes.push(("planted.alien", [0.8, 0.6], [0.0, 1.0]));
+    seed_blind_spot_vault(&dir, &nodes);
+
+    let report = read_anomaly_report(&dir, "demo").unwrap();
+    // The live swept path ran (not the stored-metadata fallback).
+    assert!(
+        report["source"].as_str().unwrap().contains("BlindSpot"),
+        "served from the live BlindSpot path: {}",
+        report["source"]
+    );
+    assert_eq!(report["source_state"]["blind_spot"]["status"], "swept");
+    assert_eq!(report["source_state"]["blind_spot"]["scored_symbols"], 9);
+
+    let blind_spots = report_blind_spot_findings(&report);
+    assert_eq!(
+        blind_spots.len(),
+        1,
+        "only the planted alien is flagged (FPR 0 on the clean cluster)"
+    );
+    let finding = &blind_spots[0];
+    assert_eq!(finding["kind"], "blind_spot");
+    assert_eq!(finding["subject_id"], "planted.alien");
+    assert_eq!(finding["severity"], "high");
+    // The gap is hand-computable: confident (struct) sim 800 mp − neighbor
+    // (semantic) mean 0 mp = 800 mp (matches the weave algorithm-level fixture).
+    assert_eq!(finding["score_millipoints"], 800);
+    assert!(
+        finding["calibration_provenance_ref"]
+            .as_str()
+            .is_some_and(|reference| !reference.is_empty()),
+        "the served finding carries its calibration provenance"
+    );
+    assert!(
+        !blind_spots.iter().any(|finding| finding["subject_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cluster.")),
+        "no clean-cluster member is flagged"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #361 clean-corpus case: a corpus with no blind spot (every symbol identical on
+/// both lenses) serves no `blind_spot` finding through the report path.
+#[test]
+fn detect_anomalies_serves_no_blind_spot_finding_for_clean_corpus() {
+    let dir = temp_dir("blind-spot-clean");
+    fs::create_dir_all(&dir).unwrap();
+    seed_blind_spot_vault(&dir, &clean_cluster_nodes());
+
+    let report = read_anomaly_report(&dir, "demo").unwrap();
+    assert!(
+        report_blind_spot_findings(&report).is_empty(),
+        "a corpus with no blind spot serves no blind_spot finding: {}",
+        report["findings"]
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #361 regression pin: a shadow vault with anomaly substrates but NO graph
+/// snapshot cannot reconstruct the corpus, so the blind-spot sweep is labeled
+/// `Unavailable` (never silently dropped) while the other findings still serve —
+/// the degradation is non-destructive.
+#[test]
+fn detect_anomalies_labels_blind_spot_unavailable_without_a_graph_snapshot() {
+    let dir = temp_dir("blind-spot-no-snapshot");
+    fs::create_dir_all(&dir).unwrap();
+    let vault = AsterVault::new_durable(
+        vault_dir(&dir, "demo"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        vault_salt("demo").as_bytes().to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    // One Assay-backed drift substrate so the live report is built — but no graph
+    // snapshot, so the blind-spot reconstruction fails.
+    let mut assay = AssayStore::default();
+    assay.put_with_payload(
+        AssayCacheKey::scoped(
+            DEFAULT_PANEL_VERSION,
+            "week-2026-27",
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            AnchorKind::Reward,
+        ),
+        AssaySubject::Panel,
+        MiEstimate::point(1.0, 16, EstimatorKind::PanelSufficiency, TrustTag::Trusted),
+        "assay:mmd:slot18:week27",
+        vault.snapshot(),
+        json!({
+            "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+            "anomaly_calibrations": [
+                {"kind":"drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:drift:v1"}
+            ],
+            "anomaly_substrates": [
+                {
+                    "kind":"drift",
+                    "subject_id":"slot:S18:week-2026-27",
+                    "score_millipoints":850,
+                    "message":"MMD drift alarm for semantic slot",
+                    "substrate_provenance_refs":["assay:mmd:slot18:week27"],
+                    "lens_evidence":["MMD:S18"]
+                }
+            ]
+        }),
+    );
+    assay.persist_to_vault(&vault).unwrap();
+    vault.flush().unwrap();
+    drop(vault);
+    persist_dial_at(&dir, "demo", MigrationDial::Shadow).unwrap();
+
+    let report = read_anomaly_report(&dir, "demo").unwrap();
+    // The report is still built from the other substrate (non-destructive)...
+    assert!(report["source"].as_str().unwrap().contains("BlindSpot"));
+    // ...but the blind-spot sweep is labeled Unavailable, not silently dropped.
+    assert_eq!(
+        report["source_state"]["blind_spot"]["status"], "unavailable",
+        "snapshot-less vault labels the blind-spot sweep Unavailable"
+    );
+    assert!(report_blind_spot_findings(&report).is_empty());
+    // The other substrate still surfaces — the degradation is non-destructive.
+    assert!(report["finding_count"].as_u64().unwrap() >= 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
     let provenance = provenance_from_row_sink_rows(&sample_provenance_rows());
@@ -4970,6 +5236,242 @@ fn optimizer_status_reads_measured_guard_health_profile_from_config() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// --- guard_drift server-surface FSV (#360) -----------------------------------
+
+/// A guard profile whose `slot` calibration carries a small measured FAR, so its
+/// drift bound (`DRIFT_ALARM_MULTIPLIER × far`) is reachable by a realistic
+/// rejection rate. Every other slot keeps its cold-start bound (unreachable) and
+/// is never exercised by the single-slot reports below.
+fn small_drift_profile(
+    slot: astrolabe_guard::profile::GuardSlot,
+    far: f32,
+) -> astrolabe_guard::profile::GuardProfile {
+    use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
+    use astrolabe_guard::profile::{DRIFT_ALARM_MULTIPLIER, GuardProfile};
+    let domain = CalibrationDomain::new(CalibrationLanguage::Rust, "core").unwrap();
+    let mut profile = GuardProfile::cold_start(domain);
+    for calibration in &mut profile.slots {
+        if calibration.slot == slot {
+            calibration.achieved_far = far;
+            calibration.drift_bound = DRIFT_ALARM_MULTIPLIER * far;
+            calibration.provisional = false;
+        }
+    }
+    profile
+}
+
+/// A single-slot `CheckReport` whose only per-slot verdict passes (`rejected =
+/// false`, `cos ≥ tau`) or fails (`rejected = true`, `cos < tau`). The server
+/// drift path reads only `combined.per_slot`, so the surrounding report fields are
+/// valid placeholders.
+fn single_slot_drift_report(
+    slot: astrolabe_guard::profile::GuardSlot,
+    rejected: bool,
+) -> astrolabe_guard::check::CheckReport {
+    use astrolabe_guard::check::{CheckReport, NearestExemplar, RegionClass};
+    use astrolabe_guard::profile::{CombinedVerdict, GuardVerdict, SlotVerdict};
+    let tau = 0.7_f32;
+    let cos = if rejected { 0.5 } else { 0.9 };
+    let slot_verdict = SlotVerdict { slot, cos, tau };
+    assert_eq!(
+        slot_verdict.pass(),
+        !rejected,
+        "report geometry matches intent"
+    );
+    CheckReport {
+        schema: astrolabe_guard::check::GUARD_VERDICT_SCHEMA,
+        combined: CombinedVerdict {
+            verdict: if rejected {
+                GuardVerdict::Refuse
+            } else {
+                GuardVerdict::Accept
+            },
+            per_slot: vec![slot_verdict],
+            provisional: false,
+            reason: String::new(),
+        },
+        region_class: RegionClass::KernelNear,
+        nearest_exemplar: NearestExemplar {
+            cx_id_hex: String::new(),
+            kernel_near: true,
+            mean_cosine: cos,
+        },
+        measures: "distributional conformance, not correctness",
+        remediation: String::new(),
+        trust: "verified",
+        freshness: "fresh",
+    }
+}
+
+/// #360 server-level FSV: a deterministic sequence of `guard_check` outcomes whose
+/// rolling rejection rate crosses the calibrated drift bound is recorded through
+/// the real durable path (`record_guard_check_outcomes`, one call per check, each a
+/// separate snapshot round-trip through the config store), and the emitted
+/// recalibration proposal surfaces — labeled — on **both** `optimizer_status` and
+/// `get_readiness`. The proof is independent persisted-state readback of the
+/// proposals and the latched monitor snapshot; the hysteresis latch then prevents a
+/// re-fire across further snapshot reloads while the rate stays elevated.
+#[test]
+fn guard_drift_crossing_surfaces_labeled_proposal_on_both_surfaces_and_latches() {
+    use astrolabe_guard::profile::GuardSlot;
+    let dir = temp_dir("guard-drift-crossing");
+    fs::create_dir_all(&dir).unwrap();
+    // Shadow project so optimizer_status / get_readiness build a full response.
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let outcome = sample_shadow_outcome(&dir, security);
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    // FAR 0.02 → drift bound 0.03 over the production window (500).
+    let profile = small_drift_profile(GuardSlot::CodeSemantic, 0.02);
+    let conforming = single_slot_drift_report(GuardSlot::CodeSemantic, false);
+    let rejecting = single_slot_drift_report(GuardSlot::CodeSemantic, true);
+    const WINDOW: usize = 500; // DRIFT_REJECTION_WINDOW, the registry-declared window
+
+    // Fill the rolling window with conforming outcomes: rate 0, never crosses.
+    for _ in 0..WINDOW {
+        let fired = record_guard_check_outcomes(&dir, "demo", &profile, &conforming).unwrap();
+        assert_eq!(fired, 0, "a full conforming window never fires");
+    }
+    // Drive rejections until the rolling rate exceeds 0.03: 16/500 = 0.032 crosses;
+    // every rejection before the 16th keeps the rate at/below the bound.
+    let mut total_fired = 0usize;
+    for i in 1..=16 {
+        let fired = record_guard_check_outcomes(&dir, "demo", &profile, &rejecting).unwrap();
+        if i < 16 {
+            assert_eq!(fired, 0, "no crossing before the rate exceeds the bound");
+        }
+        total_fired += fired;
+    }
+    assert_eq!(total_fired, 1, "exactly one crossing proposal fired");
+
+    // (1) Persisted proposal history read back independently from the config store.
+    let proposals_raw =
+        read_config_value(&dir, &metadata_key("demo", "guard_drift_proposals_json"))
+            .unwrap()
+            .unwrap();
+    let proposals: Value = serde_json::from_str(&proposals_raw).unwrap();
+    assert_eq!(proposals.as_array().unwrap().len(), 1);
+    let proposal = &proposals[0];
+    assert_eq!(proposal["schema"], "astro.guard.drift_proposal.v1");
+    assert_eq!(proposal["slot"], "code_semantic");
+    assert_eq!(proposal["proposal"], "recalibrate");
+    assert_eq!(proposal["window"], 500);
+    assert!((proposal["drift_bound"].as_f64().unwrap() - 0.03).abs() < 1e-6);
+    assert!(proposal["rejection_rate"].as_f64().unwrap() > 0.03);
+
+    // (2) The persisted monitor snapshot for the slot is latched above the bound.
+    let snaps_raw = read_config_value(&dir, &metadata_key("demo", "guard_drift_snapshots_json"))
+        .unwrap()
+        .unwrap();
+    let snaps: Value = serde_json::from_str(&snaps_raw).unwrap();
+    let cs = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snap| snap["slot"] == "code_semantic")
+        .expect("code_semantic snapshot persisted");
+    assert_eq!(
+        cs["above"], true,
+        "slot latched above the bound in the snapshot"
+    );
+    assert_eq!(cs["samples"].as_array().unwrap().len(), 500);
+
+    // (3) Both served surfaces carry the labeled proposal.
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    let od = &status["guard_drift"];
+    assert_eq!(od["schema"], "astro.guard.drift_surface.v1");
+    assert_eq!(od["count"], 1);
+    assert_eq!(od["trust"], "verified");
+    assert_eq!(od["freshness"], "fresh");
+    assert_eq!(od["proposals"][0]["slot"], "code_semantic");
+    assert_eq!(od["proposals"][0]["proposal"], "recalibrate");
+
+    let readiness = readiness_status_json_at(&dir, "demo", None, None).unwrap();
+    let rd = &readiness["guard_drift"];
+    assert_eq!(rd["count"], 1);
+    assert_eq!(rd["proposals"][0]["slot"], "code_semantic");
+
+    // (4) Latch across snapshot reload: each record call reloads the persisted
+    // (latched) snapshot; more rejections while elevated fire nothing new.
+    for _ in 0..5 {
+        let fired = record_guard_check_outcomes(&dir, "demo", &profile, &rejecting).unwrap();
+        assert_eq!(
+            fired, 0,
+            "latch prevents re-fire across reload while elevated"
+        );
+    }
+    let status_again = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    assert_eq!(
+        status_again["guard_drift"]["count"], 1,
+        "no new proposal appended while latched"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #360 negative case: a full window whose rejection rate stays at/below the drift
+/// bound fires no proposal — the proposals key is never written and both surfaces
+/// honestly report `count: 0` / `freshness: "not_evaluated"`, with the persisted
+/// snapshot un-latched.
+#[test]
+fn guard_drift_below_bound_surfaces_no_proposal() {
+    use astrolabe_guard::profile::GuardSlot;
+    let dir = temp_dir("guard-drift-below-bound");
+    fs::create_dir_all(&dir).unwrap();
+    let security = security_screen_from_row_sink_rows(&sample_pipeline_rows());
+    let outcome = sample_shadow_outcome(&dir, security);
+    persist_shadow_outcome_at(&dir, "demo", &outcome).unwrap();
+
+    let profile = small_drift_profile(GuardSlot::CodeSemantic, 0.02); // bound 0.03
+    let conforming = single_slot_drift_report(GuardSlot::CodeSemantic, false);
+    let rejecting = single_slot_drift_report(GuardSlot::CodeSemantic, true);
+
+    // Fill the window (rate 0), then 15 rejections: 15/500 = 0.03 is NOT > 0.03, so
+    // the boundary is never crossed.
+    for _ in 0..500 {
+        assert_eq!(
+            record_guard_check_outcomes(&dir, "demo", &profile, &conforming).unwrap(),
+            0
+        );
+    }
+    for _ in 0..15 {
+        assert_eq!(
+            record_guard_check_outcomes(&dir, "demo", &profile, &rejecting).unwrap(),
+            0,
+            "at-bound rejection rate never fires"
+        );
+    }
+
+    // The proposals key was never written — honest absence, not an empty forgery.
+    assert!(
+        read_config_value(&dir, &metadata_key("demo", "guard_drift_proposals_json"))
+            .unwrap()
+            .is_none()
+    );
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    assert_eq!(status["guard_drift"]["count"], 0);
+    assert_eq!(status["guard_drift"]["freshness"], "not_evaluated");
+    let readiness = readiness_status_json_at(&dir, "demo", None, None).unwrap();
+    assert_eq!(readiness["guard_drift"]["count"], 0);
+
+    // The persisted snapshot exists and is not latched.
+    let snaps: Value = serde_json::from_str(
+        &read_config_value(&dir, &metadata_key("demo", "guard_drift_snapshots_json"))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let cs = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snap| snap["slot"] == "code_semantic")
+        .expect("code_semantic snapshot persisted");
+    assert_eq!(cs["above"], false, "un-latched: no crossing occurred");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 // --- guard_calibrate (P7.2, #46) ---------------------------------------------
 
 fn guard_calibrate_slots_json() -> Value {
@@ -6566,8 +7068,17 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
         ),
         (
             "kernel_answer",
-            json!({"project": project, "query": "how does main work"}),
+            json!({"project": project.clone(), "query": "how does main work"}),
             "kernel_answer requires calyx shadow indexing",
+        ),
+        // Appended at the end (wave-13 lane I, #353). anchor_erase reaches its
+        // handler and refuses fail-closed on the non-shadow project; confirm=true
+        // pushes past the confirmation gate so the shadow refusal is the one
+        // observed here.
+        (
+            "anchor_erase",
+            json!({"project": project, "source": "ci:github:demo:run-1", "confirm": true}),
+            "anchor_erase requires calyx shadow indexing",
         ),
     ];
     let advertised = astrolabe_tool_definitions()
@@ -8001,6 +8512,202 @@ fn seed_anchor_subject_vault(cache_dir: &Path, seed_ts: u64) {
     .unwrap();
     drop(vault);
     persist_dial_at(cache_dir, "demo", MigrationDial::Shadow).unwrap();
+}
+
+/// #353 server-level FSV: the `anchor_erase` tool is reachable over the wire
+/// (through the shared `anchor_erase_json_at` core that both the MCP surface and
+/// the `astrolabe cli anchor_erase` subcommand route into), retracts every anchor
+/// from a source, and pairs the tombstone with a Grounding ledger entry. The proof
+/// is independent persisted-state readback: after erasing, (1) a tombstone row is
+/// present in the Kv CF keyed to the source, (2) the active query path
+/// (`read_anchor_rows`) excludes the erased anchors, and (3) the raw Anchor CF
+/// bytes are unrewritten — the anchor survives physically in `read_all_anchor_rows`
+/// (append-only retraction). Re-erasing is an idempotent ledger-only noop.
+#[test]
+fn anchor_erase_tombstones_source_and_excludes_it_from_active_queries() {
+    const SEED_TS: u64 = 10_000_000_000_000; // far future in SystemClock milliseconds
+    const SUBJECT_QN: &str = "demo.main"; // seed_minimal_cbm_sqlite node qualified name
+    const OBSERVED_AT: &str = "1786400000";
+    const RETRACT_AT: &str = "1786500000";
+    const SOURCE: &str = "ci:github:erase-1";
+    let report = format!(
+        "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}}\n\
+         {{\"type\":\"test\",\"name\":\"{SUBJECT_QN}\",\"event\":\"started\"}}\n\
+         {{\"type\":\"test\",\"name\":\"{SUBJECT_QN}\",\"event\":\"ok\"}}\n\
+         {{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\
+         \"measured\":0,\"filtered_out\":0}}\n"
+    );
+
+    let dir = temp_dir("anchor-erase-fsv");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    // Ground one anchor from SOURCE on the seeded node.
+    let ingest = anchor_outcome_json_at(
+        &dir,
+        "demo",
+        "test_run",
+        SOURCE,
+        None,
+        "cargo_test_json",
+        &report,
+        OBSERVED_AT,
+    )
+    .unwrap();
+    assert_eq!(ingest["status"], "grounded");
+    assert_eq!(ingest["anchors_written"], 1);
+
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&dir, "demo").unwrap();
+    let reopen = |cfs: Vec<ColumnFamily>| {
+        open_shadow_vault_with_access(&vault_dir, &vault_id, &vault_salt, cfs, true).unwrap()
+    };
+
+    // Pre-erase: the active-query path serves the anchor; no tombstone yet.
+    {
+        let vault = reopen(vec![
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Ledger,
+        ]);
+        let active_before: usize = astrolabe_anchors::read_anchor_rows(&vault)
+            .unwrap()
+            .iter()
+            .map(|persisted| persisted.row.anchors.len())
+            .sum();
+        assert_eq!(active_before, 1, "anchor is served before erasure");
+        assert!(
+            astrolabe_anchors::read_anchor_tombstones(&vault)
+                .unwrap()
+                .is_empty(),
+            "no tombstone before erasure"
+        );
+        drop(vault);
+    }
+
+    // Erase over the wire.
+    let erased = anchor_erase_json_at(&dir, "demo", SOURCE, true, RETRACT_AT).unwrap();
+    assert_eq!(erased["schema"], ANCHOR_ERASE_SCHEMA);
+    assert_eq!(erased["status"], "erased");
+    assert_eq!(erased["source"], SOURCE);
+    assert_eq!(erased["tombstone_written"], true);
+    assert_eq!(erased["anchors_retracted"], 1);
+    assert_eq!(erased["trust"], "verified");
+    assert_eq!(
+        erased["promotion_semantics"], "append_only_promotions_untouched",
+        "erase must not silently un-justify append-only promotions (#354 open)"
+    );
+    let ledger_seq = erased["ledger_ref"]["seq"].as_u64().unwrap();
+    assert!(ledger_seq > 0, "erasure paired with a real ledger seq");
+    // The full-readback FSV witness is pinned to the same commit.
+    assert_eq!(erased["fsv"]["full_readback"], true);
+    assert_eq!(erased["fsv"]["ledger_seq"].as_u64().unwrap(), ledger_seq);
+
+    // Independent persisted-state readback after reopen.
+    {
+        let vault = reopen(vec![
+            ColumnFamily::Anchors,
+            ColumnFamily::Kv,
+            ColumnFamily::Ledger,
+        ]);
+        // (1) Tombstone row persisted in Kv, keyed to the source.
+        let tombs = astrolabe_anchors::read_anchor_tombstones(&vault).unwrap();
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].source, SOURCE);
+        assert_eq!(tombs[0].schema, astrolabe_anchors::SCHEMA_ANCHOR_TOMBSTONE);
+        // (2) Active queries exclude the erased source.
+        let active_after: usize = astrolabe_anchors::read_anchor_rows(&vault)
+            .unwrap()
+            .iter()
+            .map(|persisted| persisted.row.anchors.len())
+            .sum();
+        assert_eq!(active_after, 0, "erased anchor left the active-query path");
+        // (3) Raw Anchor CF bytes are unrewritten — the anchor survives physically.
+        let physical_from_source = astrolabe_anchors::read_all_anchor_rows(&vault)
+            .unwrap()
+            .iter()
+            .flat_map(|persisted| persisted.row.anchors.clone())
+            .filter(|anchor| anchor.source == SOURCE)
+            .count();
+        assert_eq!(
+            physical_from_source, 1,
+            "append-only: raw anchor bytes are not rewritten by erasure"
+        );
+        drop(vault);
+    }
+
+    // Idempotent re-erase: ledger-only noop, no new tombstone.
+    let again = anchor_erase_json_at(&dir, "demo", SOURCE, true, RETRACT_AT).unwrap();
+    assert_eq!(again["status"], "noop");
+    assert_eq!(again["tombstone_written"], false);
+    assert!(
+        again["fsv"].is_null(),
+        "idempotent replay earns no FSV witness"
+    );
+    {
+        let vault = reopen(vec![ColumnFamily::Kv]);
+        assert_eq!(
+            astrolabe_anchors::read_anchor_tombstones(&vault)
+                .unwrap()
+                .len(),
+            1,
+            "re-erase did not append a second tombstone"
+        );
+        drop(vault);
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// #353: `anchor_erase` fails closed on every refusal path without writing a
+/// tombstone — an unconfirmed request, an unclassifiable source, and a zero
+/// timestamp each return a labeled `{code, message, remediation}` refusal, and the
+/// Kv CF is independently confirmed to hold no tombstone afterward.
+#[test]
+fn anchor_erase_refuses_unconfirmed_and_invalid_requests() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    const SOURCE: &str = "ci:github:erase-2";
+
+    let dir = temp_dir("anchor-erase-refuse");
+    fs::create_dir_all(&dir).unwrap();
+    seed_anchor_subject_vault(&dir, SEED_TS);
+
+    // Unconfirmed: the destructive-op gate refuses before touching the vault.
+    let unconfirmed = anchor_erase_json_at(&dir, "demo", SOURCE, false, "1786500000").unwrap();
+    assert_eq!(unconfirmed["status"], "refused");
+    assert_eq!(unconfirmed["code"], "ASTRO_ANCHOR_ERASE_UNCONFIRMED");
+    assert_eq!(unconfirmed["tombstone_written"], false);
+
+    // Unclassifiable source refuses fail-closed even with confirm=true.
+    let bad_source =
+        anchor_erase_json_at(&dir, "demo", "not-a-catalog-source", true, "1786500000").unwrap();
+    assert_eq!(bad_source["status"], "refused");
+    assert_eq!(bad_source["tombstone_written"], false);
+    assert!(bad_source["code"].as_str().unwrap().starts_with("ASTRO_"));
+
+    // Zero timestamp refuses (the classic unset sentinel).
+    let zero_ts = anchor_erase_json_at(&dir, "demo", SOURCE, true, "0").unwrap();
+    assert_eq!(zero_ts["status"], "refused");
+    assert_eq!(zero_ts["tombstone_written"], false);
+
+    // No refusal wrote a tombstone.
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&dir, "demo").unwrap();
+    let vault = open_shadow_vault_with_access(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Kv],
+        true,
+    )
+    .unwrap();
+    assert!(
+        astrolabe_anchors::read_anchor_tombstones(&vault)
+            .unwrap()
+            .is_empty(),
+        "no refusal path wrote a tombstone"
+    );
+    drop(vault);
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
