@@ -421,6 +421,6 @@ mod tests {
         assert!(knob.accepts(WATCHER_MAX_POLL_INTERVAL_MS));
         assert!(!knob.accepts(0));
         assert!(!knob.accepts(WATCHER_MAX_POLL_INTERVAL_MS + 1));
-        assert!(WATCHER_MAX_POLL_INTERVAL_MS < 5_000);
+        const { assert!(WATCHER_MAX_POLL_INTERVAL_MS < 5_000) };
     }
 }
