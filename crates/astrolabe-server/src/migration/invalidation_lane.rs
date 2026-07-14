@@ -3,7 +3,10 @@ use super::*;
 use calyx_aster::cf::prefix_range;
 use calyx_ledger::EntryKind;
 
-const INVALIDATION_SCHEMA: &str = "astrolabe.delta_invalidation.v1";
+// Single source of truth (#348): the live-anomaly reader must accept exactly
+// this schema tag as an Assay-CF co-tenant, so both sides reference the const
+// defined in astrolabe-weave rather than duplicating the literal.
+const INVALIDATION_SCHEMA: &str = astrolabe_weave::ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA;
 const INVALIDATION_ACTOR: &str = "astrolabe-shadow-invalidation";
 const INVALIDATION_PREFIX: &[u8] = b"astrolabe:shadow:invalidation:v1\0";
 

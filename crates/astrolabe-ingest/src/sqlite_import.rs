@@ -4245,9 +4245,15 @@ where
     // modern node-map rows (#23): the decoded Base row is only needed for
     // panel_version (first node) and for legacy rows that predate the inline
     // name/line/properties fields. (A Base keys-only range scan would be
-    // cheaper still, but `scan_cf_range_keys_at` access-violates on vaults
-    // opened with selected CFs — see the #23 session notes — so the point read
-    // stays as the existence proof.)
+    // cheaper still. The #23 session note claimed `scan_cf_range_keys_at`
+    // access-violates on selected-CF vaults; #349 EXONERATED it — the
+    // deterministic FSV `issue349_selected_cf_keys_scan_fsv` reads back
+    // byte-exact keys over multiple SST generations on a read-only
+    // selected_cfs=[Base] vault, and the keys path is bounds-checked safe Rust
+    // with no `unsafe`. The historical AV was the debug + mingw + static-libcbm
+    // thread-attach fault (#349), not this function. Swapping these point reads
+    // for the keys scan is therefore a safe perf change, deferred to its own
+    // read-path FSV rather than folded into #349's exoneration scope.)
     for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
         if row.project != project {
             continue;
@@ -4376,10 +4382,17 @@ where
         .collect::<Vec<_>>();
     // Validation + conversion is per-row independent; the JSON object check on
     // every edge properties string dominated this read at M scale (#23). The
-    // worker count is deliberately fixed at 1 here pending the debug-build
-    // access-violation investigation around ad-hoc thread pools on snapshot
-    // reads; the loop stays in parallel_map form so a caller-supplied worker
-    // count can be threaded through once that is resolved.
+    // worker count is deliberately fixed at 1 here as containment for the
+    // debug-build STATUS_ACCESS_VIOLATION (#349): the ad-hoc `thread::scope`
+    // pools that decode snapshot rows fault on thread-attach ONLY in the debug +
+    // mingw + static-libcbm astrolabe-server binary (green in release, and green
+    // in the non-libcbm ingest/weave test binaries where this same helper runs
+    // worker>1). rayon's global pool (the SST `par_iter` layer) does NOT fault in
+    // that binary, so the tracked root-cause fix is to route this decode through
+    // the already-attached rayon pool rather than ad-hoc thread spawns; that cure
+    // must be verified against the debug libcbm server binary (#349, server-side).
+    // The loop stays in parallel_map form so worker>1 can be re-enabled once the
+    // fix lands. Note: `scan_cf_range_keys_at` was exonerated separately (#349).
     let mut edges = parallel_map(raw_edge_rows, 1, |row| {
         if row.schema != SCHEMA_CBM_EDGE_ROW {
             return Err(IngestError::InvalidInput(format!(

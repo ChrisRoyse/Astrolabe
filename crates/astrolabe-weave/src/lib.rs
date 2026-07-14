@@ -197,6 +197,13 @@ pub const DETECT_ANOMALIES_SCHEMA: &str = "astrolabe.detect_anomalies.v1";
 pub const ASTRO_ANOMALY_INVALID_KIND: &str = "ASTRO_ANOMALY_INVALID_KIND";
 pub const ASTROLABE_REACTIVE_ACK_TAG: &str = "astrolabe_reactive_ack_v1";
 pub const ASSAY_ANOMALY_PAYLOAD_SCHEMA: &str = "astrolabe.assay_anomalies.v1";
+/// Schema tag of the delta-invalidation rows the shadow importer co-tenants into
+/// `ColumnFamily::Assay` (#348). The live-anomaly reader passes this as an
+/// accepted foreign schema to [`calyx_assay::AssayStore::load_from_vault_with_cotenants`]
+/// so those rows are skipped (counted) instead of decoded as assay rows —
+/// while a genuinely corrupt assay shard still fails closed. This const is the
+/// single source of truth: the writer (`invalidation_lane.rs`) references it.
+pub const ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA: &str = "astrolabe.delta_invalidation.v1";
 pub const REACTIVE_NEW_REGION_SCORE_POLICY: &str = "policy:reactive_new_region_binary_score:v1";
 
 pub const SLOT_COMPLEXITY: SlotId = SlotId::new(2);
@@ -1386,6 +1393,9 @@ pub struct LiveAnomalyInputs {
     pub xterm_rows_read: usize,
     pub assay_rows_read: usize,
     pub reactive_rows_read: usize,
+    /// Count of shared-CF co-tenant rows (e.g. delta-invalidation rows, #348)
+    /// skipped during the Assay CF load — a counted, labeled skip, not an error.
+    pub assay_cotenant_rows_skipped: usize,
 }
 
 impl LiveAnomalyInputs {
@@ -1536,7 +1546,17 @@ where
         }
     }
 
-    let assay = AssayStore::load_from_vault(vault)?;
+    // ColumnFamily::Assay is shared: the shadow importer co-tenants
+    // delta-invalidation rows here (#348). Load co-tenant-aware so those rows
+    // are skipped (counted) instead of failing the whole anomaly read with
+    // CALYX_ASTER_CORRUPT_SHARD; a genuinely corrupt assay shard still errors.
+    let accepted_cotenant_schemas: std::collections::BTreeSet<&str> =
+        [ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA]
+            .into_iter()
+            .collect();
+    let (assay, assay_cotenant_skips) =
+        AssayStore::load_from_vault_with_cotenants(vault, &accepted_cotenant_schemas)?;
+    inputs.assay_cotenant_rows_skipped = assay_cotenant_skips.skipped_rows;
     for row in assay.rows() {
         inputs.assay_rows_read += 1;
         let Some(payload) = row.payload.as_ref() else {
@@ -3767,6 +3787,102 @@ mod tests {
             ood.lens_evidence
                 .contains(&REACTIVE_NEW_REGION_SCORE_POLICY.to_string())
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // #348: a real vault whose ColumnFamily::Assay holds BOTH a genuine assay
+    // anomaly row and a co-tenant delta-invalidation row. Before the fix the
+    // whole live-anomaly read failed with CALYX_ASTER_CORRUPT_SHARD
+    // ("decode assay row: missing field cache_key"); after the fix the anomaly
+    // surface is served, the invalidation row is skipped+counted, and a
+    // genuinely corrupt assay row still fails closed.
+    #[test]
+    fn live_anomaly_read_tolerates_delta_invalidation_cotenant_rows() {
+        let (dir, vault) = reactive_vault("live-anomalies-cotenant");
+
+        // Genuine assay anomaly row (the same shape the shadow importer writes).
+        let mut assay = AssayStore::default();
+        assay.put_with_payload(
+            AssayCacheKey::scoped(7, "week-2026-27", reactive_vault_id(), AnchorKind::Reward),
+            AssaySubject::Panel,
+            MiEstimate::point(1.0, 16, EstimatorKind::PanelSufficiency, TrustTag::Trusted),
+            "assay:mmd:slot18:week27",
+            vault.snapshot(),
+            json!({
+                "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+                "anomaly_calibrations": [
+                    {"kind":"drift","medium_min_score_millipoints":500,"high_min_score_millipoints":800,"provenance_ref":"calibration:drift:v1"}
+                ],
+                "anomaly_substrates": [
+                    {"kind":"drift","subject_id":"slot:S18:week-2026-27","score_millipoints":850,"message":"MMD drift alarm","substrate_provenance_refs":["assay:mmd:slot18:week27"],"lens_evidence":["MMD:S18"]}
+                ]
+            }),
+        );
+        assay
+            .persist_to_vault(&vault)
+            .expect("persist genuine assay row");
+
+        // Plant a delta-invalidation co-tenant row exactly as invalidation_lane.rs
+        // writes it: keyed outside the assay keyspace, valued with the
+        // delta-invalidation schema tag and no cache_key field.
+        let mut inval_key = b"astrolabe:shadow:invalidation:v1\0".to_vec();
+        inval_key.extend_from_slice(b"astrolabe\0assay\0");
+        inval_key.extend_from_slice(b"crate::foo::bar");
+        let inval_value = serde_json::to_vec(&json!({
+            "schema": ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA,
+            "kind": "assay_stratum_dirty",
+            "project": "astrolabe",
+            "qualified_name": "crate::foo::bar",
+            "dirty": true,
+            "dirty_since_seq": vault.snapshot(),
+        }))
+        .expect("encode invalidation row");
+        vault
+            .write_cf_batch([(ColumnFamily::Assay, inval_key.clone(), inval_value.clone())])
+            .expect("write invalidation co-tenant row");
+        vault.flush().expect("flush shared assay CF");
+
+        let reopened = open_reactive_vault(&dir);
+
+        // The invalidation row is independently readable back (semantics intact).
+        let raw_inval = reopened
+            .read_cf_at(reopened.snapshot(), ColumnFamily::Assay, &inval_key)
+            .expect("read invalidation CF row")
+            .expect("invalidation row present");
+        assert_eq!(raw_inval, inval_value);
+
+        // The anomaly reader now serves rather than erroring on CORRUPT_SHARD.
+        let inputs = live_anomaly_inputs_from_vault(&reopened)
+            .expect("live anomaly read must not fail closed");
+        assert_eq!(inputs.assay_rows_read, 1, "genuine assay row still read");
+        assert_eq!(
+            inputs.assay_cotenant_rows_skipped, 1,
+            "invalidation co-tenant row skipped and counted"
+        );
+        let report = detect_anomalies(&inputs.substrates, &inputs.calibrations, None, true)
+            .expect("detect anomalies");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == AnomalyKind::Drift),
+            "genuine drift finding still surfaced despite co-tenant row"
+        );
+
+        // Negative case: a genuinely corrupt assay row (no schema tag) in the
+        // same CF still fails the read closed.
+        reopened
+            .write_cf_batch([(
+                ColumnFamily::Assay,
+                b"corrupt-assay-key".to_vec(),
+                vec![0xde, 0xad, 0xbe, 0xef],
+            )])
+            .expect("write corrupt assay row");
+        reopened.flush().expect("flush corrupt row");
+        let error = live_anomaly_inputs_from_vault(&reopened)
+            .expect_err("corrupt assay row must fail closed");
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+
         fs::remove_dir_all(dir).ok();
     }
 

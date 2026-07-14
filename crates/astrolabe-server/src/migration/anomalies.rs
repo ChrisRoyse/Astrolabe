@@ -317,6 +317,9 @@ pub(crate) fn live_anomaly_source_state_json(
         "snapshot": inputs.snapshot,
         "xterm_rows_read": inputs.xterm_rows_read,
         "assay_rows_read": inputs.assay_rows_read,
+        // Shared Assay CF co-tenant rows (delta-invalidation, #348) skipped
+        // during load: a counted, labeled skip, not a degradation (invariant 3).
+        "assay_cotenant_rows_skipped": inputs.assay_cotenant_rows_skipped,
         "reactive_fired_rows_read": inputs.reactive_rows_read,
         "schema_skipped_rows": inputs.skipped_rows,
         "blind_spot": blind_spot_source_state_json(blind_spot),
