@@ -518,6 +518,17 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * Re-targets these edges to Route nodes for cross-service traversal. */
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 
+/* Aggregate the callee names of the calls attributed to `def_qn` (matched by
+ * enclosing_func_qn equality — the SAME attribution the guard per-snippet
+ * reparse applies) into a newline-delimited "name\tcount" list that seeds the
+ * panel S4 (api_callees) encoder. Counts are deduplicated so the index-time S4
+ * vector matches a guard reparse of the same body. Writes a NUL-terminated
+ * string into buf (empty when the def makes no attributed call) and returns the
+ * number of bytes written. Shared by the sequential and parallel definition
+ * passes; defined in pass_definitions.c. */
+int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn, char *buf,
+                                   int bufsize);
+
 /* ── Pass function prototypes ────────────────────────────────────── */
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

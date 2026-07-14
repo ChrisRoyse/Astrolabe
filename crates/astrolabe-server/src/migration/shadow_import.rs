@@ -319,9 +319,15 @@ fn shadow_encoder_input(input: &PanelInput) -> astrolabe_panel::EncoderLensInput
 
     EncoderLensInput {
         ast_profile: property_string(properties, "sp").and_then(parse_ast_profile),
-        struct_trigrams: None,
+        // S1 (struct_trigrams) / S4 (api_callees) guard-slot encoder sources, now
+        // serialized by libcbm at index time (#374): the `st` property carries the
+        // normalised AST node-type trigram list and `callees` the deduplicated
+        // api-callee counts. Both parse to `None` when absent so a symbol libcbm
+        // could not measure stays honestly unmeasured (a fail-closed slot deficit),
+        // never a fabricated vector.
+        struct_trigrams: property_string(properties, "st").and_then(parse_struct_trigrams),
         complexity: complexity_input,
-        api_calls: None,
+        api_calls: property_string(properties, "callees").and_then(parse_api_callees),
         type_surface: Some(TypeSurfaceInput {
             param_types: property_strings(properties, "param_types"),
             return_types: property_string(properties, "return_type")
@@ -456,6 +462,63 @@ fn parse_ast_profile(encoded: &str) -> Option<astrolabe_panel::AstProfile> {
         body_lines: values[23],
         body_tokens: values[24],
     })
+}
+
+/// Parse libcbm's serialized struct-trigram list (panel S1 encoder source, the
+/// `st` node property emitted by pass_definitions.c) into panel trigrams. Each
+/// non-empty line is `a\tb\tc\tweight`; a line that is not exactly four
+/// tab-separated fields, or whose weight is not a finite number, is skipped
+/// rather than fabricated. Returns `None` when no valid trigram survives so the
+/// slot stays honestly unmeasured (never an empty encoded vector).
+fn parse_struct_trigrams(encoded: &str) -> Option<Vec<astrolabe_panel::StructuralTrigram>> {
+    let trigrams: Vec<astrolabe_panel::StructuralTrigram> = encoded
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let a = fields.next()?;
+            let b = fields.next()?;
+            let c = fields.next()?;
+            let weight = fields.next()?.trim().parse::<f32>().ok()?;
+            if fields.next().is_some() || !weight.is_finite() {
+                return None;
+            }
+            Some(astrolabe_panel::StructuralTrigram {
+                a: a.to_string(),
+                b: b.to_string(),
+                c: c.to_string(),
+                weight,
+            })
+        })
+        .collect();
+    (!trigrams.is_empty()).then_some(trigrams)
+}
+
+/// Parse libcbm's serialized api-callee list (panel S4 encoder source, the
+/// `callees` node property) into panel [`astrolabe_panel::ApiCall`]s. Each
+/// non-empty line is `name\tcount`; the callees are index-time attributed by
+/// enclosing function, so they are marked unresolved to match the guard
+/// per-snippet reparse instrument (which sees no cross-file resolution).
+/// Returns `None` when no valid callee survives.
+fn parse_api_callees(encoded: &str) -> Option<Vec<astrolabe_panel::ApiCall>> {
+    let calls: Vec<astrolabe_panel::ApiCall> = encoded
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let callee = fields.next()?.trim();
+            let count = fields.next()?.trim().parse::<f32>().ok()?;
+            if callee.is_empty() || fields.next().is_some() || !count.is_finite() || count < 0.0 {
+                return None;
+            }
+            Some(astrolabe_panel::ApiCall {
+                callee: callee.to_string(),
+                call_count: count,
+                resolved: false,
+            })
+        })
+        .collect();
+    (!calls.is_empty()).then_some(calls)
 }
 
 /// Panel roster version the shadow import pipeline measures and persists.
@@ -2526,4 +2589,82 @@ pub(crate) fn persist_shadow_outcome_at(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod struct_trigram_callee_slot_tests {
+    //! #374: the shadow importer measures S1 (struct_trigrams) and S4 (api_callees)
+    //! from the `st` / `callees` node properties libcbm now serializes, so
+    //! generated-mode guard calibration no longer refuses every real symbol with
+    //! `ASTRO_GUARD_AUTO_SLOT_UNMEASURED`. A symbol whose property is absent stays
+    //! honestly unmeasured (an absent slot), never a fabricated vector.
+    use super::*;
+    use astrolabe_panel::{PanelInput, SlotId, encode_slot};
+
+    fn input_with(st: Option<&str>, callees: Option<&str>) -> PanelInput {
+        let mut input = PanelInput::fixture(astrolabe_domain::SymbolLabel::Function);
+        let props = input.properties.as_object_mut().unwrap();
+        if let Some(st) = st {
+            props.insert("st".to_string(), Value::String(st.to_string()));
+        }
+        if let Some(callees) = callees {
+            props.insert("callees".to_string(), Value::String(callees.to_string()));
+        }
+        input
+    }
+
+    #[test]
+    fn emitted_properties_yield_measured_s1_and_s4() {
+        // Exactly the wire format libcbm emits: "a\tb\tc\tweight" trigrams and
+        // "name\tcount" callees.
+        let st = "if_statement\tcall_expression\tbinary_expression\t3\n\
+                  call_expression\tbinary_expression\treturn_statement\t2\n";
+        let callees = "compute\t2\nvalidate\t1\n";
+        let input = input_with(Some(st), Some(callees));
+
+        let encoder = shadow_encoder_input(&input);
+        let trigrams = encoder.struct_trigrams.as_ref().expect("S1 measured");
+        assert_eq!(trigrams.len(), 2);
+        assert_eq!(trigrams[0].a, "if_statement");
+        assert_eq!(trigrams[0].weight, 3.0);
+        let calls = encoder.api_calls.as_ref().expect("S4 measured");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].callee, "compute");
+        assert_eq!(calls[0].call_count, 2.0);
+        assert!(!calls[0].resolved);
+
+        let s1 = encode_slot(SlotId::new(1), &encoder).expect("encode S1");
+        let s4 = encode_slot(SlotId::new(4), &encoder).expect("encode S4");
+        assert!(!s1.is_absent(), "S1 must be a measured (non-absent) vector");
+        assert!(!s4.is_absent(), "S4 must be a measured (non-absent) vector");
+    }
+
+    #[test]
+    fn absent_properties_stay_unmeasured_not_fabricated() {
+        let encoder = shadow_encoder_input(&input_with(None, None));
+        assert!(encoder.struct_trigrams.is_none(), "no `st` → S1 unmeasured");
+        assert!(encoder.api_calls.is_none(), "no `callees` → S4 unmeasured");
+        assert!(
+            encode_slot(SlotId::new(1), &encoder).expect("encode S1").is_absent(),
+            "absent property must encode to an absent S1 vector, never a fabricated one"
+        );
+        assert!(
+            encode_slot(SlotId::new(4), &encoder).expect("encode S4").is_absent(),
+        );
+    }
+
+    #[test]
+    fn malformed_records_are_skipped_not_admitted() {
+        // A trigram line without four fields and a callee with a non-numeric count
+        // are dropped; only well-formed records survive (never a fabricated one).
+        let encoder = shadow_encoder_input(&input_with(
+            Some("a\tb\tc\t1\nonly\ttwo\nx\ty\tz\tnan_weight\n"),
+            Some("good\t3\nbad\tcount\n"),
+        ));
+        let trigrams = encoder.struct_trigrams.as_ref().expect("one valid trigram survives");
+        assert_eq!(trigrams.len(), 1, "malformed trigram lines dropped");
+        let calls = encoder.api_calls.as_ref().expect("one valid callee survives");
+        assert_eq!(calls.len(), 1, "malformed callee lines dropped");
+        assert_eq!(calls[0].callee, "good");
+    }
 }

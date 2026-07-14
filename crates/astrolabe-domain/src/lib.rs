@@ -484,6 +484,64 @@ impl SymbolLabel {
     pub const fn is_structural(self) -> bool {
         matches!(self, Self::Project | Self::Branch | Self::Folder)
     }
+
+    /// Every stable node label in declaration order. The single canonical roster
+    /// the ingest admission path and the emission-vocabulary parity check both
+    /// enumerate.
+    pub const ALL: [Self; 35] = [
+        Self::Function,
+        Self::Method,
+        Self::Class,
+        Self::Struct,
+        Self::Interface,
+        Self::Enum,
+        Self::EnumMember,
+        Self::Trait,
+        Self::Type,
+        Self::TypeAlias,
+        Self::Field,
+        Self::Variable,
+        Self::Constant,
+        Self::Module,
+        Self::File,
+        Self::Route,
+        Self::Channel,
+        Self::Resource,
+        Self::Chart,
+        Self::Package,
+        Self::Macro,
+        Self::Section,
+        Self::Namespace,
+        Self::Property,
+        Self::Union,
+        Self::Protocol,
+        Self::Mixin,
+        Self::Object,
+        Self::Impl,
+        Self::Annotation,
+        Self::Decorator,
+        Self::EnvVar,
+        Self::Project,
+        Self::Branch,
+        Self::Folder,
+    ];
+
+    /// Parses a Codebase Memory MCP node-label string into Astrolabe's stable
+    /// vocabulary, tolerating the `_`/`-`/whitespace and case variations CBM
+    /// emits (e.g. `Enum_Member` or `enum member` → [`SymbolLabel::EnumMember`]).
+    /// Returns `None` for a label with no spine counterpart; this is the single
+    /// admission oracle the ingest path and the emission-vocabulary parity check
+    /// share, so a new C-side label is caught in one place.
+    pub fn from_cbm_label(value: &str) -> Option<Self> {
+        let normalized = value
+            .chars()
+            .filter(|ch| *ch != '_' && *ch != '-' && !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        Self::ALL
+            .into_iter()
+            .find(|label| label.as_str().to_ascii_lowercase() == normalized)
+    }
 }
 
 impl fmt::Display for SymbolLabel {

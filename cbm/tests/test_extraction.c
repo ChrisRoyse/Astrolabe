@@ -3599,9 +3599,97 @@ TEST(extract_wide_flat_file_is_linear) {
     PASS();
 }
 
+/* #373 measurement: collect the deduplicated callee names attributed to calls
+ * whose enclosing_func_qn contains `fn_substr` (NULL = every call), joined with
+ * '|' in first-seen order, into `out`. Returns the distinct callee count. */
+static int callee_set_for(CBMFileResult *r, const char *fn_substr, char *out, size_t out_sz) {
+    out[0] = '\0';
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->callee_name[0]) {
+            continue;
+        }
+        if (fn_substr &&
+            !(c->enclosing_func_qn && strstr(c->enclosing_func_qn, fn_substr) != NULL)) {
+            continue;
+        }
+        /* dedup */
+        char needle[256];
+        snprintf(needle, sizeof(needle), "|%s|", c->callee_name);
+        char haystack[2048];
+        snprintf(haystack, sizeof(haystack), "|%s|", out);
+        if (strstr(haystack, needle)) {
+            continue;
+        }
+        size_t len = strlen(out);
+        snprintf(out + len, out_sz - len, "%s%s", len ? "|" : "", c->callee_name);
+        n++;
+    }
+    return n;
+}
+
+/* #373: the guard per-snippet reparse must never surface a callee the whole-file
+ * parse did not — the whole-file parse is the superset and the reparse never
+ * fabricates (#358). A Rust method call embedded in a macro invocation
+ * (`assert!(self.check())`) is the sensitive case: tree-sitter-rust resolves the
+ * macro token_tree interior context-sensitively, so the two parses can differ.
+ * This probe measures both callee sets and asserts the isolated set is a subset
+ * of the whole-file set. It also prints the two sets so the FAR/FRR direction is
+ * recorded from real extraction, not asserted from memory. */
+TEST(rust_macro_embedded_call_isolation_is_subset_of_whole_file_issue373) {
+    const char *whole =
+        "struct S;\n"
+        "impl S {\n"
+        "    fn run(&self) {\n"
+        "        assert!(self.check());\n"
+        "        direct_call();\n"
+        "    }\n"
+        "    fn check(&self) -> bool { true }\n"
+        "}\n"
+        "fn direct_call() {}\n";
+    const char *isolated =
+        "fn run(&self) {\n"
+        "    assert!(self.check());\n"
+        "    direct_call();\n"
+        "}\n";
+
+    CBMFileResult *rw = extract(whole, CBM_LANG_RUST, "t", "w.rs");
+    CBMFileResult *ri = extract(isolated, CBM_LANG_RUST, "t", "i.rs");
+    ASSERT_NOT_NULL(rw);
+    ASSERT_NOT_NULL(ri);
+
+    char whole_set[2048];
+    char iso_set[2048];
+    int whole_n = callee_set_for(rw, "run", whole_set, sizeof(whole_set));
+    int iso_n = callee_set_for(ri, NULL, iso_set, sizeof(iso_set));
+    fprintf(stderr, "[#373] whole-file run callees (%d): %s\n", whole_n, whole_set);
+    fprintf(stderr, "[#373] isolated   run callees (%d): %s\n", iso_n, iso_set);
+
+    /* Every isolated callee must exist in the whole-file superset. */
+    for (int i = 0; i < ri->calls.count; i++) {
+        const char *callee = ri->calls.items[i].callee_name;
+        if (!callee || !callee[0]) {
+            continue;
+        }
+        char needle[256];
+        snprintf(needle, sizeof(needle), "|%s|", callee);
+        char haystack[2048];
+        snprintf(haystack, sizeof(haystack), "|%s|", whole_set);
+        if (!strstr(haystack, needle)) {
+            fprintf(stderr, "[#373] FABRICATED isolated callee not in whole-file: %s\n", callee);
+            FAIL("isolated reparse fabricated a callee absent from the whole-file parse");
+        }
+    }
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    /* #373 macro-embedded call recovery measurement */
+    RUN_TEST(rust_macro_embedded_call_isolation_is_subset_of_whole_file_issue373);
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
