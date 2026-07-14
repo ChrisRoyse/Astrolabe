@@ -4077,7 +4077,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(early_repo_path);
     }
 #endif
-    if (cbm_index_supervisor_should_wrap()) {
+    /* #346: the streaming row sink is an in-process FFI callback into the host's
+     * own address space (an embedder installs it via cbm_mcp_server_set_row_sink).
+     * A supervised worker is a SEPARATE process that runs a fresh pipeline with no
+     * sink registered, so every row it emits is lost to the parent and all
+     * row-derived shadow surfaces (provenance/skill_tree/bridges/kernel_context/
+     * anomalies) degrade to sqlite_fallback in the host. A function pointer cannot
+     * be transported across the process boundary, so when a sink is registered we
+     * index IN-PROCESS where the sink lives. This is an explicit, labeled
+     * trade-off: the shadow-import path forgoes the supervisor's crash isolation to
+     * deliver the real row stream. The Rust sink is fail-closed on malformed bytes
+     * (it refuses rather than corrupt), so integrity is not weakened. The
+     * watcher/auto-index path indexes with srv==NULL (index_run_supervised) and a
+     * plain server carries no sink, so both keep their supervised worker for crash
+     * isolation and RSS reclamation (#832/#845). */
+    bool row_sink_registered = srv && (srv->row_node_sink || srv->row_edge_sink);
+    if (row_sink_registered) {
+        cbm_log_info("index.supervisor.inprocess", "reason", "row_sink_registered",
+                     "tradeoff", "crash_isolation_forgone_to_deliver_row_stream");
+    } else if (cbm_index_supervisor_should_wrap()) {
         char *supervised = index_run_supervised(srv, args);
         if (supervised) {
             return supervised;
