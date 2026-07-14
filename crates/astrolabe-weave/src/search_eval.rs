@@ -319,7 +319,7 @@ mod tests {
         // Cutoff k=2 only sees {x,hit1} => 1 of 3.
         assert_eq!(
             recall_at_k_permille(&retrieved, &relevant, 2).unwrap(),
-            1 * 1000 / 3
+            1000 / 3
         );
         // Empty ground truth is refused, never a fabricated perfect score.
         let err = recall_at_k_permille(&retrieved, &BTreeSet::new(), 5).unwrap_err();

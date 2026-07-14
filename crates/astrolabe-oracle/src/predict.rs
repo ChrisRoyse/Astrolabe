@@ -910,19 +910,17 @@ fn resolve_evidence(
     if node == seed {
         let thin =
             direct.as_ref().map(|e| e.n).unwrap_or(0) < config.cohort_thin_threshold as usize;
-        if thin {
-            if let Some(peers) = request.cohort_peers.get(&seed) {
-                let mut merged = direct.clone();
-                let mut folded = false;
-                for peer in peers {
-                    if let Some(peer_ev) = evidence.node(*peer) {
-                        merged = Some(merge_evidence(merged, peer_ev));
-                        folded = true;
-                    }
+        if thin && let Some(peers) = request.cohort_peers.get(&seed) {
+            let mut merged = direct.clone();
+            let mut folded = false;
+            for peer in peers {
+                if let Some(peer_ev) = evidence.node(*peer) {
+                    merged = Some(merge_evidence(merged, peer_ev));
+                    folded = true;
                 }
-                if folded {
-                    return (merged, true);
-                }
+            }
+            if folded {
+                return (merged, true);
             }
         }
     }
@@ -1062,8 +1060,9 @@ fn hop_distance_ranking(graph: &ConsequenceGraph, seed: CxId) -> Vec<CxId> {
         for node in frontier {
             if let Some(children) = graph.hop_distance_edges.get(&node) {
                 for &child in children {
-                    if !distance.contains_key(&child) {
-                        distance.insert(child, depth);
+                    if let std::collections::btree_map::Entry::Vacant(entry) = distance.entry(child)
+                    {
+                        entry.insert(depth);
                         next.push(child);
                     }
                 }

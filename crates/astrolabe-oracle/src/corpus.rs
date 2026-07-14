@@ -530,7 +530,7 @@ pub fn precedes_edges(
             median_lag_s,
         });
     }
-    edges.sort_by(|a, b| a.subject.cmp(&b.subject));
+    edges.sort_by_key(|edge| edge.subject);
     edges
 }
 
@@ -1364,8 +1364,8 @@ mod tests {
 
         // Support gate: two in-window occurrences (< min_edge_support 3) => no edge.
         let gate = mine_corpus(
-            &vec![change("a", cx(1), 1_000), change("b", cx(1), 2_000)],
-            &vec![
+            &[change("a", cx(1), 1_000), change("b", cx(1), 2_000)],
+            &[
                 outcome("ci:g:1", cx(1), 1_010, true),
                 outcome("ci:g:2", cx(1), 2_020, true),
             ],
@@ -1430,12 +1430,8 @@ mod tests {
         );
 
         // Partial: first two changes and first two outcomes.
-        let partial = mine_corpus(
-            &all_changes[..2].to_vec(),
-            &all_outcomes[..2].to_vec(),
-            &config,
-        )
-        .expect("partial corpus");
+        let partial =
+            mine_corpus(&all_changes[..2], &all_outcomes[..2], &config).expect("partial corpus");
 
         // Vault A: persist partial, then full (incremental convergence).
         let (dir_a, vault_a) = fresh_vault("incr-a");
