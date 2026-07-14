@@ -3606,6 +3606,15 @@ where
     input.signature = node.symbol.signature.clone();
     input.properties = serde_json::from_str(&node.properties_json)?;
     let readout = driver.measure(&input, runtime)?;
+    // #386: `st` (S1 struct-trigram source) and `callees` (S4 api-callee source) are
+    // emitted by libcbm into properties_json solely to feed the S1/S4 slot encoders
+    // that `driver.measure` just ran. Once the slot vectors exist in `readout.slots`
+    // (persisted to the S1/S4 slot CFs below, the source of truth), the raw strings
+    // are redundant persisted bytes — at M scale (15k+ defs) meaningful vault growth
+    // for data stored twice. Strip them from the properties_json before it reaches the
+    // Graph-CF node-map row; the encoded slot vectors are untouched (byte-identical
+    // pre/post strip). A node without either key keeps its exact original bytes.
+    let properties_json = strip_slot_source_properties(&node.properties_json);
     let mut metadata = symbol_metadata(options, &node, &identity);
     metadata.insert(
         "input_hash_blake3".to_string(),
@@ -3642,12 +3651,34 @@ where
     Ok(PreparedConstellation {
         node_id: node.id,
         name: node.name,
-        properties_json: node.properties_json,
+        properties_json,
         node_vector: node.node_vector,
         symbol: node.symbol,
         identity,
         constellation,
     })
+}
+
+/// #386: remove the `st` and `callees` node properties (the S1 struct-trigram and S4
+/// api-callee slot-encoder sources) from a `properties_json` string after the slots
+/// have been encoded. Returns the input unchanged when neither key is present, so a
+/// node that never carried them keeps byte-identical persisted properties; otherwise
+/// returns the re-serialized object with both keys removed. On any parse or
+/// re-serialization failure the original string is returned untouched — fail-closed:
+/// saving redundant bytes must never corrupt persisted properties.
+fn strip_slot_source_properties(properties_json: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(properties_json) else {
+        return properties_json.to_string();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return properties_json.to_string();
+    };
+    let removed_st = object.remove("st").is_some();
+    let removed_callees = object.remove("callees").is_some();
+    if !removed_st && !removed_callees {
+        return properties_json.to_string();
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| properties_json.to_string())
 }
 
 fn slot_is_degraded(vector: &SlotVector) -> bool {
@@ -5548,6 +5579,51 @@ mod tests {
     use calyx_ledger::{ErasureScope as LedgerErasureScope, decode, tombstone_from_entry};
 
     const TEST_VAULT_ID: &str = "00000000000000000000000000";
+
+    // #386: `strip_slot_source_properties` removes the S1/S4 slot-encoder sources
+    // (`st`, `callees`) from persisted node properties AFTER the slots are encoded,
+    // without disturbing any other property or corrupting the JSON.
+    #[test]
+    fn strip_slot_source_properties_removes_st_and_callees_only() {
+        let input = r#"{"complexity":3,"st":"a\tb\tc","callees":"foo\t2\nbar\t1\n","lines":9}"#;
+        let stripped = strip_slot_source_properties(input);
+        let value: serde_json::Value = serde_json::from_str(&stripped).expect("valid json");
+        let object = value.as_object().expect("object");
+        assert!(!object.contains_key("st"), "st must be stripped");
+        assert!(!object.contains_key("callees"), "callees must be stripped");
+        // Every other property is preserved byte-for-byte in meaning.
+        assert_eq!(
+            object.get("complexity").and_then(serde_json::Value::as_i64),
+            Some(3)
+        );
+        assert_eq!(
+            object.get("lines").and_then(serde_json::Value::as_i64),
+            Some(9)
+        );
+        assert_eq!(object.len(), 2, "only st and callees removed");
+        // The stripped bytes are strictly smaller (the redundancy is gone).
+        assert!(
+            stripped.len() < input.len(),
+            "stripped properties are smaller"
+        );
+    }
+
+    #[test]
+    fn strip_slot_source_properties_is_identity_without_st_or_callees() {
+        // A node that never carried the slot sources keeps byte-identical properties.
+        let input = r#"{"complexity":1,"lines":4,"is_test":true}"#;
+        assert_eq!(strip_slot_source_properties(input), input);
+    }
+
+    #[test]
+    fn strip_slot_source_properties_fails_closed_on_malformed_json() {
+        // Never corrupt persisted properties to save bytes: unparseable input passes through.
+        let malformed = r#"{"st":"x","callees":"#;
+        assert_eq!(strip_slot_source_properties(malformed), malformed);
+        // A JSON non-object (array) is also returned untouched.
+        let array = r#"["st","callees"]"#;
+        assert_eq!(strip_slot_source_properties(array), array);
+    }
 
     fn vault() -> AsterVault<FixedClock> {
         AsterVault::with_clock(
