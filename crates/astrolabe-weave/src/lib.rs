@@ -1419,6 +1419,83 @@ pub fn anomaly_substrate_row_from_eager_cross_term(
     ))
 }
 
+/// The millipoint scale ceiling for a drift anomaly score.
+///
+/// A drift score is the permille complement of the MMD permutation p-value:
+/// `score = 1000 − p_value_permille`. A p-value of 0 (maximally significant
+/// drift) maps to 1000; a p-value of 1000 (no drift) maps to 0. This is the same
+/// fixed `[0, 1000]` millipoint scale every other anomaly kind reports on — a
+/// unit convention, not a severity threshold (severity is measured per corpus by
+/// [`drift_anomaly_calibration`]).
+pub const DRIFT_SCORE_MAX_MILLIPOINTS: u64 =
+    astrolabe_assay::score_calibration::ASSAY_CALIBRATION_MAX_SCORE_MILLIPOINTS;
+
+/// Converts a single measured MMD [`DriftCard`](astrolabe_assay::DriftCard) into
+/// a `Drift` [`AnomalySubstrateRow`], preserving the measured statistics as
+/// provenance and per-lens evidence.
+///
+/// The anomaly score is `1000 − p_value_permille`: a smaller permutation p-value
+/// (stronger evidence the new sample drifted from the reference) yields a larger
+/// score. Severity tiering is left to a measured [`AnomalyCalibration`] (see
+/// [`drift_anomaly_calibration`]); this function never decides an alarm on its
+/// own, so a non-significant card simply carries a low score and falls below the
+/// calibrated threshold rather than being dropped.
+pub fn drift_anomaly_substrate_from_card(
+    card: &astrolabe_assay::DriftCard,
+    substrate_provenance_ref: impl Into<String>,
+) -> AnomalySubstrateRow {
+    let score = DRIFT_SCORE_MAX_MILLIPOINTS.saturating_sub(card.p_value_permille);
+    AnomalySubstrateRow::new(
+        AnomalyKind::Drift,
+        format!("slot:{}", card.slot),
+        score,
+        format!(
+            "MMD drift slot={} mmd_squared={:.6} p_value_permille={} detected={} (ref {} vs new {})",
+            card.slot,
+            card.mmd_squared,
+            card.p_value_permille,
+            card.drift_detected,
+            card.n_reference,
+            card.n_sample
+        ),
+        [substrate_provenance_ref.into()],
+        [
+            format!("MMD:{}", card.slot),
+            format!("mmd_squared={:.6}", card.mmd_squared),
+            format!("p_value_permille={}", card.p_value_permille),
+            format!("bandwidth={:.6}", card.bandwidth),
+            format!("trust={:?}", card.trust),
+        ],
+    )
+}
+
+/// Measures a `Drift` [`AnomalyCalibration`] from a batch of drift cards' own
+/// score distribution via the assay calibration substrate — the same measured
+/// (never fixed) medium/high thresholds the blind-spot sweep uses.
+///
+/// Returns `None` when the cards' score spread is below the calibration floor or
+/// degenerate (e.g. every card reports no drift, so every score is identical):
+/// with no calibration the aggregator honestly reports each drift substrate as a
+/// missing-calibration skip instead of tiering it on a fabricated threshold.
+pub fn drift_anomaly_calibration(
+    cards: &[astrolabe_assay::DriftCard],
+    config: &astrolabe_assay::score_calibration::CalibrationConfig,
+    provenance_label: &str,
+) -> Option<AnomalyCalibration> {
+    let scores: Vec<u64> = cards
+        .iter()
+        .map(|card| DRIFT_SCORE_MAX_MILLIPOINTS.saturating_sub(card.p_value_permille))
+        .collect();
+    let distribution =
+        astrolabe_assay::calibrate_score_distribution(provenance_label, &scores, config).ok()?;
+    Some(AnomalyCalibration::new(
+        AnomalyKind::Drift,
+        distribution.medium_min_score_millipoints,
+        distribution.high_min_score_millipoints,
+        distribution.provenance_ref,
+    ))
+}
+
 pub fn live_anomaly_inputs_from_vault<C>(
     vault: &AsterVault<C>,
 ) -> calyx_core::Result<LiveAnomalyInputs>
@@ -1612,6 +1689,38 @@ fn add_anomaly_payload_inputs(
         }
         None => {
             if payload.get("anomaly_calibrations").is_some() {
+                inputs.skipped_rows += 1;
+            }
+        }
+    }
+    // Real MMD drift cards (#33's `DriftCard`) are the `drift` kind's substrate:
+    // convert each card to a `Drift` substrate row and measure the medium/high
+    // thresholds from the batch's own score spread — no fixed drift threshold.
+    match payload.get("drift_cards").and_then(Value::as_array) {
+        Some(values) => {
+            saw_input = true;
+            let cards: Vec<astrolabe_assay::DriftCard> = values
+                .iter()
+                .filter_map(|value| {
+                    serde_json::from_value::<astrolabe_assay::DriftCard>(value.clone()).ok()
+                })
+                .collect();
+            inputs.skipped_rows += values.len().saturating_sub(cards.len());
+            for card in &cards {
+                inputs
+                    .substrates
+                    .push(drift_anomaly_substrate_from_card(card, row_provenance));
+            }
+            if let Some(calibration) = drift_anomaly_calibration(
+                &cards,
+                &astrolabe_assay::score_calibration::CalibrationConfig::default(),
+                row_provenance,
+            ) {
+                inputs.calibrations.push(calibration);
+            }
+        }
+        None => {
+            if payload.get("drift_cards").is_some() {
                 inputs.skipped_rows += 1;
             }
         }
@@ -2310,6 +2419,123 @@ pub fn blind_spot_report(
     )
     .expect("blind_spot is a valid detect_anomalies kind");
     Ok((sweep, report))
+}
+
+/// The default blind-spot lens pair swept by the live `detect_anomalies` path.
+///
+/// The *confident* lens (structural, S1) defines each symbol's cluster; the
+/// *neighbor* lens (semantic, S18) is measured for agreement across that same
+/// cluster. A large gap — a symbol that is structurally like its cluster yet
+/// semantically alien to it (the classic "looks like it belongs but means
+/// something else" blind spot, e.g. a misleading identifier) — is flagged. Both
+/// families read slots the shadow importer persists (S1, S18), so the sweep runs
+/// against live vault vectors with no extra substrate.
+///
+/// One pair, not many: [`detect_anomalies`] keys calibration by [`AnomalyKind`],
+/// so two blind-spot pairs would each measure a distinct gap distribution yet
+/// collide on the single `BlindSpot` calibration slot. A calibrated
+/// multi-pair sweep (per-pair calibration keyed by pair) is tracked as follow-up
+/// rather than silently letting one pair's threshold tier another pair's gaps.
+pub const DEFAULT_BLIND_SPOT_PAIRS: [BlindSpotLensPair; 1] = [BlindSpotLensPair::new(
+    SimilarityFamily::Struct,
+    SimilarityFamily::Semantic,
+)];
+
+/// The deduplicated, ascending set of slots the given blind-spot `pairs` read —
+/// the exact slot column families a caller must load to reconstruct the
+/// [`SimilarityNode`]s the sweep scores.
+pub fn blind_spot_slots(pairs: &[BlindSpotLensPair]) -> Vec<SlotId> {
+    let mut slots = pairs
+        .iter()
+        .flat_map(|pair| [pair.confident.slot(), pair.neighbor.slot()])
+        .collect::<Vec<_>>();
+    slots.sort_by_key(|slot| slot.get());
+    slots.dedup();
+    slots
+}
+
+/// A per-pair blind-spot calibration deficit surfaced from a live sweep: the
+/// pair scored symbols but could not derive a threshold, so its findings are
+/// suppressed — labeled here rather than silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotPairDeficit {
+    /// The lens pair (`CONFIDENTxNEIGHBOR` wire key) that could not calibrate.
+    pub pair_key: String,
+    /// The assay calibration refusal code (below-floor or degenerate spread).
+    pub code: &'static str,
+    /// The human-readable calibration refusal message.
+    pub message: String,
+    /// The number of scored symbols available to calibrate on.
+    pub n_eff: u64,
+}
+
+/// The merged blind-spot anomaly inputs across every swept lens pair, ready to
+/// fold into a [`LiveAnomalyInputs`] before [`detect_anomalies`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlindSpotAnomalyInputs {
+    /// `AnomalyKind::BlindSpot` substrate rows across all pairs, sorted by
+    /// [`anomaly_substrate_order`].
+    pub substrates: Vec<AnomalySubstrateRow>,
+    /// The measured per-pair calibrations (one per pair that calibrated).
+    pub calibrations: Vec<AnomalyCalibration>,
+    /// Labeled per-pair calibration deficits (pairs that scored but could not
+    /// tier), so no degradation is silent.
+    pub deficits: Vec<BlindSpotPairDeficit>,
+    /// Total symbols scored across all pairs.
+    pub scored_symbols: usize,
+    /// Total symbols excluded (with labeled reasons) across all pairs.
+    pub skipped_symbols: usize,
+}
+
+impl BlindSpotAnomalyInputs {
+    /// Whether the sweep produced any substrate row, calibration, or deficit —
+    /// i.e. whether blind-spot detection contributed anything to fold in.
+    pub fn is_empty(&self) -> bool {
+        self.substrates.is_empty() && self.calibrations.is_empty() && self.deficits.is_empty()
+    }
+}
+
+/// Runs [`blind_spot_sweep`] for each lens pair over `nodes` and merges every
+/// pair's `BlindSpot` substrate rows and measured calibration into one
+/// [`BlindSpotAnomalyInputs`].
+///
+/// Pure and worker-count invariant: a deterministic function of `nodes`, `pairs`,
+/// and `config`. A pair whose calibration is refused contributes its substrate
+/// rows (so the scored symbols remain visible) and a labeled
+/// [`BlindSpotPairDeficit`]; with no calibration for that pair `detect_anomalies`
+/// honestly reports each of its symbols as a missing-calibration skip rather than
+/// tiering them on a fabricated threshold.
+///
+/// # Errors
+/// Propagates a [`BlindSpotError`] from the first invalid pair or config knob
+/// (same-family pair, or an out-of-bounds config value) — a fail-closed refusal,
+/// never a partial merge over an invalid request.
+pub fn blind_spot_anomaly_inputs(
+    nodes: &[SimilarityNode],
+    pairs: &[BlindSpotLensPair],
+    config: &BlindSpotConfig,
+) -> Result<BlindSpotAnomalyInputs, BlindSpotError> {
+    let mut out = BlindSpotAnomalyInputs::default();
+    for &pair in pairs {
+        let sweep = blind_spot_sweep(nodes, pair, config)?;
+        out.scored_symbols += sweep.scores.len();
+        out.skipped_symbols += sweep.skipped.len();
+        out.substrates.extend(sweep.substrates);
+        out.calibrations.extend(sweep.calibration);
+        if let Some(deficit) = sweep.deficit {
+            out.deficits.push(BlindSpotPairDeficit {
+                pair_key: pair.pair_key(),
+                code: deficit.code,
+                message: deficit.message,
+                n_eff: deficit.n_eff,
+            });
+        }
+    }
+    out.substrates.sort_by(anomaly_substrate_order);
+    out.calibrations.sort_by(anomaly_calibration_order);
+    out.deficits
+        .sort_by(|left, right| left.pair_key.cmp(&right.pair_key));
+    Ok(out)
 }
 
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
@@ -6529,5 +6755,187 @@ mod tests {
         let err =
             blind_spot_sweep(&nodes, struct_semantic_pair(), &bad).expect_err("bad config refused");
         assert_eq!(err.code(), ASTRO_BLIND_SPOT_INVALID_CONFIG);
+    }
+
+    #[test]
+    fn blind_spot_anomaly_inputs_flags_planted_alien_via_default_pair_and_is_deterministic() {
+        // The live merge path (#36 server clause): the default (Struct-confident,
+        // Semantic-neighbor) pair over the planted corpus surfaces the one alien
+        // symbol and spares the clean cluster (FPR=0), and the merged inputs are a
+        // deterministic function of the corpus regardless of node order.
+        let nodes = planted_blind_spot_corpus();
+        let merged = blind_spot_anomaly_inputs(
+            &nodes,
+            &DEFAULT_BLIND_SPOT_PAIRS,
+            &BlindSpotConfig::default(),
+        )
+        .expect("aggregate blind-spot sweep");
+
+        assert_eq!(merged.scored_symbols, 9);
+        assert_eq!(
+            merged.calibrations.len(),
+            1,
+            "one calibration for the one pair"
+        );
+        assert!(
+            merged.deficits.is_empty(),
+            "calibration succeeded, no deficit"
+        );
+        let planted = merged
+            .substrates
+            .iter()
+            .find(|substrate| substrate.subject_id == "planted.alien")
+            .expect("planted substrate present");
+        assert_eq!(planted.kind, AnomalyKind::BlindSpot);
+        assert_eq!(planted.score_millipoints, 800);
+
+        // Order invariance: reversing the corpus yields byte-identical inputs.
+        let mut reversed = nodes.clone();
+        reversed.reverse();
+        let merged_reversed = blind_spot_anomaly_inputs(
+            &reversed,
+            &DEFAULT_BLIND_SPOT_PAIRS,
+            &BlindSpotConfig::default(),
+        )
+        .expect("aggregate blind-spot sweep (reordered)");
+        assert_eq!(merged, merged_reversed);
+
+        // Tiered through the shared aggregator: only the planted symbol, no
+        // cluster member (false-positive rate zero on the clean cluster).
+        let report = detect_anomalies(
+            &merged.substrates,
+            &merged.calibrations,
+            Some("blind_spot"),
+            true,
+        )
+        .expect("tier blind-spot findings");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].subject_id, "planted.alien");
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| !finding.subject_id.starts_with("cluster."))
+        );
+    }
+
+    #[test]
+    fn drift_cards_payload_surfaces_measured_mmd_alarm_and_spares_stable_slots() {
+        // #33's real MMD DriftCards, persisted as an Assay CF `drift_cards`
+        // payload, flow through the live read path into the `drift` anomaly kind:
+        // a planted distribution shift is flagged; slots with identical reference
+        // and new samples are not (FPR on the calibrated distribution).
+        let cfg = astrolabe_assay::DiffConfig::from_defaults().expect("diff config");
+        let reference: Vec<Vec<f64>> = (0..12).map(|i| vec![f64::from(i) * 0.01]).collect();
+
+        let mut cards = Vec::new();
+        // Eight stable slots (new sample == reference): no drift, score 0. These
+        // also clear the calibration floor so the measured thresholds exist.
+        for i in 0..8 {
+            let card = astrolabe_assay::measure_drift(
+                format!("stable_slot_{i}"),
+                &reference,
+                &reference,
+                3,
+                &cfg,
+            )
+            .expect("stable drift card");
+            assert!(!card.drift_detected, "identical samples must not drift");
+            cards.push(card);
+        }
+        // One planted distribution shift: the new sample is translated far away.
+        let sample: Vec<Vec<f64>> = (0..12).map(|i| vec![5.0 + f64::from(i) * 0.01]).collect();
+        let drifted = astrolabe_assay::measure_drift("S18_semantic", &reference, &sample, 3, &cfg)
+            .expect("drifted card");
+        assert!(drifted.drift_detected, "planted shift must be detected");
+        cards.push(drifted);
+
+        let (dir, vault) = reactive_vault("drift-cards");
+        let mut assay = AssayStore::default();
+        assay.put_with_payload(
+            AssayCacheKey::scoped(9, "week-2026-28", reactive_vault_id(), AnchorKind::Reward),
+            AssaySubject::Panel,
+            MiEstimate::point(1.0, 16, EstimatorKind::PanelSufficiency, TrustTag::Trusted),
+            "assay:mmd:driftcards:week28",
+            vault.snapshot(),
+            json!({
+                "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
+                "drift_cards": cards
+                    .iter()
+                    .map(|card| serde_json::to_value(card).expect("serialize drift card"))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        assay
+            .persist_to_vault(&vault)
+            .expect("persist drift-card assay row");
+        vault.flush().expect("flush drift-card CF rows");
+
+        // Independent readback: reopen the vault and rebuild the report from the
+        // persisted Assay bytes.
+        let reopened = open_reactive_vault(&dir);
+        let inputs = live_anomaly_inputs_from_vault(&reopened).expect("live drift inputs");
+        assert_eq!(inputs.skipped_rows, 0, "every drift card parsed");
+        // Nine substrate rows (8 stable + 1 drifted) plus one measured calibration.
+        assert_eq!(
+            inputs
+                .substrates
+                .iter()
+                .filter(|substrate| substrate.kind == AnomalyKind::Drift)
+                .count(),
+            9
+        );
+        assert_eq!(
+            inputs
+                .calibrations
+                .iter()
+                .filter(|calibration| calibration.kind == AnomalyKind::Drift)
+                .count(),
+            1
+        );
+
+        let report = detect_anomalies(
+            &inputs.substrates,
+            &inputs.calibrations,
+            Some("drift"),
+            true,
+        )
+        .expect("tier drift findings");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.subject_id == "slot:S18_semantic"),
+            "planted-shift slot must surface as a drift finding: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.subject_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| !finding.subject_id.starts_with("slot:stable_slot_")),
+            "stable slots must not be flagged"
+        );
+        // The finding carries the assay substrate provenance (substrate honesty).
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.subject_id == "slot:S18_semantic")
+            .expect("drift finding");
+        assert!(
+            finding
+                .substrate_provenance_refs
+                .iter()
+                .any(|reference| reference.contains("assay:mmd:driftcards:week28")),
+            "drift finding must reference its assay substrate row"
+        );
+
+        drop(reopened);
+        drop(vault);
+        let _ = fs::remove_dir_all(dir);
     }
 }
