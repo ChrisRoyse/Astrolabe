@@ -65,6 +65,12 @@ const PROJECT_SUMMARY_ROW_PREFIX: &[u8] = b"astrolabe:project-summary:v1:";
 const TOKEN_VECTOR_ROW_PREFIX: &[u8] = b"astrolabe:token-vector:v1:";
 const CBM_EDGE_ROW_PREFIX: &[u8] = b"astrolabe:cbm-edge:v1:";
 pub(crate) const EDGE_ROW_PREFIX: &[u8] = b"astrolabe:edge:v1:";
+/// Persisted per-file content-digest manifest prefix (#345). One row per source file,
+/// keyed by (project, file_path), recording the file's content digest and the identity
+/// (node_id → cx_id/series_id) of every symbol it produced. A later import compares the
+/// incoming per-file digest against this row to short-circuit unchanged files before the
+/// O(corpus) per-symbol conversion, so a one-symbol delta reconciles only its file.
+const FILE_DIGEST_ROW_PREFIX: &[u8] = b"astrolabe:file-digest:v1:";
 const SCHEMA_NODE_MAP: &str = "astrolabe-node-map-v2";
 const SCHEMA_SYMBOL_METADATA: &str = "astrolabe-sqlite-symbol-v2";
 const SCHEMA_STRUCTURAL_NODE: &str = "astrolabe-structural-node-v1";
@@ -74,6 +80,11 @@ const SCHEMA_PROJECT_SUMMARY_ROW: &str = "astrolabe-project-summary-v1";
 const SCHEMA_TOKEN_VECTOR_ROW: &str = "astrolabe-token-vector-v1";
 const SCHEMA_CBM_EDGE_ROW: &str = "astrolabe-cbm-edge-v1";
 pub(crate) const SCHEMA_EDGE_ROW: &str = "astrolabe-edge-v1";
+const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
+/// Domain separator for the per-file content digest (#345). Bumped only when the set of
+/// raw fields folded into the digest changes, so an old-domain digest can never be
+/// compared against a new-domain one (a mismatch then fails open into full reconcile).
+const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v1";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
 /// mutating the live graph projection.
@@ -383,6 +394,12 @@ pub struct SqliteImportReport {
     /// every reused constellation in the full CBM snapshot.
     #[serde(default)]
     pub new_cx_id_values: Vec<CxId>,
+    /// Per-file digest short-circuit accounting for this import (#345): how many files
+    /// were observed, how many matched a persisted digest and skipped conversion, how many
+    /// were fully reconciled (the labeled fail-open path), and how many symbols reused an
+    /// identity straight from a matching file digest.
+    #[serde(default)]
+    pub file_digest: FileDigestReport,
     /// Per-phase wall-clock milliseconds of this import run (#23 latency
     /// telemetry): stable labels, measured values — not knobs. Empty when the
     /// report was deserialized from persisted state.
@@ -567,6 +584,58 @@ struct RawCbmImportInput {
     edges: Vec<RawEdgeRow>,
     sqlite_fingerprint: [u8; 32],
     ledger_rows_before: usize,
+}
+
+/// One symbol's persisted identity inside a per-file digest manifest row (#345).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct FileDigestSymbol {
+    node_id: i64,
+    cx_id: CxId,
+    series_id: SeriesId,
+}
+
+/// Persisted per-file content-digest manifest row (#345).
+///
+/// Written once per source file in the same ledger-paired batch as the graph rows it
+/// summarizes, so the manifest and the rows it describes are always mutually consistent
+/// (a crash rolls back the whole group). A later import recomputes each incoming file's
+/// digest from its raw CBM rows and compares it here: an exact match (same digest domain
+/// and panel version) proves every one of that file's symbols is byte-for-byte unchanged,
+/// so their content-addressed identities are reused straight from `symbols` without
+/// recomputing canonical bytes / CxIds or re-reading Base — turning the delta import from
+/// O(corpus) into O(changed files). Any mismatch, missing row, or domain/version drift
+/// fails open into the full per-symbol reconcile.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct FileDigestRow {
+    schema: String,
+    project: String,
+    file_path: String,
+    panel_version: u32,
+    /// Digest domain tag, so an old-domain digest is never compared against a new one.
+    domain: String,
+    digest: String,
+    symbols: Vec<FileDigestSymbol>,
+}
+
+/// Skip-accounting for the per-file digest short-circuit (#345), surfaced in the import
+/// report so an unchanged-corpus reimport can prove it converted no unchanged file
+/// (standing invariant 3: every skip is counted, never silent).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDigestReport {
+    /// Distinct source files observed in this import.
+    pub files_total: usize,
+    /// Files whose persisted digest matched, so their symbols were reused without
+    /// re-measuring.
+    pub files_unchanged: usize,
+    /// Files with no comparable persisted digest (first import, domain/version drift,
+    /// or a digest mismatch) that were fully reconciled — the labeled fail-open count.
+    pub files_reconciled: usize,
+    /// Non-structural symbols whose identity was reused from a matching file digest
+    /// instead of being recomputed and re-read from Base.
+    pub symbols_reused_via_digest: usize,
+    /// True when a persisted manifest existed for at least one file (so this was a real
+    /// incremental import, not a cold first import with nothing to compare against).
+    pub had_prior_manifest: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -907,6 +976,10 @@ where
     // import cost without external profilers.
     let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut phase_start = std::time::Instant::now();
+    // Per-file content digests (#345) must be computed from the raw node rows before
+    // `extract_nodes` consumes them; the manifest comparison happens after the shared
+    // Graph scan below.
+    let new_file_digests = compute_file_digests(&input.nodes, options.panel_version);
     let extracted = extract_nodes(input.nodes)?;
     timing_ms.push(("extract_nodes", phase_start.elapsed().as_millis() as u64));
     phase_start = std::time::Instant::now();
@@ -923,6 +996,21 @@ where
         phase_start.elapsed().as_millis() as u64,
     ));
     phase_start = std::time::Instant::now();
+    // Per-file digest short-circuit (#345): compare each incoming file's content digest
+    // (computed above from the raw rows) against the persisted manifest read out of the
+    // shared Graph scan. A file whose digest matches contributes its symbols' identities
+    // to the reuse map, so `prepare_live_symbol` skips recomputing their canonical bytes /
+    // CxIds and `verify_preexisting_constellations` skips re-reading their Base rows —
+    // turning the delta from O(corpus) into O(changed files). Any absent/mismatched digest
+    // fails open into the full per-symbol reconcile.
+    let prior_manifest = read_file_digest_manifest(&existing_graph, &options.project);
+    let digest_plan = plan_digest_reuse(&new_file_digests, &prior_manifest, options.panel_version);
+    let file_digest_report = digest_plan.report.clone();
+    timing_ms.push((
+        "plan_file_digest_reuse",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     // Hand ownership of the extracted node graph to `prepare_batch` (moved, not borrowed) so the
     // full `Vec<ExtractedNode>` does not stay alive in this frame alongside the prepared
     // constellations and serialized graph rows. Holding raw -> extracted -> prepared -> serialized
@@ -936,6 +1024,8 @@ where
         input.metadata,
         input.sqlite_fingerprint,
         &existing_graph,
+        &digest_plan.reuse,
+        &new_file_digests,
     )?;
     timing_ms.push(("prepare_batch", phase_start.elapsed().as_millis() as u64));
     timing_ms.extend(prepared.timing_ms.iter().copied());
@@ -964,7 +1054,13 @@ where
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
     let mut quantization = quantization_gate_report(options, &prepared);
-    verify_preexisting_constellations(vault, before_snapshot, &prepared, options.workers)?;
+    verify_preexisting_constellations(
+        vault,
+        before_snapshot,
+        &prepared,
+        options.workers,
+        &digest_plan.reuse,
+    )?;
     timing_ms.push((
         "verify_preexisting",
         phase_start.elapsed().as_millis() as u64,
@@ -1066,6 +1162,7 @@ where
         fsv,
         cx_ids,
         new_cx_id_values,
+        file_digest: file_digest_report,
         timing_ms: PhaseTimings(timing_ms),
     })
 }
@@ -2480,6 +2577,8 @@ fn prepare_batch<C, R>(
     metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    new_file_digests: &BTreeMap<String, String>,
 ) -> IngestResult<PreparedBatch>
 where
     C: Clock,
@@ -2497,8 +2596,14 @@ where
         .partition(|node| node.label.is_structural());
     let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut phase_start = std::time::Instant::now();
-    let mut constellations =
-        prepare_live_symbols_parallel(vault, runtime, options, &driver, non_structural)?;
+    let mut constellations = prepare_live_symbols_parallel(
+        vault,
+        runtime,
+        options,
+        &driver,
+        non_structural,
+        digest_reuse,
+    )?;
     constellations.sort_by_key(|prepared| prepared.node_id);
     timing_ms.push((
         "prepare_live_symbols",
@@ -2522,6 +2627,15 @@ where
         &edges,
         sqlite_fingerprint,
         options.workers,
+    )?);
+    // Per-file digest manifest rows (#345). Appended to the same graph-row stream as the
+    // metadata/node-map/edge rows so they are reconciled, ledgered, and read back through
+    // the identical path: an unchanged file's manifest row reverts to its persisted bytes
+    // (no write), a changed file's row is rewritten in this batch.
+    graph_rows.extend(file_digest_manifest_rows(
+        options,
+        &constellations,
+        new_file_digests,
     )?);
     parallel_for_each_mut(&mut graph_rows, options.workers, |(_, value)| {
         append_import_fingerprint(value, sqlite_fingerprint)
@@ -2678,6 +2792,179 @@ fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
         }
     }
     Ok(value)
+}
+
+/// Content digest over one source file's raw CBM node rows (#345).
+///
+/// Folds every raw field that determines a symbol's content-addressed identity or its
+/// persisted graph/base/slot rows — id, project, label, name, qualified name, file path,
+/// line span, properties JSON, and node vector — length-prefixed so no field boundary is
+/// ambiguous, together with the digest domain and panel version. Node order is normalized
+/// by id so the digest is independent of CBM's emission order. Deliberately conservative:
+/// it never excludes a field that could change the persisted rows, because an under-broad
+/// digest would let a changed symbol be wrongly reused, whereas an over-broad one only
+/// costs a fail-open full reconcile.
+fn file_content_digest(nodes: &mut Vec<&RawNodeRow>, panel_version: u32) -> String {
+    // Length-prefixed field so no boundary between adjacent fields is ambiguous.
+    fn section(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    nodes.sort_by_key(|node| node.id);
+    let mut hasher = Sha256::new();
+    section(&mut hasher, FILE_DIGEST_DOMAIN.as_bytes());
+    section(&mut hasher, &panel_version.to_be_bytes());
+    for node in nodes.iter() {
+        section(&mut hasher, &node.id.to_be_bytes());
+        section(&mut hasher, node.project.as_bytes());
+        section(&mut hasher, node.label.as_bytes());
+        section(&mut hasher, node.name.as_bytes());
+        section(&mut hasher, node.qualified_name.as_bytes());
+        section(&mut hasher, node.file_path.as_bytes());
+        section(&mut hasher, &node.start_line.to_be_bytes());
+        section(&mut hasher, &node.end_line.to_be_bytes());
+        section(&mut hasher, node.properties_json.as_bytes());
+        match &node.node_vector {
+            Some(bytes) => {
+                section(&mut hasher, &[1u8]);
+                section(&mut hasher, bytes);
+            }
+            None => section(&mut hasher, &[0u8]),
+        }
+    }
+    hex_lower(hasher.finalize().as_slice())
+}
+
+/// Groups this import's raw nodes by source file and computes each file's content digest
+/// (#345). One entry per distinct `file_path`.
+fn compute_file_digests(nodes: &[RawNodeRow], panel_version: u32) -> BTreeMap<String, String> {
+    let mut by_file: BTreeMap<String, Vec<&RawNodeRow>> = BTreeMap::new();
+    for node in nodes {
+        by_file
+            .entry(node.file_path.clone())
+            .or_default()
+            .push(node);
+    }
+    by_file
+        .into_iter()
+        .map(|(file_path, mut file_nodes)| {
+            let digest = file_content_digest(&mut file_nodes, panel_version);
+            (file_path, digest)
+        })
+        .collect()
+}
+
+/// Reads the persisted per-file digest manifest for `project` out of the one shared
+/// pre-commit Graph CF scan (#345). A row that fails to decode, or belongs to another
+/// project, is skipped (fail-open: the file it describes is then treated as new).
+fn read_file_digest_manifest(
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    project: &str,
+) -> BTreeMap<String, FileDigestRow> {
+    let mut manifest = BTreeMap::new();
+    for (key, value) in existing_graph {
+        if !key.starts_with(FILE_DIGEST_ROW_PREFIX) {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_slice::<FileDigestRow>(value)
+            && row.project == project
+        {
+            manifest.insert(row.file_path.clone(), row);
+        }
+    }
+    manifest
+}
+
+/// The digest-derived reuse plan for one import (#345): which non-structural node ids may
+/// take their content-addressed identity straight from a matching persisted file digest,
+/// plus the skip accounting surfaced in the report.
+struct DigestReusePlan {
+    /// node_id → reused (cx_id, series_id) for symbols in files whose digest matched.
+    reuse: HashMap<i64, (CxId, SeriesId)>,
+    report: FileDigestReport,
+}
+
+/// Builds the reuse plan by comparing this import's per-file digests against the persisted
+/// manifest (#345). A file is reused only when a persisted row exists with the same digest
+/// domain, panel version, and digest value; every other file is counted as reconciled
+/// (the labeled fail-open path) and none of its symbols enter the reuse map.
+fn plan_digest_reuse(
+    new_digests: &BTreeMap<String, String>,
+    manifest: &BTreeMap<String, FileDigestRow>,
+    panel_version: u32,
+) -> DigestReusePlan {
+    let mut reuse = HashMap::new();
+    let mut report = FileDigestReport {
+        files_total: new_digests.len(),
+        had_prior_manifest: !manifest.is_empty(),
+        ..FileDigestReport::default()
+    };
+    for (file_path, digest) in new_digests {
+        let matched = manifest.get(file_path).filter(|row| {
+            row.domain == FILE_DIGEST_DOMAIN
+                && row.panel_version == panel_version
+                && &row.digest == digest
+        });
+        match matched {
+            Some(row) => {
+                report.files_unchanged += 1;
+                for symbol in &row.symbols {
+                    reuse.insert(symbol.node_id, (symbol.cx_id, symbol.series_id));
+                    report.symbols_reused_via_digest += 1;
+                }
+            }
+            None => report.files_reconciled += 1,
+        }
+    }
+    DigestReusePlan { reuse, report }
+}
+
+/// Builds the fresh per-file digest manifest rows for this import (#345), one per source
+/// file, recording the file's new digest and the identity of every non-structural symbol
+/// it produced. These flow through the same graph-row reconcile/write/readback path as the
+/// metadata rows, so an unchanged file's manifest row reverts to its persisted bytes (no
+/// write) while a changed file's row is rewritten in the same ledger-paired batch.
+fn file_digest_manifest_rows(
+    options: &SqliteImportOptions,
+    constellations: &[PreparedLiveSymbol],
+    new_digests: &BTreeMap<String, String>,
+) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut symbols_by_file: BTreeMap<&str, Vec<FileDigestSymbol>> = BTreeMap::new();
+    for prepared in constellations {
+        symbols_by_file
+            .entry(prepared.symbol.rel_file_path.as_str())
+            .or_default()
+            .push(FileDigestSymbol {
+                node_id: prepared.node_id,
+                cx_id: prepared.identity.cx_id,
+                series_id: prepared.identity.series_id,
+            });
+    }
+    let mut rows = Vec::with_capacity(new_digests.len());
+    for (file_path, digest) in new_digests {
+        let mut symbols = symbols_by_file
+            .remove(file_path.as_str())
+            .unwrap_or_default();
+        symbols.sort_by_key(|symbol| symbol.node_id);
+        let row = FileDigestRow {
+            schema: SCHEMA_FILE_DIGEST_ROW.to_string(),
+            project: options.project.clone(),
+            file_path: file_path.clone(),
+            panel_version: options.panel_version,
+            domain: FILE_DIGEST_DOMAIN.to_string(),
+            digest: digest.clone(),
+            symbols,
+        };
+        rows.push((
+            keyed_graph_key(
+                FILE_DIGEST_ROW_PREFIX,
+                &options.project,
+                file_path.as_bytes(),
+            ),
+            serde_json::to_vec(&row)?,
+        ));
+    }
+    Ok(rows)
 }
 
 fn metadata_graph_rows(
@@ -2847,6 +3134,7 @@ fn prepare_live_symbols_parallel<C, R>(
     options: &SqliteImportOptions,
     driver: &PanelDriver,
     nodes: Vec<ExtractedNode>,
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
 ) -> IngestResult<Vec<PreparedLiveSymbol>>
 where
     C: Clock,
@@ -2859,7 +3147,7 @@ where
     if worker_count == 1 {
         return nodes
             .into_iter()
-            .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+            .map(|node| prepare_live_symbol(vault, runtime, options, driver, node, digest_reuse))
             .collect();
     }
     let chunk_size = nodes.len().div_ceil(worker_count);
@@ -2879,7 +3167,9 @@ where
                 scope.spawn(move || {
                     chunk
                         .into_iter()
-                        .map(|node| prepare_live_symbol(vault, runtime, options, driver, node))
+                        .map(|node| {
+                            prepare_live_symbol(vault, runtime, options, driver, node, digest_reuse)
+                        })
                         .collect::<IngestResult<Vec<_>>>()
                 })
             })
@@ -2900,11 +3190,37 @@ fn prepare_live_symbol<C, R>(
     options: &SqliteImportOptions,
     driver: &PanelDriver,
     node: ExtractedNode,
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
 ) -> IngestResult<PreparedLiveSymbol>
 where
     C: Clock,
     R: SlotRuntime,
 {
+    // Per-file digest fast path (#345): this node's file matched a persisted digest, so
+    // its content — and therefore its content-addressed identity — is provably unchanged
+    // since the import that wrote the manifest. Reuse the recorded (cx_id, series_id)
+    // without recomputing canonical bytes / CxId or reading Base. The digest was written
+    // in the same ledger-paired batch as the Base/graph rows it summarizes, so a matching
+    // digest guarantees those rows exist; `verify_preexisting_constellations` skips the
+    // redundant per-symbol Base readback for exactly these node ids. `canonical_input_bytes`
+    // and `vault_salt` are left empty because a reused symbol writes no Base row and no
+    // downstream reader consumes them for a `measured: None` constellation.
+    if let Some((cx_id, series_id)) = digest_reuse.get(&node.id).copied() {
+        return Ok(PreparedLiveSymbol {
+            node_id: node.id,
+            name: node.name,
+            properties_json: node.properties_json,
+            node_vector: node.node_vector,
+            symbol: node.symbol,
+            identity: SymbolIdentity {
+                series_id,
+                cx_id,
+                canonical_input_bytes: Vec::new(),
+                vault_salt: String::new(),
+            },
+            measured: None,
+        });
+    }
     let identity = node.symbol.identity(options.panel_version)?;
     let reused = vault
         .read_cf_at(
@@ -3232,6 +3548,7 @@ fn verify_preexisting_constellations<C>(
     snapshot: Seq,
     prepared: &PreparedBatch,
     workers: usize,
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
 ) -> IngestResult<()>
 where
     C: Clock,
@@ -3239,10 +3556,19 @@ where
     // Per-row verification is independent, so chunking it over `workers`
     // threads cannot change the outcome (#23); each reused row is still read
     // back from the persisted Base CF and identity-checked exactly as before.
+    //
+    // Symbols reused via a matching file digest (#345) are excluded: their Base row was
+    // written in the same ledger-paired batch as the digest that just matched, and the
+    // whole-vault `verify_chain` still runs after the import, so re-reading each of their
+    // Base rows here would reintroduce the O(corpus) point reads the digest layer exists
+    // to remove. Symbols reused by the Base-existence path (digest absent/mismatched) are
+    // still verified individually.
     let reused = prepared
         .constellations
         .iter()
-        .filter(|prepared_cx| prepared_cx.measured.is_none())
+        .filter(|prepared_cx| {
+            prepared_cx.measured.is_none() && !digest_reuse.contains_key(&prepared_cx.node_id)
+        })
         .collect::<Vec<_>>();
     parallel_map(reused, workers, |prepared_cx| {
         let bytes = vault
@@ -5642,9 +5968,16 @@ mod tests {
             report.readback.slot_rows_verified,
             default_panel_slots().len()
         );
-        assert_eq!(report.readback.graph_rows_verified, 4);
+        // 4 graph rows (project row, node-map, structural, node_vector edge-absent) plus
+        // 2 per-file digest manifest rows (#345) — one for "src/math.rs" and one for the
+        // empty-path project row — all newly written on this first import.
+        assert_eq!(report.readback.graph_rows_verified, 6);
         assert_eq!(report.readback.edge_rows_verified, 0);
         assert_eq!(report.readback.expected_edge_rows, 0);
+        assert_eq!(report.file_digest.files_total, 2);
+        assert_eq!(report.file_digest.files_unchanged, 0);
+        assert_eq!(report.file_digest.files_reconciled, 2);
+        assert!(!report.file_digest.had_prior_manifest);
         let deep = crate::verify_deep(&vault).expect("deep verify");
         assert_eq!(deep.sqlite_node_map_rows, 1);
         assert_eq!(deep.sqlite_structural_rows, 1);
@@ -5722,6 +6055,139 @@ mod tests {
         assert_eq!(
             payload.get("edge_rows_written").and_then(Value::as_u64),
             Some(0)
+        );
+    }
+
+    /// #345 FSV: the persisted per-file digest layer makes a delta import O(changed
+    /// files). Reads back the persisted manifest rows, proves an unchanged reimport skips
+    /// every file with zero graph writes, and proves a one-symbol change reconciles only
+    /// that symbol's file while the other file's symbols are reused straight from their
+    /// digest.
+    #[test]
+    fn file_digest_layer_skips_unchanged_files_and_reconciles_only_changed_file() {
+        let path = temp_db("file-digest");
+        let connection = create_db(&path);
+        // Two files, two functions each.
+        insert_node(
+            &connection,
+            "Function",
+            "a1",
+            "demo.a.a1",
+            "src/a.rs",
+            1,
+            3,
+            r#"{"language":"rust","source_snippet":"fn a1() -> i32 { 1 }","signature":"fn a1() -> i32"}"#,
+        );
+        insert_node(
+            &connection,
+            "Function",
+            "a2",
+            "demo.a.a2",
+            "src/a.rs",
+            5,
+            7,
+            r#"{"language":"rust","source_snippet":"fn a2() -> i32 { 2 }","signature":"fn a2() -> i32"}"#,
+        );
+        insert_node(
+            &connection,
+            "Function",
+            "b1",
+            "demo.b.b1",
+            "src/b.rs",
+            1,
+            3,
+            r#"{"language":"rust","source_snippet":"fn b1() -> i32 { 3 }","signature":"fn b1() -> i32"}"#,
+        );
+        insert_node(
+            &connection,
+            "Function",
+            "b2",
+            "demo.b.b2",
+            "src/b.rs",
+            5,
+            7,
+            r#"{"language":"rust","source_snippet":"fn b2() -> i32 { 4 }","signature":"fn b2() -> i32"}"#,
+        );
+        drop(connection);
+        let vault = vault();
+
+        // First import: no prior manifest, so every file is reconciled (fail-open) and all
+        // four symbols mint new CxIds.
+        let first = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("first import");
+        assert_eq!(first.file_digest.files_total, 2);
+        assert_eq!(first.file_digest.files_reconciled, 2);
+        assert_eq!(first.file_digest.files_unchanged, 0);
+        assert_eq!(first.file_digest.symbols_reused_via_digest, 0);
+        assert!(!first.file_digest.had_prior_manifest);
+        assert_eq!(first.new_cx_ids, 4);
+
+        // Persisted-state readback: two manifest rows, each recording its file's two
+        // symbols under the current digest domain.
+        let manifest = graph_rows(&vault, vault.latest_seq())
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(FILE_DIGEST_ROW_PREFIX))
+            .map(|(_, value)| {
+                serde_json::from_slice::<FileDigestRow>(&value).expect("decode manifest row")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(manifest.len(), 2, "one manifest row per source file");
+        for row in &manifest {
+            assert_eq!(row.domain, FILE_DIGEST_DOMAIN);
+            assert_eq!(row.panel_version, 1);
+            assert_eq!(row.symbols.len(), 2);
+            assert!(!row.digest.is_empty());
+        }
+
+        // Second import of the identical corpus: every file matches its persisted digest,
+        // so all four symbols are reused via the digest and NO graph row is rewritten.
+        let second = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("second import");
+        assert!(second.file_digest.had_prior_manifest);
+        assert_eq!(second.file_digest.files_unchanged, 2);
+        assert_eq!(second.file_digest.files_reconciled, 0);
+        assert_eq!(second.file_digest.symbols_reused_via_digest, 4);
+        assert_eq!(second.new_cx_ids, 0);
+        assert_eq!(second.reused_cx_ids, 4);
+        assert_eq!(
+            second.graph_rows_written, 0,
+            "an unchanged reimport skips conversion for 100% of unchanged files"
+        );
+
+        // Change exactly one symbol in file A. File B is byte-identical, so its digest
+        // still matches and its symbols are reused; only file A is reconciled.
+        let mutate = Connection::open(&*path).expect("reopen sqlite for mutation");
+        mutate
+            .execute(
+                "UPDATE nodes SET properties = ?1 WHERE qualified_name = 'demo.a.a1'",
+                params![
+                    r#"{"language":"rust","source_snippet":"fn a1() -> i32 { 999 }","signature":"fn a1() -> i32"}"#
+                ],
+            )
+            .expect("mutate one symbol");
+        drop(mutate);
+
+        let third = import_sqlite_to_vault(&path, &vault, &FixtureSlotRuntime, &options(1))
+            .expect("third import");
+        assert_eq!(
+            third.file_digest.files_unchanged, 1,
+            "only file B still matches its digest"
+        );
+        assert_eq!(
+            third.file_digest.files_reconciled, 1,
+            "only the file with the changed symbol is reconciled"
+        );
+        assert_eq!(
+            third.file_digest.symbols_reused_via_digest, 2,
+            "file B's two symbols are reused straight from its digest"
+        );
+        assert_eq!(
+            third.new_cx_ids, 1,
+            "only the one changed symbol mints a new CxId"
+        );
+        assert_eq!(
+            third.reused_cx_ids, 3,
+            "the unchanged symbol in file A plus both of file B are reused"
         );
     }
 
@@ -5871,7 +6337,9 @@ mod tests {
         assert_eq!(report.sqlite_edges, 4);
         assert_eq!(report.edge_skips.dangling, 1);
         assert_eq!(report.edge_rows_written, 3);
-        assert_eq!(report.graph_rows_written, 11);
+        // 11 prior graph rows + 2 per-file digest manifest rows (#345), one each for
+        // "src/http.rs" and "src/net.rs", written on this first import.
+        assert_eq!(report.graph_rows_written, 13);
         assert_eq!(report.readback.edge_rows_verified, 3);
         assert_eq!(report.readback.expected_edge_rows, 3);
 

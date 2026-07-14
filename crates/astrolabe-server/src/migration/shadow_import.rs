@@ -12,6 +12,22 @@ pub(crate) const ASTRO_SHADOW_VERIFY_NOT_INTACT: &str = "ASTRO_SHADOW_VERIFY_NOT
 /// Genuine source staleness that the read path refuses to reconcile on its own, because
 /// the refresh available to it cannot rebuild the row-sink-derived surfaces (#222).
 pub(crate) const ASTRO_SHADOW_STALE_REINDEX_REQUIRED: &str = "ASTRO_SHADOW_STALE_REINDEX_REQUIRED";
+/// The live git source tree changed out of band since the last shadow import (#347):
+/// its content fingerprint no longer matches the persisted git-source watermark. The
+/// derived CBM `<project>.db` is unchanged (an out-of-band `git commit`/edit never
+/// touches it), so the CBM-db content gate alone would have wrongly reported Fresh.
+pub(crate) const ASTRO_SHADOW_SOURCE_OUT_OF_BAND: &str = "ASTRO_SHADOW_SOURCE_OUT_OF_BAND";
+/// A git-source watermark and repo path are persisted, but the live git source
+/// fingerprint cannot be recomputed (the source tree was moved/deleted, or git is
+/// unavailable), so freshness cannot be asserted against the real source (#347).
+pub(crate) const ASTRO_SHADOW_GIT_SOURCE_UNREADABLE: &str = "ASTRO_SHADOW_GIT_SOURCE_UNREADABLE";
+pub(crate) const SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION: &str = "the git source tree changed out of band (commit or working-tree edit) since the last shadow import; rerun index_repository with calyx=\"shadow\" so the vault, lowered artifact, and row-sink-derived surfaces are rebuilt from the current source. index_status reconciles this automatically when a CBM tool runner is available";
+pub(crate) const SHADOW_GIT_SOURCE_UNREADABLE_REMEDIATION: &str = "the persisted git source path could not be fingerprinted (the source tree was moved/deleted, or git is unavailable); restore the source tree at its indexed path, or rerun index_repository with calyx=\"shadow\" from the current source location";
+/// Metadata key holding the git working-tree source fingerprint captured at import time.
+pub(crate) const GIT_SOURCE_FINGERPRINT_KEY: &str = "git_source_fingerprint";
+/// Metadata key holding the absolute repo path whose git source fingerprint was recorded,
+/// so the read-path freshness gate can recompute it against the live tree (#347).
+pub(crate) const GIT_SOURCE_REPO_PATH_KEY: &str = "git_source_repo_path";
 /// The row-sink direct import failed and there is no CBM SQLite artifact to fall back to
 /// (the sqlite path is intentionally absent). Falling back would only mask the real
 /// row-sink error behind a misleading "cannot open SQLite" error, so the direct-import
@@ -103,6 +119,13 @@ pub(crate) struct ShadowImportOutcome {
     pub(crate) provenance: Value,
     pub(crate) git_archaeology: Value,
     pub(crate) weave: Value,
+    /// Git working-tree source fingerprint captured at import time (#347), present only
+    /// when the import ran against a real repo path. Persisted as the source-of-truth
+    /// freshness watermark the read path recomputes against the live tree.
+    pub(crate) git_source_fingerprint: Option<String>,
+    /// Absolute repo path whose git source fingerprint was recorded, so the read-path
+    /// freshness gate can recompute it (#347). `None` when the import had no repo path.
+    pub(crate) git_source_repo_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +511,14 @@ pub(crate) enum ShadowContentVerdict {
     /// same domain ([`SHADOW_WATERMARK_ALGO`]/[`SHADOW_WATERMARK_VERSION`]), so the
     /// inequality is real staleness and not a units mismatch.
     Stale { expected: String, actual: String },
+    /// The live git source tree changed out of band since the last shadow import (#347):
+    /// its fingerprint differs from the persisted git-source watermark, even though the
+    /// derived CBM `<project>.db` fingerprint still matches (a commit/edit never rewrites
+    /// the db). This is real staleness sourced from the ground truth (git) rather than the
+    /// derived artifact, so it is reconciled exactly like [`ShadowContentVerdict::Stale`]
+    /// but labeled distinctly so the mismatch is diagnosable as an out-of-band source
+    /// change rather than a db drift.
+    SourceOutOfBand { expected: String, actual: String },
     /// The persisted watermark's digest domain is not — or cannot be proven to be — the
     /// domain the gate recomputes, so the two digests are incommensurable and comparing
     /// them is meaningless (#223).
@@ -662,6 +693,54 @@ pub(crate) fn evaluate_shadow_content_freshness_with_verify(
         });
     }
 
+    // Source-of-truth gate (#347): the CBM `<project>.db` only changes when
+    // `index_repository` re-runs, so the db-fingerprint content gate below is blind to an
+    // out-of-band `git commit`/edit — it would report Fresh while the real source has
+    // moved on, and the reconcile path would never engage. When a git-source watermark and
+    // repo path were persisted at import time, recompute the live git working-tree
+    // fingerprint and compare: any drift is real staleness sourced from the ground truth.
+    // This runs BEFORE the db gate so a source change is caught even when the db is
+    // byte-identical to the last import.
+    // An empty stored value is the explicit "no git-source watermark" sentinel a
+    // repo-less recovery import writes to clear a prior repo-aware watermark, so it is
+    // treated as absent — never as a present-but-empty fingerprint to compare.
+    if let Some(persisted_source_fp) = read_config_value(
+        cache_dir,
+        &metadata_key(project, GIT_SOURCE_FINGERPRINT_KEY),
+    )?
+    .filter(|value| !value.trim().is_empty())
+    {
+        // A watermark with no companion repo path cannot be checked; fall through to the
+        // db gate rather than guessing a path (labeled by absence, never a false Fresh
+        // claim about git-tracked freshness).
+        if let Some(repo_path) =
+            read_config_value(cache_dir, &metadata_key(project, GIT_SOURCE_REPO_PATH_KEY))?
+                .filter(|value| !value.trim().is_empty())
+        {
+            match astrolabe_anchors::archaeology::git_source_fingerprint(Path::new(&repo_path)) {
+                Ok(live) if live == persisted_source_fp => {
+                    // Source unchanged; the db gate below decides Fresh vs db-Stale.
+                }
+                Ok(live) => {
+                    return Ok(ShadowContentVerdict::SourceOutOfBand {
+                        expected: persisted_source_fp,
+                        actual: live,
+                    });
+                }
+                Err(error) => {
+                    return Ok(ShadowContentVerdict::Unverifiable {
+                        code: ASTRO_SHADOW_GIT_SOURCE_UNREADABLE,
+                        message: format!(
+                            "{ASTRO_SHADOW_GIT_SOURCE_UNREADABLE}: the persisted git source path {repo_path:?} for project {project:?} could not be fingerprinted: {error}"
+                        ),
+                        remediation: SHADOW_GIT_SOURCE_UNREADABLE_REMEDIATION,
+                        source_missing: false,
+                    });
+                }
+            }
+        }
+    }
+
     // Content gate: recompute the live CBM SQLite fingerprint and compare it to the
     // watermark persisted at import time. Existence of the artifacts above is necessary
     // but never sufficient — only a byte-for-byte fingerprint match proves freshness.
@@ -757,11 +836,12 @@ pub(crate) fn ensure_shadow_import_current_at(
             source_missing: true,
             ..
         } => return Ok(ShadowRefreshStatus::Current),
-        // Genuine staleness (#222), an unusable watermark domain (#223), or a
-        // missing/broken derived artifact while the source is live. All need
-        // reconciliation against current source — but only an import that can rebuild the
-        // derived surfaces may persist one.
+        // Genuine staleness (#222), an out-of-band git source change (#347), an unusable
+        // watermark domain (#223), or a missing/broken derived artifact while the source
+        // is live. All need reconciliation against current source — but only an import
+        // that can rebuild the derived surfaces may persist one.
         ShadowContentVerdict::Stale { .. }
+        | ShadowContentVerdict::SourceOutOfBand { .. }
         | ShadowContentVerdict::WatermarkDomainMismatch { .. }
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
@@ -856,9 +936,11 @@ pub(crate) fn reconcile_shadow_import_current_at(
             source_missing: true,
             ..
         } => return Ok(ShadowRefreshStatus::Current),
-        // Genuine staleness, an unusable watermark domain, or a missing/broken
-        // derived artifact while the source is live: all need reconciliation.
+        // Genuine staleness, an out-of-band git source change (#347), an unusable
+        // watermark domain, or a missing/broken derived artifact while the source is
+        // live: all need reconciliation.
         ShadowContentVerdict::Stale { .. }
+        | ShadowContentVerdict::SourceOutOfBand { .. }
         | ShadowContentVerdict::WatermarkDomainMismatch { .. }
         | ShadowContentVerdict::Unverifiable {
             source_missing: false,
@@ -901,9 +983,36 @@ pub(crate) fn reconcile_shadow_import_current_at(
         return Ok(ShadowRefreshStatus::Busy);
     };
     let search_scale_settings = search_scale_settings_for_import(project, None)?;
-    let outcome = import_shadow_vault(project, Some(row_sink), &search_scale_settings)?;
+    // Resolve the source repo path from the replayed index args (#347): passing it to
+    // the repo-aware import both mines archaeology Since the previous head and refreshes
+    // the git-source watermark, so a subsequent freshness check sees the reconciled tree
+    // as current instead of permanently out-of-band.
+    let repo = repo_path_from_index_args(&index_args);
+    let outcome = import_shadow_vault_with_archaeology(
+        project,
+        Some(row_sink),
+        &search_scale_settings,
+        repo.as_deref(),
+    )?;
     persist_shadow_outcome(project, &outcome)?;
     Ok(ShadowRefreshStatus::Refreshed)
+}
+
+/// Extracts the source repo path from persisted CBM `index_repository` args (#347),
+/// mirroring `handle_index_repository`'s `repo_path`/`name` resolution. Returns `None`
+/// when the args carry no filesystem path (project resolved from the tool result), in
+/// which case the reconcile import proceeds without archaeology / git-source refresh.
+pub(crate) fn repo_path_from_index_args(index_args: &str) -> Option<PathBuf> {
+    let value = serde_json::from_str::<Value>(index_args).ok()?;
+    let object = value.as_object()?;
+    for key in ["repo_path", "name"] {
+        if let Some(path) = object.get(key).and_then(Value::as_str)
+            && !path.trim().is_empty()
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
 }
 
 pub(crate) fn try_shadow_import_lock(
@@ -971,6 +1080,23 @@ pub(crate) fn shadow_import_current_summary(verdict: &ShadowContentVerdict) -> V
             "actual_vault_fingerprint": actual,
             "derived_surfaces": "last_known_good_preserved",
             "remediation": SHADOW_STALE_REMEDIATION,
+        }),
+        ShadowContentVerdict::SourceOutOfBand { expected, actual } => json!({
+            // #347: the git source tree changed out of band (commit/edit). The derived
+            // CBM db is unchanged, so a db-only gate would have reported "current"; the
+            // source-of-truth gate caught it. Reconciled exactly like db-Stale (surfaces
+            // preserved as last-known-good until a runner-driven reindex rebuilds them),
+            // but labeled distinctly so it reads as a source change, not db drift.
+            "status": "stale_reindex_required",
+            "freshness": "stale",
+            "trust": "provisional",
+            "verification": "source_fingerprint_mismatch",
+            "watermark_format": SHADOW_WATERMARK_FORMAT_REGISTRY_VERSION,
+            "code": ASTRO_SHADOW_SOURCE_OUT_OF_BAND,
+            "expected_source_fingerprint": expected,
+            "actual_source_fingerprint": actual,
+            "derived_surfaces": "last_known_good_preserved",
+            "remediation": SHADOW_SOURCE_OUT_OF_BAND_REMEDIATION,
         }),
         ShadowContentVerdict::WatermarkDomainMismatch {
             code,
@@ -1082,6 +1208,20 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let commit = match repo {
         Some(repo) => astrolabe_anchors::archaeology::git_head(repo)?,
         None => format!("shadow-import-v1:{project}"),
+    };
+    // Source-of-truth watermark (#347): fingerprint the live git working tree of the
+    // indexed repo now, at import time, so the read-path freshness gate can later detect
+    // an out-of-band commit/edit that never touches the derived CBM db. Absent for a
+    // recovery import with no repo path — freshness then falls back to the db gate,
+    // labeled by the watermark's absence rather than a false git-freshness claim.
+    let (git_source_fingerprint, git_source_repo_path) = match repo {
+        Some(repo) => (
+            Some(astrolabe_anchors::archaeology::git_source_fingerprint(
+                repo,
+            )?),
+            Some(repo.to_string_lossy().into_owned()),
+        ),
+        None => (None, None),
     };
     // Measured host parallelism, not a constant (#23): the corpus-wide import
     // passes (symbol preparation, row encode/reconcile, readback verification)
@@ -1260,6 +1400,8 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         provenance,
         git_archaeology,
         weave,
+        git_source_fingerprint,
+        git_source_repo_path,
     })
 }
 
@@ -2286,6 +2428,24 @@ pub(crate) fn persist_shadow_outcome_at(
             params![metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY), head],
         )?;
     }
+    // #347: persist the git-source watermark + repo path (or clear them when this import
+    // had no repo, so a stale watermark from a prior repo-aware import can never linger
+    // and drive a false out-of-band verdict). Written inside the same transaction as the
+    // rest of the outcome so the watermark and the vault/db it describes commit atomically.
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, GIT_SOURCE_FINGERPRINT_KEY),
+            outcome.git_source_fingerprint.clone().unwrap_or_default()
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![
+            metadata_key(project, GIT_SOURCE_REPO_PATH_KEY),
+            outcome.git_source_repo_path.clone().unwrap_or_default()
+        ],
+    )?;
     tx.commit()?;
     Ok(())
 }

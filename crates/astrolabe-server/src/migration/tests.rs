@@ -8414,6 +8414,8 @@ fn sample_shadow_outcome(root: &Path, security_screen: Value) -> ShadowImportOut
         provenance: sample_provenance(),
         git_archaeology: json!({"status": "fixture"}),
         weave: json!({"status": "fixture"}),
+        git_source_fingerprint: None,
+        git_source_repo_path: None,
     }
 }
 
