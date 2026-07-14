@@ -1156,6 +1156,90 @@ mod tests {
         CxId::from_bytes([byte; 16])
     }
 
+    /// Regression (#340): a persisted occurrence row's raw f64 `decay_weight` and
+    /// `credit` must read back bit-for-bit identical after a serde_json round-trip
+    /// through the `Kv` CF, or a served prediction recomputed from reloaded corpus
+    /// rows silently drifts from the value committed at ingest.
+    ///
+    /// serde_json's default float parser is lossy for some f64 values — e.g.
+    /// `0.9500000000000001` (bits `0x3fee666666666667`) parses back as `0.95`
+    /// (bits `0x3fee666666666666`), a one-ULP shift. The `float_roundtrip`
+    /// feature (declared on this crate's serde_json) makes the parse exact. This
+    /// FSV writes real durable rows carrying known-lossy and edge-case f64 values,
+    /// reopens the store, reads them back through the production
+    /// [`read_occurrence_rows`] reader, and asserts exact IEEE-754 bit equality.
+    #[test]
+    fn occurrence_row_f64_round_trips_bit_exact_across_persist_reload() {
+        // Known-lossy under the default parser, plus max-precision, subnormals,
+        // negative zero, and exactly-representable no-op values.
+        let probes: &[(f64, f64)] = &[
+            // Headline Wilson-CI-shaped lossy value in both float fields.
+            (0.9500000000000001, 0.9500000000000001),
+            (f64::MAX, f64::MIN_POSITIVE),      // max magnitude / smallest normal
+            // smallest subnormal / largest subnormal (denormal boundary, by bits).
+            (5e-324, f64::from_bits(0x000f_ffff_ffff_ffff)),
+            (1.0 / 3.0, std::f64::consts::PI),  // repeating / transcendental
+            (-0.0, 0.5),                        // negative zero vs exact no-op
+            (0.29999999999999993, 0.1 + 0.2),   // classic binary-fp residues
+        ];
+
+        let corpus = OracleCorpus {
+            occurrences: probes
+                .iter()
+                .enumerate()
+                .map(|(i, &(decay_weight, credit))| OccurrenceRecord {
+                    subject: cx(1),
+                    change_id: format!("fix-{i}"),
+                    source: "ci:test".to_string(),
+                    change_ts: 1_000,
+                    outcome_ts: 4_600,
+                    lag_s: 3_600,
+                    decay_weight,
+                    credit,
+                    passed: true,
+                    candidate_count: 1,
+                    trust: TrustTag::Trusted,
+                })
+                .collect(),
+            edges: Vec::new(),
+        };
+
+        let (vault_dir, vault) = fresh_vault("f64-roundtrip");
+        let report = persist_corpus(&vault, &corpus, "oracle-f64-fsv").expect("persist corpus");
+        assert_eq!(report.occurrence_count, probes.len());
+        drop(vault);
+
+        // Independent readback from a reopened durable store — real persisted bytes.
+        let reopened = open_vault(&vault_dir);
+        let rows = read_occurrence_rows(&reopened).expect("read occurrence rows");
+        assert_eq!(rows.len(), probes.len(), "every row persisted and re-read");
+
+        for (i, &(decay_weight, credit)) in probes.iter().enumerate() {
+            let change_id = format!("fix-{i}");
+            let row = rows
+                .iter()
+                .map(|persisted| &persisted.row)
+                .find(|row| row.change_id == change_id)
+                .unwrap_or_else(|| panic!("row {change_id} missing after reload"));
+            assert_eq!(
+                row.decay_weight.to_bits(),
+                decay_weight.to_bits(),
+                "decay_weight bit drift for {change_id}: wrote {decay_weight:?} \
+                 (0x{:016x}) read 0x{:016x}",
+                decay_weight.to_bits(),
+                row.decay_weight.to_bits(),
+            );
+            assert_eq!(
+                row.credit.to_bits(),
+                credit.to_bits(),
+                "credit bit drift for {change_id}: wrote {credit:?} \
+                 (0x{:016x}) read 0x{:016x}",
+                credit.to_bits(),
+                row.credit.to_bits(),
+            );
+        }
+    }
+
     fn change(id: &str, subject: CxId, ts: Ts) -> ChangeEvent {
         ChangeEvent {
             change_id: id.to_string(),

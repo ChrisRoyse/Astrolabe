@@ -16,7 +16,16 @@ calyx-core.workspace = true
 calyx-ledger.workspace = true
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes the JSON float parser bit-exact so a persisted
+# occurrence row's raw f64 fields (`decay_weight` = 0.5^(lag/half_life),
+# `credit` = normalized causal share) read back identical to what was written.
+# Without it serde_json's fast parser shifts some f64 values by one ULP (e.g.
+# 0.9500000000000001 -> 0.95), so a served prediction recomputed from reloaded
+# corpus rows would silently drift from the value committed at ingest — a
+# serve-what-you-persist determinism break. Declared explicitly rather than
+# leaning on transitive feature unification via astrolabe-assay: the guarantee
+# must be local to this crate, not an accident of the dependency graph.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [lib]
 path = "src/lib.rs"
