@@ -29,7 +29,9 @@
 //! than admitting an unmeasured candidate.
 
 use crate::calibration::CalibrationError;
-use crate::profile::{CombinedVerdict, GuardProfile, GuardSlot, SlotVerdict, combine_verdicts};
+use crate::profile::{
+    CombinedVerdict, GuardProfile, GuardSlot, SlotVerdict, combine_verdicts_with_lock,
+};
 
 /// Schema tag for the served/ledgered guard-check verdict payload.
 pub const GUARD_VERDICT_SCHEMA: &str = "astro.guard.verdict.v1";
@@ -351,11 +353,31 @@ fn slot_cosine_to_region(
 /// Route a measured candidate against a calibrated profile and its comparison
 /// region into a full [`CheckReport`]. Per-slot cosines are scored against the
 /// profile's calibrated `tau`, combined **per-slot never averaged** via
-/// [`combine_verdicts`], and turned into a verdict-class remediation.
+/// [`combine_verdicts_with_lock`], and turned into a verdict-class remediation.
+///
+/// The candidate's target is treated as identity-locked (exported/public);
+/// callers holding a per-target lock decision use [`check_candidate_with_lock`]
+/// to downgrade the identity slot to content-class for a non-exported target.
 pub fn check_candidate(
     candidate: &MeasuredSymbol,
     profile: &GuardProfile,
     region: &ComparisonRegion<'_>,
+) -> Result<CheckReport, CalibrationError> {
+    check_candidate_with_lock(candidate, profile, region, true)
+}
+
+/// Route a measured candidate with an explicit **identity-lock** decision (P7.4).
+/// An exported/public target (`identity_locked = true`) enforces the public-API
+/// signature slot `AllRequired` at the identity FAR — breaking-change drift on a
+/// locked surface refuses. A non-exported target (`identity_locked = false`)
+/// folds the same slot into the content `KofN` set (content-class handling), so
+/// signature drift on a private symbol routes to `new_region`, not an identity
+/// refuse. Per-slot detail is preserved either way (A3 no-flatten).
+pub fn check_candidate_with_lock(
+    candidate: &MeasuredSymbol,
+    profile: &GuardProfile,
+    region: &ComparisonRegion<'_>,
+    identity_locked: bool,
 ) -> Result<CheckReport, CalibrationError> {
     // Per-slot verdicts: candidate cosine to the region vs the calibrated tau.
     let mut per_slot = Vec::with_capacity(GuardSlot::ALL.len());
@@ -379,7 +401,12 @@ pub fn check_candidate(
         });
     }
 
-    let combined = combine_verdicts(&per_slot, profile.content_policy, profile.provisional);
+    let combined = combine_verdicts_with_lock(
+        &per_slot,
+        profile.content_policy,
+        profile.provisional,
+        identity_locked,
+    );
     let nearest = nearest_exemplar(candidate, region)?;
     let remediation = remediation_for(&combined, region.class, &nearest);
 
@@ -968,6 +995,73 @@ mod tests {
             report.remediation
         );
         assert!(report.remediation.to_lowercase().contains("quarantine"));
+    }
+
+    // -- DoD #1 (P7.4): identity-lock contrast -------------------------------
+
+    #[test]
+    fn locked_signature_drift_refuses_but_unlocked_is_content_class() {
+        // Candidate and exemplar share every slot direction (cosine ~1.0), so
+        // the ONLY failing slot is the public-API signature, forced to miss by a
+        // tau above 1.0 outside the quarantine band.
+        let exemplars = vec![exemplar_from(0.5, 24, "cx:kernel", true)];
+        let region = resolve_region(&exemplars).unwrap();
+        let candidate = measure_symbol_slots(&symbol_input(0.5, 24)).unwrap();
+        let mut profile = profile_with_tau(0.5); // every other slot passes wide.
+        if let Some(id) = profile
+            .slots
+            .iter_mut()
+            .find(|s| s.slot == GuardSlot::PublicApiSignature)
+        {
+            // cos ~1.0, tau 1.5 => margin ~ -0.5, an outright identity breach
+            // (well outside the 0.05 quarantine band).
+            id.tau = 1.5;
+        }
+
+        // Exported/public target: the signature slot is identity-locked, so
+        // breaking-change drift on it REFUSES.
+        let locked = check_candidate_with_lock(&candidate, &profile, &region, true).unwrap();
+        assert_eq!(
+            locked.combined.verdict,
+            GuardVerdict::Refuse,
+            "a locked public signature drift must refuse: {}",
+            locked.remediation
+        );
+        assert!(
+            locked
+                .remediation
+                .contains(GuardSlot::PublicApiSignature.as_str()),
+            "refusal names the breached identity slot: {}",
+            locked.remediation
+        );
+
+        // Non-exported target: the SAME drift is content-class. One content miss
+        // (the folded signature slot) is within the KofN tolerance => new_region,
+        // never an identity refuse.
+        let unlocked = check_candidate_with_lock(&candidate, &profile, &region, false).unwrap();
+        assert_eq!(
+            unlocked.combined.verdict,
+            GuardVerdict::NewRegion,
+            "the same drift on a non-exported symbol is content-class new_region: {}",
+            unlocked.remediation
+        );
+
+        // Per-slot detail is preserved on both paths (A3 no-flatten): the
+        // signature slot's cos/tau/pass are identical; only the routing differs.
+        let locked_sig = locked
+            .combined
+            .per_slot
+            .iter()
+            .find(|sv| sv.slot == GuardSlot::PublicApiSignature)
+            .unwrap();
+        let unlocked_sig = unlocked
+            .combined
+            .per_slot
+            .iter()
+            .find(|sv| sv.slot == GuardSlot::PublicApiSignature)
+            .unwrap();
+        assert_eq!(locked_sig.cos.to_bits(), unlocked_sig.cos.to_bits());
+        assert!(!locked_sig.pass() && !unlocked_sig.pass());
     }
 
     #[test]
