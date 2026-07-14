@@ -5166,6 +5166,7 @@ fn parse_symbol_label(value: &str) -> IngestResult<SymbolLabel> {
         "object" => SymbolLabel::Object,
         "impl" => SymbolLabel::Impl,
         "annotation" => SymbolLabel::Annotation,
+        "decorator" => SymbolLabel::Decorator,
         "envvar" => SymbolLabel::EnvVar,
         "project" => SymbolLabel::Project,
         "branch" => SymbolLabel::Branch,

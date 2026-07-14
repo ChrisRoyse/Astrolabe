@@ -425,6 +425,9 @@ pub enum SymbolLabel {
     Impl,
     /// Annotation symbol.
     Annotation,
+    /// Decorator symbol (synthetic decorator target node emitted by CBM for
+    /// DECORATES relations whose decorator has no definition in the corpus).
+    Decorator,
     /// Environment variable symbol.
     EnvVar,
     /// Structural project label that does not receive panel measurements.
@@ -469,6 +472,7 @@ impl SymbolLabel {
             Self::Object => "Object",
             Self::Impl => "Impl",
             Self::Annotation => "Annotation",
+            Self::Decorator => "Decorator",
             Self::EnvVar => "EnvVar",
             Self::Project => "Project",
             Self::Branch => "Branch",

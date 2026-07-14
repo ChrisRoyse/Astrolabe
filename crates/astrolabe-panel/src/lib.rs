@@ -882,7 +882,8 @@ pub const fn label_class(label: SymbolLabel) -> LabelClass {
         | SymbolLabel::Mixin
         | SymbolLabel::Object
         | SymbolLabel::Impl
-        | SymbolLabel::Annotation => LabelClass::TypeDeclaration,
+        | SymbolLabel::Annotation
+        | SymbolLabel::Decorator => LabelClass::TypeDeclaration,
         SymbolLabel::Field
         | SymbolLabel::Variable
         | SymbolLabel::Constant
@@ -2760,6 +2761,7 @@ mod tests {
             SymbolLabel::Object,
             SymbolLabel::Impl,
             SymbolLabel::Annotation,
+            SymbolLabel::Decorator,
             SymbolLabel::EnvVar,
             SymbolLabel::Project,
             SymbolLabel::Branch,
