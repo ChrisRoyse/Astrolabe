@@ -184,6 +184,7 @@ name = "astrolabe-oracle"
 version = "0.1.0"
 dependencies = [
  "astrolabe-anchors",
+ "astrolabe-assay",
  "astrolabe-domain",
  "astrolabe-ingest",
  "blake3",
@@ -229,6 +230,7 @@ dependencies = [
  "astrolabe-ingest",
  "astrolabe-kernel",
  "astrolabe-lower",
+ "astrolabe-oracle",
  "astrolabe-panel",
  "astrolabe-provenance",
  "astrolabe-weave",
