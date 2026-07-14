@@ -4,6 +4,7 @@ mod erasure_scrub;
 pub mod fsv;
 mod graph_projection;
 mod janitor;
+mod kernel_artifact;
 mod label_propagation;
 mod ledger_scan;
 mod ledger_verify;
@@ -46,6 +47,12 @@ pub use graph_projection::{
     GraphProjectionMaterializeEntry, GraphProjectionMaterializeReport, GraphProjectionNode,
     ensure_graph_projection_csr, materialize_graph_projection, materialize_graph_projections,
     read_graph_projection_csr,
+};
+pub use kernel_artifact::{
+    ASTRO_KERNEL_ARTIFACT_PERSIST_READBACK, ASTRO_KERNEL_GRAPH_ADAPTER_REFUSED,
+    KERNEL_ARTIFACT_ACTOR, KERNEL_ARTIFACT_CF_PREFIX, KernelArtifactPersistReport,
+    build_and_persist_kernel, kernel_graph_from_projection_csr, persist_kernel_artifact,
+    read_persisted_kernel_artifact,
 };
 pub use ledger_scan::{
     ASTRO_LEDGER_SCAN_CHAIN_NOT_INTACT, ASTRO_LEDGER_SCAN_ROW_CORRUPT,
