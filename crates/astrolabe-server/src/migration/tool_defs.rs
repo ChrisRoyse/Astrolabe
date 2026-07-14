@@ -218,7 +218,7 @@ pub(crate) fn guard_advisory_hook_tool_definition() -> Value {
                 },
                 "budget_ms": {
                     "type": "integer",
-                    "description": "Optional per-call deadline override in milliseconds; defaults to the registry-declared ADVISORY_HOOK_BUDGET_MS. The never-blocks guarantee holds for any value."
+                    "description": "Optional per-call deadline override in milliseconds; defaults to the registry-declared ADVISORY_HOOK_BUDGET_MS. TIGHTENING-ONLY (min(call, knob)): a value <= the registry default shortens the deadline (0 = never wait, always go silent); a value that widens it beyond the default is refused fail-closed with {code,message,remediation}, because widening the agent-facing advisory wait past the product cadence is a governance defect."
                 }
             },
             "required": ["project", "candidate"],
@@ -736,7 +736,15 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
                 },
                 "seed": {
                     "type": "integer",
-                    "description": "generated mode (optional): deterministic corpus shuffle seed (default 0). The same inputs + seed produce a byte-identical corpus_hash."
+                    "description": "generated mode (optional): deterministic corpus shuffle seed (default 0). The same inputs + seed produce a byte-identical corpus_hash. Also seeds the deterministic good/alien population sampling (#367)."
+                },
+                "good_sample_cap": {
+                    "type": "integer",
+                    "description": "generated mode (optional): registry-declared cap (astro.guard.calibration_sampling.v1) on the trusted (good) symbols reparsed through the panel, bounding the panel-read count on M-scale corpora. Selection is deterministic + seeded. Out-of-bounds values are refused fail-closed; omit for the registry default."
+                },
+                "alien_sample_cap": {
+                    "type": "integer",
+                    "description": "generated mode (optional): registry-declared cap (astro.guard.calibration_sampling.v1) on the alien bad cases drawn per referenced project (seeded, deterministic). The R16 mix policy is still enforced AFTER sampling. Out-of-bounds values are refused fail-closed; omit for the registry default."
                 },
                 "sources": {
                     "type": "array",

@@ -1049,6 +1049,128 @@ impl MixPolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Generated-mode sampling / cap knobs (#367, invariant #4)
+// ---------------------------------------------------------------------------
+
+/// Registry version for the generated-mode calibration sampling/cap knobs
+/// (invariant #4: caps that bound M-scale cost are declared knobs with bounds +
+/// provenance, never bare constants buried in the read loop).
+pub const CALIBRATION_SAMPLING_KNOB_REGISTRY_VERSION: &str = "astro.guard.calibration_sampling.v1";
+
+/// Deficit code: a sampling/cap knob was supplied outside its declared bounds.
+pub const ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS: &str = "ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS";
+
+/// Default cap on the trusted (good) population read back for generated
+/// calibration. On an M-scale corpus the good side is the unbounded cost driver
+/// (every kept symbol reparses S1/S4 through libcbm); this bounds that read to a
+/// population still far larger than the trusted region needs.
+pub const DEFAULT_GOOD_SAMPLE_CAP: usize = 2_000;
+/// Lower bound on the good cap: a trusted region needs at least this many
+/// in-distribution symbols; below it, capping would starve calibration.
+pub const MIN_GOOD_SAMPLE_CAP: usize = MIN_BAD_CASES_PER_DOMAIN;
+/// Upper bound on the good cap (a sanity ceiling, not a tuning target).
+pub const MAX_GOOD_SAMPLE_CAP: usize = 1_000_000;
+
+/// Default cap on the alien bad population drawn from a single referenced
+/// project. Aliens feed the R16 mix and are subject to the `≤60%` per-generator
+/// cap; this bounds how many alien vectors one reference contributes.
+pub const DEFAULT_ALIEN_SAMPLE_CAP: usize = 1_000;
+/// Lower bound on the alien cap (at least one alien per reference or it is not a
+/// meaningful reference).
+pub const MIN_ALIEN_SAMPLE_CAP: usize = 1;
+/// Upper bound on the alien cap.
+pub const MAX_ALIEN_SAMPLE_CAP: usize = 1_000_000;
+
+/// Declared-knob sampling policy for generated-mode calibration (#367): the caps
+/// that bound how much of an M-scale corpus is read into the good/alien
+/// populations, with deterministic seeded selection. The R16 [`MixPolicy`] is
+/// still enforced **after** sampling, so a cap can never smuggle a thin or
+/// single-source corpus past the guard — it only bounds cost.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SamplingPolicy {
+    /// Maximum trusted (good) symbols kept; the rest are deterministically
+    /// dropped (seeded selection) before measurement.
+    pub good_sample_cap: usize,
+    /// Maximum alien bad cases kept **per referenced project**.
+    pub alien_sample_cap: usize,
+}
+
+impl SamplingPolicy {
+    /// The registry-declared default caps.
+    pub const fn default_policy() -> Self {
+        Self {
+            good_sample_cap: DEFAULT_GOOD_SAMPLE_CAP,
+            alien_sample_cap: DEFAULT_ALIEN_SAMPLE_CAP,
+        }
+    }
+
+    /// Validate operator-supplied caps against the declared bounds, failing
+    /// closed (never silently clamping) when either is out of range.
+    pub fn validated(
+        good_sample_cap: usize,
+        alien_sample_cap: usize,
+    ) -> Result<Self, CalibrationError> {
+        if !(MIN_GOOD_SAMPLE_CAP..=MAX_GOOD_SAMPLE_CAP).contains(&good_sample_cap) {
+            return Err(CalibrationError::new(
+                ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS,
+                format!(
+                    "good_sample_cap {good_sample_cap} is outside the declared bounds \
+                     [{MIN_GOOD_SAMPLE_CAP}, {MAX_GOOD_SAMPLE_CAP}] \
+                     ({CALIBRATION_SAMPLING_KNOB_REGISTRY_VERSION})"
+                ),
+                "Pass a good_sample_cap within the declared bounds, or omit it to use the \
+                 registry default.",
+            ));
+        }
+        if !(MIN_ALIEN_SAMPLE_CAP..=MAX_ALIEN_SAMPLE_CAP).contains(&alien_sample_cap) {
+            return Err(CalibrationError::new(
+                ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS,
+                format!(
+                    "alien_sample_cap {alien_sample_cap} is outside the declared bounds \
+                     [{MIN_ALIEN_SAMPLE_CAP}, {MAX_ALIEN_SAMPLE_CAP}] \
+                     ({CALIBRATION_SAMPLING_KNOB_REGISTRY_VERSION})"
+                ),
+                "Pass an alien_sample_cap within the declared bounds, or omit it to use the \
+                 registry default.",
+            ));
+        }
+        Ok(Self {
+            good_sample_cap,
+            alien_sample_cap,
+        })
+    }
+}
+
+/// Deterministically select at most `cap` of `len` positions, seeded by `seed`.
+///
+/// - When `len <= cap` every position `0..len` is returned in order, so an
+///   under-cap population is byte-identical to the un-sampled behavior (the
+///   caller keeps its full input unchanged).
+/// - When `len > cap` a seeded partial Fisher–Yates draws `cap` distinct
+///   positions; the returned indices are sorted ascending so the caller's kept
+///   subset preserves its original relative order. The selection is
+///   byte-identical for a given `(len, cap, seed)` (asserted in tests) — the
+///   deterministic-seeded-selection requirement of #367.
+pub fn seeded_sample_indices(len: usize, cap: usize, seed: u64) -> Vec<usize> {
+    if len <= cap {
+        return (0..len).collect();
+    }
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut pool: Vec<usize> = (0..len).collect();
+    let mut rng = SplitMix64(seed ^ 0x5A11_9E00_D00D_1234);
+    for i in 0..cap {
+        // Draw a swap partner from the still-unselected tail `[i, len)`.
+        let j = i + (rng.next_u64() % ((len - i) as u64)) as usize;
+        pool.swap(i, j);
+    }
+    let mut chosen = pool[..cap].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
 /// A built, stratified bad-case corpus for one domain, with provenance.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CalibrationCorpus {
@@ -1999,5 +2121,123 @@ mod tests {
         let err = CalibrationDomain::new(CalibrationLanguage::Rust, "   ")
             .expect_err("empty scope refused");
         assert_eq!(err.code(), "ASTRO_GUARD_DOMAIN_INVALID");
+    }
+
+    // -- #367: generated-mode sampling / cap knobs --------------------------
+
+    #[test]
+    fn sampling_policy_default_is_within_declared_bounds() {
+        let policy = SamplingPolicy::default_policy();
+        assert!((MIN_GOOD_SAMPLE_CAP..=MAX_GOOD_SAMPLE_CAP).contains(&policy.good_sample_cap));
+        assert!((MIN_ALIEN_SAMPLE_CAP..=MAX_ALIEN_SAMPLE_CAP).contains(&policy.alien_sample_cap));
+        // The default is reproducible through the validator (a knob, not a bare
+        // constant): validating the declared default round-trips it.
+        assert_eq!(
+            SamplingPolicy::validated(DEFAULT_GOOD_SAMPLE_CAP, DEFAULT_ALIEN_SAMPLE_CAP).unwrap(),
+            policy
+        );
+    }
+
+    #[test]
+    fn sampling_policy_rejects_out_of_bounds_caps_fail_closed() {
+        // Good cap below the trusted-region floor.
+        let err = SamplingPolicy::validated(MIN_GOOD_SAMPLE_CAP - 1, DEFAULT_ALIEN_SAMPLE_CAP)
+            .expect_err("under-floor good cap must refuse");
+        assert_eq!(err.code(), ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS);
+        assert!(!err.remediation().is_empty());
+        // Good cap above the ceiling.
+        assert_eq!(
+            SamplingPolicy::validated(MAX_GOOD_SAMPLE_CAP + 1, DEFAULT_ALIEN_SAMPLE_CAP)
+                .expect_err("over-ceiling good cap must refuse")
+                .code(),
+            ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS
+        );
+        // Alien cap of zero (below MIN_ALIEN_SAMPLE_CAP).
+        assert_eq!(
+            SamplingPolicy::validated(DEFAULT_GOOD_SAMPLE_CAP, 0)
+                .expect_err("zero alien cap must refuse")
+                .code(),
+            ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS
+        );
+    }
+
+    #[test]
+    fn seeded_sample_indices_under_cap_is_identity_order_preserved() {
+        // len <= cap: every position, in order — the un-sampled behavior.
+        assert_eq!(seeded_sample_indices(5, 10, 42), vec![0, 1, 2, 3, 4]);
+        assert_eq!(seeded_sample_indices(5, 5, 42), vec![0, 1, 2, 3, 4]);
+        assert_eq!(seeded_sample_indices(0, 10, 42), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn seeded_sample_indices_caps_and_is_sorted_distinct_subset() {
+        let chosen = seeded_sample_indices(1_000, 50, 7);
+        assert_eq!(chosen.len(), 50, "exactly `cap` positions selected");
+        // Sorted, distinct, and every index in range.
+        for window in chosen.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "indices sorted + distinct: {chosen:?}"
+            );
+        }
+        assert!(chosen.iter().all(|&i| i < 1_000), "in range");
+    }
+
+    #[test]
+    fn seeded_sample_indices_is_deterministic_for_a_seed() {
+        // Byte-identical for the same (len, cap, seed) — the deterministic-seeded
+        // selection FSV. A different seed selects a different (but still valid)
+        // subset.
+        let a = seeded_sample_indices(5_000, 200, 123);
+        let b = seeded_sample_indices(5_000, 200, 123);
+        assert_eq!(a, b, "same seed => byte-identical selection");
+        let c = seeded_sample_indices(5_000, 200, 124);
+        assert_ne!(a, c, "a different seed selects a different subset");
+        assert_eq!(c.len(), 200);
+    }
+
+    fn sample_aliens(inputs: &mut CorpusInputs, cap: usize, seed: u64) {
+        let indices = seeded_sample_indices(inputs.alien_symbols.len(), cap, seed);
+        inputs.alien_symbols = indices
+            .iter()
+            .map(|&i| inputs.alien_symbols[i].clone())
+            .collect();
+    }
+
+    #[test]
+    fn sampled_alien_corpus_still_builds_with_a_reasonable_cap() {
+        // A large alien pool capped to a still-sufficient sample builds, and the
+        // R16 mix policy runs AFTER sampling: >= MIN_BAD, >= 3 generators.
+        let mut inputs = rich_inputs();
+        sample_aliens(&mut inputs, 16, 9);
+        assert_eq!(inputs.alien_symbols.len(), 16, "capped to the sample");
+        let corpus =
+            build_corpus(domain(), &inputs, MixPolicy::default_policy(), 9).expect("builds");
+        assert!(corpus.bad_cases.len() >= MIN_BAD_CASES_PER_DOMAIN);
+        let contributing = corpus
+            .generator_counts()
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .count();
+        assert!(contributing >= MixPolicy::default_policy().min_generators);
+    }
+
+    #[test]
+    fn over_aggressive_alien_cap_fails_closed_not_thinned() {
+        // Capping aliens so hard that the total falls below MIN_BAD must REFUSE:
+        // the mix policy is enforced on the post-sampling population, so a cap can
+        // never smuggle a thin corpus past the guard.
+        let mut inputs = rich_inputs();
+        inputs.revert_records.clear(); // lean on aliens for the count …
+        sample_aliens(&mut inputs, 2, 9); // … then starve them.
+        let err = build_corpus(domain(), &inputs, MixPolicy::default_policy(), 9)
+            .expect_err("an over-capped corpus must fail closed, not be thinned");
+        assert!(
+            err.code() == "ASTRO_GUARD_INSUFFICIENT_BAD_CASES"
+                || err.code() == "ASTRO_GUARD_SINGLE_SOURCE_CALIBRATION"
+                || err.code() == "ASTRO_GUARD_GENERATOR_DOMINATES",
+            "unexpected code after over-capping: {}",
+            err.code()
+        );
     }
 }
