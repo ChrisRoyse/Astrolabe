@@ -267,6 +267,85 @@ pub fn git_head(repo: &Path) -> Result<String, ArchaeologyError> {
     Ok(head)
 }
 
+/// Self-describing algorithm tag for the git source fingerprint (#347).
+pub const GIT_SOURCE_FINGERPRINT_ALGO: &str = "blake3";
+/// Self-describing version tag for the git source fingerprint (#347).
+pub const GIT_SOURCE_FINGERPRINT_VERSION: &str = "v1";
+
+/// Content fingerprint of the live git working tree at `repo` — the source-of-truth
+/// freshness signal for shadow imports (#347).
+///
+/// The derived CBM `<project>.db` only changes when `index_repository` re-runs, so
+/// fingerprinting it cannot detect an out-of-band `git commit` or working-tree edit:
+/// the freshness verdict stays Fresh and the reconcile path never engages. This
+/// fingerprints the *real source of truth* instead — the git working tree — so any
+/// out-of-band mutation moves the digest:
+///
+/// * the HEAD commit oid (catches commits / checkouts / resets),
+/// * the porcelain working-tree status (catches staged/unstaged/untracked/renamed
+///   entries appearing or disappearing),
+/// * the tracked content diff vs HEAD (catches a content-only edit that leaves the
+///   porcelain flag unchanged), and
+/// * the bytes of each untracked, non-ignored file (catches new-file content).
+///
+/// The returned value is `blake3:v1:<hex>` — self-describing so a persisted watermark
+/// can be domain-gated exactly like the CBM-db watermark. Fails closed with a coded
+/// error when `repo` is not a usable git repository (so a missing/renamed source tree
+/// is reported, never silently treated as Fresh).
+pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
+    // HEAD oid, or an explicit unborn-branch marker for a repo with no commit yet.
+    // Any spawn/exit failure here is tolerated and disambiguated by the mandatory
+    // `git status` below: a non-repository fails that call fail-closed.
+    let head = match git_text(repo, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(text) => {
+            let head = text.trim().to_string();
+            validate_oid(&head)?;
+            head
+        }
+        Err(_) => "unborn-head".to_string(),
+    };
+    // NUL-delimited machine status over all untracked files. This is the fail-closed
+    // gate: it errors if `repo` is not a git repository, so we never fingerprint a
+    // non-source directory as if it were fresh.
+    let status = git_bytes(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    // Tracked content changes vs HEAD (staged + unstaged). Empty on an unborn head or a
+    // clean tree; a content-only re-edit still moves these bytes.
+    let diff =
+        git_bytes(repo, &["diff", "HEAD", "--no-color", "--no-ext-diff"]).unwrap_or_default();
+    // Untracked, non-ignored paths (NUL-delimited). Their current bytes are folded in so
+    // a brand-new file's content — not just its presence — participates in the digest.
+    let untracked = git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut section = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    section(GIT_SOURCE_FINGERPRINT_VERSION.as_bytes());
+    section(head.as_bytes());
+    section(&status);
+    section(&diff);
+    for path in untracked.split(|byte| *byte == 0).filter(|p| !p.is_empty()) {
+        section(path);
+        let rel = String::from_utf8_lossy(path);
+        match std::fs::read(repo.join(rel.as_ref())) {
+            Ok(bytes) => section(&bytes),
+            // A path git listed but we cannot read (race: deleted between listing and
+            // read, or permissions) is folded in as a stable absence marker rather than
+            // aborting: the next status call reflects the real state, and the marker
+            // still differs from the file being present with content.
+            Err(_) => section(b"<unreadable-untracked>"),
+        }
+    }
+    Ok(format!(
+        "{GIT_SOURCE_FINGERPRINT_ALGO}:{GIT_SOURCE_FINGERPRINT_VERSION}:{}",
+        hasher.finalize().to_hex()
+    ))
+}
+
 /// Returns the new-side ranges introduced by `commit` for exact version lookup.
 pub fn changed_new_ranges(
     repo: &Path,
@@ -873,5 +952,61 @@ mod tests {
         assert!(forced.force_removed_commits.contains(&fix));
         assert!(forced.force_removed_commits.contains(&feature));
         assert!(forced.force_removed_commits.contains(&revert));
+    }
+
+    #[test]
+    fn git_source_fingerprint_tracks_out_of_band_changes_and_fails_closed_off_repo() {
+        let mut fixture = Fixture::new();
+        fs::write(fixture.root.join("src/lib.rs"), b"pub fn a() {}\n").unwrap();
+        fixture.commit("initial");
+
+        let fp1 = git_source_fingerprint(&fixture.root).expect("fingerprint clean tree");
+        assert!(
+            fp1.starts_with(&format!(
+                "{GIT_SOURCE_FINGERPRINT_ALGO}:{GIT_SOURCE_FINGERPRINT_VERSION}:"
+            )),
+            "fingerprint must be self-describing, got {fp1:?}"
+        );
+        // Deterministic: an unchanged tree yields the identical digest (negative case —
+        // no false-stale on an untouched repo).
+        assert_eq!(
+            fp1,
+            git_source_fingerprint(&fixture.root).expect("fingerprint again"),
+            "unchanged tree must not move the source fingerprint"
+        );
+
+        // Out-of-band commit moves the digest (the #347 DoD-1 positive case).
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            b"pub fn a() {}\npub fn b() {}\n",
+        )
+        .unwrap();
+        fixture.commit("add b out of band");
+        let fp2 = git_source_fingerprint(&fixture.root).expect("fingerprint after commit");
+        assert_ne!(fp1, fp2, "an out-of-band commit must move the fingerprint");
+
+        // Uncommitted tracked edit moves the digest even without a commit.
+        fs::write(
+            fixture.root.join("src/lib.rs"),
+            b"pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        )
+        .unwrap();
+        let fp3 = git_source_fingerprint(&fixture.root).expect("fingerprint dirty tree");
+        assert_ne!(
+            fp2, fp3,
+            "an uncommitted tracked edit must move the fingerprint"
+        );
+
+        // A brand-new untracked file's content moves the digest.
+        fs::write(fixture.root.join("src/new.rs"), b"pub fn d() {}\n").unwrap();
+        let fp4 = git_source_fingerprint(&fixture.root).expect("fingerprint with untracked");
+        assert_ne!(fp3, fp4, "a new untracked file must move the fingerprint");
+
+        // A missing source tree (deleted/renamed out of band) fails closed rather than
+        // silently reporting a digest — the #347 fail-closed requirement.
+        let missing = fixture.root.join("does/not/exist");
+        let err =
+            git_source_fingerprint(&missing).expect_err("missing source tree must fail closed");
+        assert_eq!(err.code, ASTRO_ARCHAEOLOGY_GIT_FAILED);
     }
 }
