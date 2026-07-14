@@ -121,6 +121,10 @@ fn git_archaeology_full_pass_persists_exact_historical_anchors_idempotently() {
         "idempotent full pass must preserve anchor bytes"
     );
     assert!(verify_chain(&vault).unwrap().is_intact());
+    assert_eq!(
+        second.cleanup_remnants, 0,
+        "bounded cleanup retry must leave no labeled remnants: {second:#?}"
+    );
     assert!(cache.read_dir().unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -297,6 +301,10 @@ fn git_archaeology_incremental_ticks_converge_to_full_pass_anchor_bytes() {
         "historical admission must not alter the live graph"
     );
     assert!(verify_chain(&vault).unwrap().is_intact());
+    assert_eq!(
+        full.cleanup_remnants, 0,
+        "bounded cleanup retry must leave no labeled remnants: {full:#?}"
+    );
     assert!(cache.read_dir().unwrap().all(|entry| {
         !entry
             .unwrap()
