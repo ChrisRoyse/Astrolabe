@@ -523,6 +523,30 @@ pub const ASSAY_MAX_TE_QUORUM: u64 = 1_000_000;
 
 /// The P5.3 differentiation knob registry (#33).
 pub const ASSAY_DIFF_KNOBS: &[U64KnobDeclaration] = &[
+    // The redundancy/synergy quorum knobs are shared with the card registry
+    // (#34's `assay_card_knob`); lane #33's differentiation path resolves them
+    // through `assay_diff_knob`, so the same knob name is declared in both
+    // registries against the one set of `ASSAY_*_QUORUM` bounds constants.
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_REDUNDANCY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_REDUNDANCY_QUORUM,
+        min: ASSAY_MIN_REDUNDANCY_QUORUM,
+        max: ASSAY_MAX_REDUNDANCY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §3 (total-correlation quorum 50/slot)",
+        rationale: "minimum aligned sample count below which the total-correlation / n_eff card is reported provisional; the plug-in joint entropy over many slots is badly under-sampled below it",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SYNERGY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_SYNERGY_QUORUM,
+        min: ASSAY_MIN_SYNERGY_QUORUM,
+        max: ASSAY_MAX_SYNERGY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §4 (three-way interaction-information quorum 150)",
+        rationale: "minimum aligned sample count below which a synergy triple is reported provisional; a three-way contingency table needs more support than a pairwise one before its interaction-information sign is trusted",
+    },
     U64KnobDeclaration {
         registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
         name: ASSAY_DIFF_DISCRETIZATION_BINS_KNOB,
