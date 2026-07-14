@@ -624,6 +624,204 @@ where
     }
 }
 
+/// Fixed RNG seed for the index-time signal-ranking bits null. A declared seed
+/// (not a threshold), so each per-axis ranking is a pure function of the persisted
+/// slot vectors, the derived structural axes, and the bits config.
+const SHADOW_SIGNAL_CARDS_SEED: u64 = 0x5165_A15C_A5D5_EED1;
+
+/// Labeled fail-closed degradation for the index-time signal-card summary — a
+/// telemetry surface, so a failure is labeled, never a hard import failure.
+fn signal_cards_unavailable(reason: String) -> Value {
+    json!({
+        "status": "unavailable",
+        "reason": reason,
+        "trust": "provisional",
+        "provenance": "unavailable",
+    })
+}
+
+/// Best-effort index-time signal-card production (#379), the write counterpart of
+/// the `get_architecture` `signal_ranking` aspect (`read_signal_ranking_aspect`),
+/// which reads per-axis `assay_card.signals.axis:*` config rows that nothing
+/// produced on a real corpus — so the aspect served labeled-`unavailable` forever.
+///
+/// Derives each symbol's structural axes (`symbol_kind`, `structural_degree`) from
+/// the persisted graph and measures every dense slot's bits about each axis
+/// ([`astrolabe_weave::measure_index_time_signal_cards`]), then persists one
+/// `astrolabe.assay_card.v1` doc per axis to the config store (keyed exactly as
+/// `measure_bits` mode=signals and the aspect reader expect) and ledger-pairs each
+/// card into an append-only hash-chained [`astrolabe_assay::CardLedger`]. Every
+/// persisted doc is proved by an independent readback (invariant 5). Signal
+/// production is telemetry over an already-verified import, so any failure is a
+/// labeled degradation in the returned summary, never a hard import failure; a
+/// corpus with no informative axis is a labeled `absent`, leaving the aspect
+/// honestly `unavailable` rather than fabricating a card.
+fn index_time_signal_cards_summary<C>(
+    cache_dir: &Path,
+    vault: &AsterVault<C>,
+    project: &str,
+    vault_dir: &Path,
+) -> Value
+where
+    C: Clock,
+{
+    let slots = shadow_available_slots();
+    let production = match astrolabe_weave::measure_index_time_signal_cards(
+        vault,
+        project,
+        &slots,
+        SHADOW_SIGNAL_CARDS_SEED,
+    ) {
+        Ok(production) => production,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "reason": format!("signal-card production failed: {error}"),
+                "trust": "provisional",
+                "provenance": "unavailable",
+            });
+        }
+    };
+    if production.cards.is_empty() {
+        // Genuinely absent: no informative index-time axis for this corpus. The
+        // aspect stays labeled-unavailable — an honest absence, not a faked card.
+        return json!({
+            "status": "absent",
+            "reason": "no informative index-time signal axis for this corpus",
+            "symbols_measured": production.symbols_measured,
+            "axes_skipped_degenerate": production.axes_skipped_degenerate,
+            "slots_skipped_no_dense": production.slots_skipped_no_dense,
+            "trust": "provisional",
+            "provenance": "index_time_signal_cards",
+        });
+    }
+
+    let ledger = match astrolabe_assay::CardLedger::open(vault_dir.join("signal-cards.ndjson")) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "reason": format!("signal card ledger unavailable: {error}"),
+                "trust": "provisional",
+                "provenance": "unavailable",
+            });
+        }
+    };
+    let produced_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut axes = Vec::new();
+    let mut cards_persisted = 0usize;
+    let mut cards_ledgered = 0usize;
+    for card in &production.cards {
+        let axis = card.axis.clone();
+        // Ledger the card first so the persisted config doc can cite its entry.
+        // The fingerprint pairs the entry with the (project, axis, seed) that
+        // produced it (a provenance tag; the reproducible-input hash is future work
+        // once the aligned observation matrix is captured alongside the card).
+        let fingerprint =
+            format!("index_time_signal_cards:{project}:{axis}:seed{SHADOW_SIGNAL_CARDS_SEED:#x}");
+        let entry = match ledger.append(card, SHADOW_SIGNAL_CARDS_SEED, &fingerprint) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return signal_cards_unavailable(format!(
+                    "ledger append for axis {axis:?} failed: {error}"
+                ));
+            }
+        };
+        cards_ledgered += 1;
+
+        let card_value = match serde_json::to_value(card) {
+            Ok(value) => value,
+            Err(error) => {
+                return signal_cards_unavailable(format!("encode card for axis {axis:?}: {error}"));
+            }
+        };
+        // A card is Trusted only when no contributing slot was a below-floor
+        // provisional posterior estimate.
+        let trust = if card.signals.iter().any(|signal| signal.provisional) {
+            "provisional"
+        } else {
+            "trusted"
+        };
+        let key = measure_bits_card_key(project, "signals", Some(&axis), None);
+        let doc = json!({
+            "schema": ASSAY_CARD_SCHEMA,
+            "mode": "signals",
+            "project": project,
+            "axis": axis,
+            "scope": Value::Null,
+            "seq": entry.seq,
+            "produced_at": produced_at,
+            "freshness": "fresh",
+            "freshness_lag": 0,
+            "trust": trust,
+            "provenance": [
+                format!("index_time_signal_cards:{project}"),
+                format!("ledger:signal-cards.ndjson#{}", entry.seq),
+                format!("axis:{axis}"),
+            ],
+            "card": card_value,
+        });
+        let serialized = doc.to_string();
+        if let Err(error) = write_config_value(cache_dir, &key, &serialized) {
+            return signal_cards_unavailable(format!(
+                "persist card for axis {axis:?} failed: {error}"
+            ));
+        }
+        // FSV: read the row back through a fresh connection and confirm the
+        // persisted bytes parse to exactly the document written (invariant 5).
+        match read_config_value(cache_dir, &key) {
+            Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
+                Ok(readback) if readback == doc => {}
+                Ok(_) => {
+                    return signal_cards_unavailable(format!(
+                        "card for axis {axis:?} read back a different value than written"
+                    ));
+                }
+                Err(error) => {
+                    return signal_cards_unavailable(format!(
+                        "card for axis {axis:?} did not parse after write: {error}"
+                    ));
+                }
+            },
+            Ok(None) => {
+                return signal_cards_unavailable(format!(
+                    "card for axis {axis:?} was not readable back immediately after write"
+                ));
+            }
+            Err(error) => {
+                return signal_cards_unavailable(format!(
+                    "card for axis {axis:?} readback failed: {error}"
+                ));
+            }
+        }
+        cards_persisted += 1;
+        axes.push(json!({
+            "axis": axis,
+            "signal_count": card.signals.len(),
+            "trust": trust,
+            "ledger_seq": entry.seq,
+            "config_key": key,
+        }));
+    }
+
+    json!({
+        "status": "produced",
+        "axis_count": production.cards.len(),
+        "cards_persisted": cards_persisted,
+        "cards_ledgered": cards_ledgered,
+        "symbols_measured": production.symbols_measured,
+        "axes_skipped_degenerate": production.axes_skipped_degenerate,
+        "slots_skipped_no_dense": production.slots_skipped_no_dense,
+        "axes": axes,
+        "trust": "measured",
+        "provenance": "index_time_signal_cards",
+    })
+}
+
 pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
     match status {
         ShadowRefreshStatus::Current => "current",
@@ -1476,11 +1674,22 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // build a kernel is a labeled surface, never an index failure. (Overlaps lane
     // A's shadow_import.rs — keep this to exactly this one call.)
     let kernel_artifact = persist_index_time_kernel_artifact(&vault, project);
+    // #379 index-time hook (lane A/w15): produce and persist the per-axis
+    // signal-ranking cards the get_architecture signal_ranking aspect reads, so
+    // that aspect serves real measured bits instead of labeled-unavailable
+    // forever. Single post-import call — placed after the graph import and weave
+    // (so slot vectors and the graph snapshot are materialized) and before ledger
+    // verification (so the config writes sit alongside a verified chain).
+    // Best-effort telemetry: a labeled degradation in the summary, never an index
+    // failure. (Shares shadow_import.rs with lane D/E/F index-time hooks — keep
+    // this to exactly this one call.)
+    let signal_cards = index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir);
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
         object.insert("drift".to_string(), drift);
         object.insert("kernel_artifact".to_string(), kernel_artifact);
+        object.insert("signal_cards".to_string(), signal_cards);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {

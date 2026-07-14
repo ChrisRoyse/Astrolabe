@@ -38,6 +38,7 @@ use serde_json::Value;
 
 mod ann;
 pub mod drift_producer;
+pub mod signal_cards;
 mod sim_rows;
 mod xterm_cotenant;
 mod xterm_rows;
@@ -60,6 +61,10 @@ pub use kernel_index::{
     ASTRO_KERNEL_INDEX_STALE, ASTRO_KERNEL_INDEX_VAULT, KERNEL_INDEX_RECALL_GATE_PERMILLE,
     KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind, KernelMemberIndex, KernelRecallMeasurement,
     build_kernel_member_index, kernel_scoped_semantic_query, measure_kernel_index_recall,
+};
+pub use signal_cards::{
+    SIGNAL_AXIS_STRUCTURAL_DEGREE, SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes,
+    derive_symbol_axes, measure_index_time_signal_cards, signal_cards_from_symbol_axes,
 };
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
