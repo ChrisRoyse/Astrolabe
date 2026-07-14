@@ -1434,6 +1434,7 @@ fn is_dataflow_edge(kind: EdgeKind) -> bool {
             | EdgeKind::Writes
             | EdgeKind::Usage
             | EdgeKind::Throws
+            | EdgeKind::Raises
             | EdgeKind::DataFlows
     )
 }

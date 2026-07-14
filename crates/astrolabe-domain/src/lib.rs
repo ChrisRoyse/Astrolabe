@@ -576,11 +576,13 @@ pub enum EdgeKind {
     CrossGraphqlCalls = 39,
     /// Cross-project tRPC service call edge.
     CrossTrpcCalls = 40,
+    /// Unchecked-exception raise edge (CBM `RAISES`; the checked form is `THROWS`).
+    Raises = 41,
 }
 
 impl EdgeKind {
     /// All stable edge kinds in `etype` order.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::Calls,
         Self::ResolvedCalls,
         Self::Imports,
@@ -621,6 +623,7 @@ impl EdgeKind {
         Self::CrossGrpcCalls,
         Self::CrossGraphqlCalls,
         Self::CrossTrpcCalls,
+        Self::Raises,
     ];
 
     /// Returns the stable `u16` edge vocabulary code.
@@ -648,6 +651,7 @@ impl EdgeKind {
             Self::Reads => "READS",
             Self::Writes => "WRITES",
             Self::Throws => "THROWS",
+            Self::Raises => "RAISES",
             Self::Tests => "TESTS",
             Self::TestsFile => "TESTS_FILE",
             Self::HttpCalls => "HTTP_CALLS",
@@ -695,6 +699,7 @@ impl EdgeKind {
             "READS" => Some(Self::Reads),
             "WRITES" => Some(Self::Writes),
             "THROWS" => Some(Self::Throws),
+            "RAISES" => Some(Self::Raises),
             "TESTS" => Some(Self::Tests),
             "TESTS_FILE" => Some(Self::TestsFile),
             "HTTP_CALLS" => Some(Self::HttpCalls),
@@ -738,7 +743,7 @@ impl EdgeKind {
             | Self::Decorates
             | Self::Instantiates
             | Self::UsesType => EdgeWeightPrior::new(0.9, None),
-            Self::Usage | Self::Reads | Self::Writes | Self::Throws => {
+            Self::Usage | Self::Reads | Self::Writes | Self::Throws | Self::Raises => {
                 EdgeWeightPrior::new(0.7, None)
             }
             Self::Tests | Self::TestsFile => EdgeWeightPrior::new(0.9, None),
