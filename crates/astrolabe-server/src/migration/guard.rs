@@ -1058,29 +1058,27 @@ fn read_project_measured_symbols(
         // source text (or with an unreparseable body) simply contributes no
         // S1/S4 measurement — never a fabricated vector — and the guard crate's
         // fail-closed slot deficit still fires when NO symbol measures a slot.
-        if !slots.contains_key(&PANEL_SLOT_STRUCT_TRIGRAMS)
-            || !slots.contains_key(&PANEL_SLOT_API_CALLEES)
+        if (!slots.contains_key(&PANEL_SLOT_STRUCT_TRIGRAMS)
+            || !slots.contains_key(&PANEL_SLOT_API_CALLEES))
+            && let Ok(properties) = serde_json::from_str::<Value>(&node.properties_json)
+            && let Some(source) = ["source_snippet", "source", "body", "snippet"]
+                .iter()
+                .find_map(|field| properties.get(*field).and_then(Value::as_str))
+            && !source.trim().is_empty()
         {
-            if let Ok(properties) = serde_json::from_str::<Value>(&node.properties_json)
-                && let Some(source) = ["source_snippet", "source", "body", "snippet"]
-                    .iter()
-                    .find_map(|field| properties.get(*field).and_then(Value::as_str))
-                && !source.trim().is_empty()
-            {
-                let language = properties
-                    .get("language")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if let Ok((s1, s4)) = reparse_structural_panel_sources(
-                    source.as_bytes(),
-                    &node.file_path,
-                    language,
-                    &node.name,
-                    0,
-                ) {
-                    slots.entry(PANEL_SLOT_STRUCT_TRIGRAMS).or_insert(s1);
-                    slots.entry(PANEL_SLOT_API_CALLEES).or_insert(s4);
-                }
+            let language = properties
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Ok((s1, s4)) = reparse_structural_panel_sources(
+                source.as_bytes(),
+                &node.file_path,
+                language,
+                &node.name,
+                0,
+            ) {
+                slots.entry(PANEL_SLOT_STRUCT_TRIGRAMS).or_insert(s1);
+                slots.entry(PANEL_SLOT_API_CALLEES).or_insert(s4);
             }
         }
         if !slots.is_empty() {

@@ -24,7 +24,9 @@ pub(crate) struct GapMember {
 
 /// Extracts the kernel members from the persisted kernel-context metadata, or a
 /// reason string when the scope summaries are unavailable (fail-closed).
-pub(crate) fn gap_members_from_kernel_context(kernel_context: &Value) -> Result<Vec<GapMember>, String> {
+pub(crate) fn gap_members_from_kernel_context(
+    kernel_context: &Value,
+) -> Result<Vec<GapMember>, String> {
     let scope_summaries = kernel_context
         .get("scope_summaries")
         .ok_or_else(|| "kernel context carries no scope_summaries block".to_string())?;

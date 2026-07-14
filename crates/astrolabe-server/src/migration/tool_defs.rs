@@ -149,7 +149,6 @@ pub(crate) fn anchor_erase_tool_definition() -> Value {
     })
 }
 
-
 pub(crate) fn guard_commit_ood_tool_definition() -> Value {
     json!({
         "name": "guard_commit_ood",

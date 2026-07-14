@@ -172,7 +172,10 @@ pub(crate) fn guard_commit_ood_at(
         Err(err) => {
             return guard_secondary_refused_owned(
                 "ASTRO_GUARD_COMMIT_OOD_PANEL_VERSION".to_string(),
-                format!("panel version {panel_version} is invalid: {}", err.message()),
+                format!(
+                    "panel version {panel_version} is invalid: {}",
+                    err.message()
+                ),
                 "Score with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
             );
         }
@@ -333,8 +336,10 @@ fn record_commit_ood_review(
 
 /// Read the raw persisted commit-OOD review history (empty when unset).
 fn read_commit_ood_reviews_raw(cache_dir: &Path, project: &str) -> Result<Vec<Value>, DynError> {
-    let Some(raw) =
-        read_config_value(cache_dir, &metadata_key(project, GUARD_COMMIT_OOD_REVIEWS_KEY))?
+    let Some(raw) = read_config_value(
+        cache_dir,
+        &metadata_key(project, GUARD_COMMIT_OOD_REVIEWS_KEY),
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -401,8 +406,10 @@ pub(crate) fn commit_ood_reviews_section(cache_dir: &Path, project: &str) -> Val
 /// and continues) — a bad request never crashes the tick, but is also never
 /// silently swallowed.
 pub(crate) fn score_pending_commit_ood(cache_dir: &Path, project: &str) -> Result<usize, DynError> {
-    let Some(raw) =
-        read_config_value(cache_dir, &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY))?
+    let Some(raw) = read_config_value(
+        cache_dir,
+        &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY),
+    )?
     else {
         return Ok(0);
     };
@@ -412,7 +419,10 @@ pub(crate) fn score_pending_commit_ood(cache_dir: &Path, project: &str) -> Resul
     let request: Value = serde_json::from_str(&raw)?;
     let Some(request_obj) = request.as_object() else {
         // A malformed pending request is cleared (never re-processed) but reported.
-        delete_config_value(cache_dir, &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY))?;
+        delete_config_value(
+            cache_dir,
+            &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY),
+        )?;
         return Err(format!(
             "ASTRO_GUARD_COMMIT_OOD_PENDING_INVALID: pending commit-OOD request for {project:?} is not a JSON object"
         )
@@ -420,7 +430,10 @@ pub(crate) fn score_pending_commit_ood(cache_dir: &Path, project: &str) -> Resul
     };
     // Consume the request first so a scoring fault cannot wedge the tick on a
     // permanently-failing request.
-    delete_config_value(cache_dir, &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY))?;
+    delete_config_value(
+        cache_dir,
+        &metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY),
+    )?;
 
     let response = guard_commit_ood_at(cache_dir, project, request_obj)?;
     let value: Value = serde_json::from_str(&response)?;
@@ -538,7 +551,10 @@ pub(crate) fn guard_advisory_hook_at(
         Err(err) => {
             return guard_secondary_refused_owned(
                 "ASTRO_GUARD_HOOK_PANEL_VERSION".to_string(),
-                format!("panel version {panel_version} is invalid: {}", err.message()),
+                format!(
+                    "panel version {panel_version} is invalid: {}",
+                    err.message()
+                ),
                 "Advise with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
             );
         }
@@ -586,7 +602,14 @@ pub(crate) fn guard_advisory_hook_at(
     let outcome = run_advisory_hook_with_budget(budget_ms, move || {
         quick_signal_owned(candidate, profile, exemplars)
     });
-    persist_and_serve_advisory(cache_dir, project, outcome, budget_ms, budget_overridden, None)
+    persist_and_serve_advisory(
+        cache_dir,
+        project,
+        outcome,
+        budget_ms,
+        budget_overridden,
+        None,
+    )
 }
 
 /// Persist the advisory outcome (latest outcome + cumulative counters, readback

@@ -2109,7 +2109,9 @@ fn detect_anomalies_serves_no_blind_spot_finding_for_clean_corpus() {
 #[test]
 fn detect_anomalies_labels_blind_spot_unavailable_without_a_graph_snapshot() {
     use astrolabe_weave::ASSAY_ANOMALY_PAYLOAD_SCHEMA;
-    use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag};
+    use calyx_assay::{
+        AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag,
+    };
     use calyx_core::AnchorKind;
     let dir = temp_dir("blind-spot-no-snapshot");
     fs::create_dir_all(&dir).unwrap();
@@ -6523,7 +6525,9 @@ const COMMIT_OOD_ALIEN_SOURCE: &str = "fn parse_tokens(raw: &str) -> Vec<String>
 /// threshold, not the measured cosines — the panel measurement is untouched.
 fn force_guard_profile_taus(dir: &Path, tau: f64) {
     let key = metadata_key("demo", "optimizer_guard_health_json");
-    let raw = read_config_value(dir, &key).unwrap().expect("calibrated profile");
+    let raw = read_config_value(dir, &key)
+        .unwrap()
+        .expect("calibrated profile");
     let mut value: Value = serde_json::from_str(&raw).unwrap();
     for slot in value["slots"].as_array_mut().expect("profile slots") {
         slot["tau"] = json!(tau);
@@ -6565,7 +6569,10 @@ fn guard_commit_ood_planted_ood_commit_surfaces_verdict_and_readback() {
     assert_eq!(result["status"], "scored");
     assert_eq!(result["commit_ref"], "commit:planted-ood");
     assert_eq!(result["scored"], 1);
-    assert_eq!(result["ood"], true, "an alien changed symbol makes the commit OOD: {result}");
+    assert_eq!(
+        result["ood"], true,
+        "an alien changed symbol makes the commit OOD: {result}"
+    );
     let triggers = result["triggers"].as_array().unwrap();
     assert_eq!(triggers.len(), 1, "{result}");
     assert_eq!(triggers[0]["subject_cx"], "cx:changed");
@@ -6574,7 +6581,9 @@ fn guard_commit_ood_planted_ood_commit_surfaces_verdict_and_readback() {
 
     // FSV: independently read the review surface back from the config store.
     let reviews_key = metadata_key("demo", "guard_commit_ood_reviews_json");
-    let persisted = read_config_value(&dir, &reviews_key).unwrap().expect("review surface persisted");
+    let persisted = read_config_value(&dir, &reviews_key)
+        .unwrap()
+        .expect("review surface persisted");
     let reviews: Value = serde_json::from_str(&persisted).unwrap();
     let reviews = reviews.as_array().unwrap();
     assert_eq!(reviews.len(), 1);
@@ -6584,7 +6593,10 @@ fn guard_commit_ood_planted_ood_commit_surfaces_verdict_and_readback() {
 
     // Surfaced (labeled) on optimizer_status + get_readiness.
     let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
-    assert_eq!(status["commit_ood"]["schema"], "astro.guard.commit_ood_surface.v1");
+    assert_eq!(
+        status["commit_ood"]["schema"],
+        "astro.guard.commit_ood_surface.v1"
+    );
     assert_eq!(status["commit_ood"]["count"], 1);
     assert_eq!(status["commit_ood"]["ood_count"], 1);
     assert_eq!(status["commit_ood"]["trust"], "verified");
@@ -6600,13 +6612,24 @@ fn guard_commit_ood_planted_ood_commit_surfaces_verdict_and_readback() {
     let raw = guard_commit_ood_at(&dir, "demo", clean_args.as_object().unwrap()).unwrap();
     let clean: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(clean["isError"], false, "{clean}");
-    assert_eq!(clean["structuredContent"]["ood"], false, "a conforming commit raises no alarm: {clean}");
-    assert!(clean["structuredContent"]["triggers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        clean["structuredContent"]["ood"], false,
+        "a conforming commit raises no alarm: {clean}"
+    );
+    assert!(
+        clean["structuredContent"]["triggers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     // The clean review appends without raising the OOD count beyond the planted one.
     let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
     assert_eq!(status["commit_ood"]["count"], 2);
-    assert_eq!(status["commit_ood"]["ood_count"], 1, "only the planted commit is OOD");
+    assert_eq!(
+        status["commit_ood"]["ood_count"], 1,
+        "only the planted commit is OOD"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -6631,9 +6654,14 @@ fn guard_commit_ood_watcher_pending_tick_scores_and_clears() {
 
     // FSV: the review is persisted and the pending request is cleared.
     let reviews_key = metadata_key("demo", "guard_commit_ood_reviews_json");
-    let persisted = read_config_value(&dir, &reviews_key).unwrap().expect("review persisted");
+    let persisted = read_config_value(&dir, &reviews_key)
+        .unwrap()
+        .expect("review persisted");
     let reviews: Value = serde_json::from_str(&persisted).unwrap();
-    assert_eq!(reviews.as_array().unwrap()[0]["commit_ref"], "commit:watcher-tick");
+    assert_eq!(
+        reviews.as_array().unwrap()[0]["commit_ref"],
+        "commit:watcher-tick"
+    );
     assert_eq!(reviews.as_array().unwrap()[0]["ood"], true);
     assert!(
         read_config_value(&dir, &pending_key).unwrap().is_none(),
@@ -6654,7 +6682,10 @@ fn guard_commit_ood_refuses_not_shadow_and_missing_symbols() {
     let envelope: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_COMMIT_OOD_NOT_SHADOW"),
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_COMMIT_OOD_NOT_SHADOW"),
         "{envelope}"
     );
 
@@ -6665,7 +6696,10 @@ fn guard_commit_ood_refuses_not_shadow_and_missing_symbols() {
     let envelope: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_COMMIT_OOD_INVALID"),
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_COMMIT_OOD_INVALID"),
         "{envelope}"
     );
     fs::remove_dir_all(&dir).ok();
@@ -6711,9 +6745,14 @@ fn guard_advisory_hook_in_budget_measures_and_persists() {
 
     // FSV: read the persisted outcome surface back byte-identically.
     let key = metadata_key("demo", "guard_advisory_hook_json");
-    let persisted = read_config_value(&dir, &key).unwrap().expect("advisory surface persisted");
+    let persisted = read_config_value(&dir, &key)
+        .unwrap()
+        .expect("advisory surface persisted");
     let stored: Value = serde_json::from_str(&persisted).unwrap();
-    assert_eq!(stored, *result, "served advisory outcome must equal the persisted bytes");
+    assert_eq!(
+        stored, *result,
+        "served advisory outcome must equal the persisted bytes"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -6731,7 +6770,10 @@ fn guard_advisory_hook_over_budget_is_silent_counted_and_never_blocks() {
     let elapsed = started.elapsed();
     let envelope: Value = serde_json::from_str(&raw).unwrap();
     // Never blocks (never a refusal / isError), never returns a blocking verdict.
-    assert_eq!(envelope["isError"], false, "an over-budget advisory must never error: {envelope}");
+    assert_eq!(
+        envelope["isError"], false,
+        "an over-budget advisory must never error: {envelope}"
+    );
     let result = &envelope["structuredContent"];
     assert_eq!(result["outcome"], "silent_timeout", "{result}");
     assert_eq!(result["advisory"], false);
@@ -6764,14 +6806,20 @@ fn guard_advisory_hook_unmeasurable_candidate_is_silent_counted_never_refuses() 
     let args = advisory_hook_args(None, "   \n\t\n");
     let raw = guard_advisory_hook_at(&dir, "demo", args.as_object().unwrap()).unwrap();
     let envelope: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(envelope["isError"], false, "a silent skip must never block: {envelope}");
+    assert_eq!(
+        envelope["isError"], false,
+        "a silent skip must never block: {envelope}"
+    );
     let result = &envelope["structuredContent"];
     assert_eq!(result["outcome"], "silent_error", "{result}");
     assert_eq!(result["advisory"], false);
     assert_eq!(result["code"], "ASTRO_GUARD_HOOK_MEASUREMENT_FAILED");
     assert_eq!(result["counters"]["silent_error"], 1, "{result}");
     assert!(
-        result["detail"].as_str().unwrap().contains("ASTRO_GUARD_REPARSE"),
+        result["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_REPARSE"),
         "the labeled root cause travels with the counted skip: {result}"
     );
     fs::remove_dir_all(&dir).ok();
@@ -6785,7 +6833,10 @@ fn guard_advisory_hook_refuses_not_shadow_at_boundary() {
     let envelope: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap().contains("ASTRO_GUARD_HOOK_NOT_SHADOW"),
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_HOOK_NOT_SHADOW"),
         "{envelope}"
     );
     fs::remove_dir_all(&dir).ok();

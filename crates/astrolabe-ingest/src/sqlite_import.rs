@@ -2697,7 +2697,7 @@ where
     // error; the per-element mutation is independent, so the result is invariant to
     // the worker count.
     use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
-    items.par_iter_mut().try_for_each(|item| f(item))
+    items.par_iter_mut().try_for_each(f)
 }
 
 /// Maps `items` through `f`, chunked over at most `workers` scoped threads,
@@ -8046,7 +8046,7 @@ mod tests {
                 "Function",
                 "",
                 r#"{"source_snippet":"x"}"#,
-                7,
+                1,
                 ASTRO_SYMBOL_IDENTITY_EMPTY,
                 "Populate project, qualified_name, and label before deriving Astrolabe identity.",
             ),
@@ -8064,7 +8064,7 @@ mod tests {
                 "Function",
                 "demo.bad.nan",
                 r#"{"source_snippet":"x","scalar_complexity":"NaN"}"#,
-                7,
+                1,
                 ASTRO_SYMBOL_NON_FINITE,
                 "Drop or repair non-finite scalar values before admitting the symbol.",
             ),
@@ -8076,7 +8076,7 @@ mod tests {
                     r#"{{"source_snippet":"x","source_snippet_blake3":"{}"}}"#,
                     "07".repeat(32)
                 ),
-                7,
+                1,
                 ASTRO_SOURCE_DRIFT,
                 "Re-read the source snippet from persisted bytes and recompute the supplied hash before ingest.",
             ),
@@ -8085,7 +8085,7 @@ mod tests {
                 "Function",
                 "demo.bad.anchor",
                 r#"{"source_snippet":"x","anchors":[{"source":"ci:github:run-1","confidence":0.0}]}"#,
-                7,
+                1,
                 ASTRO_ANCHOR_CONFIDENCE_RANGE,
                 "Clamp or reject anchor confidence so only values in (0, 1] are admitted.",
             ),
