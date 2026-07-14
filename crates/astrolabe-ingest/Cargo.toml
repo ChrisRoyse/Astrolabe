@@ -15,6 +15,7 @@ calyx-core.workspace = true
 calyx-ledger.workspace = true
 calyx-paths.workspace = true
 blake3 = "1"
+rayon = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

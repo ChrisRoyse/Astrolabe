@@ -2681,7 +2681,7 @@ where
 fn parallel_for_each_mut<T, F>(items: &mut [T], workers: usize, f: F) -> IngestResult<()>
 where
     T: Send,
-    F: Fn(&mut T) -> IngestResult<()> + Sync,
+    F: Fn(&mut T) -> IngestResult<()> + Sync + Send,
 {
     let worker_count = workers.min(items.len()).max(1);
     if worker_count == 1 {
@@ -2690,27 +2690,14 @@ where
         }
         return Ok(());
     }
-    let chunk_size = items.len().div_ceil(worker_count);
-    thread::scope(|scope| {
-        let f = &f;
-        let handles = items
-            .chunks_mut(chunk_size)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    for item in chunk.iter_mut() {
-                        f(item)?;
-                    }
-                    Ok::<(), IngestError>(())
-                })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            handle
-                .join()
-                .map_err(|_| IngestError::InvalidInput("parallel row worker panicked".into()))??;
-        }
-        Ok(())
-    })
+    // #349 root cause (see `parallel_map`): route the per-row work through rayon's
+    // pre-attached global pool instead of ad-hoc `thread::scope` spawns, which
+    // thread-attach-fault in the debug + mingw + static-libcbm server binary.
+    // `try_for_each` mutates each element in place and short-circuits on the first
+    // error; the per-element mutation is independent, so the result is invariant to
+    // the worker count.
+    use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+    items.par_iter_mut().try_for_each(|item| f(item))
 }
 
 /// Maps `items` through `f`, chunked over at most `workers` scoped threads,
@@ -2719,40 +2706,24 @@ fn parallel_map<T, U, F>(items: Vec<T>, workers: usize, f: F) -> IngestResult<Ve
 where
     T: Send,
     U: Send,
-    F: Fn(T) -> IngestResult<U> + Sync,
+    F: Fn(T) -> IngestResult<U> + Sync + Send,
 {
     let worker_count = workers.min(items.len()).max(1);
     if worker_count == 1 {
         return items.into_iter().map(f).collect();
     }
-    let chunk_size = items.len().div_ceil(worker_count);
-    let mut chunks = Vec::with_capacity(worker_count);
-    let mut drain = items.into_iter();
-    loop {
-        let chunk = drain.by_ref().take(chunk_size).collect::<Vec<_>>();
-        if chunk.is_empty() {
-            break;
-        }
-        chunks.push(chunk);
-    }
-    thread::scope(|scope| {
-        let f = &f;
-        let handles = chunks
-            .into_iter()
-            .map(|chunk| {
-                scope.spawn(move || chunk.into_iter().map(f).collect::<IngestResult<Vec<_>>>())
-            })
-            .collect::<Vec<_>>();
-        let mut out = Vec::new();
-        for handle in handles {
-            out.extend(
-                handle.join().map_err(|_| {
-                    IngestError::InvalidInput("parallel row worker panicked".into())
-                })??,
-            );
-        }
-        Ok(out)
-    })
+    // #349 root cause: the previous ad-hoc `thread::scope` spawned fresh OS
+    // threads, and in the debug + mingw + static-libcbm astrolabe-server binary
+    // every new thread's C-runtime thread-attach STATUS_ACCESS_VIOLATIONs before
+    // the closure even runs (green in release and in the non-libcbm ingest/weave
+    // test binaries, which is why worker>1 was pinned to 1 as containment). rayon's
+    // global pool threads are attached once at pool init and reused, so routing the
+    // per-row decode through them avoids the repeated thread-attach fault entirely.
+    // `into_par_iter().map(..).collect::<Result<Vec<_>>>()` preserves input order and
+    // short-circuits on the first error, so the output stays byte-identical across
+    // worker counts (the seeded worker-count-invariance FSVs still hold).
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    items.into_par_iter().map(f).collect()
 }
 
 /// Reverts planned Graph rows to their persisted bytes when only volatile
@@ -4382,18 +4353,14 @@ where
         .collect::<Vec<_>>();
     // Validation + conversion is per-row independent; the JSON object check on
     // every edge properties string dominated this read at M scale (#23). The
-    // worker count is deliberately fixed at 1 here as containment for the
-    // debug-build STATUS_ACCESS_VIOLATION (#349): the ad-hoc `thread::scope`
-    // pools that decode snapshot rows fault on thread-attach ONLY in the debug +
-    // mingw + static-libcbm astrolabe-server binary (green in release, and green
-    // in the non-libcbm ingest/weave test binaries where this same helper runs
-    // worker>1). rayon's global pool (the SST `par_iter` layer) does NOT fault in
-    // that binary, so the tracked root-cause fix is to route this decode through
-    // the already-attached rayon pool rather than ad-hoc thread spawns; that cure
-    // must be verified against the debug libcbm server binary (#349, server-side).
-    // The loop stays in parallel_map form so worker>1 can be re-enabled once the
-    // fix lands. Note: `scan_cf_range_keys_at` was exonerated separately (#349).
-    let mut edges = parallel_map(raw_edge_rows, 1, |row| {
+    // decode now runs worker>1 again: `parallel_map` routes any worker_count>1
+    // through rayon's pre-attached global pool (see its body), which is the #349
+    // root-cause cure for the debug + mingw + static-libcbm STATUS_ACCESS_VIOLATION
+    // — the fault was the ad-hoc `thread::scope` thread-attach, not this decode or
+    // `scan_cf_range_keys_at` (both exonerated). rayon's global pool threads attach
+    // once at pool init, so they never hit the fault. Output order is preserved by
+    // rayon's ordered collect, so the read-back stays byte-identical.
+    let mut edges = parallel_map(raw_edge_rows, rayon::current_num_threads().max(2), |row| {
         if row.schema != SCHEMA_CBM_EDGE_ROW {
             return Err(IngestError::InvalidInput(format!(
                 "raw edge row {} has wrong schema {}",
