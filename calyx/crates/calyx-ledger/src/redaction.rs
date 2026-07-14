@@ -221,6 +221,17 @@ fn allowed_stable_identifier(token: &str, field: Option<&str>) -> bool {
         // `shadow-import-v1:<project>` label that never reaches this check.
         return matches!(token.len(), 7..=40) && is_hex(token);
     }
+    if field == "project" {
+        // The project identifier is the CBM/Astrolabe sanitized repo-path slug
+        // (`index_project_from_args` -> `cbm_project_name_from_path`): filesystem
+        // path characters mapped to an ascii dash/dot/underscore identifier. It is
+        // derived provenance metadata, never user secret material, and is
+        // legitimately long for a deeply-nested repo path (e.g.
+        // `C-code-...-fusiondemo`), so it is allowlisted by its identifier shape.
+        return token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    }
     if field_allows_manifest_slug(&field) && is_manifest_slug(token) {
         return true;
     }
