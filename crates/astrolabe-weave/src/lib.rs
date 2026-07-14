@@ -48,8 +48,9 @@ pub use drift_producer::{
     DRIFT_REFERENCE_KNOBS, DRIFT_REFERENCE_MAX_SAMPLE_CAP, DRIFT_REFERENCE_MIN_SAMPLE_CAP,
     DRIFT_REFERENCE_PAYLOAD_SCHEMA, DRIFT_REFERENCE_SAMPLE_CAP_KNOB, DriftProductionReport,
     DriftReferenceSamplingReport, DriftSlotSamples, SlotSamplingProvenance, bound_reference_window,
-    drift_reference_sample_cap, load_drift_reference, persist_drift_reference, produce_drift_cards,
-    read_slot_samples_from_vault, run_index_time_drift,
+    drift_reference_sample_cap, load_drift_reference, load_drift_reference_counted,
+    persist_drift_reference, produce_drift_cards, read_slot_samples_from_vault,
+    run_index_time_drift,
 };
 pub use kernel_index::{
     ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT, ASTRO_KERNEL_INDEX_NO_MEMBERS,

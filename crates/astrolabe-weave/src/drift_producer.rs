@@ -19,7 +19,7 @@
 //! is a **labeled absence** — counted in [`DriftProductionReport`], never a
 //! fabricated baseline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astrolabe_assay::rng::DeterministicRng;
 use astrolabe_assay::{DiffConfig, DiffLedger, DifferentiationCard, DriftCard, measure_drift};
@@ -33,7 +33,25 @@ use calyx_core::{CalyxError, Clock, Result, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::ASSAY_ANOMALY_PAYLOAD_SCHEMA;
+use crate::{ASSAY_ANOMALY_PAYLOAD_SCHEMA, ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA};
+
+/// Loads the Assay store co-tenant-aware. `ColumnFamily::Assay` is shared: the
+/// shadow importer co-tenants `astrolabe.delta_invalidation.v1` rows there
+/// (#348), and — the wave-14 live finding on real cbm/ — the strict
+/// [`AssayStore::load_from_vault`] failed the WHOLE index-time drift pass with
+/// `CALYX_ASTER_CORRUPT_SHARD: decode assay row: missing field cache_key` on
+/// any corpus whose import wrote invalidation rows. Accepted co-tenant rows are
+/// skipped and **counted** (invariant 3); anything else still fails closed.
+fn load_assay_store_cotenant_aware<C>(vault: &AsterVault<C>) -> Result<(AssayStore, usize)>
+where
+    C: Clock,
+{
+    let accepted: BTreeSet<&str> = [ASSAY_DELTA_INVALIDATION_COTENANT_SCHEMA]
+        .into_iter()
+        .collect();
+    let (store, skips) = AssayStore::load_from_vault_with_cotenants(vault, &accepted)?;
+    Ok((store, skips.skipped_rows))
+}
 
 /// Registry version tag for the drift-reference bounding knobs (invariant 4).
 pub const DRIFT_REFERENCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-drift-reference-knobs-v1";
@@ -144,6 +162,10 @@ pub struct DriftReferenceSamplingReport {
     pub total_retained: usize,
     /// Per-slot sampling provenance, one entry per input slot.
     pub per_slot: Vec<SlotSamplingProvenance>,
+    /// Accepted Assay-CF co-tenant rows (delta-invalidation schema) skipped —
+    /// counted, never silent — while loading the store to merge the reference
+    /// row into (invariant 3).
+    pub assay_cotenant_rows_skipped: usize,
 }
 
 /// Deterministically bounds each slot's samples to at most `cap` points via a
@@ -222,6 +244,10 @@ pub struct DriftProductionReport {
     /// Differentiation-card ledger entries appended (one per card), each
     /// hash-chain verified by [`DiffLedger::append`] on write.
     pub cards_ledgered: usize,
+    /// Accepted Assay-CF co-tenant rows (delta-invalidation schema) skipped —
+    /// counted, never silent — across the pass's reference load, card persist,
+    /// and reference persist (invariant 3).
+    pub assay_cotenant_rows_skipped: usize,
 }
 
 /// Reads the current import's per-slot samples from the persisted Slot column
@@ -276,7 +302,18 @@ pub fn load_drift_reference<C>(vault: &AsterVault<C>) -> Result<Vec<DriftSlotSam
 where
     C: Clock,
 {
-    let assay = AssayStore::load_from_vault(vault)?;
+    Ok(load_drift_reference_counted(vault)?.0)
+}
+
+/// [`load_drift_reference`] with the accepted-co-tenant skip count surfaced, so
+/// callers that report drift production can count the skips (invariant 3).
+pub fn load_drift_reference_counted<C>(
+    vault: &AsterVault<C>,
+) -> Result<(Vec<DriftSlotSamples>, usize)>
+where
+    C: Clock,
+{
+    let (assay, cotenant_rows_skipped) = load_assay_store_cotenant_aware(vault)?;
     for row in assay.rows() {
         let Some(payload) = row.payload.as_ref() else {
             continue;
@@ -285,7 +322,7 @@ where
             continue;
         }
         let Some(values) = payload.get("slots").and_then(Value::as_array) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), cotenant_rows_skipped));
         };
         let mut out = Vec::with_capacity(values.len());
         for value in values {
@@ -295,9 +332,9 @@ where
                 })?;
             out.push(slot);
         }
-        return Ok(out);
+        return Ok((out, cotenant_rows_skipped));
     }
-    Ok(Vec::new())
+    Ok((Vec::new(), cotenant_rows_skipped))
 }
 
 /// Persists `slots` as the reference window for the next import, **bounded** by a
@@ -336,7 +373,7 @@ where
         },
         "slots": bounded,
     });
-    let mut assay = AssayStore::load_from_vault(vault)?;
+    let (mut assay, assay_cotenant_rows_skipped) = load_assay_store_cotenant_aware(vault)?;
     assay.put_with_payload(
         cache_key,
         AssaySubject::EnsembleCard,
@@ -356,6 +393,7 @@ where
         total_population,
         total_retained,
         per_slot,
+        assay_cotenant_rows_skipped,
     })
 }
 
@@ -426,7 +464,8 @@ where
         "schema": ASSAY_ANOMALY_PAYLOAD_SCHEMA,
         "drift_cards": drift_cards,
     });
-    let mut assay = AssayStore::load_from_vault(vault)?;
+    let (mut assay, assay_cotenant_rows_skipped) = load_assay_store_cotenant_aware(vault)?;
+    report.assay_cotenant_rows_skipped += assay_cotenant_rows_skipped;
     assay.put_with_payload(
         cache_key,
         AssaySubject::Panel,
@@ -465,7 +504,7 @@ where
 {
     let provenance = provenance.into();
     let current = read_slot_samples_from_vault(vault, project, slots)?;
-    let reference = load_drift_reference(vault)?;
+    let (reference, reference_load_skips) = load_drift_reference_counted(vault)?;
     let mut report = if reference.is_empty() {
         // First import: no reference window at all — every populated slot is a
         // labeled absence, no card produced.
@@ -488,7 +527,7 @@ where
             ledger,
         )?
     };
-    persist_drift_reference(
+    let sampling = persist_drift_reference(
         vault,
         cache_key,
         format!("{provenance}:reference"),
@@ -496,6 +535,8 @@ where
         seed,
     )?;
     report.reference_persisted = true;
+    report.assay_cotenant_rows_skipped +=
+        reference_load_skips + sampling.assay_cotenant_rows_skipped;
     Ok(report)
 }
 

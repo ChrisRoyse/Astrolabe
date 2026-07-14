@@ -91,18 +91,17 @@ pub(crate) fn apply_live_reproduce(
     Ok(())
 }
 
+/// Parsed reproduce-fixture graph: the answer-engine inputs (`nodes`, `edges`,
+/// `matched_ids`) decoded from a persisted fixture.
+type ReproduceGraphParts = (
+    Vec<astrolabe_kernel::AnswerNode>,
+    Vec<astrolabe_kernel::AnswerEdge>,
+    Vec<astrolabe_domain::calyx::CxId>,
+);
+
 /// Parses a persisted reproduce-fixture `graph` object into the answer-engine
 /// inputs (`nodes`, `edges`, `matched_ids`), failing closed on a malformed graph.
-fn parse_reproduce_graph(
-    graph: &Value,
-) -> Result<
-    (
-        Vec<astrolabe_kernel::AnswerNode>,
-        Vec<astrolabe_kernel::AnswerEdge>,
-        Vec<astrolabe_domain::calyx::CxId>,
-    ),
-    DynError,
-> {
+fn parse_reproduce_graph(graph: &Value) -> Result<ReproduceGraphParts, DynError> {
     let nodes = graph
         .get("nodes")
         .and_then(Value::as_array)

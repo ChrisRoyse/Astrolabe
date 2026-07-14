@@ -5785,8 +5785,10 @@ fn guard_calibrate_generated_mode_builds_and_measures_the_bad_corpus() {
 #[test]
 fn guard_calibrate_generated_mode_caps_good_population_deterministically() {
     let dir = temp_dir("guard-calibrate-generated-cap");
-    // A large trusted population (M-representative): 40 indexed good symbols.
-    let names: Vec<String> = (0..40).map(|i| format!("good_{i}")).collect();
+    // A large trusted population (M-representative): 120 indexed good symbols —
+    // comfortably above MIN_GOOD_SAMPLE_CAP (50, the Ward MIN_BAD_SCORES floor
+    // the registry bounds pin) so an in-bounds cap still engages.
+    let names: Vec<String> = (0..120).map(|i| format!("good_{i}")).collect();
     let good_symbols: Vec<(&str, i32)> = names
         .iter()
         .enumerate()
@@ -5810,8 +5812,10 @@ fn guard_calibrate_generated_mode_caps_good_population_deterministically() {
             "mode": "generated",
             "domain": {"language": "rust", "scope_class": "core"},
             "seed": seed,
-            // Cap the good population far below its size to force the cap to engage.
-            "good_sample_cap": 10,
+            // Cap the good population below its size to force the cap to engage.
+            // 50 is the registry floor (MIN_GOOD_SAMPLE_CAP == Ward MIN_BAD_SCORES);
+            // anything lower is refused fail-closed, as the bad_args leg asserts.
+            "good_sample_cap": 50,
             "mutation_sources": [
                 "fn f(a: i32, b: i32) -> i32 { if a < b && a == 0 { return a + 1; } a - b }",
                 "fn g(x: i32) -> bool { !(x > 3) || x <= 10 }",
@@ -5833,14 +5837,14 @@ fn guard_calibrate_generated_mode_caps_good_population_deterministically() {
         sampling["knob_registry"], "astro.guard.calibration_sampling.v1",
         "sampling knobs are registry-declared: {sampling}"
     );
-    assert_eq!(sampling["good_sample_cap"], 10);
+    assert_eq!(sampling["good_sample_cap"], 50);
     assert_eq!(
-        sampling["good_population_total"], 40,
+        sampling["good_population_total"], 120,
         "the pre-sampling trusted population is the whole indexed set: {sampling}"
     );
     let good_sampled = sampling["good_sampled"].as_u64().expect("good_sampled");
     assert!(
-        good_sampled <= 10,
+        good_sampled <= 50,
         "the panel-read count is bounded by the cap: {sampling}"
     );
     assert_eq!(sampling["good_capped"], true, "the cap engaged: {sampling}");

@@ -611,6 +611,7 @@ where
             "cards_payload_persisted": report.cards_payload_persisted,
             "reference_persisted": report.reference_persisted,
             "cards_ledgered": report.cards_ledgered,
+            "assay_cotenant_rows_skipped": report.assay_cotenant_rows_skipped,
             "trust": "measured",
             "provenance": "index_time_drift",
         }),
