@@ -88,6 +88,35 @@ pub(crate) fn read_config_value(cache_dir: &Path, key: &str) -> Result<Option<St
         .optional()?)
 }
 
+/// Reads every `(key, value)` config row whose key starts with `prefix`, ordered
+/// by key ascending for deterministic enumeration.
+///
+/// `_` and `%` in `prefix` are escaped so a literal metadata prefix (which
+/// contains neither today, but might) is matched exactly rather than as a LIKE
+/// wildcard. Used to enumerate the persisted per-axis assay cards behind the
+/// `get_architecture` `signal_ranking` aspect (#43).
+pub(crate) fn scan_config_prefix(
+    cache_dir: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, DynError> {
+    let conn = open_config(cache_dir)?;
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let mut stmt =
+        conn.prepare("SELECT key, value FROM config WHERE key LIKE ? ESCAPE '\\' ORDER BY key")?;
+    let rows = stmt.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn write_config_value(cache_dir: &Path, key: &str, value: &str) -> Result<(), DynError> {
     let conn = open_config(cache_dir)?;
     conn.execute(
