@@ -73,6 +73,18 @@ pub use incremental::{
     GraphDelta, RebuildReport, RegionGraph, build_region_graph, rebuild_dirty, region_id,
 };
 
+/// Grounded kernel answer paths: hop-attenuated, ledger-wired Q&A (#40).
+pub mod answer;
+pub use answer::{
+    ASTRO_KERNEL_ANSWER_KNOB_RANGE, ASTRO_KERNEL_ANSWER_NO_ENTRY,
+    ASTRO_KERNEL_ANSWER_TRACE_MISMATCH, ASTRO_KERNEL_ANSWER_UNGROUNDED, AnswerConfig,
+    AnswerDeficit, AnswerEdge, AnswerHop, AnswerNode, AnswerRefusal, AnswerResolution,
+    CALYX_KERNEL_ANSWER_LEDGER_REQUIRED, KERNEL_ANSWER_KNOB_REGISTRY_VERSION, KERNEL_ANSWER_KNOBS,
+    KERNEL_ANSWER_REFUSAL_SCHEMA, KERNEL_ANSWER_SCHEMA, KERNEL_GAP_REPORT_SCHEMA, KernelAnswer,
+    KernelGap, KernelGapReport, answer_artifact_bytes, answer_query, attenuation_at,
+    kernel_gap_report, verify_answer_trace, weight_to_permille,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SEARCH_SCALE_SCHEMA: &str = "astrolabe.search_scale_plan.v1";
 pub const SEARCH_SCALE_KNOB_REGISTRY_VERSION: &str = "astro.kernel.search_scale_knobs.v1";

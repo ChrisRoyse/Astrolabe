@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 18] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 19] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -19,15 +19,17 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 18] {
         assay_gate_tool_definition(),
         abduce_cause_tool_definition(),
         forecast_tool_definition(),
+        // #39 + #40: unified get_kernel (modes read|gaps|quadrant|build) + kernel_answer.
         get_kernel_tool_definition(),
+        kernel_answer_tool_definition(),
     ]
 }
 
 pub(crate) fn get_kernel_tool_definition() -> Value {
     json!({
         "name": "get_kernel",
-        "title": "Kernel Grounding Gaps",
-        "description": "The \"here be dragons\" QA map (P6.3): kernel members with no grounding anchor, surfaced from a shadow-indexed project's persisted kernel context. mode=\"gaps\" (default) serves the grounding-gap report — kernel members whose persisted grounded flag is false — ranked by persisted kernel weight (importance), with a labeled degradation because the change-frequency churn term and the exact 3-hop grounding boundary live in the persisted kernel artifact, not this metadata surface. mode=\"quadrant\" serves the coverage-vs-importance scatter, classifying every member into critical/peripheral × verified/unverified with the kernel crate's registry-knob split; the critical-and-unverified quadrant is the actionable QA target that feeds readiness and the UI overlay. Every response carries trust/freshness/provenance and fails closed with {code,message,remediation} when the project is not shadow-indexed, its kernel context is unavailable, or the mode is unknown.",
+        "title": "Get Kernel",
+        "description": "Serve the persisted kernel for a shadow-indexed project. Four modes over the persisted kernel context (scope-summary members: qualified name, kernel weight/score in permille, grounded flag, provenance, recall metrics). mode=\"read\" (default) serves every kernel member per scope with recall metrics and grounded fraction. mode=\"gaps\" serves the \"here be dragons\" grounding-gap report — kernel members whose persisted grounded flag is false — ranked by persisted kernel weight (importance), with a labeled degradation because the change-frequency churn term and the exact 3-hop grounding boundary live in the persisted kernel artifact, not this metadata surface. mode=\"quadrant\" serves the coverage-vs-importance scatter, classifying every member into critical/peripheral × verified/unverified with the kernel crate's registry-knob split; the critical-and-unverified quadrant is the actionable QA target that feeds readiness and the UI overlay. mode=\"build\" recomputes the feedback-vertex-set kernel over the vault association graph — pending the GraphProjectionCsr->KernelGraph adapter (#343), it fails closed with that dependency. Optionally scoped by scope id. Every response carries trust/freshness/provenance and fails closed with {code,message,remediation} when the project is not shadow-indexed, its kernel context is unavailable, the scope is absent, or the mode is unknown.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -37,8 +39,16 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["gaps", "quadrant"],
-                    "description": "gaps (default): ranked grounding-gap report of ungrounded kernel members. quadrant: coverage-vs-importance scatter with per-quadrant counts."
+                    "enum": ["read", "gaps", "quadrant", "build"],
+                    "description": "read (default): kernel members + recall per scope. gaps: ranked grounding-gap report of ungrounded kernel members. quadrant: coverage-vs-importance scatter with per-quadrant counts. build: recompute the FVS kernel (pending vault adapter #343)."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to restrict the kernel to (read/gaps modes). Omit for every persisted scope. An unknown scope refuses fail-closed."
+                },
+                "budget": {
+                    "type": "integer",
+                    "description": "Optional member budget hint for mode=build (honored once the FVS build is wired to the vault adapter #343)."
                 }
             },
             "required": ["project"],
@@ -47,10 +57,44 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
         "outputSchema": {
             "type": "object",
             "properties": {
-                "content": {
-                    "type": "array",
-                    "items": {"type": "object"}
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn kernel_answer_tool_definition() -> Value {
+    json!({
+        "name": "kernel_answer",
+        "title": "Kernel Answer",
+        "description": "Grounded kernel-first Q&A for a shadow-indexed project: kernel-first search resolves an anchored (Trusted-grounded) entry point, then a hop-attenuated answer path walks association edges outward with hop_score = edge_weight * 0.9^hop, every hop carrying its ledger reference and every node its provenance. The answer is assembled from the path nodes with a total score, ordered provenance, and a rolled-up trust tag; an ungrounded scope or an unanswerable query refuses with a per-lens deficit rather than an empty answer, and a multi-hop answer without complete ledger wiring fails closed with CALYX_KERNEL_ANSWER_LEDGER_REQUIRED (never served unprovenanced). The answer-path algorithm is implemented and FSV-covered in astrolabe_kernel::answer; assembling the association graph over the vault is pending the GraphProjectionCsr->KernelGraph adapter (#343), so this tool currently fails closed with that dependency. Fails closed with {code,message,remediation} on a missing project/query or a non-shadow project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
                 },
+                "query": {
+                    "type": "string",
+                    "description": "The question to answer from the kernel. An empty query refuses fail-closed."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to restrict the kernel-first search to."
+                }
+            },
+            "required": ["project", "query"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
                 "structuredContent": {"type": "object"},
                 "isError": {"type": "boolean"}
             },

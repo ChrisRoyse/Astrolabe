@@ -4,80 +4,16 @@ use astrolabe_kernel::{
     COVERAGE_QUADRANT_SCHEMA, GROUNDING_GAP_SCHEMA, GapQuadrant, QuadrantConfig, classify_quadrant,
 };
 
-/// `get_kernel` refusal codes (fail-closed, `{code, message, remediation}`).
-pub(crate) const ASTRO_GET_KERNEL_SHADOW_REQUIRED: &str = "ASTRO_GET_KERNEL_SHADOW_REQUIRED";
-pub(crate) const ASTRO_GET_KERNEL_CONTEXT_UNAVAILABLE: &str =
-    "ASTRO_GET_KERNEL_CONTEXT_UNAVAILABLE";
-pub(crate) const ASTRO_GET_KERNEL_MODE_UNSUPPORTED: &str = "ASTRO_GET_KERNEL_MODE_UNSUPPORTED";
-
-/// The "here be dragons" QA surface (#39): kernel members with no grounding
-/// anchor, ranked and quadranted for readiness + UI overlay.
-///
-/// `mode="gaps"` (default) serves the grounding-gap report — the kernel members
-/// carried in the persisted kernel context whose `grounded` flag is false —
-/// ranked by persisted kernel weight (importance). `mode="quadrant"` serves the
-/// coverage-vs-importance scatter, classifying every member by importance
-/// (kernel weight normalized to permille against the scope maximum) against
-/// coverage (grounded → covered) using the kernel crate's registry-knob split.
-///
-/// The report reads back the persisted `kernel_context_json` metadata (the
-/// durable scope-summary rows), never an in-memory echo. The change-frequency
-/// churn term and the exact hop-distance boundary of the grounding-gap ranking
-/// live in the persisted kernel artifact, which this metadata surface does not
-/// yet carry; that degradation is labeled on every response (`ranking_basis`,
-/// `degraded`, `remediation`) rather than silently substituted (HONEST invariant
-/// 3), and the full artifact-backed ranking is tracked as follow-up.
-pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
-    let args = serde_json::from_str::<Value>(args_json)?;
-    let Some(args_obj) = args.as_object() else {
-        return tool_error_result("get_kernel arguments must be a JSON object");
-    };
-    let Some(project) = status_project_from_args(args_obj)? else {
-        return tool_error_result("get_kernel requires project");
-    };
-    let mode = string_arg(args_obj, "mode").unwrap_or("gaps");
-
-    if read_dial(&project)? != MigrationDial::Shadow {
-        return tool_json_error_result(get_kernel_refused(
-            &project,
-            mode,
-            ASTRO_GET_KERNEL_SHADOW_REQUIRED,
-            format!("get_kernel requires calyx shadow indexing for project {project:?}"),
-            "run index_repository with calyx=\"shadow\" for this project before requesting kernel gaps",
-        ));
-    }
-
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    let kernel_context = read_kernel_context_metadata(&cache_dir, &project)?;
-    let members = match gap_members_from_kernel_context(&kernel_context) {
-        Ok(members) => members,
-        Err(reason) => {
-            return tool_json_error_result(get_kernel_refused(
-                &project,
-                mode,
-                ASTRO_GET_KERNEL_CONTEXT_UNAVAILABLE,
-                reason,
-                "rerun index_repository with calyx=\"shadow\" so the kernel context scope summaries are persisted before requesting kernel gaps",
-            ));
-        }
-    };
-
-    match mode {
-        "gaps" => tool_json_result(gap_report_value(&project, &members)),
-        "quadrant" => tool_json_result(quadrant_value(&project, &members)),
-        other => tool_json_error_result(get_kernel_refused(
-            &project,
-            other,
-            ASTRO_GET_KERNEL_MODE_UNSUPPORTED,
-            format!("get_kernel mode {other:?} is not available"),
-            "use mode=\"gaps\" (default) or mode=\"quadrant\"",
-        )),
-    }
-}
+// #39 + #40 unification: the `get_kernel` MCP handler lives in `kernel_answer`
+// (the single tool exposing modes read|gaps|quadrant|build). This module owns the
+// grounding-gap (#39) member extraction, the ranked gap report, and the
+// coverage-vs-importance quadrant that the `gaps`/`quadrant` modes serve; the
+// handler calls `gap_members_from_kernel_context`, `gap_report_value`, and
+// `quadrant_value` below.
 
 /// One kernel member read back from the persisted kernel-context scope summaries.
 #[derive(Debug, Clone)]
-struct GapMember {
+pub(crate) struct GapMember {
     scope_id: String,
     symbol_id: String,
     qualified_name: String,
@@ -88,7 +24,7 @@ struct GapMember {
 
 /// Extracts the kernel members from the persisted kernel-context metadata, or a
 /// reason string when the scope summaries are unavailable (fail-closed).
-fn gap_members_from_kernel_context(kernel_context: &Value) -> Result<Vec<GapMember>, String> {
+pub(crate) fn gap_members_from_kernel_context(kernel_context: &Value) -> Result<Vec<GapMember>, String> {
     let scope_summaries = kernel_context
         .get("scope_summaries")
         .ok_or_else(|| "kernel context carries no scope_summaries block".to_string())?;
@@ -154,7 +90,7 @@ fn gap_members_from_kernel_context(kernel_context: &Value) -> Result<Vec<GapMemb
 
 /// The grounding-gap report envelope: ungrounded members ranked by persisted
 /// kernel weight, `symbol_id` ascending on a tie.
-fn gap_report_value(project: &str, members: &[GapMember]) -> Value {
+pub(crate) fn gap_report_value(project: &str, members: &[GapMember]) -> Value {
     let mut gaps: Vec<&GapMember> = members.iter().filter(|member| !member.grounded).collect();
     gaps.sort_by(|left, right| {
         right
@@ -206,7 +142,7 @@ fn gap_report_value(project: &str, members: &[GapMember]) -> Value {
 /// kernel weight normalized to permille against the scope maximum; coverage is
 /// the persisted grounded flag (grounded → full density, gap → zero). Every
 /// member is classified with the kernel crate's registry-knob split.
-fn quadrant_value(project: &str, members: &[GapMember]) -> Value {
+pub(crate) fn quadrant_value(project: &str, members: &[GapMember]) -> Value {
     let config = QuadrantConfig::with_registry_defaults();
     let max_weight = members
         .iter()
@@ -292,25 +228,4 @@ fn quadrant_ordinal(quadrant: GapQuadrant) -> u8 {
         GapQuadrant::PeripheralUnverified => 2,
         GapQuadrant::PeripheralCovered => 3,
     }
-}
-
-fn get_kernel_refused(
-    project: &str,
-    mode: &str,
-    code: &str,
-    message: impl Into<String>,
-    remediation: &str,
-) -> Value {
-    json!({
-        "schema": GROUNDING_GAP_SCHEMA,
-        "project": project,
-        "mode": mode,
-        "status": "refused",
-        "code": code,
-        "message": message.into(),
-        "remediation": remediation,
-        "trust": "provisional",
-        "freshness": "not_evaluated",
-        "provenance": ["refusal:get_kernel"],
-    })
 }

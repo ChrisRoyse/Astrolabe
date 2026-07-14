@@ -24,11 +24,12 @@ pub fn handle_tool_raw(
         "guard_check" => handle_guard_check(args_json),
         "guard_lock" => handle_guard_lock(args_json),
         "assay_gate" => handle_assay_gate(args_json),
+        "get_kernel" => handle_get_kernel(args_json),
+        "kernel_answer" => handle_kernel_answer(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
         "search_graph" => handle_search_graph(runner, args_json),
         "find_similar" => handle_find_similar(args_json),
         "detect_changes" => handle_detect_changes_grounded_risk(runner, args_json),
-        "get_kernel" => handle_get_kernel(args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
