@@ -115,7 +115,7 @@ fn impact_edge(edge_type: &str, src: CxId, dst: CxId) -> Option<ConsequenceEdge>
 /// composite consequence graph. Every edge that could not be used is counted,
 /// never silently dropped (HONEST invariant 3).
 #[derive(Debug, Default, Clone)]
-struct GraphBuild {
+pub(crate) struct GraphBuild {
     edges_used: usize,
     calls: usize,
     dataflow: usize,
@@ -135,11 +135,18 @@ struct GraphBuild {
 /// invalidation lanes do (raw-edge snapshot rows carry only SQLite node ids).
 /// The covered-symbol -> covering-tests index derived alongside the consequence
 /// graph (each covered `CxId` maps to the set of TESTS `CxId`s that exercise it).
-type CoveredTestsIndex = BTreeMap<CxId, BTreeSet<CxId>>;
+pub(crate) type CoveredTestsIndex = BTreeMap<CxId, BTreeSet<CxId>>;
 
-fn build_consequence_graph(
+/// Derives the raw directed [`ConsequenceEdge`] set (plus the covered→tests index
+/// and the build accounting) from a persisted CBM graph snapshot. Endpoints are
+/// resolved through the node→constellation map exactly as the coverage-ingest and
+/// invalidation lanes do; every edge that could not be used is counted, never
+/// silently dropped (HONEST invariant 3). Shared by [`build_consequence_graph`]
+/// (which validates the edges into a [`ConsequenceGraph`]) and by the
+/// `abduce_cause` surface, which reverse-walks the same edge set.
+pub(crate) fn consequence_edges_from_snapshot(
     snapshot: &CbmGraphSnapshot,
-) -> Result<(ConsequenceGraph, CoveredTestsIndex, GraphBuild), OracleError> {
+) -> (Vec<ConsequenceEdge>, CoveredTestsIndex, GraphBuild) {
     let mut cx_by_node_id: BTreeMap<i64, CxId> = BTreeMap::new();
     for node in &snapshot.nodes {
         if let Some(cx_id) = node.cx_id {
@@ -184,11 +191,18 @@ fn build_consequence_graph(
         edges.push(impact);
     }
 
+    (edges, tests_by_covered, build)
+}
+
+fn build_consequence_graph(
+    snapshot: &CbmGraphSnapshot,
+) -> Result<(ConsequenceGraph, CoveredTestsIndex, GraphBuild), OracleError> {
+    let (edges, tests_by_covered, build) = consequence_edges_from_snapshot(snapshot);
     let graph = ConsequenceGraph::from_edges(&edges)?;
     Ok((graph, tests_by_covered, build))
 }
 
-fn graph_build_json(build: &GraphBuild) -> Value {
+pub(crate) fn graph_build_json(build: &GraphBuild) -> Value {
     json!({
         "edges_used": build.edges_used,
         "calls": build.calls,
@@ -274,14 +288,14 @@ fn persist_predict_gate(cache_dir: &Path, project: &str, record: &Value) -> Resu
 // Response rendering
 // ---------------------------------------------------------------------------
 
-fn cx_label(cx: CxId, cx_to_qn: &BTreeMap<CxId, String>) -> Value {
+pub(crate) fn cx_label(cx: CxId, cx_to_qn: &BTreeMap<CxId, String>) -> Value {
     json!({
         "cx": hex_lower(cx.as_bytes()),
         "qualified_name": cx_to_qn.get(&cx),
     })
 }
 
-fn cx_path(path: &[CxId], cx_to_qn: &BTreeMap<CxId, String>) -> Value {
+pub(crate) fn cx_path(path: &[CxId], cx_to_qn: &BTreeMap<CxId, String>) -> Value {
     Value::Array(path.iter().map(|cx| cx_label(*cx, cx_to_qn)).collect())
 }
 
