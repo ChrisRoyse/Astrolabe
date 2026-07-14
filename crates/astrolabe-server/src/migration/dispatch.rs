@@ -123,7 +123,31 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
             tools.push(definition);
         }
     }
+    // #328: overlay the Astrolabe-side extensions onto the CBM `search_graph`
+    // schema so MCP clients can discover propagated_label + fusion from tools/list.
+    for tool in tools.iter_mut() {
+        if tool.get("name").and_then(Value::as_str) == Some("search_graph") {
+            overlay_search_graph_extensions(tool);
+        }
+    }
     Ok(serde_json::to_string(&response)?)
+}
+
+/// #328: merge the Astrolabe `search_graph` extension properties into the CBM
+/// tool's `inputSchema.properties`, leaving any CBM-native property untouched.
+pub(crate) fn overlay_search_graph_extensions(tool: &mut Value) {
+    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let properties = schema
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(properties) = properties.as_object_mut() else {
+        return;
+    };
+    for (name, spec) in search_graph_astrolabe_property_overlay() {
+        properties.entry(name).or_insert(spec);
+    }
 }
 
 pub(crate) fn should_wrap_tool(
@@ -371,12 +395,27 @@ pub(crate) fn handle_get_architecture(
     )
 }
 
-/// #69 box 5 — `search_graph` with an optional `propagated_label` exact filter.
-/// Without the knob this is a byte-identical passthrough to the CBM tool. With it,
-/// the raw hits are intersected against the project's persisted propagated labels
-/// (`kernel_context.label_propagation`) so an inferred label such as
-/// `security-sensitive` is usable as an exact search filter. Fails closed (coded)
-/// when the project is missing, not shadow-indexed, or propagation is unavailable.
+/// The Astrolabe-only `search_graph` knobs that must never reach the CBM tool
+/// (which rejects unknown args): the #42 fusion engine controls and the #69
+/// propagated_label filter. Advertised in tools/list via
+/// [`search_graph_astrolabe_property_overlay`].
+const SEARCH_GRAPH_ASTROLABE_ONLY_KEYS: [&str; 4] = [
+    "fusion",
+    "fusion_override",
+    "temporal_alpha_millis",
+    "propagated_label",
+];
+
+/// `search_graph` with Astrolabe extensions (#42 fusion, #69 propagated_label).
+///
+/// Default (no Astrolabe knob) is a byte-identical passthrough to the CBM tool.
+/// `fusion: true` (#42) serves the Sextant-fused engine instead of legacy BM25.
+/// `propagated_label` (#69) intersects the raw CBM hits against the project's
+/// persisted propagated labels so an inferred label such as `security-sensitive`
+/// is usable as an exact search filter. Every Astrolabe-only knob is stripped
+/// before the CBM tool sees it. Fails closed (coded) when a filter/fusion request
+/// cannot be served (missing project, not shadow-indexed, propagation/vault
+/// unavailable).
 pub(crate) fn handle_search_graph(
     runner: &CbmToolRunner,
     args_json: &str,
@@ -387,20 +426,39 @@ pub(crate) fn handle_search_graph(
     let Some(args_obj) = args.as_object() else {
         return Ok(runner.handle_tool_raw("search_graph", args_json)?);
     };
-    let Some(label_filter) = string_arg(args_obj, "propagated_label").map(ToOwned::to_owned) else {
-        // No Astrolabe filter requested — pass the original request through unchanged.
-        return Ok(runner.handle_tool_raw("search_graph", args_json)?);
-    };
 
-    // The Astrolabe-only knob must never reach the CBM tool, which rejects unknown args.
+    // #42: opt-in fused engine. Only an explicit `fusion: true` diverts from the
+    // legacy path; anything else keeps the byte-identical CBM passthrough.
+    if args_obj.get("fusion").and_then(Value::as_bool) == Some(true) {
+        return run_fused_search_graph(args_obj);
+    }
+
+    let label_filter = string_arg(args_obj, "propagated_label").map(ToOwned::to_owned);
+    let carries_astrolabe_knob = SEARCH_GRAPH_ASTROLABE_ONLY_KEYS
+        .iter()
+        .any(|key| args_obj.contains_key(*key));
+    if !carries_astrolabe_knob {
+        // Pure legacy request — pass the original bytes through unchanged.
+        return Ok(runner.handle_tool_raw("search_graph", args_json)?);
+    }
+
+    // Strip every Astrolabe-only knob before the CBM tool, which rejects unknown args.
     let mut sanitized = args_obj.clone();
-    sanitized.remove("propagated_label");
+    for key in SEARCH_GRAPH_ASTROLABE_ONLY_KEYS {
+        sanitized.remove(key);
+    }
     let sanitized_json = serde_json::to_string(&Value::Object(sanitized.clone()))?;
 
     let raw = runner.handle_tool_raw("search_graph", &sanitized_json)?;
     if tool_result_is_error(&raw)? {
         return Ok(raw);
     }
+
+    // With only fusion-family knobs present (e.g. an inert `fusion: false`), the
+    // sanitized legacy result is the answer; the label filter is optional.
+    let Some(label_filter) = label_filter.filter(|label| !label.is_empty()) else {
+        return Ok(raw);
+    };
 
     let Some(project) = status_project_from_args(&sanitized)? else {
         return tool_error_result(
