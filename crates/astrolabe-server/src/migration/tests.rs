@@ -1,5 +1,7 @@
 use super::*;
 
+use astrolabe_ingest::import_cbm_graph_snapshot_to_vault_direct;
+
 const M_SCALE_PROJECT: &str = "mscale";
 const M_SCALE_SYMBOL_COUNT: usize = astrolabe_weave::DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT;
 const M_SCALE_EDGES_PER_SYMBOL: usize = 10;

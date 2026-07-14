@@ -251,7 +251,7 @@ fn shadow_encoder_input(input: &PanelInput) -> astrolabe_panel::EncoderLensInput
     });
     let body_tokens = property_string(properties, "bt")
         .map(|tokens| text_tokens(tokens).len() as f32)
-        .or_else(|| Some(body_identifiers.len() as f32));
+        .or(Some(body_identifiers.len() as f32));
     let complexity_input = Some(ComplexityMetrics {
         cyclomatic: complexity.unwrap_or(0.0),
         cognitive: cognitive.unwrap_or(0.0),
@@ -1031,7 +1031,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     repo: Option<&Path>,
 ) -> Result<ShadowImportOutcome, DynError> {
     fs::create_dir_all(cache_dir)?;
-    let sqlite_path = sqlite_path(&cache_dir, project);
+    let sqlite_path = sqlite_path(cache_dir, project);
     if !sqlite_path.exists() {
         return Err(format!(
             "CBM SQLite store is missing after index_repository: {}",
@@ -1051,7 +1051,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let content_freshness_watermark_sha256 =
         astrolabe_ingest::fingerprint_sqlite_hex(&sqlite_path)?;
 
-    let vault_dir = vault_dir(&cache_dir, project);
+    let vault_dir = vault_dir(cache_dir, project);
     fs::create_dir_all(&vault_dir)?;
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID)?;
     let vault_salt = vault_salt(project);
@@ -1145,7 +1145,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
     }
-    let lowered_sqlite_path = lowered_sqlite_path(&cache_dir, project);
+    let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {
         read_persisted_lower_state(&cache_dir, project)?
     } else {
