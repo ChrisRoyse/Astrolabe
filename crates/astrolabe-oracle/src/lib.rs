@@ -9,7 +9,9 @@
 //! The corpus is persisted as ledger-paired, FSV-verified `Kv` CF rows so the
 //! downstream oracle chain reads verified persisted state, never a planner echo.
 
+pub mod abduce;
 pub mod corpus;
+pub mod forecast;
 pub mod predict;
 
 pub use predict::{
@@ -21,6 +23,22 @@ pub use predict::{
     ORACLE_SENSOR_DIRECT_CHANGE_HISTORY, OracleEvidence, PredictConfig, PredictRequest,
     SensorDeficit, TestSelection, backtest_phase_gate, oracle_predict_knob, predict_impact,
     run_backtest,
+};
+
+pub use abduce::{
+    ASTRO_ORACLE_ABDUCE_CONFIG_INVALID, ASTRO_ORACLE_ABDUCE_REQUEST_INVALID, AbductionConfig,
+    AbductionOutcome, AbductionReport, AbductionRequest, CauseHypothesis,
+    ORACLE_ABDUCE_INSUFFICIENT_REMEDIATION, ORACLE_ABDUCE_KNOB_REGISTRY_VERSION,
+    ORACLE_ABDUCE_KNOBS, ORACLE_SENSOR_FAILURE_HISTORY, abduce_cause, oracle_abduce_knob,
+};
+
+pub use forecast::{
+    ASTRO_FLAKY_EVIDENCE, ASTRO_NO_RECURRENCE, ASTRO_ORACLE_FORECAST_CONFIG_INVALID, FlakyOutcome,
+    FlakyRefusal, ForecastConfig, ForecastOutcome, ForecastReport,
+    ORACLE_FLAKY_EVIDENCE_REMEDIATION, ORACLE_FORECAST_KNOB_REGISTRY_VERSION,
+    ORACLE_FORECAST_KNOBS, ORACLE_NO_RECURRENCE_REMEDIATION, PeriodicityFit, RecurrenceRefusal,
+    RegimeChange, RegimeDirection, failure_events_from_occurrences, forecast_flaky_window,
+    forecast_recurrence, oracle_forecast_knob, outcome_series_from_occurrences,
 };
 
 pub use corpus::{
