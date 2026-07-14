@@ -896,3 +896,42 @@ pub fn effective_anchor_trust(
     }
     Ok(classify_source(source).map_err(domain_to_calyx)?.trust)
 }
+
+/// Rolls up aggregate trust across active anchor rows **honoring promotions**.
+///
+/// Each active anchor contributes its [`effective_anchor_trust`]: a proxy
+/// `agent:*` Reward anchor that a resolved outcome has promoted contributes
+/// Trusted, every other anchor contributes its catalog trust. The aggregate is
+/// Trusted iff at least one anchor contributes and every contributor is Trusted;
+/// empty evidence fails closed to Provisional (via [`crate::rollup_trust`]).
+///
+/// This is the promotion-aware counterpart of [`crate::rollup_anchor_trust`] and
+/// the exact point at which the agent-task flywheel reaches the #29 aggregate
+/// trust lifecycle: `rollup_anchor_trust` classifies by catalog source alone, so
+/// a promoted `agent:*` anchor stays Provisional there forever; this function
+/// lifts the aggregate from Provisional to Trusted once CI has resolved the
+/// agent claim, without ever rewriting the anchor's catalog source. Every
+/// anchor's persisted confidence is re-validated against its grounding kind
+/// first, so a corrupt confidence refuses fail-closed rather than silently
+/// rolling up.
+///
+/// Callers pass the active rows (`crate::read_anchor_rows`, tombstone-excluded)
+/// and the persisted promotions (`read_anchor_promotions`); source erasure is
+/// therefore honored by construction, because erased anchors are already absent
+/// from the active rows the aggregate is computed over.
+pub fn rollup_effective_anchor_trust<'a>(
+    rows: impl IntoIterator<Item = &'a crate::PersistedAnchorRow>,
+    promotions: &[AnchorPromotionV1],
+) -> calyx_core::Result<TrustTag> {
+    let mut tags = Vec::new();
+    for persisted in rows {
+        let cx_id = persisted.row.cx_id;
+        for anchor in &persisted.row.anchors {
+            let classification = classify_source(&anchor.source).map_err(domain_to_calyx)?;
+            crate::validate_confidence(classification.grounding_kind, Some(anchor.confidence))
+                .map_err(domain_to_calyx)?;
+            tags.push(effective_anchor_trust(cx_id, &anchor.source, promotions)?);
+        }
+    }
+    Ok(crate::rollup_trust(tags))
+}

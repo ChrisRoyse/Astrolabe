@@ -11,11 +11,15 @@ use std::time::{Duration, Instant};
 use astrolabe_anchors::{
     AGENT_TASK_REWARD_CONFIDENCE, ASTRO_ANCHOR_CONTRADICTION, ASTRO_ANCHOR_PACK_INPUT_INVALID,
     ASTRO_ANCHOR_PACK_UNKNOWN, HookOutcome, OutcomeAnchorRequest, OutcomeKind, OutcomeSubject,
-    TrustTag, effective_anchor_trust, ingest_agent_task_outcome, ingest_outcome_anchors,
-    is_anchor_promoted, promote_on_resolution, read_agent_task_pack, read_anchor_contradictions,
-    read_anchor_promotions, read_anchor_rows, record_agent_task_pack, run_hook_process,
+    TrustTag, effective_anchor_trust, erase_anchors_by_source, ingest_agent_task_outcome,
+    ingest_outcome_anchors, is_anchor_promoted, promote_on_resolution, read_agent_task_pack,
+    read_all_anchor_rows, read_anchor_contradictions, read_anchor_promotions, read_anchor_rows,
+    read_anchor_tombstones, record_agent_task_pack, rollup_anchor_trust,
+    rollup_effective_anchor_trust, run_hook_process,
 };
+use calyx_aster::cf::{ColumnFamily, ledger_key};
 use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::VaultStore;
 use calyx_core::{AnchorKind, AnchorValue, CxId, SystemClock, VaultId};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -82,6 +86,18 @@ fn seed_ci_testpass(
         .map(|(cx_id, _)| (cx_id.to_string(), *cx_id))
         .collect();
     ingest_outcome_anchors(vault, &request, &cx_ids, ACTOR).expect("seed ci testpass");
+}
+
+/// Independent raw readback of the whole Anchors CF (sorted), for append-only
+/// byte-equality assertions across a tombstone commit.
+fn raw_anchor_cf(vault: &AsterVault<SystemClock>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = vault
+        .scan_cf_at(vault.snapshot(), ColumnFamily::Anchors)
+        .expect("scan anchors cf")
+        .into_iter()
+        .collect();
+    rows.sort();
+    rows
 }
 
 fn reward_cx_ids_for_source(vault: &AsterVault<SystemClock>, source: &str) -> Vec<CxId> {
@@ -338,6 +354,195 @@ fn unknown_pack_id_refuses_fail_closed_with_no_orphan_anchors() {
         ASTRO_ANCHOR_PACK_INPUT_INVALID
     );
     drop(vault);
+}
+
+/// The agent-task flywheel reaches the #29 aggregate trust lifecycle end to end:
+/// a promoted proxy anchor lifts the promotion-aware aggregate from Provisional
+/// to Trusted while the promotion-blind catalog rollup never moves, and source
+/// erasure then recomputes the aggregate over the tombstone-excluded active rows
+/// with the original Anchor CF bytes never rewritten.
+#[test]
+fn promotion_lifts_aggregate_trust_and_erasure_recomputes_it() {
+    let dir = temp_dir("aggregate-lifecycle");
+    let vault = open(dir.as_ref());
+    let members = [cx(1), cx(2)];
+    record_agent_task_pack(&vault, "pack-agg", &members, 1_786_500_000, ACTOR)
+        .expect("record pack");
+    ingest_agent_task_outcome(
+        &vault,
+        "pack-agg",
+        "codex",
+        "agg",
+        true,
+        1_786_500_100,
+        ACTOR,
+    )
+    .expect("agent success");
+
+    // Before any resolved evidence the only anchors are proxy agent Rewards: both
+    // the catalog rollup and the promotion-aware rollup are Provisional.
+    let rows = read_anchor_rows(&vault).expect("rows before ci");
+    let promotions = read_anchor_promotions(&vault).expect("promotions before");
+    assert!(promotions.is_empty());
+    assert_eq!(
+        rollup_anchor_trust(rows.iter()).unwrap(),
+        TrustTag::Provisional
+    );
+    assert_eq!(
+        rollup_effective_anchor_trust(rows.iter(), &promotions).unwrap(),
+        TrustTag::Provisional
+    );
+
+    // A resolved CI pass lands on the same symbols but is not yet reconciled.
+    seed_ci_testpass(
+        &vault,
+        "ci:gh:agg",
+        1_786_500_200,
+        &[(cx(1), true), (cx(2), true)],
+    );
+    let rows = read_anchor_rows(&vault).expect("rows after ci");
+    let promotions = read_anchor_promotions(&vault).expect("promotions after ci");
+    // The agent anchor is still an unpromoted proxy, so one proxy contributor
+    // poisons both rollups fail-closed even though a Trusted ci anchor co-exists.
+    assert_eq!(
+        rollup_anchor_trust(rows.iter()).unwrap(),
+        TrustTag::Provisional
+    );
+    assert_eq!(
+        rollup_effective_anchor_trust(rows.iter(), &promotions).unwrap(),
+        TrustTag::Provisional
+    );
+
+    // Reconcile: CI confirms the agent claim, promoting both proxy anchors.
+    let report =
+        promote_on_resolution(&vault, "agent:codex:agg", "ci:gh:agg", 1_786_500_300, ACTOR)
+            .expect("promote");
+    assert_eq!(report.promotions_written, 2);
+    drop(vault);
+
+    // FSV: reopen; the promotion-aware aggregate is now Trusted (every active
+    // anchor is Trusted: ci by catalog, agent by promotion) while the
+    // promotion-blind catalog rollup still reports Provisional — the wiring, not
+    // a return value, carries the promotion into the aggregate.
+    let vault = open(dir.as_ref());
+    let rows = read_anchor_rows(&vault).expect("rows after promote");
+    let promotions = read_anchor_promotions(&vault).expect("promotions after promote");
+    assert_eq!(promotions.len(), 2);
+    assert!(is_anchor_promoted(&promotions, cx(1), "agent:codex:agg"));
+    assert_eq!(
+        rollup_effective_anchor_trust(rows.iter(), &promotions).unwrap(),
+        TrustTag::Trusted,
+        "promotion lifts the aggregate to Trusted"
+    );
+    assert_eq!(
+        rollup_anchor_trust(rows.iter()).unwrap(),
+        TrustTag::Provisional,
+        "the promotion-blind catalog rollup never sees the promotion"
+    );
+    // The persisted agent anchor source is unchanged — trust rose without a rewrite.
+    for row in &rows {
+        if row.row.kind == AnchorKind::Reward {
+            for anchor in &row.row.anchors {
+                assert_eq!(anchor.source, "agent:codex:agg");
+                assert_eq!(
+                    anchor.confidence.to_bits(),
+                    AGENT_TASK_REWARD_CONFIDENCE.to_bits()
+                );
+            }
+        }
+    }
+
+    // --- Erase the resolved ci source: aggregate recomputes over active rows. ---
+    let raw_before = raw_anchor_cf(&vault);
+    let erased = erase_anchors_by_source(&vault, "ci:gh:agg", 1_786_500_400, ACTOR)
+        .expect("erase ci source");
+    assert_eq!(erased.anchors_retracted, 2);
+    assert!(erased.tombstone_written);
+    let fsv = erased.fsv.as_ref().expect("tombstone earns FSV witness");
+    assert_eq!(
+        fsv.ledger_seq(),
+        erased.ledger_ref.seq,
+        "erasure commit carries its paired ledger entry"
+    );
+    // Original Anchor CF bytes are not rewritten by the append-only tombstone.
+    assert_eq!(raw_anchor_cf(&vault), raw_before);
+    drop(vault);
+
+    // FSV: reopen; tombstone CF row + paired ledger entry read back independently.
+    let reopened = open(dir.as_ref());
+    assert_eq!(
+        raw_anchor_cf(&reopened),
+        raw_before,
+        "durable bytes survive"
+    );
+    let tombstones = read_anchor_tombstones(&reopened).expect("tombstones");
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].source, "ci:gh:agg");
+    let ledger_bytes = reopened
+        .read_cf_at(
+            reopened.snapshot(),
+            ColumnFamily::Ledger,
+            &ledger_key(erased.ledger_ref.seq),
+        )
+        .expect("ledger read")
+        .expect("paired erasure ledger row present");
+    assert!(!ledger_bytes.is_empty(), "erasure ledger entry persisted");
+    // The erased ci anchors survive in raw history but are gone from active queries.
+    assert!(
+        read_all_anchor_rows(&reopened)
+            .unwrap()
+            .iter()
+            .flat_map(|r| &r.row.anchors)
+            .any(|a| a.source == "ci:gh:agg"),
+        "erased anchors remain in append-only history"
+    );
+    let active = read_anchor_rows(&reopened).expect("active after erase");
+    assert!(
+        active
+            .iter()
+            .flat_map(|r| &r.row.anchors)
+            .all(|a| a.source == "agent:codex:agg"),
+        "only the promoted agent anchors remain active"
+    );
+    let promotions = read_anchor_promotions(&reopened).unwrap();
+    // Aggregate after erase: active rows are the promoted agent anchors alone =>
+    // promotion-aware rollup is Trusted (the promotion is an append-only fact,
+    // unaffected by erasing the resolving source), catalog rollup Provisional.
+    assert_eq!(
+        rollup_effective_anchor_trust(active.iter(), &promotions).unwrap(),
+        TrustTag::Trusted
+    );
+    assert_eq!(
+        rollup_anchor_trust(active.iter()).unwrap(),
+        TrustTag::Provisional
+    );
+
+    // Edge: erase the agent source too => no active anchors => both aggregates
+    // fail closed to Provisional (empty evidence is never Trusted).
+    let erased_agent = erase_anchors_by_source(&reopened, "agent:codex:agg", 1_786_500_500, ACTOR)
+        .expect("erase agent source");
+    assert_eq!(erased_agent.anchors_retracted, 2);
+    assert_ne!(
+        erased.ledger_ref.seq, erased_agent.ledger_ref.seq,
+        "each erasure appends its own ledger entry"
+    );
+    drop(reopened);
+    let reopened = open(dir.as_ref());
+    let active = read_anchor_rows(&reopened).expect("active after both erased");
+    assert!(
+        active.is_empty(),
+        "both sources erased => no active anchors"
+    );
+    let promotions = read_anchor_promotions(&reopened).unwrap();
+    assert_eq!(
+        rollup_effective_anchor_trust(active.iter(), &promotions).unwrap(),
+        TrustTag::Provisional
+    );
+    assert_eq!(
+        rollup_anchor_trust(active.iter()).unwrap(),
+        TrustTag::Provisional
+    );
+    drop(reopened);
 }
 
 // ---- Opt-in hook contract (scripted harness) ----
