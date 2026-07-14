@@ -307,7 +307,10 @@ impl ProfileDriftMonitor {
 
     /// Serializable snapshots for every slot monitor (the persisted image).
     pub fn snapshots(&self) -> Vec<SlotDriftSnapshot> {
-        self.monitors.iter().map(SlotDriftMonitor::snapshot).collect()
+        self.monitors
+            .iter()
+            .map(SlotDriftMonitor::snapshot)
+            .collect()
     }
 
     /// Rebuild a profile monitor from per-slot snapshots. Snapshots with an unknown

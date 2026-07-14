@@ -1175,12 +1175,12 @@ mod tests {
         let probes: &[(f64, f64)] = &[
             // Headline Wilson-CI-shaped lossy value in both float fields.
             (0.9500000000000001, 0.9500000000000001),
-            (f64::MAX, f64::MIN_POSITIVE),      // max magnitude / smallest normal
+            (f64::MAX, f64::MIN_POSITIVE), // max magnitude / smallest normal
             // smallest subnormal / largest subnormal (denormal boundary, by bits).
             (5e-324, f64::from_bits(0x000f_ffff_ffff_ffff)),
-            (1.0 / 3.0, std::f64::consts::PI),  // repeating / transcendental
-            (-0.0, 0.5),                        // negative zero vs exact no-op
-            (0.29999999999999993, 0.1 + 0.2),   // classic binary-fp residues
+            (1.0 / 3.0, std::f64::consts::PI), // repeating / transcendental
+            (-0.0, 0.5),                       // negative zero vs exact no-op
+            (0.29999999999999993, 0.1 + 0.2),  // classic binary-fp residues
         ];
 
         let corpus = OracleCorpus {

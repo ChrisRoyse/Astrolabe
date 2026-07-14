@@ -43,9 +43,7 @@ pub(crate) fn record_guard_check_outcomes(
     report: &CheckReport,
 ) -> Result<usize, DynError> {
     let mut monitor = match read_drift_snapshots(cache_dir, project)? {
-        Some(snapshots) if !snapshots.is_empty() => {
-            ProfileDriftMonitor::from_snapshots(&snapshots)
-        }
+        Some(snapshots) if !snapshots.is_empty() => ProfileDriftMonitor::from_snapshots(&snapshots),
         _ => ProfileDriftMonitor::from_profile(profile),
     };
 
@@ -91,7 +89,8 @@ fn read_drift_snapshots(
     cache_dir: &Path,
     project: &str,
 ) -> Result<Option<Vec<SlotDriftSnapshot>>, DynError> {
-    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, GUARD_DRIFT_SNAPSHOTS_KEY))?
+    let Some(raw) =
+        read_config_value(cache_dir, &metadata_key(project, GUARD_DRIFT_SNAPSHOTS_KEY))?
     else {
         return Ok(None);
     };
@@ -142,7 +141,8 @@ fn finite_f64(value: f32) -> Value {
 
 /// Read the raw persisted drift-proposal history (empty when unset).
 fn read_drift_proposals_raw(cache_dir: &Path, project: &str) -> Result<Vec<Value>, DynError> {
-    let Some(raw) = read_config_value(cache_dir, &metadata_key(project, GUARD_DRIFT_PROPOSALS_KEY))?
+    let Some(raw) =
+        read_config_value(cache_dir, &metadata_key(project, GUARD_DRIFT_PROPOSALS_KEY))?
     else {
         return Ok(Vec::new());
     };

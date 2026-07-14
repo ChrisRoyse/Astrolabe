@@ -175,7 +175,9 @@ fn guard_lock_mutate(
     let before_hash = hex_lower(&Sha256::digest(inventory.canonical_bytes()));
 
     let change = if lock {
-        let qualified_name = string_arg(args_obj, "qualified_name").unwrap_or(cx).to_string();
+        let qualified_name = string_arg(args_obj, "qualified_name")
+            .unwrap_or(cx)
+            .to_string();
         let exported = args_obj
             .get("exported")
             .and_then(Value::as_bool)
@@ -270,7 +272,10 @@ fn guard_lock_rebuild_at(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let exported = obj.get("exported").and_then(Value::as_bool).unwrap_or(false);
+        let exported = obj
+            .get("exported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if exported {
             exported_count += 1;
         }
@@ -299,12 +304,7 @@ fn guard_lock_rebuild_at(
     }))
 }
 
-fn lock_event_payload_bytes(
-    project: &str,
-    lock: bool,
-    cx: &str,
-    inventory_hash: &str,
-) -> Vec<u8> {
+fn lock_event_payload_bytes(project: &str, lock: bool, cx: &str, inventory_hash: &str) -> Vec<u8> {
     let value = json!({
         "cx": cx,
         "inventory_sha256": inventory_hash,

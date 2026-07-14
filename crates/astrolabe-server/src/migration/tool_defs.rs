@@ -219,7 +219,6 @@ pub(crate) fn forecast_tool_definition() -> Value {
     })
 }
 
-
 pub(crate) fn measure_bits_tool_definition() -> Value {
     json!({
         "name": "measure_bits",

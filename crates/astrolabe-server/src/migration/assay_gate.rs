@@ -54,13 +54,8 @@ fn assay_gate_subject(project: &str) -> Vec<u8> {
 /// but keyed by the persisted Ledger seq rather than a filesystem line number).
 #[derive(Debug, Clone)]
 enum GateJournalAction {
-    Decide {
-        lens: String,
-        verdict: GateVerdict,
-    },
-    Revert {
-        reverts_seq: u64,
-    },
+    Decide { lens: String, verdict: GateVerdict },
+    Revert { reverts_seq: u64 },
 }
 
 /// A decoded gate journal entry: its Ledger seq plus the action it recorded.
@@ -356,7 +351,11 @@ fn push_gate_index(cache_dir: &Path, project: &str, seq: u64) -> Result<(), DynE
     let mut index = read_gate_index(cache_dir, project)?;
     index.push(seq);
     let json = serde_json::to_string(&index)?;
-    write_config_value(cache_dir, &metadata_key(project, ASSAY_GATE_INDEX_KEY), &json)?;
+    write_config_value(
+        cache_dir,
+        &metadata_key(project, ASSAY_GATE_INDEX_KEY),
+        &json,
+    )?;
     Ok(())
 }
 

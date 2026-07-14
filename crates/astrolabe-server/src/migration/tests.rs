@@ -10792,12 +10792,16 @@ fn guard_lock_persists_ledgers_gates_guard_check_and_reverts() {
             {"cx": "cx:kernel", "kernel_near": true, "slots": guard_check_symbol_body(&exemplar_vec)["slots"].clone()},
         ],
     });
-    let verdict: Value =
-        serde_json::from_str(&guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap())
-            .unwrap();
+    let verdict: Value = serde_json::from_str(
+        &guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(verdict["isError"], false, "{verdict}");
     let v = &verdict["structuredContent"];
-    assert_eq!(v["identity_locked"], true, "lock must travel with verdict: {v}");
+    assert_eq!(
+        v["identity_locked"], true,
+        "lock must travel with verdict: {v}"
+    );
     assert_eq!(v["verdict"], "refuse", "{v}");
     assert!(
         v["slots"]
@@ -10822,9 +10826,10 @@ fn guard_lock_persists_ledgers_gates_guard_check_and_reverts() {
     );
 
     // guard_check no longer sees the target as locked.
-    let after: Value =
-        serde_json::from_str(&guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap())
-            .unwrap();
+    let after: Value = serde_json::from_str(
+        &guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(after["structuredContent"]["identity_locked"], false);
     fs::remove_dir_all(&dir).ok();
 }
