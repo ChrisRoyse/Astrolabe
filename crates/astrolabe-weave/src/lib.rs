@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod kernel_index;
 pub mod search;
 pub mod search_eval;
 pub mod search_index;
@@ -40,6 +41,12 @@ mod sim_rows;
 mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
+pub use kernel_index::{
+    ASTRO_KERNEL_INDEX_ABSENT, ASTRO_KERNEL_INDEX_MEMBER_ABSENT, ASTRO_KERNEL_INDEX_NO_MEMBERS,
+    ASTRO_KERNEL_INDEX_STALE, ASTRO_KERNEL_INDEX_VAULT, KERNEL_INDEX_RECALL_GATE_PERMILLE,
+    KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind, KernelMemberIndex, KernelRecallMeasurement,
+    build_kernel_member_index, kernel_scoped_semantic_query, measure_kernel_index_recall,
+};
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
