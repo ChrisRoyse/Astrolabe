@@ -198,17 +198,50 @@ fn prepare_as_of_store(
 /// views. Kept under the cache dir so it shares the store's lifecycle and is
 /// cleaned with it.
 fn as_of_bucket_store_dir(cache_dir: &Path, project: &str, bucket: u64) -> PathBuf {
+    // Structural sanitization: the project must flatten to ONE traversal-free,
+    // device-free Windows path component BY CONSTRUCTION, for any input class —
+    // not merely for the inputs a test happens to plant. Three hazard classes:
+    //   (a) `.`/`..` traversal components,
+    //   (b) any ".." substring (never representable: a dot is only admitted when
+    //       the previous emitted byte is not a dot, so consecutive dots collapse
+    //       to `._` while building),
+    //   (c) Windows reserved device names (CON/PRN/AUX/NUL/COM1-9/LPT1-9, with
+    //       any extension — `nul.txt` IS the NUL device; the superscript
+    //       COM¹/²/³ forms are non-ASCII and already fold to '_' in the char
+    //       filter).
+    // A name that still lands in a hazard class is disambiguated by suffixing a
+    // short hash of the RAW project string: deterministic, collision-safe (the
+    // hash input is the raw name, so two distinct raw names cannot converge),
+    // and cache-appropriate (nothing needs to survive but uniqueness).
     let mut safe = String::with_capacity(project.len());
     for ch in project.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            safe.push(ch);
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            ch
         } else {
+            '_'
+        };
+        if mapped == '.' && safe.ends_with('.') {
             safe.push('_');
+        } else {
+            safe.push(mapped);
         }
     }
-    if safe.is_empty() {
-        safe.push('_');
+    const RESERVED_DEVICE_STEMS: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = safe.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if safe.is_empty() || safe == "." || RESERVED_DEVICE_STEMS.contains(&stem.as_str()) {
+        let digest = Sha256::digest(project.as_bytes());
+        safe = format!(
+            "{safe}-p{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3]
+        );
     }
+    debug_assert!(
+        !safe.is_empty() && safe != "." && safe != ".." && !safe.contains(".."),
+        "sanitized project component must be traversal-free by construction: {safe}"
+    );
     cache_dir
         .join(".astrolabe-asof")
         .join(safe)
@@ -432,5 +465,55 @@ mod tests {
         assert!(s.contains(".astrolabe-asof"));
         assert!(s.contains("bucket-3"));
         assert!(!s.contains(".."), "project segment must be sanitized: {s}");
+        // Traversal-shaped raw names can never surface a ".." substring or a
+        // bare-dot component — the property holds by construction, not by
+        // enumerating inputs.
+        for raw in ["..", ".", "a..b", "../..", "...."] {
+            let dir = as_of_bucket_store_dir(Path::new("C:/store"), raw, 3);
+            let component = dir
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|c| c.to_str())
+                .expect("project component present");
+            assert!(
+                !component.contains(".."),
+                "no traversal substring: {raw} -> {component}"
+            );
+            assert!(
+                component != "." && component != "..",
+                "no dot component: {component}"
+            );
+        }
+        // Windows reserved device names: a project literally named `nul` (or
+        // `nul.txt` — an extension does not un-reserve a device) must not become
+        // a raw device-path component. Fail-closed by deterministic
+        // disambiguation, never by panicking.
+        for raw in ["nul", "NUL", "nul.txt", "com1"] {
+            let dir = as_of_bucket_store_dir(Path::new("C:/store"), raw, 3);
+            let component = dir
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|c| c.to_str())
+                .expect("project component present");
+            let stem = component.split('.').next().unwrap_or("");
+            assert!(
+                !["CON", "PRN", "AUX", "NUL", "COM1", "LPT1"]
+                    .iter()
+                    .any(|d| stem.eq_ignore_ascii_case(d)),
+                "reserved device stem must be disambiguated: {raw} -> {component}"
+            );
+            assert!(
+                !component.contains(".."),
+                "no traversal substring: {component}"
+            );
+            // Deterministic: the same raw name maps to the same directory.
+            assert_eq!(dir, as_of_bucket_store_dir(Path::new("C:/store"), raw, 3));
+        }
+        // Collision safety: the disambiguation hashes the RAW name, so a raw
+        // name adjacent to a reserved one cannot collide with its rewrite.
+        assert_ne!(
+            as_of_bucket_store_dir(Path::new("C:/store"), "nul", 3),
+            as_of_bucket_store_dir(Path::new("C:/store"), "nul_", 3),
+        );
     }
 }
