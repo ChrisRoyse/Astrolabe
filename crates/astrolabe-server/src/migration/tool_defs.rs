@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 18] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -19,7 +19,45 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
         assay_gate_tool_definition(),
         abduce_cause_tool_definition(),
         forecast_tool_definition(),
+        get_kernel_tool_definition(),
     ]
+}
+
+pub(crate) fn get_kernel_tool_definition() -> Value {
+    json!({
+        "name": "get_kernel",
+        "title": "Kernel Grounding Gaps",
+        "description": "The \"here be dragons\" QA map (P6.3): kernel members with no grounding anchor, surfaced from a shadow-indexed project's persisted kernel context. mode=\"gaps\" (default) serves the grounding-gap report — kernel members whose persisted grounded flag is false — ranked by persisted kernel weight (importance), with a labeled degradation because the change-frequency churn term and the exact 3-hop grounding boundary live in the persisted kernel artifact, not this metadata surface. mode=\"quadrant\" serves the coverage-vs-importance scatter, classifying every member into critical/peripheral × verified/unverified with the kernel crate's registry-knob split; the critical-and-unverified quadrant is the actionable QA target that feeds readiness and the UI overlay. Every response carries trust/freshness/provenance and fails closed with {code,message,remediation} when the project is not shadow-indexed, its kernel context is unavailable, or the mode is unknown.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["gaps", "quadrant"],
+                    "description": "gaps (default): ranked grounding-gap report of ungrounded kernel members. quadrant: coverage-vs-importance scatter with per-quadrant counts."
+                }
+            },
+            "required": ["project"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn assay_gate_tool_definition() -> Value {

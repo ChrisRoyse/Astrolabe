@@ -101,6 +101,9 @@ use bridges::*;
 mod kernel_context;
 use kernel_context::*;
 
+mod kernel_gaps;
+use kernel_gaps::*;
+
 mod anomalies;
 use anomalies::*;
 

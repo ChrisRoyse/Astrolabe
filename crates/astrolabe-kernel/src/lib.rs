@@ -45,6 +45,17 @@ pub use kernel_build::{
     members_hash, refine_kernel_with_recall_support, write_kernel_artifacts,
 };
 
+/// Grounding-gap report + coverage-vs-importance quadrant over a persisted
+/// kernel (#39): the "here be dragons" QA map.
+pub mod gaps;
+pub use gaps::{
+    COVERAGE_QUADRANT_SCHEMA, CoverageImportanceQuadrant, GAP_QUADRANT_KNOB_REGISTRY_VERSION,
+    GAP_QUADRANT_KNOBS, GROUNDING_GAP_SCHEMA, GapQuadrant, GroundingGap, GroundingGapReport,
+    QuadrantConfig, QuadrantPoint, classify_quadrant, coverage_importance_quadrant,
+    coverage_importance_quadrant_artifact_bytes, grounding_gap_report,
+    grounding_gap_report_artifact_bytes,
+};
+
 /// Scope algebra for scoped and hierarchical kernels (#38).
 pub mod scope;
 pub use scope::{NodeScope, Scope, ScopeAttributes, induced_subgraph};
