@@ -1357,6 +1357,67 @@ fn row_sink_bridges_recover_planted_connectors_from_scope_metadata() {
 }
 
 #[test]
+fn derived_bridges_from_real_graph_structure_are_available_with_measured_weights() {
+    // #388: a real corpus never carries explicit `bridge_scopes`, so the surface
+    // must derive scopes from the persisted graph. Two directory scopes (`api`,
+    // `core`) with cross-scope reference edges make the referenced core symbols
+    // bridges; the weight in each scope is the number of structural associations.
+    let bridges = bridges_from_row_sink_rows(&sample_derived_bridge_rows());
+
+    assert_eq!(bridges["schema"], BRIDGE_COLLECTION_SCHEMA);
+    assert_eq!(bridges["status"], "built");
+    assert_eq!(
+        bridges["scope_source"], "graph_structural_scope_membership",
+        "derived, not explicit"
+    );
+    assert_eq!(bridges["scope_count"], 2);
+    assert_eq!(bridges["scopes_truncated"], 0);
+    assert_eq!(bridges["scope_pair_count"], 1);
+    assert_eq!(bridges["bridge_count"], 2);
+    assert_eq!(bridges["skipped_count"], 0);
+
+    let report = &bridges["reports"][0];
+    assert_eq!(report["scope_a"], "api");
+    assert_eq!(report["scope_b"], "core");
+    let rows = report["bridges"].as_array().expect("bridge rows");
+    // audit is called from two api functions (weight 2) and defined in core (weight 1).
+    assert_eq!(rows[0]["symbol_id"], "core.audit");
+    assert_eq!(rows[0]["scope_a_kernel_weight"], 2);
+    assert_eq!(rows[0]["scope_b_kernel_weight"], 1);
+    assert_eq!(rows[0]["combined_kernel_weight"], 3);
+    assert_eq!(rows[1]["symbol_id"], "core.session");
+    assert_eq!(rows[1]["combined_kernel_weight"], 2);
+    assert_eq!(bridges["artifact_sha256"].as_str().expect("sha").len(), 64);
+}
+
+#[test]
+fn single_scope_fixture_keeps_bridges_labeled_unavailable() {
+    // #388 negative case: every symbol lives in one directory scope and no edge
+    // crosses a scope, so there is genuinely no bridge. The surface must stay
+    // labeled unavailable, not fabricate a report.
+    let bridges = bridges_from_row_sink_rows(&sample_pipeline_rows());
+    assert_eq!(bridges["status"], "unavailable");
+    assert!(bridges["reason"].is_string());
+    assert_eq!(bridges["freshness"], "not_evaluated");
+}
+
+#[test]
+fn structural_containment_edges_do_not_fabricate_bridges() {
+    // A CONTAINS/DEFINES edge nests a symbol in its own file; it must never make a
+    // symbol a bridge to its own home scope. Same two-scope fixture but with the
+    // cross-scope CALLS edges swapped for CONTAINS => no bridge remains.
+    let mut rows = sample_derived_bridge_rows();
+    for edge in &mut rows.edges {
+        edge.edge_type = "CONTAINS".to_string();
+    }
+    let bridges = bridges_from_row_sink_rows(&rows);
+    assert_eq!(
+        bridges["status"], "unavailable",
+        "containment edges express nesting, not cross-domain usage"
+    );
+}
+
+#[test]
 fn bridge_summary_persists_reads_back_and_augments_architecture_payload() {
     let dir = temp_dir("bridges-readback");
     let bridges = bridges_from_row_sink_rows(&sample_bridge_rows());
@@ -2180,7 +2241,14 @@ fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
     assert_eq!(provenance["schema"], PROVENANCE_SURFACE_SCHEMA);
     assert_eq!(provenance["tool_schema"], GET_PROVENANCE_SCHEMA);
     assert_eq!(provenance["status"], "built");
-    assert_eq!(provenance["symbol_count"], 1);
+    // #389: auth.login declares an explicit lineage; auth.incomplete declares
+    // answer/reproduce blocks but no lineage, so it now receives a derived
+    // "indexed" lineage (every materialized symbol has a truthful minimal lineage).
+    assert_eq!(provenance["symbol_count"], 2);
+    assert_eq!(
+        provenance["store"]["symbols"]["auth.incomplete"]["versions"][0]["kind"],
+        "indexed"
+    );
     assert_eq!(provenance["answer_count"], 2);
     assert_eq!(provenance["reproduce_count"], 2);
     assert_eq!(provenance["manifest_count"], 1);
@@ -2247,6 +2315,66 @@ fn row_sink_provenance_contract_modes_are_labeled_and_fail_closed() {
 // it reads back the real persisted provenance surface and asserts its deterministic
 // fail-closed contract, so there is no seed schema to guard here. The production
 // reader remains covered by the provenance surface/round-trip tests below.
+
+#[test]
+fn derived_provenance_lineage_from_real_symbols_is_available_and_ledger_stamped() {
+    // #389: a real corpus carries no explicit provenance blocks, so the surface
+    // must derive a truthful minimal lineage for each materialized symbol. At
+    // row-sink time the event's ledger pointer is a pending sentinel; post-import
+    // `provenance_surface_with_chain` rewrites it to the real import head.
+    let rows = sample_pipeline_rows();
+    let built = provenance_from_row_sink_rows(&rows);
+    assert_eq!(built["status"], "built");
+    assert_eq!(
+        built["symbol_count"], 1,
+        "the single Function node, not Project"
+    );
+    // Before the real chain is stamped, the row-sink chain attests nothing.
+    assert_eq!(built["trust"], "provisional");
+    let pending = &built["store"]["symbols"]["demo.helper"]["versions"][0];
+    assert_eq!(pending["kind"], "indexed");
+    assert_eq!(pending["ledger"]["chain_hash"], "row-sink:pending");
+
+    let fingerprint = "ab".repeat(32);
+    let surface = provenance_surface_with_chain(
+        built,
+        &fingerprint,
+        7,
+        &verify_chain_report("intact", 0, 7, None, None),
+    );
+    // The derived event now points at the real import ledger head, and a complete
+    // build over an intact non-empty chain is verified.
+    let stamped = &surface["store"]["symbols"]["demo.helper"]["versions"][0];
+    assert_eq!(stamped["ledger"]["seq"], 7);
+    assert_eq!(stamped["ledger"]["chain_hash"], fingerprint);
+    assert_eq!(surface["metadata_skipped_count"], 0);
+    assert_eq!(surface["trust"], "verified");
+    assert_eq!(surface["freshness"], "fresh");
+}
+
+#[test]
+fn project_only_corpus_keeps_provenance_labeled_unavailable() {
+    // #389 negative case: a graph with no symbol nodes has no lineage to derive,
+    // so the surface must stay labeled unavailable rather than fabricate a store.
+    let rows = CbmPipelineRows {
+        project: "demo".to_string(),
+        nodes: vec![astrolabe_bridge::CbmPipelineNodeRow {
+            id: 1,
+            project: "demo".to_string(),
+            label: "Project".to_string(),
+            name: "demo".to_string(),
+            qualified_name: "demo".to_string(),
+            file_path: String::new(),
+            start_line: 0,
+            end_line: 0,
+            properties_json: "{}".to_string(),
+        }],
+        edges: Vec::new(),
+    };
+    let provenance = provenance_from_row_sink_rows(&rows);
+    assert_eq!(provenance["status"], "unavailable");
+    assert!(provenance["reason"].is_string());
+}
 
 #[test]
 fn provenance_summary_persists_reads_back_and_augments_architecture_payload() {
@@ -8738,6 +8866,61 @@ fn sample_bridge_rows() -> CbmPipelineRows {
             ],
             edges: Vec::new(),
         }
+}
+
+/// Two directory scopes (`crates/api`, `crates/core`) whose api functions call
+/// core functions across the scope boundary — the structural shape a real corpus
+/// produces and from which #388 derives bridges without any explicit metadata.
+fn sample_derived_bridge_rows() -> CbmPipelineRows {
+    let function =
+        |id: i64, qn: &str, file: &str, line: i64| astrolabe_bridge::CbmPipelineNodeRow {
+            id,
+            project: "demo".to_string(),
+            label: "Function".to_string(),
+            name: qn.rsplit('.').next().unwrap_or(qn).to_string(),
+            qualified_name: qn.to_string(),
+            file_path: file.to_string(),
+            start_line: line,
+            end_line: line + 4,
+            properties_json: "{}".to_string(),
+        };
+    let call = |id: i64, source_id: i64, target_id: i64| astrolabe_bridge::CbmPipelineEdgeRow {
+        id,
+        project: "demo".to_string(),
+        source_id,
+        target_id,
+        edge_type: "CALLS".to_string(),
+        properties_json: "{}".to_string(),
+        url_path_gen: String::new(),
+        local_name_gen: String::new(),
+    };
+    CbmPipelineRows {
+        project: "demo".to_string(),
+        nodes: vec![
+            astrolabe_bridge::CbmPipelineNodeRow {
+                id: 1,
+                project: "demo".to_string(),
+                label: "Project".to_string(),
+                name: "demo".to_string(),
+                qualified_name: "demo".to_string(),
+                file_path: String::new(),
+                start_line: 0,
+                end_line: 0,
+                properties_json: "{}".to_string(),
+            },
+            function(2, "app.route", "crates/api/route.rs", 10),
+            function(3, "app.serve", "crates/api/serve.rs", 10),
+            function(4, "core.audit", "crates/core/audit.rs", 10),
+            function(5, "core.session", "crates/core/session.rs", 10),
+        ],
+        edges: vec![
+            // api.route + api.serve both call core.audit (api weight 2, core home 1).
+            call(10, 2, 4),
+            call(11, 3, 4),
+            // api.route calls core.session (api weight 1, core home 1).
+            call(12, 2, 5),
+        ],
+    }
 }
 
 fn sample_kernel_context_rows() -> CbmPipelineRows {

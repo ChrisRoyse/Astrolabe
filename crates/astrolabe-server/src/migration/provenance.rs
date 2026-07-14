@@ -244,6 +244,8 @@ pub(crate) fn provenance_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
         if let Some(lineage) = symbol_lineage_from_node(node, &properties, &mut skipped_properties)
         {
             store.symbols.insert(lineage.symbol_id.clone(), lineage);
+        } else if let Some(derived) = derived_symbol_lineage(node, &properties) {
+            store.symbols.insert(derived.symbol_id.clone(), derived);
         }
         if let Some(trace) = answer_trace_from_properties(&properties, &mut skipped_properties) {
             store.answers.insert(trace.answer_id.clone(), trace);
@@ -301,6 +303,61 @@ pub(crate) fn symbol_lineage_from_node(
     Some(SymbolLineage {
         symbol_id: symbol_id.to_string(),
         versions,
+    })
+}
+
+/// Chain-hash sentinel for a derived-at-index lineage event whose real ledger
+/// pointer is not known until the import writes its ledger entry. Any lineage
+/// ledger pointer carrying this prefix is rewritten to the real import head by
+/// [`provenance_surface_with_chain`] (post-import), the same way manifest vault
+/// fingerprints are refreshed. It must remain distinct from every real chain hash.
+pub(crate) const DERIVED_LINEAGE_PENDING_CHAIN_HASH: &str = "row-sink:pending";
+
+/// Derives a truthful minimal lineage for a real symbol node that declared no
+/// explicit `provenance_lineage` block (#389).
+///
+/// Real-corpus nodes never carry provenance metadata, so the provenance surface
+/// had no symbol producer and served unavailable forever. Every symbol a real
+/// import materializes is attested by that import's single ledger entry, so the
+/// honest minimal lineage is one `indexed` event pointing at the import ledger
+/// head. The head is unknown at row-sink time, so the event is stamped with the
+/// [`DERIVED_LINEAGE_PENDING_CHAIN_HASH`] sentinel and rewritten to the real head
+/// post-import (see [`refresh_derived_lineage_ledgers`]).
+///
+/// Returns `None` for project/anonymous nodes (a truthful "no symbol") and for any
+/// node that *declared* a lineage block (even a malformed one) — that node is the
+/// explicit path's responsibility and must not be papered over with a derived
+/// stub. So a project-only corpus keeps the surface labeled unavailable.
+pub(crate) fn derived_symbol_lineage(
+    node: &astrolabe_bridge::CbmPipelineNodeRow,
+    properties: &Value,
+) -> Option<SymbolLineage> {
+    if node.qualified_name.trim().is_empty() || node.label.eq_ignore_ascii_case("project") {
+        return None;
+    }
+    if properties.get("provenance_lineage").is_some() || properties.get("lineage_events").is_some()
+    {
+        return None;
+    }
+    let symbol_id = properties
+        .get("provenance_symbol_id")
+        .or_else(|| properties.get("symbol_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&node.qualified_name);
+    let location = if node.file_path.trim().is_empty() {
+        node.qualified_name.clone()
+    } else {
+        format!("{}:{}", node.file_path.trim(), node.start_line)
+    };
+    Some(SymbolLineage {
+        symbol_id: symbol_id.to_string(),
+        versions: vec![astrolabe_provenance::LineageEvent {
+            kind: "indexed".to_string(),
+            ledger: LedgerPointer::new(0, DERIVED_LINEAGE_PENDING_CHAIN_HASH),
+            summary: format!("indexed {} from {location}", node.qualified_name),
+        }],
     })
 }
 
@@ -565,6 +622,7 @@ pub(crate) fn provenance_surface_with_chain(
         store.insert("ledger_head".to_string(), ledger_pointer_json(&ledger_head));
         store.insert("chain".to_string(), chain_verification_json(&chain));
         refresh_manifest_vault_fingerprints(store, vault_fingerprint);
+        refresh_derived_lineage_ledgers(store, &ledger_head);
     }
     surface["vault_fingerprint"] = Value::String(vault_fingerprint.to_string());
     surface["ledger_head"] = ledger_pointer_json(&ledger_head);
@@ -605,6 +663,40 @@ pub(crate) fn refresh_manifest_vault_fingerprints(
                 "vault_fingerprint".to_string(),
                 Value::String(vault_fingerprint.to_string()),
             );
+        }
+    }
+}
+
+/// Rewrites every derived-at-index lineage event's placeholder ledger pointer to
+/// the real import ledger head, post-import (#389).
+///
+/// A lineage version stamped with [`DERIVED_LINEAGE_PENDING_CHAIN_HASH`] was
+/// produced by [`derived_symbol_lineage`] before the import wrote its ledger
+/// entry; the real `ledger_head` (seq + lowered vault fingerprint) is exactly the
+/// entry that attests the import that materialized the symbol, so pointing the
+/// event at it makes the lineage truthful rather than fabricated. Explicit lineage
+/// events carry real chain hashes and are left untouched.
+pub(crate) fn refresh_derived_lineage_ledgers(
+    store: &mut Map<String, Value>,
+    ledger_head: &LedgerPointer,
+) {
+    let Some(symbols) = store.get_mut("symbols").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let head_json = ledger_pointer_json(ledger_head);
+    for lineage in symbols.values_mut() {
+        let Some(versions) = lineage.get_mut("versions").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for version in versions {
+            let is_derived = version
+                .get("ledger")
+                .and_then(|ledger| ledger.get("chain_hash"))
+                .and_then(Value::as_str)
+                .is_some_and(|hash| hash == DERIVED_LINEAGE_PENDING_CHAIN_HASH);
+            if is_derived {
+                version["ledger"] = head_json.clone();
+            }
         }
     }
 }
