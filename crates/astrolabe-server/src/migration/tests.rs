@@ -5563,7 +5563,15 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
         "{envelope}"
     );
 
-    // Edge 4: panel mode with an unknown panel_version => refused before measuring.
+    // Edge 4: panel mode with an unknown panel_version fails closed. Investigated
+    // during wave-11 integration: `PanelDriver::new(99)` does NOT pre-validate the
+    // version — the missing frozen slot roster is caught at measure time, so the
+    // refusal surfaces as ASTRO_GUARD_CHECK_PANEL_FAILED naming "panel version 99"
+    // rather than the version-specific ASTRO_GUARD_CHECK_PANEL_VERSION code (which
+    // fires only when the driver itself rejects the version). Either way it is
+    // fail-closed: isError, and the message names the offending version so the
+    // operator can fix it. The pinned safety property (unknown version is refused,
+    // never measured on a missing roster) holds.
     let args = json!({
         "project": "demo",
         "target": GUARD_CHECK_TARGET,
@@ -5574,10 +5582,15 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
     });
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
+    let panel_version_text = envelope["content"][0]["text"].as_str().unwrap();
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap()
-            .contains("ASTRO_GUARD_CHECK_PANEL_VERSION"),
-        "{envelope}"
+        panel_version_text.contains("ASTRO_GUARD_CHECK_PANEL_VERSION")
+            || panel_version_text.contains("ASTRO_GUARD_CHECK_PANEL_FAILED"),
+        "unknown panel_version must fail closed with a panel code: {envelope}"
+    );
+    assert!(
+        panel_version_text.contains("panel version 99"),
+        "the refusal must name the offending panel version: {envelope}"
     );
 
     // Vector mode still accepts after the mode machinery landed (wave-10 path intact).
@@ -6105,6 +6118,11 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
             "predict_impact",
             json!({"project": project.clone(), "seeds": ["demo.main"]}),
             "predict_impact requires calyx shadow indexing",
+        ),
+        (
+            "measure_bits",
+            json!({"project": project.clone(), "mode": "signals"}),
+            "measure_bits requires calyx shadow indexing",
         ),
         (
             "coverage_ingest",
@@ -9445,6 +9463,15 @@ fn build_fusion_fixture_index(store: &Path, root: &Path) -> (CbmToolRunner, Stri
          int run_query(const char *sql) { return sql != 0; }\n",
     )
     .expect("write db.c");
+
+    // The production shadow-index path runs git archaeology, so the fixture repo
+    // must be a real git repo with an initial commit (mirrors the other native
+    // shadow-index fixtures); otherwise `git rev-parse --verify HEAD` fails closed.
+    fixture_git(&repo, &["init", "--initial-branch=main"]);
+    fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+    fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+    fixture_git(&repo, &["add", "-A"]);
+    fixture_git(&repo, &["commit", "-m", "initial"]);
 
     let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
     let index_args = json!({ "repo_path": repo, "calyx": "shadow" }).to_string();

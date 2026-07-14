@@ -688,7 +688,7 @@ mod tests {
     fn persisted_frame_row_parses_back_with_frame_hash() {
         let root = temp_root("frame-readback");
         let vault = AsterVault::new_durable(
-            &vault_dir(&root, "demo"),
+            vault_dir(&root, "demo"),
             VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
             vault_salt("demo").as_bytes().to_vec(),
             VaultOptions::default(),
@@ -742,7 +742,7 @@ mod tests {
     fn persisted_placement_truth_row_bytes_exact() {
         let root = temp_root("placement-bytes");
         let vault = AsterVault::new_durable(
-            &vault_dir(&root, "demo"),
+            vault_dir(&root, "demo"),
             VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
             vault_salt("demo").as_bytes().to_vec(),
             VaultOptions::default(),

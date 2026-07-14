@@ -133,9 +133,13 @@ struct GraphBuild {
 /// derive backtest cases) from a persisted CBM graph snapshot. Endpoints are
 /// resolved through the node→constellation map exactly as the coverage-ingest and
 /// invalidation lanes do (raw-edge snapshot rows carry only SQLite node ids).
+/// The covered-symbol -> covering-tests index derived alongside the consequence
+/// graph (each covered `CxId` maps to the set of TESTS `CxId`s that exercise it).
+type CoveredTestsIndex = BTreeMap<CxId, BTreeSet<CxId>>;
+
 fn build_consequence_graph(
     snapshot: &CbmGraphSnapshot,
-) -> Result<(ConsequenceGraph, BTreeMap<CxId, BTreeSet<CxId>>, GraphBuild), OracleError> {
+) -> Result<(ConsequenceGraph, CoveredTestsIndex, GraphBuild), OracleError> {
     let mut cx_by_node_id: BTreeMap<i64, CxId> = BTreeMap::new();
     for node in &snapshot.nodes {
         if let Some(cx_id) = node.cx_id {

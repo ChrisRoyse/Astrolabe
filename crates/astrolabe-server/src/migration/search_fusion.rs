@@ -401,6 +401,10 @@ pub(crate) fn execute_fused_query(
     let query = SlotQuery {
         text: request.query.to_string(),
         vectors: query_vectors,
+        // A free-text fusion query supplies no structural sparse vectors; any
+        // structural slot in the manifest is refused ASTRO_SEARCH_INDEX_QUERY_MISSING
+        // exactly as a dense vector slot is when it receives no query vector (#332).
+        sparse_vectors: BTreeMap::new(),
     };
     let results = run_indexed_search(
         &plan,
@@ -434,7 +438,9 @@ fn declared_vector_slots(manifest: &SlotIndexManifest) -> BTreeSet<SlotId> {
         .iter()
         .filter_map(|spec| match spec.kind {
             SlotIndexKind::Vector { .. } => Some(spec.slot),
-            SlotIndexKind::Lexical => None,
+            // Structural (#332) slots carry sparse per-symbol vectors, not dense
+            // query embeddings, so the free-text fusion path never embeds into them.
+            SlotIndexKind::Lexical | SlotIndexKind::Structural { .. } => None,
         })
         .collect()
 }
