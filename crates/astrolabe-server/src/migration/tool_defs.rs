@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 10] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 11] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -12,7 +12,57 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 10] {
         team_artifact_tool_definition(),
         guard_calibrate_tool_definition(),
         guard_check_tool_definition(),
+        measure_bits_tool_definition(),
     ]
+}
+
+pub(crate) fn measure_bits_tool_definition() -> Value {
+    json!({
+        "name": "measure_bits",
+        "title": "Measure Bits",
+        "description": "Serve per-repo measured assay cards for a shadow-indexed project, replacing CBM's fixed constants with measured values. Six modes: signals (per-slot bits ± CI ranked about an axis), sufficiency (I(panel;axis) vs H(axis) with the deficit breakdown), redundancy (total correlation + effective rank n_eff + the pairwise redundancy map), synergy (three-way interaction information over designed triples), causality (transfer-entropy DRIVES edges with a lag sweep), and calibration (each edge-resolution strategy's measured empirical precision vs its CBM prior, with a Wilson CI; measured supersedes the prior above quorum, the prior is retained as a labeled fallback below it). Every response carries trust/freshness/provenance. refresh:true recomputes the calibration card on demand from persisted observations (re-persisted with an incremented seq and reset freshness, write-then-readback verified); other modes' recompute is owned by the background assay lane and refresh is labeled accordingly. Fails closed with {code,message,remediation} on an unknown mode, a malformed axis, or an absent/corrupt card.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["signals", "sufficiency", "redundancy", "synergy", "causality", "calibration"],
+                    "description": "Which assay card to serve."
+                },
+                "axis": {
+                    "type": "string",
+                    "description": "Outcome axis for per-axis modes (signals, sufficiency, synergy, causality). Omit for the panel-wide modes (redundancy, calibration). A present-but-empty axis is refused."
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope id to partition the card by. If omitted, the project-level card is served."
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "If true, recompute on demand. Wired for mode=\"calibration\" (recomputes from persisted observations, bumps the card seq, resets freshness); other modes serve the cached card and label refresh as lane-owned."
+                }
+            },
+            "required": ["project", "mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn guard_check_tool_definition() -> Value {

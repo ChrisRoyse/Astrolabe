@@ -10,7 +10,7 @@ publish.workspace = true
 astrolabe-domain.workspace = true
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [lib]
 path = "src/lib.rs"

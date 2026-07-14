@@ -139,6 +139,9 @@ use impute::*;
 mod readiness;
 use readiness::*;
 
+mod measure_bits;
+use measure_bits::*;
+
 mod anchor_outcome;
 use anchor_outcome::*;
 

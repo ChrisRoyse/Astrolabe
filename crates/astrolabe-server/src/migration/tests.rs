@@ -8944,3 +8944,221 @@ fn wait_for_lowered_sqlite_lock(cache_dir: &Path, project: &str) -> LoweredSqlit
         lowered_sqlite_lock_path(cache_dir, project).display()
     );
 }
+
+// ------- #34 measure_bits tool + n_eff surfacing (server-pending FSV) -------
+
+fn measure_bits_card_doc(seq: u64, freshness: &str, lag: u64, trust: &str, card: Value) -> Value {
+    json!({
+        "schema": ASSAY_CARD_SCHEMA,
+        "trust": trust,
+        "freshness": freshness,
+        "freshness_lag": lag,
+        "seq": seq,
+        "provenance": ["assay:test:card:1"],
+        "card": card,
+    })
+}
+
+#[test]
+fn measure_bits_serves_persisted_card_with_labeled_envelope() {
+    let dir = temp_dir("measure-bits-serve");
+    let card = json!({
+        "axis": "defect",
+        "signals": [{"slot": "complexity", "bits": 0.61, "trust": "trusted", "n": 160}],
+    });
+    let key = measure_bits_card_key("demo", "signals", Some("defect"), None);
+    write_config_value(
+        &dir,
+        &key,
+        &measure_bits_card_doc(2, "fresh", 0, "trusted", card).to_string(),
+    )
+    .unwrap();
+
+    let value = measure_bits_json_at(&dir, "demo", "signals", Some("defect"), None, false).unwrap();
+    assert_eq!(value["schema"], MEASURE_BITS_SCHEMA);
+    assert_eq!(value["status"], "served");
+    assert_eq!(value["mode"], "signals");
+    assert_eq!(value["trust"], "trusted");
+    assert_eq!(value["freshness"], "fresh");
+    assert_eq!(value["seq"], 2);
+    assert!(!value["provenance"].as_array().unwrap().is_empty());
+    assert_eq!(value["card"]["signals"][0]["slot"], "complexity");
+    assert_eq!(value["refresh_applied"], false);
+    assert_eq!(value["artifact_sha256"].as_str().unwrap().len(), 64);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_refuses_unknown_mode_fail_closed() {
+    let dir = temp_dir("measure-bits-bad-mode");
+    let value = measure_bits_json_at(&dir, "demo", "entropy", None, None, false).unwrap();
+    assert_eq!(value["status"], "refused");
+    assert_eq!(value["code"], "ASTRO_ASSAY_MEASURE_BITS_MODE_UNSUPPORTED");
+    assert!(value["message"].as_str().unwrap().contains("entropy"));
+    assert!(!value["remediation"].as_str().unwrap().is_empty());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_refuses_absent_card_with_deficit() {
+    let dir = temp_dir("measure-bits-absent");
+    let value =
+        measure_bits_json_at(&dir, "demo", "sufficiency", Some("defect"), None, false).unwrap();
+    assert_eq!(value["status"], "refused");
+    assert_eq!(value["code"], "ASTRO_ASSAY_MEASURE_BITS_CARD_UNAVAILABLE");
+    assert!(!value["remediation"].as_str().unwrap().is_empty());
+    assert_eq!(value["trust"], "provisional");
+    assert_eq!(value["freshness"], "not_evaluated");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_refuses_corrupt_card_fail_closed() {
+    let dir = temp_dir("measure-bits-corrupt");
+    // A card doc missing its required freshness/provenance labels is refused.
+    let bad = json!({"schema": ASSAY_CARD_SCHEMA, "trust": "trusted", "seq": 1, "card": {}});
+    let key = measure_bits_card_key("demo", "redundancy", None, None);
+    write_config_value(&dir, &key, &bad.to_string()).unwrap();
+    let value = measure_bits_json_at(&dir, "demo", "redundancy", None, None, false).unwrap();
+    assert_eq!(value["status"], "refused");
+    assert_eq!(value["code"], "ASTRO_ASSAY_MEASURE_BITS_CARD_CORRUPT");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_axis_arg_invalid_predicate() {
+    let mut empty = Map::new();
+    empty.insert("axis".to_string(), json!(""));
+    assert!(measure_bits_axis_arg_invalid(&empty));
+    let mut nonstr = Map::new();
+    nonstr.insert("axis".to_string(), json!(7));
+    assert!(measure_bits_axis_arg_invalid(&nonstr));
+    let mut good = Map::new();
+    good.insert("axis".to_string(), json!("defect"));
+    assert!(!measure_bits_axis_arg_invalid(&good));
+    // Absent axis is the legitimate panel-wide default.
+    assert!(!measure_bits_axis_arg_invalid(&Map::new()));
+}
+
+#[test]
+fn measure_bits_all_six_modes_serve_persisted_cards() {
+    let dir = temp_dir("measure-bits-six-modes");
+    for mode in MEASURE_BITS_MODES {
+        let (axis, key_axis) = if mode_is_panel_wide(mode) {
+            (None, None)
+        } else {
+            (Some("defect"), Some("defect"))
+        };
+        let key = measure_bits_card_key("demo", mode, key_axis, None);
+        let card = json!({"mode": mode, "n_eff": 1.0});
+        write_config_value(
+            &dir,
+            &key,
+            &measure_bits_card_doc(0, "fresh", 0, "trusted", card).to_string(),
+        )
+        .unwrap();
+        let value = measure_bits_json_at(&dir, "demo", mode, axis, None, false).unwrap();
+        assert_eq!(value["status"], "served", "mode {mode} must serve");
+        assert_eq!(value["mode"], mode);
+        assert_eq!(value["trust"], "trusted");
+        assert!(!value["provenance"].as_array().unwrap().is_empty());
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_calibration_refresh_recomputes_and_resets_freshness() {
+    let dir = temp_dir("measure-bits-refresh");
+    // Persist ground-truth observations: service_pattern's prior 0.5 is contradicted
+    // (8/40=0.2, above quorum -> measured); suffix below quorum keeps its prior.
+    let inputs_key = measure_bits_calibration_inputs_key("demo", None);
+    let inputs = json!([
+        {"strategy": "service_pattern", "prior": 0.5, "correct": 8, "total": 40},
+        {"strategy": "suffix", "prior": 0.55, "correct": 3, "total": 5}
+    ]);
+    write_config_value(&dir, &inputs_key, &inputs.to_string()).unwrap();
+
+    // A stale prior card at seq 3 with a nonzero freshness lag.
+    let card_key = measure_bits_card_key("demo", "calibration", None, None);
+    write_config_value(
+        &dir,
+        &card_key,
+        &measure_bits_card_doc(3, "stale", 5, "provisional", json!({"strategies": []})).to_string(),
+    )
+    .unwrap();
+
+    // refresh:false serves the cached, stale card with its freshness lag intact.
+    let cached = measure_bits_json_at(&dir, "demo", "calibration", None, None, false).unwrap();
+    assert_eq!(cached["status"], "served");
+    assert_eq!(cached["seq"], 3);
+    assert_eq!(cached["freshness"], "stale");
+    assert_eq!(cached["freshness_lag"], 5);
+
+    // refresh:true recomputes, resets freshness, and bumps the sequence.
+    let refreshed = measure_bits_json_at(&dir, "demo", "calibration", None, None, true).unwrap();
+    assert_eq!(refreshed["status"], "refreshed");
+    assert_eq!(refreshed["seq"], 4);
+    assert_eq!(refreshed["freshness"], "fresh");
+    assert_eq!(refreshed["freshness_lag"], 0);
+    assert_eq!(refreshed["refresh_applied"], true);
+
+    // The recomputed card carries both calibration states.
+    let strategies = refreshed["card"]["strategies"].as_array().unwrap();
+    let sp = strategies
+        .iter()
+        .find(|s| s["strategy"] == "service_pattern")
+        .unwrap();
+    assert_eq!(sp["source"], "measured");
+    assert!((sp["measured"]["precision"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+    let sfx = strategies
+        .iter()
+        .find(|s| s["strategy"] == "suffix")
+        .unwrap();
+    assert_eq!(sfx["source"], "prior_fallback");
+
+    // FSV: independently read the persisted card row back; seq 4 is durable.
+    let raw = read_config_value(&dir, &card_key).unwrap().unwrap();
+    let persisted: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(persisted["seq"], 4);
+    assert_eq!(persisted["freshness"], "fresh");
+    assert_eq!(persisted["schema"], ASSAY_CARD_SCHEMA);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn measure_bits_refresh_without_inputs_is_refused() {
+    let dir = temp_dir("measure-bits-refresh-noinputs");
+    let value = measure_bits_json_at(&dir, "demo", "calibration", None, None, true).unwrap();
+    assert_eq!(value["status"], "refused");
+    assert_eq!(
+        value["code"],
+        "ASTRO_ASSAY_MEASURE_BITS_REFRESH_INPUTS_MISSING"
+    );
+    assert!(!value["remediation"].as_str().unwrap().is_empty());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn get_architecture_redundancy_aspect_surfaces_neff() {
+    let dir = temp_dir("measure-bits-neff");
+    // Unavailable when no redundancy card is persisted.
+    let missing = read_redundancy_neff_aspect(&dir, "demo");
+    assert_eq!(missing["status"], "unavailable");
+    assert!(missing["n_eff"].is_null());
+
+    // Present: n_eff is surfaced from the persisted redundancy card.
+    let card = json!({"n_eff": 9.0, "n_slots": 22, "total_correlation_bits": 4.2});
+    let key = measure_bits_card_key("demo", "redundancy", None, None);
+    write_config_value(
+        &dir,
+        &key,
+        &measure_bits_card_doc(1, "fresh", 0, "trusted", card).to_string(),
+    )
+    .unwrap();
+    let aspect = read_redundancy_neff_aspect(&dir, "demo");
+    assert_eq!(aspect["status"], "measured");
+    assert_eq!(aspect["n_eff"], 9.0);
+    assert_eq!(aspect["n_slots"], 22);
+    assert_eq!(aspect["trust"], "trusted");
+    fs::remove_dir_all(&dir).ok();
+}

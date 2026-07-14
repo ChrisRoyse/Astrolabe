@@ -376,6 +376,134 @@ pub fn assay_bits_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ASSAY_BITS_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the card-shaping knobs (calibration, redundancy,
+/// synergy, causality) that back the `measure_bits` tool's non-signal modes (#34).
+pub const ASSAY_CARD_KNOB_REGISTRY_VERSION: &str = "astrolabe-assay-card-knobs-v1";
+
+/// Name of the minimum ground-truth-sample knob below which an edge strategy's
+/// prior confidence is retained as a fallback instead of being measured.
+pub const ASSAY_CALIBRATION_MIN_SAMPLES_KNOB: &str = "assay_calibration_min_samples";
+/// Name of the per-slot redundancy quorum knob (min samples per slot before its
+/// entropy contributes to the total-correlation / effective-rank card).
+pub const ASSAY_REDUNDANCY_QUORUM_KNOB: &str = "assay_redundancy_quorum";
+/// Name of the synergy quorum knob (min aligned samples before a three-way
+/// interaction-information triple is measured).
+pub const ASSAY_SYNERGY_QUORUM_KNOB: &str = "assay_synergy_quorum";
+/// Name of the causality minimum-series-length knob (min aligned time-series
+/// steps before a transfer-entropy edge is measured).
+pub const ASSAY_CAUSALITY_MIN_SERIES_KNOB: &str = "assay_causality_min_series";
+/// Name of the causality maximum-lag knob (largest lag in the power-of-two lag
+/// sweep the transfer-entropy card evaluates).
+pub const ASSAY_CAUSALITY_MAX_LAG_KNOB: &str = "assay_causality_max_lag";
+
+/// Default minimum ground-truth samples to measure an edge strategy's precision.
+///
+/// Below this the per-strategy precision `x/n` is too noisy to replace the CBM
+/// prior, so the prior is retained as a labeled fallback. 30 is the classic
+/// large-sample rule of thumb (the CLT normal approximation is usually adequate
+/// by n≈30); Brown, Cai & DasGupta (2001) recommend the Wilson interval used
+/// here for all n, but a strategy's *measured* precision only supersedes its
+/// prior once the sample is at least this large.
+pub const ASSAY_DEFAULT_CALIBRATION_MIN_SAMPLES: u64 = 30;
+/// Smallest legal calibration min-samples: at least two trials define a proportion.
+pub const ASSAY_MIN_CALIBRATION_MIN_SAMPLES: u64 = 2;
+/// Largest legal calibration min-samples. An upper bound keeps the measured
+/// regime reachable on a real per-repo ground-truth set.
+pub const ASSAY_MAX_CALIBRATION_MIN_SAMPLES: u64 = 1_000_000;
+
+/// Default per-slot redundancy quorum (blueprint 08 §3: "quorum 50/slot").
+pub const ASSAY_DEFAULT_REDUNDANCY_QUORUM: u64 = 50;
+/// Smallest legal redundancy quorum: at least two samples estimate any entropy.
+pub const ASSAY_MIN_REDUNDANCY_QUORUM: u64 = 2;
+/// Largest legal redundancy quorum. An upper bound keeps the gate reachable.
+pub const ASSAY_MAX_REDUNDANCY_QUORUM: u64 = 1_000_000;
+
+/// Default synergy quorum (blueprint 08 §4: "Quorum 150").
+pub const ASSAY_DEFAULT_SYNERGY_QUORUM: u64 = 150;
+/// Smallest legal synergy quorum: a three-way table needs several samples.
+pub const ASSAY_MIN_SYNERGY_QUORUM: u64 = 3;
+/// Largest legal synergy quorum. An upper bound keeps the gate reachable.
+pub const ASSAY_MAX_SYNERGY_QUORUM: u64 = 1_000_000;
+
+/// Default minimum series length for a transfer-entropy edge. A transfer-entropy
+/// estimate conditions on the target's own past, so it needs enough lagged
+/// (future, target-past, driver-past) triples to fill the conditional table; 50
+/// mirrors the per-slot MI quorum so a causality edge is held to the same
+/// evidence floor as a redundancy slot.
+pub const ASSAY_DEFAULT_CAUSALITY_MIN_SERIES: u64 = 50;
+/// Smallest legal causality series length: at least one lagged triple past the
+/// largest lag plus a couple of observations.
+pub const ASSAY_MIN_CAUSALITY_MIN_SERIES: u64 = 4;
+/// Largest legal causality series length. An upper bound keeps the gate reachable.
+pub const ASSAY_MAX_CAUSALITY_MIN_SERIES: u64 = 1_000_000;
+
+/// Default maximum transfer-entropy lag (blueprint 08 §6 lag sweep {1,2,4,8}).
+pub const ASSAY_DEFAULT_CAUSALITY_MAX_LAG: u64 = 8;
+/// Smallest legal maximum lag: a one-step lag is the tightest causal window.
+pub const ASSAY_MIN_CAUSALITY_MAX_LAG: u64 = 1;
+/// Largest legal maximum lag. An upper bound keeps the lagged table populated at
+/// realistic series lengths.
+pub const ASSAY_MAX_CAUSALITY_MAX_LAG: u64 = 1_024;
+
+/// The card-shaping knob registry (#34).
+pub const ASSAY_CARD_KNOBS: &[U64KnobDeclaration] = &[
+    U64KnobDeclaration {
+        registry_version: ASSAY_CARD_KNOB_REGISTRY_VERSION,
+        name: ASSAY_CALIBRATION_MIN_SAMPLES_KNOB,
+        default: ASSAY_DEFAULT_CALIBRATION_MIN_SAMPLES,
+        min: ASSAY_MIN_CALIBRATION_MIN_SAMPLES,
+        max: ASSAY_MAX_CALIBRATION_MIN_SAMPLES,
+        unit: "samples",
+        source: "Brown, Cai & DasGupta, 'Interval Estimation for a Binomial Proportion', Statistical Science 16(2) (2001) (Wilson interval for all n) and the classic n≈30 CLT large-sample rule of thumb",
+        rationale: "minimum LSP/trace-confirmed ground-truth observations before an edge strategy's measured precision x/n supersedes its CBM prior confidence; below it the prior is retained as a labeled fallback rather than replaced by a noisy point; zero/one is illegal because a proportion needs at least two trials",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_CARD_KNOB_REGISTRY_VERSION,
+        name: ASSAY_REDUNDANCY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_REDUNDANCY_QUORUM,
+        min: ASSAY_MIN_REDUNDANCY_QUORUM,
+        max: ASSAY_MAX_REDUNDANCY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §3 (total correlation / effective rank, 'quorum 50/slot')",
+        rationale: "minimum aligned samples a slot must carry before its marginal entropy contributes to the total-correlation and effective-rank (n_eff) card; below it the slot is reported as below-quorum rather than folded into a noisy redundancy estimate",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_CARD_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SYNERGY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_SYNERGY_QUORUM,
+        min: ASSAY_MIN_SYNERGY_QUORUM,
+        max: ASSAY_MAX_SYNERGY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §4 (interaction information over designed triples, 'Quorum 150')",
+        rationale: "minimum aligned samples a designed triple must carry before its three-way interaction information is measured; a three-way contingency table thins fast, so below quorum the triple is reported below-quorum rather than measured on a sparse table",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_CARD_KNOB_REGISTRY_VERSION,
+        name: ASSAY_CAUSALITY_MIN_SERIES_KNOB,
+        default: ASSAY_DEFAULT_CAUSALITY_MIN_SERIES,
+        min: ASSAY_MIN_CAUSALITY_MIN_SERIES,
+        max: ASSAY_MAX_CAUSALITY_MIN_SERIES,
+        unit: "steps",
+        source: "ASTROLABE blueprint 08_ASSAY §6 (transfer entropy over change/failure series) and the §3 per-slot MI quorum (50)",
+        rationale: "minimum aligned time-series steps before a transfer-entropy edge is measured; TE conditions on the target's own past, so it needs enough lagged triples to fill the conditional table; below it the edge is reported below-quorum",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_CARD_KNOB_REGISTRY_VERSION,
+        name: ASSAY_CAUSALITY_MAX_LAG_KNOB,
+        default: ASSAY_DEFAULT_CAUSALITY_MAX_LAG,
+        min: ASSAY_MIN_CAUSALITY_MAX_LAG,
+        max: ASSAY_MAX_CAUSALITY_MAX_LAG,
+        unit: "steps",
+        source: "ASTROLABE blueprint 08_ASSAY §6 (transfer-entropy lag sweep {1,2,4,8})",
+        rationale: "largest lag in the power-of-two lag sweep the transfer-entropy card evaluates; the reported direction is the lag with the largest TE; 8 is the blueprint's top window, larger sweeps need proportionally longer series",
+    },
+];
+
+/// Returns the card-shaping declaration for `name`, or `None` when undeclared.
+pub fn assay_card_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ASSAY_CARD_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +569,54 @@ mod tests {
         // k defaults to the blueprint-fixed 3.
         let k = assay_bits_knob(ASSAY_KSG_NEIGHBORS_K_KNOB).expect("declared");
         assert_eq!(k.default, 3);
+    }
+
+    #[test]
+    fn every_card_knob_declares_bounds_that_contain_its_default() {
+        assert!(!ASSAY_CARD_KNOBS.is_empty());
+        for knob in ASSAY_CARD_KNOBS {
+            assert_eq!(
+                knob.registry_version, ASSAY_CARD_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+        // Blueprint-fixed defaults: 50/slot redundancy, 150 synergy, lag sweep top 8.
+        assert_eq!(
+            assay_card_knob(ASSAY_REDUNDANCY_QUORUM_KNOB)
+                .unwrap()
+                .default,
+            50
+        );
+        assert_eq!(
+            assay_card_knob(ASSAY_SYNERGY_QUORUM_KNOB).unwrap().default,
+            150
+        );
+        assert_eq!(
+            assay_card_knob(ASSAY_CAUSALITY_MAX_LAG_KNOB)
+                .unwrap()
+                .default,
+            8
+        );
+    }
+
+    #[test]
+    fn card_knobs_reject_zero_and_one_where_meaningless() {
+        for name in [
+            ASSAY_CALIBRATION_MIN_SAMPLES_KNOB,
+            ASSAY_REDUNDANCY_QUORUM_KNOB,
+            ASSAY_SYNERGY_QUORUM_KNOB,
+            ASSAY_CAUSALITY_MIN_SERIES_KNOB,
+        ] {
+            let knob = assay_card_knob(name).expect("declared");
+            assert!(!knob.accepts(0), "{name} must reject zero");
+            assert!(!knob.accepts(1), "{name} must reject one");
+            assert!(knob.accepts(knob.default), "{name} accepts default");
+        }
     }
 
     #[test]

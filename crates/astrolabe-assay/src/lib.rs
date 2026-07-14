@@ -29,6 +29,8 @@
 #![deny(missing_docs)]
 
 pub mod bits;
+pub mod calibration;
+pub mod causality;
 pub mod deficits;
 pub mod error;
 pub mod estimators;
@@ -37,15 +39,27 @@ pub mod knobs;
 pub mod ledger;
 pub mod population;
 pub mod projection;
+pub mod redundancy;
 pub mod rng;
 pub mod scheduler;
+pub mod stats;
 pub mod store;
 pub mod strata;
+pub mod synergy;
 
 pub use bits::{
     AxisValues, BitsConfig, BitsInterval, DeficitSuggestedAction, SignalBits, SignalRankingCard,
     SlotDeficit, SlotObservations, SlotSummary, SlotValues, SufficiencyCard, build_signal_ranking,
     build_sufficiency_card, enforce_dpi_ceiling, measure_slot_bits,
+};
+pub use calibration::{
+    CalibrationCard, CalibrationConfig, CalibrationLedger, CalibrationLedgerEntry,
+    CalibrationSource, MeasuredPrecision, StrategyCalibration, StrategyObservation,
+    build_calibration_card, calibration_input_fingerprint,
+};
+pub use causality::{
+    CausalityCard, CausalityConfig, CausalityEdge, CausalityEdgeInput, CausalityLag,
+    build_causality_card,
 };
 pub use deficits::{DeficitMeasurement, OPTIMIZER_DEFICITS_SCHEMA, optimizer_deficits_document};
 pub use error::{AssayError, Result};
@@ -53,12 +67,20 @@ pub use estimators::{entropy_bits, mi_continuous_ksg, mi_discrete, mi_mixed_ross
 pub use fingerprint::InputFingerprint;
 pub use ledger::{AssayCardEntry, CardLedger, input_fingerprint};
 pub use population::{AssaySubject, Population};
+pub use redundancy::{
+    RedundancyCard, RedundancyConfig, RedundantPair, SlotColumn, build_redundancy_card,
+};
 pub use scheduler::{
     AssayScheduler, CooperativeScorer, IsolationDecision, SampleRequest, ScheduleOutcome,
     TickReport, TickStep, check_serving_isolation, serving_p99_micros,
 };
+pub use stats::{inverse_standard_normal_cdf, wilson_interval};
 pub use store::AssayStore;
 pub use strata::{SampleResult, SelectedSubject, StratumAllocation, stratified_sample};
+pub use synergy::{
+    SynergyCard, SynergyClassification, SynergyConfig, SynergyTriple, SynergyTripleInput,
+    build_synergy_card,
+};
 
 /// The Cargo package name for this crate.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
