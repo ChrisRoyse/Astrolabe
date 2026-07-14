@@ -11,9 +11,16 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use astrolabe_ingest::{CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, read_cbm_graph_snapshot};
-use astrolabe_weave::{PersistedSimilarityEdgeRow, read_similarity_edge_rows};
-use calyx_aster::cf::ColumnFamily;
+use astrolabe_domain::knobs::U64KnobDeclaration;
+use astrolabe_ingest::{
+    CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, read_cbm_graph_snapshot,
+    read_cbm_graph_snapshot_at,
+};
+use astrolabe_weave::{
+    PersistedSimilarityEdgeRow, SCHEMA_SIM_EDGE_ROW, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
+    read_similarity_edge_rows,
+};
+use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId, decode};
@@ -255,29 +262,22 @@ where
 {
     validate_options(options)?;
     let output_path = output_path.as_ref().to_path_buf();
-    let snapshot = read_cbm_graph_snapshot(vault, &options.project)?;
+    // The canonical lowering reads the vault's latest committed state and uses
+    // weave's own key-verified similarity reader, so its output byte-stream is
+    // unchanged by the `as_of` time-travel work below.
+    let snapshot = vault.latest_seq();
     let similarity_edges = read_similarity_edge_rows(vault)?;
-    let source_ledger_head_hash = source_ledger_head_hash(vault)?;
-    let vault_fingerprint_sha256 = snapshot_fingerprint(&snapshot, &source_ledger_head_hash);
-    let lowered = LoweredRows::from_snapshot(snapshot, similarity_edges)?;
-
-    write_sqlite_artifact(
-        &output_path,
-        &lowered,
-        &source_ledger_head_hash,
-        &vault_fingerprint_sha256,
-        &options.lowered_at,
-    )?;
-    let artifact_sha256 = hex_lower(&sha256_digest(&fs::read(&output_path)?));
+    let build = lower_at_inner(vault, &output_path, options, snapshot, similarity_edges)?;
     let manifest_seq = write_lower_manifest(
         vault,
         &output_path,
-        &lowered,
-        &source_ledger_head_hash,
-        &vault_fingerprint_sha256,
-        &artifact_sha256,
+        &build.lowered,
+        &build.source_ledger_head_hash,
+        &build.vault_fingerprint_sha256,
+        &build.artifact_sha256,
         &options.lowered_at,
     )?;
+    let lowered = build.lowered;
 
     Ok(LoweredSqliteReport {
         project: lowered.project,
@@ -294,10 +294,118 @@ where
             .count(),
         token_vector_count: lowered.token_vectors.len(),
         panel_version: lowered.panel_version,
+        source_ledger_head_hash: build.source_ledger_head_hash,
+        vault_fingerprint_sha256: build.vault_fingerprint_sha256,
+        artifact_sha256: build.artifact_sha256,
+        manifest_seq,
+    })
+}
+
+/// The built lowered artifact, before any manifest is (or is not) committed.
+struct LoweredArtifactBuild {
+    lowered: LoweredRows,
+    source_ledger_head_hash: String,
+    vault_fingerprint_sha256: String,
+    artifact_sha256: String,
+}
+
+/// Reads the graph at `snapshot`, writes the lowered SQLite artifact to
+/// `output_path`, and returns its content digest. Pure derivation: it never
+/// mutates the vault, so both the canonical lowering (which then commits a
+/// manifest) and the `as_of` lowering (which does not) share it.
+fn lower_at_inner<C>(
+    vault: &AsterVault<C>,
+    output_path: &Path,
+    options: &LowerSqliteOptions,
+    snapshot: Seq,
+    similarity_edges: Vec<PersistedSimilarityEdgeRow>,
+) -> LowerResult<LoweredArtifactBuild>
+where
+    C: Clock,
+{
+    let graph = read_cbm_graph_snapshot_at(vault, &options.project, snapshot)?;
+    let source_ledger_head_hash = source_ledger_head_hash_at(vault, snapshot)?;
+    let vault_fingerprint_sha256 = snapshot_fingerprint(&graph, &source_ledger_head_hash);
+    let lowered = LoweredRows::from_snapshot(graph, similarity_edges)?;
+
+    write_sqlite_artifact(
+        output_path,
+        &lowered,
+        &source_ledger_head_hash,
+        &vault_fingerprint_sha256,
+        &options.lowered_at,
+    )?;
+    let artifact_sha256 = hex_lower(&sha256_digest(&fs::read(output_path)?));
+    Ok(LoweredArtifactBuild {
+        lowered,
         source_ledger_head_hash,
         vault_fingerprint_sha256,
         artifact_sha256,
-        manifest_seq,
+    })
+}
+
+/// A lowered SQLite artifact built as of an explicit MVCC snapshot sequence
+/// (#43 `query_graph` `as_of`). Unlike [`LoweredSqliteReport`] this carries no
+/// `manifest_seq`: the `as_of` lowering is a read-only historical projection
+/// and never commits a lowering manifest into the (present-time) vault.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AsOfLoweredArtifact {
+    /// Project the artifact serves.
+    pub project: String,
+    /// Path the artifact was written to.
+    pub output_path: PathBuf,
+    /// MVCC snapshot sequence the graph was read at.
+    pub snapshot_seq: Seq,
+    /// Node rows written.
+    pub node_count: usize,
+    /// Edge rows written.
+    pub edge_count: usize,
+    /// Source edges dropped because an endpoint was outside the snapshot.
+    pub skipped_edges: usize,
+    /// SHA-256 of the artifact bytes on disk.
+    pub artifact_sha256: String,
+    /// Vault content fingerprint at the snapshot.
+    pub vault_fingerprint_sha256: String,
+    /// Non-lowering ledger head hash visible at the snapshot.
+    pub source_ledger_head_hash: String,
+}
+
+/// Lowers the CBM graph to a throwaway SQLite artifact **as of** an explicit
+/// MVCC snapshot sequence (#43 `query_graph` `as_of` time-travel).
+///
+/// The read is pinned to `snapshot`: nodes, edges, projects, file hashes,
+/// summaries, token vectors, similarity edges, and the source ledger head are
+/// all read at that seqno, so the artifact is a pure function of
+/// `(vault, project, snapshot, options.lowered_at)`. Re-lowering the same
+/// `snapshot` after later commits yields a byte-identical file. Callers resolve
+/// a wall-clock `as_of` to a seqno with [`AsterVault::as_of`] (the `time_index`
+/// CF); the resolution fails closed (`CALYX_TIMETRAVEL_*`) when the vault has no
+/// write at or before the timestamp, or the timestamp is below the retention
+/// horizon. No manifest is committed — this is a read-only view, never a
+/// canonical lowering of present state.
+pub fn lower_cbm_sqlite_at<C>(
+    vault: &AsterVault<C>,
+    output_path: impl AsRef<Path>,
+    options: &LowerSqliteOptions,
+    snapshot: Seq,
+) -> LowerResult<AsOfLoweredArtifact>
+where
+    C: Clock,
+{
+    validate_options(options)?;
+    let output_path = output_path.as_ref().to_path_buf();
+    let similarity_edges = read_similarity_edge_rows_at(vault, snapshot)?;
+    let build = lower_at_inner(vault, &output_path, options, snapshot, similarity_edges)?;
+    Ok(AsOfLoweredArtifact {
+        project: build.lowered.project,
+        output_path,
+        snapshot_seq: snapshot,
+        node_count: build.lowered.nodes.len(),
+        edge_count: build.lowered.edges.len(),
+        skipped_edges: build.lowered.skipped_edges,
+        artifact_sha256: build.artifact_sha256,
+        vault_fingerprint_sha256: build.vault_fingerprint_sha256,
+        source_ledger_head_hash: build.source_ledger_head_hash,
     })
 }
 
@@ -406,7 +514,7 @@ where
         ));
     }
 
-    let current_head = source_ledger_head_hash(vault)?;
+    let current_head = source_ledger_head_hash_at(vault, vault.latest_seq())?;
     let current_snapshot = read_cbm_graph_snapshot(vault, project)?;
     let current_fingerprint = snapshot_fingerprint(&current_snapshot, &current_head);
     if current_fingerprint != meta.vault_fingerprint {
@@ -939,12 +1047,17 @@ fn insert_token_vectors(tx: &Transaction<'_>, rows: &LoweredRows) -> LowerResult
     Ok(())
 }
 
-fn source_ledger_head_hash<C>(vault: &AsterVault<C>) -> LowerResult<String>
+/// Non-lowering ledger head hash visible at an explicit MVCC `snapshot`.
+///
+/// Pins the Ledger CF scan to `snapshot` so the fingerprint reflects exactly the
+/// ledger state as of that sequence (#43 `as_of`); passing `vault.latest_seq()`
+/// reproduces the present-time head used by the canonical lowering.
+fn source_ledger_head_hash_at<C>(vault: &AsterVault<C>, snapshot: Seq) -> LowerResult<String>
 where
     C: Clock,
 {
     let mut selected = None;
-    for (_key, bytes) in vault.scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)? {
+    for (_key, bytes) in vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
         let entry = decode(&bytes)?;
         if matches!(&entry.actor, ActorId::Service(actor) if actor == ASTRO_LOWER_ACTOR) {
             continue;
@@ -956,6 +1069,48 @@ where
     Ok(hex_lower(
         &selected.map_or([0_u8; 32], |(_, entry_hash)| entry_hash),
     ))
+}
+
+/// Reads the persisted similarity (`SIM_*`) edge rows at an explicit MVCC
+/// `snapshot` sequence, mirroring [`astrolabe_weave::read_similarity_edge_rows`]
+/// but pinned to a historical seqno instead of the vault's latest snapshot.
+///
+/// Rows are scanned in Graph-CF key order (identical to weave's reader), each
+/// decoded to a [`SimEdgeGraphRow`], schema-checked, and required to name a
+/// known similarity family. At `vault.latest_seq()` this yields the same rows
+/// weave's reader returns for the same vault, so the `as_of` lowering of the
+/// present state matches the canonical lowering.
+fn read_similarity_edge_rows_at<C>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> LowerResult<Vec<PersistedSimilarityEdgeRow>>
+where
+    C: Clock,
+{
+    let mut rows = Vec::new();
+    for (key, value) in vault.scan_cf_range_at(
+        snapshot,
+        ColumnFamily::Graph,
+        &prefix_range(SIM_EDGE_ROW_PREFIX),
+    )? {
+        let row: SimEdgeGraphRow = serde_json::from_slice(&value)?;
+        if row.schema != SCHEMA_SIM_EDGE_ROW {
+            return Err(LowerError::InvalidInput(format!(
+                "persisted SIM_* row {} carries schema {:?}, expected {SCHEMA_SIM_EDGE_ROW}",
+                hex_lower(&key),
+                row.schema
+            )));
+        }
+        if row.similarity_family().is_none() {
+            return Err(LowerError::InvalidInput(format!(
+                "persisted SIM_* row {} names unknown similarity family {:?}",
+                hex_lower(&key),
+                row.family
+            )));
+        }
+        rows.push(PersistedSimilarityEdgeRow { key, row });
+    }
+    Ok(rows)
 }
 
 fn write_lower_manifest<C>(
@@ -1194,6 +1349,269 @@ fn hex_lower(bytes: &[u8]) -> String {
         write!(&mut out, "{byte:02x}").expect("hex write to String");
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// #43 `query_graph` `as_of`: per-t-bucket lowered-SQLite cache.
+// ---------------------------------------------------------------------------
+
+/// Registry version tag for the `as_of` time-bucket lowering knobs (#43).
+pub const AS_OF_BUCKET_KNOB_REGISTRY_VERSION: &str = "astrolabe-as-of-bucket-knobs-v1";
+
+/// Name of the `as_of` lowered-SQLite time-bucket width knob.
+pub const AS_OF_BUCKET_WIDTH_MS_KNOB: &str = "as_of_bucket_width_ms";
+
+/// Default width, in milliseconds, of one `as_of` cache bucket.
+///
+/// A `query_graph` `as_of=t` request is quantized to the bucket
+/// `floor(t / width)`; every `t` in a bucket serves the one lowered artifact
+/// built for that bucket's floor timestamp, so repeated historical queries in
+/// the same window reuse the cached SQLite view byte-for-byte and a re-lowering
+/// happens only when a query crosses into a new bucket. 1000ms mirrors the
+/// wall-clock second an operator naturally reasons in ("the graph a minute
+/// ago") and keeps the cache from re-lowering on every millisecond of clock
+/// jitter, while staying fine enough that adjacent edits usually fall in
+/// distinct buckets.
+pub const AS_OF_BUCKET_DEFAULT_WIDTH_MS: u64 = 1_000;
+/// Smallest legal bucket width. Zero is illegal: a zero-width bucket cannot be
+/// divided into and would re-lower on every distinct millisecond, defeating the
+/// cache this knob exists to bound (the same "zero disables the protection"
+/// failure the FSV sampling and debounce knobs forbid).
+pub const AS_OF_BUCKET_MIN_WIDTH_MS: u64 = 1;
+/// Largest legal bucket width: one day. An upper bound keeps a bucket from
+/// growing so coarse that "an hour ago" and "now" collapse into one served view.
+pub const AS_OF_BUCKET_MAX_WIDTH_MS: u64 = 86_400_000;
+
+/// The `as_of` time-bucket lowering knob registry (#43).
+pub const AS_OF_BUCKET_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: AS_OF_BUCKET_KNOB_REGISTRY_VERSION,
+    name: AS_OF_BUCKET_WIDTH_MS_KNOB,
+    default: AS_OF_BUCKET_DEFAULT_WIDTH_MS,
+    min: AS_OF_BUCKET_MIN_WIDTH_MS,
+    max: AS_OF_BUCKET_MAX_WIDTH_MS,
+    unit: "milliseconds",
+    source: "ASTROLABE #43 query_graph as_of time-travel; wall-clock-second granularity that an operator reasons in",
+    rationale: "quantizes an as_of wall-clock timestamp to a floor(t/width) cache bucket so historical queries in the same window reuse one lowered SQLite artifact byte-identically and re-lower only on a bucket boundary crossing; 1000ms is the natural operator second; zero is illegal (undivisible, re-lowers per millisecond); replace with a measured value once historical-query cadence is benchmarked",
+}];
+
+/// Returns the `as_of` bucket declaration for `name`, or `None` when undeclared.
+pub fn as_of_bucket_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    AS_OF_BUCKET_KNOBS.iter().find(|knob| knob.name == name)
+}
+
+/// Stable refusal code: the requested `as_of` bucket width is outside the
+/// registry-declared bounds.
+pub const ASTRO_AS_OF_BUCKET_WIDTH_OUT_OF_RANGE: &str = "ASTRO_AS_OF_BUCKET_WIDTH_OUT_OF_RANGE";
+
+const AS_OF_BUCKET_WIDTH_REMEDIATION: &str = "Pass an as_of bucket width inside the declared as_of_bucket_width_ms knob bounds (1..=86_400_000 ms).";
+
+/// One cached lowered artifact for a single `as_of` time bucket.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AsOfBucketEntry {
+    canonical_millis: u64,
+    snapshot_seq: Seq,
+    artifact_path: PathBuf,
+    artifact_sha256: String,
+    node_count: usize,
+    edge_count: usize,
+    skipped_edges: usize,
+}
+
+/// The outcome of serving one `as_of` request through the cache.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AsOfServeReport {
+    /// Bucket the requested timestamp quantized to (`floor(as_of / width)`).
+    pub bucket: u64,
+    /// Bucket floor timestamp the snapshot seqno was resolved from.
+    pub canonical_millis: u64,
+    /// MVCC snapshot sequence the served artifact was lowered at.
+    pub snapshot_seq: Seq,
+    /// Path of the served lowered SQLite artifact.
+    pub artifact_path: PathBuf,
+    /// SHA-256 of the served artifact bytes.
+    pub artifact_sha256: String,
+    /// `true` when this bucket was already cached (no re-lowering happened).
+    pub cache_hit: bool,
+    /// Node rows in the served artifact.
+    pub node_count: usize,
+    /// Edge rows in the served artifact.
+    pub edge_count: usize,
+    /// Source edges dropped because an endpoint was outside the snapshot.
+    pub skipped_edges: usize,
+    /// Total re-lowerings this cache has performed (bumped only on a miss).
+    pub relower_count: u64,
+    /// Total cache hits this cache has served (bumped only on a hit).
+    pub hit_count: u64,
+}
+
+/// A per-t-bucket cache of `as_of` lowered SQLite artifacts (#43).
+///
+/// A `query_graph` `as_of=t` request is quantized to the bucket
+/// `floor(t / width)` (`width` is the registry-declared
+/// [`AS_OF_BUCKET_WIDTH_MS_KNOB`]). The first request in a bucket resolves the
+/// bucket floor timestamp to an MVCC seqno via [`AsterVault::as_of`] and lowers
+/// that snapshot to a SQLite file, bumping the instrumented re-lower counter.
+/// Every later request in the same bucket is served from that cached file
+/// byte-for-byte, bumping only the hit counter — so the served view is stable
+/// within a bucket and re-lowers exactly on a boundary crossing. Resolution
+/// fails closed (`CALYX_TIMETRAVEL_*`) when the vault has no write at or before
+/// the bucket floor, or the floor is below the retention horizon.
+#[derive(Debug)]
+pub struct AsOfLoweredCache {
+    project: String,
+    output_dir: PathBuf,
+    bucket_width_ms: u64,
+    entries: BTreeMap<u64, AsOfBucketEntry>,
+    relower_count: u64,
+    hit_count: u64,
+}
+
+impl AsOfLoweredCache {
+    /// Builds a cache with an explicit bucket width, refusing a width outside
+    /// the declared knob bounds.
+    pub fn new(
+        project: impl Into<String>,
+        output_dir: impl Into<PathBuf>,
+        bucket_width_ms: u64,
+    ) -> LowerResult<Self> {
+        let knob = as_of_bucket_knob(AS_OF_BUCKET_WIDTH_MS_KNOB)
+            .expect("as_of bucket width knob is declared in the as_of bucket knob registry");
+        if !knob.accepts(bucket_width_ms) {
+            return Err(LowerError::refused(
+                ASTRO_AS_OF_BUCKET_WIDTH_OUT_OF_RANGE,
+                format!(
+                    "as_of bucket width {bucket_width_ms} ms is outside the declared knob bounds [{}, {}] for {}",
+                    knob.min, knob.max, knob.name
+                ),
+                AS_OF_BUCKET_WIDTH_REMEDIATION,
+            ));
+        }
+        Ok(Self {
+            project: project.into(),
+            output_dir: output_dir.into(),
+            bucket_width_ms,
+            entries: BTreeMap::new(),
+            relower_count: 0,
+            hit_count: 0,
+        })
+    }
+
+    /// Builds a cache at the registry-default bucket width.
+    pub fn with_default_width(project: impl Into<String>, output_dir: impl Into<PathBuf>) -> Self {
+        Self::new(project, output_dir, AS_OF_BUCKET_DEFAULT_WIDTH_MS)
+            .expect("registry-default as_of bucket width is inside its own declared bounds")
+    }
+
+    /// The bucket a wall-clock `as_of` timestamp quantizes to.
+    pub fn bucket_for(&self, as_of_millis: u64) -> u64 {
+        as_of_millis / self.bucket_width_ms
+    }
+
+    /// The bucket floor timestamp a snapshot is resolved at for `bucket`.
+    pub fn canonical_millis(&self, bucket: u64) -> u64 {
+        bucket.saturating_mul(self.bucket_width_ms)
+    }
+
+    /// Re-lowerings performed so far (bumped only when a bucket boundary is
+    /// crossed into an uncached bucket).
+    pub fn relower_count(&self) -> u64 {
+        self.relower_count
+    }
+
+    /// Cache hits served so far.
+    pub fn hit_count(&self) -> u64 {
+        self.hit_count
+    }
+
+    /// Serves the lowered artifact for a wall-clock `as_of` timestamp, lowering
+    /// (and caching) the bucket's snapshot on a miss and reusing the cached
+    /// artifact byte-for-byte on a hit.
+    pub fn serve<C>(
+        &mut self,
+        vault: &AsterVault<C>,
+        as_of_millis: u64,
+    ) -> LowerResult<AsOfServeReport>
+    where
+        C: Clock,
+    {
+        let bucket = self.bucket_for(as_of_millis);
+        if let Some(entry) = self.entries.get(&bucket) {
+            self.hit_count += 1;
+            return Ok(AsOfServeReport {
+                bucket,
+                canonical_millis: entry.canonical_millis,
+                snapshot_seq: entry.snapshot_seq,
+                artifact_path: entry.artifact_path.clone(),
+                artifact_sha256: entry.artifact_sha256.clone(),
+                cache_hit: true,
+                node_count: entry.node_count,
+                edge_count: entry.edge_count,
+                skipped_edges: entry.skipped_edges,
+                relower_count: self.relower_count,
+                hit_count: self.hit_count,
+            });
+        }
+
+        let canonical_millis = self.canonical_millis(bucket);
+        // Hold the time-travel pin across the whole lowering so version GC
+        // cannot reclaim the historical versions the read walks.
+        let snapshot = vault.as_of(canonical_millis)?;
+        let snapshot_seq = snapshot.seqno();
+        let artifact_path = self
+            .output_dir
+            .join(as_of_artifact_filename(&self.project, bucket));
+        // Deterministic `lowered_at` derived from the bucket floor keeps the
+        // artifact a pure function of the bucket, so re-lowering it is
+        // byte-identical.
+        let options = LowerSqliteOptions::new(self.project.clone())
+            .with_lowered_at(format!("as_of:{canonical_millis}"));
+        let artifact = lower_cbm_sqlite_at(vault, &artifact_path, &options, snapshot_seq)?;
+        drop(snapshot);
+
+        self.relower_count += 1;
+        let entry = AsOfBucketEntry {
+            canonical_millis,
+            snapshot_seq,
+            artifact_path: artifact.output_path.clone(),
+            artifact_sha256: artifact.artifact_sha256.clone(),
+            node_count: artifact.node_count,
+            edge_count: artifact.edge_count,
+            skipped_edges: artifact.skipped_edges,
+        };
+        self.entries.insert(bucket, entry);
+        Ok(AsOfServeReport {
+            bucket,
+            canonical_millis,
+            snapshot_seq,
+            artifact_path: artifact.output_path,
+            artifact_sha256: artifact.artifact_sha256,
+            cache_hit: false,
+            node_count: artifact.node_count,
+            edge_count: artifact.edge_count,
+            skipped_edges: artifact.skipped_edges,
+            relower_count: self.relower_count,
+            hit_count: self.hit_count,
+        })
+    }
+}
+
+/// Filesystem-safe artifact filename for one project/bucket pair. The project
+/// segment is reduced to `[A-Za-z0-9._-]` (other bytes become `_`) so an
+/// arbitrary project name can never escape `output_dir` or collide with a
+/// sidecar suffix.
+fn as_of_artifact_filename(project: &str, bucket: u64) -> String {
+    let mut safe = String::with_capacity(project.len());
+    for ch in project.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            safe.push(ch);
+        } else {
+            safe.push('_');
+        }
+    }
+    if safe.is_empty() {
+        safe.push('_');
+    }
+    format!("asof-{safe}-bucket-{bucket}.sqlite")
 }
 
 #[cfg(test)]
@@ -2872,5 +3290,294 @@ mod tests {
             err.remediation().is_some(),
             "missing-artifact refusal must carry operator remediation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #43 query_graph as_of: time-travel lowering + per-t-bucket cache FSVs.
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A manually-advanced wall clock so tests can commit vault state at known
+    /// timestamps and then resolve historical `as_of` snapshots deterministically
+    /// through the vault's own `time_index` CF.
+    #[derive(Clone)]
+    struct StepClock(Arc<AtomicU64>);
+
+    impl StepClock {
+        fn new(millis: u64) -> Self {
+            Self(Arc::new(AtomicU64::new(millis)))
+        }
+
+        fn set(&self, millis: u64) {
+            self.0.store(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl calyx_core::Clock for StepClock {
+        fn now(&self) -> calyx_core::Ts {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn stepped_vault(clock: StepClock) -> AsterVault<StepClock> {
+        AsterVault::with_clock(
+            "00000000000000000000000000"
+                .parse::<VaultId>()
+                .expect("vault id"),
+            b"astrolabe-lower-test".to_vec(),
+            clock,
+        )
+    }
+
+    /// Writes one real similarity (`SIM_*`) edge row into the Graph CF between
+    /// two fixture nodes. In the lowered artifact this becomes a fourth edge, so
+    /// it is a genuine, snapshot-visible graph edit (not just a ledger append).
+    fn commit_sim_edge_between_alpha_and_beta<C: calyx_core::Clock>(vault: &AsterVault<C>) -> Seq {
+        let row = SimEdgeGraphRow {
+            schema: SCHEMA_SIM_EDGE_ROW.to_string(),
+            family: "SIM_STRUCT".to_string(),
+            source_qn: "demo.src.main.alpha".to_string(),
+            target_qn: "demo.src.main.beta".to_string(),
+            slot: 1,
+            etype: 0,
+            metric: "cosine".to_string(),
+            weight_bits: 0.99_f32.to_bits(),
+            threshold_bits: 0.95_f32.to_bits(),
+            props: BTreeMap::new(),
+        };
+        let mut key = SIM_EDGE_ROW_PREFIX.to_vec();
+        key.extend_from_slice(b"struct:demo.src.main.alpha:demo.src.main.beta");
+        let value = serde_json::to_vec(&row).expect("encode sim edge row");
+        vault
+            .write_cf(ColumnFamily::Graph, key, value)
+            .expect("commit sim edge row")
+    }
+
+    /// FSV: a lowering pinned to a historical MVCC seqno is a pure function of
+    /// that seqno — re-lowering it after a later commit yields byte-identical
+    /// bytes, while lowering at the newer seqno reflects the edit. This is the
+    /// core `as_of` correctness property (#43 DoD "returns the t1 graph exactly").
+    #[test]
+    fn as_of_lowering_is_byte_stable_across_a_later_edit() {
+        let clock = StepClock::new(1_000);
+        let vault = stepped_vault(clock.clone());
+        let source = temp_path("asof-stable-source.db");
+        fixture_sqlite(&source);
+        import_sqlite_to_vault(
+            &source,
+            &vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import at t=1000");
+        let seq_a = vault.latest_seq();
+
+        // Archive the t1 view now (while t1 is the present).
+        let archive_path = temp_path("asof-stable-archive.db");
+        let opts = LowerSqliteOptions::new("demo").with_lowered_at("as_of:1000");
+        let archived =
+            lower_cbm_sqlite_at(&vault, &archive_path, &opts, seq_a).expect("archive t1");
+        let archived_bytes = fs::read(&archive_path).expect("read archived t1 db");
+
+        // Edit at t2: a real graph edge lands, advancing latest_seq.
+        clock.set(3_000);
+        let seq_b = commit_sim_edge_between_alpha_and_beta(&vault);
+        assert!(seq_b > seq_a, "the t2 edit must advance the vault sequence");
+
+        // Re-lower the SAME historical seqno AFTER the t2 edit: byte-identical.
+        let replay_path = temp_path("asof-stable-replay.db");
+        let replay = lower_cbm_sqlite_at(&vault, &replay_path, &opts, seq_a).expect("replay t1");
+        let replay_bytes = fs::read(&replay_path).expect("read replayed t1 db");
+        assert_eq!(
+            archived.artifact_sha256, replay.artifact_sha256,
+            "re-lowering the historical seqno must reproduce the archived digest"
+        );
+        assert_eq!(
+            archived_bytes, replay_bytes,
+            "re-lowering the historical seqno must reproduce the archived bytes exactly"
+        );
+
+        // Lowering at the newer seqno reflects the edit: the sim edge appears.
+        let latest_path = temp_path("asof-stable-latest.db");
+        let latest = lower_cbm_sqlite_at(
+            &vault,
+            &latest_path,
+            &LowerSqliteOptions::new("demo").with_lowered_at("as_of:3000"),
+            seq_b,
+        )
+        .expect("lower at t2");
+        assert_eq!(
+            latest.edge_count,
+            archived.edge_count + 1,
+            "the t2 sim edge must be visible only at the newer snapshot"
+        );
+        assert_ne!(
+            latest.artifact_sha256, archived.artifact_sha256,
+            "the t2 snapshot must differ from the archived t1 snapshot"
+        );
+
+        cleanup(&source);
+        cleanup(&archive_path);
+        cleanup(&replay_path);
+        cleanup(&latest_path);
+    }
+
+    /// FSV: the per-t-bucket cache serves the same bucket byte-identically and
+    /// re-lowers exactly on a bucket boundary crossing, with the instrumented
+    /// counters read back (#43 DoD "same t-bucket served from cache
+    /// byte-identically; bucket boundary crossing re-lowers (instrumented)").
+    #[test]
+    fn as_of_cache_reuses_bucket_and_relowers_on_boundary() {
+        let clock = StepClock::new(1_000);
+        let vault = stepped_vault(clock.clone());
+        let source = temp_path("asof-cache-source.db");
+        fixture_sqlite(&source);
+        import_sqlite_to_vault(
+            &source,
+            &vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import at t=1000");
+        let seq_a = vault.latest_seq();
+        clock.set(3_000);
+        commit_sim_edge_between_alpha_and_beta(&vault);
+
+        let out_dir = temp_dir_path("asof-cache-out");
+        fs::create_dir_all(&out_dir).expect("create cache out dir");
+        let mut cache = AsOfLoweredCache::new("demo", &out_dir, 1_000).expect("build cache");
+
+        // First request in bucket 1 (t=1500): a miss -> re-lower at seq_a.
+        let first = cache.serve(&vault, 1_500).expect("serve 1500");
+        assert!(!first.cache_hit, "first bucket-1 request is a miss");
+        assert_eq!(first.bucket, 1);
+        assert_eq!(first.canonical_millis, 1_000);
+        assert_eq!(first.snapshot_seq, seq_a);
+        assert_eq!(first.relower_count, 1);
+        assert_eq!(first.hit_count, 0);
+
+        // Second request in the SAME bucket (t=1900): a hit, byte-identical.
+        let second = cache.serve(&vault, 1_900).expect("serve 1900");
+        assert!(second.cache_hit, "second bucket-1 request is a cache hit");
+        assert_eq!(second.bucket, 1);
+        assert_eq!(second.relower_count, 1, "a hit must not re-lower");
+        assert_eq!(second.hit_count, 1);
+        assert_eq!(
+            first.artifact_sha256, second.artifact_sha256,
+            "same-bucket serves must be byte-identical"
+        );
+        assert_eq!(
+            first.artifact_path, second.artifact_path,
+            "same-bucket serves must reuse one cached artifact file"
+        );
+
+        // Crossing into bucket 3 (t=3500): a miss -> re-lower at seq_b (edit visible).
+        let third = cache.serve(&vault, 3_500).expect("serve 3500");
+        assert!(
+            !third.cache_hit,
+            "bucket-3 request crosses a boundary -> miss"
+        );
+        assert_eq!(third.bucket, 3);
+        assert_eq!(third.canonical_millis, 3_000);
+        assert_eq!(third.relower_count, 2, "boundary crossing re-lowers");
+        assert_eq!(third.hit_count, 1);
+        assert_eq!(
+            third.edge_count,
+            first.edge_count + 1,
+            "the newer bucket must reflect the t2 sim edge"
+        );
+
+        // The served bucket-1 artifact equals an independent 'archived t1 db'
+        // lowered at the same canonical parameters (#43 DoD parity).
+        let archive_path = temp_path("asof-cache-archive.db");
+        let archived = lower_cbm_sqlite_at(
+            &vault,
+            &archive_path,
+            &LowerSqliteOptions::new("demo").with_lowered_at("as_of:1000"),
+            seq_a,
+        )
+        .expect("independent archive of t1");
+        assert_eq!(
+            first.artifact_sha256, archived.artifact_sha256,
+            "cache-served bucket-1 view must equal the independently archived t1 db"
+        );
+
+        // Read the counters back off the cache itself, not just the reports.
+        assert_eq!(cache.relower_count(), 2);
+        assert_eq!(cache.hit_count(), 1);
+
+        cleanup(&source);
+        cleanup(&archive_path);
+        cleanup_dir(&out_dir);
+    }
+
+    /// Edge triad: resolving before the first write fails closed (no silent
+    /// stale seqno), and an out-of-range bucket width is refused with a stable
+    /// code + remediation.
+    #[test]
+    fn as_of_edge_cases_fail_closed() {
+        let clock = StepClock::new(1_000);
+        let vault = stepped_vault(clock.clone());
+        let source = temp_path("asof-edge-source.db");
+        fixture_sqlite(&source);
+        import_sqlite_to_vault(
+            &source,
+            &vault,
+            &FixtureSlotRuntime,
+            &SqliteImportOptions::new("demo", "commit-a", 1),
+        )
+        .expect("import at t=1000");
+
+        // (1) as_of before any committed write -> CALYX_TIMETRAVEL_NO_DATA.
+        let out_dir = temp_dir_path("asof-edge-out");
+        fs::create_dir_all(&out_dir).expect("create edge out dir");
+        let mut cache = AsOfLoweredCache::new("demo", &out_dir, 1_000).expect("build cache");
+        let err = cache
+            .serve(&vault, 500)
+            .expect_err("as_of before the first write must fail closed");
+        match err {
+            LowerError::Calyx(inner) => {
+                assert_eq!(inner.code, "CALYX_TIMETRAVEL_NO_DATA", "{inner:?}");
+            }
+            other => panic!("expected a fail-closed timetravel error, got {other:?}"),
+        }
+
+        // (2) zero bucket width is refused (undivisible / re-lowers per ms).
+        let zero = AsOfLoweredCache::new("demo", &out_dir, 0)
+            .expect_err("zero bucket width must be refused");
+        assert_eq!(
+            zero.code(),
+            Some(ASTRO_AS_OF_BUCKET_WIDTH_OUT_OF_RANGE),
+            "{zero:?}"
+        );
+        assert!(zero.remediation().is_some());
+
+        // (3) a width above the declared maximum is refused.
+        let too_wide = AsOfLoweredCache::new("demo", &out_dir, AS_OF_BUCKET_MAX_WIDTH_MS + 1)
+            .expect_err("over-max bucket width must be refused");
+        assert_eq!(
+            too_wide.code(),
+            Some(ASTRO_AS_OF_BUCKET_WIDTH_OUT_OF_RANGE),
+            "{too_wide:?}"
+        );
+
+        cleanup(&source);
+        cleanup_dir(&out_dir);
+    }
+
+    #[test]
+    fn as_of_bucket_knob_declares_bounds_that_contain_its_default() {
+        let knob = as_of_bucket_knob(AS_OF_BUCKET_WIDTH_MS_KNOB).expect("declared");
+        assert_eq!(knob.registry_version, AS_OF_BUCKET_KNOB_REGISTRY_VERSION);
+        assert_eq!(knob.unit, "milliseconds");
+        assert!(knob.min <= knob.max);
+        assert!(knob.accepts(knob.default));
+        assert_eq!(knob.default, AS_OF_BUCKET_DEFAULT_WIDTH_MS);
+        assert!(!knob.accepts(0));
+        assert!(knob.accepts(AS_OF_BUCKET_MIN_WIDTH_MS));
+        assert!(knob.accepts(AS_OF_BUCKET_MAX_WIDTH_MS));
+        assert!(!knob.accepts(AS_OF_BUCKET_MAX_WIDTH_MS + 1));
     }
 }

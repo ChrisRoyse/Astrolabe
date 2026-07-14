@@ -34,6 +34,10 @@ use astrolabe_kernel::{
     summarize_scope_kernel,
 };
 use astrolabe_lower::{
+    AS_OF_BUCKET_DEFAULT_WIDTH_MS, AS_OF_BUCKET_WIDTH_MS_KNOB, as_of_bucket_knob,
+    lower_cbm_sqlite_at,
+};
+use astrolabe_lower::{
     ASTRO_TEAM_ARTIFACT_GRAPH_BYTES, ASTRO_TEAM_ARTIFACT_LEDGER_TAIL,
     ASTRO_TEAM_ARTIFACT_MERKLE_ROOT, ASTRO_TEAM_ARTIFACT_MISSING_GRAPH,
     ASTRO_TEAM_ARTIFACT_SIGNATURE, ASTRO_TEAM_ARTIFACT_SIGNATURE_SIGNER,
@@ -199,6 +203,9 @@ use find_similar::*;
 
 mod trace_path;
 use trace_path::*;
+
+mod query_graph_as_of;
+use query_graph_as_of::*;
 
 mod architecture_aspects;
 use architecture_aspects::*;
