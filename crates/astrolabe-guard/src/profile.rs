@@ -1266,8 +1266,8 @@ mod tests {
         // that differ by < 1/255 survive distinctly through the raw round-trip.
         let mut a = calibrated;
         let mut b = calibrated;
-        a.tau = 0.900_000_0;
-        b.tau = 0.900_500_0;
+        a.tau = 0.9;
+        b.tau = 0.9005;
         let da = slot_calibration_from_raw_bytes(&profile.raw_slot_bytes(&a)).unwrap();
         let db = slot_calibration_from_raw_bytes(&profile.raw_slot_bytes(&b)).unwrap();
         assert_ne!(
