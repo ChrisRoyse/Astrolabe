@@ -80,6 +80,23 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     // importance scatter. Both read back the same persisted kernel-context
     // metadata and fail closed when the scope summaries are unavailable.
     if mode == "gaps" || mode == "quadrant" {
+        // #365: prefer the persisted KernelArtifact — the real kernel_score × churn
+        // ranking, exact hop boundary, and per-member groundedness permille — read
+        // back from the vault Kernel CF. Only when no artifact is persisted (a scope
+        // that never built a kernel) do we fall back to the labeled degraded
+        // scope-summary surface below.
+        match read_project_kernel_artifact(&cache_dir, &project) {
+            Ok(Some(artifact)) => {
+                return if mode == "gaps" {
+                    tool_json_result(artifact_gap_report_value(&project, &artifact))
+                } else {
+                    tool_json_result(artifact_quadrant_value(&project, &artifact))
+                };
+            }
+            Ok(None) => {} // fall through to the labeled scope-summary fallback
+            Err(_error) => {} // artifact read failed: labeled fallback below
+        }
+
         let members = match gap_members_from_kernel_context(&kernel_context) {
             Ok(members) => members,
             Err(reason) => {
@@ -161,6 +178,27 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         .map(|summary| scope_gap_count(summary))
         .sum();
 
+    // #365: the served index.json upgraded to embedding_backed_hnsw when the
+    // persisted kernel members carry S18 vectors, labeled membership_manifest
+    // otherwise (or absent when no artifact is persisted).
+    let index = match read_project_kernel_artifact(&cache_dir, &project) {
+        Ok(Some(artifact)) => serve_kernel_index_value(&cache_dir, &project, &artifact),
+        Ok(None) => json!({
+            "index_kind": "membership_manifest",
+            "status": "unavailable",
+            "reason": "no persisted kernel artifact for this project",
+            "trust": "provisional",
+            "freshness": "not_evaluated",
+        }),
+        Err(error) => json!({
+            "index_kind": "membership_manifest",
+            "status": "unavailable",
+            "reason": format!("kernel artifact read failed: {error}"),
+            "trust": "provisional",
+            "freshness": "not_evaluated",
+        }),
+    };
+
     tool_json_result(json!({
         "schema": if mode == "gaps" { KERNEL_GAP_REPORT_SCHEMA } else { "astrolabe.get_kernel.v1" },
         "status": "served",
@@ -170,10 +208,119 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         "scope_count": scopes_json.len(),
         "gap_count": total_gaps,
         "scopes": scopes_json,
+        "index": index,
         "trust": if all_grounded { "verified" } else { "provisional" },
         "freshness": "fresh",
         "provenance": format!("kernel_context.scope_summaries (astrolabe.scope_summary.v1) of {project}"),
     }))
+}
+
+/// Reads the persisted whole-repo `KernelArtifact` for a project back out of the
+/// vault Kernel CF (#365), read-only and independent of the index-time write path.
+/// `Ok(None)` when no kernel artifact was persisted for the project (a labeled
+/// fallback, not an error).
+pub(crate) fn read_project_kernel_artifact(
+    cache_dir: &Path,
+    project: &str,
+) -> Result<Option<astrolabe_kernel::KernelArtifact>, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(None);
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Kernel, ColumnFamily::Graph, ColumnFamily::Base],
+    )?;
+    let scope_id = kernel_artifact_scope_id(project);
+    let artifact = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?;
+    Ok(artifact)
+}
+
+/// Serves the kernel `index.json` for a project (#365), upgrading its
+/// `index_kind` to `embedding_backed_hnsw` when the kernel members carry persisted
+/// S18 code-semantic vectors — via the weave kernel-member index (#344) — and
+/// labeling it `membership_manifest` otherwise (no member carried an S18 vector).
+/// A read/build error degrades to a labeled membership_manifest, never a silent
+/// upgrade claim.
+pub(crate) fn serve_kernel_index_value(
+    cache_dir: &Path,
+    project: &str,
+    artifact: &astrolabe_kernel::KernelArtifact,
+) -> Value {
+    use astrolabe_weave::search::SLOT_CODE_SEMANTIC;
+    use astrolabe_weave::search_index::IndexKnobs;
+
+    let member_cx_ids: Vec<_> = artifact.members.iter().map(|member| member.id).collect();
+    let membership_manifest = |reason: &str| {
+        json!({
+            "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
+            "index_kind": "membership_manifest",
+            "members_hash": artifact.members_hash,
+            "member_count": artifact.member_count,
+            "indexed_member_count": 0,
+            "note": reason,
+            "trust": "provisional",
+            "freshness": "fresh",
+        })
+    };
+
+    let config = match shadow_vault_config_at(cache_dir, project) {
+        Ok(config) => config,
+        Err(error) => return membership_manifest(&format!("vault config unavailable: {error}")),
+    };
+    let (vault_dir, vault_id, vault_salt) = config;
+    if !vault_dir.exists() {
+        return membership_manifest("shadow vault missing");
+    }
+    let vault = match open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![
+            ColumnFamily::Base,
+            ColumnFamily::Graph,
+            ColumnFamily::Kernel,
+            ColumnFamily::Kv,
+            ColumnFamily::slot(SLOT_CODE_SEMANTIC),
+        ],
+    ) {
+        Ok(vault) => vault,
+        Err(error) => return membership_manifest(&format!("vault unavailable: {error}")),
+    };
+
+    // Deterministic seed pinned per members_hash so the same member set yields the
+    // same index bytes (invariant 5).
+    let index = match astrolabe_weave::build_kernel_member_index(
+        &vault,
+        project,
+        &member_cx_ids,
+        &artifact.members_hash,
+        IndexKnobs::defaults(0x4B45_524E_454C_0001),
+    ) {
+        Ok(index) => index,
+        Err(error) => return membership_manifest(&format!("kernel-member index unavailable: {error}")),
+    };
+
+    let embedding_backed = index.index_kind == astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw;
+    json!({
+        "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
+        "index_kind": index.index_kind.as_str(),
+        "members_hash": index.members_hash,
+        "member_count": artifact.member_count,
+        "indexed_member_count": index.indexed_member_count,
+        "missing_vector_members": index.missing_vector_members,
+        "semantic_dim": index.semantic_dim,
+        "base_seq": index.base_seq,
+        "trust": if embedding_backed { "verified" } else { "provisional" },
+        "freshness": "fresh",
+        "provenance": [
+            format!("kernel-artifact:scope={}", artifact.scope_id),
+            "vault:slot(SLOT_CODE_SEMANTIC)".to_string(),
+            "astrolabe_weave::build_kernel_member_index(#344)".to_string(),
+        ],
+    })
 }
 
 /// Reshapes one persisted scope-summary into the `get_kernel` per-scope view.

@@ -44,9 +44,10 @@ pub use agent_task::{
     ASTRO_ANCHOR_PROMOTION_INPUT_INVALID, AgentTaskPackManifestV1, AgentTaskPackReport,
     AnchorContradictionV1, AnchorPromotionReport, AnchorPromotionV1, ContradictionPair,
     PromotedPair, SCHEMA_AGENT_TASK_PACK, SCHEMA_ANCHOR_CONTRADICTION, SCHEMA_ANCHOR_PROMOTION,
-    effective_anchor_trust, ingest_agent_task_outcome, is_anchor_promoted, promote_on_resolution,
-    read_agent_task_pack, read_agent_task_packs, read_anchor_contradictions,
-    read_anchor_promotions, record_agent_task_pack, rollup_effective_anchor_trust,
+    effective_anchor_trust, effective_anchor_trust_map, ingest_agent_task_outcome,
+    is_anchor_promoted, promote_on_resolution, read_agent_task_pack, read_agent_task_packs,
+    read_anchor_contradictions, read_anchor_promotions, record_agent_task_pack,
+    rollup_effective_anchor_trust,
 };
 
 pub use parsers::{
