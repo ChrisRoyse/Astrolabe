@@ -1,6 +1,6 @@
 //! In-memory Assay result CF/cache with provenance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_aster::vault::AsterVault;
@@ -10,6 +10,34 @@ use serde::{Deserialize, Serialize};
 use crate::estimate::MiEstimate;
 
 type AsterAssayRow = (ColumnFamily, Vec<u8>, Vec<u8>);
+
+/// Summary of co-tenant rows skipped during a co-tenant-aware Assay CF load.
+///
+/// `ColumnFamily::Assay` is a *shared* column family: besides genuine
+/// [`AssayRow`] entries, other subsystems (e.g. Astrolabe's delta-invalidation
+/// lane) route rows here that carry a self-declaring top-level `schema` string
+/// outside the assay row schema. A co-tenant-aware load skips those rows
+/// instead of failing closed on them, but every skip is *counted and labeled*
+/// here (invariant 3: no silent skips) so the reader can surface the
+/// degradation-free co-tenancy in its provenance. A row that is neither a valid
+/// `AssayRow` nor a declared, *accepted* foreign schema still fails closed with
+/// `CALYX_ASTER_CORRUPT_SHARD` — real corruption is never masked (invariant 5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssayCotenantSkips {
+    /// Total co-tenant rows skipped across all accepted foreign schemas.
+    pub skipped_rows: usize,
+    /// Per-schema skip counts, keyed by the row's declared `schema` string.
+    pub skipped_schemas: BTreeMap<String, usize>,
+}
+
+/// Classification of one raw Assay CF `(key, value)` pair during load.
+enum AssayRowClass {
+    /// A genuine assay row, decoded and key-verified.
+    Assay(Box<AssayRow>),
+    /// A co-tenant row that positively declares an *accepted* foreign top-level
+    /// `schema` tag; carries that schema string for counting.
+    Foreign(String),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AssayCacheKey {
@@ -178,6 +206,47 @@ impl AssayStore {
         Ok(store)
     }
 
+    /// Loads assay rows from a vault whose `ColumnFamily::Assay` is shared with
+    /// co-tenant writers.
+    ///
+    /// `accepted_foreign_schemas` is the allowlist of top-level `schema` tags
+    /// whose rows are *not* assay rows and must be skipped rather than decoded.
+    /// Each such row is counted in the returned [`AssayCotenantSkips`]. A row
+    /// that neither decodes as a valid [`AssayRow`] nor positively declares an
+    /// **accepted** foreign schema still fails closed with
+    /// `CALYX_ASTER_CORRUPT_SHARD` — this is the invariant-3-vs-5 seam: a
+    /// foreign-schema co-tenant row is a counted skip, a genuinely corrupt assay
+    /// shard is a hard error, and the two are distinguished by a *positive*
+    /// schema-tag match, never by "decode failed → skip".
+    ///
+    /// Pure-Calyx callers with no co-tenants use [`load_from_vault`] /
+    /// [`load_from_aster`] (empty allowlist), preserving strict fail-closed
+    /// semantics unchanged.
+    pub fn load_from_vault_with_cotenants<C>(
+        vault: &AsterVault<C>,
+        accepted_foreign_schemas: &BTreeSet<&str>,
+    ) -> Result<(Self, AssayCotenantSkips)>
+    where
+        C: Clock,
+    {
+        let mut store = Self::default();
+        let mut skips = AssayCotenantSkips::default();
+        for (key, value) in vault.scan_cf_at(vault.snapshot(), ColumnFamily::Assay)? {
+            match classify_aster_row(&key, &value, accepted_foreign_schemas)? {
+                AssayRowClass::Assay(row) => {
+                    store
+                        .rows
+                        .insert((row.cache_key.clone(), row.subject.clone()), *row);
+                }
+                AssayRowClass::Foreign(schema) => {
+                    skips.skipped_rows += 1;
+                    *skips.skipped_schemas.entry(schema).or_default() += 1;
+                }
+            }
+        }
+        Ok((store, skips))
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -199,19 +268,63 @@ impl AssayStore {
     }
 
     fn insert_aster_row(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let row: AssayRow = serde_json::from_slice(&value).map_err(|error| {
-            CalyxError::aster_corrupt_shard(format!("decode assay row: {error}"))
-        })?;
-        row.cache_key.require_scoped()?;
-        let expected = assay_key(&row.cache_key, &row.subject);
-        if key != expected {
-            return Err(CalyxError::aster_corrupt_shard(
-                "assay CF key does not match row subject",
-            ));
+        // Strict load: no accepted co-tenant schemas, so any row that is not a
+        // valid, key-matching AssayRow fails closed (unchanged behavior).
+        match classify_aster_row(&key, &value, &BTreeSet::new())? {
+            AssayRowClass::Assay(row) => {
+                self.rows
+                    .insert((row.cache_key.clone(), row.subject.clone()), *row);
+                Ok(())
+            }
+            // Unreachable with an empty allowlist: a foreign row can only be
+            // classified as such when its schema is in the accepted set.
+            AssayRowClass::Foreign(schema) => Err(CalyxError::aster_corrupt_shard(format!(
+                "unexpected foreign assay co-tenant schema {schema} in strict load"
+            ))),
         }
-        self.rows
-            .insert((row.cache_key.clone(), row.subject.clone()), row);
-        Ok(())
+    }
+}
+
+/// Classifies one raw `ColumnFamily::Assay` row as a genuine [`AssayRow`] or an
+/// accepted foreign co-tenant row.
+///
+/// A genuine `AssayRow` is decoded first: if it deserializes, its scope is
+/// re-checked and its stored key is verified against the recomputed
+/// [`assay_key`] (a mismatch is corruption). Only when the `AssayRow` decode
+/// *fails* is the value inspected for a co-tenant marker: a top-level `schema`
+/// string that is present in `accepted_foreign_schemas` yields
+/// [`AssayRowClass::Foreign`]; anything else (invalid JSON, no `schema`, or an
+/// unaccepted `schema`) fails closed with `CALYX_ASTER_CORRUPT_SHARD`. Decoding
+/// the concrete `AssayRow` first guarantees a real assay row is never
+/// misclassified as foreign even if it happened to carry a `schema`-named field.
+fn classify_aster_row(
+    key: &[u8],
+    value: &[u8],
+    accepted_foreign_schemas: &BTreeSet<&str>,
+) -> Result<AssayRowClass> {
+    match serde_json::from_slice::<AssayRow>(value) {
+        Ok(row) => {
+            row.cache_key.require_scoped()?;
+            let expected = assay_key(&row.cache_key, &row.subject);
+            if key != expected {
+                return Err(CalyxError::aster_corrupt_shard(
+                    "assay CF key does not match row subject",
+                ));
+            }
+            Ok(AssayRowClass::Assay(Box::new(row)))
+        }
+        Err(decode_error) => {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_slice::<serde_json::Value>(value)
+                && let Some(serde_json::Value::String(schema)) = map.get("schema")
+                && accepted_foreign_schemas.contains(schema.as_str())
+            {
+                return Ok(AssayRowClass::Foreign(schema.clone()));
+            }
+            Err(CalyxError::aster_corrupt_shard(format!(
+                "decode assay row: {decode_error}"
+            )))
+        }
     }
 }
 
@@ -455,6 +568,121 @@ mod tests {
         assert_eq!(row.payload.as_ref(), Some(&payload));
         assert_eq!(row.estimate.bits, 1.25);
         cleanup(dir);
+    }
+
+    // --- #348: shared Assay CF co-tenant classification -------------------
+
+    /// A byte-for-byte stand-in for an Astrolabe delta-invalidation row as
+    /// written into `ColumnFamily::Assay` by the shadow invalidation lane:
+    /// keyed outside the assay keyspace, valued as JSON with a top-level
+    /// `schema` tag and no `cache_key` field.
+    const DELTA_INVALIDATION_SCHEMA: &str = "astrolabe.delta_invalidation.v1";
+
+    fn invalidation_row(project: &str, symbol: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut key = b"astrolabe:shadow:invalidation:v1\0".to_vec();
+        key.extend_from_slice(project.as_bytes());
+        key.push(0);
+        key.extend_from_slice(b"assay\0");
+        key.extend_from_slice(symbol.as_bytes());
+        let value = serde_json::to_vec(&serde_json::json!({
+            "schema": DELTA_INVALIDATION_SCHEMA,
+            "kind": "assay_stratum_dirty",
+            "project": project,
+            "qualified_name": symbol,
+            "dirty": true,
+            "dirty_since_seq": 7u64,
+        }))
+        .unwrap();
+        (key, value)
+    }
+
+    fn genuine_assay_row(vault: &AsterVault<FixedClock>) {
+        let mut store = AssayStore::default();
+        store.put(
+            AssayCacheKey::scoped(7, "cotenant-corpus", vault_a(), AnchorKind::Reward),
+            AssaySubject::Panel,
+            estimate(0.42),
+            "cotenant-genuine",
+            11,
+        );
+        store.persist_to_vault(vault).unwrap();
+    }
+
+    #[test]
+    fn cotenant_foreign_schema_row_is_skipped_and_counted() {
+        let vault = AsterVault::with_clock(vault_a(), b"assay-cotenant", FixedClock::new(7));
+        genuine_assay_row(&vault);
+        let (key, value) = invalidation_row("astrolabe", "crate::foo::bar");
+        vault
+            .write_cf_batch([(ColumnFamily::Assay, key, value)])
+            .unwrap();
+        vault.flush().unwrap();
+
+        let accepted: BTreeSet<&str> = [DELTA_INVALIDATION_SCHEMA].into_iter().collect();
+        let (store, skips) = AssayStore::load_from_vault_with_cotenants(&vault, &accepted).unwrap();
+
+        // Genuine assay row loaded; the invalidation co-tenant row skipped+counted.
+        assert_eq!(store.len(), 1);
+        assert_eq!(skips.skipped_rows, 1);
+        assert_eq!(
+            skips
+                .skipped_schemas
+                .get(DELTA_INVALIDATION_SCHEMA)
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cotenant_unaccepted_foreign_schema_fails_closed() {
+        let vault =
+            AsterVault::with_clock(vault_a(), b"assay-cotenant-unaccepted", FixedClock::new(7));
+        let (key, value) = invalidation_row("astrolabe", "crate::foo::bar");
+        vault
+            .write_cf_batch([(ColumnFamily::Assay, key, value)])
+            .unwrap();
+        vault.flush().unwrap();
+
+        // Allowlist does NOT contain the row's schema -> real corruption vs an
+        // accepted co-tenant is indistinguishable to the reader, so fail closed.
+        let accepted: BTreeSet<&str> = ["some.other.schema.v1"].into_iter().collect();
+        let error = AssayStore::load_from_vault_with_cotenants(&vault, &accepted).unwrap_err();
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+    }
+
+    #[test]
+    fn cotenant_corrupt_assay_row_still_fails_closed() {
+        let vault =
+            AsterVault::with_clock(vault_a(), b"assay-cotenant-corrupt", FixedClock::new(7));
+        // A genuinely corrupt shard: not valid JSON, no schema tag.
+        vault
+            .write_cf_batch([(
+                ColumnFamily::Assay,
+                b"bad-assay-key".to_vec(),
+                vec![0xff, 0x00, 0x13],
+            )])
+            .unwrap();
+        vault.flush().unwrap();
+
+        let accepted: BTreeSet<&str> = [DELTA_INVALIDATION_SCHEMA].into_iter().collect();
+        let error = AssayStore::load_from_vault_with_cotenants(&vault, &accepted).unwrap_err();
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+        assert!(error.message.contains("decode assay row"));
+    }
+
+    #[test]
+    fn strict_load_from_vault_still_fails_on_foreign_row() {
+        // load_from_vault uses the empty allowlist: pure-Calyx callers keep
+        // strict fail-closed behavior on any non-assay row.
+        let vault = AsterVault::with_clock(vault_a(), b"assay-strict", FixedClock::new(7));
+        let (key, value) = invalidation_row("astrolabe", "crate::foo::bar");
+        vault
+            .write_cf_batch([(ColumnFamily::Assay, key, value)])
+            .unwrap();
+        vault.flush().unwrap();
+
+        let error = AssayStore::load_from_vault(&vault).unwrap_err();
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
     }
 
     fn estimate(bits: f32) -> MiEstimate {
