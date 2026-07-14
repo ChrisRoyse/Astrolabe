@@ -264,6 +264,50 @@ bool cbm_minhash_compute(TSNode func_body, const char *source, int language, cbm
     return unique_structural >= MIN_UNIQUE_TRIGRAMS;
 }
 
+/* ── Struct-trigram serialization (panel S1 encoder source) ──────────
+ *
+ * Surfaces the identical normalised AST node-type trigrams that drive the
+ * MinHash fingerprint as a text list the Rust panel S1 lens can hash into a
+ * sparse structural vector. This is the shared instrument between per-symbol
+ * indexing (compute_fingerprint stores the result on the definition) and the
+ * per-snippet guard reparse (which reads it back through the same extraction),
+ * so identical body bytes yield a byte-identical trigram list either way. */
+int cbm_struct_trigrams_serialize(TSNode func_body, char *buf, int bufsize) {
+    if (!buf || bufsize < SKIP_ONE) {
+        return 0;
+    }
+    buf[0] = '\0';
+    if (ts_node_is_null(func_body)) {
+        return 0;
+    }
+
+    const char *tokens[MAX_TOKENS];
+    int token_count = collect_ast_tokens(func_body, tokens, MAX_TOKENS);
+
+    int pos = 0;
+    for (int i = 0; i + TRIGRAM_WINDOW < token_count; i++) {
+        const char *a = tokens[i];
+        const char *b = tokens[i + SKIP_ONE];
+        const char *c = tokens[i + TRIGRAM_WINDOW];
+        int w = trigram_structural_weight(a, b, c);
+        if (w == 0) {
+            continue; /* pure I/S/N/T noise — skipped exactly as MinHash does */
+        }
+        char rec[TRIGRAM_BUF_LEN + 16];
+        int len = snprintf(rec, sizeof(rec), "%s\t%s\t%s\t%d\n", a, b, c, w);
+        if (len <= 0 || (size_t)len >= sizeof(rec)) {
+            continue; /* pathologically long kind string — skip this record */
+        }
+        if (pos + len >= bufsize) {
+            break; /* deterministic record-boundary truncation */
+        }
+        memcpy(buf + pos, rec, (size_t)len);
+        pos += len;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
 /* ── Jaccard similarity ──────────────────────────────────────────── */
 
 double cbm_minhash_jaccard(const cbm_minhash_t *a, const cbm_minhash_t *b) {

@@ -447,6 +447,7 @@ pub struct CBMDefinition {
     pub is_entry_point: bool,
     pub structural_profile: *const ::std::os::raw::c_char,
     pub body_tokens: *const ::std::os::raw::c_char,
+    pub struct_trigrams: *const ::std::os::raw::c_char,
 }
 impl Default for CBMDefinition {
     fn default() -> Self {

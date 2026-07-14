@@ -788,6 +788,23 @@ impl Language {
     pub fn as_raw(self) -> cbm_sys::CBMLanguage {
         self.0
     }
+
+    /// Resolve the tree-sitter language for a file name/relative path exactly as
+    /// the indexing pipeline does (`cbm_language_for_filename`), so a per-snippet
+    /// reparse tags the snippet with the same grammar the symbol was indexed
+    /// under. Returns `None` when libcbm has no grammar for the name
+    /// (`CBM_LANG_COUNT` sentinel) — the caller must fail closed, never guess.
+    pub fn from_filename(filename: &str) -> Option<Self> {
+        let c = CString::new(filename).ok()?;
+        // SAFETY: `c` is a valid NUL-terminated C string that outlives the call;
+        // cbm_language_for_filename only reads it and returns a plain enum value.
+        let raw = unsafe { cbm_sys::cbm_language_for_filename(c.as_ptr()) };
+        if raw == cbm_sys::CBMLanguage_CBM_LANG_COUNT {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
 }
 
 pub fn map_cbm_status(status: i32) -> Result<(), BridgeError> {
@@ -1484,6 +1501,7 @@ impl ExtractedFile {
             is_entry_point: item.is_entry_point,
             structural_profile: self.optional_string(item.structural_profile)?,
             body_tokens: self.optional_string(item.body_tokens)?,
+            struct_trigrams: self.optional_string(item.struct_trigrams)?,
         })
     }
 
@@ -1600,6 +1618,49 @@ pub struct Definition {
     pub is_entry_point: bool,
     pub structural_profile: Option<String>,
     pub body_tokens: Option<String>,
+    /// Panel S1 encoder source: newline-delimited `a\tb\tc\tweight` records of
+    /// normalised AST node-type struct trigrams (see [`Definition::parsed_struct_trigrams`]).
+    pub struct_trigrams: Option<String>,
+}
+
+impl Definition {
+    /// Parse the serialized [`Definition::struct_trigrams`] into `(a, b, c, weight)`
+    /// tuples in document order. A malformed record fails closed with a coded error;
+    /// the caller decides whether an empty list is a measurable structural surface.
+    pub fn parsed_struct_trigrams(&self) -> Result<Vec<(String, String, String, f32)>, BridgeError> {
+        let Some(raw) = self.struct_trigrams.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for line in raw.split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split('\t');
+            let (Some(a), Some(b), Some(c), Some(w), None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                return Err(envelope(
+                    "ASTRO_CBM_STRUCT_TRIGRAM_MALFORMED",
+                    format!("struct-trigram record `{line}` is not a 4-field a\\tb\\tc\\tweight tuple"),
+                    "Treat this as libcbm serialization drift and reject the reparse as a fault.",
+                ));
+            };
+            let weight: f32 = w.parse().map_err(|_| {
+                envelope(
+                    "ASTRO_CBM_STRUCT_TRIGRAM_MALFORMED",
+                    format!("struct-trigram weight `{w}` in `{line}` is not a number"),
+                    "Treat this as libcbm serialization drift and reject the reparse as a fault.",
+                )
+            })?;
+            out.push((a.to_string(), b.to_string(), c.to_string(), weight));
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
