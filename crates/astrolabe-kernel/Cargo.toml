@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 astrolabe-domain.workspace = true
 astrolabe-panel.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 proptest = "1"
