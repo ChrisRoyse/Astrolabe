@@ -503,6 +503,360 @@ fn planted_shift_still_detected_through_the_sampled_reference() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The 8 MiB Calyx memtable byte cap (`calyx-aster` `DEFAULT_MEMTABLE_BYTES`).
+/// A single persisted Assay row (`key + value + 4`) above this fails closed with
+/// `CALYX_BACKPRESSURE` — the wave-14 live falsification of #371.
+const MEMTABLE_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+/// Byte cost the memtable charges one raw row: `key + value + ENTRY_OVERHEAD(4)`.
+fn row_entry_size(key: &[u8], value: &[u8]) -> usize {
+    key.len() + value.len() + 4
+}
+
+/// Every persisted drift-reference row (`(key, value)`) read back from the Assay
+/// CF, identified by the schema tag. Multi-chunk references land as several rows.
+fn persisted_reference_rows(vault: &AsterVault<SystemClock>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Assay)
+        .expect("scan assay cf")
+        .into_iter()
+        .filter(|(_key, value)| {
+            std::str::from_utf8(value)
+                .map(|text| text.contains(DRIFT_REFERENCE_PAYLOAD_SCHEMA))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// `n` samples of `dim` floats, offset by `base`; distinct per (i, j) so the JSON
+/// is corpus-realistic, not a compressible constant.
+fn wide(n: usize, dim: usize, base: f64) -> Vec<Vec<f64>> {
+    (0..n)
+        .map(|i| {
+            (0..dim)
+                .map(|j| base + (i as f64) * 0.01 + (j as f64) * 0.001)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn chunk_budget_knob_is_declared_within_bounds_and_refuses_out_of_bounds() {
+    // #371 edge: the global byte-budget knob resolves, is in-bounds, and a
+    // declaration whose default violates its own bounds is refused fail-closed.
+    let budget = drift_reference_chunk_budget_bytes().expect("budget resolves");
+    assert_eq!(budget, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES as usize);
+    let knob = DRIFT_REFERENCE_KNOBS
+        .iter()
+        .find(|k| k.name == DRIFT_REFERENCE_CHUNK_BUDGET_KNOB)
+        .expect("budget knob is declared");
+    assert!(
+        knob.accepts(knob.default),
+        "declared default must be in-bounds"
+    );
+    assert_eq!(knob.min, DRIFT_REFERENCE_MIN_CHUNK_BUDGET_BYTES);
+    assert_eq!(knob.max, DRIFT_REFERENCE_MAX_CHUNK_BUDGET_BYTES);
+    assert_eq!(knob.registry_version, DRIFT_REFERENCE_KNOB_REGISTRY_VERSION);
+    // The budget stays strictly below the memtable cap so a max-budget chunk is
+    // still admissible after the row envelope is added.
+    assert!(
+        (knob.max as usize) < MEMTABLE_BYTE_CAP,
+        "max chunk budget must leave headroom under the memtable cap"
+    );
+    // Fail-closed guard: an out-of-bounds default is rejected by the same
+    // `accepts` gate the resolver enforces.
+    let bad = astrolabe_domain::knobs::U64KnobDeclaration {
+        registry_version: DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
+        name: "synthetic_bad",
+        default: 0,
+        min: DRIFT_REFERENCE_MIN_CHUNK_BUDGET_BYTES,
+        max: DRIFT_REFERENCE_MAX_CHUNK_BUDGET_BYTES,
+        unit: "bytes",
+        source: "test",
+        rationale: "test",
+    };
+    assert!(
+        !bad.accepts(bad.default),
+        "an out-of-bounds default must be refused, never clamped"
+    );
+}
+
+#[test]
+fn tiny_corpus_persists_one_legacy_row_without_a_chunk_header() {
+    // #371 edge: a tiny corpus fits in one chunk → exactly one Assay row, the
+    // pre-chunking payload shape (no `chunk` header), byte-identical across a
+    // same-seed re-persist.
+    let (dir, vault) = durable_vault("tiny-one-row");
+    let (reference, _) = shift_fixture();
+    let report = persist_drift_reference(&vault, cache_key(), "drift:reference", &reference, SEED)
+        .expect("persist tiny reference");
+    assert_eq!(report.chunks.len(), 1, "tiny corpus is a single chunk");
+
+    let rows = persisted_reference_rows(&vault);
+    assert_eq!(rows.len(), 1, "exactly one persisted reference row");
+    let value = rows[0].1.clone();
+    let row: Value = serde_json::from_slice(&value).expect("row json");
+    assert!(
+        row["payload"].get("chunk").is_none(),
+        "single-chunk payload keeps the legacy shape (no chunk header)"
+    );
+    assert!(
+        row["payload"]["sampling"]
+            .get("chunk_budget_bytes")
+            .is_none(),
+        "single-chunk sampling block is byte-identical to the pre-chunking format"
+    );
+    let reloaded = load_drift_reference(&vault).expect("reload");
+    assert_eq!(reloaded, reference, "single-chunk round-trips whole");
+
+    // Byte-identical re-persist into a fresh vault (determinism).
+    let (dir2, vault2) = durable_vault("tiny-one-row-2");
+    persist_drift_reference(&vault2, cache_key(), "drift:reference", &reference, SEED)
+        .expect("re-persist");
+    assert_eq!(
+        persisted_reference_rows(&vault2)[0].1,
+        value,
+        "same seed → byte-identical persisted reference row"
+    );
+
+    drop(vault);
+    drop(vault2);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn chunk_packer_respects_the_byte_budget_at_the_boundary() {
+    // #371 edge: exactly-at-budget boundary. With a budget sized for exactly two
+    // slots, two slots pack into one chunk and a third spills to a second — the
+    // greedy packer never exceeds the budget.
+    // Identical-size slots (same samples, same-length labels) so the budget can
+    // be pinned to an exact two-slot boundary.
+    let slots: Vec<DriftSlotSamples> = (0..3)
+        .map(|i| DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: scalars(20, 0.0),
+        })
+        .collect();
+    // No per-slot reduction: cap far above population, so provenance is whole.
+    let (bounded, prov) = bound_reference_window(&slots, 10_000, SEED);
+    let per_slot_cost = slot_json_cost(&bounded[0]).expect("slot cost");
+    // A budget with exactly two slots' worth of slots-budget headroom.
+    let budget =
+        CHUNK_SCAFFOLD_RESERVE_BYTES + 2 * (per_slot_cost + CHUNK_PER_SLOT_PROVENANCE_BYTES);
+
+    let two = plan_reference_chunks(&bounded[..2], &prov[..2], budget, SEED).expect("plan two");
+    assert_eq!(two.len(), 1, "two slots fit exactly one chunk at budget");
+
+    let three = plan_reference_chunks(&bounded, &prov, budget, SEED).expect("plan three");
+    assert_eq!(three.len(), 2, "the third slot spills to a second chunk");
+    assert_eq!(three[0].slots.len(), 2);
+    assert_eq!(three[1].slots.len(), 1);
+    for chunk in &three {
+        assert!(
+            chunk.per_slot.iter().all(|s| !s.budget_downsampled),
+            "no slot exceeded the budget, so none was budget-down-sampled"
+        );
+    }
+}
+
+#[test]
+fn m_representative_reference_splits_under_the_memtable_cap() {
+    // #371 DoD box 1 (byte-budget layer): an M-representative fixture whose
+    // UNBOUNDED single reference row exceeds the 8 MiB memtable cap (the wave-14
+    // live falsification) persists as multiple chunk rows, EACH under the cap,
+    // with byte readback of every row and a byte-identical same-seed re-persist.
+    let cap = drift_reference_sample_cap().expect("cap");
+    let budget = drift_reference_chunk_budget_bytes().expect("budget");
+
+    // 20 dense slots × 400 samples × dim 256: bounded to the cap this sums to
+    // more than 8 MiB in one JSON row.
+    let fixture: Vec<DriftSlotSamples> = (0..20)
+        .map(|i| DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: wide(400, 256, i as f64),
+        })
+        .collect();
+
+    // Prove the falsification condition: the single bounded row exceeds the cap.
+    let (bounded, bound_prov) = bound_reference_window(&fixture, cap, SEED);
+    let single_payload = serde_json::json!({
+        "schema": DRIFT_REFERENCE_PAYLOAD_SCHEMA,
+        "sampling": { "reservoir": "vitter-algorithm-r", "sample_cap": cap, "seed": SEED, "per_slot": bound_prov },
+        "slots": bounded,
+    });
+    let single_value = serde_json::to_vec(&single_payload).expect("single row bytes");
+    assert!(
+        single_value.len() > MEMTABLE_BYTE_CAP,
+        "the unbounded single reference row must exceed the memtable cap ({} bytes)",
+        single_value.len()
+    );
+
+    // Corroborate: a raw write of that single blob fails closed (backpressure).
+    {
+        let (probe_dir, probe_vault) = durable_vault("m-backpressure-probe");
+        let err = probe_vault
+            .write_cf(
+                ColumnFamily::Assay,
+                b"driftref-probe".to_vec(),
+                single_value.clone(),
+            )
+            .expect_err("an over-cap single row must fail closed");
+        assert_eq!(err.code, "CALYX_BACKPRESSURE", "{err:?}");
+        drop(probe_vault);
+        let _ = std::fs::remove_dir_all(&probe_dir);
+    }
+
+    // The chunked producer persists it under the cap.
+    let (dir, vault) = durable_vault("m-chunked");
+    let report = persist_drift_reference(&vault, cache_key(), "drift:reference", &fixture, SEED)
+        .expect("persist chunked reference");
+    assert!(
+        report.chunks.len() > 1,
+        "M reference must split: {report:?}"
+    );
+    assert_eq!(report.chunk_budget_bytes, budget);
+    for info in &report.chunks {
+        assert!(info.payload_bytes <= budget, "chunk over budget: {info:?}");
+        assert!(
+            info.budget_downsampled_slots.is_empty(),
+            "no single slot exceeded the budget in this fixture: {info:?}"
+        );
+    }
+
+    // Byte readback: EVERY persisted row is admissible under the memtable cap.
+    let rows = persisted_reference_rows(&vault);
+    assert_eq!(rows.len(), report.chunks.len(), "one row per chunk");
+    for (key, value) in &rows {
+        assert!(
+            row_entry_size(key, value) <= MEMTABLE_BYTE_CAP,
+            "persisted chunk row {} bytes exceeds the memtable cap",
+            row_entry_size(key, value)
+        );
+    }
+
+    // The merged reload reconstitutes all 20 slots, each bounded to the cap.
+    let reloaded = load_drift_reference(&vault).expect("reload merged reference");
+    assert_eq!(reloaded.len(), 20, "all slots reconstituted across chunks");
+    for slot in &reloaded {
+        assert_eq!(
+            slot.samples.len(),
+            cap,
+            "each slot bounded to the cap: {}",
+            slot.slot
+        );
+    }
+    let mut labels: Vec<&str> = reloaded.iter().map(|s| s.slot.as_str()).collect();
+    labels.sort();
+    let mut expected: Vec<String> = (0..20).map(|i| format!("S{i}")).collect();
+    expected.sort();
+    assert_eq!(
+        labels,
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+
+    // Determinism: a same-seed re-persist into a fresh vault yields a
+    // byte-identical set of chunk row values.
+    let (dir2, vault2) = durable_vault("m-chunked-2");
+    persist_drift_reference(&vault2, cache_key(), "drift:reference", &fixture, SEED)
+        .expect("re-persist chunked reference");
+    let mut a: Vec<Vec<u8>> = rows.into_iter().map(|(_, v)| v).collect();
+    let mut b: Vec<Vec<u8>> = persisted_reference_rows(&vault2)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "same seed → byte-identical chunked reference");
+
+    drop(vault);
+    drop(vault2);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn planted_shift_survives_a_multi_chunk_reference() {
+    // #371 DoD box 2 (byte-budget layer): a reference large enough to split into
+    // multiple chunk rows is reloaded from bytes and STILL surfaces a planted
+    // shift — chunking splits storage, not the MMD sample sets, so sensitivity is
+    // pinned.
+    let (dir, vault) = durable_vault("multi-chunk-shift");
+    let cfg = DiffConfig::from_defaults().expect("diff config");
+    let budget = drift_reference_chunk_budget_bytes().expect("budget");
+
+    // 27 stable + 1 planted-shift slot, wide enough (dim 512) that the reference
+    // exceeds the 4 MiB chunk budget with few enough samples to keep MMD cheap.
+    let mut reference = Vec::new();
+    let mut current = Vec::new();
+    for i in 0..27 {
+        reference.push(DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: wide(60, 512, 0.0),
+        });
+        current.push(DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: wide(60, 512, 0.0),
+        });
+    }
+    reference.push(DriftSlotSamples {
+        slot: "S18".to_string(),
+        samples: wide(60, 512, 0.0),
+    });
+    current.push(DriftSlotSamples {
+        slot: "S18".to_string(),
+        samples: wide(60, 512, 50.0),
+    });
+
+    let report = persist_drift_reference(&vault, cache_key(), "drift:reference", &reference, SEED)
+        .expect("persist multi-chunk reference");
+    assert!(
+        report.chunks.len() > 1,
+        "reference must span multiple chunks: {report:?}"
+    );
+    for info in &report.chunks {
+        assert!(info.payload_bytes <= budget, "chunk over budget: {info:?}");
+    }
+
+    // Reload the reference from the persisted chunk bytes and produce cards.
+    let bounded_reference = load_drift_reference(&vault).expect("reload multi-chunk reference");
+    assert_eq!(bounded_reference.len(), 28, "all slots reconstituted");
+    let card_report = produce_drift_cards(
+        &vault,
+        cache_key(),
+        "drift:cards",
+        &bounded_reference,
+        &current,
+        SEED,
+        &cfg,
+        None,
+    )
+    .expect("produce drift cards");
+    assert!(card_report.cards_payload_persisted, "{card_report:?}");
+
+    drop(vault);
+    let reopened = open_durable_vault(&dir);
+    let inputs = live_anomaly_inputs_from_vault(&reopened).expect("live drift inputs");
+    let anomaly = detect_anomalies(
+        &inputs.substrates,
+        &inputs.calibrations,
+        Some("drift"),
+        true,
+    )
+    .expect("tier drift findings");
+    assert!(
+        anomaly
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AnomalyKind::Drift && finding.subject_id == "slot:S18"),
+        "planted shift must survive a multi-chunk reference: {:?}",
+        anomaly.findings
+    );
+
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn below_two_point_history_is_a_labeled_short_history_absence() {
     // A slot whose current window has fewer than the two points MMD requires is a

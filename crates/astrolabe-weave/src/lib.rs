@@ -38,16 +38,20 @@ use serde_json::Value;
 
 mod ann;
 pub mod drift_producer;
+pub mod signal_cards;
 mod sim_rows;
 mod xterm_cotenant;
 mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use drift_producer::{
+    DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
     DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP, DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
-    DRIFT_REFERENCE_KNOBS, DRIFT_REFERENCE_MAX_SAMPLE_CAP, DRIFT_REFERENCE_MIN_SAMPLE_CAP,
+    DRIFT_REFERENCE_KNOBS, DRIFT_REFERENCE_MAX_CHUNK_BUDGET_BYTES, DRIFT_REFERENCE_MAX_SAMPLE_CAP,
+    DRIFT_REFERENCE_MIN_CHUNK_BUDGET_BYTES, DRIFT_REFERENCE_MIN_SAMPLE_CAP,
     DRIFT_REFERENCE_PAYLOAD_SCHEMA, DRIFT_REFERENCE_SAMPLE_CAP_KNOB, DriftProductionReport,
-    DriftReferenceSamplingReport, DriftSlotSamples, SlotSamplingProvenance, bound_reference_window,
+    DriftReferenceChunkInfo, DriftReferenceSamplingReport, DriftSlotSamples,
+    SlotSamplingProvenance, bound_reference_window, drift_reference_chunk_budget_bytes,
     drift_reference_sample_cap, load_drift_reference, load_drift_reference_counted,
     persist_drift_reference, produce_drift_cards, read_slot_samples_from_vault,
     run_index_time_drift,
@@ -57,6 +61,10 @@ pub use kernel_index::{
     ASTRO_KERNEL_INDEX_STALE, ASTRO_KERNEL_INDEX_VAULT, KERNEL_INDEX_RECALL_GATE_PERMILLE,
     KERNEL_MEMBER_INDEX_SCHEMA, KernelIndexKind, KernelMemberIndex, KernelRecallMeasurement,
     build_kernel_member_index, kernel_scoped_semantic_query, measure_kernel_index_recall,
+};
+pub use signal_cards::{
+    SIGNAL_AXIS_STRUCTURAL_DEGREE, SIGNAL_AXIS_SYMBOL_KIND, SignalCardProduction, SymbolAxes,
+    derive_symbol_axes, measure_index_time_signal_cards, signal_cards_from_symbol_axes,
 };
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
