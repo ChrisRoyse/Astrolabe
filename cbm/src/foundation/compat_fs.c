@@ -41,7 +41,9 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
         return NULL;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #383: extended-length widen so directories deeper than MAX_PATH (260) are
+     * enumerable (FindFirstFileW below) instead of silently skipped by the walk. */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }
@@ -377,7 +379,9 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #383: extended-length widen for the path (not the mode) so files deeper than
+     * MAX_PATH (260) open instead of returning NULL (a silent scan skip). */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }

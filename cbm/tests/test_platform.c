@@ -18,6 +18,15 @@
 #include <sys/stat.h>
 #endif
 
+#ifdef _WIN32
+/* #383 long-path test: extended-length fixture creation + teardown. */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <string.h>
+#endif
+
 TEST(platform_now_ns) {
     uint64_t t1 = cbm_now_ns();
     ASSERT_GT(t1, 0);
@@ -304,7 +313,84 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* #383: a source file whose absolute path exceeds MAX_PATH (260) must be reachable
+ * by the scan/read functions the pipeline uses (cbm_file_exists / cbm_file_size /
+ * cbm_mmap_read), NOT silently skipped. Before the extended-length ("\\?\") widen,
+ * these returned "not found" on a >260 path on this host (LongPathsEnabled unset),
+ * so the discovery walk dropped the file without a trace. This pins the outcome as
+ * "indexed/accessible". Windows-only: POSIX has no MAX_PATH barrier. */
+TEST(platform_long_path_over_260_is_accessible_not_skipped_issue383) {
+#ifdef _WIN32
+    wchar_t tmp[1024];
+    DWORD tn = GetTempPathW(1024, tmp);
+    ASSERT_TRUE(tn > 0 && tn < 900);
+    /* GetTempPathW yields a trailing backslash; drop it for uniform joining. */
+    if (tmp[tn - 1] == L'\\') {
+        tmp[tn - 1] = L'\0';
+    }
+
+    /* Plain UTF-8 path handed to the cbm_ API (which adds the \\?\ prefix itself). */
+    char u8[2048];
+    int u8n = WideCharToMultiByte(CP_UTF8, 0, tmp, -1, u8, (int)sizeof(u8), NULL, NULL);
+    ASSERT_GT(u8n, 0);
+
+    /* Extended wide path used ONLY to create/tear down the fixture (setup must
+     * itself bypass the 260 barrier). */
+    wchar_t ext[2200];
+    wcscpy(ext, L"\\\\?\\");
+    wcscat(ext, tmp);
+
+    const char *u8seg = "/lp383_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const wchar_t *wseg = L"\\lp383_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (int i = 0; i < 6; i++) {
+        strcat(u8, u8seg);
+        wcscat(ext, wseg);
+        CreateDirectoryW(ext, NULL);
+    }
+    strcat(u8, "/probe.rs");
+    wcscat(ext, L"\\probe.rs");
+
+    ASSERT_GT((int)strlen(u8), MAX_PATH); /* the path genuinely exceeds 260 */
+
+    HANDLE h =
+        CreateFileW(ext, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ASSERT_TRUE(h != INVALID_HANDLE_VALUE);
+    const char *body = "fn long_path_fn() {}\n";
+    DWORD wr = 0;
+    WriteFile(h, body, (DWORD)strlen(body), &wr, NULL);
+    CloseHandle(h);
+    ASSERT_EQ((int)wr, (int)strlen(body));
+
+    /* The fix: plain-path scan/read functions now reach the >260-char file. */
+    ASSERT_TRUE(cbm_file_exists(u8));
+    ASSERT_EQ((int)cbm_file_size(u8), (int)strlen(body));
+    size_t msz = 0;
+    void *mapped = cbm_mmap_read(u8, &msz);
+    ASSERT_NOT_NULL(mapped);
+    ASSERT_EQ((int)msz, (int)strlen(body));
+    if (mapped) {
+        cbm_munmap(mapped, msz);
+    }
+
+    /* Teardown: remove the file then each of the 6 planted directory levels via
+     * extended paths (never touching the temp root itself). */
+    DeleteFileW(ext);
+    for (int i = 0; i < 6; i++) {
+        wchar_t *last = wcsrchr(ext, L'\\');
+        if (!last) {
+            break;
+        }
+        *last = L'\0';
+        RemoveDirectoryW(ext);
+    }
+    PASS();
+#else
+    PASS();
+#endif
+}
+
 SUITE(platform) {
+    RUN_TEST(platform_long_path_over_260_is_accessible_not_skipped_issue383);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
     RUN_TEST(platform_nprocs);
