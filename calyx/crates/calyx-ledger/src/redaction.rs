@@ -213,6 +213,14 @@ fn allowed_stable_identifier(token: &str, field: Option<&str>) -> bool {
     if field == "git_sha" {
         return matches!(token.len(), 7..=40) && is_hex(token);
     }
+    if field == "commit" || field == "historical_commit" {
+        // A git commit SHA recorded as import provenance (Astrolabe shadow index
+        // and git-archaeology write the HEAD / historical commit into these
+        // metadata fields) is not a secret; it is allowlisted exactly like an
+        // explicit `git_sha` field. A non-git shadow import records a short
+        // `shadow-import-v1:<project>` label that never reaches this check.
+        return matches!(token.len(), 7..=40) && is_hex(token);
+    }
     if field_allows_manifest_slug(&field) && is_manifest_slug(token) {
         return true;
     }
