@@ -121,7 +121,31 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
             tools.push(definition);
         }
     }
+    // #328: overlay the Astrolabe-side extensions onto the CBM `search_graph`
+    // schema so MCP clients can discover propagated_label + fusion from tools/list.
+    for tool in tools.iter_mut() {
+        if tool.get("name").and_then(Value::as_str) == Some("search_graph") {
+            overlay_search_graph_extensions(tool);
+        }
+    }
     Ok(serde_json::to_string(&response)?)
+}
+
+/// #328: merge the Astrolabe `search_graph` extension properties into the CBM
+/// tool's `inputSchema.properties`, leaving any CBM-native property untouched.
+pub(crate) fn overlay_search_graph_extensions(tool: &mut Value) {
+    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let properties = schema
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(properties) = properties.as_object_mut() else {
+        return;
+    };
+    for (name, spec) in search_graph_astrolabe_property_overlay() {
+        properties.entry(name).or_insert(spec);
+    }
 }
 
 pub(crate) fn should_wrap_tool(
