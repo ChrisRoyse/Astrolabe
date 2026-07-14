@@ -16,6 +16,7 @@ pub fn handle_tool_raw(
         "measure_bits" => handle_measure_bits(args_json),
         "impute_fields" => handle_impute_fields(args_json),
         "anchor_outcome" => handle_anchor_outcome(args_json),
+        "predict_impact" => handle_predict_impact(args_json),
         "coverage_ingest" => handle_coverage_ingest(args_json),
         "guard_calibrate" => handle_guard_calibrate(args_json),
         "guard_check" => handle_guard_check(args_json),

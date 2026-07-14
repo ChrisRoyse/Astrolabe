@@ -148,6 +148,9 @@ use measure_bits::*;
 mod anchor_outcome;
 use anchor_outcome::*;
 
+mod predict_impact;
+use predict_impact::*;
+
 mod coverage_ingest;
 use coverage_ingest::*;
 

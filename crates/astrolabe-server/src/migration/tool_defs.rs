@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 11] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 12] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -8,6 +8,7 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 11] {
         get_readiness_tool_definition(),
         impute_fields_tool_definition(),
         anchor_outcome_tool_definition(),
+        predict_impact_tool_definition(),
         coverage_ingest_tool_definition(),
         team_artifact_tool_definition(),
         guard_calibrate_tool_definition(),
@@ -47,6 +48,48 @@ pub(crate) fn measure_bits_tool_definition() -> Value {
                 }
             },
             "required": ["project", "mode"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"type": "object"}
+                },
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn predict_impact_tool_definition() -> Value {
+    json!({
+        "name": "predict_impact",
+        "title": "Predict Impact",
+        "description": "\"If I change X, what breaks?\" — a grounded change-impact prediction for a shadow-indexed project, answered from the persisted change→outcome corpus (astrolabe_oracle), never from raw topology. Builds a composite consequence graph from the persisted CBM graph edges (CALLS/DATA_FLOWS/service/TESTS, direction-corrected to impact flow) and grounds each node in the vault's occurrence rows; a cycle-guarded butterfly walk (×0.7 per hop, prune <0.05, depth ≤4) expands the tree, three independent ceilings keep every probability strictly below 1.0, and consequences that intersect TESTS edges become a ranked test-selection set. Grounded confidence is advertised ONLY when this repo's persisted backtest gate passed; otherwise every consequence is labeled provisional (never a silent grounded default). When the seeds carry no grounded history the tool refuses with a per-sensor deficit card rather than guessing. mode=\"backtest\" runs the grounded-vs-topology backtest over cases derived from the corpus and persists (with FSV readback) the per-repo gate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "seeds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Qualified name(s) of the symbol(s) you intend to change. Required for mode=\"predict\"; any seed absent from the indexed graph refuses fail-closed."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["predict", "backtest"],
+                    "description": "predict (default): ranked consequences + test-selection, or an Insufficient deficit card. backtest: run the grounded-vs-topology backtest and persist this repo's grounded-mode gate."
+                }
+            },
+            "required": ["project"],
             "additionalProperties": false
         },
         "outputSchema": {
