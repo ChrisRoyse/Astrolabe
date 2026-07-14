@@ -48,7 +48,7 @@ void *cbm_mmap_read(const char *path, size_t *out_size) {
     }
     *out_size = 0;
 
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path); /* #383 long-path read */
     if (!wpath) {
         return NULL;
     }
@@ -109,7 +109,7 @@ int cbm_nprocs(void) {
 }
 
 bool cbm_file_exists(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path); /* #383 long-path read */
     if (!wpath) {
         return false;
     }
@@ -119,7 +119,7 @@ bool cbm_file_exists(const char *path) {
 }
 
 bool cbm_is_dir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path); /* #383 long-path read */
     if (!wpath) {
         return false;
     }
@@ -129,7 +129,7 @@ bool cbm_is_dir(const char *path) {
 }
 
 int64_t cbm_file_size(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path); /* #383 long-path read */
     if (!wpath) {
         return CBM_NOT_FOUND;
     }

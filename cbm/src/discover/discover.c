@@ -587,7 +587,9 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
 /* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
 static int wide_stat(const char *path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #383: extended-length widen so a source file deeper than MAX_PATH (260) stats
+     * successfully instead of returning CBM_NOT_FOUND — a silent discovery skip. */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -612,7 +614,9 @@ static int wide_stat(const char *path, struct stat *st) {
  * root, mirroring the POSIX S_ISLNK skip. */
 static int safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    /* #383: extended-length widen so the reparse-point probe on a >260-char path
+     * reads real attributes instead of failing (which would skip the check). */
+    wchar_t *wpath = cbm_utf8_to_wide_path(abs_path);
     if (wpath) {
         DWORD attr = GetFileAttributesW(wpath);
         free(wpath);
