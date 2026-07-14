@@ -180,43 +180,176 @@ pub(crate) fn read_live_anomaly_report(
     if !vault_dir.exists() {
         return Ok(None);
     }
-    let vault = open_shadow_vault_read_only(
-        &vault_dir,
-        &vault_id,
-        &vault_salt,
-        vec![
-            ColumnFamily::XTerm,
-            ColumnFamily::Assay,
-            ColumnFamily::Reactive,
-        ],
-    )?;
-    let inputs = live_anomaly_inputs_from_vault(&vault)?;
+    let mut selected_cfs = vec![
+        ColumnFamily::XTerm,
+        ColumnFamily::Assay,
+        ColumnFamily::Reactive,
+        // The blind-spot sweep reconstructs SimilarityNodes from the live vault.
+        // read_cbm_graph_snapshot reads node identity (qualified_name <-> CxId)
+        // from Base + Graph and asserts no legacy series state via Kv +
+        // Recurrence; the slot CFs carry the confident/neighbor lens vectors.
+        ColumnFamily::Base,
+        ColumnFamily::Graph,
+        ColumnFamily::Kv,
+        ColumnFamily::Recurrence,
+    ];
+    selected_cfs.extend(
+        blind_spot_slots(&DEFAULT_BLIND_SPOT_PAIRS)
+            .into_iter()
+            .map(ColumnFamily::slot),
+    );
+    let vault = open_shadow_vault_read_only(&vault_dir, &vault_id, &vault_salt, selected_cfs)?;
+    let mut inputs = live_anomaly_inputs_from_vault(&vault)?;
+    let blind_spot = merge_live_blind_spot_inputs(&vault, project, &mut inputs);
     if !inputs.has_anomaly_inputs() {
         return Ok(None);
     }
     let report = detect_anomalies(&inputs.substrates, &inputs.calibrations, None, true)?;
     let mut value = anomaly_report_json(&report, inputs.skipped_rows);
-    value["source"] = json!("AsterVault:ColumnFamily::XTerm+Assay+Reactive");
-    value["source_state"] = live_anomaly_source_state_json(&inputs, &vault_dir);
+    value["source"] = json!("AsterVault:ColumnFamily::XTerm+Assay+Reactive+BlindSpot");
+    value["source_state"] = live_anomaly_source_state_json(&inputs, &vault_dir, &blind_spot);
     refresh_anomaly_report_counts_and_artifact(&mut value);
     Ok(Some(value))
+}
+
+/// The labeled outcome of folding the live blind-spot sweep into the anomaly
+/// inputs — recorded in `source_state` so a degradation (no graph snapshot, a
+/// slot-decode failure, or a per-pair calibration deficit) is never silent.
+pub(crate) enum BlindSpotMergeOutcome {
+    /// The sweep ran; carries the merged inputs' summary counts.
+    Swept(BlindSpotAnomalyInputs),
+    /// The sweep could not run against the live vault; carries the labeled reason.
+    Unavailable(String),
+}
+
+/// Reconstructs SimilarityNodes from the live vault and folds the blind-spot
+/// sweep's `BlindSpot` substrate rows and measured calibration into `inputs`.
+///
+/// Fail-open with a label: if the graph snapshot cannot be read or a slot vector
+/// cannot be decoded, the other anomaly kinds still report and the blind-spot
+/// degradation is surfaced as [`BlindSpotMergeOutcome::Unavailable`] rather than
+/// aborting the whole `detect_anomalies` call.
+pub(crate) fn merge_live_blind_spot_inputs<C: Clock>(
+    vault: &AsterVault<C>,
+    project: &str,
+    inputs: &mut LiveAnomalyInputs,
+) -> BlindSpotMergeOutcome {
+    let slots = blind_spot_slots(&DEFAULT_BLIND_SPOT_PAIRS);
+    let nodes = match reconstruct_similarity_nodes(vault, project, &slots) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            return BlindSpotMergeOutcome::Unavailable(format!(
+                "blind-spot reconstruction failed: {error}"
+            ));
+        }
+    };
+    match blind_spot_anomaly_inputs(
+        &nodes,
+        &DEFAULT_BLIND_SPOT_PAIRS,
+        &BlindSpotConfig::default(),
+    ) {
+        Ok(blind_spot) => {
+            inputs
+                .substrates
+                .extend(blind_spot.substrates.iter().cloned());
+            inputs
+                .calibrations
+                .extend(blind_spot.calibrations.iter().cloned());
+            BlindSpotMergeOutcome::Swept(blind_spot)
+        }
+        Err(error) => BlindSpotMergeOutcome::Unavailable(format!(
+            "blind-spot sweep refused: {} ({})",
+            error.message(),
+            error.code()
+        )),
+    }
+}
+
+/// Reconstructs the live corpus's [`SimilarityNode`]s (non-structural symbols,
+/// each carrying the requested `slots`) from the vault's graph snapshot and slot
+/// column families — the read-side twin of the shadow importer's slot load.
+pub(crate) fn reconstruct_similarity_nodes<C: Clock>(
+    vault: &AsterVault<C>,
+    project: &str,
+    slots: &[SlotId],
+) -> Result<Vec<SimilarityNode>, DynError> {
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let at_seq = vault.snapshot();
+    let mut slot_rows =
+        std::collections::BTreeMap::<SlotId, std::collections::BTreeMap<Vec<u8>, Vec<u8>>>::new();
+    for slot in slots {
+        slot_rows.insert(
+            *slot,
+            vault
+                .scan_cf_at(at_seq, ColumnFamily::slot(*slot))?
+                .into_iter()
+                .collect(),
+        );
+    }
+    let mut nodes = Vec::new();
+    for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+        let Some(cx_id) = node.cx_id else {
+            continue;
+        };
+        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
+        for slot in slots {
+            if let Some(bytes) = slot_rows
+                .get(slot)
+                .and_then(|rows| rows.get(slot_key(cx_id).as_slice()))
+            {
+                let vector = calyx_aster::vault::encode::decode_slot_vector(bytes)?;
+                similarity_node.slots.insert(*slot, vector);
+            }
+        }
+        nodes.push(similarity_node);
+    }
+    Ok(nodes)
 }
 
 pub(crate) fn live_anomaly_source_state_json(
     inputs: &LiveAnomalyInputs,
     vault_dir: &Path,
+    blind_spot: &BlindSpotMergeOutcome,
 ) -> Value {
     json!({
-        "source": "AsterVault:ColumnFamily::XTerm+Assay+Reactive",
+        "source": "AsterVault:ColumnFamily::XTerm+Assay+Reactive+BlindSpot",
         "vault_dir": vault_dir,
         "snapshot": inputs.snapshot,
         "xterm_rows_read": inputs.xterm_rows_read,
         "assay_rows_read": inputs.assay_rows_read,
         "reactive_fired_rows_read": inputs.reactive_rows_read,
         "schema_skipped_rows": inputs.skipped_rows,
+        "blind_spot": blind_spot_source_state_json(blind_spot),
         "freshness": "fresh",
         "trust": if inputs.skipped_rows == 0 { "verified" } else { "provisional" },
     })
+}
+
+pub(crate) fn blind_spot_source_state_json(outcome: &BlindSpotMergeOutcome) -> Value {
+    match outcome {
+        BlindSpotMergeOutcome::Swept(inputs) => json!({
+            "status": "swept",
+            "pairs": DEFAULT_BLIND_SPOT_PAIRS
+                .iter()
+                .map(|pair| pair.pair_key())
+                .collect::<Vec<_>>(),
+            "scored_symbols": inputs.scored_symbols,
+            "skipped_symbols": inputs.skipped_symbols,
+            "substrate_rows": inputs.substrates.len(),
+            "calibrations": inputs.calibrations.len(),
+            "deficits": inputs.deficits.iter().map(|deficit| json!({
+                "pair_key": deficit.pair_key,
+                "code": deficit.code,
+                "message": deficit.message,
+                "n_eff": deficit.n_eff,
+            })).collect::<Vec<_>>(),
+        }),
+        BlindSpotMergeOutcome::Unavailable(reason) => json!({
+            "status": "unavailable",
+            "reason": reason,
+            "trust": "provisional",
+        }),
+    }
 }
 
 pub(crate) fn read_anomaly_report_metadata(
