@@ -39,6 +39,7 @@ pub mod drift;
 pub mod error;
 pub mod estimators;
 pub mod fingerprint;
+pub mod gate;
 pub mod knobs;
 pub mod ledger;
 pub mod multivariate;
@@ -78,6 +79,11 @@ pub use drift::{DriftCard, measure_drift};
 pub use error::{AssayError, Result};
 pub use estimators::{entropy_bits, mi_continuous_ksg, mi_discrete, mi_mixed_ross};
 pub use fingerprint::InputFingerprint;
+pub use gate::{
+    GateAction, GateConfig, GateDecision, GateEvaluation, GateJournal, GateJournalEntry,
+    GateVerdict, LensCapabilityCard, ServingAdmission, build_capability_card, gate_lens,
+    is_sole_critical_carrier, max_admitted_correlation, pearson_correlation,
+};
 pub use ledger::{AssayCardEntry, CardLedger, input_fingerprint};
 pub use multivariate::{
     conditional_mi_bits, interaction_information_bits, joint_entropy_bits, normalized_mi_bits,
@@ -85,7 +91,7 @@ pub use multivariate::{
 };
 pub use periodicity::{PeriodicityCard, measure_periodicity};
 pub use population::{AssaySubject, Population};
-pub use redundancy::{GateDecision, PairwiseNmi, RedundancyGate, measure_redundancy};
+pub use redundancy::{PairwiseNmi, RedundancyGate, measure_redundancy};
 pub use redundancy_card::{
     RedundancyCard, RedundancyConfig, RedundantPair, SlotColumn, build_redundancy_card,
 };

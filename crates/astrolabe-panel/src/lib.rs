@@ -1113,6 +1113,71 @@ fn absent_reason_label(reason: &AbsentReason) -> String {
     }
 }
 
+/// Returns a slot specification by its stable key, searching the v2 superset roster.
+///
+/// The lens capability gate (`astrolabe-assay`, #35) reaches verdicts in lens-name
+/// space; this bridges a gated lens key to its frozen [`SlotId`] so a per-repo
+/// admission set can be applied to a readout without touching the frozen roster.
+pub fn slot_spec_by_key(key: &str) -> Option<&'static PanelSlotSpec> {
+    PANEL_V2_SLOTS.iter().find(|slot| slot.key == key)
+}
+
+impl PanelReadout {
+    /// Returns a per-repo serving view with parked/retired lenses masked.
+    ///
+    /// `active_slots` is the repo's admitted lens set expressed as [`SlotId`]s
+    /// (the capability gate's Admit set, #35). Any slot that currently carries a
+    /// real measured vector whose id is **not** in `active_slots` is replaced with
+    /// `Absent{LensInactive}` in the returned readout, and its accounting moves
+    /// from `measured` to a labeled `degraded` entry so the serving exclusion is
+    /// never silent (standing invariant 3).
+    ///
+    /// This is a **non-destructive overlay**: `self` is left untouched — its real
+    /// vectors stay readable for historical/as-of reads — and the frozen roster
+    /// ([`slots_for_version`]) is never consulted for mutation. Parking a lens is a
+    /// per-repo serving decision, not a roster-contract edit, so the panel-version
+    /// roster is unchanged by admission.
+    pub fn serving_view(&self, active_slots: &BTreeSet<SlotId>) -> PanelReadout {
+        let mut slots = BTreeMap::new();
+        let mut summary = PanelReadoutSummary::default();
+        for (slot_id, vector) in &self.slots {
+            let is_measured = matches!(
+                vector,
+                SlotVector::Dense { .. } | SlotVector::Sparse { .. } | SlotVector::Multi { .. }
+            );
+            let out = if is_measured && !active_slots.contains(slot_id) {
+                SlotVector::Absent {
+                    reason: AbsentReason::LensInactive,
+                }
+            } else {
+                vector.clone()
+            };
+            match &out {
+                SlotVector::Absent {
+                    reason: AbsentReason::NotApplicable,
+                } => summary.not_applicable += 1,
+                SlotVector::Absent { reason } => {
+                    summary
+                        .degraded
+                        .insert(*slot_id, absent_reason_label(reason));
+                }
+                SlotVector::Dense { .. } | SlotVector::Sparse { .. } | SlotVector::Multi { .. } => {
+                    summary.measured += 1
+                }
+            }
+            slots.insert(*slot_id, out);
+        }
+        PanelReadout {
+            schema_id: self.schema_id.clone(),
+            panel_version: self.panel_version,
+            label: self.label,
+            slots,
+            scalars: self.scalars.clone(),
+            summary,
+        }
+    }
+}
+
 /// Default Astrolabe panel driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PanelDriver {
@@ -2120,6 +2185,85 @@ mod tests {
     #[test]
     fn identifies_calyx_parent() {
         assert_eq!(parent_system(), astrolabe_domain::ParentSystem::Calyx);
+    }
+
+    #[test]
+    fn serving_view_masks_parked_lenses_non_destructively() {
+        // A readout with two measured slots and one structurally not-applicable slot.
+        let s0 = SlotId::new(0);
+        let s1 = SlotId::new(1);
+        let s2 = SlotId::new(2);
+        let mut slots = BTreeMap::new();
+        slots.insert(
+            s0,
+            SlotVector::Dense {
+                dim: 2,
+                data: vec![0.6, 0.8],
+            },
+        );
+        slots.insert(
+            s1,
+            SlotVector::Sparse {
+                dim: 65_536,
+                entries: vec![SparseEntry { idx: 7, val: 1.0 }],
+            },
+        );
+        slots.insert(
+            s2,
+            SlotVector::Absent {
+                reason: AbsentReason::NotApplicable,
+            },
+        );
+        let readout = PanelReadout {
+            schema_id: PANEL_SCHEMA_ID.to_string(),
+            panel_version: DEFAULT_PANEL_VERSION,
+            label: SymbolLabel::Function,
+            slots,
+            scalars: BTreeMap::new(),
+            summary: PanelReadoutSummary {
+                measured: 2,
+                not_applicable: 1,
+                degraded: BTreeMap::new(),
+            },
+        };
+
+        // The frozen roster before applying admission — captured for comparison.
+        let roster_before: Vec<PanelSlotSpec> = slots_for_version(1).unwrap().to_vec();
+
+        // Admit only S0; S1's lens is parked/retired for this repo.
+        let active = BTreeSet::from([s0]);
+        let view = readout.serving_view(&active);
+
+        // S0 keeps its real vector; S1 is masked; S2 stays not-applicable.
+        assert!(matches!(view.slots[&s0], SlotVector::Dense { .. }));
+        assert!(matches!(
+            view.slots[&s1],
+            SlotVector::Absent {
+                reason: AbsentReason::LensInactive
+            }
+        ));
+        assert!(matches!(
+            view.slots[&s2],
+            SlotVector::Absent {
+                reason: AbsentReason::NotApplicable
+            }
+        ));
+        // The exclusion is accounted, not silent.
+        assert_eq!(view.summary.measured, 1);
+        assert_eq!(view.summary.not_applicable, 1);
+        assert_eq!(
+            view.summary.degraded.get(&s1).map(String::as_str),
+            Some("lens_inactive")
+        );
+
+        // Non-destructive: the original readout still carries S1's real vector.
+        assert!(matches!(readout.slots[&s1], SlotVector::Sparse { .. }));
+
+        // Frozen-roster discipline: the roster contract is byte-identical, and the
+        // parked slot's spec is still resolvable (its historical data stays readable).
+        assert_eq!(slots_for_version(1).unwrap(), roster_before.as_slice());
+        assert!(slot_spec(s1).is_some());
+        assert_eq!(slot_spec_by_key("struct_trigrams").map(|s| s.slot), Some(1));
     }
 
     #[test]

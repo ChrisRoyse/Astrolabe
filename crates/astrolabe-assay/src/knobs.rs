@@ -808,6 +808,47 @@ pub fn assay_card_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ASSAY_CARD_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the lens capability-gate knobs (#35, P5.5).
+pub const ASSAY_GATE_KNOB_REGISTRY_VERSION: &str = "astrolabe-assay-gate-knobs-v1";
+
+/// Name of the retire-by-correlation threshold knob (permille of a correlation).
+pub const ASSAY_GATE_RETIRE_CORRELATION_PERMILLE_KNOB: &str =
+    "assay_gate_retire_correlation_permille";
+
+/// Default retire-by-correlation threshold, in permille of a Pearson correlation.
+///
+/// The blueprint (`05_LENS_PANEL.md` capability 1.8/4.8) retires a candidate lens
+/// whose maximum pairwise correlation with an already-admitted lens *exceeds*
+/// 0.6: past that the two lenses carry substantially the same variance and the
+/// second is redundant. 600 permille = 0.60; the comparison is strict (`>`), so a
+/// lens at exactly 0.60 is not retired on that ground.
+pub const ASSAY_DEFAULT_GATE_RETIRE_CORRELATION_PERMILLE: u64 = 600;
+/// Smallest legal retire-correlation threshold: 1 permille (0.001). Zero is
+/// illegal because a zero threshold retires every lens that carries any shared
+/// variance at all, collapsing the panel.
+pub const ASSAY_MIN_GATE_RETIRE_CORRELATION_PERMILLE: u64 = 1;
+/// Largest legal retire-correlation threshold: 1000 permille (1.0). A Pearson
+/// correlation cannot exceed 1.0 in magnitude, so a threshold at the ceiling
+/// only retires a perfectly collinear duplicate.
+pub const ASSAY_MAX_GATE_RETIRE_CORRELATION_PERMILLE: u64 = 1_000;
+
+/// The lens capability-gate knob registry (#35).
+pub const ASSAY_GATE_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: ASSAY_GATE_KNOB_REGISTRY_VERSION,
+    name: ASSAY_GATE_RETIRE_CORRELATION_PERMILLE_KNOB,
+    default: ASSAY_DEFAULT_GATE_RETIRE_CORRELATION_PERMILLE,
+    min: ASSAY_MIN_GATE_RETIRE_CORRELATION_PERMILLE,
+    max: ASSAY_MAX_GATE_RETIRE_CORRELATION_PERMILLE,
+    unit: "permille",
+    source: "ASTROLABE blueprint 05_LENS_PANEL.md §6 capability 1.8/4.8 (retire a lens whose max pairwise correlation with an admitted lens exceeds 0.6)",
+    rationale: "Pearson-correlation ceiling above which a candidate lens is redundant with an already-admitted lens and is retired; 600 permille = 0.60 is the blueprint threshold; the gate compares strictly (>) so a lens at exactly the threshold is kept; replace with a per-repo measured redundancy target once the panel-wide correlation spectrum is benchmarked",
+}];
+
+/// Returns the capability-gate declaration for `name`, or `None` when undeclared.
+pub fn assay_gate_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ASSAY_GATE_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +950,31 @@ mod tests {
     }
 
     #[test]
+    fn every_gate_knob_declares_bounds_that_contain_its_default() {
+        assert!(!ASSAY_GATE_KNOBS.is_empty());
+        for knob in ASSAY_GATE_KNOBS {
+            assert_eq!(
+                knob.registry_version, ASSAY_GATE_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+        // The retire-correlation threshold defaults to the blueprint's 0.6 (600 permille).
+        let corr = assay_gate_knob(ASSAY_GATE_RETIRE_CORRELATION_PERMILLE_KNOB).expect("declared");
+        assert_eq!(corr.default, 600);
+        assert!(!corr.accepts(0), "correlation threshold must reject zero");
+        assert!(corr.accepts(1_000), "correlation threshold accepts 1.0");
+        assert!(
+            !corr.accepts(1_001),
+            "correlation threshold rejects over 1.0"
+        );
+    }
+
+    #[test]
     fn card_knobs_reject_zero_and_one_where_meaningless() {
         for name in [
             ASSAY_CALIBRATION_MIN_SAMPLES_KNOB,
@@ -951,7 +1017,6 @@ mod tests {
         assert_eq!(assay_diff_knob(ASSAY_TE_MIN_LAG_KNOB).unwrap().default, 1);
         assert_eq!(assay_diff_knob(ASSAY_TE_MAX_LAG_KNOB).unwrap().default, 8);
     }
-
 
     #[test]
     fn lane_budget_and_tripwire_reject_zero_and_over_max() {
