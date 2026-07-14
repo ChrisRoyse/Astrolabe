@@ -5130,54 +5130,12 @@ fn language_from_path(path: &str) -> &'static str {
 }
 
 fn parse_symbol_label(value: &str) -> IngestResult<SymbolLabel> {
-    let normalized = value
-        .chars()
-        .filter(|ch| *ch != '_' && *ch != '-' && !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    let label = match normalized.as_str() {
-        "function" => SymbolLabel::Function,
-        "method" => SymbolLabel::Method,
-        "class" => SymbolLabel::Class,
-        "struct" => SymbolLabel::Struct,
-        "interface" => SymbolLabel::Interface,
-        "enum" => SymbolLabel::Enum,
-        "enummember" => SymbolLabel::EnumMember,
-        "trait" => SymbolLabel::Trait,
-        "type" => SymbolLabel::Type,
-        "typealias" => SymbolLabel::TypeAlias,
-        "field" => SymbolLabel::Field,
-        "variable" => SymbolLabel::Variable,
-        "constant" => SymbolLabel::Constant,
-        "module" => SymbolLabel::Module,
-        "file" => SymbolLabel::File,
-        "route" => SymbolLabel::Route,
-        "channel" => SymbolLabel::Channel,
-        "resource" => SymbolLabel::Resource,
-        "chart" => SymbolLabel::Chart,
-        "package" => SymbolLabel::Package,
-        "macro" => SymbolLabel::Macro,
-        "section" => SymbolLabel::Section,
-        "namespace" => SymbolLabel::Namespace,
-        "property" => SymbolLabel::Property,
-        "union" => SymbolLabel::Union,
-        "protocol" => SymbolLabel::Protocol,
-        "mixin" => SymbolLabel::Mixin,
-        "object" => SymbolLabel::Object,
-        "impl" => SymbolLabel::Impl,
-        "annotation" => SymbolLabel::Annotation,
-        "decorator" => SymbolLabel::Decorator,
-        "envvar" => SymbolLabel::EnvVar,
-        "project" => SymbolLabel::Project,
-        "branch" => SymbolLabel::Branch,
-        "folder" => SymbolLabel::Folder,
-        _ => {
-            return Err(invalid_sqlite(format!(
-                "unknown Codebase Memory MCP node label {value:?}"
-            )));
-        }
-    };
-    Ok(label)
+    // Single admission oracle shared with the emission-vocabulary parity check
+    // (SymbolLabel::from_cbm_label). Keeping the accepted roster in one place
+    // means a new C-side label drifts in exactly one spot.
+    SymbolLabel::from_cbm_label(value).ok_or_else(|| {
+        invalid_sqlite(format!("unknown Codebase Memory MCP node label {value:?}"))
+    })
 }
 
 fn modality_for_label(label: SymbolLabel) -> Modality {
