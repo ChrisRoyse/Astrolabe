@@ -5744,15 +5744,14 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
         "{envelope}"
     );
 
-    // Edge 4: panel mode with an unknown panel_version fails closed. Investigated
-    // during wave-11 integration: `PanelDriver::new(99)` does NOT pre-validate the
-    // version — the missing frozen slot roster is caught at measure time, so the
-    // refusal surfaces as ASTRO_GUARD_CHECK_PANEL_FAILED naming "panel version 99"
-    // rather than the version-specific ASTRO_GUARD_CHECK_PANEL_VERSION code (which
-    // fires only when the driver itself rejects the version). Either way it is
-    // fail-closed: isError, and the message names the offending version so the
-    // operator can fix it. The pinned safety property (unknown version is refused,
-    // never measured on a missing roster) holds.
+    // Edge 4: panel mode with an unknown panel_version fails closed with the
+    // version-specific code. Since #350, `PanelDriver::new(99)` validates the
+    // version eagerly against the frozen slot roster/schema set, so the driver
+    // itself rejects the unknown version at construction and guard_check maps that
+    // to ASTRO_GUARD_CHECK_PANEL_VERSION — the version error surfaces as a version
+    // error, not the generic ASTRO_GUARD_CHECK_PANEL_FAILED measure-time wrapper.
+    // The pinned safety property (unknown version is refused, never measured on a
+    // missing roster) still holds, now with the correct error taxonomy.
     let args = json!({
         "project": "demo",
         "target": GUARD_CHECK_TARGET,
@@ -5765,9 +5764,8 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
     assert_eq!(envelope["isError"], true, "{envelope}");
     let panel_version_text = envelope["content"][0]["text"].as_str().unwrap();
     assert!(
-        panel_version_text.contains("ASTRO_GUARD_CHECK_PANEL_VERSION")
-            || panel_version_text.contains("ASTRO_GUARD_CHECK_PANEL_FAILED"),
-        "unknown panel_version must fail closed with a panel code: {envelope}"
+        panel_version_text.contains("ASTRO_GUARD_CHECK_PANEL_VERSION"),
+        "unknown panel_version must fail closed with the version-specific code: {envelope}"
     );
     assert!(
         panel_version_text.contains("panel version 99"),

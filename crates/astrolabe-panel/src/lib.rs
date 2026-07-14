@@ -1193,7 +1193,15 @@ impl Default for PanelDriver {
 }
 
 impl PanelDriver {
-    /// Creates a driver for a non-zero panel version.
+    /// Creates a driver for a known, frozen panel version.
+    ///
+    /// The version is validated eagerly against the frozen slot roster and schema
+    /// set at construction, so an unknown version (e.g. 99) fails closed here with
+    /// [`ASTRO_PANEL_CONTRACT_INVALID`] naming the known versions — rather than
+    /// surviving construction and surfacing later as a generic measure-time panel
+    /// failure. Callers that map construction errors to a version-specific code
+    /// (guard_check panel mode, guard_calibrate auto path) therefore see the
+    /// version error at the point they expect it.
     pub fn new(version: u32) -> PanelResult<Self> {
         if version == 0 {
             return Err(PanelError::new(
@@ -1202,6 +1210,10 @@ impl PanelDriver {
                 "Commission a non-zero panel version before measurement.",
             ));
         }
+        // Force the frozen roster and schema lookups eagerly so an unknown version
+        // is rejected at construction, not lazily at measure time.
+        slots_for_version(version)?;
+        schema_id_for_version(version)?;
         Ok(Self { version })
     }
 
@@ -2457,6 +2469,35 @@ mod tests {
             .verify_determinism_probe(&absent, &probe)
             .expect_err("absent registration probe must be refused");
         assert_eq!(err.code(), ASTRO_PANEL_VECTOR_INVALID);
+    }
+
+    #[test]
+    fn driver_new_validates_panel_version_eagerly() {
+        // Valid frozen versions construct and expose their version unchanged.
+        for version in [DEFAULT_PANEL_VERSION, PANEL_V2_VERSION] {
+            let driver = PanelDriver::new(version).expect("known version constructs");
+            assert_eq!(driver.version(), version);
+        }
+
+        // Version 0 keeps its dedicated fail-closed message.
+        let zero = PanelDriver::new(0).expect_err("version 0 refused");
+        assert_eq!(zero.code(), ASTRO_PANEL_CONTRACT_INVALID);
+        assert!(zero.message().contains("panel version 0"));
+
+        // An unknown version is rejected at construction (eager), naming the known
+        // versions in the remediation — not deferred to measure time.
+        let unknown = PanelDriver::new(99).expect_err("unknown version refused at construction");
+        assert_eq!(unknown.code(), ASTRO_PANEL_CONTRACT_INVALID);
+        assert!(
+            unknown.message().contains("panel version 99"),
+            "message names the offending version: {}",
+            unknown.message()
+        );
+        assert!(
+            unknown.remediation().contains('1') && unknown.remediation().contains('2'),
+            "remediation names the known versions: {}",
+            unknown.remediation()
+        );
     }
 
     #[test]
