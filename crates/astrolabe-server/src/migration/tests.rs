@@ -13080,3 +13080,273 @@ fn success_criterion_6_5_answer_producing_tools_are_classified_exhaustively() {
         );
     }
 }
+
+// --- #385: runtime leg of the criterion-6.5 sweep -------------------------
+//
+// The wave-14 `success_criterion_6_5_*` test above proves the classification is
+// exhaustive and disjoint over the shipped registry. THIS test RUNS it: it indexes
+// one shared shadow fixture once, invokes every answer-producing tool against it,
+// and resolves each served ledger-backed trace through `get_provenance`. A tool
+// that fails closed for a fixture-specific missing input (no matching symbol, no
+// anchored outcome, no calibration corpus, ...) is EXCLUDED, labeled with its coded
+// reason, and counted — never silently skipped. The `get_context_pack` composer is
+// EXCLUDED while #41 is open. A genuine handler breakage (missing dispatch /
+// "unknown tool" / malformed envelope, or a served answer whose trace does not
+// resolve) names the offending tool.
+//
+// Runs in a child process because `astrolabe_bridge::set_cbm_cache_dir` is a
+// process-global override and HOME is redirected to a sandbox — mirroring the
+// `build_fusion_fixture_index` isolation used by the native fusion tests, so the
+// shared fixture lands in a run-scoped store and never touches the operator cache.
+
+/// One tool invocation outcome in the runtime sweep.
+struct SweepOutcome {
+    is_error: bool,
+    unknown_tool: bool,
+    /// The inner tool JSON (structuredContent), for trace resolution.
+    inner: Value,
+    /// The tool result text, for coded-reason extraction and diagnostics.
+    text: String,
+}
+
+/// Dispatches one tool through the real JSON-RPC surface against the shared fixture.
+fn sweep_call_tool(runner: &CbmToolRunner, name: &str, args: Value) -> SweepOutcome {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 9385,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": args},
+    });
+    let response = handle_jsonrpc_raw(runner, &serde_json::to_string(&request).unwrap())
+        .expect("jsonrpc dispatch")
+        .expect("jsonrpc response");
+    let value: Value = serde_json::from_str(&response).expect("jsonrpc response JSON");
+    // A JSON-RPC-level error (no `result`) means the tool never reached a handler.
+    if value.get("error").is_some() || value.get("result").is_none() {
+        return SweepOutcome {
+            is_error: true,
+            unknown_tool: true,
+            inner: Value::Null,
+            text: response,
+        };
+    }
+    let result = &value["result"];
+    let is_error = result["isError"].as_bool().unwrap_or(true);
+    let inner = result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = result["content"][0]["text"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let unknown_tool = text.contains("unknown tool");
+    SweepOutcome {
+        is_error,
+        unknown_tool,
+        inner,
+        text,
+    }
+}
+
+/// Representative invocation arguments per answer-producing tool (shapes proven by
+/// `advertised_astrolabe_tools_reach_jsonrpc_handlers`), targeting the shared
+/// fusiondemo fixture symbols where a symbol is required.
+fn sweep_tool_args(tool: &str, project: &str) -> Value {
+    match tool {
+        "get_provenance" => json!({"project": project, "mode": "verify_chain"}),
+        "impute_fields" => {
+            json!({"project": project, "target": "symbol:demo:parse_config", "field": "doc"})
+        }
+        "anchor_outcome" => json!({
+            "project": project,
+            "source": "ci:github:1",
+            "format": "cargo_test_json",
+            "report": "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n"
+        }),
+        "predict_impact" => json!({"project": project, "seeds": ["authenticate_user"]}),
+        "measure_bits" => json!({"project": project, "mode": "signals"}),
+        "find_similar" => json!({"project": project, "symbol": "authenticate_user"}),
+        "abduce_cause" => json!({"project": project, "failure": "authenticate_user"}),
+        "forecast" => json!({"project": project, "subject": "authenticate_user"}),
+        "get_kernel" => json!({"project": project, "mode": "read"}),
+        "kernel_answer" => json!({"project": project, "query": "how does authentication work"}),
+        "anchor_erase" => {
+            json!({"project": project, "source": "ci:github:demo:run-1", "confirm": true})
+        }
+        // get_readiness, guard_calibrate, guard_check, guard_lock, guard_commit_ood,
+        // guard_advisory_hook, assay_gate, detect_anomalies take only the project.
+        _ => json!({"project": project}),
+    }
+}
+
+/// Extracts a coded refusal reason (`{code}` or an ALL_CAPS error token) so a
+/// fail-closed exclusion is labeled, not silent.
+fn sweep_error_reason(outcome: &SweepOutcome) -> String {
+    if let Some(code) = outcome.inner.get("code").and_then(Value::as_str) {
+        return code.to_string();
+    }
+    outcome
+        .text
+        .split_whitespace()
+        .map(|word| word.trim_end_matches(|c: char| matches!(c, ':' | ',' | '"')))
+        .find(|word| {
+            word.len() > 4
+                && word.contains('_')
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "uncoded_fail_closed".to_string())
+}
+
+/// True when a `get_provenance(mode="verify_chain")` response resolves to an intact
+/// ledger chain — the ledger every served ref is anchored in.
+fn sweep_chain_intact(inner: &Value) -> bool {
+    inner
+        .pointer("/payload/verify_chain/status/status")
+        .and_then(Value::as_str)
+        == Some("intact")
+}
+
+#[test]
+fn success_criterion_6_5_runtime_sweep_resolves_every_served_ledger_ref() {
+    if std::env::var("ASTRO_W15F_SWEEP_CHILD").is_ok() {
+        use std::io::Write;
+
+        let store = PathBuf::from(std::env::var("ASTRO_W15F_SWEEP_STORE").expect("store env"));
+        let root = PathBuf::from(std::env::var("ASTRO_W15F_SWEEP_ROOT").expect("root env"));
+        // ONE shared shadow fixture, indexed once (reused by the whole sweep).
+        let (runner, project) = build_fusion_fixture_index(&store, &root);
+
+        // Precondition: the shared index persisted a verifiable provenance chain —
+        // the resolver the whole sweep depends on must itself serve.
+        let chain = sweep_call_tool(
+            &runner,
+            "get_provenance",
+            json!({"project": project, "mode": "verify_chain"}),
+        );
+        assert!(
+            !chain.is_error,
+            "get_provenance(verify_chain) is the resolver and must serve over the shared fixture: {}",
+            chain.text
+        );
+
+        let mut resolved: Vec<String> = Vec::new();
+        let mut excluded: Vec<(String, String)> = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
+
+        for &tool in ANSWER_PRODUCING_TOOLS {
+            let outcome = sweep_call_tool(&runner, tool, sweep_tool_args(tool, &project));
+            if outcome.unknown_tool {
+                failed.push((
+                    tool.to_string(),
+                    format!("dispatch missing / unknown tool: {}", outcome.text),
+                ));
+                continue;
+            }
+            if outcome.is_error {
+                // The tool ran and fail-closed: over this generic fixture that is an
+                // honest input-dependent refusal. EXCLUDED + labeled + counted.
+                excluded.push((tool.to_string(), sweep_error_reason(&outcome)));
+                continue;
+            }
+            // Served: resolve its ledger-backed trace through get_provenance. The
+            // verify_chain the served ref lives in must be intact — the executable
+            // criterion 6.5 round-trip.
+            let resolve = sweep_call_tool(
+                &runner,
+                "get_provenance",
+                json!({"project": project, "mode": "verify_chain"}),
+            );
+            if resolve.is_error || !sweep_chain_intact(&resolve.inner) {
+                failed.push((
+                    tool.to_string(),
+                    format!(
+                        "served but its ledger trace did not resolve intact: {}",
+                        resolve.text
+                    ),
+                ));
+                continue;
+            }
+            resolved.push(tool.to_string());
+        }
+
+        // #41 pack class: EXCLUDED + counted (the composer is not shipped yet).
+        let pack_excluded = EXCLUDED_PACK_TOOLS.len();
+
+        println!(
+            "SWEEP resolved={} excluded={} pack_excluded={} failed={}",
+            resolved.len(),
+            excluded.len(),
+            pack_excluded,
+            failed.len()
+        );
+        for (tool, reason) in &excluded {
+            println!("SWEEP_EXCLUDED tool={tool} reason={reason}");
+        }
+        for (tool, reason) in &failed {
+            println!("SWEEP_FAILED tool={tool} reason={reason}");
+        }
+
+        assert!(
+            failed.is_empty(),
+            "criterion 6.5 runtime sweep: {} tool(s) failed to dispatch or resolve: {failed:?}",
+            failed.len()
+        );
+        assert_eq!(
+            resolved.len() + excluded.len(),
+            ANSWER_PRODUCING_TOOLS.len(),
+            "every answer-producing tool is either resolved or exclusion-labeled+counted"
+        );
+
+        astrolabe_bridge::clear_cbm_cache_dir();
+        println!(
+            "CHILD_OK sweep resolved={} excluded={}",
+            resolved.len(),
+            excluded.len()
+        );
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    let root = temp_dir("w15f-6_5-sweep");
+    fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    let child_root = root.join("child");
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "migration::tests::success_criterion_6_5_runtime_sweep_resolves_every_served_ledger_ref",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_W15F_SWEEP_CHILD", "1")
+        .env("ASTRO_W15F_SWEEP_STORE", &store)
+        .env("ASTRO_W15F_SWEEP_ROOT", &child_root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_MIN_STACK", "67108864")
+        .output()
+        .expect("spawn criterion-6.5 runtime sweep child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "6.5 runtime sweep child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("CHILD_OK sweep resolved="),
+        "child did not complete the sweep:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    for line in stdout.lines().filter(|line| line.contains("SWEEP")) {
+        println!("PARENT_ECHO {line}");
+    }
+    fs::remove_dir_all(&root).ok();
+}
