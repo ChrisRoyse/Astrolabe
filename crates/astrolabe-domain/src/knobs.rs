@@ -359,9 +359,78 @@ pub fn cbm_pipeline_host_stack_bytes() -> usize {
     usize::try_from(CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES).unwrap_or(usize::MAX)
 }
 
+/// Registry version tag for the structural bridge-scope derivation knobs (#388).
+pub const BRIDGE_SCOPE_KNOB_REGISTRY_VERSION: &str = "astrolabe-bridge-scope-knobs-v1";
+
+/// Name of the bridge-scope directory-depth knob.
+pub const BRIDGE_SCOPE_PATH_DEPTH_KNOB: &str = "bridge_scope_path_depth";
+
+/// Default number of root-relative directory components that define one bridge
+/// "scope" when scopes are derived from graph structure rather than explicit
+/// row-sink metadata (#388).
+///
+/// Two components is the granularity the blueprint's cross-domain-bridge example
+/// (5.11, "the shared core of frontend+backend") assumes: a single top component
+/// collapses a monorepo whose whole tree lives under one directory (`crates/…`,
+/// `src/…`) into a single scope with no cross-domain bridges at all, while two
+/// components resolves the per-crate / per-subsystem boundary (`crates/<crate>`,
+/// `src/<subsystem>`) that real cross-domain references actually cross.
+pub const BRIDGE_SCOPE_DEFAULT_PATH_DEPTH: u64 = 2;
+/// Smallest legal depth. Zero would place every file in one root scope, which can
+/// never yield a two-scope bridge; the scope must name at least one directory.
+pub const BRIDGE_SCOPE_MIN_PATH_DEPTH: u64 = 1;
+/// Largest legal depth. A deep bound keeps a pathologically nested tree from
+/// fragmenting every file into its own singleton scope (which also yields no
+/// cross-scope bridges); eight components is far past any real module boundary.
+pub const BRIDGE_SCOPE_MAX_PATH_DEPTH: u64 = 8;
+
+/// The structural bridge-scope derivation knob registry (#388).
+pub const BRIDGE_SCOPE_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: BRIDGE_SCOPE_KNOB_REGISTRY_VERSION,
+    name: BRIDGE_SCOPE_PATH_DEPTH_KNOB,
+    default: BRIDGE_SCOPE_DEFAULT_PATH_DEPTH,
+    min: BRIDGE_SCOPE_MIN_PATH_DEPTH,
+    max: BRIDGE_SCOPE_MAX_PATH_DEPTH,
+    unit: "path_components",
+    source: "ASTROLABE blueprint 5.11 (cross-domain bridges: symbols that ground two scopes at once) and #388",
+    rationale: "number of root-relative directory components that name one derived bridge scope; 1 collapses a single-top-dir monorepo into one scope with no cross-domain bridges, 2 resolves the crate/subsystem boundary real references cross; bounded so neither a flat root nor a pathologically deep tree degenerates into a single scope or per-file singletons; replace with a measured module-boundary detector once one exists",
+}];
+
+/// Returns the bridge-scope declaration for `name`, or `None` when undeclared.
+pub fn bridge_scope_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    BRIDGE_SCOPE_KNOBS.iter().find(|knob| knob.name == name)
+}
+
+/// The root-relative directory depth that defines one derived bridge scope, as a
+/// `usize` ready for path slicing. The single accessor every structural
+/// bridge-scope derivation uses (#388).
+pub fn bridge_scope_path_depth() -> usize {
+    usize::try_from(BRIDGE_SCOPE_DEFAULT_PATH_DEPTH).unwrap_or(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_scope_knob_declares_bounds_that_contain_its_default() {
+        let knob = bridge_scope_knob(BRIDGE_SCOPE_PATH_DEPTH_KNOB).expect("declared");
+        assert_eq!(knob.registry_version, BRIDGE_SCOPE_KNOB_REGISTRY_VERSION);
+        assert_eq!(knob.unit, "path_components");
+        assert!(knob.min <= knob.max);
+        assert!(knob.accepts(knob.default));
+        assert_eq!(knob.default, BRIDGE_SCOPE_DEFAULT_PATH_DEPTH);
+        // Zero collapses every file into one scope (no two-scope bridge is possible),
+        // so it must never be a legal depth.
+        assert!(!knob.accepts(0));
+        assert!(knob.accepts(BRIDGE_SCOPE_MIN_PATH_DEPTH));
+        assert!(knob.accepts(BRIDGE_SCOPE_MAX_PATH_DEPTH));
+        assert!(!knob.accepts(BRIDGE_SCOPE_MAX_PATH_DEPTH + 1));
+        assert_eq!(
+            bridge_scope_path_depth(),
+            BRIDGE_SCOPE_DEFAULT_PATH_DEPTH as usize
+        );
+    }
 
     #[test]
     fn every_fsv_knob_declares_bounds_that_contain_its_default() {
