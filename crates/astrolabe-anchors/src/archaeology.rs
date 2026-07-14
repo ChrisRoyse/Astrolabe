@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Stable failure code for invalid archaeology configuration.
@@ -184,6 +184,20 @@ pub fn mine_git_archaeology(
     mode: &GitMineMode,
 ) -> Result<GitArchaeologyReport, ArchaeologyError> {
     config.validate()?;
+    // Path-namespace correctness for monorepo-member corpora (e.g. cbm/ inside
+    // the Astrolabe repo): `git diff`/`git log` emit TOPLEVEL-relative paths,
+    // but a pathspec passed back to `git blame` is resolved relative to the
+    // command's working directory. With the corpus subdirectory as cwd, every
+    // mined path gets the subtree prefix silently prepended (CLAUDE.md ->
+    // cbm/CLAUDE.md) and blame fails on paths that never existed. Run the whole
+    // mining pass from the repository toplevel so the two namespaces coincide;
+    // for a corpus that IS the toplevel this is byte-identical behavior.
+    let toplevel = PathBuf::from(
+        git_text(repo, &["rev-parse", "--show-toplevel"])?
+            .trim()
+            .to_string(),
+    );
+    let repo: &Path = &toplevel;
     let head = git_text(repo, &["rev-parse", "--verify", "HEAD"])?
         .trim()
         .to_string();
