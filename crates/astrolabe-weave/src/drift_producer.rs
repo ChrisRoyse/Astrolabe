@@ -21,7 +21,9 @@
 
 use std::collections::BTreeMap;
 
+use astrolabe_assay::rng::DeterministicRng;
 use astrolabe_assay::{DiffConfig, DiffLedger, DifferentiationCard, DriftCard, measure_drift};
+use astrolabe_domain::knobs::U64KnobDeclaration;
 use astrolabe_ingest::read_cbm_graph_snapshot;
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag};
 use calyx_aster::cf::{ColumnFamily, slot_key};
@@ -32,6 +34,69 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ASSAY_ANOMALY_PAYLOAD_SCHEMA;
+
+/// Registry version tag for the drift-reference bounding knobs (invariant 4).
+pub const DRIFT_REFERENCE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-drift-reference-knobs-v1";
+
+/// Name of the per-slot reference-window sample-cap knob.
+pub const DRIFT_REFERENCE_SAMPLE_CAP_KNOB: &str = "weave_drift_reference_sample_cap";
+
+/// Default per-slot cap on the persisted reference window.
+///
+/// Seeded from the same Cochran fixed-precision plateau the assay scheduler's
+/// sample-size knob uses (`ASSAY_DEFAULT_SAMPLE_SIZE` = 384): at a 95% confidence
+/// level and a 5% margin the required sample plateaus near 385 regardless of how
+/// large the population grows, so a few hundred sampled per-symbol vectors already
+/// pin a slot's reference distribution to within a few percent. Capping the
+/// reference window here keeps the persisted reference row O(slots × cap × dim) —
+/// independent of corpus size — instead of O(corpus) (#371). It also comfortably
+/// clears the `redundancy_quorum` (50) that MMD uses to tag a card `Trusted`, so
+/// a full-cap reference never silently degrades a drift card's trust.
+pub const DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP: u64 = 384;
+
+/// Smallest legal reference-window cap. MMD needs at least two points per side
+/// ([`measure_drift`]'s own input contract), so a cap below two would guarantee a
+/// short-history absence for every reimport — a reference window that can never
+/// measure drift is illegal, not merely tight.
+pub const DRIFT_REFERENCE_MIN_SAMPLE_CAP: u64 = 2;
+
+/// Largest legal reference-window cap. An upper bound keeps one persisted
+/// reference row a bounded unit of storage even against a pathologically large
+/// corpus; a slot with fewer samples than the cap still keeps them all, so this
+/// caps the row size, never completeness of a small slot.
+pub const DRIFT_REFERENCE_MAX_SAMPLE_CAP: u64 = 100_000;
+
+/// The drift-reference bounding knob registry.
+pub const DRIFT_REFERENCE_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
+    name: DRIFT_REFERENCE_SAMPLE_CAP_KNOB,
+    default: DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP,
+    min: DRIFT_REFERENCE_MIN_SAMPLE_CAP,
+    max: DRIFT_REFERENCE_MAX_SAMPLE_CAP,
+    unit: "samples",
+    source: "Cochran fixed-precision sample-size plateau (n0 = 1.96^2 * 0.25 / 0.05^2 = 384.16), mirrored from astrolabe-assay ASSAY_DEFAULT_SAMPLE_SIZE",
+    rationale: "bounds the persisted per-slot reference window so the reference row is O(slots × cap × dim), independent of corpus size (#371); replace with a measured drift-sensitivity-vs-storage policy once M-scale drift production is benchmarked",
+}];
+
+/// Resolves the declared per-slot reference-window sample cap, failing closed if
+/// the declared default falls outside its own bounds.
+pub fn drift_reference_sample_cap() -> Result<usize> {
+    let knob = DRIFT_REFERENCE_KNOBS
+        .iter()
+        .find(|knob| knob.name == DRIFT_REFERENCE_SAMPLE_CAP_KNOB)
+        .ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "drift knob {DRIFT_REFERENCE_SAMPLE_CAP_KNOB} is not declared"
+            ))
+        })?;
+    if !knob.accepts(knob.default) {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "drift knob {DRIFT_REFERENCE_SAMPLE_CAP_KNOB} default {} is outside its declared bounds [{}, {}]",
+            knob.default, knob.min, knob.max
+        )));
+    }
+    Ok(knob.default as usize)
+}
 
 /// Schema tag for a persisted per-slot reference window: the prior import's slot
 /// sample distributions, held so the next import can measure MMD drift against
@@ -50,6 +115,91 @@ pub struct DriftSlotSamples {
     pub slot: String,
     /// Per-symbol sample vectors for this slot at this import.
     pub samples: Vec<Vec<f64>>,
+}
+
+/// Labeled record of how the seeded reservoir bounded one slot's reference
+/// window: the population it saw this import and the count it retained (`<= cap`).
+/// Persisted alongside the bounded samples so the sampling is a labeled
+/// provenance fact, never a silent truncation (invariant 3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSamplingProvenance {
+    /// Slot label (`S{n}`), matching the bounded `DriftSlotSamples::slot`.
+    pub slot: String,
+    /// Number of per-symbol samples the slot carried before bounding.
+    pub population: usize,
+    /// Number of samples retained in the persisted reference window (`<= cap`).
+    pub retained: usize,
+}
+
+/// Labeled outcome of bounding + persisting a reference window: the cap applied,
+/// the total pre-bounding population, and the total retained. `total_retained`
+/// is bounded by `slots.len() * sample_cap` regardless of corpus size (#371).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DriftReferenceSamplingReport {
+    /// The per-slot cap the seeded reservoir enforced.
+    pub sample_cap: usize,
+    /// Sum of every slot's pre-bounding population.
+    pub total_population: usize,
+    /// Sum of every slot's retained sample count (`<= slots.len() * sample_cap`).
+    pub total_retained: usize,
+    /// Per-slot sampling provenance, one entry per input slot.
+    pub per_slot: Vec<SlotSamplingProvenance>,
+}
+
+/// Deterministically bounds each slot's samples to at most `cap` points via a
+/// **seeded reservoir** (Vitter's Algorithm R). A slot with `<= cap` samples is
+/// kept whole (`retained == population`); a larger slot is downsampled to exactly
+/// `cap` points chosen by a per-slot [`DeterministicRng`] stream seeded from
+/// `(seed, slot)`, so the retained subset is a pure function of
+/// `(samples, cap, seed)` and independent of worker count or scheduling.
+///
+/// The bounded window is what [`persist_drift_reference`] writes, so the persisted
+/// reference row is O(`slots.len()` × `cap` × dim) — independent of corpus size.
+/// Because MMD is a set statistic (order-invariant), a uniform subset of the
+/// reference distribution preserves the drift measurement contract: the same mean
+/// shift a full reference would flag still clears the significance gate against a
+/// capped reference. Returns the bounded slots and a labeled provenance record.
+pub fn bound_reference_window(
+    slots: &[DriftSlotSamples],
+    cap: usize,
+    seed: u64,
+) -> (Vec<DriftSlotSamples>, Vec<SlotSamplingProvenance>) {
+    let mut bounded = Vec::with_capacity(slots.len());
+    let mut provenance = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let population = slot.samples.len();
+        let samples = if population <= cap {
+            slot.samples.clone()
+        } else {
+            reservoir_sample(&slot.samples, cap, seed, &slot.slot)
+        };
+        provenance.push(SlotSamplingProvenance {
+            slot: slot.slot.clone(),
+            population,
+            retained: samples.len(),
+        });
+        bounded.push(DriftSlotSamples {
+            slot: slot.slot.clone(),
+            samples,
+        });
+    }
+    (bounded, provenance)
+}
+
+/// Vitter's Algorithm R: a uniform `cap`-point reservoir over `samples`, seeded
+/// deterministically per slot. Precondition: `cap < samples.len()` (the caller
+/// keeps a whole slot when `samples.len() <= cap`) and `cap >= 1`.
+fn reservoir_sample(samples: &[Vec<f64>], cap: usize, seed: u64, slot: &str) -> Vec<Vec<f64>> {
+    let mut rng = DeterministicRng::from_u64_labeled(seed, &format!("drift-reservoir:{slot}"));
+    let mut reservoir: Vec<Vec<f64>> = samples[..cap].to_vec();
+    for (i, item) in samples.iter().enumerate().skip(cap) {
+        // j uniform in [0, i]; replace a reservoir slot with probability cap/(i+1).
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        if j < cap {
+            reservoir[j] = item.clone();
+        }
+    }
+    reservoir
 }
 
 /// Labeled outcome of one index-time drift production pass. Every slot that did
@@ -150,30 +300,49 @@ where
     Ok(Vec::new())
 }
 
-/// Persists `slots` as the reference window for the next import. Uses the
-/// [`AssaySubject::EnsembleCard`] subject so it coexists with the anomaly
-/// payload (written under [`AssaySubject::Panel`]) under the same cache key.
+/// Persists `slots` as the reference window for the next import, **bounded** by a
+/// seeded reservoir to the registry-declared per-slot cap
+/// ([`DRIFT_REFERENCE_SAMPLE_CAP_KNOB`]) so the persisted row is independent of
+/// corpus size (#371). Uses the [`AssaySubject::EnsembleCard`] subject so it
+/// coexists with the anomaly payload (written under [`AssaySubject::Panel`]) under
+/// the same cache key. The payload carries a labeled `sampling` block recording
+/// the reservoir algorithm, cap, seed, and per-slot population/retained counts so
+/// the bounding is a provenance fact, never a silent truncation.
+///
+/// Returns the [`DriftReferenceSamplingReport`] describing the bounding, whose
+/// `total_retained` is `<= slots.len() * sample_cap` regardless of how many
+/// symbols the corpus holds.
 pub fn persist_drift_reference<C>(
     vault: &AsterVault<C>,
     cache_key: AssayCacheKey,
     provenance: impl Into<String>,
     slots: &[DriftSlotSamples],
-) -> Result<()>
+    seed: u64,
+) -> Result<DriftReferenceSamplingReport>
 where
     C: Clock,
 {
+    let cap = drift_reference_sample_cap()?;
+    let (bounded, per_slot) = bound_reference_window(slots, cap, seed);
+    let total_population: usize = per_slot.iter().map(|slot| slot.population).sum();
+    let total_retained: usize = per_slot.iter().map(|slot| slot.retained).sum();
     let payload = json!({
         "schema": DRIFT_REFERENCE_PAYLOAD_SCHEMA,
-        "slots": slots,
+        "sampling": {
+            "reservoir": "vitter-algorithm-r",
+            "sample_cap": cap,
+            "seed": seed,
+            "per_slot": per_slot,
+        },
+        "slots": bounded,
     });
-    let sample_points: usize = slots.iter().map(|slot| slot.samples.len()).sum();
     let mut assay = AssayStore::load_from_vault(vault)?;
     assay.put_with_payload(
         cache_key,
         AssaySubject::EnsembleCard,
         MiEstimate::point(
             0.0,
-            sample_points,
+            total_retained,
             EstimatorKind::PanelSufficiency,
             TrustTag::Provisional,
         ),
@@ -182,7 +351,12 @@ where
         payload,
     );
     assay.persist_to_vault(vault)?;
-    Ok(())
+    Ok(DriftReferenceSamplingReport {
+        sample_cap: cap,
+        total_population,
+        total_retained,
+        per_slot,
+    })
 }
 
 /// Measures per-slot MMD drift (reference window vs current import), ledger-pairs
@@ -319,6 +493,7 @@ where
         cache_key,
         format!("{provenance}:reference"),
         &current,
+        seed,
     )?;
     report.reference_persisted = true;
     Ok(report)
