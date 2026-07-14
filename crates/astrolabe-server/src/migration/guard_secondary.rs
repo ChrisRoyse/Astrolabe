@@ -41,8 +41,8 @@ use super::*;
 use astrolabe_guard::check::{Exemplar, canonical_slot_number};
 use astrolabe_guard::commit::{COMMIT_OOD_SCHEMA, CommitOodReport, CommitSymbol, score_commit};
 use astrolabe_guard::hook::{
-    ADVISORY_HOOK_SCHEMA, AdvisoryOutcome, AdvisorySignal, quick_signal_owned,
-    run_advisory_hook_with_budget,
+    ADVISORY_HOOK_SCHEMA, AdvisoryOutcome, AdvisorySignal, governed_advisory_budget_ms,
+    quick_signal_owned, run_advisory_hook_with_budget,
 };
 use astrolabe_guard::profile::ADVISORY_HOOK_BUDGET_MS;
 use astrolabe_panel::PanelDriver;
@@ -459,6 +459,309 @@ pub(crate) fn score_pending_commit_ood(cache_dir: &Path, project: &str) -> Resul
 }
 
 // ===========================================================================
+// Commit-OOD producer (#368): auto per-commit extraction into the pending queue
+// ===========================================================================
+
+/// Config-store key holding the last commit sha the commit-OOD producer processed
+/// for a project. The producer advances it every time it observes a new HEAD so a
+/// commit's diff is extracted exactly once.
+const GUARD_COMMIT_OOD_LAST_COMMIT_KEY: &str = "guard_commit_ood_last_commit";
+/// Bounded cap on the number of changed symbols one commit enqueues — an
+/// operational surface cap (not a scoring knob): a sweeping refactor commit does
+/// not enqueue an unbounded scoring batch into a single watcher tick.
+const GUARD_COMMIT_OOD_PRODUCER_MAX_SYMBOLS: usize = 200;
+/// Bounded cap on the enclosing-scope exemplars attached per changed symbol.
+const GUARD_COMMIT_OOD_PRODUCER_MAX_EXEMPLARS: usize = 8;
+
+/// On a detected new commit, derive the commit's changed symbols from the diff
+/// (via the indexed graph), extract each changed symbol's candidate source +
+/// enclosing-scope exemplars, and enqueue a pending commit-OOD request the watcher
+/// tick's [`score_pending_commit_ood`] then scores (#368).
+///
+/// The baseline commit is advanced every time a new HEAD is observed (even when no
+/// changed symbol is derivable) so a commit is never re-extracted and a diff we
+/// cannot map does not re-fire forever. A symbol whose source or enclosing scope
+/// cannot be derived from the persisted graph is **labeled and counted**
+/// (`underivable`), never silently dropped and never fabricated. The producer never
+/// crashes the tick: git/vault faults return a labeled `skipped`/`degraded` status.
+pub(crate) fn produce_commit_ood_request(
+    cache_dir: &Path,
+    project: &str,
+    root: &str,
+) -> Result<Value, DynError> {
+    let repo = Path::new(root);
+    let head = match astrolabe_anchors::archaeology::git_head(repo) {
+        Ok(head) => head,
+        Err(err) => {
+            // No git HEAD (not a repo / detached bare): nothing to produce, labeled.
+            return Ok(json!({
+                "status": "skipped",
+                "reason": format!("git HEAD unavailable: {err}"),
+            }));
+        }
+    };
+    let last = read_config_value(
+        cache_dir,
+        &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
+    )?
+    .filter(|value| !value.trim().is_empty());
+
+    // First observation: record the baseline; do not score the whole history as a
+    // single "commit".
+    let Some(last) = last else {
+        write_config_value(
+            cache_dir,
+            &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
+            &head,
+        )?;
+        return Ok(json!({"status": "baseline", "head": head}));
+    };
+    if last == head {
+        return Ok(json!({"status": "unchanged", "head": head}));
+    }
+
+    let ranges = match astrolabe_anchors::archaeology::changed_new_ranges(repo, &last, &head) {
+        Ok(ranges) => ranges,
+        Err(err) => {
+            // A diff we cannot compute (e.g. the old sha was garbage-collected):
+            // advance the baseline so we do not wedge, and report the degradation.
+            write_config_value(
+                cache_dir,
+                &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
+                &head,
+            )?;
+            return Ok(json!({
+                "status": "degraded",
+                "reason": format!("commit diff {last}..{head} unavailable: {err}"),
+                "head": head,
+            }));
+        }
+    };
+
+    // Load the indexed graph to resolve changed ranges to symbols + exemplars.
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(json!({
+            "status": "skipped",
+            "reason": "shadow vault missing; index_repository with calyx=\"shadow\" first",
+            "head": head,
+        }));
+    }
+    let vault = open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Kv, ColumnFamily::Graph, ColumnFamily::Base],
+    )?;
+    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
+    drop(vault);
+
+    // Index the changed ranges by (normalized) file for overlap lookup.
+    let mut changed_files: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+    for range in &ranges {
+        let end = range.start_line.saturating_add(range.line_count);
+        changed_files
+            .entry(normalize_repo_path(&range.path))
+            .or_default()
+            .push((range.start_line, end));
+    }
+
+    // Partition the non-structural, cx-bearing nodes by whether they overlap a
+    // changed range in a changed file.
+    let mut changed_symbols: Vec<&astrolabe_ingest::CbmGraphNode> = Vec::new();
+    let mut file_nodes: BTreeMap<String, Vec<&astrolabe_ingest::CbmGraphNode>> = BTreeMap::new();
+    for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+        if node.cx_id.is_none() {
+            continue;
+        }
+        let node_path = normalize_repo_path(&node.file_path);
+        file_nodes.entry(node_path.clone()).or_default().push(node);
+        if let Some(spans) = changed_ranges_for(&changed_files, &node_path)
+            && node_overlaps_any(node, spans)
+        {
+            changed_symbols.push(node);
+        }
+    }
+    changed_symbols.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.qualified_name.cmp(&b.qualified_name))
+    });
+    changed_symbols.dedup_by(|a, b| a.cx_id == b.cx_id);
+
+    let mut symbol_entries = Vec::new();
+    let mut underivable = 0usize;
+    for &node in changed_symbols
+        .iter()
+        .take(GUARD_COMMIT_OOD_PRODUCER_MAX_SYMBOLS)
+    {
+        let Some(candidate) = node_candidate_json(node) else {
+            underivable += 1;
+            continue;
+        };
+        // Enclosing-scope exemplars: the file's OTHER (unchanged) source-bearing
+        // symbols. A symbol with no derivable trusted exemplar cannot be scored
+        // (an empty region fails closed), so it is labeled underivable, not
+        // enqueued with a fabricated region.
+        let node_path = normalize_repo_path(&node.file_path);
+        let exemplars = build_scope_exemplars(&file_nodes, &node_path, node);
+        if exemplars.is_empty() {
+            underivable += 1;
+            continue;
+        }
+        symbol_entries.push(json!({
+            "cx": node.cx_id.expect("cx present by filter").to_string(),
+            "candidate": candidate,
+            "exemplars": exemplars,
+        }));
+    }
+
+    // Advance the baseline exactly once regardless of how many symbols mapped.
+    write_config_value(
+        cache_dir,
+        &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
+        &head,
+    )?;
+
+    if symbol_entries.is_empty() {
+        // Nothing scoreable this commit — do NOT enqueue an empty request (the
+        // scorer refuses an empty symbols set), but report the labeled counts.
+        return Ok(json!({
+            "status": "no_scoreable_symbols",
+            "from": last,
+            "to": head,
+            "changed_files": changed_files.len(),
+            "underivable": underivable,
+        }));
+    }
+
+    let enqueued = symbol_entries.len();
+    let request = json!({"commit_ref": head, "symbols": symbol_entries});
+    let request_text = serde_json::to_string(&request)?;
+    let key = metadata_key(project, GUARD_COMMIT_OOD_PENDING_KEY);
+    write_config_value(cache_dir, &key, &request_text)?;
+    // Readback-verify the enqueued request (FSV: the durable bytes, not the echo).
+    let readback = read_config_value(cache_dir, &key)?;
+    if readback.as_deref() != Some(request_text.as_str()) {
+        return Err(format!(
+            "ASTRO_GUARD_COMMIT_OOD_PENDING_MISMATCH: enqueued commit-OOD request for {project:?} did not read back byte-identically; remediation: the config store diverged from the committed pending request"
+        )
+        .into());
+    }
+    Ok(json!({
+        "status": "enqueued",
+        "from": last,
+        "to": head,
+        "commit_ref": head,
+        "changed_files": changed_files.len(),
+        "enqueued": enqueued,
+        "underivable": underivable,
+    }))
+}
+
+/// Normalize a repo path for cross-source matching: `\` → `/`, trim a leading
+/// `./`. Git emits toplevel-relative forward-slash paths; the indexed graph may
+/// carry either separator, so both are normalized before comparison.
+fn normalize_repo_path(path: &str) -> String {
+    let replaced = path.replace('\\', "/");
+    replaced.strip_prefix("./").unwrap_or(&replaced).to_string()
+}
+
+/// The changed-range spans for a node path, tolerating a monorepo-member prefix
+/// mismatch (git toplevel-relative vs indexed-root-relative) by suffix match.
+fn changed_ranges_for<'a>(
+    changed_files: &'a BTreeMap<String, Vec<(u32, u32)>>,
+    node_path: &str,
+) -> Option<&'a Vec<(u32, u32)>> {
+    if let Some(spans) = changed_files.get(node_path) {
+        return Some(spans);
+    }
+    // Suffix match either direction (one path is a repo-root-relative prefix of the
+    // other in a monorepo member checkout).
+    changed_files.iter().find_map(|(changed, spans)| {
+        (node_path.ends_with(&format!("/{changed}")) || changed.ends_with(&format!("/{node_path}")))
+            .then_some(spans)
+    })
+}
+
+/// Whether a node's `[start_line, end_line]` span overlaps any changed range.
+fn node_overlaps_any(node: &astrolabe_ingest::CbmGraphNode, spans: &[(u32, u32)]) -> bool {
+    let node_start = node.start_line.max(0) as u32;
+    let node_end = node.end_line.max(node.start_line).max(0) as u32;
+    spans
+        .iter()
+        .any(|&(start, end)| node_start <= end && node_end >= start)
+}
+
+/// Build a candidate/exemplar panel-input object from a persisted graph node.
+/// Returns `None` when the node carries no source text (an underivable symbol).
+fn node_candidate_json(node: &astrolabe_ingest::CbmGraphNode) -> Option<Value> {
+    let properties: Value =
+        serde_json::from_str(&node.properties_json).unwrap_or_else(|_| Value::Object(Map::new()));
+    let source = ["source_snippet", "source", "body", "snippet"]
+        .iter()
+        .find_map(|field| properties.get(*field).and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())?;
+    let language = properties
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let signature = properties
+        .get("signature")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(json!({
+        "symbol_name": node.name,
+        "qualified_name": node.qualified_name,
+        "rel_file_path": node.file_path,
+        "language": language,
+        "signature": signature,
+        "source": source,
+        "properties": properties,
+    }))
+}
+
+/// Collect up to [`GUARD_COMMIT_OOD_PRODUCER_MAX_EXEMPLARS`] enclosing-scope
+/// exemplars for a changed symbol: the same-file source-bearing symbols other than
+/// the changed one itself.
+fn build_scope_exemplars(
+    file_nodes: &BTreeMap<String, Vec<&astrolabe_ingest::CbmGraphNode>>,
+    node_path: &str,
+    changed: &astrolabe_ingest::CbmGraphNode,
+) -> Vec<Value> {
+    let Some(siblings) = file_nodes.get(node_path) else {
+        return Vec::new();
+    };
+    let mut exemplars = Vec::new();
+    for &sibling in siblings {
+        if sibling.cx_id == changed.cx_id {
+            continue;
+        }
+        let Some(mut candidate) = node_candidate_json(sibling) else {
+            continue;
+        };
+        if let Some(obj) = candidate.as_object_mut() {
+            obj.insert(
+                "cx".to_string(),
+                json!(
+                    sibling
+                        .cx_id
+                        .expect("sibling cx present by filter")
+                        .to_string()
+                ),
+            );
+            obj.insert("kernel_near".to_string(), json!(false));
+        }
+        exemplars.push(candidate);
+        if exemplars.len() >= GUARD_COMMIT_OOD_PRODUCER_MAX_EXEMPLARS {
+            break;
+        }
+    }
+    exemplars
+}
+
+// ===========================================================================
 // PostToolUse advisory hook (DoD #4)
 // ===========================================================================
 
@@ -533,13 +836,23 @@ pub(crate) fn guard_advisory_hook_at(
         );
     };
 
-    // Registry-declared budget with an optional per-call tightening override. The
-    // default is the registry knob; the never-blocks guarantee holds for any value.
-    let budget_ms = args_obj
-        .get("budget_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(ADVISORY_HOOK_BUDGET_MS);
-    let budget_overridden = args_obj.get("budget_ms").and_then(Value::as_u64).is_some();
+    // #368: registry-declared budget with a GOVERNED per-call override —
+    // tightening-only. An override that widens the deadline beyond the product
+    // cadence (or a 0ms override) is refused fail-closed with
+    // {code,message,remediation}; only a shorter deadline is honored. Ungoverned
+    // per-call widening was the defect.
+    let override_ms = args_obj.get("budget_ms").and_then(Value::as_u64);
+    let budget_overridden = override_ms.is_some();
+    let budget_ms = match governed_advisory_budget_ms(override_ms) {
+        Ok(budget) => budget,
+        Err(error) => {
+            return guard_secondary_refused_owned(
+                error.code().to_string(),
+                error.message().to_string(),
+                error.remediation().to_string(),
+            );
+        }
+    };
 
     let panel_version = args_obj
         .get("panel_version")

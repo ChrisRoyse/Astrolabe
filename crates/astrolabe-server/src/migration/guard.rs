@@ -6,8 +6,9 @@ use astrolabe_guard::auto::{
     guard_slot_panel_sources,
 };
 use astrolabe_guard::calibration::{
-    AlienSymbol, BadCase, BadCaseGenerator, CalibrationDomain, CalibrationError,
-    CalibrationLanguage, CorpusInputs, MixPolicy, RevertRecord, build_corpus,
+    AlienSymbol, BadCase, BadCaseGenerator, CALIBRATION_SAMPLING_KNOB_REGISTRY_VERSION,
+    CalibrationDomain, CalibrationError, CalibrationLanguage, CorpusInputs, MixPolicy,
+    RevertRecord, SamplingPolicy, build_corpus, seeded_sample_indices,
 };
 use astrolabe_guard::profile::{
     CONFORMAL_ALPHA, GUARD_PROFILE_SCHEMA, GuardProfile, GuardSlot, SlotCalibration,
@@ -874,12 +875,21 @@ fn build_generated_profile(
     let runtime = ShadowSlotRuntime;
     let seed = args_obj.get("seed").and_then(Value::as_u64).unwrap_or(0);
 
-    // 1. Trusted (good) population: the project's own persisted indexed symbols.
+    // #367: registry-declared sampling/cap knobs bound how much of an M-scale
+    // corpus is read into the good/alien populations, with deterministic seeded
+    // selection (the calibration `seed`). Out-of-bounds knobs fail closed; the
+    // R16 mix policy is still enforced AFTER sampling by `build_corpus`.
+    let sampling = parse_sampling_policy(args_obj)?;
+
+    // 1. Trusted (good) population: the project's own persisted indexed symbols,
+    //    capped to `good_sample_cap` (seeded) so the reparse-per-symbol panel-read
+    //    count is bounded on M-scale corpora.
     let good_project = args_obj
         .get("good_project")
         .and_then(Value::as_str)
         .unwrap_or(project);
-    let good_symbols = read_project_measured_symbols(cache_dir, good_project)?;
+    let (good_symbols, good_population_total) =
+        read_project_measured_symbols(cache_dir, good_project, sampling.good_sample_cap, seed)?;
     if good_symbols.is_empty() {
         return Err((
             ASTRO_GUARD_GENERATED_NO_GOOD.to_string(),
@@ -892,6 +902,7 @@ fn build_generated_profile(
                 .to_string(),
         ));
     }
+    let good_sampled = good_symbols.len();
     let good: Vec<MeasuredSymbol> = good_symbols
         .into_iter()
         .map(|entry| entry.measured)
@@ -907,8 +918,16 @@ fn build_generated_profile(
     //    alien IS its persisted measurement.
     let mut alien_symbols: Vec<AlienSymbol> = Vec::new();
     let mut aliens_by_provenance: BTreeMap<String, MeasuredSymbol> = BTreeMap::new();
+    let mut alien_population_total = 0usize;
     for (index, alien_project) in parse_alien_projects(args_obj)?.into_iter().enumerate() {
-        let symbols = read_project_measured_symbols(cache_dir, &alien_project)?;
+        // Cap the alien draw per referenced project (seeded, deterministic).
+        let (symbols, alien_total) = read_project_measured_symbols(
+            cache_dir,
+            &alien_project,
+            sampling.alien_sample_cap,
+            seed,
+        )?;
+        alien_population_total += alien_total;
         if symbols.is_empty() {
             return Err((
                 ASTRO_GUARD_GENERATED_ALIEN_EMPTY.to_string(),
@@ -975,8 +994,40 @@ fn build_generated_profile(
             "min_generators": corpus.policy.min_generators,
             "max_single_generator_pct": corpus.policy.max_single_generator_pct,
         },
+        // #367: the sampling/cap knobs that bounded the read, plus the pre-sampling
+        // population sizes so the readback proves the caps engaged (or that an
+        // under-cap corpus was read whole). `good_sampled` is the exact count of
+        // trusted symbols reparsed through the panel — the bounded panel-read count.
+        "sampling": {
+            "knob_registry": CALIBRATION_SAMPLING_KNOB_REGISTRY_VERSION,
+            "good_sample_cap": sampling.good_sample_cap,
+            "alien_sample_cap": sampling.alien_sample_cap,
+            "good_population_total": good_population_total,
+            "good_sampled": good_sampled,
+            "good_capped": good_population_total > sampling.good_sample_cap,
+            "alien_population_total": alien_population_total,
+        },
     });
     Ok((profile, Some(generated)))
+}
+
+/// Parse the optional generated-mode sampling/cap knobs (`good_sample_cap`,
+/// `alien_sample_cap`) from the request, falling back to the registry-declared
+/// defaults. Out-of-bounds values fail closed with the guard-crate deficit.
+fn parse_sampling_policy(args_obj: &Map<String, Value>) -> Result<SamplingPolicy, GuardRefusal> {
+    let default = SamplingPolicy::default_policy();
+    let good_sample_cap = args_obj
+        .get("good_sample_cap")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default.good_sample_cap);
+    let alien_sample_cap = args_obj
+        .get("alien_sample_cap")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default.alien_sample_cap);
+    SamplingPolicy::validated(good_sample_cap, alien_sample_cap)
+        .map_err(calibration_error_to_refusal)
 }
 
 /// A trusted/alien symbol read back from a persisted vault: its guard panel-source
@@ -987,14 +1038,24 @@ struct PersistedMeasuredSymbol {
     measured: MeasuredSymbol,
 }
 
-/// Read every non-structural indexed symbol of a shadow-indexed project back from its
+/// Read non-structural indexed symbols of a shadow-indexed project back from its
 /// persisted slot column families into a [`MeasuredSymbol`] per symbol. A symbol whose
 /// guard panel-source slots are all absent is skipped (it carries no measurable guard
 /// surface); a genuinely missing vault or a decode fault fails closed.
+///
+/// #367: the candidate (non-structural, cx-bearing) node set is capped to `cap`
+/// via deterministic seeded selection **before** the per-symbol libcbm reparse, so
+/// the panel-read count on an M-scale corpus is bounded by the cap rather than the
+/// corpus size. Returns `(kept, pre_sampling_total)` where `pre_sampling_total` is
+/// the candidate count before the cap (so the caller can report whether the cap
+/// engaged). When the candidate count is `<= cap` every candidate is read, in
+/// index order — byte-identical to the un-capped behavior.
 fn read_project_measured_symbols(
     cache_dir: &Path,
     project: &str,
-) -> Result<Vec<PersistedMeasuredSymbol>, GuardRefusal> {
+    cap: usize,
+    seed: u64,
+) -> Result<(Vec<PersistedMeasuredSymbol>, usize), GuardRefusal> {
     let (vault_dir, vault_id, vault_salt) =
         shadow_vault_config_at(cache_dir, project).map_err(vault_read_refusal)?;
     if !vault_dir.exists() {
@@ -1027,8 +1088,20 @@ fn read_project_measured_symbols(
         astrolabe_ingest::read_cbm_graph_snapshot(&vault, project).map_err(vault_read_refusal)?;
     let at_seq = vault.latest_seq();
 
+    // #367: bound the reparse population up front. Only non-structural, cx-bearing
+    // nodes are ever kept, so they form the sampling pool; a seeded selection caps
+    // it before any per-symbol reparse cost is paid.
+    let candidates: Vec<&astrolabe_ingest::CbmGraphNode> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !node.structural && node.cx_id.is_some())
+        .collect();
+    let population_total = candidates.len();
+    let selection = seeded_sample_indices(population_total, cap, seed);
+
     let mut out = Vec::new();
-    for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+    for &candidate_index in &selection {
+        let node = candidates[candidate_index];
         let Some(cx_id) = node.cx_id else {
             continue;
         };
@@ -1089,7 +1162,7 @@ fn read_project_measured_symbols(
             });
         }
     }
-    Ok(out)
+    Ok((out, population_total))
 }
 
 /// Parse a required non-empty array of source strings (e.g. `mutation_sources`).

@@ -5775,6 +5775,119 @@ fn guard_calibrate_generated_mode_builds_and_measures_the_bad_corpus() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// FSV (#367): generated mode caps the trusted (good) population it reparses
+/// through the panel via the registry-declared `good_sample_cap` knob, with
+/// deterministic seeded selection. On an M-representative fixture (many good
+/// symbols) the readback proves the cap engaged — the panel-read count is bounded
+/// (`good_sampled <= good_sample_cap < good_population_total`) — and the same seed
+/// reproduces the identical bounded population + corpus_hash. Server-pending:
+/// exercises the libcbm reparse measurer.
+#[test]
+fn guard_calibrate_generated_mode_caps_good_population_deterministically() {
+    let dir = temp_dir("guard-calibrate-generated-cap");
+    // A large trusted population (M-representative): 40 indexed good symbols.
+    let names: Vec<String> = (0..40).map(|i| format!("good_{i}")).collect();
+    let good_symbols: Vec<(&str, i32)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), (i as i32) + 1))
+        .collect();
+    index_generated_project(&dir, "demo", "guard-generated-cap", &good_symbols);
+    // Alien population so the R16 mix policy is satisfiable.
+    let alien_symbols: Vec<(&str, i32)> = (0..30)
+        .map(|i| (ALIEN_NAMES[i % ALIEN_NAMES.len()], (i as i32) + 7))
+        .collect();
+    index_generated_project(
+        &dir,
+        "alienrepo",
+        "guard-generated-cap-alien",
+        &alien_symbols,
+    );
+
+    let build_args = |seed: u64| {
+        json!({
+            "project": "demo",
+            "mode": "generated",
+            "domain": {"language": "rust", "scope_class": "core"},
+            "seed": seed,
+            // Cap the good population far below its size to force the cap to engage.
+            "good_sample_cap": 10,
+            "mutation_sources": [
+                "fn f(a: i32, b: i32) -> i32 { if a < b && a == 0 { return a + 1; } a - b }",
+                "fn g(x: i32) -> bool { !(x > 3) || x <= 10 }",
+                "fn h(v: i32, w: i32) -> i32 { if v >= w || v != 0 { return v * 2; } v / 3 }",
+                "fn k(n: i32, d: i32) -> i32 { if n <= d && d > 1 { return n + d; } n - d }",
+            ],
+            "aliens": [{"project": "alienrepo"}],
+        })
+    };
+
+    let envelope = guard_calibrate_structured(&dir, &build_args(7));
+    assert_eq!(
+        envelope["isError"], false,
+        "generated calibrate: {envelope}"
+    );
+    let generated = &envelope["structuredContent"]["generated"];
+    let sampling = &generated["sampling"];
+    assert_eq!(
+        sampling["knob_registry"], "astro.guard.calibration_sampling.v1",
+        "sampling knobs are registry-declared: {sampling}"
+    );
+    assert_eq!(sampling["good_sample_cap"], 10);
+    assert_eq!(
+        sampling["good_population_total"], 40,
+        "the pre-sampling trusted population is the whole indexed set: {sampling}"
+    );
+    let good_sampled = sampling["good_sampled"].as_u64().expect("good_sampled");
+    assert!(
+        good_sampled <= 10,
+        "the panel-read count is bounded by the cap: {sampling}"
+    );
+    assert_eq!(sampling["good_capped"], true, "the cap engaged: {sampling}");
+    // The reported good_symbols equals the bounded (sampled) count actually measured.
+    assert_eq!(
+        generated["good_symbols"].as_u64().unwrap(),
+        good_sampled,
+        "good_symbols is the sampled (bounded) population, not the corpus size"
+    );
+
+    // Determinism: the same seed reproduces the identical bounded population and
+    // corpus_hash (deterministic seeded selection FSV).
+    let corpus_hash = generated["corpus_hash"].clone();
+    let repeat = guard_calibrate_structured(&dir, &build_args(7));
+    let repeat_generated = &repeat["structuredContent"]["generated"];
+    assert_eq!(
+        repeat_generated["corpus_hash"], corpus_hash,
+        "same seed => byte-identical generated corpus"
+    );
+    assert_eq!(
+        repeat_generated["sampling"]["good_sampled"], good_sampled,
+        "same seed => identical bounded good population"
+    );
+
+    // An out-of-bounds cap fails closed (never a silent clamp).
+    let bad_args = json!({
+        "project": "demo",
+        "mode": "generated",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "good_sample_cap": 0,
+        "mutation_sources": ["fn t() -> i32 { 1 }"],
+    });
+    let refused = guard_calibrate_structured(&dir, &bad_args);
+    assert_eq!(
+        refused["isError"], true,
+        "an out-of-bounds sampling knob must refuse: {refused}"
+    );
+    assert!(
+        refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_SAMPLING_KNOB_OUT_OF_BOUNDS"),
+        "the refusal is the labeled sampling-knob deficit: {refused}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// Distinct alien symbol names so the alien project carries many separable symbols.
 const ALIEN_NAMES: &[&str] = &[
     "parse_header",
@@ -6839,6 +6952,124 @@ fn guard_advisory_hook_refuses_not_shadow_at_boundary() {
             .contains("ASTRO_GUARD_HOOK_NOT_SHADOW"),
         "{envelope}"
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// FSV (#368): the per-call advisory-hook budget override is governed
+/// tightening-only. A widening override is refused fail-closed with a labeled
+/// {code,message,remediation}; a tightening override is honored. This pins the
+/// budget_ms governance decision at the server boundary (the pure decision is also
+/// unit-tested in astrolabe-guard::hook). Server-pending: needs a calibrated
+/// shadow profile.
+#[test]
+fn guard_advisory_hook_refuses_budget_widening_tightening_ok() {
+    let dir = temp_dir("guard-advisory-budget-governance");
+    setup_guard_check_calibrated(&dir, "guard-advisory-budget-governance");
+
+    // Widening the deadline past the registry cadence (300ms) is refused.
+    let widen = advisory_hook_args(Some(5_000), COMMIT_OOD_CONFORMING_SOURCE);
+    let raw = guard_advisory_hook_at(&dir, "demo", widen.as_object().unwrap()).unwrap();
+    let envelope: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        envelope["isError"], true,
+        "widening the advisory budget must refuse: {envelope}"
+    );
+    assert!(
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_GUARD_HOOK_BUDGET_WIDENED"),
+        "the refusal is the labeled widen deficit: {envelope}"
+    );
+
+    // A tightening override (<= 300ms) is honored and produces a real advisory.
+    let tighten = advisory_hook_args(Some(200), COMMIT_OOD_CONFORMING_SOURCE);
+    let raw = guard_advisory_hook_at(&dir, "demo", tighten.as_object().unwrap()).unwrap();
+    let ok: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(ok["isError"], false, "tightening is allowed: {ok}");
+    assert_eq!(ok["structuredContent"]["budget_ms"], 200);
+    assert_eq!(ok["structuredContent"]["budget_overridden"], true);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// FSV (#368): the commit-OOD producer wires a REAL git commit diff into the
+/// pending queue. A commit lands on a real fixture repo whose changed lines fall in
+/// an indexed symbol's span; the producer derives that changed symbol from the
+/// diff + graph, extracts its real source + enclosing-scope exemplars, and enqueues
+/// the pending request the watcher tick's scorer consumes — proved by an
+/// independent readback of the persisted pending request bytes. Server-pending:
+/// reads the persisted graph snapshot.
+#[test]
+fn commit_ood_producer_enqueues_changed_symbols_from_a_real_commit() {
+    let dir = temp_dir("guard-commit-ood-producer");
+    // Index a project whose nodes span src/lib.rs lines [i*4+1, i*4+3] (the
+    // index_generated_project convention): node 0 -> lines 1-3, node 1 -> 5-7, ….
+    index_generated_project(
+        &dir,
+        "demo",
+        "guard-commit-ood-producer",
+        &[("alpha", 1), ("bravo", 2), ("charlie", 3)],
+    );
+
+    // A real git repo whose src/lib.rs has functions on those same line spans.
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fixture_git(&repo, &["init", "--initial-branch=main"]);
+    fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+    fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+    let base_src = "fn alpha() -> i32 {\n    1\n}\n\nfn bravo() -> i32 {\n    2\n}\n\nfn charlie() -> i32 {\n    3\n}\n";
+    fs::write(repo.join("src/lib.rs"), base_src).unwrap();
+    fixture_git(&repo, &["add", "src/lib.rs"]);
+    fixture_git(&repo, &["commit", "-m", "base"]);
+    let base_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+
+    // First producer run: records the baseline (no diff to score yet).
+    let baseline = produce_commit_ood_request(&dir, "demo", repo.to_str().unwrap()).unwrap();
+    assert_eq!(baseline["status"], "baseline", "{baseline}");
+
+    // A commit that edits line 2 — inside alpha's span [1,3].
+    let changed_src = "fn alpha() -> i32 {\n    42\n}\n\nfn bravo() -> i32 {\n    2\n}\n\nfn charlie() -> i32 {\n    3\n}\n";
+    fs::write(repo.join("src/lib.rs"), changed_src).unwrap();
+    fixture_git(&repo, &["add", "src/lib.rs"]);
+    fixture_git(&repo, &["commit", "-m", "edit alpha"]);
+    let head_sha = fixture_git(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(base_sha, head_sha);
+
+    // Producer run: extracts alpha as the changed symbol and enqueues a request.
+    let summary = produce_commit_ood_request(&dir, "demo", repo.to_str().unwrap()).unwrap();
+    assert_eq!(summary["status"], "enqueued", "{summary}");
+    assert_eq!(summary["commit_ref"], head_sha);
+    assert!(
+        summary["enqueued"].as_u64().unwrap() >= 1,
+        "at least alpha is enqueued: {summary}"
+    );
+
+    // FSV: independently read the persisted pending request back and confirm it
+    // carries the changed symbol with REAL extracted source + enclosing exemplars.
+    let pending_key = metadata_key("demo", "guard_commit_ood_pending_json");
+    let pending_raw = read_config_value(&dir, &pending_key)
+        .unwrap()
+        .expect("pending request persisted");
+    let pending: Value = serde_json::from_str(&pending_raw).unwrap();
+    assert_eq!(pending["commit_ref"], head_sha);
+    let symbols = pending["symbols"].as_array().unwrap();
+    assert!(!symbols.is_empty(), "the pending request has symbols");
+    let alpha = &symbols[0];
+    assert!(
+        alpha["candidate"]["source"]
+            .as_str()
+            .unwrap()
+            .contains("fn alpha"),
+        "the candidate carries alpha's real indexed source: {alpha}"
+    );
+    assert!(
+        !alpha["exemplars"].as_array().unwrap().is_empty(),
+        "the changed symbol carries enclosing-scope exemplars (bravo/charlie): {alpha}"
+    );
+
+    // A second producer run with no new commit enqueues nothing (baseline advanced).
+    let unchanged = produce_commit_ood_request(&dir, "demo", repo.to_str().unwrap()).unwrap();
+    assert_eq!(unchanged["status"], "unchanged", "{unchanged}");
     fs::remove_dir_all(&dir).ok();
 }
 

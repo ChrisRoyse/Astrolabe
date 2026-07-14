@@ -207,6 +207,23 @@ fn run_watcher_index_tick(
         )?;
         return Err(format!("watcher index tick failed for {project:?}").into());
     }
+    // P7.4 (#368): after the delta converges, auto-extract this project's newest
+    // commit diff into a pending commit-OOD request (changed symbols + enclosing
+    // exemplars, derived from the indexed graph). The producer advances its own
+    // per-commit baseline and never crashes the tick — a git/vault fault is a
+    // labeled degradation.
+    let commit_ood_producer = match produce_commit_ood_request(cache_dir, project, root) {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(
+                project,
+                error = %error,
+                "incremental_watcher.commit_ood_producer_failed"
+            );
+            json!({"status": "degraded", "reason": error.to_string()})
+        }
+    };
+
     // P7.4 (#48 DoD 3, #355): after the delta converges, score any pending
     // commit-OOD request for this project through the shared panel instrument
     // (#341 per-snippet reparse) and surface OOD verdicts on the review surface.
@@ -232,6 +249,7 @@ fn run_watcher_index_tick(
         "freshness": "fresh",
         "trust": "verified",
         "response_hash": hex_lower(&Sha256::digest(response.as_bytes())),
+        "commit_ood_producer": commit_ood_producer,
         "commit_ood": commit_ood,
     });
     write_config_value(

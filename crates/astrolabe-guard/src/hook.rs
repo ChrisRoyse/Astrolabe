@@ -147,6 +147,40 @@ pub fn quick_signal(
     Ok(AdvisorySignal::from_slots(slots))
 }
 
+/// Deficit code: a per-call advisory-hook `budget_ms` override that would
+/// **widen** the deadline beyond the registry-declared product cadence is
+/// refused. Only tightening (a shorter-or-equal deadline) is permitted (#368).
+pub const ASTRO_GUARD_HOOK_BUDGET_WIDENED: &str = "ASTRO_GUARD_HOOK_BUDGET_WIDENED";
+
+/// Govern a per-call advisory-hook `budget_ms` override: **tightening-only**
+/// (`min(call, knob)` semantics, #368). The advisory hook's whole contract is that
+/// the agent-facing wait is bounded by the registry-declared product cadence
+/// ([`ADVISORY_HOOK_BUDGET_MS`]); an ungoverned override that *widens* the deadline
+/// defeats that bound, so it is refused fail-closed rather than silently honored.
+/// A shorter deadline (down to and including `0`, the extreme "never wait, always
+/// go silent" tightening) only makes the hook faster to yield, so it is always
+/// permitted.
+///
+/// - `None` → the registry-declared default budget.
+/// - `Some(ms)` with `ms <= default` → the tightened budget `ms` (OK, incl. `0`).
+/// - `Some(ms)` with `ms > default` → refuse ([`ASTRO_GUARD_HOOK_BUDGET_WIDENED`]).
+pub fn governed_advisory_budget_ms(override_ms: Option<u64>) -> Result<u64, CalibrationError> {
+    match override_ms {
+        None => Ok(ADVISORY_HOOK_BUDGET_MS),
+        Some(ms) if ms <= ADVISORY_HOOK_BUDGET_MS => Ok(ms),
+        Some(ms) => Err(CalibrationError::new_owned(
+            ASTRO_GUARD_HOOK_BUDGET_WIDENED,
+            format!(
+                "advisory-hook budget_ms override {ms} widens the deadline beyond the \
+                 registry-declared {ADVISORY_HOOK_BUDGET_MS}ms product cadence; the advisory hook \
+                 permits tightening (<= {ADVISORY_HOOK_BUDGET_MS}ms) only"
+            ),
+            "Pass a budget_ms <= the registry default to tighten the deadline, or omit it to use \
+             the default. Widening the advisory wait past the product cadence is refused.",
+        )),
+    }
+}
+
 /// Run an advisory quick check under the registry-declared budget
 /// ([`ADVISORY_HOOK_BUDGET_MS`]). The agent-facing wait is bounded by the budget:
 /// on timeout the caller returns [`AdvisoryOutcome::SilentTimeout`] and does not
@@ -322,6 +356,49 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(budget * 3),
             "caller wait {elapsed:?} must be bounded near the budget, not the injected slowness"
+        );
+    }
+
+    // -- #368: budget_ms governance (tightening-only) -----------------------
+
+    #[test]
+    fn governed_budget_defaults_when_no_override() {
+        assert_eq!(
+            governed_advisory_budget_ms(None).unwrap(),
+            ADVISORY_HOOK_BUDGET_MS
+        );
+    }
+
+    #[test]
+    fn governed_budget_allows_tightening() {
+        // A strictly shorter deadline is honored (tightening OK).
+        assert_eq!(governed_advisory_budget_ms(Some(100)).unwrap(), 100);
+        // Exactly the registry default is the boundary — allowed.
+        assert_eq!(
+            governed_advisory_budget_ms(Some(ADVISORY_HOOK_BUDGET_MS)).unwrap(),
+            ADVISORY_HOOK_BUDGET_MS
+        );
+        // Zero is the extreme tightening (never wait, always go silent) — the
+        // safe direction, so it is permitted (it can only make the hook yield
+        // sooner, never block longer).
+        assert_eq!(governed_advisory_budget_ms(Some(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn governed_budget_refuses_widening_fail_closed() {
+        // One millisecond over the cadence is a widen — refused with a labeled
+        // {code, message, remediation}, never silently honored.
+        let err = governed_advisory_budget_ms(Some(ADVISORY_HOOK_BUDGET_MS + 1))
+            .expect_err("widening the advisory deadline must refuse");
+        assert_eq!(err.code(), ASTRO_GUARD_HOOK_BUDGET_WIDENED);
+        assert!(!err.message().is_empty());
+        assert!(!err.remediation().is_empty());
+        // A far-larger widen is refused the same way.
+        assert_eq!(
+            governed_advisory_budget_ms(Some(60_000))
+                .expect_err("large widen refused")
+                .code(),
+            ASTRO_GUARD_HOOK_BUDGET_WIDENED
         );
     }
 
