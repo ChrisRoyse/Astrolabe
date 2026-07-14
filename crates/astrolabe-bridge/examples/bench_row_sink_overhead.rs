@@ -53,10 +53,29 @@ struct RunTiming {
     row_sink_edges: usize,
 }
 
+/// Stack reserve for the bench worker thread. The CBM pipeline needs more
+/// stack than the OS default main-thread reserve on windows-gnu (observed
+/// 0xC00000FD before any pipeline log even on a 6-file corpus), so the bench
+/// runs on an explicitly sized thread, mirroring the server-test harnesses.
+const BENCH_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("bench_row_sink_overhead: {error}");
-        std::process::exit(1);
+    let worker = std::thread::Builder::new()
+        .name("bench-row-sink".to_string())
+        .stack_size(BENCH_STACK_BYTES)
+        // `Box<dyn Error>` is not Send; stringify the error inside the worker.
+        .spawn(|| run().map_err(|error| error.to_string()))
+        .expect("spawn bench worker thread");
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("bench_row_sink_overhead: {error}");
+            std::process::exit(1);
+        }
+        Err(panic) => {
+            eprintln!("bench_row_sink_overhead: worker panicked: {panic:?}");
+            std::process::exit(2);
+        }
     }
 }
 

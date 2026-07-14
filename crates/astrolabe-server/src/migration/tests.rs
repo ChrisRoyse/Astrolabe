@@ -6541,6 +6541,74 @@ fn tool_definition<'a>(tools: &'a [Value], name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{name} tool definition"))
 }
 
+// #328 regression: CBM paginates tools/list and serves `search_graph` on a
+// NON-final page (the page carrying `nextCursor`). The fusion/propagated_label
+// overlay must apply on whatever page `search_graph` appears, while Astrolabe's
+// own tools are still appended only on the final page (each tool served once).
+#[test]
+fn tools_list_overlays_search_graph_on_a_paginated_nonfinal_page() {
+    let paginated = json!({
+        "jsonrpc": "2.0",
+        "id": 90,
+        "result": {
+            "tools": [
+                {
+                    "name": "search_graph",
+                    "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}
+                }
+            ],
+            "nextCursor": "page-2"
+        }
+    });
+    let augmented: Value =
+        serde_json::from_str(&augment_tools_list_response(&paginated.to_string()).unwrap())
+            .unwrap();
+    let tools = augmented["result"]["tools"].as_array().unwrap();
+    assert_eq!(
+        tools.len(),
+        1,
+        "astrolabe tools must NOT be appended on a non-final page: {augmented}"
+    );
+    let properties = tools[0]["inputSchema"]["properties"].as_object().unwrap();
+    for knob in [
+        "propagated_label",
+        "fusion",
+        "fusion_override",
+        "temporal_alpha_millis",
+    ] {
+        assert!(
+            properties.contains_key(knob),
+            "{knob} must be overlaid on the non-final page carrying search_graph: {augmented}"
+        );
+    }
+    assert!(
+        properties.contains_key("query"),
+        "CBM-native properties must survive the overlay"
+    );
+    assert_eq!(augmented["result"]["nextCursor"], "page-2");
+}
+
+/// FSV instrument for the #328 live-binary readback: prints the canonical JSON
+/// of every advertised Astrolabe tool definition plus the search_graph overlay
+/// so an out-of-process harness can byte-compare the SERVED tools/list against
+/// these definitions (serve-what-you-persist).
+#[test]
+fn dump_advertised_tool_definitions_for_live_fsv() {
+    for definition in astrolabe_tool_definitions() {
+        let name = definition["name"].as_str().expect("tool name");
+        println!(
+            "TOOL_DEF {name} {}",
+            serde_json::to_string(&definition).unwrap()
+        );
+    }
+    for (name, spec) in search_graph_astrolabe_property_overlay() {
+        println!(
+            "OVERLAY_PROP {name} {}",
+            serde_json::to_string(&spec).unwrap()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // #209 — a broken/empty embedded chain must never ride surface `trust: "verified"`.
 // ---------------------------------------------------------------------------------------
@@ -9638,6 +9706,25 @@ fn build_fusion_fixture_index(store: &Path, root: &Path) -> (CbmToolRunner, Stri
     fs::create_dir_all(store).expect("create run-scoped store");
     astrolabe_bridge::set_cbm_cache_dir(store).expect("configure run-scoped store");
 
+    // #42 M-corpus mode: when ASTRO_FUSION_CORPUS_REPO names a real repo (owner
+    // directive: the repo's own cbm/ tree is the established M-corpus), index it
+    // instead of the generated fixture. The store stays run-scoped either way.
+    if let Ok(corpus) = std::env::var("ASTRO_FUSION_CORPUS_REPO")
+        && !corpus.is_empty()
+    {
+        let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+        let index_args = json!({ "repo_path": corpus, "calyx": "shadow" }).to_string();
+        let raw =
+            handle_index_repository(&runner, &index_args).expect("shadow index returns a result");
+        assert!(
+            !tool_result_is_error(&raw).expect("index result parses"),
+            "M-corpus shadow index must succeed: {raw}"
+        );
+        let project = project_from_tool_result(&raw)
+            .expect("shadow index result carries a derived project name");
+        return (runner, project);
+    }
+
     let repo = root.join("fusiondemo");
     let src = repo.join("src");
     fs::create_dir_all(&src).expect("create fixture repo src");
@@ -9708,15 +9795,27 @@ fn fused_vs_legacy_search_ab_nonregression_fsv() {
         let (runner, project) = build_fusion_fixture_index(&store, &root);
 
         // Lexical, identifier-shaped queries where the fused S7 BM25 slot is
-        // competitive with legacy CBM BM25. (query, ground-truth token).
-        let queries = [
-            ("authenticate user", "authenticate"),
-            ("parse config", "config"),
-            ("database connect", "database"),
-        ];
+        // competitive with legacy CBM BM25. (query, ground-truth token). The
+        // M-corpus set uses tokens verified abundant in cbm/src (parse 234,
+        // node 352, search 65, index 176 call sites).
+        let m_corpus = std::env::var("ASTRO_FUSION_CORPUS_REPO").is_ok_and(|v| !v.is_empty());
+        let queries: &[(&str, &str)] = if m_corpus {
+            &[
+                ("parse file", "parse"),
+                ("graph node", "node"),
+                ("search graph", "search"),
+                ("index repository", "index"),
+            ]
+        } else {
+            &[
+                ("authenticate user", "authenticate"),
+                ("parse config", "config"),
+                ("database connect", "database"),
+            ]
+        };
         let k = 10usize;
         let mut verdict_rows = Vec::new();
-        for (query, token) in queries {
+        for &(query, token) in queries {
             let legacy_raw = handle_search_graph(
                 &runner,
                 &json!({ "query": query, "project": project, "limit": k }).to_string(),
@@ -9796,6 +9895,20 @@ fn fused_vs_legacy_search_ab_nonregression_fsv() {
                 .unwrap_or_else(|error| panic!("A/B regression on {query:?}: {}", error.message()));
         }
 
+        for (query, verdict) in &verdict_rows {
+            println!(
+                "AB_ROW query={query:?} fused_recall_permille={} legacy_recall_permille={} \
+                 overlap_permille={} non_regression={} fused_wins={}",
+                verdict.fused_recall_permille,
+                verdict.legacy_recall_permille,
+                verdict.overlap_permille,
+                verdict.non_regression,
+                verdict.fused_wins,
+            );
+        }
+        // Print the independently READ-BACK persisted bytes so the parent log
+        // carries the FSV readback itself, not only the pre-persist values.
+        println!("AB_JSON {read_back}");
         astrolabe_bridge::clear_cbm_cache_dir();
         println!("CHILD_OK ab_verdicts={}", verdict_rows.len());
         std::io::stdout().flush().ok();
@@ -9822,6 +9935,10 @@ fn fused_vs_legacy_search_ab_nonregression_fsv() {
         .env("ASTRO_FUSION_AB_ROOT", &child_root)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
+        // M-corpus indexing parses ~1MB generated C sources (tree-sitter
+        // parser.c tables, stdlib data) on the child's 2MiB-default libtest
+        // thread and overflows it (0xC00000FD); raise only the harness stack.
+        .env("RUST_MIN_STACK", "67108864")
         .output()
         .expect("spawn fused A/B child");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9835,6 +9952,25 @@ fn fused_vs_legacy_search_ab_nonregression_fsv() {
         stdout.contains("CHILD_OK ab_verdicts="),
         "child did not complete the A/B assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
+    // `contains`, not `starts_with`: libtest glues the child's first print onto
+    // its own "test <name> ... " progress line, which would hide that row.
+    for line in stdout
+        .lines()
+        .filter(|l| l.contains("AB_ROW") || l.contains("AB_JSON") || l.contains("CHILD_OK"))
+    {
+        println!("PARENT_ECHO {line}");
+    }
+    // Optionally preserve the persisted verdict artifact for out-of-process
+    // readback before the run-scoped store is removed.
+    if let Ok(dir) = std::env::var("ASTRO_FUSION_EVIDENCE_DIR")
+        && !dir.is_empty()
+    {
+        fs::copy(
+            store.join("fusion_ab_verdicts.json"),
+            Path::new(&dir).join("fusion_ab_verdicts.json"),
+        )
+        .expect("preserve fusion_ab_verdicts.json evidence");
+    }
     fs::remove_dir_all(&root).ok();
 }
 
@@ -9865,13 +10001,24 @@ fn fused_search_warm_p99_within_budget_fsv() {
         let index_set = SlotIndexSet::from_manifest(&manifest).expect("build index set");
         let table = astrolabe_panel::StaticEmbeddingTable::load_default().expect("load table");
 
-        let queries = [
-            "authenticate user",
-            "parse config",
-            "database connect",
-            "verify token",
-            "run query",
-        ];
+        let m_corpus = std::env::var("ASTRO_FUSION_CORPUS_REPO").is_ok_and(|v| !v.is_empty());
+        let queries: [&'static str; 5] = if m_corpus {
+            [
+                "parse file",
+                "graph node",
+                "search graph",
+                "index repository",
+                "config load",
+            ]
+        } else {
+            [
+                "authenticate user",
+                "parse config",
+                "database connect",
+                "verify token",
+                "run query",
+            ]
+        };
         let make_req = |query: &'static str| FusedQueryRequest {
             query,
             k: 10,
@@ -9927,6 +10074,17 @@ fn fused_search_warm_p99_within_budget_fsv() {
             .require_p99_within(SEARCH_P99_BUDGET_NANOS)
             .unwrap_or_else(|error| panic!("warm p99 over budget: {}", error.message()));
 
+        println!(
+            "P99_SUMMARY sample_count={} p50_nanos={} p95_nanos={} p99_nanos={} max_nanos={} budget_nanos={}",
+            summary.sample_count,
+            summary.p50_nanos,
+            summary.p95_nanos,
+            summary.p99_nanos,
+            summary.max_nanos,
+            SEARCH_P99_BUDGET_NANOS,
+        );
+        // Print the independently READ-BACK persisted bytes (FSV readback).
+        println!("P99_JSON {read_back}");
         astrolabe_bridge::clear_cbm_cache_dir();
         println!("CHILD_OK p99_nanos={}", summary.p99_nanos);
         std::io::stdout().flush().ok();
@@ -9953,6 +10111,9 @@ fn fused_search_warm_p99_within_budget_fsv() {
         .env("ASTRO_FUSION_P99_ROOT", &child_root)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
+        // See the A/B harness: M-corpus parsing overflows the 2MiB libtest
+        // thread stack; this raises only the harness child's thread stack.
+        .env("RUST_MIN_STACK", "67108864")
         .output()
         .expect("spawn fused p99 child");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9966,6 +10127,325 @@ fn fused_search_warm_p99_within_budget_fsv() {
         stdout.contains("CHILD_OK p99_nanos="),
         "child did not complete the p99 assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
+    // `contains`, not `starts_with`: libtest glues the child's first print onto
+    // its own "test <name> ... " progress line, which would hide that row.
+    for line in stdout
+        .lines()
+        .filter(|l| l.contains("P99_SUMMARY") || l.contains("P99_JSON") || l.contains("CHILD_OK"))
+    {
+        println!("PARENT_ECHO {line}");
+    }
+    // Optionally preserve the persisted latency artifact for out-of-process
+    // readback before the run-scoped store is removed.
+    if let Ok(dir) = std::env::var("ASTRO_FUSION_EVIDENCE_DIR")
+        && !dir.is_empty()
+    {
+        fs::copy(
+            store.join("fusion_p99.json"),
+            Path::new(&dir).join("fusion_p99.json"),
+        )
+        .expect("preserve fusion_p99.json evidence");
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #52 DoD4 — grounded vs ungrounded detect_changes E2E over a real repo
+// ---------------------------------------------------------------------------
+
+/// Parses the inner JSON payload out of a CBM text tool result.
+fn detect_changes_inner_json(raw: &str) -> Value {
+    let value: Value = serde_json::from_str(raw).expect("tool result JSON");
+    let text = value["content"][0]["text"].as_str().expect("text content");
+    serde_json::from_str(text).expect("inner JSON")
+}
+
+/// #52 legacy byte-compat: removing the additive `grounded_risk` block must
+/// restore the legacy CBM shape exactly (consumers that ignore the new block
+/// see byte-identical legacy fields).
+fn assert_detect_changes_legacy_compat(legacy: &Value, augmented: &Value) {
+    let mut stripped = augmented.clone();
+    stripped
+        .as_object_mut()
+        .expect("augmented inner is an object")
+        .remove("grounded_risk");
+    assert_eq!(
+        &stripped, legacy,
+        "grounded-risk augmentation must be strictly additive over the legacy shape"
+    );
+}
+
+/// #52 DoD4: E2E over a REAL mixed-language git repo through the production
+/// `handle_detect_changes_grounded_risk` path. Ungrounded (fresh project, no
+/// oracle rows): the response preserves the legacy CBM shape byte-compatibly
+/// and layers a `grounded_risk` block labeled provisional with NO fabricated
+/// risk. Grounded (after persisting a mined change→outcome corpus into the
+/// project's shadow vault): the same call carries grounded risk with
+/// resolution provenance, cross-checked against independently read-back
+/// persisted occurrence rows. Child-process isolated (process-global cache
+/// override + HOME sandbox), mirroring the fusion FSV harnesses.
+#[test]
+fn detect_changes_grounded_vs_ungrounded_real_repo_e2e_fsv() {
+    if std::env::var("ASTRO_DC_E2E_CHILD").is_ok() {
+        use std::io::Write;
+
+        let store = PathBuf::from(std::env::var("ASTRO_DC_E2E_STORE").expect("store env"));
+        let root = PathBuf::from(std::env::var("ASTRO_DC_E2E_ROOT").expect("root env"));
+        fs::create_dir_all(&store).expect("create run-scoped store");
+        astrolabe_bridge::set_cbm_cache_dir(&store).expect("configure run-scoped store");
+
+        // Mixed-language fixture: C and Python symbols in one real git repo.
+        let repo = root.join("dcdemo");
+        let src = repo.join("src");
+        fs::create_dir_all(&src).expect("create fixture src");
+        fs::write(
+            src.join("calc.c"),
+            "int calc_add(int a, int b) { return a + b; }\n\
+             int calc_sub(int a, int b) { return a - b; }\n",
+        )
+        .expect("write calc.c");
+        fs::write(
+            src.join("util.py"),
+            "def util_scale(x):\n    return x * 2\n\n\ndef util_shift(x):\n    return x + 1\n",
+        )
+        .expect("write util.py");
+        fixture_git(&repo, &["init", "--initial-branch=main"]);
+        fixture_git(&repo, &["config", "user.name", "Astrolabe FSV"]);
+        fixture_git(&repo, &["config", "user.email", "fsv@astrolabe.invalid"]);
+        fixture_git(&repo, &["add", "-A"]);
+        fixture_git(&repo, &["commit", "-m", "initial"]);
+
+        let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+        let raw = handle_index_repository(
+            &runner,
+            &json!({ "repo_path": repo, "calyx": "shadow" }).to_string(),
+        )
+        .expect("shadow index returns");
+        assert!(
+            !tool_result_is_error(&raw).expect("index result parses"),
+            "fixture shadow index must succeed: {raw}"
+        );
+        let project = project_from_tool_result(&raw).expect("derived project name");
+
+        // An unstaged edit so the REAL detect_changes reports impacted symbols.
+        fs::write(
+            src.join("calc.c"),
+            "int calc_add(int a, int b) { return (a + b); }\n\
+             int calc_sub(int a, int b) { return a - b; }\n",
+        )
+        .expect("edit calc.c");
+
+        let args = json!({ "project": project }).to_string();
+        let legacy_raw = runner
+            .handle_tool_raw("detect_changes", &args)
+            .expect("legacy detect_changes returns");
+        assert!(
+            !tool_result_is_error(&legacy_raw).expect("legacy parses"),
+            "legacy detect_changes must succeed: {legacy_raw}"
+        );
+        let legacy_inner = detect_changes_inner_json(&legacy_raw);
+        assert!(
+            legacy_inner["impacted_symbols"]
+                .as_array()
+                .is_some_and(|symbols| !symbols.is_empty()),
+            "legacy run must report impacted symbols: {legacy_inner}"
+        );
+
+        // --- Ungrounded leg: fresh project, zero oracle rows. ---
+        let ungrounded_raw =
+            handle_detect_changes_grounded_risk(&runner, &args).expect("wrapper returns");
+        let ungrounded_inner = detect_changes_inner_json(&ungrounded_raw);
+        assert_detect_changes_legacy_compat(&legacy_inner, &ungrounded_inner);
+        let risk = &ungrounded_inner["grounded_risk"];
+        assert_eq!(risk["status"], "ungrounded", "fresh project: {risk}");
+        assert_eq!(risk["trust"], "provisional");
+        assert_eq!(risk["grounded_symbol_count"], 0);
+        for symbol in risk["symbols"].as_array().expect("symbols") {
+            assert_eq!(symbol["grounded"], false, "no fabricated risk: {symbol}");
+            assert_eq!(symbol["trust"], "provisional", "{symbol}");
+            assert_eq!(symbol["evidence_occurrences"], 0, "{symbol}");
+        }
+        // FSV: the vault really holds zero occurrence rows.
+        let cache_dir = astrolabe_bridge::cbm_cache_dir().expect("cache dir");
+        let (vault_dir, vault_id, vault_salt) =
+            shadow_vault_config_at(&cache_dir, &project).expect("vault config");
+        {
+            let vault = open_shadow_vault_read_only(
+                &vault_dir,
+                &vault_id,
+                &vault_salt,
+                vec![ColumnFamily::Kv],
+            )
+            .expect("open vault for occurrence readback");
+            assert_eq!(
+                astrolabe_oracle::read_occurrence_rows(&vault)
+                    .unwrap()
+                    .len(),
+                0,
+                "fresh project persists zero occurrence rows"
+            );
+        }
+
+        // --- Grounded leg: persist a mined corpus on two REAL indexed symbols. ---
+        let map_vault = open_shadow_vault_read_only(
+            &vault_dir,
+            &vault_id,
+            &vault_salt,
+            vec![ColumnFamily::Graph, ColumnFamily::Base],
+        )
+        .expect("open vault for node map");
+        let node_map = astrolabe_ingest::read_node_map_cx_ids(&map_vault, &project).unwrap();
+        drop(map_vault);
+        let find_cx = |needle: &str| {
+            node_map
+                .iter()
+                .find(|(qn, _)| qn.contains(needle))
+                .map(|(qn, cx)| (qn.clone(), *cx))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{needle} must be indexed; sample qns={:?}",
+                        node_map.keys().take(20).collect::<Vec<_>>()
+                    )
+                })
+        };
+        let (add_qn, add_cx) = find_cx("calc_add");
+        let (_sub_qn, sub_cx) = find_cx("calc_sub");
+
+        const PAIR_SPACING_SECS: u64 = 30 * 24 * 60 * 60;
+        const CORPUS_BASE_TS: u64 = 1_000_000_000;
+        let mut changes = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut push_failures = |subject: calyx_core::CxId, tag: &str, n: usize| {
+            for i in 0..n {
+                let change_ts = CORPUS_BASE_TS + (i as u64) * PAIR_SPACING_SECS;
+                changes.push(astrolabe_oracle::ChangeEvent {
+                    change_id: format!("chg-{tag}-{i}"),
+                    subject,
+                    change_ts,
+                });
+                outcomes.push(astrolabe_oracle::OutcomeEvent {
+                    source: format!("ci:bt:{tag}-{i}"),
+                    subject,
+                    outcome_ts: change_ts + 3_600,
+                    passed: false,
+                });
+            }
+        };
+        push_failures(add_cx, "add", 4);
+        push_failures(sub_cx, "sub", 3);
+        let corpus = astrolabe_oracle::mine_corpus(
+            &changes,
+            &outcomes,
+            &astrolabe_oracle::AttributionConfig::default(),
+        )
+        .unwrap();
+        {
+            let write_vault = open_shadow_vault_writable(
+                &vault_dir,
+                &vault_id,
+                &vault_salt,
+                vec![ColumnFamily::Kv, ColumnFamily::Ledger],
+            )
+            .expect("open vault writable");
+            astrolabe_oracle::persist_corpus(&write_vault, &corpus, "dc-e2e-52").unwrap();
+        }
+
+        let grounded_raw = handle_detect_changes_grounded_risk(&runner, &args)
+            .expect("wrapper returns (grounded)");
+        let grounded_inner = detect_changes_inner_json(&grounded_raw);
+        assert_detect_changes_legacy_compat(&legacy_inner, &grounded_inner);
+        let risk = &grounded_inner["grounded_risk"];
+        assert_eq!(risk["status"], "grounded", "corpus persisted: {risk}");
+        let symbols = risk["symbols"].as_array().expect("symbols");
+        let add_entry = symbols
+            .iter()
+            .find(|symbol| {
+                symbol["symbol"]
+                    .as_str()
+                    .is_some_and(|name| add_qn.contains(name) || name.contains("calc_add"))
+            })
+            .unwrap_or_else(|| panic!("calc_add must be impacted: {symbols:?}"));
+        assert_eq!(add_entry["grounded"], true, "{add_entry}");
+        assert!(
+            add_entry["resolution"]
+                .as_str()
+                .is_some_and(|how| how == "exact_qualified_name" || how == "short_name"),
+            "resolution provenance: {add_entry}"
+        );
+        assert_eq!(add_entry["evidence_occurrences"], 4, "{add_entry}");
+        assert!(add_entry["cx"].as_str().is_some(), "{add_entry}");
+
+        // FSV: grounded risk rides on independently read-back persisted rows.
+        {
+            let vault = open_shadow_vault_read_only(
+                &vault_dir,
+                &vault_id,
+                &vault_salt,
+                vec![ColumnFamily::Kv],
+            )
+            .expect("open vault for final readback");
+            let rows = astrolabe_oracle::read_occurrence_rows(&vault).unwrap();
+            let add_fails = rows
+                .iter()
+                .filter(|persisted| persisted.row.subject == add_cx && !persisted.row.passed)
+                .count();
+            let sub_fails = rows
+                .iter()
+                .filter(|persisted| persisted.row.subject == sub_cx && !persisted.row.passed)
+                .count();
+            assert_eq!(add_fails, 4, "persisted calc_add failing rows");
+            assert_eq!(sub_fails, 3, "persisted calc_sub failing rows");
+        }
+
+        println!(
+            "DC_E2E ungrounded_status=ungrounded grounded_status=grounded \
+             add_occ=4 sub_occ=3 project={project}"
+        );
+        astrolabe_bridge::clear_cbm_cache_dir();
+        println!("CHILD_OK dc_e2e=1");
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    let root = temp_dir("dc-e2e-52");
+    fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    let child_root = root.join("child");
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "migration::tests::detect_changes_grounded_vs_ungrounded_real_repo_e2e_fsv",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_DC_E2E_CHILD", "1")
+        .env("ASTRO_DC_E2E_STORE", &store)
+        .env("ASTRO_DC_E2E_ROOT", &child_root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("spawn dc e2e child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dc e2e child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("CHILD_OK dc_e2e=1"),
+        "child did not complete the E2E assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    for line in stdout
+        .lines()
+        .filter(|l| l.contains("DC_E2E") || l.contains("CHILD_OK"))
+    {
+        println!("PARENT_ECHO {line}");
+    }
     fs::remove_dir_all(&root).ok();
 }
 

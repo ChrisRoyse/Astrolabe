@@ -112,25 +112,31 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
     let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
         return Ok(response_json.to_string());
     };
-    if result.contains_key("nextCursor") {
-        return Ok(response_json.to_string());
-    }
+    let is_final_page = !result.contains_key("nextCursor");
     let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
         return Ok(response_json.to_string());
     };
-    for definition in astrolabe_tool_definitions() {
-        let Some(name) = definition.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !tools
-            .iter()
-            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-        {
-            tools.push(definition);
+    // Astrolabe's own tools are appended only on the final page so a client
+    // walking cursors sees each tool exactly once.
+    if is_final_page {
+        for definition in astrolabe_tool_definitions() {
+            let Some(name) = definition.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            {
+                tools.push(definition);
+            }
         }
     }
     // #328: overlay the Astrolabe-side extensions onto the CBM `search_graph`
     // schema so MCP clients can discover propagated_label + fusion from tools/list.
+    // The overlay must apply on WHATEVER page `search_graph` appears: CBM
+    // paginates tools/list and serves `search_graph` on a non-final page, so
+    // gating the whole augmentation on the final page served the bare legacy
+    // schema (found by the #328 live-binary readback FSV).
     for tool in tools.iter_mut() {
         if tool.get("name").and_then(Value::as_str) == Some("search_graph") {
             overlay_search_graph_extensions(tool);
