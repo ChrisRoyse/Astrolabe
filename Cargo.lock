@@ -158,6 +158,8 @@ dependencies = [
  "astrolabe-domain",
  "astrolabe-panel",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

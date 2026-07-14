@@ -10,6 +10,58 @@ use std::str::FromStr;
 pub mod layout;
 pub use layout::*;
 
+/// Kernel build graph substrate: the kernel-owned input the pipeline consumes
+/// (#37). Decoupled from the ingest projection crate to avoid a dependency
+/// cycle.
+pub mod kernel_graph;
+pub use kernel_graph::{
+    ASTRO_KERNEL_EMPTY_GRAPH, ASTRO_KERNEL_GRAPH_INVALID, IndexedGraph, KernelGraph,
+    KernelGraphEdge, KernelGraphNode,
+};
+
+/// Iterative Tarjan strongly-connected components (#37).
+pub mod scc;
+pub use scc::{all_strongly_connected_components, strongly_connected_components};
+
+/// Betweenness centrality with exact/sampled auto-switch (#37).
+pub mod betweenness;
+pub use betweenness::{BetweennessResult, betweenness_auto, brandes, select_pivots};
+
+/// Groundedness scoring against Trusted anchors (#37).
+pub mod groundedness;
+pub use groundedness::{GroundednessResult, score_groundedness};
+
+/// Approximate directed feedback vertex set (#37).
+pub mod fvs;
+pub use fvs::{FeedbackVertexSet, approximate_directed_fvs};
+
+/// Kernel build pipeline, recall gate, and persisted artifacts (#37).
+pub mod kernel_build;
+pub use kernel_build::{
+    KERNEL_ARTIFACT_SCHEMA, KERNEL_BUILD_KNOB_REGISTRY_VERSION, KERNEL_BUILD_KNOBS,
+    KERNEL_INDEX_SCHEMA, KERNEL_LEDGER_SCHEMA, KernelArtifact, KernelArtifactPaths,
+    KernelBuildConfig, KernelIndexManifest, KernelLedgerEntry, KernelMember, RecallMeasurement,
+    build_kernel, build_kernel_reusing_betweenness, kernel_betweenness_permille, measure_recall,
+    members_hash, refine_kernel_with_recall_support, write_kernel_artifacts,
+};
+
+/// Scope algebra for scoped and hierarchical kernels (#38).
+pub mod scope;
+pub use scope::{NodeScope, Scope, ScopeAttributes, induced_subgraph};
+
+/// Scoped builds, scope cache, standing-kernel triggers, freshness (#38).
+pub mod scope_cache;
+pub use scope_cache::{
+    CacheKey, FreshnessDecision, KernelCache, RefreshReason, STANDING_KERNEL_KNOB_REGISTRY_VERSION,
+    STANDING_KERNEL_KNOBS, StandingKernelPolicy, build_scoped_kernel, decide_freshness,
+};
+
+/// Incremental rebuild and hierarchical region kernels (#38).
+pub mod incremental;
+pub use incremental::{
+    GraphDelta, RebuildReport, RegionGraph, build_region_graph, rebuild_dirty, region_id,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SEARCH_SCALE_SCHEMA: &str = "astrolabe.search_scale_plan.v1";
 pub const SEARCH_SCALE_KNOB_REGISTRY_VERSION: &str = "astro.kernel.search_scale_knobs.v1";
