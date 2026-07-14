@@ -31,6 +31,7 @@ pub fn handle_tool_raw(
         "kernel_answer" => handle_kernel_answer(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
         "search_graph" => handle_search_graph(runner, args_json),
+        "query_graph" => handle_query_graph(runner, args_json),
         "trace_path" | "trace_call_path" => handle_trace_path(runner, args_json),
         "find_similar" => handle_find_similar(args_json),
         "detect_changes" => handle_detect_changes_grounded_risk(runner, args_json),
@@ -97,6 +98,7 @@ pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
             | "index_status"
             | "get_architecture"
             | "detect_changes"
+            | "query_graph"
             | "trace_path"
             | "trace_call_path"
     ) || is_advertised_astrolabe_tool(tool_name)
@@ -154,6 +156,9 @@ pub(crate) fn augment_tools_list_response(response_json: &str) -> Result<String,
             // #43: advertise the opt-in `scored` best-first knob on the CBM
             // trace_path schema so clients can discover it, same overlay pattern.
             Some("trace_path") | Some("trace_call_path") => overlay_trace_path_extensions(tool),
+            // #43: advertise the opt-in `as_of` time-travel knob on the CBM
+            // query_graph schema so clients can discover it, same overlay pattern.
+            Some("query_graph") => overlay_query_graph_extensions(tool),
             _ => {}
         }
     }
@@ -190,6 +195,23 @@ pub(crate) fn overlay_trace_path_extensions(tool: &mut Value) {
         return;
     };
     for (name, spec) in trace_path_astrolabe_property_overlay() {
+        properties.entry(name).or_insert(spec);
+    }
+}
+
+/// #43: merge the Astrolabe `as_of` extension property into the CBM `query_graph`
+/// tool's `inputSchema.properties`, leaving CBM-native properties untouched.
+pub(crate) fn overlay_query_graph_extensions(tool: &mut Value) {
+    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let properties = schema
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(properties) = properties.as_object_mut() else {
+        return;
+    };
+    for (name, spec) in query_graph_astrolabe_property_overlay() {
         properties.entry(name).or_insert(spec);
     }
 }
@@ -237,6 +259,12 @@ pub(crate) fn should_wrap_tool(
             // BFS. Without `scored:true` we never intercept, so the legacy traversal
             // is served byte-for-byte by libcbm (the #43 plain-BFS byte-parity floor).
             Ok(trace_path_scored_requested(args))
+        }
+        "query_graph" => {
+            // The `as_of` time-travel is the ONLY divergence from CBM's live Cypher.
+            // Without `as_of` we never intercept, so the query is served byte-for-byte
+            // by libcbm against the live store (#43 live-query byte-parity floor).
+            Ok(query_graph_as_of_requested(args))
         }
         name if is_advertised_astrolabe_tool(name) => Ok(true),
         _ => Ok(false),

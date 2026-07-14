@@ -4464,8 +4464,28 @@ pub fn read_cbm_graph_snapshot<C>(
 where
     C: Clock,
 {
+    read_cbm_graph_snapshot_at(vault, project, vault.latest_seq())
+}
+
+/// Reads the CBM graph snapshot as it existed at an explicit MVCC `snapshot`
+/// sequence (#43 `query_graph` `as_of` time-travel).
+///
+/// Identical to [`read_cbm_graph_snapshot`] except that every CF read is pinned
+/// to the caller-supplied `snapshot` seqno rather than `vault.latest_seq()`, so
+/// the returned graph is the temporally-consistent state as of that sequence.
+/// Callers resolve a wall-clock `as_of` timestamp to a seqno with
+/// [`calyx_aster::vault::AsterVault::as_of`] (the `time_index` CF) and pass its
+/// `seqno()` here. The read is a pure function of `(vault, project, snapshot)`:
+/// re-reading the same seqno after later commits yields byte-identical rows.
+pub fn read_cbm_graph_snapshot_at<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    snapshot: Seq,
+) -> IngestResult<CbmGraphSnapshot>
+where
+    C: Clock,
+{
     ensure_no_legacy_series_state(vault)?;
-    let snapshot = vault.latest_seq();
     let mut panel_version = None;
     let mut nodes = Vec::new();
 
