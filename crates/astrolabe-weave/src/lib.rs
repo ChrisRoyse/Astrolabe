@@ -1197,15 +1197,17 @@ pub enum AnomalyKind {
     Drift,
     OodCommit,
     PromptInjection,
+    BlindSpot,
 }
 
 impl AnomalyKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::DocDrift,
         Self::NameTruth,
         Self::Drift,
         Self::OodCommit,
         Self::PromptInjection,
+        Self::BlindSpot,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -1215,6 +1217,7 @@ impl AnomalyKind {
             Self::Drift => "drift",
             Self::OodCommit => "ood_commit",
             Self::PromptInjection => "prompt_injection",
+            Self::BlindSpot => "blind_spot",
         }
     }
 }
@@ -1229,10 +1232,11 @@ impl std::str::FromStr for AnomalyKind {
             "drift" => Ok(Self::Drift),
             "ood_commit" => Ok(Self::OodCommit),
             "prompt_injection" => Ok(Self::PromptInjection),
+            "blind_spot" => Ok(Self::BlindSpot),
             _ => Err(astrolabe_domain::DomainError::new(
                 ASTRO_ANOMALY_INVALID_KIND,
                 format!("unknown detect_anomalies kind {value}"),
-                "use one of doc_drift, name_truth, drift, ood_commit, or prompt_injection",
+                "use one of doc_drift, name_truth, drift, ood_commit, prompt_injection, or blind_spot",
             )),
         }
     }
@@ -1834,6 +1838,478 @@ fn anomaly_finding_order(left: &AnomalyFinding, right: &AnomalyFinding) -> Order
         .then_with(|| right.score_millipoints.cmp(&left.score_millipoints))
         .then_with(|| left.kind.cmp(&right.kind))
         .then_with(|| left.subject_id.cmp(&right.subject_id))
+}
+
+// ---------------------------------------------------------------------------
+// Blind-spot sweep (P5.6, #36): calibrated per-lens-pair anomaly detection.
+//
+// A "blind spot" is a symbol that one lens (the *confident* lens) is confident
+// belongs to a cluster, while a second lens (the *neighbor* lens) disagrees
+// across that same cluster. CBM's original blind-spot sweep hardcoded one
+// comparison; this generalizes it to any pair of similarity families, with the
+// medium/high severity thresholds MEASURED per repo from the pair's own gap
+// distribution (see `astrolabe-assay`'s calibration substrate) rather than
+// fixed. The detector emits `AnomalyKind::BlindSpot` substrate rows that flow
+// through the existing `detect_anomalies` severity/trust/provenance path.
+// ---------------------------------------------------------------------------
+
+/// Error code: a blind-spot lens pair named the same family for both lenses.
+pub const ASTRO_BLIND_SPOT_INVALID_PAIR: &str = "ASTRO_BLIND_SPOT_INVALID_PAIR";
+/// Error code: a blind-spot sweep config knob was outside its declared bounds.
+pub const ASTRO_BLIND_SPOT_INVALID_CONFIG: &str = "ASTRO_BLIND_SPOT_INVALID_CONFIG";
+
+/// Default number of top confident-lens neighbors that define a symbol's cluster.
+///
+/// v1 prior carried over from the similarity per-node cap's neighborhood scale
+/// (`DEFAULT_SIMILARITY_PER_NODE_CAP` = 10): five neighbors is a compact cluster
+/// large enough that one alien member cannot dominate the neighbor-lens mean yet
+/// small enough to stay a *local* neighborhood. A declared knob (annealable),
+/// not a measurement.
+pub const DEFAULT_BLIND_SPOT_NEIGHBOR_CAP: usize = 5;
+/// Default minimum comparable neighbors below which a symbol is skipped.
+///
+/// The neighbor-lens mean is only meaningful across at least two neighbors that
+/// both carry the neighbor lens; with fewer than two the "mean" is a single
+/// point, so the symbol is skipped as an insufficient neighborhood rather than
+/// scored on noise. Declared knob (annealable).
+pub const DEFAULT_BLIND_SPOT_MIN_NEIGHBORS: usize = 2;
+
+/// A blind-spot lens pair: the *confident* lens whose top-`k` neighborhood
+/// defines a symbol's cluster, and the *neighbor* lens whose agreement across
+/// that same cluster is measured against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindSpotLensPair {
+    /// The lens that is confident about the cluster (defines the neighborhood).
+    pub confident: SimilarityFamily,
+    /// The lens whose agreement across that neighborhood is measured.
+    pub neighbor: SimilarityFamily,
+}
+
+impl BlindSpotLensPair {
+    /// Builds a lens pair from two similarity families.
+    pub const fn new(confident: SimilarityFamily, neighbor: SimilarityFamily) -> Self {
+        Self {
+            confident,
+            neighbor,
+        }
+    }
+
+    /// The stable pair key (`CONFIDENT_WIRExNEIGHBOR_WIRE`) echoed into provenance.
+    pub fn pair_key(&self) -> String {
+        format!(
+            "{}x{}",
+            self.confident.wire_name(),
+            self.neighbor.wire_name()
+        )
+    }
+}
+
+/// Configuration for [`blind_spot_sweep`], every field a declared knob value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotConfig {
+    /// Number of top confident-lens neighbors that define a symbol's cluster.
+    pub neighbor_cap: usize,
+    /// Minimum comparable neighbors below which a symbol is skipped.
+    pub min_neighbors: usize,
+    /// Per-pair threshold calibration knobs (measured from the gap distribution).
+    pub calibration: astrolabe_assay::score_calibration::CalibrationConfig,
+}
+
+impl Default for BlindSpotConfig {
+    fn default() -> Self {
+        Self {
+            neighbor_cap: DEFAULT_BLIND_SPOT_NEIGHBOR_CAP,
+            min_neighbors: DEFAULT_BLIND_SPOT_MIN_NEIGHBORS,
+            calibration: astrolabe_assay::score_calibration::CalibrationConfig::default(),
+        }
+    }
+}
+
+/// A per-symbol blind-spot score: how far the confident lens's cluster
+/// confidence exceeds the neighbor lens's agreement across that same cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotScore {
+    /// The scored symbol's qualified name.
+    pub qualified_name: String,
+    /// Mean confident-lens cosine over the top-`k` neighbors, in millipoints.
+    pub confident_sim_millipoints: u64,
+    /// Mean neighbor-lens cosine across the comparable neighbors, in millipoints.
+    pub neighbor_mean_millipoints: u64,
+    /// The gap `max(0, confident_sim - neighbor_mean)`, in millipoints — the
+    /// per-symbol score the calibration and severity tiers are applied to.
+    pub gap_millipoints: u64,
+    /// Number of comparable neighbors the neighbor mean was taken over.
+    pub neighbor_count: usize,
+}
+
+/// A symbol excluded from scoring, with the labeled reason (no silent drops).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotSkip {
+    /// The skipped symbol's qualified name.
+    pub qualified_name: String,
+    /// Why it could not be scored.
+    pub reason: BlindSpotSkipReason,
+}
+
+/// Why a symbol was excluded from the blind-spot sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindSpotSkipReason {
+    /// The symbol has no usable confident-lens vector.
+    MissingConfidentLens,
+    /// The symbol has no usable neighbor-lens vector.
+    MissingNeighborLens,
+    /// The symbol has no confident-lens neighbor to form a cluster.
+    NoConfidentNeighbors,
+    /// Fewer than `min_neighbors` of the cluster carry the neighbor lens.
+    InsufficientNeighborhood {
+        /// How many comparable neighbors were found.
+        comparable: usize,
+    },
+}
+
+impl BlindSpotSkipReason {
+    /// A stable wire label for the skip reason.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConfidentLens => "missing_confident_lens",
+            Self::MissingNeighborLens => "missing_neighbor_lens",
+            Self::NoConfidentNeighbors => "no_confident_neighbors",
+            Self::InsufficientNeighborhood { .. } => "insufficient_neighborhood",
+        }
+    }
+}
+
+/// A labeled calibration deficit: the sweep scored symbols but could not derive
+/// a per-pair threshold, so no findings can be tiered (degradation is labeled,
+/// never silent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotDeficit {
+    /// The assay calibration error code (below-floor or degenerate/zero-spread).
+    pub code: &'static str,
+    /// The human-readable calibration refusal message.
+    pub message: String,
+    /// The number of scored symbols that were available to calibrate on.
+    pub n_eff: u64,
+}
+
+/// The outcome of a blind-spot sweep over one lens pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlindSpotSweep {
+    /// The lens pair swept.
+    pub pair: BlindSpotLensPair,
+    /// Per-symbol scores, sorted by qualified name.
+    pub scores: Vec<BlindSpotScore>,
+    /// The `AnomalyKind::BlindSpot` substrate rows (one per scored symbol),
+    /// ready for [`detect_anomalies`], sorted by [`anomaly_substrate_order`].
+    pub substrates: Vec<AnomalySubstrateRow>,
+    /// The measured per-pair calibration, or `None` when calibration was refused
+    /// (see `deficit`).
+    pub calibration: Option<AnomalyCalibration>,
+    /// The raw measured distribution calibration (present iff `calibration` is).
+    pub distribution: Option<astrolabe_assay::DistributionCalibration>,
+    /// A labeled calibration deficit, present iff `calibration` is `None`.
+    pub deficit: Option<BlindSpotDeficit>,
+    /// Symbols excluded from scoring, each with a labeled reason.
+    pub skipped: Vec<BlindSpotSkip>,
+    /// Number of scored symbols (the effective calibration sample size).
+    pub n_eff: u64,
+}
+
+impl BlindSpotSweep {
+    /// The calibration as a single-element slice for [`detect_anomalies`] (empty
+    /// when calibration was refused, so every finding is honestly reported as a
+    /// missing-calibration skip rather than silently tiered).
+    pub fn calibrations(&self) -> Vec<AnomalyCalibration> {
+        self.calibration.clone().into_iter().collect()
+    }
+}
+
+/// Fail-closed error for a blind-spot sweep with a bad pair or config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindSpotError {
+    code: &'static str,
+    message: String,
+    remediation: &'static str,
+}
+
+impl BlindSpotError {
+    /// The stable machine-readable error code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The human-readable message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The operator remediation string.
+    pub fn remediation(&self) -> &'static str {
+        self.remediation
+    }
+}
+
+impl fmt::Display for BlindSpotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} (remediation: {})",
+            self.code, self.message, self.remediation
+        )
+    }
+}
+
+impl Error for BlindSpotError {}
+
+/// Runs the blind-spot sweep over `nodes` for one lens pair.
+///
+/// For each symbol with a confident-lens vector, the sweep takes its top
+/// `neighbor_cap` confident-lens neighbors (its cluster), measures the mean
+/// confident-lens similarity to them (cluster confidence) and the mean
+/// neighbor-lens similarity across those same neighbors (cross-lens agreement),
+/// and scores the symbol by the gap `max(0, confidence − agreement)`. The
+/// per-pair medium/high severity thresholds are then MEASURED from the corpus's
+/// own gap distribution via `astrolabe-assay`. The whole computation is a pure,
+/// deterministic function of `nodes` and the config (worker-count invariant).
+///
+/// # Errors
+/// Returns [`ASTRO_BLIND_SPOT_INVALID_PAIR`] when both lenses are the same
+/// family, or [`ASTRO_BLIND_SPOT_INVALID_CONFIG`] when a config knob is invalid.
+/// Calibration refusal (too few scores, or a zero-spread distribution) is *not*
+/// an error: it is a labeled [`BlindSpotDeficit`] on the returned sweep.
+pub fn blind_spot_sweep(
+    nodes: &[SimilarityNode],
+    pair: BlindSpotLensPair,
+    config: &BlindSpotConfig,
+) -> Result<BlindSpotSweep, BlindSpotError> {
+    if pair.confident == pair.neighbor {
+        return Err(BlindSpotError {
+            code: ASTRO_BLIND_SPOT_INVALID_PAIR,
+            message: format!(
+                "blind-spot lens pair uses the same family {} for both lenses",
+                pair.confident.wire_name()
+            ),
+            remediation: "choose two distinct similarity families for the confident and neighbor lenses",
+        });
+    }
+    if config.neighbor_cap == 0 {
+        return Err(BlindSpotError {
+            code: ASTRO_BLIND_SPOT_INVALID_CONFIG,
+            message: "blind-spot neighbor_cap must be greater than zero".to_string(),
+            remediation: "set neighbor_cap to at least one confident-lens neighbor",
+        });
+    }
+    if config.min_neighbors == 0 || config.min_neighbors > config.neighbor_cap {
+        return Err(BlindSpotError {
+            code: ASTRO_BLIND_SPOT_INVALID_CONFIG,
+            message: format!(
+                "blind-spot min_neighbors {} must be in 1..=neighbor_cap ({})",
+                config.min_neighbors, config.neighbor_cap
+            ),
+            remediation: "set min_neighbors between one and neighbor_cap inclusive",
+        });
+    }
+    if let Err(error) = config.calibration.validate() {
+        return Err(BlindSpotError {
+            code: ASTRO_BLIND_SPOT_INVALID_CONFIG,
+            message: format!("blind-spot calibration config invalid: {}", error.message()),
+            remediation: "set every calibration knob inside its declared closed interval",
+        });
+    }
+
+    let pair_key = pair.pair_key();
+    let confident_slot = pair.confident.slot();
+    let neighbor_slot = pair.neighbor.slot();
+
+    // Collect each lens's usable vectors (sorted by qualified name), keyed for
+    // O(log n) neighbor lookups.
+    let mut confident_skips = SimilaritySkipReport::default();
+    let confident_vectors = collect_family_vectors(nodes, pair.confident, &mut confident_skips);
+    let mut neighbor_skips = SimilaritySkipReport::default();
+    let neighbor_vectors = collect_family_vectors(nodes, pair.neighbor, &mut neighbor_skips);
+    let neighbor_by_name: BTreeMap<&str, &NormalizedVector> = neighbor_vectors
+        .iter()
+        .map(|indexed| (indexed.qualified_name.as_str(), &indexed.vector))
+        .collect();
+    let confident_present: BTreeSet<&str> = confident_vectors
+        .iter()
+        .map(|indexed| indexed.qualified_name.as_str())
+        .collect();
+
+    let mut scores = Vec::new();
+    let mut substrates = Vec::new();
+    let mut skipped = Vec::new();
+
+    // Any symbol with a neighbor-lens vector but no confident-lens vector cannot
+    // be scored — record it so no symbol is silently dropped.
+    for indexed in &neighbor_vectors {
+        if !confident_present.contains(indexed.qualified_name.as_str()) {
+            skipped.push(BlindSpotSkip {
+                qualified_name: indexed.qualified_name.clone(),
+                reason: BlindSpotSkipReason::MissingConfidentLens,
+            });
+        }
+    }
+
+    for source in &confident_vectors {
+        // The source's own neighbor-lens vector is required to measure its
+        // agreement with the cluster.
+        let Some(source_neighbor_vec) = neighbor_by_name.get(source.qualified_name.as_str()) else {
+            skipped.push(BlindSpotSkip {
+                qualified_name: source.qualified_name.clone(),
+                reason: BlindSpotSkipReason::MissingNeighborLens,
+            });
+            continue;
+        };
+
+        // Rank every other confident-lens symbol by confident-lens cosine.
+        let mut candidates: Vec<(f32, &str)> = confident_vectors
+            .iter()
+            .filter(|target| target.qualified_name != source.qualified_name)
+            .filter_map(|target| {
+                cosine(&source.vector, &target.vector)
+                    .map(|score| (score, target.qualified_name.as_str()))
+            })
+            .collect();
+        candidates
+            .sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        candidates.truncate(config.neighbor_cap);
+
+        if candidates.is_empty() {
+            skipped.push(BlindSpotSkip {
+                qualified_name: source.qualified_name.clone(),
+                reason: BlindSpotSkipReason::NoConfidentNeighbors,
+            });
+            continue;
+        }
+
+        let confident_sum: f32 = candidates.iter().map(|(score, _)| score).sum();
+        let confident_sim = confident_sum / candidates.len() as f32;
+
+        // Measure the neighbor lens's agreement across the SAME cluster members.
+        let mut neighbor_scores: Vec<f32> = Vec::new();
+        for (_, neighbor_qn) in &candidates {
+            let Some(neighbor_vec) = neighbor_by_name.get(neighbor_qn) else {
+                continue;
+            };
+            if let Some(score) = cosine(source_neighbor_vec, neighbor_vec) {
+                neighbor_scores.push(score);
+            }
+        }
+        if neighbor_scores.len() < config.min_neighbors {
+            skipped.push(BlindSpotSkip {
+                qualified_name: source.qualified_name.clone(),
+                reason: BlindSpotSkipReason::InsufficientNeighborhood {
+                    comparable: neighbor_scores.len(),
+                },
+            });
+            continue;
+        }
+        let neighbor_mean = neighbor_scores.iter().sum::<f32>() / neighbor_scores.len() as f32;
+
+        let confident_sim_millipoints = agreement_to_millipoints(confident_sim);
+        let neighbor_mean_millipoints = agreement_to_millipoints(neighbor_mean);
+        let gap = (confident_sim - neighbor_mean).max(0.0);
+        let gap_millipoints = agreement_to_millipoints(gap);
+
+        scores.push(BlindSpotScore {
+            qualified_name: source.qualified_name.clone(),
+            confident_sim_millipoints,
+            neighbor_mean_millipoints,
+            gap_millipoints,
+            neighbor_count: neighbor_scores.len(),
+        });
+
+        substrates.push(AnomalySubstrateRow::new(
+            AnomalyKind::BlindSpot,
+            source.qualified_name.clone(),
+            gap_millipoints,
+            format!(
+                "blind_spot {pair_key}: {} confidence {confident_sim_millipoints} vs {} agreement {neighbor_mean_millipoints} (gap {gap_millipoints})",
+                pair.confident.wire_name(),
+                pair.neighbor.wire_name()
+            ),
+            [
+                format!("blind_spot_sweep:{pair_key}"),
+                format!("confident_lens:{}:S{}", pair.confident.wire_name(), confident_slot.get()),
+                format!("neighbor_lens:{}:S{}", pair.neighbor.wire_name(), neighbor_slot.get()),
+            ],
+            [
+                format!("{}:confidence={confident_sim_millipoints}", pair.confident.wire_name()),
+                format!("{}:neighbor_mean={neighbor_mean_millipoints}", pair.neighbor.wire_name()),
+                format!("neighbors={}", neighbor_scores.len()),
+            ],
+        ));
+    }
+
+    scores.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    substrates.sort_by(anomaly_substrate_order);
+    skipped.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+    let n_eff = scores.len() as u64;
+
+    // Measure the per-pair severity thresholds from this corpus's own gap
+    // distribution. A below-floor or zero-spread distribution refuses with a
+    // labeled deficit rather than fabricating a threshold.
+    let gaps: Vec<u64> = scores.iter().map(|score| score.gap_millipoints).collect();
+    let (calibration, distribution, deficit) = match astrolabe_assay::calibrate_score_distribution(
+        &pair_key,
+        &gaps,
+        &config.calibration,
+    ) {
+        Ok(distribution) => {
+            let calibration = AnomalyCalibration::new(
+                AnomalyKind::BlindSpot,
+                distribution.medium_min_score_millipoints,
+                distribution.high_min_score_millipoints,
+                distribution.provenance_ref.clone(),
+            );
+            (Some(calibration), Some(distribution), None)
+        }
+        Err(error) => {
+            let deficit = BlindSpotDeficit {
+                code: error.code(),
+                message: error.message().to_string(),
+                n_eff,
+            };
+            (None, None, Some(deficit))
+        }
+    };
+
+    Ok(BlindSpotSweep {
+        pair,
+        scores,
+        substrates,
+        calibration,
+        distribution,
+        deficit,
+        skipped,
+        n_eff,
+    })
+}
+
+/// Runs [`blind_spot_sweep`] and tiers its findings through [`detect_anomalies`].
+///
+/// `vault_grounded` controls the trust label exactly as in [`detect_anomalies`]:
+/// on an ungrounded (cold-start) vault the sweep still runs and produces
+/// findings, but every finding carries provisional trust. When calibration was
+/// refused, the report carries no findings and lists every scored symbol as a
+/// missing-calibration skip — an honest, labeled degradation.
+pub fn blind_spot_report(
+    nodes: &[SimilarityNode],
+    pair: BlindSpotLensPair,
+    config: &BlindSpotConfig,
+    vault_grounded: bool,
+) -> Result<(BlindSpotSweep, AnomalyReport), BlindSpotError> {
+    let sweep = blind_spot_sweep(nodes, pair, config)?;
+    let calibrations = sweep.calibrations();
+    let report = detect_anomalies(
+        &sweep.substrates,
+        &calibrations,
+        Some(AnomalyKind::BlindSpot.as_str()),
+        vault_grounded,
+    )
+    .expect("blind_spot is a valid detect_anomalies kind");
+    Ok((sweep, report))
 }
 
 pub fn plan_eager_cross_terms(nodes: &[SimilarityNode]) -> EagerCrossTermPlan {
@@ -5701,5 +6177,357 @@ mod tests {
 
     fn reactive_vault_id() -> VaultId {
         "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
+    }
+
+    // --- Blind-spot sweep (#36) FSV fixtures & tests ----------------------
+
+    fn dense2(x: f32, y: f32) -> SlotVector {
+        SlotVector::Dense {
+            dim: 2,
+            data: vec![x, y],
+        }
+    }
+
+    /// A symbol carrying a struct (confident) and semantic (neighbor) lens.
+    fn blind_spot_node(
+        name: &str,
+        struct_vec: SlotVector,
+        semantic_vec: SlotVector,
+    ) -> SimilarityNode {
+        SimilarityNode::new(name)
+            .with_slot(SIM_STRUCT_SLOT, struct_vec)
+            .with_slot(SIM_SEMANTIC_SLOT, semantic_vec)
+    }
+
+    /// Eight-member conforming cluster (struct & semantic both [1,0], so cluster
+    /// members are structurally AND semantically identical) plus one planted
+    /// symbol that is structurally similar to the cluster (struct cosine 0.8) but
+    /// semantically alien (semantic cosine 0.0). Hand-computable: every cluster
+    /// member scores gap 0; the planted symbol scores gap 800 millipoints.
+    fn planted_blind_spot_corpus() -> Vec<SimilarityNode> {
+        let mut nodes = Vec::new();
+        for i in 0..8 {
+            nodes.push(blind_spot_node(
+                &format!("cluster.c{i}"),
+                dense2(1.0, 0.0),
+                dense2(1.0, 0.0),
+            ));
+        }
+        // [0.8, 0.6] has unit norm and cosine 0.8 with [1,0]; [0,1] is orthogonal
+        // (cosine 0.0) to the cluster's semantic vector.
+        nodes.push(blind_spot_node(
+            "planted.alien",
+            dense2(0.8, 0.6),
+            dense2(0.0, 1.0),
+        ));
+        nodes
+    }
+
+    fn struct_semantic_pair() -> BlindSpotLensPair {
+        BlindSpotLensPair::new(SimilarityFamily::Struct, SimilarityFamily::Semantic)
+    }
+
+    #[test]
+    fn blind_spot_flags_planted_symbol_and_spares_the_clean_cluster() {
+        let nodes = planted_blind_spot_corpus();
+        let sweep = blind_spot_sweep(&nodes, struct_semantic_pair(), &BlindSpotConfig::default())
+            .expect("sweep runs");
+
+        // Hand-computable scores: eight zeros and one 800.
+        assert_eq!(sweep.n_eff, 9);
+        let planted = sweep
+            .scores
+            .iter()
+            .find(|score| score.qualified_name == "planted.alien")
+            .expect("planted scored");
+        assert_eq!(planted.confident_sim_millipoints, 800);
+        assert_eq!(planted.neighbor_mean_millipoints, 0);
+        assert_eq!(planted.gap_millipoints, 800);
+        for score in &sweep.scores {
+            if score.qualified_name != "planted.alien" {
+                assert_eq!(
+                    score.gap_millipoints, 0,
+                    "{} is clean",
+                    score.qualified_name
+                );
+            }
+        }
+
+        // Calibration measured from the corpus's own gap distribution.
+        let distribution = sweep.distribution.as_ref().expect("calibrated");
+        assert_eq!(distribution.medium_min_score_millipoints, 340);
+        assert_eq!(distribution.high_min_score_millipoints, 592);
+
+        // Tiered findings: only the planted symbol, at high severity; FPR = 0.
+        let report = detect_anomalies(
+            &sweep.substrates,
+            &sweep.calibrations(),
+            Some("blind_spot"),
+            true,
+        )
+        .expect("tier findings");
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.subject_id, "planted.alien");
+        assert_eq!(finding.severity, AnomalySeverity::High);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.subject_id.starts_with("cluster."))
+        );
+    }
+
+    #[test]
+    fn blind_spot_report_carries_severity_evidence_trust_and_provenance() {
+        let nodes = planted_blind_spot_corpus();
+        let (sweep, report) = blind_spot_report(
+            &nodes,
+            struct_semantic_pair(),
+            &BlindSpotConfig::default(),
+            true,
+        )
+        .expect("report");
+
+        assert_eq!(report.schema, DETECT_ANOMALIES_SCHEMA);
+        assert_eq!(report.kind_filter, Some(AnomalyKind::BlindSpot));
+        assert_eq!(report.trust, "verified");
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.subject_id == "planted.alien")
+            .expect("planted finding");
+        assert_eq!(finding.kind, AnomalyKind::BlindSpot);
+        assert_eq!(finding.severity, AnomalySeverity::High);
+        // Per-lens evidence names both lenses.
+        assert!(
+            finding
+                .lens_evidence
+                .iter()
+                .any(|e| e.contains("SIM_STRUCT"))
+        );
+        assert!(
+            finding
+                .lens_evidence
+                .iter()
+                .any(|e| e.contains("SIM_SEMANTIC"))
+        );
+        // Substrate + calibration provenance are populated.
+        assert!(
+            finding
+                .substrate_provenance_refs
+                .iter()
+                .any(|p| p.contains("blind_spot_sweep:SIM_STRUCTxSIM_SEMANTIC"))
+        );
+        assert_eq!(
+            finding.calibration_provenance_ref,
+            sweep.distribution.as_ref().unwrap().provenance_ref
+        );
+        assert!(finding.freshness == "fresh");
+    }
+
+    #[test]
+    fn blind_spot_cold_start_marks_findings_provisional() {
+        let nodes = planted_blind_spot_corpus();
+        let (_, report) = blind_spot_report(
+            &nodes,
+            struct_semantic_pair(),
+            &BlindSpotConfig::default(),
+            false,
+        )
+        .expect("cold-start report");
+        // The sweep still runs and flags the planted symbol, but provisionally.
+        assert_eq!(report.trust, "provisional");
+        assert!(!report.findings.is_empty());
+        assert!(report.findings.iter().all(|f| f.trust == "provisional"));
+    }
+
+    #[test]
+    fn blind_spot_calibration_differs_across_corpora_with_different_spreads() {
+        let wide = planted_blind_spot_corpus();
+        // A tighter corpus: the planted symbol is only mildly semantically off
+        // ([0.6, 0.8] has cosine 0.6 with [1,0]), so its gap is 800-600=200.
+        let mut tight = Vec::new();
+        for i in 0..8 {
+            tight.push(blind_spot_node(
+                &format!("cluster.c{i}"),
+                dense2(1.0, 0.0),
+                dense2(1.0, 0.0),
+            ));
+        }
+        tight.push(blind_spot_node(
+            "planted.alien",
+            dense2(0.8, 0.6),
+            dense2(0.6, 0.8),
+        ));
+
+        let wide_sweep =
+            blind_spot_sweep(&wide, struct_semantic_pair(), &BlindSpotConfig::default())
+                .expect("wide");
+        let tight_sweep =
+            blind_spot_sweep(&tight, struct_semantic_pair(), &BlindSpotConfig::default())
+                .expect("tight");
+        let wide_high = wide_sweep
+            .distribution
+            .as_ref()
+            .unwrap()
+            .high_min_score_millipoints;
+        let tight_high = tight_sweep
+            .distribution
+            .as_ref()
+            .unwrap()
+            .high_min_score_millipoints;
+        assert_ne!(
+            wide_high, tight_high,
+            "distinct gap spreads must yield distinct calibrated thresholds"
+        );
+    }
+
+    #[test]
+    fn blind_spot_sweep_is_deterministic_regardless_of_node_order() {
+        let nodes = planted_blind_spot_corpus();
+        let mut shuffled = nodes.clone();
+        shuffled.reverse();
+        shuffled.swap(0, 3);
+        let first = blind_spot_sweep(&nodes, struct_semantic_pair(), &BlindSpotConfig::default())
+            .expect("first");
+        let second = blind_spot_sweep(
+            &shuffled,
+            struct_semantic_pair(),
+            &BlindSpotConfig::default(),
+        )
+        .expect("second");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn blind_spot_persisted_calibration_and_report_read_back() {
+        let nodes = planted_blind_spot_corpus();
+        let (sweep, report) = blind_spot_report(
+            &nodes,
+            struct_semantic_pair(),
+            &BlindSpotConfig::default(),
+            true,
+        )
+        .expect("report");
+
+        // Persist the measured calibration, read the bytes back off disk, and
+        // confirm they re-parse to the same value (FSV of the calibration).
+        let distribution = sweep.distribution.as_ref().expect("calibrated");
+        let cal_bytes = astrolabe_assay::calibration_dump_bytes(distribution);
+        let cal_path = std::env::temp_dir().join(format!(
+            "astrolabe-blindspot-cal-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&cal_path, &cal_bytes).expect("write calibration");
+        let cal_read = std::fs::read(&cal_path).expect("read calibration");
+        std::fs::remove_file(&cal_path).ok();
+        let reparsed =
+            astrolabe_assay::read_calibration_bytes(&cal_read).expect("reparse calibration");
+        assert_eq!(&reparsed, distribution);
+
+        // Persist the tiered report artifact and read it back (FSV of the sweep
+        // result).
+        let report_bytes = anomaly_report_artifact_bytes(&report);
+        let report_path = std::env::temp_dir().join(format!(
+            "astrolabe-blindspot-report-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&report_path, &report_bytes).expect("write report");
+        let report_read = std::fs::read(&report_path).expect("read report");
+        std::fs::remove_file(&report_path).ok();
+        assert_eq!(report_read, report_bytes);
+        assert!(
+            String::from_utf8(report_read)
+                .unwrap()
+                .contains("planted.alien")
+        );
+    }
+
+    #[test]
+    fn blind_spot_empty_corpus_refuses_calibration_with_below_floor_deficit() {
+        let sweep = blind_spot_sweep(&[], struct_semantic_pair(), &BlindSpotConfig::default())
+            .expect("empty sweep runs");
+        assert!(sweep.scores.is_empty());
+        assert!(sweep.substrates.is_empty());
+        assert!(sweep.calibration.is_none());
+        let deficit = sweep.deficit.expect("deficit labeled");
+        assert_eq!(
+            deficit.code,
+            astrolabe_assay::error::ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR
+        );
+        assert_eq!(deficit.n_eff, 0);
+    }
+
+    #[test]
+    fn blind_spot_single_lens_corpus_skips_every_symbol() {
+        // Only the confident (struct) lens is present — no neighbor lens exists.
+        let nodes: Vec<SimilarityNode> = (0..9)
+            .map(|i| {
+                SimilarityNode::new(format!("s{i}")).with_slot(SIM_STRUCT_SLOT, dense2(1.0, 0.0))
+            })
+            .collect();
+        let sweep = blind_spot_sweep(&nodes, struct_semantic_pair(), &BlindSpotConfig::default())
+            .expect("single-lens sweep runs");
+        assert!(sweep.scores.is_empty());
+        assert_eq!(sweep.skipped.len(), 9);
+        assert!(
+            sweep
+                .skipped
+                .iter()
+                .all(|s| s.reason == BlindSpotSkipReason::MissingNeighborLens)
+        );
+        assert!(sweep.calibration.is_none());
+        assert_eq!(
+            sweep.deficit.unwrap().code,
+            astrolabe_assay::error::ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR
+        );
+    }
+
+    #[test]
+    fn blind_spot_all_identical_vectors_refuse_as_degenerate_and_flag_nothing() {
+        // Ten symbols identical in BOTH lenses: every gap is 0, so the gap
+        // distribution has zero spread — the zero-signal negative control.
+        let nodes: Vec<SimilarityNode> = (0..10)
+            .map(|i| blind_spot_node(&format!("id{i}"), dense2(1.0, 0.0), dense2(1.0, 0.0)))
+            .collect();
+        let sweep = blind_spot_sweep(&nodes, struct_semantic_pair(), &BlindSpotConfig::default())
+            .expect("degenerate sweep runs");
+        // Before: every symbol WAS scored (gap 0).
+        assert_eq!(sweep.scores.len(), 10);
+        assert!(sweep.scores.iter().all(|s| s.gap_millipoints == 0));
+        // After: calibration refuses, so nothing is tiered.
+        assert!(sweep.calibration.is_none());
+        assert_eq!(
+            sweep.deficit.as_ref().unwrap().code,
+            astrolabe_assay::error::ASTRO_ASSAY_CALIBRATION_DEGENERATE
+        );
+        let report = detect_anomalies(
+            &sweep.substrates,
+            &sweep.calibrations(),
+            Some("blind_spot"),
+            true,
+        )
+        .expect("tier");
+        assert!(report.findings.is_empty());
+        assert_eq!(report.skipped.len(), 10);
+    }
+
+    #[test]
+    fn blind_spot_rejects_same_family_pair_and_bad_config() {
+        let nodes = planted_blind_spot_corpus();
+        let err = blind_spot_sweep(
+            &nodes,
+            BlindSpotLensPair::new(SimilarityFamily::Struct, SimilarityFamily::Struct),
+            &BlindSpotConfig::default(),
+        )
+        .expect_err("same-family pair refused");
+        assert_eq!(err.code(), ASTRO_BLIND_SPOT_INVALID_PAIR);
+
+        let mut bad = BlindSpotConfig::default();
+        bad.min_neighbors = bad.neighbor_cap + 1;
+        let err =
+            blind_spot_sweep(&nodes, struct_semantic_pair(), &bad).expect_err("bad config refused");
+        assert_eq!(err.code(), ASTRO_BLIND_SPOT_INVALID_CONFIG);
     }
 }

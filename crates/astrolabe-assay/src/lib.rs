@@ -50,6 +50,7 @@ pub mod redundancy;
 pub mod redundancy_card;
 pub mod rng;
 pub mod scheduler;
+pub mod score_calibration;
 pub mod stats;
 pub mod store;
 pub mod strata;
@@ -98,6 +99,16 @@ pub use redundancy_card::{
 pub use scheduler::{
     AssayScheduler, CooperativeScorer, IsolationDecision, SampleRequest, ScheduleOutcome,
     TickReport, TickStep, check_serving_isolation, serving_p99_micros,
+};
+// The score-distribution calibration substrate (#36) that turns a repo's own
+// blind-spot gap scores into measured severity thresholds. Its `CalibrationConfig`
+// is intentionally *not* re-exported at the crate root — that bare name belongs to
+// the edge-strategy calibration card (#34); reach it as
+// `score_calibration::CalibrationConfig`.
+pub use score_calibration::{
+    ASSAY_CALIBRATION_KNOB_REGISTRY_VERSION, ASSAY_CALIBRATION_KNOBS,
+    ASSAY_CALIBRATION_MAX_SCORE_MILLIPOINTS, DistributionCalibration, assay_calibration_knob,
+    calibrate_score_distribution, calibration_dump_bytes, read_calibration_bytes,
 };
 pub use stats::{inverse_standard_normal_cdf, wilson_interval};
 pub use store::AssayStore;
