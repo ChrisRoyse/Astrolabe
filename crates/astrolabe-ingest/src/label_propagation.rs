@@ -845,6 +845,83 @@ mod tests {
         }
     }
 
+    // #369 pin: `read_propagated_label_rows` strict-decodes each scanned value as
+    // a `PropagatedLabelRow`, but it is a PREFIX scan over
+    // `astrolabe:propagated-label:v1:` — provably disjoint from the shadow
+    // importer's Kernel-CF co-tenant prefixes (`astrolabe:shadow:invalidation:…`
+    // and `astrolabe:shadow:layout_frame:…`, which diverge at byte index 10:
+    // 's' vs 'p'). This test plants both co-tenant kinds directly into the Kernel
+    // CF and proves they are invisible to the reader (no fail-closed, unchanged
+    // result) — the disjointness that keeps this strict reader non-hazardous.
+    #[test]
+    fn propagated_label_reader_ignores_kernel_cf_cotenant_rows() {
+        let (_dir, vault) = vault("cotenant-pin");
+        let seeds = [seed("A", "security", 1000)];
+        let edges = [edge("A", "B")];
+        persist_label_graph(&vault, &seeds, &edges, &[], "astrolabe-ingest-test")
+            .expect("persist label graph");
+        propagate_labels_over_vault(
+            &vault,
+            &LabelPropagationConfig::default(),
+            "astrolabe-ingest-test",
+        )
+        .expect("propagate over vault");
+        let baseline = read_propagated_label_rows(&vault).expect("baseline read");
+        assert_eq!(baseline.len(), 1, "one genuine propagated row (B)");
+
+        // Plant a delta-invalidation JSON co-tenant row (kernel family), exactly as
+        // invalidation_lane.rs keys and values it.
+        let mut inval_key = b"astrolabe:shadow:invalidation:v1\0".to_vec();
+        inval_key.extend_from_slice(b"astrolabe\0kernel\0");
+        inval_key.extend_from_slice(b"scc-deadbeef");
+        let inval_value = serde_json::to_vec(&serde_json::json!({
+            "schema": "astrolabe.delta_invalidation.v1",
+            "kind": "kernel_dirty_scc",
+            "scc_id": "scc-deadbeef",
+            "dirty": true,
+        }))
+        .unwrap();
+        // Plant a layout directory-role FRAME co-tenant row (line-based text,
+        // NOT JSON), exactly as layout_lane.rs keys and values it.
+        let mut frame_key = b"astrolabe:shadow:layout_frame:v1\0".to_vec();
+        frame_key.extend_from_slice(b"astrolabe\0");
+        frame_key.extend_from_slice(b"cx:dir:7");
+        let frame_value =
+            b"schema=astrolabe.scope_summary.v1\nkind=directory_role_frame\ndirectory_id=cx:dir:7\n"
+                .to_vec();
+        vault
+            .write_cf_batch([
+                (ColumnFamily::Kernel, inval_key.clone(), inval_value.clone()),
+                (ColumnFamily::Kernel, frame_key.clone(), frame_value.clone()),
+            ])
+            .expect("write kernel co-tenant rows");
+        vault.flush().expect("flush kernel co-tenant rows");
+
+        // The co-tenant rows are independently readable back at their own keys.
+        let snap = vault.snapshot();
+        assert_eq!(
+            vault
+                .read_cf_at(snap, ColumnFamily::Kernel, &inval_key)
+                .unwrap()
+                .as_deref(),
+            Some(inval_value.as_slice())
+        );
+        assert_eq!(
+            vault
+                .read_cf_at(snap, ColumnFamily::Kernel, &frame_key)
+                .unwrap()
+                .as_deref(),
+            Some(frame_value.as_slice())
+        );
+
+        // The reader neither fails closed nor sees the co-tenant rows: its prefix
+        // range excludes them entirely, so the result is byte-identical to the
+        // pre-plant baseline.
+        let after = read_propagated_label_rows(&vault).expect("read must not fail closed");
+        assert_eq!(after.len(), 1, "co-tenant rows are invisible to the reader");
+        assert_eq!(persisted_pairs(&after), persisted_pairs(&baseline));
+    }
+
     /// Edge triad #1: empty scope (no persisted rows) => explicit empty, not error.
     #[test]
     fn edge_empty_scope_yields_explicit_empty() {

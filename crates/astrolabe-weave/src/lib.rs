@@ -39,6 +39,7 @@ use serde_json::Value;
 mod ann;
 pub mod drift_producer;
 mod sim_rows;
+mod xterm_cotenant;
 mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
@@ -59,13 +60,19 @@ pub use sim_rows::{
     SimilarityPersistReport, persist_similarity_edges, persist_similarity_edges_delta,
     read_similarity_edge_rows, sim_edge_graph_key,
 };
+pub use xterm_cotenant::{
+    XTERM_PLACEMENT_TRUTH_COTENANT_SCHEMA, accepted_xterm_cotenant_schemas,
+    is_accepted_xterm_cotenant, xterm_cotenant_schema_tag,
+};
 pub use xterm_rows::{
     AGREEMENT_GRAPH_ASPECT_PROVENANCE, AGREEMENT_GRAPH_ASPECT_SCHEMA, ASTRO_XTERM_CX_ID_MISSING,
     ASTRO_XTERM_ROW_CORRUPT, AgreementGraphAspect, EagerCrossTermPersistReport,
     PersistedAgreementEdge, PersistedEagerCrossTermRow, XTERM_EAGER_LEDGER_SCHEMA,
-    agreement_graph_aspect, agreement_graph_from_persisted_rows, designed_kind_for_slots,
+    agreement_graph_aspect, agreement_graph_from_persisted_rows,
+    agreement_graph_from_persisted_rows_with_cotenants, designed_kind_for_slots,
     eager_xterm_dump_bytes, eager_xterm_key, lazy_agreement, persist_eager_cross_terms,
     persist_eager_cross_terms_delta, read_eager_cross_term_rows,
+    read_eager_cross_term_rows_with_cotenants,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -1451,6 +1458,10 @@ pub struct LiveAnomalyInputs {
     /// Count of shared-CF co-tenant rows (e.g. delta-invalidation rows, #348)
     /// skipped during the Assay CF load — a counted, labeled skip, not an error.
     pub assay_cotenant_rows_skipped: usize,
+    /// Count of shared `ColumnFamily::XTerm` co-tenant rows (layout
+    /// `placement_truth` rows, #369) skipped during the live XTerm scan — a
+    /// counted, labeled skip, not an error.
+    pub xterm_cotenant_rows_skipped: usize,
 }
 
 impl LiveAnomalyInputs {
@@ -1580,11 +1591,27 @@ where
         ..LiveAnomalyInputs::default()
     };
 
+    // ColumnFamily::XTerm is shared: the shadow importer's layout lane
+    // co-tenants `placement_truth` cross-term rows here (#369). Those rows are
+    // line-based text (`schema=...`), not loom-row JSON, so strict-decoding every
+    // row failed the whole live-anomaly read with CALYX_ASTER_CORRUPT_SHARD on a
+    // real corpus. Classify co-tenant-aware: an accepted co-tenant schema is a
+    // counted skip; a genuinely corrupt xterm row still fails closed.
+    let accepted_xterm_cotenants = accepted_xterm_cotenant_schemas();
     for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::XTerm)? {
+        let row: XtermRow = match serde_json::from_slice(&value) {
+            Ok(row) => row,
+            Err(error) => {
+                if is_accepted_xterm_cotenant(&value, &accepted_xterm_cotenants) {
+                    inputs.xterm_cotenant_rows_skipped += 1;
+                    continue;
+                }
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "decode live XTerm anomaly row: {error}"
+                )));
+            }
+        };
         inputs.xterm_rows_read += 1;
-        let row: XtermRow = serde_json::from_slice(&value).map_err(|error| {
-            CalyxError::aster_corrupt_shard(format!("decode live XTerm anomaly row: {error}"))
-        })?;
         let expected_key = xterm_key(
             row.key.cx_id,
             row.key.a,
@@ -3978,6 +4005,155 @@ mod tests {
             .expect_err("corrupt assay row must fail closed");
         assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // #369 (CONFIRMED LIVE on cbm/): a real vault whose ColumnFamily::XTerm holds
+    // BOTH a genuine loom agreement row and a co-tenant layout `placement_truth`
+    // row (line-based text, not JSON). Before the fix the whole live-anomaly read
+    // failed with CALYX_ASTER_CORRUPT_SHARD ("decode live XTerm anomaly row:
+    // expected value at line 1 column 1"); after the fix the anomaly surface is
+    // served, the placement_truth row is skipped+counted, and a genuinely corrupt
+    // xterm row still fails closed.
+    #[test]
+    fn live_anomaly_read_tolerates_placement_truth_xterm_cotenant_rows() {
+        use astrolabe_kernel::{
+            PLACEMENT_TRUTH_PROVENANCE, PLACEMENT_TRUTH_SCHEMA, PlacementTruthRow,
+            placement_truth_row_bytes, placement_truth_xterm_key,
+        };
+        use astrolabe_panel::LayerRole;
+
+        let (dir, vault) = reactive_vault("live-anomalies-xterm-cotenant");
+
+        // Genuine loom agreement row: a doc-drift designed pair (S18/S19), the
+        // exact XtermRow JSON shape live_anomaly_inputs_from_vault reads back.
+        let genuine_cx = cx(101);
+        let agreement_key = xterm_key(
+            genuine_cx,
+            SLOT_DOC_SEMANTIC,
+            SIM_SEMANTIC_SLOT,
+            XTermKind::Agreement,
+        );
+        let genuine_row = XtermRow {
+            key: calyx_loom::CrossTermKey {
+                cx_id: genuine_cx,
+                a: SLOT_DOC_SEMANTIC,
+                b: SIM_SEMANTIC_SLOT,
+                kind: LoomCrossTermKind::Agreement,
+            },
+            value: LoomCrossTermValue::Scalar(0.2),
+            tag: calyx_loom::SignalProvenanceTag::Derived,
+        };
+        let genuine_value = serde_json::to_vec(&genuine_row).expect("encode genuine xterm row");
+        vault
+            .write_cf_batch([(ColumnFamily::XTerm, agreement_key.clone(), genuine_value)])
+            .expect("write genuine xterm row");
+        vault.flush().expect("flush genuine xterm row");
+
+        // Plant a placement_truth co-tenant row exactly as layout_lane.rs writes
+        // it: key = "astrolabe:shadow:placement_truth:v1\0<project>\0" ||
+        // placement_truth_xterm_key(symbol_cx, dir_cx); value = the line-based
+        // `schema=astrolabe.placement_truth.v1\n...` artifact bytes (NOT JSON).
+        let placement_value = placement_truth_row_bytes(&PlacementTruthRow {
+            schema: PLACEMENT_TRUTH_SCHEMA,
+            symbol_id: "cx:55".to_string(),
+            qualified_name: "crate::layout::widget".to_string(),
+            directory_id: "cx:7".to_string(),
+            agreement: 0.9,
+            symbol_role: LayerRole::Persistence,
+            directory_role: LayerRole::Persistence,
+            agrees: true,
+            provenance: PLACEMENT_TRUTH_PROVENANCE,
+        });
+        assert!(
+            placement_value.starts_with(b"schema=astrolabe.placement_truth.v1\n"),
+            "planted row must match the live line-based text shape"
+        );
+        let mut placement_key = b"astrolabe:shadow:placement_truth:v1\0".to_vec();
+        placement_key.extend_from_slice(b"astrolabe\0");
+        placement_key.extend_from_slice(&placement_truth_xterm_key(b"cx:55", b"cx:7"));
+        vault
+            .write_cf_batch([(
+                ColumnFamily::XTerm,
+                placement_key.clone(),
+                placement_value.clone(),
+            )])
+            .expect("write placement_truth co-tenant row");
+        vault.flush().expect("flush placement_truth co-tenant row");
+
+        let reopened = open_reactive_vault(&dir);
+
+        // The co-tenant row is independently readable back (semantics intact).
+        let raw_placement = reopened
+            .read_cf_at(reopened.snapshot(), ColumnFamily::XTerm, &placement_key)
+            .expect("read placement_truth CF row")
+            .expect("placement_truth row present");
+        assert_eq!(raw_placement, placement_value);
+
+        // SERVE: the anomaly reader no longer fails closed on the co-tenant row.
+        let inputs = live_anomaly_inputs_from_vault(&reopened)
+            .expect("live anomaly read must not fail closed on placement_truth co-tenant");
+        assert_eq!(
+            inputs.xterm_rows_read, 1,
+            "genuine loom agreement row still read"
+        );
+        // COUNTED SKIP: the placement_truth row is skipped and counted.
+        assert_eq!(
+            inputs.xterm_cotenant_rows_skipped, 1,
+            "placement_truth co-tenant row skipped and counted"
+        );
+
+        // Also pin the second full-XTerm-scan reader (read_eager_cross_term_rows /
+        // agreement graph aspect): it must serve and count the co-tenant too.
+        let (designed_rows, eager_skipped) =
+            read_eager_cross_term_rows_with_cotenants(&reopened).expect("read designed rows");
+        assert_eq!(
+            eager_skipped, 1,
+            "agreement reader counts the co-tenant skip"
+        );
+        assert_eq!(
+            designed_rows.len(),
+            1,
+            "the one genuine designed doc-drift row is returned"
+        );
+        let aspect = xterm_rows::agreement_graph_aspect(&reopened).expect("agreement graph aspect");
+        assert_eq!(aspect.cotenant_rows_skipped, 1);
+
+        // NEGATIVE: a genuinely corrupt xterm row (no schema tag) still fails the
+        // read closed (invariant 5 preserved).
+        reopened
+            .write_cf_batch([(
+                ColumnFamily::XTerm,
+                b"astrolabe:corrupt:xterm-key".to_vec(),
+                vec![0x00, 0x01, 0x02, 0x03],
+            )])
+            .expect("write corrupt xterm row");
+        reopened.flush().expect("flush corrupt xterm row");
+        let error = live_anomaly_inputs_from_vault(&reopened)
+            .expect_err("corrupt xterm row must fail closed");
+        assert_eq!(error.code, "CALYX_ASTER_CORRUPT_SHARD");
+        let eager_error = read_eager_cross_term_rows_with_cotenants(&reopened)
+            .expect_err("corrupt xterm row must fail the agreement reader closed");
+        assert_eq!(eager_error.code, ASTRO_XTERM_ROW_CORRUPT);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // #369: empty XTerm CF edge — the co-tenant-aware readers serve an empty
+    // result with a zero skip count, never fabricating rows or failing closed.
+    #[test]
+    fn live_anomaly_read_empty_xterm_cf_serves_zero() {
+        let (dir, vault) = reactive_vault("live-anomalies-xterm-empty");
+        let reopened = open_reactive_vault(&dir);
+        let inputs =
+            live_anomaly_inputs_from_vault(&reopened).expect("empty XTerm CF must not fail closed");
+        assert_eq!(inputs.xterm_rows_read, 0);
+        assert_eq!(inputs.xterm_cotenant_rows_skipped, 0);
+        let (rows, skipped) =
+            read_eager_cross_term_rows_with_cotenants(&reopened).expect("empty designed read");
+        assert!(rows.is_empty());
+        assert_eq!(skipped, 0);
+        let _ = &vault;
         fs::remove_dir_all(dir).ok();
     }
 

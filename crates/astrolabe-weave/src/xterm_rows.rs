@@ -312,21 +312,48 @@ pub struct PersistedEagerCrossTermRow {
 /// mismatches (the CF-wide `XtermRow` JSON shape is already the contract the
 /// live anomaly reader enforces), and returns exactly the rows whose slot pair
 /// and kind match one of the six designed agreements.
+///
+/// `ColumnFamily::XTerm` is shared with the layout lane's `placement_truth`
+/// co-tenant rows (#369); those are skipped (co-tenant-aware) exactly as the
+/// live-anomaly reader does. Use [`read_eager_cross_term_rows_with_cotenants`]
+/// when the count of skipped co-tenant rows must be surfaced.
 pub fn read_eager_cross_term_rows<C>(
     vault: &AsterVault<C>,
 ) -> calyx_core::Result<Vec<PersistedEagerCrossTermRow>>
 where
     C: Clock,
 {
+    Ok(read_eager_cross_term_rows_with_cotenants(vault)?.0)
+}
+
+/// [`read_eager_cross_term_rows`] returning the count of shared-CF co-tenant
+/// rows skipped (layout `placement_truth` rows, #369) alongside the designed
+/// rows — a counted, labeled skip, not an error. A genuinely corrupt xterm row
+/// (undecodable, no accepted co-tenant schema marker) still fails closed.
+pub fn read_eager_cross_term_rows_with_cotenants<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<(Vec<PersistedEagerCrossTermRow>, usize)>
+where
+    C: Clock,
+{
     let snapshot = vault.snapshot();
+    let accepted_cotenants = crate::accepted_xterm_cotenant_schemas();
     let mut rows = Vec::new();
+    let mut cotenant_skipped = 0usize;
     for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::XTerm)? {
-        let row: XtermRow = serde_json::from_slice(&value).map_err(|error| {
-            xterm_corrupt(format!(
-                "decode XTerm row {}: {error}",
-                hex_lower_bytes(&key)
-            ))
-        })?;
+        let row: XtermRow = match serde_json::from_slice(&value) {
+            Ok(row) => row,
+            Err(error) => {
+                if crate::is_accepted_xterm_cotenant(&value, &accepted_cotenants) {
+                    cotenant_skipped += 1;
+                    continue;
+                }
+                return Err(xterm_corrupt(format!(
+                    "decode XTerm row {}: {error}",
+                    hex_lower_bytes(&key)
+                )));
+            }
+        };
         let expected_key = xterm_key(
             row.key.cx_id,
             row.key.a,
@@ -347,7 +374,7 @@ where
         };
         rows.push(PersistedEagerCrossTermRow { key, kind, row });
     }
-    Ok(rows)
+    Ok((rows, cotenant_skipped))
 }
 
 /// Recomputes the designed-pair agreement graph from persisted XTerm CF rows.
@@ -362,15 +389,28 @@ pub fn agreement_graph_from_persisted_rows<C>(
 where
     C: Clock,
 {
+    Ok(agreement_graph_from_persisted_rows_with_cotenants(vault)?.0)
+}
+
+/// [`agreement_graph_from_persisted_rows`] returning the count of shared-CF
+/// co-tenant rows skipped (layout `placement_truth` rows, #369) alongside the
+/// edges — surfaced by [`agreement_graph_aspect`] as a labeled, counted skip.
+pub fn agreement_graph_from_persisted_rows_with_cotenants<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<(Vec<PersistedAgreementEdge>, usize)>
+where
+    C: Clock,
+{
     let mut sums = BTreeMap::<EagerAgreementKind, (f64, usize)>::new();
-    for persisted in read_eager_cross_term_rows(vault)? {
+    let (rows, cotenant_skipped) = read_eager_cross_term_rows_with_cotenants(vault)?;
+    for persisted in rows {
         if let LoomCrossTermValue::Scalar(value) = persisted.row.value {
             let entry = sums.entry(persisted.kind).or_default();
             entry.0 += f64::from(value);
             entry.1 += 1;
         }
     }
-    Ok(EagerAgreementKind::ALL
+    let edges = EagerAgreementKind::ALL
         .into_iter()
         .map(|kind| {
             let (sum, scalar_count) = sums.get(&kind).copied().unwrap_or_default();
@@ -384,7 +424,8 @@ where
                 provenance: AGREEMENT_GRAPH_ASPECT_PROVENANCE,
             }
         })
-        .collect())
+        .collect();
+    Ok((edges, cotenant_skipped))
 }
 
 /// The `get_architecture` agreement-graph aspect payload.
@@ -412,6 +453,10 @@ pub struct AgreementGraphAspect {
     pub populated_edge_count: usize,
     /// Total persisted scalar rows across all designed pairs.
     pub scalar_row_count: usize,
+    /// Count of shared `ColumnFamily::XTerm` co-tenant rows (layout
+    /// `placement_truth` rows, #369) skipped while reading the designed rows — a
+    /// counted, labeled skip, not an error.
+    pub cotenant_rows_skipped: usize,
     /// The six designed-pair edges (mean nullable, never zero-filled).
     pub edges: Vec<PersistedAgreementEdge>,
     /// Provenance label: the physical source of these bytes.
@@ -434,7 +479,7 @@ pub fn agreement_graph_aspect<C>(vault: &AsterVault<C>) -> calyx_core::Result<Ag
 where
     C: Clock,
 {
-    let edges = agreement_graph_from_persisted_rows(vault)?;
+    let (edges, cotenant_rows_skipped) = agreement_graph_from_persisted_rows_with_cotenants(vault)?;
     let populated_edge_count = edges.iter().filter(|edge| edge.scalar_count > 0).count();
     let scalar_row_count = edges.iter().map(|edge| edge.scalar_count).sum();
     let status = if scalar_row_count == 0 {
@@ -448,6 +493,7 @@ where
         edge_count: edges.len(),
         populated_edge_count,
         scalar_row_count,
+        cotenant_rows_skipped,
         edges,
         provenance: AGREEMENT_GRAPH_ASPECT_PROVENANCE,
         freshness: "fresh",

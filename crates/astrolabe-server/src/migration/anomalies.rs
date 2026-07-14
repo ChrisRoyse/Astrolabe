@@ -358,6 +358,10 @@ pub(crate) fn live_anomaly_source_state_json(
         "snapshot": inputs.snapshot,
         "xterm_rows_read": inputs.xterm_rows_read,
         "assay_rows_read": inputs.assay_rows_read,
+        // Shared XTerm CF co-tenant rows (layout placement_truth, #369) skipped
+        // during the live XTerm scan: a counted, labeled skip, not a degradation
+        // (invariant 3). Before #369 these rows failed the whole read closed.
+        "xterm_cotenant_rows_skipped": inputs.xterm_cotenant_rows_skipped,
         // Shared Assay CF co-tenant rows (delta-invalidation, #348) skipped
         // during load: a counted, labeled skip, not a degradation (invariant 3).
         "assay_cotenant_rows_skipped": inputs.assay_cotenant_rows_skipped,
