@@ -13372,7 +13372,7 @@ fn sweep_error_reason(outcome: &SweepOutcome) -> String {
     outcome
         .text
         .split_whitespace()
-        .map(|word| word.trim_end_matches(|c: char| matches!(c, ':' | ',' | '"')))
+        .map(|word| word.trim_end_matches([':', ',', '"']))
         .find(|word| {
             word.len() > 4
                 && word.contains('_')

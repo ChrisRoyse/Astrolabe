@@ -216,7 +216,7 @@ fn as_of_bucket_store_dir(cache_dir: &Path, project: &str, bucket: u64) -> PathB
 }
 
 /// The `as_of` provenance metadata stamped onto a served historical result.
-struct AsOfMeta {
+pub(crate) struct AsOfMeta {
     requested_millis: u64,
     canonical_millis: u64,
     bucket: u64,
