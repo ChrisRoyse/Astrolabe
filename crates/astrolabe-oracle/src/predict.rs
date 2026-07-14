@@ -331,6 +331,22 @@ impl PredictConfig {
     fn max_confidence(&self) -> f64 {
         self.max_confidence_permille as f64 / 1000.0
     }
+
+    /// The hard confidence ceiling (DPI abundance cap) served consequences are
+    /// bounded by, always strictly below `1.0`. This is the ceiling metadata that
+    /// accompanies every served confidence through [`crate::gate::GatedConfidence`]
+    /// (HONEST invariant 1: no unlabeled claim).
+    pub fn served_ceiling(&self) -> f64 {
+        self.max_confidence()
+    }
+
+    /// The structural-only provisional risk served for a symbol with no grounded
+    /// change→outcome evidence — the registry-declared provisional-confidence knob
+    /// (blueprint §3, default 0.35). Used as the labeled-provisional fallback in
+    /// [`grounded_risk`] and the `detect_changes` grounded-risk surface.
+    pub fn provisional_fallback_risk(&self) -> f64 {
+        self.provisional_confidence()
+    }
 }
 
 fn check_predict_knob(name: &str, value: u64) -> Result<(), OracleError> {
@@ -695,6 +711,98 @@ pub struct InsufficientReport {
 pub enum ImpactOutcome {
     Grounded(ImpactPrediction),
     Insufficient(InsufficientReport),
+}
+
+// ---------------------------------------------------------------------------
+// detect_changes grounded risk (blueprint P6.3 scaffold, finalized #52)
+// ---------------------------------------------------------------------------
+
+/// A per-symbol change risk, grounded in oracle evidence where it exists and
+/// falling back to the topological hop→risk (labeled provisional) where it does
+/// not.
+///
+/// This finalizes the P6.3 `detect_changes` grounded-risk scaffold: an
+/// oracle-backed failure-association probability *replaces* the hop→risk heuristic
+/// whenever the subject carries grounded change→outcome evidence, and the legacy
+/// hop→risk is served — clearly labeled `provisional` (HONEST invariant 3, a
+/// labeled degradation) — only when no evidence exists. The risk is always capped
+/// by the DPI ceiling so it is strictly below `1.0` and can be served through
+/// [`crate::gate::GatedConfidence`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundedRisk {
+    /// The subject the risk was computed for.
+    pub subject: CxId,
+    /// The change risk in `[0, ceiling]`, always strictly `< 1.0`.
+    pub risk: f64,
+    /// The DPI ceiling the risk is capped by (strictly `< 1.0`).
+    pub ceiling: f64,
+    /// Trust of the risk: the evidence trust when grounded above the floor, else
+    /// `Provisional`.
+    pub trust: TrustTag,
+    /// Whether the risk came from oracle evidence (`true`) or the hop fallback.
+    pub grounded: bool,
+    /// Number of grounded occurrences backing the risk (`0` = hop fallback).
+    pub evidence_n: usize,
+}
+
+/// Computes the grounded change risk for one subject.
+///
+/// * **Grounded** (subject carries at least the evidence floor of occurrences):
+///   the risk is the subject's ceiling-capped failure-association confidence, with
+///   the evidence's trust (or `Provisional` when grounded mode is off).
+/// * **Thin** (subject carries some but fewer than the floor occurrences): still a
+///   probability from evidence, but labeled `Provisional`.
+/// * **Ungrounded** (no occurrences): the `fallback_hop_risk` heuristic, clamped
+///   below the ceiling and labeled `Provisional`.
+///
+/// `fallback_hop_risk` must be a finite, non-negative value (the legacy
+/// `detect_changes` hop→risk); a malformed fallback fails closed.
+pub fn grounded_risk(
+    evidence: &OracleEvidence,
+    subject: CxId,
+    fallback_hop_risk: f64,
+    config: &PredictConfig,
+) -> Result<GroundedRisk, OracleError> {
+    config.validate()?;
+    let ceiling = config.max_confidence();
+    match evidence.node(subject) {
+        Some(node) => {
+            let risk = node.ceiled_confidence(config).min(ceiling);
+            let grounded_enough =
+                node.n >= config.evidence_floor as usize && config.advertise_grounded;
+            let trust = if grounded_enough {
+                node.trust
+            } else {
+                TrustTag::Provisional
+            };
+            Ok(GroundedRisk {
+                subject,
+                risk,
+                ceiling,
+                trust,
+                grounded: true,
+                evidence_n: node.n,
+            })
+        }
+        None => {
+            if !fallback_hop_risk.is_finite() || fallback_hop_risk < 0.0 {
+                return Err(predict_error(
+                    ASTRO_ORACLE_PREDICT_REQUEST_INVALID,
+                    format!(
+                        "fallback hop risk {fallback_hop_risk} is not a finite non-negative value"
+                    ),
+                ));
+            }
+            Ok(GroundedRisk {
+                subject,
+                risk: fallback_hop_risk.min(ceiling),
+                ceiling,
+                trust: TrustTag::Provisional,
+                grounded: false,
+                evidence_n: 0,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,6 +1759,90 @@ mod tests {
                 .expect_err("self loop")
                 .code,
             ASTRO_ORACLE_GRAPH_INVALID
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // detect_changes grounded risk (P6.3 scaffold finalized, #52).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn grounded_risk_replaces_hop_fallback_when_evidence_exists() {
+        let config = PredictConfig::default();
+        let base = 1_700_000_000u64;
+        // cx1: 4 fails, 0 pass => ceiled 0.8; well above the evidence floor.
+        let records = records_on(cx(1), base, 4, 0);
+        let evidence = OracleEvidence::from_occurrences(&records);
+
+        // A wildly different hop fallback is IGNORED because evidence exists.
+        let risk = grounded_risk(&evidence, cx(1), 0.123, &config).unwrap();
+        assert!(risk.grounded, "evidence-backed => grounded");
+        assert_eq!(risk.evidence_n, 4);
+        assert!(
+            (risk.risk - 0.8).abs() < 1e-12,
+            "probability replaces hop, got {}",
+            risk.risk
+        );
+        assert_eq!(risk.trust, TrustTag::Trusted);
+        assert!(risk.risk < 1.0 && risk.risk <= risk.ceiling);
+        assert!(risk.ceiling < 1.0);
+    }
+
+    #[test]
+    fn grounded_risk_falls_back_to_hop_provisional_when_ungrounded() {
+        let config = PredictConfig::default();
+        // cx5 has no evidence at all: the hop→risk fallback is served, provisional.
+        let evidence = OracleEvidence::from_occurrences(&[]);
+        let risk = grounded_risk(&evidence, cx(5), 0.42, &config).unwrap();
+        assert!(!risk.grounded, "no evidence => hop fallback");
+        assert_eq!(risk.evidence_n, 0);
+        assert!((risk.risk - 0.42).abs() < 1e-12, "hop risk passed through");
+        assert_eq!(
+            risk.trust,
+            TrustTag::Provisional,
+            "fallback is labeled provisional"
+        );
+
+        // A fallback above the ceiling is clamped below 1.0.
+        let clamped = grounded_risk(&evidence, cx(5), 5.0, &config).unwrap();
+        assert!((clamped.risk - config.max_confidence()).abs() < 1e-12);
+        assert!(clamped.risk < 1.0);
+
+        // A malformed fallback fails closed.
+        assert_eq!(
+            grounded_risk(&evidence, cx(5), f64::NAN, &config)
+                .expect_err("non-finite fallback")
+                .code,
+            ASTRO_ORACLE_PREDICT_REQUEST_INVALID
+        );
+        assert_eq!(
+            grounded_risk(&evidence, cx(5), -1.0, &config)
+                .expect_err("negative fallback")
+                .code,
+            ASTRO_ORACLE_PREDICT_REQUEST_INVALID
+        );
+    }
+
+    #[test]
+    fn thin_evidence_yields_provisional_grounded_risk() {
+        let config = PredictConfig::default();
+        let base = 1_800_000_000u64;
+        // cx2 has a single occurrence (below evidence floor 3): still a probability
+        // from evidence, but labeled provisional, not the hop fallback.
+        let records = records_on(cx(2), base, 1, 0);
+        let evidence = OracleEvidence::from_occurrences(&records);
+        let risk = grounded_risk(&evidence, cx(2), 0.99, &config).unwrap();
+        assert!(risk.grounded, "evidence exists even if thin");
+        assert_eq!(risk.evidence_n, 1);
+        assert_eq!(
+            risk.trust,
+            TrustTag::Provisional,
+            "thin evidence => provisional"
+        );
+        assert!(risk.risk < 1.0, "still capped below 1.0");
+        assert!(
+            (risk.risk - 0.99).abs() > 1e-9,
+            "not the hop fallback value"
         );
     }
 

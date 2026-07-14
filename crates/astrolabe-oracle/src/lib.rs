@@ -10,17 +10,28 @@
 //! downstream oracle chain reads verified persisted state, never a planner echo.
 
 pub mod corpus;
+pub mod gate;
 pub mod predict;
 
 pub use predict::{
     ASTRO_ORACLE_GRAPH_INVALID, ASTRO_ORACLE_PREDICT_CONFIG_INVALID,
     ASTRO_ORACLE_PREDICT_REQUEST_INVALID, BacktestCase, BacktestReport, Consequence,
-    ConsequenceEdge, ConsequenceEdgeKind, ConsequenceGraph, ImpactOutcome, ImpactPrediction,
-    InsufficientReport, NodeEvidence, ORACLE_BACKTEST_TOP_K_SUCCESS_RATE,
+    ConsequenceEdge, ConsequenceEdgeKind, ConsequenceGraph, GroundedRisk, ImpactOutcome,
+    ImpactPrediction, InsufficientReport, NodeEvidence, ORACLE_BACKTEST_TOP_K_SUCCESS_RATE,
     ORACLE_INSUFFICIENT_REMEDIATION, ORACLE_PREDICT_KNOB_REGISTRY_VERSION, ORACLE_PREDICT_KNOBS,
     ORACLE_SENSOR_DIRECT_CHANGE_HISTORY, OracleEvidence, PredictConfig, PredictRequest,
-    SensorDeficit, TestSelection, backtest_phase_gate, oracle_predict_knob, predict_impact,
-    run_backtest,
+    SensorDeficit, TestSelection, backtest_phase_gate, grounded_risk, oracle_predict_knob,
+    predict_impact, run_backtest,
+};
+
+pub use gate::{
+    ASTRO_ORACLE_BACKTEST_NOT_BEATEN, ASTRO_ORACLE_FLAKY_EVIDENCE, ASTRO_ORACLE_INSUFFICIENT,
+    ASTRO_ORACLE_NO_RECURRENCE, ASTRO_ORACLE_UNGATED_CONFIDENCE, DegradedMode, EvidenceSnapshot,
+    FailureMode, GateConfig, GateRefusal, GateVerdict, GatedConfidence, LensDeficit,
+    ORACLE_FAILURE_MODES, ORACLE_GATE_FLAKY_SELF_CONSISTENCY_PERMILLE_KNOB,
+    ORACLE_GATE_KNOB_REGISTRY_VERSION, ORACLE_GATE_KNOBS,
+    ORACLE_GATE_MIN_GROUNDED_OCCURRENCES_KNOB, ORACLE_GATE_RECURRENCE_FLOOR_KNOB,
+    ORACLE_GATE_SENSOR_DIRECT_CHANGE_HISTORY, honesty_gate, oracle_failure_mode, oracle_gate_knob,
 };
 
 pub use corpus::{
