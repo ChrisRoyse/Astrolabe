@@ -29,6 +29,8 @@
 #![deny(missing_docs)]
 
 pub mod bits;
+pub mod calibration;
+pub mod causality;
 pub mod changepoint;
 pub mod deficits;
 pub mod diff;
@@ -44,17 +46,29 @@ pub mod periodicity;
 pub mod population;
 pub mod projection;
 pub mod redundancy;
+pub mod redundancy_card;
 pub mod rng;
 pub mod scheduler;
+pub mod stats;
 pub mod store;
 pub mod strata;
 pub mod synergy;
+pub mod synergy_card;
 pub mod transfer_entropy;
 
 pub use bits::{
     AxisValues, BitsConfig, BitsInterval, DeficitSuggestedAction, SignalBits, SignalRankingCard,
     SlotDeficit, SlotObservations, SlotSummary, SlotValues, SufficiencyCard, build_signal_ranking,
     build_sufficiency_card, enforce_dpi_ceiling, measure_slot_bits,
+};
+pub use calibration::{
+    CalibrationCard, CalibrationConfig, CalibrationLedger, CalibrationLedgerEntry,
+    CalibrationSource, MeasuredPrecision, StrategyCalibration, StrategyObservation,
+    build_calibration_card, calibration_input_fingerprint,
+};
+pub use causality::{
+    CausalityCard, CausalityConfig, CausalityEdge, CausalityEdgeInput, CausalityLag,
+    build_causality_card,
 };
 pub use changepoint::{ChangePointCard, measure_change_point};
 pub use deficits::{DeficitMeasurement, OPTIMIZER_DEFICITS_SCHEMA, optimizer_deficits_document};
@@ -71,22 +85,23 @@ pub use multivariate::{
 };
 pub use periodicity::{PeriodicityCard, measure_periodicity};
 pub use population::{AssaySubject, Population};
-pub use redundancy::{
-    GateDecision, PairwiseNmi, RedundancyCard, RedundancyGate, measure_redundancy,
+pub use redundancy::{GateDecision, PairwiseNmi, RedundancyGate, measure_redundancy};
+pub use redundancy_card::{
+    RedundancyCard, RedundancyConfig, RedundantPair, SlotColumn, build_redundancy_card,
 };
 pub use scheduler::{
     AssayScheduler, CooperativeScorer, IsolationDecision, SampleRequest, ScheduleOutcome,
     TickReport, TickStep, check_serving_isolation, serving_p99_micros,
 };
+pub use stats::{inverse_standard_normal_cdf, wilson_interval};
 pub use store::AssayStore;
 pub use strata::{SampleResult, SelectedSubject, StratumAllocation, stratified_sample};
-pub use synergy::{
-    SynergyCard, SynergyClass, SynergyTriple, SynergyTripleInput, measure_synergy,
-    measure_synergy_triple,
+pub use synergy::{SynergyClass, measure_synergy, measure_synergy_triple};
+pub use synergy_card::{
+    SynergyCard, SynergyClassification, SynergyConfig, SynergyTriple, SynergyTripleInput,
+    build_synergy_card,
 };
-pub use transfer_entropy::{
-    CausalityCard, DirectionEval, DrivesEdge, NamedSeries, measure_transfer_entropy,
-};
+pub use transfer_entropy::{DirectionEval, DrivesEdge, NamedSeries, measure_transfer_entropy};
 
 /// The Cargo package name for this crate.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

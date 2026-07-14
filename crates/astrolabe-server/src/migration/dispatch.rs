@@ -13,6 +13,7 @@ pub fn handle_tool_raw(
         "get_provenance" => handle_get_provenance(args_json),
         "optimizer_status" => handle_optimizer_status(args_json),
         "get_readiness" => handle_get_readiness(args_json),
+        "measure_bits" => handle_measure_bits(args_json),
         "impute_fields" => handle_impute_fields(args_json),
         "anchor_outcome" => handle_anchor_outcome(args_json),
         "coverage_ingest" => handle_coverage_ingest(args_json),
@@ -353,6 +354,7 @@ pub(crate) fn handle_get_architecture(
                 "anomalies": read_anomaly_report(&cache_dir, &project)?,
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
                 "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
+                "redundancy": read_redundancy_neff_aspect(&cache_dir, &project),
             },
         }),
     )
@@ -623,6 +625,52 @@ pub(crate) fn handle_get_readiness(args_json: &str) -> Result<String, DynError> 
     let axis = string_arg(args_obj, "axis");
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
     tool_json_result(readiness_status_json_at(&cache_dir, &project, scope, axis)?)
+}
+
+pub(crate) fn handle_measure_bits(args_json: &str) -> Result<String, DynError> {
+    let args = serde_json::from_str::<Value>(args_json)?;
+    let Some(args_obj) = args.as_object() else {
+        return tool_error_result("measure_bits arguments must be a JSON object");
+    };
+    let Some(project) = status_project_from_args(args_obj)? else {
+        return tool_error_result("measure_bits requires project");
+    };
+    let Some(mode) = string_arg(args_obj, "mode") else {
+        return tool_error_result(
+            "ASTRO_ASSAY_MEASURE_BITS_MODE_REQUIRED: measure_bits requires mode; remediation: pass one of signals, sufficiency, redundancy, synergy, causality, calibration",
+        );
+    };
+    if !MEASURE_BITS_MODES.contains(&mode) {
+        return tool_error_result(format!(
+            "ASTRO_ASSAY_MEASURE_BITS_MODE_UNSUPPORTED: measure_bits mode {mode:?} is not available; remediation: use one of signals, sufficiency, redundancy, synergy, causality, calibration"
+        ));
+    }
+    // An axis argument that is present but not a non-empty string is refused: the
+    // caller asked for a specific axis and we will not silently ignore a malformed
+    // one. Absence of the key is the legitimate panel-wide default.
+    if measure_bits_axis_arg_invalid(args_obj) {
+        return tool_error_result(
+            "ASTRO_ASSAY_MEASURE_BITS_AXIS_INVALID: measure_bits axis must be a non-empty string when provided; remediation: pass a named outcome axis or omit axis for a panel-wide mode",
+        );
+    }
+    if read_dial(&project)? != MigrationDial::Shadow {
+        return tool_error_result(
+            "measure_bits requires calyx shadow indexing; run index_repository with calyx=\"shadow\"",
+        );
+    }
+    let axis = string_arg(args_obj, "axis");
+    let scope = string_arg(args_obj, "scope");
+    let refresh = args_obj
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let value = measure_bits_json_at(&cache_dir, &project, mode, axis, scope, refresh)?;
+    if value.get("status").and_then(Value::as_str) == Some("refused") {
+        tool_json_error_result(value)
+    } else {
+        tool_json_result(value)
+    }
 }
 
 pub(crate) fn handle_impute_fields(args_json: &str) -> Result<String, DynError> {
