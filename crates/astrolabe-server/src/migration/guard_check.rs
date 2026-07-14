@@ -347,7 +347,10 @@ fn measure_candidate_and_exemplars_through_panel(
     let driver = PanelDriver::new(panel_version).map_err(|err| {
         (
             "ASTRO_GUARD_CHECK_PANEL_VERSION",
-            format!("panel version {panel_version} is invalid: {}", err.message()),
+            format!(
+                "panel version {panel_version} is invalid: {}",
+                err.message()
+            ),
             "Check with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
         )
     })?;
@@ -356,10 +359,11 @@ fn measure_candidate_and_exemplars_through_panel(
     let measure = |obj: &Map<String, Value>,
                    index: usize|
      -> Result<MeasuredSymbol, (&'static str, String, String)> {
-        let map = measure_guard_panel_sources(&driver, &runtime, obj, index)
-            .map_err(|(_code, message, remediation)| {
+        let map = measure_guard_panel_sources(&driver, &runtime, obj, index).map_err(
+            |(_code, message, remediation)| {
                 ("ASTRO_GUARD_CHECK_PANEL_FAILED", message, remediation)
-            })?;
+            },
+        )?;
         let input = slot_input_from_panel(&map).map_err(|error| {
             (
                 error.code(),

@@ -16,7 +16,9 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use astrolabe_guard::auto::{CorpusPanelMeasurer, MeasuredSymbol as AutoMeasured, calibrate_auto_from_corpus};
+use astrolabe_guard::auto::{
+    CorpusPanelMeasurer, MeasuredSymbol as AutoMeasured, calibrate_auto_from_corpus,
+};
 use astrolabe_guard::calibration::{
     AlienSymbol, BadCase, CalibrationDomain, CalibrationError, CalibrationLanguage, CorpusInputs,
     MixPolicy, RevertRecord, build_corpus, enumerate_mutants,
@@ -42,7 +44,8 @@ use calyx_core::{SlotId, SlotVector};
 
 fn embedding_table() -> &'static StaticEmbeddingTable {
     static TABLE: OnceLock<StaticEmbeddingTable> = OnceLock::new();
-    TABLE.get_or_init(|| StaticEmbeddingTable::load_default().expect("load default embedding table"))
+    TABLE
+        .get_or_init(|| StaticEmbeddingTable::load_default().expect("load default embedding table"))
 }
 
 /// The family-stable prefix of a symbol name: the name with any trailing digits and
@@ -121,7 +124,11 @@ fn measure_source(code: &str, name: &str) -> BTreeMap<u16, SlotVector> {
         cyclomatic: 1.0 + count("if") + count("for") + count("while") + count("match"),
         cognitive: count("if") + count("for") + count("while"),
         loop_count: count("for") + count("while"),
-        loop_depth: if count("for") + count("while") > 0.0 { 1.0 } else { 0.0 },
+        loop_depth: if count("for") + count("while") > 0.0 {
+            1.0
+        } else {
+            0.0
+        },
         max_access_depth: code.matches('.').count() as f32,
         param_count: code.matches(',').count() as f32,
         body_lines: code.lines().count() as f32,
@@ -216,7 +223,8 @@ fn measure_source(code: &str, name: &str) -> BTreeMap<u16, SlotVector> {
         ..EncoderLensInput::default()
     };
     let s = |slot: u16| -> SlotVector {
-        encode_slot(SlotId::new(slot), &lens_input).unwrap_or_else(|e| panic!("S{slot} encodes: {e}"))
+        encode_slot(SlotId::new(slot), &lens_input)
+            .unwrap_or_else(|e| panic!("S{slot} encodes: {e}"))
     };
 
     BTreeMap::from([
@@ -278,7 +286,10 @@ struct RealPanelMeasurer;
 
 impl CorpusPanelMeasurer for RealPanelMeasurer {
     fn measure_bad_case(&self, case: &BadCase) -> Result<AutoMeasured, CalibrationError> {
-        Ok(AutoMeasured::new(measure_source(&case.code, &case.provenance)))
+        Ok(AutoMeasured::new(measure_source(
+            &case.code,
+            &case.provenance,
+        )))
     }
 }
 
@@ -293,8 +304,7 @@ fn domain() -> CalibrationDomain {
 fn corpus_inputs() -> CorpusInputs {
     // Mutation sources are the alien/collection family: real mutants of code unlike the
     // trusted arithmetic scope, so the generated bad population is out-of-distribution.
-    let mutation_sources: Vec<String> =
-        alien_family(6, 0).into_iter().map(|(_, c)| c).collect();
+    let mutation_sources: Vec<String> = alien_family(6, 0).into_iter().map(|(_, c)| c).collect();
     let alien_symbols: Vec<AlienSymbol> = alien_family(20, 100)
         .into_iter()
         .map(|(_, code)| AlienSymbol {
@@ -347,7 +357,10 @@ fn auto_from_corpus_real_panel_calibrates_and_persists() {
     )
     .expect("auto-from-corpus calibrates over the real panel");
     assert!(!profile.provisional, "profile must be measured");
-    assert_eq!(profile.corpus_hash, corpus.corpus_hash, "corpus hash pinned");
+    assert_eq!(
+        profile.corpus_hash, corpus.corpus_hash,
+        "corpus hash pinned"
+    );
 
     // FSV: persist the calibration meta bytes, read them back, re-parse, and confirm
     // the corpus hash round-trips from disk (persisted bytes, not an in-memory echo).
@@ -377,7 +390,10 @@ fn auto_from_corpus_real_panel_calibrates_and_persists() {
         CONFORMAL_ALPHA,
     )
     .unwrap();
-    assert_eq!(profile.canonical_profile_hash(), again.canonical_profile_hash());
+    assert_eq!(
+        profile.canonical_profile_hash(),
+        again.canonical_profile_hash()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +509,10 @@ fn panel_driven_guard_check_real_corpus_roc_gate() {
     let mut held_bad: Vec<(String, CheckMeasured)> = Vec::new();
     for (name, code) in alien_family(10, 400) {
         held_bad.push((name.clone(), measure_check(&code, &name)));
-        if let Some(mutant) = enumerate_mutants(&code, CalibrationLanguage::Rust).into_iter().next() {
+        if let Some(mutant) = enumerate_mutants(&code, CalibrationLanguage::Rust)
+            .into_iter()
+            .next()
+        {
             held_bad.push((format!("{name}_mut"), measure_check(&mutant.code, &name)));
         }
     }
@@ -519,10 +538,8 @@ fn panel_driven_guard_check_real_corpus_roc_gate() {
 
     // FSV: persist the last verdict payload, read it back, and confirm it re-parses
     // with the full per-slot detail (persisted bytes, not an echo).
-    let path = std::env::temp_dir().join(format!(
-        "astro-guard-verdict-{}.json",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("astro-guard-verdict-{}.json", std::process::id()));
     std::fs::write(&path, &last_verdict_bytes).expect("write verdict");
     let read = std::fs::read(&path).expect("read verdict");
     std::fs::remove_file(&path).ok();

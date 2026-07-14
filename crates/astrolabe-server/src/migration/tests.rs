@@ -5422,7 +5422,6 @@ fn guard_check_new_region_records_awaiting_grounding() {
     fs::remove_dir_all(&dir).ok();
 }
 
-
 // ---- #331 panel-mode guard_check contract (wave-11 orchestrator insertion) ----
 
 /// A panel-mode candidate/exemplar body: real source text + panel input fields,
@@ -5527,7 +5526,9 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap()
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
             .contains("ASTRO_GUARD_CHECK_MEASUREMENT_AMBIGUOUS"),
         "{envelope}"
     );
@@ -5542,7 +5543,9 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap()
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
             .contains("ASTRO_GUARD_CHECK_MEASUREMENT_MISSING"),
         "{envelope}"
     );
@@ -5558,7 +5561,9 @@ fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
     let envelope = guard_check_structured(&dir, &args);
     assert_eq!(envelope["isError"], true, "{envelope}");
     assert!(
-        envelope["content"][0]["text"].as_str().unwrap()
+        envelope["content"][0]["text"]
+            .as_str()
+            .unwrap()
             .contains("ASTRO_GUARD_CHECK_MEASUREMENT_INVALID"),
         "{envelope}"
     );

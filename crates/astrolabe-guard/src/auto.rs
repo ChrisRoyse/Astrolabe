@@ -212,14 +212,7 @@ pub fn calibrate_auto_from_corpus<M: CorpusPanelMeasurer>(
         bad.push(measurer.measure_bad_case(case)?);
     }
 
-    calibrate_auto(
-        domain,
-        panel_version,
-        good,
-        &bad,
-        corpus.corpus_hash,
-        alpha,
-    )
+    calibrate_auto(domain, panel_version, good, &bad, corpus.corpus_hash, alpha)
 }
 
 fn calibrate_auto_slot(
@@ -579,7 +572,10 @@ mod tests {
             if case.code.contains(PANEL_FAULT_MARKER) {
                 return Err(CalibrationError::new(
                     ASTRO_GUARD_AUTO_PANEL_ERROR,
-                    format!("injected panel fault measuring bad case `{}`", case.provenance),
+                    format!(
+                        "injected panel fault measuring bad case `{}`",
+                        case.provenance
+                    ),
                     "Fix the panel input; the auto path never falls back on a measurement fault.",
                 ));
             }
@@ -659,12 +655,24 @@ mod tests {
             7,
         )
         .unwrap();
-        let a =
-            calibrate_auto_from_corpus(domain(), 1, &trusted_set(), &corpus, &AlienCorpusMeasurer, 0.05)
-                .unwrap();
-        let b =
-            calibrate_auto_from_corpus(domain(), 1, &trusted_set(), &corpus, &AlienCorpusMeasurer, 0.05)
-                .unwrap();
+        let a = calibrate_auto_from_corpus(
+            domain(),
+            1,
+            &trusted_set(),
+            &corpus,
+            &AlienCorpusMeasurer,
+            0.05,
+        )
+        .unwrap();
+        let b = calibrate_auto_from_corpus(
+            domain(),
+            1,
+            &trusted_set(),
+            &corpus,
+            &AlienCorpusMeasurer,
+            0.05,
+        )
+        .unwrap();
         assert_eq!(a.canonical_profile_hash(), b.canonical_profile_hash());
     }
 
@@ -702,9 +710,8 @@ mod tests {
             7,
         )
         .unwrap();
-        let err =
-            calibrate_auto_from_corpus(domain(), 1, &[], &corpus, &AlienCorpusMeasurer, 0.05)
-                .expect_err("empty trusted set must refuse");
+        let err = calibrate_auto_from_corpus(domain(), 1, &[], &corpus, &AlienCorpusMeasurer, 0.05)
+            .expect_err("empty trusted set must refuse");
         assert_eq!(err.code(), ASTRO_GUARD_AUTO_NO_TRUSTED);
     }
 
