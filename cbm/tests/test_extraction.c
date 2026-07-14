@@ -7,8 +7,38 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "helpers.h" /* cbm_utf8_truncate (#362 boundary-safe truncation) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include <time.h>
+
+/* #362: strict UTF-8 validator — mirrors the Rust row-sink's std::str::from_utf8
+ * refusal. Returns 1 if the whole NUL-terminated buffer is valid UTF-8. */
+static int is_valid_utf8(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        int n;
+        if (c < 0x80) {
+            n = 0; /* ASCII */
+        } else if ((c & 0xE0) == 0xC0 && c >= 0xC2) {
+            n = 1; /* 2-byte */
+        } else if ((c & 0xF0) == 0xE0) {
+            n = 2; /* 3-byte */
+        } else if ((c & 0xF8) == 0xF0 && c <= 0xF4) {
+            n = 3; /* 4-byte */
+        } else {
+            return 0; /* invalid lead byte (or lone continuation) */
+        }
+        p++;
+        for (int i = 0; i < n; i++) {
+            if ((*p & 0xC0) != 0x80) {
+                return 0; /* missing/short continuation */
+            }
+            p++;
+        }
+    }
+    return 1;
+}
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -1927,6 +1957,87 @@ TEST(python_docstring) {
     PASS();
 }
 
+/* #362 unit: cbm_utf8_truncate never leaves a partial multibyte sequence.
+ * Hand-computed: "aaaé" where é = 0xC3 0xA9 sits at byte indices 3,4.
+ *   - cap 5 (>= full len 5): unchanged, "aaaé".
+ *   - cap 4: byte[4]=0xA9 is a continuation → back up to lead 0xC3 at 3 → drop
+ *     the whole é → "aaa" (len 3), valid UTF-8.
+ *   - cap 3: byte[3]=0xC3 is a lead byte (boundary) → cut exactly → "aaa". */
+TEST(utf8_truncate_boundary_safe_issue362) {
+    char buf[8];
+
+    memcpy(buf, "aaa\xC3\xA9", 6); /* includes NUL */
+    ASSERT_EQ((int)cbm_utf8_truncate(buf, 10), 5); /* cap beyond len: no-op */
+    ASSERT_STR_EQ(buf, "aaa\xC3\xA9");
+    ASSERT_TRUE(is_valid_utf8(buf));
+
+    memcpy(buf, "aaa\xC3\xA9", 6);
+    ASSERT_EQ((int)cbm_utf8_truncate(buf, 4), 3); /* cap splits é: drop whole char */
+    ASSERT_STR_EQ(buf, "aaa");
+    ASSERT_TRUE(is_valid_utf8(buf));
+
+    memcpy(buf, "aaa\xC3\xA9", 6);
+    ASSERT_EQ((int)cbm_utf8_truncate(buf, 3), 3); /* cap on the lead byte: clean cut */
+    ASSERT_STR_EQ(buf, "aaa");
+    ASSERT_TRUE(is_valid_utf8(buf));
+
+    /* NULL and empty are no-ops (fail-safe). */
+    ASSERT_EQ((int)cbm_utf8_truncate(NULL, 4), 0);
+    PASS();
+}
+
+/* #362 integration: a Python docstring whose multibyte char straddles the
+ * MAX_COMMENT_LEN=500 comment cap must be truncated BEFORE the split char, so
+ * the emitted docstring is valid UTF-8 (the exact defect that fail-closed the
+ * real-corpus row sink at ~index 801). Hand-computed layout of the docstring
+ * NODE TEXT (includes the triple quotes):
+ *   index 0..2   : """            (3 bytes)
+ *   index 3..498 : 496 'a' filler (496 bytes)
+ *   index 499    : 0xC3  ── é lead byte  (straddles the 500 cap)
+ *   index 500    : 0xA9  ── é continuation byte
+ *   then "zzz" + closing """       (node text length 507 > 500)
+ * A naive cap keeps index 499 (lone 0xC3) → invalid. The fix backs up to 499
+ * and drops the whole é → retained prefix = """+496a = 499 bytes, valid. */
+TEST(docstring_multibyte_straddle_cap_issue362) {
+    char src[1024];
+    size_t p = 0;
+    const char *prefix = "def f():\n    \"\"\""; /* def header + opening triple quote */
+    memcpy(src + p, prefix, strlen(prefix));
+    p += strlen(prefix);
+    for (int i = 0; i < 496; i++) {
+        src[p++] = 'a';
+    }
+    src[p++] = (char)0xC3; /* é lead — node-text byte index 499 */
+    src[p++] = (char)0xA9; /* é continuation — node-text byte index 500 */
+    const char *suffix = "zzz\"\"\"\n    pass\n";
+    memcpy(src + p, suffix, strlen(suffix));
+    p += strlen(suffix);
+    src[p] = '\0';
+
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "test", "test.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "f") == 0) {
+            found = 1;
+            const char *doc = r->defs.items[i].docstring;
+            ASSERT_NOT_NULL(doc);
+            /* Truncated on the char boundary: """ + 496 'a' = 499 bytes. */
+            ASSERT_EQ((int)strlen(doc), 499);
+            /* Valid UTF-8 — the whole é was dropped, no lone 0xC3 tail. */
+            ASSERT_TRUE(is_valid_utf8(doc));
+            ASSERT_EQ((unsigned char)doc[498], (unsigned char)'a');
+            for (const char *q = doc; *q; q++) {
+                ASSERT_TRUE((unsigned char)*q != 0xC3);
+            }
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_function_extraction) {
     CBMFileResult *r =
         extract("package main\n\n// Greet returns a greeting.\nfunc Greet(name string) string "
@@ -3654,6 +3765,8 @@ SUITE(extraction) {
 
     /* cbm_test.go ports */
     RUN_TEST(python_docstring);
+    RUN_TEST(utf8_truncate_boundary_safe_issue362);
+    RUN_TEST(docstring_multibyte_straddle_cap_issue362);
     RUN_TEST(go_function_extraction);
     RUN_TEST(js_arrow_function);
 

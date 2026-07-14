@@ -109,9 +109,8 @@ static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpe
     if (is_throw_node(node, spec)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
-            if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
-                exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
-            }
+            // UTF-8-boundary-safe truncation (never split a multibyte char; #362).
+            cbm_utf8_truncate(exc_name, MAX_EXCEPTION_NAME_LEN);
             CBMThrow thr;
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
@@ -307,9 +306,8 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     if (has_throws && is_throw_node(node, spec)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
-            if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
-                exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
-            }
+            // UTF-8-boundary-safe truncation (never split a multibyte char; #362).
+            cbm_utf8_truncate(exc_name, MAX_EXCEPTION_NAME_LEN);
             CBMThrow thr;
             thr.exception_name = exc_name;
             thr.enclosing_func_qn = state->enclosing_func_qn;

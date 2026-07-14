@@ -1184,9 +1184,10 @@ static bool is_comment_node(const char *kind) {
 // Extract comment text, truncating to MAX_COMMENT_LEN.
 static char *extract_comment_text(CBMArena *a, TSNode node, const char *source) {
     char *text = cbm_node_text(a, node, source);
-    if (text && strlen(text) > MAX_COMMENT_LEN) {
-        text[MAX_COMMENT_LEN] = '\0';
-    }
+    // Truncate on a UTF-8 character boundary: a naive text[MAX_COMMENT_LEN]=0
+    // can slice a multibyte char in half and emit an invalid sequence that
+    // fail-closes the UTF-8-strict row sink (#362).
+    cbm_utf8_truncate(text, MAX_COMMENT_LEN);
     return text;
 }
 

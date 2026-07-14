@@ -844,10 +844,53 @@ TEST(tool_index_status_no_project) {
     PASS();
 }
 
-TEST(tool_index_status_includes_git_metadata) {
+/* #362/#342: create a minimal-but-valid .git under `root` so git repo discovery
+ * (`git rev-parse --show-toplevel`) recognizes `root` itself as the toplevel.
+ * The nearest .git wins, so this makes is_git deterministic (true) regardless of
+ * whether the test-runner's temp dir is nested inside an enclosing git worktree
+ * — the exact non-determinism that made the old hard-asserted is_git:false flap
+ * (green from a non-git CWD, RED from a lane worktree). objects/ + refs/ + a
+ * valid HEAD are git's is_git_directory() signature; no commit is needed for
+ * --show-toplevel to resolve. */
+static void make_min_git_marker(const char *root) {
+    char p[600];
+    snprintf(p, sizeof(p), "%s/.git", root);
+    cbm_mkdir(p);
+    snprintf(p, sizeof(p), "%s/.git/objects", root);
+    cbm_mkdir(p);
+    snprintf(p, sizeof(p), "%s/.git/refs", root);
+    cbm_mkdir(p);
+    snprintf(p, sizeof(p), "%s/.git/HEAD", root);
+    FILE *f = fopen(p, "w");
+    if (f) {
+        fputs("ref: refs/heads/main\n", f);
+        fclose(f);
+    }
+}
+
+static void remove_min_git_marker(const char *root) {
+    char p[600];
+    snprintf(p, sizeof(p), "%s/.git/HEAD", root);
+    cbm_unlink(p);
+    snprintf(p, sizeof(p), "%s/.git/objects", root);
+    cbm_rmdir(p);
+    snprintf(p, sizeof(p), "%s/.git/refs", root);
+    cbm_rmdir(p);
+    snprintf(p, sizeof(p), "%s/.git", root);
+    cbm_rmdir(p);
+}
+
+/* Truthful branch: the fixture root IS a git tree (own .git), so index_status
+ * must report is_git:true. Deterministic in every context — the fixture, not the
+ * runner's CWD, controls git-ness. */
+TEST(tool_index_status_git_metadata_true) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
+
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    make_min_git_marker(proj_dir);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
@@ -858,9 +901,53 @@ TEST(tool_index_status_includes_git_metadata) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"root_path\""));
     ASSERT_NOT_NULL(strstr(inner, "\"git\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"is_git\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    remove_min_git_marker(proj_dir);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Non-git branch: same fixture WITHOUT a .git, and GIT_CEILING_DIRECTORIES set
+ * to the fixture's temp root so git repo discovery cannot ascend into any
+ * enclosing worktree. index_status must then report is_git:false with the root
+ * still existing — proving the false branch is exercised deterministically
+ * rather than accidentally (which "accept either" would never do). */
+TEST(tool_index_status_git_metadata_false) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Block ascent above the fixture temp root so the surrounding worktree (if
+     * any) is invisible to `git rev-parse`. */
+    char *prev = getenv("GIT_CEILING_DIRECTORIES");
+    char saved[1024] = {0};
+    if (prev) {
+        snprintf(saved, sizeof(saved), "%s", prev);
+    }
+    cbm_setenv("GIT_CEILING_DIRECTORIES", tmp, 1);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"index_status\","
+                                   "\"arguments\":{\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"root_path\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"git\""));
     ASSERT_NOT_NULL(strstr(inner, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
 
+    if (prev) {
+        cbm_setenv("GIT_CEILING_DIRECTORIES", saved, 1);
+    } else {
+        cbm_unsetenv("GIT_CEILING_DIRECTORIES");
+    }
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -5102,7 +5189,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
-    RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_git_metadata_true);
+    RUN_TEST(tool_index_status_git_metadata_false);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
