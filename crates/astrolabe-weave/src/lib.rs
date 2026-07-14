@@ -36,10 +36,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod ann;
+pub mod drift_producer;
 mod sim_rows;
 mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
+pub use drift_producer::{
+    DRIFT_REFERENCE_PAYLOAD_SCHEMA, DriftProductionReport, DriftSlotSamples, load_drift_reference,
+    persist_drift_reference, produce_drift_cards, read_slot_samples_from_vault,
+    run_index_time_drift,
+};
 pub use sim_rows::{
     ASTRO_SIM_EDGE_LEDGER_MISSING, ASTRO_SIM_EDGE_ROW_CORRUPT, PersistedSimilarityEdgeRow,
     SCHEMA_SIM_EDGE_ROW, SIM_EDGE_LEDGER_SCHEMA, SIM_EDGE_ROW_PREFIX, SimEdgeGraphRow,
