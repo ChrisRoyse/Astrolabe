@@ -249,6 +249,7 @@ dependencies = [
 name = "astrolabe-weave"
 version = "0.1.0"
 dependencies = [
+ "astrolabe-assay",
  "astrolabe-domain",
  "astrolabe-ingest",
  "astrolabe-panel",

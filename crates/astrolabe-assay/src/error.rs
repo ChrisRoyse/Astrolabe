@@ -84,3 +84,14 @@ pub const ASTRO_ASSAY_MEASUREMENT_INPUT_INVALID: &str = "ASTRO_ASSAY_MEASUREMENT
 /// A card read back from the ledger did not re-derive to the recorded value
 /// (reproduce/FSV failure).
 pub const ASTRO_ASSAY_REPRODUCE_MISMATCH: &str = "ASTRO_ASSAY_REPRODUCE_MISMATCH";
+/// A per-pair calibration input was malformed: a config knob fell outside its
+/// declared bounds, a score exceeded the millipoint ceiling, or persisted
+/// calibration bytes failed to parse.
+pub const ASTRO_ASSAY_CALIBRATION_INPUT_INVALID: &str = "ASTRO_ASSAY_CALIBRATION_INPUT_INVALID";
+/// Per-pair calibration refused because the score sample was below the floor
+/// observation count (too few scores to pin a distribution).
+pub const ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR: &str = "ASTRO_ASSAY_CALIBRATION_BELOW_FLOOR";
+/// Per-pair calibration refused because the score distribution had zero spread
+/// (every observation identical), so no threshold can separate an anomaly from
+/// the bulk — the zero-signal negative-control case.
+pub const ASTRO_ASSAY_CALIBRATION_DEGENERATE: &str = "ASTRO_ASSAY_CALIBRATION_DEGENERATE";

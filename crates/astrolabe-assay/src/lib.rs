@@ -29,6 +29,7 @@
 #![deny(missing_docs)]
 
 pub mod bits;
+pub mod calibration;
 pub mod deficits;
 pub mod error;
 pub mod estimators;
@@ -46,6 +47,12 @@ pub use bits::{
     AxisValues, BitsConfig, BitsInterval, DeficitSuggestedAction, SignalBits, SignalRankingCard,
     SlotDeficit, SlotObservations, SlotSummary, SlotValues, SufficiencyCard, build_signal_ranking,
     build_sufficiency_card, enforce_dpi_ceiling, measure_slot_bits,
+};
+pub use calibration::{
+    ASSAY_CALIBRATION_KNOB_REGISTRY_VERSION, ASSAY_CALIBRATION_KNOBS,
+    ASSAY_CALIBRATION_MAX_SCORE_MILLIPOINTS, CalibrationConfig, DistributionCalibration,
+    assay_calibration_knob, calibrate_score_distribution, calibration_dump_bytes,
+    read_calibration_bytes,
 };
 pub use deficits::{DeficitMeasurement, OPTIMIZER_DEFICITS_SCHEMA, optimizer_deficits_document};
 pub use error::{AssayError, Result};
