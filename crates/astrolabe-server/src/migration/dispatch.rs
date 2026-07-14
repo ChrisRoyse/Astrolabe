@@ -20,6 +20,7 @@ pub fn handle_tool_raw(
         "guard_check" => handle_guard_check(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),
         "search_graph" => handle_search_graph(runner, args_json),
+        "detect_changes" => handle_detect_changes_grounded_risk(runner, args_json),
         _ => Ok(runner.handle_tool_raw(tool_name, args_json)?),
     }
 }
@@ -79,7 +80,7 @@ pub fn handle_jsonrpc_raw(
 pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "index_repository" | "index_status" | "get_architecture"
+        "index_repository" | "index_status" | "get_architecture" | "detect_changes"
     ) || is_advertised_astrolabe_tool(tool_name)
 }
 
@@ -148,6 +149,15 @@ pub(crate) fn should_wrap_tool(
             Ok(read_dial(&project)? == MigrationDial::Shadow)
         }
         "get_architecture" => {
+            let Some(project) = status_project_from_args(args)? else {
+                return Ok(false);
+            };
+            Ok(read_dial(&project)? == MigrationDial::Shadow)
+        }
+        "detect_changes" => {
+            // Only augment grounded risk when the project is shadow-indexed; a
+            // non-shadow project has no vault, so it passes straight through with
+            // the pure legacy detect_changes shape.
             let Some(project) = status_project_from_args(args)? else {
                 return Ok(false);
             };

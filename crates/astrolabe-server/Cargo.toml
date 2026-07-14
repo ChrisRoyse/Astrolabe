@@ -15,6 +15,7 @@ astrolabe-guard = { path = "../astrolabe-guard" }
 astrolabe-ingest.workspace = true
 astrolabe-kernel.workspace = true
 astrolabe-lower.workspace = true
+astrolabe-oracle = { path = "../astrolabe-oracle" }
 astrolabe-panel.workspace = true
 astrolabe-provenance.workspace = true
 astrolabe-weave.workspace = true
