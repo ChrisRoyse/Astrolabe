@@ -569,7 +569,7 @@ fn reparse_structural_panel_sources(
     .map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_PARSE_FAILED",
-            format!("source #{index} libcbm reparse failed: {}", err.message()),
+            format!("source #{index} libcbm reparse failed: {err}"),
             "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
         )
     })?;
@@ -577,7 +577,7 @@ fn reparse_structural_panel_sources(
     let definitions = extracted.definitions().map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_PARSE_FAILED",
-            format!("source #{index} reparse produced no readable definitions: {}", err.message()),
+            format!("source #{index} reparse produced no readable definitions: {err}"),
             "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
         )
     })?;
@@ -603,7 +603,7 @@ fn reparse_structural_panel_sources(
     let trigrams = primary.parsed_struct_trigrams().map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_PARSE_FAILED",
-            format!("source #{index} struct-trigram readback failed: {}", err.message()),
+            format!("source #{index} struct-trigram readback failed: {err}"),
             "Treat this as libcbm serialization drift and reject the reparse as a fault.",
         )
     })?;
@@ -629,7 +629,10 @@ fn reparse_structural_panel_sources(
     let s1 = encode_slot(SlotId::new(PANEL_SLOT_STRUCT_TRIGRAMS), &s1_input).map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_ENCODE_FAILED",
-            format!("source #{index} S1 struct-trigram encode failed: {}", err.message()),
+            format!(
+                "source #{index} S1 struct-trigram encode failed: {}",
+                err.message()
+            ),
             "Reject the candidate; its structural trigrams do not encode to a valid S1 vector.",
         )
     })?;
@@ -641,7 +644,7 @@ fn reparse_structural_panel_sources(
     let calls = extracted.calls().map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_PARSE_FAILED",
-            format!("source #{index} callee readback failed: {}", err.message()),
+            format!("source #{index} callee readback failed: {err}"),
             "Reject the candidate as unparseable; the guard never scores a snippet it cannot parse.",
         )
     })?;
@@ -681,7 +684,10 @@ fn reparse_structural_panel_sources(
     let s4 = encode_slot(SlotId::new(PANEL_SLOT_API_CALLEES), &s4_input).map_err(|err| {
         refusal(
             "ASTRO_GUARD_REPARSE_ENCODE_FAILED",
-            format!("source #{index} S4 api-callee encode failed: {}", err.message()),
+            format!(
+                "source #{index} S4 api-callee encode failed: {}",
+                err.message()
+            ),
             "Reject the candidate; its callees do not encode to a valid S4 vector.",
         )
     })?;
@@ -694,10 +700,10 @@ fn reparse_structural_panel_sources(
 /// synthesized from the declared language tag. Returns `None` when neither resolves
 /// to a real grammar — the caller refuses rather than guessing.
 fn resolve_reparse_language(rel_file_path: &str, language_hint: &str) -> Option<Language> {
-    if !rel_file_path.trim().is_empty() {
-        if let Some(language) = Language::from_filename(rel_file_path) {
-            return Some(language);
-        }
+    if !rel_file_path.trim().is_empty()
+        && let Some(language) = Language::from_filename(rel_file_path)
+    {
+        return Some(language);
     }
     let hint = language_hint.trim().to_ascii_lowercase();
     let filename = match hint.as_str() {

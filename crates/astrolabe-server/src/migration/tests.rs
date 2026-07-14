@@ -5443,6 +5443,12 @@ fn guard_check_panel_body(name: &str, source: &str) -> Value {
             "param_types": ["u32"],
             "return_type": "Result<u32, Error>",
             "throws": ["Error"],
+            // A route surface so the public_api_signature guard slot's S17 source is
+            // measurable from the candidate's indexed properties (S5/S15/S17 are
+            // property-derived; only S1/S4 need the #341 reparse). Real route-bearing
+            // symbols carry these fields.
+            "route_path": format!("/{name}"),
+            "route_method": "GET",
             "docstring": "Checked demo function."
         },
     })
@@ -5501,7 +5507,11 @@ fn guard_check_panel_mode_accepts_reparsed_conforming_candidate() {
     // Every guard slot passed at cosine 1.0 — including the reparse-measured S1/S4.
     for slot in result["slots"].as_array().unwrap() {
         let name = slot["slot"].as_str().unwrap();
-        assert_eq!(slot["pass"], json!(true), "slot {name} did not pass: {slot}");
+        assert_eq!(
+            slot["pass"],
+            json!(true),
+            "slot {name} did not pass: {slot}"
+        );
         let cos = slot["cos"].as_f64().unwrap();
         assert!(
             (cos - 1.0).abs() < 1e-4,
@@ -5564,7 +5574,97 @@ fn guard_check_panel_mode_refuses_genuinely_unmeasurable_source() {
 
     // FSV after-state: a refused panel check persists no new Guard verdict.
     let after = count_guard_ledger_entries(&vault_dir);
-    assert_eq!(after, before, "a refused panel check must persist no verdict");
+    assert_eq!(
+        after, before,
+        "a refused panel check must persist no verdict"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_panel_mode_reparse_edge_triad_fails_closed() {
+    // #341 edge triad: the per-snippet reparse fails closed with a distinct labeled
+    // code on (1) an unresolvable language tag, (2) a snippet with no measurable
+    // definition, and (3) an empty body — none of which persists a verdict.
+    let dir = temp_dir("guard-check-reparse-edges");
+    setup_guard_check_calibrated(&dir, "guard-check-reparse-edges");
+    let vault_dir = dir.join("demo.astrolabe-vault");
+
+    // A valid kernel exemplar (never reached: candidate is measured first and fails).
+    let exemplar_source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    if input > 100 {\n        return Err(Error::TooBig);\n    }\n    input.checked_add(1).ok_or(Error::Overflow)\n}\n";
+    let mut exemplar = guard_check_panel_body("checked_add", exemplar_source);
+    let exemplar_obj = exemplar.as_object_mut().unwrap();
+    exemplar_obj.insert("cx".to_string(), json!("cx:kernel"));
+    exemplar_obj.insert("kernel_near".to_string(), json!(true));
+
+    // (candidate, expected-code) triad. Each candidate carries panel properties so
+    // the shadow-runtime slots measure; only the reparse leg fails.
+    let cases: [(Value, &str); 3] = [
+        (
+            // Unsupported language: neither the file extension nor the tag resolves.
+            json!({
+                "source": "fn f(x: u32) -> u32 { if x > 0 { x - 1 } else { x } }",
+                "symbol_name": "f",
+                "qualified_name": "demo::f",
+                "rel_file_path": "src/demo.klingon",
+                "language": "klingon",
+                "properties": {"complexity": 2.0, "route_path": "/f", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN",
+        ),
+        (
+            // No measurable definition: a bare non-definition fragment.
+            json!({
+                "source": "let mut total = 0; total += 1;",
+                "symbol_name": "frag",
+                "qualified_name": "demo::frag",
+                "rel_file_path": "src/demo.rs",
+                "language": "rust",
+                "properties": {"complexity": 2.0, "route_path": "/frag", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_NO_STRUCTURE",
+        ),
+        (
+            // Empty body.
+            json!({
+                "source": "   \n\t\n",
+                "symbol_name": "blank",
+                "qualified_name": "demo::blank",
+                "rel_file_path": "src/demo.rs",
+                "language": "rust",
+                "properties": {"complexity": 2.0, "route_path": "/blank", "route_method": "GET",
+                               "param_types": ["u32"], "throws": ["Error"]},
+            }),
+            "ASTRO_GUARD_REPARSE_EMPTY_SOURCE",
+        ),
+    ];
+
+    for (candidate, expected_code) in cases {
+        let before = count_guard_ledger_entries(&vault_dir);
+        let args = json!({
+            "project": "demo",
+            "target": GUARD_CHECK_TARGET,
+            "measurement": "panel",
+            "candidate": candidate,
+            "exemplars": [exemplar.clone()],
+        });
+        let envelope = guard_check_structured(&dir, &args);
+        assert_eq!(envelope["isError"], true, "{envelope}");
+        let text = envelope["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(expected_code),
+            "expected labeled refusal {expected_code}, got: {text}"
+        );
+        // FSV: each refused reparse persists no verdict (before == after).
+        let after = count_guard_ledger_entries(&vault_dir);
+        assert_eq!(
+            after, before,
+            "reparse refusal {expected_code} must persist no verdict"
+        );
+        eprintln!("reparse edge OK: {expected_code} refused, ledger before={before} after={after}");
+    }
     fs::remove_dir_all(&dir).ok();
 }
 

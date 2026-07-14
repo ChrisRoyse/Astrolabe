@@ -1627,7 +1627,9 @@ impl Definition {
     /// Parse the serialized [`Definition::struct_trigrams`] into `(a, b, c, weight)`
     /// tuples in document order. A malformed record fails closed with a coded error;
     /// the caller decides whether an empty list is a measurable structural surface.
-    pub fn parsed_struct_trigrams(&self) -> Result<Vec<(String, String, String, f32)>, BridgeError> {
+    pub fn parsed_struct_trigrams(
+        &self,
+    ) -> Result<Vec<(String, String, String, f32)>, BridgeError> {
         let Some(raw) = self.struct_trigrams.as_deref() else {
             return Ok(Vec::new());
         };
@@ -1646,7 +1648,9 @@ impl Definition {
             ) else {
                 return Err(envelope(
                     "ASTRO_CBM_STRUCT_TRIGRAM_MALFORMED",
-                    format!("struct-trigram record `{line}` is not a 4-field a\\tb\\tc\\tweight tuple"),
+                    format!(
+                        "struct-trigram record `{line}` is not a 4-field a\\tb\\tc\\tweight tuple"
+                    ),
                     "Treat this as libcbm serialization drift and reject the reparse as a fault.",
                 ));
             };
