@@ -309,6 +309,56 @@ pub fn watcher_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     WATCHER_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the CBM pipeline host-thread stack knob (#364).
+pub const CBM_PIPELINE_STACK_KNOB_REGISTRY_VERSION: &str = "astrolabe-cbm-pipeline-stack-knobs-v1";
+/// Name of the CBM pipeline host-thread stack-reserve knob.
+pub const CBM_PIPELINE_HOST_STACK_BYTES_KNOB: &str = "cbm_pipeline_host_stack_bytes";
+/// Default stack reserve, in bytes, for any thread that enters the in-process
+/// CBM pipeline (`cbm_pipeline_run` via `CbmToolRunner`/`CbmPipeline`).
+///
+/// The CBM pipeline consumes more than 2 MiB of stack **before it emits its
+/// first log line**, even on a 6-file corpus (#364): the real-corpus bench
+/// `bench_row_sink_overhead.rs` hit `STATUS_STACK_OVERFLOW` (0xC00000FD) on both
+/// the default libtest 2 MiB thread and the default main-thread reserve, and
+/// only completes on an explicitly sized 64 MiB worker. Any production thread
+/// that runs the pipeline on a default stack is therefore at risk of a
+/// diagnostic-free crash. 64 MiB is the measured-working reserve; sizing the
+/// host thread explicitly turns a latent 0xC00000FD into an impossible state.
+pub const CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES: u64 = 64 * 1024 * 1024;
+/// Smallest legal reserve. The measured floor is above 2 MiB (the default
+/// libtest/main reserve overflows pre-log), so 8 MiB is the smallest value that
+/// is not already known to fault; below it the knob would re-admit the crash.
+pub const CBM_PIPELINE_MIN_HOST_STACK_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest legal reserve. 512 MiB bounds a misconfiguration from reserving an
+/// unbounded per-thread address range while leaving ample headroom over 64 MiB.
+pub const CBM_PIPELINE_MAX_HOST_STACK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The CBM pipeline host-thread stack knob registry (#364).
+pub const CBM_PIPELINE_STACK_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: CBM_PIPELINE_STACK_KNOB_REGISTRY_VERSION,
+    name: CBM_PIPELINE_HOST_STACK_BYTES_KNOB,
+    default: CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES,
+    min: CBM_PIPELINE_MIN_HOST_STACK_BYTES,
+    max: CBM_PIPELINE_MAX_HOST_STACK_BYTES,
+    unit: "bytes",
+    source: "ASTROLABE #364 real-corpus bench_row_sink_overhead.rs stack measurement (#59)",
+    rationale: "the in-process CBM pipeline overflows the default 2 MiB stack before its first log line even on a 6-file corpus; 64 MiB is the measured-working reserve, and every production spawn site that enters the pipeline supplies this sized stack so a diagnostic-free STATUS_STACK_OVERFLOW cannot occur",
+}];
+
+/// Returns the CBM pipeline stack declaration for `name`, or `None`.
+pub fn cbm_pipeline_stack_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    CBM_PIPELINE_STACK_KNOBS
+        .iter()
+        .find(|knob| knob.name == name)
+}
+
+/// The CBM pipeline host-thread stack reserve, in bytes, as a `usize` ready for
+/// [`std::thread::Builder::stack_size`]. This is the single accessor every
+/// production spawn site entering the pipeline uses (#364).
+pub fn cbm_pipeline_host_stack_bytes() -> usize {
+    usize::try_from(CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +460,30 @@ mod tests {
         assert!(knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS));
         assert!(!knob.accepts(LOWER_DEBOUNCE_MAX_WINDOW_MS + 1));
         assert_eq!(knob.default, LOWER_DEBOUNCE_DEFAULT_WINDOW_MS);
+    }
+
+    #[test]
+    fn cbm_pipeline_stack_knob_declares_bounds_that_contain_its_default() {
+        let knob = cbm_pipeline_stack_knob(CBM_PIPELINE_HOST_STACK_BYTES_KNOB).expect("declared");
+        assert_eq!(
+            knob.registry_version,
+            CBM_PIPELINE_STACK_KNOB_REGISTRY_VERSION
+        );
+        assert_eq!(knob.unit, "bytes");
+        assert!(knob.min <= knob.max);
+        assert!(knob.accepts(knob.default));
+        assert_eq!(knob.default, CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES);
+        // The measured floor is above the default 2 MiB stack that overflows
+        // pre-log (#364): the knob must never re-admit a sub-2-MiB reserve.
+        assert!(!knob.accepts(2 * 1024 * 1024));
+        assert!(knob.accepts(CBM_PIPELINE_MIN_HOST_STACK_BYTES));
+        assert!(knob.accepts(CBM_PIPELINE_MAX_HOST_STACK_BYTES));
+        assert!(!knob.accepts(CBM_PIPELINE_MAX_HOST_STACK_BYTES + 1));
+        const { assert!(CBM_PIPELINE_MIN_HOST_STACK_BYTES > 2 * 1024 * 1024) };
+        assert_eq!(
+            cbm_pipeline_host_stack_bytes(),
+            CBM_PIPELINE_DEFAULT_HOST_STACK_BYTES as usize
+        );
     }
 
     #[test]

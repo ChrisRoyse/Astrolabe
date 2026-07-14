@@ -53,6 +53,11 @@ pub fn parent_system() -> astrolabe_domain::ParentSystem {
     astrolabe_domain::ParentSystem::CodebaseMemoryMcp
 }
 
+/// Registry-declared stack reserve (bytes) for any host thread that enters the
+/// in-process CBM pipeline (#364). Re-exported so the binary entrypoint sizes
+/// its host thread from the single declared knob.
+pub use astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes;
+
 pub fn run_from_env() -> i32 {
     let args: Vec<String> = env::args().collect();
     let hook_mode = is_hook_augment_invocation(&args);
@@ -577,11 +582,22 @@ impl IncrementalWatcherLoop {
     fn start() -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
-        let handle = thread::spawn(move || {
-            if let Err(error) = migration::run_incremental_watcher_loop(thread_shutdown) {
-                tracing::warn!("incremental_watcher.stopped error={error}");
-            }
-        });
+        // #364: this loop enters the in-process CBM pipeline (via
+        // run_incremental_watcher_loop -> handle_index_repository), which
+        // consumes >2 MiB of stack before its first log line. A bare
+        // `thread::spawn` gives Rust's default 2 MiB stack, which overflows with
+        // a diagnostic-free STATUS_STACK_OVERFLOW (0xC00000FD). Size the host
+        // thread from the registry-declared knob so real indexing cannot die
+        // undiagnosed on a default stack.
+        let handle = thread::Builder::new()
+            .name("astrolabe-incremental-watcher".to_string())
+            .stack_size(astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes())
+            .spawn(move || {
+                if let Err(error) = migration::run_incremental_watcher_loop(thread_shutdown) {
+                    tracing::warn!("incremental_watcher.stopped error={error}");
+                }
+            })
+            .expect("spawn sized incremental-watcher thread");
         Self {
             shutdown,
             handle: Some(handle),
