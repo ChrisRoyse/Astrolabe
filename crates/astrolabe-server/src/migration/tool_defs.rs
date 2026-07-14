@@ -469,7 +469,7 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
     json!({
         "name": "guard_calibrate",
         "title": "Guard Calibrate",
-        "description": "Build/refresh a per-domain guard profile by split (inductive) conformal calibration. Two declared modes: auto (score sources through the real panel/lens stack S18/S1/S4/S20/S2/S15/S5+S17 to derive the per-slot good/bad cosine populations itself) and supplied (operator-supplied per-slot cosine arrays). Each fixed guard slot's per-slot tau is set on a calibration half of its measured bad-cosine population (binomial-bounded), the achieved FAR is measured on a held-out validation half and checked against a finite-sample ceiling, and the FRR is measured on the good population. The calibration is ledgered (kind=Guard, subject=Guard(profile_hash)) and the astrolabe.optimizer_guard_health.v1 profile is persisted. Fails closed on an unknown/ambiguous mode, a missing slot, a panel that lacks a required slot, a thin (<2) or single-source population, or a slot whose held-out FAR breaches its bound; an auto panel failure never falls back to supplied cosines.",
+        "description": "Build/refresh a per-domain guard profile by split (inductive) conformal calibration. Three declared modes: generated (auto-generate the bad calibration population from the indexed corpus itself — mutation of real HEAD source, revert records, the vulnerability registry, and alien constellations from other indexed projects — and read the trusted/good population from persisted indexed slot vectors, so NO caller-supplied class tags are needed); auto (score caller-supplied sources through the real panel/lens stack S18/S1/S4/S20/S2/S15/S5+S17 with an explicit good/bad class tag); and supplied (operator-supplied per-slot cosine arrays). Each fixed guard slot's per-slot tau is set on a calibration half of its measured bad-cosine population (binomial-bounded), the achieved FAR is measured on a held-out validation half and checked against a finite-sample ceiling, and the FRR is measured on the good population. The calibration is ledgered (kind=Guard, subject=Guard(profile_hash)) and the astrolabe.optimizer_guard_health.v1 profile is persisted. Generated mode enforces the R16 mix policy (>=50 bad cases, >=3 generators, <=60% per generator) and fails closed on an under-mixed corpus. Fails closed on an unknown/ambiguous mode, a missing slot, a panel that lacks a required slot, a thin (<2) or single-source population, or a slot whose held-out FAR breaches its bound; a generated/auto panel failure never falls back to caller tags or supplied cosines.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -479,12 +479,49 @@ pub(crate) fn guard_calibrate_tool_definition() -> Value {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["auto", "supplied"],
-                    "description": "Population-source mode. auto scores sources through the real panel; supplied consumes operator cosine arrays. Inferred from sources/slots when omitted; ambiguous (both) or absent (neither) is refused."
+                    "enum": ["generated", "auto", "supplied"],
+                    "description": "Population-source mode. generated auto-generates the bad corpus from the indexed corpus and reads the trusted population from persisted slot vectors; auto scores caller sources through the real panel with class tags; supplied consumes operator cosine arrays. Inferred from mutation_sources/sources/slots when omitted; ambiguous (more than one) or absent (none) is refused."
                 },
                 "panel_version": {
                     "type": "integer",
-                    "description": "Frozen panel roster version used to measure sources in auto mode (1=S0-S22, 2=S0-S23; default 1)."
+                    "description": "Frozen panel roster version used to measure sources/mutants (1=S0-S22, 2=S0-S23; auto defaults to 1, generated defaults to the shadow panel version 2 so it matches persisted vectors)."
+                },
+                "mutation_sources": {
+                    "type": "array",
+                    "description": "generated mode: real HEAD source-text strings to mutate (per-language token mutators produce the guaranteed-wrong bad cases). Required for generated mode.",
+                    "items": {"type": "string"}
+                },
+                "revert_records": {
+                    "type": "array",
+                    "description": "generated mode (optional): reverted-code records (real historical rejections). Each carries reverted_code plus optional introduced_commit/revert_commit provenance.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "reverted_code": {"type": "string"},
+                            "introduced_commit": {"type": "string"},
+                            "revert_commit": {"type": "string"}
+                        },
+                        "required": ["reverted_code"],
+                        "additionalProperties": true
+                    }
+                },
+                "aliens": {
+                    "type": "array",
+                    "description": "generated mode (optional): other shadow-indexed projects whose persisted, non-vendored symbol slot vectors become the alien bad population (valid code, wrong distribution). Each is {\"project\": \"<other-indexed-project>\"}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {"project": {"type": "string"}},
+                        "required": ["project"],
+                        "additionalProperties": true
+                    }
+                },
+                "good_project": {
+                    "type": "string",
+                    "description": "generated mode (optional): the shadow-indexed project whose persisted indexed symbols form the trusted (good) population. Defaults to project."
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": "generated mode (optional): deterministic corpus shuffle seed (default 0). The same inputs + seed produce a byte-identical corpus_hash."
                 },
                 "sources": {
                     "type": "array",

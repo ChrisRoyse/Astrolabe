@@ -5102,6 +5102,209 @@ fn guard_calibrate_calibrates_ledgers_and_persists_measured_profile() {
     fs::remove_dir_all(&dir).ok();
 }
 
+// ---- #334 generated-mode guard_calibrate (auto-generate the bad corpus) ----
+
+/// Index `symbols` (name -> full rust body) into a shadow vault for `project` via the
+/// real row-sink import path (persisting graph nodes + panel slot vectors), then write
+/// the vault config rows generated mode reads. No libcbm parse is needed to build the
+/// rows (they are pre-shaped), but the persisted slot vectors are the real panel's.
+fn index_generated_project(root: &Path, project: &str, salt: &str, symbols: &[(&str, i32)]) {
+    let vault_dir = root.join(format!("{project}.astrolabe-vault"));
+    let vault = AsterVault::new_durable(
+        &vault_dir,
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        salt.as_bytes().to_vec(),
+        VaultOptions::default(),
+    )
+    .unwrap();
+    let mut nodes = Vec::new();
+    for (index, (name, increment)) in symbols.iter().enumerate() {
+        let properties_json = format!(
+            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ if input > {increment} {{ return input + {increment}; }} input - {increment} }}","signature":"fn {name}(input: i32) -> i32","bt":"{name} input compare return add sub {increment}","docstring":"transform an input value by {increment}","complexity":3.0,"cognitive":2.0,"param_count":1.0,"lines":3.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+        );
+        nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
+            id: (index as i64) + 1,
+            project: project.to_string(),
+            label: "Function".to_string(),
+            name: (*name).to_string(),
+            qualified_name: format!("{project}.{name}"),
+            file_path: "src/lib.rs".to_string(),
+            start_line: (index as i64) * 4 + 1,
+            end_line: (index as i64) * 4 + 3,
+            properties_json,
+        });
+    }
+    let rows = CbmPipelineRows {
+        project: project.to_string(),
+        nodes,
+        edges: Vec::new(),
+    };
+    let options = SqliteImportOptions::new(project, "commit-1", SHADOW_PANEL_VERSION)
+        .with_available_slots(shadow_available_slots());
+    import_shadow_vault_report(
+        &root.join("unused.db"),
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(row_sink_import_candidate_from_rows(rows)),
+    )
+    .unwrap();
+    drop(vault);
+    for (name, value) in [
+        ("vault_dir", vault_dir.display().to_string()),
+        ("vault_id", SHADOW_VAULT_ID.to_string()),
+        ("vault_salt", salt.to_string()),
+    ] {
+        write_config_value(root, &metadata_key(project, name), &value).unwrap();
+    }
+    persist_dial_at(root, project, MigrationDial::Shadow).unwrap();
+}
+
+/// FSV: generated mode auto-generates the bad corpus (mutation of real source +
+/// vulnerability registry + alien constellations from another indexed project),
+/// measures it through the real panel, reads the trusted population from persisted
+/// indexed slot vectors, calibrates, and pairs the profile with its ledger entry —
+/// never a caller-supplied class tag. Server-pending: exercises the libcbm reparse
+/// measurer, so it runs on the consolidated native pass.
+#[test]
+fn guard_calibrate_generated_mode_builds_and_measures_the_bad_corpus() {
+    let dir = temp_dir("guard-calibrate-generated");
+    // Trusted (good) population: this project's own indexed increment functions.
+    index_generated_project(
+        &dir,
+        "demo",
+        "guard-generated-demo",
+        &[
+            ("alpha", 1),
+            ("bravo", 2),
+            ("charlie", 3),
+            ("delta", 4),
+            ("echo", 5),
+            ("foxtrot", 6),
+        ],
+    );
+    // Alien population: a *different* indexed project's non-vendored symbols.
+    let alien_symbols: Vec<(&str, i32)> = (0..30)
+        .map(|i| (ALIEN_NAMES[i % ALIEN_NAMES.len()], (i as i32) + 7))
+        .collect();
+    index_generated_project(&dir, "alienrepo", "guard-generated-alien", &alien_symbols);
+
+    let args = json!({
+        "project": "demo",
+        "mode": "generated",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "seed": 7,
+        "mutation_sources": [
+            "fn f(a: i32, b: i32) -> i32 { if a < b && a == 0 { return a + 1; } a - b }",
+            "fn g(x: i32) -> bool { !(x > 3) || x <= 10 }",
+        ],
+        "aliens": [{"project": "alienrepo"}],
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(
+        envelope["isError"], false,
+        "generated calibrate: {envelope}"
+    );
+    let result = &envelope["structuredContent"];
+    assert_eq!(result["status"], "calibrated");
+    assert_eq!(result["mode"], "generated");
+
+    // The bad corpus was GENERATED (not caller-tagged): the response records the
+    // enforced generator mix (>=3 generators, >=50 bad cases, mix-policy knobs).
+    let generated = &result["generated"];
+    assert_eq!(generated["seed"], 7);
+    assert!(generated["good_symbols"].as_u64().unwrap() >= 1);
+    assert!(
+        generated["bad_cases"].as_u64().unwrap() >= 50,
+        "mix policy requires >=50 bad cases: {generated}"
+    );
+    let contributing = generated["generator_mix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["count"].as_u64().unwrap() > 0)
+        .count();
+    assert!(
+        contributing >= 3,
+        "generated corpus must draw from >=3 generators: {generated}"
+    );
+    assert_eq!(generated["mix_policy"]["max_single_generator_pct"], 60);
+
+    // FSV: independently read the persisted guard-health config row (bytes on disk)
+    // back and confirm it is MEASURED with a corpus_hash matching the GENERATED
+    // corpus — proof the persisted profile was calibrated over the generated bad
+    // population, not caller-supplied class tags.
+    let seq = result["ledger_ref"]["seq"].as_u64().expect("ledger seq");
+    let health_key = metadata_key("demo", "optimizer_guard_health_json");
+    let health_raw = read_config_value(&dir, &health_key)
+        .unwrap()
+        .expect("persisted guard-health config row");
+    let health: Value = serde_json::from_str(&health_raw).unwrap();
+    assert_eq!(health["status"], "measured");
+    assert_eq!(health["corpus_hash"], generated["corpus_hash"]);
+    // The independent optimizer_status validator also reports MEASURED guard health.
+    let status = optimizer_status_json_at(&dir, "demo", None).unwrap();
+    assert_eq!(status["guard_health"]["status"], "measured");
+
+    // FSV: the ledger row at `seq` is the paired Guard calibration entry.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)
+        .unwrap()
+        .expect("guard calibration ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Guard);
+    assert!(matches!(entry.subject, SubjectId::Guard(_)));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Distinct alien symbol names so the alien project carries many separable symbols.
+const ALIEN_NAMES: &[&str] = &[
+    "parse_header",
+    "encode_frame",
+    "route_request",
+    "hash_block",
+    "scan_tokens",
+    "merge_ranges",
+    "flush_buffer",
+    "resolve_path",
+    "walk_tree",
+    "emit_record",
+];
+
+/// FSV fail-closed: generated mode with a single thin mutation source and no aliens
+/// cannot meet the R16 mix policy (>=50 bad cases / >=3 generators), so it REFUSES with
+/// a labeled deficit — it never calibrates on a thin, single-source bad corpus.
+#[test]
+fn guard_calibrate_generated_mode_refuses_undermixed_corpus() {
+    let dir = temp_dir("guard-calibrate-generated-thin");
+    index_generated_project(
+        &dir,
+        "demo",
+        "guard-generated-thin",
+        &[("alpha", 1), ("bravo", 2)],
+    );
+
+    let args = json!({
+        "project": "demo",
+        "mode": "generated",
+        "domain": {"language": "rust", "scope_class": "core"},
+        "mutation_sources": ["fn t() -> i32 { 1 }"],
+    });
+    let envelope = guard_calibrate_structured(&dir, &args);
+    assert_eq!(
+        envelope["isError"], true,
+        "under-mixed must refuse: {envelope}"
+    );
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("ASTRO_GUARD_INSUFFICIENT_BAD_CASES")
+            || text.contains("ASTRO_GUARD_SINGLE_SOURCE_CALIBRATION")
+            || text.contains("ASTRO_GUARD_GENERATOR_DOMINATES"),
+        "generated mode must fail closed with a labeled mix-policy deficit, got: {text}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn guard_calibrate_refuses_missing_slot() {
     let dir = temp_dir("guard-calibrate-missing-slot");
