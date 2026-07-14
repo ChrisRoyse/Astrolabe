@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use astrolabe_panel::{slot_centroid, slot_vector_cosine};
 use calyx_core::SlotVector;
 
-use crate::calibration::{CalibrationDomain, CalibrationError};
+use crate::calibration::{BadCase, CalibrationCorpus, CalibrationDomain, CalibrationError};
 use crate::profile::{
     GuardProfile, GuardSlot, SlotCalibration, calibrate_slot, default_content_policy,
 };
@@ -42,6 +42,9 @@ pub const ASTRO_GUARD_AUTO_PANEL_VERSION: &str = "ASTRO_GUARD_AUTO_PANEL_VERSION
 /// Deficit code: a panel cosine/centroid computation failed (shape/dim contract
 /// violation) while deriving a slot's cosine population.
 pub const ASTRO_GUARD_AUTO_PANEL_ERROR: &str = "ASTRO_GUARD_AUTO_PANEL_ERROR";
+/// Deficit code: an auto-generated bad corpus produced no bad cases, so the guard
+/// has nothing out-of-distribution to calibrate the conformal tau against.
+pub const ASTRO_GUARD_AUTO_CORPUS_EMPTY: &str = "ASTRO_GUARD_AUTO_CORPUS_EMPTY";
 
 /// The panel slot id(s) each guard slot measures (blueprint `10_GUARD.md` §1 table).
 ///
@@ -149,6 +152,76 @@ pub fn calibrate_auto(
     })
 }
 
+/// Measures one auto-generated [`BadCase`] (a real source transformation — mutant,
+/// alien symbol, reverted code, or vulnerability snippet) into its guard panel-source
+/// slot vectors *through the real panel*.
+///
+/// This is the seam the blueprint's fuller AUTO path needs (#334): the bad calibration
+/// population is *generated* from the indexed corpus (mutation operators + alien
+/// constellations via [`crate::calibration::build_corpus`]) and each bad case is
+/// re-measured through the panel — never a caller-supplied `class` tag. The concrete
+/// implementor drives the real libcbm re-parse + panel encoders (the server's
+/// `ShadowSlotRuntime`); the guard crate stays panel-runtime-agnostic and only
+/// orchestrates, so a panel measurement failure surfaces as a fail-closed refusal
+/// (standing invariant #3 — never a silent skip or a revert to the class-tag path).
+pub trait CorpusPanelMeasurer {
+    /// Measure a generated bad case into its guard panel-source slot vectors. A
+    /// measurement fault must be returned as a coded [`CalibrationError`], never
+    /// swallowed into an absent/empty measurement.
+    fn measure_bad_case(&self, case: &BadCase) -> Result<MeasuredSymbol, CalibrationError>;
+}
+
+/// Auto-generate-and-calibrate: measure every bad case in a *generated* corpus through
+/// the real panel and calibrate every guard slot against those measured populations.
+///
+/// `good` is the trusted (in-distribution) population, already measured through the
+/// same panel (the server measures the indexed good symbols). `corpus` is the
+/// stratified bad-case corpus produced by [`crate::calibration::build_corpus`]
+/// (mutation + revert + alien + vulnerability, mix-policy enforced). Each bad case is
+/// re-measured through `measurer`, then the good/bad measured populations feed
+/// [`calibrate_auto`] unchanged, pinning the corpus's `corpus_hash` into the profile.
+///
+/// Fails closed (never a partial or over-accepting profile) when:
+/// - the generated corpus has no bad cases ([`ASTRO_GUARD_AUTO_CORPUS_EMPTY`]);
+/// - measuring any bad case through the panel fails (the measurer's coded error is
+///   surfaced verbatim — the auto path never falls back to caller tags on a fault);
+/// - any condition [`calibrate_auto`] itself refuses (empty trusted set, unmeasured
+///   required slot, invalid panel version, thin/over-accepting slot population).
+pub fn calibrate_auto_from_corpus<M: CorpusPanelMeasurer>(
+    domain: CalibrationDomain,
+    panel_version: u32,
+    good: &[MeasuredSymbol],
+    corpus: &CalibrationCorpus,
+    measurer: &M,
+    alpha: f32,
+) -> Result<GuardProfile, CalibrationError> {
+    if corpus.bad_cases.is_empty() {
+        return Err(CalibrationError::new(
+            ASTRO_GUARD_AUTO_CORPUS_EMPTY,
+            "the auto-generated calibration corpus produced no bad cases; there is nothing \
+             out-of-distribution to calibrate the conformal tau against",
+            "Widen the mutation source set or supply alien/revert records so build_corpus yields \
+             a stratified bad population before auto-calibrating.",
+        ));
+    }
+
+    let mut bad: Vec<MeasuredSymbol> = Vec::with_capacity(corpus.bad_cases.len());
+    for case in &corpus.bad_cases {
+        // Fail-closed: a panel fault on any generated bad case refuses the whole run;
+        // it never silently drops the case or reverts to caller-supplied populations.
+        bad.push(measurer.measure_bad_case(case)?);
+    }
+
+    calibrate_auto(
+        domain,
+        panel_version,
+        good,
+        &bad,
+        corpus.corpus_hash,
+        alpha,
+    )
+}
+
 fn calibrate_auto_slot(
     slot: GuardSlot,
     good: &[MeasuredSymbol],
@@ -247,7 +320,10 @@ fn panel_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::CalibrationLanguage;
+    use crate::calibration::{
+        BadCase, BadCaseGenerator, CalibrationCorpus, CalibrationLanguage, CorpusInputs, MixPolicy,
+        build_corpus,
+    };
     use crate::profile::validate_high_stakes_profile;
     use astrolabe_panel::{EncoderLensInput, StructuralTrigram, encode_slot};
     use calyx_core::SlotId;
@@ -483,5 +559,183 @@ mod tests {
         let a = calibrate_auto(domain(), 1, &trusted_set(), &alien_set(), [9u8; 32], 0.05).unwrap();
         let b = calibrate_auto(domain(), 1, &trusted_set(), &alien_set(), [9u8; 32], 0.05).unwrap();
         assert_eq!(a.canonical_profile_hash(), b.canonical_profile_hash());
+    }
+
+    // -- #334: auto-generate the bad corpus, measure through the panel -----------
+
+    /// Marker embedded in a generated bad case to inject a mid-corpus panel fault.
+    const PANEL_FAULT_MARKER: &str = "__ASTRO_PANEL_FAULT__";
+
+    /// Orchestration measurer for [`calibrate_auto_from_corpus`]: maps each generated
+    /// bad case to a separated, structurally-alien [`MeasuredSymbol`] (deterministic in
+    /// the case's bytes, so the wiring is byte-reproducible). A case carrying the fault
+    /// marker returns a coded error, exercising the fail-closed mid-corpus path. The
+    /// real per-slot panel/libcbm measurement is the server's (server-pending); this
+    /// double isolates the corpus→measure→calibrate orchestration under test.
+    struct AlienCorpusMeasurer;
+
+    impl CorpusPanelMeasurer for AlienCorpusMeasurer {
+        fn measure_bad_case(&self, case: &BadCase) -> Result<MeasuredSymbol, CalibrationError> {
+            if case.code.contains(PANEL_FAULT_MARKER) {
+                return Err(CalibrationError::new(
+                    ASTRO_GUARD_AUTO_PANEL_ERROR,
+                    format!("injected panel fault measuring bad case `{}`", case.provenance),
+                    "Fix the panel input; the auto path never falls back on a measurement fault.",
+                ));
+            }
+            // Deterministic separated axis from the case bytes: out-of-distribution.
+            let axis = 3 + (case.code.len() % 4);
+            Ok(symbol(axis, 0.01, false))
+        }
+    }
+
+    fn rust_corpus_inputs() -> CorpusInputs {
+        use crate::calibration::{AlienSymbol, RevertRecord};
+        let mut alien_symbols = Vec::new();
+        for i in 0..20 {
+            alien_symbols.push(AlienSymbol {
+                language: CalibrationLanguage::Rust,
+                code: format!("fn alien_{i}() -> usize {{ {i} }}"),
+                repo_id: "other/repo".to_string(),
+                is_vendored: false,
+            });
+        }
+        let mut revert_records = Vec::new();
+        for i in 0..16 {
+            revert_records.push(RevertRecord {
+                language: CalibrationLanguage::Rust,
+                reverted_code: format!("fn reverted_{i}(x: i32) -> i32 {{ x / {} }}", i + 1),
+                introduced_commit: "aaaa".to_string(),
+                revert_commit: "bbbb".to_string(),
+            });
+        }
+        CorpusInputs {
+            mutation_sources: vec![
+                "fn f(a: i32, b: i32) -> i32 { if a < b && a == 0 { return a + 1; } a - b }"
+                    .to_string(),
+                "fn g(x: i32) -> bool { !(x > 3) || x <= 10 }".to_string(),
+                "fn h() -> i32 { let n = 41; n * 2 }".to_string(),
+            ],
+            revert_records,
+            alien_symbols,
+            good_cases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn auto_from_corpus_calibrates_over_generated_bad_population() {
+        let corpus = build_corpus(
+            domain(),
+            &rust_corpus_inputs(),
+            MixPolicy::default_policy(),
+            7,
+        )
+        .expect("corpus builds");
+        // Every bad case is a real generated source transformation (mutant/revert/
+        // alien/vuln), measured through the (test) panel — never a caller class tag.
+        assert!(corpus.bad_cases.len() >= 50);
+        let profile = calibrate_auto_from_corpus(
+            domain(),
+            1,
+            &trusted_set(),
+            &corpus,
+            &AlienCorpusMeasurer,
+            0.05,
+        )
+        .expect("auto-from-corpus calibrates");
+        assert!(!profile.provisional, "must be measured, not cold-start");
+        // The generated corpus's hash is pinned into the profile (provenance).
+        assert_eq!(profile.corpus_hash, corpus.corpus_hash);
+        assert_eq!(profile.slots.len(), GuardSlot::ALL.len());
+        validate_high_stakes_profile(&profile).expect("calibrated auto-from-corpus is high-stakes");
+    }
+
+    #[test]
+    fn auto_from_corpus_is_deterministic() {
+        let corpus = build_corpus(
+            domain(),
+            &rust_corpus_inputs(),
+            MixPolicy::default_policy(),
+            7,
+        )
+        .unwrap();
+        let a =
+            calibrate_auto_from_corpus(domain(), 1, &trusted_set(), &corpus, &AlienCorpusMeasurer, 0.05)
+                .unwrap();
+        let b =
+            calibrate_auto_from_corpus(domain(), 1, &trusted_set(), &corpus, &AlienCorpusMeasurer, 0.05)
+                .unwrap();
+        assert_eq!(a.canonical_profile_hash(), b.canonical_profile_hash());
+    }
+
+    #[test]
+    fn edge_empty_generated_corpus_is_refused_as_degenerate() {
+        // Edge: a source with no mutable operator yields no mutants, and with no other
+        // generators the corpus has no bad cases — refused, never calibrated thin.
+        let empty = CalibrationCorpus {
+            domain: domain(),
+            policy: MixPolicy::default_policy(),
+            seed: 1,
+            bad_cases: Vec::new(),
+            good_cases: Vec::new(),
+            corpus_hash: [0u8; 32],
+        };
+        let err = calibrate_auto_from_corpus(
+            domain(),
+            1,
+            &trusted_set(),
+            &empty,
+            &AlienCorpusMeasurer,
+            0.05,
+        )
+        .expect_err("empty bad corpus must refuse");
+        assert_eq!(err.code(), ASTRO_GUARD_AUTO_CORPUS_EMPTY);
+        assert!(!err.remediation().is_empty());
+    }
+
+    #[test]
+    fn edge_empty_good_set_is_refused() {
+        let corpus = build_corpus(
+            domain(),
+            &rust_corpus_inputs(),
+            MixPolicy::default_policy(),
+            7,
+        )
+        .unwrap();
+        let err =
+            calibrate_auto_from_corpus(domain(), 1, &[], &corpus, &AlienCorpusMeasurer, 0.05)
+                .expect_err("empty trusted set must refuse");
+        assert_eq!(err.code(), ASTRO_GUARD_AUTO_NO_TRUSTED);
+    }
+
+    #[test]
+    fn edge_panel_fault_mid_corpus_fails_closed() {
+        // A generated corpus whose Nth bad case faults during panel measurement must
+        // refuse the whole run with the measurer's coded error — never a silent skip
+        // and never a revert to the caller-class-tag path.
+        let mut corpus = build_corpus(
+            domain(),
+            &rust_corpus_inputs(),
+            MixPolicy::default_policy(),
+            7,
+        )
+        .unwrap();
+        corpus.bad_cases.push(BadCase {
+            generator: BadCaseGenerator::Mutation,
+            language: CalibrationLanguage::Rust,
+            code: format!("fn boom() {{ {PANEL_FAULT_MARKER} }}"),
+            provenance: "fault@0".to_string(),
+        });
+        let err = calibrate_auto_from_corpus(
+            domain(),
+            1,
+            &trusted_set(),
+            &corpus,
+            &AlienCorpusMeasurer,
+            0.05,
+        )
+        .expect_err("panel fault mid-corpus must refuse");
+        assert_eq!(err.code(), ASTRO_GUARD_AUTO_PANEL_ERROR);
+        assert!(err.message().contains("injected panel fault"));
     }
 }
