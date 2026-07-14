@@ -172,6 +172,68 @@ fn check_payload_allows_stable_calyx_code_fields_only() {
     assert_secret(same_token_wrong_field);
 }
 
+#[test]
+fn check_payload_allows_git_commit_provenance_fields() {
+    // Regression (aba5127): the shadow index / git-archaeology writers put the
+    // git HEAD and historical commit SHAs into these ledger metadata fields; the
+    // registry declares them as `GitSha`-shaped, so a real 40-hex commit is not a
+    // false positive.
+    let head = "faac5d1a6b391c584ab8264c33fcbee4892bd53a";
+    let payload = serde_json::to_vec(&json!({
+        "commit": head,
+        "historical_commit": head,
+        "git_sha": head,
+    }))
+    .unwrap();
+    assert!(RedactionPolicy::check_payload(&payload).is_ok());
+
+    // A genuinely secret (non-hex) token in a git-SHA field still fails closed.
+    let secret = serde_json::to_vec(&json!({
+        "commit": "mF9zK4sQ7xP2nT8vB3cD6eG1hJ5lR0uW9yA2bC4dE6",
+    }))
+    .unwrap();
+    assert_secret(secret);
+}
+
+#[test]
+fn check_payload_allows_deep_path_project_slug() {
+    // Regression (dd46441): a deeply-nested repo path produces a 100+-char
+    // dash/dot/underscore `project` slug via `cbm_project_name_from_path`; the
+    // registry declares it as `PathSlug`-shaped so it is not a false positive.
+    let deep_slug = "C-code-Astrolabe-target-fsv-fusion-a1b2c3-workspace-crates-astrolabe-ingest-fixtures-deeply-nested-repo-fusiondemo";
+    assert!(deep_slug.len() > 100);
+    let payload = serde_json::to_vec(&json!({ "project": deep_slug })).unwrap();
+    assert!(RedactionPolicy::check_payload(&payload).is_ok());
+
+    // A high-entropy token with slug-illegal characters in `project` still fails.
+    let secret = serde_json::to_vec(&json!({
+        "project": "mF9zK4sQ7xP2nT8v/B3cD6eG1hJ5lR0uW9yA2bC4dE6+secretmaterialx",
+    }))
+    .unwrap();
+    assert_secret(secret);
+}
+
+#[test]
+fn check_payload_unregistered_field_fails_closed() {
+    // A field with no row in IDENTIFIER_FIELD_REGISTRY must reject a
+    // long/high-entropy token: the registry is fail-closed for unknown fields, so
+    // a real key landing in a brand-new writer's field cannot slip through.
+    let real_key_shaped = "a".repeat(64); // 64-hex, would pass under `_hash`/`_id`.
+    let unregistered = serde_json::to_vec(&json!({
+        "session_material": real_key_shaped,
+    }))
+    .unwrap();
+    assert_secret(unregistered);
+
+    // The SAME token in a registered generic-identifier field is accepted, proving
+    // the difference is the field registration, not the token.
+    let registered = serde_json::to_vec(&json!({
+        "session_hash": "a".repeat(64),
+    }))
+    .unwrap();
+    assert!(RedactionPolicy::check_payload(&registered).is_ok());
+}
+
 fn assert_secret(payload: Vec<u8>) {
     let error = RedactionPolicy::check_payload(&payload).unwrap_err();
     assert_eq!(error.code, "CALYX_LEDGER_SECRET_IN_PAYLOAD");

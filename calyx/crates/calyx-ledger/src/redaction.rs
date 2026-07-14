@@ -196,55 +196,167 @@ fn is_token_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-' | '.')
 }
 
+/// Field names whose values are provably a git object name, not a secret.
+///
+/// `git_sha` is the explicit provenance field; `commit` / `historical_commit`
+/// are the import-archaeology metadata fields the Astrolabe shadow index and
+/// git-archaeology writers populate with the HEAD / historical commit SHA. A
+/// non-git shadow import records a short `shadow-import-v1:<project>` label that
+/// never reaches this check.
+const GIT_SHA_FIELDS: &[&str] = &["git_sha", "commit", "historical_commit"];
+
+/// Field names whose values are a discovery/run manifest slug.
+const MANIFEST_SLUG_FIELDS: &[&str] = &[
+    "run_id",
+    "corpus_vault_id",
+    "stage_id",
+    "upstream_stage_id",
+    "command",
+];
+
+/// Field names whose values are a 32-byte public verification key (64 hex).
+const PUBLIC_KEY_FIELDS: &[&str] = &["signer_pubkey", "public_key", "verifying_key"];
+
+/// Declared, ordered registry of ledger fields that legitimately carry a
+/// non-secret identifier-shaped value, paired with the exact token shape that is
+/// provably non-secret for that field. A new ledger writer that emits an
+/// identifier-shaped metadata value adds a row here (matcher + shape) instead of
+/// growing an ad-hoc allowlist branch in the scanner. Any field with no matching
+/// row is treated fail-closed: a long/high-entropy token in it is rejected as a
+/// possible secret (`allowed_stable_identifier` returns `false`).
+///
+/// Rows are evaluated top-to-bottom; the first matching row decides the shape,
+/// so specific fields (e.g. `signature` = 128-hex) must precede the broad
+/// generic-identifier row.
+const IDENTIFIER_FIELD_REGISTRY: &[IdentifierFieldRule] = &[
+    // Source-path provenance metadata (chunk / database identifiers).
+    IdentifierFieldRule::new(
+        FieldMatcher::AnyOf(&[METADATA_CHUNK_ID, METADATA_DATABASE_NAME]),
+        IdentifierShape::SourceMetadata,
+    ),
+    // Stable `CALYX_*` diagnostic code.
+    IdentifierFieldRule::new(FieldMatcher::Exact("code"), IdentifierShape::CalyxCode),
+    // Ed25519 signature (64 bytes -> 128 hex).
+    IdentifierFieldRule::new(
+        FieldMatcher::Exact("signature"),
+        IdentifierShape::HexExact(128),
+    ),
+    // Git object names recorded as import provenance.
+    IdentifierFieldRule::new(FieldMatcher::AnyOf(GIT_SHA_FIELDS), IdentifierShape::GitSha),
+    // Filesystem-derived project slug (deeply-nested repo path -> long slug).
+    IdentifierFieldRule::new(FieldMatcher::Exact("project"), IdentifierShape::PathSlug),
+    // Discovery/run manifest slugs.
+    IdentifierFieldRule::new(
+        FieldMatcher::AnyOf(MANIFEST_SLUG_FIELDS),
+        IdentifierShape::ManifestSlug,
+    ),
+    // Public verification keys (32 bytes -> 64 hex).
+    IdentifierFieldRule::new(
+        FieldMatcher::AnyOf(PUBLIC_KEY_FIELDS),
+        IdentifierShape::HexExact(MAX_HASH_OR_ID_LEN),
+    ),
+    // Quantization slot hex metadata.
+    IdentifierFieldRule::new(
+        FieldMatcher::Prefix("quant_slot_"),
+        IdentifierShape::HexBounded(MAX_QUANT_SLOT_METADATA_LEN),
+    ),
+    // Generic stable identifiers: hash / *_id / *_hash / *_sha256 / *_digest and
+    // the explicit id/hash fields enumerated in `field_allows_stable_identifier`.
+    IdentifierFieldRule::new(
+        FieldMatcher::Predicate(field_allows_stable_identifier),
+        IdentifierShape::StableIdentifier,
+    ),
+];
+
+/// One declared row of [`IDENTIFIER_FIELD_REGISTRY`].
+struct IdentifierFieldRule {
+    matcher: FieldMatcher,
+    shape: IdentifierShape,
+}
+
+impl IdentifierFieldRule {
+    const fn new(matcher: FieldMatcher, shape: IdentifierShape) -> Self {
+        Self { matcher, shape }
+    }
+}
+
+/// How a registry row matches a (normalized) ledger field name.
+enum FieldMatcher {
+    /// Exact normalized field name.
+    Exact(&'static str),
+    /// Membership in a fixed set of normalized field names.
+    AnyOf(&'static [&'static str]),
+    /// Normalized field name starts with this prefix.
+    Prefix(&'static str),
+    /// Arbitrary predicate over the normalized field name.
+    Predicate(fn(&str) -> bool),
+}
+
+impl FieldMatcher {
+    fn matches(&self, field: &str) -> bool {
+        match self {
+            Self::Exact(name) => field == *name,
+            Self::AnyOf(names) => names.contains(&field),
+            Self::Prefix(prefix) => field.starts_with(prefix),
+            Self::Predicate(predicate) => predicate(field),
+        }
+    }
+}
+
+/// The provably-non-secret token shape a registered field's value must satisfy.
+#[derive(Clone, Copy)]
+enum IdentifierShape {
+    /// Bounded source-path metadata (alnum + `_-.:/`, <= 128 chars).
+    SourceMetadata,
+    /// Stable `CALYX_*` diagnostic code.
+    CalyxCode,
+    /// Hex digest of exactly `n` chars.
+    HexExact(usize),
+    /// Git object name: 7..=40 hex chars (short or full SHA-1).
+    GitSha,
+    /// Filesystem-derived path slug (ascii alnum + `-_.`).
+    PathSlug,
+    /// Discovery/run manifest slug (bounded, alnum + `-_:/.`).
+    ManifestSlug,
+    /// Hex digest bounded to `n` chars.
+    HexBounded(usize),
+    /// Generic stable identifier: hex / base58 / uuid, bounded to 64 chars.
+    StableIdentifier,
+}
+
+impl IdentifierShape {
+    fn accepts(self, token: &str) -> bool {
+        match self {
+            Self::SourceMetadata => allowed_source_metadata_value(token),
+            Self::CalyxCode => allowed_stable_code(token),
+            Self::HexExact(len) => token.len() == len && is_hex(token),
+            Self::GitSha => matches!(token.len(), 7..=40) && is_hex(token),
+            Self::PathSlug => token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+            Self::ManifestSlug => is_manifest_slug(token),
+            Self::HexBounded(max) => token.len() <= max && is_hex(token),
+            Self::StableIdentifier => {
+                token.len() <= MAX_HASH_OR_ID_LEN
+                    && (is_hex(token) || is_base58(token) || is_uuid(token))
+            }
+        }
+    }
+}
+
+/// Returns whether `token` is a provably-non-secret identifier for `field`,
+/// resolved through the declared [`IDENTIFIER_FIELD_REGISTRY`]. A field with no
+/// registered row is fail-closed (`false`): a long/high-entropy token in an
+/// unregistered field is treated as a possible secret and rejected.
 fn allowed_stable_identifier(token: &str, field: Option<&str>) -> bool {
     let Some(field) = field else {
         return false;
     };
     let field = normalized_field(field);
-    if is_source_metadata_field(&field) {
-        return allowed_source_metadata_value(token);
-    }
-    if field == "code" {
-        return allowed_stable_code(token);
-    }
-    if field == "signature" {
-        return token.len() == 128 && is_hex(token);
-    }
-    if field == "git_sha" {
-        return matches!(token.len(), 7..=40) && is_hex(token);
-    }
-    if field == "commit" || field == "historical_commit" {
-        // A git commit SHA recorded as import provenance (Astrolabe shadow index
-        // and git-archaeology write the HEAD / historical commit into these
-        // metadata fields) is not a secret; it is allowlisted exactly like an
-        // explicit `git_sha` field. A non-git shadow import records a short
-        // `shadow-import-v1:<project>` label that never reaches this check.
-        return matches!(token.len(), 7..=40) && is_hex(token);
-    }
-    if field == "project" {
-        // The project identifier is the CBM/Astrolabe sanitized repo-path slug
-        // (`index_project_from_args` -> `cbm_project_name_from_path`): filesystem
-        // path characters mapped to an ascii dash/dot/underscore identifier. It is
-        // derived provenance metadata, never user secret material, and is
-        // legitimately long for a deeply-nested repo path (e.g.
-        // `C-code-...-fusiondemo`), so it is allowlisted by its identifier shape.
-        return token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    }
-    if field_allows_manifest_slug(&field) && is_manifest_slug(token) {
-        return true;
-    }
-    if is_public_key_field(&field) {
-        return token.len() == MAX_HASH_OR_ID_LEN && is_hex(token);
-    }
-    if field.starts_with("quant_slot_") {
-        return token.len() <= MAX_QUANT_SLOT_METADATA_LEN && is_hex(token);
-    }
-    if !field_allows_stable_identifier(&field) || token.len() > MAX_HASH_OR_ID_LEN {
-        return false;
-    }
-    is_hex(token) || is_base58(token) || is_uuid(token)
+    IDENTIFIER_FIELD_REGISTRY
+        .iter()
+        .find(|rule| rule.matcher.matches(&field))
+        .is_some_and(|rule| rule.shape.accepts(token))
 }
 
 fn allowed_stable_code(token: &str) -> bool {
@@ -270,13 +382,6 @@ fn field_allows_stable_identifier(field: &str) -> bool {
         || field.ends_with("_id")
         || field.ends_with("_sha256")
         || field.ends_with("_digest")
-}
-
-fn field_allows_manifest_slug(field: &str) -> bool {
-    matches!(
-        field,
-        "run_id" | "corpus_vault_id" | "stage_id" | "upstream_stage_id" | "command",
-    )
 }
 
 fn is_manifest_slug(token: &str) -> bool {
@@ -318,7 +423,7 @@ fn is_secret_field(field: &str) -> bool {
 }
 
 fn is_public_key_field(field: &str) -> bool {
-    matches!(field, "signer_pubkey" | "public_key" | "verifying_key")
+    PUBLIC_KEY_FIELDS.contains(&field)
 }
 
 fn normalized_field(field: &str) -> String {
