@@ -12,6 +12,8 @@ pub(crate) fn readiness_status_json_at(
     let effective_axis = axis.unwrap_or("general");
     let kernel_context = read_kernel_context_metadata(cache_dir, project)?;
     let readiness_measurements = readiness_tier_measurements_json(cache_dir, project)?;
+    let layout_coherence_tier =
+        readiness_layout_coherence_tier(cache_dir, project, effective_scope)?;
     let tiers = vec![
         readiness_configured_tier(
             &readiness_measurements,
@@ -59,6 +61,7 @@ pub(crate) fn readiness_status_json_at(
             "mistake_closure:not_persisted",
             "run mistake-closure replay and persist wrong-only-once regression state for this scope",
         ),
+        layout_coherence_tier,
     ];
     let ready = tiers.iter().all(readiness_tier_passed);
     let first_failing = tiers
@@ -417,6 +420,87 @@ pub(crate) fn readiness_kernel_recall_tier(kernel_context: &Value, scope: &str) 
             Value::String("increase or repair the scoped kernel until persisted recall_millipoints is at least 950".to_string())
         },
     })
+}
+
+/// The `layout_coherence` readiness tier (#313 / #180d).
+///
+/// Reads the persisted per-scope layout-coherence enforcement decision back off
+/// the shadow vault (the observe-only / escalation-ladder verdict the shadow
+/// import wrote from the measured mean `placement_truth` agreement) and surfaces
+/// it as a measured readiness tier. The tier PASSES only when the ladder licensed
+/// escalation (coherence at or above the registry escalation threshold); below the
+/// floor it is observe-only. Fails closed to a labeled unavailable tier when no
+/// enforcement row is persisted for the scope (no S23 posteriors, or a scope with
+/// no scored members) or the persisted row is malformed — never a fabricated pass.
+pub(crate) fn readiness_layout_coherence_tier(
+    cache_dir: &Path,
+    project: &str,
+    scope: &str,
+) -> Result<Value, DynError> {
+    const REQUIRED: &str = "layout coherence >= escalation threshold, measured";
+    let unavailable = |source: &'static str| {
+        readiness_unavailable_tier(
+            "layout_coherence",
+            REQUIRED,
+            source,
+            "index with calyx=\"shadow\" so S23 layer_role posteriors persist and the layout \
+             enforcement ladder scores this scope's mean placement_truth agreement, or declare \
+             the directory role in astro.layout.declared_map.v1",
+        )
+    };
+    let enforce_scope = if scope == project {
+        layout_enforcement_project_scope()
+    } else {
+        scope
+    };
+    let Some(row) = read_layout_enforcement_row(cache_dir, project, enforce_scope)? else {
+        return Ok(unavailable("layout_enforcement:not_persisted"));
+    };
+    let coherence = row.get("coherence").and_then(Value::as_f64);
+    let mode = row
+        .get("enforcement_mode")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let (Some(coherence), Some(mode)) = (coherence, mode) else {
+        return Ok(unavailable("layout_enforcement:malformed"));
+    };
+    let observe_only = row.get("enforcement_skipped").and_then(Value::as_bool) == Some(true);
+    let pass = mode == "escalation_licensed";
+    let trust = row
+        .get("trust")
+        .and_then(Value::as_str)
+        .unwrap_or("provisional")
+        .to_string();
+    Ok(json!({
+        "tier": "layout_coherence",
+        "pass": pass,
+        "measured": true,
+        "value": {
+            "scope": enforce_scope,
+            "coherence": coherence,
+            "coherence_bits": row.get("coherence_bits").cloned().unwrap_or(Value::Null),
+            "enforcement_mode": mode,
+            "enforcement_skipped": observe_only,
+            "coherence_floor": row.get("coherence_floor").cloned().unwrap_or(Value::Null),
+            "escalation_threshold": row.get("escalation_threshold").cloned().unwrap_or(Value::Null),
+            "member_count": row.get("member_count").cloned().unwrap_or(Value::Null),
+        },
+        "required": REQUIRED,
+        "provenance_refs": [row.get("provenance").and_then(Value::as_str).unwrap_or("AsterVault:ColumnFamily::Kv:layout_enforcement")],
+        "source": "shadow_vault:layout_enforcement",
+        "freshness": "fresh",
+        "trust": trust,
+        "enforcement_mode": mode,
+        "observe_only": observe_only,
+        "knob_content_sha256": row.get("knob_content_sha256").cloned().unwrap_or(Value::Null),
+        "cheapest_fix": if pass {
+            Value::Null
+        } else if observe_only {
+            Value::String("layout coherence is at or below the chance floor: the enforcement ladder is observe-only. Move drifting symbols to role-matching directories (or reclassify the directory in astro.layout.declared_map.v1) until the scope's mean placement_truth agreement rises above the escalation threshold.".to_string())
+        } else {
+            Value::String("layout coherence is monitored but below the escalation threshold: raise the scope's mean placement_truth agreement (align member roles with the directory role) before layout enforcement can escalate past observe-only.".to_string())
+        },
+    }))
 }
 
 pub(crate) fn readiness_tier_passed(tier: &Value) -> bool {

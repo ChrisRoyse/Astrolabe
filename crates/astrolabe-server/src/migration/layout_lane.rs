@@ -43,6 +43,9 @@ use astrolabe_kernel::{
     placement_truth_row_bytes, placement_truth_xterm_key,
 };
 use astrolabe_panel::LayerRole;
+use astrolabe_panel::layout_registry::{
+    LAYOUT_COHERENCE_FLOOR, LAYOUT_ESCALATION_THRESHOLD, classify_layout_coherence,
+};
 use calyx_core::CxId;
 use calyx_ledger::EntryKind;
 
@@ -54,6 +57,17 @@ const LAYOUT_FRAME_ACTOR: &str = "astrolabe-shadow-layout-frame";
 const LAYOUT_FRAME_PREFIX: &[u8] = b"astrolabe:shadow:layout_frame:v1\0";
 /// XTerm CF key prefix for a persisted `placement_truth` cross-term row.
 const LAYOUT_PLACEMENT_PREFIX: &[u8] = b"astrolabe:shadow:placement_truth:v1\0";
+/// Kv CF key prefix for a persisted per-scope layout-coherence enforcement row
+/// (the observe-only / escalation-ladder decision — #313).
+const LAYOUT_ENFORCE_PREFIX: &[u8] = b"astrolabe:shadow:layout_enforcement:v1\0";
+/// Reserved scope name for the whole-project enforcement row (mean coherence).
+/// A real directory path from [`directory_of`] never begins with `@`, so this
+/// cannot collide with a directory scope.
+const LAYOUT_ENFORCE_PROJECT_SCOPE: &str = "@project";
+/// Row/aspect schema for a persisted layout-coherence enforcement decision.
+const LAYOUT_ENFORCE_SCHEMA: &str = "astrolabe.layout.enforcement.v1";
+/// Provenance label: the physical source of a persisted enforcement row.
+const LAYOUT_ENFORCE_PROVENANCE: &str = "AsterVault:ColumnFamily::Kv:layout_enforcement";
 /// S23 `layer_role` slot id — the posterior a directory-role frame aggregates.
 const LAYER_ROLE_SLOT: u16 = 23;
 
@@ -111,6 +125,49 @@ fn layout_placement_key(project: &str, symbol_cx: &[u8], directory_cx: &[u8]) ->
     key.push(0);
     key.extend_from_slice(&placement_truth_xterm_key(symbol_cx, directory_cx));
     key
+}
+
+/// Kv CF key for a per-scope layout-coherence enforcement row.
+fn layout_enforcement_key(project: &str, scope: &str) -> Vec<u8> {
+    let mut key = LAYOUT_ENFORCE_PREFIX.to_vec();
+    key.extend_from_slice(project.as_bytes());
+    key.push(0);
+    key.extend_from_slice(scope.as_bytes());
+    key
+}
+
+/// Canonical value bytes for one persisted enforcement decision row.
+///
+/// `coherence` is emitted both as a JSON number (for the readiness surface) and as
+/// its exact IEEE-754 bit pattern (for byte-stable readback). The enforcement mode
+/// is classified by the frozen [`classify_layout_coherence`] ladder — the registry
+/// knob thresholds, never inline literals.
+fn layout_enforcement_row_bytes(
+    scope: &str,
+    scope_kind: &str,
+    coherence: f32,
+    member_count: usize,
+    directory_count: usize,
+    trust: &str,
+) -> Vec<u8> {
+    let mode = classify_layout_coherence(coherence);
+    serde_json::to_vec(&json!({
+        "schema": LAYOUT_ENFORCE_SCHEMA,
+        "scope": scope,
+        "scope_kind": scope_kind,
+        "coherence": coherence,
+        "coherence_bits": format!("{:08x}", coherence.to_bits()),
+        "member_count": member_count,
+        "directory_count": directory_count,
+        "coherence_floor": LAYOUT_COHERENCE_FLOOR,
+        "escalation_threshold": LAYOUT_ESCALATION_THRESHOLD,
+        "enforcement_mode": mode.as_str(),
+        "enforcement_skipped": mode.is_observe_only(),
+        "knob_content_sha256": hex_lower(&astrolabe_panel::layout_registry::enforcement_content_sha()),
+        "provenance": LAYOUT_ENFORCE_PROVENANCE,
+        "trust": trust,
+    }))
+    .expect("encode layout enforcement row")
 }
 
 /// Prefix over which persisted frame rows for a project can be scanned back.
@@ -313,17 +370,27 @@ where
     let mut rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut placement_rows_written = 0usize;
     let mut disagreeing_rows = 0usize;
+    // Per-scope layout coherence (mean placement_truth agreement) drives the
+    // enforcement ladder (#313). Computed here off the same placements the frame
+    // lane already scores, so the persisted coherence is byte-consistent with the
+    // layout_map aspect's `mean_coherence`.
+    let mut coherence_sum = 0.0_f64;
+    let mut coherence_count = 0usize;
+    let mut enforcement_rows: Vec<(String, String, f32, usize, &'static str)> = Vec::new();
+    let mut observe_only_scopes = 0usize;
     for bundle in &gathered.bundles {
         rows.push((
             ColumnFamily::Kernel,
             layout_frame_key(project, &bundle.directory_cx),
             directory_role_frame_artifact_bytes(&bundle.frame),
         ));
+        let mut agreement_sum = 0.0_f64;
         for member in &bundle.members {
             let placement = compute_placement_truth(&member.member, &bundle.frame)?;
             if !placement.agrees {
                 disagreeing_rows += 1;
             }
+            agreement_sum += f64::from(placement.agreement);
             rows.push((
                 ColumnFamily::XTerm,
                 layout_placement_key(project, member.symbol_cx.as_bytes(), &bundle.directory_cx),
@@ -331,7 +398,56 @@ where
             ));
             placement_rows_written += 1;
         }
+        // A directory with no scored members has no measured coherence — never
+        // zero-filled; it simply persists no enforcement row (fail-closed absence).
+        if !bundle.members.is_empty() {
+            let coherence = (agreement_sum / bundle.members.len() as f64) as f32;
+            coherence_sum += f64::from(coherence);
+            coherence_count += 1;
+            if classify_layout_coherence(coherence).is_observe_only() {
+                observe_only_scopes += 1;
+            }
+            enforcement_rows.push((
+                bundle.directory_path.clone(),
+                "directory".to_string(),
+                coherence,
+                bundle.members.len(),
+                bundle.frame.trust,
+            ));
+        }
     }
+
+    // Whole-project scope: mean over directories that have a scored coherence,
+    // matching `LayoutMapAspect::mean_coherence`. Only persisted when at least one
+    // directory scored, so the readiness tier fails closed (unavailable) otherwise.
+    let project_coherence =
+        (coherence_count > 0).then(|| (coherence_sum / coherence_count as f64) as f32);
+    if let Some(project_coherence) = project_coherence {
+        if classify_layout_coherence(project_coherence).is_observe_only() {
+            observe_only_scopes += 1;
+        }
+        rows.push((
+            ColumnFamily::Kv,
+            layout_enforcement_key(project, LAYOUT_ENFORCE_PROJECT_SCOPE),
+            layout_enforcement_row_bytes(
+                LAYOUT_ENFORCE_PROJECT_SCOPE,
+                "project",
+                project_coherence,
+                placement_rows_written,
+                coherence_count,
+                "verified",
+            ),
+        ));
+    }
+    for (scope, scope_kind, coherence, member_count, trust) in &enforcement_rows {
+        rows.push((
+            ColumnFamily::Kv,
+            layout_enforcement_key(project, scope),
+            layout_enforcement_row_bytes(scope, scope_kind, *coherence, *member_count, 1, trust),
+        ));
+    }
+    let enforcement_rows_written =
+        enforcement_rows.len() + usize::from(project_coherence.is_some());
 
     let frame_rows_written = gathered.bundles.len();
     let row_count = rows.len();
@@ -381,12 +497,91 @@ where
         "s23_symbols_seen": gathered.s23_symbols_seen,
         "missing_s23": gathered.missing_s23,
         "rows_written": row_count,
+        "enforcement": {
+            "schema": LAYOUT_ENFORCE_SCHEMA,
+            "rows_written": enforcement_rows_written,
+            "project_coherence": project_coherence,
+            "observe_only_scopes": observe_only_scopes,
+            "coherence_floor": LAYOUT_COHERENCE_FLOOR,
+            "escalation_threshold": LAYOUT_ESCALATION_THRESHOLD,
+            "provenance": LAYOUT_ENFORCE_PROVENANCE,
+        },
         "fsv": {
             "kind": "vault_cf_readback",
             "readback_verified_rows": readback_verified,
-            "families": ["Kernel", "XTerm", "Ledger"],
+            "families": ["Kernel", "XTerm", "Kv", "Ledger"],
         },
     }))
+}
+
+/// Reads the persisted per-scope layout-coherence enforcement decision row back
+/// off the shadow vault (`ColumnFamily::Kv`), for the readiness surface (#313).
+///
+/// `Ok(None)` is a labeled absence (no enforcement row persisted for this scope —
+/// the shadow import has not scored layout coherence for it, e.g. no S23 posteriors
+/// or a directory with no members), never a fabricated verdict. Fails closed on a
+/// genuine vault fault or a corrupt row.
+pub(crate) fn read_layout_enforcement_row(
+    cache_dir: &Path,
+    project: &str,
+    scope: &str,
+) -> Result<Option<Value>, DynError> {
+    let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;
+    if !vault_dir.exists() {
+        return Ok(None);
+    }
+    let vault = match open_shadow_vault_read_only(
+        &vault_dir,
+        &vault_id,
+        &vault_salt,
+        vec![ColumnFamily::Kv],
+    ) {
+        Ok(vault) => vault,
+        Err(_) => return Ok(None),
+    };
+    let Some(bytes) = vault.read_cf_at(
+        vault.snapshot(),
+        ColumnFamily::Kv,
+        &layout_enforcement_key(project, scope),
+    )?
+    else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("persisted layout enforcement row for scope {scope} is corrupt: {error}")
+    })?;
+    Ok(Some(value))
+}
+
+/// The reserved whole-project enforcement scope name (for the readiness surface).
+pub(crate) fn layout_enforcement_project_scope() -> &'static str {
+    LAYOUT_ENFORCE_PROJECT_SCOPE
+}
+
+/// Seeds one persisted layout-coherence enforcement row into a fresh shadow vault,
+/// for readiness-surface tests that need a measured `layout_coherence` tier without
+/// running a full shadow import. Writes the same bytes the production persist path
+/// writes, so the readback path exercises real persisted state.
+#[cfg(test)]
+pub(crate) fn seed_layout_enforcement_row_for_test(
+    cache_dir: &Path,
+    project: &str,
+    scope: &str,
+    coherence: f32,
+    member_count: usize,
+) -> Result<(), DynError> {
+    let vault = AsterVault::new_durable(
+        vault_dir(cache_dir, project),
+        VaultId::from_str(SHADOW_VAULT_ID)?,
+        vault_salt(project).as_bytes().to_vec(),
+        VaultOptions::default(),
+    )?;
+    vault.write_cf_batch([(
+        ColumnFamily::Kv,
+        layout_enforcement_key(project, scope),
+        layout_enforcement_row_bytes(scope, "directory", coherence, member_count, 1, "verified"),
+    )])?;
+    Ok(())
 }
 
 fn layout_ledger_payload(
@@ -949,10 +1144,46 @@ mod tests {
 
         // --- The frame lane forms real frames — never skipped_no_frame (#336).
         let persisted = persist_layout_frames(&vault, project, true).unwrap();
-        assert_eq!(persisted["status"], "persisted", "frames formed: {persisted}");
+        assert_eq!(
+            persisted["status"], "persisted",
+            "frames formed: {persisted}"
+        );
         assert_eq!(persisted["s23_symbols_seen"], 3);
         assert_eq!(persisted["missing_s23"], 0);
         assert_eq!(persisted["directory_frame_rows_written"], 2);
+
+        // --- #313: the enforcement ladder scored every directory + the project.
+        // cbm/internal/cbm = {transport, other} -> coherence 0.5 (escalation);
+        // cbm/src = {other} -> coherence 1.0 (escalation); project mean 0.75.
+        assert_eq!(persisted["enforcement"]["rows_written"], 3);
+        assert_eq!(persisted["enforcement"]["observe_only_scopes"], 0);
+        let project_coh = persisted["enforcement"]["project_coherence"]
+            .as_f64()
+            .expect("project coherence");
+        assert!((project_coh - 0.75).abs() < 1e-6, "project coherence 0.75");
+        // Independent readback of the persisted per-scope enforcement rows.
+        let enforce_commit = vault.snapshot();
+        for (scope, want_coherence) in [
+            (LAYOUT_ENFORCE_PROJECT_SCOPE, 0.75_f64),
+            ("cbm/internal/cbm", 0.5),
+            ("cbm/src", 1.0),
+        ] {
+            let bytes = vault
+                .read_cf_at(
+                    enforce_commit,
+                    ColumnFamily::Kv,
+                    &layout_enforcement_key(project, scope),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("enforcement row for {scope}"));
+            let row: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!((row["coherence"].as_f64().unwrap() - want_coherence).abs() < 1e-6);
+            assert_eq!(
+                row["enforcement_mode"], "escalation_licensed",
+                "coherence {want_coherence} licenses escalation"
+            );
+            assert_eq!(row["enforcement_skipped"], false);
+        }
 
         // --- Independent readback #2 (FSV-2): recompute each directory's L1
         // aggregate straight from the members' persisted S23 CF bytes and compare
@@ -1014,6 +1245,112 @@ mod tests {
         );
 
         drop(vault);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // #313: the enforcement ladder thresholds are the frozen registry knob, and the
+    // observe-only floor is the chance line (1/LAYER_ROLE_COUNT).
+    #[test]
+    fn enforcement_ladder_boundaries_are_the_registry_knob() {
+        assert_eq!(LAYOUT_COHERENCE_FLOOR, 1.0 / LAYER_ROLE_COUNT as f32);
+        assert_eq!(LAYOUT_ESCALATION_THRESHOLD, 0.5);
+        // At or below the chance floor: observe-only.
+        assert!(classify_layout_coherence(LAYOUT_COHERENCE_FLOOR).is_observe_only());
+        assert!(classify_layout_coherence(0.05).is_observe_only());
+        // Between floor and threshold: monitored, not escalatable.
+        assert_eq!(classify_layout_coherence(0.3).as_str(), "monitor");
+        // At or above the majority boundary: escalation licensed.
+        assert_eq!(
+            classify_layout_coherence(LAYOUT_ESCALATION_THRESHOLD).as_str(),
+            "escalation_licensed"
+        );
+    }
+
+    // #313 FSV 5(a): a below-floor coherence persists an observe-only skip row, and
+    // the readiness tier reads that persisted row back and refuses (observe-only,
+    // not ready) — enforcement is never silently escalated below the floor.
+    #[test]
+    fn below_floor_coherence_persists_observe_only_skip_row_and_tier_refuses() {
+        let root = temp_root("enforce-observe");
+        // 0.1 < 1/8: the chance-floor case. Written with the production row bytes,
+        // so classify_layout_coherence stamps observe_only + enforcement_skipped.
+        seed_layout_enforcement_row_for_test(&root, "demo", LAYOUT_ENFORCE_PROJECT_SCOPE, 0.1, 8)
+            .unwrap();
+
+        // FSV: the persisted skip row read straight back off the Kv CF.
+        let row = read_layout_enforcement_row(&root, "demo", LAYOUT_ENFORCE_PROJECT_SCOPE)
+            .unwrap()
+            .expect("persisted enforcement row");
+        assert_eq!(row["enforcement_mode"], "observe_only");
+        assert_eq!(row["enforcement_skipped"], true);
+        assert!(
+            row["coherence"].as_f64().unwrap() <= row["coherence_floor"].as_f64().unwrap(),
+            "coherence at or below the floor"
+        );
+
+        // The readiness tier reads the persisted verdict and drives observe-only.
+        let tier = readiness_layout_coherence_tier(&root, "demo", "demo").unwrap();
+        assert_eq!(tier["tier"], "layout_coherence");
+        assert_eq!(tier["measured"], true);
+        assert_eq!(tier["pass"], false);
+        assert_eq!(tier["observe_only"], true);
+        assert_eq!(tier["enforcement_mode"], "observe_only");
+        assert!(
+            tier["cheapest_fix"]
+                .as_str()
+                .unwrap()
+                .contains("observe-only")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // #313: a coherence at or above the escalation threshold licenses escalation and
+    // the tier passes, read back off the persisted row.
+    #[test]
+    fn above_threshold_coherence_licenses_escalation_tier() {
+        let root = temp_root("enforce-escalate");
+        seed_layout_enforcement_row_for_test(&root, "demo", LAYOUT_ENFORCE_PROJECT_SCOPE, 0.9, 5)
+            .unwrap();
+        let tier = readiness_layout_coherence_tier(&root, "demo", "demo").unwrap();
+        assert_eq!(tier["measured"], true);
+        assert_eq!(tier["pass"], true);
+        assert_eq!(tier["enforcement_mode"], "escalation_licensed");
+        assert_eq!(tier["observe_only"], false);
+        assert_eq!(tier["cheapest_fix"], Value::Null);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // #313 fail-closed: no shadow vault at all -> unavailable tier, never a
+    // fabricated pass.
+    #[test]
+    fn absent_layout_enforcement_yields_unavailable_tier() {
+        let root = temp_root("enforce-absent");
+        let tier =
+            readiness_layout_coherence_tier(&root, "no-such-project", "no-such-project").unwrap();
+        assert_eq!(tier["tier"], "layout_coherence");
+        assert_eq!(tier["measured"], false);
+        assert_eq!(tier["pass"], false);
+        assert!(tier["cheapest_fix"].as_str().unwrap().contains("index"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // #313 fail-closed: a shadow vault that persisted no layout coherence (no S23
+    // posteriors / degenerate project) -> unavailable tier.
+    #[test]
+    fn vault_without_enforcement_row_yields_unavailable_tier() {
+        let root = temp_root("enforce-no-row");
+        let vault = AsterVault::new_durable(
+            vault_dir(&root, "demo"),
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            vault_salt("demo").as_bytes().to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+        drop(vault);
+        let tier = readiness_layout_coherence_tier(&root, "demo", "demo").unwrap();
+        assert_eq!(tier["tier"], "layout_coherence");
+        assert_eq!(tier["measured"], false);
+        assert_eq!(tier["pass"], false);
         let _ = fs::remove_dir_all(&root);
     }
 }

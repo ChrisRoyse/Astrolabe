@@ -873,6 +873,10 @@ fn get_readiness_reads_all_measured_tiers_and_reports_ready() {
         &readiness_tiers.to_string(),
     )
     .unwrap();
+    // Seed a persisted layout-coherence enforcement row above the escalation
+    // threshold so the layout_coherence readiness tier is measured and passing
+    // (#313): 1.0 coherence licenses escalation for the payments scope.
+    seed_layout_enforcement_row_for_test(&dir, "demo", "payments", 1.0, 3).unwrap();
     let raw_kernel_context = read_config_value(&dir, &metadata_key("demo", "kernel_context_json"))
         .unwrap()
         .unwrap();
@@ -892,7 +896,7 @@ fn get_readiness_reads_all_measured_tiers_and_reports_ready() {
     assert_eq!(readiness["status"], "ready");
     assert_eq!(readiness["ready"], true);
     assert_eq!(readiness["trust"], "verified");
-    assert_eq!(readiness["measured_tier_count"], 6);
+    assert_eq!(readiness["measured_tier_count"], 7);
     assert_eq!(readiness["first_failing_tier"], Value::Null);
     assert_eq!(
         readiness["source_state"]["readiness_tiers"]["metadata_ref"],
@@ -998,12 +1002,15 @@ fn get_readiness_identifies_each_single_failing_measured_tier() {
             &readiness_tier_measurements_fixture(readiness_failure).to_string(),
         )
         .unwrap();
+        // Seed a passing layout-coherence enforcement row so the ONLY failing tier
+        // is the one under test (#313: layout_coherence is now a readiness tier).
+        seed_layout_enforcement_row_for_test(&dir, "demo", "payments", 0.9, 4).unwrap();
 
         let readiness =
             readiness_status_json_at(&dir, "demo", Some("payments"), Some("defects")).unwrap();
         assert_eq!(readiness["status"], "not_ready");
         assert_eq!(readiness["ready"], false);
-        assert_eq!(readiness["measured_tier_count"], 6);
+        assert_eq!(readiness["measured_tier_count"], 7);
         assert_eq!(readiness["first_failing_tier"]["tier"], failing_tier);
         assert!(
             readiness["first_failing_tier"]["cheapest_fix"]

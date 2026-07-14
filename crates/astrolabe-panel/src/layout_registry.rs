@@ -40,6 +40,8 @@ pub const API_FAMILIES_SCHEMA: &str = "astro.layout.api_families.v1";
 pub const EVIDENCE_WEIGHTS_SCHEMA: &str = "astro.layout.evidence_weights.v1";
 /// Content-address schema id of the directory→role declared-map knob.
 pub const DECLARED_MAP_SCHEMA: &str = "astro.layout.declared_map.v1";
+/// Content-address schema id of the layout-coherence enforcement-ladder knob.
+pub const ENFORCEMENT_SCHEMA: &str = "astro.layout.enforcement.v1";
 
 // ---------------------------------------------------------------------------
 // Knob 3 content: weighted-evidence combiner weights.
@@ -144,8 +146,126 @@ pub fn role_for_directory(component: &str) -> Option<LayerRole> {
 }
 
 // ---------------------------------------------------------------------------
+// Knob 5 content: layout-coherence enforcement-ladder thresholds (#180d / #313).
+//
+// Layout coherence (per scope) is the mean `placement_truth` agreement of a
+// scope's members with their directory-role frame — an overlap in [0, 1] over the
+// frozen LAYER_ROLE_COUNT-role coordinate system. Two thresholds gate the
+// enforcement ladder, both *derived* (a measured default, not a tuned literal):
+//
+//  * `coherence_floor` = 1 / LAYER_ROLE_COUNT. The overlap of a uniform-random
+//    posterior with any one-hot frame is exactly 1/LAYER_ROLE_COUNT, so this is
+//    the no-better-than-chance line: at or below it the layout signal carries no
+//    role information and the ladder stays OBSERVE-ONLY (drift is recorded, never
+//    escalated). It moves only if the role taxonomy's cardinality changes.
+//  * `escalation_threshold` = 0.5. The probability-majority boundary: a scope
+//    whose mean agreement reaches one half has its dominant role holding at least
+//    half the frame mass with conforming members, so layout-based enforcement can
+//    be ESCALATED past observe-only. One half is a definitional anchor of a
+//    probability distribution (majority), not a tuned constant.
+// ---------------------------------------------------------------------------
+
+/// Coherence floor of the enforcement ladder: mean `placement_truth` agreement at
+/// or below which a scope is no more coherent than chance (`1 / LAYER_ROLE_COUNT`)
+/// and the ladder stays observe-only. Derived from the role-taxonomy cardinality.
+pub const LAYOUT_COHERENCE_FLOOR: f32 = 1.0 / crate::LAYER_ROLE_COUNT as f32;
+
+/// Escalation threshold of the enforcement ladder: the probability-majority
+/// boundary (`0.5`) at or above which layout-based enforcement is licensed past
+/// observe-only. A definitional majority anchor, not a tuned literal.
+pub const LAYOUT_ESCALATION_THRESHOLD: f32 = 0.5;
+
+/// Ordered, named enforcement-ladder thresholds — the canonical content of the
+/// enforcement knob. The order is frozen: it is the byte order folded into the
+/// content address.
+pub const ENFORCEMENT_KNOBS: &[(&str, f32)] = &[
+    ("coherence_floor", LAYOUT_COHERENCE_FLOOR),
+    ("escalation_threshold", LAYOUT_ESCALATION_THRESHOLD),
+];
+
+/// The enforcement mode a measured coherence licenses under the ladder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutEnforcementMode {
+    /// coherence <= floor: no better than chance; drift recorded, never escalated.
+    ObserveOnly,
+    /// floor < coherence < escalation_threshold: monitored, not yet escalatable.
+    Monitor,
+    /// coherence >= escalation_threshold: layout enforcement licensed.
+    EscalationLicensed,
+}
+
+impl LayoutEnforcementMode {
+    /// Stable snake_case label for persisted rows and readiness tiers.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LayoutEnforcementMode::ObserveOnly => "observe_only",
+            LayoutEnforcementMode::Monitor => "monitor",
+            LayoutEnforcementMode::EscalationLicensed => "escalation_licensed",
+        }
+    }
+
+    /// True when the ladder is observe-only (enforcement skipped).
+    pub const fn is_observe_only(self) -> bool {
+        matches!(self, LayoutEnforcementMode::ObserveOnly)
+    }
+}
+
+/// Classifies a measured layout coherence under the frozen enforcement ladder.
+///
+/// The comparison is the single source of truth for observe-only vs escalation:
+/// `<= floor` is observe-only (chance or worse), `>= escalation_threshold` licenses
+/// enforcement, and the band between is monitored. Thresholds come from the
+/// [`ENFORCEMENT_KNOBS`] registry knob, never inline literals at the call site.
+pub fn classify_layout_coherence(coherence: f32) -> LayoutEnforcementMode {
+    if coherence <= LAYOUT_COHERENCE_FLOOR {
+        LayoutEnforcementMode::ObserveOnly
+    } else if coherence >= LAYOUT_ESCALATION_THRESHOLD {
+        LayoutEnforcementMode::EscalationLicensed
+    } else {
+        LayoutEnforcementMode::Monitor
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Content addressing.
 // ---------------------------------------------------------------------------
+
+/// Canonical content address (32-byte SHA-256) of the layout-coherence
+/// enforcement-ladder knob.
+pub fn enforcement_content_sha() -> [u8; 32] {
+    let mut bit_bufs: Vec<[u8; 4]> = Vec::with_capacity(ENFORCEMENT_KNOBS.len());
+    for (_, value) in ENFORCEMENT_KNOBS {
+        bit_bufs.push(value.to_bits().to_be_bytes());
+    }
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(ENFORCEMENT_KNOBS.len() * 2 + 2);
+    parts.push(LAYOUT_REGISTRY_VERSION.as_bytes());
+    parts.push(ENFORCEMENT_SCHEMA.as_bytes());
+    for (idx, (name, _)) in ENFORCEMENT_KNOBS.iter().enumerate() {
+        parts.push(name.as_bytes());
+        parts.push(&bit_bufs[idx]);
+    }
+    sha256_digest(&parts)
+}
+
+/// The identity-locked manifest entry for the enforcement-ladder knob.
+///
+/// Declared alongside — but deliberately separate from — the four S23-lens knobs of
+/// [`layout_knobs`]: enforcement thresholds are a governance knob that no encoder
+/// consumes, so they carry their own content identity and never move the frozen S23
+/// lens id.
+pub fn layout_enforcement_knob() -> LayoutKnobManifest {
+    LayoutKnobManifest {
+        registry_version: LAYOUT_REGISTRY_VERSION.to_string(),
+        schema: ENFORCEMENT_SCHEMA.to_string(),
+        content_sha256_hex: hex32(&enforcement_content_sha()),
+        source: "derived layout-coherence enforcement ladder (#180d/#313)".to_string(),
+        rationale: "coherence_floor = 1/LAYER_ROLE_COUNT (chance overlap of a uniform posterior \
+            with a one-hot frame) gates observe-only; escalation_threshold = 0.5 (probability \
+            majority) licenses layout enforcement; both derived, not tuned literals"
+            .to_string(),
+    }
+}
 
 /// Canonical content address (32-byte SHA-256) of the canonical-roles knob.
 pub fn canonical_roles_content_sha() -> [u8; 32] {
