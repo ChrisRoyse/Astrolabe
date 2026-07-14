@@ -31,8 +31,8 @@
 
 use std::collections::BTreeMap;
 
-use calyx_core::{CxId, SlotId, SlotVector};
-use calyx_sextant::{HnswIndex, IndexStats, InvertedIndex, SextantIndex};
+use calyx_core::{CxId, SlotId, SlotShape, SlotVector, SparseEntry};
+use calyx_sextant::{HnswIndex, IndexSearchHit, IndexStats, InvertedIndex, SextantIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::search::{
@@ -141,6 +141,16 @@ pub enum SlotIndexKind {
     Lexical,
     /// Dense HNSW index over `dim`-dimensional vectors.
     Vector { dim: u32 },
+    /// Sparse structural slot (S1 struct-trigrams / S4 API-callees) of ambient
+    /// dimension `dim`. These slots carry a per-symbol **sparse** vector with no
+    /// free-text representation, so they are never served by a text query
+    /// (a text query has no structural vector — [`ASTRO_SEARCH_INDEX_QUERY_MISSING`]).
+    /// They are ranked only in the **symbol-anchored structural query mode**
+    /// (see `search_production::structural_more_like_this`), which supplies an
+    /// already-indexed symbol's own persisted sparse vector as the query and
+    /// ranks the corpus by exact sparse cosine (the same metric the weave
+    /// similarity pipeline admits SIM_STRUCT/SIM_API edges with).
+    Structural { dim: u32 },
 }
 
 /// One slot's declared index kind (manifest entry).
@@ -148,6 +158,18 @@ pub enum SlotIndexKind {
 pub struct SlotSpec {
     pub slot: SlotId,
     pub kind: SlotIndexKind,
+}
+
+/// One sparse coordinate in a byte-stable form: the ambient index plus the value
+/// as its IEEE-754 bit pattern (`f32::to_bits`), so a persisted structural vector
+/// serializes identically on every platform (no float-formatting drift in the
+/// content hash — the same discipline [`StoredContent::VectorBits`] uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseWord {
+    /// Ambient dimension index (`< dim`).
+    pub idx: u32,
+    /// Coordinate value as `f32::to_bits`.
+    pub val_bits: u32,
 }
 
 /// One document's content for one slot, in a byte-stable form. Dense vectors are
@@ -160,6 +182,9 @@ pub enum StoredContent {
     Text(String),
     /// Dense vector as `f32::to_bits` words.
     VectorBits(Vec<u32>),
+    /// Sparse structural vector: ambient `dim` plus coordinates sorted by `idx`
+    /// (canonical order — a `BTreeMap` build guarantees byte-stability).
+    SparseBits { dim: u32, entries: Vec<SparseWord> },
 }
 
 /// One document (a symbol) with per-slot content.
@@ -289,6 +314,41 @@ impl SlotIndexSetBuilder {
         self
     }
 
+    /// Declares slot `slot` as a sparse structural index of ambient dimension
+    /// `dim` (see [`SlotIndexKind::Structural`]).
+    pub fn declare_structural(&mut self, slot: SlotId, dim: u32) -> &mut Self {
+        self.kinds.insert(slot, SlotIndexKind::Structural { dim });
+        self
+    }
+
+    /// Adds a sparse structural vector for `symbol_id` at a structural slot.
+    /// Coordinates are stored in canonical (`idx`-sorted) order for byte
+    /// stability; `f32` values are stored as bit patterns.
+    pub fn add_structural(
+        &mut self,
+        symbol_id: impl Into<String>,
+        slot: SlotId,
+        dim: u32,
+        entries: &[SparseEntry],
+    ) -> &mut Self {
+        let mut words: Vec<SparseWord> = entries
+            .iter()
+            .map(|entry| SparseWord {
+                idx: entry.idx,
+                val_bits: entry.val.to_bits(),
+            })
+            .collect();
+        words.sort_by_key(|word| word.idx);
+        self.documents.entry(symbol_id.into()).or_default().insert(
+            slot,
+            StoredContent::SparseBits {
+                dim,
+                entries: words,
+            },
+        );
+        self
+    }
+
     /// Validates the corpus and freezes it into a manifest at `base_seq`.
     /// Fail-closed on undeclared slots, kind mismatches, and dim mismatches.
     pub fn build_manifest(&self, base_seq: u64) -> Result<SlotIndexManifest, SearchError> {
@@ -320,15 +380,47 @@ impl SlotIndexSetBuilder {
                             )));
                         }
                     }
-                    (SlotIndexKind::Lexical, StoredContent::VectorBits(_)) => {
+                    (
+                        SlotIndexKind::Structural { dim },
+                        StoredContent::SparseBits {
+                            dim: content_dim,
+                            entries,
+                        },
+                    ) => {
+                        if content_dim != dim {
+                            return Err(corpus(format!(
+                                "symbol {symbol_id} structural slot {} has ambient dim {} != declared {}",
+                                slot.get(),
+                                content_dim,
+                                dim
+                            )));
+                        }
+                        for word in entries {
+                            if word.idx >= *dim {
+                                return Err(corpus(format!(
+                                    "symbol {symbol_id} structural slot {} coordinate {} is outside ambient dim {}",
+                                    slot.get(),
+                                    word.idx,
+                                    dim
+                                )));
+                            }
+                        }
+                    }
+                    (SlotIndexKind::Lexical, _) => {
                         return Err(corpus(format!(
-                            "symbol {symbol_id} slot {} is lexical but got a vector",
+                            "symbol {symbol_id} slot {} is lexical but got a non-text content",
                             slot.get()
                         )));
                     }
-                    (SlotIndexKind::Vector { .. }, StoredContent::Text(_)) => {
+                    (SlotIndexKind::Vector { .. }, _) => {
                         return Err(corpus(format!(
-                            "symbol {symbol_id} slot {} is a vector index but got text",
+                            "symbol {symbol_id} slot {} is a dense vector index but got non-dense content",
+                            slot.get()
+                        )));
+                    }
+                    (SlotIndexKind::Structural { .. }, _) => {
+                        return Err(corpus(format!(
+                            "symbol {symbol_id} slot {} is a structural (sparse) index but got non-sparse content",
                             slot.get()
                         )));
                     }
@@ -363,13 +455,19 @@ impl SlotIndexSetBuilder {
     }
 }
 
-/// A query, in the two forms the per-slot indexes consume.
+/// A query, in the forms the per-slot indexes consume.
 #[derive(Debug, Clone, Default)]
 pub struct SlotQuery {
     /// Free text for lexical slots (split with [`split_identifier_tokens`]).
     pub text: String,
-    /// Per-slot dense query vectors for vector slots.
+    /// Per-slot dense query vectors for [`SlotIndexKind::Vector`] slots.
     pub vectors: BTreeMap<SlotId, Vec<f32>>,
+    /// Per-slot **sparse** query vectors for [`SlotIndexKind::Structural`]
+    /// slots. Only the symbol-anchored structural query mode supplies these; a
+    /// free-text query leaves this empty, so structural slots are refused
+    /// [`ASTRO_SEARCH_INDEX_QUERY_MISSING`] exactly as a dense vector slot is
+    /// when it receives no query vector.
+    pub sparse_vectors: BTreeMap<SlotId, SlotVector>,
 }
 
 impl SlotQuery {
@@ -378,6 +476,7 @@ impl SlotQuery {
         Self {
             text: text.into(),
             vectors: BTreeMap::new(),
+            sparse_vectors: BTreeMap::new(),
         }
     }
 
@@ -386,11 +485,29 @@ impl SlotQuery {
         self.vectors.insert(slot, vector);
         self
     }
+
+    /// Attaches a sparse structural query vector for `slot`. The vector must be
+    /// a [`SlotVector::Sparse`]; any other shape is refused at rank time.
+    pub fn with_sparse_vector(mut self, slot: SlotId, vector: SlotVector) -> Self {
+        self.sparse_vectors.insert(slot, vector);
+        self
+    }
 }
 
 enum LiveIndex {
     Lexical(InvertedIndex),
-    Vector { dim: u32, index: HnswIndex },
+    Vector {
+        dim: u32,
+        index: HnswIndex,
+    },
+    /// Sparse structural slot. There is no vendored ANN for the sparse S1/S4
+    /// spaces here, so the per-symbol normalized vectors are retained and ranked
+    /// by exact sparse cosine (deterministic, bounded per query). Keyed by CxId
+    /// to share [`SlotIndexSet::symbol_by_cx`] for the reverse lookup.
+    Structural {
+        dim: u32,
+        vectors: BTreeMap<CxId, crate::NormalizedVector>,
+    },
 }
 
 /// A live per-slot index set, rebuilt from a [`SlotIndexManifest`]. Holds one
@@ -436,6 +553,10 @@ impl SlotIndexSet {
                 SlotIndexKind::Vector { dim } => LiveIndex::Vector {
                     dim,
                     index: HnswIndex::new(spec.slot, dim, manifest.knobs.seed),
+                },
+                SlotIndexKind::Structural { dim } => LiveIndex::Structural {
+                    dim,
+                    vectors: BTreeMap::new(),
                 },
             };
             indexes.insert(spec.slot, live);
@@ -509,6 +630,57 @@ impl SlotIndexSet {
                                 ))
                             })?;
                     }
+                    (
+                        LiveIndex::Structural {
+                            dim,
+                            vectors: stored,
+                        },
+                        StoredContent::SparseBits {
+                            dim: content_dim,
+                            entries,
+                        },
+                    ) => {
+                        if content_dim != dim {
+                            return Err(SearchError::new(
+                                ASTRO_SEARCH_INDEX_CORPUS,
+                                format!(
+                                    "document {} structural slot {} ambient dim {} != declared {}",
+                                    doc.symbol_id,
+                                    slot.get(),
+                                    content_dim,
+                                    dim
+                                ),
+                                "Structural vector ambient dimensions must match the declared slot dimension.",
+                            ));
+                        }
+                        let sparse = SlotVector::Sparse {
+                            dim: *dim,
+                            entries: entries
+                                .iter()
+                                .map(|word| SparseEntry {
+                                    idx: word.idx,
+                                    val: f32::from_bits(word.val_bits),
+                                })
+                                .collect(),
+                        };
+                        // Normalize once at build time; a persisted structural
+                        // vector that cannot be normalized (degenerate/zero-norm,
+                        // wrong shape, non-finite) is a corpus defect, refused —
+                        // never a silently unrankable row.
+                        let normalized = crate::normalized_vector(&sparse).map_err(|reason| {
+                            SearchError::new(
+                                ASTRO_SEARCH_INDEX_CORPUS,
+                                format!(
+                                    "document {} structural slot {} vector is not rankable: {reason:?}",
+                                    doc.symbol_id,
+                                    slot.get()
+                                ),
+                                "Rebuild the corpus so every persisted structural vector is a \
+                                 finite, non-degenerate sparse vector.",
+                            )
+                        })?;
+                        stored.insert(cx_id, normalized);
+                    }
                     _ => {
                         return Err(SearchError::new(
                             ASTRO_SEARCH_INDEX_CORPUS,
@@ -541,10 +713,18 @@ impl SlotIndexSet {
     /// kind, live length). Makes the index layer auditable, never a black box.
     pub fn freshness(&self) -> Vec<IndexStats> {
         self.indexes
-            .values()
-            .map(|live| match live {
+            .iter()
+            .map(|(slot, live)| match live {
                 LiveIndex::Lexical(index) => index.stats(),
                 LiveIndex::Vector { index, .. } => index.stats(),
+                LiveIndex::Structural { dim, vectors } => IndexStats {
+                    slot: *slot,
+                    shape: SlotShape::Sparse(*dim),
+                    len: vectors.len(),
+                    built_at_seq: self.built_at_seq,
+                    base_seq: self.built_at_seq,
+                    kind: "structural_sparse_cosine",
+                },
             })
             .collect()
     }
@@ -564,7 +744,10 @@ impl SlotIndexSet {
     /// Fail-closed contract:
     /// - a slot with no constructed index => [`ASTRO_SEARCH_INDEX_ABSENT`]
     ///   (never a silent scan fallback);
-    /// - a vector slot with no query vector => [`ASTRO_SEARCH_INDEX_QUERY_MISSING`].
+    /// - a vector slot with no query vector => [`ASTRO_SEARCH_INDEX_QUERY_MISSING`];
+    /// - a structural (sparse) slot with no structural query vector =>
+    ///   [`ASTRO_SEARCH_INDEX_QUERY_MISSING`] (a free-text query has no S1/S4
+    ///   representation — the symbol-anchored structural mode supplies it).
     ///
     /// An index that exists but holds no matching candidates (empty corpus,
     /// query term absent from every document) returns an *empty* ranking — a
@@ -639,6 +822,96 @@ impl SlotIndexSet {
                                 "The vendored HNSW rejected the query; check k/ef bounds.",
                             )
                         })?
+                }
+            }
+            LiveIndex::Structural { dim, vectors } => {
+                // A structural slot has no free-text representation: a text query
+                // supplies no structural vector and is refused exactly like a
+                // dense vector slot without a query vector.
+                let Some(query_vector) = query.sparse_vectors.get(&slot) else {
+                    return Err(SearchError::new(
+                        ASTRO_SEARCH_INDEX_QUERY_MISSING,
+                        format!(
+                            "planned structural slot {} received no structural query vector",
+                            slot.get()
+                        ),
+                        "A free-text query has no S1/S4 structural representation. Use the \
+                         symbol-anchored structural query mode \
+                         (search_production::structural_more_like_this), which supplies an \
+                         indexed symbol's own persisted sparse vector as the query.",
+                    ));
+                };
+                let SlotVector::Sparse { dim: query_dim, .. } = query_vector else {
+                    return Err(SearchError::new(
+                        ASTRO_SEARCH_INDEX_CORPUS,
+                        format!(
+                            "structural query for slot {} must be a sparse vector",
+                            slot.get()
+                        ),
+                        "Structural slots rank sparse vectors; supply a SlotVector::Sparse query.",
+                    ));
+                };
+                if *query_dim != *dim {
+                    return Err(SearchError::new(
+                        ASTRO_SEARCH_INDEX_CORPUS,
+                        format!(
+                            "structural query for slot {} has ambient dim {} != index dim {}",
+                            slot.get(),
+                            query_dim,
+                            dim
+                        ),
+                        "Query and index structural vectors must share one ambient dimension.",
+                    ));
+                }
+                if vectors.is_empty() {
+                    Vec::new()
+                } else {
+                    let query_norm = crate::normalized_vector(query_vector).map_err(|reason| {
+                        SearchError::new(
+                            ASTRO_SEARCH_INDEX_CORPUS,
+                            format!(
+                                "structural query for slot {} is not rankable: {reason:?}",
+                                slot.get()
+                            ),
+                            "Supply a finite, non-degenerate sparse structural query vector.",
+                        )
+                    })?;
+                    // Exact sparse cosine over the retained per-symbol vectors,
+                    // ranked deterministically (score desc, then symbol id asc —
+                    // the same tie-break the fused stage uses).
+                    let mut scored: Vec<(f32, &str, CxId)> = Vec::with_capacity(vectors.len());
+                    for (cx_id, stored) in vectors {
+                        let Some(score) = crate::cosine(&query_norm, stored) else {
+                            return Err(SearchError::new(
+                                ASTRO_SEARCH_INDEX_BUILD,
+                                format!(
+                                    "structural cosine on slot {} produced no score for an indexed vector",
+                                    slot.get()
+                                ),
+                                "Report this: indexed structural vectors must share the query's \
+                                 ambient dimension.",
+                            ));
+                        };
+                        let symbol_id = self
+                            .symbol_by_cx
+                            .get(cx_id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        scored.push((score, symbol_id, *cx_id));
+                    }
+                    scored.sort_by(|left, right| {
+                        right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1))
+                    });
+                    scored.truncate(k as usize);
+                    scored
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, (score, _symbol_id, cx_id))| IndexSearchHit {
+                            cx_id,
+                            score,
+                            rank,
+                        })
+                        .collect()
                 }
             }
         };
@@ -735,8 +1008,8 @@ pub fn split_identifier_tokens(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::search::{
-        SLOT_CODE_SEMANTIC, SLOT_LEXICAL_BM25, SLOT_NAME_SEMANTIC, SearchCaps, SearchRequest,
-        plan_search,
+        SLOT_CODE_SEMANTIC, SLOT_LEXICAL_BM25, SLOT_NAME_SEMANTIC, SLOT_STRUCT_TRIGRAMS,
+        SearchCaps, SearchRequest, plan_search,
     };
     use std::path::PathBuf;
 
@@ -783,6 +1056,127 @@ mod tests {
                 .add_vector(*id, SLOT_CODE_SEMANTIC, vector);
         }
         builder
+    }
+
+    /// Ambient dimension for the structural-slot fixtures below (small so the
+    /// hand-built sparse vectors are easy to reason about; the real S1/S4 spaces
+    /// are 65_536 / 262_144).
+    const STRUCT_DIM: u32 = 16;
+
+    fn sparse(entries: &[(u32, f32)]) -> Vec<SparseEntry> {
+        entries
+            .iter()
+            .map(|(idx, val)| SparseEntry {
+                idx: *idx,
+                val: *val,
+            })
+            .collect()
+    }
+
+    /// A structural fixture: S1 (struct-trigrams) declared as a sparse structural
+    /// slot, four symbols with distinct multi-coordinate sparse vectors so cosine
+    /// separates them (unlike single-coordinate panel fixtures, which all tie).
+    fn structural_fixture() -> SlotIndexSetBuilder {
+        let mut builder = SlotIndexSetBuilder::new(IndexKnobs::defaults(SEED));
+        builder.declare_structural(SLOT_STRUCT_TRIGRAMS, STRUCT_DIM);
+        let corpus: &[(&str, &[(u32, f32)])] = &[
+            ("sym:a", &[(0, 1.0), (1, 1.0), (2, 1.0)]),
+            ("sym:b", &[(0, 1.0), (1, 1.0), (3, 0.5)]), // close to a
+            ("sym:c", &[(8, 1.0), (9, 1.0)]),           // disjoint from a
+            ("sym:d", &[(0, 0.2), (2, 1.0), (5, 1.0)]), // partial overlap with a
+        ];
+        for (id, entries) in corpus {
+            builder.add_structural(*id, SLOT_STRUCT_TRIGRAMS, STRUCT_DIM, &sparse(entries));
+        }
+        builder
+    }
+
+    #[test]
+    fn structural_slot_ranks_by_sparse_cosine() {
+        let manifest = structural_fixture().build_manifest(3).expect("manifest");
+        let set = SlotIndexSet::from_manifest(&manifest).expect("build");
+        // Anchor on sym:a's own vector; b (shares 0,1) must outrank c (disjoint).
+        let query = SlotQuery::default().with_sparse_vector(
+            SLOT_STRUCT_TRIGRAMS,
+            SlotVector::Sparse {
+                dim: STRUCT_DIM,
+                entries: sparse(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
+            },
+        );
+        let ranking = set
+            .rank_slot(SLOT_STRUCT_TRIGRAMS, &query, 4, 32)
+            .expect("structural rank");
+        // sym:a ranks itself first (cosine 1.0); sym:c (disjoint) ranks last.
+        assert_eq!(
+            ranking.ranked_symbol_ids.first().map(String::as_str),
+            Some("sym:a")
+        );
+        assert_eq!(
+            ranking.ranked_symbol_ids.last().map(String::as_str),
+            Some("sym:c")
+        );
+        let pos = |id: &str| {
+            ranking
+                .ranked_symbol_ids
+                .iter()
+                .position(|s| s == id)
+                .unwrap()
+        };
+        assert!(
+            pos("sym:b") < pos("sym:c"),
+            "closer neighbor must outrank disjoint one"
+        );
+    }
+
+    #[test]
+    fn text_query_for_structural_slot_refuses_query_missing() {
+        // The refusal is a feature: a free-text query has NO S1/S4 representation,
+        // so planning a structural slot with a text-only query fails closed with
+        // ASTRO_SEARCH_INDEX_QUERY_MISSING (never a silent degrade or empty).
+        let manifest = structural_fixture().build_manifest(1).expect("manifest");
+        let set = SlotIndexSet::from_manifest(&manifest).expect("build");
+        let mut weights = BTreeMap::new();
+        weights.insert(SLOT_STRUCT_TRIGRAMS, 1_000_u64);
+        let req = SearchRequest {
+            query: "anything at all".to_string(),
+            k: 3,
+            ef: 32,
+            timeout_ms: 1_000,
+            fusion_override_millis: Some(weights),
+            temporal_alpha_millis: 0,
+        };
+        let plan = plan_search(&req, &SearchCaps::default_caps()).expect("plan");
+        // A text-only query carries no sparse_vectors for the structural slot.
+        let query = SlotQuery::text("anything at all");
+        let empty = BTreeMap::new();
+        let err = run_indexed_search(
+            &plan,
+            &set,
+            &query,
+            &empty,
+            &empty_attrs(),
+            &empty_recency(),
+        )
+        .expect_err("structural slot with a text query must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_INDEX_QUERY_MISSING);
+        assert!(!err.remediation().is_empty());
+    }
+
+    #[test]
+    fn structural_query_dim_mismatch_refuses_fail_closed() {
+        let manifest = structural_fixture().build_manifest(1).expect("manifest");
+        let set = SlotIndexSet::from_manifest(&manifest).expect("build");
+        let query = SlotQuery::default().with_sparse_vector(
+            SLOT_STRUCT_TRIGRAMS,
+            SlotVector::Sparse {
+                dim: STRUCT_DIM + 1, // wrong ambient dim
+                entries: sparse(&[(0, 1.0)]),
+            },
+        );
+        let err = set
+            .rank_slot(SLOT_STRUCT_TRIGRAMS, &query, 3, 32)
+            .expect_err("dim mismatch must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_INDEX_CORPUS);
     }
 
     fn scratch_path(tag: &str) -> PathBuf {

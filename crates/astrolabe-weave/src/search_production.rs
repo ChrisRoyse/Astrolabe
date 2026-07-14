@@ -40,11 +40,15 @@ use astrolabe_ingest::read_cbm_graph_snapshot;
 use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_core::{Clock, SlotId, SlotVector};
+use calyx_core::{Clock, SlotId, SlotVector, SparseEntry};
 
-use crate::search::{SLOT_CODE_SEMANTIC, SLOT_LEXICAL_BM25, SLOT_NAME_SEMANTIC, SearchError};
+use crate::search::{
+    FusedResult, SLOT_API_CALLEES, SLOT_CODE_SEMANTIC, SLOT_LEXICAL_BM25, SLOT_NAME_SEMANTIC,
+    SLOT_STRUCT_TRIGRAMS, SearchCaps, SearchError, SearchRequest, WEIGHT_SCALE_MILLIS, plan_search,
+};
 use crate::search_index::{
-    ASTRO_SEARCH_INDEX_CORPUS, IndexKnobs, SlotIndexManifest, SlotIndexSetBuilder,
+    ASTRO_SEARCH_INDEX_CORPUS, IndexKnobs, SlotIndexManifest, SlotIndexSet, SlotIndexSetBuilder,
+    SlotQuery, StoredContent, run_indexed_search,
 };
 
 /// Fail-closed: reading the persisted shadow vault (graph snapshot or a slot
@@ -67,11 +71,31 @@ pub const ASTRO_SEARCH_PRODUCTION_IO: &str = "ASTRO_SEARCH_PRODUCTION_IO";
 /// Deliberately excluded: S1 (struct trigrams) and S4 (API callees) are
 /// persisted per symbol but have **no free-text query representation** — you
 /// cannot embed a natural-language query into a struct-trigram or callee vector
-/// space — so ranking them for a text query would fail-closed
-/// `ASTRO_SEARCH_INDEX_QUERY_MISSING`. Fusing those corpus vectors requires a
-/// structural query surface (a symbol-anchored "more like this" query), a
-/// distinct path tracked separately; they are not part of the text-search owner.
+/// space — so ranking them for a text query still fails closed
+/// `ASTRO_SEARCH_INDEX_QUERY_MISSING`. Those slots are served instead by the
+/// distinct, **declared** symbol-anchored structural query mode
+/// ([`structural_more_like_this`], via [`STRUCTURAL_QUERY_SLOTS`]): it reads an
+/// already-indexed symbol's own persisted sparse S1/S4 vector and ranks the
+/// corpus by exact sparse cosine — never a silently degraded text profile.
 pub const PRODUCTION_VECTOR_SLOTS: [SlotId; 2] = [SLOT_CODE_SEMANTIC, SLOT_NAME_SEMANTIC];
+
+/// The structural slots the symbol-anchored "more like this" query ranks: S1
+/// (struct-trigrams) and S4 (API-callees), persisted per symbol as **sparse**
+/// vectors with no free-text representation. Pass these (or a narrower subset)
+/// to [`build_search_index_manifest_from_vault`] to declare them, and to
+/// [`structural_more_like_this`] to rank against them.
+pub const STRUCTURAL_QUERY_SLOTS: [SlotId; 2] = [SLOT_STRUCT_TRIGRAMS, SLOT_API_CALLEES];
+
+/// Fail-closed: a symbol-anchored structural query named an anchor symbol that
+/// is not present in the manifest at all (never a silent empty result).
+pub const ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT: &str = "ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT";
+/// Fail-closed: the anchor symbol is present but carries no persisted structural
+/// vector for a requested slot (S1/S4), or the requested slot is not a declared
+/// structural index in this manifest. The query refuses rather than
+/// partial-scoring on a subset of the requested structural slots.
+pub const ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT: &str = "ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT";
+/// Fail-closed: no structural slots were requested for the anchored query.
+pub const ASTRO_SEARCH_STRUCTURAL_NO_SLOTS: &str = "ASTRO_SEARCH_STRUCTURAL_NO_SLOTS";
 
 /// One corpus symbol read from the vault: its unique id (qualified name), the
 /// identifier text for the S7 lexical slot, the legacy CBM label (kept for the
@@ -87,6 +111,10 @@ pub struct CorpusSymbol {
     pub label: String,
     /// Dense per-slot query-space vectors keyed by slot id (sorted).
     pub vectors: BTreeMap<SlotId, Vec<f32>>,
+    /// Sparse per-slot structural vectors (S1 struct-trigrams / S4 API-callees)
+    /// keyed by slot id (sorted). These have no free-text query representation
+    /// and are served only by the symbol-anchored structural query mode.
+    pub sparse_vectors: BTreeMap<SlotId, SlotVector>,
 }
 
 /// The corpus read from a vault, with a full accounting of every skip so no
@@ -99,15 +127,23 @@ pub struct CorpusReadReport {
     pub symbols_total: usize,
     /// Dense slot vectors admitted across all symbols.
     pub vector_rows_read: usize,
+    /// Sparse **structural** slot vectors (S1/S4) admitted across all symbols.
+    pub structural_rows_read: usize,
     /// Slot rows that decoded to `SlotVector::Absent` (labeled skip).
     pub absent_slot_rows: usize,
     /// Requested slot rows that were not present for a symbol (labeled skip).
     pub missing_slot_rows: usize,
-    /// Slot rows that were present but not dense (sparse/multi; labeled skip).
+    /// Slot rows that were present but neither dense nor sparse (multi; labeled skip).
     pub non_dense_slot_rows: usize,
+    /// Sparse structural rows skipped because their norm is degenerate/zero and
+    /// they cannot be ranked by cosine (labeled skip, invariant #3).
+    pub zero_norm_structural_rows: usize,
     /// Vector slots that ended up declared (present as dense on ≥1 symbol),
     /// each mapped to its dimension.
     pub declared_vector_slots: BTreeMap<SlotId, u32>,
+    /// Structural slots that ended up declared (present as a rankable sparse
+    /// vector on ≥1 symbol), each mapped to its ambient dimension.
+    pub declared_structural_slots: BTreeMap<SlotId, u32>,
     /// Vault sequence this corpus was read at — the manifest freshness base.
     pub base_seq: u64,
 }
@@ -115,7 +151,10 @@ pub struct CorpusReadReport {
 impl CorpusReadReport {
     /// Total labeled skips across every skip bucket.
     pub fn skip_count(&self) -> usize {
-        self.absent_slot_rows + self.missing_slot_rows + self.non_dense_slot_rows
+        self.absent_slot_rows
+            + self.missing_slot_rows
+            + self.non_dense_slot_rows
+            + self.zero_norm_structural_rows
     }
 }
 
@@ -149,10 +188,13 @@ where
     let mut symbols = Vec::new();
     let mut symbols_total = 0usize;
     let mut vector_rows_read = 0usize;
+    let mut structural_rows_read = 0usize;
     let mut absent_slot_rows = 0usize;
     let mut missing_slot_rows = 0usize;
     let mut non_dense_slot_rows = 0usize;
+    let mut zero_norm_structural_rows = 0usize;
     let mut declared_vector_slots: BTreeMap<SlotId, u32> = BTreeMap::new();
+    let mut declared_structural_slots: BTreeMap<SlotId, u32> = BTreeMap::new();
 
     for node in snapshot.nodes.into_iter().filter(|node| !node.structural) {
         let Some(cx_id) = node.cx_id else {
@@ -168,6 +210,7 @@ where
         };
         symbols_total += 1;
         let mut vectors: BTreeMap<SlotId, Vec<f32>> = BTreeMap::new();
+        let mut sparse_vectors: BTreeMap<SlotId, SlotVector> = BTreeMap::new();
         for slot in vector_slots {
             let Some(bytes) = vault
                 .read_cf_at(at_seq, ColumnFamily::slot(*slot), &slot_key(cx_id))
@@ -217,6 +260,40 @@ where
                     vector_rows_read += 1;
                     vectors.insert(*slot, data);
                 }
+                SlotVector::Sparse { dim, entries } => {
+                    // S1/S4 persist as sparse vectors. A degenerate/zero-norm
+                    // sparse vector cannot be cosine-ranked, so it is a labeled
+                    // skip (invariant #3), never silently admitted.
+                    let squared_norm = crate::sparse_norm(&entries);
+                    if crate::zero_norm(squared_norm) {
+                        zero_norm_structural_rows += 1;
+                    } else {
+                        match declared_structural_slots.entry(*slot) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(dim);
+                            }
+                            std::collections::btree_map::Entry::Occupied(entry) => {
+                                if *entry.get() != dim {
+                                    return Err(SearchError::new(
+                                        ASTRO_SEARCH_INDEX_CORPUS,
+                                        format!(
+                                            "structural slot {} ambient dim {} for {:?} disagrees with declared dim {}",
+                                            slot.get(),
+                                            dim,
+                                            node.qualified_name,
+                                            entry.get()
+                                        ),
+                                        "Every symbol's structural vector for a slot must share one \
+                                         ambient dimension; rebuild the vault so the panel measured a \
+                                         consistent shape.",
+                                    ));
+                                }
+                            }
+                        }
+                        structural_rows_read += 1;
+                        sparse_vectors.insert(*slot, SlotVector::Sparse { dim, entries });
+                    }
+                }
                 SlotVector::Absent { .. } => absent_slot_rows += 1,
                 _ => non_dense_slot_rows += 1,
             }
@@ -226,6 +303,7 @@ where
             name: node.name,
             label: node.label,
             vectors,
+            sparse_vectors,
         });
     }
 
@@ -233,10 +311,13 @@ where
         symbols,
         symbols_total,
         vector_rows_read,
+        structural_rows_read,
         absent_slot_rows,
         missing_slot_rows,
         non_dense_slot_rows,
+        zero_norm_structural_rows,
         declared_vector_slots,
+        declared_structural_slots,
         base_seq: at_seq,
     })
 }
@@ -256,6 +337,9 @@ pub fn build_manifest_from_corpus(
     for (slot, dim) in &report.declared_vector_slots {
         builder.declare_vector(*slot, *dim);
     }
+    for (slot, dim) in &report.declared_structural_slots {
+        builder.declare_structural(*slot, *dim);
+    }
     for symbol in &report.symbols {
         builder.add_lexical(
             symbol.symbol_id.clone(),
@@ -264,6 +348,11 @@ pub fn build_manifest_from_corpus(
         );
         for (slot, vector) in &symbol.vectors {
             builder.add_vector(symbol.symbol_id.clone(), *slot, vector);
+        }
+        for (slot, vector) in &symbol.sparse_vectors {
+            if let SlotVector::Sparse { dim, entries } = vector {
+                builder.add_structural(symbol.symbol_id.clone(), *slot, *dim, entries);
+            }
         }
     }
     builder.build_manifest(report.base_seq)
@@ -373,6 +462,151 @@ pub fn load_manifest_if_fresh(
              the fused planner must not rank against a stale corpus.",
         )),
     }
+}
+
+/// A symbol-anchored structural query result: the ranked structural neighbors of
+/// an anchor symbol, with the anchor itself excluded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructuralQueryResult {
+    /// The anchor symbol whose persisted S1/S4 vectors drove the query.
+    pub anchor_symbol_id: String,
+    /// The structural slots actually anchored (each had a persisted vector on the
+    /// anchor and a declared structural index in the manifest), in request order.
+    pub anchored_slots: Vec<SlotId>,
+    /// Ranked neighbors (anchor excluded), best first, at most `k`.
+    pub neighbors: Vec<FusedResult>,
+}
+
+/// Symbol-anchored structural "more like this" query — a DECLARED mode, never a
+/// silently degraded text profile.
+///
+/// Given an ALREADY-INDEXED `anchor_symbol_id`, this reads that symbol's own
+/// persisted sparse structural vectors (S1 struct-trigrams / S4 API-callees) out
+/// of the index set's manifest and uses them as the query against the production
+/// search index, ranking the corpus by exact sparse cosine and fusing the
+/// requested structural slots with RRF. The anchor — its own nearest neighbor at
+/// cosine 1.0 — is excluded from the returned neighbor list.
+///
+/// This is the intended entry point for a future MCP `find_similar` structural
+/// mode (#43): it takes a built [`SlotIndexSet`], the anchor symbol id, the
+/// structural slots to anchor on ([`STRUCTURAL_QUERY_SLOTS`] or a subset), and
+/// the standard `k`/`ef`/`caps`, and returns the fused neighbors.
+///
+/// Fail-closed contract (no silent fallback, no partial scoring):
+/// - empty `structural_slots` => [`ASTRO_SEARCH_STRUCTURAL_NO_SLOTS`];
+/// - anchor absent from the manifest => [`ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT`];
+/// - a requested slot that is not a declared structural index, **or** for which
+///   the anchor holds no persisted vector => [`ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT`]
+///   (the whole query refuses — it never partial-scores a subset of the requested
+///   structural slots);
+/// - `k`/`ef`/slot-count over the declared caps => the planner's `PLAN_COST_EXCEEDED`.
+pub fn structural_more_like_this(
+    index_set: &SlotIndexSet,
+    anchor_symbol_id: &str,
+    structural_slots: &[SlotId],
+    k: u64,
+    ef: u64,
+    caps: &SearchCaps,
+) -> Result<StructuralQueryResult, SearchError> {
+    if structural_slots.is_empty() {
+        return Err(SearchError::new(
+            ASTRO_SEARCH_STRUCTURAL_NO_SLOTS,
+            "structural query requested no structural slots".to_string(),
+            "Request at least one structural slot (S1 struct-trigrams and/or S4 API-callees).",
+        ));
+    }
+
+    let manifest = index_set.manifest();
+    let Some(doc) = manifest
+        .documents
+        .iter()
+        .find(|doc| doc.symbol_id == anchor_symbol_id)
+    else {
+        return Err(SearchError::new(
+            ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT,
+            format!(
+                "anchor symbol {anchor_symbol_id:?} is not present in the search index manifest"
+            ),
+            "Anchor a structural query on a symbol that was indexed; rebuild the corpus if it \
+             should be present.",
+        ));
+    };
+
+    // Read the anchor's own persisted structural vectors for every requested
+    // slot. A single missing slot fails the whole query closed — never a partial.
+    let mut query = SlotQuery::default();
+    let mut weights: BTreeMap<SlotId, u64> = BTreeMap::new();
+    let mut anchored_slots = Vec::with_capacity(structural_slots.len());
+    for slot in structural_slots {
+        if !index_set.has_slot(*slot) {
+            return Err(SearchError::new(
+                ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT,
+                format!(
+                    "slot {} is not a declared structural index in this manifest",
+                    slot.get()
+                ),
+                "Build the manifest with the structural slots declared \
+                 (STRUCTURAL_QUERY_SLOTS) before anchoring a structural query on them.",
+            ));
+        }
+        let Some(StoredContent::SparseBits { dim, entries }) = doc.slots.get(slot) else {
+            return Err(SearchError::new(
+                ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT,
+                format!(
+                    "anchor symbol {anchor_symbol_id:?} has no persisted structural vector for slot {}",
+                    slot.get()
+                ),
+                "The anchor carries no S1/S4 vector for this slot; choose an anchor whose \
+                 structural vectors were persisted, or drop the slot from the request.",
+            ));
+        };
+        let sparse = SlotVector::Sparse {
+            dim: *dim,
+            entries: entries
+                .iter()
+                .map(|word| SparseEntry {
+                    idx: word.idx,
+                    val: f32::from_bits(word.val_bits),
+                })
+                .collect(),
+        };
+        query = query.with_sparse_vector(*slot, sparse);
+        weights.insert(*slot, WEIGHT_SCALE_MILLIS);
+        anchored_slots.push(*slot);
+    }
+
+    // Request one extra result so the anchor (its own nearest neighbor at cosine
+    // 1.0) can be dropped without shrinking the neighbor list below `k`; clamp to
+    // the declared cap so the extra never turns a legal `k` into a cost refusal.
+    let internal_k = k.saturating_add(1).min(caps.max_k);
+    let request = SearchRequest {
+        query: String::new(),
+        k: internal_k,
+        ef,
+        timeout_ms: caps.max_timeout_ms,
+        fusion_override_millis: Some(weights),
+        temporal_alpha_millis: 0,
+    };
+    let plan = plan_search(&request, caps)?;
+    let empty_filters: BTreeMap<String, String> = BTreeMap::new();
+    let empty_attrs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let empty_recency: BTreeMap<String, u64> = BTreeMap::new();
+    let mut results = run_indexed_search(
+        &plan,
+        index_set,
+        &query,
+        &empty_filters,
+        &empty_attrs,
+        &empty_recency,
+    )?;
+    results.retain(|result| result.symbol_id != anchor_symbol_id);
+    results.truncate(k as usize);
+
+    Ok(StructuralQueryResult {
+        anchor_symbol_id: anchor_symbol_id.to_string(),
+        anchored_slots,
+        neighbors: results,
+    })
 }
 
 #[cfg(test)]
@@ -664,10 +898,13 @@ mod tests {
             symbols: Vec::new(),
             symbols_total: 0,
             vector_rows_read: 0,
+            structural_rows_read: 0,
             absent_slot_rows: 0,
             missing_slot_rows: 0,
             non_dense_slot_rows: 0,
+            zero_norm_structural_rows: 0,
             declared_vector_slots: BTreeMap::new(),
+            declared_structural_slots: BTreeMap::new(),
             base_seq: 0,
         };
         let manifest =
@@ -676,5 +913,237 @@ mod tests {
         // S7 lexical is still declared (the schema is always well-formed).
         assert_eq!(manifest.slots.len(), 1);
         assert_eq!(manifest.slots[0].slot, SLOT_LEXICAL_BM25);
+    }
+
+    // --- Symbol-anchored structural query mode (#332) --------------------------
+
+    fn sparse_entries(entries: &[(u32, f32)]) -> Vec<SparseEntry> {
+        entries
+            .iter()
+            .map(|(idx, val)| SparseEntry {
+                idx: *idx,
+                val: *val,
+            })
+            .collect()
+    }
+
+    /// Hand-built structural manifest: S1 declared sparse with multi-coordinate
+    /// vectors, so cosine truly separates neighbors (the panel fixture's
+    /// single-coordinate S1 vectors all tie at cosine 1.0).
+    fn structural_manifest(base_seq: u64) -> SlotIndexManifest {
+        const DIM: u32 = 16;
+        let mut builder = SlotIndexSetBuilder::new(IndexKnobs::defaults(0x5732));
+        builder.declare_structural(SLOT_STRUCT_TRIGRAMS, DIM);
+        builder.add_structural(
+            "demo.anchor",
+            SLOT_STRUCT_TRIGRAMS,
+            DIM,
+            &sparse_entries(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
+        );
+        builder.add_structural(
+            "demo.near",
+            SLOT_STRUCT_TRIGRAMS,
+            DIM,
+            &sparse_entries(&[(0, 1.0), (1, 1.0), (4, 0.3)]),
+        );
+        builder.add_structural(
+            "demo.far",
+            SLOT_STRUCT_TRIGRAMS,
+            DIM,
+            &sparse_entries(&[(10, 1.0), (11, 1.0)]),
+        );
+        builder
+            .build_manifest(base_seq)
+            .expect("structural manifest")
+    }
+
+    // FSV: persist a structural manifest, read the bytes back independently,
+    // rebuild, and run the symbol-anchored query TWICE — proving a real persisted
+    // structural corpus ranks deterministically, excludes the anchor, and orders
+    // neighbors by true sparse cosine (near before far).
+    #[test]
+    fn structural_more_like_this_ranks_persisted_vectors_fsv() {
+        let dir = temp_dir("struct-fsv");
+        let path = dir.join("structural_index.v1.json");
+        let manifest = structural_manifest(9);
+        let written = persist_manifest(&path, &manifest).expect("persist");
+        println!(
+            "FSV before: wrote {written} structural manifest bytes to {}",
+            path.display()
+        );
+
+        let run = || {
+            let bytes = std::fs::read(&path).expect("read bytes");
+            let reloaded = SlotIndexManifest::from_bytes(&bytes).expect("parse");
+            let set = SlotIndexSet::from_manifest(&reloaded).expect("build");
+            structural_more_like_this(
+                &set,
+                "demo.anchor",
+                &[SLOT_STRUCT_TRIGRAMS],
+                5,
+                32,
+                &SearchCaps::default_caps(),
+            )
+            .expect("structural query")
+        };
+        let a = run();
+        let b = run();
+        let ids: Vec<&str> = a.neighbors.iter().map(|n| n.symbol_id.as_str()).collect();
+        println!(
+            "FSV after: anchor={} anchored_slots={:?} neighbors={ids:?}",
+            a.anchor_symbol_id, a.anchored_slots
+        );
+        assert_eq!(a, b, "two persisted-bytes readbacks must rank identically");
+        assert_eq!(a.anchored_slots, vec![SLOT_STRUCT_TRIGRAMS]);
+        assert!(
+            !ids.contains(&"demo.anchor"),
+            "anchor is excluded from its own neighbor list"
+        );
+        assert_eq!(
+            ids,
+            vec!["demo.near", "demo.far"],
+            "near neighbor must outrank the disjoint far one"
+        );
+    }
+
+    // FSV: real vault path. Import a real snapshot, build the structural manifest
+    // from the persisted (sparse) S1/S4 slot rows, read it back from disk, and
+    // query a real symbol — proving the whole vault -> structural-manifest ->
+    // ranked-neighbor lifecycle over genuinely persisted state.
+    #[test]
+    fn structural_mode_serves_real_persisted_s1_s4_vectors_fsv() {
+        let dir = temp_dir("struct-vault");
+        let vault = open_vault(&dir.join("vault"));
+        import_demo(&vault);
+
+        let (manifest, report) = build_search_index_manifest_from_vault(
+            &vault,
+            "demo",
+            &STRUCTURAL_QUERY_SLOTS,
+            IndexKnobs::defaults(0xA1),
+        )
+        .expect("build structural manifest from vault");
+        println!(
+            "FSV before: structural_rows_read={} declared_structural_slots={:?} skips={}",
+            report.structural_rows_read,
+            report.declared_structural_slots,
+            report.skip_count()
+        );
+        assert!(
+            report.structural_rows_read > 0,
+            "real persisted S1/S4 sparse vectors must be admitted, not skipped"
+        );
+        assert!(
+            report
+                .declared_structural_slots
+                .contains_key(&SLOT_STRUCT_TRIGRAMS),
+            "S1 must be a declared structural slot"
+        );
+        assert!(
+            report
+                .declared_structural_slots
+                .contains_key(&SLOT_API_CALLEES),
+            "S4 must be a declared structural slot"
+        );
+
+        let path = dir.join("struct.json");
+        persist_manifest(&path, &manifest).expect("persist");
+        let reloaded =
+            SlotIndexManifest::from_bytes(&std::fs::read(&path).expect("read")).expect("parse");
+        let set = SlotIndexSet::from_manifest(&reloaded).expect("rebuild index set");
+        let result = structural_more_like_this(
+            &set,
+            "demo.cfg.parse_config",
+            &STRUCTURAL_QUERY_SLOTS,
+            5,
+            32,
+            &SearchCaps::default_caps(),
+        )
+        .expect("structural query on a real symbol");
+        let ids: Vec<&str> = result
+            .neighbors
+            .iter()
+            .map(|n| n.symbol_id.as_str())
+            .collect();
+        println!("FSV after: structural neighbors of parse_config = {ids:?}");
+        assert!(
+            !ids.contains(&"demo.cfg.parse_config"),
+            "anchor excluded from its own neighbors"
+        );
+        assert!(
+            !ids.is_empty(),
+            "a real symbol's structural query returns neighbors"
+        );
+    }
+
+    // Edge triad (+): anchor absent, requested slot absent (declared-but-missing
+    // AND undeclared), empty manifest, and no-slots — every one a labeled refusal,
+    // never a partial score or a silent empty.
+    #[test]
+    fn structural_query_edges_are_all_fail_closed() {
+        let caps = SearchCaps::default_caps();
+        let set = SlotIndexSet::from_manifest(&structural_manifest(1)).expect("build");
+
+        // Edge 1: anchor symbol not in the manifest.
+        println!("edge anchor-absent before: manifest holds anchor/near/far only");
+        let err =
+            structural_more_like_this(&set, "demo.ghost", &[SLOT_STRUCT_TRIGRAMS], 5, 32, &caps)
+                .expect_err("absent anchor must refuse");
+        println!("edge anchor-absent after: code={}", err.code());
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT);
+
+        // Edge 2: requested slot (S4) is not a declared structural index here.
+        let err = structural_more_like_this(&set, "demo.anchor", &[SLOT_API_CALLEES], 5, 32, &caps)
+            .expect_err("undeclared structural slot must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT);
+
+        // Edge 2b: slot IS declared, but this anchor holds no vector for it —
+        // fail-closed, never partial-scored on the slots it does have.
+        let mut builder = SlotIndexSetBuilder::new(IndexKnobs::defaults(7));
+        builder.declare_structural(SLOT_STRUCT_TRIGRAMS, 16);
+        builder.declare_structural(SLOT_API_CALLEES, 16);
+        builder.add_structural(
+            "demo.only_s1",
+            SLOT_STRUCT_TRIGRAMS,
+            16,
+            &sparse_entries(&[(0, 1.0), (1, 1.0)]),
+        );
+        let partial_set =
+            SlotIndexSet::from_manifest(&builder.build_manifest(2).expect("m")).expect("s");
+        println!("edge slot-absent before: demo.only_s1 has S1 but no S4 vector");
+        let err = structural_more_like_this(
+            &partial_set,
+            "demo.only_s1",
+            &[SLOT_API_CALLEES],
+            5,
+            32,
+            &caps,
+        )
+        .expect_err("declared-but-missing anchor vector must refuse");
+        println!("edge slot-absent after: code={}", err.code());
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT);
+
+        // Edge 3: empty manifest — no documents, so any anchor is absent.
+        let empty = SlotIndexSetBuilder::new(IndexKnobs::defaults(0))
+            .build_manifest(0)
+            .expect("empty manifest");
+        let empty_set = SlotIndexSet::from_manifest(&empty).expect("build empty");
+        println!("edge empty before: manifest has 0 documents");
+        let err = structural_more_like_this(
+            &empty_set,
+            "demo.anchor",
+            &[SLOT_STRUCT_TRIGRAMS],
+            5,
+            32,
+            &caps,
+        )
+        .expect_err("empty manifest must refuse");
+        println!("edge empty after: code={}", err.code());
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT);
+
+        // Edge 4: no structural slots requested at all.
+        let err = structural_more_like_this(&set, "demo.anchor", &[], 5, 32, &caps)
+            .expect_err("no slots must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_NO_SLOTS);
     }
 }
