@@ -29,9 +29,25 @@ use calyx_ledger::decode as decode_ledger;
 use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
 use serde::{Deserialize, Serialize};
 
+pub mod agent_task;
 pub mod archaeology;
+pub mod hook;
 mod parsers;
 pub mod propagation;
+
+pub use hook::{HookOutcome, run_hook_process};
+
+pub use agent_task::{
+    AGENT_TASK_PACK_LEDGER_SCHEMA, AGENT_TASK_REWARD_CONFIDENCE,
+    ANCHOR_CONTRADICTION_LEDGER_SCHEMA, ANCHOR_PROMOTION_LEDGER_SCHEMA, ASTRO_ANCHOR_CONTRADICTION,
+    ASTRO_ANCHOR_PACK_CONFLICT, ASTRO_ANCHOR_PACK_INPUT_INVALID, ASTRO_ANCHOR_PACK_UNKNOWN,
+    ASTRO_ANCHOR_PROMOTION_INPUT_INVALID, AgentTaskPackManifestV1, AgentTaskPackReport,
+    AnchorContradictionV1, AnchorPromotionReport, AnchorPromotionV1, ContradictionPair,
+    PromotedPair, SCHEMA_AGENT_TASK_PACK, SCHEMA_ANCHOR_CONTRADICTION, SCHEMA_ANCHOR_PROMOTION,
+    effective_anchor_trust, ingest_agent_task_outcome, is_anchor_promoted, promote_on_resolution,
+    read_agent_task_pack, read_agent_task_packs, read_anchor_contradictions,
+    read_anchor_promotions, record_agent_task_pack,
+};
 
 pub use parsers::{
     ASTRO_ANCHOR_PARSE_MALFORMED, ParsedTestCase, ParsedTestRun, TestReportFormat, TestStatus,
@@ -799,7 +815,10 @@ fn decode_anchor_row(
     Ok(row)
 }
 
-fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: u64) -> calyx_core::Result<LedgerRef>
+pub(crate) fn ledger_ref_at_commit<C>(
+    vault: &AsterVault<C>,
+    commit_seq: u64,
+) -> calyx_core::Result<LedgerRef>
 where
     C: Clock,
 {
@@ -830,7 +849,7 @@ where
     })
 }
 
-fn anchor_corrupt(message: String) -> CalyxError {
+pub(crate) fn anchor_corrupt(message: String) -> CalyxError {
     CalyxError {
         code: ASTRO_ANCHOR_ROW_CORRUPT,
         message,
@@ -838,7 +857,7 @@ fn anchor_corrupt(message: String) -> CalyxError {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
