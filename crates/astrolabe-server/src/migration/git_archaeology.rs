@@ -35,6 +35,11 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) anchors_deduplicated: usize,
     pub(crate) evidence_without_symbol: usize,
     pub(crate) skipped_merge_fixes: usize,
+    /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
+    /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
+    /// a cleanup that cannot complete degrades to a counted remnant, never a
+    /// silently swallowed `let _`.
+    pub(crate) cleanup_remnants: usize,
 }
 
 #[cfg(test)]
@@ -113,8 +118,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         ..GitArchaeologyImportReport::default()
     };
     for (commit, group) in group_evidence_by_commit(&evidence) {
-        let rows = index_historical_commit(repo, cache_dir, project, commit)?;
-        let selected = select_implicated_rows(rows, group);
+        let indexed = index_historical_commit(repo, cache_dir, project, commit)?;
+        report.cleanup_remnants += indexed.cleanup_remnants;
+        let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
             report.evidence_without_symbol += group.len();
             continue;
@@ -182,12 +188,26 @@ fn group_evidence_by_commit(evidence: &[Evidence]) -> Vec<(&str, &[Evidence])> {
     groups
 }
 
+/// Number of removal attempts (initial + retries) for each archaeology scratch
+/// path before it is declared a remnant.
+const ARCHAEOLOGY_CLEANUP_ATTEMPTS: u32 = 6;
+/// Base backoff between cleanup retries; doubled each attempt (10, 20, 40, 80,
+/// 160 ms), bounded so a genuinely stuck handle never blocks the import.
+const ARCHAEOLOGY_CLEANUP_BACKOFF_BASE: Duration = Duration::from_millis(10);
+
+/// Outcome of indexing one historical commit: the pipeline rows plus the count
+/// of scratch paths that could not be removed after the bounded retry budget.
+struct HistoricalCommitIndex {
+    rows: CbmPipelineRows,
+    cleanup_remnants: usize,
+}
+
 fn index_historical_commit(
     repo: &Path,
     cache_dir: &Path,
     project: &str,
     commit: &str,
-) -> Result<CbmPipelineRows, DynError> {
+) -> Result<HistoricalCommitIndex, DynError> {
     let nonce = format!(
         "{}-{}",
         std::process::id(),
@@ -206,30 +226,69 @@ fn index_historical_commit(
             CbmIndexMode::Fast,
         )?;
         pipeline.set_project_name(project)?;
-        Ok(pipeline.collect_rows()?)
+        let rows = pipeline.collect_rows()?;
+        // Drop the pipeline (and with it CBM's SQLite handle) explicitly before
+        // cleanup so the removals below race only Windows' async handle release,
+        // which the bounded retry absorbs — not a still-open handle.
+        drop(pipeline);
+        Ok(rows)
     })();
+    // Ask git to release and remove its worktree registration first; retries below
+    // sweep any file/dir it leaves behind under Windows handle latency.
     let cleanup = git_checked(
         repo,
         &["worktree", "remove", "--force", path_str(&worktree)?],
     );
-    cleanup_archaeology_database(&database);
-    if worktree.exists() {
-        fs::remove_dir_all(&worktree)?;
+    let mut cleanup_remnants = cleanup_archaeology_database(&database);
+    if !remove_path_with_retry(&worktree, |path| fs::remove_dir_all(path)) {
+        cleanup_remnants += 1;
     }
     match (indexed, cleanup) {
-        (Ok(rows), Ok(())) => Ok(rows),
+        (Ok(rows), Ok(())) => Ok(HistoricalCommitIndex {
+            rows,
+            cleanup_remnants,
+        }),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
 }
 
-fn cleanup_archaeology_database(path: &Path) {
-    let _ = fs::remove_file(path);
+/// Removes the SQLite database and its `-wal`/`-shm`/`-journal` sidecars with a
+/// bounded retry, returning the number that survived (labeled remnant count).
+fn cleanup_archaeology_database(path: &Path) -> usize {
+    let mut remnants = 0;
+    if !remove_path_with_retry(path, |target| fs::remove_file(target)) {
+        remnants += 1;
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
-        let _ = fs::remove_file(PathBuf::from(sidecar));
+        let sidecar = PathBuf::from(sidecar);
+        if !remove_path_with_retry(&sidecar, |target| fs::remove_file(target)) {
+            remnants += 1;
+        }
     }
+    remnants
+}
+
+/// Removes `path` with the archaeology retry budget. Returns `true` when the
+/// path is gone (removed, or already absent), `false` when it survived every
+/// attempt — in which case the caller records it as a labeled remnant rather
+/// than swallowing the error. Windows releases file handles asynchronously after
+/// a close, so a scratch file/dir can linger briefly after the owning handle is
+/// dropped; the exponential backoff absorbs that latency.
+fn remove_path_with_retry(path: &Path, remove: impl Fn(&Path) -> std::io::Result<()>) -> bool {
+    for attempt in 0..ARCHAEOLOGY_CLEANUP_ATTEMPTS {
+        match remove(path) {
+            Ok(()) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) if attempt + 1 < ARCHAEOLOGY_CLEANUP_ATTEMPTS => {
+                thread::sleep(ARCHAEOLOGY_CLEANUP_BACKOFF_BASE * (1u32 << attempt));
+            }
+            Err(_) => {}
+        }
+    }
+    !path.exists()
 }
 
 fn path_str(path: &Path) -> Result<&str, DynError> {
@@ -312,6 +371,7 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "anchors_deduplicated": report.anchors_deduplicated,
         "evidence_without_symbol": report.evidence_without_symbol,
         "skipped_merge_fixes": report.skipped_merge_fixes,
+        "cleanup_remnants": report.cleanup_remnants,
         "trust": "mixed",
         "provenance": "git_history",
     })

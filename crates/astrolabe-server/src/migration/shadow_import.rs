@@ -484,6 +484,82 @@ pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
         .collect()
 }
 
+/// Fixed permutation seed for the index-time MMD drift null. A declared RNG seed
+/// (not a threshold), so the drift null is a pure function of the persisted
+/// samples, seed, and config — identical across runs of a byte-identical import.
+const SHADOW_DRIFT_SEED: u64 = 0x0DD1_DEAF_1DE7_5EED;
+
+/// Best-effort index-time drift production layered on a completed shadow import
+/// (#356): measures per-slot MMD drift of this import against the persisted
+/// reference window, persists the recognized `astrolabe.assay_anomalies.v1`
+/// payload the live `detect_anomalies` drift kind consumes, ledger-pairs each
+/// card into the assay diff-card ledger, and snapshots the current samples as the
+/// next import's reference window. Drift is telemetry over an already-verified
+/// import, so any failure is a labeled degradation in the returned summary, never
+/// a hard import failure. The first import (no reference window) reports every
+/// populated slot as a labeled absence and produces no card.
+fn index_time_drift_summary<C>(vault: &AsterVault<C>, project: &str, vault_dir: &Path) -> Value
+where
+    C: Clock,
+{
+    let config = match astrolabe_assay::DiffConfig::from_defaults() {
+        Ok(config) => config,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "reason": format!("drift config unavailable: {error}"),
+                "trust": "provisional",
+                "provenance": "unavailable",
+            });
+        }
+    };
+    let ledger = match astrolabe_assay::DiffLedger::open(vault_dir.join("drift-cards.ndjson")) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "reason": format!("drift card ledger unavailable: {error}"),
+                "trust": "provisional",
+                "provenance": "unavailable",
+            });
+        }
+    };
+    let cache_key = calyx_assay::AssayCacheKey::scoped(
+        SHADOW_PANEL_VERSION,
+        format!("drift:{project}"),
+        vault.vault_id(),
+        calyx_core::AnchorKind::Reward,
+    );
+    match run_index_time_drift(
+        vault,
+        project,
+        &shadow_available_slots(),
+        cache_key,
+        format!("shadow-drift:{project}"),
+        SHADOW_DRIFT_SEED,
+        &config,
+        Some(&ledger),
+    ) {
+        Ok(report) => json!({
+            "status": "produced",
+            "cards_written": report.cards_written,
+            "slots_missing_reference": report.slots_missing_reference,
+            "slots_short_history": report.slots_short_history,
+            "cards_payload_persisted": report.cards_payload_persisted,
+            "reference_persisted": report.reference_persisted,
+            "cards_ledgered": report.cards_ledgered,
+            "trust": "measured",
+            "provenance": "index_time_drift",
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "reason": format!("drift production failed: {error}"),
+            "trust": "provisional",
+            "provenance": "unavailable",
+        }),
+    }
+}
+
 pub(crate) fn shadow_refresh_status_str(status: ShadowRefreshStatus) -> &'static str {
     match status {
         ShadowRefreshStatus::Current => "current",
@@ -1326,9 +1402,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         Some(&after_snapshot),
     )?;
     let layout_frames = persist_layout_frames(&vault, project, import_changed)?;
+    let drift = index_time_drift_summary(&vault, project, &vault_dir);
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
+        object.insert("drift".to_string(), drift);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {
