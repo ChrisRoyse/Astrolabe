@@ -1273,6 +1273,15 @@ impl AnomalySeverity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnomalyCalibration {
     pub kind: AnomalyKind,
+    /// The per-pair calibration discriminator. `Some(pair_key)` for kinds whose
+    /// thresholds are measured per lens-pair (`BlindSpot`, one distribution per
+    /// [`BlindSpotLensPair`]); `None` for kinds with a single global calibration
+    /// slot (drift, doc-drift, name-truth, ood-commit, prompt-injection) and for
+    /// legacy persisted rows that predate per-pair keying. The composite
+    /// `(kind, pair_key)` is the true calibration key, so two blind-spot pairs
+    /// with distinct measured distributions never collide on the single
+    /// `BlindSpot` kind (see [`Self::calibration_key`]).
+    pub pair_key: Option<String>,
     pub medium_min_score_millipoints: u64,
     pub high_min_score_millipoints: u64,
     pub provenance_ref: String,
@@ -1287,10 +1296,29 @@ impl AnomalyCalibration {
     ) -> Self {
         Self {
             kind,
+            pair_key: None,
             medium_min_score_millipoints,
             high_min_score_millipoints,
             provenance_ref: provenance_ref.into(),
         }
+    }
+
+    /// Tags this calibration with the blind-spot lens pair it was measured for.
+    ///
+    /// Consumed-builder form so per-pair calibrations read as
+    /// `AnomalyCalibration::new(..).with_pair_key(pair.pair_key())`. A pair-keyed
+    /// calibration only tiers substrate rows carrying the same pair key.
+    #[must_use]
+    pub fn with_pair_key(mut self, pair_key: impl Into<String>) -> Self {
+        self.pair_key = Some(pair_key.into());
+        self
+    }
+
+    /// The composite calibration key `(kind, pair_key)`. Blind-spot pairs each
+    /// key on their own pair, so one pair's threshold can never tier another
+    /// pair's gaps; every other kind keys on `(kind, None)` exactly as before.
+    pub fn calibration_key(&self) -> (AnomalyKind, Option<&str>) {
+        (self.kind, self.pair_key.as_deref())
     }
 
     fn severity_for(&self, score_millipoints: u64) -> Option<AnomalySeverity> {
@@ -1312,6 +1340,12 @@ pub struct AnomalySubstrateRow {
     pub message: String,
     pub substrate_provenance_refs: Vec<String>,
     pub lens_evidence: Vec<String>,
+    /// The per-pair calibration discriminator this row is tiered under — mirrors
+    /// [`AnomalyCalibration::pair_key`]. `Some(pair_key)` for a blind-spot row
+    /// produced by a specific [`BlindSpotLensPair`]; `None` for every other kind
+    /// and for legacy persisted rows. A row only tiers against the calibration
+    /// sharing its `(kind, pair_key)` composite key (see [`Self::calibration_key`]).
+    pub pair_key: Option<String>,
 }
 
 impl AnomalySubstrateRow {
@@ -1333,7 +1367,22 @@ impl AnomalySubstrateRow {
                 .map(Into::into)
                 .collect(),
             lens_evidence: lens_evidence.into_iter().map(Into::into).collect(),
+            pair_key: None,
         }
+    }
+
+    /// Tags this substrate row with the blind-spot lens pair that produced it, so
+    /// it tiers only against that pair's measured calibration.
+    #[must_use]
+    pub fn with_pair_key(mut self, pair_key: impl Into<String>) -> Self {
+        self.pair_key = Some(pair_key.into());
+        self
+    }
+
+    /// The composite calibration key `(kind, pair_key)` this row tiers under —
+    /// the exact key an [`AnomalyCalibration`] must expose to tier it.
+    pub fn calibration_key(&self) -> (AnomalyKind, Option<&str>) {
+        (self.kind, self.pair_key.as_deref())
     }
 }
 
@@ -1730,11 +1779,34 @@ fn add_anomaly_payload_inputs(
     }
 }
 
+/// Migration-safe decode of the optional per-pair calibration key from a
+/// persisted payload value.
+///
+/// Returns `Ok(None)` when the field is absent or JSON `null` — the documented
+/// default for legacy rows written before per-pair keying, which decode as the
+/// single pair-agnostic calibration slot (byte-compatible single-pair behavior).
+/// Fails closed (`Err`) when the field is present but is not a non-empty string,
+/// so a malformed `pair_key` is refused rather than silently reinterpreted as
+/// "no pair".
+fn pair_key_from_payload_value(value: &Value) -> Result<Option<String>, ()> {
+    match value.get("pair_key") {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => {
+            let text = raw.as_str().ok_or(())?.trim();
+            if text.is_empty() {
+                return Err(());
+            }
+            Ok(Some(text.to_string()))
+        }
+    }
+}
+
 fn anomaly_substrate_from_payload_value(
     value: &Value,
     row_provenance: &str,
 ) -> Option<AnomalySubstrateRow> {
     let kind = value.get("kind")?.as_str()?.parse::<AnomalyKind>().ok()?;
+    let pair_key = pair_key_from_payload_value(value).ok()?;
     let subject_id = value.get("subject_id")?.as_str()?.trim();
     if subject_id.is_empty() {
         return None;
@@ -1752,14 +1824,18 @@ fn anomaly_substrate_from_payload_value(
     if provenance.iter().any(|item| item.trim().is_empty()) {
         return None;
     }
-    Some(AnomalySubstrateRow::new(
+    let mut row = AnomalySubstrateRow::new(
         kind,
         subject_id.to_string(),
         score,
         message.to_string(),
         provenance,
         string_array_value(value, "lens_evidence"),
-    ))
+    );
+    if let Some(pair_key) = pair_key {
+        row = row.with_pair_key(pair_key);
+    }
+    Some(row)
 }
 
 fn anomaly_calibration_from_payload_value(
@@ -1767,6 +1843,7 @@ fn anomaly_calibration_from_payload_value(
     row_provenance: &str,
 ) -> Option<AnomalyCalibration> {
     let kind = value.get("kind")?.as_str()?.parse::<AnomalyKind>().ok()?;
+    let pair_key = pair_key_from_payload_value(value).ok()?;
     let medium = value.get("medium_min_score_millipoints")?.as_u64()?;
     let high = value.get("high_min_score_millipoints")?.as_u64()?;
     if medium > high || high > 1_000 {
@@ -1777,7 +1854,11 @@ fn anomaly_calibration_from_payload_value(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(row_provenance);
-    Some(AnomalyCalibration::new(kind, medium, high, provenance))
+    let mut calibration = AnomalyCalibration::new(kind, medium, high, provenance);
+    if let Some(pair_key) = pair_key {
+        calibration = calibration.with_pair_key(pair_key);
+    }
+    Some(calibration)
 }
 
 fn string_array_value(value: &Value, field: &str) -> Vec<String> {
@@ -1813,6 +1894,7 @@ fn anomaly_substrate_order(left: &AnomalySubstrateRow, right: &AnomalySubstrateR
 fn anomaly_calibration_order(left: &AnomalyCalibration, right: &AnomalyCalibration) -> Ordering {
     left.kind
         .cmp(&right.kind)
+        .then_with(|| left.pair_key.cmp(&right.pair_key))
         .then_with(|| left.provenance_ref.cmp(&right.provenance_ref))
 }
 
@@ -1833,9 +1915,15 @@ pub fn detect_anomalies(
     vault_grounded: bool,
 ) -> astrolabe_domain::Result<AnomalyReport> {
     let parsed_filter = kind_filter.map(str::parse::<AnomalyKind>).transpose()?;
-    let calibration_by_kind = calibrations
+    // Key calibrations by the composite (kind, pair_key), not kind alone: two
+    // blind-spot lens pairs each carry their own measured gap distribution under
+    // the single `BlindSpot` kind, so keying on kind would let the second pair's
+    // threshold silently overwrite the first's. Every non-per-pair kind keys on
+    // (kind, None) exactly as before, so single-pair/legacy behavior is
+    // byte-identical.
+    let calibration_by_key = calibrations
         .iter()
-        .map(|calibration| (calibration.kind, calibration))
+        .map(|calibration| (calibration.calibration_key(), calibration))
         .collect::<BTreeMap<_, _>>();
     let trust = if vault_grounded {
         "verified"
@@ -1849,7 +1937,7 @@ pub fn detect_anomalies(
         if parsed_filter.is_some_and(|filter| row.kind != filter) {
             continue;
         }
-        let Some(calibration) = calibration_by_kind.get(&row.kind) else {
+        let Some(calibration) = calibration_by_key.get(&row.calibration_key()) else {
             skipped.push(SkippedAnomalySubstrate {
                 kind: row.kind,
                 subject_id: row.subject_id.clone(),
@@ -2348,7 +2436,7 @@ pub fn blind_spot_sweep(
                 format!("{}:neighbor_mean={neighbor_mean_millipoints}", pair.neighbor.wire_name()),
                 format!("neighbors={}", neighbor_scores.len()),
             ],
-        ));
+        ).with_pair_key(pair_key.clone()));
     }
 
     scores.sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
@@ -2371,7 +2459,8 @@ pub fn blind_spot_sweep(
                 distribution.medium_min_score_millipoints,
                 distribution.high_min_score_millipoints,
                 distribution.provenance_ref.clone(),
-            );
+            )
+            .with_pair_key(pair_key.clone());
             (Some(calibration), Some(distribution), None)
         }
         Err(error) => {
@@ -6667,6 +6756,270 @@ mod tests {
             String::from_utf8(report_read)
                 .unwrap()
                 .contains("planted.alien")
+        );
+    }
+
+    /// A symbol carrying all four similarity lenses, so it can be scored by two
+    /// independent blind-spot pairs (Struct/Semantic and Api/Profile) at once.
+    fn blind_spot_node4(
+        name: &str,
+        struct_vec: SlotVector,
+        api_vec: SlotVector,
+        semantic_vec: SlotVector,
+        profile_vec: SlotVector,
+    ) -> SimilarityNode {
+        SimilarityNode::new(name)
+            .with_slot(SIM_STRUCT_SLOT, struct_vec)
+            .with_slot(SIM_API_SLOT, api_vec)
+            .with_slot(SIM_SEMANTIC_SLOT, semantic_vec)
+            .with_slot(SIM_PROFILE_SLOT, profile_vec)
+    }
+
+    fn api_profile_pair() -> BlindSpotLensPair {
+        BlindSpotLensPair::new(SimilarityFamily::Api, SimilarityFamily::Profile)
+    }
+
+    /// Two blind-spot lens pairs, each with its own measured gap distribution and
+    /// its own planted alien, calibrate and tier independently — the second pair
+    /// never overwrites or reuses the first's calibration. Every gap is hand
+    /// computable from unit-norm cosines, and each pair's calibration row is read
+    /// back from disk (FSV) with its pair key intact.
+    ///
+    /// Corpus (ten symbols, all four lenses each): an eight-member cluster that is
+    /// conforming on all lenses ([1,0]); `planted.struct_alien` is structurally
+    /// like the cluster (struct cosine 0.8) yet semantically orthogonal (gap 800)
+    /// while staying conforming on Api/Profile; `planted.api_alien` is API-like
+    /// the cluster (api cosine 0.6) yet profile-orthogonal (gap 600) while staying
+    /// conforming on Struct/Semantic. So the Struct/Semantic pair sees the
+    /// distribution [0x9, 800] and the Api/Profile pair sees [0x9, 600] — genuinely
+    /// different distributions, hence different thresholds.
+    #[test]
+    fn blind_spot_two_pairs_calibrate_independently_per_pair_key() {
+        let mut nodes = Vec::new();
+        for i in 0..8 {
+            nodes.push(blind_spot_node4(
+                &format!("cluster.c{i}"),
+                dense2(1.0, 0.0),
+                dense2(1.0, 0.0),
+                dense2(1.0, 0.0),
+                dense2(1.0, 0.0),
+            ));
+        }
+        // struct cosine 0.8 vs cluster, semantic orthogonal -> Struct/Semantic gap 800.
+        // Conforming on Api/Profile ([1,0]) -> Api/Profile gap 0.
+        nodes.push(blind_spot_node4(
+            "planted.struct_alien",
+            dense2(0.8, 0.6),
+            dense2(1.0, 0.0),
+            dense2(0.0, 1.0),
+            dense2(1.0, 0.0),
+        ));
+        // api cosine 0.6 vs cluster, profile orthogonal -> Api/Profile gap 600.
+        // Conforming on Struct/Semantic ([1,0]) -> Struct/Semantic gap 0.
+        nodes.push(blind_spot_node4(
+            "planted.api_alien",
+            dense2(1.0, 0.0),
+            dense2(0.6, 0.8),
+            dense2(1.0, 0.0),
+            dense2(0.0, 1.0),
+        ));
+
+        let pairs = [struct_semantic_pair(), api_profile_pair()];
+        let struct_key = struct_semantic_pair().pair_key(); // SIM_STRUCTxSIM_SEMANTIC
+        let api_key = api_profile_pair().pair_key(); // SIM_APIxSIM_PROFILE
+        assert_ne!(struct_key, api_key);
+
+        let inputs = blind_spot_anomaly_inputs(&nodes, &pairs, &BlindSpotConfig::default())
+            .expect("two-pair sweep runs");
+
+        // Each pair produced exactly one calibration, keyed by its own pair.
+        assert_eq!(inputs.calibrations.len(), 2, "one calibration per pair");
+        let cal_struct = inputs
+            .calibrations
+            .iter()
+            .find(|c| c.pair_key.as_deref() == Some(struct_key.as_str()))
+            .expect("struct/semantic calibration keyed by its pair");
+        let cal_api = inputs
+            .calibrations
+            .iter()
+            .find(|c| c.pair_key.as_deref() == Some(api_key.as_str()))
+            .expect("api/profile calibration keyed by its pair");
+        assert_eq!(cal_struct.kind, AnomalyKind::BlindSpot);
+        assert_eq!(cal_api.kind, AnomalyKind::BlindSpot);
+        // The two distributions differ, so the two thresholds differ: keying on
+        // kind alone would have collapsed these into one.
+        assert_ne!(
+            (
+                cal_struct.medium_min_score_millipoints,
+                cal_struct.high_min_score_millipoints
+            ),
+            (
+                cal_api.medium_min_score_millipoints,
+                cal_api.high_min_score_millipoints
+            ),
+            "distinct distributions must yield distinct thresholds"
+        );
+
+        // FSV: persist each pair's calibration row as JSON, read the bytes back
+        // off disk, and re-decode through the migration-safe payload decoder,
+        // asserting each row round-trips with its own pair key.
+        for cal in [cal_struct, cal_api] {
+            let row = json!({
+                "kind": cal.kind.as_str(),
+                "pair_key": cal.pair_key,
+                "medium_min_score_millipoints": cal.medium_min_score_millipoints,
+                "high_min_score_millipoints": cal.high_min_score_millipoints,
+                "provenance_ref": cal.provenance_ref,
+            });
+            let path = std::env::temp_dir().join(format!(
+                "astrolabe-blindspot-pair-cal-{}-{}.json",
+                std::process::id(),
+                cal.pair_key.as_deref().unwrap_or("none")
+            ));
+            std::fs::write(&path, serde_json::to_vec(&row).unwrap()).expect("write pair cal");
+            let read = std::fs::read(&path).expect("read pair cal");
+            std::fs::remove_file(&path).ok();
+            let value: Value = serde_json::from_slice(&read).expect("reparse pair cal");
+            let decoded = anomaly_calibration_from_payload_value(&value, "row-provenance")
+                .expect("decode pair cal");
+            assert_eq!(&decoded, cal, "persisted pair calibration read back intact");
+        }
+
+        // Tier the merged substrates: exactly the two planted aliens alarm, each
+        // against its OWN pair's calibration. The finding's
+        // calibration_provenance_ref embeds the pair key, so a collision (one
+        // pair's threshold tiering the other's gap) is directly observable.
+        let report = detect_anomalies(&inputs.substrates, &inputs.calibrations, None, true)
+            .expect("tier merged findings");
+        assert_eq!(report.findings.len(), 2, "one finding per planted alien");
+
+        let struct_finding = report
+            .findings
+            .iter()
+            .find(|f| f.subject_id == "planted.struct_alien")
+            .expect("struct alien flagged");
+        assert_eq!(struct_finding.score_millipoints, 800);
+        assert_eq!(struct_finding.severity, AnomalySeverity::High);
+        assert!(
+            struct_finding
+                .calibration_provenance_ref
+                .contains(struct_key.as_str()),
+            "struct alien tiered against its own pair: {}",
+            struct_finding.calibration_provenance_ref
+        );
+        assert!(
+            !struct_finding
+                .calibration_provenance_ref
+                .contains(api_key.as_str()),
+            "struct alien must NOT tier against the api pair's calibration: {}",
+            struct_finding.calibration_provenance_ref
+        );
+
+        let api_finding = report
+            .findings
+            .iter()
+            .find(|f| f.subject_id == "planted.api_alien")
+            .expect("api alien flagged");
+        assert_eq!(api_finding.score_millipoints, 600);
+        assert_eq!(api_finding.severity, AnomalySeverity::High);
+        assert!(
+            api_finding
+                .calibration_provenance_ref
+                .contains(api_key.as_str()),
+            "api alien tiered against its own pair: {}",
+            api_finding.calibration_provenance_ref
+        );
+        assert!(
+            !api_finding
+                .calibration_provenance_ref
+                .contains(struct_key.as_str()),
+            "api alien must NOT tier against the struct pair's calibration: {}",
+            api_finding.calibration_provenance_ref
+        );
+
+        // No cluster member is ever flagged under either pair.
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.subject_id.starts_with("cluster.")),
+            "clean cluster stays clean under both pairs"
+        );
+    }
+
+    /// Migration safety: a legacy persisted calibration row with no `pair_key`
+    /// field decodes as the pair-agnostic slot (`None`), preserving byte-compatible
+    /// single-pair behavior; a row whose `pair_key` is present but malformed fails
+    /// closed (decoded as `None` == rejected) rather than being silently reinterpreted.
+    #[test]
+    fn anomaly_calibration_decode_is_migration_safe_for_pair_key() {
+        // Legacy row: no pair_key at all -> None (old single-pair behavior).
+        let legacy = json!({
+            "kind": "blind_spot",
+            "medium_min_score_millipoints": 100,
+            "high_min_score_millipoints": 300,
+            "provenance_ref": "legacy:blind_spot",
+        });
+        let decoded =
+            anomaly_calibration_from_payload_value(&legacy, "row").expect("legacy decodes");
+        assert_eq!(decoded.pair_key, None);
+        assert_eq!(decoded.calibration_key(), (AnomalyKind::BlindSpot, None));
+
+        // Explicit null pair_key is also treated as the pair-agnostic slot.
+        let null_pair = json!({
+            "kind": "blind_spot",
+            "pair_key": Value::Null,
+            "medium_min_score_millipoints": 100,
+            "high_min_score_millipoints": 300,
+            "provenance_ref": "legacy:blind_spot",
+        });
+        assert_eq!(
+            anomaly_calibration_from_payload_value(&null_pair, "row")
+                .expect("null pair decodes")
+                .pair_key,
+            None
+        );
+
+        // Present-but-populated pair_key is preserved verbatim.
+        let keyed = json!({
+            "kind": "blind_spot",
+            "pair_key": "SIM_STRUCTxSIM_SEMANTIC",
+            "medium_min_score_millipoints": 100,
+            "high_min_score_millipoints": 300,
+            "provenance_ref": "v1:SIM_STRUCTxSIM_SEMANTIC",
+        });
+        assert_eq!(
+            anomaly_calibration_from_payload_value(&keyed, "row")
+                .expect("keyed decodes")
+                .pair_key
+                .as_deref(),
+            Some("SIM_STRUCTxSIM_SEMANTIC")
+        );
+
+        // Malformed pair_key (non-string) is refused, not reinterpreted as "no pair".
+        let bad_type = json!({
+            "kind": "blind_spot",
+            "pair_key": 7,
+            "medium_min_score_millipoints": 100,
+            "high_min_score_millipoints": 300,
+            "provenance_ref": "v1:bad",
+        });
+        assert!(
+            anomaly_calibration_from_payload_value(&bad_type, "row").is_none(),
+            "non-string pair_key must fail closed"
+        );
+
+        // Empty pair_key is refused (schema-complete, not a silent None).
+        let empty = json!({
+            "kind": "blind_spot",
+            "pair_key": "   ",
+            "medium_min_score_millipoints": 100,
+            "high_min_score_millipoints": 300,
+            "provenance_ref": "v1:empty",
+        });
+        assert!(
+            anomaly_calibration_from_payload_value(&empty, "row").is_none(),
+            "empty pair_key must fail closed"
         );
     }
 

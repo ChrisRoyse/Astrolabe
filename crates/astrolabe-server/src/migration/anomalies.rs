@@ -8,6 +8,25 @@ pub(crate) fn anomalies_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
     }
 }
 
+/// Migration-safe decode of a persisted row's optional per-pair calibration key.
+///
+/// Absent or JSON `null` => `Ok(None)` (the legacy pair-agnostic slot, so old
+/// blind-spot rows keep byte-compatible single-pair behavior). Present but not a
+/// non-empty string => `Err(())` so a malformed `pair_key` fails closed as a
+/// schema-skipped row rather than being silently reinterpreted as "no pair".
+fn row_sink_pair_key(value: &Value) -> Result<Option<String>, ()> {
+    match value.get("pair_key") {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => {
+            let text = raw.as_str().ok_or(())?.trim();
+            if text.is_empty() {
+                return Err(());
+            }
+            Ok(Some(text.to_string()))
+        }
+    }
+}
+
 pub(crate) fn anomaly_inputs_from_rows(
     rows: &CbmPipelineRows,
 ) -> (Vec<AnomalySubstrateRow>, Vec<AnomalyCalibration>, usize) {
@@ -48,9 +67,16 @@ pub(crate) fn anomaly_inputs_from_rows(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("row-sink anomaly substrate");
+                let pair_key = match row_sink_pair_key(value) {
+                    Ok(pair_key) => pair_key,
+                    Err(()) => {
+                        skipped_properties += 1;
+                        continue;
+                    }
+                };
                 let provenance = string_array_field(value, "substrate_provenance_refs");
                 let evidence = string_array_field(value, "lens_evidence");
-                substrates.push(AnomalySubstrateRow::new(
+                let mut row = AnomalySubstrateRow::new(
                     kind,
                     subject_id.to_string(),
                     score,
@@ -61,7 +87,11 @@ pub(crate) fn anomaly_inputs_from_rows(
                         provenance
                     },
                     evidence,
-                ));
+                );
+                if let Some(pair_key) = pair_key {
+                    row = row.with_pair_key(pair_key);
+                }
+                substrates.push(row);
             }
         }
         if let Some(values) = properties
@@ -91,6 +121,13 @@ pub(crate) fn anomaly_inputs_from_rows(
                     skipped_properties += 1;
                     continue;
                 };
+                let pair_key = match row_sink_pair_key(value) {
+                    Ok(pair_key) => pair_key,
+                    Err(()) => {
+                        skipped_properties += 1;
+                        continue;
+                    }
+                };
                 let provenance = value
                     .get("provenance_ref")
                     .and_then(Value::as_str)
@@ -98,7 +135,11 @@ pub(crate) fn anomaly_inputs_from_rows(
                     .unwrap_or_else(|| {
                         format!("row_sink:{}:{}#anomaly_calibration", node.project, node.id)
                     });
-                calibrations.push(AnomalyCalibration::new(kind, medium, high, provenance));
+                let mut calibration = AnomalyCalibration::new(kind, medium, high, provenance);
+                if let Some(pair_key) = pair_key {
+                    calibration = calibration.with_pair_key(pair_key);
+                }
+                calibrations.push(calibration);
             }
         }
     }
