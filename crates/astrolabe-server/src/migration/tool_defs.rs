@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 15] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -17,6 +17,8 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 15] {
         find_similar_tool_definition(),
         guard_lock_tool_definition(),
         assay_gate_tool_definition(),
+        abduce_cause_tool_definition(),
+        forecast_tool_definition(),
     ]
 }
 
@@ -124,6 +126,99 @@ pub(crate) fn guard_lock_tool_definition() -> Value {
         }
     })
 }
+
+pub(crate) fn abduce_cause_tool_definition() -> Value {
+    json!({
+        "name": "abduce_cause",
+        "title": "Abduce Cause",
+        "description": "\"This failed — what most plausibly caused it?\" — grounded root-cause abduction for a shadow-indexed project, the inverse of predict_impact. Reverse-walks the composite consequence graph backward from an observed failure (depth <= 3, x0.7 per-hop attenuation) through the persisted change->outcome corpus (astrolabe_oracle), scoring each candidate cause against the recency- and credit-weighted failing occurrences it has actually preceded. A candidate with grounded failing history is scored s/(s+1) (always < 1.0); a structural-only candidate is a labeled provisional leaf capped at 0.35. Two cross-checks (membership in recent_changes, a DRIVES edge into the failure region) can only rank a grounded cause UP; every hypothesis is capped strictly below certainty and names its disconfirming test. When the failure's reverse-reachable region carries too little grounded failing history the tool refuses with a per-sensor deficit card rather than abducing from a coincidence (HONEST invariant 2). Fails closed with {code,message,remediation} on a missing/unresolved failure symbol or a malformed observed_at.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "failure": {
+                    "type": "string",
+                    "description": "Qualified name of the failing symbol to reason back from. Must resolve in this project's indexed graph or the call refuses fail-closed."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Alias for failure."
+                },
+                "observed_at": {
+                    "type": "integer",
+                    "description": "Server-observed epoch (seconds or ms) at which the failure was observed — the recency and causality reference. Defaults to the server wall clock; pass an explicit value for reproducible abduction. 0 refuses."
+                },
+                "recent_changes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Qualified names of symbols changed in the caller's recent window. A grounded candidate in this set is ranked up (the recent-change cross-check). Names that do not resolve are labeled and ignored, never guessed."
+                }
+            },
+            "required": ["project", "failure"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn forecast_tool_definition() -> Value {
+    json!({
+        "name": "forecast",
+        "title": "Forecast Recurrence",
+        "description": "\"When will this fail again?\" — a grounded recurrence forecast for a shadow-indexed project, answered from the subject's persisted failure series in the change->outcome corpus (astrolabe_oracle). mode=\"recurrence\" (default) forecasts the next-failure cadence: a robust median inter-arrival interval, a credible interval widened (and labeled provisional) for a small sample, a renewal overdue hazard, and CUSUM-detected cadence regime changes; the confidence is regularity*support, strictly < 1.0. mode=\"flaky\" forecasts a test's clean failure-recurrence window but REFUSES with ASTRO_FLAKY_EVIDENCE when the pass/fail series is self-inconsistent — forecasting a cadence from flaky noise would be a confident guess. Too few failure events refuses with ASTRO_NO_RECURRENCE. Every interval is labeled with its trust; fails closed with {code,message,remediation} on a missing/unresolved subject, a malformed now, or an unsupported mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Qualified name of the symbol/test whose failure recurrence to forecast. Must resolve in this project's indexed graph or the call refuses fail-closed."
+                },
+                "test": {
+                    "type": "string",
+                    "description": "Alias for subject."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["recurrence", "flaky"],
+                    "description": "recurrence (default): forecast the subject's failure-recurrence cadence. flaky: forecast a test's clean failure window, refusing on flaky (self-inconsistent) evidence."
+                },
+                "now": {
+                    "type": "integer",
+                    "description": "Server-observed epoch (seconds or ms) used as the reference instant for the overdue hazard. Defaults to the server wall clock; pass an explicit value for reproducible forecasts. 0 refuses."
+                }
+            },
+            "required": ["project", "subject"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
 
 pub(crate) fn measure_bits_tool_definition() -> Value {
     json!({

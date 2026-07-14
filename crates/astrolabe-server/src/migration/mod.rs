@@ -153,6 +153,9 @@ use anchor_outcome::*;
 mod predict_impact;
 use predict_impact::*;
 
+mod oracle_surface;
+use oracle_surface::*;
+
 mod coverage_ingest;
 use coverage_ingest::*;
 
