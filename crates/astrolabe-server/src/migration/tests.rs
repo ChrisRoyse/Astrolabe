@@ -1858,7 +1858,7 @@ fn anomaly_report_prefers_live_vault_rows_over_stored_metadata() {
     let report = read_anomaly_report(&dir, "demo").unwrap();
     assert_eq!(
         report["source"],
-        "AsterVault:ColumnFamily::XTerm+Assay+Reactive"
+        "AsterVault:ColumnFamily::XTerm+Assay+Reactive+BlindSpot"
     );
     assert_eq!(report["source_state"]["xterm_rows_read"], 1);
     assert_eq!(report["source_state"]["assay_rows_read"], 1);
@@ -10702,4 +10702,228 @@ fn detect_changes_grounded_risk_labels_unresolved_short_name_provisional() {
     assert_eq!(symbol["resolution"], "unresolved");
     assert_eq!(symbol["grounded"], false);
     assert_eq!(symbol["trust"], "provisional");
+}
+
+// ---- wave-12 deferred server FSV: guard_lock (#48) --------------------------
+
+/// #48 server residue: lock an exported symbol, prove the inventory persisted +
+/// ledgered to the Guard CF, that guard_check consults the persisted lock (the
+/// verdict surfaces `identity_locked` and a locked target refuses a drifted
+/// candidate with the public_api_signature slot named), and that unlock returns
+/// the inventory byte-for-byte to its pre-lock image (reversibility at the server
+/// boundary). Full State Verification: independent Ledger-CF row readback +
+/// inventory-hash before/after byte comparison.
+#[test]
+fn guard_lock_persists_ledgers_gates_guard_check_and_reverts() {
+    let dir = temp_dir("guard-lock-fsv");
+    setup_guard_check_calibrated(&dir, "guard-lock-fsv");
+
+    // Empty baseline inventory.
+    let empty = json!({"project": "demo", "mode": "inventory"});
+    let empty: Value =
+        serde_json::from_str(&guard_lock_at(&dir, empty.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(empty["isError"], false, "{empty}");
+    assert_eq!(empty["structuredContent"]["locked_count"], 0);
+    let empty_hash = empty["structuredContent"]["inventory_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Lock the guard_check target (an exported/public symbol).
+    let lock = json!({
+        "project": "demo",
+        "mode": "lock",
+        "cx": GUARD_CHECK_TARGET,
+        "qualified_name": "demo::public_api",
+        "exported": true,
+    });
+    let lock: Value =
+        serde_json::from_str(&guard_lock_at(&dir, lock.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(lock["isError"], false, "{lock}");
+    let locked = &lock["structuredContent"];
+    assert_eq!(locked["status"], "locked");
+    assert_eq!(locked["now_locked"], true);
+    assert_eq!(locked["locked_count"], 1);
+    assert_eq!(locked["inventory_hash_before"], empty_hash);
+    assert_ne!(locked["inventory_hash_after"], json!(empty_hash));
+    let lock_seq = locked["ledger_ref"]["seq"].as_u64().expect("lock seq");
+    assert_eq!(locked["ledger_ref"]["kind"], "guard");
+    let after_hash = locked["inventory_hash_after"].as_str().unwrap().to_string();
+
+    // FSV: independently read the Guard Ledger CF row back and confirm it decodes
+    // to an EntryKind::Guard entry whose payload names this lock event.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, lock_seq)
+        .unwrap()
+        .expect("guard lock ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Guard);
+    assert!(matches!(entry.subject, SubjectId::Guard(_)));
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload["kind"], "lock");
+    assert_eq!(payload["cx"], GUARD_CHECK_TARGET);
+    assert_eq!(payload["inventory_sha256"], after_hash);
+
+    // Inventory readback surfaces exactly the locked cx.
+    let inv = json!({"project": "demo", "mode": "inventory"});
+    let inv: Value =
+        serde_json::from_str(&guard_lock_at(&dir, inv.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(inv["structuredContent"]["locked_count"], 1);
+    assert_eq!(inv["structuredContent"]["inventory_hash"], after_hash);
+    assert!(
+        inv["structuredContent"]["locked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == GUARD_CHECK_TARGET),
+        "inventory must list the locked cx: {inv}"
+    );
+
+    // Integration: guard_check now consults the persisted lock. A drifted (alien)
+    // candidate on the locked identity refuses, the verdict surfaces the lock, and
+    // the public_api_signature slot is in the breakdown.
+    let exemplar_vec = vec![1.0, 0.0, 0.0, 0.0];
+    let candidate_vec = vec![0.0, 0.0, 0.0, 1.0];
+    let check_args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": guard_check_symbol_body(&candidate_vec),
+        "exemplars": [
+            {"cx": "cx:kernel", "kernel_near": true, "slots": guard_check_symbol_body(&exemplar_vec)["slots"].clone()},
+        ],
+    });
+    let verdict: Value =
+        serde_json::from_str(&guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(verdict["isError"], false, "{verdict}");
+    let v = &verdict["structuredContent"];
+    assert_eq!(v["identity_locked"], true, "lock must travel with verdict: {v}");
+    assert_eq!(v["verdict"], "refuse", "{v}");
+    assert!(
+        v["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["slot"] == "public_api_signature"),
+        "locked verdict must carry the public_api_signature slot: {v}"
+    );
+
+    // Unlock is reversible: the inventory returns byte-for-byte to the pre-lock
+    // image (its hash equals the original empty-inventory hash).
+    let unlock = json!({"project": "demo", "mode": "unlock", "cx": GUARD_CHECK_TARGET});
+    let unlock: Value =
+        serde_json::from_str(&guard_lock_at(&dir, unlock.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(unlock["isError"], false, "{unlock}");
+    assert_eq!(unlock["structuredContent"]["status"], "unlocked");
+    assert_eq!(unlock["structuredContent"]["locked_count"], 0);
+    assert_eq!(
+        unlock["structuredContent"]["inventory_hash_after"], empty_hash,
+        "unlock must restore the pre-lock inventory image: {unlock}"
+    );
+
+    // guard_check no longer sees the target as locked.
+    let after: Value =
+        serde_json::from_str(&guard_check_at(&dir, "demo", check_args.as_object().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(after["structuredContent"]["identity_locked"], false);
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---- wave-12 deferred server FSV: assay_gate (P5.5) -------------------------
+
+/// P5.5 server residue: decide a lens from a measured capability card, prove the
+/// verdict ledgered to the Assay CF and re-folded the serving state, that a
+/// status as_of_seq reads the journal entry back, and that revert restores the
+/// prior serving state. Full State Verification: independent Assay-Ledger-CF row
+/// readback + before-decide/after-revert serving byte comparison.
+#[test]
+fn assay_gate_decide_ledgers_serves_and_reverts_serving_state() {
+    let dir = temp_dir("assay-gate-fsv");
+    setup_guard_calibrate_shadow(&dir, "assay-gate-fsv");
+
+    // Serving baseline before any decision.
+    let before = json!({"project": "demo", "mode": "status"});
+    let before: Value =
+        serde_json::from_str(&assay_gate_at(&dir, before.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(before["isError"], false, "{before}");
+    let before_serving = before["structuredContent"]["serving"].clone();
+
+    // A measured, admissible capability card (mirrors calyx/astrolabe-assay's
+    // admit_when_signal_and_low_correlation fixture: strong signal, full coverage,
+    // two-stratum spread, low correlation).
+    let card = json!({
+        "lens": "strong",
+        "axis_bits": {"defect": 0.5},
+        "signal_bits": 0.5,
+        "coverage": 1.0,
+        "spread": 1.707_825_127_659_933_2,
+        "separation": 0.771_428_571_428_571_5,
+        "cost_units": 1.0,
+        "n": 6,
+    });
+    let decide = json!({
+        "project": "demo",
+        "mode": "decide",
+        "card": card,
+        "max_admitted_correlation": 0.1,
+        "sole_critical_carrier": false,
+    });
+    let decide: Value =
+        serde_json::from_str(&assay_gate_at(&dir, decide.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(decide["isError"], false, "{decide}");
+    let decided = &decide["structuredContent"];
+    assert_eq!(decided["status"], "decided");
+    assert_eq!(decided["decision"]["lens"], "strong");
+    let verdict = decided["decision"]["verdict"].as_str().unwrap().to_string();
+    let seq = decided["ledger_ref"]["seq"].as_u64().expect("decide seq");
+    assert_eq!(decided["ledger_ref"]["kind"], "assay");
+
+    // FSV: independently read the Assay Ledger CF row back.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let row = calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)
+        .unwrap()
+        .expect("assay decide ledger row exists");
+    let entry = decode_ledger(&row.bytes).unwrap();
+    assert_eq!(entry.kind, calyx_ledger::EntryKind::Assay);
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload["kind"], "decide");
+    assert_eq!(payload["lens"], "strong");
+
+    // status reflects the decision; as_of_seq reads the very entry back.
+    let status = json!({"project": "demo", "mode": "status", "as_of_seq": seq});
+    let status: Value =
+        serde_json::from_str(&assay_gate_at(&dir, status.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(status["isError"], false, "{status}");
+    let served = &status["structuredContent"];
+    assert_eq!(served["as_of"]["kind"], "decide");
+    let bucket = match verdict.as_str() {
+        "admit" => "admitted",
+        "park" => "parked",
+        "retire" => "retired",
+        other => panic!("unexpected verdict {other}"),
+    };
+    assert!(
+        served["serving"][bucket]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "strong"),
+        "decided lens must serve in {bucket}: {served}"
+    );
+
+    // revert restores the serving state to the pre-decision baseline.
+    let revert = json!({"project": "demo", "mode": "revert", "reverts_seq": seq});
+    let revert: Value =
+        serde_json::from_str(&assay_gate_at(&dir, revert.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(revert["isError"], false, "{revert}");
+    assert_eq!(revert["structuredContent"]["status"], "reverted");
+
+    let after = json!({"project": "demo", "mode": "status"});
+    let after: Value =
+        serde_json::from_str(&assay_gate_at(&dir, after.as_object().unwrap()).unwrap()).unwrap();
+    assert_eq!(
+        after["structuredContent"]["serving"], before_serving,
+        "revert must restore the prior serving state byte-for-byte"
+    );
+    fs::remove_dir_all(&dir).ok();
 }

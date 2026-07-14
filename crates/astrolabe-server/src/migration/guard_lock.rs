@@ -127,23 +127,32 @@ pub(crate) fn handle_guard_lock(args_json: &str) -> Result<String, DynError> {
             "ASTRO_GUARD_LOCK_INVALID: guard_lock arguments must be a JSON object; remediation: pass a JSON object with project and mode",
         );
     };
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    guard_lock_at(&cache_dir, args_obj)
+}
+
+/// Cache-dir-explicit entry point for `guard_lock` (shared by the MCP handler and
+/// in-process FSV tests, avoiding the process-global cbm cache dir).
+pub(crate) fn guard_lock_at(
+    cache_dir: &Path,
+    args_obj: &Map<String, Value>,
+) -> Result<String, DynError> {
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result(
             "ASTRO_GUARD_LOCK_INVALID: guard_lock requires project; remediation: pass the shadow-indexed project whose lock inventory is consulted",
         );
     };
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    if read_dial_at(&cache_dir, &project)? != MigrationDial::Shadow {
+    if read_dial_at(cache_dir, &project)? != MigrationDial::Shadow {
         return tool_error_result(
             "ASTRO_GUARD_LOCK_NOT_SHADOW: guard_lock requires calyx shadow indexing; remediation: run index_repository with calyx=\"shadow\" before locking symbols",
         );
     }
     let mode = string_arg(args_obj, "mode").unwrap_or("inventory");
     match mode {
-        "lock" => guard_lock_mutate(&cache_dir, &project, args_obj, true),
-        "unlock" => guard_lock_mutate(&cache_dir, &project, args_obj, false),
-        "inventory" => guard_lock_inventory_at(&cache_dir, &project),
-        "rebuild" => guard_lock_rebuild_at(&cache_dir, &project, args_obj),
+        "lock" => guard_lock_mutate(cache_dir, &project, args_obj, true),
+        "unlock" => guard_lock_mutate(cache_dir, &project, args_obj, false),
+        "inventory" => guard_lock_inventory_at(cache_dir, &project),
+        "rebuild" => guard_lock_rebuild_at(cache_dir, &project, args_obj),
         other => tool_error_result(format!(
             "ASTRO_GUARD_LOCK_MODE_UNSUPPORTED: guard_lock mode {other:?} is not available; remediation: use mode=\"lock\", mode=\"unlock\", mode=\"inventory\", or mode=\"rebuild\""
         )),

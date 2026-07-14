@@ -78,22 +78,31 @@ pub(crate) fn handle_assay_gate(args_json: &str) -> Result<String, DynError> {
             "ASTRO_ASSAY_GATE_INVALID: assay_gate arguments must be a JSON object; remediation: pass a JSON object with project and mode",
         );
     };
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    assay_gate_at(&cache_dir, args_obj)
+}
+
+/// Cache-dir-explicit entry point for `assay_gate` (shared by the MCP handler and
+/// in-process FSV tests, avoiding the process-global cbm cache dir).
+pub(crate) fn assay_gate_at(
+    cache_dir: &Path,
+    args_obj: &Map<String, Value>,
+) -> Result<String, DynError> {
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result(
             "ASTRO_ASSAY_GATE_INVALID: assay_gate requires project; remediation: pass the shadow-indexed project whose lens gate is consulted",
         );
     };
-    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
-    if read_dial_at(&cache_dir, &project)? != MigrationDial::Shadow {
+    if read_dial_at(cache_dir, &project)? != MigrationDial::Shadow {
         return tool_error_result(
             "ASTRO_ASSAY_GATE_NOT_SHADOW: assay_gate requires calyx shadow indexing; remediation: run index_repository with calyx=\"shadow\" before gating lenses",
         );
     }
     let mode = string_arg(args_obj, "mode").unwrap_or("status");
     match mode {
-        "decide" => assay_gate_decide_at(&cache_dir, &project, args_obj),
-        "revert" => assay_gate_revert_at(&cache_dir, &project, args_obj),
-        "status" => assay_gate_status_at(&cache_dir, &project, args_obj),
+        "decide" => assay_gate_decide_at(cache_dir, &project, args_obj),
+        "revert" => assay_gate_revert_at(cache_dir, &project, args_obj),
+        "status" => assay_gate_status_at(cache_dir, &project, args_obj),
         other => tool_error_result(format!(
             "ASTRO_ASSAY_GATE_MODE_UNSUPPORTED: assay_gate mode {other:?} is not available; remediation: use mode=\"decide\", mode=\"revert\", or mode=\"status\""
         )),
