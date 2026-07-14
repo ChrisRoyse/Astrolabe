@@ -407,6 +407,23 @@ fn measure_source_through_panel(
     obj: &Map<String, Value>,
     index: usize,
 ) -> Result<MeasuredSymbol, GuardRefusal> {
+    Ok(MeasuredSymbol {
+        slots: measure_guard_panel_sources(driver, runtime, obj, index)?,
+    })
+}
+
+/// Measure one source object through the real panel and extract its guard panel-source
+/// slot vectors, keyed by panel slot id. Shared by the guard_calibrate auto path (which
+/// wraps the map in an [`astrolabe_guard::auto::MeasuredSymbol`]) and the guard_check
+/// panel-driven candidate/exemplar path (#331, which hands the map to
+/// [`astrolabe_guard::check::slot_input_from_panel`]). A panel error is a fail-closed
+/// refusal, never a silent skip.
+pub(crate) fn measure_guard_panel_sources(
+    driver: &PanelDriver,
+    runtime: &ShadowSlotRuntime,
+    obj: &Map<String, Value>,
+    index: usize,
+) -> Result<BTreeMap<u16, SlotVector>, GuardRefusal> {
     let string_field = |key: &str| -> String {
         obj.get(key)
             .and_then(Value::as_str)
@@ -456,7 +473,7 @@ fn measure_source_through_panel(
             }
         }
     }
-    Ok(MeasuredSymbol { slots })
+    Ok(slots)
 }
 
 /// Parse a source's `label` into a [`SymbolLabel`] governing panel applicability.
