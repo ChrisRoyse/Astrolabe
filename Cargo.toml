@@ -33,6 +33,7 @@ astrolabe-domain = { path = "crates/astrolabe-domain" }
 astrolabe-ingest = { path = "crates/astrolabe-ingest" }
 astrolabe-kernel = { path = "crates/astrolabe-kernel" }
 astrolabe-lower = { path = "crates/astrolabe-lower" }
+astrolabe-oracle = { path = "crates/astrolabe-oracle" }
 astrolabe-panel = { path = "crates/astrolabe-panel" }
 astrolabe-provenance = { path = "crates/astrolabe-provenance" }
 astrolabe-weave = { path = "crates/astrolabe-weave" }

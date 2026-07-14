@@ -5930,6 +5930,11 @@ fn advertised_astrolabe_tools_reach_jsonrpc_handlers() {
             "anchor_outcome requires calyx shadow indexing",
         ),
         (
+            "predict_impact",
+            json!({"project": project.clone(), "seeds": ["demo.main"]}),
+            "predict_impact requires calyx shadow indexing",
+        ),
+        (
             "coverage_ingest",
             json!({
                 "project": project.clone(),
@@ -8943,4 +8948,332 @@ fn wait_for_lowered_sqlite_lock(cache_dir: &Path, project: &str) -> LoweredSqlit
         "timed out waiting to reacquire lowered SQLite lock {}",
         lowered_sqlite_lock_path(cache_dir, project).display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// #329 — predict_impact MCP surfacing (composite graph + corpus + gate)
+// ---------------------------------------------------------------------------
+
+/// Seeds a shadow vault for `calc` with three non-test symbols
+/// (`calc.add` 1-3, `calc.sub` 5-7, `calc.mul` 9-11) and a test symbol
+/// (`tests.test_arith`), wired by `add CALLS sub` and `test_arith TESTS {add,sub}`.
+/// When `with_corpus` is true a grounded change→outcome corpus is mined and
+/// persisted into the vault: `calc.sub` gets `sub_fail` failing occurrences and
+/// `calc.add` gets `add_fail` failing occurrences, all single-candidate Trusted
+/// `ci:` outcomes — exactly the shape `predict_impact` grounds on.
+fn seed_predict_impact_vault(
+    cache_dir: &Path,
+    seed_ts: u64,
+    with_corpus: bool,
+    sub_fail: usize,
+    add_fail: usize,
+) {
+    let sqlite = cache_dir.join("source.db");
+    let conn = Connection::open(&sqlite).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               label TEXT NOT NULL,
+               name TEXT NOT NULL,
+               qualified_name TEXT NOT NULL,
+               file_path TEXT DEFAULT '',
+               start_line INTEGER DEFAULT 0,
+               end_line INTEGER DEFAULT 0,
+               properties TEXT DEFAULT '{}'
+             );
+             CREATE TABLE edges (
+               id INTEGER PRIMARY KEY,
+               project TEXT NOT NULL,
+               source_id INTEGER NOT NULL,
+               target_id INTEGER NOT NULL,
+               type TEXT NOT NULL,
+               properties TEXT DEFAULT '{}',
+               url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),
+               local_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS'
+                 THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),
+               UNIQUE(source_id, target_id, type, local_name_gen)
+             );",
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO nodes(id, project, label, name, qualified_name, file_path, start_line, end_line, properties) VALUES
+           (1,'calc','Function','add','calc.add','src/calc.py',1,3,'{}'),
+           (2,'calc','Function','sub','calc.sub','src/calc.py',5,7,'{}'),
+           (3,'calc','Function','mul','calc.mul','src/calc.py',9,11,'{}'),
+           (4,'calc','Function','test_arith','tests.test_arith','tests/test_calc.py',1,5,'{}');
+         INSERT INTO edges(id, project, source_id, target_id, type, properties) VALUES
+           (1,'calc',1,2,'CALLS','{}'),
+           (2,'calc',4,1,'TESTS','{}'),
+           (3,'calc',4,2,'TESTS','{}');",
+    )
+    .unwrap();
+    drop(conn);
+    let vault = AsterVault::new_durable_with_clock(
+        vault_dir(cache_dir, "calc"),
+        VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+        vault_salt("calc").as_bytes().to_vec(),
+        VaultOptions::default(),
+        calyx_core::FixedClock::new(seed_ts),
+    )
+    .unwrap();
+    let options = SqliteImportOptions::new("calc", "commit-predict", DEFAULT_PANEL_VERSION)
+        .with_available_slots(std::iter::empty());
+    import_shadow_vault_report(
+        &sqlite,
+        &vault,
+        &ShadowSlotRuntime,
+        &options,
+        Some(RowSinkImportCandidate::Unavailable(
+            "forced sqlite import for deterministic predict seed".to_string(),
+        )),
+    )
+    .unwrap();
+    drop(vault);
+    persist_dial_at(cache_dir, "calc", MigrationDial::Shadow).unwrap();
+
+    if !with_corpus {
+        return;
+    }
+
+    // Resolve the imported constellation ids and mine a grounded corpus on them.
+    let map_vault = open_shadow_vault_read_only(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Graph, ColumnFamily::Base],
+    )
+    .unwrap();
+    let node_map = astrolabe_ingest::read_node_map_cx_ids(&map_vault, "calc").unwrap();
+    let sub = *node_map.get("calc.sub").expect("calc.sub resolves");
+    let add = *node_map.get("calc.add").expect("calc.add resolves");
+    drop(map_vault);
+
+    // 30-day spacing keeps each outcome a single in-window candidate (credit 1.0).
+    const PAIR_SPACING_SECS: u64 = 30 * 24 * 60 * 60;
+    const CORPUS_BASE_TS: u64 = 1_000_000_000;
+    let mut changes = Vec::new();
+    let mut outcomes = Vec::new();
+    let mut push_failures = |subject: calyx_core::CxId, tag: &str, n: usize| {
+        for i in 0..n {
+            let change_ts = CORPUS_BASE_TS + (i as u64) * PAIR_SPACING_SECS;
+            changes.push(astrolabe_oracle::ChangeEvent {
+                change_id: format!("chg-{tag}-{i}"),
+                subject,
+                change_ts,
+            });
+            outcomes.push(astrolabe_oracle::OutcomeEvent {
+                source: format!("ci:bt:{tag}-{i}"),
+                subject,
+                outcome_ts: change_ts + 3_600,
+                passed: false,
+            });
+        }
+    };
+    push_failures(sub, "sub", sub_fail);
+    push_failures(add, "add", add_fail);
+    let corpus = astrolabe_oracle::mine_corpus(
+        &changes,
+        &outcomes,
+        &astrolabe_oracle::AttributionConfig::default(),
+    )
+    .unwrap();
+
+    let write_vault = open_shadow_vault_writable(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Kv, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    astrolabe_oracle::persist_corpus(&write_vault, &corpus, "predict-impact-test").unwrap();
+    drop(write_vault);
+}
+
+/// Independent FSV: reopen the vault and count persisted failing occurrence rows
+/// for the constellation named `qn`, proving the grounded prediction rides on real
+/// persisted `Kv` rows rather than an echo.
+fn read_back_failing_occurrences(cache_dir: &Path, qn: &str) -> usize {
+    let vault = open_shadow_vault_read_only(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Graph, ColumnFamily::Base, ColumnFamily::Kv],
+    )
+    .unwrap();
+    let node_map = astrolabe_ingest::read_node_map_cx_ids(&vault, "calc").unwrap();
+    let cx = *node_map.get(qn).unwrap();
+    let count = astrolabe_oracle::read_occurrence_rows(&vault)
+        .unwrap()
+        .into_iter()
+        .filter(|persisted| persisted.row.subject == cx && !persisted.row.passed)
+        .count();
+    drop(vault);
+    count
+}
+
+fn predict_p_approx(value: &Value, expected: f64) -> bool {
+    value.as_f64().is_some_and(|v| (v - expected).abs() < 1e-9)
+}
+
+#[test]
+fn predict_impact_grounded_ranks_consequences_and_selects_tests_with_gate_passed() {
+    // FSV: a real seeded CBM graph (add CALLS sub; test_arith TESTS add,sub) plus a
+    // grounded corpus (calc.sub 4 fails, calc.add 3 fails). With the repo backtest
+    // gate persisted as passed, predict_impact grounds seed=calc.sub:
+    //   sub: raw .8, sc 1.0, dpi .8 -> ceiled .8; p = .8
+    //   add: raw .75, sc 1.0, dpi .75 -> ceiled .75; p = 0.7 * .75 = .525
+    // test_arith is selected (covers sub) at p .8 via calc.sub. Every claim is
+    // cross-checked against independently read-back persisted occurrence rows.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("predict-impact-grounded");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 3);
+
+    // Persist a passing backtest gate so grounded confidence is advertised.
+    write_config_value(
+        &dir,
+        &metadata_key("calc", PREDICT_GATE_KEY),
+        "{\"advertise_grounded\":true,\"source\":\"test-gate\"}",
+    )
+    .unwrap();
+
+    let response =
+        predict_impact_json_at(&dir, "calc", &["calc.sub".to_string()], "predict").unwrap();
+
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["grounded_mode"], true, "envelope: {response}");
+    assert_eq!(response["trust"], "trusted");
+    assert_eq!(response["consequence_count"], 2, "envelope: {response}");
+
+    let consequences = response["consequences"].as_array().unwrap();
+    assert_eq!(consequences[0]["target"]["qualified_name"], "calc.sub");
+    assert!(
+        predict_p_approx(&consequences[0]["p"], 0.8),
+        "sub p: {}",
+        consequences[0]["p"]
+    );
+    assert_eq!(consequences[0]["grounded"], true);
+    assert_eq!(consequences[0]["trust"], "trusted");
+    assert_eq!(consequences[0]["evidence_n"], 4);
+    assert_eq!(consequences[1]["target"]["qualified_name"], "calc.add");
+    assert!(
+        predict_p_approx(&consequences[1]["p"], 0.525),
+        "add p: {}",
+        consequences[1]["p"]
+    );
+    assert_eq!(consequences[1]["evidence_n"], 3);
+
+    let tests = response["test_selection"].as_array().unwrap();
+    assert_eq!(tests.len(), 1, "one covering test selected: {response}");
+    assert_eq!(tests[0]["test"]["qualified_name"], "tests.test_arith");
+    assert_eq!(tests[0]["via"]["qualified_name"], "calc.sub");
+    assert!(
+        predict_p_approx(&tests[0]["p"], 0.8),
+        "test p: {}",
+        tests[0]["p"]
+    );
+
+    // FSV: the grounded confidences ride on real persisted failing rows.
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 4);
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.add"), 3);
+}
+
+#[test]
+fn predict_impact_refuses_zero_history_with_deficit_card_not_a_guess() {
+    // No corpus persisted: the seed carries zero grounded change history, so
+    // predict_impact must return the per-sensor deficit card (HONEST invariant 2),
+    // never a fabricated consequence tree.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("predict-impact-insufficient");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, false, 0, 0);
+
+    let response =
+        predict_impact_json_at(&dir, "calc", &["calc.sub".to_string()], "predict").unwrap();
+
+    assert_eq!(response["status"], "insufficient", "envelope: {response}");
+    assert!(response.get("consequences").is_none(), "no guessed tree");
+    let deficits = response["deficits"].as_array().unwrap();
+    assert_eq!(deficits.len(), 1);
+    assert_eq!(deficits[0]["sensor"], "direct_change_history");
+    assert_eq!(deficits[0]["have"], 0);
+    assert_eq!(deficits[0]["need"], 3);
+    assert!(
+        predict_p_approx(&deficits[0]["bits_short"], 2.0),
+        "bits_short: {}",
+        deficits[0]["bits_short"]
+    );
+    assert_eq!(response["trust"], "provisional");
+    // FSV: there really are no persisted occurrences to ground on.
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 0);
+}
+
+#[test]
+fn predict_impact_labels_provisional_when_backtest_gate_not_passed() {
+    // Same grounded corpus, but no persisted backtest gate: grounded mode is
+    // withheld, so every consequence is labeled provisional (never a silent
+    // grounded default). The evidence is still real; only the advertised trust
+    // downgrades.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("predict-impact-gate-closed");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 3);
+
+    // No gate row written -> default provisional.
+    let response =
+        predict_impact_json_at(&dir, "calc", &["calc.sub".to_string()], "predict").unwrap();
+
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["grounded_mode"], false, "envelope: {response}");
+    assert_eq!(response["trust"], "provisional");
+    assert_eq!(response["gate"]["source"], "absent");
+    let consequences = response["consequences"].as_array().unwrap();
+    assert_eq!(consequences.len(), 2);
+    for consequence in consequences {
+        assert_eq!(
+            consequence["trust"], "provisional",
+            "gate-closed consequence must be provisional: {consequence}"
+        );
+    }
+    // The ranking/probabilities are unchanged — only the advertised trust differs.
+    assert!(predict_p_approx(&consequences[0]["p"], 0.8));
+    assert_eq!(consequences[0]["target"]["qualified_name"], "calc.sub");
+}
+
+#[test]
+fn predict_impact_backtest_mode_persists_and_reads_back_the_gate() {
+    // mode="backtest" derives cases from the persisted corpus + TESTS edges, runs
+    // the grounded-vs-topology backtest, and persists the per-repo gate. FSV: the
+    // gate config row is independently read back and must resolve to the same
+    // advertise_grounded verdict the response reported.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("predict-impact-backtest");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 3);
+
+    let response = predict_impact_json_at(&dir, "calc", &[], "backtest").unwrap();
+    assert_eq!(
+        response["status"], "backtest_recorded",
+        "envelope: {response}"
+    );
+    assert!(
+        response["gate"]["cases"].as_u64().unwrap() >= 2,
+        "envelope: {response}"
+    );
+    let advertised = response["advertise_grounded"].as_bool().unwrap();
+
+    // FSV: independently read the persisted gate row and confirm it matches.
+    let raw = read_config_value(&dir, &metadata_key("calc", PREDICT_GATE_KEY))
+        .unwrap()
+        .expect("gate row persisted");
+    let parsed: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["advertise_grounded"].as_bool().unwrap(), advertised);
+    assert_eq!(parsed["recorded_by"], "astrolabe-predict-backtest");
+
+    // A subsequent predict reads that same gate back and honors it.
+    let predict =
+        predict_impact_json_at(&dir, "calc", &["calc.sub".to_string()], "predict").unwrap();
+    assert_eq!(predict["status"], "grounded");
+    assert_eq!(predict["grounded_mode"].as_bool().unwrap(), advertised);
 }

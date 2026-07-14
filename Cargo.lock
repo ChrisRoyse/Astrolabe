@@ -229,6 +229,7 @@ dependencies = [
  "astrolabe-ingest",
  "astrolabe-kernel",
  "astrolabe-lower",
+ "astrolabe-oracle",
  "astrolabe-panel",
  "astrolabe-provenance",
  "astrolabe-weave",
