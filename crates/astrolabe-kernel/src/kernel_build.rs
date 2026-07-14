@@ -492,6 +492,47 @@ pub fn build_kernel(
     scope_id: &str,
     config: &KernelBuildConfig,
 ) -> Result<KernelArtifact> {
+    build_kernel_inner(graph, scope_id, config, None)
+}
+
+/// Computes the per-node betweenness permille vector (index order = ascending
+/// `CxId`) for a graph. Callers cache this across a topology-preserving graph
+/// delta so [`build_kernel_reusing_betweenness`] can skip the O(V·E) recompute.
+pub fn kernel_betweenness_permille(
+    graph: &KernelGraph,
+    config: &KernelBuildConfig,
+) -> Result<Vec<u64>> {
+    config.validate()?;
+    let indexed = graph.compile()?;
+    Ok(betweenness_auto(
+        &indexed,
+        config.betweenness_exact_max_nodes,
+        config.betweenness_sample_pivots,
+        config.betweenness_sample_seed,
+    )
+    .permille)
+}
+
+/// Builds a kernel reusing a cached betweenness permille vector when it matches
+/// the node count. Betweenness is topology-only (unweighted), so under a
+/// topology-preserving delta (edge-weight / node-frequency changes) the cached
+/// vector is exactly what a fresh computation would produce — the incremental
+/// win. A length mismatch falls back to a full recompute, fail-safe.
+pub fn build_kernel_reusing_betweenness(
+    graph: &KernelGraph,
+    scope_id: &str,
+    config: &KernelBuildConfig,
+    cached_betweenness_permille: &[u64],
+) -> Result<KernelArtifact> {
+    build_kernel_inner(graph, scope_id, config, Some(cached_betweenness_permille))
+}
+
+fn build_kernel_inner(
+    graph: &KernelGraph,
+    scope_id: &str,
+    config: &KernelBuildConfig,
+    cached_betweenness_permille: Option<&[u64]>,
+) -> Result<KernelArtifact> {
     config.validate()?;
     if graph.node_count() == 0 {
         return Err(DomainError::new(
@@ -503,12 +544,20 @@ pub fn build_kernel(
     let indexed = graph.compile()?;
     let n = indexed.len();
 
-    let betweenness = betweenness_auto(
-        &indexed,
-        config.betweenness_exact_max_nodes,
-        config.betweenness_sample_pivots,
-        config.betweenness_sample_seed,
-    );
+    let betweenness = match cached_betweenness_permille {
+        Some(cached) if cached.len() == n => crate::betweenness::BetweennessResult {
+            raw: Vec::new(),
+            permille: cached.to_vec(),
+            exact: (n as u64) <= config.betweenness_exact_max_nodes,
+            sources_used: 0,
+        },
+        _ => betweenness_auto(
+            &indexed,
+            config.betweenness_exact_max_nodes,
+            config.betweenness_sample_pivots,
+            config.betweenness_sample_seed,
+        ),
+    };
     let groundedness = score_groundedness(
         &indexed,
         config.groundedness_hop_limit,

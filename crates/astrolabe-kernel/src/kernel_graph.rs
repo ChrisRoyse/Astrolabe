@@ -140,6 +140,11 @@ impl KernelGraph {
         &self.nodes
     }
 
+    /// Edges as supplied.
+    pub fn edges(&self) -> &[KernelGraphEdge] {
+        &self.edges
+    }
+
     /// Compiles this graph into the index-addressed representation the pipeline
     /// algorithms operate on. Nodes are ordered by `CxId`, so the index of a
     /// node — and therefore every downstream artifact ordering — is a pure

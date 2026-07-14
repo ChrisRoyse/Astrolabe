@@ -41,8 +41,25 @@ pub use kernel_build::{
     KERNEL_ARTIFACT_SCHEMA, KERNEL_BUILD_KNOB_REGISTRY_VERSION, KERNEL_BUILD_KNOBS,
     KERNEL_INDEX_SCHEMA, KERNEL_LEDGER_SCHEMA, KernelArtifact, KernelArtifactPaths,
     KernelBuildConfig, KernelIndexManifest, KernelLedgerEntry, KernelMember, RecallMeasurement,
-    build_kernel, measure_recall, members_hash, refine_kernel_with_recall_support,
-    write_kernel_artifacts,
+    build_kernel, build_kernel_reusing_betweenness, kernel_betweenness_permille, measure_recall,
+    members_hash, refine_kernel_with_recall_support, write_kernel_artifacts,
+};
+
+/// Scope algebra for scoped and hierarchical kernels (#38).
+pub mod scope;
+pub use scope::{NodeScope, Scope, ScopeAttributes, induced_subgraph};
+
+/// Scoped builds, scope cache, standing-kernel triggers, freshness (#38).
+pub mod scope_cache;
+pub use scope_cache::{
+    CacheKey, FreshnessDecision, KernelCache, RefreshReason, STANDING_KERNEL_KNOB_REGISTRY_VERSION,
+    STANDING_KERNEL_KNOBS, StandingKernelPolicy, build_scoped_kernel, decide_freshness,
+};
+
+/// Incremental rebuild and hierarchical region kernels (#38).
+pub mod incremental;
+pub use incremental::{
+    GraphDelta, RebuildReport, RegionGraph, build_region_graph, rebuild_dirty, region_id,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
