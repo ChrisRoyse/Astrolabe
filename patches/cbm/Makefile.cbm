@@ -123,7 +123,14 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # --allow-multiple-definition (MinGW CRT symbol clashes). The relocatable
 # libcbm merge needs the same allowance before the archive is formed.
 # Auto-detected via compiler; no manual override needed.
-IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
+#
+# #387: derive IS_MINGW fail-closed from the compiler macro dump rather than the
+# former `... grep _WIN32 ... || echo no` form, whose trailing `|| echo no` folded
+# a probe FAILURE into a silent non-Windows "no" that drops -lws2_32/-lpsapi/
+# -lshell32. CC_FAMILY above already refused an unprobeable compiler ($(error) on
+# probe-failed), so a dump that runs but lacks _WIN32 is a real non-Windows answer.
+CC_MACRO_DUMP := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)
+IS_MINGW := $(if $(findstring define _WIN32 ,$(CC_MACRO_DUMP)),yes,no)
 WIN32_LIBS :=
 MINGW_RELOC_LD_FLAGS :=
 ifeq ($(IS_MINGW),yes)

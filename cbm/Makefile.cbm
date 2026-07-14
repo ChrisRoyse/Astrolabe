@@ -44,8 +44,32 @@ TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 CC_FOR_SHELL := $(subst \,/,$(CC))
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
-# Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
-IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+#
+# #387: fail-closed compiler-family + platform detection. The former probes
+#   IS_GCC   := $(shell ... grep __GNUC__ ... || echo no)
+#   IS_MINGW := $(shell ... grep _WIN32  ... || echo no)
+# folded EVERY probe failure — a compiler that could not be invoked at all (PATH
+# miss, Windows backslash mangling despite CC_FOR_SHELL, transient spawn failure)
+# — into a silent "no" via the trailing `|| echo no`. "no" then drops the GCC-only
+# -Wno-* suppressions AND (for IS_MINGW) the Windows link libraries
+# -lws2_32/-lpsapi/-lshell32, so a probe that merely FAILED to run compiles/links
+# the same sources under a DIFFERENT contract than one that ran it — exactly the
+# silent per-invocation flag flip #387 sweeps for.
+#
+# Fail-closed replacement (mirrors patches/cbm/Makefile.cbm #274, extended to
+# IS_MINGW): capture the compiler's predefined-macro dump ONCE. An empty dump means
+# the compiler could not be probed — a HARD $(error) with remediation, never a
+# silent flag flip. IS_GCC and IS_MINGW are then pure functions of that single
+# captured dump, so a legitimate Clang answer (dump defines __clang__) or a
+# legitimate non-Windows answer (dump ran but lacks _WIN32) is preserved, while a
+# probe FAILURE is refused instead of masquerading as those answers.
+CC_MACRO_DUMP := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null)
+ifeq ($(strip $(CC_MACRO_DUMP)),)
+$(error [#387] Makefile.cbm could not probe the compiler predefined macros for CC="$(CC)". `echo | $(CC_FOR_SHELL) -dM -E -` produced no output, so the GCC-only -Wno-* suppression set and the Windows link libraries (-lws2_32/-lpsapi/-lshell32) cannot be selected deterministically. remediation: pass a working CC=/path/to/gcc (or clang) on the make command line, or bootstrap the pinned toolchain via `powershell -ExecutionPolicy Bypass -File scripts/windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap`. Refusing to guess a warning-suppression / link contract.)
+endif
+# Clang defines both __GNUC__ and __clang__ and genuinely rejects unknown -Wno-*,
+# so it must classify as IS_GCC=no; a real GCC has __GNUC__ without __clang__.
+IS_GCC := $(if $(findstring __clang__,$(CC_MACRO_DUMP)),no,$(if $(findstring __GNUC__,$(CC_MACRO_DUMP)),yes,no))
 # #179: -Wno-alloc-size-larger-than retired. The two sites that tripped GCC 14's
 # -Walloc-size-larger-than under -Werror (src/pipeline/pass_definitions.c and
 # src/ui/layout3d.c) now carry unconditional fail-closed count clamps that narrow
@@ -89,8 +113,10 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
 # --allow-multiple-definition (MinGW CRT symbol clashes).
-# Auto-detected via compiler; no manual override needed.
-IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
+# Auto-detected via the single fail-closed CC_MACRO_DUMP probe above (#387): a
+# non-empty dump lacking _WIN32 is a real non-Windows "no"; a probe failure was
+# already refused by the $(error) above, so this can never silently drop -lws2_32.
+IS_MINGW := $(if $(findstring define _WIN32 ,$(CC_MACRO_DUMP)),yes,no)
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
