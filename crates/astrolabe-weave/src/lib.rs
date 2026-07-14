@@ -44,10 +44,13 @@ mod xterm_rows;
 
 pub use ann::{AnnFamilyReport, QuantScaleMeasurement};
 pub use drift_producer::{
+    DRIFT_REFERENCE_CHUNK_BUDGET_KNOB, DRIFT_REFERENCE_DEFAULT_CHUNK_BUDGET_BYTES,
     DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP, DRIFT_REFERENCE_KNOB_REGISTRY_VERSION,
-    DRIFT_REFERENCE_KNOBS, DRIFT_REFERENCE_MAX_SAMPLE_CAP, DRIFT_REFERENCE_MIN_SAMPLE_CAP,
+    DRIFT_REFERENCE_KNOBS, DRIFT_REFERENCE_MAX_CHUNK_BUDGET_BYTES, DRIFT_REFERENCE_MAX_SAMPLE_CAP,
+    DRIFT_REFERENCE_MIN_CHUNK_BUDGET_BYTES, DRIFT_REFERENCE_MIN_SAMPLE_CAP,
     DRIFT_REFERENCE_PAYLOAD_SCHEMA, DRIFT_REFERENCE_SAMPLE_CAP_KNOB, DriftProductionReport,
-    DriftReferenceSamplingReport, DriftSlotSamples, SlotSamplingProvenance, bound_reference_window,
+    DriftReferenceChunkInfo, DriftReferenceSamplingReport, DriftSlotSamples,
+    SlotSamplingProvenance, bound_reference_window, drift_reference_chunk_budget_bytes,
     drift_reference_sample_cap, load_drift_reference, load_drift_reference_counted,
     persist_drift_reference, produce_drift_cards, read_slot_samples_from_vault,
     run_index_time_drift,
