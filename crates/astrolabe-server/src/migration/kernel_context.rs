@@ -95,6 +95,180 @@ pub(crate) fn kernel_artifact_persist_unavailable(scope_id: &str, reason: &str) 
     })
 }
 
+/// #390 index-time hook (lane E): the grounded-label **seed producer** + live
+/// propagation, run against real persisted data.
+///
+/// The served `kernel_context.label_propagation` was computed from the CBM
+/// row-sink node properties (`label_seeds`/`grounded_labels`), which a real
+/// corpus like `cbm/` never emits — so it always starved to `zero_seed_scope`.
+/// This derives grounded seeds from data that genuinely exists after an index:
+///
+/// 1. the persisted `KernelArtifact` members (persisted immediately above by
+///    [`persist_index_time_kernel_artifact`]) — the measured kernel core, each a
+///    grounded, provenance-carrying seed of the `kernel-core` label; and
+/// 2. any persisted `AnchorKind::Label(..)` anchors — genuine grounded labels
+///    (the blueprint 5.9 / P7 source), folded in as caller seeds.
+///
+/// The ingest producer persists the seed graph and runs live propagation over
+/// the persisted association graph (both ledger-paired and readback-verified),
+/// then this reads the persisted propagated-label rows back **independently** and
+/// builds the label_propagation block from those bytes. Best-effort on the index
+/// (a scope that yields no grounded seed is a labeled empty, never an index
+/// failure); the persistence beneath is fail-closed on its own bytes.
+pub(crate) fn persist_index_time_label_propagation<C>(vault: &AsterVault<C>, project: &str) -> Value
+where
+    C: Clock,
+{
+    let scope_id = kernel_artifact_scope_id(project);
+    let extra_seeds = label_anchor_seeds(vault);
+    match astrolabe_ingest::derive_and_propagate_index_time_labels(
+        vault,
+        &scope_id,
+        &extra_seeds,
+        &astrolabe_ingest::GraphProjectionBuildOptions::new(),
+        &LabelPropagationConfig::default(),
+        astrolabe_ingest::LABEL_SEED_ACTOR,
+    ) {
+        Ok(report) => match astrolabe_ingest::read_propagated_label_rows(vault) {
+            Ok(rows) => persisted_label_propagation_json(&report, &rows),
+            Err(error) => label_propagation_unavailable_json(&format!(
+                "propagated label rows unreadable after propagation: {error}"
+            )),
+        },
+        Err(error) => label_propagation_unavailable_json(&format!(
+            "index-time label seed/propagation failed: {error}"
+        )),
+    }
+}
+
+/// Derives caller seeds from persisted `AnchorKind::Label(..)` anchors. Each
+/// labeled symbol becomes one grounded seed carrying its highest-confidence
+/// anchor as provenance. Fail-open on a read error (returns no anchor seeds) —
+/// kernel-membership seeds still ground the scope.
+fn label_anchor_seeds<C>(vault: &AsterVault<C>) -> Vec<LabelSeed>
+where
+    C: Clock,
+{
+    let Ok(rows) = astrolabe_anchors::read_anchor_rows(vault) else {
+        return Vec::new();
+    };
+    let mut seeds = Vec::new();
+    for persisted in rows {
+        let calyx_core::AnchorKind::Label(name) = &persisted.row.kind else {
+            continue;
+        };
+        let Some(best) = persisted.row.anchors.iter().max_by(|left, right| {
+            left.confidence
+                .partial_cmp(&right.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+        let millipoints = (f64::from(best.confidence) * 1_000.0)
+            .round()
+            .clamp(1.0, 1_000.0) as u64;
+        let symbol_id = persisted.row.cx_id.to_string();
+        let provenance = format!("anchor:label:{name}:{}", best.source);
+        seeds.push(LabelSeed::new(
+            symbol_id,
+            name.clone(),
+            millipoints,
+            provenance,
+        ));
+    }
+    seeds
+}
+
+/// Builds the served `label_propagation` block from the **independently
+/// read-back** persisted propagated-label rows (never from the producer's own
+/// return value). Same field shape as [`label_propagation_json`] so the
+/// `propagated_label` search filter ([`propagated_label_symbol_ids`]) consumes it
+/// unchanged.
+fn persisted_label_propagation_json(
+    report: &astrolabe_ingest::IndexTimeLabelReport,
+    rows: &[astrolabe_ingest::PersistedPropagatedLabel],
+) -> Value {
+    let propagation = &report.propagation;
+    let status = if rows.is_empty() { "empty" } else { "built" };
+    let labels = rows
+        .iter()
+        .map(|persisted| {
+            let row = &persisted.row;
+            json!({
+                "symbol_id": row.symbol_id,
+                "label": row.label,
+                "confidence_millipoints": row.confidence_millipoints,
+                "seed_symbol_id": row.seed_symbol_id,
+                "seed_confidence_millipoints": row.seed_confidence_millipoints,
+                "distance": row.distance,
+                "provenance": {
+                    "seed_provenance_ref": row.seed_provenance_ref,
+                    "graph_provenance_refs": row.graph_provenance_refs,
+                    "math": row.math,
+                },
+                "freshness": row.freshness,
+                "trust": row.trust,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema": LABEL_PROPAGATION_SCHEMA,
+        "status": status,
+        "knob_registry_version": LABEL_PROPAGATION_KNOB_REGISTRY_VERSION,
+        "decay_milliper_step": LabelPropagationConfig::default().decay_milliper_step,
+        "seed_count": report.seed_count,
+        "kernel_member_seed_count": report.kernel_member_seed_count,
+        "extra_seed_count": report.extra_seed_count,
+        "edge_count": report.edge_count,
+        "seed_source_empty_reason": report.seed_source_empty_reason,
+        "label_count": labels.len(),
+        "empty_reason": propagation.empty_reason,
+        "seeds_read": propagation.seeds_read,
+        "edges_read": propagation.edges_read,
+        "rows_written": propagation.rows_written,
+        "ledger_seq": propagation.ledger_seq,
+        "labels": labels,
+        "freshness": propagation.freshness,
+        "trust": propagation.trust,
+        "provenance": propagation.provenance,
+    })
+}
+
+/// #390: replace the row-sink-derived `label_propagation` on `base_kernel_context`
+/// with the persisted-propagation block, keeping the existing `scope_summaries`,
+/// and recompute the rolled-up kernel_context status/trust. Keeps the base block
+/// only if the persisted one is `unavailable` (never downgrade a served surface).
+pub(crate) fn kernel_context_with_persisted_labels(
+    base_kernel_context: Value,
+    persisted_label_propagation: Value,
+) -> Value {
+    // Strictly additive: only replace the served block when the persisted
+    // propagation actually produced labels (`built`). An `empty`/`zero_seed_scope`
+    // or `unavailable` persisted result never downgrades the row-sink block, which
+    // already carries the honest empty on a corpus with no grounded seed source.
+    let use_persisted = persisted_label_propagation
+        .get("status")
+        .and_then(Value::as_str)
+        == Some("built");
+    let label_propagation = if use_persisted {
+        persisted_label_propagation
+    } else {
+        base_kernel_context
+            .get("label_propagation")
+            .cloned()
+            .unwrap_or(persisted_label_propagation)
+    };
+    let scope_summaries = base_kernel_context
+        .get("scope_summaries")
+        .cloned()
+        .unwrap_or_else(|| {
+            scope_summaries_unavailable_json(
+                "scope summaries missing during label-propagation merge",
+            )
+        });
+    kernel_context_json(label_propagation, scope_summaries)
+}
+
 pub(crate) fn kernel_context_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
     let label_propagation = label_propagation_from_row_sink_rows(rows);
     let scope_summaries = scope_summaries_from_row_sink_rows(rows);

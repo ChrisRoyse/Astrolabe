@@ -1684,6 +1684,20 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // failure. (Shares shadow_import.rs with lane D/E/F index-time hooks — keep
     // this to exactly this one call.)
     let signal_cards = index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir);
+    // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
+    // propagation. ── EXACT INSERTION POINT ── one post-import call, placed
+    // immediately AFTER the kernel artifact persist above (its members are the
+    // primary grounded seed source) and before ledger verification (so the seed
+    // graph + propagation writes are inside the verified chain). Overlaps lanes
+    // A/D on this file — keep this to exactly this one call. It rebuilds the
+    // served kernel_context.label_propagation from the independently read-back
+    // persisted propagated-label rows so a real corpus (cbm/) serves label data
+    // instead of the starved zero_seed_scope.
+    let index_time_label_propagation = persist_index_time_label_propagation(&vault, project);
+    let kernel_context = kernel_context_with_persisted_labels(
+        shadow_import.kernel_context,
+        index_time_label_propagation,
+    );
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
@@ -1756,7 +1770,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         search_scale,
         skill_tree: shadow_import.skill_tree,
         bridges: shadow_import.bridges,
-        kernel_context: shadow_import.kernel_context,
+        kernel_context,
         anomalies: shadow_import.anomalies,
         provenance,
         git_archaeology,
