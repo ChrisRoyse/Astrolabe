@@ -129,7 +129,7 @@ fn initialize_tracing() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token still works but is deprecated and warns.\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token is no longer supported and is refused (ASTRO_CLI_RAW_JSON_ARGV_REMOVED).\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -325,7 +325,7 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
     if args.is_empty() {
-        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin) | '<json>' (deprecated)]".into());
+        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin)] (raw '<json>' argv is no longer supported)".into());
     }
 
     let _worker_watchdog = index_worker.then(ParentWatchdog::start);
@@ -499,13 +499,20 @@ fn strip_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 
-/// How the leading `cli` argv supplies the tool JSON. Only [`CliArgSource::RawJsonArgv`]
-/// is deprecated; `--args-file <path>` and piped stdin are the supported forms.
+/// Fail-closed code for the removed raw-JSON argv form (#378). The deprecation
+/// window closed at wave-15: #377 migrated every owned invocation site to
+/// `--args-file`/stdin and recorded that this repo has no external installed
+/// base to protect, so the form is rejected rather than warned.
+const ASTRO_CLI_RAW_JSON_ARGV_REMOVED: &str = "ASTRO_CLI_RAW_JSON_ARGV_REMOVED";
+
+/// How the leading `cli` argv supplies the tool JSON. [`CliArgSource::RawJsonArgv`]
+/// is still *detected* here so it can be refused fail-closed (#378); `--args-file
+/// <path>` and piped stdin are the only supported forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliArgSource {
     /// `cli <tool> --args-file <path>` — JSON read from a file.
     ArgsFile,
-    /// `cli <tool> '{...}'` — raw JSON as an argv token (deprecated; still accepted).
+    /// `cli <tool> '{...}'` — raw JSON as an argv token (removed; refused fail-closed).
     RawJsonArgv,
 }
 
@@ -529,12 +536,13 @@ fn classify_cli_argv(args: &[String]) -> Option<CliArgSource> {
 fn resolve_cli_args(args: &[String]) -> Result<String, DynError> {
     match classify_cli_argv(args) {
         Some(CliArgSource::ArgsFile) => Ok(fs::read_to_string(&args[1])?),
-        Some(CliArgSource::RawJsonArgv) => {
-            eprintln!(
-                "warning: passing raw JSON to 'cli' is deprecated; use --args-file <path> or piped stdin."
-            );
-            Ok(args[0].clone())
-        }
+        Some(CliArgSource::RawJsonArgv) => Err(format!(
+            "{ASTRO_CLI_RAW_JSON_ARGV_REMOVED}: passing raw JSON as a 'cli' argv token is no longer \
+             supported. remediation: write the JSON to a file and pass `--args-file <path>`, or \
+             pipe it on stdin (e.g. `astrolabe cli <tool> --args-file args.json` or \
+             `echo '<json>' | astrolabe cli <tool>`)."
+        )
+        .into()),
         None => {
             if !io::stdin().is_terminal() {
                 let mut text = String::new();
@@ -871,26 +879,25 @@ mod tests {
         assert_eq!(mcp_result_exit_code(r#"{"content":[]}"#), 0);
     }
     #[test]
-    fn cli_argv_classifier_only_flags_raw_json_argv_as_deprecated() {
-        // #377: --args-file and stdin are the supported forms; only a raw-JSON
-        // argv token routes through the deprecation branch. classify_cli_argv is
-        // the pure seam that decides this, so we can assert the split without a
-        // real stdin/stderr. Zero deprecation warnings for the supported forms
-        // <=> classify never returns RawJsonArgv for them.
+    fn cli_argv_classifier_still_detects_raw_json_argv_for_refusal() {
+        // #378: --args-file and stdin are the supported forms; a raw-JSON argv
+        // token is still *detected* (so `resolve_cli_args` can refuse it fail-
+        // closed) but is no longer accepted. classify_cli_argv is the pure seam
+        // that decides this, so we can assert the split without a real stdin.
 
-        // --args-file <path>: supported, never warns.
+        // --args-file <path>: supported.
         assert_eq!(
             classify_cli_argv(&["--args-file".into(), "args.json".into()]),
             Some(CliArgSource::ArgsFile)
         );
-        // --args-file with no value falls through to the stdin path (None), no warn.
+        // --args-file with no value falls through to the stdin path (None).
         assert_eq!(classify_cli_argv(&["--args-file".into()]), None);
-        // No inline args -> stdin fallback (None), no warn.
+        // No inline args -> stdin fallback (None).
         assert_eq!(classify_cli_argv(&[]), None);
-        // A non-JSON, non-flag first token (e.g. a bare value) -> stdin path, no warn.
+        // A non-JSON, non-flag first token (e.g. a bare value) -> stdin path.
         assert_eq!(classify_cli_argv(&["not-json".into()]), None);
 
-        // Raw-JSON argv token: the ONLY deprecated form.
+        // Raw-JSON argv token: detected so it can be refused.
         assert_eq!(
             classify_cli_argv(&["{\"repo_path\":\".\"}".into()]),
             Some(CliArgSource::RawJsonArgv)
@@ -900,6 +907,35 @@ mod tests {
             classify_cli_argv(&["  {\"a\":1}".into()]),
             Some(CliArgSource::RawJsonArgv)
         );
+    }
+
+    #[test]
+    fn resolve_cli_args_refuses_raw_json_and_preserves_supported_forms() {
+        // #378: the hard removal. A raw-JSON argv token is refused fail-closed
+        // with the documented code + remediation naming both supported forms.
+        let err = resolve_cli_args(&["{\"repo_path\":\".\"}".into()])
+            .expect_err("raw JSON argv must be refused fail-closed");
+        let message = err.to_string();
+        assert!(
+            message.contains(ASTRO_CLI_RAW_JSON_ARGV_REMOVED),
+            "refusal carries the documented code: {message}"
+        );
+        assert!(
+            message.contains("--args-file") && message.contains("stdin"),
+            "refusal names both supported forms: {message}"
+        );
+
+        // Supported form (--args-file) returns the file bytes byte-for-byte
+        // unchanged — the removal touches only the raw-JSON branch.
+        let mut path = std::env::temp_dir();
+        path.push(format!("astro_378_args_{}.json", std::process::id()));
+        let payload = "{\"repo_path\":\".\",\"nested\":{\"k\":[1,2,3]}}";
+        std::fs::write(&path, payload).expect("write args file");
+        let resolved =
+            resolve_cli_args(&["--args-file".into(), path.to_string_lossy().into_owned()])
+                .expect("args-file resolves");
+        assert_eq!(resolved, payload, "--args-file bytes are unchanged");
+        std::fs::remove_file(&path).ok();
     }
 
     use std::io::Cursor;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -2666,6 +2666,9 @@ where
     // derivation's "current" set so stale detection preserves them without a re-encode.
     let mut preserved_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut encode_skip = EncodeSkipReport::default();
+    // Hash each distinct project string once for the whole batch's key derivation (#380)
+    // rather than once per candidate row in the preserved-detection loops below.
+    let mut project_digests = ProjectDigestCache::default();
     // Split the owned node graph into structural and non-structural buckets by MOVE. `partition`
     // is order-preserving and hands each `ExtractedNode` to exactly one bucket, so no whole-graph
     // clone is created (the previous `.iter().filter().cloned()` held a second full copy of every
@@ -2702,6 +2705,7 @@ where
         existing_graph,
         &mut preserved_keys,
         &mut encode_skip,
+        &mut project_digests,
     )?;
     // Node-map rows. A digest-reused symbol's persisted node-map row is provably unchanged
     // (its file's content matched, so every derived row matches; volatile fields are reverted
@@ -2711,7 +2715,7 @@ where
         .iter()
         .filter(|prepared| {
             if digest_reuse.contains_key(&prepared.node_id)
-                && let Ok(key) = node_map_reuse_key(prepared)
+                && let Ok(key) = node_map_reuse_key(prepared, &mut project_digests)
                 && existing_graph.contains_key(&key)
             {
                 encode_skip.node_map_rows_preserved += 1;
@@ -2738,6 +2742,7 @@ where
         existing_graph,
         &mut preserved_keys,
         &mut encode_skip,
+        &mut project_digests,
         options.workers,
     )?);
     // Per-file digest manifest rows (#345). Appended to the same graph-row stream as the
@@ -2753,6 +2758,7 @@ where
         existing_graph,
         &mut preserved_keys,
         &mut encode_skip,
+        &mut project_digests,
     )?);
     parallel_for_each_mut(&mut graph_rows, options.workers, |(_, value)| {
         append_import_fingerprint(value, sqlite_fingerprint)
@@ -3068,6 +3074,7 @@ fn plan_digest_reuse(
 /// it produced. These flow through the same graph-row reconcile/write/readback path as the
 /// metadata rows, so an unchanged file's manifest row reverts to its persisted bytes (no
 /// write) while a changed file's row is rewritten in the same ledger-paired batch.
+#[allow(clippy::too_many_arguments)]
 fn file_digest_manifest_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedLiveSymbol],
@@ -3076,7 +3083,9 @@ fn file_digest_manifest_rows(
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     preserved_keys: &mut BTreeSet<Vec<u8>>,
     encode_skip: &mut EncodeSkipReport,
+    project_digests: &mut ProjectDigestCache,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let project_digest = project_digests.digest(&options.project);
     let mut symbols_by_file: BTreeMap<&str, Vec<FileDigestSymbol>> = BTreeMap::new();
     for prepared in constellations {
         symbols_by_file
@@ -3090,9 +3099,9 @@ fn file_digest_manifest_rows(
     }
     let mut rows = Vec::with_capacity(new_digests.len());
     for (file_path, digest) in new_digests {
-        let key = keyed_graph_key(
+        let key = keyed_graph_key_with_digest(
             FILE_DIGEST_ROW_PREFIX,
-            &options.project,
+            &project_digest,
             file_path.as_bytes(),
         );
         // An unchanged file's new manifest row is byte-identical to the persisted one: the
@@ -3124,6 +3133,7 @@ fn file_digest_manifest_rows(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn metadata_graph_rows(
     options: &SqliteImportOptions,
     metadata: RawMetadataRows,
@@ -3132,6 +3142,7 @@ fn metadata_graph_rows(
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     preserved_keys: &mut BTreeSet<Vec<u8>>,
     encode_skip: &mut EncodeSkipReport,
+    project_digests: &mut ProjectDigestCache,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let fingerprint = hex_lower(&sqlite_fingerprint);
     let mut rows = Vec::new();
@@ -3145,14 +3156,14 @@ fn metadata_graph_rows(
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
         rows.push((
-            project_key(PROJECT_ROW_PREFIX, &row.project),
+            project_key_with_digest(PROJECT_ROW_PREFIX, &project_digests.digest(&row.project)),
             serde_json::to_vec(&row)?,
         ));
     }
     for file_hash in metadata.file_hashes {
-        let key = keyed_graph_key(
+        let key = keyed_graph_key_with_digest(
             FILE_HASH_ROW_PREFIX,
-            &file_hash.project,
+            &project_digests.digest(&file_hash.project),
             file_hash.rel_path.as_bytes(),
         );
         // A file whose per-file digest matched (#345) is byte-for-byte unchanged, so its
@@ -3189,7 +3200,10 @@ fn metadata_graph_rows(
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
         rows.push((
-            project_key(PROJECT_SUMMARY_ROW_PREFIX, &row.project),
+            project_key_with_digest(
+                PROJECT_SUMMARY_ROW_PREFIX,
+                &project_digests.digest(&row.project),
+            ),
             serde_json::to_vec(&row)?,
         ));
     }
@@ -3205,7 +3219,11 @@ fn metadata_graph_rows(
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
         rows.push((
-            graph_key(TOKEN_VECTOR_ROW_PREFIX, &row.project, row.id)?,
+            graph_key_with_digest(
+                TOKEN_VECTOR_ROW_PREFIX,
+                &project_digests.digest(&row.project),
+                row.id,
+            )?,
             serde_json::to_vec(&row)?,
         ));
     }
@@ -3222,6 +3240,7 @@ fn raw_edge_graph_rows(
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     preserved_keys: &mut BTreeSet<Vec<u8>>,
     encode_skip: &mut EncodeSkipReport,
+    project_digests: &mut ProjectDigestCache,
     workers: usize,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let fingerprint = hex_lower(&sqlite_fingerprint);
@@ -3233,7 +3252,8 @@ fn raw_edge_graph_rows(
     for edge in edges {
         if digest_reuse.contains_key(&edge.source_id)
             && digest_reuse.contains_key(&edge.target_id)
-            && let Ok(key) = raw_edge_key_parts(&edge.project, edge.id)
+            && let Ok(key) =
+                raw_edge_key_parts_with_digest(&project_digests.digest(&edge.project), edge.id)
             && existing_graph.contains_key(&key)
         {
             encode_skip.raw_edge_rows_preserved += 1;
@@ -3698,8 +3718,15 @@ fn symbol_metadata(
 /// The Graph CF key of a symbol's node-map row, without encoding the row value (#372).
 /// Used to decide whether a digest-reused symbol's persisted node-map row can be carried
 /// forward untouched, and to fold its key into the "current" set for stale detection.
-fn node_map_reuse_key(prepared: &PreparedLiveSymbol) -> IngestResult<Vec<u8>> {
-    graph_key(NODE_MAP_PREFIX, &prepared.symbol.project, prepared.node_id)
+fn node_map_reuse_key(
+    prepared: &PreparedLiveSymbol,
+    project_digests: &mut ProjectDigestCache,
+) -> IngestResult<Vec<u8>> {
+    graph_key_with_digest(
+        NODE_MAP_PREFIX,
+        &project_digests.digest(&prepared.symbol.project),
+        prepared.node_id,
+    )
 }
 
 fn node_map_graph_row(
@@ -4457,6 +4484,29 @@ where
     Ok(counts)
 }
 
+/// Test-only counter for the Base-CF point reads `read_cbm_graph_snapshot` still
+/// issues (#370). Pre-change this was one point read per node-map row; post-change
+/// only the rows that genuinely decode a Base value read it, so the FSV can measure
+/// exactly how many point reads the single keys-only scan eliminated.
+#[cfg(test)]
+mod base_point_reads {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn reset() {
+        COUNT.store(0, Ordering::SeqCst);
+    }
+
+    pub(super) fn record() {
+        COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn get() -> usize {
+        COUNT.load(Ordering::SeqCst)
+    }
+}
+
 pub fn read_cbm_graph_snapshot<C>(
     vault: &AsterVault<C>,
     project: &str,
@@ -4469,20 +4519,23 @@ where
     let mut panel_version = None;
     let mut nodes = Vec::new();
 
-    // Every node-map -> Base binding is still proven with a per-row Base point
-    // read, but the FULL constellation decode of every Base row is skipped for
-    // modern node-map rows (#23): the decoded Base row is only needed for
-    // panel_version (first node) and for legacy rows that predate the inline
-    // name/line/properties fields. (A Base keys-only range scan would be
-    // cheaper still. The #23 session note claimed `scan_cf_range_keys_at`
-    // access-violates on selected-CF vaults; #349 EXONERATED it — the
-    // deterministic FSV `issue349_selected_cf_keys_scan_fsv` reads back
-    // byte-exact keys over multiple SST generations on a read-only
-    // selected_cfs=[Base] vault, and the keys path is bounds-checked safe Rust
-    // with no `unsafe`. The historical AV was the debug + mingw + static-libcbm
-    // thread-attach fault (#349), not this function. Swapping these point reads
-    // for the keys scan is therefore a safe perf change, deferred to its own
-    // read-path FSV rather than folded into #349's exoneration scope.)
+    // Every node-map -> Base binding is proven against ONE keys-only range scan
+    // of the Base CF (#370) rather than a per-row Base point read: the point read
+    // only ever existed to assert the Base row's *existence*, since the FULL
+    // constellation decode is skipped for modern node-map rows (#23) — the decoded
+    // Base row is needed only for panel_version (first node) and for legacy rows
+    // that predate the inline name/line/properties fields. #349 EXONERATED
+    // `scan_cf_range_keys_at` (the deterministic FSV `issue349_selected_cf_keys_scan_fsv`
+    // reads back byte-exact keys over multiple SST generations; the keys path is
+    // bounds-checked safe Rust with no `unsafe`, and the historical AV was the
+    // debug + mingw + static-libcbm thread-attach fault, not this scan). A membership
+    // test against the scanned key set is therefore existence-equivalent to the point
+    // read, and the byte output is unchanged; only rows that genuinely need a decode
+    // still issue a point read to fetch the value.
+    let base_keys: HashSet<Vec<u8>> = vault
+        .scan_cf_range_keys_at(snapshot, ColumnFamily::Base, &prefix_range(&[]))?
+        .into_iter()
+        .collect();
     for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
         if row.project != project {
             continue;
@@ -4499,20 +4552,31 @@ where
                 row.node_id, row.series_id_schema
             )));
         }
-        let base = vault
-            .read_cf_at(snapshot, ColumnFamily::Base, &base_key(row.cx_id))?
-            .ok_or_else(|| {
-                IngestError::InvalidInput(format!(
-                    "node map row {} points to missing Base row {}",
-                    row.node_id, row.cx_id
-                ))
-            })?;
+        let bkey = base_key(row.cx_id);
+        if !base_keys.contains(&bkey) {
+            return Err(IngestError::InvalidInput(format!(
+                "node map row {} points to missing Base row {}",
+                row.node_id, row.cx_id
+            )));
+        }
         let needs_base_decode = panel_version.is_none()
             || row.name.is_none()
             || row.file_path.is_empty()
             || row.start_line.is_none()
             || row.end_line.is_none();
         let decoded = if needs_base_decode {
+            // The value is only materialized for the rows that actually decode it;
+            // the scanned key set already proved existence for the rest (#370).
+            #[cfg(test)]
+            base_point_reads::record();
+            let base = vault
+                .read_cf_at(snapshot, ColumnFamily::Base, &bkey)?
+                .ok_or_else(|| {
+                    IngestError::InvalidInput(format!(
+                        "node map row {} points to missing Base row {}",
+                        row.node_id, row.cx_id
+                    ))
+                })?;
             Some(encode::decode_constellation_base(&base)?)
         } else {
             None
@@ -5212,27 +5276,74 @@ where
     Ok(())
 }
 
+/// Memoizes `sha256(project)` so the delta key-derivation helpers hash each distinct
+/// project string once per import instead of once per row (#380). The preserved-row
+/// detection loops derive a Graph CF key per candidate row; recomputing the 32-byte
+/// project digest on every call was a pure-key-derivation floor (~42ms at 10k/40k even
+/// when zero rows are encoded). A cached hit is byte-identical to a fresh
+/// `sha256_digest(project.as_bytes())` because the digest is a pure function of the
+/// project bytes, so keys are unchanged.
+#[derive(Default)]
+struct ProjectDigestCache {
+    entries: HashMap<String, [u8; 32]>,
+}
+
+impl ProjectDigestCache {
+    fn digest(&mut self, project: &str) -> [u8; 32] {
+        if let Some(found) = self.entries.get(project) {
+            return *found;
+        }
+        let digest = sha256_digest(project.as_bytes());
+        self.entries.insert(project.to_owned(), digest);
+        digest
+    }
+}
+
 fn graph_key(prefix: &[u8], project: &str, node_id: i64) -> IngestResult<Vec<u8>> {
+    graph_key_with_digest(prefix, &sha256_digest(project.as_bytes()), node_id)
+}
+
+/// The node-keyed Graph CF key from a precomputed project digest (#380). Byte-identical
+/// to `graph_key` because the same digest bytes are concatenated in the same order.
+fn graph_key_with_digest(
+    prefix: &[u8],
+    project_digest: &[u8; 32],
+    node_id: i64,
+) -> IngestResult<Vec<u8>> {
     let node_id = u64::try_from(node_id)
         .map_err(|_| invalid_sqlite(format!("node id {node_id} cannot be encoded")))?;
     let mut key = Vec::with_capacity(prefix.len() + 32 + 8);
     key.extend_from_slice(prefix);
-    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key.extend_from_slice(project_digest);
     key.extend_from_slice(&node_id.to_be_bytes());
     Ok(key)
 }
 
+/// Convenience wrapper hashing the project inline; only the delta reconcile tests still
+/// derive a project-row key without a shared digest cache (#380).
+#[cfg(test)]
 fn project_key(prefix: &[u8], project: &str) -> Vec<u8> {
+    project_key_with_digest(prefix, &sha256_digest(project.as_bytes()))
+}
+
+/// The project-only Graph CF key from a precomputed project digest (#380).
+fn project_key_with_digest(prefix: &[u8], project_digest: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + 32);
     key.extend_from_slice(prefix);
-    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key.extend_from_slice(project_digest);
     key
 }
 
-fn keyed_graph_key(prefix: &[u8], project: &str, discriminator: &[u8]) -> Vec<u8> {
+/// The discriminator-keyed Graph CF key from a precomputed project digest (#380). The
+/// discriminator digest is content-derived (small path bytes) and left inline.
+fn keyed_graph_key_with_digest(
+    prefix: &[u8],
+    project_digest: &[u8; 32],
+    discriminator: &[u8],
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + 64);
     key.extend_from_slice(prefix);
-    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key.extend_from_slice(project_digest);
     key.extend_from_slice(&sha256_digest(discriminator));
     key
 }
@@ -5245,11 +5356,19 @@ fn raw_edge_key(row: &CbmRawEdgeRow) -> IngestResult<Vec<u8>> {
 /// row value (#372) — used to decide whether an internal-to-unchanged edge can be carried
 /// forward and to fold its key into the "current" set for stale detection.
 fn raw_edge_key_parts(project: &str, sqlite_edge_id: i64) -> IngestResult<Vec<u8>> {
+    raw_edge_key_parts_with_digest(&sha256_digest(project.as_bytes()), sqlite_edge_id)
+}
+
+/// The raw CBM edge Graph CF key from a precomputed project digest (#380).
+fn raw_edge_key_parts_with_digest(
+    project_digest: &[u8; 32],
+    sqlite_edge_id: i64,
+) -> IngestResult<Vec<u8>> {
     let id = u64::try_from(sqlite_edge_id)
         .map_err(|_| invalid_sqlite(format!("edge id {sqlite_edge_id} cannot be encoded")))?;
     let mut key = Vec::with_capacity(CBM_EDGE_ROW_PREFIX.len() + 32 + 8);
     key.extend_from_slice(CBM_EDGE_ROW_PREFIX);
-    key.extend_from_slice(&sha256_digest(project.as_bytes()));
+    key.extend_from_slice(project_digest);
     key.extend_from_slice(&id.to_be_bytes());
     Ok(key)
 }
@@ -6402,6 +6521,103 @@ mod tests {
     // direct persisted-byte readback proves the carried-forward rows are untouched while the
     // changed file's rows are rewritten and removed rows are tombstoned. Exercises the four
     // required edge cases: manifest-absent (fail-open), zero-changed, one-changed, all-changed.
+    // #380: the hoisted `*_with_digest` key derivers must produce keys byte-identical to the
+    // per-row `sha256(project)` derivers, and the memo cache must return a digest identical to
+    // a fresh hash. This is the byte-identity contract that lets the delta path reuse one
+    // project digest per import instead of recomputing it per candidate row.
+    #[test]
+    fn hoisted_project_digest_keys_are_byte_identical() {
+        let mut cache = ProjectDigestCache::default();
+        for project in ["demo", "astrolabe/cbm-corpus", "", "a/b/c"] {
+            let fresh = sha256_digest(project.as_bytes());
+            assert_eq!(
+                cache.digest(project),
+                fresh,
+                "memoized digest matches fresh"
+            );
+            // Second call is a cache hit; still identical.
+            assert_eq!(cache.digest(project), fresh, "cache hit stays identical");
+
+            assert_eq!(
+                graph_key(NODE_MAP_PREFIX, project, 7).unwrap(),
+                graph_key_with_digest(NODE_MAP_PREFIX, &fresh, 7).unwrap(),
+                "graph_key parity",
+            );
+            assert_eq!(
+                project_key_with_digest(PROJECT_ROW_PREFIX, &fresh),
+                {
+                    let mut k = Vec::new();
+                    k.extend_from_slice(PROJECT_ROW_PREFIX);
+                    k.extend_from_slice(&fresh);
+                    k
+                },
+                "project_key parity",
+            );
+            for disc in [b"src/http.rs".as_slice(), b"".as_slice(), b"x".as_slice()] {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(FILE_HASH_ROW_PREFIX);
+                expected.extend_from_slice(&fresh);
+                expected.extend_from_slice(&sha256_digest(disc));
+                assert_eq!(
+                    keyed_graph_key_with_digest(FILE_HASH_ROW_PREFIX, &fresh, disc),
+                    expected,
+                    "keyed_graph_key parity",
+                );
+            }
+            assert_eq!(
+                raw_edge_key_parts(project, 42).unwrap(),
+                raw_edge_key_parts_with_digest(&fresh, 42).unwrap(),
+                "raw_edge_key_parts parity",
+            );
+        }
+    }
+
+    // #370 FSV: `read_cbm_graph_snapshot` proves every node-map -> Base binding
+    // against ONE keys-only Base scan instead of a per-row point read. The readback
+    // must be byte-identical, and the instrumented counter must show the point reads
+    // collapsed from one-per-node-row to only the rows that actually decode a value.
+    #[test]
+    fn snapshot_readback_uses_one_base_keys_scan_not_per_row_point_reads() {
+        let base = edge_snapshot();
+        let vault = vault();
+        import_cbm_graph_snapshot_to_vault_direct(
+            &base,
+            [7; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("import fixture");
+
+        // Real readback against the persisted vault, counting Base point reads.
+        base_point_reads::reset();
+        let snap1 = read_cbm_graph_snapshot(&vault, "demo").expect("read snapshot");
+        let point_reads = base_point_reads::get();
+        let node_rows = snap1.nodes.iter().filter(|node| !node.structural).count();
+        assert!(
+            node_rows >= 3,
+            "fixture has >= 3 non-structural node-map rows, got {node_rows}"
+        );
+
+        // Byte-identical readback: a second read of the same snapshot serializes to
+        // the exact same bytes (the keys-scan path is deterministic and value-stable).
+        let snap2 = read_cbm_graph_snapshot(&vault, "demo").expect("re-read snapshot");
+        assert_eq!(snap1, snap2, "snapshot readback is identical across reads");
+
+        // Pre-change this function issued one Base point read per node-map row
+        // (`node_rows`). Post-change only rows that decode a Base value read it — a
+        // modern import decodes just the first node (for panel_version) — so the one
+        // keys-only scan eliminated `node_rows - point_reads` point reads.
+        assert!(
+            point_reads < node_rows,
+            "point reads {point_reads} must be below the {node_rows} pre-change per-row reads"
+        );
+        eprintln!(
+            "#370: node-map rows={node_rows}, Base point reads post-change={point_reads}, eliminated={} (now 1 keys-only scan)",
+            node_rows - point_reads
+        );
+    }
+
     #[test]
     fn delta_encode_is_o_changed_files_and_preserves_unchanged_rows_byte_for_byte() {
         let base = edge_snapshot();

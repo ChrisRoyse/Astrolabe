@@ -19,6 +19,7 @@ astrolabe-weave.workspace = true
 calyx-aster.workspace = true
 calyx-core.workspace = true
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+trybuild = "1"
 
 [lib]
 path = "src/lib.rs"
