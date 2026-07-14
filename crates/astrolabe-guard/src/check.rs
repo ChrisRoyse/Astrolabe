@@ -28,6 +28,11 @@
 //! `{code, message, remediation}` [`crate::calibration::CalibrationError`] rather
 //! than admitting an unmeasured candidate.
 
+use std::collections::BTreeMap;
+
+use calyx_core::SlotVector;
+
+use crate::auto::guard_slot_panel_sources;
 use crate::calibration::CalibrationError;
 use crate::profile::{CombinedVerdict, GuardProfile, GuardSlot, SlotVerdict, combine_verdicts};
 
@@ -176,6 +181,112 @@ pub fn measure_for_index(input: &SymbolSlotInput) -> Result<MeasuredSymbol, Cali
 /// (DoD #1 — the candidate path and the indexing path are literally one call).
 pub fn measure_for_check(input: &SymbolSlotInput) -> Result<MeasuredSymbol, CalibrationError> {
     measure_symbol_slots(input)
+}
+
+// ---------------------------------------------------------------------------
+// Panel-driven candidate/exemplar measurement (#331)
+// ---------------------------------------------------------------------------
+
+/// Error code: a guard slot's required panel source was absent (or explicitly
+/// [`SlotVector::Absent`]) in the panel readout, so the slot cannot be measured.
+pub const ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING: &str = "ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING";
+/// Error code: a guard slot's panel source is a `Multi` (late-interaction token)
+/// vector, which has no single direction and cannot be flattened into one guard-slot
+/// vector — refused rather than silently averaged.
+pub const ASTRO_GUARD_CHECK_PANEL_UNSUPPORTED_SHAPE: &str =
+    "ASTRO_GUARD_CHECK_PANEL_UNSUPPORTED_SHAPE";
+
+/// Densify one panel slot vector into a plain `f32` vector for the guard instrument.
+///
+/// `Dense` passes through; `Sparse` is expanded to its full `dim`; `Absent` yields
+/// `Ok(None)` (a genuine gap the caller must fail closed on, never a zero vector);
+/// `Multi` fails closed (a token bundle is not a single guard-slot direction).
+fn densify_panel_vector(
+    slot: GuardSlot,
+    panel_slot: u16,
+    vector: &SlotVector,
+) -> Result<Option<Vec<f32>>, CalibrationError> {
+    match vector {
+        SlotVector::Absent { .. } => Ok(None),
+        SlotVector::Dense { data, .. } => Ok(Some(data.clone())),
+        SlotVector::Sparse { dim, entries } => {
+            let mut dense = vec![0.0f32; *dim as usize];
+            for entry in entries {
+                if let Some(slot_ref) = dense.get_mut(entry.idx as usize) {
+                    *slot_ref = entry.val;
+                }
+            }
+            Ok(Some(dense))
+        }
+        SlotVector::Multi { .. } => Err(CalibrationError::new(
+            ASTRO_GUARD_CHECK_PANEL_UNSUPPORTED_SHAPE,
+            format!(
+                "guard slot `{}` panel source S{panel_slot} is a Multi token vector, which has no \
+                 single direction to compare by cosine",
+                slot.as_str()
+            ),
+            "Guard slots measure Dense/Sparse panel sources; do not route the token_multi slot \
+             into guard_check.",
+        )),
+    }
+}
+
+/// Derive a guard-check [`SymbolSlotInput`] from a panel readout of the candidate's
+/// (or an exemplar's) guard panel-source slots, keyed by panel slot id.
+///
+/// This is the panel-driven measurement path (#331): instead of accepting
+/// caller-supplied per-slot vectors, the server measures the candidate's source text
+/// through the real libcbm + panel pipeline (the same instruments as indexing) and
+/// hands the resulting per-panel-slot vectors here. Each guard slot's vector is the
+/// densified panel source, and a multi-source guard slot (`PublicApiSignature` = S5 +
+/// S17) is the **concatenation** of its source vectors in canonical source order — a
+/// structural, assumption-free combiner that is byte-identical for identical input, so
+/// the candidate and exemplar paths stay a shared instrument.
+///
+/// Fails closed when a required panel source is absent/missing
+/// ([`ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING`]) or is an unsupported `Multi` shape — a
+/// candidate the panel could not fully measure is refused, never partially measured.
+pub fn slot_input_from_panel(
+    sources: &BTreeMap<u16, SlotVector>,
+) -> Result<SymbolSlotInput, CalibrationError> {
+    let mut slots = Vec::with_capacity(GuardSlot::ALL.len());
+    for slot in GuardSlot::ALL {
+        let mut vector: Vec<f32> = Vec::new();
+        for &panel_slot in guard_slot_panel_sources(slot) {
+            let measured = sources
+                .get(&panel_slot)
+                .and_then(|vector| densify_panel_vector(slot, panel_slot, vector).transpose());
+            match measured {
+                Some(Ok(dense)) => vector.extend_from_slice(&dense),
+                Some(Err(error)) => return Err(error),
+                None => {
+                    return Err(CalibrationError::new(
+                        ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING,
+                        format!(
+                            "guard slot `{}` panel source S{panel_slot} was not measured in the \
+                             panel readout; the candidate cannot be scored on this slot",
+                            slot.as_str()
+                        ),
+                        "Measure every guard panel source through the panel before checking; a \
+                         partially-measured candidate is refused, never partially scored.",
+                    ));
+                }
+            }
+        }
+        slots.push(SlotFeature { slot, vector });
+    }
+    Ok(SymbolSlotInput { slots })
+}
+
+/// Panel-driven candidate/exemplar measurement (#331): densify a panel readout into a
+/// guard-check [`SymbolSlotInput`] and run it through the shared instrument
+/// ([`measure_symbol_slots`]) so a panel-derived symbol is byte-identical to one built
+/// from the same vectors supplied directly. Fails closed on a missing/absent/`Multi`
+/// panel source or a degenerate vector.
+pub fn measure_from_panel(
+    sources: &BTreeMap<u16, SlotVector>,
+) -> Result<MeasuredSymbol, CalibrationError> {
+    measure_symbol_slots(&slot_input_from_panel(sources)?)
 }
 
 /// Cosine of two equal-length finite vectors. The inputs are already unit-norm
@@ -808,6 +919,132 @@ mod tests {
             kernel_near,
             measured: measure_symbol_slots(&symbol_input(seed, dim)).expect("measures"),
         }
+    }
+
+    // -- #331: panel-driven candidate/exemplar measurement -------------------
+
+    use calyx_core::{AbsentReason, SparseEntry};
+
+    /// A panel readout of the eight guard panel-source slots, each a Dense vector
+    /// seeded so distinct seeds separate. S5/S17 (the identity slot's two sources)
+    /// carry distinct dims so the concatenation length is checkable.
+    fn panel_readout(seed: f32) -> BTreeMap<u16, SlotVector> {
+        let dense = |dim: usize, salt: f32| SlotVector::Dense {
+            dim: dim as u32,
+            data: (0..dim)
+                .map(|i| (seed * (i as f32 + 1.0) + salt).sin())
+                .collect(),
+        };
+        // Guard panel sources: S1,S2,S4,S5,S15,S17,S18,S20.
+        BTreeMap::from([
+            (1u16, dense(6, 0.1)),
+            (2, dense(8, 0.2)),
+            (4, dense(10, 0.3)),
+            (5, dense(12, 0.4)),
+            (15, dense(9, 0.5)),
+            (17, dense(7, 0.6)),
+            (18, dense(16, 0.7)),
+            (20, dense(16, 0.8)),
+        ])
+    }
+
+    #[test]
+    fn panel_readout_concatenates_multi_source_identity_slot() {
+        let readout = panel_readout(0.5);
+        let input = slot_input_from_panel(&readout).expect("converts");
+        // Every guard slot present.
+        assert_eq!(input.slots.len(), GuardSlot::ALL.len());
+        // Single-source slot length == its panel source dim.
+        let struct_slot = input
+            .slots
+            .iter()
+            .find(|f| f.slot == GuardSlot::StructTrigrams)
+            .unwrap();
+        assert_eq!(struct_slot.vector.len(), 6, "S1 dim");
+        // Identity slot (S5 dim 12 + S17 dim 7) is the concatenation, in source order.
+        let identity = input
+            .slots
+            .iter()
+            .find(|f| f.slot == GuardSlot::PublicApiSignature)
+            .unwrap();
+        assert_eq!(identity.vector.len(), 12 + 7, "S5 ++ S17 concatenation");
+    }
+
+    #[test]
+    fn panel_missing_source_fails_closed() {
+        let mut readout = panel_readout(0.5);
+        readout.remove(&4); // S4 = api_callees.
+        let err = slot_input_from_panel(&readout).expect_err("missing source refused");
+        assert_eq!(err.code(), ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING);
+        assert!(err.message().contains("S4"));
+    }
+
+    #[test]
+    fn panel_absent_source_fails_closed() {
+        let mut readout = panel_readout(0.5);
+        readout.insert(
+            17,
+            SlotVector::Absent {
+                reason: AbsentReason::NotApplicable,
+            },
+        );
+        let err = slot_input_from_panel(&readout).expect_err("absent source refused");
+        assert_eq!(err.code(), ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING);
+    }
+
+    #[test]
+    fn panel_multi_shape_fails_closed() {
+        let mut readout = panel_readout(0.5);
+        readout.insert(
+            18,
+            SlotVector::Multi {
+                token_dim: 4,
+                tokens: vec![vec![1.0, 0.0, 0.0, 0.0]],
+            },
+        );
+        let err = slot_input_from_panel(&readout).expect_err("multi shape refused");
+        assert_eq!(err.code(), ASTRO_GUARD_CHECK_PANEL_UNSUPPORTED_SHAPE);
+    }
+
+    #[test]
+    fn panel_sparse_source_densifies_to_dim() {
+        let mut readout = panel_readout(0.5);
+        readout.insert(
+            1,
+            SlotVector::Sparse {
+                dim: 32,
+                entries: vec![
+                    SparseEntry { idx: 3, val: 2.0 },
+                    SparseEntry { idx: 30, val: 1.0 },
+                ],
+            },
+        );
+        let input = slot_input_from_panel(&readout).unwrap();
+        let struct_slot = input
+            .slots
+            .iter()
+            .find(|f| f.slot == GuardSlot::StructTrigrams)
+            .unwrap();
+        assert_eq!(struct_slot.vector.len(), 32, "densified to full dim");
+        assert_eq!(struct_slot.vector[3], 2.0);
+        assert_eq!(struct_slot.vector[30], 1.0);
+        assert_eq!(struct_slot.vector[0], 0.0);
+    }
+
+    #[test]
+    fn panel_driven_measurement_is_byte_identical_to_supplied_vectors() {
+        // A candidate measured from a panel readout must be byte-identical to the same
+        // candidate built from those vectors supplied directly — the panel-driven path
+        // and the supplied path are one shared instrument (#331 mirrors DoD #1).
+        let readout = panel_readout(1.3);
+        let from_panel = measure_from_panel(&readout).expect("panel-driven measures");
+        let supplied = measure_for_check(&slot_input_from_panel(&readout).unwrap()).unwrap();
+        assert_eq!(from_panel.canonical_bytes(), supplied.canonical_bytes());
+        // And it is internally deterministic.
+        assert_eq!(
+            measure_from_panel(&readout).unwrap().canonical_bytes(),
+            from_panel.canonical_bytes()
+        );
     }
 
     // -- DoD #1: same-instruments invariant (byte-compare) -------------------

@@ -4,12 +4,26 @@ use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
 use astrolabe_guard::check::{
     Exemplar, GUARD_NEW_REGION_SCHEMA, GUARD_VERDICT_SCHEMA, MeasuredSymbol, NewRegionRecord,
     SlotFeature, SymbolSlotInput, check_candidate, measure_for_check, measure_for_index,
-    resolve_region, verdict_ledger_payload_bytes,
+    resolve_region, slot_input_from_panel, verdict_ledger_payload_bytes,
 };
 use astrolabe_guard::profile::{
     GuardProfile, GuardSlot, GuardVerdict, SlotCalibration, default_content_policy,
 };
+use astrolabe_panel::PanelDriver;
 use calyx_core::CxId;
+
+/// Which measurement mode `guard_check` runs in for the candidate and exemplars.
+///
+/// The mode is **declared**, never silently inferred into a fallback: `vector` consumes
+/// operator-supplied per-slot lens vectors (the wave-10 path), while `panel` derives the
+/// slot vectors from each symbol's source text through the real libcbm + panel pipeline —
+/// the true same-instruments-as-indexing path (#331). A panel failure in `panel` mode
+/// fails closed; it never reverts to the supplied path (standing invariant #3).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MeasurementMode {
+    Vector,
+    Panel,
+}
 
 /// Actor recorded on the guard-check verdict ledger entry.
 pub(crate) const GUARD_CHECK_ACTOR: &str = "astrolabe-server-guard-check";
@@ -22,18 +36,30 @@ pub(crate) const GUARD_CHECK_ACTOR: &str = "astrolabe-server-guard-check";
 /// and ledger the verdict (kind=Guard, subject=Cx(target)) with full per-slot
 /// detail.
 ///
-/// Request shape:
+/// Request shape (two declared measurement modes; ambiguity is refused):
 /// ```json
+/// // measurement = "vector" (operator-supplied per-slot lens vectors):
 /// {
 ///   "project": "demo",
 ///   "target": "<candidate cx hex>",
+///   "measurement": "vector",
 ///   "candidate": {"slots": [{"slot": "code_semantic", "vector": [..]}, ...]},
 ///   "exemplars": [
 ///     {"cx": "<hex>", "kernel_near": true, "slots": [{"slot": .., "vector": [..]}, ...]},
 ///     ...
 ///   ]
 /// }
+/// // measurement = "panel" (derive slot vectors from source through the panel — #331):
+/// {
+///   "project": "demo",
+///   "target": "<candidate cx hex>",
+///   "measurement": "panel",
+///   "candidate": {"source": "..", "symbol_name": "..", "properties": {..}, ..},
+///   "exemplars": [{"cx": "<hex>", "kernel_near": true, "source": "..", ..}, ...]
+/// }
 /// ```
+/// With no explicit `measurement`, the mode is inferred from the candidate's shape (a
+/// `slots` array is `vector`; panel inputs are `panel`); both/neither is a refusal.
 ///
 /// Fail-closed: no persisted calibrated profile, an unparseable target CxId, a
 /// candidate/exemplar missing a guard slot or carrying a degenerate vector, or an
@@ -101,25 +127,47 @@ pub(crate) fn guard_check_at(
     };
     let target_cx_hex = target_cx.to_string();
 
-    // 3. Measure the candidate through the shared instrument.
-    let candidate = match parse_symbol_input(args_obj.get("candidate"), "candidate") {
-        Ok(input) => match measure_for_check(&input) {
-            Ok(measured) => measured,
-            Err(error) => {
-                return guard_check_refused_str(error.code(), error.message(), error.remediation());
-            }
-        },
+    // 3-4. Declared measurement mode: `vector` (operator-supplied per-slot lens
+    //      vectors) vs `panel` (derive slot vectors from source text through the real
+    //      libcbm + panel pipeline, the same instruments as indexing — #331). Ambiguity
+    //      is refused, never guessed; a panel failure fails closed.
+    let mode = match resolve_measurement_mode(args_obj) {
+        Ok(mode) => mode,
         Err((code, message, remediation)) => {
             return guard_check_refused_owned(code, message, remediation);
         }
     };
-
-    // 4. Parse + measure the enclosing scope's trusted exemplars.
-    let exemplars = match parse_exemplars(args_obj.get("exemplars")) {
-        Ok(exemplars) => exemplars,
-        Err((code, message, remediation)) => {
-            return guard_check_refused_owned(code, message, remediation);
+    let (candidate, exemplars) = match mode {
+        MeasurementMode::Vector => {
+            let candidate = match parse_symbol_input(args_obj.get("candidate"), "candidate") {
+                Ok(input) => match measure_for_check(&input) {
+                    Ok(measured) => measured,
+                    Err(error) => {
+                        return guard_check_refused_str(
+                            error.code(),
+                            error.message(),
+                            error.remediation(),
+                        );
+                    }
+                },
+                Err((code, message, remediation)) => {
+                    return guard_check_refused_owned(code, message, remediation);
+                }
+            };
+            let exemplars = match parse_exemplars(args_obj.get("exemplars")) {
+                Ok(exemplars) => exemplars,
+                Err((code, message, remediation)) => {
+                    return guard_check_refused_owned(code, message, remediation);
+                }
+            };
+            (candidate, exemplars)
         }
+        MeasurementMode::Panel => match measure_candidate_and_exemplars_through_panel(args_obj) {
+            Ok(pair) => pair,
+            Err((code, message, remediation)) => {
+                return guard_check_refused_owned(code, message, remediation);
+            }
+        },
     };
 
     // 5. Resolve region (kernel-near first, peripheral fallback) + route.
@@ -229,6 +277,148 @@ pub(crate) fn guard_check_at(
         "freshness": report.freshness,
         "source": format!("AsterVault:ColumnFamily::Ledger seq={seq}"),
     }))
+}
+
+/// Resolve the declared measurement mode. An explicit `measurement` field wins;
+/// otherwise it is inferred from the candidate's shape — a `slots` array (per-slot
+/// vectors) is `vector`, panel inputs (`source`/`symbol_name`/`properties`) are `panel`.
+/// Both or neither present is a fail-closed ambiguity, never a silent default.
+fn resolve_measurement_mode(
+    args_obj: &Map<String, Value>,
+) -> Result<MeasurementMode, (&'static str, String, String)> {
+    if let Some(raw) = args_obj.get("measurement").and_then(Value::as_str) {
+        return match raw {
+            "vector" => Ok(MeasurementMode::Vector),
+            "panel" => Ok(MeasurementMode::Panel),
+            other => Err((
+                "ASTRO_GUARD_CHECK_MEASUREMENT_INVALID",
+                format!("guard_check measurement `{other}` is not recognized"),
+                "Pass measurement \"panel\" (derive slot vectors from source through the panel) or \
+                 \"vector\" (operator-supplied per-slot vectors)."
+                    .to_string(),
+            )),
+        };
+    }
+    let candidate = args_obj.get("candidate").and_then(Value::as_object);
+    let has_slots = candidate
+        .and_then(|obj| obj.get("slots"))
+        .and_then(Value::as_array)
+        .is_some();
+    let has_panel = candidate.is_some_and(|obj| {
+        ["source", "symbol_name", "qualified_name", "properties"]
+            .iter()
+            .any(|key| obj.contains_key(*key))
+    });
+    match (has_slots, has_panel) {
+        (true, false) => Ok(MeasurementMode::Vector),
+        (false, true) => Ok(MeasurementMode::Panel),
+        (true, true) => Err((
+            "ASTRO_GUARD_CHECK_MEASUREMENT_AMBIGUOUS",
+            "guard_check candidate carries both per-slot vectors and panel inputs; the \
+             measurement mode is ambiguous"
+                .to_string(),
+            "Declare measurement \"panel\" or \"vector\", or pass only panel inputs (panel) or only \
+             a slots array (vector)."
+                .to_string(),
+        )),
+        (false, false) => Err((
+            "ASTRO_GUARD_CHECK_MEASUREMENT_MISSING",
+            "guard_check candidate has neither per-slot vectors nor panel inputs".to_string(),
+            "Pass candidate panel inputs with measurement \"panel\", or a slots array with \
+             measurement \"vector\"."
+                .to_string(),
+        )),
+    }
+}
+
+/// Measure the candidate and exemplars through the real libcbm + panel pipeline (#331):
+/// each symbol's panel-source slot vectors are measured with the same instruments as
+/// indexing, then densified into the guard's per-slot input via
+/// [`slot_input_from_panel`]. A panel failure or a partially-measured symbol fails
+/// closed; the panel path never falls back to supplied vectors.
+fn measure_candidate_and_exemplars_through_panel(
+    args_obj: &Map<String, Value>,
+) -> Result<(MeasuredSymbol, Vec<Exemplar>), (&'static str, String, String)> {
+    let panel_version = args_obj
+        .get("panel_version")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+        .unwrap_or(DEFAULT_PANEL_VERSION);
+    let driver = PanelDriver::new(panel_version).map_err(|err| {
+        (
+            "ASTRO_GUARD_CHECK_PANEL_VERSION",
+            format!("panel version {panel_version} is invalid: {}", err.message()),
+            "Check with panel version 1 (S0-S22) or 2 (S0-S23).".to_string(),
+        )
+    })?;
+    let runtime = ShadowSlotRuntime;
+
+    let measure = |obj: &Map<String, Value>,
+                   index: usize|
+     -> Result<MeasuredSymbol, (&'static str, String, String)> {
+        let map = measure_guard_panel_sources(&driver, &runtime, obj, index)
+            .map_err(|(_code, message, remediation)| {
+                ("ASTRO_GUARD_CHECK_PANEL_FAILED", message, remediation)
+            })?;
+        let input = slot_input_from_panel(&map).map_err(|error| {
+            (
+                error.code(),
+                error.message().to_string(),
+                error.remediation().to_string(),
+            )
+        })?;
+        measure_for_check(&input).map_err(|error| {
+            (
+                error.code(),
+                error.message().to_string(),
+                error.remediation().to_string(),
+            )
+        })
+    };
+
+    let Some(candidate_obj) = args_obj.get("candidate").and_then(Value::as_object) else {
+        return Err((
+            "ASTRO_GUARD_CHECK_INVALID",
+            "guard_check (panel mode) requires a candidate object with panel inputs".to_string(),
+            "Pass candidate with source and its indexed panel inputs (symbol_name, properties, …)."
+                .to_string(),
+        ));
+    };
+    let candidate = measure(candidate_obj, 0)?;
+
+    let Some(exemplar_array) = args_obj.get("exemplars").and_then(Value::as_array) else {
+        return Err((
+            "ASTRO_GUARD_CHECK_INVALID",
+            "guard_check requires an exemplars array".to_string(),
+            "Provide the enclosing scope's trusted exemplars, each with panel inputs.".to_string(),
+        ));
+    };
+    let mut exemplars = Vec::with_capacity(exemplar_array.len());
+    for (index, entry) in exemplar_array.iter().enumerate() {
+        let Some(obj) = entry.as_object() else {
+            return Err((
+                "ASTRO_GUARD_CHECK_INVALID",
+                format!("exemplar #{index} must be an object"),
+                "Each exemplar needs cx, kernel_near, and panel inputs.".to_string(),
+            ));
+        };
+        let cx = obj
+            .get("cx")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("exemplar:{index}"));
+        let kernel_near = obj
+            .get("kernel_near")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let measured = measure(obj, index)?;
+        exemplars.push(Exemplar {
+            cx_id_hex: cx,
+            kernel_near,
+            measured,
+        });
+    }
+    Ok((candidate, exemplars))
 }
 
 /// Reconstruct the calibrated [`GuardProfile`] from the persisted
