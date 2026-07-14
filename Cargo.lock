@@ -256,6 +256,7 @@ dependencies = [
  "astrolabe-assay",
  "astrolabe-domain",
  "astrolabe-ingest",
+ "astrolabe-kernel",
  "astrolabe-panel",
  "blake3",
  "calyx-assay",
