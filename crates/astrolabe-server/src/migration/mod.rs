@@ -179,6 +179,9 @@ use guard_check::*;
 mod guard_drift;
 use guard_drift::*;
 
+mod guard_secondary;
+use guard_secondary::*;
+
 mod assay_gate;
 use assay_gate::*;
 

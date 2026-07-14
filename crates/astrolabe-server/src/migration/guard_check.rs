@@ -4,7 +4,7 @@ use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
 use astrolabe_guard::check::{
     Exemplar, GUARD_NEW_REGION_SCHEMA, GUARD_VERDICT_SCHEMA, MeasuredSymbol, NewRegionRecord,
     SlotFeature, SymbolSlotInput, check_candidate_with_lock, measure_for_check, measure_for_index,
-    resolve_region, slot_input_from_panel, verdict_ledger_payload_bytes,
+    resolve_region, verdict_ledger_payload_bytes,
 };
 use astrolabe_guard::profile::{
     GuardProfile, GuardSlot, GuardVerdict, SlotCalibration, default_content_policy,
@@ -359,9 +359,9 @@ fn resolve_measurement_mode(
 
 /// Measure the candidate and exemplars through the real libcbm + panel pipeline (#331):
 /// each symbol's panel-source slot vectors are measured with the same instruments as
-/// indexing, then densified into the guard's per-slot input via
-/// [`slot_input_from_panel`]. A panel failure or a partially-measured symbol fails
-/// closed; the panel path never falls back to supplied vectors.
+/// indexing, then densified into the guard's per-slot input via the shared
+/// [`measure_symbol_from_panel`] instrument. A panel failure or a partially-measured
+/// symbol fails closed; the panel path never falls back to supplied vectors.
 fn measure_candidate_and_exemplars_through_panel(
     args_obj: &Map<String, Value>,
 ) -> Result<(MeasuredSymbol, Vec<Exemplar>), (&'static str, String, String)> {
@@ -385,33 +385,20 @@ fn measure_candidate_and_exemplars_through_panel(
     let measure = |obj: &Map<String, Value>,
                    index: usize|
      -> Result<MeasuredSymbol, (&'static str, String, String)> {
-        let map = measure_guard_panel_sources(&driver, &runtime, obj, index).map_err(
+        // Measure through the single shared secondary-process instrument (#331/#341,
+        // reused by the commit-OOD watcher tick and advisory hook under #355), then
+        // preserve the specific measurement/reparse code (e.g.
+        // ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN) inside the panel-failed envelope so
+        // the operator sees the labeled root cause, not just the generic wrapper.
+        measure_symbol_from_panel(&driver, &runtime, obj, index).map_err(
             |(code, message, remediation)| {
-                // Preserve the specific measurement/reparse code (e.g.
-                // ASTRO_GUARD_REPARSE_LANGUAGE_UNKNOWN) inside the panel-failed
-                // envelope so the operator sees the labeled root cause, not just the
-                // generic panel-failed wrapper.
                 (
                     "ASTRO_GUARD_CHECK_PANEL_FAILED",
                     format!("[{code}] {message}"),
                     remediation,
                 )
             },
-        )?;
-        let input = slot_input_from_panel(&map).map_err(|error| {
-            (
-                error.code(),
-                error.message().to_string(),
-                error.remediation().to_string(),
-            )
-        })?;
-        measure_for_check(&input).map_err(|error| {
-            (
-                error.code(),
-                error.message().to_string(),
-                error.remediation().to_string(),
-            )
-        })
+        )
     };
 
     let Some(candidate_obj) = args_obj.get("candidate").and_then(Value::as_object) else {
@@ -463,7 +450,7 @@ fn measure_candidate_and_exemplars_through_panel(
 /// `astrolabe.optimizer_guard_health.v1` config the guard_calibrate tool wrote.
 /// Every fixed guard slot must be present with a numeric tau; a missing profile
 /// or slot fails closed.
-fn load_persisted_profile(
+pub(crate) fn load_persisted_profile(
     cache_dir: &Path,
     project: &str,
 ) -> Result<GuardProfile, (&'static str, String, String)> {
