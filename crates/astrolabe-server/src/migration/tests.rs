@@ -10103,3 +10103,410 @@ fn predict_impact_backtest_mode_persists_and_reads_back_the_gate() {
     assert_eq!(predict["status"], "grounded");
     assert_eq!(predict["grounded_mode"].as_bool().unwrap(), advertised);
 }
+
+// ---------------------------------------------------------------------------
+// #338 — abduce_cause + forecast MCP surfacing (oracle plumbing)
+// ---------------------------------------------------------------------------
+
+/// Seeds a shadow vault for `calc` (same graph as `seed_predict_impact_vault`)
+/// and mines a *mixed* pass/fail corpus on `calc.sub`: `passes` passing and
+/// `fails` failing single-candidate `ci:` occurrences, spaced 30 days apart and
+/// interleaved so a flaky series is genuinely self-inconsistent. Returns nothing;
+/// the corpus is persisted into the vault exactly as production would.
+fn seed_mixed_corpus_on_sub(cache_dir: &Path, seed_ts: u64, passes: usize, fails: usize) {
+    seed_predict_impact_vault(cache_dir, seed_ts, false, 0, 0);
+
+    let map_vault = open_shadow_vault_read_only(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Graph, ColumnFamily::Base],
+    )
+    .unwrap();
+    let node_map = astrolabe_ingest::read_node_map_cx_ids(&map_vault, "calc").unwrap();
+    let sub = *node_map.get("calc.sub").expect("calc.sub resolves");
+    drop(map_vault);
+
+    const PAIR_SPACING_SECS: u64 = 30 * 24 * 60 * 60;
+    const CORPUS_BASE_TS: u64 = 1_000_000_000;
+    let mut changes = Vec::new();
+    let mut outcomes = Vec::new();
+    // Interleave pass/fail so the series alternates (worst-case self-consistency).
+    let total = passes + fails;
+    let mut pass_left = passes;
+    let mut fail_left = fails;
+    for i in 0..total {
+        let passed = if i % 2 == 0 && pass_left > 0 {
+            pass_left -= 1;
+            true
+        } else if fail_left > 0 {
+            fail_left -= 1;
+            false
+        } else {
+            pass_left -= 1;
+            true
+        };
+        let change_ts = CORPUS_BASE_TS + (i as u64) * PAIR_SPACING_SECS;
+        changes.push(astrolabe_oracle::ChangeEvent {
+            change_id: format!("chg-sub-{i}"),
+            subject: sub,
+            change_ts,
+        });
+        outcomes.push(astrolabe_oracle::OutcomeEvent {
+            source: format!("ci:mix:sub-{i}"),
+            subject: sub,
+            outcome_ts: change_ts + 3_600,
+            passed,
+        });
+    }
+    let corpus = astrolabe_oracle::mine_corpus(
+        &changes,
+        &outcomes,
+        &astrolabe_oracle::AttributionConfig::default(),
+    )
+    .unwrap();
+    let write_vault = open_shadow_vault_writable(
+        &vault_dir(cache_dir, "calc"),
+        SHADOW_VAULT_ID,
+        &vault_salt("calc"),
+        vec![ColumnFamily::Kv, ColumnFamily::Ledger],
+    )
+    .unwrap();
+    astrolabe_oracle::persist_corpus(&write_vault, &corpus, "forecast-flaky-test").unwrap();
+    drop(write_vault);
+}
+
+// The corpus's most-recent failing outcome instant (CORPUS_BASE_TS + 3·30d +
+// 3600 = 1_007_779_600). Observing the failure at that instant gives the latest
+// failure recency weight 1.0, keeping the grounded support well above the prune
+// floor so the planted cause is a robust #1.
+const ABDUCE_OBSERVED_TS: &str = "1007779600";
+
+#[test]
+fn abduce_cause_ranks_planted_grounded_cause_first_with_disconfirming_test() {
+    // FSV: a real seeded graph (add CALLS sub; test_arith TESTS add,sub) plus a
+    // grounded corpus where calc.sub carries 4 failing occurrences. Reverse-walking
+    // from the observed failure calc.sub, the only reverse-reachable grounded
+    // candidate is calc.sub's own depth-0 history, so it ranks #1 with a confidence
+    // strictly below 1.0 and names its disconfirming test tests.test_arith.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("abduce-grounded");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let response = abduce_cause_json_at(
+        &dir,
+        "calc",
+        Some("calc.sub"),
+        Some(ABDUCE_OBSERVED_TS),
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "grounded", "envelope: {response}");
+    assert_eq!(response["schema"], ABDUCE_CAUSE_SCHEMA);
+    let hypotheses = response["hypotheses"].as_array().unwrap();
+    assert!(
+        !hypotheses.is_empty(),
+        "at least one hypothesis: {response}"
+    );
+    let top = &hypotheses[0];
+    assert_eq!(top["cause"]["qualified_name"], "calc.sub", "top: {top}");
+    assert_eq!(top["grounded"], true);
+    assert_eq!(top["depth"], 0);
+    let confidence = top["confidence"].as_f64().unwrap();
+    assert!(
+        confidence > 0.0 && confidence < 0.99,
+        "grounded confidence strictly below certainty: {confidence}"
+    );
+    assert_eq!(
+        top["disconfirming_test"]["qualified_name"], "tests.test_arith",
+        "top: {top}"
+    );
+    // FSV: the abduction rides on real persisted failing rows.
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 4);
+}
+
+#[test]
+fn abduce_cause_recent_change_cross_check_ranks_a_cause_up() {
+    // Passing the failing subject in recent_changes must engage the recent-change
+    // cross-check boost on the grounded candidate (a cross-check can only rank up).
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("abduce-recent-change");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let boosted = abduce_cause_json_at(
+        &dir,
+        "calc",
+        Some("calc.sub"),
+        Some(ABDUCE_OBSERVED_TS),
+        &["calc.sub".to_string()],
+    )
+    .unwrap();
+    let top = &boosted["hypotheses"][0];
+    assert_eq!(top["cause"]["qualified_name"], "calc.sub");
+    assert_eq!(
+        top["recent_change_boosted"], true,
+        "recent-change cross-check must fire: {top}"
+    );
+}
+
+#[test]
+fn abduce_cause_refuses_insufficient_failure_history_with_deficit_card() {
+    // No corpus: the failure region carries zero grounded failing occurrences
+    // (below the evidence floor of 3), so abduce refuses with a per-sensor deficit
+    // card rather than abducing from a coincidence (HONEST invariant 2).
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("abduce-insufficient");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, false, 0, 0);
+
+    let response = abduce_cause_json_at(
+        &dir,
+        "calc",
+        Some("calc.sub"),
+        Some(ABDUCE_OBSERVED_TS),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(response["status"], "insufficient", "envelope: {response}");
+    assert!(response.get("hypotheses").is_none(), "no guessed causes");
+    let deficits = response["deficits"].as_array().unwrap();
+    assert_eq!(deficits[0]["sensor"], "failure_history");
+    assert_eq!(deficits[0]["have"], 0);
+    assert_eq!(response["trust"], "provisional");
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 0);
+}
+
+#[test]
+fn abduce_cause_refuses_unresolved_failure_symbol_fail_closed() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("abduce-unresolved");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let response = abduce_cause_json_at(
+        &dir,
+        "calc",
+        Some("calc.nonesuch"),
+        Some(ABDUCE_OBSERVED_TS),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(response["status"], "refused", "envelope: {response}");
+    assert_eq!(response["code"], "ASTRO_ABDUCE_FAILURE_UNRESOLVED");
+    assert!(response["remediation"].as_str().is_some());
+}
+
+#[test]
+fn abduce_cause_refuses_when_not_shadow_indexed() {
+    let dir = temp_dir("abduce-not-shadow");
+    fs::create_dir_all(&dir).unwrap();
+    // No shadow dial persisted at all -> read_dial_at returns Off.
+    let response = abduce_cause_json_at(
+        &dir,
+        "calc",
+        Some("calc.sub"),
+        Some(ABDUCE_OBSERVED_TS),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(response["status"], "refused");
+    assert_eq!(response["code"], "ASTRO_ABDUCE_SHADOW_REQUIRED");
+}
+
+#[test]
+fn forecast_recurrence_returns_provisional_interval_from_failure_series() {
+    // FSV: calc.sub carries 4 failing occurrences spaced 30 days apart; the
+    // recurrence forecast must recover a 30-day median cadence and a labeled
+    // provisional (small-sample) credible interval on the next occurrence.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    const THIRTY_DAYS: u64 = 30 * 24 * 60 * 60;
+    let dir = temp_dir("forecast-recurrence");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let now = "1200000000";
+    let response =
+        forecast_json_at(&dir, "calc", Some("calc.sub"), Some(now), "recurrence").unwrap();
+
+    assert_eq!(response["status"], "forecast", "envelope: {response}");
+    assert_eq!(response["schema"], FORECAST_SCHEMA);
+    assert_eq!(response["event_count"], 4);
+    assert_eq!(
+        response["median_cadence_secs"].as_u64().unwrap(),
+        THIRTY_DAYS
+    );
+    assert_eq!(response["small_sample"], true, "3 intervals < threshold 5");
+    assert_eq!(
+        response["trust"], "provisional",
+        "small-sample is provisional"
+    );
+    // The interval brackets the next-occurrence estimate.
+    let low = response["interval"]["low_ts"].as_u64().unwrap();
+    let high = response["interval"]["high_ts"].as_u64().unwrap();
+    let next = response["next_occurrence_ts"].as_u64().unwrap();
+    assert!(
+        low <= next && next <= high,
+        "interval brackets next: {response}"
+    );
+    // FSV: the forecast rides on real persisted failing rows.
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 4);
+}
+
+#[test]
+fn forecast_recurrence_refuses_no_recurrence_for_a_symbol_with_no_failures() {
+    // calc.mul carries no occurrences: too few events to forecast -> ASTRO_NO_RECURRENCE.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("forecast-no-recurrence");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let response = forecast_json_at(
+        &dir,
+        "calc",
+        Some("calc.mul"),
+        Some("1200000000"),
+        "recurrence",
+    )
+    .unwrap();
+    assert_eq!(response["status"], "refused", "envelope: {response}");
+    assert_eq!(response["code"], "ASTRO_NO_RECURRENCE");
+    assert_eq!(response["have_events"], 0);
+}
+
+#[test]
+fn forecast_flaky_refuses_on_self_inconsistent_series() {
+    // calc.sub carries an interleaved 2-pass/2-fail series (self-consistency 1/3 <
+    // floor 0.7): forecasting a cadence from flaky noise is refused, ASTRO_FLAKY_EVIDENCE.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("forecast-flaky");
+    fs::create_dir_all(&dir).unwrap();
+    seed_mixed_corpus_on_sub(&dir, SEED_TS, 2, 2);
+
+    let response =
+        forecast_json_at(&dir, "calc", Some("calc.sub"), Some("1200000000"), "flaky").unwrap();
+    assert_eq!(response["status"], "refused", "envelope: {response}");
+    assert_eq!(response["code"], "ASTRO_FLAKY_EVIDENCE");
+    let sc = response["self_consistency"].as_f64().unwrap();
+    let floor = response["floor"].as_f64().unwrap();
+    assert!(sc < floor, "self-consistency {sc} below floor {floor}");
+}
+
+#[test]
+fn forecast_refuses_unresolved_subject_and_unsupported_mode() {
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("forecast-refusals");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 0);
+
+    let unresolved = forecast_json_at(
+        &dir,
+        "calc",
+        Some("calc.nope"),
+        Some("1200000000"),
+        "recurrence",
+    )
+    .unwrap();
+    assert_eq!(unresolved["code"], "ASTRO_FORECAST_SUBJECT_UNRESOLVED");
+
+    let bad_mode = forecast_json_at(
+        &dir,
+        "calc",
+        Some("calc.sub"),
+        Some("1200000000"),
+        "sideways",
+    )
+    .unwrap();
+    assert_eq!(bad_mode["code"], "ASTRO_FORECAST_MODE_UNSUPPORTED");
+}
+
+// ---------------------------------------------------------------------------
+// #339 — detect_changes grounded-risk resolves CBM short name vs vault FQN
+// ---------------------------------------------------------------------------
+
+/// Builds a CBM `detect_changes` result envelope whose `impacted_symbols` carry
+/// the *short* names (`nodes[i].name`) the real CBM tool emits — the exact shape
+/// that under-matched the vault's qualified names before #339.
+fn cbm_detect_changes_result(symbols: &[(&str, &str)]) -> String {
+    let impacted: Vec<Value> = symbols
+        .iter()
+        .map(|(name, file)| json!({"name": name, "label": "Function", "file": file}))
+        .collect();
+    let inner = json!({
+        "changed_files": ["src/calc.py"],
+        "changed_count": 1,
+        "impacted_symbols": impacted,
+        "depth": 2,
+    });
+    serde_json::to_string(&json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&inner).unwrap()}],
+        "isError": false,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn detect_changes_grounded_risk_resolves_short_name_against_vault_fqn() {
+    // FSV #339 regression: the seeded vault holds calc.add / calc.sub (FQNs), but
+    // CBM detect_changes reports the short names `add` / `sub`. Resolving the short
+    // name directly against the qualified-name node map under-matched; the resolver
+    // must now attach grounded risk to the namespaced symbols from persisted rows.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("detect-changes-fqn");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 3);
+
+    let raw = cbm_detect_changes_result(&[("sub", "src/calc.py"), ("add", "src/calc.py")]);
+    let block = grounded_risk_block(&dir, "calc", &raw).unwrap();
+    let risk = &block["grounded_risk"];
+
+    assert_eq!(risk["status"], "grounded", "block: {block}");
+    assert_eq!(
+        risk["grounded_symbol_count"], 2,
+        "both namespaced symbols ground"
+    );
+    assert_eq!(risk["ambiguous_symbol_count"], 0);
+
+    let symbols = risk["symbols"].as_array().unwrap();
+    let sub = symbols
+        .iter()
+        .find(|s| s["symbol"] == "sub")
+        .expect("sub present");
+    assert_eq!(sub["resolution"], "short_name", "sub: {sub}");
+    assert_eq!(sub["grounded"], true);
+    assert_eq!(sub["evidence_occurrences"], 4);
+    assert!(sub["cx"].as_str().is_some(), "cx is a hex string: {sub}");
+
+    let add = symbols
+        .iter()
+        .find(|s| s["symbol"] == "add")
+        .expect("add present");
+    assert_eq!(add["resolution"], "short_name");
+    assert_eq!(add["grounded"], true);
+    assert_eq!(add["evidence_occurrences"], 3);
+
+    // FSV: grounded risk rides on real persisted failing occurrence rows.
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.sub"), 4);
+    assert_eq!(read_back_failing_occurrences(&dir, "calc.add"), 3);
+}
+
+#[test]
+fn detect_changes_grounded_risk_labels_unresolved_short_name_provisional() {
+    // A CBM name that matches no indexed constellation stays a labeled provisional
+    // fallback (resolution="unresolved"), not a grounded claim.
+    const SEED_TS: u64 = 10_000_000_000_000;
+    let dir = temp_dir("detect-changes-unresolved");
+    fs::create_dir_all(&dir).unwrap();
+    seed_predict_impact_vault(&dir, SEED_TS, true, 4, 3);
+
+    let raw = cbm_detect_changes_result(&[("nonesuch", "src/other.py")]);
+    let block = grounded_risk_block(&dir, "calc", &raw).unwrap();
+    let risk = &block["grounded_risk"];
+    assert_eq!(risk["status"], "ungrounded");
+    let symbol = &risk["symbols"][0];
+    assert_eq!(symbol["resolution"], "unresolved");
+    assert_eq!(symbol["grounded"], false);
+    assert_eq!(symbol["trust"], "provisional");
+}
