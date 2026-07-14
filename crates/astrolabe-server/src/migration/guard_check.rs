@@ -458,8 +458,12 @@ fn new_region_key(project: &str, cx_hex: &str) -> String {
     metadata_key(project, &format!("guard_new_region:{cx_hex}"))
 }
 
+// Served slot numbers must byte-match the persisted verdict payload, which
+// writes shortest-decimal f32 (`verdict_ledger_payload_bytes`). A bare
+// `as f64` widening serves 0.9999998807907104 where the ledger row reads back
+// 0.9999999 — same measurement, unequal JSON.
 fn finite_f64_check(value: f32) -> f64 {
-    if value.is_finite() { value as f64 } else { 0.0 }
+    astrolabe_guard::canonical_slot_number(value)
 }
 
 fn guard_check_refused(code: &str, message: &str, remediation: &str) -> Result<String, DynError> {

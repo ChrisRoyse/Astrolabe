@@ -559,6 +559,15 @@ pub fn verdict_ledger_payload_bytes(report: &CheckReport, target_cx_hex: &str) -
     out.into_bytes()
 }
 
+/// Canonical JSON number form for a measured `f32`: the value a reader gets
+/// back when parsing the shortest-decimal encoding
+/// [`verdict_ledger_payload_bytes`] writes. Serving any other widening (e.g. a
+/// bare `as f64`) makes a served report and its persisted verdict compare
+/// unequal on identical measurements.
+pub fn canonical_slot_number(value: f32) -> f64 {
+    json_f32(value).parse().unwrap_or(0.0)
+}
+
 /// Emit an `f32` as a finite JSON number (never `NaN`/`Infinity`).
 fn json_f32(value: f32) -> String {
     if value.is_nan() {

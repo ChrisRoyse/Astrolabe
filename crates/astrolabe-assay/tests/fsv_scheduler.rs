@@ -315,14 +315,9 @@ fn cooperative_tick_preemption_yields_in_bounded_slices_with_identical_result() 
     let pop = population_100();
     let mut scorer = CooperativeScorer::new(pop.subjects(), 42, 30);
     let mut slices = Vec::new();
-    loop {
-        match scorer.tick() {
-            TickStep::Scored { from, to } => {
-                assert!(to - from <= 30, "tick honored the 30-subject budget");
-                slices.push((from, to));
-            }
-            TickStep::Complete => break,
-        }
+    while let TickStep::Scored { from, to } = scorer.tick() {
+        assert!(to - from <= 30, "tick honored the 30-subject budget");
+        slices.push((from, to));
     }
     // 100 subjects / 30 per tick -> slices [0,30) [30,60) [60,90) [90,100).
     assert_eq!(slices, vec![(0, 30), (30, 60), (60, 90), (90, 100)]);
@@ -357,7 +352,7 @@ fn cooperative_tick_preemption_yields_in_bounded_slices_with_identical_result() 
     };
     assert_eq!(
         small_ticks.ticks,
-        (100 + 6) / 7,
+        100_usize.div_ceil(7),
         "ceil(100/7) cooperative ticks"
     );
     assert_eq!(big_ticks.ticks, 1, "unbudgeted pass takes a single tick");

@@ -7809,8 +7809,13 @@ fn coverage_ingest_proxy_source_refuses_fail_closed() {
     // any anchor is written.
     const SEED_TS: u64 = 10_000_000_000_000;
     let coverage = "SF:src/calc.py\nDA:2,1\nend_of_record\n";
-    let test_report =
-        "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}\n";
+    // A well-formed one-case report: the report must parse cleanly so the refusal
+    // under test is the proxy-source class check in plan_propagation, not the
+    // earlier empty-report ASTRO_ANCHOR_PARSE_MALFORMED refusal.
+    let test_report = "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"started\"}\n\
+                       {\"type\":\"test\",\"name\":\"tests.test_arith\",\"event\":\"ok\"}\n\
+                       {\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"measured\":0,\"filtered_out\":0}\n";
     let dir = temp_dir("coverage-ingest-proxy");
     fs::create_dir_all(&dir).unwrap();
     seed_coverage_ingest_vault(&dir, SEED_TS);
