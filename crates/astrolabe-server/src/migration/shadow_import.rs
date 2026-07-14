@@ -1237,8 +1237,11 @@ where
         }));
     }
 
+    let t_snapshot = std::time::Instant::now();
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let at_seq = vault.snapshot();
+    let t_slot_load = std::time::Instant::now();
     let slots = EagerAgreementKind::ALL
         .into_iter()
         .flat_map(|kind| {
@@ -1288,7 +1291,9 @@ where
         }
         nodes.push(similarity_node);
     }
+    let ms_slot_load = t_slot_load.elapsed().as_millis() as u64;
 
+    let t_similarity = std::time::Instant::now();
     let similarity_config = SimilarityPlannerConfig::default();
     let (similarity_plan, similarity_region) = match delta {
         Some(delta) => {
@@ -1321,6 +1326,8 @@ where
         )?,
         _ => persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?,
     };
+    let ms_similarity = t_similarity.elapsed().as_millis() as u64;
+    let t_xterm = std::time::Instant::now();
     let xterm_plan = match delta {
         Some(delta) => plan_eager_cross_terms_for_symbols(&nodes, &delta.dirty_qualified_names),
         None => plan_eager_cross_terms(&nodes),
@@ -1342,6 +1349,7 @@ where
         }
         None => persist_eager_cross_terms(vault, &xterm_plan, &cx_ids, "astrolabe-shadow-weave")?,
     };
+    let ms_xterm = t_xterm.elapsed().as_millis() as u64;
     let absent_by_kind = xterm
         .absent_by_kind
         .iter()
@@ -1350,6 +1358,12 @@ where
 
     Ok(json!({
         "status": "reconciled",
+        "timing_ms": {
+            "snapshot_read": ms_snapshot,
+            "slot_load": ms_slot_load,
+            "similarity": ms_similarity,
+            "xterm": ms_xterm,
+        },
         "trust": "verified",
         "freshness": "current",
         "provenance": "AsterVault Graph + persisted Slot CF readback",

@@ -8307,6 +8307,10 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
     let changed_rows = mscale_pipeline_rows(true);
 
     let started = Instant::now();
+    // #23 phase-level latency instrumentation: each `Instant` fences one delta-path
+    // phase so the MSCALE_DELTA_FSV JSON carries the persisted per-phase breakdown
+    // (the source of truth for where the ~45s went), not eyeballed wall-clock.
+    let phase_import_start = Instant::now();
     let changed = import_shadow_vault_report(
         &root.join("unused.db"),
         &vault,
@@ -8315,12 +8319,16 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
         Some(mscale_row_sink_candidate(changed_rows)),
     )
     .unwrap();
+    let phase_import_ms = phase_import_start.elapsed().as_millis() as u64;
+    let phase_after_snapshot_start = Instant::now();
     let after_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT)
         .unwrap()
         .nodes
         .into_iter()
         .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
         .collect::<BTreeMap<_, _>>();
+    let phase_after_snapshot_ms = phase_after_snapshot_start.elapsed().as_millis() as u64;
+    let phase_delta_build_start = Instant::now();
     let new_cx_ids = changed
         .report
         .new_cx_id_values
@@ -8355,15 +8363,22 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
         BTreeSet::from([changed_qn.clone()])
     );
     assert!(delta.removed_cx_ids.contains(&old_changed_cx));
+    let phase_delta_build_ms = phase_delta_build_start.elapsed().as_millis() as u64;
 
+    let phase_weave_start = Instant::now();
     let weave = run_live_weave(&vault, M_SCALE_PROJECT, true, Some(&delta)).unwrap();
+    let phase_weave_ms = phase_weave_start.elapsed().as_millis() as u64;
     assert_eq!(weave["status"], "reconciled");
     assert!(weave["eager_cross_terms"]["rows_written"].as_u64().unwrap() > 0);
+    let phase_invalidations_start = Instant::now();
     let invalidations =
         persist_delta_invalidations(&vault, M_SCALE_PROJECT, true, Some(&delta), &weave).unwrap();
+    let phase_invalidations_ms = phase_invalidations_start.elapsed().as_millis() as u64;
     assert_eq!(invalidations["status"], "dirty");
+    let phase_schedule_start = Instant::now();
     let scheduled =
         schedule_lowering_after_convergence(&root, M_SCALE_PROJECT, true, &weave).unwrap();
+    let phase_schedule_ms = phase_schedule_start.elapsed().as_millis() as u64;
     assert_eq!(
         scheduled
             .as_ref()
@@ -8426,6 +8441,16 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
             "guard_invalidations": guard_invalidations.len(),
             "lowering_debounce": scheduled,
             "verify_chain": "intact",
+            "phase_breakdown_ms": {
+                "import": phase_import_ms,
+                "after_snapshot": phase_after_snapshot_ms,
+                "delta_build": phase_delta_build_ms,
+                "weave": phase_weave_ms,
+                "weave_internal": weave.get("timing_ms").cloned().unwrap_or(Value::Null),
+                "invalidations": phase_invalidations_ms,
+                "invalidations_internal": invalidations.get("timing_ms").cloned().unwrap_or(Value::Null),
+                "schedule": phase_schedule_ms,
+            },
         })
     );
     assert!(

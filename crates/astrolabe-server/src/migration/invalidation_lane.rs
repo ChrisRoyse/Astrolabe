@@ -38,7 +38,9 @@ where
         }));
     }
 
+    let t_snapshot = std::time::Instant::now();
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let live_symbols = snapshot
         .nodes
         .iter()
@@ -66,7 +68,10 @@ where
     }
 
     let snapshot_seq = vault.snapshot();
+    let t_kernel_sccs = std::time::Instant::now();
     let kernel_sccs = kernel_dirty_sccs(&snapshot, &dirty_symbols, &removed_symbols);
+    let ms_kernel_sccs = t_kernel_sccs.elapsed().as_millis() as u64;
+    let t_guard_reads = std::time::Instant::now();
     let mut rows = Vec::new();
 
     for qualified_name in &affected_symbols {
@@ -95,8 +100,12 @@ where
         ));
     }
 
+    let ms_guard_reads = t_guard_reads.elapsed().as_millis() as u64;
     let row_count = rows.len();
+    let t_ledger_before = std::time::Instant::now();
     let ledger_rows_before = vault.scan_cf_at(snapshot_seq, ColumnFamily::Ledger)?.len();
+    let ms_ledger_scan_before = t_ledger_before.elapsed().as_millis() as u64;
+    let t_commit = std::time::Instant::now();
     let payload = invalidation_ledger_payload(
         project,
         snapshot_seq,
@@ -112,6 +121,8 @@ where
         payload,
         ActorId::Service(INVALIDATION_ACTOR.to_string()),
     )?;
+    let ms_commit = t_commit.elapsed().as_millis() as u64;
+    let t_readback = std::time::Instant::now();
     let mut readback_verified = 0usize;
     for (cf, key, expected) in &rows {
         let actual = vault.read_cf_at(commit_seq, *cf, key)?;
@@ -125,11 +136,23 @@ where
         }
         readback_verified += 1;
     }
+    let ms_readback = t_readback.elapsed().as_millis() as u64;
+    let t_ledger_after = std::time::Instant::now();
     let ledger_rows_after = vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?.len();
+    let ms_ledger_scan_after = t_ledger_after.elapsed().as_millis() as u64;
 
     Ok(json!({
         "schema": INVALIDATION_SCHEMA,
         "status": "dirty",
+        "timing_ms": {
+            "snapshot_read": ms_snapshot,
+            "kernel_sccs": ms_kernel_sccs,
+            "guard_reads": ms_guard_reads,
+            "ledger_scan_before": ms_ledger_scan_before,
+            "commit": ms_commit,
+            "readback": ms_readback,
+            "ledger_scan_after": ms_ledger_scan_after,
+        },
         "trust": "verified",
         "freshness": "current",
         "provenance": "AsterVault Assay/Kernel/Guard CF readback after delta weave",
