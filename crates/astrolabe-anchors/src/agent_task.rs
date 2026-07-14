@@ -760,6 +760,57 @@ where
     })
 }
 
+/// Builds the per-symbol promotion-aware anchor trust map the kernel groundedness
+/// pipeline consumes (#352, the anchors → kernel adapter seam).
+///
+/// The kernel build (`astrolabe_kernel::kernel_build`, via the
+/// `GraphProjectionCsr -> KernelGraph` adapter in
+/// `astrolabe_ingest::kernel_artifact`) grounds a symbol at a *Trusted* anchor:
+/// `KernelGraphNode::anchor_trust == Some(Trusted)` seeds the groundedness BFS.
+/// Until this map existed, the only per-symbol trust available to that adapter
+/// was the catalog trust of a source, so a proxy `agent:*` Reward anchor that CI
+/// had already resolved (`promote_on_resolution`) still reported Provisional and
+/// never grounded its symbol — the #28→#29 promotion flywheel stopped one hop
+/// short of the kernel.
+///
+/// This builder closes that hop. It groups the active anchor rows by symbol and
+/// rolls each symbol's anchors up with [`rollup_effective_anchor_trust`], so a
+/// symbol whose anchors are all effectively Trusted — counting promotions — maps
+/// to [`TrustTag::Trusted`] and becomes a groundedness BFS source; a symbol with
+/// anchors but no effective-Trusted aggregate maps to [`TrustTag::Provisional`];
+/// a symbol with no anchors is simply absent (the kernel adapter reads absent as
+/// `None`, i.e. "carries no anchor"). Source erasure is honored by construction:
+/// tombstoned anchors are already excluded from [`read_anchor_rows`].
+///
+/// Determinism: the returned map is keyed by `CxId`, and the per-symbol rollup is
+/// order-independent, so the map is a pure function of the persisted anchor rows
+/// and promotions — worker-count invariant (standing invariant 5).
+pub fn effective_anchor_trust_map<C>(
+    vault: &AsterVault<C>,
+) -> calyx_core::Result<BTreeMap<CxId, TrustTag>>
+where
+    C: Clock,
+{
+    let rows = read_anchor_rows(vault)?;
+    let promotions = read_anchor_promotions(vault)?;
+    let mut by_symbol: BTreeMap<CxId, Vec<&crate::PersistedAnchorRow>> = BTreeMap::new();
+    for persisted in &rows {
+        if persisted.row.anchors.is_empty() {
+            continue;
+        }
+        by_symbol
+            .entry(persisted.row.cx_id)
+            .or_default()
+            .push(persisted);
+    }
+    let mut map = BTreeMap::new();
+    for (cx_id, symbol_rows) in by_symbol {
+        let trust = rollup_effective_anchor_trust(symbol_rows, &promotions)?;
+        map.insert(cx_id, trust);
+    }
+    Ok(map)
+}
+
 fn update_latest(
     map: &mut BTreeMap<CxId, (bool, Ts)>,
     cx_id: CxId,

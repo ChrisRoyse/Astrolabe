@@ -2,6 +2,99 @@ use super::*;
 pub(crate) const KERNEL_CONTEXT_SCHEMA: &str = "astrolabe.kernel_context.v1";
 pub(crate) const SCOPE_SUMMARY_COLLECTION_SCHEMA: &str = "astrolabe.scope_summary_collection.v1";
 
+/// Schema tag for the index-time persisted-kernel-artifact summary surfaced on the
+/// shadow import outcome (#365).
+pub(crate) const KERNEL_ARTIFACT_PERSIST_SCHEMA: &str = "astrolabe.kernel_artifact_persist.v1";
+
+/// The stable scope identity a shadow-imported project's whole-repo kernel is
+/// persisted and served under (#365). One serializer for the index-time persist
+/// hook and every serve-time readback so the artifact key never diverges.
+pub(crate) fn kernel_artifact_scope_id(project: &str) -> String {
+    format!("repo:{project}")
+}
+
+/// Index-time hook (#365): persists the real `KernelArtifact` for the freshly
+/// imported project into the vault Kernel CF via `build_and_persist_kernel`, using
+/// the promotion-aware per-symbol anchor trust map (#352) as the groundedness
+/// input, and returns a labeled summary for the import outcome.
+///
+/// Best-effort and fail-open on the *import*: a scope that cannot yet build a
+/// kernel (no typed edges, an unreachable recall gate, an empty anchor set) is a
+/// legitimate "not persisted yet" state, surfaced with a labeled reason rather
+/// than aborting the whole index. The persist path itself is fail-closed
+/// internally (it reads its own bytes back and refuses on divergence); this
+/// wrapper only decides that a build refusal degrades the surface, never the
+/// index. The persisted bytes are independently read back by the serve path.
+pub(crate) fn persist_index_time_kernel_artifact<C>(vault: &AsterVault<C>, project: &str) -> Value
+where
+    C: Clock,
+{
+    let scope_id = kernel_artifact_scope_id(project);
+    let anchor_trust = match astrolabe_anchors::effective_anchor_trust_map(vault) {
+        Ok(map) => map,
+        Err(error) => {
+            return kernel_artifact_persist_unavailable(
+                &scope_id,
+                &format!("promotion-aware anchor trust map unavailable: {error}"),
+            );
+        }
+    };
+    let trusted_anchor_count = anchor_trust
+        .values()
+        .filter(|tag| matches!(tag, astrolabe_anchors::TrustTag::Trusted))
+        .count();
+    let config = astrolabe_kernel::KernelBuildConfig::with_registry_defaults();
+    let options = astrolabe_ingest::GraphProjectionBuildOptions::new();
+    match astrolabe_ingest::build_and_persist_kernel(
+        vault,
+        &scope_id,
+        &anchor_trust,
+        &config,
+        &options,
+    ) {
+        Ok(report) => json!({
+            "schema": KERNEL_ARTIFACT_PERSIST_SCHEMA,
+            "status": "persisted",
+            "scope_id": report.scope_id,
+            "members_hash": report.members_hash,
+            "member_count": report.member_count,
+            "node_count": report.node_count,
+            "recall_permille": report.recall_permille,
+            "recall_gated": report.recall_gated,
+            "anchor_grounded": report.anchor_grounded,
+            "trusted_anchor_count": trusted_anchor_count,
+            "rows_readback_verified": report.rows_readback_verified,
+            "ledger_paired": report.ledger_paired,
+            "commit_seq": report.commit_seq,
+            "trust": if report.anchor_grounded { "verified" } else { "provisional" },
+            "freshness": "fresh",
+            "provenance": [
+                format!("kernel-artifact:scope={scope_id}"),
+                "vault:ColumnFamily::Kernel".to_string(),
+                "anchors:effective_anchor_trust_map(#352)".to_string(),
+            ],
+        }),
+        Err(error) => kernel_artifact_persist_unavailable(
+            &scope_id,
+            &format!("kernel build not persisted: {error}"),
+        ),
+    }
+}
+
+/// A labeled "not persisted" kernel-artifact summary — the honest surface when the
+/// scope cannot yet yield a kernel (invariant 3).
+pub(crate) fn kernel_artifact_persist_unavailable(scope_id: &str, reason: &str) -> Value {
+    json!({
+        "schema": KERNEL_ARTIFACT_PERSIST_SCHEMA,
+        "status": "unavailable",
+        "scope_id": scope_id,
+        "reason": reason,
+        "trust": "provisional",
+        "freshness": "not_evaluated",
+        "provenance": ["fallback:kernel-artifact-not-persisted"],
+    })
+}
+
 pub(crate) fn kernel_context_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
     let label_propagation = label_propagation_from_row_sink_rows(rows);
     let scope_summaries = scope_summaries_from_row_sink_rows(rows);

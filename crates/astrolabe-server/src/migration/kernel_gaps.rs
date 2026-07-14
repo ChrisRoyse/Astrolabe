@@ -1,8 +1,137 @@
 use super::*;
 
 use astrolabe_kernel::{
-    COVERAGE_QUADRANT_SCHEMA, GROUNDING_GAP_SCHEMA, GapQuadrant, QuadrantConfig, classify_quadrant,
+    COVERAGE_QUADRANT_SCHEMA, CoverageImportanceQuadrant, GROUNDING_GAP_SCHEMA, GapQuadrant,
+    GroundingGapReport, KernelArtifact, QuadrantConfig, classify_quadrant,
+    coverage_importance_quadrant, coverage_importance_quadrant_artifact_bytes,
+    grounding_gap_report, grounding_gap_report_artifact_bytes,
 };
+
+/// Serves the ranked grounding-gap report from the persisted `KernelArtifact`
+/// (#365): the real `kernel_score × churn` ranking with the exact
+/// groundedness-hop boundary and per-member groundedness permille, not the
+/// degraded kernel-weight scope-summary surface. The served envelope carries the
+/// crate's canonical report-bytes digest so an independent FSV recomputes
+/// `grounding_gap_report_artifact_bytes(&grounding_gap_report(&artifact))` and
+/// byte-matches it.
+pub(crate) fn artifact_gap_report_value(project: &str, artifact: &KernelArtifact) -> Value {
+    let report: GroundingGapReport = grounding_gap_report(artifact);
+    let artifact_bytes = grounding_gap_report_artifact_bytes(&report);
+    let report_sha256 = hex_lower(&Sha256::digest(&artifact_bytes));
+    let gap_rows: Vec<Value> = report
+        .gaps
+        .iter()
+        .map(|gap| {
+            json!({
+                "scope_id": report.scope_id,
+                "symbol_id": hex_lower(gap.id.as_bytes()),
+                "kernel_score_permille": gap.kernel_score_permille,
+                "churn": gap.churn,
+                "rank_score": gap.rank_score.to_string(),
+                "groundedness_permille": gap.groundedness_permille,
+                "in_fvs": gap.in_fvs,
+                "grounded": false,
+            })
+        })
+        .collect();
+
+    json!({
+        "schema": GROUNDING_GAP_SCHEMA,
+        "project": project,
+        "scope_id": report.scope_id,
+        "mode": "gaps",
+        "status": "served",
+        "source": "kernel_artifact",
+        "hop_limit": report.hop_limit,
+        "has_trusted_anchor": report.has_trusted_anchor,
+        "member_count": report.member_count,
+        "gap_count": report.gap_count,
+        "gaps": gap_rows,
+        // The real blueprint ranking: kernel_score × churn with the exact hop
+        // boundary, read back from the persisted artifact — no longer degraded.
+        "ranking_basis": "kernel_score_times_churn",
+        "degraded": false,
+        "artifact_report_sha256": report_sha256,
+        "trust": report.trust,
+        "freshness": report.freshness,
+        "provenance": [
+            format!("kernel-artifact:scope={}", report.scope_id),
+            "vault:ColumnFamily::Kernel".to_string(),
+            "astrolabe_kernel::grounding_gap_report".to_string(),
+        ],
+    })
+}
+
+/// Serves the coverage-vs-importance quadrant from the persisted `KernelArtifact`
+/// (#365): the anchor-density axis is the real per-member groundedness permille
+/// (not the binary grounded flag). Carries the canonical quadrant-bytes digest for
+/// a byte-match FSV. Fails closed (labeled) if a split threshold is out of bounds.
+pub(crate) fn artifact_quadrant_value(project: &str, artifact: &KernelArtifact) -> Value {
+    let config = QuadrantConfig::with_registry_defaults();
+    let quadrant: CoverageImportanceQuadrant = match coverage_importance_quadrant(artifact, &config)
+    {
+        Ok(quadrant) => quadrant,
+        Err(error) => {
+            return json!({
+                "schema": COVERAGE_QUADRANT_SCHEMA,
+                "project": project,
+                "mode": "quadrant",
+                "status": "refused",
+                "code": error.code(),
+                "message": error.message(),
+                "remediation": error.remediation(),
+                "trust": "provisional",
+                "freshness": "not_evaluated",
+            });
+        }
+    };
+    let artifact_bytes = coverage_importance_quadrant_artifact_bytes(&quadrant);
+    let quadrant_sha256 = hex_lower(&Sha256::digest(&artifact_bytes));
+    let point_rows: Vec<Value> = quadrant
+        .points
+        .iter()
+        .map(|point| {
+            json!({
+                "scope_id": quadrant.scope_id,
+                "symbol_id": hex_lower(point.id.as_bytes()),
+                "kernel_score_permille": point.kernel_score_permille,
+                "anchor_density_permille": point.anchor_density_permille,
+                "churn": point.churn,
+                "grounded": point.grounded,
+                "quadrant": point.quadrant.as_str(),
+            })
+        })
+        .collect();
+
+    json!({
+        "schema": COVERAGE_QUADRANT_SCHEMA,
+        "project": project,
+        "scope_id": quadrant.scope_id,
+        "mode": "quadrant",
+        "status": "served",
+        "source": "kernel_artifact",
+        "importance_threshold_permille": quadrant.config.importance_threshold_permille,
+        "anchor_density_threshold_permille": quadrant.config.anchor_density_threshold_permille,
+        "has_trusted_anchor": quadrant.has_trusted_anchor,
+        "member_count": quadrant.member_count,
+        "critical_unverified_count": quadrant.critical_unverified_count,
+        "critical_covered_count": quadrant.critical_covered_count,
+        "peripheral_unverified_count": quadrant.peripheral_unverified_count,
+        "peripheral_covered_count": quadrant.peripheral_covered_count,
+        "points": point_rows,
+        // The real anchor-density axis is the per-member groundedness permille from
+        // the persisted artifact — no longer the binary grounded-flag degradation.
+        "degraded": false,
+        "artifact_quadrant_sha256": quadrant_sha256,
+        "trust": quadrant.trust,
+        "freshness": quadrant.freshness,
+        "provenance": [
+            format!("kernel-artifact:scope={}", quadrant.scope_id),
+            "vault:ColumnFamily::Kernel".to_string(),
+            "astrolabe_kernel::coverage_importance_quadrant".to_string(),
+        ],
+    })
+}
 
 // #39 + #40 unification: the `get_kernel` MCP handler lives in `kernel_answer`
 // (the single tool exposing modes read|gaps|quadrant|build). This module owns the

@@ -767,6 +767,79 @@ mod tests {
     }
 
     #[test]
+    fn promotion_aware_trust_flips_persisted_groundedness() {
+        // #352 adapter seam FSV: the per-symbol anchor trust map the kernel
+        // consumes drives the persisted kernel score. Building the SAME graph with
+        // cx(1) as a Provisional anchor vs a Trusted anchor must flip cx(1)'s
+        // grounded flag and lift its groundedness permille on the readback — this
+        // is exactly the flip a `promote_on_resolution` produces in
+        // `astrolabe_anchors::effective_anchor_trust_map`.
+        let config = KernelBuildConfig::with_registry_defaults();
+        let options = GraphProjectionBuildOptions::new();
+
+        // Unpromoted: cx(1) carries only a Provisional (proxy) anchor => no Trusted
+        // anchor in scope, so no member is grounded.
+        let unpromoted = vault();
+        write_sources(&unpromoted, fixture_rows());
+        let mut before = BTreeMap::new();
+        before.insert(cx(1), TrustTag::Provisional);
+        let before_report =
+            build_and_persist_kernel(&unpromoted, "repo:demo", &before, &config, &options)
+                .expect("build unpromoted");
+        assert!(
+            !before_report.anchor_grounded,
+            "a Provisional-only scope has no Trusted grounding anchor"
+        );
+        let before_artifact = read_persisted_kernel_artifact(&unpromoted, "repo:demo")
+            .expect("read unpromoted")
+            .expect("unpromoted artifact present");
+        let before_member = before_artifact
+            .members
+            .iter()
+            .find(|member| member.id == cx(1))
+            .expect("cx(1) is a kernel member");
+        assert!(
+            !before_member.grounded,
+            "cx(1) is not grounded before promotion"
+        );
+
+        // Promoted: cx(1)'s anchor is now effectively Trusted (a CI resolution).
+        let promoted = vault();
+        write_sources(&promoted, fixture_rows());
+        let mut after = BTreeMap::new();
+        after.insert(cx(1), TrustTag::Trusted);
+        let after_report =
+            build_and_persist_kernel(&promoted, "repo:demo", &after, &config, &options)
+                .expect("build promoted");
+        assert!(
+            after_report.anchor_grounded,
+            "promotion makes cx(1) a Trusted grounding anchor"
+        );
+        let after_artifact = read_persisted_kernel_artifact(&promoted, "repo:demo")
+            .expect("read promoted")
+            .expect("promoted artifact present");
+        let after_member = after_artifact
+            .members
+            .iter()
+            .find(|member| member.id == cx(1))
+            .expect("cx(1) is a kernel member");
+        assert!(after_member.grounded, "cx(1) is grounded after promotion");
+        assert!(
+            after_member.groundedness_permille > before_member.groundedness_permille,
+            "promotion lifts cx(1) groundedness ({} -> {})",
+            before_member.groundedness_permille,
+            after_member.groundedness_permille
+        );
+        // The members-hash is unchanged (same member set, same graph); only the
+        // groundedness contribution moved — the flip is in the scoring, not the
+        // membership.
+        assert_ne!(
+            before_report.members_hash, "",
+            "a members-hash was persisted"
+        );
+    }
+
+    #[test]
     fn empty_graph_refuses_fail_closed() {
         // A vault with no typed edge rows projects an empty kernel graph; the
         // kernel build must refuse rather than persist a meaningless kernel.

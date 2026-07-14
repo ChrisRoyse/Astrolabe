@@ -545,6 +545,73 @@ fn promotion_lifts_aggregate_trust_and_erasure_recomputes_it() {
     drop(reopened);
 }
 
+/// #352: the per-symbol promotion-aware anchor trust map (the anchors → kernel
+/// adapter seam) flips a symbol from Provisional to Trusted the moment CI promotes
+/// its proxy agent anchor, while an unpromoted agent anchor on a sibling symbol
+/// stays Provisional. This is the map `astrolabe_ingest::build_and_persist_kernel`
+/// consumes as `KernelGraphNode::anchor_trust`, so this flip is exactly what
+/// grounds a symbol in the kernel groundedness BFS.
+#[test]
+fn effective_anchor_trust_map_flips_on_promotion() {
+    use astrolabe_anchors::effective_anchor_trust_map;
+
+    let dir = temp_dir("trust-map");
+    let vault = open(dir.as_ref());
+    // cx(1) and cx(2) both receive a proxy agent Reward anchor from one session.
+    record_agent_task_pack(&vault, "pack-map", &[cx(1), cx(2)], 1_786_600_000, ACTOR)
+        .expect("record pack");
+    ingest_agent_task_outcome(
+        &vault,
+        "pack-map",
+        "codex",
+        "mapt",
+        true,
+        1_786_600_100,
+        ACTOR,
+    )
+    .expect("agent success");
+
+    // Before any promotion, every anchored symbol is Provisional and no symbol
+    // without an anchor appears in the map at all.
+    let map_before = effective_anchor_trust_map(&vault).expect("map before");
+    assert_eq!(map_before.get(&cx(1)), Some(&TrustTag::Provisional));
+    assert_eq!(map_before.get(&cx(2)), Some(&TrustTag::Provisional));
+    assert_eq!(map_before.get(&cx(9)), None, "unanchored symbol is absent");
+
+    // CI resolves ONLY cx(1); promote reconciles just that symbol's proxy anchor.
+    seed_ci_testpass(&vault, "ci:gh:map", 1_786_600_200, &[(cx(1), true)]);
+    let promoted = promote_on_resolution(
+        &vault,
+        "agent:codex:mapt",
+        "ci:gh:map",
+        1_786_600_300,
+        ACTOR,
+    )
+    .expect("promote cx1");
+    assert_eq!(promoted.promotions_written, 1);
+    drop(vault);
+
+    // FSV: reopen and rebuild the map from persisted bytes independently.
+    let vault = open(dir.as_ref());
+    let map_after = effective_anchor_trust_map(&vault).expect("map after");
+    assert_eq!(
+        map_after.get(&cx(1)),
+        Some(&TrustTag::Trusted),
+        "the promoted symbol flips to Trusted — it now grounds the kernel"
+    );
+    assert_eq!(
+        map_after.get(&cx(2)),
+        Some(&TrustTag::Provisional),
+        "the unpromoted sibling anchor is unchanged (negative case)"
+    );
+    // The catalog source of the promoted anchor is unchanged; trust rose without a
+    // rewrite (the promotion is an append-only fact the map reads through).
+    let promotions = read_anchor_promotions(&vault).unwrap();
+    assert!(is_anchor_promoted(&promotions, cx(1), "agent:codex:mapt"));
+    assert!(!is_anchor_promoted(&promotions, cx(2), "agent:codex:mapt"));
+    drop(vault);
+}
+
 // ---- Opt-in hook contract (scripted harness) ----
 
 #[cfg(windows)]

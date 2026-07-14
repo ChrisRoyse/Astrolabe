@@ -1466,10 +1466,20 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     )?;
     let layout_frames = persist_layout_frames(&vault, project, import_changed)?;
     let drift = index_time_drift_summary(&vault, project, &vault_dir);
+    // #365 index-time hook (lane F): persist the real KernelArtifact for this
+    // project into the vault Kernel CF via build_and_persist_kernel, grounded on
+    // the promotion-aware anchor trust map (#352). Single post-import call — placed
+    // after the graph import and weave (so S18 vectors and the composite kernel
+    // projection are materialized) and before ledger verification (so the artifact
+    // write is inside the verified chain). Best-effort: a scope that cannot yet
+    // build a kernel is a labeled surface, never an index failure. (Overlaps lane
+    // A's shadow_import.rs — keep this to exactly this one call.)
+    let kernel_artifact = persist_index_time_kernel_artifact(&vault, project);
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
         object.insert("drift".to_string(), drift);
+        object.insert("kernel_artifact".to_string(), kernel_artifact);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {

@@ -85,6 +85,16 @@ pub use answer::{
     kernel_gap_report, verify_answer_trace, weight_to_permille,
 };
 
+/// Change blast-radius reach through the kernel graph and its risk composition
+/// (#366): the answer-path reach term folded into `detect_changes` grounded risk.
+pub mod blast_radius;
+pub use blast_radius::{
+    ASTRO_CHANGE_REACH_KNOB_RANGE, ASTRO_CHANGE_REACH_UNKNOWN_SYMBOL,
+    CHANGE_REACH_KNOB_REGISTRY_VERSION, CHANGE_REACH_KNOBS, CHANGE_REACH_SCHEMA, ChangeReach,
+    ReachConfig, ReachRisk, ReachedNode, change_reach, change_reach_artifact_bytes,
+    reach_risk_permille,
+};
+
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const SEARCH_SCALE_SCHEMA: &str = "astrolabe.search_scale_plan.v1";
 pub const SEARCH_SCALE_KNOB_REGISTRY_VERSION: &str = "astro.kernel.search_scale_knobs.v1";
