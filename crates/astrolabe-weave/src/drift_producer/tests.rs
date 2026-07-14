@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use astrolabe_assay::DiffConfig;
+use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{AnchorKind, SystemClock, VaultId};
+use serde_json::Value;
 
 use crate::{AnomalyKind, detect_anomalies, live_anomaly_inputs_from_vault};
 
@@ -87,7 +89,7 @@ fn planted_shift_between_imports_surfaces_a_drift_finding_from_persisted_bytes()
 
     // Import 1: snapshot the reference window, and round-trip it back from the
     // persisted Assay CF bytes.
-    persist_drift_reference(&vault, cache_key(), "drift:reference", &reference)
+    persist_drift_reference(&vault, cache_key(), "drift:reference", &reference, SEED)
         .expect("persist reference window");
     let reloaded = load_drift_reference(&vault).expect("load reference window");
     assert_eq!(reloaded, reference, "reference window must round-trip");
@@ -243,6 +245,258 @@ fn missing_reference_is_a_labeled_absence_not_a_fabricated_card() {
             .count(),
         0,
         "no fabricated drift substrate without a reference window"
+    );
+
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reads the raw persisted reference-row value bytes back from the Assay CF,
+/// never trusting an in-memory value. The reference row is the only Assay row
+/// carrying [`DRIFT_REFERENCE_PAYLOAD_SCHEMA`].
+fn persisted_reference_value(vault: &AsterVault<SystemClock>) -> Vec<u8> {
+    for (_key, value) in vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Assay)
+        .expect("scan assay cf")
+    {
+        if std::str::from_utf8(&value)
+            .map(|text| text.contains(DRIFT_REFERENCE_PAYLOAD_SCHEMA))
+            .unwrap_or(false)
+        {
+            return value;
+        }
+    }
+    panic!("no persisted drift reference row in Assay CF");
+}
+
+#[test]
+fn reference_cap_knob_is_declared_and_within_bounds() {
+    let cap = drift_reference_sample_cap().expect("cap resolves");
+    assert_eq!(cap, DRIFT_REFERENCE_DEFAULT_SAMPLE_CAP as usize);
+    let knob = DRIFT_REFERENCE_KNOBS
+        .iter()
+        .find(|k| k.name == DRIFT_REFERENCE_SAMPLE_CAP_KNOB)
+        .expect("cap knob is declared");
+    assert!(
+        knob.accepts(knob.default),
+        "declared default must be in-bounds"
+    );
+    assert_eq!(knob.min, DRIFT_REFERENCE_MIN_SAMPLE_CAP);
+    assert_eq!(knob.max, DRIFT_REFERENCE_MAX_SAMPLE_CAP);
+    assert!(knob.min >= 2, "MMD needs at least two points per side");
+    assert_eq!(knob.registry_version, DRIFT_REFERENCE_KNOB_REGISTRY_VERSION);
+}
+
+#[test]
+fn reservoir_bounds_and_is_deterministic() {
+    // cap >= population → whole slot kept; provenance retained == population.
+    let small = vec![DriftSlotSamples {
+        slot: "S0".to_string(),
+        samples: scalars(10, 0.0),
+    }];
+    let (bounded, prov) = bound_reference_window(&small, 384, 7);
+    assert_eq!(bounded[0].samples.len(), 10);
+    assert_eq!(prov[0].population, 10);
+    assert_eq!(prov[0].retained, 10);
+
+    // cap == population exactly → boundary keeps the whole slot, no reservoir.
+    let (bounded_eq, _) = bound_reference_window(&small, 10, 7);
+    assert_eq!(bounded_eq[0].samples, small[0].samples);
+
+    // population > cap → retained == cap exactly, only genuine members kept.
+    let big = vec![DriftSlotSamples {
+        slot: "S0".to_string(),
+        samples: scalars(1000, 0.0),
+    }];
+    let (bounded_big, prov_big) = bound_reference_window(&big, 50, 7);
+    assert_eq!(bounded_big[0].samples.len(), 50);
+    assert_eq!(prov_big[0].population, 1000);
+    assert_eq!(prov_big[0].retained, 50);
+    for point in &bounded_big[0].samples {
+        assert!(
+            big[0].samples.contains(point),
+            "reservoir keeps only real population members (no fabrication)"
+        );
+    }
+
+    // Determinism: same (samples, cap, seed) → byte-identical retained subset.
+    let (again, _) = bound_reference_window(&big, 50, 7);
+    assert_eq!(
+        bounded_big[0].samples, again[0].samples,
+        "reservoir is a pure function of (samples, cap, seed)"
+    );
+    // A different seed selects a different subset.
+    let (other_seed, _) = bound_reference_window(&big, 50, 8);
+    assert_ne!(
+        bounded_big[0].samples, other_seed[0].samples,
+        "the reservoir is seed-dependent"
+    );
+}
+
+#[test]
+fn bounded_reference_row_is_independent_of_corpus_size() {
+    // #371 DoD box 1: the persisted reference row is bounded and independent of
+    // corpus size. Fixed-width samples make the persisted `slots` payload a pure
+    // function of the retained COUNT, so two corpora of wildly different size that
+    // both exceed the cap persist a byte-identical `slots` payload.
+    let cap = drift_reference_sample_cap().expect("declared cap");
+
+    let flat = |n: usize| {
+        vec![DriftSlotSamples {
+            slot: "S18".to_string(),
+            samples: vec![vec![1.0]; n],
+        }]
+    };
+
+    // Returns (retained-count, persisted-slots-byte-length) read back from bytes.
+    let persist_and_read = |name: &str, population: usize| -> (usize, usize) {
+        let (dir, vault) = durable_vault(name);
+        let report = persist_drift_reference(
+            &vault,
+            cache_key(),
+            "drift:reference",
+            &flat(population),
+            SEED,
+        )
+        .expect("persist bounded reference");
+        // Independent readback of the persisted Assay CF bytes.
+        let value = persisted_reference_value(&vault);
+        let row: Value = serde_json::from_slice(&value).expect("row json");
+        let persisted_slots = &row["payload"]["slots"];
+        let persisted_retained = persisted_slots[0]["samples"]
+            .as_array()
+            .expect("samples array")
+            .len();
+        assert_eq!(
+            report.total_retained, persisted_retained,
+            "in-memory report must match the persisted bytes"
+        );
+        let slots_len = serde_json::to_vec(persisted_slots)
+            .expect("slots bytes")
+            .len();
+        drop(vault);
+        let _ = std::fs::remove_dir_all(&dir);
+        (persisted_retained, slots_len)
+    };
+
+    let (r_small, b_small) = persist_and_read("bound-small", 100); // below cap
+    let (r_500, b_500) = persist_and_read("bound-500", 500); // above cap
+    let (r_5000, b_5000) = persist_and_read("bound-5000", 5000); // 10x corpus
+
+    assert_eq!(r_small, 100, "a below-cap slot keeps every sample");
+    assert_eq!(r_500, cap, "an above-cap slot bounds to the cap");
+    assert_eq!(r_5000, cap, "a 10x-larger corpus bounds to the SAME cap");
+    assert_eq!(
+        b_500, b_5000,
+        "the O(corpus) payload is byte-identical across a 10x corpus difference ({b_500} vs {b_5000})"
+    );
+    assert!(
+        b_small < b_500,
+        "a below-cap slot persists strictly fewer bytes"
+    );
+
+    // The bound actually shrinks the row: an unbounded 5000-sample persist would
+    // be an order of magnitude larger than the bounded payload.
+    let unbounded = serde_json::to_vec(&flat(5000))
+        .expect("unbounded bytes")
+        .len();
+    assert!(
+        b_5000 * 5 < unbounded,
+        "bounding cut the reference far below O(corpus): bounded={b_5000} unbounded={unbounded}"
+    );
+}
+
+#[test]
+fn planted_shift_still_detected_through_the_sampled_reference() {
+    // #371 DoD box 2: planted-shift detection stays green with the sampled
+    // reference (sensitivity pinned). One reference slot far exceeds the cap and
+    // is reservoir-bounded before persistence; the bounded reference is reloaded
+    // from bytes and still surfaces a planted shift.
+    let (dir, vault) = durable_vault("sampled-sensitivity");
+    let cfg = DiffConfig::from_defaults().expect("diff config");
+    let cap = drift_reference_sample_cap().expect("declared cap");
+
+    let mut reference = Vec::new();
+    for i in 0..8 {
+        reference.push(DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: scalars(12, 0.0),
+        });
+    }
+    reference.push(DriftSlotSamples {
+        slot: "S18".to_string(),
+        samples: scalars(500, 0.0),
+    });
+
+    let report = persist_drift_reference(&vault, cache_key(), "drift:reference", &reference, SEED)
+        .expect("persist bounded reference");
+    assert_eq!(report.sample_cap, cap);
+    let s18 = report
+        .per_slot
+        .iter()
+        .find(|s| s.slot == "S18")
+        .expect("S18 provenance");
+    assert_eq!(s18.population, 500);
+    assert_eq!(
+        s18.retained, cap,
+        "the high-population reference slot was bounded"
+    );
+
+    // Reload the BOUNDED reference from persisted bytes.
+    let bounded_reference = load_drift_reference(&vault).expect("load bounded reference");
+    let bounded_s18 = bounded_reference
+        .iter()
+        .find(|s| s.slot == "S18")
+        .expect("reloaded S18");
+    assert_eq!(
+        bounded_s18.samples.len(),
+        cap,
+        "reloaded reference is bounded"
+    );
+
+    let mut current = Vec::new();
+    for i in 0..8 {
+        current.push(DriftSlotSamples {
+            slot: format!("S{i}"),
+            samples: scalars(12, 0.0),
+        });
+    }
+    current.push(DriftSlotSamples {
+        slot: "S18".to_string(),
+        samples: scalars(300, 100.0),
+    });
+
+    let report = produce_drift_cards(
+        &vault,
+        cache_key(),
+        "drift:cards",
+        &bounded_reference,
+        &current,
+        SEED,
+        &cfg,
+        None,
+    )
+    .expect("produce drift cards");
+    assert_eq!(report.cards_written, 9, "{report:?}");
+    assert!(report.cards_payload_persisted, "{report:?}");
+
+    drop(vault);
+    let reopened = open_durable_vault(&dir);
+    let inputs = live_anomaly_inputs_from_vault(&reopened).expect("live drift inputs");
+    let anomaly = detect_anomalies(
+        &inputs.substrates,
+        &inputs.calibrations,
+        Some("drift"),
+        true,
+    )
+    .expect("tier drift findings");
+    assert!(
+        anomaly
+            .findings
+            .iter()
+            .any(|finding| finding.kind == AnomalyKind::Drift && finding.subject_id == "slot:S18"),
+        "planted shift must survive the sampled reference: {:?}",
+        anomaly.findings
     );
 
     drop(reopened);
