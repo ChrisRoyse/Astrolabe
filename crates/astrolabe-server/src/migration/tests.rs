@@ -1911,6 +1911,7 @@ fn anomaly_report_prefers_live_vault_rows_over_stored_metadata() {
 /// assigns the CxIds; the S1/S18 lens vectors are then written under `slot_key(cx)`
 /// exactly as the shadow importer's slot load would.
 fn seed_blind_spot_vault(cache_dir: &Path, nodes: &[(&str, [f32; 2], [f32; 2])]) {
+    use calyx_core::CxId;
     let mut rows = CbmPipelineRows {
         project: "demo".to_string(),
         nodes: vec![astrolabe_bridge::CbmPipelineNodeRow {
@@ -2107,6 +2108,9 @@ fn detect_anomalies_serves_no_blind_spot_finding_for_clean_corpus() {
 /// the degradation is non-destructive.
 #[test]
 fn detect_anomalies_labels_blind_spot_unavailable_without_a_graph_snapshot() {
+    use astrolabe_weave::ASSAY_ANOMALY_PAYLOAD_SCHEMA;
+    use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, TrustTag};
+    use calyx_core::AnchorKind;
     let dir = temp_dir("blind-spot-no-snapshot");
     fs::create_dir_all(&dir).unwrap();
     let vault = AsterVault::new_durable(
@@ -5621,8 +5625,12 @@ fn index_generated_project(root: &Path, project: &str, salt: &str, symbols: &[(&
     .unwrap();
     let mut nodes = Vec::new();
     for (index, (name, increment)) in symbols.iter().enumerate() {
+        // The snippet makes a real call (`scale_input`) so the #341 S4 api-callee
+        // reparse is measurable, and the properties carry throws + a route so the
+        // persisted S15/S17 panel sources are non-degenerate — every guard slot's
+        // trusted centroid is formed from a real measurement (wave-13, #334).
         let properties_json = format!(
-            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ if input > {increment} {{ return input + {increment}; }} input - {increment} }}","signature":"fn {name}(input: i32) -> i32","bt":"{name} input compare return add sub {increment}","docstring":"transform an input value by {increment}","complexity":3.0,"cognitive":2.0,"param_count":1.0,"lines":3.0,"return_type":"i32","param_types":["i32"],"is_exported":true}}"#
+            r#"{{"language":"rust","source_snippet":"fn {name}(input: i32) -> i32 {{ let scaled = scale_input(input); if scaled > {increment} {{ return scaled + {increment}; }} scaled - {increment} }}","signature":"fn {name}(input: i32) -> i32","bt":"{name} input scale_input scaled compare return add sub {increment}","docstring":"transform an input value by {increment}","complexity":3.0,"cognitive":2.0,"param_count":1.0,"lines":3.0,"return_type":"i32","param_types":["i32"],"throws":["ParseError"],"route_path":"/api/{name}","route_method":"GET","is_exported":true}}"#
         );
         nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
             id: (index as i64) + 1,
@@ -5696,9 +5704,15 @@ fn guard_calibrate_generated_mode_builds_and_measures_the_bad_corpus() {
         "mode": "generated",
         "domain": {"language": "rust", "scope_class": "core"},
         "seed": 7,
+        // Fixture tuning (wave-13 consolidation): the R16 mix policy demands >=50
+        // bad cases and 2 sources yielded 8 mutants (+8 vuln +30 alien = 46,
+        // refused). Four sources yield ~18 mutants -> ~56 total with the alien
+        // share at ~54% (< the 60% cap). The policy itself is untouched.
         "mutation_sources": [
             "fn f(a: i32, b: i32) -> i32 { if a < b && a == 0 { return a + 1; } a - b }",
             "fn g(x: i32) -> bool { !(x > 3) || x <= 10 }",
+            "fn h(v: i32, w: i32) -> i32 { if v >= w || v != 0 { return v * 2; } v / 3 }",
+            "fn k(n: i32, d: i32) -> i32 { if n <= d && d > 1 { return n + d; } n - d }",
         ],
         "aliens": [{"project": "alienrepo"}],
     });

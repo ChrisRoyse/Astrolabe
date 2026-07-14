@@ -1047,6 +1047,42 @@ fn read_project_measured_symbols(
                 }
             }
         }
+        // #334: the shadow importer never persists the S1 (struct-trigram) / S4
+        // (api-callee) panel sources — they are reparse-derived (#341), so a good
+        // or alien population read from persisted vectors alone could never
+        // exercise the StructTrigrams/ApiCallees guard slots and generated-mode
+        // calibration would always refuse ASTRO_GUARD_AUTO_SLOT_UNMEASURED.
+        // Where the persisted node properties carry the symbol's real source
+        // text, re-measure S1/S4 through the SAME per-snippet libcbm reparse
+        // instrument the bad corpus and guard_check use. A symbol without
+        // source text (or with an unreparseable body) simply contributes no
+        // S1/S4 measurement — never a fabricated vector — and the guard crate's
+        // fail-closed slot deficit still fires when NO symbol measures a slot.
+        if !slots.contains_key(&PANEL_SLOT_STRUCT_TRIGRAMS)
+            || !slots.contains_key(&PANEL_SLOT_API_CALLEES)
+        {
+            if let Ok(properties) = serde_json::from_str::<Value>(&node.properties_json)
+                && let Some(source) = ["source_snippet", "source", "body", "snippet"]
+                    .iter()
+                    .find_map(|field| properties.get(*field).and_then(Value::as_str))
+                && !source.trim().is_empty()
+            {
+                let language = properties
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Ok((s1, s4)) = reparse_structural_panel_sources(
+                    source.as_bytes(),
+                    &node.file_path,
+                    language,
+                    &node.name,
+                    0,
+                ) {
+                    slots.entry(PANEL_SLOT_STRUCT_TRIGRAMS).or_insert(s1);
+                    slots.entry(PANEL_SLOT_API_CALLEES).or_insert(s4);
+                }
+            }
+        }
         if !slots.is_empty() {
             out.push(PersistedMeasuredSymbol {
                 qualified_name: node.qualified_name.clone(),

@@ -556,7 +556,7 @@ pub(crate) fn guard_advisory_hook_at(
                 cache_dir,
                 project,
                 AdvisoryOutcome::SilentError {
-                    code: "ASTRO_GUARD_HOOK_MEASUREMENT_FAILED",
+                    code: "ASTRO_GUARD_HOOK_MEASUREMENT_FAILED".to_string(),
                 },
                 budget_ms,
                 budget_overridden,
@@ -571,7 +571,7 @@ pub(crate) fn guard_advisory_hook_at(
                 cache_dir,
                 project,
                 AdvisoryOutcome::SilentError {
-                    code: "ASTRO_GUARD_HOOK_EXEMPLARS_UNMEASURABLE",
+                    code: "ASTRO_GUARD_HOOK_EXEMPLARS_UNMEASURABLE".to_string(),
                 },
                 budget_ms,
                 budget_overridden,

@@ -157,7 +157,7 @@ pub(crate) fn guard_check_at(
             let exemplars = match parse_exemplars(args_obj.get("exemplars")) {
                 Ok(exemplars) => exemplars,
                 Err((code, message, remediation)) => {
-                    return guard_check_refused_owned(code, message, remediation);
+                    return guard_check_refused_owned(&code, message, remediation);
                 }
             };
             (candidate, exemplars)
@@ -604,10 +604,10 @@ fn parse_symbol_input(
 
 /// Parse the exemplars array into measured [`Exemplar`]s via the shared indexing
 /// instrument (byte-identical to the candidate's measurement path).
-fn parse_exemplars(value: Option<&Value>) -> Result<Vec<Exemplar>, (&'static str, String, String)> {
+fn parse_exemplars(value: Option<&Value>) -> Result<Vec<Exemplar>, GuardRefusal> {
     let Some(array) = value.and_then(Value::as_array) else {
         return Err((
-            "ASTRO_GUARD_CHECK_INVALID",
+            "ASTRO_GUARD_CHECK_INVALID".to_string(),
             "guard_check requires an exemplars array".to_string(),
             "Provide the enclosing scope's trusted exemplars, each measured on every guard slot."
                 .to_string(),
@@ -617,7 +617,7 @@ fn parse_exemplars(value: Option<&Value>) -> Result<Vec<Exemplar>, (&'static str
     for (index, entry) in array.iter().enumerate() {
         let Some(obj) = entry.as_object() else {
             return Err((
-                "ASTRO_GUARD_CHECK_INVALID",
+                "ASTRO_GUARD_CHECK_INVALID".to_string(),
                 format!("exemplar #{index} must be an object"),
                 "Each exemplar needs cx, kernel_near, and a slots array.".to_string(),
             ));
@@ -631,10 +631,11 @@ fn parse_exemplars(value: Option<&Value>) -> Result<Vec<Exemplar>, (&'static str
             .get("kernel_near")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let input = parse_symbol_input(Some(entry), "exemplar")?;
+        let input = parse_symbol_input(Some(entry), "exemplar")
+            .map_err(|(code, message, remediation)| (code.to_string(), message, remediation))?;
         let measured: MeasuredSymbol = measure_for_index(&input).map_err(|error| {
             (
-                error.code(),
+                error.code().to_string(),
                 error.message().to_string(),
                 error.remediation().to_string(),
             )

@@ -145,6 +145,7 @@ dependencies = [
  "calyx-ledger",
  "calyx-paths",
  "crc32fast",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
