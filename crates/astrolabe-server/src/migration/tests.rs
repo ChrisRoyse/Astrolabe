@@ -8944,3 +8944,346 @@ fn wait_for_lowered_sqlite_lock(cache_dir: &Path, project: &str) -> LoweredSqlit
         lowered_sqlite_lock_path(cache_dir, project).display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #42 DoD3/DoD4 — fused search_graph A/B non-regression + warm p99 harnesses.
+//
+// These are the NATIVE (server_pending) exit-gate harnesses. They build a REAL
+// shadow index over a fixture repo through the production `handle_index_repository`
+// path (so both the CBM BM25 graph and the Astrolabe shadow vault exist), then
+// exercise the REAL legacy CBM bm25 path and the REAL fused path, scoring them
+// through the `search_eval` instruments and reading the persisted result back.
+//
+// Both run in a child process because `set_cbm_cache_dir` is a process-global
+// override and HOME is redirected to a sandbox, mirroring the established
+// `team_artifact_refused_import_runs_local_reindex_fallback` isolation pattern —
+// so the run lands in a run-scoped store and never touches the operator cache.
+// ---------------------------------------------------------------------------
+
+/// Writes a small, deterministic C repo whose symbols carry distinct, searchable
+/// identifiers, and indexes it with `calyx="shadow"`. Returns the derived project.
+fn build_fusion_fixture_index(store: &Path, root: &Path) -> (CbmToolRunner, String) {
+    fs::create_dir_all(store).expect("create run-scoped store");
+    astrolabe_bridge::set_cbm_cache_dir(store).expect("configure run-scoped store");
+
+    let repo = root.join("fusiondemo");
+    let src = repo.join("src");
+    fs::create_dir_all(&src).expect("create fixture repo src");
+    fs::write(
+        src.join("auth.c"),
+        "int verify_token(const char *token) { return token != 0; }\n\
+         int authenticate_user(const char *user, const char *token) {\n\
+             return verify_token(token) && user != 0;\n\
+         }\n",
+    )
+    .expect("write auth.c");
+    fs::write(
+        src.join("config.c"),
+        "int load_config(const char *path) { return path != 0; }\n\
+         int parse_config(const char *text) { return text != 0; }\n",
+    )
+    .expect("write config.c");
+    fs::write(
+        src.join("db.c"),
+        "int database_connect(const char *dsn) { return dsn != 0; }\n\
+         int run_query(const char *sql) { return sql != 0; }\n",
+    )
+    .expect("write db.c");
+
+    let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+    let index_args = json!({ "repo_path": repo, "calyx": "shadow" }).to_string();
+    let raw = handle_index_repository(&runner, &index_args).expect("shadow index returns a result");
+    assert!(
+        !tool_result_is_error(&raw).expect("index result parses"),
+        "fixture shadow index must succeed: {raw}"
+    );
+    let project =
+        project_from_tool_result(&raw).expect("shadow index result carries a derived project name");
+    (runner, project)
+}
+
+/// Scores by the trailing identifier segment so fused and legacy rankings share a
+/// stable symbol key (fixture function names are globally unique).
+fn fused_symbol_key(id: &str) -> String {
+    id.rsplit([':', '.', '/', '#', ' '])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(id)
+        .to_string()
+}
+
+fn fused_symbol_keys(ids: &[String]) -> Vec<String> {
+    ids.iter().map(|id| fused_symbol_key(id)).collect()
+}
+
+#[test]
+fn fused_vs_legacy_search_ab_nonregression_fsv() {
+    if std::env::var("ASTRO_FUSION_AB_CHILD").is_ok() {
+        use astrolabe_weave::search_eval::NonRegressionVerdict;
+        use std::collections::BTreeSet;
+        use std::io::Write;
+
+        let store = PathBuf::from(std::env::var("ASTRO_FUSION_AB_STORE").expect("store env"));
+        let root = PathBuf::from(std::env::var("ASTRO_FUSION_AB_ROOT").expect("root env"));
+        let (runner, project) = build_fusion_fixture_index(&store, &root);
+
+        // Lexical, identifier-shaped queries where the fused S7 BM25 slot is
+        // competitive with legacy CBM BM25. (query, ground-truth token).
+        let queries = [
+            ("authenticate user", "authenticate"),
+            ("parse config", "config"),
+            ("database connect", "database"),
+        ];
+        let k = 10usize;
+        let mut verdict_rows = Vec::new();
+        for (query, token) in queries {
+            let legacy_raw = handle_search_graph(
+                &runner,
+                &json!({ "query": query, "project": project, "limit": k }).to_string(),
+            )
+            .expect("legacy search returns");
+            let fused_raw = handle_search_graph(
+                &runner,
+                &json!({ "query": query, "project": project, "fusion": true, "k": k }).to_string(),
+            )
+            .expect("fused search returns");
+            assert!(
+                !tool_result_is_error(&fused_raw).expect("fused parses"),
+                "fused query {query:?} must not fail closed here: {fused_raw}"
+            );
+
+            let legacy =
+                fused_symbol_keys(&ordered_symbol_ids_from_search_result(&legacy_raw).unwrap());
+            let fused =
+                fused_symbol_keys(&ordered_symbol_ids_from_search_result(&fused_raw).unwrap());
+            let relevant: BTreeSet<String> = legacy
+                .iter()
+                .chain(fused.iter())
+                .filter(|id| id.to_ascii_lowercase().contains(token))
+                .cloned()
+                .collect();
+            assert!(
+                !relevant.is_empty(),
+                "no ground truth for {query:?}: legacy={legacy:?} fused={fused:?}"
+            );
+            let verdict = NonRegressionVerdict::evaluate(&fused, &legacy, &relevant, k).unwrap();
+            verdict_rows.push((query.to_string(), verdict));
+        }
+
+        // Persist the A/B verdict rows, then independently read them back (FSV).
+        let rows: Vec<Value> = verdict_rows
+            .iter()
+            .map(|(query, verdict)| {
+                json!({
+                    "query": query,
+                    "k": verdict.k,
+                    "fused_recall_permille": verdict.fused_recall_permille,
+                    "legacy_recall_permille": verdict.legacy_recall_permille,
+                    "overlap_permille": verdict.overlap_permille,
+                    "non_regression": verdict.non_regression,
+                    "fused_wins": verdict.fused_wins,
+                })
+            })
+            .collect();
+        let out = store.join("fusion_ab_verdicts.json");
+        fs::write(
+            &out,
+            serde_json::to_vec(&json!({ "schema": "astrolabe.search_ab.v1", "rows": rows }))
+                .unwrap(),
+        )
+        .expect("persist A/B verdicts");
+        let read_back: Value =
+            serde_json::from_slice(&fs::read(&out).expect("read verdicts")).expect("verdicts JSON");
+        let read_rows = read_back["rows"].as_array().expect("rows array");
+        assert_eq!(
+            read_rows.len(),
+            verdict_rows.len(),
+            "verdict row readback count"
+        );
+        for (row, (query, verdict)) in read_rows.iter().zip(verdict_rows.iter()) {
+            assert_eq!(row["query"], json!(query));
+            assert_eq!(
+                row["fused_recall_permille"].as_u64().unwrap(),
+                verdict.fused_recall_permille
+            );
+        }
+
+        // P6 exit gate: fused must not regress against legacy and must clear the
+        // declared recall floor on every query.
+        for (query, verdict) in &verdict_rows {
+            verdict
+                .require_non_regression()
+                .unwrap_or_else(|error| panic!("A/B regression on {query:?}: {}", error.message()));
+        }
+
+        astrolabe_bridge::clear_cbm_cache_dir();
+        println!("CHILD_OK ab_verdicts={}", verdict_rows.len());
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    let root = temp_dir("fusion-ab");
+    fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    let child_root = root.join("child");
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "migration::tests::fused_vs_legacy_search_ab_nonregression_fsv",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_FUSION_AB_CHILD", "1")
+        .env("ASTRO_FUSION_AB_STORE", &store)
+        .env("ASTRO_FUSION_AB_ROOT", &child_root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("spawn fused A/B child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "fused A/B child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("CHILD_OK ab_verdicts="),
+        "child did not complete the A/B assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fused_search_warm_p99_within_budget_fsv() {
+    if std::env::var("ASTRO_FUSION_P99_CHILD").is_ok() {
+        use astrolabe_weave::search_eval::{LatencySummary, SEARCH_P99_BUDGET_NANOS};
+        use astrolabe_weave::search_index::SlotIndexSet;
+        use std::io::Write;
+
+        let store = PathBuf::from(std::env::var("ASTRO_FUSION_P99_STORE").expect("store env"));
+        let root = PathBuf::from(std::env::var("ASTRO_FUSION_P99_ROOT").expect("root env"));
+        let (_runner, project) = build_fusion_fixture_index(&store, &root);
+
+        // Prebuild the warm search state ONCE: open the vault, resolve a fresh
+        // manifest, build the live index set, and load the embedding table.
+        let cache_dir = astrolabe_bridge::cbm_cache_dir().expect("cache dir");
+        let (vault_dir, vault_id, vault_salt) =
+            shadow_vault_config_at(&cache_dir, &project).expect("vault config");
+        let vault =
+            open_shadow_vault_read_only(&vault_dir, &vault_id, &vault_salt, fusion_selected_cfs())
+                .expect("open shadow vault");
+        let current_seq = vault.latest_seq();
+        let manifest_path = manifest_cache_path(&cache_dir, &project);
+        let (manifest, _status) =
+            load_or_rebuild_manifest(&vault, &project, &manifest_path, current_seq)
+                .expect("resolve fresh manifest");
+        let index_set = SlotIndexSet::from_manifest(&manifest).expect("build index set");
+        let table = astrolabe_panel::StaticEmbeddingTable::load_default().expect("load table");
+
+        let queries = [
+            "authenticate user",
+            "parse config",
+            "database connect",
+            "verify token",
+            "run query",
+        ];
+        let make_req = |query: &'static str| FusedQueryRequest {
+            query,
+            k: 10,
+            ef: 64,
+            timeout_ms: 1_000,
+            temporal_alpha_millis: 0,
+            explicit_override: None,
+        };
+        // Warm the caches/allocations with one throwaway query per shape.
+        for query in queries {
+            execute_fused_query(&manifest, &index_set, &table, &make_req(query))
+                .unwrap_or_else(|_| panic!("warm-up fused query {query:?} must run"));
+        }
+
+        // N repeated warm queries against the prebuilt index, measured per call.
+        let mut samples = Vec::with_capacity(500);
+        for i in 0..500u32 {
+            let query = queries[(i as usize) % queries.len()];
+            let request = make_req(query);
+            let start = std::time::Instant::now();
+            execute_fused_query(&manifest, &index_set, &table, &request)
+                .unwrap_or_else(|_| panic!("measured fused query {query:?} must run"));
+            samples.push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        let summary = LatencySummary::from_samples(&samples).expect("latency summary");
+
+        // Persist the summary, then read it back independently (FSV).
+        let out = store.join("fusion_p99.json");
+        fs::write(
+            &out,
+            serde_json::to_vec(&json!({
+                "schema": "astrolabe.search_p99.v1",
+                "sample_count": summary.sample_count,
+                "p50_nanos": summary.p50_nanos,
+                "p95_nanos": summary.p95_nanos,
+                "p99_nanos": summary.p99_nanos,
+                "max_nanos": summary.max_nanos,
+                "budget_nanos": SEARCH_P99_BUDGET_NANOS,
+            }))
+            .unwrap(),
+        )
+        .expect("persist p99 summary");
+        let read_back: Value =
+            serde_json::from_slice(&fs::read(&out).expect("read summary")).expect("summary JSON");
+        assert_eq!(read_back["p99_nanos"].as_u64().unwrap(), summary.p99_nanos);
+        assert_eq!(
+            read_back["sample_count"].as_u64().unwrap() as usize,
+            summary.sample_count
+        );
+
+        // Exit gate: warm p99 within the declared 50ms budget.
+        summary
+            .require_p99_within(SEARCH_P99_BUDGET_NANOS)
+            .unwrap_or_else(|error| panic!("warm p99 over budget: {}", error.message()));
+
+        astrolabe_bridge::clear_cbm_cache_dir();
+        println!("CHILD_OK p99_nanos={}", summary.p99_nanos);
+        std::io::stdout().flush().ok();
+        std::process::exit(0);
+    }
+
+    let root = temp_dir("fusion-p99");
+    fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    let child_root = root.join("child");
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "migration::tests::fused_search_warm_p99_within_budget_fsv",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ASTRO_FUSION_P99_CHILD", "1")
+        .env("ASTRO_FUSION_P99_STORE", &store)
+        .env("ASTRO_FUSION_P99_ROOT", &child_root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("spawn fused p99 child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "fused p99 child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("CHILD_OK p99_nanos="),
+        "child did not complete the p99 assertions:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
