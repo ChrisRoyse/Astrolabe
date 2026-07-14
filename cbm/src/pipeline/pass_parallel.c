@@ -454,7 +454,8 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            const char *callees) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
      * keep a lean properties blob (lossless — those fields are always zero for
@@ -518,6 +519,11 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
         append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
     }
+
+    /* Struct trigrams (panel S1) + api callees (panel S4) encoder sources (#374).
+     * Keep in sync with pass_definitions.c::build_def_props. */
+    append_json_string(buf, bufsize, &pos, "st", def->struct_trigrams);
+    append_json_string(buf, bufsize, &pos, "callees", callees);
 
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
@@ -716,9 +722,14 @@ enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 CBMDefinition *def) {
-    char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+                                 const CBMCallArray *calls, CBMDefinition *def) {
+    /* CBM_SZ_32K: room for the struct-trigram (S1) + api-callee (S4) encoder
+     * sources alongside the existing props (#374). Keep in sync with
+     * pass_definitions.c::process_def. */
+    char props[CBM_SZ_32K];
+    char callees[CBM_SZ_8K];
+    cbm_pipeline_build_def_callees(calls, def->qualified_name, callees, (int)sizeof(callees));
+    build_def_props(props, sizeof(props), def, callees);
     int64_t func_id =
         cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
@@ -908,7 +919,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, def);
+                insert_def_into_gbuf(ws, fi, &result->calls, def);
             }
         }
 

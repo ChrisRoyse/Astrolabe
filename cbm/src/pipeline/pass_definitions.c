@@ -243,8 +243,11 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-/* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+/* Build properties JSON for a definition node. `callees` is the def's
+ * newline-delimited "name\tcount" api-callee list (S4 encoder source) or NULL;
+ * the caller aggregates it with cbm_pipeline_build_def_callees. */
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            const char *callees) {
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -309,19 +312,95 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
     }
 
+    /* Struct trigrams — panel S1 (struct_trigrams guard slot) encoder source.
+     * libcbm already computes this normalised AST node-type trigram list
+     * (compute_fingerprint → def->struct_trigrams); serializing it here is what
+     * lets the shadow importer measure S1 on a real corpus instead of dropping
+     * ASTRO_GUARD_AUTO_SLOT_UNMEASURED for every symbol (#374). The append is
+     * atomic, so a body whose trigram list would overflow the buffer emits no
+     * "st" and stays honestly unmeasured rather than truncated. */
+    append_json_string(buf, bufsize, &pos, "st", def->struct_trigrams);
+
+    /* API callees — panel S4 (api_callees guard slot) encoder source (#374). */
+    append_json_string(buf, bufsize, &pos, "callees", callees);
+
     if (pos < bufsize - SKIP_ONE) {
         buf[pos] = '}';
         buf[pos + SKIP_ONE] = '\0';
     }
 }
 
+/* Aggregate the api-callee list for one definition. See the declaration in
+ * pipeline_internal.h for the contract. Deduplicates by callee name and counts
+ * occurrences; the emitted order is dedup-insertion order (the S4 encoder hashes
+ * terms into a sparse sum, so order does not affect the resulting vector). */
+int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn, char *buf,
+                                   int bufsize) {
+    if (!buf || bufsize < 1) {
+        return 0;
+    }
+    buf[0] = '\0';
+    if (!calls || !calls->items || calls->count <= 0 || !def_qn || !def_qn[0]) {
+        return 0;
+    }
+    enum { CBM_DEF_CALLEE_MAX = 512 };
+    const char *names[CBM_DEF_CALLEE_MAX];
+    int counts[CBM_DEF_CALLEE_MAX];
+    int distinct = 0;
+    for (int i = 0; i < calls->count; i++) {
+        const CBMCall *call = &calls->items[i];
+        if (!call->callee_name || !call->callee_name[0]) {
+            continue;
+        }
+        if (!call->enclosing_func_qn || strcmp(call->enclosing_func_qn, def_qn) != 0) {
+            continue;
+        }
+        int found = -1;
+        for (int j = 0; j < distinct; j++) {
+            if (strcmp(names[j], call->callee_name) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found >= 0) {
+            counts[found]++;
+        } else if (distinct < CBM_DEF_CALLEE_MAX) {
+            names[distinct] = call->callee_name;
+            counts[distinct] = 1;
+            distinct++;
+        }
+    }
+    int pos = 0;
+    for (int j = 0; j < distinct; j++) {
+        char rec[CBM_SZ_512];
+        int len = snprintf(rec, sizeof(rec), "%s\t%d\n", names[j], counts[j]);
+        if (len <= 0 || (size_t)len >= sizeof(rec)) {
+            continue; /* pathologically long callee text — skip this record */
+        }
+        if (pos + len >= bufsize) {
+            break; /* deterministic record-boundary truncation */
+        }
+        memcpy(buf + pos, rec, (size_t)len);
+        pos += len;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMCallArray *calls,
+                        const CBMDefinition *def, const char *rel) {
     if (!def->qualified_name || !def->name) {
         return;
     }
-    char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    /* CBM_SZ_32K holds the existing props plus the up-to-16K struct-trigram list
+     * (S1) and the api-callee list (S4); append_json_string drops any field that
+     * still would not fit, so the JSON stays valid and the symbol stays honestly
+     * unmeasured for that slot rather than truncated (#374). */
+    char props[CBM_SZ_32K];
+    char callees[CBM_SZ_8K];
+    cbm_pipeline_build_def_callees(calls, def->qualified_name, callees, (int)sizeof(callees));
+    build_def_props(props, sizeof(props), def, callees);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
@@ -604,7 +683,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->calls, &result->defs.items[d], rel);
             total_defs++;
         }
 

@@ -342,6 +342,87 @@ TEST(pipeline_row_sink_receives_dump_rows) {
     PASS();
 }
 
+/* #374: capture the properties_json of a specific Function node so the test can
+ * confirm libcbm serializes the S1 struct-trigram ("st") and S4 api-callee
+ * ("callees") encoder sources for a symbol with real structure and calls. */
+typedef struct {
+    const char *target_name;
+    char props[8192];
+    int found;
+} pipeline_props_capture_t;
+
+static int pipeline_props_capture_sink(const cbm_gbuf_row_node_t *node, void *ctx) {
+    pipeline_props_capture_t *cap = (pipeline_props_capture_t *)ctx;
+    if (!node || !cap) {
+        return -1;
+    }
+    if (node->name && node->properties_json && strcmp(node->name, cap->target_name) == 0) {
+        snprintf(cap->props, sizeof(cap->props), "%s", node->properties_json);
+        cap->found = 1;
+    }
+    return 0;
+}
+
+static int pipeline_props_edge_noop(const cbm_gbuf_row_edge_t *edge, void *ctx) {
+    (void)edge;
+    (void)ctx;
+    return 0;
+}
+
+/* #374: a structurally-rich, call-bearing function must expose measured S1
+ * (struct trigrams) and S4 (api callees) panel sources through its persisted node
+ * properties, so generated-mode guard calibration can measure them on a real
+ * corpus instead of dropping ASTRO_GUARD_AUTO_SLOT_UNMEASURED for every symbol. */
+TEST(pipeline_def_props_carry_struct_trigrams_and_callees) {
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    if (!cbm_mkdtemp(g_tmpdir)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/proc.go", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write fixture");
+    }
+    /* Process() has control flow (for/if + binary expressions → struct trigrams)
+     * and two distinct callees (compute/validate → api callees). */
+    fprintf(f, "package main\n\n"
+               "func Process(items []int) int {\n"
+               "\ttotal := 0\n"
+               "\tfor i := 0; i < len(items); i++ {\n"
+               "\t\tif items[i] > 0 {\n"
+               "\t\t\ttotal = total + compute(items[i])\n"
+               "\t\t}\n"
+               "\t}\n"
+               "\treturn validate(total)\n"
+               "}\n\n"
+               "func compute(x int) int { return x * 2 }\n\n"
+               "func validate(x int) int { return x }\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/props.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    pipeline_props_capture_t cap = {.target_name = "Process", .found = 0};
+    cbm_pipeline_set_sink(p, pipeline_props_capture_sink, pipeline_props_edge_noop, &cap);
+
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cap.found, 1);
+    /* S1 source: the normalised struct-trigram list. */
+    ASSERT_TRUE(strstr(cap.props, "\"st\":\"") != NULL);
+    /* S4 source: the api-callee list, carrying both distinct callees. */
+    ASSERT_TRUE(strstr(cap.props, "\"callees\":\"") != NULL);
+    ASSERT_TRUE(strstr(cap.props, "compute") != NULL);
+    ASSERT_TRUE(strstr(cap.props, "validate") != NULL);
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 TEST(pipeline_row_sink_failure_aborts_run_before_sqlite_open) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -6806,6 +6887,7 @@ SUITE(pipeline) {
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_row_sink_receives_dump_rows);
+    RUN_TEST(pipeline_def_props_carry_struct_trigrams_and_callees);
     RUN_TEST(pipeline_row_sink_failure_aborts_run_before_sqlite_open);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
