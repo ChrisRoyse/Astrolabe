@@ -19,12 +19,34 @@ struct KernelDirtyScc {
 #[cfg(test)]
 type RawCfRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+// Self-reading convenience wrapper: production always passes the shared
+// post-import snapshot (#23), so only tests exercise this shape. Gated to test
+// builds rather than shipped as dead code (invariant 6).
+#[cfg(test)]
 pub(crate) fn persist_delta_invalidations<C>(
     vault: &AsterVault<C>,
     project: &str,
     import_changed: bool,
     delta: Option<&WeaveDelta>,
     weave: &Value,
+) -> Result<Value, DynError>
+where
+    C: Clock,
+{
+    persist_delta_invalidations_with_snapshot(vault, project, import_changed, delta, weave, None)
+}
+
+/// [`persist_delta_invalidations`] with an optional caller-preloaded graph
+/// snapshot (#23). The invalidation lane only consumes node/edge rows, which the
+/// weave phase leaves untouched, so a snapshot read for the delta derivation or
+/// the weave remains valid here; `None` preserves the self-reading behavior.
+pub(crate) fn persist_delta_invalidations_with_snapshot<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    import_changed: bool,
+    delta: Option<&WeaveDelta>,
+    weave: &Value,
+    preloaded_snapshot: Option<&CbmGraphSnapshot>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -39,7 +61,13 @@ where
     }
 
     let t_snapshot = std::time::Instant::now();
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let owned_snapshot = match preloaded_snapshot {
+        Some(_) => None,
+        None => Some(astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?),
+    };
+    let snapshot = preloaded_snapshot
+        .or(owned_snapshot.as_ref())
+        .expect("invalidation snapshot present by construction");
     let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let live_symbols = snapshot
         .nodes
@@ -69,7 +97,7 @@ where
 
     let snapshot_seq = vault.snapshot();
     let t_kernel_sccs = std::time::Instant::now();
-    let kernel_sccs = kernel_dirty_sccs(&snapshot, &dirty_symbols, &removed_symbols);
+    let kernel_sccs = kernel_dirty_sccs(snapshot, &dirty_symbols, &removed_symbols);
     let ms_kernel_sccs = t_kernel_sccs.elapsed().as_millis() as u64;
     let t_guard_reads = std::time::Instant::now();
     let mut rows = Vec::new();
@@ -355,20 +383,26 @@ fn kernel_dirty_sccs(
     dirty_symbols: &BTreeSet<String>,
     removed_symbols: &BTreeSet<String>,
 ) -> Vec<KernelDirtyScc> {
-    let mut id_to_qn = BTreeMap::<i64, String>::new();
+    // Index-based Kosaraju over the live graph (#23): the previous String-keyed
+    // BTreeMap adjacency cloned qualified names per edge and per traversal step
+    // (~1s at 50k nodes / 500k edges). Components are traversal-order-invariant
+    // sets, member lists are sorted before hashing, and the final list is
+    // sorted by id, so the output is byte-identical to the map-based shape.
+    let mut id_to_qn = BTreeMap::<i64, &str>::new();
     for node in snapshot.nodes.iter().filter(|node| !node.structural) {
-        id_to_qn.insert(node.source_node_id, node.qualified_name.clone());
+        id_to_qn.insert(node.source_node_id, node.qualified_name.as_str());
     }
-    let mut adjacency = id_to_qn
-        .values()
-        .cloned()
-        .map(|qualified_name| (qualified_name, BTreeSet::<String>::new()))
+    // Deterministic node indexing by qualified name (BTreeSet iteration order).
+    let qns = id_to_qn.values().copied().collect::<BTreeSet<_>>();
+    let qn_list = qns.iter().copied().collect::<Vec<_>>();
+    let qn_index = qn_list
+        .iter()
+        .enumerate()
+        .map(|(index, qn)| (*qn, index))
         .collect::<BTreeMap<_, _>>();
-    let mut reverse = adjacency
-        .keys()
-        .cloned()
-        .map(|qualified_name| (qualified_name, BTreeSet::<String>::new()))
-        .collect::<BTreeMap<_, _>>();
+    let node_count = qn_list.len();
+    let mut adjacency = vec![Vec::<u32>::new(); node_count];
+    let mut reverse = vec![Vec::<u32>::new(); node_count];
     for edge in &snapshot.edges {
         let (Some(source), Some(target)) = (
             id_to_qn.get(&edge.source_node_id),
@@ -379,71 +413,76 @@ fn kernel_dirty_sccs(
         if source == target {
             continue;
         }
-        if let Some(targets) = adjacency.get_mut(source) {
-            targets.insert(target.clone());
-        }
-        if let Some(sources) = reverse.get_mut(target) {
-            sources.insert(source.clone());
-        }
+        let source = qn_index[source];
+        let target = qn_index[target];
+        adjacency[source].push(target as u32);
+        reverse[target].push(source as u32);
+    }
+    for neighbors in adjacency.iter_mut().chain(reverse.iter_mut()) {
+        neighbors.sort_unstable();
+        neighbors.dedup();
     }
 
-    let mut visited = BTreeSet::<String>::new();
-    let mut order = Vec::<String>::new();
-    for node in adjacency.keys() {
-        if visited.contains(node) {
+    let mut visited = vec![false; node_count];
+    let mut order = Vec::<u32>::with_capacity(node_count);
+    for start in 0..node_count {
+        if visited[start] {
             continue;
         }
-        let mut stack = vec![(node.clone(), false)];
+        let mut stack = vec![(start as u32, false)];
         while let Some((current, expanded)) = stack.pop() {
             if expanded {
                 order.push(current);
                 continue;
             }
-            if !visited.insert(current.clone()) {
+            if visited[current as usize] {
                 continue;
             }
-            stack.push((current.clone(), true));
-            if let Some(neighbors) = adjacency.get(&current) {
-                for neighbor in neighbors.iter().rev() {
-                    if !visited.contains(neighbor) {
-                        stack.push((neighbor.clone(), false));
-                    }
+            visited[current as usize] = true;
+            stack.push((current, true));
+            for neighbor in adjacency[current as usize].iter().rev() {
+                if !visited[*neighbor as usize] {
+                    stack.push((*neighbor, false));
                 }
             }
         }
     }
 
-    let live_dirty = dirty_symbols
+    let live_dirty_indices = dirty_symbols
         .iter()
-        .filter(|symbol| adjacency.contains_key(*symbol))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut assigned = BTreeSet::<String>::new();
+        .filter_map(|symbol| qn_index.get(symbol.as_str()).map(|index| *index as u32))
+        .collect::<BTreeSet<u32>>();
+    let mut assigned = vec![false; node_count];
     let mut sccs = Vec::<KernelDirtyScc>::new();
     for node in order.into_iter().rev() {
-        if !assigned.insert(node.clone()) {
+        if assigned[node as usize] {
             continue;
         }
-        let mut component = BTreeSet::new();
+        assigned[node as usize] = true;
+        let mut component = Vec::<u32>::new();
         let mut stack = vec![node];
         while let Some(current) = stack.pop() {
-            component.insert(current.clone());
-            if let Some(neighbors) = reverse.get(&current) {
-                for neighbor in neighbors {
-                    if assigned.insert(neighbor.clone()) {
-                        stack.push(neighbor.clone());
-                    }
+            component.push(current);
+            for neighbor in &reverse[current as usize] {
+                if !assigned[*neighbor as usize] {
+                    assigned[*neighbor as usize] = true;
+                    stack.push(*neighbor);
                 }
             }
         }
+        component.sort_unstable();
         let dirty_members = component
-            .intersection(&live_dirty)
-            .cloned()
+            .iter()
+            .filter(|index| live_dirty_indices.contains(*index))
+            .map(|index| qn_list[*index as usize].to_string())
             .collect::<Vec<_>>();
         if dirty_members.is_empty() {
             continue;
         }
-        let members = component.iter().cloned().collect::<Vec<_>>();
+        let members = component
+            .iter()
+            .map(|index| qn_list[*index as usize].to_string())
+            .collect::<Vec<_>>();
         let id = dirty_scc_id(&members, &[]);
         sccs.push(KernelDirtyScc {
             id,
@@ -454,7 +493,9 @@ fn kernel_dirty_sccs(
     }
 
     for removed in removed_symbols {
-        if adjacency.contains_key(removed) && live_dirty.contains(removed) {
+        if let Some(index) = qn_index.get(removed.as_str())
+            && live_dirty_indices.contains(&(*index as u32))
+        {
             continue;
         }
         let members = vec![removed.clone()];

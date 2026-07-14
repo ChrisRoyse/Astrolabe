@@ -159,6 +159,7 @@ where
     let batch = params.drain_batch_rows;
     let project = options.project.as_str();
 
+    let drain_start = std::time::Instant::now();
     let mut nodes: Vec<CbmGraphNode> = Vec::new();
     let mut edges: Vec<CbmGraphEdge> = Vec::new();
     let mut drain_batches: usize = 0;
@@ -214,18 +215,20 @@ where
         token_vectors: Vec::new(),
     };
 
+    let drain_ms = drain_start.elapsed().as_millis() as u64;
     // Phase B: single ledger-paired persistence through the shared direct path.
     // Exactly one write batch, one ledger entry — the invariant the raw-CF byte
     // parity with the SQLite importer depends on. An empty stream reaches here with
     // zero nodes and is refused by the shared path's >=1-node contract, so an empty
     // import never records a successful-but-empty ledger entry.
-    let import = import_cbm_graph_snapshot_to_vault_direct(
+    let mut import = import_cbm_graph_snapshot_to_vault_direct(
         &snapshot,
         source_fingerprint_sha256,
         vault,
         runtime,
         options,
     )?;
+    import.timing_ms.0.insert(0, ("stream_drain", drain_ms));
 
     Ok(RowSinkStreamReport {
         import,

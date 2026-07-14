@@ -1065,7 +1065,16 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         Some(repo) => astrolabe_anchors::archaeology::git_head(repo)?,
         None => format!("shadow-import-v1:{project}"),
     };
+    // Measured host parallelism, not a constant (#23): the corpus-wide import
+    // passes (symbol preparation, row encode/reconcile, readback verification)
+    // are worker-count-invariant in results, and one worker left the whole
+    // delta path serial on many-core hosts.
     let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
+        .with_workers(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        )
         .with_available_slots(shadow_available_slots())
         .with_series_registry(repo.is_some());
     // A fresh vault carries no `astrolabe:cbm-project:v1` row yet: the first import of a
@@ -1112,10 +1121,14 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         || report.graph_rows_written > 0
         || report.edge_rows_written > 0
         || report.series_mutated_rows > 0;
-    let after_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?
+    // Read the post-import snapshot ONCE and share it with the weave and the
+    // invalidation lane below (#23): re-reading the full graph in each phase
+    // tripled the largest fixed cost of the delta path at M scale.
+    let after_snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
+    let after_cx_by_qn = after_snapshot
         .nodes
-        .into_iter()
-        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name.clone(), cx_id)))
         .collect::<BTreeMap<_, _>>();
     let new_cx_ids = report
         .new_cx_id_values
@@ -1139,9 +1152,21 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             .map(|(_, cx_id)| *cx_id)
             .collect(),
     });
-    let mut weave = run_live_weave(&vault, project, import_changed, delta.as_ref())?;
-    let invalidations =
-        persist_delta_invalidations(&vault, project, import_changed, delta.as_ref(), &weave)?;
+    let mut weave = run_live_weave_with_snapshot(
+        &vault,
+        project,
+        import_changed,
+        delta.as_ref(),
+        Some(&after_snapshot),
+    )?;
+    let invalidations = persist_delta_invalidations_with_snapshot(
+        &vault,
+        project,
+        import_changed,
+        delta.as_ref(),
+        &weave,
+        Some(&after_snapshot),
+    )?;
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
     }
@@ -1218,11 +1243,35 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     })
 }
 
+// Self-reading convenience wrapper: production always passes the shared
+// post-import snapshot (#23), so only tests exercise this shape. Gated to test
+// builds rather than shipped as dead code (invariant 6).
+#[cfg(test)]
 pub(crate) fn run_live_weave<C>(
     vault: &AsterVault<C>,
     project: &str,
     import_changed: bool,
     delta: Option<&WeaveDelta>,
+) -> Result<Value, DynError>
+where
+    C: Clock,
+{
+    run_live_weave_with_snapshot(vault, project, import_changed, delta, None)
+}
+
+/// [`run_live_weave`] with an optional caller-preloaded graph snapshot (#23).
+///
+/// A shadow import already reads the full CBM graph snapshot to derive the
+/// weave delta; re-reading it here doubled the largest fixed cost of the delta
+/// path at M scale. `snapshot` must be the current live graph for `project`
+/// (read at a seq with no intervening node/edge mutation); `None` preserves the
+/// self-reading behavior.
+pub(crate) fn run_live_weave_with_snapshot<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+    import_changed: bool,
+    delta: Option<&WeaveDelta>,
+    snapshot: Option<&CbmGraphSnapshot>,
 ) -> Result<Value, DynError>
 where
     C: Clock,
@@ -1238,7 +1287,13 @@ where
     }
 
     let t_snapshot = std::time::Instant::now();
-    let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?;
+    let owned_snapshot = match snapshot {
+        Some(_) => None,
+        None => Some(astrolabe_ingest::read_cbm_graph_snapshot(vault, project)?),
+    };
+    let snapshot = snapshot
+        .or(owned_snapshot.as_ref())
+        .expect("weave snapshot present by construction");
     let ms_snapshot = t_snapshot.elapsed().as_millis() as u64;
     let at_seq = vault.snapshot();
     let t_slot_load = std::time::Instant::now();
@@ -1257,51 +1312,128 @@ where
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut nodes = Vec::new();
+    // One range scan per slot CF instead of one MVCC point read per (node, slot):
+    // the slot CFs are keyed by CxId, so a full-CF scan yields every row this loop
+    // previously fetched individually (~700k point reads at M scale).
+    let mut slot_rows_by_slot = BTreeMap::<SlotId, BTreeMap<Vec<u8>, Vec<u8>>>::new();
+    for slot in &slots {
+        slot_rows_by_slot.insert(
+            *slot,
+            vault
+                .scan_cf_at(at_seq, ColumnFamily::slot(*slot))?
+                .into_iter()
+                .collect(),
+        );
+    }
+    let live_nodes = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !node.structural)
+        .collect::<Vec<_>>();
+    // Per-node slot decode is independent, so chunking the node list over
+    // measured host parallelism cannot change results (#23); chunk outputs are
+    // concatenated in input order and the duplicate check runs sequentially
+    // below, exactly as before.
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(live_nodes.len())
+        .max(1);
+    let chunk_size = live_nodes.len().div_ceil(workers);
+    struct SlotChunk {
+        nodes: Vec<(SimilarityNode, calyx_core::CxId)>,
+        absent: usize,
+        missing: usize,
+    }
+    let chunk_results: Vec<Result<SlotChunk, DynError>> = std::thread::scope(|scope| {
+        let slots = &slots;
+        let slot_rows_by_slot = &slot_rows_by_slot;
+        live_nodes
+            .chunks(chunk_size.max(1))
+            .map(|chunk| {
+                scope.spawn(move || -> Result<SlotChunk, DynError> {
+                    let mut built = Vec::with_capacity(chunk.len());
+                    let mut absent = 0usize;
+                    let mut missing = 0usize;
+                    for node in chunk {
+                        let cx_id = node.cx_id.ok_or_else(|| {
+                            format!(
+                                "live non-structural graph node {:?} has no CxId",
+                                node.qualified_name
+                            )
+                        })?;
+                        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
+                        for slot in slots {
+                            let Some(bytes) = slot_rows_by_slot
+                                .get(slot)
+                                .and_then(|rows| rows.get(slot_key(cx_id).as_slice()))
+                            else {
+                                missing += 1;
+                                continue;
+                            };
+                            let vector = calyx_aster::vault::encode::decode_slot_vector(bytes)?;
+                            if matches!(vector, SlotVector::Absent { .. }) {
+                                absent += 1;
+                            }
+                            similarity_node.slots.insert(*slot, vector);
+                        }
+                        built.push((similarity_node, cx_id));
+                    }
+                    Ok(SlotChunk {
+                        nodes: built,
+                        absent,
+                        missing,
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("weave slot worker panicked".into()))
+            })
+            .collect()
+    });
+    let mut nodes = Vec::with_capacity(live_nodes.len());
     let mut cx_ids = BTreeMap::new();
     let mut absent_slot_rows = 0usize;
     let mut missing_slot_rows = 0usize;
-    for node in snapshot.nodes.into_iter().filter(|node| !node.structural) {
-        let cx_id = node.cx_id.ok_or_else(|| {
-            format!(
-                "live non-structural graph node {:?} has no CxId",
-                node.qualified_name
-            )
-        })?;
-        let mut similarity_node = SimilarityNode::new(node.qualified_name.clone());
-        for slot in &slots {
-            let Some(bytes) =
-                vault.read_cf_at(at_seq, ColumnFamily::slot(*slot), &slot_key(cx_id))?
-            else {
-                missing_slot_rows += 1;
-                continue;
-            };
-            let vector = calyx_aster::vault::encode::decode_slot_vector(&bytes)?;
-            if matches!(vector, SlotVector::Absent { .. }) {
-                absent_slot_rows += 1;
+    for chunk in chunk_results {
+        let chunk = chunk?;
+        absent_slot_rows += chunk.absent;
+        missing_slot_rows += chunk.missing;
+        for (similarity_node, cx_id) in chunk.nodes {
+            if cx_ids
+                .insert(similarity_node.qualified_name.clone(), cx_id)
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate live qualified name {:?} while planning weave",
+                    similarity_node.qualified_name
+                )
+                .into());
             }
-            similarity_node.slots.insert(*slot, vector);
+            nodes.push(similarity_node);
         }
-        if cx_ids.insert(node.qualified_name.clone(), cx_id).is_some() {
-            return Err(format!(
-                "duplicate live qualified name {:?} while planning weave",
-                node.qualified_name
-            )
-            .into());
-        }
-        nodes.push(similarity_node);
     }
     let ms_slot_load = t_slot_load.elapsed().as_millis() as u64;
 
     let t_similarity = std::time::Instant::now();
+    let mut ms_sim_read_rows = 0u64;
+    let mut ms_sim_expand = 0u64;
     let similarity_config = SimilarityPlannerConfig::default();
     let (similarity_plan, similarity_region) = match delta {
         Some(delta) => {
+            let t_read_rows = std::time::Instant::now();
             let persisted = read_similarity_edge_rows(vault)?;
+            ms_sim_read_rows = t_read_rows.elapsed().as_millis() as u64;
             let mut changed = delta.dirty_qualified_names.clone();
             changed.extend(delta.removed_qualified_names.iter().cloned());
+            let t_expand = std::time::Instant::now();
             let region =
                 expand_similarity_dirty_region(&nodes, &changed, &persisted, &similarity_config);
+            ms_sim_expand = t_expand.elapsed().as_millis() as u64;
             let region_nodes = nodes
                 .iter()
                 .filter(|node| region.contains(&node.qualified_name))
@@ -1314,8 +1446,12 @@ where
         }
         None => (plan_similarity_edges(&nodes, &similarity_config)?, None),
     };
+    let ms_sim_plan = (t_similarity.elapsed().as_millis() as u64)
+        .saturating_sub(ms_sim_read_rows)
+        .saturating_sub(ms_sim_expand);
     let vector_skip_count = similarity_plan.skips.vector_skips.len();
     let family_opt_out_count = similarity_plan.skips.family_opt_outs.len();
+    let t_sim_persist = std::time::Instant::now();
     let similarity = match (delta, similarity_region.as_ref()) {
         (Some(delta), Some(region)) => persist_similarity_edges_delta(
             vault,
@@ -1326,6 +1462,7 @@ where
         )?,
         _ => persist_similarity_edges(vault, &similarity_plan, "astrolabe-shadow-weave")?,
     };
+    let ms_sim_persist = t_sim_persist.elapsed().as_millis() as u64;
     let ms_similarity = t_similarity.elapsed().as_millis() as u64;
     let t_xterm = std::time::Instant::now();
     let xterm_plan = match delta {
@@ -1362,6 +1499,16 @@ where
             "snapshot_read": ms_snapshot,
             "slot_load": ms_slot_load,
             "similarity": ms_similarity,
+            "similarity_read_rows": ms_sim_read_rows,
+            "similarity_expand_region": ms_sim_expand,
+            "similarity_plan": ms_sim_plan,
+            "similarity_persist": ms_sim_persist,
+            "similarity_persist_internal": similarity
+                .timing_ms
+                .0
+                .iter()
+                .map(|(label, ms)| ((*label).to_string(), json!(ms)))
+                .collect::<serde_json::Map<_, _>>(),
             "xterm": ms_xterm,
         },
         "trust": "verified",

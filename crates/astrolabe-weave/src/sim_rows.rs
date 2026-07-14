@@ -130,7 +130,25 @@ pub struct SimilarityPersistReport {
     /// Unforgeable full-readback witness when Graph rows changed.
     /// A ledger-only no-delta replay carries labeled absence (`None`).
     pub fsv: Option<FsvAck>,
+    /// Per-phase wall-clock millis of this persist (#23 latency telemetry):
+    /// stable labels, measured values.
+    pub timing_ms: PhaseTimings,
 }
+
+/// Wall-clock phase telemetry (#23).
+///
+/// Deliberately equality-neutral so report-level equality assertions stay
+/// claims about persisted state, never about wall-clock.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseTimings(pub Vec<(&'static str, u64)>);
+
+impl PartialEq for PhaseTimings {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PhaseTimings {}
 
 /// Builds the canonical Graph CF key for one SIM_* edge.
 pub fn sim_edge_graph_key(family: SimilarityFamily, source_qn: &str, target_qn: &str) -> Vec<u8> {
@@ -192,6 +210,8 @@ fn persist_similarity_edges_owned<C>(
 where
     C: Clock,
 {
+    let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
+    let mut phase_start = std::time::Instant::now();
     let dump = similarity_edge_dump_bytes(&plan.edges);
     let edge_dump_hash = hex_lower_bytes(blake3::hash(&dump).as_bytes());
 
@@ -212,6 +232,8 @@ where
         *family_counts.entry(edge.family.wire_name()).or_default() += 1;
     }
 
+    timing_ms.push(("encode_plan", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
     let snapshot = vault.snapshot();
     let mut existing: BTreeMap<Vec<u8>, Vec<u8>> = vault
         .scan_cf_range_at(
@@ -221,6 +243,8 @@ where
         )?
         .into_iter()
         .collect();
+    timing_ms.push(("scan_existing", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
     if let Some((owned_sources, removed)) = ownership {
         let mut owned_existing = BTreeMap::new();
         for (key, value) in existing {
@@ -283,6 +307,8 @@ where
             fsv_plan.push_content(*cf, key.clone(), value);
         }
     }
+    timing_ms.push(("reconcile", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
     let (ledger_ref, commit_seq) = if batch.is_empty() {
         (
             vault.append_ledger_entry(EntryKind::Ingest, subject, payload, actor)?,
@@ -298,10 +324,15 @@ where
         )?;
         (ledger_ref_at_commit(vault, commit_seq)?, Some(commit_seq))
     };
+    timing_ms.push(("commit", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
     vault.flush()?;
+    timing_ms.push(("flush", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
     let fsv = commit_seq
         .map(|commit_seq| fsv_plan.verify_committed(vault, commit_seq))
         .transpose()?;
+    timing_ms.push(("fsv_readback", phase_start.elapsed().as_millis() as u64));
 
     Ok(SimilarityPersistReport {
         edge_count: plan.edges.len(),
@@ -311,6 +342,7 @@ where
         edge_dump_hash,
         ledger_ref,
         fsv,
+        timing_ms: PhaseTimings(timing_ms),
     })
 }
 

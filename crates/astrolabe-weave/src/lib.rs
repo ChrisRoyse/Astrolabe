@@ -1862,9 +1862,18 @@ fn plan_eager_cross_terms_selected(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
-    for kind in EagerAgreementKind::ALL {
+    // Each kind's value pass is independent of the others, so computing the six
+    // kinds on scoped threads cannot change any value (#23); rows are still
+    // appended in `EagerAgreementKind::ALL` order and sorted below, keeping the
+    // plan byte-identical to the sequential shape.
+    let selected = &selected_indices;
+    let values_by_kind = std::thread::scope(|scope| {
+        EagerAgreementKind::ALL
+            .map(|kind| scope.spawn(move || cross_term_values(nodes, kind, selected)))
+            .map(|handle| handle.join().expect("cross-term kind worker panicked"))
+    });
+    for (kind, values) in EagerAgreementKind::ALL.into_iter().zip(values_by_kind) {
         let (left_slot, right_slot) = kind.slots();
-        let values = cross_term_values(nodes, kind, &selected_indices);
         for (&node_index, value) in selected_indices.iter().zip(values) {
             let node = &nodes[node_index];
             rows.push(EagerCrossTermRow {

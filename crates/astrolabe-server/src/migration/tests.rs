@@ -8280,7 +8280,15 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
     .unwrap();
 
     let import_options = |commit: &str| {
+        // Mirror the production shadow-import options exactly (#23): the real
+        // wrapper supplies measured host parallelism for the worker-count-
+        // invariant import passes.
         SqliteImportOptions::new(M_SCALE_PROJECT, commit, DEFAULT_PANEL_VERSION)
+            .with_workers(
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(1),
+            )
             .with_available_slots(shadow_available_slots())
             .with_series_registry(true)
     };
@@ -8296,6 +8304,12 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
     assert_eq!(initial.report.sqlite_nodes, M_SCALE_SYMBOL_COUNT);
     assert_eq!(initial.report.sqlite_edges, M_SCALE_EDGE_COUNT);
     assert_eq!(initial.report.new_cx_ids, M_SCALE_SYMBOL_COUNT);
+    // Flush the initial import's WAL debt before the measured window, exactly
+    // as production does: a first `index_repository(calyx=shadow)` call runs
+    // the full weave whose persist flushes its own WAL. Without this, the
+    // measured delta's first flush pays for durably writing the entire initial
+    // 50k-symbol import — a first-import cost, not a delta cost (#23).
+    vault.flush().unwrap();
     let before_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT)
         .unwrap()
         .nodes
@@ -8321,11 +8335,12 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
     .unwrap();
     let phase_import_ms = phase_import_start.elapsed().as_millis() as u64;
     let phase_after_snapshot_start = Instant::now();
-    let after_cx_by_qn = astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT)
-        .unwrap()
+    let after_snapshot =
+        astrolabe_ingest::read_cbm_graph_snapshot(&vault, M_SCALE_PROJECT).unwrap();
+    let after_cx_by_qn = after_snapshot
         .nodes
-        .into_iter()
-        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name, cx_id)))
+        .iter()
+        .filter_map(|node| node.cx_id.map(|cx_id| (node.qualified_name.clone(), cx_id)))
         .collect::<BTreeMap<_, _>>();
     let phase_after_snapshot_ms = phase_after_snapshot_start.elapsed().as_millis() as u64;
     let phase_delta_build_start = Instant::now();
@@ -8366,13 +8381,27 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
     let phase_delta_build_ms = phase_delta_build_start.elapsed().as_millis() as u64;
 
     let phase_weave_start = Instant::now();
-    let weave = run_live_weave(&vault, M_SCALE_PROJECT, true, Some(&delta)).unwrap();
+    let weave = run_live_weave_with_snapshot(
+        &vault,
+        M_SCALE_PROJECT,
+        true,
+        Some(&delta),
+        Some(&after_snapshot),
+    )
+    .unwrap();
     let phase_weave_ms = phase_weave_start.elapsed().as_millis() as u64;
     assert_eq!(weave["status"], "reconciled");
     assert!(weave["eager_cross_terms"]["rows_written"].as_u64().unwrap() > 0);
     let phase_invalidations_start = Instant::now();
-    let invalidations =
-        persist_delta_invalidations(&vault, M_SCALE_PROJECT, true, Some(&delta), &weave).unwrap();
+    let invalidations = persist_delta_invalidations_with_snapshot(
+        &vault,
+        M_SCALE_PROJECT,
+        true,
+        Some(&delta),
+        &weave,
+        Some(&after_snapshot),
+    )
+    .unwrap();
     let phase_invalidations_ms = phase_invalidations_start.elapsed().as_millis() as u64;
     assert_eq!(invalidations["status"], "dirty");
     let phase_schedule_start = Instant::now();
@@ -8443,6 +8472,13 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
             "verify_chain": "intact",
             "phase_breakdown_ms": {
                 "import": phase_import_ms,
+                "import_internal": changed
+                    .report
+                    .timing_ms
+                    .0
+                    .iter()
+                    .map(|(label, ms)| ((*label).to_string(), json!(ms)))
+                    .collect::<serde_json::Map<_, _>>(),
                 "after_snapshot": phase_after_snapshot_ms,
                 "delta_build": phase_delta_build_ms,
                 "weave": phase_weave_ms,

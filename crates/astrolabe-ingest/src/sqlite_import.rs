@@ -383,7 +383,29 @@ pub struct SqliteImportReport {
     /// every reused constellation in the full CBM snapshot.
     #[serde(default)]
     pub new_cx_id_values: Vec<CxId>,
+    /// Per-phase wall-clock milliseconds of this import run (#23 latency
+    /// telemetry): stable labels, measured values — not knobs. Empty when the
+    /// report was deserialized from persisted state.
+    #[serde(default, skip)]
+    pub timing_ms: PhaseTimings,
 }
+
+/// Wall-clock phase telemetry (#23).
+///
+/// Deliberately equality-neutral: two otherwise-identical reports must compare
+/// equal regardless of how long their phases took, so report-level byte-parity
+/// FSV assertions (e.g. direct row-sink vs SQLite import) stay claims about
+/// persisted state, never about wall-clock.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseTimings(pub Vec<(&'static str, u64)>);
+
+impl PartialEq for PhaseTimings {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PhaseTimings {}
 
 /// Deterministic location and identity of one admitted historical symbol.
 ///
@@ -591,6 +613,8 @@ struct PreparedBatch {
     structural_only: usize,
     sqlite_edges: usize,
     edge_skips: EdgeSkipCounters,
+    /// Per-phase wall-clock millis of batch preparation (#23 latency telemetry).
+    timing_ms: Vec<(&'static str, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -878,7 +902,27 @@ where
         .filter(|node| node.node_vector.is_some())
         .count();
     let sqlite_nodes = input.nodes.len();
+    // #23 latency telemetry: stable-labeled per-phase millis, surfaced through
+    // `SqliteImportReport::timing_ms` so M-scale FSV evidence can attribute the
+    // import cost without external profilers.
+    let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
+    let mut phase_start = std::time::Instant::now();
     let extracted = extract_nodes(input.nodes)?;
+    timing_ms.push(("extract_nodes", phase_start.elapsed().as_millis() as u64));
+    phase_start = std::time::Instant::now();
+    // The one shared pre-commit Graph CF scan (#23). Every pre-commit
+    // reconciliation pass (reuse, change derivation, stale detection) reads
+    // this map instead of issuing per-row MVCC point reads or re-scanning the
+    // CF once per pass.
+    let existing_graph: BTreeMap<Vec<u8>, Vec<u8>> = vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Graph)?
+        .into_iter()
+        .collect();
+    timing_ms.push((
+        "scan_existing_graph",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     // Hand ownership of the extracted node graph to `prepare_batch` (moved, not borrowed) so the
     // full `Vec<ExtractedNode>` does not stay alive in this frame alongside the prepared
     // constellations and serialized graph rows. Holding raw -> extracted -> prepared -> serialized
@@ -891,7 +935,11 @@ where
         input.edges,
         input.metadata,
         input.sqlite_fingerprint,
+        &existing_graph,
     )?;
+    timing_ms.push(("prepare_batch", phase_start.elapsed().as_millis() as u64));
+    timing_ms.extend(prepared.timing_ms.iter().copied());
+    phase_start = std::time::Instant::now();
 
     let before_snapshot = vault.latest_seq();
     let mut new_cx_ids = 0;
@@ -916,9 +964,25 @@ where
         .map(|prepared| prepared.identity.cx_id)
         .collect::<Vec<_>>();
     let mut quantization = quantization_gate_report(options, &prepared);
-    verify_preexisting_constellations(vault, before_snapshot, &prepared)?;
-    let (planned_graph_rows_written, planned_edge_rows_written) =
-        count_changed_graph_rows(vault, before_snapshot, &prepared, &options.project)?;
+    verify_preexisting_constellations(vault, before_snapshot, &prepared, options.workers)?;
+    timing_ms.push((
+        "verify_preexisting",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
+    let changes = derive_graph_row_changes(
+        vault,
+        before_snapshot,
+        &prepared,
+        &options.project,
+        &existing_graph,
+        options.workers,
+    )?;
+    timing_ms.push((
+        "derive_graph_changes",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     let payload = ingest_ledger_payload(
         input.sqlite_fingerprint,
         options,
@@ -928,8 +992,8 @@ where
             sqlite_node_vectors,
             new_cx_ids,
             reused_cx_ids,
-            graph_rows_written: planned_graph_rows_written,
-            edge_rows_written: planned_edge_rows_written,
+            graph_rows_written: changes.graph_rows_written,
+            edge_rows_written: changes.edge_rows_written,
         },
     )?;
     let (ledger_ref, fsv, graph_rows_written, edge_rows_written) = write_import_rows(
@@ -938,9 +1002,25 @@ where
         input.sqlite_fingerprint,
         payload,
         options.quantization_gate.as_ref(),
-        &options.project,
+        &changes,
     )?;
-    let readback = verify_import_readback(vault, &prepared, options.quantization_gate.as_ref())?;
+    timing_ms.push((
+        "write_import_rows",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
+    let readback = verify_import_readback(
+        vault,
+        &prepared,
+        options.quantization_gate.as_ref(),
+        &changes,
+        &existing_graph,
+    )?;
+    timing_ms.push((
+        "verify_import_readback",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     let (series_inputs, series_mutated_rows) = if options.update_series_registry {
         let inputs = prepared
             .constellations
@@ -959,6 +1039,7 @@ where
     } else {
         (0, 0)
     };
+    timing_ms.push(("series_registry", phase_start.elapsed().as_millis() as u64));
     quantization.raw_guard_slot_rows_verified = readback.raw_guard_slot_rows_verified;
     let ledger_rows_after = ledger_row_count(vault)?;
 
@@ -985,6 +1066,7 @@ where
         fsv,
         cx_ids,
         new_cx_id_values,
+        timing_ms: PhaseTimings(timing_ms),
     })
 }
 
@@ -1044,11 +1126,13 @@ where
             snapshot.project, options.project
         )));
     }
+    let convert_start = std::time::Instant::now();
     let raw_metadata = snapshot_metadata_rows(snapshot, options, source_fingerprint_sha256)?;
-    let raw_nodes = snapshot_node_rows(snapshot, &options.project)?;
-    let raw_edges = snapshot_edge_rows(snapshot, &options.project)?;
+    let raw_nodes = snapshot_node_rows(snapshot, &options.project, options.workers)?;
+    let raw_edges = snapshot_edge_rows(snapshot, &options.project, options.workers)?;
+    let convert_ms = convert_start.elapsed().as_millis() as u64;
     let ledger_rows_before = ledger_row_count(vault)?;
-    import_raw_cbm_rows_to_vault(
+    let mut report = import_raw_cbm_rows_to_vault(
         vault,
         runtime,
         options,
@@ -1059,7 +1143,12 @@ where
             sqlite_fingerprint: source_fingerprint_sha256,
             ledger_rows_before,
         },
-    )
+    )?;
+    report
+        .timing_ms
+        .0
+        .insert(0, ("snapshot_row_convert", convert_ms));
+    Ok(report)
 }
 
 /// Admits implicated historical CBM symbols as exact constellations without
@@ -1097,7 +1186,11 @@ where
         )));
     }
 
-    let extracted = extract_nodes(snapshot_node_rows(snapshot, &options.project)?)?;
+    let extracted = extract_nodes(snapshot_node_rows(
+        snapshot,
+        &options.project,
+        options.workers,
+    )?)?;
     let non_structural = extracted
         .into_iter()
         .filter(|node| !node.label.is_structural())
@@ -1642,9 +1735,17 @@ fn snapshot_metadata_rows(
     })
 }
 
-fn snapshot_node_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResult<Vec<RawNodeRow>> {
-    let mut rows = Vec::new();
-    for node in snapshot.nodes.iter().filter(|node| node.project == project) {
+fn snapshot_node_rows(
+    snapshot: &CbmGraphSnapshot,
+    project: &str,
+    workers: usize,
+) -> IngestResult<Vec<RawNodeRow>> {
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.project == project)
+        .collect::<Vec<_>>();
+    let mut rows = parallel_map(nodes, workers, |node| {
         let properties = serde_json::from_str::<Value>(&node.properties_json).map_err(|error| {
             invalid_sqlite(format!(
                 "row-sink node {} properties JSON is invalid: {error}",
@@ -1657,7 +1758,7 @@ fn snapshot_node_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResul
                 node.source_node_id
             )));
         }
-        rows.push(RawNodeRow {
+        Ok(RawNodeRow {
             id: node.source_node_id,
             project: node.project.clone(),
             label: node.label.clone(),
@@ -1669,15 +1770,23 @@ fn snapshot_node_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResul
             properties,
             properties_json: node.properties_json.clone(),
             node_vector: node.node_vector.clone(),
-        });
-    }
+        })
+    })?;
     rows.sort_by_key(|row| row.id);
     Ok(rows)
 }
 
-fn snapshot_edge_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResult<Vec<RawEdgeRow>> {
-    let mut rows = Vec::new();
-    for edge in snapshot.edges.iter().filter(|edge| edge.project == project) {
+fn snapshot_edge_rows(
+    snapshot: &CbmGraphSnapshot,
+    project: &str,
+    workers: usize,
+) -> IngestResult<Vec<RawEdgeRow>> {
+    let edges = snapshot
+        .edges
+        .iter()
+        .filter(|edge| edge.project == project)
+        .collect::<Vec<_>>();
+    let mut rows = parallel_map(edges, workers, |edge| {
         let properties = serde_json::from_str::<Value>(&edge.properties_json).map_err(|error| {
             invalid_sqlite(format!(
                 "row-sink edge {} properties JSON is invalid: {error}",
@@ -1697,7 +1806,7 @@ fn snapshot_edge_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResul
                 edge.sqlite_edge_id, edge.local_name_gen, expected_local_name
             )));
         }
-        rows.push(RawEdgeRow {
+        Ok(RawEdgeRow {
             id: edge.sqlite_edge_id,
             project: edge.project.clone(),
             source_id: edge.source_node_id,
@@ -1706,8 +1815,8 @@ fn snapshot_edge_rows(snapshot: &CbmGraphSnapshot, project: &str) -> IngestResul
             properties,
             properties_json: edge.properties_json.clone(),
             local_name_gen: edge.local_name_gen.clone(),
-        });
-    }
+        })
+    })?;
     rows.sort_by(|left, right| {
         left.source_id
             .cmp(&right.source_id)
@@ -2358,6 +2467,10 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
     Ok(out)
 }
 
+// The eighth argument is the shared pre-commit Graph scan (#23); bundling it
+// into a struct with the five owned batch inputs would only relocate the
+// argument list.
+#[allow(clippy::too_many_arguments)]
 fn prepare_batch<C, R>(
     vault: &AsterVault<C>,
     runtime: &R,
@@ -2366,6 +2479,7 @@ fn prepare_batch<C, R>(
     edges: Vec<RawEdgeRow>,
     metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> IngestResult<PreparedBatch>
 where
     C: Clock,
@@ -2381,23 +2495,48 @@ where
     let (structural, non_structural): (Vec<ExtractedNode>, Vec<ExtractedNode>) = nodes
         .into_iter()
         .partition(|node| node.label.is_structural());
+    let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
+    let mut phase_start = std::time::Instant::now();
     let mut constellations =
         prepare_live_symbols_parallel(vault, runtime, options, &driver, non_structural)?;
     constellations.sort_by_key(|prepared| prepared.node_id);
+    timing_ms.push((
+        "prepare_live_symbols",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
 
     let mut graph_rows = metadata_graph_rows(options, metadata, sqlite_fingerprint)?;
-    for prepared in &constellations {
-        graph_rows.push(node_map_graph_row(options, prepared)?);
-    }
+    let node_map_rows = parallel_map(
+        constellations.iter().collect::<Vec<_>>(),
+        options.workers,
+        |prepared| node_map_graph_row(options, prepared),
+    )?;
+    graph_rows.extend(node_map_rows);
     let structural_only = structural.len();
     for node in &structural {
         graph_rows.push(structural_graph_row(options, node)?);
     }
-    graph_rows.extend(raw_edge_graph_rows(options, &edges, sqlite_fingerprint)?);
-    for (_, value) in &mut graph_rows {
-        append_import_fingerprint(value, sqlite_fingerprint)?;
-    }
-    reuse_semantically_unchanged_graph_rows(vault, &mut graph_rows)?;
+    graph_rows.extend(raw_edge_graph_rows(
+        options,
+        &edges,
+        sqlite_fingerprint,
+        options.workers,
+    )?);
+    parallel_for_each_mut(&mut graph_rows, options.workers, |(_, value)| {
+        append_import_fingerprint(value, sqlite_fingerprint)
+    })?;
+    timing_ms.push((
+        "encode_graph_rows",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
+    reuse_semantically_unchanged_graph_rows(existing_graph, &mut graph_rows, options.workers)?;
+    timing_ms.push((
+        "reuse_unchanged_graph_rows",
+        phase_start.elapsed().as_millis() as u64,
+    ));
+    phase_start = std::time::Instant::now();
     let sqlite_edges = edges.len();
     let structural_node_ids = structural
         .iter()
@@ -2405,6 +2544,10 @@ where
         .collect::<BTreeSet<_>>();
     let (edge_rows, edge_skips) =
         prepare_edge_rows(options, &constellations, &structural_node_ids, edges)?;
+    timing_ms.push((
+        "prepare_edge_rows",
+        phase_start.elapsed().as_millis() as u64,
+    ));
 
     Ok(PreparedBatch {
         constellations,
@@ -2413,26 +2556,111 @@ where
         structural_only,
         sqlite_edges,
         edge_skips,
+        timing_ms,
     })
 }
 
-fn reuse_semantically_unchanged_graph_rows<C>(
-    vault: &AsterVault<C>,
-    rows: &mut [(Vec<u8>, Vec<u8>)],
-) -> IngestResult<()>
+/// Applies `f` to every item of `items` in place, chunked over at most
+/// `workers` scoped threads. Chunk boundaries never change results: `f` is
+/// applied to each item independently and items stay in their slots, so the
+/// outcome is worker-count-invariant (#23).
+fn parallel_for_each_mut<T, F>(items: &mut [T], workers: usize, f: F) -> IngestResult<()>
 where
-    C: Clock,
+    T: Send,
+    F: Fn(&mut T) -> IngestResult<()> + Sync,
 {
-    let snapshot = vault.latest_seq();
-    for (key, planned) in rows {
-        let Some(existing) = vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? else {
-            continue;
-        };
-        if graph_semantic_json(&existing)? == graph_semantic_json(planned)? {
-            *planned = existing;
+    let worker_count = workers.min(items.len()).max(1);
+    if worker_count == 1 {
+        for item in items.iter_mut() {
+            f(item)?;
         }
+        return Ok(());
     }
-    Ok(())
+    let chunk_size = items.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        let f = &f;
+        let handles = items
+            .chunks_mut(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    for item in chunk.iter_mut() {
+                        f(item)?;
+                    }
+                    Ok::<(), IngestError>(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| IngestError::InvalidInput("parallel row worker panicked".into()))??;
+        }
+        Ok(())
+    })
+}
+
+/// Maps `items` through `f`, chunked over at most `workers` scoped threads,
+/// preserving input order in the output regardless of worker count (#23).
+fn parallel_map<T, U, F>(items: Vec<T>, workers: usize, f: F) -> IngestResult<Vec<U>>
+where
+    T: Send,
+    U: Send,
+    F: Fn(T) -> IngestResult<U> + Sync,
+{
+    let worker_count = workers.min(items.len()).max(1);
+    if worker_count == 1 {
+        return items.into_iter().map(f).collect();
+    }
+    let chunk_size = items.len().div_ceil(worker_count);
+    let mut chunks = Vec::with_capacity(worker_count);
+    let mut drain = items.into_iter();
+    loop {
+        let chunk = drain.by_ref().take(chunk_size).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+    thread::scope(|scope| {
+        let f = &f;
+        let handles = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || chunk.into_iter().map(f).collect::<IngestResult<Vec<_>>>())
+            })
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.extend(
+                handle.join().map_err(|_| {
+                    IngestError::InvalidInput("parallel row worker panicked".into())
+                })??,
+            );
+        }
+        Ok(out)
+    })
+}
+
+/// Reverts planned Graph rows to their persisted bytes when only volatile
+/// fields differ, so the import stays byte-idempotent for unchanged symbols.
+///
+/// `existing` is the one shared pre-commit Graph CF scan (#23): the previous
+/// per-row `read_cf_at` did one MVCC point read per planned row (~550k at M
+/// scale) with identical semantics.
+fn reuse_semantically_unchanged_graph_rows(
+    existing: &BTreeMap<Vec<u8>, Vec<u8>>,
+    rows: &mut [(Vec<u8>, Vec<u8>)],
+    workers: usize,
+) -> IngestResult<()> {
+    parallel_for_each_mut(rows, workers, |(key, planned)| {
+        let Some(existing_bytes) = existing.get(key.as_slice()) else {
+            return Ok(());
+        };
+        if graph_semantic_json(existing_bytes)? == graph_semantic_json(planned)? {
+            *planned = existing_bytes.clone();
+        }
+        Ok(())
+    })
 }
 
 fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
@@ -2529,10 +2757,10 @@ fn raw_edge_graph_rows(
     options: &SqliteImportOptions,
     edges: &[RawEdgeRow],
     sqlite_fingerprint: [u8; 32],
+    workers: usize,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let fingerprint = hex_lower(&sqlite_fingerprint);
-    let mut rows = Vec::with_capacity(edges.len());
-    for edge in edges {
+    let mut rows = parallel_map(edges.iter().collect::<Vec<_>>(), workers, |edge| {
         let row = CbmRawEdgeRow {
             schema: SCHEMA_CBM_EDGE_ROW.to_string(),
             sqlite_edge_id: edge.id,
@@ -2545,8 +2773,8 @@ fn raw_edge_graph_rows(
             commit: options.commit.clone(),
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
-        rows.push((raw_edge_key(&row)?, serde_json::to_vec(&row)?));
-    }
+        Ok::<(Vec<u8>, Vec<u8>), IngestError>((raw_edge_key(&row)?, serde_json::to_vec(&row)?))
+    })?;
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(rows)
 }
@@ -3003,84 +3231,141 @@ fn verify_preexisting_constellations<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     prepared: &PreparedBatch,
+    workers: usize,
 ) -> IngestResult<()>
 where
     C: Clock,
 {
-    for prepared_cx in &prepared.constellations {
-        if prepared_cx.measured.is_none() {
-            let bytes = vault
-                .read_cf_at(
-                    snapshot,
-                    ColumnFamily::Base,
-                    &base_key(prepared_cx.identity.cx_id),
-                )?
-                .ok_or_else(|| readback_mismatch("reused Base CF row disappeared"))?;
-            let decoded = encode::decode_constellation_base(&bytes)?;
-            if decoded.cx_id != prepared_cx.identity.cx_id {
-                return Err(readback_mismatch(format!(
-                    "reused Base identity differs for {}",
-                    prepared_cx.identity.cx_id
-                )));
-            }
+    // Per-row verification is independent, so chunking it over `workers`
+    // threads cannot change the outcome (#23); each reused row is still read
+    // back from the persisted Base CF and identity-checked exactly as before.
+    let reused = prepared
+        .constellations
+        .iter()
+        .filter(|prepared_cx| prepared_cx.measured.is_none())
+        .collect::<Vec<_>>();
+    parallel_map(reused, workers, |prepared_cx| {
+        let bytes = vault
+            .read_cf_at(
+                snapshot,
+                ColumnFamily::Base,
+                &base_key(prepared_cx.identity.cx_id),
+            )?
+            .ok_or_else(|| readback_mismatch("reused Base CF row disappeared"))?;
+        let decoded = encode::decode_constellation_base(&bytes)?;
+        if decoded.cx_id != prepared_cx.identity.cx_id {
+            return Err(readback_mismatch(format!(
+                "reused Base identity differs for {}",
+                prepared_cx.identity.cx_id
+            )));
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
-fn count_changed_graph_rows<C>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    prepared: &PreparedBatch,
-    project: &str,
-) -> IngestResult<(usize, usize)>
-where
-    C: Clock,
-{
-    let mut changed = 0;
-    for (key, value) in &prepared.graph_rows {
-        if vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? != Some(value.clone()) {
-            changed += 1;
-        }
-    }
-    let mut edge_changed = 0;
-    for edge in &prepared.edge_rows {
-        if !edge_row_matches_existing(vault, snapshot, edge)? {
-            edge_changed += 1;
-        }
-    }
-    let stale = stale_live_graph_keys(vault, snapshot, prepared, project)?;
-    let stale_edges = stale
-        .iter()
-        .filter(|key| key.starts_with(EDGE_ROW_PREFIX))
-        .count();
-    Ok((
-        changed + edge_changed + stale.len(),
-        edge_changed + stale_edges,
-    ))
+/// Pre-commit reconciliation of the prepared batch against the persisted
+/// Graph CF, derived exactly once (#23).
+///
+/// The previous shape recomputed this three times per import — a counting pass
+/// (`count_changed_graph_rows`), a write-derivation pass (`write_import_rows`),
+/// and a full-CF stale scan inside each — with one MVCC point read per planned
+/// row, one JSON decode plus one Ledger CF point read per typed edge, per pass.
+/// This derivation reads the one shared `existing_graph` scan, decodes each
+/// persisted edge row once, and validates each *distinct* ledger provenance
+/// once. The decision semantics are unchanged: byte inequality for plain Graph
+/// rows, field + ledger-provenance inequality for typed edge rows, and
+/// project-scoped stale tombstoning for persisted rows the batch no longer
+/// plans.
+struct GraphRowChanges {
+    /// Plain Graph rows whose planned bytes differ from the persisted bytes.
+    graph_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Typed edge rows to (re)write, already encoded.
+    edge_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Persisted project rows the batch no longer plans; tombstoned on write.
+    stale_keys: Vec<Vec<u8>>,
+    /// Edge keys proven unchanged pre-commit (fields and ledger provenance).
+    unchanged_edge_keys: BTreeSet<Vec<u8>>,
+    /// Graph rows this import will change, including edges and stale tombstones.
+    graph_rows_written: usize,
+    /// Edge rows this import will change, including stale edge tombstones.
+    edge_rows_written: usize,
 }
 
-fn stale_live_graph_keys<C>(
+fn derive_graph_row_changes<C>(
     vault: &AsterVault<C>,
     snapshot: Seq,
     prepared: &PreparedBatch,
     project: &str,
-) -> IngestResult<Vec<Vec<u8>>>
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    workers: usize,
+) -> IngestResult<GraphRowChanges>
 where
     C: Clock,
 {
+    let mut graph_writes = Vec::new();
+    for (key, value) in &prepared.graph_rows {
+        if existing_graph.get(key) != Some(value) {
+            graph_writes.push((key.clone(), value.clone()));
+        }
+    }
+
+    enum EdgeMatch {
+        Absent,
+        FieldsMatch(LedgerRef),
+        Different,
+    }
+    let matched = parallel_map(
+        prepared.edge_rows.iter().collect::<Vec<_>>(),
+        workers,
+        |edge| {
+            Ok::<EdgeMatch, IngestError>(match existing_graph.get(&edge.key) {
+                None => EdgeMatch::Absent,
+                Some(bytes) => match serde_json::from_slice::<EdgeGraphRow>(bytes) {
+                    Ok(row) if edge_row_matches_prepared(&row, edge) => {
+                        EdgeMatch::FieldsMatch(row.provenance)
+                    }
+                    _ => EdgeMatch::Different,
+                },
+            })
+        },
+    )?;
+    let mut provenance_ok = BTreeMap::<(u64, [u8; 32]), bool>::new();
+    let mut edge_writes = Vec::new();
+    let mut unchanged_edge_keys = BTreeSet::new();
+    for (edge, matched) in prepared.edge_rows.iter().zip(matched) {
+        let unchanged = match matched {
+            EdgeMatch::Absent | EdgeMatch::Different => false,
+            EdgeMatch::FieldsMatch(reference) => {
+                match provenance_ok.get(&(reference.seq, reference.hash)) {
+                    Some(known) => *known,
+                    None => {
+                        let intact = ledger_ref_matches(vault, snapshot, &reference)?;
+                        provenance_ok.insert((reference.seq, reference.hash), intact);
+                        intact
+                    }
+                }
+            }
+        };
+        if unchanged {
+            unchanged_edge_keys.insert(edge.key.clone());
+        } else {
+            edge_writes.push((edge.key.clone(), serde_json::to_vec(&edge.row)?));
+        }
+    }
+
     let current = prepared
         .graph_rows
         .iter()
-        .map(|(key, _)| key.clone())
-        .chain(prepared.edge_rows.iter().map(|edge| edge.key.clone()))
+        .map(|(key, _)| key.as_slice())
+        .chain(prepared.edge_rows.iter().map(|edge| edge.key.as_slice()))
         .collect::<BTreeSet<_>>();
-    let mut stale = Vec::new();
-    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Graph)? {
-        if current.contains(&key) {
+    let mut stale_keys = Vec::new();
+    for (key, value) in existing_graph {
+        if current.contains(key.as_slice()) {
             continue;
         }
-        let belongs_to_project = serde_json::from_slice::<Value>(&value)
+        let belongs_to_project = serde_json::from_slice::<Value>(value)
             .ok()
             .and_then(|row| {
                 row.get("project")
@@ -3089,29 +3374,23 @@ where
             })
             .is_some_and(|row_project| row_project == project);
         if belongs_to_project {
-            stale.push(key);
+            stale_keys.push(key.clone());
         }
     }
-    stale.sort();
-    Ok(stale)
-}
+    stale_keys.sort();
+    let stale_edges = stale_keys
+        .iter()
+        .filter(|key| key.starts_with(EDGE_ROW_PREFIX))
+        .count();
 
-fn edge_row_matches_existing<C>(
-    vault: &AsterVault<C>,
-    snapshot: Seq,
-    prepared: &PreparedEdgeRow,
-) -> IngestResult<bool>
-where
-    C: Clock,
-{
-    let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::Graph, &prepared.key)? else {
-        return Ok(false);
-    };
-    let Ok(row) = serde_json::from_slice::<EdgeGraphRow>(&bytes) else {
-        return Ok(false);
-    };
-    Ok(edge_row_matches_prepared(&row, prepared)
-        && ledger_ref_matches(vault, snapshot, &row.provenance)?)
+    Ok(GraphRowChanges {
+        graph_rows_written: graph_writes.len() + edge_writes.len() + stale_keys.len(),
+        edge_rows_written: edge_writes.len() + stale_edges,
+        graph_writes,
+        edge_writes,
+        stale_keys,
+        unchanged_edge_keys,
+    })
 }
 
 fn edge_row_matches_prepared(row: &EdgeGraphRow, prepared: &PreparedEdgeRow) -> bool {
@@ -3153,7 +3432,7 @@ fn write_import_rows<C>(
     sqlite_fingerprint: [u8; 32],
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
-    project: &str,
+    changes: &GraphRowChanges,
 ) -> IngestResult<(LedgerRef, Option<FsvAck>, usize, usize)>
 where
     C: Clock,
@@ -3191,31 +3470,18 @@ where
         }
     }
 
-    let mut graph_rows_written = 0;
-    for (key, value) in &prepared.graph_rows {
-        if vault.read_cf_at(snapshot, ColumnFamily::Graph, key)? != Some(value.clone()) {
-            rows.push((ColumnFamily::Graph, key.clone(), value.clone()));
-            graph_rows_written += 1;
-        }
+    // The Graph CF delta was derived exactly once against the shared pre-commit
+    // scan (#23); this function only stages it.
+    let graph_rows_written = changes.graph_rows_written;
+    let edge_rows_written = changes.edge_rows_written;
+    for (key, value) in &changes.graph_writes {
+        rows.push((ColumnFamily::Graph, key.clone(), value.clone()));
     }
-    let mut edge_rows_written = 0;
-    for prepared_edge in &prepared.edge_rows {
-        if !edge_row_matches_existing(vault, snapshot, prepared_edge)? {
-            rows.push((
-                ColumnFamily::Graph,
-                prepared_edge.key.clone(),
-                serde_json::to_vec(&prepared_edge.row)?,
-            ));
-            graph_rows_written += 1;
-            edge_rows_written += 1;
-        }
+    for (key, value) in &changes.edge_writes {
+        rows.push((ColumnFamily::Graph, key.clone(), value.clone()));
     }
-    for key in stale_live_graph_keys(vault, snapshot, prepared, project)? {
-        if key.starts_with(EDGE_ROW_PREFIX) {
-            edge_rows_written += 1;
-        }
-        rows.push((ColumnFamily::Graph, key, tombstone_value().to_vec()));
-        graph_rows_written += 1;
+    for key in &changes.stale_keys {
+        rows.push((ColumnFamily::Graph, key.clone(), tombstone_value().to_vec()));
     }
 
     if rows.is_empty() {
@@ -3325,11 +3591,26 @@ fn verify_import_readback<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
     quantization_gate: Option<&QuantizationGateConfig>,
+    changes: &GraphRowChanges,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> IngestResult<SqliteImportReadback>
 where
     C: Clock,
 {
     let snapshot = vault.latest_seq();
+    // Post-commit readback strategy (#23): rows this import WROTE are point-read
+    // back at the post-commit snapshot below. Rows the atomic group commit did
+    // not touch are verified against the shared pre-commit Graph scan — those
+    // are persisted bytes read from the store this run, the commit's write set
+    // is exactly `changes` (readback-verified row-by-row by the FSV ack in
+    // `write_import_rows`), so pre-commit bytes ARE the post-commit persisted
+    // state for every untouched key.
+    let written_keys = changes
+        .graph_writes
+        .iter()
+        .map(|(key, _)| key.as_slice())
+        .chain(changes.edge_writes.iter().map(|(key, _)| key.as_slice()))
+        .collect::<BTreeSet<_>>();
     let mut base_rows_verified = 0;
     let mut slot_rows_verified = 0;
     let mut raw_guard_slot_rows_verified = 0;
@@ -3394,16 +3675,40 @@ where
 
     let mut graph_rows_verified = 0;
     for (key, expected) in &prepared.graph_rows {
-        let actual = vault
-            .read_cf_at(snapshot, ColumnFamily::Graph, key)?
-            .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
-        if &actual != expected {
-            return Err(readback_mismatch("Graph CF row bytes changed after import"));
+        if written_keys.contains(key.as_slice()) {
+            let actual = vault
+                .read_cf_at(snapshot, ColumnFamily::Graph, key)?
+                .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
+            if &actual != expected {
+                return Err(readback_mismatch("Graph CF row bytes changed after import"));
+            }
+        } else {
+            let actual = existing_graph
+                .get(key.as_slice())
+                .ok_or_else(|| readback_mismatch("Graph CF row missing after import"))?;
+            if actual != expected {
+                return Err(readback_mismatch("Graph CF row bytes changed after import"));
+            }
         }
         graph_rows_verified += 1;
     }
     let mut edge_rows_verified = 0;
+    let mut provenance_ok = BTreeMap::<(u64, [u8; 32]), bool>::new();
     for prepared_edge in &prepared.edge_rows {
+        // Edges the pre-commit derivation proved unchanged (fields matched and
+        // their ledger provenance verified against persisted state) were not in
+        // the write batch, so their pre-commit persisted bytes are the post-
+        // commit state; the derivation already performed the decode + ledger
+        // verification this loop used to repeat per edge (#23).
+        if changes.unchanged_edge_keys.contains(&prepared_edge.key) {
+            if !existing_graph.contains_key(&prepared_edge.key) {
+                return Err(readback_mismatch(
+                    "unwritten edge Graph CF row disappeared before readback",
+                ));
+            }
+            edge_rows_verified += 1;
+            continue;
+        }
         let actual = vault
             .read_cf_at(snapshot, ColumnFamily::Graph, &prepared_edge.key)?
             .ok_or_else(|| readback_mismatch("edge Graph CF row missing after import"))?;
@@ -3414,7 +3719,16 @@ where
                 "edge Graph CF row fields changed after import",
             ));
         }
-        if !ledger_ref_matches(vault, snapshot, &decoded.provenance)? {
+        let provenance_key = (decoded.provenance.seq, decoded.provenance.hash);
+        let intact = match provenance_ok.get(&provenance_key) {
+            Some(known) => *known,
+            None => {
+                let intact = ledger_ref_matches(vault, snapshot, &decoded.provenance)?;
+                provenance_ok.insert(provenance_key, intact);
+                intact
+            }
+        };
+        if !intact {
             return Err(readback_mismatch(
                 "edge Graph CF row provenance does not match Ledger CF",
             ));
@@ -3600,6 +3914,14 @@ where
     let mut panel_version = None;
     let mut nodes = Vec::new();
 
+    // Every node-map -> Base binding is still proven with a per-row Base point
+    // read, but the FULL constellation decode of every Base row is skipped for
+    // modern node-map rows (#23): the decoded Base row is only needed for
+    // panel_version (first node) and for legacy rows that predate the inline
+    // name/line/properties fields. (A Base keys-only range scan would be
+    // cheaper still, but `scan_cf_range_keys_at` access-violates on vaults
+    // opened with selected CFs — see the #23 session notes — so the point read
+    // stays as the existence proof.)
     for row in read_graph_rows::<C, NodeMapRow>(vault, snapshot, NODE_MAP_PREFIX)? {
         if row.project != project {
             continue;
@@ -3624,15 +3946,31 @@ where
                     row.node_id, row.cx_id
                 ))
             })?;
-        let decoded = encode::decode_constellation_base(&base)?;
-        panel_version.get_or_insert(decoded.panel_version);
+        let needs_base_decode = panel_version.is_none()
+            || row.name.is_none()
+            || row.file_path.is_empty()
+            || row.start_line.is_none()
+            || row.end_line.is_none();
+        let decoded = if needs_base_decode {
+            Some(encode::decode_constellation_base(&base)?)
+        } else {
+            None
+        };
+        if let Some(decoded) = &decoded {
+            panel_version.get_or_insert(decoded.panel_version);
+        }
         let name = row
             .name
-            .or_else(|| decoded.metadata_value("name").map(ToOwned::to_owned))
+            .or_else(|| {
+                decoded
+                    .as_ref()
+                    .and_then(|decoded| decoded.metadata_value("name").map(ToOwned::to_owned))
+            })
             .unwrap_or_else(|| local_name_from_qn(&row.qualified_name));
         let file_path = if row.file_path.is_empty() {
             decoded
-                .metadata_value("file_path")
+                .as_ref()
+                .and_then(|decoded| decoded.metadata_value("file_path"))
                 .unwrap_or_default()
                 .to_string()
         } else {
@@ -3640,11 +3978,19 @@ where
         };
         let start_line = row
             .start_line
-            .or_else(|| scalar_i64(&decoded, "start_line"))
+            .or_else(|| {
+                decoded
+                    .as_ref()
+                    .and_then(|decoded| scalar_i64(decoded, "start_line"))
+            })
             .unwrap_or(0);
         let end_line = row
             .end_line
-            .or_else(|| scalar_i64(&decoded, "end_line"))
+            .or_else(|| {
+                decoded
+                    .as_ref()
+                    .and_then(|decoded| scalar_i64(decoded, "end_line"))
+            })
             .unwrap_or(0);
         let properties_json = row.properties_json.unwrap_or_else(|| "{}".to_string());
         ensure_json_object_text(&properties_json, "node properties")?;
@@ -3698,11 +4044,17 @@ where
             .then_with(|| left.source_node_id.cmp(&right.source_node_id))
     });
 
-    let mut edges = Vec::new();
-    for row in read_graph_rows::<C, CbmRawEdgeRow>(vault, snapshot, CBM_EDGE_ROW_PREFIX)? {
-        if row.project != project {
-            continue;
-        }
+    let raw_edge_rows = read_graph_rows::<C, CbmRawEdgeRow>(vault, snapshot, CBM_EDGE_ROW_PREFIX)?
+        .into_iter()
+        .filter(|row| row.project == project)
+        .collect::<Vec<_>>();
+    // Validation + conversion is per-row independent; the JSON object check on
+    // every edge properties string dominated this read at M scale (#23). The
+    // worker count is deliberately fixed at 1 here pending the debug-build
+    // access-violation investigation around ad-hoc thread pools on snapshot
+    // reads; the loop stays in parallel_map form so a caller-supplied worker
+    // count can be threaded through once that is resolved.
+    let mut edges = parallel_map(raw_edge_rows, 1, |row| {
         if row.schema != SCHEMA_CBM_EDGE_ROW {
             return Err(IngestError::InvalidInput(format!(
                 "raw edge row {} has wrong schema {}",
@@ -3710,7 +4062,7 @@ where
             )));
         }
         ensure_json_object_text(&row.properties_json, "edge properties")?;
-        edges.push(CbmGraphEdge {
+        Ok(CbmGraphEdge {
             sqlite_edge_id: row.sqlite_edge_id,
             project: row.project,
             source_node_id: row.source_node_id,
@@ -3721,8 +4073,8 @@ where
             local_name_gen: row.local_name_gen,
             weight: 1.0,
             properties_json: row.properties_json,
-        });
-    }
+        })
+    })?;
     if edges.is_empty() {
         // Every modern import persists a raw `astrolabe:cbm-edge:v1` row for each
         // source edge (see `raw_edge_graph_rows`), covering dangling and
@@ -4064,7 +4416,7 @@ fn read_graph_rows<C, T>(
 ) -> IngestResult<Vec<T>>
 where
     C: Clock,
-    T: DeserializeOwned,
+    T: DeserializeOwned + Send,
 {
     vault
         .scan_cf_range_at(snapshot, ColumnFamily::Graph, &prefix_range(prefix))?
