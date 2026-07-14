@@ -1,6 +1,218 @@
 use super::*;
 pub(crate) const PROVENANCE_SURFACE_SCHEMA: &str = "astrolabe.provenance_surface.v1";
 
+/// Config metadata field holding the per-project reproduce fixtures: a JSON map of
+/// `answer_id -> { recorded_artifact, graph }` written when a kernel answer is
+/// served and recorded (#40/#343). `recorded_artifact` is the canonical
+/// [`astrolabe_provenance::recorded_kernel_answer_bytes`] text; `graph` is the
+/// frozen-lens current vault association graph the reproduce re-executes against.
+pub(crate) const PROVENANCE_REPRODUCE_FIXTURE_FIELD: &str = "provenance_reproduce_fixture_json";
+
+/// Wires `get_provenance(mode="reproduce")` to **live re-execution** of the #40
+/// kernel answer engine against the persisted current vault graph (#67 DoD 1).
+///
+/// When a recorded reproduce fixture is persisted for `subject`, this re-runs the
+/// answer engine with the recorded answer's frozen lenses/seeds against the
+/// current graph and rewrites `store.reproductions[subject]` with the
+/// live-measured digests and drift, so the served reproduce report reflects a real
+/// re-derivation rather than two stored digests. A drift beyond the (tightening-
+/// only) bound, or a current vault that no longer grounds the answer, propagates
+/// the answer engine's coded [`astrolabe_provenance::REPRODUCE_DRIFT_EXCEEDED`]
+/// refusal to the caller — never a verified-looking report.
+///
+/// It is a no-op for every other mode, when `subject` is absent, and when no
+/// reproduce fixture is persisted yet (the pre-#343 state, in which reproduce
+/// still serves the recorded digest/drift metadata path unchanged). The current
+/// graph is produced by the `GraphProjectionCsr -> KernelGraph` vault adapter
+/// (#343); until the kernel-answer server surface persists a fixture, no live
+/// re-execution engages and existing behavior is preserved.
+pub(crate) fn apply_live_reproduce(
+    store: &mut ProvenanceStore,
+    cache_dir: &Path,
+    project: &str,
+    mode: &str,
+    subject: Option<&str>,
+    drift_bound_override: Option<u64>,
+) -> Result<(), DynError> {
+    if mode != "reproduce" {
+        return Ok(());
+    }
+    let Some(subject) = subject.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(raw) = read_config_value(
+        cache_dir,
+        &metadata_key(project, PROVENANCE_REPRODUCE_FIXTURE_FIELD),
+    )?
+    else {
+        return Ok(());
+    };
+    let fixtures = serde_json::from_str::<Value>(&raw)?;
+    let Some(fixture) = fixtures.get(subject) else {
+        return Ok(());
+    };
+
+    let recorded_text = fixture
+        .get("recorded_artifact")
+        .and_then(Value::as_str)
+        .ok_or("reproduce fixture missing recorded_artifact bytes")?;
+    let recorded = astrolabe_provenance::parse_recorded_kernel_answer(recorded_text.as_bytes())
+        .map_err(domain_error_to_dyn)?;
+    let graph = fixture
+        .get("graph")
+        .ok_or("reproduce fixture missing current vault graph")?;
+    let (nodes, edges, matched_ids) = parse_reproduce_graph(graph)?;
+
+    let bound = astrolabe_provenance::resolve_drift_bound(drift_bound_override)
+        .map_err(domain_error_to_dyn)?;
+    let report = astrolabe_provenance::reproduce_kernel_answer(
+        &recorded,
+        &nodes,
+        &edges,
+        &matched_ids,
+        bound,
+    )
+    .map_err(domain_error_to_dyn)?;
+
+    // The live re-derivation stayed within the drift bound: serve the live-measured
+    // digests/drift through the existing reproduce envelope (the crate re-derives
+    // bit_exact and re-checks the bound over these values).
+    store.reproductions.insert(
+        subject.to_string(),
+        ReproduceRecord {
+            answer_id: report.answer_id,
+            recorded_digest: report.recorded_digest,
+            current_digest: report.current_digest,
+            drift_microunits: report.drift_microunits,
+            drift_bound_microunits: report.drift_bound_microunits,
+            ledger: recorded.ledger,
+        },
+    );
+    Ok(())
+}
+
+/// Parses a persisted reproduce-fixture `graph` object into the answer-engine
+/// inputs (`nodes`, `edges`, `matched_ids`), failing closed on a malformed graph.
+fn parse_reproduce_graph(
+    graph: &Value,
+) -> Result<
+    (
+        Vec<astrolabe_kernel::AnswerNode>,
+        Vec<astrolabe_kernel::AnswerEdge>,
+        Vec<astrolabe_domain::calyx::CxId>,
+    ),
+    DynError,
+> {
+    let nodes = graph
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or("reproduce fixture graph missing nodes array")?
+        .iter()
+        .map(parse_reproduce_node)
+        .collect::<Result<Vec<_>, DynError>>()?;
+    let edges = graph
+        .get("edges")
+        .and_then(Value::as_array)
+        .ok_or("reproduce fixture graph missing edges array")?
+        .iter()
+        .map(parse_reproduce_edge)
+        .collect::<Result<Vec<_>, DynError>>()?;
+    let matched_ids = graph
+        .get("matched_ids")
+        .and_then(Value::as_array)
+        .ok_or("reproduce fixture graph missing matched_ids array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| DynError::from("matched id must be a hex string"))
+                .and_then(|hex| parse_cx_id(hex))
+        })
+        .collect::<Result<Vec<_>, DynError>>()?;
+    Ok((nodes, edges, matched_ids))
+}
+
+fn parse_reproduce_node(value: &Value) -> Result<astrolabe_kernel::AnswerNode, DynError> {
+    let id = parse_cx_id(
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("reproduce node missing id")?,
+    )?;
+    let qualified_name = value
+        .get("qualified_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let grounded = value
+        .get("grounded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let provenance_ref = value
+        .get("provenance_ref")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let kernel_weight_permille = value
+        .get("kernel_weight_permille")
+        .and_then(Value::as_u64)
+        .ok_or("reproduce node missing kernel_weight_permille")?;
+    Ok(astrolabe_kernel::AnswerNode::new(
+        id,
+        qualified_name,
+        grounded,
+        provenance_ref,
+        kernel_weight_permille,
+    ))
+}
+
+fn parse_reproduce_edge(value: &Value) -> Result<astrolabe_kernel::AnswerEdge, DynError> {
+    let src = parse_cx_id(
+        value
+            .get("src")
+            .and_then(Value::as_str)
+            .ok_or("reproduce edge missing src")?,
+    )?;
+    let dst = parse_cx_id(
+        value
+            .get("dst")
+            .and_then(Value::as_str)
+            .ok_or("reproduce edge missing dst")?,
+    )?;
+    let weight_permille = value
+        .get("weight_permille")
+        .and_then(Value::as_u64)
+        .ok_or("reproduce edge missing weight_permille")?;
+    let ledger_ref = value
+        .get("ledger_ref")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(astrolabe_kernel::AnswerEdge::new(
+        src,
+        dst,
+        weight_permille,
+        ledger_ref,
+    ))
+}
+
+fn parse_cx_id(hex: &str) -> Result<astrolabe_domain::calyx::CxId, DynError> {
+    hex.trim()
+        .parse::<astrolabe_domain::calyx::CxId>()
+        .map_err(|_| DynError::from(format!("invalid CxId hex {hex:?}")))
+}
+
+/// Formats a coded [`astrolabe_domain::DomainError`] into a `{code}: {message};
+/// remediation: {remediation}` boxed error so the reproduce handler surfaces the
+/// engine's fail-closed refusal (e.g. `REPRODUCE_DRIFT_EXCEEDED`) verbatim.
+fn domain_error_to_dyn(error: astrolabe_domain::DomainError) -> DynError {
+    format!(
+        "{}: {}; remediation: {}",
+        error.code(),
+        error.message(),
+        error.remediation()
+    )
+    .into()
+}
+
 pub(crate) fn provenance_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
     let fingerprint = hex_lower(&row_sink_fingerprint(rows));
     let ledger_head = LedgerPointer::new(0, format!("row-sink:{fingerprint}"));

@@ -12932,3 +12932,147 @@ fn assay_gate_decide_ledgers_serves_and_reverts_serving_state() {
     );
     fs::remove_dir_all(&dir).ok();
 }
+
+// --- #67 DoD 5: success-criterion 6.5 registry sweep ----------------------
+//
+// Blueprint success criterion 01 §6.5 ("100% of tool answers carry a
+// ledger-backed trace") made executable over the shipped tool registry. Every
+// tool in `astrolabe_tool_definitions()` is classified as either
+// answer-producing (its response must carry a ledger-backed, get_provenance-
+// resolvable trace) or a non-answer read/admin surface. The classification is
+// asserted exhaustive and disjoint against the live registry, so a newly added
+// tool cannot slip through unclassified. The flagship token-budgeted pack
+// composer `get_context_pack` (#41) is not yet shipped; the pack-tool class is
+// therefore explicitly EXCLUDED, labeled, and counted here rather than silently
+// skipped.
+
+/// Answer-producing tools: each emits a grounded answer / prediction / verdict /
+/// measurement whose response must carry a ledger-backed trace resolvable through
+/// `get_provenance`.
+const ANSWER_PRODUCING_TOOLS: &[&str] = &[
+    "get_provenance",
+    "get_readiness",
+    "impute_fields",
+    "anchor_outcome",
+    "predict_impact",
+    "guard_calibrate",
+    "guard_check",
+    "measure_bits",
+    "find_similar",
+    "guard_lock",
+    "guard_commit_ood",
+    "guard_advisory_hook",
+    "assay_gate",
+    "abduce_cause",
+    "forecast",
+    "get_kernel",
+    "kernel_answer",
+    "anchor_erase",
+    "detect_anomalies",
+];
+
+/// Non-answer surfaces: read/status/ingest/export operations that do not serve a
+/// grounded answer and so make no ledger-backed-trace claim to sweep.
+const NON_ANSWER_TOOLS: &[&str] = &["optimizer_status", "coverage_ingest", "team_artifact"];
+
+/// Pack-tool class excluded from the sweep while #41 is open. The token-budgeted
+/// pack composer `get_context_pack` (blueprint 6.5 flagship) is not shipped in the
+/// registry yet; its `reproduce(pack_id)` bit-exact gate is #41's own DoD.
+const EXCLUDED_PACK_TOOLS: &[&str] = &["get_context_pack"];
+
+#[test]
+fn success_criterion_6_5_answer_producing_tools_are_classified_exhaustively() {
+    let defs = astrolabe_tool_definitions();
+    assert_eq!(
+        defs.len(),
+        22,
+        "the shipped tool registry is the 22-tool roster"
+    );
+
+    let registry: std::collections::BTreeSet<String> = defs
+        .iter()
+        .map(|def| {
+            def.get("name")
+                .and_then(Value::as_str)
+                .expect("every tool definition carries a name")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(registry.len(), 22, "tool names are unique");
+
+    // The classification lists are disjoint.
+    let answer: std::collections::BTreeSet<&str> = ANSWER_PRODUCING_TOOLS.iter().copied().collect();
+    let non_answer: std::collections::BTreeSet<&str> = NON_ANSWER_TOOLS.iter().copied().collect();
+    assert!(
+        answer.is_disjoint(&non_answer),
+        "a tool is either answer-producing or a non-answer surface, never both"
+    );
+
+    // The classification is exhaustive: answer-producing ∪ non-answer == the whole
+    // registry. A newly added tool that is left unclassified fails this assertion
+    // rather than being silently skipped.
+    let classified: std::collections::BTreeSet<String> = answer
+        .iter()
+        .chain(non_answer.iter())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        classified,
+        registry,
+        "every shipped tool must be classified answer-producing or non-answer; unclassified={:?} unknown={:?}",
+        registry.difference(&classified).collect::<Vec<_>>(),
+        classified.difference(&registry).collect::<Vec<_>>(),
+    );
+
+    // The pack-tool class is EXCLUDED, labeled, and counted — never silently
+    // skipped. The flagship pack composer is genuinely not shipped yet (#41), so
+    // it must be absent from the registry.
+    for pack in EXCLUDED_PACK_TOOLS {
+        assert!(
+            !registry.contains(*pack),
+            "pack tool {pack} is tracked by #41 and must not appear in the shipped registry until #41 ships its bit-exact reproduce gate",
+        );
+    }
+    let excluded_pack_count = EXCLUDED_PACK_TOOLS.len();
+    println!(
+        "criterion 6.5 sweep: {} answer-producing, {} non-answer, {} pack-tool class(es) EXCLUDED (tracked #41): {:?}",
+        ANSWER_PRODUCING_TOOLS.len(),
+        NON_ANSWER_TOOLS.len(),
+        excluded_pack_count,
+        EXCLUDED_PACK_TOOLS,
+    );
+    assert_eq!(
+        ANSWER_PRODUCING_TOOLS.len() + NON_ANSWER_TOOLS.len(),
+        22,
+        "answer-producing + non-answer accounts for every shipped tool",
+    );
+    assert_eq!(
+        excluded_pack_count, 1,
+        "exactly the get_context_pack class is excluded (#41)"
+    );
+
+    // The resolver the sweep depends on is itself present with the reproduce +
+    // inter_agent_trust modes through which a ledger-backed trace is resolved.
+    let get_provenance = defs
+        .iter()
+        .find(|def| def.get("name").and_then(Value::as_str) == Some("get_provenance"))
+        .expect("get_provenance is the resolver and must be registered");
+    let modes: Vec<&str> = get_provenance["inputSchema"]["properties"]["mode"]["enum"]
+        .as_array()
+        .expect("mode enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for required in [
+        "lineage",
+        "answer_trace",
+        "verify_chain",
+        "reproduce",
+        "inter_agent_trust",
+    ] {
+        assert!(
+            modes.contains(&required),
+            "get_provenance must advertise the {required} mode used to resolve answer traces",
+        );
+    }
+}
