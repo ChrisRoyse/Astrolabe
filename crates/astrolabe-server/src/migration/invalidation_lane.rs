@@ -16,6 +16,7 @@ struct KernelDirtyScc {
 }
 
 /// Raw `(key, value)` rows scanned from a column family.
+#[cfg(test)]
 type RawCfRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub(crate) fn persist_delta_invalidations<C>(
