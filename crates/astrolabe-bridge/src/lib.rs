@@ -3834,6 +3834,141 @@ mod tests {
         println!("tool-runner collect-rows probe passed: {}", db.display());
     }
 
+    /// #346 FSV: with a row sink registered, `index_repository` must run
+    /// IN-PROCESS even when this process is marked as the supervisor host (as the
+    /// real astrolabe-server is, via `initialize_cbm_host_process`). The streaming
+    /// row sink is an in-process FFI callback; a supervised worker is a separate
+    /// process that would run a sink-less pipeline, so every row would be lost and
+    /// all shadow surfaces would degrade to `sqlite_fallback`. This probe marks the
+    /// host FIRST (so `cbm_index_supervisor_should_wrap()` is true), then indexes
+    /// through the sink path and asserts real rows are captured — which can only
+    /// happen if the index ran in-process. Runs in an isolated child process
+    /// because `cbm_index_supervisor_mark_host` is process-global.
+    #[test]
+    fn index_repository_with_row_sink_runs_in_process_under_supervisor_host() {
+        let test_home = sandbox_home("row-sink-host-inproc-home");
+        let before = store_entries(&test_home);
+        let dir = temp_dir("row-sink-host-inproc");
+        let store = dir.join("store");
+        let repo = dir.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).expect("create fixture repo");
+        std::fs::write(
+            src.join("main.c"),
+            "int helper(void) { return 41; }\nint main(void) { return helper() + 1; }\n",
+        )
+        .expect("write C fixture");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "tests::row_sink_host_inprocess_child_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ASTRO_PROBE_STORE", &store)
+            .env("ASTRO_PROBE_REPO", &repo)
+            .env("HOME", &test_home)
+            .env("USERPROFILE", &test_home)
+            .output()
+            .expect("spawn the row-sink host in-process probe");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "row-sink host in-process probe failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("row-sink host in-process probe passed"),
+            "probe did not run its assertions:\n{stdout}"
+        );
+        assert_eq!(
+            before,
+            store_entries(&test_home),
+            "a run-scoped index must not touch the operator home store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "spawned as a subprocess by index_repository_with_row_sink_runs_in_process_under_supervisor_host"]
+    fn row_sink_host_inprocess_child_probe() {
+        let store = PathBuf::from(std::env::var("ASTRO_PROBE_STORE").expect("parent sets store"));
+        let repo = std::env::var("ASTRO_PROBE_REPO").expect("parent sets repo");
+        std::fs::create_dir_all(&store).expect("create run-scoped store");
+
+        // Mark THIS process as the supervisor host, exactly as the real
+        // astrolabe-server does at startup. Before #346 this forced
+        // index_repository into a sink-less worker subprocess; the fix keeps it
+        // in-process whenever a row sink is registered.
+        // SAFETY: process-global startup marker; this child process runs a single
+        // index and exits.
+        unsafe {
+            cbm_sys::cbm_index_supervisor_mark_host();
+        }
+
+        let resolved = set_cbm_cache_dir(&store).expect("configure run-scoped store");
+        assert_eq!(
+            resolved.canonicalize().expect("configured store exists"),
+            store.canonicalize().expect("store dir created"),
+            "libcbm must resolve the run-scoped store"
+        );
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let project = format!("row-sink-host-{}-{nanos}", std::process::id());
+        let args = serde_json::json!({
+            "repo_path": repo,
+            "mode": "full",
+            "name": project,
+        })
+        .to_string();
+        let db = store.join(format!("{project}.db"));
+        {
+            let _db_guard = CbmProjectDbGuard {
+                project: project.clone(),
+            };
+            let runner = CbmToolRunner::new_default().expect("create CBM tool runner");
+            let run = runner
+                .handle_index_repository_with_rows(&args)
+                .expect("index_repository run with row sink under supervisor host");
+            let value: serde_json::Value =
+                serde_json::from_str(&run.raw_json).expect("valid MCP tool result JSON");
+            assert_eq!(
+                value.get("isError").and_then(serde_json::Value::as_bool),
+                Some(false),
+                "index must succeed in-process under host mark: {}",
+                run.raw_json
+            );
+            let rows = run
+                .rows
+                .expect("row sink must capture rows in-process despite the host mark");
+            // The core proof of #346: a sink-less worker subprocess would have
+            // captured ZERO nodes; real captured rows prove the in-process path.
+            assert!(
+                !rows.nodes.is_empty(),
+                "row sink captured zero nodes under host mark -> index ran in a sink-less \
+                 worker subprocess (the #346 regression): {rows:?}"
+            );
+            assert!(
+                rows.nodes
+                    .iter()
+                    .any(|node| node.qualified_name.ends_with(".main")),
+                "expected main function in the in-process row sink: {rows:?}",
+            );
+            assert!(
+                db.is_file(),
+                "index_repository must persist {project}.db under the run-scoped store {}",
+                store.display(),
+            );
+        }
+        clear_cbm_cache_dir();
+        println!("row-sink host in-process probe passed: {}", db.display());
+    }
+
     /// #283 grammar-subset FSV: a `CBM_GRAMMAR_SET=core` libcbm drops non-core
     /// tree-sitter grammars and links `grammar_stubs.c` NULL-returning factories in
     /// their place. Indexing a file of a stubbed language MUST fail closed with the

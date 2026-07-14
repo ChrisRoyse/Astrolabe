@@ -262,24 +262,45 @@ pub(crate) fn handle_index_repository(
     // row-sink candidate unavailable. The full rerun below remains ONLY for
     // errors where no usable raw result exists (pre-run argument encoding, or an
     // unusable tool result), and its label says exactly that.
-    let (result, row_sink) = match runner.handle_index_repository_with_rows(&sanitized_args) {
+    // #363: retain the structured row-sink `BridgeError` alongside the raw result.
+    // A row-sink refusal (e.g. `ASTRO_CBM_INVALID_UTF8`) aborts the pipeline in the
+    // row-emission ("dump") phase, and the raw tool result then carries only a
+    // generic `isError "Pipeline failed"` hint. Holding the envelope lets us surface
+    // `{code, message, remediation}` + phase verbatim below instead of masking it.
+    let (result, row_sink, row_sink_error) = match runner
+        .handle_index_repository_with_rows(&sanitized_args)
+    {
         Ok(run) => {
-            let candidate = match run.rows {
-                Ok(rows) => row_sink_import_candidate_from_rows_with_skills(rows, &skills),
-                Err(error) => RowSinkImportCandidate::Unavailable(format!(
-                    "row-sink capture failed; completed index result kept without a rerun: {error}"
-                )),
+            let (candidate, sink_error) = match run.rows {
+                Ok(rows) => (
+                    row_sink_import_candidate_from_rows_with_skills(rows, &skills),
+                    None,
+                ),
+                Err(error) => (
+                    RowSinkImportCandidate::Unavailable(format!(
+                        "row-sink capture failed; completed index result kept without a rerun: {error}"
+                    )),
+                    Some(error),
+                ),
             };
-            (run.raw_json, candidate)
+            (run.raw_json, candidate, sink_error)
         }
         Err(error) => (
             runner.handle_tool_raw("index_repository", &sanitized_args)?,
             RowSinkImportCandidate::Unavailable(format!(
                 "single-run row-sink index_repository returned no usable result; reran without a row sink: {error}"
             )),
+            None,
         ),
     };
     if tool_result_is_error(&result)? {
+        // #363: when the pipeline failed AND we hold the structured row-sink error,
+        // the sink refusal is the root cause of the abort. Surface the full
+        // `{code, message, remediation}` envelope plus the failing phase fail-closed
+        // (invariants 3 and 6) instead of returning the opaque "Pipeline failed".
+        if let Some(error) = row_sink_error {
+            return row_sink_refusal_error_result(&error, &result);
+        }
         return Ok(result);
     }
 
@@ -321,6 +342,35 @@ pub(crate) fn handle_index_repository(
             "grounding_summary": grounding_summary(&outcome),
         }),
     )
+}
+
+/// #363: build a fail-closed MCP tool error result that carries the row-sink
+/// `BridgeError` envelope verbatim (`{code, message, remediation}`) plus the
+/// failing pipeline phase, instead of the opaque generic "Pipeline failed" the
+/// raw tool result carries. Row-sink callbacks fire only during the graph-buffer
+/// row-emission ("dump") phase, so a sink refusal is definitionally a `dump`-phase
+/// failure. The structured payload lands in both the `structuredContent` and the
+/// text content so the operator sees the real cause without log-grepping
+/// (invariants 3 and 6). `raw_result` is retained under `pipeline_result` so the
+/// original (completed-then-aborted) tool response is not discarded.
+fn row_sink_refusal_error_result(
+    error: &astrolabe_bridge::BridgeError,
+    raw_result: &str,
+) -> Result<String, DynError> {
+    let envelope = error.envelope();
+    let mut structured = json!({
+        "code": envelope.code,
+        "message": envelope.message,
+        "remediation": envelope.remediation,
+        "phase": "dump",
+        "failing_stage": "row_sink",
+    });
+    if let Some(stderr) = &envelope.stderr {
+        structured["stderr"] = Value::String(stderr.clone());
+    }
+    structured["pipeline_result"] = serde_json::from_str::<Value>(raw_result)
+        .unwrap_or_else(|_| Value::String(raw_result.to_string()));
+    tool_json_error_result(structured)
 }
 
 pub(crate) fn handle_index_status(
