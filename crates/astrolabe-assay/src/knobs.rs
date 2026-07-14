@@ -376,6 +376,348 @@ pub fn assay_bits_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
     ASSAY_BITS_KNOBS.iter().find(|knob| knob.name == name)
 }
 
+/// Registry version tag for the P5.3 differentiation knobs (#33).
+pub const ASSAY_DIFF_KNOB_REGISTRY_VERSION: &str = "astrolabe-assay-diff-knobs-v1";
+
+/// Name of the number-of-equal-frequency-bins knob for differentiation.
+pub const ASSAY_DIFF_DISCRETIZATION_BINS_KNOB: &str = "assay_diff_discretization_bins";
+/// Name of the redundancy per-slot sample quorum knob.
+pub const ASSAY_REDUNDANCY_QUORUM_KNOB: &str = "assay_redundancy_quorum";
+/// Name of the redundancy retire-gate NMI threshold knob (permille).
+pub const ASSAY_REDUNDANCY_RETIRE_NMI_PERMILLE_KNOB: &str = "assay_redundancy_retire_nmi_permille";
+/// Name of the synergy per-triple sample quorum knob.
+pub const ASSAY_SYNERGY_QUORUM_KNOB: &str = "assay_synergy_quorum";
+/// Name of the synergy classification resample-count knob.
+pub const ASSAY_SYNERGY_RESAMPLES_KNOB: &str = "assay_synergy_resamples";
+/// Name of the synergy minimum-effect-magnitude knob (millibits).
+pub const ASSAY_SYNERGY_MIN_EFFECT_MILLIBITS_KNOB: &str = "assay_synergy_min_effect_millibits";
+/// Name of the transfer-entropy minimum-lag knob.
+pub const ASSAY_TE_MIN_LAG_KNOB: &str = "assay_te_min_lag";
+/// Name of the transfer-entropy maximum-lag knob.
+pub const ASSAY_TE_MAX_LAG_KNOB: &str = "assay_te_max_lag";
+/// Name of the transfer-entropy permutation-count knob.
+pub const ASSAY_TE_PERMUTATIONS_KNOB: &str = "assay_te_permutations";
+/// Name of the periodicity permutation-count knob.
+pub const ASSAY_PERIODICITY_PERMUTATIONS_KNOB: &str = "assay_periodicity_permutations";
+/// Name of the periodicity frequency-grid oversampling-factor knob.
+pub const ASSAY_PERIODICITY_OVERSAMPLE_KNOB: &str = "assay_periodicity_oversample";
+/// Name of the periodicity false-alarm-probability threshold knob (permille).
+pub const ASSAY_FAP_THRESHOLD_PERMILLE_KNOB: &str = "assay_fap_threshold_permille";
+/// Name of the CUSUM minimum-segment-length knob.
+pub const ASSAY_CUSUM_MIN_SEGMENT_KNOB: &str = "assay_cusum_min_segment";
+/// Name of the CUSUM bootstrap-permutation-count knob.
+pub const ASSAY_CUSUM_PERMUTATIONS_KNOB: &str = "assay_cusum_permutations";
+/// Name of the MMD permutation-count knob.
+pub const ASSAY_MMD_PERMUTATIONS_KNOB: &str = "assay_mmd_permutations";
+/// Name of the two-sample significance-level knob (permille) shared by TE and MMD.
+pub const ASSAY_SIGNIFICANCE_PERMILLE_KNOB: &str = "assay_significance_permille";
+/// Name of the transfer-entropy effective-sample quorum knob.
+pub const ASSAY_TE_QUORUM_KNOB: &str = "assay_te_quorum";
+
+/// Default equal-frequency bin count for differentiation discretization.
+pub const ASSAY_DEFAULT_DIFF_DISCRETIZATION_BINS: u64 = 4;
+/// Smallest legal differentiation bin count.
+pub const ASSAY_MIN_DIFF_DISCRETIZATION_BINS: u64 = 2;
+/// Largest legal differentiation bin count.
+pub const ASSAY_MAX_DIFF_DISCRETIZATION_BINS: u64 = 64;
+
+/// Default redundancy per-slot sample quorum (blueprint 08 §3: 50/slot).
+pub const ASSAY_DEFAULT_REDUNDANCY_QUORUM: u64 = 50;
+/// Smallest legal redundancy quorum.
+pub const ASSAY_MIN_REDUNDANCY_QUORUM: u64 = 2;
+/// Largest legal redundancy quorum.
+pub const ASSAY_MAX_REDUNDANCY_QUORUM: u64 = 1_000_000;
+
+/// Default redundancy retire-gate NMI threshold, permille: 600 = 0.6 (blueprint
+/// 05: retire when max pairwise correlation with an admitted lens > 0.6).
+pub const ASSAY_DEFAULT_REDUNDANCY_RETIRE_NMI_PERMILLE: u64 = 600;
+/// Smallest legal retire threshold: 1 permille (any dependence retires).
+pub const ASSAY_MIN_REDUNDANCY_RETIRE_NMI_PERMILLE: u64 = 1;
+/// Largest legal retire threshold: 1000 permille (only an exact duplicate retires).
+pub const ASSAY_MAX_REDUNDANCY_RETIRE_NMI_PERMILLE: u64 = 1_000;
+
+/// Default synergy per-triple sample quorum (blueprint 08 §4: 150).
+pub const ASSAY_DEFAULT_SYNERGY_QUORUM: u64 = 150;
+/// Smallest legal synergy quorum.
+pub const ASSAY_MIN_SYNERGY_QUORUM: u64 = 2;
+/// Largest legal synergy quorum.
+pub const ASSAY_MAX_SYNERGY_QUORUM: u64 = 1_000_000;
+
+/// Default synergy classification resample count for the interaction-information
+/// interval.
+pub const ASSAY_DEFAULT_SYNERGY_RESAMPLES: u64 = 200;
+/// Smallest legal synergy resample count.
+pub const ASSAY_MIN_SYNERGY_RESAMPLES: u64 = 2;
+/// Largest legal synergy resample count.
+pub const ASSAY_MAX_SYNERGY_RESAMPLES: u64 = 100_000;
+
+/// Default synergy minimum effect magnitude, millibits: 50 = 0.05 bits (the
+/// blueprint's lens-admission bit floor, reused as the smallest interaction worth
+/// classifying above finite-sample plug-in bias).
+pub const ASSAY_DEFAULT_SYNERGY_MIN_EFFECT_MILLIBITS: u64 = 50;
+/// Smallest legal synergy minimum effect: 1 millibit.
+pub const ASSAY_MIN_SYNERGY_MIN_EFFECT_MILLIBITS: u64 = 1;
+/// Largest legal synergy minimum effect: 1000 millibits = 1.0 bit.
+pub const ASSAY_MAX_SYNERGY_MIN_EFFECT_MILLIBITS: u64 = 1_000;
+
+/// Default transfer-entropy minimum lag (blueprint 08 §6 sweep {1,2,4,8}).
+pub const ASSAY_DEFAULT_TE_MIN_LAG: u64 = 1;
+/// Smallest legal transfer-entropy minimum lag.
+pub const ASSAY_MIN_TE_MIN_LAG: u64 = 1;
+/// Largest legal transfer-entropy minimum lag.
+pub const ASSAY_MAX_TE_MIN_LAG: u64 = 1_024;
+
+/// Default transfer-entropy maximum lag (blueprint 08 §6 sweep {1,2,4,8}).
+pub const ASSAY_DEFAULT_TE_MAX_LAG: u64 = 8;
+/// Smallest legal transfer-entropy maximum lag.
+pub const ASSAY_MIN_TE_MAX_LAG: u64 = 1;
+/// Largest legal transfer-entropy maximum lag.
+pub const ASSAY_MAX_TE_MAX_LAG: u64 = 1_024;
+
+/// Default transfer-entropy permutation count for the significance null.
+pub const ASSAY_DEFAULT_TE_PERMUTATIONS: u64 = 200;
+/// Smallest legal transfer-entropy permutation count.
+pub const ASSAY_MIN_TE_PERMUTATIONS: u64 = 2;
+/// Largest legal transfer-entropy permutation count.
+pub const ASSAY_MAX_TE_PERMUTATIONS: u64 = 100_000;
+
+/// Default periodicity permutation count for the false-alarm-probability null.
+pub const ASSAY_DEFAULT_PERIODICITY_PERMUTATIONS: u64 = 200;
+/// Smallest legal periodicity permutation count.
+pub const ASSAY_MIN_PERIODICITY_PERMUTATIONS: u64 = 2;
+/// Largest legal periodicity permutation count.
+pub const ASSAY_MAX_PERIODICITY_PERMUTATIONS: u64 = 100_000;
+
+/// Default Lomb–Scargle frequency-grid oversampling factor (Press & Rybicki: 4×).
+pub const ASSAY_DEFAULT_PERIODICITY_OVERSAMPLE: u64 = 4;
+/// Smallest legal oversampling factor.
+pub const ASSAY_MIN_PERIODICITY_OVERSAMPLE: u64 = 1;
+/// Largest legal oversampling factor.
+pub const ASSAY_MAX_PERIODICITY_OVERSAMPLE: u64 = 64;
+
+/// Default periodicity FAP threshold, permille: 50 = 0.05.
+pub const ASSAY_DEFAULT_FAP_THRESHOLD_PERMILLE: u64 = 50;
+/// Smallest legal FAP threshold.
+pub const ASSAY_MIN_FAP_THRESHOLD_PERMILLE: u64 = 1;
+/// Largest legal FAP threshold: 500 = 0.5 (looser than a coin flip is meaningless).
+pub const ASSAY_MAX_FAP_THRESHOLD_PERMILLE: u64 = 500;
+
+/// Default CUSUM minimum segment length before/after a change.
+pub const ASSAY_DEFAULT_CUSUM_MIN_SEGMENT: u64 = 10;
+/// Smallest legal CUSUM minimum segment length.
+pub const ASSAY_MIN_CUSUM_MIN_SEGMENT: u64 = 1;
+/// Largest legal CUSUM minimum segment length.
+pub const ASSAY_MAX_CUSUM_MIN_SEGMENT: u64 = 1_000_000;
+
+/// Default CUSUM bootstrap permutation count for the change-confidence null.
+pub const ASSAY_DEFAULT_CUSUM_PERMUTATIONS: u64 = 200;
+/// Smallest legal CUSUM permutation count.
+pub const ASSAY_MIN_CUSUM_PERMUTATIONS: u64 = 2;
+/// Largest legal CUSUM permutation count.
+pub const ASSAY_MAX_CUSUM_PERMUTATIONS: u64 = 100_000;
+
+/// Default MMD permutation count for the drift null.
+pub const ASSAY_DEFAULT_MMD_PERMUTATIONS: u64 = 200;
+/// Smallest legal MMD permutation count.
+pub const ASSAY_MIN_MMD_PERMUTATIONS: u64 = 2;
+/// Largest legal MMD permutation count.
+pub const ASSAY_MAX_MMD_PERMUTATIONS: u64 = 100_000;
+
+/// Default two-sample significance level, permille: 950 = require the observed
+/// statistic to exceed 95% of the permutation null (p ≤ 0.05).
+pub const ASSAY_DEFAULT_SIGNIFICANCE_PERMILLE: u64 = 950;
+/// Smallest legal significance level: 500 permille (median of the null).
+pub const ASSAY_MIN_SIGNIFICANCE_PERMILLE: u64 = 500;
+/// Largest legal significance level: 999 permille (short of the degenerate 100%).
+pub const ASSAY_MAX_SIGNIFICANCE_PERMILLE: u64 = 999;
+
+/// Default transfer-entropy effective-sample quorum (blueprint 08 §6 / perf table:
+/// only top lead/lag pairs, quorum 50).
+pub const ASSAY_DEFAULT_TE_QUORUM: u64 = 50;
+/// Smallest legal transfer-entropy quorum.
+pub const ASSAY_MIN_TE_QUORUM: u64 = 2;
+/// Largest legal transfer-entropy quorum.
+pub const ASSAY_MAX_TE_QUORUM: u64 = 1_000_000;
+
+/// The P5.3 differentiation knob registry (#33).
+pub const ASSAY_DIFF_KNOBS: &[U64KnobDeclaration] = &[
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_DIFF_DISCRETIZATION_BINS_KNOB,
+        default: ASSAY_DEFAULT_DIFF_DISCRETIZATION_BINS,
+        min: ASSAY_MIN_DIFF_DISCRETIZATION_BINS,
+        max: ASSAY_MAX_DIFF_DISCRETIZATION_BINS,
+        unit: "bins",
+        source: "equal-frequency (quantile) binning for plug-in contingency-table entropy (Cover & Thomas, 'Elements of Information Theory' 2nd ed., §8 on quantization)",
+        rationale: "number of equal-frequency bins a continuous slot/series is reduced to before the discrete plug-in entropy estimators run; 4 keeps expected per-cell counts non-trivial at the quorum sample sizes; more bins sharpen resolution but thin the joint table",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_REDUNDANCY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_REDUNDANCY_QUORUM,
+        min: ASSAY_MIN_REDUNDANCY_QUORUM,
+        max: ASSAY_MAX_REDUNDANCY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §3 (total-correlation quorum 50/slot)",
+        rationale: "minimum aligned sample count below which the total-correlation / n_eff card is reported provisional; the plug-in joint entropy over many slots is badly under-sampled below it",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_REDUNDANCY_RETIRE_NMI_PERMILLE_KNOB,
+        default: ASSAY_DEFAULT_REDUNDANCY_RETIRE_NMI_PERMILLE,
+        min: ASSAY_MIN_REDUNDANCY_RETIRE_NMI_PERMILLE,
+        max: ASSAY_MAX_REDUNDANCY_RETIRE_NMI_PERMILLE,
+        unit: "permille",
+        source: "ASTROLABE blueprint 05 §6 / 08 §3 capability gate (retire a lens when its max pairwise correlation with an already-admitted lens exceeds 0.6)",
+        rationale: "normalized-MI above which a lens is judged redundant with an earlier kept lens and recommended for retirement; 600 permille = 0.6 is the blueprint gate; a duplicate lens sits at 1.0 and is always caught",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SYNERGY_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_SYNERGY_QUORUM,
+        min: ASSAY_MIN_SYNERGY_QUORUM,
+        max: ASSAY_MAX_SYNERGY_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §4 (three-way interaction-information quorum 150)",
+        rationale: "minimum aligned sample count below which a synergy triple is reported provisional; a three-way contingency table needs more support than a pairwise one before its interaction-information sign is trusted",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SYNERGY_RESAMPLES_KNOB,
+        default: ASSAY_DEFAULT_SYNERGY_RESAMPLES,
+        min: ASSAY_MIN_SYNERGY_RESAMPLES,
+        max: ASSAY_MAX_SYNERGY_RESAMPLES,
+        unit: "resamples",
+        source: "Efron & Tibshirani, 'An Introduction to the Bootstrap' (1993): 100–1000 resamples for a two-sided percentile interval",
+        rationale: "number of seeded without-replacement subsamples whose interaction-information forms the interval used to classify a triple synergistic/redundant/unclear by whether the interval straddles zero (BUILDING_ON_CALYX §4)",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SYNERGY_MIN_EFFECT_MILLIBITS_KNOB,
+        default: ASSAY_DEFAULT_SYNERGY_MIN_EFFECT_MILLIBITS,
+        min: ASSAY_MIN_SYNERGY_MIN_EFFECT_MILLIBITS,
+        max: ASSAY_MAX_SYNERGY_MIN_EFFECT_MILLIBITS,
+        unit: "millibits",
+        source: "ASTROLABE blueprint 14 §4 / capability 10.3 lens-admission floor (≥ 0.05 bits), reused as the interaction-information effect floor; plug-in interaction information is finite-sample biased away from zero (Cover & Thomas §8), so a tiny confident interval must not be called synergistic",
+        rationale: "minimum absolute interaction information whose interval must clear (below −effect for synergy, above +effect for redundancy) before a triple is classified; below it the triple is Unclear, so finite-sample plug-in bias on truly independent variables does not masquerade as synergy; zero is illegal because it would classify bias as signal",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_TE_MIN_LAG_KNOB,
+        default: ASSAY_DEFAULT_TE_MIN_LAG,
+        min: ASSAY_MIN_TE_MIN_LAG,
+        max: ASSAY_MAX_TE_MIN_LAG,
+        unit: "steps",
+        source: "ASTROLABE blueprint 08_ASSAY §6 (transfer-entropy dyadic lag sweep {1,2,4,8})",
+        rationale: "smallest lag in the dyadic transfer-entropy sweep; the sweep is the powers of two in [min_lag, max_lag], giving the blueprint's {1,2,4,8} at the defaults",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_TE_MAX_LAG_KNOB,
+        default: ASSAY_DEFAULT_TE_MAX_LAG,
+        min: ASSAY_MIN_TE_MAX_LAG,
+        max: ASSAY_MAX_TE_MAX_LAG,
+        unit: "steps",
+        source: "ASTROLABE blueprint 08_ASSAY §6 (transfer-entropy dyadic lag sweep {1,2,4,8})",
+        rationale: "largest lag in the dyadic transfer-entropy sweep; the sweep is the powers of two in [min_lag, max_lag], giving the blueprint's {1,2,4,8} at the defaults",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_TE_PERMUTATIONS_KNOB,
+        default: ASSAY_DEFAULT_TE_PERMUTATIONS,
+        min: ASSAY_MIN_TE_PERMUTATIONS,
+        max: ASSAY_MAX_TE_PERMUTATIONS,
+        unit: "permutations",
+        source: "permutation-test significance for information-theoretic statistics (Good, 'Permutation, Parametric, and Bootstrap Tests of Hypotheses' 3rd ed.)",
+        rationale: "number of seeded source-shuffle permutations that build the transfer-entropy null; the observed TE must exceed the significance quantile of this null to emit a DRIVES edge; more permutations sharpen the p-value at linear cost",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_PERIODICITY_PERMUTATIONS_KNOB,
+        default: ASSAY_DEFAULT_PERIODICITY_PERMUTATIONS,
+        min: ASSAY_MIN_PERIODICITY_PERMUTATIONS,
+        max: ASSAY_MAX_PERIODICITY_PERMUTATIONS,
+        unit: "permutations",
+        source: "permutation false-alarm probability for the Lomb–Scargle periodogram (VanderPlas, 'Understanding the Lomb–Scargle Periodogram', ApJS 2018, §7.4)",
+        rationale: "number of seeded value-shuffle permutations that build the peak-power null used for the periodogram false-alarm probability; more permutations sharpen a small FAP at linear cost",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_PERIODICITY_OVERSAMPLE_KNOB,
+        default: ASSAY_DEFAULT_PERIODICITY_OVERSAMPLE,
+        min: ASSAY_MIN_PERIODICITY_OVERSAMPLE,
+        max: ASSAY_MAX_PERIODICITY_OVERSAMPLE,
+        unit: "factor",
+        source: "Press, Teukolsky, Vetterling & Flannery, 'Numerical Recipes' 3rd ed. §13.8 (Lomb–Scargle frequency oversampling factor 4)",
+        rationale: "how finely the Lomb–Scargle frequency grid is sampled relative to the natural 1/T spacing; 4× is the standard oversampling that resolves the peak period without aliasing; higher densifies the grid at linear cost",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_FAP_THRESHOLD_PERMILLE_KNOB,
+        default: ASSAY_DEFAULT_FAP_THRESHOLD_PERMILLE,
+        min: ASSAY_MIN_FAP_THRESHOLD_PERMILLE,
+        max: ASSAY_MAX_FAP_THRESHOLD_PERMILLE,
+        unit: "permille",
+        source: "conventional 0.05 false-alarm probability for periodicity detection (VanderPlas 2018, §7)",
+        rationale: "false-alarm probability below which a periodogram peak is reported as a real detected period; 50 permille = 0.05 is the reporting convention; a white-noise series sits well above it and is not flagged",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_CUSUM_MIN_SEGMENT_KNOB,
+        default: ASSAY_DEFAULT_CUSUM_MIN_SEGMENT,
+        min: ASSAY_MIN_CUSUM_MIN_SEGMENT,
+        max: ASSAY_MAX_CUSUM_MIN_SEGMENT,
+        unit: "samples",
+        source: "minimum-segment guard for change-point estimators (Truong, Oudre & Vayatis, 'Selective review of offline change point detection', Signal Processing 2020, §3.3)",
+        rationale: "minimum number of samples that must precede a reported change point so a change in the first few noisy samples is not over-claimed; a stream shorter than twice this carries no admissible change point",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_CUSUM_PERMUTATIONS_KNOB,
+        default: ASSAY_DEFAULT_CUSUM_PERMUTATIONS,
+        min: ASSAY_MIN_CUSUM_PERMUTATIONS,
+        max: ASSAY_MAX_CUSUM_PERMUTATIONS,
+        unit: "permutations",
+        source: "Taylor, 'Change-Point Analysis: A Powerful New Tool for Detecting Changes' (2000): bootstrap the CUSUM range under label exchangeability to get a change confidence",
+        rationale: "number of seeded value-shuffle bootstraps that build the null for the CUSUM range (max−min of the cumulative sum of deviations); the observed range must exceed the significance quantile of this null to declare a change point; more bootstraps sharpen the confidence at linear cost",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_MMD_PERMUTATIONS_KNOB,
+        default: ASSAY_DEFAULT_MMD_PERMUTATIONS,
+        min: ASSAY_MIN_MMD_PERMUTATIONS,
+        max: ASSAY_MAX_MMD_PERMUTATIONS,
+        unit: "permutations",
+        source: "Gretton et al., 'A Kernel Two-Sample Test', JMLR 13 (2012), §5 (permutation null for the MMD statistic)",
+        rationale: "number of seeded label-shuffle permutations that build the MMD null used for the drift p-value; the observed MMD must exceed the significance quantile of this null to raise a drift alarm; more permutations sharpen the p-value at linear cost",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_SIGNIFICANCE_PERMILLE_KNOB,
+        default: ASSAY_DEFAULT_SIGNIFICANCE_PERMILLE,
+        min: ASSAY_MIN_SIGNIFICANCE_PERMILLE,
+        max: ASSAY_MAX_SIGNIFICANCE_PERMILLE,
+        unit: "permille",
+        source: "conventional 0.05 permutation-test significance level (Good, 'Permutation, Parametric, and Bootstrap Tests of Hypotheses' 3rd ed.)",
+        rationale: "fraction of the permutation null the observed statistic must exceed to be called significant, shared by the transfer-entropy DRIVES gate and the MMD drift alarm; 950 permille = require p ≤ 0.05; a null (independent series, identical distributions) sits below it and raises no edge/alarm",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+        name: ASSAY_TE_QUORUM_KNOB,
+        default: ASSAY_DEFAULT_TE_QUORUM,
+        min: ASSAY_MIN_TE_QUORUM,
+        max: ASSAY_MAX_TE_QUORUM,
+        unit: "samples",
+        source: "ASTROLABE blueprint 08_ASSAY §6 and the performance table (transfer entropy: only top lead/lag pairs, quorum 50)",
+        rationale: "minimum effective (post-lag) sample count below which a transfer-entropy causality card is reported provisional; the lagged joint history table is badly under-sampled below it",
+    },
+];
+
+/// Returns the differentiation declaration for `name`, or `None` when undeclared.
+pub fn assay_diff_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    ASSAY_DIFF_KNOBS.iter().find(|knob| knob.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +783,46 @@ mod tests {
         // k defaults to the blueprint-fixed 3.
         let k = assay_bits_knob(ASSAY_KSG_NEIGHBORS_K_KNOB).expect("declared");
         assert_eq!(k.default, 3);
+    }
+
+    #[test]
+    fn every_diff_knob_declares_bounds_that_contain_its_default() {
+        assert!(!ASSAY_DIFF_KNOBS.is_empty());
+        for knob in ASSAY_DIFF_KNOBS {
+            assert_eq!(
+                knob.registry_version, ASSAY_DIFF_KNOB_REGISTRY_VERSION,
+                "{knob:?}"
+            );
+            assert!(knob.min <= knob.max, "{knob:?}");
+            assert!(knob.accepts(knob.default), "{knob:?}");
+            assert!(!knob.unit.is_empty(), "{knob:?}");
+            assert!(!knob.source.is_empty(), "{knob:?}");
+            assert!(!knob.rationale.is_empty(), "{knob:?}");
+        }
+    }
+
+    #[test]
+    fn diff_knob_defaults_match_the_blueprint() {
+        // Redundancy quorum 50/slot, synergy quorum 150, retire gate 0.6.
+        assert_eq!(
+            assay_diff_knob(ASSAY_REDUNDANCY_QUORUM_KNOB)
+                .unwrap()
+                .default,
+            50
+        );
+        assert_eq!(
+            assay_diff_knob(ASSAY_SYNERGY_QUORUM_KNOB).unwrap().default,
+            150
+        );
+        assert_eq!(
+            assay_diff_knob(ASSAY_REDUNDANCY_RETIRE_NMI_PERMILLE_KNOB)
+                .unwrap()
+                .default,
+            600
+        );
+        // The dyadic TE sweep spans {1,2,4,8}.
+        assert_eq!(assay_diff_knob(ASSAY_TE_MIN_LAG_KNOB).unwrap().default, 1);
+        assert_eq!(assay_diff_knob(ASSAY_TE_MAX_LAG_KNOB).unwrap().default, 8);
     }
 
     #[test]
