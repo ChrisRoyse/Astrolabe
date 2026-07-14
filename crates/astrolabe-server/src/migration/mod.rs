@@ -126,6 +126,9 @@ use lowering_lane::*;
 mod invalidation_lane;
 use invalidation_lane::*;
 
+mod layout_lane;
+use layout_lane::*;
+
 mod status_surface;
 use status_surface::*;
 pub(crate) use status_surface::{janitor_startup_verify_projects, periodic_verify_chain_tick};
