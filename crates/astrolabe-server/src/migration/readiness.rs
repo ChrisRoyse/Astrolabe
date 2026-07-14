@@ -96,6 +96,10 @@ pub(crate) fn readiness_status_json_at(
         // an elevated rolling rejection rate is a signal the calibrated tier is
         // drifting and recalibration is due (labeled; empty when no crossing fired).
         "guard_drift": drift_proposals_section(cache_dir, project),
+        // P7.4 (#48 DoD 3, #355): commit-OOD verdicts raised by the incremental
+        // watcher tick — a non-conforming changed symbol is a signal a commit
+        // introduced drift on a trusted region (labeled; empty when no OOD fired).
+        "commit_ood": commit_ood_reviews_section(cache_dir, project),
         "first_failing_tier": first_failing.as_ref().map(|tier| {
             json!({
                 "tier": tier.get("tier").cloned().unwrap_or(Value::Null),

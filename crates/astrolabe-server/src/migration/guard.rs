@@ -41,7 +41,7 @@ impl CalibrationMode {
 }
 
 /// A fail-closed refusal carried out of a profile builder: `(code, message, remediation)`.
-type GuardRefusal = (String, String, String);
+pub(crate) type GuardRefusal = (String, String, String);
 
 /// Actor recorded on the guard calibration ledger entry.
 pub(crate) const GUARD_CALIBRATE_ACTOR: &str = "astrolabe-server-guard-calibrate";
@@ -501,6 +501,41 @@ pub(crate) fn measure_guard_panel_sources(
     slots.insert(PANEL_SLOT_STRUCT_TRIGRAMS, s1);
     slots.insert(PANEL_SLOT_API_CALLEES, s4);
     Ok(slots)
+}
+
+/// Measure one symbol object through the panel + the #341 per-snippet reparse into
+/// the guard's densified per-slot [`astrolabe_guard::check::MeasuredSymbol`].
+///
+/// This is the single measurement instrument every **secondary-process** guard
+/// surface shares — `guard_check` (panel mode), the commit-OOD watcher tick
+/// (#355), and the PostToolUse advisory hook (#355) all measure a candidate or
+/// exemplar through THIS one path, never a parallel one, so a symbol scored in the
+/// watcher/hook is measured byte-identically to one scored on the request path. The
+/// raw [`GuardRefusal`] — carrying the specific reparse/encode code — is returned
+/// so each caller wraps it in its own labeled envelope (or, for the advisory hook,
+/// maps it to a labeled silent skip). A measurement fault is always a fail-closed
+/// refusal, never a silently-absent slot (standing invariants #2/#3).
+pub(crate) fn measure_symbol_from_panel(
+    driver: &PanelDriver,
+    runtime: &ShadowSlotRuntime,
+    obj: &Map<String, Value>,
+    index: usize,
+) -> Result<astrolabe_guard::check::MeasuredSymbol, GuardRefusal> {
+    let map = measure_guard_panel_sources(driver, runtime, obj, index)?;
+    let input = astrolabe_guard::check::slot_input_from_panel(&map).map_err(|error| {
+        (
+            error.code().to_string(),
+            error.message().to_string(),
+            error.remediation().to_string(),
+        )
+    })?;
+    astrolabe_guard::check::measure_for_check(&input).map_err(|error| {
+        (
+            error.code().to_string(),
+            error.message().to_string(),
+            error.remediation().to_string(),
+        )
+    })
 }
 
 /// Measure the S1 (struct-trigram) and S4 (api-callee) panel sources of one

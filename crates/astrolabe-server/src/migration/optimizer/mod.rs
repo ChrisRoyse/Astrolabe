@@ -89,6 +89,7 @@ pub(crate) fn optimizer_status_json_at(
         "pending_proposals": optimizer_pending_proposals_json(cache_dir, project)?,
         "guard_health": optimizer_guard_health_json(cache_dir, project)?,
         "guard_drift": drift_proposals_section(cache_dir, project),
+        "commit_ood": commit_ood_reviews_section(cache_dir, project),
         "drift_alarms": drift_alarms,
         "reactive_triggers": reactive_triggers,
         "capabilities": {

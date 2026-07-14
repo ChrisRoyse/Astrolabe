@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 19] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -16,10 +16,100 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
         measure_bits_tool_definition(),
         find_similar_tool_definition(),
         guard_lock_tool_definition(),
+        guard_commit_ood_tool_definition(),
+        guard_advisory_hook_tool_definition(),
         assay_gate_tool_definition(),
         abduce_cause_tool_definition(),
         forecast_tool_definition(),
     ]
+}
+
+pub(crate) fn guard_commit_ood_tool_definition() -> Value {
+    json!({
+        "name": "guard_commit_ood",
+        "title": "Guard Commit Out-of-Distribution Scoring",
+        "description": "Score a commit's changed symbols through the guard panel instrument in a secondary tick (P7.4, #48 DoD 3): each changed symbol's candidate + enclosing-scope exemplars are measured through the SAME libcbm+panel #341 instrument as indexing/guard_check, then routed against the calibrated profile. A symbol that does not conform to its trusted region (any verdict other than accept) makes the commit out-of-distribution and raises a new_region reactive trigger carrying the commit ref; a commit whose symbols all conform raises no alarm. Verdicts are appended to a durable, readback-verified review surface surfaced (labeled) on optimizer_status.commit_ood and get_readiness.commit_ood. This is the watcher/review-surface plumbing: the incremental watcher tick consumes a pending request and scores it through this same core. Every response carries trust/freshness. Fails closed with {code,message,remediation} on not-shadow, no calibrated profile, a missing commit_ref, an empty symbols set, a missing comparison region, or a panel measurement fault (an unscored change is never treated as conforming).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "commit_ref": {
+                    "type": "string",
+                    "description": "The commit ref that introduced the changed symbols (carried on every OOD trigger to the review surface)."
+                },
+                "panel_version": {
+                    "type": "integer",
+                    "description": "Panel version to measure through (1 = S0-S22, 2 = S0-S23). Defaults to the server default."
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "The commit's changed symbols, each {cx, candidate:{panel inputs}, exemplars:[{cx, kernel_near, panel inputs}], identity_locked?}."
+                }
+            },
+            "required": ["project", "commit_ref", "symbols"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
+}
+
+pub(crate) fn guard_advisory_hook_tool_definition() -> Value {
+    json!({
+        "name": "guard_advisory_hook",
+        "title": "Guard PostToolUse Advisory Hook",
+        "description": "Advisory quick guard check for an edited candidate under a strict wall-clock budget (P7.4, #48 DoD 4). Scores only the two cheapest, highest-signal slots (S18 code-semantic, S4 api-callees) of the edited candidate against its enclosing-scope exemplars, measured through the SAME libcbm+panel #341 instrument as indexing. Strictly advisory: it never blocks the agent flow and never refuses a valid candidate. The pure per-slot scoring runs on a worker bounded by the registry-declared ADVISORY_HOOK_BUDGET_MS (300ms) deadline; on timeout or scoring fault it goes silent and the skip is labeled and COUNTED in the persisted, readback-verified outcome surface (never a silent swallow). The candidate/exemplars are measured on the caller thread (the reparse handle is !Send) and bounded by the reparse timeout. Fails closed with {code,message,remediation} only at the tool boundary (not-shadow, no calibrated profile, malformed args, missing candidate); a candidate that measures but cannot be scored in budget is a labeled silent skip, not a refusal.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "candidate": {
+                    "type": "object",
+                    "description": "The edited candidate's panel inputs (source, symbol_name, qualified_name, rel_file_path, language, signature, properties, label)."
+                },
+                "exemplars": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "The enclosing scope's trusted exemplars, each {cx, kernel_near, panel inputs}."
+                },
+                "panel_version": {
+                    "type": "integer",
+                    "description": "Panel version to measure through (1 = S0-S22, 2 = S0-S23). Defaults to the server default."
+                },
+                "budget_ms": {
+                    "type": "integer",
+                    "description": "Optional per-call deadline override in milliseconds; defaults to the registry-declared ADVISORY_HOOK_BUDGET_MS. The never-blocks guarantee holds for any value."
+                }
+            },
+            "required": ["project", "candidate"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn assay_gate_tool_definition() -> Value {

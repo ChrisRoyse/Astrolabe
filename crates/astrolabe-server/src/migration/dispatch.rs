@@ -22,6 +22,8 @@ pub fn handle_tool_raw(
         "coverage_ingest" => handle_coverage_ingest(args_json),
         "guard_calibrate" => handle_guard_calibrate(args_json),
         "guard_check" => handle_guard_check(args_json),
+        "guard_commit_ood" => handle_guard_commit_ood(args_json),
+        "guard_advisory_hook" => handle_guard_advisory_hook(args_json),
         "guard_lock" => handle_guard_lock(args_json),
         "assay_gate" => handle_assay_gate(args_json),
         "team_artifact" => handle_team_artifact(runner, args_json),

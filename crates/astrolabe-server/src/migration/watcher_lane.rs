@@ -207,6 +207,23 @@ fn run_watcher_index_tick(
         )?;
         return Err(format!("watcher index tick failed for {project:?}").into());
     }
+    // P7.4 (#48 DoD 3, #355): after the delta converges, score any pending
+    // commit-OOD request for this project through the shared panel instrument
+    // (#341 per-snippet reparse) and surface OOD verdicts on the review surface.
+    // This is measurement inside the live watcher tick — a bad request is labeled
+    // (never a silent swallow) and never crashes the tick.
+    let commit_ood = match score_pending_commit_ood(cache_dir, project) {
+        Ok(triggers) => json!({"status": "scored", "ood_triggers": triggers}),
+        Err(error) => {
+            tracing::warn!(
+                project,
+                error = %error,
+                "incremental_watcher.commit_ood_tick_failed"
+            );
+            json!({"status": "degraded", "reason": error.to_string()})
+        }
+    };
+
     let status = json!({
         "schema": "astrolabe-watcher-tick-v1",
         "status": "converged",
@@ -215,6 +232,7 @@ fn run_watcher_index_tick(
         "freshness": "fresh",
         "trust": "verified",
         "response_hash": hex_lower(&Sha256::digest(response.as_bytes())),
+        "commit_ood": commit_ood,
     });
     write_config_value(
         cache_dir,
