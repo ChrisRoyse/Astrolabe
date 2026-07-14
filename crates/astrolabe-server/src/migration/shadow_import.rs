@@ -1167,8 +1167,10 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         &weave,
         Some(&after_snapshot),
     )?;
+    let layout_frames = persist_layout_frames(&vault, project, import_changed)?;
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
+        object.insert("layout_frames".to_string(), layout_frames);
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {

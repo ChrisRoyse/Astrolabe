@@ -365,6 +365,7 @@ pub(crate) fn handle_get_architecture(
                 "provenance": read_provenance_metadata(&cache_dir, &project)?,
                 "agreement_graph": read_agreement_graph_aspect(&cache_dir, &project)?,
                 "redundancy": read_redundancy_neff_aspect(&cache_dir, &project),
+                "layout_map": read_layout_map_aspect(&cache_dir, &project)?,
             },
         }),
     )
