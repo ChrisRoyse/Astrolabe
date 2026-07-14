@@ -84,3 +84,9 @@ pub const ASTRO_ASSAY_MEASUREMENT_INPUT_INVALID: &str = "ASTRO_ASSAY_MEASUREMENT
 /// A card read back from the ledger did not re-derive to the recorded value
 /// (reproduce/FSV failure).
 pub const ASTRO_ASSAY_REPRODUCE_MISMATCH: &str = "ASTRO_ASSAY_REPRODUCE_MISMATCH";
+/// A lens capability-gate input was malformed: misaligned sample vectors, a
+/// non-finite measured value, or an out-of-range correlation.
+pub const ASTRO_ASSAY_GATE_INPUT_INVALID: &str = "ASTRO_ASSAY_GATE_INPUT_INVALID";
+/// A ledgered gate reversal targeted a sequence that is not a reversible
+/// decision (missing, already reverted, or itself a reversal).
+pub const ASTRO_ASSAY_GATE_REVERT_INVALID: &str = "ASTRO_ASSAY_GATE_REVERT_INVALID";
