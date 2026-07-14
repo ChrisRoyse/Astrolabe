@@ -166,6 +166,9 @@ use detect_changes_risk::*;
 mod search_fusion;
 use search_fusion::*;
 
+mod find_similar;
+use find_similar::*;
+
 mod dispatch;
 // Non-test code reaches dispatch only through the two public entry points; the
 // glob is needed by the colocated tests, which drive the gate internals directly.

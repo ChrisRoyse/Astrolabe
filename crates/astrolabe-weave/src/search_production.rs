@@ -51,6 +51,15 @@ use crate::search_index::{
     SlotQuery, StoredContent, run_indexed_search,
 };
 
+/// The dense semantic slots the symbol-anchored "more like this" query ranks: S18
+/// (code-semantic) and S20 (name-semantic), persisted per symbol as **dense**
+/// embedding vectors. Pass these (or a narrower subset) to
+/// [`semantic_more_like_this`] to rank against an anchor symbol's own persisted
+/// semantic vectors. Identical membership to [`PRODUCTION_VECTOR_SLOTS`] (both are
+/// the two query-embeddable semantic slots), named separately for the symbol-
+/// anchored query surface so a reader sees the intent at the call site.
+pub const SEMANTIC_QUERY_SLOTS: [SlotId; 2] = [SLOT_CODE_SEMANTIC, SLOT_NAME_SEMANTIC];
+
 /// Fail-closed: reading the persisted shadow vault (graph snapshot or a slot
 /// column-family row) failed. Wraps the underlying Calyx/ingest error.
 pub const ASTRO_SEARCH_PRODUCTION_VAULT: &str = "ASTRO_SEARCH_PRODUCTION_VAULT";
@@ -609,6 +618,253 @@ pub fn structural_more_like_this(
     })
 }
 
+/// A symbol-anchored semantic query result: the ranked semantic neighbors of an
+/// anchor symbol (its own dense S18/S20 vectors used as the query), anchor
+/// excluded. The dense analogue of [`StructuralQueryResult`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticQueryResult {
+    /// The anchor symbol whose persisted S18/S20 vectors drove the query.
+    pub anchor_symbol_id: String,
+    /// The semantic slots actually anchored (each had a persisted dense vector on
+    /// the anchor and a declared vector index in the manifest), in request order.
+    pub anchored_slots: Vec<SlotId>,
+    /// Ranked neighbors (anchor excluded), best first, at most `k`.
+    pub neighbors: Vec<FusedResult>,
+}
+
+/// Symbol-anchored semantic "more like this" query — the dense analogue of
+/// [`structural_more_like_this`]. It is the DECLARED semantic mode of a future
+/// MCP `find_similar` (#43): given an ALREADY-INDEXED `anchor_symbol_id`, it reads
+/// that symbol's own persisted dense semantic vectors (S18 code-semantic / S20
+/// name-semantic) out of the manifest and uses them as the query against the
+/// production index, ranking the corpus by dense cosine (HNSW) and fusing the
+/// requested semantic slots with RRF. The anchor — its own nearest neighbor — is
+/// excluded from the returned neighbor list.
+///
+/// Fail-closed contract (identical shape to [`structural_more_like_this`], no
+/// silent fallback, no partial scoring):
+/// - empty `semantic_slots` => [`ASTRO_SEARCH_STRUCTURAL_NO_SLOTS`];
+/// - anchor absent from the manifest => [`ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT`];
+/// - a requested slot that is not a declared vector index, **or** for which the
+///   anchor holds no persisted dense vector => [`ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT`]
+///   (the whole query refuses — it never partial-scores a subset);
+/// - `k`/`ef`/slot-count over the declared caps => the planner's `PLAN_COST_EXCEEDED`.
+pub fn semantic_more_like_this(
+    index_set: &SlotIndexSet,
+    anchor_symbol_id: &str,
+    semantic_slots: &[SlotId],
+    k: u64,
+    ef: u64,
+    caps: &SearchCaps,
+) -> Result<SemanticQueryResult, SearchError> {
+    if semantic_slots.is_empty() {
+        return Err(SearchError::new(
+            ASTRO_SEARCH_STRUCTURAL_NO_SLOTS,
+            "semantic query requested no semantic slots".to_string(),
+            "Request at least one semantic slot (S18 code-semantic and/or S20 name-semantic).",
+        ));
+    }
+
+    let manifest = index_set.manifest();
+    let Some(doc) = manifest
+        .documents
+        .iter()
+        .find(|doc| doc.symbol_id == anchor_symbol_id)
+    else {
+        return Err(SearchError::new(
+            ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT,
+            format!(
+                "anchor symbol {anchor_symbol_id:?} is not present in the search index manifest"
+            ),
+            "Anchor a semantic query on a symbol that was indexed; rebuild the corpus if it \
+             should be present.",
+        ));
+    };
+
+    let mut query = SlotQuery::default();
+    let mut weights: BTreeMap<SlotId, u64> = BTreeMap::new();
+    let mut anchored_slots = Vec::with_capacity(semantic_slots.len());
+    for slot in semantic_slots {
+        if !index_set.has_slot(*slot) {
+            return Err(SearchError::new(
+                ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT,
+                format!(
+                    "slot {} is not a declared vector index in this manifest",
+                    slot.get()
+                ),
+                "Build the manifest with the semantic slots declared (SEMANTIC_QUERY_SLOTS) \
+                 before anchoring a semantic query on them.",
+            ));
+        }
+        let Some(StoredContent::VectorBits(words)) = doc.slots.get(slot) else {
+            return Err(SearchError::new(
+                ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT,
+                format!(
+                    "anchor symbol {anchor_symbol_id:?} has no persisted dense vector for slot {}",
+                    slot.get()
+                ),
+                "The anchor carries no S18/S20 vector for this slot; choose an anchor whose \
+                 semantic vectors were persisted, or drop the slot from the request.",
+            ));
+        };
+        let data: Vec<f32> = words.iter().map(|bits| f32::from_bits(*bits)).collect();
+        query = query.with_vector(*slot, data);
+        weights.insert(*slot, WEIGHT_SCALE_MILLIS);
+        anchored_slots.push(*slot);
+    }
+
+    // One extra result so the anchor (its own nearest neighbor) can be dropped
+    // without shrinking the list below `k`; clamp to the declared cap so the extra
+    // never turns a legal `k` into a cost refusal.
+    let internal_k = k.saturating_add(1).min(caps.max_k);
+    let request = SearchRequest {
+        query: String::new(),
+        k: internal_k,
+        ef,
+        timeout_ms: caps.max_timeout_ms,
+        fusion_override_millis: Some(weights),
+        temporal_alpha_millis: 0,
+    };
+    let plan = plan_search(&request, caps)?;
+    let empty_filters: BTreeMap<String, String> = BTreeMap::new();
+    let empty_attrs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let empty_recency: BTreeMap<String, u64> = BTreeMap::new();
+    let mut results = run_indexed_search(
+        &plan,
+        index_set,
+        &query,
+        &empty_filters,
+        &empty_attrs,
+        &empty_recency,
+    )?;
+    results.retain(|result| result.symbol_id != anchor_symbol_id);
+    results.truncate(k as usize);
+
+    Ok(SemanticQueryResult {
+        anchor_symbol_id: anchor_symbol_id.to_string(),
+        anchored_slots,
+        neighbors: results,
+    })
+}
+
+/// The clone-taxonomy class of a candidate neighbor, decided by which anchored
+/// signal(s) surfaced it (#43). Copy-paste shares structure but not (necessarily)
+/// semantics; a reimplementation shares semantics but not structure; a true clone
+/// shares both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneClass {
+    /// Surfaced only by the structural (S1/S4) signal — copy-paste / near-textual.
+    CopyPaste,
+    /// Surfaced only by the semantic (S18/S20) signal — reimplementation.
+    Reimplementation,
+    /// Surfaced by BOTH signals — a true clone (structure and semantics agree).
+    TrueClone,
+}
+
+impl CloneClass {
+    /// Stable string label for the response envelope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CopyPaste => "copy_paste",
+            Self::Reimplementation => "reimplementation",
+            Self::TrueClone => "true_clone",
+        }
+    }
+}
+
+/// One classified clone candidate: the neighbor symbol, its taxonomy class, and
+/// the best (lowest, i.e. nearest) rank it achieved under each signal (`None` when
+/// that signal did not surface it). Ranks are 0-based positions in each signal's
+/// neighbor list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneCandidate {
+    /// The neighbor symbol id.
+    pub symbol_id: String,
+    /// The clone-taxonomy class.
+    pub class: CloneClass,
+    /// 0-based rank under the structural signal, if it surfaced this symbol.
+    pub structural_rank: Option<usize>,
+    /// 0-based rank under the semantic signal, if it surfaced this symbol.
+    pub semantic_rank: Option<usize>,
+}
+
+/// Classifies clone candidates by fusing a structural neighbor list and a semantic
+/// neighbor list into the clone taxonomy (#43): present in both => true clone;
+/// structural only => copy-paste; semantic only => reimplementation.
+///
+/// Pure and deterministic: the two inputs are ordered neighbor id lists (as
+/// returned by [`structural_more_like_this`] / [`semantic_more_like_this`], anchor
+/// already excluded). The output is ordered true-clone first, then copy-paste,
+/// then reimplementation; within a class by ascending combined rank
+/// (structural_rank + semantic_rank, missing side counted as its list length) so
+/// the ordering is stable and never depends on iteration nondeterminism.
+pub fn classify_clone_taxonomy(
+    structural_neighbors: &[String],
+    semantic_neighbors: &[String],
+) -> Vec<CloneCandidate> {
+    let structural_rank: BTreeMap<&str, usize> = structural_neighbors
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (id.as_str(), rank))
+        .collect();
+    let semantic_rank: BTreeMap<&str, usize> = semantic_neighbors
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (id.as_str(), rank))
+        .collect();
+
+    // Union of both neighbor sets, deduplicated, deterministic order.
+    let mut ids: Vec<&str> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for id in structural_neighbors.iter().chain(semantic_neighbors.iter()) {
+        if seen.insert(id.as_str()) {
+            ids.push(id.as_str());
+        }
+    }
+
+    let mut candidates: Vec<CloneCandidate> = ids
+        .into_iter()
+        .map(|id| {
+            let s_rank = structural_rank.get(id).copied();
+            let m_rank = semantic_rank.get(id).copied();
+            let class = match (s_rank.is_some(), m_rank.is_some()) {
+                (true, true) => CloneClass::TrueClone,
+                (true, false) => CloneClass::CopyPaste,
+                (false, true) => CloneClass::Reimplementation,
+                // Unreachable: every id came from at least one list.
+                (false, false) => CloneClass::Reimplementation,
+            };
+            CloneCandidate {
+                symbol_id: id.to_string(),
+                class,
+                structural_rank: s_rank,
+                semantic_rank: m_rank,
+            }
+        })
+        .collect();
+
+    let class_order = |class: CloneClass| match class {
+        CloneClass::TrueClone => 0u8,
+        CloneClass::CopyPaste => 1,
+        CloneClass::Reimplementation => 2,
+    };
+    let s_len = structural_neighbors.len();
+    let m_len = semantic_neighbors.len();
+    candidates.sort_by(|a, b| {
+        class_order(a.class)
+            .cmp(&class_order(b.class))
+            .then_with(|| {
+                let a_combined =
+                    a.structural_rank.unwrap_or(s_len) + a.semantic_rank.unwrap_or(m_len);
+                let b_combined =
+                    b.structural_rank.unwrap_or(s_len) + b.semantic_rank.unwrap_or(m_len);
+                a_combined.cmp(&b_combined)
+            })
+            .then_with(|| a.symbol_id.cmp(&b.symbol_id))
+    });
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1145,5 +1401,133 @@ mod tests {
         let err = structural_more_like_this(&set, "demo.anchor", &[], 5, 32, &caps)
             .expect_err("no slots must refuse");
         assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_NO_SLOTS);
+    }
+
+    // --- Symbol-anchored semantic query mode + clone taxonomy (#43) ------------
+
+    /// Hand-built dense semantic manifest: S18 declared as a dim-4 vector index
+    /// with vectors chosen so cosine separates near from far.
+    fn semantic_manifest(base_seq: u64) -> SlotIndexManifest {
+        const DIM: u32 = 4;
+        let mut builder = SlotIndexSetBuilder::new(IndexKnobs::defaults(0x5EED));
+        builder.declare_vector(SLOT_CODE_SEMANTIC, DIM);
+        builder.add_vector("demo.anchor", SLOT_CODE_SEMANTIC, &[1.0, 0.0, 0.0, 0.0]);
+        builder.add_vector("demo.near", SLOT_CODE_SEMANTIC, &[0.9, 0.1, 0.0, 0.0]);
+        builder.add_vector("demo.far", SLOT_CODE_SEMANTIC, &[0.0, 0.0, 1.0, 0.0]);
+        builder.build_manifest(base_seq).expect("semantic manifest")
+    }
+
+    // FSV: persist a dense semantic manifest, read the bytes back independently,
+    // rebuild, and run the symbol-anchored semantic query TWICE — proving a real
+    // persisted dense corpus ranks deterministically, excludes the anchor, and
+    // orders neighbors by dense cosine (near before far).
+    #[test]
+    fn semantic_more_like_this_ranks_persisted_dense_vectors_fsv() {
+        let dir = temp_dir("semantic-fsv");
+        let path = dir.join("semantic_index.v1.json");
+        let manifest = semantic_manifest(11);
+        let written = persist_manifest(&path, &manifest).expect("persist");
+        println!(
+            "FSV before: wrote {written} semantic manifest bytes to {}",
+            path.display()
+        );
+
+        let run = || {
+            let bytes = std::fs::read(&path).expect("read bytes");
+            let reloaded = SlotIndexManifest::from_bytes(&bytes).expect("parse");
+            let set = SlotIndexSet::from_manifest(&reloaded).expect("build");
+            semantic_more_like_this(
+                &set,
+                "demo.anchor",
+                &[SLOT_CODE_SEMANTIC],
+                5,
+                32,
+                &SearchCaps::default_caps(),
+            )
+            .expect("semantic query")
+        };
+        let a = run();
+        let b = run();
+        let ids: Vec<&str> = a.neighbors.iter().map(|n| n.symbol_id.as_str()).collect();
+        println!(
+            "FSV after: anchor={} anchored_slots={:?} neighbors={ids:?}",
+            a.anchor_symbol_id, a.anchored_slots
+        );
+        assert_eq!(a, b, "two persisted-bytes readbacks must rank identically");
+        assert_eq!(a.anchored_slots, vec![SLOT_CODE_SEMANTIC]);
+        assert!(
+            !ids.contains(&"demo.anchor"),
+            "anchor excluded from its own neighbor list"
+        );
+        assert_eq!(
+            ids,
+            vec!["demo.near", "demo.far"],
+            "near neighbor must outrank the disjoint far one"
+        );
+    }
+
+    // Edge triad: semantic anchor absent / undeclared slot / declared-but-missing
+    // anchor vector / no slots — every one a labeled refusal, mirroring the
+    // structural mode's fail-closed contract.
+    #[test]
+    fn semantic_query_edges_are_all_fail_closed() {
+        let caps = SearchCaps::default_caps();
+        let set = SlotIndexSet::from_manifest(&semantic_manifest(1)).expect("build");
+
+        let err = semantic_more_like_this(&set, "demo.ghost", &[SLOT_CODE_SEMANTIC], 5, 32, &caps)
+            .expect_err("absent anchor must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_ANCHOR_ABSENT);
+
+        // S20 is not declared in this manifest.
+        let err = semantic_more_like_this(&set, "demo.anchor", &[SLOT_NAME_SEMANTIC], 5, 32, &caps)
+            .expect_err("undeclared vector slot must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_SLOT_ABSENT);
+
+        let err = semantic_more_like_this(&set, "demo.anchor", &[], 5, 32, &caps)
+            .expect_err("no slots must refuse");
+        assert_eq!(err.code(), ASTRO_SEARCH_STRUCTURAL_NO_SLOTS);
+    }
+
+    // Pure FSV of the clone taxonomy: a candidate in BOTH neighbor lists is a true
+    // clone, structural-only is copy-paste, semantic-only is reimplementation, and
+    // the ordering is deterministic (true_clone first, then by combined rank).
+    #[test]
+    fn classify_clone_taxonomy_partitions_by_signal() {
+        let structural = vec!["sym.true".to_string(), "sym.copy".to_string()];
+        let semantic = vec!["sym.true".to_string(), "sym.reimpl".to_string()];
+        let classified = classify_clone_taxonomy(&structural, &semantic);
+        println!(
+            "clone taxonomy: {:?}",
+            classified
+                .iter()
+                .map(|c| (c.symbol_id.as_str(), c.class.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            classified.len(),
+            3,
+            "union of {{true,copy}} and {{true,reimpl}}"
+        );
+        // True clone ranks first.
+        assert_eq!(classified[0].symbol_id, "sym.true");
+        assert_eq!(classified[0].class, CloneClass::TrueClone);
+        assert_eq!(classified[0].structural_rank, Some(0));
+        assert_eq!(classified[0].semantic_rank, Some(0));
+        // Copy-paste (structural only) next.
+        assert_eq!(classified[1].symbol_id, "sym.copy");
+        assert_eq!(classified[1].class, CloneClass::CopyPaste);
+        assert_eq!(classified[1].semantic_rank, None);
+        // Reimplementation (semantic only) last.
+        assert_eq!(classified[2].symbol_id, "sym.reimpl");
+        assert_eq!(classified[2].class, CloneClass::Reimplementation);
+        assert_eq!(classified[2].structural_rank, None);
+
+        // Deterministic: reclassifying the same inputs yields identical output.
+        assert_eq!(classify_clone_taxonomy(&structural, &semantic), classified);
+
+        // Disjoint lists => no true clones.
+        let disjoint = classify_clone_taxonomy(&["a".to_string()], &["b".to_string()]);
+        assert!(!disjoint.iter().any(|c| c.class == CloneClass::TrueClone));
     }
 }
