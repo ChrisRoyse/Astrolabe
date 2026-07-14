@@ -3,7 +3,7 @@ use super::*;
 use astrolabe_guard::calibration::{CalibrationDomain, CalibrationLanguage};
 use astrolabe_guard::check::{
     Exemplar, GUARD_NEW_REGION_SCHEMA, GUARD_VERDICT_SCHEMA, MeasuredSymbol, NewRegionRecord,
-    SlotFeature, SymbolSlotInput, check_candidate, measure_for_check, measure_for_index,
+    SlotFeature, SymbolSlotInput, check_candidate_with_lock, measure_for_check, measure_for_index,
     resolve_region, slot_input_from_panel, verdict_ledger_payload_bytes,
 };
 use astrolabe_guard::profile::{
@@ -171,13 +171,22 @@ pub(crate) fn guard_check_at(
     };
 
     // 5. Resolve region (kernel-near first, peripheral fallback) + route.
+    //
+    // P7.4 identity-lock (#48): consult the persisted lock inventory for this
+    // target. An exported/public (identity-locked) symbol enforces its public-API
+    // signature slot `AllRequired` at the identity FAR — breaking-change drift on
+    // a locked surface refuses; a non-exported target folds the same slot into the
+    // content class (content-class handling), so its signature drift routes to
+    // new_region rather than an identity refuse. The lock decision is surfaced and
+    // travels with the verdict for audit.
+    let identity_locked = load_lock_inventory(cache_dir, project)?.is_locked(&target_cx_hex);
     let region = match resolve_region(&exemplars) {
         Ok(region) => region,
         Err(error) => {
             return guard_check_refused_str(error.code(), error.message(), error.remediation());
         }
     };
-    let report = match check_candidate(&candidate, &profile, &region) {
+    let report = match check_candidate_with_lock(&candidate, &profile, &region, identity_locked) {
         Ok(report) => report,
         Err(error) => {
             return guard_check_refused_str(error.code(), error.message(), error.remediation());
@@ -226,6 +235,21 @@ pub(crate) fn guard_check_at(
         }
     }
 
+    // 6b. Feed the per-slot outcomes into the durable drift monitor (P7.4 #48): the
+    //     rolling per-slot rejection rate is tracked across checks and a crossing of
+    //     the calibrated drift bound emits a recalibration proposal surfaced on
+    //     optimizer_status / get_readiness. Drift monitoring is a secondary signal on
+    //     top of the verdict, so a recording fault is labeled (never blocks the
+    //     served verdict, invariant 3) rather than failing the check.
+    let drift_monitor = match record_guard_check_outcomes(cache_dir, project, &profile, &report) {
+        Ok(fired) => json!({"status": "recorded", "proposals_fired": fired}),
+        Err(error) => json!({
+            "status": "degraded",
+            "reason": "drift monitor could not persist this check's outcomes",
+            "detail": error.to_string(),
+        }),
+    };
+
     // 7. FSV pairing: read the persisted ledger entry back and confirm the served
     //    per-slot detail matches the persisted bytes.
     let readback = match calyx_aster::ledger_view::read_ledger_seq(&vault_dir, seq)? {
@@ -241,6 +265,8 @@ pub(crate) fn guard_check_at(
         "status": "checked",
         "project": project,
         "target_cx": target_cx_hex,
+        "identity_locked": identity_locked,
+        "drift_monitor": drift_monitor,
         "verdict": report.combined.verdict.as_str(),
         "provisional": report.combined.provisional,
         "region_class": report.region_class.as_str(),
