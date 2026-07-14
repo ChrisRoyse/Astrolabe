@@ -5422,6 +5422,178 @@ fn guard_check_new_region_records_awaiting_grounding() {
     fs::remove_dir_all(&dir).ok();
 }
 
+
+// ---- #331 panel-mode guard_check contract (wave-11 orchestrator insertion) ----
+
+/// A panel-mode candidate/exemplar body: real source text + panel input fields,
+/// as indexed symbols carry them (shadow_import property vocabulary).
+fn guard_check_panel_body(name: &str, source: &str) -> Value {
+    json!({
+        "source": source,
+        "symbol_name": name,
+        "qualified_name": format!("demo::{name}"),
+        "rel_file_path": "src/demo.rs",
+        "language": "rust",
+        "signature": format!("fn {name}(input: u32) -> Result<u32, Error>"),
+        "properties": {
+            "complexity": 3.0,
+            "cognitive": 2.0,
+            "loop_count": 1.0,
+            "loop_depth": 1.0,
+            "param_count": 1.0,
+            "param_types": ["u32"],
+            "return_type": "Result<u32, Error>",
+            "throws": ["Error"],
+            "docstring": "Checked demo function."
+        },
+    })
+}
+
+#[test]
+fn guard_check_panel_mode_fails_closed_on_unmeasurable_panel_source() {
+    // #331 server contract, current truth: ShadowSlotRuntime never populates the
+    // S1 (struct_trigrams) / S4 (api_calls) encoder inputs (shadow_import.rs
+    // hardcodes them None), so those guard panel sources read back Absent and the
+    // panel path MUST refuse — never partially score, never silently fall back to
+    // supplied vectors (standing invariant #3). The accept path through the panel
+    // lands with the per-snippet libcbm reparse (#341).
+    let dir = temp_dir("guard-check-panel-closed");
+    setup_guard_check_calibrated(&dir, "guard-check-panel-closed");
+
+    // Before-state: guard_calibrate itself ledgers one EntryKind::Guard row, so the
+    // fail-closed proof is a BEFORE == AFTER count, not an absolute zero.
+    let vault_dir = dir.join("demo.astrolabe-vault");
+    let count_guard_entries = |vault_dir: &Path| -> usize {
+        let mut seq = 1u64;
+        let mut guard_entries = 0usize;
+        while let Some(row) = calyx_aster::ledger_view::read_ledger_seq(vault_dir, seq).unwrap() {
+            let entry = decode_ledger(&row.bytes).unwrap();
+            if entry.kind == calyx_ledger::EntryKind::Guard {
+                guard_entries += 1;
+            }
+            seq += 1;
+        }
+        guard_entries
+    };
+    let guard_entries_before = count_guard_entries(&vault_dir);
+
+    let source = "fn checked_add(input: u32) -> Result<u32, Error> {\n    let bumped = input.checked_add(1).ok_or(Error::Overflow)?;\n    Ok(bumped)\n}\n";
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "measurement": "panel",
+        "candidate": guard_check_panel_body("checked_add", source),
+        "exemplars": [
+            {"cx": "cx:kernel", "kernel_near": true, "source": source, "symbol_name": "checked_add",
+             "qualified_name": "demo::checked_add", "rel_file_path": "src/demo.rs", "language": "rust",
+             "properties": {"complexity": 3.0, "throws": ["Error"]}},
+        ],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    let text = envelope["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("ASTRO_GUARD_CHECK_PANEL_SLOT_MISSING")
+            || text.contains("ASTRO_GUARD_CHECK_PANEL_FAILED"),
+        "panel mode must fail closed on an unmeasurable source, got: {text}"
+    );
+
+    // FSV after-state: a refused panel check persists NO verdict — the Guard-kind
+    // ledger count is byte-for-byte unchanged from before the call.
+    let guard_entries_after = count_guard_entries(&vault_dir);
+    assert_eq!(
+        guard_entries_after, guard_entries_before,
+        "a refused panel check must persist no verdict"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn guard_check_refuses_ambiguous_missing_and_invalid_measurement_modes() {
+    let dir = temp_dir("guard-check-mode-edges");
+    setup_guard_check_calibrated(&dir, "guard-check-mode-edges");
+    let vector = vec![1.0, 2.0, 3.0, 4.0];
+
+    // Edge 1: candidate carries BOTH per-slot vectors and panel inputs, no declared
+    // mode => ambiguity is refused, never guessed.
+    let mut both = guard_check_symbol_body(&vector);
+    both["source"] = json!("fn f() {}");
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": both,
+        "exemplars": [{"cx": "cx:k", "kernel_near": true, "slots": guard_check_symbol_body(&vector)["slots"].clone()}],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap()
+            .contains("ASTRO_GUARD_CHECK_MEASUREMENT_AMBIGUOUS"),
+        "{envelope}"
+    );
+
+    // Edge 2: neither vectors nor panel inputs => refused as missing.
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "candidate": {},
+        "exemplars": [],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap()
+            .contains("ASTRO_GUARD_CHECK_MEASUREMENT_MISSING"),
+        "{envelope}"
+    );
+
+    // Edge 3: an unrecognized declared mode => refused as invalid.
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "measurement": "psychic",
+        "candidate": guard_check_symbol_body(&vector),
+        "exemplars": [],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap()
+            .contains("ASTRO_GUARD_CHECK_MEASUREMENT_INVALID"),
+        "{envelope}"
+    );
+
+    // Edge 4: panel mode with an unknown panel_version => refused before measuring.
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "measurement": "panel",
+        "panel_version": 99,
+        "candidate": {"source": "fn f() {}", "symbol_name": "f"},
+        "exemplars": [],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], true, "{envelope}");
+    assert!(
+        envelope["content"][0]["text"].as_str().unwrap()
+            .contains("ASTRO_GUARD_CHECK_PANEL_VERSION"),
+        "{envelope}"
+    );
+
+    // Vector mode still accepts after the mode machinery landed (wave-10 path intact).
+    let args = json!({
+        "project": "demo",
+        "target": GUARD_CHECK_TARGET,
+        "measurement": "vector",
+        "candidate": guard_check_symbol_body(&vector),
+        "exemplars": [{"cx": "cx:k", "kernel_near": true, "slots": guard_check_symbol_body(&vector)["slots"].clone()}],
+    });
+    let envelope = guard_check_structured(&dir, &args);
+    assert_eq!(envelope["isError"], false, "{envelope}");
+    assert_eq!(envelope["structuredContent"]["verdict"], "accept");
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn optimizer_status_reads_measured_tripwires_from_config() {
     let dir = temp_dir("optimizer-tripwires-readback");
