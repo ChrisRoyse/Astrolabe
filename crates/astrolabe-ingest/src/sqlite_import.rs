@@ -5399,9 +5399,8 @@ fn parse_symbol_label(value: &str) -> IngestResult<SymbolLabel> {
     // Single admission oracle shared with the emission-vocabulary parity check
     // (SymbolLabel::from_cbm_label). Keeping the accepted roster in one place
     // means a new C-side label drifts in exactly one spot.
-    SymbolLabel::from_cbm_label(value).ok_or_else(|| {
-        invalid_sqlite(format!("unknown Codebase Memory MCP node label {value:?}"))
-    })
+    SymbolLabel::from_cbm_label(value)
+        .ok_or_else(|| invalid_sqlite(format!("unknown Codebase Memory MCP node label {value:?}")))
 }
 
 fn modality_for_label(label: SymbolLabel) -> Modality {

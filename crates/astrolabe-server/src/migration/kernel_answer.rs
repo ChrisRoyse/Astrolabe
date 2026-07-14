@@ -93,7 +93,7 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
                     tool_json_result(artifact_quadrant_value(&project, &artifact))
                 };
             }
-            Ok(None) => {} // fall through to the labeled scope-summary fallback
+            Ok(None) => {}    // fall through to the labeled scope-summary fallback
             Err(_error) => {} // artifact read failed: labeled fallback below
         }
 
@@ -231,7 +231,11 @@ pub(crate) fn read_project_kernel_artifact(
         &vault_dir,
         &vault_id,
         &vault_salt,
-        vec![ColumnFamily::Kernel, ColumnFamily::Graph, ColumnFamily::Base],
+        vec![
+            ColumnFamily::Kernel,
+            ColumnFamily::Graph,
+            ColumnFamily::Base,
+        ],
     )?;
     let scope_id = kernel_artifact_scope_id(project);
     let artifact = astrolabe_ingest::read_persisted_kernel_artifact(&vault, &scope_id)?;
@@ -300,10 +304,13 @@ pub(crate) fn serve_kernel_index_value(
         IndexKnobs::defaults(0x4B45_524E_454C_0001),
     ) {
         Ok(index) => index,
-        Err(error) => return membership_manifest(&format!("kernel-member index unavailable: {error}")),
+        Err(error) => {
+            return membership_manifest(&format!("kernel-member index unavailable: {error}"));
+        }
     };
 
-    let embedding_backed = index.index_kind == astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw;
+    let embedding_backed =
+        index.index_kind == astrolabe_weave::KernelIndexKind::EmbeddingBackedHnsw;
     json!({
         "schema": astrolabe_weave::KERNEL_MEMBER_INDEX_SCHEMA,
         "index_kind": index.index_kind.as_str(),

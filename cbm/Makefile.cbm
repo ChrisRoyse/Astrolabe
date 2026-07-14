@@ -34,9 +34,18 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
+# GNU Make expands $(shell ...) through a POSIX shell, where an unquoted
+# backslashed Windows compiler path (CC=C:\...\gcc.exe, as the pinned launcher
+# exports it) has its backslashes eaten as escapes — the probe then fails and
+# silently flips the warning/link contract (IS_GCC/IS_MINGW fold every probe
+# failure into "no": WIN32_LIBS drops -lws2_32 and the test-runner link dies).
+# Normalize separators for probes only; recipes keep the native $(CC) form.
+# (Mirrors patches/cbm/Makefile.cbm's CC_FOR_SHELL, wave-14 consolidation.)
+CC_FOR_SHELL := $(subst \,/,$(CC))
+
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
-IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
+IS_GCC := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
 # #179: -Wno-alloc-size-larger-than retired. The two sites that tripped GCC 14's
 # -Walloc-size-larger-than under -Werror (src/pipeline/pass_definitions.c and
 # src/ui/layout3d.c) now carry unconditional fail-closed count clamps that narrow
@@ -81,7 +90,7 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
-IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
+IS_MINGW := $(shell echo | $(CC_FOR_SHELL) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static

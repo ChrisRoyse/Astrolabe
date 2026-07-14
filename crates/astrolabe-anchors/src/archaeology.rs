@@ -373,6 +373,23 @@ pub fn changed_new_ranges(
     changed_ranges(repo, parent, commit, false)
 }
 
+/// Returns the new-side ranges introduced between two arbitrary commits
+/// (`git diff old..new`), for callers that track a last-processed baseline
+/// which may span multiple commits — e.g. the guard commit-OOD producer
+/// diffing `last-processed..HEAD` (#368). Unlike [`changed_new_ranges`] this
+/// does not derive the old side from the commit's parent, so a baseline that
+/// fell several commits behind still yields exactly the lines that changed
+/// since it was recorded.
+pub fn changed_new_ranges_between(
+    repo: &Path,
+    old: &str,
+    new: &str,
+) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+    validate_oid(old)?;
+    validate_oid(new)?;
+    changed_ranges(repo, old, new, false)
+}
+
 fn changed_old_ranges(
     repo: &Path,
     parent: &str,

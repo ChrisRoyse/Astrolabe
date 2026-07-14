@@ -2609,7 +2609,7 @@ mod struct_trigram_callee_slot_tests {
     //! `ASTRO_GUARD_AUTO_SLOT_UNMEASURED`. A symbol whose property is absent stays
     //! honestly unmeasured (an absent slot), never a fabricated vector.
     use super::*;
-    use astrolabe_panel::{PanelInput, SlotId, encode_slot};
+    use astrolabe_panel::{PanelInput, encode_slot};
 
     fn input_with(st: Option<&str>, callees: Option<&str>) -> PanelInput {
         let mut input = PanelInput::fixture(astrolabe_domain::SymbolLabel::Function);
@@ -2655,11 +2655,15 @@ mod struct_trigram_callee_slot_tests {
         assert!(encoder.struct_trigrams.is_none(), "no `st` → S1 unmeasured");
         assert!(encoder.api_calls.is_none(), "no `callees` → S4 unmeasured");
         assert!(
-            encode_slot(SlotId::new(1), &encoder).expect("encode S1").is_absent(),
+            encode_slot(SlotId::new(1), &encoder)
+                .expect("encode S1")
+                .is_absent(),
             "absent property must encode to an absent S1 vector, never a fabricated one"
         );
         assert!(
-            encode_slot(SlotId::new(4), &encoder).expect("encode S4").is_absent(),
+            encode_slot(SlotId::new(4), &encoder)
+                .expect("encode S4")
+                .is_absent(),
         );
     }
 
@@ -2671,9 +2675,15 @@ mod struct_trigram_callee_slot_tests {
             Some("a\tb\tc\t1\nonly\ttwo\nx\ty\tz\tnan_weight\n"),
             Some("good\t3\nbad\tcount\n"),
         ));
-        let trigrams = encoder.struct_trigrams.as_ref().expect("one valid trigram survives");
+        let trigrams = encoder
+            .struct_trigrams
+            .as_ref()
+            .expect("one valid trigram survives");
         assert_eq!(trigrams.len(), 1, "malformed trigram lines dropped");
-        let calls = encoder.api_calls.as_ref().expect("one valid callee survives");
+        let calls = encoder
+            .api_calls
+            .as_ref()
+            .expect("one valid callee survives");
         assert_eq!(calls.len(), 1, "malformed callee lines dropped");
         assert_eq!(calls[0].callee, "good");
     }

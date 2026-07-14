@@ -32,8 +32,7 @@ use super::*;
 pub(crate) const TRACE_PATH_SCORED_SCHEMA: &str = "astrolabe.trace_path.scored.v1";
 
 /// Registry version for the scored `trace_path` surface knobs.
-pub(crate) const TRACE_PATH_KNOB_REGISTRY_VERSION: &str =
-    "astro.server.trace_path_scored_knobs.v1";
+pub(crate) const TRACE_PATH_KNOB_REGISTRY_VERSION: &str = "astro.server.trace_path_scored_knobs.v1";
 
 /// Name of the per-hop attenuation knob.
 pub(crate) const TRACE_PATH_HOP_ATTENUATION_PERMILLE_KNOB: &str =
@@ -122,10 +121,7 @@ pub(crate) fn handle_trace_path(
 /// and the scoring provenance + trust/freshness envelope is attached. Both the
 /// `structuredContent` object and the mirrored `content[0].text` payload are kept
 /// byte-consistent.
-pub(crate) fn score_trace_result(
-    raw: &str,
-    attenuation_permille: u64,
-) -> Result<String, DynError> {
+pub(crate) fn score_trace_result(raw: &str, attenuation_permille: u64) -> Result<String, DynError> {
     let mut envelope: Value = serde_json::from_str(raw)?;
 
     // Transform the structuredContent graph object in place.
@@ -225,7 +221,10 @@ fn score_and_sort_hops(hops: &mut [Value], fraction: f64) {
     }
 
     hops.sort_by(|left, right| {
-        let ls = left.get("score_micros").and_then(Value::as_u64).unwrap_or(0);
+        let ls = left
+            .get("score_micros")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let rs = right
             .get("score_micros")
             .and_then(Value::as_u64)
@@ -294,7 +293,10 @@ mod tests {
         assert_eq!(knob.default, 900);
         assert!(!knob.accepts(0), "zero attenuation erases the ordering");
         assert!(knob.accepts(1000), "1000 permille disables decay");
-        assert!(!knob.accepts(1001), "above 1.0 would amplify, not attenuate");
+        assert!(
+            !knob.accepts(1001),
+            "above 1.0 would amplify, not attenuate"
+        );
     }
 
     // Hand-computable golden: with attenuation 0.9 and measured edge weights,
@@ -439,7 +441,10 @@ mod tests {
         let sc = structured(&score_trace_result(&raw, 1000).unwrap());
         let callees = sc.get("callees").and_then(Value::as_array).unwrap();
         for c in callees {
-            assert_eq!(c.get("score_micros").and_then(Value::as_u64), Some(1_000_000));
+            assert_eq!(
+                c.get("score_micros").and_then(Value::as_u64),
+                Some(1_000_000)
+            );
         }
         // Equal scores -> qualified_name ascending.
         assert_eq!(

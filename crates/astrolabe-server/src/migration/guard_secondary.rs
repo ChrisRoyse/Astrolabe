@@ -29,7 +29,8 @@
 //! two cheapest slots (S18 code-semantic, S4 api-callees) of the edited candidate
 //! against its enclosing-scope exemplars. It is strictly advisory: it runs the
 //! pure scoring on a worker thread bounded by the registry-declared
-//! [`ADVISORY_HOOK_BUDGET_MS`] budget and, on timeout or fault, goes **silent** —
+//! [`ADVISORY_HOOK_BUDGET_MS`](astrolabe_guard::profile::ADVISORY_HOOK_BUDGET_MS)
+//! budget and, on timeout or fault, goes **silent** —
 //! the skip is labeled and **counted** in the persisted surface (never a silent
 //! swallow), and the agent flow is never blocked past the budget. The candidate
 //! and exemplars are measured on the caller thread (the libcbm reparse handle is
@@ -44,7 +45,6 @@ use astrolabe_guard::hook::{
     ADVISORY_HOOK_SCHEMA, AdvisoryOutcome, AdvisorySignal, governed_advisory_budget_ms,
     quick_signal_owned, run_advisory_hook_with_budget,
 };
-use astrolabe_guard::profile::ADVISORY_HOOK_BUDGET_MS;
 use astrolabe_panel::PanelDriver;
 
 /// Config-store key (per project) holding the bounded commit-OOD review history.
@@ -520,23 +520,24 @@ pub(crate) fn produce_commit_ood_request(
         return Ok(json!({"status": "unchanged", "head": head}));
     }
 
-    let ranges = match astrolabe_anchors::archaeology::changed_new_ranges(repo, &last, &head) {
-        Ok(ranges) => ranges,
-        Err(err) => {
-            // A diff we cannot compute (e.g. the old sha was garbage-collected):
-            // advance the baseline so we do not wedge, and report the degradation.
-            write_config_value(
-                cache_dir,
-                &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
-                &head,
-            )?;
-            return Ok(json!({
-                "status": "degraded",
-                "reason": format!("commit diff {last}..{head} unavailable: {err}"),
-                "head": head,
-            }));
-        }
-    };
+    let ranges =
+        match astrolabe_anchors::archaeology::changed_new_ranges_between(repo, &last, &head) {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                // A diff we cannot compute (e.g. the old sha was garbage-collected):
+                // advance the baseline so we do not wedge, and report the degradation.
+                write_config_value(
+                    cache_dir,
+                    &metadata_key(project, GUARD_COMMIT_OOD_LAST_COMMIT_KEY),
+                    &head,
+                )?;
+                return Ok(json!({
+                    "status": "degraded",
+                    "reason": format!("commit diff {last}..{head} unavailable: {err}"),
+                    "head": head,
+                }));
+            }
+        };
 
     // Load the indexed graph to resolve changed ranges to symbols + exemplars.
     let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(cache_dir, project)?;

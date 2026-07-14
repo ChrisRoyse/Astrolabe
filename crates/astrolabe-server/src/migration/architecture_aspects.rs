@@ -22,7 +22,8 @@ use astrolabe_kernel::GROUNDING_GAP_SCHEMA;
 use super::*;
 
 /// Schema tag for the `signal_ranking` architecture aspect envelope.
-pub(crate) const SIGNAL_RANKING_ASPECT_SCHEMA: &str = "astrolabe.get_architecture.signal_ranking.v1";
+pub(crate) const SIGNAL_RANKING_ASPECT_SCHEMA: &str =
+    "astrolabe.get_architecture.signal_ranking.v1";
 
 /// Builds the `grounding_gaps` architecture aspect from the persisted kernel
 /// context. Returns the same grounding-gap report `get_kernel` mode=gaps serves, or
@@ -320,9 +321,15 @@ mod tests {
         let aspect = read_signal_ranking_aspect(&cache, project).unwrap();
         assert_eq!(aspect.get("status").and_then(Value::as_str), Some("served"));
         assert_eq!(aspect.get("axis_count").and_then(Value::as_u64), Some(2));
-        assert_eq!(aspect.get("trust").and_then(Value::as_str), Some("grounded"));
+        assert_eq!(
+            aspect.get("trust").and_then(Value::as_str),
+            Some("grounded")
+        );
 
-        let ranked = aspect.get("ranked_signals").and_then(Value::as_array).unwrap();
+        let ranked = aspect
+            .get("ranked_signals")
+            .and_then(Value::as_array)
+            .unwrap();
         let order: Vec<(&str, &str)> = ranked
             .iter()
             .map(|r| {

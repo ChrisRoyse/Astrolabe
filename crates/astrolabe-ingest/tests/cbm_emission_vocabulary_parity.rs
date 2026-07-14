@@ -186,8 +186,7 @@ fn string_literals(expr: &str) -> Vec<String> {
 fn simple_identifier(expr: &str) -> Option<&str> {
     let e = expr.trim();
     (!e.is_empty()
-        && e.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !e.chars().next().unwrap().is_ascii_digit())
     .then_some(e)
 }
@@ -233,7 +232,11 @@ fn emitted_edge_types(files: &[(String, String)]) -> BTreeSet<String> {
                         .strip_prefix(ident)
                         .or_else(|| trimmed.split(ident).nth(1).map(|_| ""));
                     if after.is_some() && line.contains(&format!("{ident} =")) {
-                        out.extend(string_literals(line).into_iter().filter(|t| is_edge_shape(t)));
+                        out.extend(
+                            string_literals(line)
+                                .into_iter()
+                                .filter(|t| is_edge_shape(t)),
+                        );
                     }
                 }
             }
@@ -251,7 +254,11 @@ fn emitted_node_labels(files: &[(String, String)]) -> BTreeSet<String> {
         // (1) Direct literal / ternary-fallback labels at the emit choke point.
         for call in call_arguments(content, "cbm_gbuf_upsert_node") {
             if let Some(label_arg) = call.get(1) {
-                out.extend(string_literals(label_arg).into_iter().filter(|t| is_label_shape(t)));
+                out.extend(
+                    string_literals(label_arg)
+                        .into_iter()
+                        .filter(|t| is_label_shape(t)),
+                );
             }
         }
         // (2) def-label assignments (`label = "Class"`, `def.label = "Method"`,
@@ -265,10 +272,14 @@ fn emitted_node_labels(files: &[(String, String)]) -> BTreeSet<String> {
                 current_fn = name;
             }
             let is_label_assign = line.contains("label =") || line.contains("label=");
-            let is_label_return =
-                line.trim_start().starts_with("return ") && current_fn.to_lowercase().contains("label");
+            let is_label_return = line.trim_start().starts_with("return ")
+                && current_fn.to_lowercase().contains("label");
             if is_label_assign || is_label_return {
-                out.extend(string_literals(line).into_iter().filter(|t| is_label_shape(t)));
+                out.extend(
+                    string_literals(line)
+                        .into_iter()
+                        .filter(|t| is_label_shape(t)),
+                );
             }
         }
     }
@@ -360,8 +371,14 @@ void demo(cbm_gbuf_t *g) {
     )];
 
     let edges = emitted_edge_types(&planted);
-    assert!(edges.contains("TELEPORTS"), "literal edge not extracted: {edges:?}");
-    assert!(edges.contains("WARPS_TO"), "variable-resolved edge not extracted: {edges:?}");
+    assert!(
+        edges.contains("TELEPORTS"),
+        "literal edge not extracted: {edges:?}"
+    );
+    assert!(
+        edges.contains("WARPS_TO"),
+        "variable-resolved edge not extracted: {edges:?}"
+    );
     let edge_orphans: Vec<&String> = edges
         .iter()
         .filter(|e| EdgeKind::from_cbm_type(e).is_none())
@@ -373,7 +390,10 @@ void demo(cbm_gbuf_t *g) {
     );
 
     let labels = emitted_node_labels(&planted);
-    assert!(labels.contains("Frobnicator"), "planted label not extracted: {labels:?}");
+    assert!(
+        labels.contains("Frobnicator"),
+        "planted label not extracted: {labels:?}"
+    );
     assert!(
         SymbolLabel::from_cbm_label("Frobnicator").is_none(),
         "planted label must be a spine orphan"
@@ -390,5 +410,8 @@ fn scanner_argument_parser_is_literal_and_comment_safe() {
     let calls = call_arguments(src, "cbm_gbuf_insert_edge");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].len(), 5, "args mis-split: {:?}", calls[0]);
-    assert_eq!(string_literals(&calls[0][3]), vec!["HAS, COMMA".to_string()]);
+    assert_eq!(
+        string_literals(&calls[0][3]),
+        vec!["HAS, COMMA".to_string()]
+    );
 }
