@@ -29,36 +29,64 @@
 #![deny(missing_docs)]
 
 pub mod bits;
+pub mod changepoint;
 pub mod deficits;
+pub mod diff;
+pub mod diff_ledger;
+pub mod drift;
 pub mod error;
 pub mod estimators;
 pub mod fingerprint;
 pub mod knobs;
 pub mod ledger;
+pub mod multivariate;
+pub mod periodicity;
 pub mod population;
 pub mod projection;
+pub mod redundancy;
 pub mod rng;
 pub mod scheduler;
 pub mod store;
 pub mod strata;
+pub mod synergy;
+pub mod transfer_entropy;
 
 pub use bits::{
     AxisValues, BitsConfig, BitsInterval, DeficitSuggestedAction, SignalBits, SignalRankingCard,
     SlotDeficit, SlotObservations, SlotSummary, SlotValues, SufficiencyCard, build_signal_ranking,
     build_sufficiency_card, enforce_dpi_ceiling, measure_slot_bits,
 };
+pub use changepoint::{ChangePointCard, measure_change_point};
 pub use deficits::{DeficitMeasurement, OPTIMIZER_DEFICITS_SCHEMA, optimizer_deficits_document};
+pub use diff::{DiffConfig, discretize_slot};
+pub use diff_ledger::{DiffCardEntry, DiffLedger, DifferentiationCard};
+pub use drift::{DriftCard, measure_drift};
 pub use error::{AssayError, Result};
 pub use estimators::{entropy_bits, mi_continuous_ksg, mi_discrete, mi_mixed_ross};
 pub use fingerprint::InputFingerprint;
 pub use ledger::{AssayCardEntry, CardLedger, input_fingerprint};
+pub use multivariate::{
+    conditional_mi_bits, interaction_information_bits, joint_entropy_bits, normalized_mi_bits,
+    transfer_entropy_bits,
+};
+pub use periodicity::{PeriodicityCard, measure_periodicity};
 pub use population::{AssaySubject, Population};
+pub use redundancy::{
+    GateDecision, PairwiseNmi, RedundancyCard, RedundancyGate, measure_redundancy,
+};
 pub use scheduler::{
     AssayScheduler, CooperativeScorer, IsolationDecision, SampleRequest, ScheduleOutcome,
     TickReport, TickStep, check_serving_isolation, serving_p99_micros,
 };
 pub use store::AssayStore;
 pub use strata::{SampleResult, SelectedSubject, StratumAllocation, stratified_sample};
+pub use synergy::{
+    SynergyCard, SynergyClass, SynergyTriple, SynergyTripleInput, measure_synergy,
+    measure_synergy_triple,
+};
+pub use transfer_entropy::{
+    CausalityCard, DirectionEval, DrivesEdge, NamedSeries, measure_transfer_entropy,
+};
 
 /// The Cargo package name for this crate.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

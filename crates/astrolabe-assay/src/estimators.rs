@@ -194,9 +194,15 @@ pub fn entropy_bits(labels: &[i64]) -> f64 {
     for &l in labels {
         *counts.entry(l).or_insert(0) += 1;
     }
+    // Sum in a deterministic order (ascending count): a `HashMap` iterates in a
+    // per-instance random order, and floating-point addition is not associative, so
+    // an unordered sum would differ in the last ULP between two otherwise-identical
+    // calls and break the bit-exact reproducibility contract (invariant 5).
+    let mut freqs: Vec<usize> = counts.into_values().collect();
+    freqs.sort_unstable();
     let n_f = n as f64;
     let mut h = 0.0;
-    for &c in counts.values() {
+    for c in freqs {
         let p = c as f64 / n_f;
         h -= p * p.log2();
     }
