@@ -21,8 +21,11 @@
 //!   and prepends the first-touch orientation preamble
 //!   ([`astrolabe_kernel::first_touch_layout`], fail-closed). It never
 //!   zero-fills: when the S23 posteriors that the frame aggregates from are not
-//!   persisted (the shadow pipeline currently runs panel v1, S0–S21), the aspect
-//!   is a labeled `unavailable` payload, never a fabricated or empty map.
+//!   persisted (a vault imported before the panel v2 roster landed, or one with
+//!   no applicable symbols), the aspect is a labeled `unavailable` payload, never
+//!   a fabricated or empty map. Since #336 the shadow pipeline runs panel v2
+//!   ([`SHADOW_PANEL_VERSION`], S0–S23), so S23 `layer_role` posteriors are
+//!   persisted for applicable symbols and real repos yield real frames.
 //!
 //! No thresholds live here: every structural decision is the kernel's fixed math
 //! (argmax role, overlap agreement). This module only reads persisted bytes,
@@ -397,7 +400,7 @@ fn layout_ledger_payload(
         "schema": LAYOUT_FRAME_SCHEMA,
         "project": project,
         "snapshot_seq_before": at_seq,
-        "panel_version": DEFAULT_PANEL_VERSION,
+        "panel_version": SHADOW_PANEL_VERSION,
         "directory_frame_rows": frame_rows,
         "placement_truth_rows": placement_rows,
         "placement_disagreements": disagreeing_rows,
@@ -819,5 +822,198 @@ mod tests {
     #[test]
     fn canonical_roles_are_frozen_length() {
         assert_eq!(CANONICAL_ROLES.len(), LAYER_ROLE_COUNT);
+    }
+
+    // #336 / #311 FSV-2 (real corpus): a full shadow import at panel v2
+    // (SHADOW_PANEL_VERSION) over a real subset of the repo's own `cbm/` tree
+    // persists S23 `layer_role` posteriors into the slot(23) CF, the layout-frame
+    // lane forms real directory frames (never `skipped_no_frame`), and each
+    // directory frame equals the L1 aggregate independently recomputed from the
+    // members' persisted S23 CF bytes read straight back off the vault.
+    //
+    // This is the end-to-end regression for #336: before the v2 bump the shadow
+    // import ran panel v1 (S0–S22), never wrote slot(23), and this frame lane
+    // returned `skipped_no_frame` on every real repo.
+    #[test]
+    fn real_cbm_corpus_shadow_import_persists_s23_and_aggregates_frames() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // Smallest real subset spanning two real directories of the owned cbm/
+        // corpus. `route` mirrors the parser-emitted route surface for a symbol on
+        // the transport layer; the rest carry no role evidence (→ LayerRole::Other),
+        // exactly as the production encoder resolves an unflagged C function.
+        let files: [(&str, &str, Option<&str>); 3] = [
+            ("cbm/internal/cbm/arena.c", "arena_alloc", None),
+            ("cbm/internal/cbm/ac.c", "ac_scan", Some("/scan")),
+            ("cbm/src/main.c", "cbm_main", None),
+        ];
+        // Real-data-never-a-blocker: the repo's own cbm/ tree is the established
+        // corpus. If it moved, fail loudly rather than silently degrade.
+        for (rel, _, _) in &files {
+            assert!(
+                repo_root.join(rel).is_file(),
+                "real cbm corpus file missing: {rel}"
+            );
+        }
+
+        let project = "cbmreal";
+        let mut nodes = vec![astrolabe_bridge::CbmPipelineNodeRow {
+            id: 1,
+            project: project.to_string(),
+            label: "Project".to_string(),
+            name: project.to_string(),
+            qualified_name: project.to_string(),
+            file_path: String::new(),
+            start_line: 0,
+            end_line: 0,
+            properties_json: "{}".to_string(),
+        }];
+        for (index, (rel, fname, route)) in files.iter().enumerate() {
+            let bytes = fs::read(repo_root.join(rel)).expect("read real cbm source file");
+            let line_count = bytes.iter().filter(|byte| **byte == b'\n').count() as i64;
+            let properties_json = match route {
+                Some(path) => format!(r#"{{"route_path":"{path}","route_method":"GET"}}"#),
+                None => "{}".to_string(),
+            };
+            nodes.push(astrolabe_bridge::CbmPipelineNodeRow {
+                id: (index as i64) + 2,
+                project: project.to_string(),
+                label: "Function".to_string(),
+                name: (*fname).to_string(),
+                qualified_name: format!("{project}::{fname}"),
+                file_path: (*rel).to_string(),
+                start_line: 1,
+                end_line: line_count.max(1),
+                properties_json,
+            });
+        }
+        let rows = astrolabe_bridge::CbmPipelineRows {
+            project: project.to_string(),
+            nodes,
+            edges: Vec::new(),
+        };
+
+        let root = temp_root("real-cbm-s23");
+        let vault = AsterVault::new_durable(
+            vault_dir(&root, project),
+            VaultId::from_str(SHADOW_VAULT_ID).unwrap(),
+            vault_salt(project).as_bytes().to_vec(),
+            VaultOptions::default(),
+        )
+        .unwrap();
+
+        // The real production shadow-import entrypoint at the real roster version.
+        let options = SqliteImportOptions::new(project, "real-commit", SHADOW_PANEL_VERSION)
+            .with_available_slots(shadow_available_slots());
+        let imported = import_shadow_vault_report(
+            &root.join("unused.db"),
+            &vault,
+            &ShadowSlotRuntime,
+            &options,
+            Some(row_sink_import_candidate_from_rows(rows)),
+        )
+        .expect("real cbm shadow import");
+        assert_eq!(imported.report.constellation_inputs, 3);
+
+        // --- Independent readback #1: slot(23) rows are non-empty for the real
+        // symbols (the #336 core claim). Before the v2 bump this CF was empty.
+        let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project).unwrap();
+        let at_seq = vault.snapshot();
+        let mut s23_rows = 0usize;
+        let mut by_dir: BTreeMap<String, Vec<CxId>> = BTreeMap::new();
+        for node in snapshot.nodes.iter().filter(|node| !node.structural) {
+            let cx_id = node.cx_id.expect("real function symbol has a cx_id");
+            let raw = vault
+                .read_cf_at(
+                    at_seq,
+                    ColumnFamily::slot(SlotId::new(LAYER_ROLE_SLOT)),
+                    &slot_key(cx_id),
+                )
+                .unwrap();
+            assert!(
+                raw.is_some(),
+                "slot(23) row must be persisted for {}",
+                node.qualified_name
+            );
+            s23_rows += 1;
+            by_dir
+                .entry(directory_of(&node.file_path))
+                .or_default()
+                .push(cx_id);
+        }
+        assert_eq!(s23_rows, 3, "S23 persisted for all three real symbols");
+        assert!(
+            by_dir.contains_key("cbm/internal/cbm") && by_dir.contains_key("cbm/src"),
+            "two real directories present: {:?}",
+            by_dir.keys().collect::<Vec<_>>()
+        );
+
+        // --- The frame lane forms real frames — never skipped_no_frame (#336).
+        let persisted = persist_layout_frames(&vault, project, true).unwrap();
+        assert_eq!(persisted["status"], "persisted", "frames formed: {persisted}");
+        assert_eq!(persisted["s23_symbols_seen"], 3);
+        assert_eq!(persisted["missing_s23"], 0);
+        assert_eq!(persisted["directory_frame_rows_written"], 2);
+
+        // --- Independent readback #2 (FSV-2): recompute each directory's L1
+        // aggregate straight from the members' persisted S23 CF bytes and compare
+        // to the persisted Kernel-CF frame row (frame_hash-verified parse).
+        let commit_seq = vault.snapshot();
+        for (dir_path, members) in &by_dir {
+            let frame_bytes = vault
+                .read_cf_at(
+                    commit_seq,
+                    ColumnFamily::Kernel,
+                    &layout_frame_key(project, &directory_cx_bytes(project, dir_path)),
+                )
+                .unwrap()
+                .expect("persisted directory-role frame row");
+            let parsed = parse_directory_role_frame_artifact(&frame_bytes)
+                .expect("frame row parses back (frame_hash verified)");
+
+            // Independent aggregate: mean of the members' decoded posteriors.
+            let mut accum = [0.0_f32; LAYER_ROLE_COUNT];
+            for cx_id in members {
+                let bytes = read_member_s23_bytes(&vault, commit_seq, *cx_id)
+                    .unwrap()
+                    .expect("member S23 bytes present");
+                let vector = astrolabe_panel::decode_slot_raw(&bytes).unwrap();
+                let SlotVector::Dense { dim, data } = vector else {
+                    panic!("S23 posterior must decode to Dense(8)");
+                };
+                assert_eq!(dim, LAYER_ROLE_COUNT as u32);
+                for (slot, value) in accum.iter_mut().zip(data.iter()) {
+                    *slot += *value;
+                }
+            }
+            let count = members.len() as f32;
+            for slot in accum.iter_mut() {
+                *slot /= count;
+            }
+            assert_eq!(
+                parsed.role_vector, accum,
+                "persisted frame for {dir_path} == independent L1 aggregate of persisted S23 bytes"
+            );
+        }
+
+        // The transport-flagged real symbol pulls its directory frame off pure
+        // Other: the mixed directory must carry transport_api mass, proving the
+        // real S23 encoder output (not a fabricated prior) drove the frame.
+        let mixed = vault
+            .read_cf_at(
+                commit_seq,
+                ColumnFamily::Kernel,
+                &layout_frame_key(project, &directory_cx_bytes(project, "cbm/internal/cbm")),
+            )
+            .unwrap()
+            .expect("mixed directory frame");
+        let mixed_frame = parse_directory_role_frame_artifact(&mixed).unwrap();
+        assert!(
+            mixed_frame.role_vector[LayerRole::TransportApi.index()] > 0.0,
+            "transport-flagged real symbol contributes transport_api mass: {:?}",
+            mixed_frame.role_vector
+        );
+
+        drop(vault);
+        let _ = fs::remove_dir_all(&root);
     }
 }

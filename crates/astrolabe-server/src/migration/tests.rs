@@ -489,7 +489,7 @@ fn row_sink_snapshot_maps_bridge_rows_without_inventing_metadata() {
     let rows = sample_pipeline_rows();
     let snapshot = pipeline_rows_to_graph_snapshot(rows);
     assert_eq!(snapshot.project, "demo");
-    assert_eq!(snapshot.panel_version, Some(DEFAULT_PANEL_VERSION));
+    assert_eq!(snapshot.panel_version, Some(SHADOW_PANEL_VERSION));
     assert!(snapshot.projects.is_empty());
     assert!(snapshot.file_hashes.is_empty());
     assert_eq!(snapshot.nodes.len(), 2);
@@ -8205,7 +8205,7 @@ fn production_shadow_panel_weave_reconciles_persisted_state_before_lowering() {
         }
     };
 
-    let first_options = SqliteImportOptions::new("demo", "commit-1", DEFAULT_PANEL_VERSION)
+    let first_options = SqliteImportOptions::new("demo", "commit-1", SHADOW_PANEL_VERSION)
         .with_available_slots(shadow_available_slots());
     let first = import_shadow_vault_report(
         &root.join("unused.db"),
@@ -8483,7 +8483,7 @@ fn mscale_single_file_delta_converges_under_five_seconds() {
         // Mirror the production shadow-import options exactly (#23): the real
         // wrapper supplies measured host parallelism for the worker-count-
         // invariant import passes.
-        SqliteImportOptions::new(M_SCALE_PROJECT, commit, DEFAULT_PANEL_VERSION)
+        SqliteImportOptions::new(M_SCALE_PROJECT, commit, SHADOW_PANEL_VERSION)
             .with_workers(
                 std::thread::available_parallelism()
                     .map(std::num::NonZeroUsize::get)
@@ -8765,7 +8765,7 @@ fn masking_row_sink_candidate(rows: CbmPipelineRows) -> RowSinkImportCandidate {
 }
 
 fn masking_import_options() -> SqliteImportOptions {
-    SqliteImportOptions::new("maskcheck", "mask-commit", DEFAULT_PANEL_VERSION)
+    SqliteImportOptions::new("maskcheck", "mask-commit", SHADOW_PANEL_VERSION)
         .with_available_slots(shadow_available_slots())
 }
 

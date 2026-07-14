@@ -258,7 +258,10 @@ fn guard_invalidation_key(project: &str, qualified_name: &str) -> Vec<u8> {
 }
 
 fn assay_stratum(project: &str, qualified_name: &str) -> String {
-    format!("panel_v{DEFAULT_PANEL_VERSION}:project:{project}:symbol:{qualified_name}")
+    // The invalidation lane runs inside the shadow import pipeline, so its stratum
+    // label must name the roster version the symbols were actually measured under
+    // (SHADOW_PANEL_VERSION), not a stale v1 literal (#336).
+    format!("panel_v{SHADOW_PANEL_VERSION}:project:{project}:symbol:{qualified_name}")
 }
 
 fn assay_dirty_value(project: &str, qualified_name: &str, snapshot_seq: u64) -> Vec<u8> {
@@ -266,7 +269,7 @@ fn assay_dirty_value(project: &str, qualified_name: &str, snapshot_seq: u64) -> 
         "schema": INVALIDATION_SCHEMA,
         "kind": "assay_stratum_dirty",
         "project": project,
-        "panel_version": DEFAULT_PANEL_VERSION,
+        "panel_version": SHADOW_PANEL_VERSION,
         "qualified_name": qualified_name,
         "stratum": assay_stratum(project, qualified_name),
         "dirty": true,
@@ -281,7 +284,7 @@ fn kernel_dirty_value(project: &str, scc: &KernelDirtyScc, snapshot_seq: u64) ->
         "schema": INVALIDATION_SCHEMA,
         "kind": "kernel_dirty_scc",
         "project": project,
-        "panel_version": DEFAULT_PANEL_VERSION,
+        "panel_version": SHADOW_PANEL_VERSION,
         "scc_id": scc.id,
         "members": scc.members,
         "dirty_members": scc.dirty_members,
@@ -357,7 +360,7 @@ fn invalidation_ledger_payload(
         "schema": INVALIDATION_SCHEMA,
         "project": project,
         "snapshot_seq_before": snapshot_seq,
-        "panel_version": DEFAULT_PANEL_VERSION,
+        "panel_version": SHADOW_PANEL_VERSION,
         "dirty_symbol_count": dirty_symbols.len(),
         "removed_symbol_count": removed_symbols.len(),
         "kernel_dirty_scc_count": kernel_sccs.len(),

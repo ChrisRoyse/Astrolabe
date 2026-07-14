@@ -435,10 +435,28 @@ fn parse_ast_profile(encoded: &str) -> Option<astrolabe_panel::AstProfile> {
     })
 }
 
+/// Panel roster version the shadow import pipeline measures and persists.
+///
+/// v2 (S0–S23) rather than v1 (S0–S22): the v1 roster never measured the S23
+/// `layer_role` slot, so `ColumnFamily::slot_raw(23)` was never written and the
+/// #311 directory-role layout frames were permanently starved (`skipped_no_frame`
+/// on every real repo — #336). v2 is the honest path per frozen-roster discipline:
+/// rosters change only by version bump, so persisting S23 means minting shadow
+/// constellations under panel version 2 (their CxIds are v2-derived).
+pub(crate) const SHADOW_PANEL_VERSION: u32 = astrolabe_panel::PANEL_V2_VERSION;
+
+/// Slots the shadow import feeds to the panel driver.
+///
+/// The v2 roster minus S22 (`token_multi`, `SlotShape::Multi` — the CBM shadow
+/// substrate carries no token-multi source, so it stays a labeled `LensUnavailable`
+/// absence rather than a measured row). S23 (`layer_role`) IS included so the
+/// directory-role layout frames can be built (#336). Applicability is still enforced
+/// per class by the panel driver, so value/structural atoms carry `NotApplicable` for
+/// S23 exactly as the v2 contract prescribes.
 pub(crate) fn shadow_available_slots() -> Vec<SlotId> {
-    astrolabe_panel::PANEL_V1_SLOTS
+    astrolabe_panel::PANEL_V2_SLOTS
         .iter()
-        .filter(|slot| slot.slot <= 21)
+        .filter(|slot| slot.slot <= 21 || slot.slot == 23)
         .map(|slot| (*slot).slot_id())
         .collect()
 }
@@ -1069,7 +1087,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // passes (symbol preparation, row encode/reconcile, readback verification)
     // are worker-count-invariant in results, and one worker left the whole
     // delta path serial on many-core hosts.
-    let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
+    let options = SqliteImportOptions::new(project, commit, SHADOW_PANEL_VERSION)
         .with_workers(
             std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
@@ -1773,7 +1791,7 @@ pub(crate) fn pipeline_rows_to_graph_snapshot(rows: CbmPipelineRows) -> CbmGraph
         .collect();
     CbmGraphSnapshot {
         project,
-        panel_version: Some(DEFAULT_PANEL_VERSION),
+        panel_version: Some(SHADOW_PANEL_VERSION),
         projects: Vec::new(),
         nodes,
         edges,
@@ -1996,7 +2014,7 @@ pub(crate) fn grounding_summary(outcome: &ShadowImportOutcome) -> Value {
         "ledger_rows_after": outcome.ledger_rows_after,
         "verify_chain": outcome.verify_chain_status,
         "fsv": outcome.import_fsv.as_ref().map(fsv_ack_envelope),
-        "panel_version": DEFAULT_PANEL_VERSION,
+        "panel_version": SHADOW_PANEL_VERSION,
         "panel_runtime": "cbm_frozen_v1",
         "vault_import": vault_import_summary(
             &outcome.vault_import_source,
@@ -2231,7 +2249,7 @@ pub(crate) fn persist_shadow_outcome_at(
         ),
         ("ledger_seq", outcome.ledger_seq.to_string()),
         ("ledger_rows", outcome.ledger_rows_after.to_string()),
-        ("panel_version", DEFAULT_PANEL_VERSION.to_string()),
+        ("panel_version", SHADOW_PANEL_VERSION.to_string()),
         ("structural_only", outcome.structural_only.to_string()),
         ("new_cx_ids", outcome.new_cx_ids.to_string()),
         ("reused_cx_ids", outcome.reused_cx_ids.to_string()),

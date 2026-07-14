@@ -120,7 +120,11 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             continue;
         }
         let snapshot = pipeline_rows_to_graph_snapshot(selected);
-        let options = SqliteImportOptions::new(project, commit, DEFAULT_PANEL_VERSION)
+        // Historical constellations dedup against the live shadow vault, so they must
+        // be minted under the same roster version as the main shadow import
+        // (SHADOW_PANEL_VERSION) — a v1/v2 mismatch would derive divergent CxIds and
+        // defeat reuse (#336).
+        let options = SqliteImportOptions::new(project, commit, SHADOW_PANEL_VERSION)
             .with_available_slots(shadow_available_slots());
         let admission =
             admit_historical_symbol_snapshot(&snapshot, vault, &ShadowSlotRuntime, &options)?;
