@@ -84,7 +84,14 @@ const SCHEMA_FILE_DIGEST_ROW: &str = "astrolabe-file-digest-v1";
 /// Domain separator for the per-file content digest (#345). Bumped only when the set of
 /// raw fields folded into the digest changes, so an old-domain digest can never be
 /// compared against a new-domain one (a mismatch then fails open into full reconcile).
-const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v1";
+// v2 (#372): the digest additionally folds every raw edge whose SOURCE node lives in the
+// file, so a matching digest proves the file's outgoing edges are byte-identical too —
+// the soundness condition for carrying persisted edge rows forward without re-encoding.
+// (An edge's properties, e.g. resolution strategy/candidates, can change when a THIRD file
+// changes; folding edges into the source file's digest makes such a change invalidate the
+// digest instead of being wrongly preserved.) v1 manifests mismatch and fail open into one
+// labeled full reconcile.
+const FILE_DIGEST_DOMAIN: &str = "astrolabe-file-digest-v2";
 const SCHEMA_LEDGER: &str = "astrolabe-sqlite-ingest-ledger-v1";
 /// Ledger payload schema for admitting historical symbol versions without
 /// mutating the live graph projection.
@@ -400,6 +407,13 @@ pub struct SqliteImportReport {
     /// identity straight from a matching file digest.
     #[serde(default)]
     pub file_digest: FileDigestReport,
+    /// Row/edge encode short-circuit accounting for the delta fast path (#372): how many
+    /// node-map, typed/raw edge, manifest, and file-hash rows were re-serialized this run
+    /// versus carried forward byte-for-byte from unchanged files. On an unchanged-corpus
+    /// reimport every `*_encoded` count collapses to zero, proving the encode/derive work
+    /// is O(changed files), not O(corpus).
+    #[serde(default)]
+    pub encode_skip: EncodeSkipReport,
     /// Per-phase wall-clock milliseconds of this import run (#23 latency
     /// telemetry): stable labels, measured values — not knobs. Empty when the
     /// report was deserialized from persisted state.
@@ -638,6 +652,53 @@ pub struct FileDigestReport {
     pub had_prior_manifest: bool,
 }
 
+/// Row/edge encode short-circuit accounting for the delta-import fast path (#372).
+///
+/// The per-file digest layer (#345) already skips recomputing identities for unchanged
+/// files' symbols; #372 extends the skip to the graph-row and edge ENCODE and to the
+/// change derivation. An unchanged file's persisted graph rows (node-map, typed/raw edge,
+/// manifest, and file-hash rows) are carried forward byte-for-byte without re-serializing
+/// them, comparing them, or re-deriving their provenance — the same doctrine as #345's
+/// Base-row skip, backstopped by the whole-vault `verify_chain`. These counters make the
+/// short-circuit auditable: on an unchanged-corpus reimport every `*_encoded` count is
+/// driven purely by the changed files, so a test reads them back and asserts the encode
+/// work is O(changed files), never O(corpus) (standing invariant 3: every skip counted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodeSkipReport {
+    /// Node-map rows serialized this run (changed/new symbols only).
+    pub node_map_rows_encoded: usize,
+    /// Node-map rows preserved from persisted bytes without re-encoding (digest-reused symbols).
+    pub node_map_rows_preserved: usize,
+    /// Typed edge rows serialized this run.
+    pub edge_rows_encoded: usize,
+    /// Typed edge rows preserved from persisted bytes without re-encoding (both endpoints reused).
+    pub edge_rows_preserved: usize,
+    /// Raw CBM edge rows serialized this run.
+    pub raw_edge_rows_encoded: usize,
+    /// Raw CBM edge rows preserved from persisted bytes without re-encoding.
+    pub raw_edge_rows_preserved: usize,
+    /// Per-file digest manifest rows serialized this run (changed/reconciled files only).
+    pub manifest_rows_encoded: usize,
+    /// Per-file digest manifest rows preserved from persisted bytes without re-encoding.
+    pub manifest_rows_preserved: usize,
+    /// File-hash metadata rows serialized this run.
+    pub file_hash_rows_encoded: usize,
+    /// File-hash metadata rows preserved from persisted bytes without re-encoding.
+    pub file_hash_rows_preserved: usize,
+}
+
+impl EncodeSkipReport {
+    /// Total persisted graph rows this import carried forward byte-for-byte instead of
+    /// re-encoding and re-deriving. The delta fast path's O(changed-files) evidence.
+    pub fn rows_preserved(&self) -> usize {
+        self.node_map_rows_preserved
+            + self.edge_rows_preserved
+            + self.raw_edge_rows_preserved
+            + self.manifest_rows_preserved
+            + self.file_hash_rows_preserved
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExtractedNode {
     id: i64,
@@ -682,6 +743,15 @@ struct PreparedBatch {
     structural_only: usize,
     sqlite_edges: usize,
     edge_skips: EdgeSkipCounters,
+    /// Persisted Graph CF keys this batch reuses byte-for-byte from unchanged files (#372):
+    /// node-map rows for digest-reused symbols, typed/raw edge rows whose endpoints are both
+    /// reused, manifest rows for unchanged files, and their file-hash rows. These keys were
+    /// deliberately NOT re-encoded into `graph_rows`/`edge_rows`, so change derivation folds
+    /// them into the "current" key set (preventing a spurious stale tombstone) without paying
+    /// the per-row encode/compare/provenance cost.
+    preserved_keys: BTreeSet<Vec<u8>>,
+    /// Encode/derive short-circuit accounting for this run (#372 O(changed-files) evidence).
+    encode_skip: EncodeSkipReport,
     /// Per-phase wall-clock millis of batch preparation (#23 latency telemetry).
     timing_ms: Vec<(&'static str, u64)>,
 }
@@ -881,6 +951,10 @@ struct IngestLedgerPayload {
     expected_graph_rows: u64,
     expected_edge_rows: u64,
     quantization: SqliteImportQuantizationReport,
+    /// Delta-import encode/derive short-circuit accounting (#372): durable, independently
+    /// readable proof that this run's row/edge encode was O(changed files), not O(corpus).
+    #[serde(default)]
+    encode_skip: EncodeSkipReport,
     first_cx_id: Option<String>,
     last_cx_id: Option<String>,
 }
@@ -979,7 +1053,7 @@ where
     // Per-file content digests (#345) must be computed from the raw node rows before
     // `extract_nodes` consumes them; the manifest comparison happens after the shared
     // Graph scan below.
-    let new_file_digests = compute_file_digests(&input.nodes, options.panel_version);
+    let new_file_digests = compute_file_digests(&input.nodes, &input.edges, options.panel_version);
     let extracted = extract_nodes(input.nodes)?;
     timing_ms.push(("extract_nodes", phase_start.elapsed().as_millis() as u64));
     phase_start = std::time::Instant::now();
@@ -1025,6 +1099,7 @@ where
         input.sqlite_fingerprint,
         &existing_graph,
         &digest_plan.reuse,
+        &digest_plan.unchanged_files,
         &new_file_digests,
     )?;
     timing_ms.push(("prepare_batch", phase_start.elapsed().as_millis() as u64));
@@ -1163,6 +1238,7 @@ where
         cx_ids,
         new_cx_id_values,
         file_digest: file_digest_report,
+        encode_skip: prepared.encode_skip.clone(),
         timing_ms: PhaseTimings(timing_ms),
     })
 }
@@ -2578,6 +2654,7 @@ fn prepare_batch<C, R>(
     sqlite_fingerprint: [u8; 32],
     existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
     digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    unchanged_files: &BTreeSet<String>,
     new_file_digests: &BTreeMap<String, String>,
 ) -> IngestResult<PreparedBatch>
 where
@@ -2585,6 +2662,10 @@ where
     R: SlotRuntime + Sync,
 {
     let driver = PanelDriver::new(options.panel_version)?;
+    // Keys this batch reuses byte-for-byte from unchanged files (#372); folded into change
+    // derivation's "current" set so stale detection preserves them without a re-encode.
+    let mut preserved_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut encode_skip = EncodeSkipReport::default();
     // Split the owned node graph into structural and non-structural buckets by MOVE. `partition`
     // is order-preserving and hands each `ExtractedNode` to exactly one bucket, so no whole-graph
     // clone is created (the previous `.iter().filter().cloned()` held a second full copy of every
@@ -2611,12 +2692,39 @@ where
     ));
     phase_start = std::time::Instant::now();
 
-    let mut graph_rows = metadata_graph_rows(options, metadata, sqlite_fingerprint)?;
-    let node_map_rows = parallel_map(
-        constellations.iter().collect::<Vec<_>>(),
-        options.workers,
-        |prepared| node_map_graph_row(options, prepared),
+    // Metadata rows. File-hash rows for unchanged files are carried forward from persisted
+    // bytes rather than re-encoded (#372); their keys join `preserved_keys`.
+    let mut graph_rows = metadata_graph_rows(
+        options,
+        metadata,
+        sqlite_fingerprint,
+        unchanged_files,
+        existing_graph,
+        &mut preserved_keys,
+        &mut encode_skip,
     )?;
+    // Node-map rows. A digest-reused symbol's persisted node-map row is provably unchanged
+    // (its file's content matched, so every derived row matches; volatile fields are reverted
+    // anyway), so skip re-encoding it and preserve its key. Fail open: if the persisted row is
+    // somehow absent, fall back to encoding it (the reconcile path then writes it).
+    let to_encode = constellations
+        .iter()
+        .filter(|prepared| {
+            if digest_reuse.contains_key(&prepared.node_id)
+                && let Ok(key) = node_map_reuse_key(prepared)
+                && existing_graph.contains_key(&key)
+            {
+                encode_skip.node_map_rows_preserved += 1;
+                preserved_keys.insert(key);
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    encode_skip.node_map_rows_encoded = to_encode.len();
+    let node_map_rows = parallel_map(to_encode, options.workers, |prepared| {
+        node_map_graph_row(options, prepared)
+    })?;
     graph_rows.extend(node_map_rows);
     let structural_only = structural.len();
     for node in &structural {
@@ -2626,16 +2734,25 @@ where
         options,
         &edges,
         sqlite_fingerprint,
+        digest_reuse,
+        existing_graph,
+        &mut preserved_keys,
+        &mut encode_skip,
         options.workers,
     )?);
     // Per-file digest manifest rows (#345). Appended to the same graph-row stream as the
     // metadata/node-map/edge rows so they are reconciled, ledgered, and read back through
-    // the identical path: an unchanged file's manifest row reverts to its persisted bytes
-    // (no write), a changed file's row is rewritten in this batch.
+    // the identical path: an unchanged file's manifest row is byte-identical to its persisted
+    // bytes, so (#372) skip re-encoding it and preserve its key; a changed file's row is
+    // rewritten in this batch.
     graph_rows.extend(file_digest_manifest_rows(
         options,
         &constellations,
         new_file_digests,
+        unchanged_files,
+        existing_graph,
+        &mut preserved_keys,
+        &mut encode_skip,
     )?);
     parallel_for_each_mut(&mut graph_rows, options.workers, |(_, value)| {
         append_import_fingerprint(value, sqlite_fingerprint)
@@ -2656,8 +2773,16 @@ where
         .iter()
         .map(|node| node.id)
         .collect::<BTreeSet<_>>();
-    let (edge_rows, edge_skips) =
-        prepare_edge_rows(options, &constellations, &structural_node_ids, edges)?;
+    let (edge_rows, edge_skips) = prepare_edge_rows(
+        options,
+        &constellations,
+        &structural_node_ids,
+        edges,
+        digest_reuse,
+        existing_graph,
+        &mut preserved_keys,
+        &mut encode_skip,
+    )?;
     timing_ms.push((
         "prepare_edge_rows",
         phase_start.elapsed().as_millis() as u64,
@@ -2670,6 +2795,8 @@ where
         structural_only,
         sqlite_edges,
         edge_skips,
+        preserved_keys,
+        encode_skip,
         timing_ms,
     })
 }
@@ -2765,23 +2892,33 @@ fn graph_semantic_json(bytes: &[u8]) -> IngestResult<Value> {
     Ok(value)
 }
 
-/// Content digest over one source file's raw CBM node rows (#345).
+/// Content digest over one source file's raw CBM node rows and outgoing edge rows
+/// (#345, edge fold #372).
 ///
 /// Folds every raw field that determines a symbol's content-addressed identity or its
 /// persisted graph/base/slot rows — id, project, label, name, qualified name, file path,
-/// line span, properties JSON, and node vector — length-prefixed so no field boundary is
-/// ambiguous, together with the digest domain and panel version. Node order is normalized
-/// by id so the digest is independent of CBM's emission order. Deliberately conservative:
-/// it never excludes a field that could change the persisted rows, because an under-broad
-/// digest would let a changed symbol be wrongly reused, whereas an over-broad one only
-/// costs a fail-open full reconcile.
-fn file_content_digest(nodes: &mut Vec<&RawNodeRow>, panel_version: u32) -> String {
+/// line span, properties JSON, and node vector — plus, for every edge whose SOURCE node
+/// lives in this file, the edge's raw fields (id, endpoints, type, properties JSON,
+/// local_name_gen). Everything is length-prefixed so no field boundary is ambiguous,
+/// together with the digest domain and panel version. Node and edge order is normalized by
+/// id so the digest is independent of CBM's emission order. Deliberately conservative: it
+/// never excludes a field that could change the persisted rows, because an under-broad
+/// digest would let a changed symbol or edge be wrongly reused, whereas an over-broad one
+/// only costs a fail-open full reconcile. The edge fold is what makes the #372 edge-row
+/// carry-forward sound: edge properties (resolution strategy/candidates) can change when a
+/// third file changes, and that change lands in the source file's digest.
+fn file_content_digest(
+    nodes: &mut Vec<&RawNodeRow>,
+    edges: &mut Vec<&RawEdgeRow>,
+    panel_version: u32,
+) -> String {
     // Length-prefixed field so no boundary between adjacent fields is ambiguous.
     fn section(hasher: &mut Sha256, bytes: &[u8]) {
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
     nodes.sort_by_key(|node| node.id);
+    edges.sort_by_key(|edge| edge.id);
     let mut hasher = Sha256::new();
     section(&mut hasher, FILE_DIGEST_DOMAIN.as_bytes());
     section(&mut hasher, &panel_version.to_be_bytes());
@@ -2803,12 +2940,32 @@ fn file_content_digest(nodes: &mut Vec<&RawNodeRow>, panel_version: u32) -> Stri
             None => section(&mut hasher, &[0u8]),
         }
     }
+    for edge in edges.iter() {
+        section(&mut hasher, &edge.id.to_be_bytes());
+        section(&mut hasher, edge.project.as_bytes());
+        section(&mut hasher, &edge.source_id.to_be_bytes());
+        section(&mut hasher, &edge.target_id.to_be_bytes());
+        section(&mut hasher, edge.edge_type.as_bytes());
+        section(&mut hasher, edge.properties_json.as_bytes());
+        section(&mut hasher, edge.local_name_gen.as_bytes());
+    }
     hex_lower(hasher.finalize().as_slice())
 }
 
-/// Groups this import's raw nodes by source file and computes each file's content digest
-/// (#345). One entry per distinct `file_path`.
-fn compute_file_digests(nodes: &[RawNodeRow], panel_version: u32) -> BTreeMap<String, String> {
+/// Groups this import's raw nodes by source file — and raw edges by their SOURCE node's
+/// file (#372) — and computes each file's content digest (#345). One entry per distinct
+/// `file_path`. An edge whose source node id is not among this import's nodes belongs to
+/// no file and is folded into no digest; such an edge can only be preserved through the
+/// fail-open reconcile path, never wrongly skipped.
+fn compute_file_digests(
+    nodes: &[RawNodeRow],
+    edges: &[RawEdgeRow],
+    panel_version: u32,
+) -> BTreeMap<String, String> {
+    let file_by_node = nodes
+        .iter()
+        .map(|node| (node.id, node.file_path.as_str()))
+        .collect::<HashMap<i64, &str>>();
     let mut by_file: BTreeMap<String, Vec<&RawNodeRow>> = BTreeMap::new();
     for node in nodes {
         by_file
@@ -2816,10 +2973,17 @@ fn compute_file_digests(nodes: &[RawNodeRow], panel_version: u32) -> BTreeMap<St
             .or_default()
             .push(node);
     }
+    let mut edges_by_file: BTreeMap<&str, Vec<&RawEdgeRow>> = BTreeMap::new();
+    for edge in edges {
+        if let Some(file_path) = file_by_node.get(&edge.source_id) {
+            edges_by_file.entry(file_path).or_default().push(edge);
+        }
+    }
     by_file
         .into_iter()
         .map(|(file_path, mut file_nodes)| {
-            let digest = file_content_digest(&mut file_nodes, panel_version);
+            let mut file_edges = edges_by_file.remove(file_path.as_str()).unwrap_or_default();
+            let digest = file_content_digest(&mut file_nodes, &mut file_edges, panel_version);
             (file_path, digest)
         })
         .collect()
@@ -2852,6 +3016,9 @@ fn read_file_digest_manifest(
 struct DigestReusePlan {
     /// node_id → reused (cx_id, series_id) for symbols in files whose digest matched.
     reuse: HashMap<i64, (CxId, SeriesId)>,
+    /// Source file paths whose persisted digest matched, so every graph/edge row derived
+    /// from them is provably unchanged and eligible for the encode short-circuit (#372).
+    unchanged_files: BTreeSet<String>,
     report: FileDigestReport,
 }
 
@@ -2865,6 +3032,7 @@ fn plan_digest_reuse(
     panel_version: u32,
 ) -> DigestReusePlan {
     let mut reuse = HashMap::new();
+    let mut unchanged_files = BTreeSet::new();
     let mut report = FileDigestReport {
         files_total: new_digests.len(),
         had_prior_manifest: !manifest.is_empty(),
@@ -2879,6 +3047,7 @@ fn plan_digest_reuse(
         match matched {
             Some(row) => {
                 report.files_unchanged += 1;
+                unchanged_files.insert(file_path.clone());
                 for symbol in &row.symbols {
                     reuse.insert(symbol.node_id, (symbol.cx_id, symbol.series_id));
                     report.symbols_reused_via_digest += 1;
@@ -2887,7 +3056,11 @@ fn plan_digest_reuse(
             None => report.files_reconciled += 1,
         }
     }
-    DigestReusePlan { reuse, report }
+    DigestReusePlan {
+        reuse,
+        unchanged_files,
+        report,
+    }
 }
 
 /// Builds the fresh per-file digest manifest rows for this import (#345), one per source
@@ -2899,6 +3072,10 @@ fn file_digest_manifest_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedLiveSymbol],
     new_digests: &BTreeMap<String, String>,
+    unchanged_files: &BTreeSet<String>,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    preserved_keys: &mut BTreeSet<Vec<u8>>,
+    encode_skip: &mut EncodeSkipReport,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut symbols_by_file: BTreeMap<&str, Vec<FileDigestSymbol>> = BTreeMap::new();
     for prepared in constellations {
@@ -2913,6 +3090,21 @@ fn file_digest_manifest_rows(
     }
     let mut rows = Vec::with_capacity(new_digests.len());
     for (file_path, digest) in new_digests {
+        let key = keyed_graph_key(
+            FILE_DIGEST_ROW_PREFIX,
+            &options.project,
+            file_path.as_bytes(),
+        );
+        // An unchanged file's new manifest row is byte-identical to the persisted one: the
+        // digest matched and the reused symbol identities were themselves read out of that
+        // same persisted row (#345). Carry it forward without re-encoding (#372); fail open
+        // to the encode path if the persisted row is missing.
+        if unchanged_files.contains(file_path) && existing_graph.contains_key(&key) {
+            symbols_by_file.remove(file_path.as_str());
+            encode_skip.manifest_rows_preserved += 1;
+            preserved_keys.insert(key);
+            continue;
+        }
         let mut symbols = symbols_by_file
             .remove(file_path.as_str())
             .unwrap_or_default();
@@ -2926,14 +3118,8 @@ fn file_digest_manifest_rows(
             digest: digest.clone(),
             symbols,
         };
-        rows.push((
-            keyed_graph_key(
-                FILE_DIGEST_ROW_PREFIX,
-                &options.project,
-                file_path.as_bytes(),
-            ),
-            serde_json::to_vec(&row)?,
-        ));
+        encode_skip.manifest_rows_encoded += 1;
+        rows.push((key, serde_json::to_vec(&row)?));
     }
     Ok(rows)
 }
@@ -2942,6 +3128,10 @@ fn metadata_graph_rows(
     options: &SqliteImportOptions,
     metadata: RawMetadataRows,
     sqlite_fingerprint: [u8; 32],
+    unchanged_files: &BTreeSet<String>,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    preserved_keys: &mut BTreeSet<Vec<u8>>,
+    encode_skip: &mut EncodeSkipReport,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let fingerprint = hex_lower(&sqlite_fingerprint);
     let mut rows = Vec::new();
@@ -2960,6 +3150,20 @@ fn metadata_graph_rows(
         ));
     }
     for file_hash in metadata.file_hashes {
+        let key = keyed_graph_key(
+            FILE_HASH_ROW_PREFIX,
+            &file_hash.project,
+            file_hash.rel_path.as_bytes(),
+        );
+        // A file whose per-file digest matched (#345) is byte-for-byte unchanged, so its
+        // persisted file-hash row is unchanged too (sha256/size are content-derived; the
+        // volatile commit/fingerprint/mtime fields revert on reconcile anyway). Carry the
+        // persisted row forward without re-encoding it (#372); fail open if it is absent.
+        if unchanged_files.contains(&file_hash.rel_path) && existing_graph.contains_key(&key) {
+            encode_skip.file_hash_rows_preserved += 1;
+            preserved_keys.insert(key);
+            continue;
+        }
         let row = CbmFileHashRow {
             schema: SCHEMA_FILE_HASH_ROW.to_string(),
             project: file_hash.project,
@@ -2970,10 +3174,8 @@ fn metadata_graph_rows(
             commit: options.commit.clone(),
             sqlite_fingerprint_sha256: fingerprint.clone(),
         };
-        rows.push((
-            keyed_graph_key(FILE_HASH_ROW_PREFIX, &row.project, row.rel_path.as_bytes()),
-            serde_json::to_vec(&row)?,
-        ));
+        encode_skip.file_hash_rows_encoded += 1;
+        rows.push((key, serde_json::to_vec(&row)?));
     }
     for summary in metadata.project_summaries {
         let row = CbmProjectSummaryRow {
@@ -3011,14 +3213,37 @@ fn metadata_graph_rows(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn raw_edge_graph_rows(
     options: &SqliteImportOptions,
     edges: &[RawEdgeRow],
     sqlite_fingerprint: [u8; 32],
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    preserved_keys: &mut BTreeSet<Vec<u8>>,
+    encode_skip: &mut EncodeSkipReport,
     workers: usize,
 ) -> IngestResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let fingerprint = hex_lower(&sqlite_fingerprint);
-    let mut rows = parallel_map(edges.iter().collect::<Vec<_>>(), workers, |edge| {
+    // Partition edges before encoding (#372): a raw edge whose BOTH endpoints are digest-
+    // reused is derived entirely from two unchanged files, so its persisted raw row is
+    // unchanged. Carry it forward from persisted bytes (fail open if its key is absent);
+    // encode only the remainder.
+    let mut to_encode: Vec<&RawEdgeRow> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if digest_reuse.contains_key(&edge.source_id)
+            && digest_reuse.contains_key(&edge.target_id)
+            && let Ok(key) = raw_edge_key_parts(&edge.project, edge.id)
+            && existing_graph.contains_key(&key)
+        {
+            encode_skip.raw_edge_rows_preserved += 1;
+            preserved_keys.insert(key);
+            continue;
+        }
+        to_encode.push(edge);
+    }
+    encode_skip.raw_edge_rows_encoded = to_encode.len();
+    let mut rows = parallel_map(to_encode, workers, |edge| {
         let row = CbmRawEdgeRow {
             schema: SCHEMA_CBM_EDGE_ROW.to_string(),
             sqlite_edge_id: edge.id,
@@ -3037,11 +3262,16 @@ fn raw_edge_graph_rows(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_edge_rows(
     options: &SqliteImportOptions,
     constellations: &[PreparedLiveSymbol],
     structural_node_ids: &BTreeSet<i64>,
     edges: Vec<RawEdgeRow>,
+    digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    existing_graph: &BTreeMap<Vec<u8>, Vec<u8>>,
+    preserved_keys: &mut BTreeSet<Vec<u8>>,
+    encode_skip: &mut EncodeSkipReport,
 ) -> IngestResult<(Vec<PreparedEdgeRow>, EdgeSkipCounters)> {
     let cx_by_node = constellations
         .iter()
@@ -3074,6 +3304,20 @@ fn prepare_edge_rows(
                 edge.id, edge.edge_type
             ))
         })?;
+        // A typed edge whose BOTH endpoints are digest-reused connects two unchanged files,
+        // so its persisted typed row (same src/dst CxIds, same kind/local_name_gen key, same
+        // content-derived fields) is unchanged (#372). Carry it forward from persisted bytes
+        // and fold its key into the "current" set; fail open to the encode path if its key is
+        // absent. The whole-vault `verify_chain` covers provenance, mirroring #345's Base skip.
+        if digest_reuse.contains_key(&edge.source_id)
+            && digest_reuse.contains_key(&edge.target_id)
+            && let Ok(key) = edge_graph_key(src, dst, kind, &edge.local_name_gen)
+            && existing_graph.contains_key(&key)
+        {
+            encode_skip.edge_rows_preserved += 1;
+            preserved_keys.insert(key);
+            continue;
+        }
         let weight = edge_weight(kind, &edge.properties, edge.id)?;
         let row = EdgeGraphRow {
             schema: SCHEMA_EDGE_ROW.to_string(),
@@ -3095,6 +3339,7 @@ fn prepare_edge_rows(
         let key = edge_graph_key(row.src, row.dst, kind, &row.local_name_gen)?;
         prepared.push(PreparedEdgeRow { key, row });
     }
+    encode_skip.edge_rows_encoded = prepared.len();
     prepared.sort_by(|left, right| left.key.cmp(&right.key));
     Ok((prepared, skips))
 }
@@ -3450,6 +3695,13 @@ fn symbol_metadata(
     metadata
 }
 
+/// The Graph CF key of a symbol's node-map row, without encoding the row value (#372).
+/// Used to decide whether a digest-reused symbol's persisted node-map row can be carried
+/// forward untouched, and to fold its key into the "current" set for stale detection.
+fn node_map_reuse_key(prepared: &PreparedLiveSymbol) -> IngestResult<Vec<u8>> {
+    graph_key(NODE_MAP_PREFIX, &prepared.symbol.project, prepared.node_id)
+}
+
 fn node_map_graph_row(
     options: &SqliteImportOptions,
     prepared: &PreparedLiveSymbol,
@@ -3651,11 +3903,17 @@ where
         }
     }
 
+    // The "current" key set drives stale tombstoning: any persisted project row NOT here is
+    // deleted. It must include the rows this batch carried forward from unchanged files
+    // WITHOUT re-encoding (#372) — otherwise those live rows would be spuriously tombstoned.
+    // `preserved_keys` are persisted, unchanged, and still current; they simply were not
+    // re-serialized into `graph_rows`/`edge_rows`.
     let current = prepared
         .graph_rows
         .iter()
         .map(|(key, _)| key.as_slice())
         .chain(prepared.edge_rows.iter().map(|edge| edge.key.as_slice()))
+        .chain(prepared.preserved_keys.iter().map(|key| key.as_slice()))
         .collect::<BTreeSet<_>>();
     let mut stale_keys = Vec::new();
     for (key, value) in existing_graph {
@@ -4901,6 +5159,7 @@ fn ingest_ledger_payload(
         expected_graph_rows: (prepared.graph_rows.len() + prepared.edge_rows.len()) as u64,
         expected_edge_rows: prepared.edge_rows.len() as u64,
         quantization: quantization.clone(),
+        encode_skip: prepared.encode_skip.clone(),
         first_cx_id: first,
         last_cx_id: last,
     };
@@ -4979,11 +5238,18 @@ fn keyed_graph_key(prefix: &[u8], project: &str, discriminator: &[u8]) -> Vec<u8
 }
 
 fn raw_edge_key(row: &CbmRawEdgeRow) -> IngestResult<Vec<u8>> {
-    let id = u64::try_from(row.sqlite_edge_id)
-        .map_err(|_| invalid_sqlite(format!("edge id {} cannot be encoded", row.sqlite_edge_id)))?;
+    raw_edge_key_parts(&row.project, row.sqlite_edge_id)
+}
+
+/// The raw CBM edge Graph CF key from its project + sqlite edge id, without encoding the
+/// row value (#372) — used to decide whether an internal-to-unchanged edge can be carried
+/// forward and to fold its key into the "current" set for stale detection.
+fn raw_edge_key_parts(project: &str, sqlite_edge_id: i64) -> IngestResult<Vec<u8>> {
+    let id = u64::try_from(sqlite_edge_id)
+        .map_err(|_| invalid_sqlite(format!("edge id {sqlite_edge_id} cannot be encoded")))?;
     let mut key = Vec::with_capacity(CBM_EDGE_ROW_PREFIX.len() + 32 + 8);
     key.extend_from_slice(CBM_EDGE_ROW_PREFIX);
-    key.extend_from_slice(&sha256_digest(row.project.as_bytes()));
+    key.extend_from_slice(&sha256_digest(project.as_bytes()));
     key.extend_from_slice(&id.to_be_bytes());
     Ok(key)
 }
@@ -6169,6 +6435,241 @@ mod tests {
         assert_eq!(
             third.reused_cx_ids, 3,
             "the unchanged symbol in file A plus both of file B are reused"
+        );
+    }
+
+    // #372: the row/edge ENCODE and change derivation are O(changed files), not O(corpus).
+    // Unchanged files' persisted node-map, typed/raw edge, and manifest rows are carried
+    // forward byte-for-byte without re-serializing, comparing, or re-deriving them; the
+    // `encode_skip` counters (read back from the persisted ledger payload) prove it, and a
+    // direct persisted-byte readback proves the carried-forward rows are untouched while the
+    // changed file's rows are rewritten and removed rows are tombstoned. Exercises the four
+    // required edge cases: manifest-absent (fail-open), zero-changed, one-changed, all-changed.
+    #[test]
+    fn delta_encode_is_o_changed_files_and_preserves_unchanged_rows_byte_for_byte() {
+        let base = edge_snapshot();
+        let vault = vault();
+        // src/http.rs → handler(1), helper(2); src/net.rs → net(3). node-map key by node id.
+        let net_key = graph_key(NODE_MAP_PREFIX, "demo", 3).expect("net node-map key");
+        let handler_key = graph_key(NODE_MAP_PREFIX, "demo", 1).expect("handler node-map key");
+
+        // (1) Manifest-absent edge case: first import fails OPEN — nothing preserved, every
+        // row encoded, and the absence is labeled (had_prior_manifest == false), never silent.
+        let first = import_cbm_graph_snapshot_to_vault_direct(
+            &base,
+            [1; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("first import");
+        assert!(!first.file_digest.had_prior_manifest);
+        assert_eq!(
+            first.encode_skip.rows_preserved(),
+            0,
+            "cold import preserves nothing"
+        );
+        assert_eq!(first.encode_skip.node_map_rows_encoded, 3);
+        assert_eq!(
+            first.encode_skip.edge_rows_encoded, 3,
+            "3 typed edges (edge4 dangles)"
+        );
+        assert_eq!(
+            first.encode_skip.raw_edge_rows_encoded, 4,
+            "all 4 raw edges encoded"
+        );
+        assert_eq!(
+            first.encode_skip.manifest_rows_encoded, 2,
+            "one manifest row per file"
+        );
+
+        // (2) Zero-changed edge case: an identical reimport encodes ZERO node-map/typed-edge/
+        // manifest rows and writes zero Graph rows; the only raw row still "encoded" is the
+        // dangling edge (its target is not a reused symbol) and it reverts to persisted bytes.
+        let graph_before = graph_rows(&vault, vault.latest_seq());
+        let net_before = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Graph, &net_key)
+            .expect("read net row")
+            .expect("net node-map row exists");
+        let second = import_cbm_graph_snapshot_to_vault_direct(
+            &base,
+            [2; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("second import");
+        assert_eq!(second.file_digest.files_unchanged, 2);
+        assert_eq!(second.file_digest.symbols_reused_via_digest, 3);
+        assert_eq!(second.encode_skip.node_map_rows_encoded, 0);
+        assert_eq!(second.encode_skip.node_map_rows_preserved, 3);
+        assert_eq!(second.encode_skip.edge_rows_encoded, 0);
+        assert_eq!(second.encode_skip.edge_rows_preserved, 3);
+        assert_eq!(
+            second.encode_skip.raw_edge_rows_encoded, 1,
+            "only the dangling raw edge"
+        );
+        assert_eq!(second.encode_skip.raw_edge_rows_preserved, 3);
+        assert_eq!(second.encode_skip.manifest_rows_encoded, 0);
+        assert_eq!(second.encode_skip.manifest_rows_preserved, 2);
+        assert_eq!(
+            second.graph_rows_written, 0,
+            "unchanged reimport writes no Graph row"
+        );
+        assert_eq!(second.edge_rows_written, 0);
+        // FSV: the persisted Graph CF is byte-identical to before the no-op reimport.
+        assert_eq!(graph_rows(&vault, vault.latest_seq()), graph_before);
+        // The `encode_skip` counters are the ledgered import record, read back from persisted
+        // bytes (not the in-memory report), proving the skip accounting is durable evidence.
+        let ledger = vault
+            .read_cf_at(
+                vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(second.ledger_seq),
+            )
+            .expect("read ledger")
+            .expect("ledger row");
+        let payload: Value =
+            serde_json::from_slice(&decode(&ledger).expect("decode ledger").payload)
+                .expect("payload");
+        assert_eq!(payload["encode_skip"]["node_map_rows_preserved"], 3);
+        assert_eq!(payload["encode_skip"]["node_map_rows_encoded"], 0);
+        assert_eq!(payload["encode_skip"]["edge_rows_preserved"], 3);
+
+        // (3) One-changed edge case: mutate a symbol in src/http.rs. Only that file is
+        // reconciled; src/net.rs is preserved. The unchanged file's node-map row must be
+        // byte-identical to before, and the changed file's row must differ.
+        let mut delta = base.clone();
+        delta.nodes[0].properties_json =
+            r#"{"language":"rust","source_snippet":"fn handler() { helper(); helper(); }","signature":"fn handler()"}"#
+                .to_string();
+        let third = import_cbm_graph_snapshot_to_vault_direct(
+            &delta,
+            [3; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("delta import");
+        assert_eq!(
+            third.file_digest.files_unchanged, 1,
+            "only src/net.rs still matches"
+        );
+        assert_eq!(
+            third.file_digest.files_reconciled, 1,
+            "only src/http.rs reconciled"
+        );
+        assert_eq!(
+            third.encode_skip.node_map_rows_preserved, 1,
+            "net.rs node-map preserved"
+        );
+        assert_eq!(
+            third.encode_skip.node_map_rows_encoded, 2,
+            "http.rs two symbols re-encoded"
+        );
+        assert_eq!(third.encode_skip.manifest_rows_preserved, 1);
+        assert_eq!(third.encode_skip.manifest_rows_encoded, 1);
+        // FSV: net.rs node-map row carried forward untouched; handler's row was rewritten.
+        let net_after = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Graph, &net_key)
+            .expect("read net row after delta")
+            .expect("net row still present");
+        assert_eq!(
+            net_after, net_before,
+            "unchanged file's node-map row is byte-identical"
+        );
+        let handler_after = vault
+            .read_cf_at(vault.latest_seq(), ColumnFamily::Graph, &handler_key)
+            .expect("read handler row after delta")
+            .expect("handler row present");
+        let handler_json: Value = serde_json::from_slice(&handler_after).expect("handler json");
+        assert!(
+            handler_json["properties_json"]
+                .as_str()
+                .unwrap()
+                .contains("helper(); helper()"),
+            "changed file's node-map row reflects the mutation"
+        );
+        assert_eq!(
+            verify_chain(&vault).expect("verify delta chain").status,
+            "intact",
+            "whole-vault chain stays intact after the O(changed-files) delta"
+        );
+
+        // (4) All-changed edge case: mutate a symbol in BOTH files relative to the state
+        // `third` persisted. Nothing is preserved — the fast path correctly degrades to a
+        // full reconcile with no false reuse.
+        let mut all = delta.clone();
+        all.nodes[0].properties_json =
+            r#"{"language":"rust","source_snippet":"fn handler() { helper(); helper(); helper(); }","signature":"fn handler()"}"#
+                .to_string();
+        all.nodes[2].properties_json =
+            r#"{"language":"rust","source_snippet":"mod net; // touched","signature":"mod net"}"#
+                .to_string();
+        let fourth = import_cbm_graph_snapshot_to_vault_direct(
+            &all,
+            [4; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("all-changed import");
+        assert_eq!(fourth.file_digest.files_unchanged, 0);
+        assert_eq!(
+            fourth.encode_skip.rows_preserved(),
+            0,
+            "all files changed → nothing preserved"
+        );
+        assert_eq!(fourth.encode_skip.node_map_rows_preserved, 0);
+        assert_eq!(fourth.encode_skip.edge_rows_preserved, 0);
+        assert_eq!(fourth.encode_skip.manifest_rows_preserved, 0);
+
+        // (5) Soundness edge case (#372): ONLY an edge's properties change (the whole-project
+        // resolution effect — a third file can alter strategy/candidates of an edge between
+        // two files whose nodes are untouched). The edge is folded into its SOURCE file's
+        // digest, so src/http.rs must be reconciled and the edge REWRITTEN — never wrongly
+        // carried forward off the node-only content.
+        let mut edge_change = all.clone();
+        // edges[1] is IMPORTS handler(http.rs) → net(net.rs), local_name_gen "alpha".
+        edge_change.edges[1].properties_json = r#"{"local_name":"alpha","line":7}"#.to_string();
+        let fifth = import_cbm_graph_snapshot_to_vault_direct(
+            &edge_change,
+            [5; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &options(1),
+        )
+        .expect("edge-only change import");
+        assert_eq!(
+            fifth.file_digest.files_unchanged, 1,
+            "net.rs (no outgoing edges) still matches"
+        );
+        assert_eq!(
+            fifth.file_digest.files_reconciled, 1,
+            "http.rs is invalidated by its outgoing edge's property change"
+        );
+        assert_eq!(
+            fifth.encode_skip.edge_rows_preserved, 0,
+            "no edge may be preserved once its source file's digest mismatches"
+        );
+        assert!(
+            fifth.edge_rows_written >= 1,
+            "the changed edge is rewritten"
+        );
+        // FSV: the persisted typed edge row carries the NEW properties.
+        let alpha_edge = graph_rows(&vault, vault.latest_seq())
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(EDGE_ROW_PREFIX))
+            .map(|(_, value)| serde_json::from_slice::<EdgeGraphRow>(&value).expect("edge row"))
+            .find(|row| row.local_name_gen == "alpha")
+            .expect("alpha IMPORTS edge persisted");
+        assert!(
+            alpha_edge
+                .properties_json
+                .as_deref()
+                .unwrap()
+                .contains(r#""line":7"#),
+            "persisted edge bytes reflect the property-only change"
         );
     }
 
@@ -8619,5 +9120,86 @@ mod tests {
         assert_eq!(live.nodes.len(), SYMBOLS);
         assert_eq!(live.edges.len(), SYMBOLS * EDGES_PER_SYMBOL);
         assert_eq!(verify_chain(&vault).expect("verify chain").status, "intact");
+    }
+
+    fn phase_ms(report: &SqliteImportReport, label: &str) -> u64 {
+        report
+            .timing_ms
+            .0
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, ms)| *ms)
+            .unwrap_or(0)
+    }
+
+    // #372 M-representative delta timing. Ignored by default (heavy); run with:
+    //   cargo test -p astrolabe-ingest --release delta_reimport_encode_collapses_at_scale -- --ignored --nocapture
+    // A cold import measures every symbol; the unchanged reimport must encode ZERO node-map,
+    // typed-edge, and manifest rows (the entire corpus is carried forward from persisted
+    // bytes), so its prepare_batch/encode/derive phases collapse to O(changed files) == 0.
+    // The measured phase millis are printed as the honest in-worktree number; the official
+    // #23 M gate re-measure on the real cbm/ corpus happens at consolidation.
+    #[test]
+    #[ignore = "M-representative scale timing; run explicitly with --release --ignored --nocapture"]
+    fn delta_reimport_encode_collapses_at_scale() {
+        const SYMBOLS: usize = 10_000; // 100 files x 100 symbols
+        const EDGES_PER_SYMBOL: usize = 4; // 40_000 edges
+        let snapshot = scale_snapshot(SYMBOLS, EDGES_PER_SYMBOL);
+        let (_dir, vault) = durable_vault("delta-scale-timing");
+        let opts = options(8).with_series_registry(true);
+
+        let cold = import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            [1; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &opts,
+        )
+        .expect("cold import");
+        assert_eq!(cold.new_cx_ids, SYMBOLS);
+        assert_eq!(cold.encode_skip.node_map_rows_encoded, SYMBOLS);
+
+        let delta = import_cbm_graph_snapshot_to_vault_direct(
+            &snapshot,
+            [2; 32],
+            &vault,
+            &FixtureSlotRuntime,
+            &opts,
+        )
+        .expect("unchanged delta reimport");
+        // Encode/derive work is O(changed files) == 0: nothing re-serialized, nothing written.
+        assert_eq!(delta.new_cx_ids, 0);
+        assert_eq!(delta.reused_cx_ids, SYMBOLS);
+        assert_eq!(delta.encode_skip.node_map_rows_encoded, 0);
+        assert_eq!(delta.encode_skip.node_map_rows_preserved, SYMBOLS);
+        assert_eq!(delta.encode_skip.edge_rows_encoded, 0);
+        assert_eq!(
+            delta.encode_skip.edge_rows_preserved,
+            SYMBOLS * EDGES_PER_SYMBOL
+        );
+        assert_eq!(delta.encode_skip.manifest_rows_encoded, 0);
+        assert_eq!(delta.encode_skip.manifest_rows_preserved, 100);
+        assert_eq!(delta.graph_rows_written, 0);
+        assert_eq!(delta.edge_rows_written, 0);
+        assert_eq!(verify_chain(&vault).expect("verify chain").status, "intact");
+
+        println!(
+            "#372 scale delta ({SYMBOLS} symbols / {} edges / 100 files):\n  \
+             COLD  prepare_batch={:>6}ms encode_graph_rows={:>6}ms derive_graph_changes={:>6}ms\n  \
+             DELTA prepare_batch={:>6}ms encode_graph_rows={:>6}ms derive_graph_changes={:>6}ms\n  \
+             delta encoded rows: node_map={} typed_edge={} raw_edge={} manifest={} | preserved total={}",
+            SYMBOLS * EDGES_PER_SYMBOL,
+            phase_ms(&cold, "prepare_batch"),
+            phase_ms(&cold, "encode_graph_rows"),
+            phase_ms(&cold, "derive_graph_changes"),
+            phase_ms(&delta, "prepare_batch"),
+            phase_ms(&delta, "encode_graph_rows"),
+            phase_ms(&delta, "derive_graph_changes"),
+            delta.encode_skip.node_map_rows_encoded,
+            delta.encode_skip.edge_rows_encoded,
+            delta.encode_skip.raw_edge_rows_encoded,
+            delta.encode_skip.manifest_rows_encoded,
+            delta.encode_skip.rows_preserved(),
+        );
     }
 }
