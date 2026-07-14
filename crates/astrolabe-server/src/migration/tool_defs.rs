@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 12] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 13] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -14,6 +14,7 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 12] {
         guard_calibrate_tool_definition(),
         guard_check_tool_definition(),
         measure_bits_tool_definition(),
+        find_similar_tool_definition(),
     ]
 }
 
