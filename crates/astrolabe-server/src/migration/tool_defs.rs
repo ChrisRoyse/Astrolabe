@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
+pub(crate) fn astrolabe_tool_definitions() -> [Value; 18] {
     [
         get_provenance_tool_definition(),
         detect_anomalies_tool_definition(),
@@ -19,7 +19,51 @@ pub(crate) fn astrolabe_tool_definitions() -> [Value; 17] {
         assay_gate_tool_definition(),
         abduce_cause_tool_definition(),
         forecast_tool_definition(),
+        // Appended at the end (wave-13 lane I, #353); a parallel lane also appends
+        // here — the orchestrator reconciles the final tool count on merge.
+        anchor_erase_tool_definition(),
     ]
+}
+
+pub(crate) fn anchor_erase_tool_definition() -> Value {
+    json!({
+        "name": "anchor_erase",
+        "title": "Anchor Erase",
+        "description": "Retract every grounded outcome anchor attributed to one catalog source for a shadow-indexed project. Erasure is append-only at the physical layer (the original anchor rows are never rewritten) but destructive to the serving view: an erased source leaves every active query, so this tool requires an explicit confirm=true. It writes a single AnchorTombstoneV1 into the vault's Kv column family paired with a Grounding ledger entry in one atomic group commit, and (when a fresh tombstone is committed) returns a full-readback FSV witness. Idempotent: re-erasing an already-retracted source, or a source with no anchors, is a ledger-only noop with no new tombstone. Erasure retracts the source's anchors only; it does NOT un-justify append-only AnchorPromotionV1 facts (open owner decision #354) — the boundary is labeled, never silently crossed. Fails closed with {code,message,remediation} on an unconfirmed request, a non-shadow project, a missing vault, an unclassifiable source, or an invalid/zero timestamp; no tombstone is written on any refusal.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "The catalog source to retract: the exact value the anchors were sourced under (e.g. ci:github:owner/repo:run-42). Every anchor whose source matches is tombstoned. An unclassifiable source refuses fail-closed."
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Required destructive-operation gate. Must be true: erased anchors leave every active query. Absent or false refuses without writing a tombstone."
+                },
+                "observed_at": {
+                    "type": "integer",
+                    "description": "Server-observed epoch (seconds or ms) recorded as the retraction timestamp. Defaults to the server wall clock; pass an explicit value for reproducible erasure. 0 refuses."
+                }
+            },
+            "required": ["project", "source", "confirm"],
+            "additionalProperties": false
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {"type": "object"},
+                "isError": {"type": "boolean"}
+            },
+            "required": ["content", "isError"],
+            "additionalProperties": true
+        }
+    })
 }
 
 pub(crate) fn assay_gate_tool_definition() -> Value {
