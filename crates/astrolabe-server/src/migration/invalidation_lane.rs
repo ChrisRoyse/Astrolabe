@@ -15,6 +15,9 @@ struct KernelDirtyScc {
     removed_members: Vec<String>,
 }
 
+/// Raw `(key, value)` rows scanned from a column family.
+type RawCfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 pub(crate) fn persist_delta_invalidations<C>(
     vault: &AsterVault<C>,
     project: &str,
@@ -464,7 +467,7 @@ pub(crate) fn scan_invalidation_rows<C>(
     cf: ColumnFamily,
     project: &str,
     family: &str,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DynError>
+) -> Result<RawCfRows, DynError>
 where
     C: Clock,
 {

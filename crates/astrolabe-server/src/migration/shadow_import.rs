@@ -1089,7 +1089,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let git_archaeology = match repo {
         Some(repo) => {
             let mode = match read_config_value(
-                &cache_dir,
+                cache_dir,
                 &metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY),
             )? {
                 Some(previous_head) => {
@@ -1098,7 +1098,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                 None => astrolabe_anchors::archaeology::GitMineMode::Full,
             };
             git_archaeology_summary(&run_git_archaeology(
-                repo, project, &cache_dir, &vault, mode,
+                repo, project, cache_dir, &vault, mode,
             )?)
         }
         None => json!({
@@ -1147,16 +1147,16 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     }
     let lowered_sqlite_path = lowered_sqlite_path(cache_dir, project);
     let prior_lower = if delta.is_some() {
-        read_persisted_lower_state(&cache_dir, project)?
+        read_persisted_lower_state(cache_dir, project)?
     } else {
         None
     };
     let lower_state = match prior_lower {
         Some(prior) if lowered_sqlite_path.exists() => {
-            schedule_lowering_after_convergence(&cache_dir, project, import_changed, &weave)?;
+            schedule_lowering_after_convergence(cache_dir, project, import_changed, &weave)?;
             prior
         }
-        _ => ShadowLowerState::from(lower_shadow_sqlite(&cache_dir, project, &vault)?),
+        _ => ShadowLowerState::from(lower_shadow_sqlite(cache_dir, project, &vault)?),
     };
     let verify = verify_chain(&vault)?;
     if !verify.is_intact() {

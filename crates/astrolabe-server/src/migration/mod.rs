@@ -17,8 +17,7 @@ use astrolabe_guard::{
 };
 use astrolabe_ingest::{
     CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, RowSinkStreamParams, SqliteImportOptions,
-    import_cbm_row_stream_to_vault, import_sqlite_to_vault, snapshot_into_row_stream,
-    verify_chain,
+    import_cbm_row_stream_to_vault, import_sqlite_to_vault, snapshot_into_row_stream, verify_chain,
 };
 use astrolabe_kernel::{
     BRIDGE_SCHEMA, BridgeKernelSymbol, BridgeReport, BridgeScopeKernel,
