@@ -45,8 +45,20 @@ pub const NOMIC_TOKEN_TABLE_SHA256: [u8; 32] = [
     0xbc, 0x95, 0x19, 0x27, 0x27, 0x57, 0x9a, 0xa1, 0x6b, 0x06, 0x2f, 0xf8, 0xef, 0x30, 0x1d, 0x25,
 ];
 
-const CODE_VECTORS_REL: &str = "../../cbm/vendored/nomic/code_vectors.bin";
-const CODE_TOKENS_REL: &str = "../../cbm/vendored/nomic/code_tokens.txt";
+/// Blob filename inside the resolved nomic data directory.
+const NOMIC_VECTORS_FILE: &str = "code_vectors.bin";
+/// Token-table filename inside the resolved nomic data directory.
+const NOMIC_TOKENS_FILE: &str = "code_tokens.txt";
+/// Explicit operator override: absolute path to a directory holding both nomic
+/// data files. Step 1 of the declared resolution order (see [`resolve_nomic_dir`]).
+const NOMIC_DIR_ENV: &str = "ASTRO_NOMIC_DIR";
+/// Packaging-friendly location beside the shipped binary: `<exe_dir>/data/nomic`.
+/// Step 2 of the declared resolution order (see #63 packaging).
+const NOMIC_EXE_REL: &str = "data/nomic";
+/// Dev-tree convenience directory relative to this crate's manifest (owned `cbm/`
+/// source). Step 3 of the declared resolution order — active only when the
+/// running binary is inside the workspace that owns this crate.
+const NOMIC_DEV_TREE_REL: &str = "../../cbm/vendored/nomic";
 
 /// Input measured by S18-S20/S22 static embedding lenses.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,13 +81,180 @@ pub struct StaticEmbeddingTable {
     weights_sha: [u8; 32],
 }
 
+/// One candidate directory in the declared nomic-data resolution order.
+struct NomicCandidate {
+    /// Stable origin label logged for this step (e.g. `env:ASTRO_NOMIC_DIR`).
+    origin: &'static str,
+    /// Candidate directory, or `None` when this step is unavailable.
+    dir: Option<PathBuf>,
+    /// Why the step is unavailable (only set when `dir` is `None`).
+    note: Option<String>,
+}
+
+/// Case-insensitive, separator-normalized ancestor test for Windows-friendly
+/// path containment (avoids `Path::starts_with` component/case fragility).
+fn path_within(child: &Path, ancestor: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let (c, a) = (norm(child), norm(ancestor));
+    let a = a.trim_end_matches('/').to_string();
+    c == a || c.starts_with(&format!("{a}/"))
+}
+
+/// Builds the declared resolution order: env override, then exe-relative, then
+/// (only for an in-tree binary) the dev-tree convenience directory.
+fn nomic_dir_candidates() -> Vec<NomicCandidate> {
+    let mut candidates = Vec::with_capacity(3);
+
+    // Step 1 — explicit operator override.
+    match std::env::var_os(NOMIC_DIR_ENV) {
+        Some(value) if !value.is_empty() => candidates.push(NomicCandidate {
+            origin: "env:ASTRO_NOMIC_DIR",
+            dir: Some(PathBuf::from(value)),
+            note: None,
+        }),
+        _ => candidates.push(NomicCandidate {
+            origin: "env:ASTRO_NOMIC_DIR",
+            dir: None,
+            note: Some("unset".to_string()),
+        }),
+    }
+
+    // Resolve the running binary's directory once (shared by steps 2 and 3).
+    let exe = std::env::current_exe();
+    let exe_dir: Option<PathBuf> = match &exe {
+        Ok(p) => p.parent().map(Path::to_path_buf),
+        Err(_) => None,
+    };
+
+    // Step 2 — packaging-friendly location beside the shipped binary.
+    match (&exe, &exe_dir) {
+        (_, Some(dir)) => candidates.push(NomicCandidate {
+            origin: "exe-relative:<exe_dir>/data/nomic",
+            dir: Some(dir.join(NOMIC_EXE_REL)),
+            note: None,
+        }),
+        (Err(err), None) => candidates.push(NomicCandidate {
+            origin: "exe-relative:<exe_dir>/data/nomic",
+            dir: None,
+            note: Some(format!("current_exe failed: {err}")),
+        }),
+        (Ok(_), None) => candidates.push(NomicCandidate {
+            origin: "exe-relative:<exe_dir>/data/nomic",
+            dir: None,
+            note: Some("current_exe has no parent directory".to_string()),
+        }),
+    }
+
+    // Step 3 — dev-tree convenience, ONLY when the running binary is inside the
+    // workspace that owns this crate. A relocated/shipped binary (exe outside the
+    // tree, or an unknown exe path) never reaches into a build tree (#442).
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().and_then(Path::parent);
+    let in_tree = match (&exe_dir, workspace_root) {
+        (Some(d), Some(root)) => path_within(d, root),
+        _ => false,
+    };
+    if in_tree {
+        candidates.push(NomicCandidate {
+            origin: "dev-tree:<crate>/../../cbm/vendored/nomic",
+            dir: Some(manifest_dir.join(NOMIC_DEV_TREE_REL)),
+            note: None,
+        });
+    } else {
+        candidates.push(NomicCandidate {
+            origin: "dev-tree:<crate>/../../cbm/vendored/nomic",
+            dir: None,
+            note: Some(
+                "skipped: running binary is not inside the build tree (relocated/shipped)"
+                    .to_string(),
+            ),
+        });
+    }
+
+    candidates
+}
+
+/// Resolves the nomic data directory through the declared order, logging every
+/// step to stderr and failing closed (naming every path tried and the full
+/// order) when no candidate holds both data files. See
+/// [`StaticEmbeddingTable::load_default`].
+fn resolve_nomic_dir() -> PanelResult<PathBuf> {
+    let candidates = nomic_dir_candidates();
+    let mut tried: Vec<String> = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        match &candidate.dir {
+            None => {
+                let note = candidate.note.as_deref().unwrap_or("unavailable");
+                eprintln!(
+                    "astrolabe.panel.nomic: step [{}] unavailable ({note})",
+                    candidate.origin
+                );
+                tried.push(format!("{} (unavailable: {note})", candidate.origin));
+            }
+            Some(dir) => {
+                let blob = dir.join(NOMIC_VECTORS_FILE);
+                let tokens = dir.join(NOMIC_TOKENS_FILE);
+                if blob.is_file() && tokens.is_file() {
+                    eprintln!(
+                        "astrolabe.panel.nomic: resolved via step [{}] -> {}",
+                        candidate.origin,
+                        dir.display()
+                    );
+                    return Ok(dir.clone());
+                }
+                eprintln!(
+                    "astrolabe.panel.nomic: step [{}] miss at {} (requires both {} and {})",
+                    candidate.origin,
+                    dir.display(),
+                    NOMIC_VECTORS_FILE,
+                    NOMIC_TOKENS_FILE
+                );
+                tried.push(format!("{} -> {}", candidate.origin, dir.display()));
+            }
+        }
+    }
+    Err(PanelError::new(
+        ASTRO_PANEL_CONTRACT_INVALID,
+        format!(
+            "nomic vector data directory not found; declared resolution order exhausted \
+             (each step requires both {NOMIC_VECTORS_FILE} and {NOMIC_TOKENS_FILE}). \
+             Order tried: (1) env {NOMIC_DIR_ENV}, (2) <exe_dir>/{NOMIC_EXE_REL}, \
+             (3) dev-tree <crate>/{NOMIC_DEV_TREE_REL}. Steps: [{}]",
+            tried.join("; ")
+        ),
+        format!(
+            "Supply the nomic data files via one declared location, in order: \
+             (1) set {NOMIC_DIR_ENV} to a directory holding both {NOMIC_VECTORS_FILE} and \
+             {NOMIC_TOKENS_FILE}; (2) place them under <exe_dir>/{NOMIC_EXE_REL} beside the \
+             binary (packaging path); (3) run from a dev checkout so the dev tree at \
+             <crate>/{NOMIC_DEV_TREE_REL} applies."
+        ),
+    ))
+}
+
 impl StaticEmbeddingTable {
-    /// Loads and verifies the vendored Codebase Memory MCP nomic vector blob.
+    /// Loads and verifies the Codebase Memory MCP nomic vector blob, resolving
+    /// its data directory through one declared order so a relocated (shipped)
+    /// binary finds its data files without the build tree (#442).
+    ///
+    /// Declared resolution order (each step logged to stderr; no silent fallback):
+    ///   1. `$ASTRO_NOMIC_DIR` — explicit operator override: a directory holding
+    ///      both `code_vectors.bin` and `code_tokens.txt`.
+    ///   2. `<exe_dir>/data/nomic` — packaging-friendly location beside the
+    ///      shipped binary (see #63 packaging).
+    ///   3. `<crate>/../../cbm/vendored/nomic` — dev-tree convenience, active
+    ///      **only** when the running binary is inside the workspace that owns
+    ///      this crate; a relocated/shipped binary never reaches into a build tree.
+    ///
+    /// The first directory holding both files is used and hash-verified; a
+    /// present-but-mismatched blob fails closed rather than falling through to a
+    /// later step. If no directory holds the files, this fails closed with
+    /// [`ASTRO_PANEL_CONTRACT_INVALID`] naming every path tried and the full order.
     pub fn load_default() -> PanelResult<Self> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = resolve_nomic_dir()?;
         Self::load_from_paths(
-            manifest_dir.join(CODE_VECTORS_REL),
-            manifest_dir.join(CODE_TOKENS_REL),
+            dir.join(NOMIC_VECTORS_FILE),
+            dir.join(NOMIC_TOKENS_FILE),
             NOMIC_VECTOR_BLOB_SHA256,
             NOMIC_TOKEN_TABLE_SHA256,
         )
