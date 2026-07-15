@@ -13,9 +13,11 @@
 //! Both generators only *propose* pairs; every proposed pair is re-scored with
 //! the exact cosine on the raw vectors and admitted under the same canonical
 //! ownership (lower qualified name owns), sorted admission, and per-node cap
-//! as the exhaustive planner. Candidate sets are produced single-threaded and
-//! are therefore worker-count invariant by construction; only the exact
-//! rescoring loop shards across workers.
+//! as the exhaustive planner. Candidate *recording* is single-threaded, so the
+//! proposed set is worker-count invariant; the compute-heavy stages (MinHash
+//! signatures, HNSW queries, and — under the `weave_dense_ann_strategy` exact
+//! build (#441) — the per-source exact kNN scans) shard across the declared
+//! worker count over frozen, read-only inputs.
 
 use std::collections::BTreeMap;
 
@@ -126,7 +128,7 @@ pub(crate) fn generate_family_candidates(
         if group.len() < 2 {
             continue;
         }
-        report.hnsw_candidate_pairs += hnsw_candidates(
+        report.hnsw_candidate_pairs += dense_candidates(
             family,
             vectors,
             *dim,
@@ -280,18 +282,27 @@ fn minhash_params(seed: u64, family: SimilarityFamily, permutation: usize) -> (u
     (mul, add)
 }
 
-/// Quantized HNSW kNN candidate generation for one dense dimension group.
+/// Dense kNN candidate generation for one dense dimension group.
 ///
-/// The scalar8 scale is measured from the pool (`max_abs / 127`) and recorded
-/// in the report; the index is built over the quantized approximations in
-/// qualified-name order with ordinal `CxId`s, so construction, levels, and
-/// query results are deterministic. Queries fetch `per_node_cap ×
-/// candidate_multiplier + 1` neighbors (self included) per node.
+/// The scalar8 scale is measured from the pool (`max_abs / 127`) and recorded in
+/// the report; every candidate strategy scores the *same* quantized approximations
+/// (built in qualified-name order with ordinal `CxId`s), so the measured scale and
+/// the candidate breadth (`per_node_cap × candidate_multiplier + 1` neighbors, self
+/// included) are strategy-invariant. The registry-declared `weave_dense_ann_strategy`
+/// knob (#441) then selects the build:
+///
+/// - **Sequential seeded HNSW** ([`hnsw_dense_candidates`], default): the #433
+///   build/query — deterministic because inserts run once per ordinal and mutate
+///   the shared graph in that fixed order.
+/// - **Exact blocked kNN** ([`exact_dense_candidates`]): a deterministic, parallel,
+///   graph-free per-source exact top-k scan over the identical quantized pool —
+///   byte-identical across runs and worker counts, and a strict recall improvement
+///   over the approximate HNSW graph search on the same pool (see the knob).
 #[expect(
     clippy::too_many_arguments,
     reason = "single private call site; splitting into a context struct adds indirection without reuse"
 )]
-fn hnsw_candidates(
+fn dense_candidates(
     family: SimilarityFamily,
     vectors: &[IndexedVector],
     dim: u32,
@@ -301,9 +312,6 @@ fn hnsw_candidates(
     per_source: &mut [Vec<usize>],
     scale_measurements: &mut Vec<QuantScaleMeasurement>,
 ) -> Result<usize, SimilarityPlanError> {
-    let ann_failure =
-        |message: String| SimilarityPlanError::AnnCandidateFailure { family, message };
-
     let mut max_abs = 0.0f32;
     for &index in group {
         let NormalizedVector::Dense { data, .. } = &vectors[index].vector else {
@@ -332,6 +340,30 @@ fn hnsw_candidates(
         })
         .collect();
 
+    if crate::knobs::weave_dense_ann_exact() {
+        return Ok(exact_dense_candidates(&approximations, group, span, per_source));
+    }
+    hnsw_dense_candidates(family, dim, &approximations, config, span, group, per_source)
+}
+
+/// Sequential seeded-HNSW dense candidate build (#433) — the byte-parity default.
+///
+/// `HnswIndex::insert` is called once per pool ordinal in qualified-name order, so
+/// the shared-graph mutations (back-edges, neighbor pruning) happen in a fixed order
+/// and the build is deterministic. The per-ordinal queries over the frozen index are
+/// sharded across `weave_similarity_workers` (read-only searches, so worker-count
+/// invariant), and the pair recording stays sequential in ordinal order.
+fn hnsw_dense_candidates(
+    family: SimilarityFamily,
+    dim: u32,
+    approximations: &[Vec<f32>],
+    config: &AnnCandidateConfig,
+    span: usize,
+    group: &[usize],
+    per_source: &mut [Vec<usize>],
+) -> Result<usize, SimilarityPlanError> {
+    let ann_failure =
+        |message: String| SimilarityPlanError::AnnCandidateFailure { family, message };
     let mut index = HnswIndex::new(family.slot(), dim, config.seed);
     for (ordinal, approx) in approximations.iter().enumerate() {
         index
@@ -428,6 +460,103 @@ fn hnsw_candidates(
         }
     }
     Ok(new_pairs)
+}
+
+/// Deterministic, parallel, **exact** blocked kNN dense candidate build (#441).
+///
+/// For every source ordinal `s` this computes the exact cosine of its quantized
+/// approximation against every pool member, takes the top `k = span + 1`
+/// (self-inclusive, the identical candidate breadth the HNSW query uses), drops
+/// self, and records the surviving neighbors as candidate pairs. The tie-break is
+/// (score descending, ordinal ascending) — ordinals are qualified-name order, so it
+/// is fully deterministic with no RNG.
+///
+/// Determinism / parity: each source's neighbor list is a pure function of the
+/// frozen quantized pool `approximations`, with no graph and no cross-source
+/// mutation, so the per-source scans are sharded across `weave_similarity_workers`
+/// with results concatenated in ordinal order — the proposed candidate set is
+/// byte-identical across runs and worker counts (the pair recording is single
+/// threaded). Because the exact top-k over the quantized pool strictly dominates
+/// HNSW's approximate graph search on the *same* pool (it removes only the
+/// graph-approximation error over the shared quantization error), candidate recall
+/// against the exhaustive planner cannot drop; see the knob declaration.
+fn exact_dense_candidates(
+    approximations: &[Vec<f32>],
+    group: &[usize],
+    span: usize,
+    per_source: &mut [Vec<usize>],
+) -> usize {
+    let pool = approximations.len();
+    // Same candidate breadth as the HNSW query (`span + 1`, self included), clamped
+    // to the pool so a tiny group asks for at most `pool` neighbors.
+    let k = span.saturating_add(1).min(pool);
+    let indices: Vec<usize> = (0..pool).collect();
+    let workers = crate::knobs::weave_similarity_workers().min(pool).max(1);
+    let chunk_size = indices.len().div_ceil(workers).max(1);
+    let neighbor_lists: Vec<Vec<usize>> = std::thread::scope(|scope| {
+        indices
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&source| {
+                            let query = &approximations[source];
+                            let mut scored: Vec<(usize, f32)> = (0..pool)
+                                .map(|target| (target, cosine(query, &approximations[target])))
+                                .collect();
+                            // Mirrors calyx-sextant `top_k` ordering (score desc)
+                            // with an ordinal tie-break for full determinism.
+                            scored.sort_by(|left, right| {
+                                right
+                                    .1
+                                    .total_cmp(&left.1)
+                                    .then_with(|| left.0.cmp(&right.0))
+                            });
+                            scored.truncate(k);
+                            scored
+                                .into_iter()
+                                .map(|(target, _)| target)
+                                .filter(|&target| target != source)
+                                .collect::<Vec<usize>>()
+                        })
+                        .collect::<Vec<Vec<usize>>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("exact knn worker panicked"))
+            .collect()
+    });
+
+    let mut new_pairs = 0usize;
+    for (source, neighbors) in neighbor_lists.into_iter().enumerate() {
+        for target in neighbors {
+            if record_pair(per_source, group[source], group[target]) {
+                new_pairs += 1;
+            }
+        }
+    }
+    new_pairs
+}
+
+/// Cosine similarity over two equal-length dense vectors, byte-identical to the
+/// `calyx-sextant` `util::cosine` the HNSW path scores with, so the exact strategy
+/// ranks candidates in the same quantized space as the sequential build.
+fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+    for (x, y) in left.iter().zip(right) {
+        dot += x * y;
+        left_norm += x * x;
+        right_norm += y * y;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
 }
 
 /// Maps a pool ordinal to a synthetic, deterministic `CxId` (big-endian u128).
