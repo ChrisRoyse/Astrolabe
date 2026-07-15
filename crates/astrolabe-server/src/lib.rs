@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use astrolabe_bridge::{BridgeError, CbmToolRunner, ErrorEnvelope};
+use tracing::level_filters::LevelFilter;
 
 mod migration;
 
@@ -61,9 +62,20 @@ pub use astrolabe_domain::knobs::cbm_pipeline_host_stack_bytes;
 pub fn run_from_env() -> i32 {
     let args: Vec<String> = env::args().collect();
     let hook_mode = is_hook_augment_invocation(&args);
+    // #392: a `cli <tool>` invocation reserves stderr for warn/error so the
+    // supported `--args-file`/stdin forms emit empty stderr (unblocks #377). It
+    // is detected here — mirroring the hook-mode early branch — so both the
+    // tracing subscriber and the libcbm log floor are raised before any startup
+    // logging can reach stderr. Server (no-arg) dispatch is unaffected and keeps
+    // INFO.
+    let cli_mode = is_cli_invocation(&args);
     let _hook_deadline = hook_mode.then(|| HookDeadline::start(HOOK_AUGMENT_BUDGET_MS));
     if !hook_mode {
-        initialize_tracing();
+        initialize_tracing(if cli_mode {
+            cli_stderr_tracing_level()
+        } else {
+            LevelFilter::INFO
+        });
         astrolabe_bridge::route_cbm_logs_to_tracing();
     }
     let binary_path = env::current_exe()
@@ -73,6 +85,8 @@ pub fn run_from_env() -> i32 {
 
     let startup = if hook_mode {
         astrolabe_bridge::initialize_cbm_host_process_silent(binary_path.as_deref())
+    } else if cli_mode {
+        astrolabe_bridge::initialize_cbm_host_process_cli(binary_path.as_deref())
     } else {
         astrolabe_bridge::initialize_cbm_host_process(binary_path.as_deref())
     };
@@ -118,13 +132,35 @@ fn dispatch(args: &[String]) -> Result<i32, DynError> {
     }
 }
 
-fn initialize_tracing() {
+fn initialize_tracing(max_level: LevelFilter) {
     let _ = tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_ansi(false)
         .with_target(false)
         .without_time()
+        .with_max_level(max_level)
         .try_init();
+}
+
+/// True when argv is a `cli <tool> ...` invocation. Mirrors
+/// [`is_hook_augment_invocation`] so the CLI stderr log floor is decided from the
+/// same early argv inspection (#392).
+fn is_cli_invocation(args: &[String]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "cli")
+}
+
+/// The tracing `max_level` for CLI stderr, derived from the single
+/// registry-declared `cli_stderr_log_level_floor` knob (a libcbm `CBMLogLevel`
+/// ordinal: `0`=debug..`4`=none) so one number governs both this subscriber and
+/// the libcbm log floor (#392).
+fn cli_stderr_tracing_level() -> LevelFilter {
+    match astrolabe_domain::knobs::cli_stderr_log_level_floor() {
+        0 => LevelFilter::TRACE,
+        1 => LevelFilter::INFO,
+        2 => LevelFilter::WARN,
+        3 => LevelFilter::ERROR,
+        _ => LevelFilter::OFF,
+    }
 }
 
 fn print_usage() {

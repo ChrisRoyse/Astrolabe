@@ -407,3 +407,54 @@ pub fn bridge_scope_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
 pub fn bridge_scope_path_depth() -> usize {
     usize::try_from(BRIDGE_SCOPE_DEFAULT_PATH_DEPTH).unwrap_or(2)
 }
+
+/// Registry version tag for the CLI stderr log-floor knob (#392).
+pub const CLI_LOG_KNOB_REGISTRY_VERSION: &str = "astrolabe-cli-log-knobs-v1";
+
+/// Name of the CLI stderr log-level floor knob.
+pub const CLI_STDERR_LOG_LEVEL_FLOOR_KNOB: &str = "cli_stderr_log_level_floor";
+
+/// The minimum log-severity ordinal that reaches stderr for a `cli <tool>`
+/// invocation, expressed on the libcbm `CBMLogLevel` scale (`0`=debug, `1`=info,
+/// `2`=warn, `3`=error, `4`=none — see `cbm/src/foundation/log.h`).
+///
+/// For CLI invocations stderr is reserved for warnings and errors so the
+/// supported argument forms (`--args-file` / piped stdin) emit **empty** stderr
+/// (#392, unblocking #377's "empty stderr for supported CLI forms" clause).
+/// Server (no-arg) dispatch keeps the default INFO floor and is unaffected: this
+/// floor is applied only on the CLI branch. The single ordinal is consumed by
+/// both the tracing subscriber (as a `LevelFilter`) and the libcbm log level (via
+/// `cbm_log_set_level`) so exactly one number decides what CLI stderr carries.
+pub const CLI_STDERR_LOG_LEVEL_FLOOR_WARN: u64 = 2;
+/// Smallest legal CLI stderr floor. Below WARN (i.e. INFO=1 or DEBUG=0) libcbm's
+/// `mem.init`/`vmem.init` INFO lines return to stderr, which is exactly the
+/// per-call noise this knob exists to remove — the same "a lower value disables
+/// the protection this knob exists for" bound the FSV sampling knob enforces.
+pub const CLI_STDERR_LOG_LEVEL_FLOOR_MIN: u64 = 2;
+/// Largest legal CLI stderr floor: `CBM_LOG_NONE` (4), a fully silent CLI stderr.
+pub const CLI_STDERR_LOG_LEVEL_FLOOR_MAX: u64 = 4;
+
+/// The CLI stderr log-floor knob registry (#392).
+pub const CLI_LOG_KNOBS: &[U64KnobDeclaration] = &[U64KnobDeclaration {
+    registry_version: CLI_LOG_KNOB_REGISTRY_VERSION,
+    name: CLI_STDERR_LOG_LEVEL_FLOOR_KNOB,
+    default: CLI_STDERR_LOG_LEVEL_FLOOR_WARN,
+    min: CLI_STDERR_LOG_LEVEL_FLOOR_MIN,
+    max: CLI_STDERR_LOG_LEVEL_FLOOR_MAX,
+    unit: "cbm_log_level_ordinal",
+    source: "ASTROLABE #392 / cbm/src/foundation/log.h CBMLogLevel enum (debug=0..none=4); stdout is reserved for JSON-RPC, so CLI stderr carries only warn/error",
+    rationale: "reserves CLI stderr for warnings and errors so the supported `--args-file`/stdin forms emit empty stderr (#392, unblocks #377); WARN=2 is the floor because INFO=1 re-admits libcbm's per-call mem.init/vmem.init lines, and NONE=4 caps at a fully silent stderr; the same ordinal drives both the tracing subscriber and cbm_log_set_level so one number decides CLI stderr contents; server (no-arg) dispatch is unaffected and keeps INFO",
+}];
+
+/// Returns the CLI stderr log-floor declaration for `name`, or `None`.
+pub fn cli_log_knob(name: &str) -> Option<&'static U64KnobDeclaration> {
+    CLI_LOG_KNOBS.iter().find(|knob| knob.name == name)
+}
+
+/// The CLI stderr log-level floor as a libcbm `CBMLogLevel` ordinal
+/// (`0`=debug..`4`=none). This is the single accessor both the server's tracing
+/// init and the bridge's `cbm_log_set_level` call read so one declared number
+/// decides what a `cli <tool>` invocation writes to stderr (#392).
+pub fn cli_stderr_log_level_floor() -> u32 {
+    u32::try_from(CLI_STDERR_LOG_LEVEL_FLOOR_WARN).unwrap_or(2)
+}

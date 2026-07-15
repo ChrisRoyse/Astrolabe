@@ -332,12 +332,36 @@ pub fn route_cbm_logs_to_tracing() {
     }
 }
 
+/// How libcbm's own logging is initialized for this host process (#392).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CbmLogMode {
+    /// Server (no-arg) dispatch: leave libcbm at its env/default level (INFO) so
+    /// operators keep the full server log stream on stderr.
+    Default,
+    /// `cli <tool>` dispatch: raise the libcbm log floor so `mem.init`/`vmem.init`
+    /// INFO lines never reach stderr — CLI stderr is reserved for warn/error, so
+    /// the supported `--args-file`/stdin forms emit empty stderr. The exact floor
+    /// is the registry-declared `cli_stderr_log_level_floor` knob.
+    CliWarnFloor,
+    /// Hook-augment dispatch: fully silence libcbm (level NONE + silent sink) so a
+    /// short-budget hook never writes to stderr at all.
+    Silent,
+}
+
 pub fn initialize_cbm_host_process(binary_path: Option<&str>) -> Result<(), BridgeError> {
-    initialize_cbm_host_process_with_log_mode(binary_path, false)
+    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::Default)
 }
 
 pub fn initialize_cbm_host_process_silent(binary_path: Option<&str>) -> Result<(), BridgeError> {
-    initialize_cbm_host_process_with_log_mode(binary_path, true)
+    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::Silent)
+}
+
+/// Initialize the CBM host process for a `cli <tool>` invocation, raising the
+/// libcbm log floor to the registry-declared `cli_stderr_log_level_floor` (WARN)
+/// so per-call INFO lines (`mem.init`/`vmem.init`) never reach stderr (#392).
+/// Warnings and errors still flow through the tracing sink to stderr.
+pub fn initialize_cbm_host_process_cli(binary_path: Option<&str>) -> Result<(), BridgeError> {
+    initialize_cbm_host_process_with_log_mode(binary_path, CbmLogMode::CliWarnFloor)
 }
 
 pub fn run_cbm_installer_command(command: &str, args: &[String]) -> Result<i32, BridgeError> {
@@ -389,7 +413,7 @@ pub fn cbm_install_plan_json(home: &str, binary_path: &str) -> Result<String, Br
 
 fn initialize_cbm_host_process_with_log_mode(
     binary_path: Option<&str>,
-    silent: bool,
+    log_mode: CbmLogMode,
 ) -> Result<(), BridgeError> {
     // Refuse a store-relocating environment at startup rather than discovering it
     // one indexed project too late (#194/#232).
@@ -406,12 +430,25 @@ fn initialize_cbm_host_process_with_log_mode(
     // the duration of the call; CBM copies it internally.
     unsafe {
         cbm_sys::cbm_log_init_from_env();
-        if silent {
-            cbm_sys::cbm_log_set_level(cbm_sys::CBMLogLevel_CBM_LOG_NONE);
-            cbm_sys::cbm_log_set_sink_ex(
-                Some(cbm_log_silent_sink),
-                cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
-            );
+        match log_mode {
+            CbmLogMode::Default => {}
+            CbmLogMode::CliWarnFloor => {
+                // #392: reserve CLI stderr for warn/error. Raise the libcbm log
+                // floor to the registry-declared ordinal (WARN) BEFORE cbm_mem_init
+                // so its INFO `mem.init`/`vmem.init` lines are dropped at the
+                // source rather than emitted. Warn/error still flow to stderr via
+                // the tracing sink installed by route_cbm_logs_to_tracing().
+                let floor = c_int::try_from(astrolabe_domain::knobs::cli_stderr_log_level_floor())
+                    .unwrap_or(cbm_sys::CBMLogLevel_CBM_LOG_WARN);
+                cbm_sys::cbm_log_set_level(floor);
+            }
+            CbmLogMode::Silent => {
+                cbm_sys::cbm_log_set_level(cbm_sys::CBMLogLevel_CBM_LOG_NONE);
+                cbm_sys::cbm_log_set_sink_ex(
+                    Some(cbm_log_silent_sink),
+                    cbm_sys::CBMLogSinkMode_CBM_LOG_SINK_REPLACE,
+                );
+            }
         }
         cbm_sys::cbm_index_supervisor_mark_host();
         cbm_sys::cbm_cli_set_version(c"dev".as_ptr());
