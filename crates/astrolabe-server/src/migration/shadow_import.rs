@@ -2582,10 +2582,21 @@ pub(crate) fn open_shadow_vault_with_access(
     read_only: bool,
 ) -> Result<AsterVault, DynError> {
     let vault_id = VaultId::from_str(vault_id)?;
+    // Vault CF-selection contract (calyx-aster durable.rs): `None` = open all CFs;
+    // `Some(non-empty)` = open only those CFs; `Some(empty)` is rejected fail-closed
+    // (a guard against accidental empty selections). A caller that wants a read-only
+    // handle over ALL CFs therefore passes an empty list, which must map to `None`,
+    // not `Some(empty)` — otherwise the open fails with CALYX_VAULT_OPTIONS_INVALID
+    // (the #43 as_of historical-read break). Writable handles never select CFs.
+    let selected_cfs = if read_only && !selected_cfs.is_empty() {
+        Some(selected_cfs)
+    } else {
+        None
+    };
     let options = VaultOptions {
         read_only,
         restore_ledger_hook: !read_only,
-        selected_cfs: read_only.then_some(selected_cfs),
+        selected_cfs,
         ..VaultOptions::default()
     };
     Ok(AsterVault::open(
