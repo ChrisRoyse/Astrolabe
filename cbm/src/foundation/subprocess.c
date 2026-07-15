@@ -7,6 +7,7 @@
 
 #include "compat.h"    /* cbm_nanosleep */
 #include "compat_fs.h" /* cbm_fopen — #415 long-path-safe worker-log tail */
+#include "log.h"       /* cbm_log_warn — structured fail-closed handle-scope error (#438) */
 #include "platform.h"  /* cbm_now_ms */
 
 #include <stdio.h>
@@ -254,7 +255,11 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     }
 
     HANDLE hlog = INVALID_HANDLE_VALUE;
-    STARTUPINFOW si = {.cb = sizeof(si)};
+    /* Use the EXTENDED startup info so we can attach a PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+     * that scopes inheritance to exactly the log handle (#438). Its first member IS a
+     * STARTUPINFOW, so &six.StartupInfo is the CreateProcessW startup pointer either way. */
+    STARTUPINFOEXW six = {0};
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = NULL;
     if (opts->log_file) {
         /* #415: create the worker log via CreateFileW with an extended-length
          * ("\\?\") widened path so a log under a deep store (<store>/logs/…)
@@ -282,15 +287,81 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
             free(wlog);
         }
         if (hlog != INVALID_HANDLE_VALUE) {
-            si.dwFlags = STARTF_USESTDHANDLES;
-            si.hStdError = hlog;
-            si.hStdOutput = hlog;
+            /* #438: because the log handle is now inheritable (#435), a bare
+             * CreateProcessW(bInheritHandles=TRUE) would leak EVERY inheritable
+             * handle in the parent into this child — a second concurrent index
+             * worker could inherit the first job's still-open log handle and keep
+             * that log file alive past its delete-on-exit unlink. Scope inheritance
+             * to EXACTLY hlog with PROC_THREAD_ATTRIBUTE_HANDLE_LIST (STARTUPINFOEXW
+             * + EXTENDED_STARTUPINFO_PRESENT). Requirements observed (MS "Inheritance"
+             * docs + Raymond Chen, The Old New Thing 2011-12-16): the listed handle
+             * is itself inheritable (sa.bInheritHandle=TRUE above); it is a real
+             * kernel handle, never a pseudo-handle; the attribute buffer is
+             * heap-allocated with the size the first InitializeProcThreadAttributeList
+             * call reports; UpdateProcThreadAttribute takes a BYTE count
+             * (1 * sizeof(HANDLE)), not a handle count; and DeleteProcThreadAttributeList
+             * + free run on every path. hStdInput stays NULL (unchanged from the prior
+             * spawn) so no other std handle needs listing. */
+            SIZE_T attr_size = 0;
+            (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size); /* sizing call */
+            bool attr_inited = false;
+            bool attr_ok = false;
+            if (attr_size > 0) {
+                attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+                if (attr_list && InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+                    attr_inited = true;
+                    if (UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                  &hlog, sizeof(HANDLE), NULL, NULL)) {
+                        attr_ok = true;
+                    }
+                }
+            }
+            if (!attr_ok) {
+                /* Fail closed: NEVER fall back to inherit-all (that IS the #438 leak).
+                 * Surface a structured {code, message, remediation} through the
+                 * subprocess spawn-error surface (CBM_PROC_SPAWN_FAILED); the caller
+                 * turns it into the user-facing index-worker spawn error. */
+                cbm_log_warn("subprocess.win.handle_scope_failed", "code", "handle_scope_failed",
+                             "message",
+                             "could not build per-spawn PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
+                             "remediation",
+                             "no inherit-all fallback (would leak concurrent workers' log "
+                             "handles); retry the index job — if persistent, check process "
+                             "handle/memory limits");
+                if (attr_inited) {
+                    DeleteProcThreadAttributeList(attr_list);
+                }
+                free(attr_list);
+                CloseHandle(hlog);
+                free(wcmd);
+                out->outcome = CBM_PROC_SPAWN_FAILED;
+                out->exit_code = -1;
+                out->term_signal = 0;
+                return -1;
+            }
+            six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            six.StartupInfo.hStdError = hlog;
+            six.StartupInfo.hStdOutput = hlog;
+            six.lpAttributeList = attr_list;
         }
     }
 
+    /* With a scoped attribute list, inherit ONLY the listed handle; with no log
+     * handle at all, inherit NOTHING (bInheritHandles=FALSE) — the pre-#438 code
+     * passed TRUE unconditionally, which is exactly the leak this closes. When the
+     * extended block is present, cb must be sizeof(STARTUPINFOEXW). */
+    BOOL inherit = attr_list ? TRUE : FALSE;
+    DWORD create_flags = attr_list ? EXTENDED_STARTUPINFO_PRESENT : 0;
+    six.StartupInfo.cb = attr_list ? sizeof(six) : sizeof(six.StartupInfo);
+
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit, create_flags, NULL, NULL,
+                             &six.StartupInfo, &pi);
     free(wcmd);
+    if (attr_list) {
+        DeleteProcThreadAttributeList(attr_list);
+        free(attr_list);
+    }
     if (hlog != INVALID_HANDLE_VALUE) {
         CloseHandle(hlog);
     }
