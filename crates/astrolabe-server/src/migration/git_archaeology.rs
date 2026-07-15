@@ -101,6 +101,26 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             .then_with(|| left.label.cmp(right.label))
     });
 
+    // Corpus scoping (#403): a shadow index of a subdirectory nested inside a
+    // larger git repo must attribute archaeology to ONLY that subdirectory. The
+    // mining pass above deliberately runs from the repo toplevel (path-namespace
+    // correctness), so it yields toplevel-relative evidence spanning the whole
+    // enclosing repo. Left unscoped, `index_historical_commit` below then indexed
+    // the ENTIRE historical worktree (the whole enclosing workspace — e.g. the
+    // astrolabe Rust crates when indexing `crates/astrolabe-guard/src`), a
+    // spurious wrong-corpus pipeline pass that both wasted work and, running
+    // in-process, could abort the whole shadow import mid-extraction with a
+    // partial vault. `corpus_rel` is the requested corpus path relative to the
+    // toplevel (empty when the corpus IS the toplevel — behavior-neutral there).
+    // Evidence outside the corpus belongs to files this shadow index does not
+    // cover, so it is dropped here: only commits that touched the requested
+    // corpus are checked out and indexed, and only within the corpus subtree.
+    let corpus_rel = git_show_prefix(repo)?;
+    if !corpus_rel.is_empty() {
+        let corpus_prefix = format!("{corpus_rel}/");
+        evidence.retain(|item| normalized_path(&item.range.path).starts_with(&corpus_prefix));
+    }
+
     let mut report = GitArchaeologyImportReport {
         head: mined.head,
         mode: mode_name,
@@ -109,7 +129,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         ..GitArchaeologyImportReport::default()
     };
     for (commit, group) in group_evidence_by_commit(&evidence) {
-        let indexed = index_historical_commit(repo, cache_dir, project, commit)?;
+        let indexed = index_historical_commit(repo, cache_dir, project, commit, &corpus_rel)?;
         report.cleanup_remnants += indexed.cleanup_remnants;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
@@ -198,6 +218,7 @@ fn index_historical_commit(
     cache_dir: &Path,
     project: &str,
     commit: &str,
+    corpus_rel: &str,
 ) -> Result<HistoricalCommitIndex, DynError> {
     let nonce = format!(
         "{}-{}",
@@ -227,17 +248,53 @@ fn index_historical_commit(
         ],
     )?;
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
+        // Scope the historical index to the requested corpus subtree within the
+        // whole-repo worktree (#403). A git worktree is always the full repository
+        // tree, so indexing `worktree` itself walked the entire enclosing
+        // workspace — the spurious wrong-corpus pass. `worktree.join(corpus_rel)`
+        // restricts CBM discovery to exactly the requested corpus; an empty
+        // `corpus_rel` (corpus IS the toplevel) leaves this behavior-neutral.
+        let scoped_root = if corpus_rel.is_empty() {
+            worktree.clone()
+        } else {
+            worktree.join(corpus_rel)
+        };
+        // The corpus subtree may not exist at this historical commit (created or
+        // renamed later). CBM cannot index a path that is not there; treat it as
+        // "no historical rows for this commit" (the evidence then lands as
+        // evidence_without_symbol) rather than letting CBM abort on a missing
+        // root — the in-process abort would take the whole shadow import with it.
+        if !scoped_root.exists() {
+            return Ok(CbmPipelineRows {
+                project: project.to_string(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
         let mut pipeline = CbmPipeline::new(
-            path_str(&worktree)?,
+            path_str(&scoped_root)?,
             path_str(&database)?,
             CbmIndexMode::Fast,
         )?;
         pipeline.set_project_name(project)?;
-        let rows = pipeline.collect_rows()?;
+        let mut rows = pipeline.collect_rows()?;
         // Drop the pipeline (and with it CBM's SQLite handle) explicitly before
         // cleanup so the removals below race only Windows' async handle release,
         // which the bounded retry absorbs — not a still-open handle.
         drop(pipeline);
+        // Re-anchor node paths to the toplevel namespace. When scoped to the
+        // corpus subtree, CBM emits paths relative to `scoped_root`; the mined
+        // evidence (and thus `node_overlaps`/`select_implicated_rows`) is
+        // toplevel-relative. Prepending `corpus_rel` makes the two namespaces
+        // coincide again, so attribution and historical-constellation CxId
+        // derivation are byte-identical to the pre-#403 whole-worktree paths for
+        // every node inside the corpus.
+        if !corpus_rel.is_empty() {
+            for node in &mut rows.nodes {
+                node.file_path =
+                    format!("{corpus_rel}/{}", normalized_path(&node.file_path));
+            }
+        }
         Ok(rows)
     })();
     // Ask git to release and remove its worktree registration first; retries below
@@ -326,6 +383,33 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
         )
         .into())
     }
+}
+
+/// The requested corpus path relative to its git repository toplevel, forward-slash
+/// normalized with no trailing slash (`git rev-parse --show-prefix`). Empty when the
+/// corpus IS the toplevel. This is the corpus-scoping key (#403): archaeology mines
+/// from the toplevel but must index and attribute only the requested subtree. Fails
+/// closed with a structured error if `repo` is not inside a git work tree — never a
+/// silent fallback to the enclosing repo.
+fn git_show_prefix(repo: &Path) -> Result<String, DynError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-prefix"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --show-prefix failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string())
 }
 
 fn select_implicated_rows(mut rows: CbmPipelineRows, evidence: &[Evidence]) -> CbmPipelineRows {
