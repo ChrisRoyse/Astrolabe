@@ -14,13 +14,18 @@ use calyx_core::{AnchorKind, AnchorValue};
 
 const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
 
-/// Write-side prefix for the transient git-archaeology scratch artifacts this
-/// module drops into the CBM store dir: the historical-index scratch store
-/// `".astrolabe-archaeology-<pid>-<nanos>.db"` and its sibling worktree
-/// `".astrolabe-archaeology-worktree-<nonce>"`. The scratch store ends in `.db`
-/// but is NOT a project store — it is live during an archaeology pass and can
-/// survive a crash — so the C enumerator (`is_project_db_file` in
-/// `cbm/src/mcp/mcp.c`) skips the family by this reserved prefix (#414).
+/// Write-side prefix for the transient git-archaeology scratch STORE this module
+/// drops into the CBM store dir: the historical-index scratch database
+/// `".astrolabe-archaeology-<pid>-<nanos>.db"` (plus its `-wal`/`-shm`/`-journal`
+/// sidecars). The scratch store ends in `.db` but is NOT a project store — it is
+/// live during an archaeology pass and can survive a crash — so the C enumerator
+/// (`is_project_db_file` in `cbm/src/mcp/mcp.c`) skips the family by this reserved
+/// prefix (#414). The scratch WORKTREE no longer lives beside it: a Windows process
+/// CWD is hard-capped at MAX_PATH and `core.longpaths` covers git's file I/O but
+/// NOT the `chdir` git performs into a `-C <worktree>` root, so on a deep store dir
+/// `git checkout` died with `cannot change to '<deep>/…-worktree-…'`. The worktree
+/// is relocated to a short temp base ([`archaeology_worktree_home`], #427); only the
+/// `\\?\`-safe scratch `.db` (SQLite, #412) stays under the store.
 ///
 /// DRIFT CONTRACT: MUST byte-match the C-side `CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX`
 /// (declared in `cbm/src/mcp/mcp.h`); the compile-time assertion below binds
@@ -50,6 +55,25 @@ const _: () = {
         "C reserved prefix is not NUL-terminated"
     );
 };
+
+/// Directory-name prefix for the transient git-archaeology scratch WORKTREE, now
+/// rooted under a short temp base ([`archaeology_worktree_home`]) rather than the
+/// (possibly deep) CBM store dir (#427). The embedded owner PID is the sweep's
+/// concurrency discriminator: [`sweep_orphan_worktrees`] removes a leftover
+/// worktree only when its PID is dead, so a concurrent live archaeology pass is
+/// never swept out from under itself. Unlike the scratch `.db`, this name carries
+/// no C-side enumeration contract — it never lands in a CBM store dir.
+const ARCHAEOLOGY_WORKTREE_PREFIX: &str = "astrolabe-archaeology-worktree-";
+
+/// Byte budget for the scratch-worktree root path. [`add_historical_worktree`]
+/// runs `git -C <worktree> checkout …`, which makes git `chdir` into the worktree
+/// root; a Windows process CWD is hard-capped at MAX_PATH (260) and no `\\?\` form
+/// or git config lifts that `chdir` limit (confirmed against git-for-windows
+/// #3372 / #5464 — `core.longpaths` only reaches git's file I/O, never `chdir`).
+/// 240 keeps the root ~20 bytes clear of the 260 cap; a worktree path over budget
+/// fails closed (`ASTRO_ARCHAEOLOGY_WORKTREE_BASE_TOO_DEEP`) instead of letting
+/// `git checkout` die mid-pass. This is a platform limit, not a tunable knob.
+const ARCHAEOLOGY_WORKTREE_CWD_BUDGET: usize = 240;
 
 #[derive(Debug, Clone)]
 struct Evidence {
@@ -197,8 +221,29 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         skipped_merge_fixes: mined.skipped_merge_fixes,
         ..GitArchaeologyImportReport::default()
     };
+    // Relocate archaeology scratch worktrees to a short temp base (#427): a deep
+    // store dir would push the worktree root past the Windows `chdir` MAX_PATH cap
+    // that `git -C <worktree> checkout` hits (`core.longpaths` does not cover
+    // `chdir`). The scratch `.db` stays under the store dir (`\\?\`-safe, #412).
+    let worktree_home = archaeology_worktree_home();
+    fs::create_dir_all(&worktree_home).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_WORKTREE_HOME_UNUSABLE: could not create the archaeology \
+             scratch-worktree base {}: {error}; remediation: point TMP/TEMP at a writable, \
+             short directory and re-run index_repository",
+            worktree_home.display()
+        )
+        .into()
+    })?;
+    // Best-effort, PID-gated sweep of worktrees left at this shared home by a prior
+    // pass that crashed before cleanup (invariant 3: counted telemetry, never a
+    // silent skip). Only dead-PID orphans are removed, so a concurrently-running
+    // pass — its own live PID stamped in the name — is never disturbed.
+    sweep_orphan_worktrees(repo, &worktree_home);
+
     for (commit, group) in group_evidence_by_commit(&evidence) {
-        let indexed = index_historical_commit(repo, cache_dir, project, commit, &corpus_rel)?;
+        let indexed =
+            index_historical_commit(repo, cache_dir, &worktree_home, project, commit, &corpus_rel)?;
         report.cleanup_remnants += indexed.cleanup_remnants;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
@@ -285,6 +330,7 @@ struct HistoricalCommitIndex {
 fn index_historical_commit(
     repo: &Path,
     cache_dir: &Path,
+    worktree_home: &Path,
     project: &str,
     commit: &str,
     corpus_rel: &str,
@@ -294,7 +340,22 @@ fn index_historical_commit(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    let worktree = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}worktree-{nonce}"));
+    // Worktree at the short temp home (#427); the `.db` scratch store stays under
+    // the store dir where the C enumerator's reserved-prefix filter can see it.
+    let worktree = worktree_home.join(format!("{ARCHAEOLOGY_WORKTREE_PREFIX}{nonce}"));
+    let worktree_len = worktree.as_os_str().len();
+    if worktree_len > ARCHAEOLOGY_WORKTREE_CWD_BUDGET {
+        return Err(format!(
+            "ASTRO_ARCHAEOLOGY_WORKTREE_BASE_TOO_DEEP: archaeology scratch-worktree root {root} is \
+             {worktree_len} bytes, over the {ARCHAEOLOGY_WORKTREE_CWD_BUDGET}-byte budget that \
+             keeps git's chdir into the worktree under the Windows MAX_PATH (260) cap (no \\\\?\\ \
+             form or git config lifts the chdir limit); remediation: point TMP/TEMP at a shorter \
+             directory (e.g. C:\\t) so the archaeology temp base is short, then re-run \
+             index_repository",
+            root = worktree.display(),
+        )
+        .into());
+    }
     let database = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}{nonce}.db"));
     add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
@@ -411,6 +472,119 @@ fn remove_path_with_retry(path: &Path, remove: impl Fn(&Path) -> std::io::Result
     !path.exists()
 }
 
+/// Short, collision-safe base directory for archaeology scratch worktrees,
+/// deliberately OUTSIDE the CBM store dir so a deep store never pushes the
+/// worktree root past the Windows `chdir` MAX_PATH cap (#427). One shared temp
+/// subdirectory serves all owners; per-worktree collision-safety comes from the
+/// `<pid>-<nanos>` nonce, and cross-process safety from PID-gated orphan sweeping
+/// ([`sweep_orphan_worktrees`]). Exactly ONE home is chosen — no store-dir-then-temp
+/// fallback chain (issue #427: pick one home for the worktree). `std::env::temp_dir`
+/// is normally short (`%LOCALAPPDATA%\Temp`) but not guaranteed so; the per-commit
+/// [`ARCHAEOLOGY_WORKTREE_CWD_BUDGET`] guard fails closed if this base is itself deep.
+fn archaeology_worktree_home() -> PathBuf {
+    std::env::temp_dir().join("astrolabe-archaeology-worktrees")
+}
+
+/// Best-effort sweep of archaeology scratch worktrees left at the shared temp
+/// home by a prior pass that crashed between `git worktree add` and cleanup (#427).
+/// Only worktrees whose embedded owner PID is dead are removed, so a
+/// concurrently-running pass — its own live PID stamped in the directory name — is
+/// never swept out from under itself. After removing stale directories, `git
+/// worktree prune` drops the now-dangling administrative registrations from `repo`.
+/// This is best-effort maintenance: it never aborts the import, but every outcome
+/// is surfaced as counted telemetry (invariant 3), never a silent `let _`.
+fn sweep_orphan_worktrees(repo: &Path, home: &Path) {
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "astro.archaeology.orphan_sweep home={} status=unreadable error={error}",
+                home.display()
+            );
+            return;
+        }
+    };
+    let self_pid = std::process::id();
+    let mut swept = 0usize;
+    let mut skipped_live = 0usize;
+    let mut remnants = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(nonce) = name.strip_prefix(ARCHAEOLOGY_WORKTREE_PREFIX) else {
+            continue;
+        };
+        // Nonce is `<pid>-<nanos>`; the owner PID is the leading integer field.
+        let Some(pid) = nonce
+            .split('-')
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Never remove our own or a live owner's worktree (concurrency safety).
+        if pid == self_pid || process_is_alive(pid) {
+            skipped_live += 1;
+            continue;
+        }
+        if remove_path_with_retry(&entry.path(), |target| fs::remove_dir_all(target)) {
+            swept += 1;
+        } else {
+            remnants += 1;
+        }
+    }
+    // Drop administrative registrations for worktrees whose working directory is now
+    // gone (those swept here plus any removed by a prior pass' inline cleanup). Prune
+    // only touches registrations with a missing dir, so a live worktree is untouched.
+    let prune = git_checked(repo, &["-c", "core.longpaths=true", "worktree", "prune"]);
+    eprintln!(
+        "astro.archaeology.orphan_sweep home={} swept={swept} skipped_live={skipped_live} \
+         remnants={remnants} prune={}",
+        home.display(),
+        if prune.is_ok() { "ok" } else { "failed" }
+    );
+}
+
+/// Whether `pid` currently names a live process. Gates the orphan-worktree sweep
+/// only: a definitively-absent PID is dead (its crashed worktree is safe to
+/// remove); every ambiguous outcome — access-denied, transient failure, or a
+/// non-Windows port target — is treated as ALIVE so a possibly-live worktree is
+/// never swept (fail-closed toward preservation, #427). PID recycling can at worst
+/// leave one orphan uncollected; it can never cause a wrongful deletion.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    // SAFETY: OpenProcess takes only scalars and returns a handle or null; nothing
+    // is dereferenced. A non-null handle is closed exactly once via CloseHandle.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // SAFETY: GetLastError reads thread-local error state, no preconditions.
+        let code = unsafe { GetLastError() };
+        // Only "no such PID" proves death; any other failure stays conservatively alive.
+        return code != ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: handle is a valid, open process handle from the OpenProcess above.
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+/// Port-deferred (`ASTRO_PORT_PHASE`): the Windows `chdir` cap this sweep serves
+/// does not exist off-Windows and no portable liveness probe is wired yet, so every
+/// PID is treated as alive — the sweep then removes nothing rather than risk
+/// deleting a live worktree. Never reached on the shipping Windows target.
+#[cfg(not(windows))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
 fn path_str(path: &Path) -> Result<&str, DynError> {
     path.to_str()
         .ok_or_else(|| format!("archaeology path is not valid UTF-8: {}", path.display()).into())
@@ -447,8 +621,10 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
 /// `sparse-checkout init` (which force-enables `extensions.worktreeConfig` in the
 /// enclosing repo's SHARED `.git/config`), no per-worktree sparse state is written, so
 /// the canonical repo config is never mutated. `core.longpaths=true` guards every
-/// tree-touching call: deep member paths joined to the store-nested worktree base
-/// still exceed the Windows 260-char limit.
+/// tree-touching call: even joined to the short temp worktree base (#427), deep
+/// member file paths still exceed the Windows 260-char limit for git's file I/O
+/// (the worktree ROOT is separately kept under the `chdir` cap by
+/// [`ARCHAEOLOGY_WORKTREE_CWD_BUDGET`], which `core.longpaths` cannot reach).
 ///
 /// The member subtree may be absent at this historical commit (created or renamed
 /// later); it is probed with [`git_tree_has_path`] first and only checked out when

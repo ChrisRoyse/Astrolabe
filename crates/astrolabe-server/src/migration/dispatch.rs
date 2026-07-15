@@ -112,6 +112,91 @@ pub(crate) fn is_advertised_astrolabe_tool(tool_name: &str) -> bool {
         .any(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
 }
 
+/// Print per-tool `--help` for an ASTROLABE-NATIVE tool (#428) — a tool served by
+/// this Rust dispatch rather than the C schema registry (e.g. `get_provenance`,
+/// `kernel_answer`, `anchor_erase`). Membership is the SAME native set the run
+/// path dispatches from — presence in [`astrolabe_tool_definitions`], the exact
+/// predicate [`is_advertised_astrolabe_tool`] tests — so `--help` and execution can
+/// never disagree about whether a native tool exists.
+///
+/// The help text is derived entirely from the tool's `tool_defs` `inputSchema`
+/// (the single source of truth also served over `tools/list`); no per-tool help is
+/// hand-written. Its output shape mirrors the C formatter
+/// `cbm_cli_print_tool_help_prog` byte-for-byte (`Usage:` lines with `prog`, then
+/// `Arguments (JSON object keys):` and one `  name <type>[ [required]][  desc]`
+/// line per property) so both halves of the CLI surface print identically.
+///
+/// Returns `Ok(true)` when `tool_name` is a native tool (help printed), `Ok(false)`
+/// when it is not in the native registry (nothing printed) so the caller can fail
+/// closed with `ASTRO_CLI_UNKNOWN_TOOL`. Fails closed with a labeled error naming
+/// the tool and the registry gap when a name that IS in the native registry somehow
+/// carries no `inputSchema` object — a `tool_defs` defect that must never ship, and
+/// is never papered over with empty help.
+pub(crate) fn print_astrolabe_native_tool_help(
+    prog: &str,
+    tool_name: &str,
+) -> Result<bool, DynError> {
+    let Some(definition) = astrolabe_tool_definitions()
+        .into_iter()
+        .find(|definition| definition.get("name").and_then(Value::as_str) == Some(tool_name))
+    else {
+        return Ok(false);
+    };
+
+    let schema = definition
+        .get("inputSchema")
+        .and_then(Value::as_object)
+        .ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_CLI_NATIVE_TOOL_SCHEMA_MISSING: astrolabe-native tool '{tool_name}' is \
+                 registered for dispatch but its tool_defs definition carries no inputSchema \
+                 object, so its --help cannot be derived; remediation: add an inputSchema \
+                 (type/properties/required) to the '{tool_name}' definition in \
+                 crates/astrolabe-server/src/migration/tool_defs.rs"
+            )
+            .into()
+        })?;
+
+    // Only the two supported input forms are advertised, exactly as the C formatter
+    // does (one contract with the Rust host, #378/#411): --args-file <path> and
+    // piped stdin. The removed raw-JSON argv and `--flag value` forms are NOT shown.
+    println!("Usage:");
+    println!("  {prog} cli {tool_name} --args-file <path-to-json>");
+    println!("  echo '<json>' | {prog} cli {tool_name}");
+    println!();
+    println!("Arguments (JSON object keys):");
+
+    let required: std::collections::BTreeSet<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, spec) in properties {
+            // Mirror the C formatter's defaults: absent `type` prints as <string>,
+            // absent `description` prints nothing after the type.
+            let type_str = spec.get("type").and_then(Value::as_str).unwrap_or("string");
+            let desc = spec
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let req = if required.contains(name.as_str()) {
+                " [required]"
+            } else {
+                ""
+            };
+            if desc.is_empty() {
+                println!("  {name} <{type_str}>{req}");
+            } else {
+                println!("  {name} <{type_str}>{req}  {desc}");
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 pub(crate) fn handle_tools_list_jsonrpc(
     runner: &CbmToolRunner,
     request_json: &str,
