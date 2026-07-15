@@ -749,26 +749,19 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
         return repo_path;
     }
 
-    char real[CBM_SZ_4K];
-#ifdef _WIN32
-    if (_access(repo_path, 0) == 0 && _fullpath(real, repo_path, sizeof(real))) {
-        cbm_normalize_path_sep(real);
-        char *canonical = heap_strdup(real);
-        if (canonical) {
-            free(repo_path);
-            return canonical;
-        }
+    /* #432: canonicalize via the long-path-safe wrapper. The old ANSI
+     * `_access(...,0) + _fullpath` pair was MAX_PATH-bound, so a repo path deeper
+     * than 260 chars failed to canonicalize (false not-found / _fullpath NULL) and
+     * was indexed under its raw un-normalized form. cbm_canonicalize_existing_path
+     * resolves through GetFullPathNameW + cbm_path_exists ("\\?\"-widened); it
+     * returns a heap string (free()) or NULL when the path is absent/unresolvable,
+     * in which case we keep repo_path unchanged (no ANSI fallback). */
+    char *canonical = cbm_canonicalize_existing_path(repo_path);
+    if (canonical) {
+        cbm_normalize_path_sep(canonical);
+        free(repo_path);
+        return canonical;
     }
-#else
-    if (realpath(repo_path, real)) {
-        cbm_normalize_path_sep(real);
-        char *canonical = heap_strdup(real);
-        if (canonical) {
-            free(repo_path);
-            return canonical;
-        }
-    }
-#endif
 
     return repo_path;
 }
@@ -1267,8 +1260,11 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
 
     char adr_path[CBM_SZ_4K];
     snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
-    struct stat adr_st;
-    return stat(adr_path, &adr_st) == 0;
+    /* #432: extended-length-safe existence probe. The old ANSI stat() was
+     * MAX_PATH-bound, so on a deep root_path (>260-char adr path) the ADR file was
+     * really present yet this probe reported absent, suppressing ADR detection.
+     * cbm_path_exists widens via "\\?\" (GetFileAttributesW). */
+    return cbm_path_exists(adr_path);
 }
 
 /* ── Tool handler implementations ─────────────────────────────── */

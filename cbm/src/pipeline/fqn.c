@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
@@ -463,22 +464,23 @@ char *cbm_project_name_from_path(const char *abs_path) {
         return strdup("root");
     }
 
-    char real[CBM_SZ_4K];
+    /* #432: canonicalize via the long-path-safe wrapper. The old ANSI
+     * `_access(...,0) + _fullpath` pair (Windows) was MAX_PATH-bound, so a source
+     * file whose absolute path exceeds 260 chars failed to canonicalize and the
+     * project name was derived from the raw un-normalized path. cbm_canonicalize_
+     * existing_path resolves through GetFullPathNameW + cbm_path_exists
+     * ("\\?\"-widened) on Windows and realpath on POSIX, returning a heap string
+     * (free()) or NULL. On NULL we keep the original abs_path (no ANSI fallback). */
+    char *canonical = cbm_canonicalize_existing_path(abs_path);
     const char *name_path = abs_path;
-#ifdef _WIN32
-    if (_access(abs_path, 0) == 0 && _fullpath(real, abs_path, sizeof(real))) {
-        cbm_normalize_path_sep(real);
-        name_path = real;
+    if (canonical) {
+        cbm_normalize_path_sep(canonical);
+        name_path = canonical;
     }
-#else
-    if (realpath(abs_path, real)) {
-        cbm_normalize_path_sep(real);
-        name_path = real;
-    }
-#endif
 
     /* Work on mutable copy */
     char *path = strdup(name_path);
+    free(canonical);
     if (!path) {
         return NULL;
     }
