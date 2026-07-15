@@ -215,6 +215,77 @@ function Invoke-NativeCapture {
     }
 }
 
+function Remove-TreeResilient {
+    <#
+      #421: depth-independent recursive directory removal that is NOT MAX_PATH-bound.
+
+      The launcher's exit cleanup previously used `Remove-Item -LiteralPath <dir>
+      -Recurse -Force`. Under Windows PowerShell 5.1 (the documented host — see the
+      Get-SccacheServerPort note — running on .NET Framework 4.8) that provider call
+      is MAX_PATH (260-char) bound: a single path deeper than 260 bytes inside
+      target/ — exactly what deep-store FSV fixtures create — makes it throw
+      PathTooLongException. target/ then survives, the launcher exits
+      $LauncherCleanupFailedExitCode (71, ASTRO_LAUNCHER_CLEANUP_FAILED), and the
+      NEXT run refuses fail-closed at the "target must be absent" preflight (#421,
+      observed live twice in wave-17; recovery needed a manual \\?\ python rmtree).
+
+      robocopy is long-path aware WITHOUT a \\?\ prefix — it calls the *W path APIs
+      internally — and mirroring an EMPTY source over the target with /MIR purges
+      every descendant regardless of nesting depth, leaving only the now-empty top
+      directory (a short path Remove-Item deletes trivially). This is Microsoft's own
+      recommended path-too-long deletion technique. The alternatives the #421 recon
+      named are both unreliable on this host: `Remove-Item \\?\...` (the WinPS 5.1
+      provider mangles the \\?\ prefix) and .NET `[IO.Directory]::Delete(recursive)`
+      (its .NET Framework 4.8 recursive enumerator is not dependably long-path-safe
+      even under a \\?\ root). robocopy is depth-independent by construction.
+
+      Bounded retries (/R:1 /W:1) so a genuinely LOCKED file cannot hang the launcher.
+      This function does NOT decide success: the caller re-tests `Test-Path` after it
+      returns and appends to $cleanupErrors (-> fail-closed ASTRO_LAUNCHER_CLEANUP_FAILED)
+      if anything survived. The "target must be absent" preflight is untouched — only
+      the deleter is made depth-independent, exactly per the #421 scope.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    # Scratch empty dir as a SIBLING of $Path (same volume, never nested inside the
+    # tree being purged). It must not live under $env:TEMP: the launcher repoints
+    # TEMP into $workspaceTemp, which is itself one of the trees this cleans, so a
+    # scratch dir there would be deleted out from under the robocopy source.
+    $parent = Split-Path -Parent $Path
+    if ([string]::IsNullOrEmpty($parent)) {
+        $parent = "."
+    }
+    $emptyDir = Join-Path $parent (".astro-rmtree-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+    try {
+        $robocopy = Join-Path $env:SystemRoot "System32\robocopy.exe"
+        if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) {
+            $robocopy = "robocopy.exe"
+        }
+        # /MIR mirror empty->target purges all descendants (files AND dirs) at any
+        # depth. robocopy exit codes 0-7 are success bit-flags (>=8 = a real failure);
+        # either way the caller's Test-Path is the authoritative fail-closed check, so
+        # the code is captured as data (never thrown) and not used to decide success.
+        $null = Invoke-NativeCapture -Exe $robocopy -Arguments @(
+            $emptyDir, $Path, "/MIR", "/R:1", "/W:1",
+            "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/NC", "/NS"
+        )
+        if (Test-Path -LiteralPath $Path) {
+            # Only the now-empty top directory remains — a short path.
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $emptyDir) {
+            Remove-Item -LiteralPath $emptyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-SevenZip {
     $candidates = @(
         (Join-Path $env:ProgramFiles "7-Zip\7z.exe"),
@@ -1689,7 +1760,8 @@ finally {
     else {
         if (Test-Path -LiteralPath $target) {
             try {
-                Remove-Item -LiteralPath $target -Recurse -Force
+                # #421: depth-independent, not MAX_PATH-bound (deep-store FSV fixtures).
+                Remove-TreeResilient -Path $target
             }
             catch {
                 $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
@@ -1701,7 +1773,8 @@ finally {
     }
     if (Test-Path -LiteralPath $workspaceTemp) {
         try {
-            Remove-Item -LiteralPath $workspaceTemp -Recurse -Force
+            # #421: depth-independent, not MAX_PATH-bound (deep FSV temp fixtures).
+            Remove-TreeResilient -Path $workspaceTemp
         }
         catch {
             $cleanupErrors += "workspace temporary cleanup failed: $($_.Exception.Message)"
