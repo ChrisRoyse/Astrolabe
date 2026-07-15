@@ -593,7 +593,14 @@ fn changed_file_count(
 /// [`changed_file_count`] for a single commit versus its first parent — the
 /// counterpart to [`changed_new_ranges_impl`], used to cap a bulk revert TARGET
 /// before its content diff (#434). A root commit (no parent) counts as 0.
-fn changed_file_count_for_commit(
+///
+/// Public (#440) so the server's `run_git_archaeology` can pre-count a force-removed
+/// commit before its whole-commit `changed_new_ranges` diff, applying the same
+/// mass-change cap the fix/revert paths already enforce. `pathspec` should mirror the
+/// scope of the content diff it gates: pass `None` to count the WHOLE commit (matching
+/// [`changed_new_ranges`], which is unscoped) so the count reflects the exact work
+/// being gated.
+pub fn changed_file_count_for_commit(
     repo: &Path,
     commit: &str,
     pathspec: Option<&str>,
