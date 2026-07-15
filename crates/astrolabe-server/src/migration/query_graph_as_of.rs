@@ -232,9 +232,12 @@ fn as_of_bucket_store_dir(cache_dir: &Path, project: &str, bucket: u64) -> PathB
     ];
     let stem = safe.split('.').next().unwrap_or("").to_ascii_uppercase();
     if safe.is_empty() || safe == "." || RESERVED_DEVICE_STEMS.contains(&stem.as_str()) {
+        // The hash must land in the STEM (prefix position): device reservation
+        // is decided by the name before the first dot, so a suffix after an
+        // extension ("nul.txt-p1234") would leave the stem "nul" reserved.
         let digest = Sha256::digest(project.as_bytes());
         safe = format!(
-            "{safe}-p{:02x}{:02x}{:02x}{:02x}",
+            "p{:02x}{:02x}{:02x}{:02x}-{safe}",
             digest[0], digest[1], digest[2], digest[3]
         );
     }
