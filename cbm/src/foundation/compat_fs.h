@@ -76,6 +76,33 @@ bool cbm_path_exists(const char *path);
  * silent ANSI fallback — leaving the caller to keep the un-canonicalized input. */
 char *cbm_canonicalize_existing_path(const char *path);
 
+/* Resolve an *existing* filesystem path to its fully-canonical "final" form and
+ * return it as a heap-allocated UTF-8 string (caller frees with free()), or NULL
+ * on any failure (fail-closed; no lexical/ANSI fallback).
+ *
+ * Unlike cbm_canonicalize_existing_path (which is *lexical* on Windows —
+ * GetFullPathNameW resolves only '.'/'..' and relative→absolute, NOT reparse
+ * points), this follows the filesystem: NTFS junctions and symlinks are resolved
+ * to their real target and 8.3 short components are expanded to their long
+ * normalized names. It is the resolution a containment/anti-traversal guard needs
+ * so that (a) a junction planted inside a root that points outside it cannot slip
+ * a read past a prefix check, and (b) an 8.3 short-name spelling of the root
+ * cannot defeat that prefix check — the two documented ways a lexical prefix
+ * comparison is bypassed (see #437 research: Go os.Readlink/EvalSymlinks on
+ * Windows uses GetFinalPathNameByHandle for exactly this reason; CVE-2022-41722).
+ *
+ * Windows: opens the path with FILE_FLAG_BACKUP_SEMANTICS (so a *directory* handle
+ * opens, not only a file) and dwDesiredAccess=0 (metadata query only — no read/
+ * write intent, so restrictive ACLs and sharing do not block the probe), then
+ * GetFinalPathNameByHandleW with FILE_NAME_NORMALIZED | VOLUME_NAME_DOS. The
+ * returned path is long-path-safe and carries the extended-length "\\?\" (or
+ * "\\?\UNC\") prefix; the prefix is retained, NOT stripped, so two results of this
+ * function prefix-compare like-for-like. POSIX: realpath(path, NULL) (resolves
+ * symlinks + '.'/'..', mallocs the result). The path MUST exist and be openable;
+ * a non-existent or unopenable path yields NULL — for a read sink that is the
+ * correct fail-closed answer, since such a file could not be read regardless. */
+char *cbm_real_path_final(const char *path);
+
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
