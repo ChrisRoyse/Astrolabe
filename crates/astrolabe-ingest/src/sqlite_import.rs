@@ -1171,18 +1171,23 @@ where
             edge_rows_written: changes.edge_rows_written,
         },
     )?;
-    let (ledger_ref, fsv, graph_rows_written, edge_rows_written) = write_import_rows(
-        vault,
-        &prepared,
-        input.sqlite_fingerprint,
-        payload,
-        options.quantization_gate.as_ref(),
-        &changes,
-    )?;
+    let (ledger_ref, fsv, graph_rows_written, edge_rows_written, write_timing_ms) =
+        write_import_rows(
+            vault,
+            &prepared,
+            input.sqlite_fingerprint,
+            payload,
+            options.quantization_gate.as_ref(),
+            &changes,
+        )?;
     timing_ms.push((
         "write_import_rows",
         phase_start.elapsed().as_millis() as u64,
     ));
+    // #433 permanent labeled attribution INSIDE the vault write: row staging vs
+    // the single atomic group commit vs the FSV readback, so the phase's cost is
+    // attributable to a real sub-stage instead of guessed.
+    timing_ms.extend(write_timing_ms);
     phase_start = std::time::Instant::now();
     let readback = verify_import_readback(
         vault,
@@ -4208,10 +4213,22 @@ fn write_import_rows<C>(
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
     changes: &GraphRowChanges,
-) -> IngestResult<(LedgerRef, Option<FsvAck>, usize, usize)>
+) -> IngestResult<(
+    LedgerRef,
+    Option<FsvAck>,
+    usize,
+    usize,
+    Vec<(&'static str, u64)>,
+)>
 where
     C: Clock,
 {
+    // #433 sub-phase attribution (permanent labeled timing): stage_rows (encode +
+    // stage every CF row), group_commit (the single atomic ledger-paired batch),
+    // fsv_verify (the full row-by-row committed-state readback). Measurement
+    // first: the batching decision for this phase must name which of these grows.
+    let mut write_timing_ms: Vec<(&'static str, u64)> = Vec::new();
+    let mut sub_phase = std::time::Instant::now();
     let snapshot = vault.latest_seq();
     let mut rows = Vec::new();
     for prepared_cx in &prepared.constellations {
@@ -4259,6 +4276,12 @@ where
         rows.push((ColumnFamily::Graph, key.clone(), tombstone_value().to_vec()));
     }
 
+    write_timing_ms.push((
+        "write_import_rows.stage_rows",
+        sub_phase.elapsed().as_millis() as u64,
+    ));
+    sub_phase = std::time::Instant::now();
+
     if rows.is_empty() {
         let ledger_ref = vault.append_ledger_entry(
             EntryKind::Ingest,
@@ -4266,7 +4289,13 @@ where
             payload,
             ActorId::Service(ASTROLABE_INGEST_ACTOR.to_string()),
         )?;
-        return Ok((ledger_ref, None, graph_rows_written, edge_rows_written));
+        return Ok((
+            ledger_ref,
+            None,
+            graph_rows_written,
+            edge_rows_written,
+            write_timing_ms,
+        ));
     }
 
     let subject = SubjectId::Query(sqlite_fingerprint.to_vec());
@@ -4292,6 +4321,11 @@ where
         actor.clone(),
     )?;
     let ledger_ref = ledger_ref_at_commit(vault, commit_seq)?;
+    write_timing_ms.push((
+        "write_import_rows.group_commit",
+        sub_phase.elapsed().as_millis() as u64,
+    ));
+    sub_phase = std::time::Instant::now();
     let mut fsv_plan = VaultMutationPlan::new("sqlite_import", EntryKind::Ingest, &actor, &subject);
     for (cf, key, value) in planned_rows {
         if value == tombstone_value() {
@@ -4302,7 +4336,17 @@ where
         }
     }
     let fsv = fsv_plan.verify_committed(vault, commit_seq)?;
-    Ok((ledger_ref, Some(fsv), graph_rows_written, edge_rows_written))
+    write_timing_ms.push((
+        "write_import_rows.fsv_verify",
+        sub_phase.elapsed().as_millis() as u64,
+    ));
+    Ok((
+        ledger_ref,
+        Some(fsv),
+        graph_rows_written,
+        edge_rows_written,
+        write_timing_ms,
+    ))
 }
 
 /// Mirrors Calyx Aster's deterministic ledger-ref attachment for FSV

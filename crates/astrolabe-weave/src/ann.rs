@@ -190,28 +190,53 @@ fn lsh_banding_candidates(
         .map(|permutation| minhash_params(config.seed, family, permutation))
         .collect();
 
-    let signatures: Vec<Vec<u64>> = sparse_pool
-        .iter()
-        .map(|&index| {
-            let NormalizedVector::Sparse { entries, .. } = &vectors[index].vector else {
-                unreachable!("sparse pool holds only sparse vectors");
-            };
-            hash_params
-                .iter()
-                .map(|&(mul, add)| {
-                    entries
+    // #433: each node's MinHash signature is a pure function of its own support
+    // set and the fixed hash parameters, so chunking the signature pass across the
+    // declared worker count cannot change any signature. Chunk outputs are
+    // concatenated in pool order, keeping the banding below byte-identical to the
+    // serial pass.
+    let signature_workers = crate::knobs::weave_similarity_workers()
+        .min(sparse_pool.len())
+        .max(1);
+    let signature_chunk = sparse_pool.len().div_ceil(signature_workers);
+    let signatures: Vec<Vec<u64>> = std::thread::scope(|scope| {
+        let hash_params = &hash_params;
+        sparse_pool
+            .chunks(signature_chunk.max(1))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
                         .iter()
-                        .filter(|entry| entry.val != 0.0)
-                        .map(|entry| mul.wrapping_mul(u64::from(entry.idx).wrapping_add(add)))
-                        .min()
-                        // Zero-norm vectors were skipped upstream, so a sparse
-                        // vector always has non-zero support; `u64::MAX` keeps
-                        // the arm total anyway.
-                        .unwrap_or(u64::MAX)
+                        .map(|&index| {
+                            let NormalizedVector::Sparse { entries, .. } = &vectors[index].vector
+                            else {
+                                unreachable!("sparse pool holds only sparse vectors");
+                            };
+                            hash_params
+                                .iter()
+                                .map(|&(mul, add)| {
+                                    entries
+                                        .iter()
+                                        .filter(|entry| entry.val != 0.0)
+                                        .map(|entry| {
+                                            mul.wrapping_mul(u64::from(entry.idx).wrapping_add(add))
+                                        })
+                                        .min()
+                                        // Zero-norm vectors were skipped upstream, so a
+                                        // sparse vector always has non-zero support;
+                                        // `u64::MAX` keeps the arm total anyway.
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .collect::<Vec<u64>>()
+                        })
+                        .collect::<Vec<Vec<u64>>>()
                 })
-                .collect()
-        })
-        .collect();
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("lsh signature worker panicked"))
+            .collect()
+    });
 
     let rows_per_band = permutations / config.lsh_bands;
     let mut new_pairs = 0usize;
@@ -328,35 +353,78 @@ fn hnsw_candidates(
 
     let k = span.saturating_add(1).min(group.len());
     let ef = config.hnsw_ef_search.max(k);
+    // #433: the per-ordinal queries are independent read-only searches over the
+    // frozen index (`search(&self, ..)`, no interior mutability), so chunking them
+    // across the declared worker count cannot change any hit list. Per-ordinal hit
+    // lists are collected in ordinal order and the pair recording below stays
+    // sequential, keeping the proposed candidate set byte-identical to the serial
+    // query loop. Measurement drove this: `similarity_plan` was the largest weave
+    // sub-stage and its cost is dominated by these queries, previously serial.
+    let workers = crate::knobs::weave_similarity_workers()
+        .min(approximations.len())
+        .max(1);
+    let chunk_size = approximations.len().div_ceil(workers);
+    let hit_lists: Vec<Result<Vec<Vec<usize>>, SimilarityPlanError>> = std::thread::scope(
+        |scope| {
+            let index = &index;
+            approximations
+                .chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|approx| {
+                                let hits = index
+                                    .search(
+                                        &SlotVector::Dense {
+                                            dim,
+                                            data: approx.clone(),
+                                        },
+                                        k,
+                                        Some(ef),
+                                    )
+                                    .map_err(|error| {
+                                        ann_failure(format!(
+                                            "hnsw search failed for {family} dim {dim}: {} ({})",
+                                            error.message, error.code
+                                        ))
+                                    })?;
+                                hits.into_iter()
+                                    .map(|hit| {
+                                        cx_id_ordinal(hit.cx_id).ok_or_else(|| {
+                                            ann_failure(format!(
+                                                "hnsw returned a cx id outside the ordinal namespace for {family} dim {dim}"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<usize>, _>>()
+                            })
+                            .collect::<Result<Vec<Vec<usize>>, _>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(ann_failure("hnsw query worker panicked".into())))
+                })
+                .collect()
+        },
+    );
     let mut new_pairs = 0usize;
-    for (ordinal, approx) in approximations.iter().enumerate() {
-        let hits = index
-            .search(
-                &SlotVector::Dense {
-                    dim,
-                    data: approx.clone(),
-                },
-                k,
-                Some(ef),
-            )
-            .map_err(|error| {
-                ann_failure(format!(
-                    "hnsw search failed for {family} dim {dim}: {} ({})",
-                    error.message, error.code
-                ))
-            })?;
-        for hit in hits {
-            let hit_ordinal = cx_id_ordinal(hit.cx_id).ok_or_else(|| {
-                ann_failure(format!(
-                    "hnsw returned a cx id outside the ordinal namespace for {family} dim {dim}"
-                ))
-            })?;
-            if hit_ordinal == ordinal || hit_ordinal >= group.len() {
-                continue;
+    let mut ordinal = 0usize;
+    for chunk in hit_lists {
+        for hit_ordinals in chunk? {
+            for hit_ordinal in hit_ordinals {
+                if hit_ordinal == ordinal || hit_ordinal >= group.len() {
+                    continue;
+                }
+                if record_pair(per_source, group[ordinal], group[hit_ordinal]) {
+                    new_pairs += 1;
+                }
             }
-            if record_pair(per_source, group[ordinal], group[hit_ordinal]) {
-                new_pairs += 1;
-            }
+            ordinal += 1;
         }
     }
     Ok(new_pairs)

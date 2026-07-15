@@ -2134,6 +2134,14 @@ where
             "similarity_read_rows": ms_sim_read_rows,
             "similarity_expand_region": ms_sim_expand,
             "similarity_plan": ms_sim_plan,
+            // #433 permanent labeled attribution INSIDE the plan: per-family ANN
+            // candidate generation vs exact-cosine rescoring, so the superlinear
+            // residue is attributable to a real sub-stage instead of guessed.
+            "similarity_plan_internal": similarity_plan
+                .timing_ms
+                .iter()
+                .map(|(label, ms)| (label.clone(), json!(ms)))
+                .collect::<serde_json::Map<_, _>>(),
             "similarity_persist": ms_sim_persist,
             "similarity_persist_internal": similarity
                 .timing_ms
