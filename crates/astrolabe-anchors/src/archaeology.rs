@@ -281,6 +281,31 @@ pub fn git_head(repo: &Path) -> Result<String, ArchaeologyError> {
     Ok(head)
 }
 
+/// Reports whether `repo` is inside a real Git work tree.
+///
+/// Runs `git -C <repo> rev-parse --is-inside-work-tree` and returns `true` only
+/// when Git exits zero with stdout trimming to exactly `true`. Any non-zero exit
+/// (a plain directory that is not a repository, a bare repository, a spawn
+/// failure) yields `false`.
+///
+/// This is a caller-side "is this even a repository" gate, deliberately *not* a
+/// fail-closed archaeology query: it lets a non-git corpus route through the
+/// graceful archaeology-unavailable path instead of hard-erroring. It does not
+/// weaken the fail-closed behavior of the mining queries — a genuine Git fault
+/// inside a real repository still surfaces as an [`ArchaeologyError`] from those
+/// callers.
+pub fn is_git_work_tree(repo: &Path) -> bool {
+    match git_command(repo, &["rev-parse", "--is-inside-work-tree"])
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) => {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        }
+        Err(_) => false,
+    }
+}
+
 /// Self-describing algorithm tag for the git source fingerprint (#347).
 pub const GIT_SOURCE_FINGERPRINT_ALGO: &str = "blake3";
 /// Self-describing version tag for the git source fingerprint (#347).

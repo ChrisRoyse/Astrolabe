@@ -1543,7 +1543,16 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         vault_salt.as_bytes().to_vec(),
         VaultOptions::default(),
     )?;
-    let commit = match repo {
+    // Gate every git-dependent step on the corpus actually being a git work tree
+    // (#406): `dispatch.rs` passes `repo = Some(dir)` for ANY indexed directory, so a
+    // non-git corpus would otherwise hit `git_head`'s `rev-parse --verify HEAD` and
+    // abort the whole shadow import with ASTRO_ARCHAEOLOGY_GIT_FAILED. Filtering to a
+    // real work tree here routes a non-git corpus through the existing graceful `None`
+    // arms (synthetic commit, absent source fingerprint, archaeology unavailable) so it
+    // completes rc=0 with archaeology honestly labeled unavailable. A genuine git fault
+    // *inside* a real repo still fails closed in the mining queries below.
+    let git_repo = repo.filter(|r| astrolabe_anchors::archaeology::is_git_work_tree(r));
+    let commit = match git_repo {
         Some(repo) => astrolabe_anchors::archaeology::git_head(repo)?,
         None => format!("shadow-import-v1:{project}"),
     };
@@ -1552,7 +1561,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // an out-of-band commit/edit that never touches the derived CBM db. Absent for a
     // recovery import with no repo path — freshness then falls back to the db gate,
     // labeled by the watermark's absence rather than a false git-freshness claim.
-    let (git_source_fingerprint, git_source_repo_path) = match repo {
+    let (git_source_fingerprint, git_source_repo_path) = match git_repo {
         Some(repo) => (
             Some(astrolabe_anchors::archaeology::git_source_fingerprint(
                 repo,
@@ -1591,7 +1600,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
-    let git_archaeology = match repo {
+    let git_archaeology = match git_repo {
         Some(repo) => {
             let mode = match read_config_value(
                 cache_dir,
