@@ -1006,8 +1006,12 @@ where
 /// Kept as a named helper so the busy-timeout contract is directly asserted by
 /// `cbm_source_connection_sets_busy_timeout`.
 fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
+    // #412: extended-length (`\\?\`) normalization so the CBM `<project>.db` under
+    // a deep store (total path > MAX_PATH) is read back instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(sqlite_path)
+        .map_err(|error| invalid_sqlite(format!("normalize SQLite input path: {error}")))?;
     let connection = Connection::open_with_flags(
-        sqlite_path,
+        &open_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
@@ -1600,7 +1604,11 @@ where
 
 fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
     cleanup_sqlite_path(path);
-    let connection = Connection::open(path)
+    // #412: extended-length (`\\?\`) normalization so a row-sink snapshot under a
+    // deep store (total path > MAX_PATH) is created instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(path)
+        .map_err(|error| invalid_sqlite(format!("normalize row-sink SQLite path: {error}")))?;
+    let connection = Connection::open(&open_path)
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(

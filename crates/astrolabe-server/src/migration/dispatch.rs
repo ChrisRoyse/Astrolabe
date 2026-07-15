@@ -323,15 +323,15 @@ pub(crate) fn handle_index_repository(
         .or_else(|| string_arg(args_obj, "name"))
         .map(PathBuf::from);
     let skills = skill_discovery_config(skill_discovery_override.as_ref());
-    // #409: Windows path-budget preflight. The bounded project name (128-byte cap,
-    // cbm/src/pipeline/fqn.c) keeps every per-project filename COMPONENT legal, but
-    // the TOTAL path `<store>\<name><suffix>` must also stay under the Win32
-    // MAX_PATH budget or the SQLite/vault opens inside the pass fail with a
-    // misleading generic pipeline error (observed in the #409 FSV: deep store +
-    // bounded name → worker "Pipeline failed"). Refuse up front, naming the exact
-    // store and derived name, before any worker is spawned. Full extended-length
-    // (`\\?\`) support is tracked separately; until it lands this budget is a
-    // structural OS limit, not a tunable.
+    // #412: Windows path-budget preflight, narrowed to the SQLite VFS ceiling.
+    // Extended-length (`\\?\`) support now covers the whole store family (C
+    // pipeline writer, both SQLite VFSes, Calyx vault via Rust std), so a deep-
+    // but-valid store (the #409 failing config: deep store + 128-byte bounded
+    // name) is SERVED, not refused. The only residual hard ceiling is the bundled
+    // SQLite amalgamations' SQLITE_WIN32_MAX_PATH_BYTES (1040) UTF-8 path cap, so
+    // the preflight refuses only when the longest store-family SQLite path (the
+    // as_of bucket, nesting the derived name twice) would exceed that — a
+    // structural OS/SQLite limit, not a tunable.
     if let Some(repo) = repo_path.as_deref() {
         let budget_project = match project.as_deref() {
             Some(project) => Some(project.to_string()),
@@ -898,46 +898,53 @@ pub(crate) fn handle_impute_fields(args_json: &str) -> Result<String, DynError> 
     }
 }
 
-/// #409: Windows total-path budget preflight for the per-project store family.
+/// #412: Windows total-path budget preflight for the per-project store family,
+/// narrowed to the one residual structural ceiling that survives extended-length
+/// (`\\?\`) support.
 ///
-/// The Win32 legacy path budget is `MAX_PATH` (260) including the terminating
-/// NUL — 259 usable bytes — and SQLite's Windows VFS (and the vault's plain
-/// `CreateFileW` opens) do not use the `\?\` extended-length form, so any
-/// store-family path over that budget fails at open time with a generic error.
-/// The longest per-project chains under the store today are:
+/// After #412, every store-family open is extended-length-safe: the Calyx vault
+/// opens and all `std::fs` operations go through Rust std (verbatim-prefixed at
+/// the 32767 ceiling), the C pipeline writer widens via `cbm_fopen`, and both the
+/// cbm and rusqlite SQLite VFSes prefix `\\?\` for paths over `MAX_PATH`. The only
+/// remaining hard ceiling is that the two bundled SQLite amalgamations cap a
+/// UTF-8 database path at `SQLITE_WIN32_MAX_PATH_BYTES` (`MAX_PATH*4 = 1040`)
+/// bytes before that wide conversion; a longer path is refused by SQLite itself.
+/// So the preflight now guards only that SQLite ceiling — deep-but-valid stores
+/// (the #409/#412 failing configuration) pass and are served.
 ///
-/// - `<store>\<name>.astrolabe-vault\cf\time_index\flush-<20 digits>-<4>.sst`
-///   (measured longest vault-relative inner path: 49 bytes + the 16-byte vault
-///   suffix + 2 separators = 67 bytes after `<name>`),
-/// - `<store>\<name>.astrolabe-shadow-import.lock.guard` (36 bytes after
-///   `<name>`),
-/// - `<store>\<name>.astrolabe-lowered.db` (21 bytes after `<name>`).
-///
-/// `STORE_PATH_FAMILY_RESERVE` is the first chain (the maximum), i.e. the
-/// separator + suffix bytes that must still fit after `<store>\<name>`. These
-/// are structural filename constants, not tunables.
-const STORE_PATH_FAMILY_RESERVE: usize = 67;
-/// Usable Win32 legacy path budget: `MAX_PATH` (260) minus the terminating NUL.
-const WIN_PATH_BUDGET: usize = 259;
+/// [`SQLITE_VFS_PATH_BUDGET`] is a conservative margin under 1040. The longest
+/// store-family SQLite path is the as_of bucket
+/// `<store>\.astrolabe-asof\<name>\bucket-<digits>\<name>.db`, which nests the
+/// (128-byte-capped) project name TWICE; [`AS_OF_STORE_FAMILY_RESERVE`] is that
+/// chain's separator + suffix bytes. Both are structural filename constants, not
+/// tunables.
+const SQLITE_VFS_PATH_BUDGET: usize = 1024;
+/// Separator + fixed-suffix bytes of the longest store-family SQLite path, the
+/// as_of bucket chain: `\.astrolabe-asof\` (17) + `\bucket-<=20 digits>\` (29) +
+/// `.db` (3) = 49, rounded up for margin. The variable `<name>` appears twice and
+/// is added by [`store_path_budget_refusal`].
+const AS_OF_STORE_FAMILY_RESERVE: usize = 52;
 
-/// Returns a fail-closed refusal message when `<cache_dir>\<project>` plus the
-/// longest per-project store suffix chain cannot fit the Win32 path budget —
-/// naming both offending components and the arithmetic — or `None` when the
-/// family fits. See [`STORE_PATH_FAMILY_RESERVE`].
+/// Returns a fail-closed refusal message when the longest store-family SQLite path
+/// for this project cannot fit the SQLite Windows VFS byte budget even with
+/// extended-length (`\\?\`) opens — naming the offending components and the
+/// arithmetic — or `None` when the family fits. See [`SQLITE_VFS_PATH_BUDGET`].
 fn store_path_budget_refusal(cache_dir: &Path, project: &str) -> Option<String> {
     let store_len = cache_dir.as_os_str().to_string_lossy().len();
-    let needed = store_len + 1 + project.len() + STORE_PATH_FAMILY_RESERVE;
-    if needed <= WIN_PATH_BUDGET {
+    // The as_of bucket nests <project> twice; guard that worst case up front so a
+    // later time-travel query cannot exceed the SQLite VFS ceiling either.
+    let needed = store_len + 2 * project.len() + AS_OF_STORE_FAMILY_RESERVE;
+    if needed <= SQLITE_VFS_PATH_BUDGET {
         return None;
     }
     Some(format!(
-        "ASTRO_STORE_PATH_BUDGET_EXCEEDED: the store path family for this project cannot fit \
-         the Windows MAX_PATH budget: store dir {cache_dir:?} ({store_len} bytes) + derived \
-         project name {project:?} ({} bytes) + the longest per-project suffix chain \
-         ({STORE_PATH_FAMILY_RESERVE} bytes) = {needed} bytes > {WIN_PATH_BUDGET}; remediation: \
-         point CBM_CACHE_DIR at a shorter absolute path (the derived project name is already \
-         capped at 128 bytes; extended-length Win32 long-path store support is tracked \
-         separately in #412)",
+        "ASTRO_STORE_PATH_BUDGET_EXCEEDED: the store path family for this project cannot fit the \
+         SQLite Windows VFS path budget even with extended-length (\\\\?\\) opens: store dir \
+         {cache_dir:?} ({store_len} bytes) + the as_of bucket chain nesting the derived project \
+         name {project:?} ({} bytes) twice + {AS_OF_STORE_FAMILY_RESERVE} suffix bytes = {needed} \
+         bytes > {SQLITE_VFS_PATH_BUDGET} (SQLITE_WIN32_MAX_PATH_BYTES); remediation: point \
+         CBM_CACHE_DIR at a shorter absolute path (the derived project name is already capped at \
+         128 bytes)",
         project.len()
     ))
 }

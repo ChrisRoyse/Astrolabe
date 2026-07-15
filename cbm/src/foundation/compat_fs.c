@@ -428,7 +428,10 @@ bool cbm_mkdir_p(const char *path, int mode) {
 }
 
 int cbm_unlink(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #412: extended-length widen so store-family sidecars whose full path
+     * exceeds MAX_PATH (e.g. <cache>/<project>.db-wal, <db>.corrupt under a deep
+     * store) can be removed instead of failing. Short paths widen identically. */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -438,7 +441,8 @@ int cbm_unlink(const char *path) {
 }
 
 int cbm_rmdir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #412: extended-length widen for deep store-family directories. */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }

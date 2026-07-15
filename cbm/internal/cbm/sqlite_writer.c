@@ -15,6 +15,7 @@
 //   - Varints: 1-9 bytes, big-endian, MSB continuation
 
 #include "sqlite_writer.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
@@ -2206,7 +2207,10 @@ struct cbm_db_writer {
 };
 
 cbm_db_writer_t *cbm_writer_open(const char *path) {
-    FILE *fp = fopen(path, "wb");
+    /* #412: cbm_fopen widens + adds the extended-length "\\?\" prefix for paths
+     * over MAX_PATH, so the live <cache>/<project>.db writes under a deep store
+     * instead of returning NULL ("Pipeline failed"). Raw fopen was MAX_PATH-bound. */
+    FILE *fp = cbm_fopen(path, "wb");
     if (!fp) {
         return NULL;
     }
