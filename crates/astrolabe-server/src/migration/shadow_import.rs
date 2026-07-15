@@ -1221,6 +1221,23 @@ pub(crate) fn ensure_shadow_import_current_at(
 pub(crate) const SHADOW_INDEX_ARGS_KEY: &str = "index_args_json";
 pub(crate) const GIT_ARCHAEOLOGY_HEAD_KEY: &str = "git_archaeology_head";
 
+/// Metadata key recording the path convention under which this project's git-archaeology
+/// anchors and historical constellations were minted (#418).
+pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY: &str = "git_archaeology_path_convention";
+/// Current git-archaeology identity path convention.
+///
+/// `subtree_relative_v1` (#418): historical constellation identity and anchor attribution
+/// use the SAME subtree-relative `rel_file_path` the LIVE shadow import uses, so an
+/// unchanged member symbol shares one CxId across live and historical imports. The prior
+/// (unversioned, pre-#418) code re-anchored historical member node paths UP to the
+/// `corpus_rel/`-prefixed toplevel namespace, deriving CxIds disjoint from the live graph
+/// (`historical_constellations_reused` stuck at 0, anchors off-graph). A member vault
+/// imported under the old convention still carries those toplevel-namespace anchors; the
+/// mode gate below detects the absent/mismatched marker and forces a full re-mine so every
+/// anchor is re-derived under this convention (explicit reconciliation, never a silent
+/// mixed-convention incremental).
+pub(crate) const GIT_ARCHAEOLOGY_PATH_CONVENTION: &str = "subtree_relative_v1";
+
 /// Persists the calyx-stripped `index_repository` args so a later runner-driven
 /// refresh can replay them for true reconciliation (#244).
 pub(crate) fn persist_shadow_index_args(
@@ -1638,7 +1655,31 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
                 &metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY),
             )? {
                 Some(previous_head) => {
-                    astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
+                    // Convention-migration gate (#418): a prior import may have minted
+                    // archaeology anchors and historical constellations under the OLD
+                    // toplevel-prefixed path convention, whose CxIds are disjoint from the
+                    // live subtree-relative graph. An incremental (`Since`) import would
+                    // only mine NEW commits, silently leaving that off-graph evidence in
+                    // place — a mixed-convention vault. When the persisted convention marker
+                    // is absent (pre-#418 import) or does not match the current convention,
+                    // force a FULL re-mine so every anchor is re-derived under the unified
+                    // subtree-relative convention and attaches on the live graph. This is
+                    // explicit reconciliation, not a silent fallback; the resulting
+                    // `mode: "full"` is visible in the persisted git_archaeology summary.
+                    let persisted_convention = read_config_value(
+                        cache_dir,
+                        &metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
+                    )?;
+                    if persisted_convention.as_deref() == Some(GIT_ARCHAEOLOGY_PATH_CONVENTION) {
+                        astrolabe_anchors::archaeology::GitMineMode::Since { previous_head }
+                    } else {
+                        eprintln!(
+                            "astro.archaeology.migration project={project} \
+                             reason=path_convention_changed action=force_full_remine \
+                             persisted={persisted_convention:?} current={GIT_ARCHAEOLOGY_PATH_CONVENTION:?}"
+                        );
+                        astrolabe_anchors::archaeology::GitMineMode::Full
+                    }
                 }
                 None => astrolabe_anchors::archaeology::GitMineMode::Full,
             };
@@ -3034,6 +3075,17 @@ pub(crate) fn persist_shadow_outcome_at(
         tx.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
             params![metadata_key(project, GIT_ARCHAEOLOGY_HEAD_KEY), head],
+        )?;
+        // #418: stamp the identity path convention this archaeology pass was minted under,
+        // atomically with the head it advances, so the next import's mode gate can force a
+        // full re-mine if the convention ever changes again (never a silent mixed-convention
+        // incremental). Written only when archaeology actually ran (a real head exists).
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![
+                metadata_key(project, GIT_ARCHAEOLOGY_PATH_CONVENTION_KEY),
+                GIT_ARCHAEOLOGY_PATH_CONVENTION
+            ],
         )?;
     }
     // #347: persist the git-source watermark + repo path (or clear them when this import
