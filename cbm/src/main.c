@@ -204,7 +204,9 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
+#define CLI_USAGE                                                       \
+    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> " \
+    "[--args-file <path> | (JSON on stdin)]\n"
 
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
@@ -391,8 +393,11 @@ static int run_cli(int argc, char **argv) {
         }
     }
 
-    /* Resolve the JSON arguments. Precedence: --args-file, then raw JSON
-     * (back-compat), then --flags, then piped stdin, then empty {}. */
+    /* Resolve the JSON arguments. Supported forms (one contract with the Rust
+     * host, #378/#411): --args-file <path>, then piped stdin, then empty {}.
+     * Raw-JSON argv and the `--flag value` form are REMOVED — the raw-JSON token
+     * is refused fail-closed (ASTRO_CLI_RAW_JSON_ARGV_REMOVED), matching
+     * crates/astrolabe-server/src/lib.rs. */
     char *heap_args = NULL; /* freed before return when set */
     const char *args_json = "{}";
 
@@ -417,24 +422,17 @@ static int run_cli(int argc, char **argv) {
         }
         args_json = heap_args;
     } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
-        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
-         * STDERR only — stdout must stay clean JSON for piping. */
+        /* #378/#411: raw-JSON argv is removed. Fail closed with the same label
+         * and remediation the Rust host emits — no silent divergence between the
+         * two CLI surfaces. */
         (void)fprintf(stderr,
-                      "warning: passing raw JSON to 'cli %s' is deprecated and "
-                      "will be removed in a future release; use flags (run 'cli "
-                      "%s --help'), --args-file <path>, or piped stdin.\n",
+                      "ASTRO_CLI_RAW_JSON_ARGV_REMOVED: passing raw JSON as a 'cli' "
+                      "argv token is no longer supported. remediation: write the JSON "
+                      "to a file and pass `--args-file <path>`, or pipe it on stdin "
+                      "(e.g. `codebase-memory-mcp cli %s --args-file args.json` or "
+                      "`echo '<json>' | codebase-memory-mcp cli %s`).\n",
                       tool_name, tool_name);
-        args_json = rem_argv[0];
-    } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
-        /* flag form: cli <tool> --flag value --bare-bool ... */
-        char *err = NULL;
-        heap_args = cbm_cli_build_args_json(tool_name, rem_argc, rem_argv, &err);
-        if (!heap_args) {
-            (void)fprintf(stderr, "error: %s\n", err ? err : "invalid arguments");
-            free(err);
-            return SKIP_ONE;
-        }
-        args_json = heap_args;
+        return SKIP_ONE;
     } else if (!cli_isatty(0)) {
         /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
         heap_args = cli_slurp_stream(stdin);
@@ -506,7 +504,8 @@ static void print_help(void) {
     printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
+    printf("  codebase-memory-mcp cli <tool> [--args-file <path> | (JSON on stdin)]  Run a single "
+           "tool\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
