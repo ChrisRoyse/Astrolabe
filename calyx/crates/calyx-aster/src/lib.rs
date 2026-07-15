@@ -3,6 +3,7 @@
 pub mod base_page_index;
 pub mod cf;
 pub mod collection;
+mod commit_timing;
 pub mod compaction;
 pub mod dedup;
 pub mod erase;

@@ -95,9 +95,29 @@ where
     }
 
     pub(crate) fn commit_rows_locked(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        // Slice callers keep the historical one-copy contract: materialize the
+        // batch once here, then hand ownership to the shared path below. The
+        // owned path is byte-identical — the copy is simply hoisted to the caller
+        // boundary, and the hot import path (`write_cf_batch_with_ledger_entry`)
+        // that already owns its `Vec` skips it entirely via `_owned` (#444).
+        self.commit_rows_locked_owned(rows.to_vec())
+    }
+
+    /// Ownership-taking group commit. Identical committed bytes to
+    /// [`Self::commit_rows_locked`] — the batch plus its single appended
+    /// time-index row, in the same order — but appends the time-index row into
+    /// the caller's already-owned `Vec` in place instead of deep-cloning the
+    /// whole batch just to grow it by one row (#444: `group_commit` is 88–89% of
+    /// import write time and every full-batch copy in that path is linear in
+    /// rows). Byte-equivalence is structural, not incidental: `commit_prepared_rows`
+    /// observes the same slice contents either way.
+    pub(crate) fn commit_rows_locked_owned(
+        &self,
+        mut rows: Vec<encode::WriteRow>,
+    ) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
-            return self.commit_prepared_rows(rows);
+            return self.commit_prepared_rows(&rows);
         }
         // Time-travel (PH72 T04): stamp this group-commit with one time-index
         // entry in the SAME batch as the data, so the (millis -> seqno) mapping
@@ -107,9 +127,8 @@ where
         // committed seq below and fail loud on any divergence (never silent).
         let predicted = self.rows.current_seq().saturating_add(1);
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
-        let mut all_rows = rows.to_vec();
-        all_rows.push(encode::WriteRow { cf, key, value });
-        let committed = self.commit_prepared_rows(&all_rows)?;
+        rows.push(encode::WriteRow { cf, key, value });
+        let committed = self.commit_prepared_rows(&rows)?;
         if committed != predicted {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "time-index seqno prediction {predicted} diverged from committed seq {committed}"
@@ -119,15 +138,21 @@ where
     }
 
     fn commit_prepared_rows(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        let row_count = rows.len();
         if !rows.is_empty() {
             self.ensure_writeable("commit")?;
         }
+        let admission = crate::commit_timing::start();
         self.rows.ensure_memtable_admission(
             rows.iter()
                 .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice())),
         )?;
+        admission.stop("memtable_admission", row_count, 0);
         let Some(durable) = &self.durable else {
-            return self.commit_rows_to_mvcc(rows);
+            let mvcc = crate::commit_timing::start();
+            let seq = self.commit_rows_to_mvcc(rows);
+            mvcc.stop("mvcc_commit_volatile", row_count, 0);
+            return seq;
         };
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
@@ -143,12 +168,17 @@ where
         // narrow window between the WAL fsync and this anchor fsync still fails
         // closed on reopen — exactly candidate 4's intended no-silent-truncation
         // behavior.
+        let anchor_timer = crate::commit_timing::start();
         if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
+        anchor_timer.stop("ledger_head_anchor", row_count, 0);
         #[cfg(any(test, feature = "crash-fsv"))]
         crash_fsv_after_wal_append(durable_seq)?;
-        let mvcc_seq = match self.commit_rows_to_mvcc(rows) {
+        let mvcc = crate::commit_timing::start();
+        let mvcc_result = self.commit_rows_to_mvcc(rows);
+        mvcc.stop("mvcc_commit", row_count, 0);
+        let mvcc_seq = match mvcc_result {
             Ok(seq) => seq,
             Err(mvcc_error) => {
                 let restore = self.restore_committed_rows(durable_seq, rows);
@@ -166,7 +196,9 @@ where
                 "durable WAL seq {durable_seq} diverged from MVCC seq {mvcc_seq}"
             )));
         }
+        let stage = crate::commit_timing::start();
         durable.stage_checkpoint_batch(durable_seq, rows)?;
+        stage.stop("checkpoint_stage", row_count, 0);
         // Crash boundary (#276): the batch is now in the WAL and the MVCC
         // memtable and staged for checkpoint, but its checkpoint SST + manifest
         // advance have not happened. A crash here recovers via WAL replay with a

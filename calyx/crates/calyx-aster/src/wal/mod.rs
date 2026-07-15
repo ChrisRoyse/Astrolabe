@@ -181,6 +181,12 @@ impl Wal {
         let _lock = crate::file_lock::FileLockGuard::acquire(&self.dir.join(".append.lock"))?;
         self.refresh_after_external_appends_locked()?;
         let mut acks = Vec::with_capacity(payloads.len());
+        // #444 breakdown: the page-write loop (record framing + buffered writes)
+        // vs the single fsync that makes the whole coalesced group durable. One
+        // fsync per batcher flush regardless of row count — the reader can weigh
+        // per-commit-constant fsync against linear-in-bytes page-write directly.
+        let payload_bytes: usize = payloads.iter().map(|payload| payload.len()).sum();
+        let page_write = crate::commit_timing::start();
         for payload in payloads {
             // A commit that fits in one record keeps the original single-record
             // (`CXW1`) layout byte-for-byte. A larger commit is framed as an
@@ -192,10 +198,13 @@ impl Wal {
             };
             acks.push(ack);
         }
+        page_write.stop("wal_page_write", payloads.len(), payload_bytes);
 
+        let fsync = crate::commit_timing::start();
         self.file
             .sync_data()
             .map_err(|error| storage_error("fsync WAL batch", error))?;
+        fsync.stop("wal_fsync", payloads.len(), payload_bytes);
         Ok(acks)
     }
 
