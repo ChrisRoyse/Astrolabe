@@ -24,6 +24,11 @@
 #include "watcher/watcher.h"
 
 CBM_API void cbm_cli_set_version(const char *ver);
+/* #416: per-tool `--help` formatter shared with the standalone binary. Prints
+ * the supported input forms and the tool's JSON argument schema to stdout,
+ * using `prog` as the program name in the Usage lines. Returns 0 if the tool
+ * is known, non-zero (and prints nothing) if it is not. */
+CBM_API int cbm_cli_print_tool_help_prog(const char *prog, const char *tool_name);
 CBM_API int cbm_cmd_install(int argc, char **argv);
 CBM_API int cbm_cmd_uninstall(int argc, char **argv);
 CBM_API int cbm_cmd_update(int argc, char **argv);
