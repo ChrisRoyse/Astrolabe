@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 astrolabe-domain.workspace = true
 blake3 = "1"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip` makes the JSON float parser bit-exact, so a ledgered card's
 # f64 fields (bits, intervals, TC/n_eff, transfer entropy, …) read back identical
