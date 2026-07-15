@@ -125,11 +125,28 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // namespace. Empty (corpus IS the toplevel) => whole-repo control path,
     // byte-identical to pre-scoping behavior on every axis.
     let corpus_rel = git_show_prefix(repo)?;
+    // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING, off by default so
+    // production indexing is byte-for-byte unaffected. When set, the mine vs the
+    // per-evidence-commit historical-reindex loop are timed separately (with counts)
+    // so the 53.8s M-scale git_archaeology phase can be attributed to a real sub-phase
+    // instead of guessed. Emitted once per pass, never per-row.
+    let arch_timing = std::env::var_os("ASTRO_ARCH_TIMING").is_some();
+    let mine_start = std::time::Instant::now();
     let config = GitArchaeologyConfig {
         member_prefix: (!corpus_rel.is_empty()).then(|| corpus_rel.clone()),
         ..GitArchaeologyConfig::default()
     };
     let mined = mine_git_archaeology(repo, &config, &mode)?;
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=mine ms={} szz={} reverts={} force_removed={} member_prefix={:?}",
+            mine_start.elapsed().as_millis(),
+            mined.szz_findings.len(),
+            mined.revert_findings.len(),
+            mined.force_removed_commits.len(),
+            config.member_prefix,
+        );
+    }
     let mut evidence = Vec::new();
     for finding in &mined.szz_findings {
         evidence.push(Evidence {
@@ -241,7 +258,11 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // pass — its own live PID stamped in the name — is never disturbed.
     sweep_orphan_worktrees(repo, &worktree_home);
 
+    let index_loop_start = std::time::Instant::now();
+    let mut index_calls = 0usize;
+    let mut index_ms_total = 0u128;
     for (commit, group) in group_evidence_by_commit(&evidence) {
+        let one_index_start = std::time::Instant::now();
         let indexed = index_historical_commit(
             repo,
             cache_dir,
@@ -250,6 +271,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             commit,
             &corpus_rel,
         )?;
+        if arch_timing {
+            index_calls += 1;
+            index_ms_total += one_index_start.elapsed().as_millis();
+        }
         report.cleanup_remnants += indexed.cleanup_remnants;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
@@ -301,6 +326,18 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             report.anchors_written += anchored.anchors_written;
             report.anchors_deduplicated += anchored.anchors_deduplicated;
         }
+    }
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=index_loop ms={} distinct_commits={index_calls} \
+             sum_per_commit_ms={index_ms_total} evidence={} constellations_written={} \
+             constellations_reused={} evidence_without_symbol={}",
+            index_loop_start.elapsed().as_millis(),
+            report.evidence,
+            report.historical_constellations_written,
+            report.historical_constellations_reused,
+            report.evidence_without_symbol,
+        );
     }
     Ok(report)
 }

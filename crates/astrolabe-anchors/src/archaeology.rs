@@ -266,7 +266,17 @@ pub fn mine_git_archaeology(
         }
     };
 
+    // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING (off by default;
+    // behavior-neutral). Attributes the mine cost to read_commits vs diff vs blame so
+    // the dominant sub-phase is measured, not guessed.
+    let arch_timing = std::env::var_os("ASTRO_ARCH_TIMING").is_some();
+    let read_start = std::time::Instant::now();
     let commits = read_commits(repo, config, range.as_deref())?;
+    let read_commits_ms = read_start.elapsed().as_millis();
+    let commit_count = commits.len();
+    let mut diff_ms = 0u128;
+    let mut blame_ms = 0u128;
+    let mut blame_calls = 0usize;
     let mut szz = BTreeSet::new();
     let mut reverts = BTreeSet::new();
     let mut skipped_merge_fixes = 0usize;
@@ -295,8 +305,15 @@ pub fn mine_git_archaeology(
             continue;
         }
         let parent = &commit.parents[0];
-        for range in changed_old_ranges(repo, parent, &commit.sha, pathspec)? {
-            for (blamed_commit, line) in blame_range(repo, parent, &range)? {
+        let diff_start = std::time::Instant::now();
+        let old_ranges = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
+        diff_ms += diff_start.elapsed().as_millis();
+        for range in old_ranges {
+            let blame_start = std::time::Instant::now();
+            let blamed = blame_range(repo, parent, &range)?;
+            blame_ms += blame_start.elapsed().as_millis();
+            blame_calls += 1;
+            for (blamed_commit, line) in blamed {
                 szz.insert(SzzFinding {
                     fix_commit: commit.sha.clone(),
                     blamed_commit,
@@ -307,6 +324,13 @@ pub fn mine_git_archaeology(
                 });
             }
         }
+    }
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
+             commits={commit_count} diff_ms={diff_ms} blame_ms={blame_ms} \
+             blame_calls={blame_calls} skipped_merge_fixes={skipped_merge_fixes}"
+        );
     }
     Ok(GitArchaeologyReport {
         head,
