@@ -15,6 +15,8 @@ pub const WEAVE_KNOB_REGISTRY_VERSION: &str = "astrolabe-weave-knobs-v1";
 pub const WEAVE_NEIGHBORHOOD_SAMPLE_CAP_KNOB: &str = "weave_neighborhood_sample_cap";
 /// Name of the similarity-planner worker-count knob.
 pub const WEAVE_SIMILARITY_WORKERS_KNOB: &str = "weave_similarity_workers";
+/// Name of the dense ANN candidate-build strategy knob (#441).
+pub const WEAVE_DENSE_ANN_STRATEGY_KNOB: &str = "weave_dense_ann_strategy";
 
 /// Default neighborhood peer sample-cap (#433): the largest peer set the O(n²)
 /// per-symbol neighborhood-agreement cross-term profiles run over before a seeded
@@ -90,6 +92,65 @@ pub const WEAVE_MIN_SIMILARITY_WORKERS: u64 = 0;
 /// count to the source count regardless, so this caps the request, not correctness.
 pub const WEAVE_MAX_SIMILARITY_WORKERS: u64 = 4_096;
 
+/// Dense ANN candidate-build strategy (#441): the sequential seeded-HNSW build.
+///
+/// `0` is the seeded, scalar8-quantized HNSW index build/query that #433 shipped:
+/// `HnswIndex::insert` is called once per pool ordinal in qualified-name order and
+/// each insert mutates the shared graph (back-edges + neighbor pruning of earlier
+/// rows), so the build is strictly sequential *by design for determinism* — a
+/// parallel insert reorders those mutations and yields a different graph (Zhu et
+/// al., "SHINE: A Scalable HNSW Index in Disaggregated Memory", arXiv:2507.17647,
+/// and the hnswlib/usearch per-node-lock construction: concurrent insertion order
+/// is non-deterministic, so the same vectors produce a different topology). This
+/// value reproduces the pre-#441 build byte-for-byte and is the shipped default
+/// until the exact strategy is proven byte-parity on the orchestrator's real-corpus
+/// edge_dump probe.
+pub const WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW: u64 = 0;
+/// Dense ANN candidate-build strategy (#441): deterministic, parallel, **exact**
+/// blocked kNN over the identical scalar8-quantized approximations.
+///
+/// `1` replaces the sequential HNSW build+query with a per-source exact top-k scan
+/// over the same quantized pool the HNSW path scores (`k = per_node_cap ×
+/// candidate_multiplier + 1`, the identical candidate breadth), sharded across the
+/// `weave_similarity_workers` count exactly as #433 shards the HNSW queries. It has
+/// **no graph, no RNG, and no cross-source mutation**: every source's neighbor list
+/// is a pure function of the frozen quantized pool, so the pass is embarrassingly
+/// parallel, byte-identical across runs and worker counts, and cannot deadlock or
+/// reorder. Rationale (#441): the seeded-HNSW *build* is the remaining superlinear
+/// weave sub-stage (`ann_generate.SIM_PROFILE` 136,956ms at n=45,557, ~O(n²) from
+/// the exhaustive-construction prefix and per-insert back-edge pruning), and exact
+/// blocked kNN is Θ(dim·n²) with a tiny SIMD-friendly constant and perfect
+/// parallelism — for the sizes involved (< ~50k dense vectors, RECORD_VEC dim=24 /
+/// embedding dim) brute-force exact kNN is both cheaper in wall-clock than the
+/// already-O(n²) graph build and *exact* where HNSW is approximate (myscale.com,
+/// marqo.ai: brute force has zero build overhead and 100% recall for <50k vectors;
+/// HNSW never reaches 100% recall). Candidate-recall argument (standing invariant 3
+/// / #441 output-equivalence): the exact top-k over the quantized pool is a strict
+/// improvement in approximation of the exhaustive raw-cosine ground truth over
+/// HNSW's approximate graph search on the *same* quantized pool — it removes the
+/// graph-approximation error layer while keeping the shared quantization layer — so
+/// recall against the exhaustive planner cannot drop; specific edges the HNSW graph
+/// missed are *added*, and the rescoring per-node cap admits the higher raw-cosine
+/// pairs. Any resulting edge_dump drift is therefore a labeled, recall-improving
+/// change, disclosed and measured on the driving issue — never silent.
+pub const WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN: u64 = 1;
+/// Smallest legal dense ANN strategy ordinal (sequential HNSW).
+pub const WEAVE_MIN_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW;
+/// Largest legal dense ANN strategy ordinal (exact blocked kNN).
+pub const WEAVE_MAX_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN;
+/// Default dense ANN strategy: the sequential seeded-HNSW build (#441). Held at the
+/// byte-parity-safe value until the exact strategy's edge_dump parity/drift is
+/// measured on real corpora by the orchestrator; an operator (or that probe) selects
+/// the exact strategy via the `ASTRO_WEAVE_DENSE_ANN_STRATEGY` override below.
+pub const WEAVE_DEFAULT_DENSE_ANN_STRATEGY: u64 = WEAVE_DENSE_ANN_STRATEGY_SEQUENTIAL_HNSW;
+/// Environment override for the dense ANN strategy knob. A declared operator/probe
+/// channel (not a hidden constant): the value is parsed as the knob ordinal and
+/// **validated against the declaration's closed interval** — an unset, unparseable,
+/// or out-of-range value fails closed to [`WEAVE_DEFAULT_DENSE_ANN_STRATEGY`], never
+/// to an undeclared value. This is the single mechanism the #441 probe uses to
+/// exercise OFF (sequential HNSW) vs ON (exact kNN) on one consolidated binary.
+pub const WEAVE_DENSE_ANN_STRATEGY_ENV: &str = "ASTRO_WEAVE_DENSE_ANN_STRATEGY";
+
 /// The weave performance knob registry (#433).
 pub const WEAVE_KNOBS: &[U64KnobDeclaration] = &[
     U64KnobDeclaration {
@@ -111,6 +172,16 @@ pub const WEAVE_KNOBS: &[U64KnobDeclaration] = &[
         unit: "workers",
         source: "ASTROLABE #433 similarity_plan phase measurement (single-threaded default left the largest weave sub-stage serial on a many-core host) and astrolabe-ingest SqliteImportOptions::with_workers(available_parallelism) precedent",
         rationale: "worker count for the similarity edge planner's exact-cosine rescoring; 0 resolves to std::thread::available_parallelism at call time exactly as the SQLite import sizes its corpus-wide passes; the sharding is proven byte-identical to the serial plan, so this changes only wall-clock, never the persisted edge set; the planner clamps the effective count to the source count",
+    },
+    U64KnobDeclaration {
+        registry_version: WEAVE_KNOB_REGISTRY_VERSION,
+        name: WEAVE_DENSE_ANN_STRATEGY_KNOB,
+        default: WEAVE_DEFAULT_DENSE_ANN_STRATEGY,
+        min: WEAVE_MIN_DENSE_ANN_STRATEGY,
+        max: WEAVE_MAX_DENSE_ANN_STRATEGY,
+        unit: "strategy_ordinal",
+        source: "ASTROLABE #441 ann_generate build profile (SIM_PROFILE 136,956ms + SIM_SEMANTIC 56,890ms at n=45,557: the seeded-HNSW candidate-index BUILD is the remaining ~O(n²) weave sub-stage, inserts sequential by design for determinism); Zhu et al. 'SHINE: A Scalable HNSW Index in Disaggregated Memory' (arXiv:2507.17647) and hnswlib/usearch per-node-lock construction (parallel insert order is non-deterministic → different graph); myscale.com HNSW-vs-KNN and marqo.ai 'Understanding Recall in HNSW' (brute-force exact kNN is Θ(dim·n²) with zero build overhead and 100% recall for <50k vectors, where HNSW never reaches 100%); Chen & Cai 'Fast Approximate kNN Graph Construction' (JMLR 2009, NN-descent) as the surveyed approximate-graph alternative",
+        rationale: "selects the dense ANN candidate-index build: 0 = the #433 sequential seeded-HNSW build/query (strictly sequential because each insert mutates earlier rows' back-edges; a parallel insert reorders those mutations into a different graph, so bit-determinism is impossible under parallel insert), 1 = deterministic parallel EXACT blocked kNN over the identical scalar8-quantized pool with the identical candidate breadth (k = per_node_cap·candidate_multiplier+1), sharded over weave_similarity_workers with no graph/RNG/cross-source mutation so it is byte-identical across runs and worker counts; the exact strategy removes only the graph-approximation error layer over the shared quantization layer, so candidate recall vs the exhaustive planner cannot drop and any edge_dump change is a labeled recall-improving drift measured on #441; default holds at 0 (byte-parity-safe) until that probe proves parity, and the ASTRO_WEAVE_DENSE_ANN_STRATEGY env override (clamped to this declaration) selects the strategy for benches/probes; replace the default with the exact strategy once its real-corpus parity/drift and wall-clock are recorded",
     },
 ];
 
@@ -138,4 +209,28 @@ pub fn weave_similarity_workers() -> usize {
             .max(1),
         explicit => explicit,
     }
+}
+
+/// The resolved dense ANN candidate-build strategy ordinal (#441).
+///
+/// Resolves the [`WEAVE_DENSE_ANN_STRATEGY_ENV`] override, parses it as the knob
+/// ordinal, and **fails closed** to [`WEAVE_DEFAULT_DENSE_ANN_STRATEGY`] when the
+/// value is unset, unparseable, or outside the declared closed interval — an
+/// operator can never select an undeclared strategy. When the override is absent
+/// the shipped default is returned, so the sequential-HNSW path is byte-identical
+/// to the pre-#441 build.
+pub fn weave_dense_ann_strategy() -> u64 {
+    let declaration = weave_knob(WEAVE_DENSE_ANN_STRATEGY_KNOB);
+    std::env::var(WEAVE_DENSE_ANN_STRATEGY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| declaration.is_some_and(|knob| knob.accepts(*value)))
+        .unwrap_or(WEAVE_DEFAULT_DENSE_ANN_STRATEGY)
+}
+
+/// Whether the deterministic parallel exact blocked-kNN dense ANN strategy is
+/// selected (#441). `false` is the sequential seeded-HNSW build (the shipped
+/// default and byte-parity baseline).
+pub fn weave_dense_ann_exact() -> bool {
+    weave_dense_ann_strategy() == WEAVE_DENSE_ANN_STRATEGY_EXACT_KNN
 }
