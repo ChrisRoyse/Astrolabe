@@ -36,7 +36,35 @@ pub struct GitArchaeologyConfig {
     /// never enter the evidence set at the source, rather than being mined across
     /// the whole monorepo and filtered afterward.
     pub member_prefix: Option<String>,
+    /// Changed-file cap per fix/revert commit above which the commit is treated as
+    /// a MASS-CHANGE (relocation, bulk rename, mass reformat, tree deletion) and
+    /// EXCLUDED from SZZ line-range mining — labeled and counted, never silent
+    /// (#434, invariant 3/4).
+    ///
+    /// MEASURED lever (#434): on the full `cbm/` corpus the git_archaeology phase
+    /// (53.8s of 156.3s at M scale, #422) was dominated by ONE fix-classified
+    /// mass-change commit — the #286 `vendor/cbm` → `cbm` relocation (1821 changed
+    /// files in the subtree). Its `git diff --unified=0 … -- cbm` emits a ~600k-line
+    /// diff that costs ~38s to generate and parse, yet yields ZERO SZZ findings: the
+    /// relocation is pure additions in `cbm/`, so every hunk's OLD side is
+    /// `/dev/null` and no blamable parent range exists. SZZ bug-origin blame on a
+    /// mass-change is meaningless by construction (a 1000-file move is not a targeted
+    /// bug fix); excluding it is a signal improvement, not a loss. A cheap
+    /// `git diff --name-only` pre-count gates the expensive content diff so the mine
+    /// never pays the mass-change cost.
+    ///
+    /// Default 256: two orders of magnitude above any targeted bug fix observed on
+    /// the corpus (genuine fixes touch a handful of files) and below every
+    /// mass-change (relocation 1821), so it cleanly separates the two. It echoes the
+    /// changed-path threshold Git's own changed-path Bloom-filter design uses to mark
+    /// a commit "too large" (Azure DevOps VSTS: 512 changed paths). `0` disables the
+    /// cap (mine every commit regardless of size — the pre-#434 behavior).
+    pub max_commit_changed_files: usize,
 }
+
+/// Registry-declared default for [`GitArchaeologyConfig::max_commit_changed_files`]
+/// (#434). See that field's docs for the measured rationale.
+pub const DEFAULT_MAX_COMMIT_CHANGED_FILES: usize = 256;
 
 impl Default for GitArchaeologyConfig {
     fn default() -> Self {
@@ -49,6 +77,7 @@ impl Default for GitArchaeologyConfig {
             since: "1 year ago".to_string(),
             max_count: 10_000,
             member_prefix: None,
+            max_commit_changed_files: DEFAULT_MAX_COMMIT_CHANGED_FILES,
         }
     }
 }
@@ -168,6 +197,11 @@ pub struct GitArchaeologyReport {
     pub force_removed_commits: Vec<String>,
     /// Fix-like merge commits skipped rather than blending parent histories.
     pub skipped_merge_fixes: usize,
+    /// Fix/revert commits EXCLUDED from SZZ line mining because their changed-file
+    /// count exceeded [`GitArchaeologyConfig::max_commit_changed_files`] — mass
+    /// changes (relocation, bulk rename/delete, mass reformat) whose blame is
+    /// meaningless (#434). Counted and surfaced, never a silent skip (invariant 3).
+    pub skipped_large_commits: usize,
 }
 
 /// Coded, remediable archaeology error.
@@ -266,14 +300,38 @@ pub fn mine_git_archaeology(
         }
     };
 
+    // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING (off by default;
+    // behavior-neutral). Attributes the mine cost to read_commits vs diff vs blame so
+    // the dominant sub-phase is measured, not guessed.
+    let arch_timing = std::env::var_os("ASTRO_ARCH_TIMING").is_some();
+    let read_start = std::time::Instant::now();
     let commits = read_commits(repo, config, range.as_deref())?;
+    let read_commits_ms = read_start.elapsed().as_millis();
+    let commit_count = commits.len();
+    let mut diff_ms = 0u128;
+    let mut blame_ms = 0u128;
+    let mut blame_calls = 0usize;
     let mut szz = BTreeSet::new();
     let mut reverts = BTreeSet::new();
     let mut skipped_merge_fixes = 0usize;
+    let mut skipped_large_commits = 0usize;
+    // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
+    let file_cap = config.max_commit_changed_files;
     for commit in commits {
         if let Some(target) = canonical_revert_target(&commit.message) {
             validate_oid(&target)?;
-            if git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])?
+            // Mass-change cap (#434): a revert whose TARGET touched more than the
+            // cap of files within the pathspec is a bulk revert; its per-line
+            // blame/range mining is meaningless and, as with the relocation fix
+            // commit, dominated by diff generation+parse cost. Gate with the cheap
+            // `--name-only` pre-count before the expensive content diff, and count
+            // the skip (invariant 3). The target's parent is the diff old side that
+            // `changed_new_ranges_impl` derives, so count against that same pair.
+            let target_over_cap = file_cap != 0
+                && changed_file_count_for_commit(repo, &target, pathspec)? > file_cap;
+            if target_over_cap {
+                skipped_large_commits += 1;
+            } else if git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])?
                 && revert_patch_matches(repo, &target, &commit.sha)?
             {
                 for target_range in changed_new_ranges_impl(repo, &target, pathspec)? {
@@ -295,8 +353,26 @@ pub fn mine_git_archaeology(
             continue;
         }
         let parent = &commit.parents[0];
-        for range in changed_old_ranges(repo, parent, &commit.sha, pathspec)? {
-            for (blamed_commit, line) in blame_range(repo, parent, &range)? {
+        // Mass-change cap (#434): before the expensive `git diff --unified=0` content
+        // diff, cheaply count the files this fix commit changed within the pathspec
+        // (`git diff --name-only`, a tree compare with no content). Over the cap => a
+        // relocation / bulk rewrite / mass delete, NOT a targeted bug fix: exclude it
+        // from SZZ (its blame is meaningless and — for a pure-addition relocation —
+        // yields zero old-side ranges anyway), count the skip, and never pay the
+        // ~600k-line diff-and-parse cost that dominated the M-scale phase (#422).
+        if file_cap != 0 && changed_file_count(repo, parent, &commit.sha, pathspec)? > file_cap {
+            skipped_large_commits += 1;
+            continue;
+        }
+        let diff_start = std::time::Instant::now();
+        let old_ranges = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
+        diff_ms += diff_start.elapsed().as_millis();
+        for range in old_ranges {
+            let blame_start = std::time::Instant::now();
+            let blamed = blame_range(repo, parent, &range)?;
+            blame_ms += blame_start.elapsed().as_millis();
+            blame_calls += 1;
+            for (blamed_commit, line) in blamed {
                 szz.insert(SzzFinding {
                     fix_commit: commit.sha.clone(),
                     blamed_commit,
@@ -308,12 +384,21 @@ pub fn mine_git_archaeology(
             }
         }
     }
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
+             commits={commit_count} diff_ms={diff_ms} blame_ms={blame_ms} \
+             blame_calls={blame_calls} skipped_merge_fixes={skipped_merge_fixes} \
+             skipped_large_commits={skipped_large_commits} file_cap={file_cap}"
+        );
+    }
     Ok(GitArchaeologyReport {
         head,
         szz_findings: szz.into_iter().collect(),
         revert_findings: reverts.into_iter().collect(),
         force_removed_commits,
         skipped_merge_fixes,
+        skipped_large_commits,
     })
 }
 
@@ -480,6 +565,45 @@ fn changed_old_ranges(
     pathspec: Option<&str>,
 ) -> Result<Vec<GitLineRange>, ArchaeologyError> {
     changed_ranges(repo, parent, commit, true, pathspec)
+}
+
+/// Cheap changed-file count between `parent` and `commit`, limited to `pathspec`
+/// (#434 mass-change cap). Uses `git diff --name-only`, a tree comparison with NO
+/// content diff — so a mass-change commit (relocation, bulk delete) is detected in
+/// milliseconds without ever generating the multi-hundred-thousand-line unified
+/// diff that dominated the phase. Counts NUL-delimited paths (`-z`) so unusual
+/// filenames never split a count.
+fn changed_file_count(
+    repo: &Path,
+    parent: &str,
+    commit: &str,
+    pathspec: Option<&str>,
+) -> Result<usize, ArchaeologyError> {
+    let mut args = vec!["diff", "--name-only", "-z", parent, commit, "--"];
+    if let Some(prefix) = pathspec {
+        args.push(prefix);
+    }
+    let output = git_bytes(repo, &args)?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .count())
+}
+
+/// [`changed_file_count`] for a single commit versus its first parent — the
+/// counterpart to [`changed_new_ranges_impl`], used to cap a bulk revert TARGET
+/// before its content diff (#434). A root commit (no parent) counts as 0.
+fn changed_file_count_for_commit(
+    repo: &Path,
+    commit: &str,
+    pathspec: Option<&str>,
+) -> Result<usize, ArchaeologyError> {
+    validate_oid(commit)?;
+    let parents = git_text(repo, &["show", "-s", "--format=%P", commit])?;
+    let Some(parent) = parents.split_whitespace().next() else {
+        return Ok(0);
+    };
+    changed_file_count(repo, parent, commit, pathspec)
 }
 
 fn changed_ranges(

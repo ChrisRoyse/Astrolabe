@@ -96,12 +96,36 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) anchors_deduplicated: usize,
     pub(crate) evidence_without_symbol: usize,
     pub(crate) skipped_merge_fixes: usize,
+    /// Fix/revert commits excluded from SZZ mining as mass-changes (#434) — the
+    /// measured perf lever that removes the dominant M-scale diff cost. Counted
+    /// and surfaced in the summary, never a silent skip (invariant 3).
+    pub(crate) skipped_large_commits: usize,
     /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
     /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
     /// a cleanup that cannot complete degrades to a counted remnant, never a
     /// silently swallowed `let _`.
     pub(crate) cleanup_remnants: usize,
+    /// Provenance label for the git history this pass mined (#434, invariant 1/3:
+    /// no unlabeled claim, no silent fallback). `own_repo` when the corpus IS its
+    /// own git toplevel (`.git` at the corpus root); `parent_repo` when the corpus
+    /// is a subtree of an enclosing repository whose `.git` it mined (e.g. `cbm/`
+    /// inside the Astrolabe repo) — so a consumer never mistakes parent-repo-derived
+    /// anchors for the corpus's own history.
+    pub(crate) archaeology_source: &'static str,
+    /// Absolute path of the git toplevel whose history was mined (the discovered
+    /// git root). For a `parent_repo` corpus this is the ENCLOSING repository, not
+    /// the corpus dir — persisted so the parent-derived provenance is auditable.
+    pub(crate) git_root: String,
+    /// The toplevel-relative subtree pathspec every history walk was limited to
+    /// (#381). `Some("cbm")` for a `parent_repo` corpus; `None` when the corpus is
+    /// the whole repository (`own_repo`, unscoped walk).
+    pub(crate) pathspec: Option<String>,
 }
+
+/// Provenance source label for a `parent_repo` corpus (subtree of an enclosing repo).
+pub(crate) const ARCHAEOLOGY_SOURCE_PARENT_REPO: &str = "parent_repo";
+/// Provenance source label for an `own_repo` corpus (corpus IS its git toplevel).
+pub(crate) const ARCHAEOLOGY_SOURCE_OWN_REPO: &str = "own_repo";
 
 pub(crate) fn run_git_archaeology<C: Clock>(
     repo: &Path,
@@ -125,11 +149,28 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // namespace. Empty (corpus IS the toplevel) => whole-repo control path,
     // byte-identical to pre-scoping behavior on every axis.
     let corpus_rel = git_show_prefix(repo)?;
+    // #434 phase-internal timing: opt-in via ASTRO_ARCH_TIMING, off by default so
+    // production indexing is byte-for-byte unaffected. When set, the mine vs the
+    // per-evidence-commit historical-reindex loop are timed separately (with counts)
+    // so the 53.8s M-scale git_archaeology phase can be attributed to a real sub-phase
+    // instead of guessed. Emitted once per pass, never per-row.
+    let arch_timing = std::env::var_os("ASTRO_ARCH_TIMING").is_some();
+    let mine_start = std::time::Instant::now();
     let config = GitArchaeologyConfig {
         member_prefix: (!corpus_rel.is_empty()).then(|| corpus_rel.clone()),
         ..GitArchaeologyConfig::default()
     };
     let mined = mine_git_archaeology(repo, &config, &mode)?;
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=mine ms={} szz={} reverts={} force_removed={} member_prefix={:?}",
+            mine_start.elapsed().as_millis(),
+            mined.szz_findings.len(),
+            mined.revert_findings.len(),
+            mined.force_removed_commits.len(),
+            config.member_prefix,
+        );
+    }
     let mut evidence = Vec::new();
     for finding in &mined.szz_findings {
         evidence.push(Evidence {
@@ -214,11 +255,28 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         }
     }
 
+    // Provenance labeling (#434): a non-empty corpus_rel means the corpus is a
+    // subtree of an enclosing repository whose `.git` we mined — the mined history
+    // is PARENT-derived, and every walk above was pathspec-limited to `corpus_rel`
+    // (#381). An empty corpus_rel means the corpus IS its own git toplevel. Persist
+    // the discovered git root + the subtree pathspec so a consumer sees
+    // `parent_repo(<root>) pathspec=<subtree>` rather than an unlabeled implicit walk
+    // (invariant 1: no unlabeled claim; invariant 3: no silent fallback).
+    let git_root = git_toplevel(repo)?;
+    let (archaeology_source, pathspec) = if corpus_rel.is_empty() {
+        (ARCHAEOLOGY_SOURCE_OWN_REPO, None)
+    } else {
+        (ARCHAEOLOGY_SOURCE_PARENT_REPO, Some(corpus_rel.clone()))
+    };
     let mut report = GitArchaeologyImportReport {
         head: mined.head,
         mode: mode_name,
         evidence: evidence.len(),
         skipped_merge_fixes: mined.skipped_merge_fixes,
+        skipped_large_commits: mined.skipped_large_commits,
+        archaeology_source,
+        git_root,
+        pathspec,
         ..GitArchaeologyImportReport::default()
     };
     // Relocate archaeology scratch worktrees to a short temp base (#427): a deep
@@ -241,7 +299,11 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // pass — its own live PID stamped in the name — is never disturbed.
     sweep_orphan_worktrees(repo, &worktree_home);
 
+    let index_loop_start = std::time::Instant::now();
+    let mut index_calls = 0usize;
+    let mut index_ms_total = 0u128;
     for (commit, group) in group_evidence_by_commit(&evidence) {
+        let one_index_start = std::time::Instant::now();
         let indexed = index_historical_commit(
             repo,
             cache_dir,
@@ -250,6 +312,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             commit,
             &corpus_rel,
         )?;
+        if arch_timing {
+            index_calls += 1;
+            index_ms_total += one_index_start.elapsed().as_millis();
+        }
         report.cleanup_remnants += indexed.cleanup_remnants;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
@@ -301,6 +367,18 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             report.anchors_written += anchored.anchors_written;
             report.anchors_deduplicated += anchored.anchors_deduplicated;
         }
+    }
+    if arch_timing {
+        eprintln!(
+            "astro.arch.timing phase=index_loop ms={} distinct_commits={index_calls} \
+             sum_per_commit_ms={index_ms_total} evidence={} constellations_written={} \
+             constellations_reused={} evidence_without_symbol={}",
+            index_loop_start.elapsed().as_millis(),
+            report.evidence,
+            report.historical_constellations_written,
+            report.historical_constellations_reused,
+            report.evidence_without_symbol,
+        );
     }
     Ok(report)
 }
@@ -697,6 +775,30 @@ fn git_show_prefix(repo: &Path) -> Result<String, DynError> {
         .to_string())
 }
 
+/// The absolute path of the git toplevel that contains `repo` (`git rev-parse
+/// --show-toplevel`), forward-slash normalized. For a subtree corpus this is the
+/// ENCLOSING repository root (#434 provenance labeling), not the corpus dir. Fails
+/// closed if `repo` is not inside a git work tree — never a silent fallback.
+fn git_toplevel(repo: &Path) -> Result<String, DynError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --show-toplevel failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .replace('\\', "/")
+        .to_string())
+}
+
 fn select_implicated_rows(mut rows: CbmPipelineRows, evidence: &[Evidence]) -> CbmPipelineRows {
     rows.nodes.retain(|node| {
         !matches!(node.label.as_str(), "Project" | "Branch" | "Folder")
@@ -754,8 +856,18 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "anchors_deduplicated": report.anchors_deduplicated,
         "evidence_without_symbol": report.evidence_without_symbol,
         "skipped_merge_fixes": report.skipped_merge_fixes,
+        "skipped_large_commits": report.skipped_large_commits,
         "cleanup_remnants": report.cleanup_remnants,
         "trust": "mixed",
         "provenance": "git_history",
+        // #434 provenance labeling: the discovered git root, whether it is the
+        // corpus's OWN repo or an enclosing PARENT repo, and the toplevel-relative
+        // subtree pathspec every history walk was limited to. Persisted with the
+        // archaeology summary (config `git_archaeology_json`) so a consumer never
+        // mistakes parent-repo-derived anchors for the corpus's own history, and can
+        // see exactly which subtree of which repository they were mined from.
+        "archaeology_source": report.archaeology_source,
+        "git_root": report.git_root,
+        "pathspec": report.pathspec,
     })
 }
