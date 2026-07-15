@@ -280,8 +280,18 @@ impl DurableVault {
     }
 
     pub(super) fn append_batch(&self, rows: &[WriteRow]) -> Result<u64> {
+        let row_count = rows.len();
+        let serialize = crate::commit_timing::start();
         let payload = encode_write_batch(rows)?;
+        let payload_len = payload.len();
+        serialize.stop("wal_serialize", row_count, payload_len);
+        // `submit` blocks the caller thread on the group-commit batcher, which
+        // performs the WAL page-write + fsync (broken out further as
+        // `wal_page_write`/`wal_fsync` on the batcher thread). This span is the
+        // caller-observed durable-append latency including that handoff.
+        let submit = crate::commit_timing::start();
         let ack = self.batcher.submit(payload)?;
+        submit.stop("wal_submit", row_count, payload_len);
         Ok(ack.seq)
     }
 

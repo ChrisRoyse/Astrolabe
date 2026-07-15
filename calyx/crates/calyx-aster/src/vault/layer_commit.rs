@@ -24,16 +24,24 @@ where
         }
 
         self.with_durable_commit_lock(|| {
+            let data_row_count = data_rows.len();
             if let Some(hook) = &self.ledger_hook {
                 let mut hook = ledger_hook::lock_hook(hook)?;
                 let mut rows = Vec::with_capacity(data_rows.len() + 2);
+                // Ledger-bind: stage the ledger entry and stamp its ref into every
+                // Base/Graph provenance field (decode + re-encode per row) — the
+                // #444 breakdown isolates this from the durable commit that follows.
+                let bind = crate::commit_timing::start();
                 let staged = ledger_hook::stage_entry_payload(
                     &hook, &mut rows, kind, subject, payload, actor,
                 )?;
                 let ledger_ref = staged_ledger_ref(&staged)?;
                 attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
                 rows.extend(data_rows);
-                let seq = self.commit_rows_locked(&rows)?;
+                bind.stop("ledger_bind", data_row_count, 0);
+                // Ownership handed straight to the commit path: no full-batch copy
+                // to append the time-index row (#444 lever).
+                let seq = self.commit_rows_locked_owned(rows)?;
                 ledger_hook::commit_staged(&mut hook, &staged)?;
                 return Ok(seq);
             }
@@ -43,12 +51,14 @@ where
                 .get_mut()
                 .map_err(|_| CalyxError::ledger_group_commit_failed("transient hook poisoned"))?;
             let mut rows = Vec::with_capacity(data_rows.len() + 1);
+            let bind = crate::commit_timing::start();
             let staged =
                 ledger_hook::stage_entry_payload(hook, &mut rows, kind, subject, payload, actor)?;
             let ledger_ref = staged_ledger_ref(&staged)?;
             attach_ledger_ref_to_rows(&mut data_rows, &ledger_ref)?;
             rows.extend(data_rows);
-            let seq = self.commit_rows_locked(&rows)?;
+            bind.stop("ledger_bind", data_row_count, 0);
+            let seq = self.commit_rows_locked_owned(rows)?;
             ledger_hook::commit_staged(hook, &staged)?;
             Ok(seq)
         })
