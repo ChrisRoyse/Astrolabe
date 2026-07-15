@@ -186,7 +186,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
-- **CLI mode**: `echo '{"name_pattern": ".*Handler.*"}' | codebase-memory-mcp cli search_graph`
+- **CLI mode**: `echo '{"project": "my-project", "name_pattern": ".*Handler.*"}' | codebase-memory-mcp cli search_graph`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
 
 ## Team-Shared Graph Artifact
@@ -397,12 +397,15 @@ Every MCP tool can be invoked from the command line. Tool arguments are
 supplied as JSON via piped stdin or `--args-file <path>`; passing raw JSON as
 an argv token is refused fail-closed (`ASTRO_CLI_RAW_JSON_ARGV_REMOVED`).
 
+Query tools take the project name reported by `list_projects` as the
+`project` argument.
+
 ```bash
 echo '{"repo_path": "/path/to/repo"}' | codebase-memory-mcp cli index_repository
-echo '{"name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
-echo '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}' | codebase-memory-mcp cli query_graph
-codebase-memory-mcp cli trace_path --args-file trace-args.json  # trace-args.json: {"function_name": "Search", "direction": "both"}
 codebase-memory-mcp cli list_projects
+echo '{"project": "my-project", "name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
+echo '{"project": "my-project", "query": "MATCH (f:Function) RETURN f.name LIMIT 5"}' | codebase-memory-mcp cli query_graph
+codebase-memory-mcp cli trace_path --args-file trace-args.json  # trace-args.json: {"project": "my-project", "function_name": "Search", "direction": "both"}
 ```
 
 ## MCP Tools

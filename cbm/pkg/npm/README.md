@@ -57,11 +57,14 @@ arguments are supplied as JSON via piped stdin or `--args-file <path>`;
 passing raw JSON as an argv token is refused fail-closed
 (`ASTRO_CLI_RAW_JSON_ARGV_REMOVED`).
 
+Query tools take the project name reported by `list_projects` as the
+`project` argument.
+
 ```bash
 echo '{"repo_path": "/path/to/repo"}' | codebase-memory-mcp cli index_repository
-echo '{"name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
-codebase-memory-mcp cli trace_call_path --args-file trace-args.json  # trace-args.json: {"function_name": "main", "direction": "both"}
-codebase-memory-mcp cli get_architecture
+codebase-memory-mcp cli list_projects
+echo '{"project": "my-project", "name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
+codebase-memory-mcp cli trace_call_path --args-file trace-args.json  # trace-args.json: {"project": "my-project", "function_name": "main", "direction": "both"}
 ```
 
 ## MCP Tools
