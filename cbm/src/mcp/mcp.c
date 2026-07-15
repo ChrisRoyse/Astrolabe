@@ -4486,34 +4486,60 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
 /* Resolve an absolute path from root_path + file_path, verify containment,
  * and read source lines. Sets *out_abs_path (caller frees). Returns source
  * string (caller frees) or NULL if path is invalid/unreadable. */
-/* True only when abs_path, after realpath/_fullpath resolution (which collapses
- * `..` and resolves symlinks/junctions), stays within root_path. This is the
- * single containment guard every MCP file-read sink must pass before reading a
- * file into a tool response: both the snippet path (resolve_snippet_source) and
+/* True only when abs_path, after full filesystem resolution (collapsing `..` AND
+ * following symlinks/junctions to their real target), stays within root_path. This
+ * is the single containment guard every MCP file-read sink must pass before reading
+ * a file into a tool response: both the snippet path (resolve_snippet_source) and
  * the search path (attach_result_source) route through it, so a result whose
  * indexed path escapes the project root — via a `..` segment, or a symlink /
- * Windows junction picked up during discovery — is never read back out. */
+ * Windows junction picked up during discovery — is never read back out.
+ *
+ * #437: both operands are canonicalized through cbm_real_path_final, which on
+ * Windows uses GetFinalPathNameByHandleW on an opened handle. That replaces the
+ * former MAX_PATH-bound, purely-lexical ANSI _fullpath, which (1) returned NULL on
+ * a repo root >260 chars — refusing legitimate reads inside a deep repo (the bug
+ * this fixes) — and (2) never resolved reparse points, so a junction under the root
+ * pointing outside it, or an 8.3 short-name spelling of the root, would slip a read
+ * past the prefix check. Resolving BOTH sides to their real, long-normalized,
+ * junction-followed form (the "resolve first, then compare" order — comparing
+ * before resolution is the classic bypass, cf. CVE-2022-41722) and comparing them
+ * in the same canonical namespace closes both holes. Because both come from the
+ * same resolver they share the extended-length "\\?\" prefix and OS-native
+ * backslash separators; the compare is case-insensitive per NTFS with a strict
+ * separator/NUL boundary so "C:\root2" never matches root "C:\root". Fail-closed:
+ * any canonicalization failure (including a non-existent/unopenable path) → false,
+ * with no lexical/ANSI fallback. */
 bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     if (!root_path || !abs_path) {
         return false;
     }
-    char real_root[CBM_SZ_4K];
-    char real_file[CBM_SZ_4K];
-#ifdef _WIN32
-    if (_fullpath(real_root, root_path, sizeof(real_root)) &&
-        _fullpath(real_file, abs_path, sizeof(real_file))) {
-        cbm_normalize_path_sep(real_root);
-        cbm_normalize_path_sep(real_file);
-#else
-    if (realpath(root_path, real_root) && realpath(abs_path, real_file)) {
-#endif
+    char *real_root = cbm_real_path_final(root_path);
+    char *real_file = cbm_real_path_final(abs_path);
+    bool within = false;
+    if (real_root && real_file) {
         size_t root_len = strlen(real_root);
-        if (strncmp(real_file, real_root, root_len) == 0 &&
-            (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
-            return true;
+        /* Ignore a trailing separator on the resolved root (e.g. a volume root
+         * "\\?\C:\") so the boundary test below is well-defined. */
+        while (root_len > 0 && (real_root[root_len - 1] == '\\' || real_root[root_len - 1] == '/')) {
+            root_len--;
+        }
+        if (root_len > 0 &&
+#ifdef _WIN32
+            /* NTFS is case-insensitive: compare case-folded so a differently-cased
+             * spelling of the root cannot look like an escape (and a legitimate
+             * differently-cased file is not falsely refused). */
+            _strnicmp(real_file, real_root, root_len) == 0 &&
+#else
+            strncmp(real_file, real_root, root_len) == 0 &&
+#endif
+            (real_file[root_len] == '\\' || real_file[root_len] == '/' ||
+             real_file[root_len] == '\0')) {
+            within = true;
         }
     }
-    return false;
+    free(real_root);
+    free(real_file);
+    return within;
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,

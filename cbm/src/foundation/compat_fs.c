@@ -533,6 +533,58 @@ char *cbm_canonicalize_existing_path(const char *path) {
     return result;
 }
 
+char *cbm_real_path_final(const char *path) {
+    /* #437: junction/symlink- and 8.3-resolving canonicalizer for the MCP
+     * path-containment guard (cbm_path_within_root). The guard previously
+     * canonicalized with the MAX_PATH-bound ANSI _fullpath, which (1) returns NULL
+     * past 260 chars — refusing legitimate reads inside a deep repo root — and (2)
+     * is purely lexical, so a junction/symlink planted under the root would slip a
+     * read past the prefix check, and an 8.3 short-name spelling of the root would
+     * too. GetFinalPathNameByHandleW on an opened handle resolves reparse points to
+     * their real target and normalizes 8.3 → long names, closing both bypasses; it
+     * is long-path-safe (no MAX_PATH bound) and the wide handle open goes through
+     * cbm_utf8_to_wide_path's "\\?\" widening. Fail-closed: NULL on any failure. */
+    if (!path) {
+        return NULL;
+    }
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
+    if (!wpath) {
+        return NULL;
+    }
+    /* dwDesiredAccess=0: metadata-only query, so a read-restricted or exclusively
+     * held file still resolves. FILE_FLAG_BACKUP_SEMANTICS is required to obtain a
+     * handle to a directory (the root side is a directory). Share every mode so the
+     * probe never contends with a concurrent open. */
+    HANDLE h = CreateFileW(wpath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    /* Zero-size probe returns the required length INCLUDING the null terminator. */
+    DWORD need = GetFinalPathNameByHandleW(h, NULL, 0, flags);
+    if (need == 0) {
+        CloseHandle(h);
+        return NULL;
+    }
+    wchar_t *buf = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
+    if (!buf) {
+        CloseHandle(h);
+        return NULL;
+    }
+    /* On success the return value EXCLUDES the null terminator, so got < need. */
+    DWORD got = GetFinalPathNameByHandleW(h, buf, need, flags);
+    CloseHandle(h);
+    if (got == 0 || got >= need) {
+        free(buf);
+        return NULL;
+    }
+    char *u8 = cbm_wide_to_utf8(buf);
+    free(buf);
+    return u8;
+}
+
 int cbm_rmdir(const char *path) {
     /* #412: extended-length widen for deep store-family directories. */
     wchar_t *wpath = cbm_utf8_to_wide_path(path);
@@ -813,6 +865,17 @@ char *cbm_canonicalize_existing_path(const char *path) {
      * '.'/'..', and (with a NULL buffer, POSIX.1-2008) returns a malloc'd string
      * the caller frees — matching this wrapper's contract. It is not MAX_PATH-
      * bound; the Windows counterpart carries the #432 long-path work. */
+    if (!path) {
+        return NULL;
+    }
+    return realpath(path, NULL);
+}
+
+char *cbm_real_path_final(const char *path) {
+    /* POSIX realpath already resolves symlinks and '.'/'..' to the real final
+     * target (the junction/symlink resolution the Windows #437 counterpart obtains
+     * via GetFinalPathNameByHandleW), requires the path to exist, and mallocs the
+     * result with a NULL buffer. Fail-closed NULL on failure. Not MAX_PATH-bound. */
     if (!path) {
         return NULL;
     }
