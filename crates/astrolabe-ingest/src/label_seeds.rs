@@ -124,12 +124,18 @@ where
 {
     let actor = actor.into();
 
+    // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): split
+    // the label_propagation phase into artifact read / seed derive / projection /
+    // edge extraction / graph persist / propagation (the propagation flood is
+    // further sub-timed inside `propagate_labels`). Silent by default.
+    let mut timing = astrolabe_kernel::KernelPhaseTiming::start("label_propagation_wrap");
     let artifact = read_persisted_kernel_artifact(vault, scope_id)?;
     let kernel_seeds = artifact
         .as_ref()
         .map(|artifact| kernel_member_seeds(artifact, scope_id))
         .unwrap_or_default();
     let kernel_member_seed_count = kernel_seeds.len();
+    timing.lap("read_artifact");
 
     // Merge, deduplicating on (label, symbol_id). Kernel seeds are added first so
     // they win any collision with a caller seed on the same (label, symbol);
@@ -155,6 +161,7 @@ where
     } else {
         None
     };
+    timing.lap("seed_derive");
 
     // Only materialize the projection when there is at least one seed: a seed set
     // implies a real graph (kernel members come from it), and an empty scope must
@@ -163,11 +170,16 @@ where
         Vec::new()
     } else {
         let csr = ensure_graph_projection_csr(vault, GraphProjectionKind::KernelGraph, options)?;
-        label_graph_edges_from_csr(&csr)
+        timing.lap("projection");
+        let edges = label_graph_edges_from_csr(&csr);
+        timing.lap("edges");
+        edges
     };
 
     let persist = persist_label_graph(vault, &seeds, &edges, &[], actor.clone())?;
+    timing.lap("persist_graph");
     let propagation = propagate_labels_over_vault(vault, config, actor)?;
+    timing.lap("propagate");
 
     Ok(IndexTimeLabelReport {
         scope_id: scope_id.to_string(),

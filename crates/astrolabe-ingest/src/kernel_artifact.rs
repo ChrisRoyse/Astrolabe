@@ -170,10 +170,21 @@ pub fn build_and_persist_kernel<C>(
 where
     C: Clock,
 {
+    // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): split
+    // the kernel_artifact phase into projection materialization vs graph adapter
+    // vs the kernel algorithm (`build_kernel`, itself sub-timed) vs persist, so
+    // the #443 matrix separates data-plane cost from algorithm cost. build_kernel
+    // emits its own finer `phase=kernel_artifact` sub-stages.
+    let mut timing = astrolabe_kernel::KernelPhaseTiming::start("kernel_artifact_wrap");
     let csr = ensure_graph_projection_csr(vault, GraphProjectionKind::KernelGraph, options)?;
+    timing.lap("projection");
     let graph = kernel_graph_from_projection_csr(&csr, anchor_trust)?;
+    timing.lap("adapter");
     let artifact = build_kernel(&graph, scope_id, config)?;
-    persist_kernel_artifact(vault, &artifact)
+    timing.lap("build_kernel");
+    let report = persist_kernel_artifact(vault, &artifact)?;
+    timing.lap("persist");
+    Ok(report)
 }
 
 /// Persists a computed [`KernelArtifact`] to the Kernel CF and reads it back.

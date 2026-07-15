@@ -533,6 +533,11 @@ fn build_kernel_inner(
     config: &KernelBuildConfig,
     cached_betweenness_permille: Option<&[u64]>,
 ) -> Result<KernelArtifact> {
+    // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): the
+    // kernel_artifact cold-index phase's internal breakdown so the #443 3-scale
+    // matrix can attribute its 83s@n=45,557 to a real sub-stage. Silent by
+    // default; carries no behaviour.
+    let mut timing = crate::KernelPhaseTiming::start("kernel_artifact");
     config.validate()?;
     if graph.node_count() == 0 {
         return Err(DomainError::new(
@@ -543,6 +548,7 @@ fn build_kernel_inner(
     }
     let indexed = graph.compile()?;
     let n = indexed.len();
+    timing.lap("compile");
 
     let betweenness = match cached_betweenness_permille {
         Some(cached) if cached.len() == n => crate::betweenness::BetweennessResult {
@@ -558,12 +564,14 @@ fn build_kernel_inner(
             config.betweenness_sample_seed,
         ),
     };
+    timing.lap("betweenness");
     let groundedness = score_groundedness(
         &indexed,
         config.groundedness_hop_limit,
         config.groundedness_freq_cap,
         config.groundedness_freq_bonus_permille,
     );
+    timing.lap("groundedness");
 
     let max_degree = (0..n).map(|index| indexed.degree(index)).max().unwrap_or(0);
     let score_permille: Vec<u64> = (0..n)
@@ -591,15 +599,19 @@ fn build_kernel_inner(
             .then_with(|| indexed.id(left).cmp(&indexed.id(right)))
     });
     let candidates: BTreeSet<usize> = ranked.into_iter().take(candidate_count).collect();
+    timing.lap("score_rank");
 
     let fvs = approximate_directed_fvs(&indexed, &candidates, &score_usize);
     let mut members: BTreeSet<usize> = fvs.members.iter().copied().collect();
     let fvs_count = members.len();
+    timing.lap("fvs");
 
     // Recall gate over the full graph; refine when below the gate.
     let mut recall = measure_recall(&indexed, &members, config.recall_answer_radius_hops);
+    timing.lap("recall_gate");
     let support = if recall.permille < config.recall_min_permille {
         let added = refine_kernel_with_recall_support(&indexed, &mut members, config)?;
+        timing.lap("refine");
         recall = measure_recall(&indexed, &members, config.recall_answer_radius_hops);
         recall.gated = recall.permille >= config.recall_min_permille;
         if !recall.gated {
@@ -650,6 +662,10 @@ fn build_kernel_inner(
                 .to_string(),
         )
     };
+
+    // Member-row assembly + members-hash + trust rollup (and, on the refine
+    // branch, the post-refine recall re-measure above) attribute here.
+    timing.lap("assemble");
 
     Ok(KernelArtifact {
         schema: KERNEL_ARTIFACT_SCHEMA.to_string(),
@@ -709,15 +725,27 @@ pub fn refine_kernel_with_recall_support(
     config: &KernelBuildConfig,
 ) -> Result<BTreeSet<usize>> {
     let n = indexed.len();
+    let total = n as u64;
     let radius = config.recall_answer_radius_hops;
     let mut added = BTreeSet::new();
 
     loop {
-        let recall = measure_recall(indexed, members, radius);
-        if recall.permille >= config.recall_min_permille {
+        // #443 redundant-recomputation removal (output-equivalent by
+        // construction): the gate check and the uncovered-set derivation both
+        // need `coverage(indexed, members, radius)`. The prior code called
+        // `measure_recall` — which itself recomputes `coverage` — and then
+        // called `coverage` a second time with the *identical* arguments in the
+        // same iteration. `coverage` is a deterministic pure function of
+        // (members, radius); computing it once and deriving both the recall
+        // permille and the uncovered set from that single vector yields byte-
+        // identical members (proven by the persisted `members_hash` /
+        // `kernel.json`), halving the outer coverage BFS per refine sweep.
+        let covered = coverage(indexed, members, radius);
+        let recalled = covered.iter().filter(|&&flag| flag).count() as u64;
+        let permille = recalled.saturating_mul(1000).checked_div(total).unwrap_or(0);
+        if permille >= config.recall_min_permille {
             break;
         }
-        let covered = coverage(indexed, members, radius);
         let uncovered: Vec<usize> = (0..n).filter(|&index| !covered[index]).collect();
         if uncovered.is_empty() {
             return Err(DomainError::new(
