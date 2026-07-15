@@ -1763,6 +1763,12 @@ unsafe extern "C" {
     ) -> *mut ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    pub fn cbm_mcp_index_repository_supervised_strict(
+        srv: *mut cbm_mcp_server_t,
+        args: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     pub fn cbm_mcp_server_evict_idle(srv: *mut cbm_mcp_server_t, timeout_s: ::std::os::raw::c_int);
 }
 unsafe extern "C" {
