@@ -1061,8 +1061,9 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
              * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
             char bak_path[MCP_FIELD_SIZE];
             snprintf(bak_path, sizeof(bak_path), "%s.corrupt", path);
-            cbm_unlink(bak_path); /* clear any prior backup so rename succeeds on Windows */
-            if (rename(path, bak_path) != 0) {
+            /* #415: cbm_rename_replace is long-path safe (deep store) and replaces an
+             * existing .corrupt backup atomically (MOVEFILE_REPLACE_EXISTING). */
+            if (cbm_rename_replace(path, bak_path) != 0) {
                 cbm_unlink(path); /* rename failed (e.g. cross-device) — fall back to delete */
             }
             char wal_path[MCP_FIELD_SIZE];
@@ -3969,7 +3970,7 @@ static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bo
     char quarantine_path[CBM_SZ_1K];
     supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker");
     supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine");
-    (void)remove(marker_path);
+    (void)cbm_unlink(marker_path);
     /* Start the quarantine list empty (truncate any stale file). */
     FILE *qinit = cbm_fopen(quarantine_path, "wb");
     if (qinit) {
@@ -4031,7 +4032,7 @@ static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bo
             const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
             int sus_n = 0;
             char **suspects = supervisor_read_suspects(marker_path, &sus_n);
-            (void)remove(marker_path); /* fresh journal for the next re-run */
+            (void)cbm_unlink(marker_path); /* fresh journal for the next re-run */
             if (!suspects || sus_n == 0) {
                 supervisor_free_suspects(suspects, sus_n);
                 cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
@@ -4087,7 +4088,7 @@ static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bo
     }
     supervisor_free_suspects(prev_suspects, prev_n);
 
-    (void)remove(marker_path); /* marker no longer needed */
+    (void)cbm_unlink(marker_path); /* marker no longer needed */
 
     /* Terminal best-effort-partial: the loop exited WITHOUT a clean run (cap
      * exhausted, or an unattributable failure) but at least one file was already
@@ -4111,7 +4112,7 @@ static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bo
         cbm_index_worker_result_free(&wrp);
     }
 
-    (void)remove(quarantine_path);
+    (void)cbm_unlink(quarantine_path);
     supervisor_invalidate_store(srv);
 
     if (resp) {

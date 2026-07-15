@@ -167,7 +167,7 @@ static int write_file_all(const char *path, const char *data) {
     int flush_rc = fflush(f);
     int close_rc = fclose(f);
     if (wrote != len || flush_rc != 0 || close_rc != 0) {
-        (void)remove(path);
+        (void)cbm_unlink(path);
         return -1;
     }
     return 0;
@@ -315,7 +315,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     worker_tmp_path(resp_path, sizeof(resp_path), pid, ".response");
     worker_tmp_path(log_path, sizeof(log_path), pid, ".log");
     worker_tmp_path(args_path, sizeof(args_path), pid, ".args.json");
-    (void)remove(resp_path); /* clear any stale file */
+    (void)cbm_unlink(resp_path); /* clear any stale file */
 
     /* Hand the tool JSON to the worker via --args-file, the public CLI argument
      * contract. A raw-JSON argv token is REFUSED fail-closed by the Rust host
@@ -407,9 +407,9 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
 #endif
 
     if (run_rc != 0) {
-        (void)remove(resp_path);
-        (void)remove(args_path);
-        (void)remove(log_path); /* empty/partial log from a failed spawn — nothing to keep */
+        (void)cbm_unlink(resp_path);
+        (void)cbm_unlink(args_path);
+        (void)cbm_unlink(log_path); /* empty/partial log from a failed spawn — nothing to keep */
         cbm_log_warn("index.supervisor.spawn_failed", "action", "degrade_in_process");
         return -1;
     }
@@ -437,8 +437,8 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
         result->response = slurp_file(resp_path);
     }
 #endif
-    (void)remove(resp_path);
-    (void)remove(args_path);
+    (void)cbm_unlink(resp_path);
+    (void)cbm_unlink(args_path);
 
     char sig[16];
     char exit_buf[16];
@@ -459,7 +459,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * msg=prof pass/sub-phase report is only written there, and deleting it on
      * success made profiling clean runs impossible. Keep it and say where it is. */
     if (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
-        (void)remove(log_path);
+        (void)cbm_unlink(log_path);
     } else if (r.outcome == CBM_PROC_CLEAN) {
         cbm_log_info("index.supervisor.profile_log", "log", log_path);
     } else {

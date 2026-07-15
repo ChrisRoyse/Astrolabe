@@ -50,6 +50,13 @@ int cbm_unlink(const char *path);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+/* Atomically rename old_path -> new_path, replacing new_path if it already
+ * exists. Long-path safe on Windows (MoveFileExW with extended-length "\\?\"
+ * widening via cbm_utf8_to_wide_path, MOVEFILE_REPLACE_EXISTING to match POSIX
+ * rename's replace semantics); POSIX rename() already replaces and is not
+ * MAX_PATH-bound. Returns 0 on success, non-zero on failure. */
+int cbm_rename_replace(const char *old_path, const char *new_path);
+
 /* Open a file by UTF-8 path.
  * On Windows, converts to wide-char and calls _wfopen so paths with
  * non-ASCII characters (accents, CJK, etc.) are handled correctly.

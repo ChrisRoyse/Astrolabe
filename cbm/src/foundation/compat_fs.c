@@ -398,7 +398,16 @@ FILE *cbm_fopen(const char *path, const char *mode) {
 
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* #415: extended-length widen so a directory whose absolute path exceeds
+     * MAX_PATH (260) — e.g. <deep-store>/logs for the index-worker plumbing — can
+     * actually be created instead of failing at _wmkdir. Without this the worker
+     * args/log/exit-capture writes under a deep store fail closed at the missing
+     * parent dir (ASTRO_SHADOW_INDEX_PASS_CRASHED outcome=spawn_failed). Short
+     * paths (< 240 chars) widen byte-identically to the historical behavior.
+     * On a "\\?\"-prefixed path the component walk below issues a few harmless
+     * _wmkdir calls on the prefix bytes ("\", "\\?", <drive>) whose errors are
+     * ignored exactly like every other intermediate component. */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return false;
     }
@@ -449,6 +458,25 @@ int cbm_rmdir(const char *path) {
     int ret = _wrmdir(wpath);
     free(wpath);
     return ret;
+}
+
+int cbm_rename_replace(const char *old_path, const char *new_path) {
+    /* #415: extended-length widen both paths so a deep store-family atomic swap
+     * (dump/import temp -> final, corrupt-db -> .corrupt backup) is not
+     * MAX_PATH-bound. MOVEFILE_REPLACE_EXISTING matches POSIX rename's replace
+     * semantics (plain Win32 rename/MoveFile FAILS when the destination exists);
+     * MOVEFILE_WRITE_THROUGH flushes the rename to disk for crash safety. */
+    wchar_t *wold = cbm_utf8_to_wide_path(old_path);
+    wchar_t *wnew = cbm_utf8_to_wide_path(new_path);
+    if (!wold || !wnew) {
+        free(wold);
+        free(wnew);
+        return CBM_NOT_FOUND;
+    }
+    BOOL ok = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    free(wold);
+    free(wnew);
+    return ok ? 0 : CBM_NOT_FOUND;
 }
 
 /* Build a properly-quoted Windows command line from an argv array.
@@ -692,6 +720,12 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_rename_replace(const char *old_path, const char *new_path) {
+    /* POSIX rename() already replaces an existing destination and is not
+     * MAX_PATH-bound; the Windows counterpart carries the #415 long-path work. */
+    return rename(old_path, new_path);
 }
 
 int cbm_exec_no_shell(const char *const *argv) {

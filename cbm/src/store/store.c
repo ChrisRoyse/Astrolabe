@@ -63,6 +63,7 @@ enum {
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h" /* cbm_unlink / cbm_rename_replace — #415 long-path-safe dump swap */
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
@@ -1051,7 +1052,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     /* Write to temp file for atomic swap */
     char tmp_path[CBM_SZ_1K];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
+    (void)cbm_unlink(tmp_path);
 
     sqlite3 *dest_db = NULL;
     int rc = sqlite3_open(tmp_path, &dest_db);
@@ -1064,7 +1065,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (!bk) {
         store_set_error(s, "dump: backup init failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1074,7 +1075,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (rc != SQLITE_DONE) {
         store_set_error(s, "dump: backup step failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1084,9 +1085,9 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
     /* Atomic rename: old WAL/SHM become stale and get recreated by
      * the next reader's configure_pragmas call. */
-    if (rename(tmp_path, dest_path) != 0) {
+    if (cbm_rename_replace(tmp_path, dest_path) != 0) {
         store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
