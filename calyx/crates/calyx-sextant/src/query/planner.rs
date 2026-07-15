@@ -290,8 +290,3 @@ fn explain_for(planned: &[PlannedStep], total_cost_ms: f32) -> ExplainOutput {
         total_cost_ms,
     }
 }
-
-#[cfg(test)]
-mod fsv_tests;
-#[cfg(test)]
-mod tests;

@@ -203,20 +203,6 @@ impl ShadowVault {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn append_shadow_wal_marker(&mut self, bytes: &[u8]) -> Result<(), CalyxError> {
-        use std::io::Write;
-
-        let path = shadow_wal_path(&self.calyx.root);
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|error| vault_sync(format!("open shadow WAL {}: {error}", path.display())))?;
-        file.write_all(bytes)
-            .map_err(|error| vault_sync(format!("append shadow WAL: {error}")))?;
-        file.sync_all()
-            .map_err(|error| vault_sync(format!("sync shadow WAL: {error}")))
-    }
 }
 
 pub(crate) fn read_shadow_manifest(vault: &Path) -> Result<ShadowManifestReadback, CalyxError> {

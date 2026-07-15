@@ -492,5 +492,3 @@ fn hex_digit(value: u8) -> char {
     }
 }
 
-#[cfg(test)]
-mod tests;

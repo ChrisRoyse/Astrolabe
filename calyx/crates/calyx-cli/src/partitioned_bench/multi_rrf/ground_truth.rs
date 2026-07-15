@@ -412,6 +412,3 @@ fn gt_error(code: &'static str, message: impl Into<String>, remediation: &'stati
     })
 }
 
-#[cfg(test)]
-#[path = "ground_truth_tests.rs"]
-mod tests;

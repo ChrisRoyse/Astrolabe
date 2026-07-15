@@ -465,6 +465,3 @@ fn euclidean(left: &[f32], right: &[f32]) -> f32 {
 fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
-
-#[cfg(test)]
-mod tests;

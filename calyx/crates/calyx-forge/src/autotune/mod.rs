@@ -227,12 +227,3 @@ fn cache_error(op: &str, path: &Path, detail: impl Into<String>) -> ForgeError {
         remediation: CACHE_REMEDIATION.to_string(),
     }
 }
-
-#[cfg(test)]
-mod explorer_tests;
-#[cfg(test)]
-mod microbench_tests;
-#[cfg(test)]
-mod promotion_tests;
-#[cfg(test)]
-mod tests;

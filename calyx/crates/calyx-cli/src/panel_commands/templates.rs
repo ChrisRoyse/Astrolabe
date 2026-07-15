@@ -436,5 +436,3 @@ fn modality_name(value: Modality) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests;

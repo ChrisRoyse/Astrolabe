@@ -1,11 +1,7 @@
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-#[cfg(test)]
-use calyx_core::Constellation;
 use calyx_core::{CalyxError, CxId, SlotId, SlotVector};
 use calyx_sextant::index::{
     DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, IndexSearchHit, SextantIndex, ranked,
@@ -29,61 +25,6 @@ impl DenseSlotRows {
     pub(super) fn len(&self) -> usize {
         self.rows.len()
     }
-}
-
-#[cfg(test)]
-pub(super) fn slots(docs: &BTreeMap<CxId, Constellation>) -> Vec<SlotId> {
-    let mut slots = docs
-        .values()
-        .flat_map(|cx| {
-            cx.slots.iter().filter_map(|(slot, vector)| {
-                matches!(vector, SlotVector::Dense { .. }).then_some(*slot)
-            })
-        })
-        .collect::<Vec<_>>();
-    slots.sort();
-    slots.dedup();
-    slots
-}
-
-#[cfg(test)]
-pub(super) fn collect_slot(
-    docs: &BTreeMap<CxId, Constellation>,
-    target: SlotId,
-) -> CliResult<DenseSlotRows> {
-    let mut out: Option<DenseSlotRows> = None;
-    for cx in docs.values() {
-        let Some(vector) = cx.slots.get(&target) else {
-            continue;
-        };
-        let SlotVector::Dense { dim, data } = vector else {
-            continue;
-        };
-        validate_dense(target, cx.cx_id, *dim, data)?;
-        let entry = out.get_or_insert_with(|| DenseSlotRows {
-            dim: *dim,
-            rows: Vec::new(),
-        });
-        if entry.dim != *dim {
-            return Err(stale(format!(
-                "slot {target} has mixed dense dims: {} and {dim}",
-                entry.dim
-            )));
-        }
-        entry.rows.push((cx.cx_id, data.clone()));
-    }
-    out.ok_or_else(|| stale(format!("slot {target} has no dense rows")))
-}
-
-#[cfg(test)]
-pub(super) fn write(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    rows: DenseSlotRows,
-    base_seq: u64,
-) -> CliResult<SearchIndexEntry> {
-    write_with_progress(vault_dir, root, slot, rows, base_seq, |_| Ok(()))
 }
 
 pub(super) fn write_with_progress<F>(

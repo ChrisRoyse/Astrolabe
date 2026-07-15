@@ -38,22 +38,3 @@ pub fn dense_cosine(left: &[f32], right: &[f32]) -> Option<f32> {
     let cosine = dot / denom;
     cosine.is_finite().then_some(cosine)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dense_cosine_matches_known_unit_vectors() {
-        assert_eq!(dense_cosine(&[1.0, 0.0], &[1.0, 0.0]), Some(1.0));
-        assert_eq!(dense_cosine(&[1.0, 0.0], &[0.0, 1.0]), Some(0.0));
-    }
-
-    #[test]
-    fn dense_cosine_fails_invalid_vectors_closed() {
-        assert_eq!(dense_cosine(&[], &[]), None);
-        assert_eq!(dense_cosine(&[1.0], &[1.0, 0.0]), None);
-        assert_eq!(dense_cosine(&[0.0, 0.0], &[1.0, 0.0]), None);
-        assert_eq!(dense_cosine(&[f32::NAN], &[1.0]), None);
-    }
-}

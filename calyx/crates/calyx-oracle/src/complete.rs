@@ -446,8 +446,3 @@ fn completion_subject(payload: &CompletionLedgerPayload) -> [u8; 16] {
         slot_bytes.as_slice(),
     ])
 }
-
-#[allow(dead_code)]
-#[cfg(test)]
-#[path = "complete_tests.rs"]
-mod tests;

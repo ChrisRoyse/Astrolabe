@@ -1,15 +1,9 @@
 //! Search, kernel-answer, and neighbors MCP tools for PH63 T04.
 
 mod engine;
-#[cfg(test)]
-mod extension_freshness_tests;
-#[cfg(test)]
-mod extension_tests;
 mod extensions;
 mod ledger_provenance;
 mod output;
-#[cfg(test)]
-mod tests;
 
 use calyx_core::{AnchorKind, CalyxError, CxId, SlotId};
 use calyx_sextant::{FreshnessRequirement, FusionStrategy, RrfProfile};

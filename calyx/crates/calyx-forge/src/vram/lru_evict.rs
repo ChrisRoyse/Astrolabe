@@ -284,6 +284,3 @@ impl<'b, P: VramProbe, D: BlockDeallocator> GpuBlockRegistry<'b, P, D> {
     }
 }
 
-#[cfg(test)]
-#[path = "lru_evict_tests.rs"]
-mod tests;

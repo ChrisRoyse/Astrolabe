@@ -10,8 +10,6 @@ use calyx_ward::GuardProfile;
 use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
 
-#[cfg(test)]
-use super::GUARD_TAU;
 use super::GuardChoice;
 use super::support::guard_cosine;
 
@@ -133,18 +131,6 @@ pub(super) fn prefilter_in_region_candidates_traced(
         }
     }
     kept
-}
-
-#[cfg(test)]
-pub(super) fn prefilter_in_region_candidates(
-    hits: Vec<Hit>,
-    query_vectors: &[(SlotId, SlotVector)],
-) -> Vec<Hit> {
-    hits.into_iter()
-        .filter(|hit| {
-            prefilter_best_score(hit, query_vectors).is_some_and(|score| score >= GUARD_TAU)
-        })
-        .collect()
 }
 
 pub(super) fn apply_in_region_guard_traced(

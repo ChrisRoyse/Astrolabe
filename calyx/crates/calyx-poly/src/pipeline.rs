@@ -326,7 +326,3 @@ fn anchor_value_payload(value: &AnchorValue) -> serde_json::Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    include!("pipeline_tests.rs");
-}

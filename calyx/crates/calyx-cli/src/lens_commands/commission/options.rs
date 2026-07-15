@@ -288,30 +288,6 @@ impl CommissionFlags {
     }
 }
 
-#[cfg(test)]
-impl CommissionFlags {
-    pub(super) fn test_flags(runtime: CommissionRuntime) -> Self {
-        Self {
-            hf: "test/model".to_string(),
-            runtime,
-            home: None,
-            out: None,
-            name: None,
-            endpoint: None,
-            dim: None,
-            license: None,
-            non_commercial: false,
-            pooling: "mean".to_string(),
-            norm: "unit".to_string(),
-            norm_explicit: false,
-            quant_target: "avx2".to_string(),
-            max_batch: None,
-            allow_batch_1: None,
-            skip_batch_preflight: None,
-            preflight_cap: None,
-        }
-    }
-}
 
 fn require_nonempty(value: Option<String>, flag: &str) -> CliResult<String> {
     let value = value.ok_or_else(|| CliError::usage(format!("{flag} is required")))?;
@@ -362,17 +338,3 @@ fn sanitize_path_token(raw: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn onnx_colbert_commissions_as_fp16_by_default() {
-        assert_eq!(CommissionRuntime::OnnxColbert.default_dtype(), "f16");
-    }
-
-    #[test]
-    fn qwen3_commissions_as_fp16_by_default() {
-        assert_eq!(CommissionRuntime::FastembedQwen3.default_dtype(), "f16");
-    }
-}

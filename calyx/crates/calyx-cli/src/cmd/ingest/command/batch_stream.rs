@@ -16,55 +16,8 @@ use super::*;
 
 type BatchSummaryEmitter<'a> = &'a mut dyn FnMut(&BatchIngestSummary) -> CliResult<()>;
 
-#[cfg(test)]
-pub(crate) fn ingest_batch_streaming(
-    resolved: &ResolvedVault,
-    path: &std::path::Path,
-) -> CliResult<BatchIngestSummary> {
-    ingest_batch_streaming_with_output(resolved, path, IngestOutput::Summary)
-}
 
-#[cfg(test)]
-pub(crate) fn ingest_batch_streaming_with_output(
-    resolved: &ResolvedVault,
-    path: &std::path::Path,
-    output: IngestOutput,
-) -> CliResult<BatchIngestSummary> {
-    let validation = validate_batch_file(path)?;
-    if validation.row_count == 0 {
-        return Ok(BatchIngestSummary::empty());
-    }
-    ingest_validated_batch_streaming_with_output(
-        resolved,
-        path,
-        output,
-        validation.row_count,
-        IngestGpuRoute::cold_workers_allowed(),
-        None,
-        None,
-    )
-}
 
-#[cfg(test)]
-pub(crate) fn ingest_batch_streaming_with_summary_emitter(
-    resolved: &ResolvedVault,
-    path: &std::path::Path,
-    summary_emitter: &mut dyn FnMut(&BatchIngestSummary) -> CliResult<()>,
-) -> CliResult<BatchIngestSummary> {
-    let validation = validate_batch_file(path)?;
-    if validation.row_count == 0 {
-        return Ok(BatchIngestSummary::empty());
-    }
-    ingest_validated_batch_streaming_with_output(
-        resolved,
-        path,
-        IngestOutput::Summary,
-        validation.row_count,
-        IngestGpuRoute::cold_workers_allowed(),
-        Some(summary_emitter),
-        None,
-    )
-}
 
 pub(crate) fn ingest_validated_batch_streaming_with_output(
     resolved: &ResolvedVault,

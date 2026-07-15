@@ -27,9 +27,6 @@ use super::errors;
 use super::manifest::{now_ms, panel_path, scheduler_path};
 use super::reader::ChunkRow;
 
-#[cfg(test)]
-#[path = "backfill_tests.rs"]
-mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackfillMode {

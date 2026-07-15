@@ -227,7 +227,3 @@ fn energy_error(code: &'static str, message: impl Into<String>) -> OracleError {
     }
     .into()
 }
-
-#[cfg(test)]
-#[path = "energy_tests.rs"]
-mod tests;

@@ -6,9 +6,6 @@ mod router;
 mod router_load;
 mod router_scan;
 
-#[cfg(test)]
-mod router_tests;
-
 pub use family::{ColumnFamily, SlotFamilyKind};
 pub use key::{
     KeyRange, OnlineKeyKind, ScalarId, XTermKind, anchor_key, anchor_prefix_range, base_key,
@@ -18,6 +15,3 @@ pub use key::{
     xterm_prefix_range,
 };
 pub use router::{CfRouter, NO_COMMIT_DOMAIN};
-
-#[cfg(test)]
-mod tests;

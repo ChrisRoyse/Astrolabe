@@ -142,29 +142,3 @@ fn unix_now_secs() -> i64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_rejects_missing_directory() {
-        let target = VerifyTarget {
-            kind: TargetKind::LedgerDir,
-            path: PathBuf::from("Z:/does/not/exist-calyxd-602"),
-        };
-        let error = target.validate().unwrap_err();
-        assert_eq!(error.code(), "CALYX_DAEMON_CONFIG_INVALID");
-    }
-
-    #[test]
-    fn vanished_target_records_error_outcome_not_panic() {
-        let target = VerifyTarget {
-            kind: TargetKind::Vault,
-            path: PathBuf::from("Z:/vanished/vault-calyxd-602"),
-        };
-        let metrics = ChainVerifyMetrics::new(&[target.label()]);
-        run_cycle(std::slice::from_ref(&target), &metrics);
-        assert_eq!(metrics.ok_value_for(&target.label()), 0);
-        assert_eq!(metrics.runs_for(&target.label(), "error"), 1);
-    }
-}

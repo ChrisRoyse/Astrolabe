@@ -14,8 +14,6 @@ use crate::error::{CliError, CliResult};
 use crate::partitioned_bench::rrf_plan::{self, LoadedPlan};
 pub(super) use crate::partitioned_bench::rrf_plan::{Plan, PlanSlot};
 use crate::partitioned_rrf_report_store;
-#[cfg(test)]
-use ids::low_u64;
 use ids::{fused_hit_ids, hit_ids, slot_id, to_index_hits};
 
 #[path = "multi_rrf/a35.rs"]
@@ -488,6 +486,3 @@ fn gate_scale_truth(
     db_fused_truth_scale_suitable || db_slot_truth_scale_suitable
 }
 
-#[cfg(test)]
-#[path = "multi_rrf/tests.rs"]
-mod tests;

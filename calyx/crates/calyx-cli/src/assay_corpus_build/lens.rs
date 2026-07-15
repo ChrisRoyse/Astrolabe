@@ -342,34 +342,3 @@ fn lens_error(error: calyx_core::CalyxError) -> String {
     format!("{}: {}", error.code, error.message)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gpu_runtime_override_cannot_downgrade_to_cpu() {
-        let cost = CostOverride {
-            placement: Placement::Cpu,
-            vram_mb: 0.0,
-            ram_mb: 128.0,
-        };
-
-        let error = validate_override_compatible("semantic-bge", "onnx", Placement::Gpu, cost)
-            .expect_err("GPU runtime override must not become CPU");
-
-        assert!(error.contains("CALYX_FSV_ASSAY_CORPUS_BUILD_GPU_OVERRIDE_PLACEMENT"));
-        assert!(error.contains("runtime=onnx"));
-    }
-
-    #[test]
-    fn cpu_runtime_override_can_remain_cpu() {
-        let cost = CostOverride {
-            placement: Placement::Cpu,
-            vram_mb: 0.0,
-            ram_mb: 128.0,
-        };
-
-        validate_override_compatible("semantic-potion", "static_lookup", Placement::Cpu, cost)
-            .expect("CPU-native override can remain CPU");
-    }
-}

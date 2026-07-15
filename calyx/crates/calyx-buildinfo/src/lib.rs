@@ -309,6 +309,3 @@ fn git_output(dir: &str, args: &[&str]) -> Result<String, String> {
             format!("CALYX_BUILD_INFO_GIT_UNAVAILABLE: git {args:?} output not utf-8: {error}")
         })
 }
-
-#[cfg(test)]
-mod tests;

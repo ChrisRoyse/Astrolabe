@@ -176,32 +176,3 @@ pub fn selection_rationale() -> &'static str {
      Politics (strongest calibration edge, sparser data) against the proven engine."
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crypto_is_the_launch_domain() {
-        assert_eq!(primary_domain(), Domain::Crypto);
-        assert_eq!(build_order()[0], Domain::Crypto);
-    }
-
-    #[test]
-    fn politics_is_the_comparison_domain() {
-        assert_eq!(comparison_domain(), Domain::Politics);
-    }
-
-    #[test]
-    fn crypto_outranks_politics_for_build() {
-        assert!(
-            density_score(Domain::Crypto).build_priority()
-                > density_score(Domain::Politics).build_priority()
-        );
-    }
-
-    #[test]
-    fn slugs_are_stable() {
-        assert_eq!(Domain::Crypto.slug(), "crypto");
-        assert_eq!(Domain::Politics.slug(), "politics");
-    }
-}

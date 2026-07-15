@@ -28,8 +28,3 @@ uuid.workspace = true
 # with CALYX_WARD_LENS_FEATURE_DISABLED.
 default = []
 onnx-lens = ["dep:ort", "dep:tokenizers"]
-
-[dev-dependencies]
-blake3.workspace = true
-calyx-assay = { path = "../calyx-assay" }
-proptest.workspace = true

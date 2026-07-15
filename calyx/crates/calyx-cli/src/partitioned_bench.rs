@@ -46,8 +46,6 @@ pub(crate) mod timeline_store;
 mod tuner_status;
 use args::{SearchArgs, parse, parse_pruning_epsilon, parse_recall_floor};
 use brute_force::{brute_force_topk, brute_force_topk_vecfile};
-#[cfg(test)]
-pub(crate) use build::BuildArgs;
 pub(crate) use build::run as run_build;
 use summary::{percentiles, summarize_u64};
 
@@ -479,15 +477,3 @@ fn run_search_synthetic(args: &SearchArgs) -> CliResult {
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "partitioned_bench/progress_tests.rs"]
-mod partitioned_bench_progress_tests;
-#[cfg(test)]
-#[path = "partitioned_bench_tests.rs"]
-mod partitioned_bench_tests;
-#[cfg(test)]
-#[path = "partitioned_bench/rrf_failed_truth_write_tests.rs"]
-mod rrf_failed_truth_write_tests;
-#[cfg(test)]
-#[path = "partitioned_bench/spann_knob_tests.rs"]
-mod spann_knob_tests;

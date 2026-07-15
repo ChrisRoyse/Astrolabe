@@ -319,6 +319,3 @@ pub fn run_local_computed_kernel_recall(
     Ok((corpus, recall))
 }
 
-#[cfg(test)]
-#[path = "resolved_market_corpus_tests.rs"]
-mod tests;

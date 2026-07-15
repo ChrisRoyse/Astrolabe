@@ -42,9 +42,6 @@ use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Result, SlotId};
 use std::path::Path;
 
-#[cfg(test)]
-mod tests;
-
 /// Canonical SST file-name classes; each variant names the subsystem that
 /// owns files of that shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

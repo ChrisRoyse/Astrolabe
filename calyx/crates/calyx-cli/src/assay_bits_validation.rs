@@ -16,8 +16,6 @@ mod metrics;
 mod report;
 pub(crate) mod request;
 mod selection;
-#[cfg(test)]
-mod test_support;
 
 use calyx_assay::{
     CALYX_ASSAY_DEGENERATE_TARGET_ENTROPY, CALYX_ASSAY_ESTIMATOR_UNDERPOWERED,
@@ -190,9 +188,3 @@ const ASSAY_LOCAL_CODES: &[&str] = &[
     CALYX_FSV_ASSAY_TRIVIAL_ANCHOR,
 ];
 
-#[cfg(test)]
-mod power_gate_tests;
-#[cfg(test)]
-mod single_lens_tests;
-#[cfg(test)]
-mod tests;

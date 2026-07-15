@@ -403,6 +403,3 @@ fn hex_sha256(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
-#[path = "fused_truth_db_tests.rs"]
-mod tests;

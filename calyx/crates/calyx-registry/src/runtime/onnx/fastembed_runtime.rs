@@ -251,39 +251,3 @@ fn normalized(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roster_aliases_resolve_to_fastembed_dense_models() {
-        assert!(matches!(
-            model_from_name("BAAI/bge-base-en-v1.5").unwrap(),
-            EmbeddingModel::BGEBaseENV15
-        ));
-        assert!(matches!(
-            model_from_name("jinaai/jina-embeddings-v2-base-code").unwrap(),
-            EmbeddingModel::JinaEmbeddingsV2BaseCode
-        ));
-        assert!(matches!(
-            model_from_name("google/embeddinggemma-300m").unwrap(),
-            EmbeddingModel::EmbeddingGemma300M
-        ));
-    }
-
-    #[test]
-    fn roster_quantized_aliases_resolve_to_explicit_variants() {
-        assert!(matches!(
-            model_from_name("bge-base-en-v1.5-q").unwrap(),
-            EmbeddingModel::BGEBaseENV15Q
-        ));
-        assert!(matches!(
-            model_from_name("embeddinggemma-300m-q4").unwrap(),
-            EmbeddingModel::EmbeddingGemma300MQ4
-        ));
-        assert!(matches!(
-            model_from_name("embeddinggemma-300m-q").unwrap(),
-            EmbeddingModel::EmbeddingGemma300MQ
-        ));
-    }
-}

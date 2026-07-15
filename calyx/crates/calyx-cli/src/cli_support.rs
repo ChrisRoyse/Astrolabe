@@ -30,26 +30,4 @@ pub(crate) fn readback_config(name: &str, vault: &Path) -> CliResult {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn hex_lines(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .chunks(32)
-        .map(|chunk| {
-            let mut line = String::with_capacity(chunk.len() * 2);
-            for byte in chunk {
-                line.push(hex_digit(byte >> 4));
-                line.push(hex_digit(byte & 0x0f));
-            }
-            line
-        })
-        .collect()
-}
 
-#[cfg(test)]
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => char::from(b'0' + value),
-        10..=15 => char::from(b'a' + value - 10),
-        _ => unreachable!("nibble out of range"),
-    }
-}

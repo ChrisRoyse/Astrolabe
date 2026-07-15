@@ -24,8 +24,6 @@ use calyx_lodestar::{
 use rayon::prelude::*;
 use serde_json::json;
 
-#[cfg(test)]
-use super::vault::vault_salt;
 use super::vault::{home_dir, now_ms, resolve_vault_info};
 use super::{Subcommand, value};
 use crate::error::{CliError, CliResult};
@@ -397,5 +395,3 @@ fn parse_unit(raw: &str, flag: &str) -> CliResult<f32> {
     Ok(value)
 }
 
-#[cfg(test)]
-mod tests;

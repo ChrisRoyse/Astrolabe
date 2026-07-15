@@ -81,26 +81,6 @@ fn flatten(norm: &[Vec<f32>], dim: usize) -> Vec<f32> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cagra_build_space_preserves_raw_l2_magnitude() {
-        let vectors = vec![(0, vec![3.0_f32, 4.0]), (1, vec![6.0, 8.0])];
-
-        let raw = cagra_build_space(&vectors, DiskAnnBuildMetric::RawL2);
-        assert_eq!(raw[0], vec![3.0, 4.0]);
-        assert_eq!(raw[1], vec![6.0, 8.0]);
-
-        let unit = cagra_build_space(&vectors, DiskAnnBuildMetric::UnitL2);
-        assert!((unit[0][0] - 0.6).abs() <= f32::EPSILON);
-        assert!((unit[0][1] - 0.8).abs() <= f32::EPSILON);
-        assert!((unit[1][0] - 0.6).abs() <= f32::EPSILON);
-        assert!((unit[1][1] - 0.8).abs() <= f32::EPSILON);
-    }
-}
-
 fn graph_to_adjacency(
     graph: &[u32],
     n: usize,

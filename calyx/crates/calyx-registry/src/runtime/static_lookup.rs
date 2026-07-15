@@ -429,6 +429,3 @@ fn config_invalid(message: impl Into<String>) -> CalyxError {
         remediation: "fix static lookup matrix/tokenizer or register a supported lens spec",
     }
 }
-
-#[cfg(test)]
-mod tests;

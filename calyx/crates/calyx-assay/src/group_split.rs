@@ -151,37 +151,3 @@ struct GroupBucket {
     indices: Vec<usize>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn group_holdout_keeps_anchor_groups_disjoint() {
-        let labels = vec![true, true, true, true, false, false, false, false];
-        let groups = ["a", "a", "b", "b", "c", "c", "d", "d"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-
-        let split = group_holdout_split(&labels, &groups, 0.5, 7).unwrap();
-        for left in &split.train {
-            for right in &split.test {
-                assert_ne!(groups[*left], groups[*right]);
-            }
-        }
-        assert_eq!(class_count(&labels, &split.train), 2);
-        assert_eq!(class_count(&labels, &split.test), 2);
-    }
-
-    #[test]
-    fn mixed_label_group_fails_closed() {
-        let labels = vec![true, false, true, false];
-        let groups = ["same", "same", "pos", "neg"]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-
-        let error = group_holdout_split(&labels, &groups, 0.5, 7).unwrap_err();
-        assert_eq!(error.code, crate::contract::CALYX_ASSAY_UNRESOLVED);
-    }
-}

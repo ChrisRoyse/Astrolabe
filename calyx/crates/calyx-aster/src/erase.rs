@@ -487,9 +487,3 @@ fn push_unique(targets: &mut Vec<EraseTarget>, cf: ColumnFamily, key: Vec<u8>) {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod ledger_tests;

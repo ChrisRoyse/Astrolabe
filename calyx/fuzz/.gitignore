@@ -1,5 +1,0 @@
-Cargo.lock
-artifacts/
-corpus/*/*
-!corpus/*/*.json
-!corpus/*/*.txt

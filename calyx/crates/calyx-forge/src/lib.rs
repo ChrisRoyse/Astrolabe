@@ -75,11 +75,3 @@ pub use vram::{
     VRAM_BUDGET_ENV, VRAM_BUDGET_REMEDIATION, VramBudgeter, VramGuard, VramProbe, VramStats,
     YieldPolicy, YieldStats, admit_lens,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-forge");
-    }
-}

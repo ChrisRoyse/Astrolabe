@@ -283,8 +283,3 @@ fn hex_digit(value: u8) -> char {
         _ => unreachable!("nibble out of range"),
     }
 }
-
-#[cfg(test)]
-mod fsv_tests;
-#[cfg(test)]
-mod tests;

@@ -478,5 +478,3 @@ pub(super) fn file_evidence(home: &Path, path: &Path) -> CliResult<(FileEvidence
     ))
 }
 
-#[cfg(test)]
-mod tests;

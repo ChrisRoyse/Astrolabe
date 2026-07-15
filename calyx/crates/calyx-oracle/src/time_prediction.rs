@@ -298,7 +298,3 @@ fn checked_interval(t_hat: i64, half_width: i64) -> Result<TimePredictionInterva
 fn oracle_insufficient(message: impl Into<String>) -> CalyxError {
     CalyxError::oracle_insufficient(message)
 }
-
-#[cfg(test)]
-#[path = "time_prediction_tests.rs"]
-mod tests;

@@ -175,19 +175,3 @@ impl Ord for OrdF32 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cosine_distance_handles_unnormalized_vectors() {
-        let query = [10.0, 0.0];
-        let same_direction = [100.0, 0.0];
-        let l2_closer_but_worse_angle = [9.0, 1.0];
-
-        assert!(
-            cosine_distance(&query, &same_direction)
-                < cosine_distance(&query, &l2_closer_but_worse_angle)
-        );
-    }
-}

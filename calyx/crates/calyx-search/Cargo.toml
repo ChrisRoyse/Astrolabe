@@ -28,7 +28,3 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
-
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-ulid = { workspace = true }

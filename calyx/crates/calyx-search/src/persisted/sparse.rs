@@ -4,8 +4,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-#[cfg(test)]
-use calyx_core::Constellation;
 use calyx_core::{CxId, SlotId, SlotVector, SparseEntry};
 use calyx_sextant::index::bm25::Bm25;
 use calyx_sextant::index::{IndexSearchHit, ranked};
@@ -51,38 +49,6 @@ impl SparseSlotRows {
     pub(super) fn len(&self) -> usize {
         self.rows.len()
     }
-}
-
-#[cfg(test)]
-pub(super) fn collect(
-    docs: &BTreeMap<CxId, Constellation>,
-) -> CliResult<BTreeMap<SlotId, SparseSlotRows>> {
-    let mut out = BTreeMap::<SlotId, SparseSlotRows>::new();
-    for cx in docs.values() {
-        for (slot, vector) in &cx.slots {
-            let SlotVector::Sparse { dim, entries } = vector else {
-                continue;
-            };
-            vector.validate_schema().map_err(|err| {
-                stale(format!(
-                    "slot {slot} cx {} has invalid sparse payload: {}",
-                    cx.cx_id, err.message
-                ))
-            })?;
-            let entry = out.entry(*slot).or_insert_with(|| SparseSlotRows {
-                dim: *dim,
-                rows: Vec::new(),
-            });
-            if entry.dim != *dim {
-                return Err(stale(format!(
-                    "slot {slot} has mixed sparse dims: {} and {dim}",
-                    entry.dim
-                )));
-            }
-            entry.rows.push((cx.cx_id, entries.clone()));
-        }
-    }
-    Ok(out)
 }
 
 pub(super) fn write(

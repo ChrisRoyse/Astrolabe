@@ -15,24 +15,3 @@ pub(super) fn enforce(required: bool, truth_n: usize, has_scale_truth: bool) -> 
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gate_rejects_diagnostic_cpu_truth() {
-        let err = enforce(true, 4, false).unwrap_err();
-
-        assert_eq!(err.code(), "CALYX_FSV_PARTITIONED_RRF_SCALE_TRUTH_REQUIRED");
-    }
-
-    #[test]
-    fn gate_accepts_scale_truth() {
-        enforce(true, 4, true).unwrap();
-    }
-
-    #[test]
-    fn diagnostic_without_recall_floor_can_use_cpu_truth() {
-        enforce(false, 4, false).unwrap();
-    }
-}

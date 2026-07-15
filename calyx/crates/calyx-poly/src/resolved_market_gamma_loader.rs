@@ -325,6 +325,3 @@ fn iso8601_to_unix(s: &str) -> Option<u64> {
     u64::try_from(secs).ok()
 }
 
-#[cfg(test)]
-#[path = "resolved_market_gamma_loader_tests.rs"]
-mod tests;

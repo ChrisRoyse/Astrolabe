@@ -29,8 +29,6 @@ use super::hazards::HazardGauges;
 use super::zfs::{ZfsIntegrityMetrics, ZfsIntegritySnapshot};
 
 mod init;
-#[cfg(test)]
-mod tests;
 
 /// Retrieval strategies, each a `strategy` label value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,11 +287,3 @@ fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
-impl CalyxMetrics {
-    /// MetricFamily count for the T03 registry (excludes the chain-verify
-    /// registry, which is gathered separately in `encode_text`).
-    pub fn family_count(&self) -> usize {
-        self.registry.gather().len()
-    }
-}

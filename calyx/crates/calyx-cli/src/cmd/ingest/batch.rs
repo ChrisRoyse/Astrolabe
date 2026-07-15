@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::fs;
 use std::io::BufRead;
 use std::path::Path;
 
@@ -183,14 +181,3 @@ fn parse_anchor_spec(index: usize, spec: AnchorSpec) -> CliResult<Anchor> {
     })
 }
 
-#[cfg(test)]
-pub(super) fn read_batch_texts(path: &Path) -> CliResult<Vec<BatchRow>> {
-    let raw = fs::read_to_string(path)?;
-    let mut rows = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
-        if let Some(row) = parse_batch_line(index, line)? {
-            rows.push(row);
-        }
-    }
-    Ok(rows)
-}

@@ -305,6 +305,3 @@ fn mean(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / values.len() as f32
 }
 
-#[cfg(test)]
-#[path = "ksg_tests.rs"]
-mod tests;

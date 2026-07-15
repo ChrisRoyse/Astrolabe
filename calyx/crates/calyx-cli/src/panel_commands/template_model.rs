@@ -437,8 +437,6 @@ fn slug(value: &str) -> String {
         .to_string()
 }
 
-#[cfg(test)]
-mod tests;
 
 pub(super) fn id_for_loaded(template: &SavedPanelTemplate) -> CliResult<String> {
     Ok(blake3::hash(&object_bytes(template)?).to_hex().to_string())

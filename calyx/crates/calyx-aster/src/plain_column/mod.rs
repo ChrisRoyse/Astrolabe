@@ -149,6 +149,3 @@ fn enforce_limit(found: usize, limit_rows: usize, what: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

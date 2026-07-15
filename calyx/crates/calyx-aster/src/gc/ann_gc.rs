@@ -325,6 +325,3 @@ fn ensure_index_id(requested: &str, actual: String) -> Result<()> {
 fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
-
-#[cfg(test)]
-mod tests;

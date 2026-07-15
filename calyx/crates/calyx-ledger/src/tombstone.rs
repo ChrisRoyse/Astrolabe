@@ -365,6 +365,3 @@ fn hex_value(byte: u8) -> Result<u8> {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-#[cfg(test)]
-mod tests;

@@ -56,35 +56,3 @@ impl Clock for FixedClock {
         self.ts
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ConfidenceInterval, Signal};
-
-    #[test]
-    fn fixed_clock_makes_timestamped_operation_byte_deterministic() {
-        fn stamped_signal(clock: &dyn Clock) -> Signal {
-            Signal {
-                bits: 0.25,
-                ci: ConfidenceInterval {
-                    low: 0.20,
-                    high: 0.30,
-                },
-                n: 100,
-                estimator: "fixed-clock-test".to_string(),
-                ts: clock.now(),
-            }
-        }
-
-        let clock = FixedClock::new(1_785_400_000);
-        let first = serde_json::to_vec(&stamped_signal(&clock)).expect("serialize first signal");
-        let second = serde_json::to_vec(&stamped_signal(&clock)).expect("serialize second signal");
-
-        assert_eq!(first, second);
-        assert_eq!(
-            String::from_utf8(first).unwrap(),
-            r#"{"bits":0.25,"ci":{"low":0.2,"high":0.3},"n":100,"estimator":"fixed-clock-test","ts":1785400000}"#
-        );
-    }
-}

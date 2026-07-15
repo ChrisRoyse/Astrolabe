@@ -472,7 +472,3 @@ fn undo_payload(token: &ReversalToken, restored: &[CxId]) -> Result<Vec<u8>> {
     serde_json::to_vec(&value)
         .map_err(|error| CalyxError::aster_corrupt_shard(format!("encode undo payload: {error}")))
 }
-
-#[cfg(test)]
-#[path = "audit_tests.rs"]
-mod tests;

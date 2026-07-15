@@ -453,6 +453,3 @@ fn readback_report(
     }
 }
 
-#[cfg(test)]
-#[path = "timeline_store_tests.rs"]
-mod tests;

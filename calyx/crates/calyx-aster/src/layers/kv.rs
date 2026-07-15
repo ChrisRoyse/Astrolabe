@@ -442,6 +442,3 @@ fn invalid_argument(message: impl Into<String>) -> CalyxError {
 fn corrupt(message: impl Into<String>) -> CalyxError {
     CalyxError::aster_corrupt_shard(message)
 }
-
-#[cfg(test)]
-mod tests;

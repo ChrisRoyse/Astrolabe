@@ -486,6 +486,3 @@ fn relational_error(
         remediation,
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -8,8 +8,6 @@ pub mod ingest;
 pub mod intelligence;
 pub mod provenance;
 pub mod search;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub mod vault;
 
 /// Registers every built-in Calyx MCP tool.

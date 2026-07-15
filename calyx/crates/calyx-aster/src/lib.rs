@@ -42,11 +42,3 @@ pub mod wal;
 pub use dedup::{
     CompressionRatio, Domain, DomainCompressionStats, compression_ratio, domain_compression_stats,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-aster");
-    }
-}

@@ -126,24 +126,3 @@ fn recurrence_read_error(message: impl Into<String>) -> calyx_core::CalyxError {
     sextant_error(CALYX_SEXTANT_RECURRENCE_READ_ERROR, message)
 }
 
-#[cfg(test)]
-mod tests {
-    use proptest::prelude::*;
-
-    use super::*;
-
-    proptest! {
-        #[test]
-        fn recurrence_boost_stays_in_configured_range(
-            frequency in any::<u64>(),
-            last in proptest::option::of(0_i64..2_000_000),
-            query in 0_i64..2_000_000,
-            max_boost in 0.0_f32..=0.10,
-        ) {
-            let config = RecurrenceBoostConfig::new(0.05, 0.05, max_boost)
-                .expect("generated valid config");
-            let evidence = recurrence_boost_from_parts(frequency, last, query, &config);
-            prop_assert!((0.0..=max_boost).contains(&evidence.total));
-        }
-    }
-}

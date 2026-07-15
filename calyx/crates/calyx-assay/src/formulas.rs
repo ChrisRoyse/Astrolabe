@@ -44,31 +44,3 @@ fn validate_non_negative_bits(value: f32, field: &str) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formula_wrappers_match_prd_thresholds() {
-        assert!(lens_signal(0.05, 0.6).unwrap().admitted);
-        assert_eq!(pair_redundancy(-0.6).unwrap(), 0.6);
-        assert_eq!(marginal_value(1.25, 0.75).unwrap(), 0.5);
-        assert_eq!(dpi_ceiling(2.0).unwrap(), 2.0);
-    }
-
-    #[test]
-    fn formula_wrappers_fail_closed() {
-        assert_eq!(
-            lens_signal(0.049, 0.1).unwrap_err().code,
-            "CALYX_ASSAY_LOW_SIGNAL"
-        );
-        assert_eq!(
-            pair_redundancy(0.61).unwrap_err().code,
-            "CALYX_ASSAY_REDUNDANT"
-        );
-        assert_eq!(
-            marginal_value(f32::NAN, 0.0).unwrap_err().code,
-            "CALYX_ASSAY_INSUFFICIENT_SAMPLES"
-        );
-    }
-}

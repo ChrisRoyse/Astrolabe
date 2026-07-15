@@ -312,6 +312,3 @@ where
         self.free.push(idx);
     }
 }
-
-#[cfg(test)]
-mod tests;

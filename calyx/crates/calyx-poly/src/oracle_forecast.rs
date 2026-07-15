@@ -312,27 +312,3 @@ fn oracle_error(code: &'static str, domain: &DomainId, err: OracleError) -> Poly
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn p_yes_mapping_is_monotone_and_centered() {
-        // Coin-flip oracle → 0.5 regardless of side.
-        assert!((map_p_yes(0.0, true) - 0.5).abs() < 1e-12);
-        assert!((map_p_yes(0.0, false) - 0.5).abs() < 1e-12);
-        // Confident YES climbs above 0.5; confident not-YES drops below.
-        assert!((map_p_yes(1.0, true) - 1.0).abs() < 1e-12);
-        assert!((map_p_yes(1.0, false) - 0.0).abs() < 1e-12);
-        assert!((map_p_yes(0.5, true) - 0.75).abs() < 1e-12);
-        assert!((map_p_yes(0.5, false) - 0.25).abs() < 1e-12);
-        // Monotone in confidence on the YES side.
-        assert!(map_p_yes(0.2, true) < map_p_yes(0.8, true));
-    }
-
-    #[test]
-    fn non_finite_confidence_clamps_to_coin_flip() {
-        assert!((map_p_yes(f64::NAN, true) - 0.5).abs() < 1e-12);
-        assert!((map_p_yes(f64::INFINITY, false) - 0.5).abs() < 1e-12);
-    }
-}

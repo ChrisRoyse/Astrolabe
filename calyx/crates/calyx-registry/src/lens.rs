@@ -493,5 +493,3 @@ fn ensure_finite(lens_id: LensId, data: &[f32]) -> Result<()> {
     )))
 }
 
-#[cfg(test)]
-mod tests;

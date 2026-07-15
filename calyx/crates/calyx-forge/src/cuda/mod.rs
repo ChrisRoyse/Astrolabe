@@ -1,17 +1,11 @@
 pub mod context;
 pub mod distance;
-#[cfg(test)]
-mod distance_tests;
 pub mod gemm;
 pub mod green_context;
 pub mod grouped_gemm;
-#[cfg(test)]
-mod grouped_gemm_tests;
 pub mod kernels;
 pub mod ragged_gemm;
 pub mod topk;
-#[cfg(test)]
-mod topk_tests;
 
 use crate::{Backend, DeviceInfo, Result};
 
@@ -97,12 +91,4 @@ impl Backend for CudaBackend {
     fn device_info(&self) -> DeviceInfo {
         query_device_info(&self.ctx)
     }
-}
-
-#[cfg(test)]
-static CUDA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    CUDA_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }

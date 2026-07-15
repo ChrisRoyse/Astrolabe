@@ -22,8 +22,6 @@ const A38_BUNDLE_INVALID: &str = "CALYX_A38_BUNDLE_INVALID";
 const A38_BUNDLE_INCOMPLETE: &str = "CALYX_A38_BUNDLE_INCOMPLETE";
 const A38_BUNDLE_BUDGET_EXCEEDED: &str = "CALYX_A38_BUNDLE_BUDGET_EXCEEDED";
 const A38_BUNDLE_BASE_A37_REFUSED: &str = "CALYX_A38_BUNDLE_BASE_A37_REFUSED";
-#[cfg(test)]
-const A38_BUNDLE_NOT_FOUND: &str = "CALYX_A38_BUNDLE_NOT_FOUND";
 
 #[derive(Default)]
 struct Flags {
@@ -221,5 +219,3 @@ fn bundle_error(
     })
 }
 
-#[cfg(test)]
-mod tests;

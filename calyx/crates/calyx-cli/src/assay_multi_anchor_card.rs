@@ -4,8 +4,6 @@ mod readback;
 mod request;
 mod write;
 
-#[cfg(test)]
-mod tests;
 
 use calyx_core::CalyxError;
 

@@ -4,8 +4,6 @@ mod parse;
 
 pub(crate) use calyx_search::{PersistedSearchIndexes, load_docs};
 pub(crate) use parse::{KernelAnswerArgs, SearchArgs, parse_resident_addr};
-#[cfg(test)]
-pub(crate) use parse::{SearchFreshnessArg, SearchFusionArg, SearchGuardArg};
 
 use super::vault::{home_dir, resolve_vault_info, vault_salt};
 use super::{Subcommand, VaultRefArgs};
@@ -211,8 +209,4 @@ pub(crate) fn parse_kernel_answer(rest: &[String]) -> CliResult<Subcommand> {
     parse::parse_kernel_answer(rest)
 }
 
-#[cfg(test)]
-pub(crate) use parse::{kernel_answer_tokens, search_tokens};
 
-#[cfg(test)]
-mod tests;

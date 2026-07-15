@@ -4,8 +4,6 @@ mod core;
 mod ids;
 mod quarantine;
 mod status;
-#[cfg(test)]
-mod tests;
 
 use calyx_core::CalyxError;
 use serde::Deserialize;

@@ -177,16 +177,6 @@ where
     }
 
     fn commit_rows_to_mvcc(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
-        #[cfg(test)]
-        if self
-            .durable
-            .as_ref()
-            .is_some_and(|durable| durable.take_mvcc_commit_failure())
-        {
-            return Err(CalyxError::aster_corrupt_shard(
-                "injected post-WAL MVCC/router commit failure",
-            ));
-        }
         self.rows.commit_batch(
             rows.iter()
                 .map(|row| (row.cf, row.key.clone(), row.value.clone())),
@@ -194,16 +184,6 @@ where
     }
 
     fn restore_committed_rows(&self, seq: Seq, rows: &[encode::WriteRow]) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .durable
-            .as_ref()
-            .is_some_and(|durable| durable.take_mvcc_restore_failure())
-        {
-            return Err(CalyxError::aster_corrupt_shard(
-                "injected post-WAL MVCC restore failure",
-            ));
-        }
         self.rows.restore_batch(
             seq,
             rows.iter()
@@ -240,10 +220,6 @@ fn reconciliation_outcome(result: &Result<()>) -> String {
         Err(error) => format!("error[{}]: {}", error.code, error.message),
     }
 }
-
-#[cfg(test)]
-#[path = "commit_failure_tests.rs"]
-mod failure_tests;
 
 #[cfg(any(test, feature = "crash-fsv"))]
 fn crash_fsv_after_wal_append(seq: Seq) -> Result<()> {

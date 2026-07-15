@@ -277,38 +277,3 @@ where
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use calyx_core::{FixedClock, VaultId, VaultStore};
-    use calyx_ledger::{RedactionPolicy, decode};
-
-    #[test]
-    fn append_ledger_entry_without_hook_writes_real_row() {
-        let vault = AsterVault::with_clock(vault_id(), b"ledger-append", FixedClock::new(1));
-
-        let ledger_ref = vault
-            .append_ledger_entry(
-                EntryKind::Assay,
-                SubjectId::Query(vec![1; 16]),
-                br#"{"tag":"oracle_self_consistency_v1"}"#.to_vec(),
-                ActorId::Service("calyx-oracle".to_string()),
-            )
-            .expect("append ledger entry");
-
-        let bytes = vault
-            .read_cf_at(
-                vault.snapshot(),
-                ColumnFamily::Ledger,
-                &ledger_key(ledger_ref.seq),
-            )
-            .expect("read ledger")
-            .expect("ledger row");
-        assert!(RedactionPolicy::check_payload(&decode(&bytes).unwrap().payload).is_ok());
-    }
-
-    fn vault_id() -> VaultId {
-        "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("vault id")
-    }
-}

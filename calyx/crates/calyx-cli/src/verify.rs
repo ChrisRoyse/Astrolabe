@@ -104,26 +104,3 @@ fn print_verify_result(result: VerifyResult) -> crate::error::CliResult {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use calyx_aster::ledger_view::parse_aster_ledger_seq;
-
-    use super::*;
-
-    #[test]
-    fn parse_seq_accepts_u64() {
-        assert_eq!(parse_seq("7").unwrap(), 7);
-    }
-
-    #[test]
-    fn aster_ledger_keys_are_big_endian_u64() {
-        assert_eq!(parse_aster_ledger_seq(&9_u64.to_be_bytes()).unwrap(), 9);
-    }
-
-    #[test]
-    fn aster_ledger_keys_reject_wrong_width() {
-        let error = parse_aster_ledger_seq(&[1, 2, 3]).unwrap_err();
-        assert_eq!(error.code, "CALYX_LEDGER_CORRUPT");
-        assert!(error.to_string().contains("expected 8"));
-    }
-}

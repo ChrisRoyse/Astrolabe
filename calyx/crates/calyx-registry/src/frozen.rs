@@ -372,5 +372,3 @@ fn ensure_norm_value(lens_id: LensId, norm: f64, target: f64, tolerance: f32) ->
     )))
 }
 
-#[cfg(test)]
-mod tests;

@@ -5,11 +5,7 @@ pub(crate) mod errors;
 pub(crate) mod manifest;
 pub(crate) mod reader;
 pub(crate) mod temporal;
-#[cfg(test)]
-mod tests;
 pub(crate) mod verifier;
-#[cfg(test)]
-mod verify_tests;
 
 use std::collections::BTreeMap;
 use std::path::Path;

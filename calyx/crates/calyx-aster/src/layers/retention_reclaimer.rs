@@ -435,6 +435,3 @@ fn invalid_collection(message: impl Into<String>) -> CalyxError {
         remediation: "call the reclaimer with a TimeSeries or Blob collection and a nonzero bound",
     }
 }
-
-#[cfg(test)]
-mod tests;

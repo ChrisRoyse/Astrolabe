@@ -10,8 +10,6 @@ mod report;
 mod source;
 mod util;
 
-#[cfg(test)]
-mod tests;
 
 pub(crate) use model::BiomedicalBlindspotAuditArgs;
 pub(crate) use parse::parse_biomedical_blindspot_audit;

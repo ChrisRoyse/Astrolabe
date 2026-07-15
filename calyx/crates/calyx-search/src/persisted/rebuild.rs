@@ -94,59 +94,6 @@ where
     super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, progress)
 }
 
-#[cfg(test)]
-pub(super) fn rebuild_from_docs(
-    vault_dir: &Path,
-    docs: &BTreeMap<CxId, Constellation>,
-    base_seq: u64,
-) -> CliResult<RebuildSummary> {
-    let root = vault_dir.join(INDEX_ROOT);
-    fs::create_dir_all(&root)?;
-    let previous_manifest = previous_manifest(vault_dir)?;
-    let mut entries = Vec::new();
-    let mut total_rows = 0usize;
-    for slot in dense::slots(docs) {
-        let rows = dense::collect_slot(docs, slot)?;
-        total_rows += rows.len();
-        entries.push(dense::write(vault_dir, &root, slot, rows, base_seq)?);
-    }
-    for (slot, rows) in sparse::collect(docs)? {
-        total_rows += rows.len();
-        entries.push(sparse::write(vault_dir, &root, slot, rows, base_seq)?);
-    }
-    for (slot, rows) in multi::collect(docs)? {
-        total_rows += rows.len();
-        let previous = previous_manifest
-            .as_ref()
-            .and_then(|manifest| manifest.slots.iter().find(|entry| entry.slot == slot.get()));
-        entries.push(multi::write(
-            vault_dir,
-            &root,
-            slot,
-            rows,
-            base_seq,
-            previous,
-            &mut |_| Ok(()),
-        )?);
-    }
-    entries.sort_by_key(|entry| entry.slot);
-    let manifest = SearchIndexManifest {
-        format: MANIFEST_FORMAT.to_string(),
-        base_seq,
-        filter: Some(filter::write(vault_dir, &root, docs, base_seq)?),
-        slots: entries,
-    };
-    let manifest_path = manifest_path(vault_dir);
-    super::rebuild_stream::validate_staged_manifest_artifacts(vault_dir, &manifest)?;
-    write_json_atomic(&manifest_path, &manifest)?;
-    prune_stale_index_artifacts(vault_dir, &root, &manifest)?;
-    Ok(RebuildSummary {
-        slots: manifest.slots.len(),
-        total_rows,
-        manifest_path,
-    })
-}
-
 pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchIndexManifest>> {
     let path = manifest_path(vault_dir);
     if !path.exists() {

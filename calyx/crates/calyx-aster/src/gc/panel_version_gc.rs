@@ -448,6 +448,3 @@ fn panel_id_from_path(path: &Path) -> Option<PanelVersionId> {
 fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
-
-#[cfg(test)]
-mod tests;

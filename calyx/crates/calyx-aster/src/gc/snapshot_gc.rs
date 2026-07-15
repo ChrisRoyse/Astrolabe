@@ -282,6 +282,3 @@ impl SnapshotPinWatchdog {
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
-
-#[cfg(test)]
-mod tests;

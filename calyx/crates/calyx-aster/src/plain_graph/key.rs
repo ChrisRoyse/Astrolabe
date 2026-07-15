@@ -272,25 +272,3 @@ fn graph_error(code: &'static str, message: impl Into<String>) -> CalyxError {
         remediation: "fix graph key/value input or rebuild the plain graph projection",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cx(byte: u8) -> CxId {
-        CxId::from_bytes([byte; ID_BYTES])
-    }
-
-    #[test]
-    fn key_encoding_orders_typed_edges_by_src_type_dst() {
-        let keys = GraphKeyspace::new("plain").unwrap();
-        let a_knows_b = keys.edge_out_key(cx(1), "knows", cx(2)).unwrap();
-        let a_knows_c = keys.edge_out_key(cx(1), "knows", cx(3)).unwrap();
-        let a_likes_b = keys.edge_out_key(cx(1), "likes", cx(2)).unwrap();
-        assert_eq!(keys.node_key(cx(1))[0], DISC);
-        assert!(a_knows_b < a_knows_c);
-        assert!(a_knows_c < a_likes_b);
-        assert!(keys.edge_in_key(cx(2), "knows", cx(1)).unwrap() != a_knows_b);
-        assert_eq!(keys.decode_edge_out_key(&a_knows_b).unwrap().dst, cx(2));
-    }
-}

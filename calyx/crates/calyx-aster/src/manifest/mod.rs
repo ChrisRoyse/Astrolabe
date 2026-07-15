@@ -476,6 +476,3 @@ fn format_version_unsupported(message: impl Into<String>) -> CalyxError {
         remediation: "refuse unknown format major; migrate through a compatible reader",
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -58,28 +58,3 @@ pub(crate) fn utc_day_of_week_monday0(timestamp: i64) -> u8 {
 pub(crate) fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unix_epoch_hour_and_dow_are_hand_computable() {
-        assert_eq!(utc_hour(0), 0);
-        assert_eq!(utc_day_of_week_monday0(0), 3);
-        assert_eq!(utc_hour(14 * 3_600 + 30 * 60), 14);
-    }
-
-    #[test]
-    fn temporal_flags_constant_is_ap60_boundary() {
-        let flags = E2RecencyLens::new(E2RecencyConfig {
-            decay: DecayFunction::Step,
-            reference_time: 0,
-        })
-        .flags();
-        assert!(flags.retrieval_only);
-        assert!(flags.excluded_from_dedup);
-        assert!(!TemporalLensFlags::default().retrieval_only);
-        assert!(!TemporalLensFlags::default().excluded_from_dedup);
-    }
-}

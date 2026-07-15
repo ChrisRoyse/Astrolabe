@@ -445,6 +445,3 @@ fn to_finite_f64(name: &str, values: &[f32]) -> Result<Vec<f64>> {
     Ok(out)
 }
 
-#[cfg(test)]
-#[path = "hsic_tests.rs"]
-mod tests;

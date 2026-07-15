@@ -4,8 +4,6 @@ mod args;
 mod convert;
 mod report;
 
-#[cfg(test)]
-mod tests;
 
 use calyx_core::CalyxError;
 

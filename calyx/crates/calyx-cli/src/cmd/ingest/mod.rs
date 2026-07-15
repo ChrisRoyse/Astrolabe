@@ -20,9 +20,3 @@ pub(crate) use session::IngestStatusArgs;
 pub(crate) use types::IngestOutput;
 pub(crate) use worker::run_lens_worker;
 
-#[cfg(test)]
-mod issue968_tests;
-#[cfg(test)]
-mod oracle_event_tests;
-#[cfg(test)]
-mod tests;

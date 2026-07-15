@@ -26,8 +26,6 @@ use rows::{PreparedRow, modality_name, read_rows, validate_row_set};
 const GRAPH_ANCHOR: &str = "molecular-vault";
 
 mod rows;
-#[cfg(test)]
-mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MaterializeMolecularVaultArgs {

@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use super::error;
 
-#[cfg(test)]
-pub(crate) const CALYX_PG_WRITE_ATTEMPTED: &str = "CALYX_PG_WRITE_ATTEMPTED";
 pub(crate) const CALYX_VAULT_NOT_IN_PG: &str = "CALYX_VAULT_NOT_IN_PG";
 const CALYX_PG_SNAPSHOT_INCOMPLETE: &str = "CALYX_PG_SNAPSHOT_INCOMPLETE";
 pub(crate) const REQUIRED_TABLES: &[&str] = &[
@@ -28,8 +26,6 @@ pub(crate) enum PgConn {
     DumpDir {
         root: PathBuf,
     },
-    #[cfg(test)]
-    WriteCapableForTest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,12 +55,6 @@ pub(crate) fn snapshot_pg_state(
         return Err(snapshot_error("vault_name must not be empty"));
     }
     match pg_conn {
-        #[cfg(test)]
-        PgConn::WriteCapableForTest => Err(error(
-            CALYX_PG_WRITE_ATTEMPTED,
-            "write-capable PostgreSQL connection rejected",
-            "open the control-plane connection through PgConn::ReadOnlyPsql",
-        )),
         PgConn::DumpDir { root } => snapshot_from_dump_dir(root, vault_name, out_dir),
         PgConn::ReadOnlyPsql { conninfo } => snapshot_from_psql(conninfo, vault_name, out_dir),
     }

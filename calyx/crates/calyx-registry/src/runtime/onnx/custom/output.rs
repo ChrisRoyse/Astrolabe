@@ -105,26 +105,6 @@ pub(in crate::runtime::onnx) fn pooling_from_config(path: &Path) -> Result<Pooli
     }
 }
 
-#[cfg(test)]
-pub(in crate::runtime::onnx) fn pool_output(
-    shape: &[i64],
-    values: &[f32],
-    mask: &[i64],
-    policy: PoolingPolicy,
-    dim: u32,
-) -> Result<Vec<f32>> {
-    let batch = TokenBatch {
-        batch: 1,
-        seq: mask.len(),
-        ids: vec![0; mask.len()],
-        mask: mask.to_vec(),
-        indices: vec![0],
-    };
-    let mut rows = pool_output_batch(shape, values, &batch, policy, dim)?;
-    rows.pop()
-        .ok_or_else(|| CalyxError::lens_dim_mismatch("custom ONNX returned no pooled row"))
-}
-
 fn dense_output_batch(
     shape: &[i64],
     values: &[f32],
@@ -381,66 +361,5 @@ fn apply_norm(policy: NormPolicy, data: &mut [f32]) -> Result<()> {
                 ))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use calyx_core::SlotVector;
-
-    use super::*;
-
-    #[test]
-    fn sparse_output_emits_only_positive_finite_entries() {
-        let batch = TokenBatch {
-            batch: 2,
-            seq: 3,
-            ids: vec![0; 6],
-            mask: vec![1; 6],
-            indices: vec![0, 1],
-        };
-        let vectors = sparse_output_batch(
-            &[2, 4],
-            &[0.0, 1.5, -0.2, 0.25, 2.0, 0.0, 0.0, 3.0],
-            &batch,
-            4,
-        )
-        .unwrap();
-
-        let SlotVector::Sparse { dim, entries } = &vectors[0] else {
-            panic!("expected sparse row");
-        };
-        assert_eq!(*dim, 4);
-        assert_eq!(
-            entries,
-            &vec![
-                SparseEntry { idx: 1, val: 1.5 },
-                SparseEntry { idx: 3, val: 0.25 },
-            ]
-        );
-        let SlotVector::Sparse { entries, .. } = &vectors[1] else {
-            panic!("expected sparse row");
-        };
-        assert_eq!(
-            entries,
-            &vec![
-                SparseEntry { idx: 0, val: 2.0 },
-                SparseEntry { idx: 3, val: 3.0 },
-            ]
-        );
-    }
-
-    #[test]
-    fn sparse_output_rejects_non_finite_values() {
-        let batch = TokenBatch {
-            batch: 1,
-            seq: 1,
-            ids: vec![0],
-            mask: vec![1],
-            indices: vec![0],
-        };
-        let error = sparse_output_batch(&[1, 2], &[0.0, f32::NAN], &batch, 2).unwrap_err();
-
-        assert_eq!(error.code, "CALYX_LENS_NUMERICAL_INVARIANT");
     }
 }

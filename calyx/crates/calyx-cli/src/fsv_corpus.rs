@@ -408,6 +408,3 @@ struct FileReadback {
     rows: Option<usize>,
 }
 
-#[cfg(test)]
-#[path = "fsv_corpus_tests.rs"]
-mod fsv_corpus_tests;

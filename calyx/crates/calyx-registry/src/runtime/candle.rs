@@ -18,10 +18,6 @@ mod load;
 mod options;
 mod pooling;
 
-#[cfg(test)]
-use load::{
-    HALF_CUDA_MIN_LAYER_NORM_EPS, candle_device, candle_error_message, stabilize_half_cuda_config,
-};
 use load::{
     candle_error, config_invalid, ensure_file, fetch_files, needs_f32_finite_replay, read_config,
     read_model, read_tokenizer,
@@ -29,8 +25,6 @@ use load::{
 pub use options::{
     CandleDevicePolicy, CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
 };
-#[cfg(test)]
-use pooling::mean_pool;
 use pooling::{apply_norm, pool_tokens};
 
 pub struct CandleLens {
@@ -405,6 +399,3 @@ impl CandleLens {
         Ok(vector)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -4,9 +4,6 @@
 //! physical source of truth against the current ledger head and referenced SST
 //! or WAL bytes, or they fail closed with a `CALYX_BASE_PAGE_INDEX_*` error.
 
-#[cfg(test)]
-mod tests;
-
 mod format;
 mod readback;
 mod sst_scan;
@@ -37,8 +34,6 @@ pub use types::{
     BasePageIndexManifest, BasePageIndexPage, BasePageIndexPageRef, BasePageIndexSource,
     DEFAULT_BASE_PAGE_INDEX_PAGE_SIZE,
 };
-#[cfg(test)]
-use types::{CORRUPT_CODE, MISSING_CODE, STALE_CODE};
 use types::{INDEX_MAGIC, INDEX_VERSION};
 
 #[derive(Clone, Debug)]

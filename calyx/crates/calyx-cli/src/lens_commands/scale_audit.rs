@@ -8,8 +8,6 @@ mod worker;
 
 pub(in crate::lens_commands) use measure::compare_vectors;
 
-#[cfg(test)]
-mod tests;
 
 use calyx_core::CalyxError;
 

@@ -118,13 +118,6 @@ impl ReadFlip {
     }
 }
 
-#[cfg(test)]
-impl ShadowVault {
-    pub(crate) fn ask(&self, query_vec: &[f32], top_k: usize) -> Result<AskResult, CalyxError> {
-        PanelGuardEnable::ensure_flipped(self)?;
-        ask_calyx(self.paths().1, self.mode(), query_vec, top_k)
-    }
-}
 
 pub(crate) fn run_read_flip(args: &[String]) -> CliResult {
     let args = parse_flip_args(args)?;

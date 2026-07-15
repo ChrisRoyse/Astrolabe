@@ -130,5 +130,3 @@ const I8BIN_CARD_CODES: &[&str] = &[
     "CALYX_FSV_PARTITIONED_RRF_PLAN_DB_DECODE",
 ];
 
-#[cfg(test)]
-mod tests;

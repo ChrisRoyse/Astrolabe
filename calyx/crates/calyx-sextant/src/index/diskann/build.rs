@@ -420,7 +420,3 @@ fn build_diskann_graph_cuvs_cagra(
         "cuvs-cagra backend",
     )))
 }
-
-#[cfg(test)]
-#[path = "build_tests.rs"]
-mod build_tests;

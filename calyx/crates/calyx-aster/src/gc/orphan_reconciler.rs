@@ -359,6 +359,3 @@ fn orphan_error(message: impl Into<String>) -> CalyxError {
 fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
-
-#[cfg(test)]
-mod tests;

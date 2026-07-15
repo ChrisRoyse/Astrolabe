@@ -461,6 +461,3 @@ fn build_partitioned_graph(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

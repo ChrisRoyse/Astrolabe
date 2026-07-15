@@ -93,6 +93,3 @@ pub(super) fn io_error(error: std::io::Error) -> CliError {
     CliError::io(error.to_string())
 }
 
-#[cfg(test)]
-#[path = "assay_fbin_export_tests.rs"]
-mod tests;

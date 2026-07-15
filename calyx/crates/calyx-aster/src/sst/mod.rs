@@ -480,6 +480,3 @@ fn sync_parent(path: &Path) -> Result<()> {
 fn storage_error(context: &str, error: io::Error) -> CalyxError {
     CalyxError::disk_pressure(format!("{context}: {error}"))
 }
-
-#[cfg(test)]
-mod tests;

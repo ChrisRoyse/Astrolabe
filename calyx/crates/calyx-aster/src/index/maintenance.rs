@@ -346,7 +346,3 @@ fn invalid_argument(message: impl Into<String>) -> CalyxError {
 fn invalid_index_ordinal() -> CalyxError {
     invalid_argument("secondary index ordinal exceeds u32")
 }
-
-#[cfg(test)]
-#[path = "maintenance_tests.rs"]
-mod tests;

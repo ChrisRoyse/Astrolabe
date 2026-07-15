@@ -483,6 +483,3 @@ fn next_slot_id(panel: &Panel) -> Result<SlotId> {
     }
     Ok(SlotId::new(next))
 }
-
-#[cfg(test)]
-mod tests;

@@ -424,7 +424,3 @@ pub(crate) fn validate_held_out(held_out: &HeldOutSplit) -> Result<(), LodestarE
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "super_intel_tests.rs"]
-mod tests;

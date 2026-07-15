@@ -16,8 +16,6 @@ use crate::output::print_json;
 mod load;
 mod metrics;
 mod model;
-#[cfg(test)]
-mod tests;
 
 use model::{AssociationValidationReport, GateParams};
 

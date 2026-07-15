@@ -319,13 +319,6 @@ fn measure_command(args: MeasureArgs) -> CliResult {
     print_json(&cx)
 }
 
-#[cfg(test)]
-pub(super) fn ingest_texts(
-    resolved: &ResolvedVault,
-    texts: &[String],
-) -> CliResult<Vec<IngestReport>> {
-    ingest_texts_with_resident(resolved, texts, IngestGpuRoute::cold_workers_allowed())
-}
 
 fn ingest_texts_with_resident(
     resolved: &ResolvedVault,
@@ -453,10 +446,3 @@ mod batch_support;
 mod media;
 mod replay;
 
-#[cfg(test)]
-pub(super) use batch_stream::{
-    ingest_batch_streaming, ingest_batch_streaming_with_summary_emitter,
-    ingest_validated_batch_streaming_with_output,
-};
-#[cfg(test)]
-pub(crate) use batch_support::should_stage_batch_constellation;

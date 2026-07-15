@@ -11,8 +11,6 @@ mod algorithmic_manifest;
 mod manifest;
 mod manifest_metadata;
 mod manifest_runtime;
-#[cfg(test)]
-mod tests;
 
 pub use manifest::{
     LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest,

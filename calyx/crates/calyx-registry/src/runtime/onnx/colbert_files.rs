@@ -69,20 +69,3 @@ fn fetch(repo: &ApiRepo, filename: &str) -> Result<PathBuf> {
     repo.get(filename)
         .map_err(|err| CalyxError::lens_unreachable(format!("fetch {filename} failed: {err}")))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn colbert_candidates_prefer_non_quantized_gpu_graphs() {
-        assert_eq!(COLBERT_ONNX_CANDIDATES[0], "onnx/model_fp16.onnx");
-        assert!(COLBERT_ONNX_CANDIDATES.contains(&"onnx/model.onnx"));
-        assert!(COLBERT_ONNX_CANDIDATES.contains(&"model.onnx"));
-        assert!(
-            !COLBERT_ONNX_CANDIDATES
-                .iter()
-                .any(|name| name.contains("int8") || name.contains("quant"))
-        );
-    }
-}

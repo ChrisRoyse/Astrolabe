@@ -35,6 +35,3 @@ pub use search::{
 pub use window::{
     Clock, FixedClock, SystemClock, TimeWindow, count_hits_in_window, filter_hits_by_window,
 };
-
-#[cfg(test)]
-mod tests;

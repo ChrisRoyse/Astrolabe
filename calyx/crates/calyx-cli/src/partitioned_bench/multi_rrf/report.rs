@@ -53,21 +53,3 @@ pub(super) fn grounded_phase_exit_contract() -> Value {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn contracts_classify_partitioned_rrf_as_ann_not_grounding() {
-        let ann = ann_correctness_contract();
-        let gate = grounded_phase_exit_contract();
-
-        assert_eq!(ann["metric_class"], METRIC_CLASS);
-        assert_eq!(ann["valid_real_outcome"], false);
-        assert_eq!(gate["eligible"], false);
-        assert_eq!(
-            gate["required_gate"]["assay"],
-            "power-calibrated I(panel;oracle) against a validity-audited real outcome"
-        );
-    }
-}

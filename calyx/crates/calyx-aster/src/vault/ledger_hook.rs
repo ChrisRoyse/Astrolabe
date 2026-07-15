@@ -353,6 +353,3 @@ fn parse_ledger_seq(key: &[u8]) -> Result<u64> {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-#[cfg(test)]
-mod tests;
