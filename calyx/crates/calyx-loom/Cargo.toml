@@ -20,6 +20,3 @@ calyx-ward = { path = "../calyx-ward" }
 serde.workspace = true
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v7"] }
-
-[dev-dependencies]
-calyx-forge = { path = "../calyx-forge" }
