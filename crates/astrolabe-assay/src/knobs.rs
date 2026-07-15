@@ -136,6 +136,10 @@ pub const ASSAY_DPI_CEILING_SLACK_MILLIBITS_KNOB: &str = "assay_dpi_ceiling_slac
 /// Name of the minimum-per-slot-signal knob (millibits) that routes a dead lens
 /// to a lens proposal rather than to more grounding.
 pub const ASSAY_MIN_SLOT_SIGNAL_MILLIBITS_KNOB: &str = "assay_min_slot_signal_millibits";
+/// Name of the estimator sample-cap knob (#422): the maximum number of aligned
+/// samples the O(n²)-per-evaluation KSG/Ross point estimate and its bootstrap run
+/// over before a seeded without-replacement subsample bounds the cost.
+pub const ASSAY_ESTIMATOR_SAMPLE_CAP_KNOB: &str = "assay_estimator_sample_cap";
 
 /// Default KSG neighbour count. The blueprint fixes k = 3 (08 §, capability 4.1).
 pub const ASSAY_DEFAULT_KSG_NEIGHBORS_K: u64 = 3;
@@ -246,6 +250,33 @@ pub const ASSAY_DEFAULT_MIN_SLOT_SIGNAL_MILLIBITS: u64 = 50;
 pub const ASSAY_MIN_MIN_SLOT_SIGNAL_MILLIBITS: u64 = 1;
 /// Largest legal minimum-signal threshold, in millibits: 1000 = 1.0 bit.
 pub const ASSAY_MAX_MIN_SLOT_SIGNAL_MILLIBITS: u64 = 1_000;
+
+/// Default estimator sample cap (#422): the largest aligned sample the KSG/Ross
+/// point estimate (and each bootstrap resample) runs over before a seeded
+/// without-replacement subsample bounds it. The estimators are O(n²) per
+/// evaluation, and the index-time signal-card pass runs the bootstrap
+/// (`bootstrap_resamples` estimates) for every dense slot, so an uncapped n makes
+/// that pass grow superlinearly with corpus size and re-dominate the cold index
+/// at monorepo scale (#401/#422 measured: cbm/src n≈2570 signal_cards 5.8s →
+/// full-cbm n≈5242 signal_cards 20.1s, a 3.5× phase rise for a 2× sample rise).
+/// The k-NN MI estimator's statistical variance is O(1/n) (Kraskov et al. 2004;
+/// Gao, Oh & Viswanath 2016), so its standard error at n=2048 is ≈ 1/√2048 ≈
+/// 0.022 bits — inside the 0.05-bit estimator-noise band the sufficiency/DPI
+/// slacks already declare — meaning the estimate is pinned within noise well
+/// before this cap and further samples buy no accuracy while costing O(n²).
+/// Capping converts the per-slot cost from O(n²) to a corpus-size-independent
+/// O(cap²). 2048 is a power-of-two plateau ≈5× the Cochran fixed-precision sample
+/// (384) already used by `assay_sample_size`.
+pub const ASSAY_DEFAULT_ESTIMATOR_SAMPLE_CAP: u64 = 2_048;
+/// Smallest legal estimator sample cap: the Cochran fixed-precision plateau (384),
+/// below which the capped estimate loses the sample support that pins it within
+/// the estimator-noise band. Always far above the provisional floor, so a capped
+/// sample is never pushed below the trusted-estimate threshold.
+pub const ASSAY_MIN_ESTIMATOR_SAMPLE_CAP: u64 = 384;
+/// Largest legal estimator sample cap: an upper bound keeps one card's estimator
+/// work bounded even when an operator raises the cap; a corpus with fewer aligned
+/// samples than the cap is measured whole (the cap only ever subsamples down).
+pub const ASSAY_MAX_ESTIMATOR_SAMPLE_CAP: u64 = 1_000_000;
 
 /// The KSG bits-measurement knob registry (#32).
 pub const ASSAY_BITS_KNOBS: &[U64KnobDeclaration] = &[
@@ -368,6 +399,16 @@ pub const ASSAY_BITS_KNOBS: &[U64KnobDeclaration] = &[
         unit: "millibits",
         source: "ASTROLABE blueprint 14 §4 / capability 10.3 lens-admission gate (≥ 0.05 bits)",
         rationale: "per-slot marginal-bits floor below which a slot is treated as carrying no usable signal, so its share of a sufficiency deficit routes to ProposeLens (replace the dead lens) rather than to AddOutcomeAnchor (more grounding for a live lens); zero is illegal because it would classify a dead slot as informative",
+    },
+    U64KnobDeclaration {
+        registry_version: ASSAY_BITS_KNOB_REGISTRY_VERSION,
+        name: ASSAY_ESTIMATOR_SAMPLE_CAP_KNOB,
+        default: ASSAY_DEFAULT_ESTIMATOR_SAMPLE_CAP,
+        min: ASSAY_MIN_ESTIMATOR_SAMPLE_CAP,
+        max: ASSAY_MAX_ESTIMATOR_SAMPLE_CAP,
+        unit: "samples",
+        source: "Kraskov, Stögbauer & Grassberger, Phys. Rev. E 69 066138 (2004) and Gao, Oh & Viswanath, 'Demystifying Fixed k-Nearest Neighbor Information Estimators' (NeurIPS 2017 / arXiv:1604.03006): the k-NN MI estimator's variance is O(1/n), so its standard error is pinned within the 0.05-bit estimator-noise band by a few thousand samples; sklearn's mutual_info_regression and standard k-NN MI pipelines subsample large samples. KD-tree/ball-tree neighbour search was rejected as the lever because the embedding slots run KSG at a random-projection dimension of ≈2·log2(n) (rp22–rp25 measured), above the D<20 curse-of-dimensionality cliff where a tree degrades to O(n²) (scikit-learn Nearest Neighbors guide).",
+        rationale: "maximum aligned sample the O(n²)-per-evaluation KSG/Ross point estimate and each bootstrap resample run over; above it a seeded without-replacement subsample (a pure function of seed+inputs, so a capped card stays byte-reproducible) bounds the per-slot cost to O(cap²), corpus-size-independent, and the applied cap is recorded in the card's estimator label so a capped value is never a silent change; 2048 keeps the estimator's standard error (~0.022 bits) inside the declared 0.05-bit noise band; a corpus with fewer aligned samples than the cap is measured whole",
     },
 ];
 
