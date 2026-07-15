@@ -39,8 +39,3 @@ path = "src/main.rs"
 [[bin]]
 name = "codebase-memory-mcp"
 path = "src/codebase_memory_mcp_shim.rs"
-
-[dev-dependencies]
-calyx-assay.workspace = true
-calyx-loom.workspace = true
-crc32fast = "1"

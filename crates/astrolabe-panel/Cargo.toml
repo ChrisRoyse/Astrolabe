@@ -17,8 +17,5 @@ sha2 = "0.10"
 default = []
 multi-vector = []
 
-[dev-dependencies]
-proptest = "1"
-
 [lib]
 path = "src/lib.rs"

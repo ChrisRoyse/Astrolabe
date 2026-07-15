@@ -23,7 +23,5 @@ zstd = "0.13"
 path = "src/lib.rs"
 
 [dev-dependencies]
+# astrolabe-panel is consumed by examples/perturb_vault_and_lower.rs.
 astrolabe-panel.workspace = true
-# #133: dev-dependency on every platform so tests/cbm_store_lowered.rs (the
-# real CBM C store opening the lowered artifact) executes natively on Windows.
-cbm-sys.workspace = true

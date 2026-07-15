@@ -11,8 +11,5 @@ blake3 = "1"
 calyx-core.workspace = true
 serde = { version = "1", features = ["derive"] }
 
-[dev-dependencies]
-proptest = "1"
-
 [lib]
 path = "src/lib.rs"

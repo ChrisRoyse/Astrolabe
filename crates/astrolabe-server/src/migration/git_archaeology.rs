@@ -42,15 +42,6 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) cleanup_remnants: usize,
 }
 
-#[cfg(test)]
-pub(crate) fn run_full_git_archaeology<C: Clock>(
-    repo: &Path,
-    project: &str,
-    cache_dir: &Path,
-    vault: &AsterVault<C>,
-) -> Result<GitArchaeologyImportReport, DynError> {
-    run_git_archaeology(repo, project, cache_dir, vault, GitMineMode::Full)
-}
 
 pub(crate) fn run_git_archaeology<C: Clock>(
     repo: &Path,

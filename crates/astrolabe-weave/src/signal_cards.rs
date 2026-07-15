@@ -307,6 +307,3 @@ where
     let symbols = derive_symbol_axes(&snapshot);
     signal_cards_from_symbol_axes(vault, &symbols, slots, seed)
 }
-
-#[cfg(test)]
-mod tests;

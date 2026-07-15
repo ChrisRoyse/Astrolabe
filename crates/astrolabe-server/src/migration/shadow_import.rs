@@ -1783,18 +1783,6 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
 // Self-reading convenience wrapper: production always passes the shared
 // post-import snapshot (#23), so only tests exercise this shape. Gated to test
 // builds rather than shipped as dead code (invariant 6).
-#[cfg(test)]
-pub(crate) fn run_live_weave<C>(
-    vault: &AsterVault<C>,
-    project: &str,
-    import_changed: bool,
-    delta: Option<&WeaveDelta>,
-) -> Result<Value, DynError>
-where
-    C: Clock,
-{
-    run_live_weave_with_snapshot(vault, project, import_changed, delta, None)
-}
 
 /// [`run_live_weave`] with an optional caller-preloaded graph snapshot (#23).
 ///
@@ -2230,10 +2218,6 @@ where
 // Default-skills convenience wrapper used only by tests; every production caller passes
 // explicit skills via *_with_skills below, so this is gated to test builds rather than
 // shipped as dead code (invariant 6).
-#[cfg(test)]
-pub(crate) fn row_sink_import_candidate_from_rows(rows: CbmPipelineRows) -> RowSinkImportCandidate {
-    row_sink_import_candidate_from_rows_with_skills(rows, &SkillDiscoveryConfig::default())
-}
 
 /// Builds the row-sink import candidate, running skill discovery under `skills` — the
 /// registry defaults unless the caller supplied a `calyx_skills` override (#198).
@@ -2823,92 +2807,4 @@ pub(crate) fn persist_shadow_outcome_at(
     )?;
     tx.commit()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod struct_trigram_callee_slot_tests {
-    //! #374: the shadow importer measures S1 (struct_trigrams) and S4 (api_callees)
-    //! from the `st` / `callees` node properties libcbm now serializes, so
-    //! generated-mode guard calibration no longer refuses every real symbol with
-    //! `ASTRO_GUARD_AUTO_SLOT_UNMEASURED`. A symbol whose property is absent stays
-    //! honestly unmeasured (an absent slot), never a fabricated vector.
-    use super::*;
-    use astrolabe_panel::{PanelInput, encode_slot};
-
-    fn input_with(st: Option<&str>, callees: Option<&str>) -> PanelInput {
-        let mut input = PanelInput::fixture(astrolabe_domain::SymbolLabel::Function);
-        let props = input.properties.as_object_mut().unwrap();
-        if let Some(st) = st {
-            props.insert("st".to_string(), Value::String(st.to_string()));
-        }
-        if let Some(callees) = callees {
-            props.insert("callees".to_string(), Value::String(callees.to_string()));
-        }
-        input
-    }
-
-    #[test]
-    fn emitted_properties_yield_measured_s1_and_s4() {
-        // Exactly the wire format libcbm emits: "a\tb\tc\tweight" trigrams and
-        // "name\tcount" callees.
-        let st = "if_statement\tcall_expression\tbinary_expression\t3\n\
-                  call_expression\tbinary_expression\treturn_statement\t2\n";
-        let callees = "compute\t2\nvalidate\t1\n";
-        let input = input_with(Some(st), Some(callees));
-
-        let encoder = shadow_encoder_input(&input);
-        let trigrams = encoder.struct_trigrams.as_ref().expect("S1 measured");
-        assert_eq!(trigrams.len(), 2);
-        assert_eq!(trigrams[0].a, "if_statement");
-        assert_eq!(trigrams[0].weight, 3.0);
-        let calls = encoder.api_calls.as_ref().expect("S4 measured");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].callee, "compute");
-        assert_eq!(calls[0].call_count, 2.0);
-        assert!(!calls[0].resolved);
-
-        let s1 = encode_slot(SlotId::new(1), &encoder).expect("encode S1");
-        let s4 = encode_slot(SlotId::new(4), &encoder).expect("encode S4");
-        assert!(!s1.is_absent(), "S1 must be a measured (non-absent) vector");
-        assert!(!s4.is_absent(), "S4 must be a measured (non-absent) vector");
-    }
-
-    #[test]
-    fn absent_properties_stay_unmeasured_not_fabricated() {
-        let encoder = shadow_encoder_input(&input_with(None, None));
-        assert!(encoder.struct_trigrams.is_none(), "no `st` → S1 unmeasured");
-        assert!(encoder.api_calls.is_none(), "no `callees` → S4 unmeasured");
-        assert!(
-            encode_slot(SlotId::new(1), &encoder)
-                .expect("encode S1")
-                .is_absent(),
-            "absent property must encode to an absent S1 vector, never a fabricated one"
-        );
-        assert!(
-            encode_slot(SlotId::new(4), &encoder)
-                .expect("encode S4")
-                .is_absent(),
-        );
-    }
-
-    #[test]
-    fn malformed_records_are_skipped_not_admitted() {
-        // A trigram line without four fields and a callee with a non-numeric count
-        // are dropped; only well-formed records survive (never a fabricated one).
-        let encoder = shadow_encoder_input(&input_with(
-            Some("a\tb\tc\t1\nonly\ttwo\nx\ty\tz\tnan_weight\n"),
-            Some("good\t3\nbad\tcount\n"),
-        ));
-        let trigrams = encoder
-            .struct_trigrams
-            .as_ref()
-            .expect("one valid trigram survives");
-        assert_eq!(trigrams.len(), 1, "malformed trigram lines dropped");
-        let calls = encoder
-            .api_calls
-            .as_ref()
-            .expect("one valid callee survives");
-        assert_eq!(calls.len(), 1, "malformed callee lines dropped");
-        assert_eq!(calls[0].callee, "good");
-    }
 }

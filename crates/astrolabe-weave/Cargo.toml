@@ -22,8 +22,3 @@ serde_json = "1"
 
 [lib]
 path = "src/lib.rs"
-
-[dev-dependencies]
-astrolabe-kernel.workspace = true
-astrolabe-panel.workspace = true
-proptest = "1"

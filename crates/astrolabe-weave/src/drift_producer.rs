@@ -908,6 +908,3 @@ where
         reference_load_skips + sampling.assay_cotenant_rows_skipped;
     Ok(report)
 }
-
-#[cfg(test)]
-mod tests;

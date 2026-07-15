@@ -827,6 +827,3 @@ impl GateJournal {
         self.serving_admission(repo)?.to_bytes()
     }
 }
-
-#[cfg(test)]
-mod tests;

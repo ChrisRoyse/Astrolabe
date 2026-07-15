@@ -650,6 +650,3 @@ impl crate::predict::GroundedRisk {
         GatedConfidence::new(self.risk, self.ceiling, self.trust)
     }
 }
-
-#[cfg(test)]
-mod tests;

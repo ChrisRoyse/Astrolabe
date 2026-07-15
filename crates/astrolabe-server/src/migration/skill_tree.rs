@@ -62,10 +62,6 @@ pub(crate) fn skill_discovery_config(
 // Default-config convenience wrapper used only by tests; every production caller
 // passes an explicit SkillDiscoveryConfig via *_with_config below, so this is gated
 // to test builds rather than shipped as dead code (invariant 6).
-#[cfg(test)]
-pub(crate) fn skill_tree_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
-    skill_tree_from_row_sink_rows_with_config(rows, &SkillDiscoveryConfig::default())
-}
 
 /// Runs skill discovery over the row-sink rows under `config` (#198).
 ///

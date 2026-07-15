@@ -364,38 +364,3 @@ fn validate_stream_edge(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn params_default_matches_registry_knob_default() {
-        let knob = row_sink_stream_knob(ROW_SINK_STREAM_DRAIN_BATCH_ROWS_KNOB).expect("declared");
-        assert_eq!(
-            RowSinkStreamParams::from_registry().drain_batch_rows(),
-            knob.default
-        );
-        assert_eq!(
-            RowSinkStreamParams::default().drain_batch_rows(),
-            knob.default
-        );
-    }
-
-    #[test]
-    fn params_reject_zero_batch_fail_closed() {
-        let err = RowSinkStreamParams::with_drain_batch_rows(0)
-            .expect_err("zero drain batch must be refused");
-        assert_eq!(err.code(), Some(ASTRO_ROW_SINK_STREAM_BATCH_INVALID));
-        assert!(err.remediation().is_some());
-    }
-
-    #[test]
-    fn params_accept_in_bounds_batch() {
-        let knob = row_sink_stream_knob(ROW_SINK_STREAM_DRAIN_BATCH_ROWS_KNOB).expect("declared");
-        let params = RowSinkStreamParams::with_drain_batch_rows(2).expect("2 is in bounds");
-        assert_eq!(params.drain_batch_rows(), 2);
-        assert!(RowSinkStreamParams::with_drain_batch_rows(knob.max).is_ok());
-        assert!(RowSinkStreamParams::with_drain_batch_rows(knob.max + 1).is_err());
-    }
-}

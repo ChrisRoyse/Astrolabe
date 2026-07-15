@@ -544,33 +544,6 @@ fn ensure_graph_bound_to_ledger(rows: &[LedgerRow], graph_hash: &str) -> LowerRe
     Err(refuse(TeamArtifactRefusal::GraphAttestation, message))
 }
 
-/// Test-only: extract the `asl_v1` lowering attestation payload from the vault
-/// export bundled in an exported team artifact, decoding the *actual persisted
-/// ledger bytes* (hex row -> Calyx `decode` -> JSON payload) rather than any
-/// in-memory value. Used to full-state-verify that the graph digest is recorded
-/// under the Calyx-allowlisted `artifact_sha256` field name (#84).
-#[cfg(test)]
-pub(crate) fn asl_v1_attestation_payload(artifact_dir: &Path) -> serde_json::Value {
-    let vault_zst =
-        fs::read(artifact_dir.join(VAULT_EXPORT_ZST_NAME)).expect("read bundled vault.export.zst");
-    let export = read_vault_export(&vault_zst).expect("read vault export");
-    let rows = rows_from_export(&export).expect("rows from vault export");
-    for row in &rows {
-        let entry = decode(&row.bytes).expect("decode persisted ledger row");
-        if entry.kind != EntryKind::Admin {
-            continue;
-        }
-        if !matches!(&entry.actor, ActorId::Service(actor) if actor == crate::ASTRO_LOWER_ACTOR) {
-            continue;
-        }
-        let payload: serde_json::Value =
-            serde_json::from_slice(&entry.payload).expect("decode ledger payload JSON");
-        if payload.get("schema").and_then(serde_json::Value::as_str) == Some("asl_v1") {
-            return payload;
-        }
-    }
-    panic!("no asl_v1 lowering attestation found in the persisted vault-export ledger");
-}
 
 fn ensure_manifest_head_matches(
     manifest: &TeamArtifactManifest,

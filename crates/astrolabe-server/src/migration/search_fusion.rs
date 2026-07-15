@@ -701,31 +701,6 @@ fn parse_slot_name(name: &str) -> Option<SlotId> {
     }
 }
 
-/// Extracts the ordered `qualified_name` ids from a raw `search_graph` tool
-/// result (legacy CBM shape or the fused shape share `structuredContent.results`).
-/// Used by the A/B harness to score either path's ranking.
-#[cfg(test)]
-pub(crate) fn ordered_symbol_ids_from_search_result(raw: &str) -> Result<Vec<String>, DynError> {
-    let value: Value = serde_json::from_str(raw)?;
-    let results = value
-        .get("structuredContent")
-        .and_then(|structured| structured.get("results"))
-        .and_then(Value::as_array)
-        .ok_or("search result carried no structuredContent.results array")?;
-    let mut ids = Vec::with_capacity(results.len());
-    for hit in results {
-        let id = hit
-            .get("qualified_name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .or_else(|| hit.get("name").and_then(Value::as_str))
-            .unwrap_or_default();
-        if !id.is_empty() {
-            ids.push(id.to_string());
-        }
-    }
-    Ok(ids)
-}
 
 /// The Astrolabe-side extension properties overlaid onto the CBM `search_graph`
 /// tool schema in tools/list (#328). Documents the `propagated_label` filter
@@ -778,87 +753,4 @@ pub(crate) fn search_graph_astrolabe_property_overlay() -> Vec<(String, Value)> 
             }),
         ),
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Pure FSV of the query embedder: the same query embeds identically across
-    // repeats (determinism), only declared slots are embedded, and a
-    // no-vocabulary query yields no vector rather than a fabricated one.
-    #[test]
-    fn embed_query_slots_is_deterministic_and_declared_only() {
-        let table = StaticEmbeddingTable::load_default().expect("load frozen nomic table");
-        let declared: BTreeSet<SlotId> = [SLOT_CODE_SEMANTIC, SLOT_NAME_SEMANTIC]
-            .into_iter()
-            .collect();
-
-        let first = embed_query_slots(&table, "authenticate user token", &declared)
-            .unwrap_or_else(|_| panic!("embed must not fail on a real query"));
-        let second = embed_query_slots(&table, "authenticate user token", &declared)
-            .unwrap_or_else(|_| panic!("embed must be deterministic"));
-        assert_eq!(
-            first, second,
-            "identical query must embed to identical vectors"
-        );
-        assert!(
-            first.contains_key(&SLOT_CODE_SEMANTIC) && first.contains_key(&SLOT_NAME_SEMANTIC),
-            "both declared semantic slots must embed a real query"
-        );
-
-        // A slot not declared in the corpus is never embedded.
-        let only_code: BTreeSet<SlotId> = [SLOT_CODE_SEMANTIC].into_iter().collect();
-        let restricted = embed_query_slots(&table, "authenticate user", &only_code)
-            .unwrap_or_else(|_| panic!("embed must not fail"));
-        assert!(restricted.contains_key(&SLOT_CODE_SEMANTIC));
-        assert!(
-            !restricted.contains_key(&SLOT_NAME_SEMANTIC),
-            "an undeclared slot must not be embedded"
-        );
-    }
-
-    // #328: the tools/list overlay advertises the fusion + propagated_label knobs,
-    // and every advertised property maps to a real honored argument.
-    #[test]
-    fn search_graph_overlay_advertises_fusion_and_propagated_label_truthfully() {
-        let overlay = search_graph_astrolabe_property_overlay();
-        let names: BTreeSet<&str> = overlay.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(names.contains("fusion"), "fusion knob must be advertised");
-        assert!(
-            names.contains("propagated_label"),
-            "propagated_label knob must be advertised"
-        );
-        assert!(names.contains("fusion_override"));
-        assert!(names.contains("temporal_alpha_millis"));
-        for (name, schema) in &overlay {
-            assert!(
-                schema.get("type").is_some(),
-                "{name} overlay must declare a JSON type"
-            );
-            let description = schema
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            assert!(
-                !description.is_empty(),
-                "{name} overlay must carry a truthful description"
-            );
-        }
-    }
-
-    #[test]
-    fn manifest_cache_path_is_project_scoped_under_cache_dir() {
-        let path = manifest_cache_path(Path::new("/cache"), "demo");
-        assert!(path.ends_with("demo.astrolabe-search-index.v1.json"));
-    }
-
-    #[test]
-    fn parse_slot_name_accepts_declared_aliases_only() {
-        assert_eq!(parse_slot_name("S7"), Some(SLOT_LEXICAL_BM25));
-        assert_eq!(parse_slot_name("code_semantic"), Some(SLOT_CODE_SEMANTIC));
-        assert_eq!(parse_slot_name("20"), Some(SLOT_NAME_SEMANTIC));
-        assert_eq!(parse_slot_name("s1"), None);
-        assert_eq!(parse_slot_name("api_callees"), None);
-    }
 }

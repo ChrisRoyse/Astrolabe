@@ -29,6 +29,3 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [lib]
 path = "src/lib.rs"
-
-[dev-dependencies]
-proptest = "1"

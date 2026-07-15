@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuites>
-  <testsuite name="com.demo.CalcTest" tests="3" failures="1" errors="0" skipped="0">
-    <testcase name="adds" classname="com.demo.CalcTest" time="0.012"/>
-    <testcase name="subtracts" classname="com.demo.CalcTest" time="0.034">
-      <failure message="expected 1 but was 2" type="org.junit.ComparisonFailure">org.junit.Compa

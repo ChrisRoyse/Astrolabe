@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(test)]
-use calyx_aster::cf::prefix_range;
 use calyx_ledger::EntryKind;
 
 // Single source of truth (#348): the live-anomaly reader must accept exactly
@@ -18,26 +16,10 @@ struct KernelDirtyScc {
     removed_members: Vec<String>,
 }
 
-/// Raw `(key, value)` rows scanned from a column family.
-#[cfg(test)]
-type RawCfRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 // Self-reading convenience wrapper: production always passes the shared
 // post-import snapshot (#23), so only tests exercise this shape. Gated to test
 // builds rather than shipped as dead code (invariant 6).
-#[cfg(test)]
-pub(crate) fn persist_delta_invalidations<C>(
-    vault: &AsterVault<C>,
-    project: &str,
-    import_changed: bool,
-    delta: Option<&WeaveDelta>,
-    weave: &Value,
-) -> Result<Value, DynError>
-where
-    C: Clock,
-{
-    persist_delta_invalidations_with_snapshot(vault, project, import_changed, delta, weave, None)
-}
 
 /// [`persist_delta_invalidations`] with an optional caller-preloaded graph
 /// snapshot (#23). The invalidation lane only consumes node/edge rows, which the
@@ -529,22 +511,4 @@ fn dirty_scc_id(members: &[String], removed_members: &[String]) -> String {
         hasher.update(member.as_bytes());
     }
     hex_lower(&hasher.finalize())
-}
-
-#[cfg(test)]
-pub(crate) fn scan_invalidation_rows<C>(
-    vault: &AsterVault<C>,
-    snapshot: u64,
-    cf: ColumnFamily,
-    project: &str,
-    family: &str,
-) -> Result<RawCfRows, DynError>
-where
-    C: Clock,
-{
-    Ok(vault.scan_cf_range_at(
-        snapshot,
-        cf,
-        &prefix_range(&invalidation_prefix(project, family)),
-    )?)
 }
