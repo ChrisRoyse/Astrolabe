@@ -52,13 +52,16 @@ codebase-memory-mcp uninstall        # remove agent configs
 
 ### CLI Mode
 
-Every MCP tool is also available directly from the command line:
+Every MCP tool is also available directly from the command line. Tool
+arguments are supplied as JSON via piped stdin or `--args-file <path>`;
+passing raw JSON as an argv token is refused fail-closed
+(`ASTRO_CLI_RAW_JSON_ARGV_REMOVED`).
 
 ```bash
-codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
-codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_call_path '{"function_name": "main", "direction": "both"}'
-codebase-memory-mcp cli get_architecture '{}'
+echo '{"repo_path": "/path/to/repo"}' | codebase-memory-mcp cli index_repository
+echo '{"name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
+codebase-memory-mcp cli trace_call_path --args-file trace-args.json  # trace-args.json: {"function_name": "main", "direction": "both"}
+codebase-memory-mcp cli get_architecture
 ```
 
 ## MCP Tools

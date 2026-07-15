@@ -186,7 +186,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
-- **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
+- **CLI mode**: `echo '{"name_pattern": ".*Handler.*"}' | codebase-memory-mcp cli search_graph`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
 
 ## Team-Shared Graph Artifact
@@ -393,15 +393,16 @@ never gates and never blocks.
 
 ## CLI Mode
 
-Every MCP tool can be invoked from the command line:
+Every MCP tool can be invoked from the command line. Tool arguments are
+supplied as JSON via piped stdin or `--args-file <path>`; passing raw JSON as
+an argv token is refused fail-closed (`ASTRO_CLI_RAW_JSON_ARGV_REMOVED`).
 
 ```bash
-codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
-codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_path '{"function_name": "Search", "direction": "both"}'
-codebase-memory-mcp cli query_graph '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
+echo '{"repo_path": "/path/to/repo"}' | codebase-memory-mcp cli index_repository
+echo '{"name_pattern": ".*Handler.*", "label": "Function"}' | codebase-memory-mcp cli search_graph
+echo '{"query": "MATCH (f:Function) RETURN f.name LIMIT 5"}' | codebase-memory-mcp cli query_graph
+codebase-memory-mcp cli trace_path --args-file trace-args.json  # trace-args.json: {"function_name": "Search", "direction": "both"}
 codebase-memory-mcp cli list_projects
-codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.results[].name'
 ```
 
 ## MCP Tools
