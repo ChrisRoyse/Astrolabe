@@ -1033,27 +1033,55 @@ static void *index_thread_fn(void *arg) {
         snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
     }
 
-    /* Worker log path. It is created / tailed / deleted entirely inside
-     * cbm_subprocess_run via the extended-length ("\\?\") wide-path family, so a
-     * deep %TEMP% (or /tmp) is handled there — this is just the UTF-8 path string.
-     * Buffer is generous so a >MAX_PATH %TEMP% is not truncated before widening. */
+    /* Worker log + args-file paths. Both live under %TEMP% (or /tmp) and are
+     * created / read / deleted via the extended-length ("\\?\") wide-path family
+     * (cbm_fopen / cbm_unlink and cbm_subprocess_run's CreateFileW log), so a deep
+     * %TEMP% is handled by the one shared mechanism. Buffers are generous so a
+     * >MAX_PATH %TEMP% is not truncated before widening. */
     char log_file[1024];
+    char args_file[1024];
 #ifdef _WIN32
     const char *tmp_dir = getenv("TEMP");
-    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
-             tmp_dir && tmp_dir[0] ? tmp_dir : ".", (int)_getpid());
+    const char *tdir = tmp_dir && tmp_dir[0] ? tmp_dir : ".";
+    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log", tdir, (int)_getpid());
+    snprintf(args_file, sizeof(args_file), "%s\\cbm_index_%d.args.json", tdir, (int)_getpid());
 #else
     snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d.log", (int)getpid());
+    snprintf(args_file, sizeof(args_file), "/tmp/cbm_index_%d.args.json", (int)getpid());
 #endif
+
+    /* Hand the tool JSON to the worker via --args-file — the public CLI argument
+     * contract (#378/#411 removed raw-JSON argv). This is exactly how the primary
+     * index supervisor (mcp/index_supervisor.c) spawns its worker; converging onto
+     * that one mechanism means matching its arg handoff too. cbm_fopen widens +
+     * "\\?\"-prefixes so the args file writes even under a deep %TEMP%. */
+    FILE *af = cbm_fopen(args_file, "w");
+    if (!af || fputs(json_arg, af) == EOF) {
+        if (af) {
+            fclose(af);
+        }
+        (void)cbm_unlink(args_file);
+        snprintf(job->error_msg, sizeof(job->error_msg),
+                 "index args-file write failed; remediation: check that %s is writable",
+#ifdef _WIN32
+                 "%TEMP%");
+#else
+                 "/tmp");
+#endif
+        atomic_store(&job->status, 3);
+        cbm_log_info("ui.index.done", "path", job->root_path, "rc", "args_write_failed");
+        return NULL;
+    }
+    fclose(af);
 
     /* --index-worker: this http_server spawn is already the crash-isolation layer,
      * so the child indexes in-process rather than spawning its own supervisor
      * (avoids redundant process nesting). The shared cbm_subprocess_run builds the
      * command line through the MS-CRT quoter and spawns via CreateProcessW with a
-     * wide command line, so the JSON arg's embedded quotes and any non-ASCII repo
-     * path survive the parent->worker boundary intact (#423/#20). */
-    const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
-                                    json_arg, NULL};
+     * wide command line, so the args-file path (and any non-ASCII repo path it
+     * points at) survives the parent->worker boundary intact (#423/#20). */
+    const char *const idx_argv[] = {bin,          "cli",     "--index-worker", "index_repository",
+                                    "--args-file", args_file, NULL};
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
@@ -1071,6 +1099,9 @@ static void *index_thread_fn(void *arg) {
 
     cbm_proc_result_t res = {0};
     int run_rc = cbm_subprocess_run(&opts, &res);
+    /* Worker has been reaped by cbm_subprocess_run (it blocks until exit), so the
+     * args file has been fully consumed — long-path-safe delete regardless of outcome. */
+    (void)cbm_unlink(args_file);
     if (run_rc != 0 || res.outcome == CBM_PROC_SPAWN_FAILED) {
         /* Fail closed — no silent fallback to the retired ANSI spawn path. A spawn
          * failure here means the worker never ran (bad binary path, cmdline
