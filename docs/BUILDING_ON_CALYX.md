@@ -329,7 +329,7 @@ Composable flow: `create_vault → add_lens ×(diverse) → ingest → anchor �
 7. **Real-time / deterministic consumers.** keep Calyx at authoring/agent/analytics time. For a hot loop, lower the needed intelligence (kernel, bits, associations, imputed values, predictions) into fingerprinted, reproducible frozen data and consume that. Never call Calyx from a deterministic tick.
 8. **Universal DB usage.** model relational/document/KV/time-series/graph/vector/full-text as collections and lenses over the one core — don't bolt on a second engine.
 9. **Self-optimize.** enable the shadow-tested reversible tuning loops toward the objective; watch tripwires; every change logged and rollback-able.
-10. **Prove it.** a return value is a claim; the source of truth is the bytes. Read the stored rows / ledger entries / index artifacts and compare observed vs. expected — a green test is supporting evidence, not proof.
+10. **Prove it.** a return value is a claim; the source of truth is the bytes. Read the stored rows / ledger entries / index artifacts and compare observed vs. expected. (Design correction 2026-07-14: manual Full State Verification against reality is the *only* verification — the tree carries no tests; a passing test is never proof and never closure evidence.)
 
 ## 10. Cross-domain applicability — the same mechanics, any domain
 

@@ -1822,7 +1822,7 @@ C binds tree-sitter/SQLite to mimalloc through `cbm_alloc_init` (which must run 
 
 CUDA/TEI/ONNX features excluded from default builds on all platforms.
 
-## 7. Verification pipeline *(design correction 2026-07-11: local gates only — hosted CI is banned; see 00_INDEX)*
+## 7. Verification pipeline *(design correction 2026-07-11: local gates only — hosted CI is banned; see 00_INDEX. Further superseded 2026-07-14: the gate stages below are deleted — verification is manual Full State Verification against the real artifact only; see §20 head.)*
 
 Stages, all executed as local scripts from the canonical workspace: (1) C gate â€” upstream CBM lint/tests (clang-tidy -Werror, cppcheck, 5.9K tests, ASan/UBSan) unchanged; (2) Rust gate â€” fmt, clippy -D warnings, nextest (Calyx crates + astrolabe crates); (3) FFI gate â€” bindgen drift check, link test all platforms, LSan on bridge tests; (4) parity + determinism suites (20); (5) bench gate (17 Â§6); (6) release â€” cross-builds, checksums, VirusTotal scan (CBM's release discipline inherited).
 
@@ -1838,6 +1838,8 @@ Same channel network as CBM (npm/PyPI/Homebrew/Scoop/Winget/Chocolatey/AUR/`go i
 # 20_TESTING_VERIFICATION.md
 
 # 20 â€” Testing & Verification Strategy
+
+> **Design correction 2026-07-14 (owner directive — supersedes this entire section as forward-looking doctrine):** Manual Full State Verification against reality is the **only** verification. A passing test proves nothing: verification means exercising the real built artifact yourself against real data, then independently reading back the persisted state (bytes on disk, DB rows, ledger entries, process output) and comparing it to the claim. The repository therefore **carries no tests** — the inherited CBM `make test` corpus, the Calyx nextest/proptest suites, every `#[cfg(test)]` module, every `tests/` directory, all gate/check scripts, and the aggregate/release-predicate runners are **deleted from the tree** and are not to be rebuilt. All quantitative claims below (parity diffs, determinism probes, byte-verification, ROC/backtest numbers, soak bounds, agent-eval ratios) remain real *measurements*, but they are obtained by running the real binary and reading back reality — never by a gate that emits a green checkmark, and a DoD box is never closed on a test result. The layer/gate/predicate structure that follows is retained as design vocabulary for *what to measure*; it no longer describes *how closure is proven*. (Extends the 2026-07-13 FSV-only directive and the 2026-07-11 hosted-CI ban; GitHub Actions and any hosted CI/CD remain banned.)
 
 Both parents bring strong, different testing cultures: CBM's 5,900+ gating cases + red-by-design repro suite + sanitizers; Calyx's FSV byte-verification doctrine + determinism probes + pinned-invariant tests + hazard/soak. ASTROLABE inherits **both** and adds the fusion-specific layers.
 

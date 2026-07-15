@@ -15,8 +15,8 @@
     carries no readable PID). A future stale-manifest consumer (#293) can then trust
     the .tmp manifest corpus. The current run's own manifest is never swept.
 
-    Both the launcher and its FSV test (scripts/test-attribution-manifest.ps1, against
-    isolated fixture dirs -- never the live .tmp) route through these functions.
+    Both the launcher and its manual FSV (exercised against isolated fixture dirs -- never
+    the live .tmp) route through these functions.
 #>
 
 # .tmp basename shape the launcher writes: no-escape-attribution-<PID>.json (+ its

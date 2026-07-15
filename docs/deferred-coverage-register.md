@@ -24,6 +24,14 @@ prove.
 >   to co-emit `DEFERRED[ASTRO_PORT_PHASE]`) was retired with the suite. The
 >   rule it enforced is doctrine in `CLAUDE.md` and applies to any future
 >   FSV instrument that labels a skip.
+>
+> **Extended 2026-07-14 (owner directive, #397):** all test code is deleted from
+> the tree — no `#[cfg(test)]` modules, `tests/` dirs, C test corpus, or
+> test/gate scripts remain. Any token above that named a test or doctest as its
+> coverage owner (e.g. `SKIP[ASTRO_FAST_TIER_DOCTESTS]`,
+> `SKIP[ASTRO_GATE_SELFTESTS_UNCHANGED]`) is historical provenance only; the gap
+> it names, where still real, is closed exclusively by manual Full State
+> Verification against the real artifact. No test is closure evidence.
 
 > **Read this before interpreting green evidence.**
 > Green Astrolabe verification proves the system on **native Windows
