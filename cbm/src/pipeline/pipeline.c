@@ -20,6 +20,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
+#include "mcp/index_supervisor.h" /* cbm_index_worker_active — #405 FSV abort hook gate */
 #include "git/git_context.h"
 #include "store/store.h"
 #include "discover/discover.h"
@@ -1299,6 +1300,23 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
+    }
+
+    /* #405 FSV hook (DEBUG-ONLY, never reachable in normal operation): fault the
+     * pipeline pass on demand to prove out-of-process crash isolation for the
+     * shadow index path. Gated on BOTH an explicit debug env var AND running as a
+     * supervised index worker, so it can ONLY abort the isolated child subprocess —
+     * never the host process — and does nothing unless CBM_DEBUG_PIPELINE_ABORT is
+     * deliberately set (the product never sets it). This models a hard C-level pass
+     * abort (segfault/abort-class); the supervisor contains it and the caller fails
+     * closed with the vault untouched. See #405 DoD (a). */
+    if (cbm_index_worker_active()) {
+        const char *abort_hook = getenv("CBM_DEBUG_PIPELINE_ABORT");
+        if (abort_hook && abort_hook[0] && strcmp(abort_hook, "0") != 0) {
+            cbm_log_error("pipeline.debug_abort", "reason", "CBM_DEBUG_PIPELINE_ABORT", "note",
+                          "intentional_fsv_crash_405");
+            abort();
+        }
     }
 
     CBM_PROF_START(t_pipeline_total);

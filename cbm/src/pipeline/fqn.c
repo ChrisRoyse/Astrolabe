@@ -7,6 +7,7 @@
 #include "pipeline/pipeline.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 
 #include <stdbool.h>
 #include <stddef.h> // NULL
@@ -23,12 +24,27 @@
 #define FQN_MAX_PATH_SEGS 254
 #define FQN_MAX_DIR_SEGS 255
 
-/* Max bytes for a derived project name. The name becomes a filename component
- * ("<cache>/<name>.db" and sidecars ".db-wal"/".db.corrupt"), so it must stay
- * under the filesystem's 255-byte component limit. 200 leaves headroom for the
- * longest sidecar suffix. #571 hex-encodes each non-ASCII byte to 2 chars, so a
- * deep CJK path can triple past 255 and make the DB file un-openable (#624). */
-#define FQN_MAX_NAME_LEN 200
+/* Max bytes for a derived project name. The name becomes a single filename
+ * component: the C side writes "<cache>/<name>.db" (+ sidecars ".db-wal" /
+ * ".db.corrupt"), and the Rust host writes "<name>.astrolabe-lowered.db" (21
+ * bytes) and "<name>.astrolabe-vault" (16 bytes) from the SAME derived name, so
+ * the component must stay under the filesystem's 255-byte per-component limit
+ * (NTFS MAX_PATH component == 255). A cap of 128 keeps every consumer's longest
+ * suffix (128 + 21 = 149) comfortably under 255. #571 hex-encodes each
+ * non-ASCII byte to 2 chars, so a deep CJK path (or any deep tree) can flatten
+ * far past 255 and make the DB file un-openable (#624/#409) — this cap is the
+ * single structural fix, applied at the one derivation point below. */
+#define FQN_MAX_NAME_LEN 128
+
+/* Disambiguating hash suffix width: the first 8 bytes of SHA-256 rendered as 16
+ * lowercase hex chars ([0-9a-f]). 64 bits of digest makes collisions between two
+ * distinct long paths astronomically unlikely. */
+#define FQN_HASH_HEX_LEN 16
+
+/* Bytes of the sanitized name kept when it overflows the cap: the tail of the
+ * name (the corpus directory end — the human-meaningful part), plus one '-'
+ * separator, plus the hash, sums to exactly FQN_MAX_NAME_LEN. */
+#define FQN_NAME_TAIL_LEN (FQN_MAX_NAME_LEN - 1 - FQN_HASH_HEX_LEN)
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -363,28 +379,67 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
     return result;
 }
 
-/* Bound a derived project name to FQN_MAX_NAME_LEN bytes so "<cache>/<name>.db"
- * stays within the filesystem's 255-byte filename-component limit (#624). Names
- * within the cap are returned UNCHANGED (no drift). Longer names keep their first
- * (CAP-9) bytes and get a "-XXXXXXXX" FNV-1a hash of the FULL name appended, so
- * two long paths that share a prefix but differ later still map to distinct
- * names. The suffix ends in a hex digit, so the result stays validator-safe. */
+/* Bound a derived project name to FQN_MAX_NAME_LEN bytes so every consumer's
+ * filename component ("<cache>/<name>.db" on the C side, "<name>.astrolabe-
+ * lowered.db" / "<name>.astrolabe-vault" on the Rust host) stays within the
+ * filesystem's 255-byte per-component limit (#624/#409). This is the SINGLE
+ * derivation point; because all consumers route through cbm_project_name_from_
+ * path (C pipeline, mcp session-root, Rust FFI), bounding here keeps them
+ * coherent with no additional plumbing.
+ *
+ * Behavior:
+ *  - Names within the cap are returned byte-UNCHANGED (no drift — short paths
+ *    keep their historical name exactly).
+ *  - Longer names are rewritten to
+ *        <last FQN_NAME_TAIL_LEN sanitized bytes>-<16 hex>
+ *    where the 16 hex chars are the first 8 bytes of SHA-256 over the FULL
+ *    sanitized name. Two deep paths that share a truncated tail but differ
+ *    anywhere in the full name still hash differently → distinct names.
+ *    Deterministic: same input path → same bounded name, forever.
+ *
+ * We keep the TAIL (not the head): the head is the drive/home prefix, the tail
+ * is the corpus directory name — the human-meaningful part. The kept tail is
+ * advanced past any leading '.'/'-' so the result never begins with a dot
+ * (cbm_validate_project_name rejects a leading dot); the sanitizer already
+ * collapsed ".." and consecutive dashes, so no ".." can appear in any
+ * substring, and the "-<hex>" suffix always ends in a validator-safe hex
+ * digit. */
 static char *fqn_bound_name_len(char *name) {
     if (!name) {
         return name;
     }
     size_t n = strlen(name);
     if (n <= FQN_MAX_NAME_LEN) {
-        return name; /* within cap → unchanged, no drift */
+        return name; /* within cap → returned byte-unchanged, no drift */
     }
-    uint32_t h = 2166136261u; /* FNV-1a offset basis over the FULL name */
-    for (size_t i = 0; i < n; i++) {
-        h ^= (unsigned char)name[i];
-        h *= 16777619u;
+
+    /* First 8 SHA-256 digest bytes = first 16 hex chars over the FULL name. */
+    char hex[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(name, n, hex);
+    hex[FQN_HASH_HEX_LEN] = '\0';
+
+    /* Keep the tail; skip any leading '.'/'-' so the spliced name is validator-
+     * safe. The sanitized name has no "--"/".." runs, so this run is short and
+     * cannot consume the whole tail for a real (content-bearing) path; guard the
+     * degenerate all-punctuation tail by falling back to the hash alone (which
+     * begins with a hex digit, itself validator-safe). */
+    char *tail = name + (n - FQN_NAME_TAIL_LEN);
+    while (*tail == '.' || *tail == '-') {
+        tail++;
     }
-    /* Keep first (CAP-9) bytes + "-" + 8 hex = CAP total. The buffer holds n+1
-     * bytes and n > CAP, so writing 9 chars + NUL at offset (CAP-9) fits. */
-    snprintf(name + (FQN_MAX_NAME_LEN - 9), 10, "-%08x", h);
+    size_t tail_len = strlen(tail); /* ≤ FQN_NAME_TAIL_LEN */
+    if (tail_len == 0) {
+        memcpy(name, hex, FQN_HASH_HEX_LEN);
+        name[FQN_HASH_HEX_LEN] = '\0';
+        return name;
+    }
+    /* Layout: <tail_len bytes>-<16 hex>, total ≤ FQN_MAX_NAME_LEN. The buffer
+     * holds n+1 bytes with n > FQN_MAX_NAME_LEN, so the write fits. memmove
+     * because source (tail) and destination (name) overlap. */
+    memmove(name, tail, tail_len);
+    name[tail_len] = '-';
+    memcpy(name + tail_len + 1, hex, FQN_HASH_HEX_LEN);
+    name[tail_len + 1 + FQN_HASH_HEX_LEN] = '\0';
     return name;
 }
 
@@ -503,7 +558,7 @@ char *cbm_project_name_from_path(const char *abs_path) {
     char *result = strdup(start);
     free(path);
     if (result) {
-        result = fqn_bound_name_len(result); /* #624: cap filename-component length */
+        result = fqn_bound_name_len(result); /* #624/#409: cap filename-component length */
     }
     return result;
 }

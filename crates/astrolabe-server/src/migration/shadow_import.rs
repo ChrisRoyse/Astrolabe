@@ -36,6 +36,14 @@ pub(crate) const ASTRO_SHADOW_ROW_SINK_IMPORT_FAILED: &str = "ASTRO_SHADOW_ROW_S
 /// The row-sink direct import failed AND the CBM SQLite fallback import also failed. Both
 /// underlying errors are chained verbatim so neither cause is masked (#23).
 pub(crate) const ASTRO_SHADOW_IMPORT_BOTH_FAILED: &str = "ASTRO_SHADOW_IMPORT_BOTH_FAILED";
+/// The out-of-process shadow index pass did not complete cleanly (#405): a hard
+/// C-level abort (segfault/abort-class), a hang, a non-fault kill, or a spawn
+/// failure. The CBM pipeline pass runs in a supervised worker subprocess precisely
+/// so such a fault is contained there and can never leave a partially-written
+/// vault — vault writes begin only after a fully clean pass. This code marks that
+/// contained failure; the vault is left fully intact (no partial manifests/surfaces).
+pub(crate) const ASTRO_SHADOW_INDEX_PASS_CRASHED: &str = "ASTRO_SHADOW_INDEX_PASS_CRASHED";
+pub(crate) const SHADOW_INDEX_PASS_CRASHED_REMEDIATION: &str = "the CBM index pass did not complete cleanly in its isolated worker subprocess; the fault was contained and the shadow vault was left untouched (not partially committed). Inspect the worker exit code / log tail carried in this error to find the offending input, then rerun index_repository with calyx=\"shadow\"";
 pub(crate) const SHADOW_ROW_SINK_IMPORT_FAILED_REMEDIATION: &str = "the CBM row-sink snapshot could not be imported directly and no CBM SQLite artifact exists to recover from; fix the row-sink rows (the chained error names the exact offending row/field) and rerun index_repository with calyx=\"shadow\"";
 pub(crate) const SHADOW_IMPORT_BOTH_FAILED_REMEDIATION: &str = "both the CBM row-sink direct import and the CBM SQLite fallback import failed; the chained errors name each root cause — resolve the row-sink error first (it is the primary source), then rerun index_repository with calyx=\"shadow\"";
 pub(crate) const SHADOW_SOURCE_MISSING_REMEDIATION: &str = "run index_repository with calyx=\"shadow\" to build the CBM SQLite source and shadow vault before reading shadow freshness";
@@ -1295,25 +1303,23 @@ pub(crate) fn reconcile_shadow_import_current_at(
         return ensure_shadow_import_current_at(cache_dir, project);
     };
 
-    // Replay the CBM pipeline verbatim and capture the row sink, mirroring
-    // handle_index_repository's row-sink path. The lock is taken only for the
+    // Replay the CBM pipeline verbatim, OUT OF PROCESS (#405), and rebuild the
+    // row-sink-equivalent candidate from the child's persisted `<project>.db`. A
+    // hard pass abort during staleness repair is therefore contained in the child
+    // and cannot leave a partial vault. The lock is taken only for the
     // import+persist below (like index_repository), never around the pipeline run.
+    //
+    // Persist a real import ONLY for a genuine Available candidate. A contained
+    // crash, a spawn failure, an empty/Unavailable candidate, or any infrastructure
+    // error yields no Available candidate, so we fall back to the #222 fail-closed
+    // floor — preserving last-known-good surfaces and returning
+    // StaleReindexRequired rather than clobbering them with "unavailable".
     let skills = SkillDiscoveryConfig::default();
-    let candidate = match runner.handle_index_repository_with_rows(&index_args) {
-        Ok(run) => match run.rows {
-            Ok(rows) => Some(row_sink_import_candidate_from_rows_with_skills(
-                rows, &skills,
-            )),
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
-
-    // Persist a real import ONLY for a genuine Available candidate. An absent or
-    // Unavailable candidate must not clobber good surfaces with "unavailable" — the
-    // #222 floor preserves them and returns StaleReindexRequired instead.
-    let row_sink = match candidate {
-        Some(available @ RowSinkImportCandidate::Available(_)) => available,
+    let row_sink = match run_shadow_index_pass(runner, &index_args, Some(project), &skills) {
+        Ok(ShadowIndexPassOutcome::Completed {
+            candidate: available @ RowSinkImportCandidate::Available(_),
+            ..
+        }) => available,
         _ => return ensure_shadow_import_current_at(cache_dir, project),
     };
 
@@ -2240,6 +2246,178 @@ where
 // Default-skills convenience wrapper used only by tests; every production caller passes
 // explicit skills via *_with_skills below, so this is gated to test builds rather than
 // shipped as dead code (invariant 6).
+
+/// Outcome of running the shadow CBM index pass OUT OF PROCESS (#405).
+///
+/// The pass runs in a supervised worker subprocess (no FFI row sink — a callback
+/// cannot cross the process boundary), so a hard abort is contained in the child.
+pub(crate) enum ShadowIndexPassOutcome {
+    /// The child exited clean. `raw_result` is its `index_repository` response,
+    /// `project` the resolved project name, and `candidate` the row-sink-equivalent
+    /// import candidate rebuilt from the child's persisted CBM SQLite.
+    Completed {
+        raw_result: String,
+        project: String,
+        candidate: RowSinkImportCandidate,
+    },
+    /// The pass failed closed — a contained hard abort/hang/spawn-failure, or a
+    /// graceful libcbm error. `error_result` is the raw `{isError}` tool result;
+    /// the vault was never touched (no partial manifests/surfaces).
+    Failed { error_result: String },
+}
+
+/// Reads the CBM SQLite (`<project>.db`) written by the out-of-process index pass
+/// back into the row-sink-equivalent [`CbmPipelineRows`] (#405).
+///
+/// The SQLite `nodes`/`edges` tables and the in-process row-sink stream are two
+/// serializations of the identical in-memory dump arrays (same final ids), so this
+/// readback reproduces the row stream the sink would have delivered — see
+/// [`astrolabe_ingest::read_cbm_sqlite_pipeline_rows`]. Feeding the result through
+/// the same [`row_sink_import_candidate_from_rows_with_skills`] keeps every derived
+/// shadow surface byte-identical to the old in-process path.
+pub(crate) fn read_shadow_pipeline_rows(
+    sqlite_path: &Path,
+    project: &str,
+) -> Result<CbmPipelineRows, DynError> {
+    let rows = astrolabe_ingest::read_cbm_sqlite_pipeline_rows(sqlite_path, project)?;
+    Ok(CbmPipelineRows {
+        project: rows.project,
+        nodes: rows
+            .nodes
+            .into_iter()
+            .map(|node| astrolabe_bridge::CbmPipelineNodeRow {
+                id: node.id,
+                project: node.project,
+                label: node.label,
+                name: node.name,
+                qualified_name: node.qualified_name,
+                file_path: node.file_path,
+                start_line: node.start_line,
+                end_line: node.end_line,
+                properties_json: node.properties_json,
+            })
+            .collect(),
+        edges: rows
+            .edges
+            .into_iter()
+            .map(|edge| astrolabe_bridge::CbmPipelineEdgeRow {
+                id: edge.id,
+                project: edge.project,
+                source_id: edge.source_id,
+                target_id: edge.target_id,
+                edge_type: edge.edge_type,
+                properties_json: edge.properties_json,
+                url_path_gen: edge.url_path_gen,
+                local_name_gen: edge.local_name_gen,
+            })
+            .collect(),
+    })
+}
+
+/// Runs the shadow CBM index pass OUT OF PROCESS via the supervisor and, on a clean
+/// child exit, rebuilds the row-sink-equivalent import candidate from the child's
+/// persisted CBM SQLite (#405).
+///
+/// This replaces the in-process FFI row sink for the shadow full-index path: the
+/// pipeline runs in a supervised child, so a hard pass abort (segfault/abort-class)
+/// is contained there and the vault is never touched until a fully clean pass. On a
+/// clean exit the child's `<project>.db` is read back into [`CbmPipelineRows`] and
+/// fed through the identical candidate builder, so the derived surfaces match the
+/// old path byte-for-byte. Any non-clean pass (contained crash/hang/spawn-failure or
+/// a graceful libcbm error) is returned as [`ShadowIndexPassOutcome::Failed`].
+pub(crate) fn run_shadow_index_pass(
+    runner: &CbmToolRunner,
+    sanitized_args: &str,
+    project_hint: Option<&str>,
+    skills: &SkillDiscoveryConfig,
+) -> Result<ShadowIndexPassOutcome, DynError> {
+    let raw_result = runner.handle_index_repository_supervised(sanitized_args)?;
+    if tool_result_is_error(&raw_result)? {
+        return Ok(ShadowIndexPassOutcome::Failed {
+            error_result: raw_result,
+        });
+    }
+    let project = project_hint
+        .map(ToOwned::to_owned)
+        .or_else(|| project_from_tool_result(&raw_result))
+        .ok_or("shadow index pass completed without a resolvable project name")?;
+    let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+    let sqlite_path = sqlite_path(&cache_dir, &project);
+    if !sqlite_path.exists() {
+        return Err(format!(
+            "shadow index pass completed but its CBM SQLite {} is missing; cannot rebuild the graph row stream",
+            sqlite_path.display()
+        )
+        .into());
+    }
+    let rows = read_shadow_pipeline_rows(&sqlite_path, &project)?;
+    let candidate = row_sink_import_candidate_from_rows_with_skills(rows, skills);
+    Ok(ShadowIndexPassOutcome::Completed {
+        raw_result,
+        project,
+        candidate,
+    })
+}
+
+/// Maps a fail-closed out-of-process index-pass result into a structured MCP tool
+/// error (#405).
+///
+/// A contained hard abort (the supervisor reports `outcome` in
+/// crash/hang/killed/exit_nonzero/spawn_failed) is surfaced as
+/// [`ASTRO_SHADOW_INDEX_PASS_CRASHED`] with the worker exit code / log tail, and the
+/// vault is guaranteed untouched (the pass ran out of process and returned no graph
+/// to import). A graceful libcbm error (no crash `outcome`) is returned verbatim,
+/// failing closed exactly as before.
+pub(crate) fn shadow_index_pass_error_result(error_result: &str) -> Result<String, DynError> {
+    let inner = serde_json::from_str::<Value>(error_result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        });
+    let outcome = inner
+        .as_ref()
+        .and_then(|value| value.get("outcome"))
+        .and_then(Value::as_str);
+    let crash_outcome = matches!(
+        outcome,
+        Some("crash" | "hang" | "killed" | "exit_nonzero" | "spawn_failed")
+    );
+    if !crash_outcome {
+        // Graceful libcbm error — fail closed exactly as today, verbatim.
+        return Ok(error_result.to_string());
+    }
+    let outcome = outcome.unwrap_or("crash");
+    let mut structured = json!({
+        "code": ASTRO_SHADOW_INDEX_PASS_CRASHED,
+        "message": format!(
+            "{ASTRO_SHADOW_INDEX_PASS_CRASHED}: the CBM index pass did not complete cleanly (outcome={outcome}) in its isolated worker subprocess; the fault was contained and the shadow vault was left untouched (not partially committed)"
+        ),
+        "remediation": SHADOW_INDEX_PASS_CRASHED_REMEDIATION,
+        "outcome": outcome,
+    });
+    if let Some(inner) = inner {
+        // Carry the worker's own evidence verbatim so the contained failure is
+        // attributable from this artifact alone (worker exit code / log tail).
+        for (key, dest) in [
+            ("worker_exit_code", "worker_exit_code"),
+            ("worker_log_tail", "worker_log_tail"),
+            ("worker_response_tail", "worker_response_tail"),
+            ("repo_path", "repo_path"),
+            ("message", "pass_message"),
+        ] {
+            if let Some(value) = inner.get(key) {
+                structured[dest] = value.clone();
+            }
+        }
+    }
+    tool_json_error_result(structured)
+}
 
 /// Builds the row-sink import candidate, running skill discovery under `skills` — the
 /// registry defaults unless the caller supplied a `calyx_skills` override (#198).

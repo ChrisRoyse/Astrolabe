@@ -54,7 +54,22 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         GitMineMode::Full => "full",
         GitMineMode::Since { .. } => "incremental",
     };
-    let mined = mine_git_archaeology(repo, &GitArchaeologyConfig::default(), &mode)?;
+    // Member-corpus scoping key (#403 + #381): resolve the requested corpus relative
+    // to its git toplevel ONCE, up front. It drives three things: (a) it pathspec-
+    // limits the history mine to the member subtree via
+    // `GitArchaeologyConfig::member_prefix`, so the whole monorepo history is never
+    // walked and out-of-subtree commits never enter the evidence set at the source;
+    // (b) it drives the sparse historical checkout (only the member subtree
+    // materializes on disk instead of the full ~5,500-file toplevel tree); and
+    // (c) it re-anchors CBM's subtree-relative node paths back to the toplevel
+    // namespace. Empty (corpus IS the toplevel) => whole-repo control path,
+    // byte-identical to pre-scoping behavior on every axis.
+    let corpus_rel = git_show_prefix(repo)?;
+    let config = GitArchaeologyConfig {
+        member_prefix: (!corpus_rel.is_empty()).then(|| corpus_rel.clone()),
+        ..GitArchaeologyConfig::default()
+    };
+    let mined = mine_git_archaeology(repo, &config, &mode)?;
     let mut evidence = Vec::new();
     for finding in &mined.szz_findings {
         evidence.push(Evidence {
@@ -101,21 +116,13 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             .then_with(|| left.label.cmp(right.label))
     });
 
-    // Corpus scoping (#403): a shadow index of a subdirectory nested inside a
-    // larger git repo must attribute archaeology to ONLY that subdirectory. The
-    // mining pass above deliberately runs from the repo toplevel (path-namespace
-    // correctness), so it yields toplevel-relative evidence spanning the whole
-    // enclosing repo. Left unscoped, `index_historical_commit` below then indexed
-    // the ENTIRE historical worktree (the whole enclosing workspace — e.g. the
-    // astrolabe Rust crates when indexing `crates/astrolabe-guard/src`), a
-    // spurious wrong-corpus pipeline pass that both wasted work and, running
-    // in-process, could abort the whole shadow import mid-extraction with a
-    // partial vault. `corpus_rel` is the requested corpus path relative to the
-    // toplevel (empty when the corpus IS the toplevel — behavior-neutral there).
-    // Evidence outside the corpus belongs to files this shadow index does not
-    // cover, so it is dropped here: only commits that touched the requested
-    // corpus are checked out and indexed, and only within the corpus subtree.
-    let corpus_rel = git_show_prefix(repo)?;
+    // Corpus scoping defense-in-depth (#403 + #381): the mine above is already
+    // pathspec-limited to `member_prefix`, so out-of-subtree evidence should not
+    // exist. This retain is the belt-and-suspenders net — it drops any residual
+    // toplevel-relative path that fell outside the corpus subtree (e.g. a path
+    // normalization corner the git pathspec and this string prefix disagree on),
+    // so `index_historical_commit` below is never handed out-of-corpus evidence.
+    // Empty `corpus_rel` (corpus IS the toplevel) is behavior-neutral.
     if !corpus_rel.is_empty() {
         let corpus_prefix = format!("{corpus_rel}/");
         evidence.retain(|item| normalized_path(&item.range.path).starts_with(&corpus_prefix));
@@ -227,26 +234,7 @@ fn index_historical_commit(
     );
     let worktree = cache_dir.join(format!(".astrolabe-archaeology-worktree-{nonce}"));
     let database = cache_dir.join(format!(".astrolabe-archaeology-{nonce}.db"));
-    // Windows MAX_PATH containment (#376 follow-up): for a monorepo-member
-    // corpus (cbm/ inside the Astrolabe repo) this worktree materializes the
-    // FULL historical toplevel tree, whose deepest repo-relative paths exceed
-    // 260 chars once joined to the store-nested worktree base. Git for
-    // Windows handles those via \\?\-prefixed paths only when
-    // core.longpaths=true, so enable it for exactly the worktree add/remove
-    // pair; for a corpus that IS the toplevel with short paths this is
-    // behavior-neutral.
-    git_checked(
-        repo,
-        &[
-            "-c",
-            "core.longpaths=true",
-            "worktree",
-            "add",
-            "--detach",
-            path_str(&worktree)?,
-            commit,
-        ],
-    )?;
+    add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
         // Scope the historical index to the requested corpus subtree within the
         // whole-repo worktree (#403). A git worktree is always the full repository
@@ -383,6 +371,93 @@ fn git_checked(repo: &Path, args: &[&str]) -> Result<(), DynError> {
         )
         .into())
     }
+}
+
+/// Adds the scratch worktree that materializes a historical commit for indexing.
+///
+/// Whole-repo corpus (`corpus_rel` empty): the pre-#381 full detached checkout —
+/// byte-identical control behavior, the whole historical toplevel tree on disk.
+///
+/// Monorepo-member corpus (#381): materialize ONLY the member subtree, not the full
+/// historical toplevel tree (for `cbm/` that is ~5,500 files per evidence commit).
+/// Add the worktree with `--no-checkout` (index only, no working files), then
+/// `checkout <commit> -- <corpus_rel>` restores exactly the member subtree from the
+/// commit's tree. Nothing else lands on disk — not even repo-root files — and, unlike
+/// `sparse-checkout init` (which force-enables `extensions.worktreeConfig` in the
+/// enclosing repo's SHARED `.git/config`), no per-worktree sparse state is written, so
+/// the canonical repo config is never mutated. `core.longpaths=true` guards every
+/// tree-touching call: deep member paths joined to the store-nested worktree base
+/// still exceed the Windows 260-char limit.
+///
+/// The member subtree may be absent at this historical commit (created or renamed
+/// later); it is probed with [`git_tree_has_path`] first and only checked out when
+/// present, so a "pathspec did not match" never aborts the import. The absent case
+/// materializes nothing, and `index_historical_commit`'s `scoped_root.exists()` gate
+/// then yields zero rows (counted as `evidence_without_symbol` upstream).
+fn add_historical_worktree(
+    repo: &Path,
+    worktree: &Path,
+    commit: &str,
+    corpus_rel: &str,
+) -> Result<(), DynError> {
+    if corpus_rel.is_empty() {
+        git_checked(
+            repo,
+            &[
+                "-c",
+                "core.longpaths=true",
+                "worktree",
+                "add",
+                "--detach",
+                path_str(worktree)?,
+                commit,
+            ],
+        )?;
+        return Ok(());
+    }
+    git_checked(
+        repo,
+        &[
+            "-c",
+            "core.longpaths=true",
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            path_str(worktree)?,
+            commit,
+        ],
+    )?;
+    if git_tree_has_path(repo, commit, corpus_rel)? {
+        git_checked(
+            worktree,
+            &[
+                "-c",
+                "core.longpaths=true",
+                "checkout",
+                commit,
+                "--",
+                corpus_rel,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `commit`'s tree contains `path` (a toplevel-relative directory or file).
+/// Uses `git cat-file -e <commit>:<path>`, which exits zero iff the object exists; a
+/// missing path exits non-zero — not an error here, since an absent member subtree at
+/// a historical commit is an expected, gracefully-handled case (the caller then skips
+/// materialization). Only a genuine spawn failure propagates.
+fn git_tree_has_path(repo: &Path, commit: &str, path: &str) -> Result<bool, DynError> {
+    let spec = format!("{commit}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &spec])
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    Ok(output.status.success())
 }
 
 /// The requested corpus path relative to its git repository toplevel, forward-slash

@@ -73,8 +73,16 @@ pub const ASTRO_LOWER_ARTIFACT_FINGERPRINT_MISMATCH: &str =
 /// Stable refusal code: the artifact was lowered from an older vault state than
 /// the vault's current content fingerprint.
 pub const ASTRO_LOWER_ARTIFACT_STALE: &str = "ASTRO_LOWER_ARTIFACT_STALE";
+/// Stable refusal code: the lowered artifact SQLite file could not be opened for
+/// writing at its resolved cache path — most often because the cache directory
+/// plus the derived project filename exceeds an OS path or 255-byte
+/// filename-component limit (#409). The failing full path is always named so the
+/// offending length is diagnosable rather than an opaque "unable to open
+/// database file".
+pub const ASTRO_LOWER_ARTIFACT_OPEN_FAILED: &str = "ASTRO_LOWER_ARTIFACT_OPEN_FAILED";
 
 const ARTIFACT_VERIFY_REMEDIATION: &str = "Regenerate the lowered artifact from the current vault with lower_cbm_sqlite; never serve a lowered artifact that fails load-time verification.";
+const ARTIFACT_OPEN_REMEDIATION: &str = "Keep the cache directory (CBM_CACHE_DIR) plus the derived project filename within the filesystem's path and 255-byte per-component limits; shorten CBM_CACHE_DIR or relocate the cache closer to a drive root, then re-run indexing.";
 
 pub type LowerResult<T> = Result<T, LowerError>;
 
@@ -804,7 +812,20 @@ fn open_lowered_connection(output_path: &Path) -> LowerResult<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    )
+    .map_err(|error| {
+        // #409: name the offending full path fail-closed. A raw rusqlite
+        // "unable to open database file" hides *which* path overflowed an OS
+        // length limit; surface {code, message, remediation} with the path.
+        LowerError::refused(
+            ASTRO_LOWER_ARTIFACT_OPEN_FAILED,
+            format!(
+                "open lowered artifact for writing at {}: {error}.",
+                output_path.display()
+            ),
+            ARTIFACT_OPEN_REMEDIATION,
+        )
+    })?;
     // #76: wait for a transient shared-lock holder (a concurrent index_status
     // reader of the same lowered sidecar) instead of failing SQLITE_BUSY at once.
     connection.busy_timeout(std::time::Duration::from_millis(LOWERED_DB_BUSY_TIMEOUT_MS))?;

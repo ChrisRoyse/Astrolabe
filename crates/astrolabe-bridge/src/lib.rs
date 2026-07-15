@@ -2210,6 +2210,38 @@ impl CbmToolRunner {
         Ok(CbmIndexRepositoryRows { raw_json, rows })
     }
 
+    /// Runs `index_repository` OUT OF PROCESS via the CBM supervisor, failing
+    /// closed rather than degrading to the in-process pipeline (#405).
+    ///
+    /// This is the shadow full-index entry. It registers **no** row sink — an FFI
+    /// callback cannot cross the supervisor's process boundary — so the CBM
+    /// pipeline pass runs in a supervised child. A hard pass abort
+    /// (segfault/abort-class) is therefore contained in the child; the parent
+    /// rebuilds the graph row stream from the child's persisted `<project>.db`
+    /// afterwards ([`astrolabe_ingest::read_cbm_sqlite_pipeline_rows`]) instead of
+    /// from the row sink. On a clean child exit this returns the child's own
+    /// `index_repository` response verbatim. A spawn failure, an unavailable
+    /// supervisor, or a contained worker crash/hang is returned as a fail-closed
+    /// `{isError}` tool result (carrying `outcome`, and in diagnostic builds the
+    /// worker exit code and log tail) so the caller refuses before it touches the
+    /// vault. Unlike the row-sink path this never runs the pipeline in-process.
+    pub fn handle_index_repository_supervised(
+        &self,
+        args_json: &str,
+    ) -> Result<String, BridgeError> {
+        self.ensure_owner_thread()?;
+        let args_json = CString::new(args_json)?;
+        // SAFETY: server pointer is owned by self and thread-affine; args_json is
+        // live for the call. The returned heap string is freed by take_c_string.
+        unsafe {
+            let ptr = cbm_sys::cbm_mcp_index_repository_supervised_strict(
+                self.ptr.as_ptr(),
+                args_json.as_ptr(),
+            );
+            take_c_string(ptr)
+        }
+    }
+
     pub fn handle_tool(
         &self,
         tool_name: &str,

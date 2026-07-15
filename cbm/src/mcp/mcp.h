@@ -135,6 +135,21 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
+/* Run a full index of args_json's repo_path in a supervised worker SUBPROCESS,
+ * FAILING CLOSED instead of degrading to the in-process pipeline (#405). This is
+ * the shadow full-index entry: the CBM pipeline pass runs OUT OF PROCESS so a hard
+ * abort (segfault/abort-class) is contained in the child and can never leave a
+ * partially-written vault; the parent rebuilds the graph row stream from the
+ * child's persisted <project>.db after a clean exit (it registers no row sink —
+ * an FFI callback cannot cross the process boundary). On a clean worker exit this
+ * returns the worker's own index_repository response verbatim. A spawn failure, an
+ * unavailable supervisor, or a contained worker crash/hang is returned as a
+ * fail-closed {isError} tool result carrying `outcome` (and, in diagnostic builds,
+ * the worker's exit code and log tail) so the caller refuses before it touches the
+ * vault. Unlike cbm_mcp_index_run_supervised_path this NEVER returns NULL and
+ * NEVER degrades to an in-process run. */
+char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const char *args);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.

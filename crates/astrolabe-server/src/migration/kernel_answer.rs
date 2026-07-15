@@ -1,18 +1,29 @@
 //! `get_kernel` + `kernel_answer` MCP surface (#40, blueprint 09 §4, 15 §2).
 //!
-//! `get_kernel` serves the persisted kernel context — the scope-summary members
-//! (qualified name, kernel weight, grounded flag, provenance) with their recall
-//! metrics — in three modes: `read` (the members and recall), `gaps` (the
-//! ungrounded members that still need grounding), and `build`. The kernel
-//! members here are the S-lens scope-summary rollup persisted by the shadow
-//! import; the full feedback-vertex-set kernel build over the vault association
-//! graph, and the hop-attenuated `kernel_answer` walk, both consume the
-//! `GraphProjectionCsr -> KernelGraph` vault adapter tracked in #343. Until that
-//! adapter lands, `mode="build"` and `kernel_answer` fail closed with a coded
-//! `{code, message, remediation}` naming the dependency rather than fabricating
-//! an ungrounded answer — the answer-path algorithm itself (the pinned `0.9`
-//! per-hop attenuation, the ledger-required gate, the honest deficit refusal) is
-//! implemented and FSV-covered in `astrolabe_kernel::answer`.
+//! `get_kernel` serves the kernel context in four modes: `read` (the scope-summary
+//! members — qualified name, kernel weight, grounded flag, provenance — with their
+//! recall metrics), `gaps` (the ungrounded members that still need grounding),
+//! `quadrant` (the coverage-vs-importance scatter), and `build`. `read`/`gaps`/
+//! `quadrant` serve the persisted kernel members (the S-lens scope-summary rollup
+//! and the persisted `KernelArtifact`).
+//!
+//! `build` recomputes the feedback-vertex-set kernel over the vault association
+//! graph on demand (#410): it opens the project's shadow vault read-write and runs
+//! the same anchor-trust-grounded `astrolabe_ingest::build_and_persist_kernel` the
+//! shadow import runs at index time (the `GraphProjectionCsr -> KernelGraph` vault
+//! adapter it consumes landed under #343), persisting the `KernelArtifact` +
+//! projection into the vault Kernel CF and serving a labeled `status:"built"`
+//! summary. When the graph genuinely yields no kernel (empty graph, no typed edges,
+//! an unreachable recall gate) it fails closed with a coded
+//! `{code, message, remediation}` carrying the real build-layer reason rather than
+//! fabricating a build.
+//!
+//! `kernel_answer` runs the hop-attenuated answer walk (the pinned `0.9` per-hop
+//! attenuation, the ledger-required gate, the honest deficit refusal, implemented
+//! in `astrolabe_kernel::answer`) over the persisted association-graph projection
+//! and kernel artifact. When neither is persisted it fails closed with a coded
+//! `{code, message, remediation}` directing the caller to `get_kernel mode="build"`
+//! rather than fabricating an ungrounded answer.
 
 use super::*;
 
@@ -24,13 +35,14 @@ pub(crate) const ASTRO_GET_KERNEL_MODE_UNSUPPORTED: &str = "ASTRO_GET_KERNEL_MOD
 pub(crate) const ASTRO_GET_KERNEL_UNAVAILABLE: &str = "ASTRO_GET_KERNEL_UNAVAILABLE";
 /// Refusal: the requested scope is absent from the persisted kernel context.
 pub(crate) const ASTRO_GET_KERNEL_SCOPE_UNKNOWN: &str = "ASTRO_GET_KERNEL_SCOPE_UNKNOWN";
-/// Refusal: the FVS kernel build over the vault association graph is not wired
-/// (depends on the `GraphProjectionCsr -> KernelGraph` adapter, #343).
-pub(crate) const ASTRO_KERNEL_BUILD_ADAPTER_PENDING: &str = "ASTRO_KERNEL_BUILD_ADAPTER_PENDING";
+/// Refusal: the on-demand FVS kernel build over the vault association graph
+/// produced no kernel (empty graph, no typed edges, or an unreachable recall gate).
+pub(crate) const ASTRO_KERNEL_BUILD_UNAVAILABLE: &str = "ASTRO_KERNEL_BUILD_UNAVAILABLE";
 /// Refusal: `kernel_answer` requires a non-empty query.
 pub(crate) const ASTRO_KERNEL_ANSWER_QUERY_REQUIRED: &str = "ASTRO_KERNEL_ANSWER_QUERY_REQUIRED";
-/// Refusal: the answer-path walk over the vault association graph is not wired
-/// (depends on the `GraphProjectionCsr -> KernelGraph` adapter, #343).
+/// Refusal: the project has no persisted kernel artifact or association-graph
+/// projection to answer from — the answer-path substrate is absent until a kernel
+/// is built (`get_kernel mode="build"`).
 pub(crate) const ASTRO_KERNEL_ANSWER_ADAPTER_PENDING: &str = "ASTRO_KERNEL_ANSWER_ADAPTER_PENDING";
 
 const GET_KERNEL_MODES: [&str; 4] = ["read", "gaps", "quadrant", "build"];
@@ -57,20 +69,45 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     let scope = string_arg(args_obj, "scope").map(ToOwned::to_owned);
 
     if mode == "build" {
-        // The FVS kernel build over the vault association graph consumes the
-        // GraphProjectionCsr -> KernelGraph adapter (#343). Fail closed rather
-        // than fabricate a build.
-        return tool_json_error_result(json!({
-            "schema": "astrolabe.get_kernel.v1",
-            "status": "refused",
-            "mode": "build",
-            "code": ASTRO_KERNEL_BUILD_ADAPTER_PENDING,
-            "message": "recomputing the feedback-vertex-set kernel over the vault association graph is not wired in this build",
-            "remediation": "land the GraphProjectionCsr -> KernelGraph vault adapter (#343), then request mode=\"build\"; meanwhile mode=\"read\"/\"gaps\" serve the persisted scope-summary kernel members",
-            "depends_on": "#343",
-            "trust": "provisional",
-            "freshness": "not_evaluated",
-        }));
+        // #410: recompute the anchor-trust-grounded feedback-vertex-set kernel over
+        // the vault association graph on demand — the exact index-time build the
+        // shadow import runs (`persist_index_time_kernel_artifact` ->
+        // `astrolabe_ingest::build_and_persist_kernel`, consuming the #343
+        // GraphProjectionCsr -> KernelGraph adapter that landed long ago), executed
+        // here against the persisted vault. Open the shadow vault read-write so the
+        // rebuilt KernelArtifact + projection persist into the Kernel CF; the persist
+        // layer is fail-closed on its own bytes (reads them back, refuses on
+        // divergence). A scope that genuinely cannot yield a kernel surfaces as a
+        // coded fail-closed refusal carrying the real build-layer reason — never a
+        // fabricated build.
+        let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+        let (vault_dir, vault_id, vault_salt) = shadow_vault_config_at(&cache_dir, &project)?;
+        if !vault_dir.exists() {
+            return tool_json_error_result(json!({
+                "schema": "astrolabe.get_kernel.v1",
+                "status": "refused",
+                "mode": "build",
+                "code": ASTRO_KERNEL_BUILD_UNAVAILABLE,
+                "message": format!(
+                    "no shadow vault persisted for project {project:?}; there is no association graph to build a kernel over"
+                ),
+                "remediation": "run index_repository with calyx=\"shadow\" for this project, then request get_kernel mode=\"build\"",
+                "trust": "provisional",
+                "freshness": "not_evaluated",
+            }));
+        }
+        // Writable handles open every CF (the with-access contract ignores a CF
+        // selection when not read-only), which the build + persist path requires
+        // (Base/Graph to project, Anchors for the trust map, Kernel + Ledger to
+        // persist the artifact inside the verified chain).
+        let vault = open_shadow_vault_writable(&vault_dir, &vault_id, &vault_salt, Vec::new())?;
+        let summary = persist_index_time_kernel_artifact(&vault, &project);
+        let response = get_kernel_build_response_json(&project, &summary);
+        return if response.get("status").and_then(Value::as_str) == Some("built") {
+            tool_json_result(response)
+        } else {
+            tool_json_error_result(response)
+        };
     }
 
     let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
@@ -215,6 +252,59 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
         "freshness": "fresh",
         "provenance": format!("kernel_context.scope_summaries (astrolabe.scope_summary.v1) of {project}"),
     }))
+}
+
+/// Reshapes the index-time kernel-artifact persist summary
+/// ([`persist_index_time_kernel_artifact`]) into the `get_kernel mode="build"`
+/// response (#410). A `persisted` summary serves `status:"built"` carrying the real
+/// member/node/recall/readback fields the build produced and read back; any other
+/// status is a fail-closed refusal carrying the build layer's real reason under
+/// [`ASTRO_KERNEL_BUILD_UNAVAILABLE`] — never a fabricated build.
+fn get_kernel_build_response_json(project: &str, summary: &Value) -> Value {
+    let status = summary
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if status == "persisted" {
+        return json!({
+            "schema": "astrolabe.get_kernel.v1",
+            "status": "built",
+            "mode": "build",
+            "project": project,
+            "scope_id": summary.get("scope_id"),
+            "members_hash": summary.get("members_hash"),
+            "member_count": summary.get("member_count"),
+            "node_count": summary.get("node_count"),
+            "recall_permille": summary.get("recall_permille"),
+            "recall_gated": summary.get("recall_gated"),
+            "anchor_grounded": summary.get("anchor_grounded"),
+            "trusted_anchor_count": summary.get("trusted_anchor_count"),
+            "rows_readback_verified": summary.get("rows_readback_verified"),
+            "ledger_paired": summary.get("ledger_paired"),
+            "commit_seq": summary.get("commit_seq"),
+            "trust": summary.get("trust"),
+            "freshness": summary.get("freshness"),
+            "provenance": summary.get("provenance"),
+        });
+    }
+    // `unavailable` (or an unexpected summary shape): the build produced no kernel.
+    // Surface the persist layer's real reason verbatim rather than the retired
+    // ADAPTER_PENDING stub.
+    let reason = summary
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("kernel build did not persist a kernel artifact for this project");
+    json!({
+        "schema": "astrolabe.get_kernel.v1",
+        "status": "refused",
+        "mode": "build",
+        "project": project,
+        "code": ASTRO_KERNEL_BUILD_UNAVAILABLE,
+        "message": reason,
+        "remediation": "the vault association graph yielded no kernel (empty graph, no typed edges, an empty anchor set, or an unreachable recall gate); rerun index_repository with calyx=\"shadow\" over a corpus with typed associations and anchors, then retry get_kernel mode=\"build\"",
+        "trust": "provisional",
+        "freshness": "not_evaluated",
+    })
 }
 
 /// Reads the persisted whole-repo `KernelArtifact` for a project back out of the
@@ -433,8 +523,7 @@ pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> 
             "scope": scope,
             "knob_registry_version": KERNEL_ANSWER_KNOB_REGISTRY_VERSION,
             "message": "no persisted kernel artifact or association-graph projection for this project; the answer-path substrate is unavailable",
-            "remediation": "run index_repository with calyx=\"shadow\" and build the kernel (get_kernel mode=\"build\") so the association-graph projection and kernel artifact are persisted, then retry kernel_answer",
-            "depends_on": "#343",
+            "remediation": "run index_repository with calyx=\"shadow\", then build the kernel with get_kernel mode=\"build\" (which recomputes and persists the association-graph projection and kernel artifact on demand), then retry kernel_answer",
             "ledger_required_code": CALYX_KERNEL_ANSWER_LEDGER_REQUIRED,
             "trust": "provisional",
             "freshness": "not_evaluated",
