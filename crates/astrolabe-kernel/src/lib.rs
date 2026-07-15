@@ -4,6 +4,11 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+/// Env-gated (`ASTRO_KERNEL_TIMING`) permanent sub-phase timing for the
+/// kernel_artifact / label_propagation cold-index phases (#443).
+pub mod phase_timing;
+pub use phase_timing::KernelPhaseTiming;
+
 /// Directory-role frame, `placement_truth` cross-term, and `layout_map` aspect
 /// (#180b): the structure-convention reference frame built on the S23
 /// `layer_role` lens.
@@ -1018,6 +1023,11 @@ pub fn propagate_labels(
     tombstones: &[LabelTombstone],
     config: &LabelPropagationConfig,
 ) -> astrolabe_domain::Result<LabelPropagationReport> {
+    // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): the
+    // label_propagation cold-index phase's internal breakdown (adjacency build /
+    // per-seed flood / collect+sort) so the #443 matrix can attribute its
+    // 44s@n=45,557 to a real sub-stage. Silent by default; carries no behaviour.
+    let mut timing = KernelPhaseTiming::start("label_propagation");
     validate_label_propagation_knob(config.decay_milliper_step)?;
     for seed in seeds {
         validate_seed_confidence(seed)?;
@@ -1050,6 +1060,7 @@ pub fn propagate_labels(
         .map(|seed| (seed.symbol_id.clone(), seed.label.clone()))
         .collect::<BTreeSet<_>>();
     let mut best = BTreeMap::<(String, String), PropagatedLabel>::new();
+    timing.lap("adjacency");
 
     for seed in active_seeds {
         let mut queue = vec![LabelPropagationFrontier {
@@ -1125,12 +1136,15 @@ pub fn propagate_labels(
         }
     }
 
+    timing.lap("flood");
+
     let mut labels = best.into_values().collect::<Vec<_>>();
     labels.sort_by(|left, right| {
         left.symbol_id
             .cmp(&right.symbol_id)
             .then_with(|| left.label.cmp(&right.label))
     });
+    timing.lap("collect_sort");
 
     Ok(LabelPropagationReport {
         schema: LABEL_PROPAGATION_SCHEMA,

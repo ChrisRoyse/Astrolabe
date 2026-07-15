@@ -415,12 +415,19 @@ pub fn propagate_labels_over_vault<C>(
 where
     C: Clock,
 {
+    // #443 permanent sub-phase timing (env-gated `ASTRO_KERNEL_TIMING`): the
+    // over-vault propagation splits into persisted-row read / the in-memory flood
+    // (`propagate_labels`, itself sub-timed) / reconcile-persist, so the row-plane
+    // I/O is separable from the flood algorithm. Silent by default.
+    let mut timing = astrolabe_kernel::KernelPhaseTiming::start("label_propagation_vault");
     let snapshot = vault.snapshot();
     let seeds = read_seed_rows(vault, snapshot)?;
     let edges = read_edge_rows(vault, snapshot)?;
     let tombstones = read_tombstone_rows(vault, snapshot)?;
+    timing.lap("read_rows");
 
     let report = propagate_labels(&seeds, &edges, &tombstones, config)?;
+    timing.lap("flood");
 
     // Desired persisted Kernel CF rows: one per propagated (provisional) label.
     let mut desired = BTreeMap::<Vec<u8>, Vec<u8>>::new();
@@ -454,6 +461,8 @@ where
         "astrolabe-label-propagation",
         actor,
     )?;
+
+    timing.lap("reconcile_persist");
 
     let ledger_seq = fsv_ack
         .as_ref()
