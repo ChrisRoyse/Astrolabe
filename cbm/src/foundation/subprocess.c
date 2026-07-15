@@ -285,6 +285,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         out->term_signal = 0;
         return -1;
     }
+    if (opts->on_spawn) {
+        opts->on_spawn((long)pi.dwProcessId, opts->spawn_ud);
+    }
 
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
@@ -352,6 +355,10 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         }
         execv(bin, (char *const *)argv);
         _exit(127); /* exec failed */
+    }
+
+    if (opts->on_spawn) {
+        opts->on_spawn((long)pid, opts->spawn_ud);
     }
 
     long tail_pos = 0;
