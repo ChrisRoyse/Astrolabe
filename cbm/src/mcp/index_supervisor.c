@@ -154,6 +154,25 @@ static char *slurp_file_tail(const char *path, size_t max_bytes) {
 #endif
 
 /* Read an entire file into a heap string (NUL-terminated). NULL on error. */
+/* Write `data` to `path` whole, atomically enough for a single-consumer worker
+ * handoff (fresh file, fully written + flushed before the child is spawned).
+ * Returns 0 on success, -1 on any open/write failure. */
+static int write_file_all(const char *path, const char *data) {
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        return -1;
+    }
+    size_t len = strlen(data);
+    size_t wrote = fwrite(data, 1, len, f);
+    int flush_rc = fflush(f);
+    int close_rc = fclose(f);
+    if (wrote != len || flush_rc != 0 || close_rc != 0) {
+        (void)remove(path);
+        return -1;
+    }
+    return 0;
+}
+
 static char *slurp_file(const char *path) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -292,9 +311,22 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     int pid = (int)cbm_getpid();
     char resp_path[1024];
     char log_path[1024];
+    char args_path[1024];
     worker_tmp_path(resp_path, sizeof(resp_path), pid, ".response");
     worker_tmp_path(log_path, sizeof(log_path), pid, ".log");
+    worker_tmp_path(args_path, sizeof(args_path), pid, ".args.json");
     (void)remove(resp_path); /* clear any stale file */
+
+    /* Hand the tool JSON to the worker via --args-file, the public CLI argument
+     * contract. A raw-JSON argv token is REFUSED fail-closed by the Rust host
+     * (ASTRO_CLI_RAW_JSON_ARGV_REMOVED, #378), so passing args_json inline made
+     * every supervised worker exit 1 before indexing anything (#405 FSV). The
+     * file lives beside the response/log worker tmp files and is removed at the
+     * same cleanup points. */
+    if (write_file_all(args_path, args_json) != 0) {
+        cbm_log_warn("index.supervisor.args_write_failed", "path", args_path);
+        return -1;
+    }
 
     /* No --progress: the worker's DEFAULT structured logging already provides the
      * no-progress heartbeat (INFO parallel.extract.progress every 10 files + each
@@ -304,13 +336,14 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * return in-place update (no trailing '\n'), which cbm_tail_log does not count
      * as progress. (It would not corrupt the response either — that goes to the
      * separate --response-out file, not stdout.) */
-    const char *argv[8];
+    const char *argv[10];
     int n = 0;
     argv[n++] = self;
     argv[n++] = "cli";
     argv[n++] = "--index-worker";
     argv[n++] = "index_repository";
-    argv[n++] = args_json;
+    argv[n++] = "--args-file";
+    argv[n++] = args_path;
     argv[n++] = "--response-out";
     argv[n++] = resp_path;
     argv[n] = NULL;
@@ -375,6 +408,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
 
     if (run_rc != 0) {
         (void)remove(resp_path);
+        (void)remove(args_path);
         (void)remove(log_path); /* empty/partial log from a failed spawn — nothing to keep */
         cbm_log_warn("index.supervisor.spawn_failed", "action", "degrade_in_process");
         return -1;
@@ -404,6 +438,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     }
 #endif
     (void)remove(resp_path);
+    (void)remove(args_path);
 
     char sig[16];
     char exit_buf[16];

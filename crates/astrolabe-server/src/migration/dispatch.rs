@@ -323,6 +323,29 @@ pub(crate) fn handle_index_repository(
         .or_else(|| string_arg(args_obj, "name"))
         .map(PathBuf::from);
     let skills = skill_discovery_config(skill_discovery_override.as_ref());
+    // #409: Windows path-budget preflight. The bounded project name (128-byte cap,
+    // cbm/src/pipeline/fqn.c) keeps every per-project filename COMPONENT legal, but
+    // the TOTAL path `<store>\<name><suffix>` must also stay under the Win32
+    // MAX_PATH budget or the SQLite/vault opens inside the pass fail with a
+    // misleading generic pipeline error (observed in the #409 FSV: deep store +
+    // bounded name → worker "Pipeline failed"). Refuse up front, naming the exact
+    // store and derived name, before any worker is spawned. Full extended-length
+    // (`\\?\`) support is tracked separately; until it lands this budget is a
+    // structural OS limit, not a tunable.
+    if let Some(repo) = repo_path.as_deref() {
+        let budget_project = match project.as_deref() {
+            Some(project) => Some(project.to_string()),
+            None => repo
+                .to_str()
+                .and_then(|path| astrolabe_bridge::cbm_project_name_from_path(path).ok()),
+        };
+        if let Some(budget_project) = budget_project {
+            let cache_dir = astrolabe_bridge::cbm_cache_dir()?;
+            if let Some(refusal) = store_path_budget_refusal(&cache_dir, &budget_project) {
+                return tool_error_result(refusal);
+            }
+        }
+    }
     // #405: run the CBM index pass OUT OF PROCESS (supervised worker, no FFI row
     // sink — a callback cannot cross the process boundary), so a hard pass abort
     // (segfault/abort-class) is contained in the child and can NEVER leave a
@@ -873,4 +896,48 @@ pub(crate) fn handle_impute_fields(args_json: &str) -> Result<String, DynError> 
     } else {
         tool_json_result(value)
     }
+}
+
+/// #409: Windows total-path budget preflight for the per-project store family.
+///
+/// The Win32 legacy path budget is `MAX_PATH` (260) including the terminating
+/// NUL — 259 usable bytes — and SQLite's Windows VFS (and the vault's plain
+/// `CreateFileW` opens) do not use the `\?\` extended-length form, so any
+/// store-family path over that budget fails at open time with a generic error.
+/// The longest per-project chains under the store today are:
+///
+/// - `<store>\<name>.astrolabe-vault\cf\time_index\flush-<20 digits>-<4>.sst`
+///   (measured longest vault-relative inner path: 49 bytes + the 16-byte vault
+///   suffix + 2 separators = 67 bytes after `<name>`),
+/// - `<store>\<name>.astrolabe-shadow-import.lock.guard` (36 bytes after
+///   `<name>`),
+/// - `<store>\<name>.astrolabe-lowered.db` (21 bytes after `<name>`).
+///
+/// `STORE_PATH_FAMILY_RESERVE` is the first chain (the maximum), i.e. the
+/// separator + suffix bytes that must still fit after `<store>\<name>`. These
+/// are structural filename constants, not tunables.
+const STORE_PATH_FAMILY_RESERVE: usize = 67;
+/// Usable Win32 legacy path budget: `MAX_PATH` (260) minus the terminating NUL.
+const WIN_PATH_BUDGET: usize = 259;
+
+/// Returns a fail-closed refusal message when `<cache_dir>\<project>` plus the
+/// longest per-project store suffix chain cannot fit the Win32 path budget —
+/// naming both offending components and the arithmetic — or `None` when the
+/// family fits. See [`STORE_PATH_FAMILY_RESERVE`].
+fn store_path_budget_refusal(cache_dir: &Path, project: &str) -> Option<String> {
+    let store_len = cache_dir.as_os_str().to_string_lossy().len();
+    let needed = store_len + 1 + project.len() + STORE_PATH_FAMILY_RESERVE;
+    if needed <= WIN_PATH_BUDGET {
+        return None;
+    }
+    Some(format!(
+        "ASTRO_STORE_PATH_BUDGET_EXCEEDED: the store path family for this project cannot fit \
+         the Windows MAX_PATH budget: store dir {cache_dir:?} ({store_len} bytes) + derived \
+         project name {project:?} ({} bytes) + the longest per-project suffix chain \
+         ({STORE_PATH_FAMILY_RESERVE} bytes) = {needed} bytes > {WIN_PATH_BUDGET}; remediation: \
+         point CBM_CACHE_DIR at a shorter absolute path (the derived project name is already \
+         capped at 128 bytes; extended-length Win32 long-path store support is tracked \
+         separately in #412)",
+        project.len()
+    ))
 }
