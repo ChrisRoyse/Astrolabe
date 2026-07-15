@@ -33,11 +33,12 @@ use crate::knobs::{
     ASSAY_BOOTSTRAP_RESAMPLES_KNOB, ASSAY_BOOTSTRAP_SUBSAMPLE_PERMILLE_KNOB,
     ASSAY_CI_CONFIDENCE_PERMILLE_KNOB, ASSAY_DEFAULT_BOOTSTRAP_RESAMPLES,
     ASSAY_DEFAULT_BOOTSTRAP_SUBSAMPLE_PERMILLE, ASSAY_DEFAULT_CI_CONFIDENCE_PERMILLE,
-    ASSAY_DEFAULT_DPI_CEILING_SLACK_MILLIBITS, ASSAY_DEFAULT_FLOOR_DISCRETIZATION_BINS,
-    ASSAY_DEFAULT_FLOOR_SAMPLE_SIZE, ASSAY_DEFAULT_KSG_NEIGHBORS_K,
-    ASSAY_DEFAULT_MIN_SLOT_SIGNAL_MILLIBITS, ASSAY_DEFAULT_POSTERIOR_DRAWS,
-    ASSAY_DEFAULT_POSTERIOR_PRIOR_ALPHA_PERMILLE, ASSAY_DEFAULT_PROJECTION_FACTOR_PERMILLE,
-    ASSAY_DEFAULT_SUFFICIENCY_SLACK_MILLIBITS, ASSAY_DPI_CEILING_SLACK_MILLIBITS_KNOB,
+    ASSAY_DEFAULT_DPI_CEILING_SLACK_MILLIBITS, ASSAY_DEFAULT_ESTIMATOR_SAMPLE_CAP,
+    ASSAY_DEFAULT_FLOOR_DISCRETIZATION_BINS, ASSAY_DEFAULT_FLOOR_SAMPLE_SIZE,
+    ASSAY_DEFAULT_KSG_NEIGHBORS_K, ASSAY_DEFAULT_MIN_SLOT_SIGNAL_MILLIBITS,
+    ASSAY_DEFAULT_POSTERIOR_DRAWS, ASSAY_DEFAULT_POSTERIOR_PRIOR_ALPHA_PERMILLE,
+    ASSAY_DEFAULT_PROJECTION_FACTOR_PERMILLE, ASSAY_DEFAULT_SUFFICIENCY_SLACK_MILLIBITS,
+    ASSAY_DPI_CEILING_SLACK_MILLIBITS_KNOB, ASSAY_ESTIMATOR_SAMPLE_CAP_KNOB,
     ASSAY_FLOOR_DISCRETIZATION_BINS_KNOB, ASSAY_FLOOR_SAMPLE_SIZE_KNOB, ASSAY_KSG_NEIGHBORS_K_KNOB,
     ASSAY_MIN_SLOT_SIGNAL_MILLIBITS_KNOB, ASSAY_POSTERIOR_DRAWS_KNOB,
     ASSAY_POSTERIOR_PRIOR_ALPHA_PERMILLE_KNOB, ASSAY_PROJECTION_FACTOR_PERMILLE_KNOB,
@@ -240,6 +241,9 @@ pub struct BitsConfig {
     pub dpi_slack_bits: f64,
     /// Minimum per-slot signal, in bits, below which a lens is treated as dead.
     pub min_slot_signal_bits: f64,
+    /// Maximum aligned sample the O(n²) KSG/Ross point estimate (and each bootstrap
+    /// resample) runs over; a larger sample is subsampled down to this cap (#422).
+    pub estimator_sample_cap: usize,
 }
 
 impl BitsConfig {
@@ -314,6 +318,10 @@ impl BitsConfig {
                 ASSAY_DEFAULT_MIN_SLOT_SIGNAL_MILLIBITS,
             )? as f64
                 / 1000.0,
+            estimator_sample_cap: checked(
+                ASSAY_ESTIMATOR_SAMPLE_CAP_KNOB,
+                ASSAY_DEFAULT_ESTIMATOR_SAMPLE_CAP,
+            )? as usize,
         })
     }
 }
@@ -661,12 +669,50 @@ fn posterior_interval(prepared: &Prepared, seed: u64, cfg: &BitsConfig) -> (f64,
     (point, interval)
 }
 
+/// A seeded, without-replacement subsample of `cap` distinct indices from `0..n`,
+/// returned in ascending order (#422).
+///
+/// This is a partial Fisher–Yates over a fresh permutation seeded from
+/// `(seed, "estimator-cap")`, so the chosen set is a pure function of the seed and
+/// `n` — a capped card reproduces bit-for-bit across runs. The indices are sorted
+/// so the subsampled arrays keep the original stable sample order (the KSG/Ross
+/// estimators are symmetric over samples, so ordering does not change the point
+/// estimate; sorting only makes the subsample independent of shuffle order for a
+/// clean readback). `cap` is assumed `>= 1` and `< n`; callers only invoke this
+/// when `n > cap`.
+fn seeded_subsample_indices(n: usize, cap: usize, seed: u64) -> Vec<usize> {
+    let m = cap.min(n);
+    let mut rng = DeterministicRng::from_u64_labeled(seed, "estimator-cap");
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in 0..m {
+        let j = i + (rng.next_u64() % (n - i) as u64) as usize;
+        indices.swap(i, j);
+    }
+    let mut chosen = indices[..m].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
 /// Measures one slot's bits about an axis, choosing the above/below-floor path.
 ///
 /// Above the floor: the KSG/Ross/plug-in point estimate with a seeded bootstrap
 /// percentile interval, tagged `Trusted`. Below the floor: the Dirichlet(Jeffreys)
 /// posterior median with a credible interval, tagged `Provisional` — the point is
 /// never reported bare of its interval.
+///
+/// #422 sample-cap: the KSG/Ross point estimate is O(n²) per evaluation and the
+/// bootstrap runs it `bootstrap_resamples` times, so an uncapped `n` makes the
+/// index-time signal-card pass grow superlinearly with corpus size and re-dominate
+/// the cold index at monorepo scale. When the aligned sample exceeds
+/// `cfg.estimator_sample_cap`, the estimator runs over a seeded
+/// without-replacement subsample of the cap (the k-NN MI estimator's variance is
+/// O(1/n), so the estimate is already pinned within its noise band at the cap —
+/// see the `assay_estimator_sample_cap` knob), bounding the per-slot cost to
+/// O(cap²). The cap only ever narrows the trusted (above-floor) path — a
+/// below-floor sample is always `<= cap`, so the provisional posterior path is
+/// untouched — and the applied cap is recorded in the reported `estimator` label
+/// (`…+cap{m}`) and the reduced `n`, so a capped value is never a silent change
+/// (invariant 3).
 pub fn measure_slot_bits(
     slot: &SlotObservations,
     axis: &AxisValues,
@@ -687,6 +733,16 @@ pub fn measure_slot_bits(
             provisional: true,
         });
     }
+    // Trusted path: bound the O(n²) estimator to a seeded subsample when the
+    // aligned sample exceeds the declared cap.
+    let (prepared, n_eff, estimator) = if n > cfg.estimator_sample_cap {
+        let indices = seeded_subsample_indices(n, cfg.estimator_sample_cap, seed);
+        let capped = prepared.resample(&indices);
+        let m = capped.n();
+        (capped, m, format!("{base_estimator}+cap{m}"))
+    } else {
+        (prepared, n, base_estimator)
+    };
     let point = prepared.point_bits(cfg.k);
     let interval = bootstrap_interval(&prepared, seed, cfg);
     Ok(SignalBits {
@@ -694,8 +750,8 @@ pub fn measure_slot_bits(
         bits: point,
         interval,
         trust: TrustTag::Trusted,
-        n,
-        estimator: base_estimator,
+        n: n_eff,
+        estimator,
         provisional: false,
     })
 }
