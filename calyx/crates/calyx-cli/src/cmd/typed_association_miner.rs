@@ -8,8 +8,6 @@ use sha2::{Digest, Sha256};
 mod load;
 mod model;
 mod persist;
-#[cfg(test)]
-mod tests;
 
 pub(crate) use model::TypedAssociationMinerArgs;
 use model::{MinerCliSummary, MinerReport};

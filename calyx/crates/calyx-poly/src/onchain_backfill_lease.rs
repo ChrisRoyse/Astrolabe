@@ -413,6 +413,3 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-#[cfg(test)]
-#[path = "onchain_backfill_lease_tests.rs"]
-mod tests;

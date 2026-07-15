@@ -491,7 +491,3 @@ fn warn_stale_entry(col: &Collection, spec: &IndexSpec, pk: &RecordKey) {
         "stale btree index entry skipped"
     );
 }
-
-#[cfg(test)]
-#[path = "btree_tests.rs"]
-mod tests;

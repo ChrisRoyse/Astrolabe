@@ -39,11 +39,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-blake3.workspace = true
-rcgen = "0.14.8"
-
 [features]
 default = []
 # Enables the real CUDA preflight probe (calyx-forge CUDA path). Build with

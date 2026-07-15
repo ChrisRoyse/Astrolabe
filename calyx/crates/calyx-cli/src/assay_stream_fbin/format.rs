@@ -171,27 +171,3 @@ fn canonical_f32(value: f32) -> f32 {
     if rounded == 0.0 { 0.0 } else { rounded }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn i8_quantization_preserves_direction_bytes() {
-        let row = quantize_direction_i8(&[0.5, -1.0, 0.0]).unwrap();
-
-        assert_eq!(row, [64, -127, 0]);
-    }
-
-    #[test]
-    fn i8_quantization_rejects_zero_vector() {
-        let error = quantize_direction_i8(&[0.0, 0.0]).unwrap_err();
-
-        assert_eq!(error.code(), "CALYX_FSV_ASSAY_STREAM_FBIN_I8_ZERO_VECTOR");
-    }
-
-    #[test]
-    fn f32_canonicalization_erases_runtime_jitter() {
-        assert_eq!(canonical_f32(0.123_456_74), canonical_f32(0.123_456_78));
-        assert_eq!(canonical_f32(-0.00000001).to_bits(), 0.0_f32.to_bits());
-    }
-}

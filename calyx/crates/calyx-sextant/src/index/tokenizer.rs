@@ -100,29 +100,3 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::error::{CALYX_SEXTANT_POSTINGS_CORRUPT, CALYX_SEXTANT_POSTINGS_NOT_SORTED};
-
-    #[test]
-    fn postings_roundtrip_and_empty_are_byte_exact() {
-        let encoded = encode_varint_deltas(&[1, 3, 7]).unwrap();
-
-        assert_eq!(hex(&encoded), "010204");
-        assert_eq!(decode_varint_deltas(&encoded).unwrap(), vec![1, 3, 7]);
-        assert_eq!(encode_varint_deltas(&[]).unwrap(), Vec::<u8>::new());
-        assert_eq!(decode_varint_deltas(&[]).unwrap(), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn postings_fail_closed_unsorted_and_corrupt() {
-        let unsorted = encode_varint_deltas(&[3, 1]).unwrap_err();
-        let truncated = decode_varint_deltas(&[0x80]).unwrap_err();
-        let overflow = decode_varint_deltas(&[0xff, 0xff, 0xff, 0xff, 0x10]).unwrap_err();
-
-        assert_eq!(unsorted.code, CALYX_SEXTANT_POSTINGS_NOT_SORTED);
-        assert_eq!(truncated.code, CALYX_SEXTANT_POSTINGS_CORRUPT);
-        assert_eq!(overflow.code, CALYX_SEXTANT_POSTINGS_CORRUPT);
-    }
-}

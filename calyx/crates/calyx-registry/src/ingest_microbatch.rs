@@ -431,5 +431,3 @@ fn is_lens_timeout_like(error: &CalyxError) -> bool {
     error.code == "CALYX_LENS_UNREACHABLE"
 }
 
-#[cfg(test)]
-mod tests;

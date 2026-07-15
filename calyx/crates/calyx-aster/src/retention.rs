@@ -175,6 +175,3 @@ fn retention_metadata_error(cx_id: CxId, detail: impl Into<String>) -> CalyxErro
         detail.into()
     ))
 }
-
-#[cfg(test)]
-mod tests;

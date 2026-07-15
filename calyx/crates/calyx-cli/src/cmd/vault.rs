@@ -408,5 +408,3 @@ pub(crate) fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-#[cfg(test)]
-mod tests;

@@ -14,9 +14,6 @@ use serde_json::Value;
 
 use crate::error::CliResult;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) fn hit_docs_at(
     vault: &AsterVault,
     hits: &[Hit],

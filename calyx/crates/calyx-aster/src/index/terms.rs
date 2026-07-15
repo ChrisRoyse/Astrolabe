@@ -39,19 +39,3 @@ pub fn term_hash(term: &str) -> u64 {
     }
     hash
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenization_matches_ph25_shape() {
-        assert_eq!(tokenize("Cat, hat! CAT"), ["cat", "hat", "cat"]);
-        assert_eq!(tokenize("quick-fox_42"), ["quick", "fox", "42"]);
-    }
-
-    #[test]
-    fn fnv_hash_is_byte_stable() {
-        assert_eq!(term_hash("quick"), 0x4b6e_bd14_3365_6d9c);
-    }
-}

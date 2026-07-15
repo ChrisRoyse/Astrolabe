@@ -18,8 +18,6 @@ mod cli;
 mod pg;
 
 pub(crate) use cli::run_production_fsv;
-#[cfg(test)]
-pub(crate) use pg::{CALYX_PG_WRITE_ATTEMPTED, CALYX_VAULT_NOT_IN_PG};
 pub(crate) use pg::{PgConn, PgSnapshot, REQUIRED_TABLES, snapshot_pg_state};
 
 pub(crate) const CALYX_PG_STATE_CHANGED: &str = "CALYX_PG_STATE_CHANGED";

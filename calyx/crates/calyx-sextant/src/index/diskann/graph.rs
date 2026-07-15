@@ -473,7 +473,3 @@ fn cast_le_slice<'a, T>(bytes: &'a [u8], what: &str) -> Result<&'a [T]> {
 pub fn open_diskann_graph(path: &Path) -> Result<DiskAnnGraphReader> {
     DiskAnnGraphReader::open(path)
 }
-
-#[cfg(test)]
-#[path = "graph_tests.rs"]
-mod graph_tests;

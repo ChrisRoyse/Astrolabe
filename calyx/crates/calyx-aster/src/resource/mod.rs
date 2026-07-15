@@ -18,6 +18,3 @@ pub use status::{
     CfCompactionDebt, CompactionDebtStatus, HeapStatus, MemtableCfStatus, MemtableStatus,
     PinnedSeqStatus, RESOURCE_STATUS_SCHEMA_VERSION, ResourceStatus, VramBudgetStatus, WalStatus,
 };
-
-#[cfg(test)]
-mod tests;

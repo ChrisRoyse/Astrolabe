@@ -386,5 +386,3 @@ fn require_gpu_content_lenses(
     }))
 }
 
-#[cfg(test)]
-mod tests;

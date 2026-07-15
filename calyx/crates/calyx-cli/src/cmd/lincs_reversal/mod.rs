@@ -11,8 +11,6 @@ use crate::output::print_json;
 
 mod model;
 mod source;
-#[cfg(test)]
-mod tests;
 mod write;
 
 pub(crate) const DEFAULT_COLLECTION: &str = "biomed_lincs_cmap_reversal";

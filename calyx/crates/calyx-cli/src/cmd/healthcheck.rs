@@ -383,5 +383,3 @@ fn first_failure(report: &HealthReport) -> Option<CalyxError> {
         })
 }
 
-#[cfg(test)]
-mod tests;

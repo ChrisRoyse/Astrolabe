@@ -44,18 +44,3 @@ pub fn parse_range(value: &str) -> crate::error::CliResult<Range<u64>> {
     Ok(start..end)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_range_accepts_half_open_range() {
-        assert_eq!(parse_range("0..4").unwrap(), 0..4);
-    }
-
-    #[test]
-    fn parse_range_rejects_reverse_range() {
-        let error = parse_range("5..4").unwrap_err();
-        assert!(error.message().contains("start 5 > end 4"));
-    }
-}

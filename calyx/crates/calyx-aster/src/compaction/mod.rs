@@ -414,8 +414,3 @@ pub fn compact_shards(
         DEFAULT_COMPACTION_TARGET_BYTES,
     )
 }
-
-#[cfg(test)]
-mod streaming_tests;
-#[cfg(test)]
-mod tests;

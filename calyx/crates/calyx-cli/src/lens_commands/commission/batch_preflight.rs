@@ -342,5 +342,3 @@ fn read_manifest(path: &Path) -> CliResult<LensForgeManifest> {
     })
 }
 
-#[cfg(test)]
-mod tests;

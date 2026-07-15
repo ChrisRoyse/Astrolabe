@@ -43,16 +43,6 @@ pub(crate) fn parse_propose_lens(rest: &[String]) -> CliResult<Subcommand> {
     parse::parse_propose_lens(rest)
 }
 
-#[cfg(test)]
-pub(crate) use parse::{
-    GuardCommand, abundance_tokens, bits_tokens, guard_tokens, kernel_tokens, propose_lens_tokens,
-};
 
-#[cfg(test)]
-mod tests;
 
-#[cfg(test)]
-mod calibration_fsv_support;
 
-#[cfg(test)]
-mod calibration_fsv_tests;

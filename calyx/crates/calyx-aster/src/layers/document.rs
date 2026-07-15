@@ -315,6 +315,3 @@ fn rows_hash(rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)]) -> String {
 fn encode_json_value(value: &Value) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|error| corrupt_doc(format!("encode document JSON: {error}")))
 }
-
-#[cfg(test)]
-mod tests;

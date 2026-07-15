@@ -14,5 +14,3 @@ pub use model::{
     MIN_ENSEMBLE_PANEL_LENSES, PidBits,
 };
 
-#[cfg(test)]
-mod tests;

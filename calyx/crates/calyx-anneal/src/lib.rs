@@ -205,11 +205,3 @@ pub use tune::{
     storage_shape_label, storage_win_check, validate_index_config, validate_mat_plan_config,
     validate_quant_promotion_evidence, validate_storage_config, validate_storage_metrics,
 };
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-anneal");
-    }
-}

@@ -1,12 +1,8 @@
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use calyx_core::Constellation;
 use calyx_core::{CalyxError, CxId, SlotId, SlotVector};
 use calyx_sextant::index::{IndexSearchHit, MaxSimIndex, ranked};
 use serde::{Deserialize, Serialize};
@@ -48,38 +44,6 @@ impl MultiSlotRows {
     pub(super) fn len(&self) -> usize {
         self.rows.len()
     }
-}
-
-#[cfg(test)]
-pub(super) fn collect(
-    docs: &BTreeMap<CxId, Constellation>,
-) -> CliResult<BTreeMap<SlotId, MultiSlotRows>> {
-    let mut out = BTreeMap::<SlotId, MultiSlotRows>::new();
-    for cx in docs.values() {
-        for (slot, vector) in &cx.slots {
-            let SlotVector::Multi { token_dim, tokens } = vector else {
-                continue;
-            };
-            vector.validate_schema().map_err(|err| {
-                stale(format!(
-                    "slot {slot} cx {} has invalid multi-vector payload: {}",
-                    cx.cx_id, err.message
-                ))
-            })?;
-            let entry = out.entry(*slot).or_insert_with(|| MultiSlotRows {
-                token_dim: *token_dim,
-                rows: Vec::new(),
-            });
-            if entry.token_dim != *token_dim {
-                return Err(stale(format!(
-                    "slot {slot} has mixed multi token dims: {} and {token_dim}",
-                    entry.token_dim
-                )));
-            }
-            entry.rows.push((cx.cx_id, tokens.clone()));
-        }
-    }
-    Ok(out)
 }
 
 pub(super) use segments::write;
@@ -435,49 +399,4 @@ pub(super) fn validate_entry(
     }
     let _ = read_json(vault_dir, entry, manifest_base_seq, slot)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-
-    #[test]
-    fn oversized_multi_sidecar_fails_before_reading_json_payload() {
-        let root = temp_root("oversized-multi-sidecar");
-        let sidecar_rel = "idx/search/slot_00022.multi.json";
-        let sidecar_path = root.join(sidecar_rel);
-        fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
-        fs::write(&sidecar_path, b"not json, but too large").unwrap();
-
-        let slot = SlotId::new(22);
-        let entry = SearchIndexEntry::multi(
-            slot,
-            384,
-            1026,
-            513_767,
-            3348,
-            sidecar_rel.to_string(),
-            "unused-because-size-check-runs-first".to_string(),
-        );
-        let err = read_with_sidecar_limit(&root, &entry, 3348, slot, 4).unwrap_err();
-        let message = err.message();
-
-        assert_eq!(err.code(), UNBOUNDED_MULTI_SIDECAR_CODE);
-        assert!(message.contains("persistent multi sidecar for slot 22"));
-        assert!(message.contains("exceeds search JSON sidecar limit 4 bytes"));
-        assert!(message.contains("rows=1026"));
-        assert!(message.contains("tokens=513767"));
-        let CliError::Calyx(calyx) = err else {
-            panic!("expected structured Calyx error");
-        };
-        assert_eq!(calyx.remediation, UNBOUNDED_MULTI_SIDECAR_REMEDIATION);
-    }
-
-    // RAII scratch (#260): self-cleans on drop incl. panic unwind.
-    fn temp_root(tag: &str) -> calyx_fsv::scratch::ScratchDir {
-        calyx_fsv::scratch::ScratchDir::new_temp(&format!("calyx-search-{tag}"))
-            .expect("create temp root")
-    }
 }

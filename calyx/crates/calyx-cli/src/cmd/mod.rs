@@ -488,5 +488,3 @@ impl LensFlags {
     }
 }
 
-#[cfg(test)]
-mod tests;

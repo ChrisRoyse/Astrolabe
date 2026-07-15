@@ -468,7 +468,3 @@ impl ReadbackContext {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    include!("raw_onchain_backfill_readback_context_tests.rs");
-}

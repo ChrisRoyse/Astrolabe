@@ -34,8 +34,6 @@ use crate::output::print_json;
 use manifest_restore::manifest_restore;
 use registry_contract::{registry_audit, registry_repair};
 
-#[cfg(test)]
-pub(crate) use crate::lens_commands::catalog::LensCatalog;
 pub(crate) use crate::lens_commands::catalog::LensCatalogEntry;
 
 #[derive(Serialize)]

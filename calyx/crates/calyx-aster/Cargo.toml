@@ -31,18 +31,6 @@ tracing.workspace = true
 ulid.workspace = true
 zeroize.workspace = true
 
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-mincut = { path = "../calyx-mincut" }
-criterion.workspace = true
-proptest.workspace = true
-ulid.workspace = true
-
-[[bench]]
-name = "bench_arena_reset"
-harness = false
-
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 

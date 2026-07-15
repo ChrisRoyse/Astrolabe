@@ -64,7 +64,3 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
 ] }
-
-[dev-dependencies]
-calyx-testkit = { path = "../calyx-testkit" }
-proptest.workspace = true

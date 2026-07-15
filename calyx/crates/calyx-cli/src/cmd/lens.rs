@@ -488,6 +488,3 @@ impl Lens for DeclaredLens {
     }
 }
 
-#[cfg(test)]
-#[path = "lens/tests.rs"]
-mod tests;

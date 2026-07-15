@@ -5,8 +5,6 @@ mod derived_text;
 mod input_retention;
 mod media;
 mod report;
-#[cfg(test)]
-mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 

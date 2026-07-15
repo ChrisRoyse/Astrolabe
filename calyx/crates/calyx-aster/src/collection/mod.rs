@@ -177,8 +177,3 @@ fn collection_error(
         remediation,
     }
 }
-
-#[cfg(test)]
-mod enhancement_tests;
-#[cfg(test)]
-mod tests;

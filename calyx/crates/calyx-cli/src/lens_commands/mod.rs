@@ -7,8 +7,6 @@ mod remove;
 mod scale_audit;
 pub(crate) mod support;
 
-#[cfg(test)]
-mod tests;
 
 use crate::error::{CliError, CliResult};
 

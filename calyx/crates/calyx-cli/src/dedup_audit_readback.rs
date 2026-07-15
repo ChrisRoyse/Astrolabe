@@ -20,8 +20,6 @@ const CX_LIST_UNBOUNDED_ROW_LIMIT: usize = 100;
 
 mod index_progress;
 mod physical_slots;
-#[cfg(test)]
-mod tests;
 
 use index_progress::rebuild_cx_list_base_page_index;
 use physical_slots::{physical_slot_states, slot_row_json, slot_summary, tombstone_row};

@@ -2,8 +2,6 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use super::A38_BUNDLE_NOT_FOUND;
 use super::model::{
     A38_COVERAGE_STATUS, A38BundleCatalog, A38BundleIndexEntry, A38BundleVersionRef,
     BUNDLE_CATALOG_VERSION, BUNDLE_OBJECT_VERSION, BundleDraft, BundleSummary, SavedA38Bundle, mib,
@@ -107,28 +105,6 @@ impl A38BundleStore {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(super) fn load(&self, selector: &str) -> CliResult<SavedA38Bundle> {
-        let catalog = self.read_catalog()?;
-        if let Some(entry) = catalog.bundles.iter().find(|entry| entry.name == selector) {
-            let active = version_ref(entry, &entry.active_bundle_id)?;
-            return self.read_object(&active.object_path, &active.blake3_hex);
-        }
-        for entry in &catalog.bundles {
-            if let Some(version) = entry
-                .versions
-                .iter()
-                .find(|version| version.bundle_id == selector)
-            {
-                return self.read_object(&version.object_path, &version.blake3_hex);
-            }
-        }
-        Err(bundle_error(
-            A38_BUNDLE_NOT_FOUND,
-            format!("A38 bundle {selector} is not saved"),
-            "save the A38 bundle before selecting it",
-        ))
-    }
 
     pub(super) fn read_catalog(&self) -> CliResult<A38BundleCatalog> {
         let path = self.index_path();

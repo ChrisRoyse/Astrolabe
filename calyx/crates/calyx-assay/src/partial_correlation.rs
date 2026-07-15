@@ -380,6 +380,3 @@ fn atanh(r: f64) -> f64 {
     0.5 * ((1.0 + r) / (1.0 - r)).ln()
 }
 
-#[cfg(test)]
-#[path = "partial_correlation_tests.rs"]
-mod tests;

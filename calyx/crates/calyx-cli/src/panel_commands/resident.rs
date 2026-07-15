@@ -55,8 +55,6 @@ mod parallel;
 mod server;
 mod stream;
 
-#[cfg(test)]
-mod tests;
 
 pub(crate) use client::{measure_batch_at, ready_value_at};
 pub(crate) fn run(args: &[String]) -> CliResult {

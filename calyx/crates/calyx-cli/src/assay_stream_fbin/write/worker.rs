@@ -221,22 +221,6 @@ fn run_worker_process(
         .map_err(io_error)
 }
 
-#[cfg(test)]
-fn run_worker_process(
-    args: &Args,
-    selected: &SelectedLens,
-    slot: usize,
-    staging: &Path,
-    report: &Path,
-    _stdout: File,
-    _stderr: File,
-) -> Result<ExitStatus, crate::error::CliError> {
-    let mut worker_args = worker_args(args, selected, slot, staging, report);
-    worker_args.worker_report = Some(report.to_path_buf());
-    worker_args.worker_slot = Some(slot);
-    run_worker(&worker_args)?;
-    Ok(success_status())
-}
 
 pub(crate) fn run_worker(args: &Args) -> CliResult<StreamWorkerReport> {
     let report_path = args.worker_report.as_ref().ok_or_else(|| {
@@ -422,26 +406,6 @@ fn add_admission_args(command: &mut Command, args: &Args) {
     }
 }
 
-#[cfg(test)]
-fn worker_args(
-    args: &Args,
-    selected: &SelectedLens,
-    slot: usize,
-    staging: &Path,
-    report: &Path,
-) -> Args {
-    let mut worker_args = args.clone();
-    worker_args.out_dir = staging.to_path_buf();
-    worker_args.manifests = vec![
-        selected
-            .manifest
-            .clone()
-            .expect("file-mode worker must have a manifest"),
-    ];
-    worker_args.worker_report = Some(report.to_path_buf());
-    worker_args.worker_slot = Some(slot);
-    worker_args
-}
 
 fn remove_stale(path: &Path) -> CliResult {
     match fs::remove_file(path) {
@@ -455,16 +419,3 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-fn success_status() -> ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatus::from_raw(0)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatus::from_raw(0)
-    }
-}

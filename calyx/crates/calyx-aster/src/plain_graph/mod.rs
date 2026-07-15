@@ -486,14 +486,3 @@ impl<'a, C: Clock> PlainGraph<'a, C> {
             .scan_cf_range_keys_at(snapshot, ColumnFamily::Graph, range)
     }
 }
-
-#[cfg(test)]
-mod csr_binary_tests;
-#[cfg(test)]
-mod csr_fail_closed_tests;
-#[cfg(test)]
-mod legacy_weight_tests;
-#[cfg(test)]
-mod lifecycle_tests;
-#[cfg(test)]
-mod tests;

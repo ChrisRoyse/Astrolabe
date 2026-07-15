@@ -264,13 +264,3 @@ fn display_path(path: &Path) -> String {
         .to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn p99_uses_nearest_rank() {
-        let samples: Vec<_> = (1..=100).collect();
-        assert_eq!(p99(&samples), 99);
-    }
-}

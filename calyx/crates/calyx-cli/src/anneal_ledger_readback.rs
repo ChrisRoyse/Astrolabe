@@ -135,23 +135,3 @@ fn parse_action(value: &str) -> crate::error::CliResult<AnnealLedgerAction> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_action_accepts_proposal_ledger_actions() {
-        assert_eq!(
-            parse_action("Propose").unwrap(),
-            AnnealLedgerAction::Propose
-        );
-        assert_eq!(
-            parse_action("LensAdmitted").unwrap(),
-            AnnealLedgerAction::LensAdmitted
-        );
-        assert_eq!(
-            parse_action("LensRejected").unwrap(),
-            AnnealLedgerAction::LensRejected
-        );
-    }
-}

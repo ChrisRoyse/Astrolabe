@@ -8,8 +8,6 @@ mod propose;
 mod propose_backfill;
 mod propose_live;
 mod propose_profile;
-#[cfg(test)]
-mod tests;
 
 use std::path::PathBuf;
 

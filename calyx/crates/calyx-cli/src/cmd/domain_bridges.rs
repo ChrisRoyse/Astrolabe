@@ -378,5 +378,3 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests;

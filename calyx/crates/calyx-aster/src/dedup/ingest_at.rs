@@ -467,7 +467,3 @@ where
         .count();
     Ok(OccurrenceId(count as u64))
 }
-
-#[cfg(test)]
-#[path = "ingest_at_tests.rs"]
-mod tests;

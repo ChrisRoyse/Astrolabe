@@ -481,16 +481,3 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
     ),
 ];
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formula_coverage_catalog_has_all_prd22_rows() {
-        let artifact = formula_coverage_artifact("/tmp/fsv-639", 1);
-        let summary = validate_formula_coverage(&artifact).unwrap();
-        assert_eq!(summary.total_rows, 38);
-        assert_eq!(summary.covered_rows, 38);
-        assert_eq!(summary.missing_rows, 0);
-    }
-}

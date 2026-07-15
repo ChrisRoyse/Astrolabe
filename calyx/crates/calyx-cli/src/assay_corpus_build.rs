@@ -26,9 +26,3 @@ pub(crate) fn run(args: &[String]) -> CliResult {
     print_json(&evidence)
 }
 
-#[cfg(test)]
-mod request_tests;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_parallel;

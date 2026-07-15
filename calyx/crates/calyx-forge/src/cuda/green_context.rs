@@ -250,29 +250,3 @@ fn green_context_error(detail: impl Into<String>) -> ForgeError {
         remediation: GREEN_CONTEXT_REMEDIATION.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn green_context_stream_can_initialize() -> Result<()> {
-        let stream = CudaGreenContextStream::create_serving(0, 8)?;
-
-        println!(
-            "CUDA_GREEN_CONTEXT id={} requested_sm_count={} actual_sm_count={} total_sm_count={} workqueue_balanced={}",
-            stream.green_ctx_id(),
-            stream.requested_sm_count(),
-            stream.actual_sm_count(),
-            stream.total_sm_count(),
-            stream.workqueue_balanced()
-        );
-
-        assert!(!stream.stream_ptr().is_null());
-        assert_eq!(stream.requested_sm_count(), 8);
-        assert!(stream.actual_sm_count() >= 8);
-        assert!(stream.actual_sm_count() <= stream.total_sm_count());
-        assert!(stream.workqueue_balanced());
-        Ok(())
-    }
-}

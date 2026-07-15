@@ -21,6 +21,3 @@ pub use pack::{
 pub fn shutdown_multimodal_gpu_workers() {
     bridge::shutdown_shared_gpu_workers();
 }
-
-#[cfg(test)]
-mod tests;

@@ -88,16 +88,6 @@ impl OriginMetrics {
             .map_err(|error| format!("encode origin prometheus text format: {error}"))?;
         Ok(buffer)
     }
-
-    #[cfg(test)]
-    pub fn request_count(&self, endpoint: &'static str, status: &'static str) -> u64 {
-        self.requests.with_label_values(&[endpoint, status]).get()
-    }
-
-    #[cfg(test)]
-    pub fn write_count(&self, kind: &'static str, result: &'static str) -> u64 {
-        self.writes.with_label_values(&[kind, result]).get()
-    }
 }
 
 impl Default for OriginMetrics {

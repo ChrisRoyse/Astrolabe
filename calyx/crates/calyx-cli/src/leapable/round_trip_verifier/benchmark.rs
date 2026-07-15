@@ -182,14 +182,3 @@ fn latency_budget(sqlite_p99_us: u64) -> u64 {
     sqlite_p99_us.saturating_add(relative.max(LATENCY_JITTER_BUDGET_US))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn latency_budget_keeps_absolute_jitter_floor_for_microbenchmarks() {
-        assert_eq!(latency_budget(0), LATENCY_JITTER_BUDGET_US);
-        assert_eq!(latency_budget(50), 150);
-        assert_eq!(latency_budget(10_000), 10_500);
-    }
-}

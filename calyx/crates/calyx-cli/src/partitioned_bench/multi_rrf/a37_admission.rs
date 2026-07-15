@@ -315,6 +315,3 @@ fn hex_sha256(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
-#[path = "a37_admission_tests.rs"]
-mod tests;

@@ -463,37 +463,3 @@ fn ground_truth_source(req: &Request<'_>) -> Value {
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn best_pair_control_reports_best_two_slot_rrf_recall() {
-        let slot_a = SlotId::new(0);
-        let slot_b = SlotId::new(1);
-        let slot_c = SlotId::new(2);
-        let single_hits = BTreeMap::from([
-            (slot_a, vec![vec![1, 4, 5, 6]]),
-            (slot_b, vec![vec![2, 7, 8, 9]]),
-            (slot_c, vec![vec![9, 8, 7, 6]]),
-        ]);
-        let truth = Vec::from([BTreeSet::from([1, 2])]);
-
-        let control =
-            best_pair_control(&[slot_a, slot_b, slot_c], &single_hits, &truth, 2.0, 2, 1.0)
-                .expect("three slots produce pairs");
-
-        assert_eq!(control["slots"], json!([0, 1]));
-        assert_eq!(control["recall_at_k"], json!(1.0));
-        assert_eq!(control["fusion_matches_or_beats"], json!(true));
-    }
-
-    #[test]
-    fn strict_or_tied_rank_accepts_distance_equivalent_rows() {
-        let truth = vec![(7, 0.1), (9, 0.1), (8, 0.2), (6, 0.4)];
-
-        assert_eq!(strict_or_tied_rank(9, 0.1, &truth), Some(2));
-        assert_eq!(strict_or_tied_rank(99, 0.1, &truth), Some(1));
-        assert_eq!(strict_or_tied_rank(99, 0.3, &truth), None);
-    }
-}

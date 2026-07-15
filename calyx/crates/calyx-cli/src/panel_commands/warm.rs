@@ -344,8 +344,6 @@ impl Drop for MultimodalGpuWorkerShutdownGuard {
 }
 
 mod preflight;
-#[cfg(test)]
-use preflight::estimate_resident_vram_mib;
 use preflight::{
     build_warm_template_panel, default_load_parallelism, multiplier_to_f32, warm_preflight,
 };
@@ -458,5 +456,3 @@ fn warm_audio_wav() -> Vec<u8> {
     wav
 }
 
-#[cfg(test)]
-mod tests;

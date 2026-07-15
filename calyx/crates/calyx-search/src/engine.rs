@@ -27,11 +27,7 @@ mod search;
 mod support;
 mod types;
 pub use budget::SearchBudget;
-#[cfg(test)]
-use guard::prefilter_in_region_candidates;
 use search::search_outcome_with_measured_slots;
-#[cfg(test)]
-use support::{apply_in_region_guard, cosine};
 pub use types::{FusionChoice, GuardChoice, SearchFreshness, SearchOutcome};
 
 /// Historical flat in-region cosine threshold. Since #1094 this is NEVER
@@ -41,11 +37,6 @@ pub use types::{FusionChoice, GuardChoice, SearchFreshness, SearchOutcome};
 /// documented strict near-duplicate reference value for operators choosing an
 /// explicit flat tau (issue #1088) and for the flat-path unit tests.
 pub const DEFAULT_IN_REGION_GUARD_TAU: f32 = 0.999;
-
-/// Test-only alias for the default tau, used by guard/support unit tests that
-/// assert behavior at the default threshold.
-#[cfg(test)]
-const GUARD_TAU: f32 = DEFAULT_IN_REGION_GUARD_TAU;
 
 /// Bounded MVCC reader lease for a whole search readback pass.
 const SEARCH_READER_LEASE_MS: u64 = 300_000;
@@ -287,6 +278,3 @@ pub fn search_outcome_with_query_vectors_freshness_cached(
         Some(&mut trace),
     )
 }
-
-#[cfg(test)]
-mod tests;

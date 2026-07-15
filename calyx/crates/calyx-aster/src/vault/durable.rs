@@ -19,8 +19,6 @@ use calyx_ledger::CheckpointConfig;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -95,14 +93,6 @@ pub(super) struct DurableVault {
     /// (issue #1100); persisted into every manifest write as
     /// `derived_content_seq`, clamped to that manifest's `durable_seq`.
     checkpointed_derived_content_seq: AtomicU64,
-    #[cfg(test)]
-    fail_next_wal_append: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_next_mvcc_commit: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_next_mvcc_restore: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_next_checkpoint: Arc<AtomicBool>,
 }
 
 pub(super) struct RecoveredBatch {
@@ -211,14 +201,6 @@ impl DurableVault {
             disk_pressure_guard: options.disk_pressure_guard.clone(),
             pending_checkpoint: Mutex::new(Vec::new()),
             checkpointed_derived_content_seq: AtomicU64::new(0),
-            #[cfg(test)]
-            fail_next_wal_append: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_next_mvcc_commit: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_next_mvcc_restore: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_next_checkpoint: Arc::new(AtomicBool::new(false)),
         };
         if durable.root.join("CURRENT").exists() {
             let manifest = crate::manifest::ManifestStore::open(&durable.root).load_current()?;
@@ -298,10 +280,6 @@ impl DurableVault {
     }
 
     pub(super) fn append_batch(&self, rows: &[WriteRow]) -> Result<u64> {
-        #[cfg(test)]
-        if self.fail_next_wal_append.swap(false, Ordering::SeqCst) {
-            return Err(CalyxError::disk_pressure("injected WAL append failure"));
-        }
         let payload = encode_write_batch(rows)?;
         let ack = self.batcher.submit(payload)?;
         Ok(ack.seq)
@@ -324,41 +302,6 @@ impl DurableVault {
 
     pub(super) fn durable_tip_seq(&self) -> Result<u64> {
         self.batcher.tip_seq()
-    }
-
-    #[cfg(test)]
-    pub(super) fn fail_next_wal_append(&self) {
-        self.fail_next_wal_append.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(super) fn fail_next_mvcc_commit(&self) {
-        self.fail_next_mvcc_commit.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_mvcc_commit_failure(&self) -> bool {
-        self.fail_next_mvcc_commit.swap(false, Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    pub(super) fn fail_next_mvcc_restore(&self) {
-        self.fail_next_mvcc_restore.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_mvcc_restore_failure(&self) -> bool {
-        self.fail_next_mvcc_restore.swap(false, Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    pub(super) fn fail_next_checkpoint(&self) {
-        self.fail_next_checkpoint.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_checkpoint_failure(&self) -> bool {
-        self.fail_next_checkpoint.swap(false, Ordering::SeqCst)
     }
 
     fn advance_checkpointed_derived_content(&self, seq: u64, rows: &[WriteRow]) {

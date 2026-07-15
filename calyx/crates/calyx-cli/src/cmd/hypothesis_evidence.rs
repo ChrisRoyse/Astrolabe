@@ -406,17 +406,4 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-pub(crate) fn tokens(args: &HypothesisEvidenceArgs) -> Vec<String> {
-    vec![
-        "assemble-hypothesis-evidence".to_string(),
-        args.vault.clone(),
-        "--chain".to_string(),
-        args.chain.to_string_lossy().into_owned(),
-        "--out".to_string(),
-        args.out.to_string_lossy().into_owned(),
-    ]
-}
 
-#[cfg(test)]
-mod tests;

@@ -454,8 +454,6 @@ pub(super) fn register_template_lenses_with_progress(
 mod progress;
 use progress::{emit_progress, lens_progress};
 
-#[cfg(test)]
-mod tests;
 
 fn object_rel_path(template_id: &str) -> String {
     format!("objects/{template_id}.json")

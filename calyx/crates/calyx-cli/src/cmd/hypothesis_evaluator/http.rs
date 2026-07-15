@@ -243,32 +243,4 @@ fn auth_failed(message: impl Into<String>) -> CliError {
     })
 }
 
-#[cfg(test)]
-pub(crate) fn auth_for_endpoint_with_lookup_for_test<F>(
-    endpoint: &str,
-    auth_env: Option<&str>,
-    lookup: F,
-) -> CliResult<EvaluatorAuth>
-where
-    F: FnOnce(&str) -> Option<String>,
-{
-    EvaluatorAuth::for_endpoint_with_lookup(endpoint, auth_env, lookup)
-}
 
-#[cfg(test)]
-pub(crate) fn post_https_json_with_sender_for_test(
-    endpoint: &str,
-    body: &Value,
-    timeout: Duration,
-    auth: &EvaluatorAuth,
-    sender: impl FnOnce(String, String, Duration, Value) -> CliResult<Value>,
-) -> CliResult<Value> {
-    post_https_json(endpoint, body, timeout, auth, |request| {
-        sender(
-            request.safe_endpoint,
-            request.authorization,
-            request.timeout,
-            request.body,
-        )
-    })
-}

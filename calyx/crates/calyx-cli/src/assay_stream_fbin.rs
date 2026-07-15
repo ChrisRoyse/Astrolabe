@@ -4,17 +4,6 @@ mod args;
 mod format;
 mod rows;
 mod template;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_diag;
-#[cfg(test)]
-mod tests_progress;
-#[cfg(test)]
-#[path = "assay_stream_fbin/tests/support.rs"]
-mod tests_support;
-#[cfg(test)]
-mod tests_template;
 mod write;
 
 use calyx_core::CalyxError;

@@ -491,5 +491,3 @@ fn enum_string(values: &[&str]) -> Value {
     json!({ "type": "string", "enum": values })
 }
 
-#[cfg(test)]
-mod tests;

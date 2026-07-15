@@ -31,9 +31,6 @@ pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
 
-#[cfg(test)]
-mod tests;
-
 pub struct OnnxLens {
     id: LensId,
     dim: u32,

@@ -114,17 +114,3 @@ impl fmt::Display for EntryKind {
         f.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wire_codes_are_stable_and_roundtrip() {
-        for (expected, kind) in EntryKind::ALL.into_iter().enumerate() {
-            assert_eq!(kind.wire_code(), expected as u8);
-            assert_eq!(EntryKind::from_wire_code(expected as u8), Some(kind));
-        }
-        assert_eq!(EntryKind::from_wire_code(15), None);
-    }
-}

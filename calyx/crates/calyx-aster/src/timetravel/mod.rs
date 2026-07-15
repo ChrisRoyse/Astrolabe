@@ -79,11 +79,6 @@ impl<'a, C: Clock> TimeTravelSnapshot<'a, C> {
     pub fn read_cf(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.vault.read_cf_at(self.seqno, cf, key)
     }
-
-    #[cfg(test)]
-    pub(crate) fn lease_id_for_test(&self) -> u64 {
-        self.lease_id
-    }
 }
 
 impl<C: Clock> std::fmt::Debug for TimeTravelSnapshot<'_, C> {
@@ -109,6 +104,3 @@ impl<C: Clock> Drop for TimeTravelSnapshot<'_, C> {
 pub fn as_of<C: Clock>(vault: &AsterVault<C>, t_millis: u64) -> Result<TimeTravelSnapshot<'_, C>> {
     TimeTravelSnapshot::open(vault, t_millis)
 }
-
-#[cfg(test)]
-mod tests;

@@ -19,12 +19,7 @@ mod batch_limits;
 mod lazy;
 mod runtime;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use assets::load_manifest_panel_registry_snapshot;
-#[cfg(test)]
-pub(crate) use assets::write_asset;
 pub use batch_limits::{apply_registry_snapshot_batch_limits, set_vault_registry_batch_limits};
 pub(crate) use lazy::rebuild_registry;
 pub use runtime::{

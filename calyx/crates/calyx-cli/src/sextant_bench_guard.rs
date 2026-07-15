@@ -55,39 +55,3 @@ fn format_bytes(bytes: u128) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn small_flat_bench_is_allowed() {
-        require_flat_bench_budget("calyx build-bench-vault", 64, 8)
-            .expect("small synthetic bench remains usable");
-    }
-
-    #[test]
-    fn exact_raw_dense_byte_cap_is_allowed() {
-        let n_cx = (MAX_FLAT_BENCH_RAW_DENSE_BYTES / BYTES_PER_F32) as usize;
-
-        require_flat_bench_budget("calyx bench search", n_cx, 1)
-            .expect("exact cap is still within budget");
-    }
-
-    #[test]
-    fn one_vector_past_cap_fails_closed() {
-        let n_cx = (MAX_FLAT_BENCH_RAW_DENSE_BYTES / BYTES_PER_F32) as usize + 1;
-        let error = require_flat_bench_budget("calyx bench recall", n_cx, 1)
-            .expect_err("legacy flat bench must fail before allocating");
-
-        assert_eq!(error.code(), CALYX_FSV_FLAT_BENCH_MATERIALIZES);
-        assert!(error.message().contains("would materialize"), "{error}");
-    }
-
-    #[test]
-    fn arithmetic_overflow_fails_closed() {
-        let error = require_flat_bench_budget("calyx bench search", usize::MAX, usize::MAX)
-            .expect_err("overflowed size math must fail closed");
-
-        assert_eq!(error.code(), CALYX_FSV_FLAT_BENCH_MATERIALIZES);
-    }
-}

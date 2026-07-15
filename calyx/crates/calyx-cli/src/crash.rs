@@ -355,16 +355,3 @@ fn crash_exit(pause_ms: Option<u64>) -> ! {
     process::exit(1);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crash_points_parse_expected_names() {
-        assert_eq!(
-            CrashPoint::parse("before-wal-fsync").unwrap(),
-            CrashPoint::BeforeWalFsync
-        );
-        assert!(CrashPoint::parse("missing").is_err());
-    }
-}

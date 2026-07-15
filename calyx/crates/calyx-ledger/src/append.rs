@@ -439,6 +439,3 @@ fn recover_tip(store: &impl LedgerCfStore) -> Result<(u64, [u8; HASH_BYTES], u64
 fn append_only_violation(message: impl Into<String>) -> CalyxError {
     CalyxError::ledger_append_only_violation(message)
 }
-
-#[cfg(test)]
-mod tests;

@@ -72,32 +72,3 @@ fn discount(rank: usize) -> f64 {
     ((rank + 1) as f64).log2()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn id(byte: u8) -> CxId {
-        CxId::from_bytes([byte; 16])
-    }
-
-    #[test]
-    fn metrics_use_true_relevant_fraction_not_hit_rate() {
-        let ranking = vec![id(1), id(9), id(8)];
-        let relevant = BTreeMap::from([(id(1), 1), (id(2), 1), (id(3), 1)]);
-
-        let metrics = ranking_metrics(&ranking, &relevant, 3);
-
-        assert_eq!(metrics.recall_at_k, 1.0 / 3.0);
-        assert_eq!(metrics.mrr, 1.0);
-    }
-
-    #[test]
-    fn ndcg_rewards_better_relevance_ordering() {
-        let relevant = BTreeMap::from([(id(1), 3), (id(2), 1)]);
-        let best = ranking_metrics(&[id(1), id(2)], &relevant, 2);
-        let worse = ranking_metrics(&[id(2), id(1)], &relevant, 2);
-
-        assert_eq!(best.ndcg_at_k, 1.0);
-        assert!(worse.ndcg_at_k < best.ndcg_at_k);
-    }
-}

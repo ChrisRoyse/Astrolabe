@@ -13,8 +13,6 @@ mod args;
 mod import;
 
 pub(crate) use import::run_import;
-#[cfg(test)]
-pub(crate) use import::{AnchorSpec, load_rows_jsonl};
 
 const KEY_PREFIX: &[u8] = b"calyx/assay/i8bin-label-anchor/v1/";
 const VALUE_MAGIC: &[u8] = b"CAILBL1\0";
@@ -447,6 +445,3 @@ fn hex_from_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-#[path = "label_store_tests.rs"]
-mod tests;

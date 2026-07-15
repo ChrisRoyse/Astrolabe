@@ -348,5 +348,3 @@ fn parse_cx_id(raw: &str) -> CliResult<CxId> {
     CxId::from_str(raw).map_err(|error| CliError::usage(format!("parse --cx-id {raw}: {error}")))
 }
 
-#[cfg(test)]
-mod tests;

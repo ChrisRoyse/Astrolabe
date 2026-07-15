@@ -5,8 +5,6 @@ use calyx_aster::vault::AsterVault;
 use calyx_core::{Constellation, CxId, SlotVector};
 use calyx_sextant::{FreshnessTag, Hit};
 
-#[cfg(test)]
-use super::GUARD_TAU;
 use super::{SEARCH_READER_LEASE_MS, SearchFreshness};
 use crate::error::CliResult;
 use crate::persisted::{PersistedSearchIndexes, load_docs_at};
@@ -83,20 +81,6 @@ impl Drop for SearchReadSnapshot<'_> {
 
 pub(super) fn is_stale_derived(error: &crate::error::SearchError) -> bool {
     matches!(error, crate::error::SearchError::Calyx(inner) if inner.code == "CALYX_STALE_DERIVED")
-}
-
-/// Keep only hits whose best per-lens cosine to the query meets the guard tau.
-#[cfg(test)]
-pub(super) fn apply_in_region_guard(
-    hits: Vec<Hit>,
-    docs: &BTreeMap<CxId, Constellation>,
-    query_vectors: &[(calyx_core::SlotId, SlotVector)],
-) -> Vec<Hit> {
-    hits.into_iter()
-        .filter(|hit| {
-            guard_cosine(hit, docs, query_vectors).is_some_and(|value| value >= GUARD_TAU)
-        })
-        .collect()
 }
 
 pub(super) fn vault_base_count_at(vault: &AsterVault, snapshot: Snapshot) -> CliResult<usize> {

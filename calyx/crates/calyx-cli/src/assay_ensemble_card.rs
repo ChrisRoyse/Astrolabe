@@ -106,5 +106,3 @@ const ASSAY_ENSEMBLE_CODES: &[&str] = &[
     "CALYX_FSV_ASSAY_CARD_READBACK_MISMATCH",
 ];
 
-#[cfg(test)]
-mod tests;

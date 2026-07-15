@@ -6,8 +6,6 @@ mod load;
 mod matching;
 mod model;
 mod persist;
-#[cfg(test)]
-mod tests;
 
 pub(crate) use model::HypothesisFalsificationArgs;
 use model::{FalsificationReport, FalsificationSummary};

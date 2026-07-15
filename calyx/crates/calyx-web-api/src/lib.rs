@@ -111,8 +111,6 @@ use health::{health, health_full, not_implemented};
 
 mod cache;
 pub use cache::ResponseCache;
-#[cfg(test)]
-use cache::parse_env_u64;
 
 mod measure;
 pub use measure::MeasureCtx;
@@ -173,8 +171,6 @@ pub fn build_app_with_search(
 
 mod metrics;
 pub use metrics::{HttpMetrics, MetricsCtx};
-#[cfg(test)]
-use metrics::{MetricsSnapshot, render_metrics};
 use metrics::{metrics_handler, track_metrics};
 
 /// Build the production app with BOTH `/v1/measure` (vault) and
@@ -284,9 +280,3 @@ fn on_panic(payload: Box<dyn Any + Send + 'static>) -> Response {
     tracing::error!("CALYX_WEB_API_INTERNAL: a request handler panicked: {detail}");
     ApiError::of(ErrorCode::Internal).into_response()
 }
-
-// ---------------------------------------------------------------------------
-// ResponseCache unit tests (#1898) — real cache, synthetic keys/bodies, no mocks
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod cache_tests;

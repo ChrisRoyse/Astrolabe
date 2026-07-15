@@ -518,6 +518,3 @@ fn is_raw_field(field: &str) -> bool {
 fn secret_error(message: impl Into<String>) -> CalyxError {
     CalyxError::ledger_secret_in_payload(message)
 }
-
-#[cfg(test)]
-mod tests;

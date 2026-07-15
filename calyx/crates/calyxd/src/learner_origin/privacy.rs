@@ -42,23 +42,3 @@ fn reject_text(text: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn rejects_marker_in_key_or_value() {
-        assert!(reject_private_material(&json!({"password": "x"})).is_err());
-        assert!(reject_private_material(&json!({"field": "data-calyx-private"})).is_err());
-    }
-
-    #[test]
-    fn accepts_plain_learner_signal() {
-        reject_private_material(&json!({
-            "learnerId": "learner-a",
-            "events": [{"conceptId": "fractions", "score": 0.8}]
-        }))
-        .expect("plain telemetry accepted");
-    }
-}

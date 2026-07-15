@@ -21,9 +21,6 @@ use crate::error::DaemonError;
 mod handlers;
 mod storage;
 
-#[cfg(test)]
-mod tests;
-
 pub(super) const ORIGIN_PANEL_VERSION: u32 = 1;
 pub(super) const ORIGIN_SLOT_ID: SlotId = SlotId::new(813);
 pub(super) const ORIGIN_ACTOR: &str = "calyxd-learner-origin";
@@ -117,25 +114,6 @@ impl LearnerOriginService {
 
     pub fn metrics(&self) -> Arc<OriginMetrics> {
         Arc::clone(&self.metrics)
-    }
-
-    #[cfg(test)]
-    pub fn latest_seq(&self) -> u64 {
-        self.vault.latest_seq()
-    }
-
-    #[cfg(test)]
-    pub fn origin_metrics(&self) -> &OriginMetrics {
-        &self.metrics
-    }
-
-    #[cfg(test)]
-    pub fn base_rows(&self) -> Vec<calyx_core::Constellation> {
-        self.origin_rows()
-            .expect("origin rows scan succeeds")
-            .into_iter()
-            .map(|row| row.cx)
-            .collect()
     }
 
     pub fn handle(

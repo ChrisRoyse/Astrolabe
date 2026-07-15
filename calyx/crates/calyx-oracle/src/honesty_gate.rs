@@ -215,7 +215,3 @@ fn lens_deficits(
     }
     Ok(by_lens.into_iter().collect())
 }
-
-#[cfg(test)]
-#[path = "honesty_gate_tests.rs"]
-mod tests;

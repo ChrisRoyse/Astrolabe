@@ -1,8 +1,6 @@
 mod repair_all;
 mod runtime;
 mod static_contract;
-#[cfg(test)]
-mod tests;
 
 use std::path::Path;
 

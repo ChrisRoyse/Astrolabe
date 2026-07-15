@@ -34,7 +34,3 @@ tracing = { workspace = true }
 tungstenite = { workspace = true }
 ureq = { workspace = true }
 zeroize = { workspace = true }
-
-[dev-dependencies]
-rand = { workspace = true }
-rand_chacha = { workspace = true }

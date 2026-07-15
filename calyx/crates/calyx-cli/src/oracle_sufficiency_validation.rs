@@ -95,5 +95,3 @@ const ORACLE_CODES: &[&str] = &[
     "CALYX_FSV_ORACLE_MISSING_VERDICT_METADATA",
 ];
 
-#[cfg(test)]
-mod tests;

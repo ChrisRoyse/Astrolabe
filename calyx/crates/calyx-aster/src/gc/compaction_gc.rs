@@ -493,6 +493,3 @@ fn is_compaction_output(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .is_some_and(|name| name.starts_with("compacted-"))
 }
-
-#[cfg(test)]
-mod tests;

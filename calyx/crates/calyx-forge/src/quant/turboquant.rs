@@ -337,5 +337,3 @@ fn derive_rademacher_seed(seed: &RotationSeed) -> RotationSeed {
     new_seed(seed.dim, &entropy)
 }
 
-#[cfg(test)]
-mod tests;

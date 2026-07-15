@@ -17,8 +17,6 @@ mod cli;
 mod panels;
 
 pub(crate) use cli::run_remove_shadow;
-#[cfg(test)]
-pub(crate) use panels::DefaultPanelOptions;
 pub(crate) use panels::DefaultPanels;
 
 pub(crate) const CALYX_VAULT_FLIP_REQUIRED: &str = "CALYX_VAULT_FLIP_REQUIRED";

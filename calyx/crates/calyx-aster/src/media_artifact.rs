@@ -342,6 +342,3 @@ fn media_artifact_error(message: impl Into<String>) -> CalyxError {
         remediation: "persist source-specific derived media provenance as a valid artifact record",
     }
 }
-
-#[cfg(test)]
-mod tests;

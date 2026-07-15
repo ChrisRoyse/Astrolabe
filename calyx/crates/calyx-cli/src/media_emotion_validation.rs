@@ -39,5 +39,3 @@ pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests;

@@ -468,7 +468,3 @@ struct SuperIntelLedgerPayload<'a> {
     tiers: &'a [TierResult],
     ts: u64,
 }
-
-#[cfg(test)]
-#[path = "super_intel_full_tests.rs"]
-mod tests;

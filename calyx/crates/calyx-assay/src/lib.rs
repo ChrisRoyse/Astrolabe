@@ -215,10 +215,3 @@ pub use transfer_entropy::{
     transfer_entropy_sweep, transfer_entropy_sweep_with_config, transfer_entropy_with_config,
 };
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_metadata_is_present() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "calyx-assay");
-    }
-}

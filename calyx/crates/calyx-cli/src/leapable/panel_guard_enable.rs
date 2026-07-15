@@ -30,19 +30,7 @@ impl Default for PanelSpec {
 }
 
 impl PanelSpec {
-    #[cfg(test)]
-    pub(crate) fn without_backfill() -> Self {
-        Self {
-            backfill: false,
-            ..Self::default()
-        }
-    }
 
-    #[cfg(test)]
-    pub(crate) fn expecting_lens(mut self, lens_id: impl Into<String>) -> Self {
-        self.expected_base_lens_id = Some(lens_id.into());
-        self
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,18 +128,6 @@ impl PanelGuardEnable {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn ensure_flipped(vault: &ShadowVault) -> Result<()> {
-        if vault.mode() >= super::VaultMode::Calyx {
-            Ok(())
-        } else {
-            Err(error(
-                "CALYX_VAULT_NOT_FLIPPED",
-                "Ask is still routed to sqlite-vec shadow mode",
-                "run calyx leapable read-flip before asking through Calyx",
-            ))
-        }
-    }
 }
 
 fn cli_to_calyx(error: crate::error::CliError) -> CalyxError {

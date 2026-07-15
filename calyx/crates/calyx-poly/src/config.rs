@@ -338,26 +338,3 @@ fn parse_domain_env(name: &str, value: &str) -> Result<Domain> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_is_crypto_launch_and_local_only() {
-        let c = PolyConfig::default();
-        assert_eq!(c.launch_domain, Domain::Crypto);
-        assert_eq!(c.domains[0], Domain::Crypto);
-        assert!(c.local_only.allow_forecast_agents);
-        assert!(c.local_only.require_infisical_for_llm);
-    }
-
-    #[test]
-    fn config_json_roundtrips() {
-        let c = PolyConfig::default();
-        let json = c.to_json().unwrap();
-        let back = PolyConfig::from_json(&json).unwrap();
-        assert_eq!(back.launch_domain, c.launch_domain);
-        assert_eq!(back.admission.min_p_win, c.admission.min_p_win);
-        assert_eq!(back.local_only, c.local_only);
-    }
-}

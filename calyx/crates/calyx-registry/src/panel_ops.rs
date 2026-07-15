@@ -310,6 +310,3 @@ fn slot_bits(slot: &Slot) -> Option<f32> {
         .map(|signal| signal.bits)
         .max_by(|left, right| left.total_cmp(right))
 }
-
-#[cfg(test)]
-mod tests;

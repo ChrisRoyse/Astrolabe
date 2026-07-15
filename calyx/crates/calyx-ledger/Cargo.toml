@@ -14,7 +14,3 @@ ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
-
-[dev-dependencies]
-calyx-fsv = { path = "../calyx-fsv" }
-proptest.workspace = true

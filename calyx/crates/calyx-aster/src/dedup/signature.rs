@@ -109,7 +109,3 @@ fn recurrence_slot_error(message: impl Into<String>) -> CalyxError {
         remediation: "provide dense E2/E3/E4 temporal slots for recurrence signature detection",
     }
 }
-
-#[cfg(test)]
-#[path = "signature_tests.rs"]
-mod tests;

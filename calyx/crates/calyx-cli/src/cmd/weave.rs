@@ -494,5 +494,3 @@ fn write_fsv_readback(output: &serde_json::Value) -> CliResult {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests;

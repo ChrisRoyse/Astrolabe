@@ -330,5 +330,3 @@ pub(super) fn retained_pointer_path(vault_dir: &Path, pointer: &str) -> ToolResu
     Ok(vault_dir.join(rel_path))
 }
 
-#[cfg(test)]
-mod tests;

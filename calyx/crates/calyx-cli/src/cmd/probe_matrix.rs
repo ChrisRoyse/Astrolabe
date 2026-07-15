@@ -35,8 +35,6 @@ mod slot_timings;
 mod support;
 mod trace;
 pub(super) use artifact::ProbeMatrixArtifact;
-#[cfg(test)]
-pub(super) use diagnostics::ProbeMatrixArtifactStatus;
 use diagnostics::{QueryVectorCache, variant_guard_diagnostic};
 pub(crate) use parse::parse_probe_matrix;
 pub(crate) use runner::run_probe_matrix_with_home;
@@ -329,5 +327,3 @@ fn ensure_useful_log(log: &ProbeMatrixLog) -> CliResult {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests;

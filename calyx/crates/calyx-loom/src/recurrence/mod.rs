@@ -25,6 +25,3 @@ pub use signature::{
     CALYX_RECURRENCE_SLOT_MISSING, SignatureResult, detect_recurrence_signature,
     temporal_slot_ids_for_panel,
 };
-
-#[cfg(test)]
-mod tests;

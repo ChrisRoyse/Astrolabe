@@ -470,6 +470,3 @@ fn token_vector(seed: &[u8], dim: u32) -> Vec<f32> {
     }
     out
 }
-
-#[cfg(test)]
-mod tests;

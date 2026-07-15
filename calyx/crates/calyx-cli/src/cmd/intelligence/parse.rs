@@ -272,77 +272,7 @@ fn is_guard_subcommand(value: &str) -> bool {
     matches!(value, "calibrate" | "check" | "generate")
 }
 
-#[cfg(test)]
-pub(crate) fn bits_tokens(args: &BitsArgs) -> Vec<String> {
-    let mut out = vec![
-        "bits".to_string(),
-        args.vault.clone(),
-        args.anchor_kind.clone(),
-    ];
-    if args.explain {
-        out.push("--explain".to_string());
-    }
-    out
-}
 
-#[cfg(test)]
-pub(crate) fn kernel_tokens(args: &KernelArgs) -> Vec<String> {
-    let mut out = vec!["kernel".to_string(), args.vault.clone()];
-    if let Some(anchor) = &args.anchor {
-        out.extend(["--anchor".to_string(), anchor.clone()]);
-    }
-    if args.rebuild {
-        out.push("--rebuild".to_string());
-    }
-    out
-}
 
-#[cfg(test)]
-pub(crate) fn abundance_tokens(args: &AbundanceArgs) -> Vec<String> {
-    vec!["abundance".to_string(), args.vault.clone()]
-}
 
-#[cfg(test)]
-pub(crate) fn propose_lens_tokens(args: &ProposeLensArgs) -> Vec<String> {
-    vec![
-        "propose-lens".to_string(),
-        args.vault.clone(),
-        "--anchor".to_string(),
-        args.anchor.clone(),
-    ]
-}
 
-#[cfg(test)]
-pub(crate) fn guard_tokens(args: &GuardArgs) -> Vec<String> {
-    let mut out = vec!["guard".to_string(), args.vault.clone()];
-    match &args.command {
-        GuardCommand::Calibrate {
-            domain,
-            set,
-            target_far,
-        } => {
-            out.push("calibrate".to_string());
-            out.extend(["--domain".to_string(), domain.clone()]);
-            out.extend(["--set".to_string(), set.display().to_string()]);
-            out.extend(["--target-far".to_string(), target_far.to_string()]);
-        }
-        GuardCommand::Check { cx_id, identity_cx } => {
-            out.push("check".to_string());
-            out.extend(["--cx".to_string(), cx_id.clone()]);
-            if let Some(identity) = identity_cx {
-                out.extend(["--identity-cx".to_string(), identity.clone()]);
-            }
-        }
-        GuardCommand::Generate {
-            candidate_text,
-            identity_cx,
-        } => {
-            out.push("generate".to_string());
-            out.extend(["--candidate-text".to_string(), candidate_text.clone()]);
-            if let Some(identity) = identity_cx {
-                out.extend(["--identity-cx".to_string(), identity.clone()]);
-            }
-        }
-    }
-    out
-}

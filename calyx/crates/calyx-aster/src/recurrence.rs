@@ -443,7 +443,3 @@ fn recurrence_error(code: &'static str, message: impl Into<String>) -> CalyxErro
         remediation,
     }
 }
-
-#[cfg(test)]
-#[path = "recurrence_tests.rs"]
-mod tests;

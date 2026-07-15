@@ -252,6 +252,3 @@ fn supply_chain_error(
         remediation,
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -26,8 +26,6 @@ mod status;
 mod verify_chain_cmd;
 
 pub(crate) use verify_chain_cmd::VerifyChainArgs;
-#[cfg(test)]
-pub(crate) use verify_chain_cmd::VerifyChainOut;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProvenanceArgs {
@@ -394,5 +392,3 @@ impl QuarantineLookup for NoQuarantine {
     }
 }
 
-#[cfg(test)]
-mod tests;

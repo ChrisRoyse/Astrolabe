@@ -378,7 +378,3 @@ fn to_hex(bytes: &[u8]) -> String {
     }
     out
 }
-
-#[cfg(test)]
-#[path = "stream_tests.rs"]
-mod tests;

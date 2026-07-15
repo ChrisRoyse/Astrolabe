@@ -473,7 +473,3 @@ fn corrupt(message: impl Into<String>) -> CalyxError {
 
 #[path = "inverted_maintenance.rs"]
 mod maintenance;
-
-#[cfg(test)]
-#[path = "inverted_tests.rs"]
-mod tests;

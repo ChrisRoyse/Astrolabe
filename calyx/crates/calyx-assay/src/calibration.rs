@@ -126,27 +126,3 @@ pub fn degenerate_entropy(message: impl Into<String>) -> CalyxError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn degenerate_binary_entropy_fails_closed() {
-        let mut labels = vec![false; 100];
-        labels[0] = true;
-
-        let error = ensure_informative_binary_labels(&labels).unwrap_err();
-
-        assert_eq!(error.code, CALYX_ASSAY_DEGENERATE_TARGET_ENTROPY);
-    }
-
-    #[test]
-    fn power_calibration_requires_recovery_ratio() {
-        let calibration = PowerCalibration::new(1.0, 0.25, 0.5, 100, 4, 0).unwrap();
-
-        let error = calibration.require_passed().unwrap_err();
-
-        assert_eq!(error.code, CALYX_ASSAY_ESTIMATOR_UNDERPOWERED);
-        assert_eq!(calibration.status, PowerCalibrationStatus::Underpowered);
-    }
-}

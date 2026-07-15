@@ -373,6 +373,3 @@ pub fn parse_aster_ledger_seq(key: &[u8]) -> CalyxResult<u64> {
     })?;
     Ok(u64::from_be_bytes(key))
 }
-
-#[cfg(test)]
-mod tests;

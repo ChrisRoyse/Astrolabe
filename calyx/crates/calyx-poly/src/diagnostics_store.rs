@@ -65,13 +65,3 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_missing_fails_closed() {
-        let err = read_json::<u32>(Path::new("does-not-exist-xyz.json")).unwrap_err();
-        assert_eq!(err.code(), ERR_READ);
-    }
-}

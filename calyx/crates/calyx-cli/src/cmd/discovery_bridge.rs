@@ -252,5 +252,3 @@ pub(crate) fn parse_bridge_evaluate_rank(rest: &[String]) -> CliResult<EvaluateR
     Ok(args)
 }
 
-#[cfg(test)]
-mod tests;

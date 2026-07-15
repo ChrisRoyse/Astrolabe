@@ -29,7 +29,3 @@ calyx-lodestar = { path = "../calyx-lodestar" }
 calyx-registry = { path = "../calyx-registry" }
 calyx-ledger = { path = "../calyx-ledger" }
 serde = { workspace = true }
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"

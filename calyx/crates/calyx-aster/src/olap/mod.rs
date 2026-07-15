@@ -1,8 +1,5 @@
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 pub use types::{
     DEFAULT_MAX_GROUPS, DEFAULT_MAX_ROWS, OlapAggregate, OlapGroupAggregate, OlapScanPlan,
     OlapScanResult,

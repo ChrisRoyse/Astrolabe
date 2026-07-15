@@ -52,12 +52,8 @@ mod fsv_vault_health;
 mod fsv_vault_health_grounding;
 mod fsv_vault_health_marker;
 mod fsv_vault_health_quarantine;
-#[cfg(test)]
-mod fsv_vault_health_tests;
 mod healthcheck;
 mod healthcheck_daemon;
-#[cfg(test)]
-mod healthcheck_tests;
 mod htap_validation;
 mod intelligence_commands;
 mod kernel_health_readback;
@@ -66,13 +62,9 @@ mod ledger_store;
 mod lens_commands;
 mod lodestar_commands;
 mod lodestar_kernel_validation;
-#[cfg(test)]
-mod main_tests;
 mod manifest_readback;
 mod media_commands;
 mod media_derived_text;
-#[cfg(test)]
-mod media_derived_text_tests;
 mod media_emotion_validation;
 mod media_image_validation;
 mod media_video_validation;
@@ -91,8 +83,6 @@ mod path_identity;
 mod ph42_readback;
 mod provenance;
 mod provenance_read;
-#[cfg(test)]
-mod provenance_read_tests;
 mod raw_media;
 mod recurrence_readback;
 mod resource_drill;

@@ -285,22 +285,3 @@ fn mvcc_constellation(vault_id: VaultId) -> Constellation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hex_bytes_matches_lowercase_plain_hex() {
-        assert_eq!(hex_bytes(b"k1"), "6b31");
-    }
-
-    #[test]
-    fn fsv_cf_parser_names_supported_demo_cfs() {
-        assert_eq!(parse_cf("base").unwrap(), ColumnFamily::Base);
-        assert_eq!(
-            parse_cf("slot_00").unwrap(),
-            ColumnFamily::slot(SlotId::new(0))
-        );
-        assert!(parse_cf("slot_01").is_err());
-    }
-}

@@ -6,9 +6,6 @@ mod filter;
 mod freshness;
 #[path = "persisted/marker.rs"]
 pub mod marker;
-#[cfg(test)]
-#[path = "persisted/mixed_tests.rs"]
-mod mixed_tests;
 #[path = "persisted/multi.rs"]
 mod multi;
 #[path = "persisted/pinned.rs"]
@@ -21,9 +18,6 @@ mod rebuild_plan;
 mod rebuild_stream;
 #[path = "persisted/sparse.rs"]
 mod sparse;
-#[cfg(test)]
-#[path = "persisted/tests.rs"]
-mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -45,8 +39,6 @@ pub use marker::{
 };
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub(crate) use rebuild::load_docs_at;
-#[cfg(test)]
-use rebuild::rebuild_from_docs;
 pub use rebuild::{
     RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
     rebuild_for_vault_with_progress,
@@ -357,31 +349,6 @@ impl SearchIndexEntry {
             index_rel: Some(index_rel),
             sha256: Some(sha256),
             token_count: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn multi(
-        slot: SlotId,
-        token_dim: u32,
-        len: usize,
-        token_count: usize,
-        base_seq: u64,
-        index_rel: String,
-        sha256: String,
-    ) -> Self {
-        Self {
-            slot: slot.get(),
-            kind: "multi_maxsim".to_string(),
-            dim: None,
-            token_dim: Some(token_dim),
-            len,
-            built_at_seq: base_seq,
-            graph_rel: None,
-            id_map_rel: None,
-            index_rel: Some(index_rel),
-            sha256: Some(sha256),
-            token_count: Some(token_count),
         }
     }
 
