@@ -70,15 +70,41 @@ fn main() {
     for spawn_overlay in &spawn_overlays {
         println!("cargo:rerun-if-changed={}", spawn_overlay.display());
     }
-    // The CBM tree under cbm/ is owned first-class source
-    // (#286), but it is deliberately NOT watched file-by-file here (#192): the
-    // whole src/, internal/cbm, and vendored/ trees are large, and watching them
-    // made any mtime churn re-run this script — paying the make walk plus a full
-    // libclang bindgen parse. Within one build, Make depfiles (-MMD -MP) plus the
-    // config stamp own C-level incremental correctness; the Makefile itself and
-    // the Astrolabe-owned TUs above are watched, so a change to the build recipe
-    // or the glue code still forces a rebuild. A source-only edit to a CBM .c that
-    // does not touch those inputs is picked up on the next `cargo clean`/rebuild.
+    // #420: watch the owned CBM C source trees so an edit to ANY of them rebuilds
+    // libcbm.a. cargo:rerun-if-changed on a directory recursively scans the whole
+    // tree and re-runs on any file content change, addition, or deletion within it
+    // (Cargo Book: "If the path points to a directory, it will scan the entire
+    // directory for any modifications" — present since rust-lang/cargo cee088b,
+    // well before the pinned 1.95 toolchain). Three directory emissions therefore
+    // cover EVERY translation unit and header the Makefile.cbm `libcbm` target
+    // compiles, with no hand-maintained per-file list that could silently drift:
+    //   cbm/src/**      — foundation, store, cypher, mcp, discover, graph_buffer,
+    //                     pipeline, simhash, semantic, traces, watcher, git, cli,
+    //                     ui, plus vendored/yyjson.c reached via src includes
+    //   cbm/internal/** — extraction (cbm.c, extract_*.c, helpers.c, lang_specs.c,
+    //                     service_patterns.c), grammar_*.c, lsp/** (lsp_all unity),
+    //                     ts_runtime.c, preprocessor.cpp, ac.c, lz4_store.c,
+    //                     zstd_store.c, sqlite_writer.c, every *.h, AND
+    //                     internal/cbm/vendored/{lz4,zstd,ts_runtime}
+    //   cbm/vendored/** — mimalloc, sqlite3, yyjson, nomic (code_vectors blob),
+    //                     tre (MinGW). Also the bindgen include roots.
+    //
+    // Directory (not per-file) watching is deliberate: it stays complete as sources
+    // are added/removed, and it fires on any junk dropped into these trees — but the
+    // trees only ever hold checked-in SOURCE. The libcbm build writes its objects to
+    // OUT_DIR (BUILD_DIR is $OUT_DIR/cbm-build below), NEVER into cbm/, so watching
+    // adds NO self-inflicted mtime churn; only a real source edit re-triggers the
+    // make walk + bindgen parse, which is exactly the invalidation #420 requires.
+    // This reverses the #192 speed-over-correctness choice that let a stale libcbm.a
+    // link after an owned-C edit and silently invalidated FSV evidence (wave-16/17).
+    // Make depfiles (-MMD -MP) + the config stamp still own C-level incrementalism
+    // WITHIN a build; the Makefile and Astrolabe-owned TUs above remain watched too.
+    for cbm_source_tree in ["src", "internal", "vendored"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            cbm_root.join(cbm_source_tree).display()
+        );
+    }
     println!("cargo:rustc-check-cfg=cfg(cbm_sys_asan)");
     println!(
         "cargo:rustc-env=CBM_MIMALLOC_VERSION={}",
