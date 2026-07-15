@@ -443,8 +443,12 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
 /// WITHOUT running the tool. cbm MCP tools are described by the single shared C
 /// help formatter (one schema source of truth, branded `astrolabe`).
 /// `verify_chain` is an astrolabe-host-only tool with no cbm input schema, so its
-/// supported form is printed here directly. An unknown tool is refused fail-closed
-/// with a labeled error rather than silently executed.
+/// supported form is printed here directly. ASTROLABE-NATIVE tools served by the
+/// Rust dispatch (not in the C schema registry — e.g. `get_provenance`,
+/// `kernel_answer`, `anchor_erase`) are described from their `tool_defs` JSON
+/// schema, matching the C formatter's output shape (#428). Only a tool in NEITHER
+/// registry is refused fail-closed with a labeled `ASTRO_CLI_UNKNOWN_TOOL` error
+/// rather than silently executed.
 fn run_cli_tool_help(tool_name: &str) -> Result<i32, DynError> {
     if tool_name == "verify_chain" {
         println!("Usage:");
@@ -458,15 +462,26 @@ fn run_cli_tool_help(tool_name: &str) -> Result<i32, DynError> {
         return Ok(0);
     }
     let known = astrolabe_bridge::cbm_print_tool_help("astrolabe", tool_name)?;
-    if !known {
-        return Err(format!(
-            "ASTRO_CLI_UNKNOWN_TOOL: no such tool '{tool_name}', cannot print --help. \
-             remediation: run `astrolabe cli <tool> --help` with a valid tool name; list the \
-             available tools by running the server (`astrolabe`) and calling `tools/list`."
-        )
-        .into());
+    if known {
+        return Ok(0);
     }
-    Ok(0)
+    // #428: the C schema registry does not know this tool, but the astrolabe-native
+    // half of the surface (served by the Rust dispatch — e.g. get_provenance,
+    // kernel_answer, anchor_erase) might. Consult the SAME native registry the run
+    // path dispatches from (astrolabe_tool_definitions / is_advertised_astrolabe_tool)
+    // and print real per-tool help derived from that tool's tool_defs JSON schema,
+    // matching the C formatter's output shape. A native tool EXISTS and runs on this
+    // surface, so refusing it with ASTRO_CLI_UNKNOWN_TOOL was a factual mislabel;
+    // only a name in NEITHER registry is genuinely unknown.
+    if migration::print_astrolabe_native_tool_help("astrolabe", tool_name)? {
+        return Ok(0);
+    }
+    Err(format!(
+        "ASTRO_CLI_UNKNOWN_TOOL: no such tool '{tool_name}', cannot print --help. \
+         remediation: run `astrolabe cli <tool> --help` with a valid tool name; list the \
+         available tools by running the server (`astrolabe`) and calling `tools/list`."
+    )
+    .into())
 }
 
 fn run_verify_chain_cli(

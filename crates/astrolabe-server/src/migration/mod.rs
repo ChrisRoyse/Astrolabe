@@ -217,6 +217,10 @@ mod dispatch;
 // Non-test code reaches dispatch only through the two public entry points; the
 // glob is needed by the colocated tests, which drive the gate internals directly.
 pub use dispatch::{handle_jsonrpc_raw, handle_tool_raw};
+// #428: the CLI `--help` path (lib.rs `run_cli_tool_help`) consults the native
+// tool registry through this single entry point when the C schema registry does
+// not know the tool, so help and execution share one membership predicate.
+pub(crate) use dispatch::print_astrolabe_native_tool_help;
 
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 /// Write-side name for the per-project lowered-SQLite mirror the Rust host
