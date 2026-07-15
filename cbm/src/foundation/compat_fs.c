@@ -465,6 +465,74 @@ bool cbm_path_exists(const char *path) {
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
+char *cbm_canonicalize_existing_path(const char *path) {
+    /* #432: replaces the MAX_PATH-bound `_access(...,0) + _fullpath` pair used at
+     * the repo-path (mcp.c) and source-file FQN (fqn.c) canonicalization sites.
+     * cbm_utf8_to_wide_path fully-qualifies + "\\?\"-widens a >MAX_PATH input so
+     * GetFullPathNameW accepts it (its documented way to take >260-char input);
+     * for short inputs it returns the plain widened path and GetFullPathNameW does
+     * the relative->absolute + '.'/'..' + '/'→'\\' resolution _fullpath did. The
+     * extended-length prefix (if any) is stripped from the result so the canonical
+     * path is a clean drive/UNC form. Existence is then confirmed via
+     * cbm_path_exists (GetFileAttributesW, "\\?\"-widened). Fail-closed: any step
+     * failing returns NULL (no ANSI fallback). */
+    if (!path) {
+        return NULL;
+    }
+    wchar_t *win = cbm_utf8_to_wide_path(path);
+    if (!win) {
+        return NULL;
+    }
+    DWORD need = GetFullPathNameW(win, 0, NULL, NULL);
+    if (need == 0) {
+        free(win);
+        return NULL;
+    }
+    wchar_t *full = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
+    if (!full) {
+        free(win);
+        return NULL;
+    }
+    DWORD got = GetFullPathNameW(win, need, full, NULL);
+    free(win);
+    if (got == 0 || got >= need) {
+        free(full);
+        return NULL;
+    }
+    char *u8full = cbm_wide_to_utf8(full);
+    free(full);
+    if (!u8full) {
+        return NULL;
+    }
+    /* Strip a leading extended-length prefix so the canonical path is a clean
+     * drive/UNC form (the "\\?\" and "\\?\UNC\" bytes are ASCII, so slicing the
+     * UTF-8 byte string never splits a multibyte sequence). */
+    char *result;
+    if (strncmp(u8full, "\\\\?\\UNC\\", 8) == 0) {
+        /* "\\?\UNC\server\share\..." -> "\\server\share\..." */
+        size_t rest = strlen(u8full + 8);
+        result = (char *)malloc(rest + 3);
+        if (result) {
+            result[0] = '\\';
+            result[1] = '\\';
+            memcpy(result + 2, u8full + 8, rest + 1);
+        }
+    } else if (strncmp(u8full, "\\\\?\\", 4) == 0) {
+        result = _strdup(u8full + 4);
+    } else {
+        result = _strdup(u8full);
+    }
+    free(u8full);
+    if (!result) {
+        return NULL;
+    }
+    if (!cbm_path_exists(result)) {
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
 int cbm_rmdir(const char *path) {
     /* #412: extended-length widen for deep store-family directories. */
     wchar_t *wpath = cbm_utf8_to_wide_path(path);
@@ -738,6 +806,17 @@ bool cbm_path_exists(const char *path) {
     /* POSIX access() is not MAX_PATH-bound; the Windows counterpart carries the
      * #430 long-path work. */
     return access(path, F_OK) == 0;
+}
+
+char *cbm_canonicalize_existing_path(const char *path) {
+    /* POSIX realpath already requires the path to exist, resolves symlinks and
+     * '.'/'..', and (with a NULL buffer, POSIX.1-2008) returns a malloc'd string
+     * the caller frees — matching this wrapper's contract. It is not MAX_PATH-
+     * bound; the Windows counterpart carries the #432 long-path work. */
+    if (!path) {
+        return NULL;
+    }
+    return realpath(path, NULL);
 }
 
 int cbm_rmdir(const char *path) {

@@ -55,6 +55,27 @@ int cbm_unlink(const char *path);
  * POSIX uses access(F_OK). Returns true iff the path exists. */
 bool cbm_path_exists(const char *path);
 
+/* Canonicalize an *existing* filesystem path to its fully-qualified absolute
+ * form. Returns a heap-allocated UTF-8 string (caller frees with free()) on
+ * success, or NULL when the path does not exist or cannot be canonicalized.
+ *
+ * Long-path safe on Windows: the fixed-buffer ANSI `_access(...,0)` + `_fullpath`
+ * pair it replaces is MAX_PATH-bound — on a repo/root path longer than 260 chars
+ * `_access` reports a false "not found" and `_fullpath` returns NULL (its result
+ * cannot exceed _MAX_PATH), so a deep repo silently loses canonicalization. Here
+ * the resolution runs through GetFullPathNameW with a grow-on-demand buffer
+ * (accepting the "\\?\"-widened input cbm_utf8_to_wide_path produces for >MAX_PATH
+ * inputs) and the existence probe runs through cbm_path_exists (GetFileAttributesW,
+ * "\\?\"-widened), so a >260-char path is resolved correctly. The returned path is
+ * a clean drive/UNC form with OS-native separators and NO "\\?\" prefix (matching
+ * the historical _fullpath output shape); callers that need forward slashes call
+ * cbm_normalize_path_sep afterward. Resolution is lexical on Windows (GetFullPathNameW,
+ * like _fullpath: resolves '.'/'..', '/'→'\\', relative→absolute against the CWD)
+ * and symlink-resolving on POSIX (realpath), preserving each platform's prior
+ * behavior. On any canonicalization/allocation failure it returns NULL — never a
+ * silent ANSI fallback — leaving the caller to keep the un-canonicalized input. */
+char *cbm_canonicalize_existing_path(const char *path);
+
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
