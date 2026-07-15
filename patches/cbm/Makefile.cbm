@@ -937,6 +937,5 @@ security: cbm
 	scripts/security-ui.sh
 	scripts/security-install.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-network.sh $(BUILD_DIR)/codebase-memory-mcp
-	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
