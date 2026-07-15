@@ -2393,7 +2393,13 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     snprintf(wal, sizeof(wal), "%s-wal", path);
     snprintf(shm, sizeof(shm), "%s-shm", path);
 
-    bool exists = (access(path, F_OK) == 0);
+    /* #430: extended-length-safe existence probe. The old access(path, F_OK)
+     * was MAX_PATH-bound, so on a deep store (>260-char db path) the .db file
+     * was really present yet this gate reported "not_found" and never reached
+     * the cbm_unlink sites below — orphaning the whole .db/-wal/-shm family.
+     * cbm_path_exists widens via "\\?\" (GetFileAttributesW) so the probe agrees
+     * with the unlink calls that are already long-path-safe (#415). */
+    bool exists = cbm_path_exists(path);
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;

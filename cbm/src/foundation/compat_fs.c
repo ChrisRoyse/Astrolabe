@@ -449,6 +449,22 @@ int cbm_unlink(const char *path) {
     return ret;
 }
 
+bool cbm_path_exists(const char *path) {
+    /* #430: extended-length widen so an existence probe on a store-family path
+     * deeper than MAX_PATH (e.g. <deep-store>/<project>.db that delete_project's
+     * not_found gate checks) reports the file that is really there, instead of
+     * the false "not found" the ANSI access()/stat() probe returns past 260
+     * chars. GetFileAttributesW honors the "\\?\" prefix cbm_utf8_to_wide_path
+     * applies; short paths widen byte-identically to the historical access(). */
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
+    if (!wpath) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(wpath);
+    free(wpath);
+    return attrs != INVALID_FILE_ATTRIBUTES;
+}
+
 int cbm_rmdir(const char *path) {
     /* #412: extended-length widen for deep store-family directories. */
     wchar_t *wpath = cbm_utf8_to_wide_path(path);
@@ -716,6 +732,12 @@ bool cbm_mkdir_p(const char *path, int mode) {
 
 int cbm_unlink(const char *path) {
     return unlink(path);
+}
+
+bool cbm_path_exists(const char *path) {
+    /* POSIX access() is not MAX_PATH-bound; the Windows counterpart carries the
+     * #430 long-path work. */
+    return access(path, F_OK) == 0;
 }
 
 int cbm_rmdir(const char *path) {
