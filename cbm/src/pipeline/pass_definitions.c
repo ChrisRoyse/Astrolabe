@@ -21,6 +21,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h" // cbm_json_escape — control chars in string property values (#402)
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
@@ -459,9 +460,11 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         char channel_qn[CBM_SZ_512];
         snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
                  ch->transport ? ch->transport : "unknown", ch->channel_name);
+        char esc_cn[CBM_SZ_256];
+        cbm_json_escape(esc_cn, sizeof(esc_cn), ch->channel_name); /* #402: control chars */
         char channel_props[CBM_SZ_512];
         snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
-                 ch->transport ? ch->transport : "unknown", ch->channel_name);
+                 ch->transport ? ch->transport : "unknown", esc_cn);
         int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
                                                   channel_qn, "", 0, 0, channel_props);
 
@@ -494,8 +497,10 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         }
         char env_qn[CBM_SZ_512];
         snprintf(env_qn, sizeof(env_qn), "__env__%s", ea->env_key);
+        char esc_ek[CBM_SZ_256];
+        cbm_json_escape(esc_ek, sizeof(esc_ek), ea->env_key); /* #402: control chars */
         char env_props[CBM_SZ_512];
-        snprintf(env_props, sizeof(env_props), "{\"env_key\":\"%s\"}", ea->env_key);
+        snprintf(env_props, sizeof(env_props), "{\"env_key\":\"%s\"}", esc_ek);
         int64_t env_id =
             cbm_gbuf_upsert_node(ctx->gbuf, "EnvVar", ea->env_key, env_qn, "", 0, 0, env_props);
         if (env_id <= 0) {
@@ -541,9 +546,16 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
+            /* #402: local_name captures a source fragment that, for Rust
+             * brace-grouped imports (`use a::{\n  B,\n  C}`), spans lines and
+             * carries raw control chars. Emitting it verbatim produced invalid
+             * JSON (unescaped U+000A) and the strict streaming importer
+             * fail-closed on the whole shadow stream. Escape per JSON spec,
+             * mirroring pass_parallel.c::create_imports_edges. */
+            char esc_ln[CBM_SZ_128];
+            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
             char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                     imp->local_name ? imp->local_name : "");
+            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
