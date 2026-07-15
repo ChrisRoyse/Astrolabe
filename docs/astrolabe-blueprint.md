@@ -433,7 +433,7 @@ One binary, `astrolabe`, four modes (mirroring CBM's dispatch):
 astrolabe                      # MCP stdio server (default) â€” JSON-RPC 2.0, stdout=protocol, stderr=logs
 astrolabe cli <tool> --args-file <path>   # one-shot tool invocation (parity with CBM cli); args from file
 echo '<json>' | astrolabe cli <tool>      # â€¦or JSON piped on stdin
-astrolabe cli <tool> '<json>'  # deprecated raw-JSON argv form: still accepted, warns; prefer --args-file/stdin
+astrolabe cli <tool> '<json>'  # removed (#378): raw-JSON argv is refused fail-closed (ASTRO_CLI_RAW_JSON_ARGV_REMOVED); use --args-file/stdin
 astrolabe install|uninstall|update|config â€¦   # agent installer network (inherited)
 astrolabe --ui=true --port=N   # embedded graph UI thread (inherited, UI variant)
 ```
