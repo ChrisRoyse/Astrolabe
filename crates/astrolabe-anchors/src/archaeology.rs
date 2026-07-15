@@ -26,6 +26,16 @@ pub struct GitArchaeologyConfig {
     pub since: String,
     /// Maximum commits considered per pass.
     pub max_count: usize,
+    /// Optional toplevel-relative member prefix (forward-slash normalized, no
+    /// leading or trailing slash) that pathspec-limits ALL history mining to a
+    /// monorepo-member subtree (#381) — e.g. `cbm` when the corpus is `cbm/`
+    /// inside the enclosing Astrolabe repo. `None` mines the whole repository
+    /// (the corpus IS the git toplevel): the control path, byte-identical to
+    /// pre-#381 behavior. `Some(prefix)` appends `-- <prefix>` to every
+    /// `git log`/`git diff`/`rev-list` walk so out-of-subtree commits and ranges
+    /// never enter the evidence set at the source, rather than being mined across
+    /// the whole monorepo and filtered afterward.
+    pub member_prefix: Option<String>,
 }
 
 impl Default for GitArchaeologyConfig {
@@ -38,6 +48,7 @@ impl Default for GitArchaeologyConfig {
             issue_markers: vec!["closes #".to_string(), "fixes #".to_string()],
             since: "1 year ago".to_string(),
             max_count: 10_000,
+            member_prefix: None,
         }
     }
 }
@@ -61,6 +72,22 @@ impl GitArchaeologyConfig {
             return Err(ArchaeologyError::new(
                 ASTRO_ARCHAEOLOGY_CONFIG_INVALID,
                 "Git archaeology configuration is empty, unbounded, or non-ASCII",
+            ));
+        }
+        // A member prefix, when present, is a git pathspec appended after `--` on
+        // every mining walk (#381). Refuse an empty, non-ASCII, absolute, or
+        // NUL-bearing prefix rather than silently scoping to a nonsense path; a
+        // leading slash or `..` component is not a valid toplevel-relative subtree.
+        if let Some(prefix) = &self.member_prefix
+            && (prefix.trim().is_empty()
+                || !prefix.is_ascii()
+                || prefix.starts_with('/')
+                || prefix.contains('\0')
+                || prefix.split('/').any(|component| component == ".."))
+        {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_CONFIG_INVALID,
+                "Git archaeology member prefix is empty, non-ASCII, absolute, or path-escaping",
             ));
         }
         Ok(())
@@ -203,6 +230,13 @@ pub fn mine_git_archaeology(
         .to_string();
     validate_oid(&head)?;
 
+    // Monorepo-member pathspec (#381): every history walk below is limited to the
+    // member subtree so only commits (and, via the scoped diffs, only ranges) that
+    // touch the requested corpus enter the evidence set — the whole-monorepo mine
+    // never happens. `None` (corpus IS the toplevel) leaves each walk unscoped:
+    // byte-identical to pre-#381 behavior.
+    let pathspec = config.member_prefix.as_deref();
+
     let (range, force_removed_commits) = match mode {
         GitMineMode::Full => (None, Vec::new()),
         GitMineMode::Since { previous_head } => {
@@ -212,10 +246,16 @@ pub fn mine_git_archaeology(
             let removed = if ancestor {
                 Vec::new()
             } else {
-                oid_lines(&git_bytes(
-                    repo,
-                    &["rev-list", "--reverse", previous_head, "--not", &head],
-                )?)?
+                // Force-removed scan (#381): scope the unreachable-commit walk to the
+                // member subtree so a force move that only rewrote out-of-subtree
+                // history never manufactures reverted-anchor evidence for this corpus.
+                let mut args =
+                    vec!["rev-list", "--reverse", previous_head.as_str(), "--not", head.as_str()];
+                if let Some(prefix) = pathspec {
+                    args.push("--");
+                    args.push(prefix);
+                }
+                oid_lines(&git_bytes(repo, &args)?)?
             };
             (Some(format!("{previous_head}..{head}")), removed)
         }
@@ -231,7 +271,7 @@ pub fn mine_git_archaeology(
             if git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])?
                 && revert_patch_matches(repo, &target, &commit.sha)?
             {
-                for target_range in changed_new_ranges(repo, &target)? {
+                for target_range in changed_new_ranges_impl(repo, &target, pathspec)? {
                     reverts.insert(RevertFinding {
                         revert_commit: commit.sha.clone(),
                         target_commit: target.clone(),
@@ -250,7 +290,7 @@ pub fn mine_git_archaeology(
             continue;
         }
         let parent = &commit.parents[0];
-        for range in changed_old_ranges(repo, parent, &commit.sha)? {
+        for range in changed_old_ranges(repo, parent, &commit.sha, pathspec)? {
             for (blamed_commit, line) in blame_range(repo, parent, &range)? {
                 szz.insert(SzzFinding {
                     fix_commit: commit.sha.clone(),
@@ -390,12 +430,25 @@ pub fn changed_new_ranges(
     repo: &Path,
     commit: &str,
 ) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+    changed_new_ranges_impl(repo, commit, None)
+}
+
+/// Shared implementation of [`changed_new_ranges`] with an optional member-subtree
+/// pathspec (#381). `pathspec: Some(prefix)` limits the underlying `git diff` to the
+/// subtree so a fix/revert commit that also touched files outside the corpus does not
+/// contribute out-of-subtree ranges to the evidence set; `None` keeps the whole-commit
+/// behavior for whole-repo callers.
+fn changed_new_ranges_impl(
+    repo: &Path,
+    commit: &str,
+    pathspec: Option<&str>,
+) -> Result<Vec<GitLineRange>, ArchaeologyError> {
     validate_oid(commit)?;
     let parents = git_text(repo, &["show", "-s", "--format=%P", commit])?;
     let Some(parent) = parents.split_whitespace().next() else {
         return Ok(Vec::new());
     };
-    changed_ranges(repo, parent, commit, false)
+    changed_ranges(repo, parent, commit, false, pathspec)
 }
 
 /// Returns the new-side ranges introduced between two arbitrary commits
@@ -412,15 +465,16 @@ pub fn changed_new_ranges_between(
 ) -> Result<Vec<GitLineRange>, ArchaeologyError> {
     validate_oid(old)?;
     validate_oid(new)?;
-    changed_ranges(repo, old, new, false)
+    changed_ranges(repo, old, new, false, None)
 }
 
 fn changed_old_ranges(
     repo: &Path,
     parent: &str,
     commit: &str,
+    pathspec: Option<&str>,
 ) -> Result<Vec<GitLineRange>, ArchaeologyError> {
-    changed_ranges(repo, parent, commit, true)
+    changed_ranges(repo, parent, commit, true, pathspec)
 }
 
 fn changed_ranges(
@@ -428,21 +482,27 @@ fn changed_ranges(
     parent: &str,
     commit: &str,
     old_side: bool,
+    pathspec: Option<&str>,
 ) -> Result<Vec<GitLineRange>, ArchaeologyError> {
-    let output = git_text(
-        repo,
-        &[
-            "diff",
-            "--unified=0",
-            "--no-prefix",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            parent,
-            commit,
-            "--",
-        ],
-    )?;
+    // The trailing `--` separates the two revisions from any pathspec. When a
+    // member-subtree pathspec is supplied (#381) it is appended after `--`, so the
+    // diff — and thus every range the SZZ/revert miners derive — is confined to the
+    // requested corpus. Without it the diff spans the whole commit (whole-repo).
+    let mut args = vec![
+        "diff",
+        "--unified=0",
+        "--no-prefix",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        parent,
+        commit,
+        "--",
+    ];
+    if let Some(prefix) = pathspec {
+        args.push(prefix);
+    }
+    let output = git_text(repo, &args)?;
     parse_unified_ranges(&output, old_side)
 }
 
@@ -585,6 +645,14 @@ fn read_commits(
     }
     if let Some(range) = range {
         args.push(range);
+    }
+    // Member-subtree pathspec (#381): restrict the fix/revert commit walk to
+    // commits that touched the requested corpus. Placed after `--` so it is an
+    // unambiguous pathspec, never confused with a revision. Absent for a
+    // whole-repo corpus, so the walk stays byte-identical there.
+    if let Some(prefix) = config.member_prefix.as_deref() {
+        args.push("--");
+        args.push(prefix);
     }
     let output = git_bytes(repo, &args)?;
     let fields = output.split(|byte| *byte == 0).collect::<Vec<_>>();
