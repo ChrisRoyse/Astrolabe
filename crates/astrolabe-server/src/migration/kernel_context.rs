@@ -121,6 +121,21 @@ where
 {
     let scope_id = kernel_artifact_scope_id(project);
     let extra_seeds = label_anchor_seeds(vault);
+    // #394: the persisted propagated-label rows are keyed by durable CxId hex
+    // (the seed producer stores `cx_id.to_string()`), but the `propagated_label`
+    // search filter matches search_graph hits by qualified_name/name. Resolve the
+    // CxId→qualified_name relation from the persisted node map (the same readback
+    // #400 uses for kernel scope members) so the served labels carry the
+    // qualified_name the filter can actually match. Fail-open to an empty map
+    // (each label then falls back to its CxId hex — never a fuzzy guess).
+    let qn_by_cx_hex = astrolabe_ingest::read_node_map_cx_ids(vault, project)
+        .map(|by_qn| {
+            by_qn
+                .into_iter()
+                .map(|(qualified_name, cx_id)| (cx_id.to_string(), qualified_name))
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
     match astrolabe_ingest::derive_and_propagate_index_time_labels(
         vault,
         &scope_id,
@@ -130,7 +145,7 @@ where
         astrolabe_ingest::LABEL_SEED_ACTOR,
     ) {
         Ok(report) => match astrolabe_ingest::read_propagated_label_rows(vault) {
-            Ok(rows) => persisted_label_propagation_json(&report, &rows),
+            Ok(rows) => persisted_label_propagation_json(&report, &rows, &qn_by_cx_hex),
             Err(error) => label_propagation_unavailable_json(&format!(
                 "propagated label rows unreadable after propagation: {error}"
             )),
@@ -184,9 +199,16 @@ where
 /// return value). Same field shape as [`label_propagation_json`] so the
 /// `propagated_label` search filter ([`propagated_label_symbol_ids`]) consumes it
 /// unchanged.
+///
+/// #394: each row's durable `symbol_id` is a CxId hex, but the search filter
+/// matches hits by qualified_name/name. `qn_by_cx_hex` (CxId hex → qualified_name,
+/// resolved from the persisted node map) supplies the served `qualified_name` the
+/// filter matches on; an unresolved CxId falls back to its hex (the filter then
+/// simply matches nothing for that label — honest, never fuzzy).
 fn persisted_label_propagation_json(
     report: &astrolabe_ingest::IndexTimeLabelReport,
     rows: &[astrolabe_ingest::PersistedPropagatedLabel],
+    qn_by_cx_hex: &BTreeMap<String, String>,
 ) -> Value {
     let propagation = &report.propagation;
     let status = if rows.is_empty() { "empty" } else { "built" };
@@ -194,8 +216,13 @@ fn persisted_label_propagation_json(
         .iter()
         .map(|persisted| {
             let row = &persisted.row;
+            let qualified_name = qn_by_cx_hex
+                .get(&row.symbol_id)
+                .cloned()
+                .unwrap_or_else(|| row.symbol_id.clone());
             json!({
                 "symbol_id": row.symbol_id,
+                "qualified_name": qualified_name,
                 "label": row.label,
                 "confidence_millipoints": row.confidence_millipoints,
                 "seed_symbol_id": row.seed_symbol_id,
@@ -849,11 +876,14 @@ pub(crate) fn kernel_context_unavailable_json(reason: &str) -> Value {
     })
 }
 
-/// #69 box 5 — exact set of symbol ids carrying `label` as a *propagated* label in
+/// #69 box 5 — exact set of match keys carrying `label` as a *propagated* label in
 /// the persisted kernel context. Fails closed (coded) when propagation is
 /// unavailable so the search filter never silently degrades into an unfiltered or
 /// spuriously empty result. Same exact-match semantics as the kernel's
-/// [`astrolabe_kernel::filter_symbols_by_propagated_label`].
+/// [`astrolabe_kernel::filter_symbols_by_propagated_label`]. The returned key is
+/// the served `qualified_name` (node-map-resolved) when present — the identity the
+/// search_graph hits carry — falling back to the durable `symbol_id`/CxId hex
+/// (#394).
 pub(crate) fn propagated_label_symbol_ids(
     kernel_context: &Value,
     label: &str,
@@ -877,14 +907,26 @@ pub(crate) fn propagated_label_symbol_ids(
     let mut ids = BTreeSet::new();
     if let Some(labels) = propagation.get("labels").and_then(Value::as_array) {
         for entry in labels {
+            // #394: match on the served `qualified_name` (resolved from the node
+            // map) so the CxId-hex-keyed persisted labels line up with the
+            // search_graph hits (which carry qualified_name/name), falling back to
+            // the durable `symbol_id` for the row-sink block that has no
+            // qualified_name field. Never a substring/fuzzy match.
             if entry.get("label").and_then(Value::as_str) == Some(label)
-                && let Some(symbol_id) = entry
-                    .get("symbol_id")
+                && let Some(candidate) = entry
+                    .get("qualified_name")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|symbol_id| !symbol_id.is_empty())
+                    .filter(|candidate| !candidate.is_empty())
+                    .or_else(|| {
+                        entry
+                            .get("symbol_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|symbol_id| !symbol_id.is_empty())
+                    })
             {
-                ids.insert(symbol_id.to_string());
+                ids.insert(candidate.to_string());
             }
         }
     }
