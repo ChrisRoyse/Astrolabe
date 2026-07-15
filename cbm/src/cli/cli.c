@@ -4787,7 +4787,10 @@ static bool cli_schema_required_has(yyjson_val *required, const char *key) {
     return false;
 }
 
-int cbm_cli_print_tool_help(const char *tool_name) {
+int cbm_cli_print_tool_help_prog(const char *prog, const char *tool_name) {
+    if (!prog) {
+        prog = "codebase-memory-mcp";
+    }
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
         return CLI_ERR;
@@ -4800,10 +4803,12 @@ int cbm_cli_print_tool_help(const char *tool_name) {
 
     /* Only the supported input forms (one contract with the Rust host,
      * #378/#411): --args-file <path> and piped stdin. The removed raw-JSON argv
-     * and `--flag value` forms are NOT advertised. */
+     * and `--flag value` forms are NOT advertised. The invoking program name is
+     * a parameter (#416) so the astrolabe host surface prints `astrolabe cli ...`
+     * from this single formatter rather than mirroring the help text in Rust. */
     printf("Usage:\n");
-    printf("  codebase-memory-mcp cli %s --args-file <path-to-json>\n", tool_name);
-    printf("  echo '<json>' | codebase-memory-mcp cli %s\n", tool_name);
+    printf("  %s cli %s --args-file <path-to-json>\n", prog, tool_name);
+    printf("  echo '<json>' | %s cli %s\n", prog, tool_name);
 
     printf("\nArguments (JSON object keys):\n");
     if (props && yyjson_is_obj(props)) {
@@ -4840,5 +4845,12 @@ int cbm_cli_print_tool_help(const char *tool_name) {
     if (doc) {
         yyjson_doc_free(doc);
     }
+    /* #416: flush so the help is emitted even when the caller (the astrolabe Rust
+     * host over FFI) returns up the stack rather than exiting immediately. */
+    (void)fflush(stdout);
     return CLI_OK;
+}
+
+int cbm_cli_print_tool_help(const char *tool_name) {
+    return cbm_cli_print_tool_help_prog("codebase-memory-mcp", tool_name);
 }
