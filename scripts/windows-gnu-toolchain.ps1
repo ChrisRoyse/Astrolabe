@@ -1381,7 +1381,18 @@ $isWorktreeRoot = (-not $isCanonicalRoot) -and
     $root.StartsWith($worktreeParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
     (Test-Path -LiteralPath (Join-Path $root ".git") -PathType Leaf)
 if (-not ($isCanonicalRoot -or $isWorktreeRoot)) {
-    throw "canonical workspace required: $ExpectedWorkspace (found $root)"
+    # #436: fail closed with a structured, layout-naming remediation. #226 deliberately
+    # scoped valid worktree roots to `.claude\worktrees\` (predictable hygiene surface --
+    # worktree-local target/, .tmp/, and session lock -- with shared pinned tools adjacent
+    # to the canonical workspace). A registered git worktree (a `.git` FILE) parked anywhere
+    # else is still refused, but the operator gets the exact `git worktree move` remediation
+    # instead of a bare boundary message. Scope kept (not widened to gitdir-verified roots
+    # anywhere): the fixed layout is what makes the shared-tool/port/lock derivation and the
+    # cross-session hygiene sweeps predictable, and wave provisioning already parks worktrees
+    # under `.claude\worktrees\`.
+    $rootIsRegisteredWorktree = Test-Path -LiteralPath (Join-Path $root ".git") -PathType Leaf
+    $rootKind = if ($rootIsRegisteredWorktree) { "a registered git worktree outside the supported worktree layout" } else { "neither the canonical workspace nor a registered git worktree of it" }
+    throw "LAUNCHER_BOUNDARY[ASTRO_LAUNCHER_ROOT_UNSUPPORTED]: {code=ASTRO_LAUNCHER_ROOT_UNSUPPORTED; message=`"the native launcher runs only from the canonical workspace '$ExpectedWorkspace' or a registered git worktree directly under '$worktreeParent\'; the resolved root '$root' is $rootKind`"; remediation=`"move the worktree under the supported layout with: git -C '$ExpectedWorkspace' worktree move '$root' '$worktreeParent\<name>' -- then rerun the launcher from the new path; or run the launcher from the canonical workspace '$ExpectedWorkspace'`"}"
 }
 if ($isWorktreeRoot -and $Bootstrap) {
     throw "LAUNCHER_BOUNDARY[ASTRO_BOOTSTRAP_CANONICAL_ONLY]: -Bootstrap installs pinned tools and must run from $ExpectedWorkspace, not worktree $root"
