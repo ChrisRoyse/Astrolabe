@@ -8,7 +8,7 @@ allowed-tools: Bash(git status *), Bash(git diff *), Bash(git log *), Bash(git a
 # Commit and push (validated)
 
 1. **Review reality:** `git status --short` and `git diff` — read what actually changed; never stage blind.
-2. **Hygiene sweep — must NOT be staged:** `target/`, `.tmp/`, `.sccache/`, `.toolchains/`, `.astro-gate-cache/`, test databases, logs, fixtures outside their tracked homes. `calyx/` and `cbm/` are **owned first-class source** (#286): commit edits there like any other code — same quality bar, tests, and blast-radius gating (they are foundational surface).
+2. **Hygiene sweep — must NOT be staged:** `target/`, `.tmp/`, `.sccache/`, `.toolchains/`, `.astro-gate-cache/`, test databases, logs, fixtures outside their tracked homes. `calyx/` and `cbm/` are **owned first-class source** (#286): commit edits there like any other code — same quality bar and manual-FSV evidence (they are foundational surface; no tests exist, owner directive 2026-07-14).
 3. **Commit message:** short imperative subject; body **must** reference the driving issue (`Refs #N`, or `Closes #N` only when that issue's gates have passed). Match recent `git log --oneline` style. End with `Co-Authored-By:` trailer per repo convention.
 4. **Secret scanner:** long hex tokens in committed Calyx ledger payloads must live under allowlisted field names (`*_sha256`/`*_hash`/`*_digest`) or the commit fails closed. That failure is correct — rename the field; never bypass with `--no-verify`.
 5. **Push** to the current branch. No `--force` on `main`, ever.

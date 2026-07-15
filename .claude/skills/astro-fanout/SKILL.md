@@ -9,7 +9,7 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 
 ## What parallelizes
 
-- **Cleanly:** single-crate work in pure-Rust crates (`astrolabe-domain`, `-ingest`, `-lower`, `-panel`, `-weave`, `-kernel`, `-guard`, `-oracle`, `-assay`, `-anchors`, `-provenance`). Disjoint files → clean octopus merge. Workers self-verify with `cargo check/test -p <crate>` (any native Windows toolchain works for pure-Rust; the launcher is NOT needed and hard-refuses non-canonical roots anyway).
+- **Cleanly:** single-crate work in pure-Rust crates (`astrolabe-domain`, `-ingest`, `-lower`, `-panel`, `-weave`, `-kernel`, `-guard`, `-oracle`, `-assay`, `-anchors`, `-provenance`). Disjoint files → clean octopus merge. Workers self-verify with `cargo check -p <crate>` for buildability plus manual FSV of their changed behavior (real data, persisted readback — never tests; owner directive 2026-07-14).
 - **Never in parallel:** anything touching `crates/astrolabe-server` (needs the GNU/libcbm launcher build and collides in `src/migration.rs`, #85), cross-crate issues sharing a crate pairwise, and any two efforts needing the one native toolchain simultaneously.
 
 ## Worker contract (put verbatim in every worker prompt)
@@ -26,8 +26,8 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 
 1. Preflight — check `.tmp/astrolabe-launcher.lock` and live toolchain processes; never start a wave while another session's live-locked build owns the toolchain.
 2. Partition ready issues by crate; one worker per crate works its issues sequentially.
-3. On completion: octopus-merge the disjoint `sweep/*` branches; run ONE consolidated `cargo test` + clippy as independent FSV of the merge.
-4. **Server-pending consolidation:** merge all server-pending branches into one local tree, run ONE native `cargo test -p astrolabe-server` through the launcher from `C:/code/Astrolabe`; on green, publish each branch, close the `Refs` issues manually with that shared evidence. Before any `git reset --hard`, save an insurance patch of applied stash/edits (`git diff <file> > <scratchpad>/x.patch`).
+3. On completion: octopus-merge the disjoint `sweep/*` branches; run ONE consolidated `cargo check --workspace` + clippy for buildability, then manual FSV of the merged behavior against a real corpus (no tests — owner directive 2026-07-14).
+4. **Server-pending consolidation:** merge all server-pending branches into one local tree, run ONE native build through the launcher from `C:/code/Astrolabe`, then manually exercise the real binary's changed surfaces against a real corpus with persisted readback; on that evidence, publish each branch and close the `Refs` issues. Before any `git reset --hard`, save an insurance patch of applied stash/edits (`git diff <file> > <scratchpad>/x.patch`).
 5. Close each issue with evidence (astro-issue §7); file every `new_problems` entry (astro-new-issue); post a wave summary with telemetry kind `fanout` (`wave`, `agents`, `results{}`).
 6. Cleanup: prune worktrees and `sweep/*` branches, delete `target/`, verify absent.
 

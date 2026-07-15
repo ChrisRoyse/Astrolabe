@@ -26,7 +26,7 @@ GitHub issues are the single source of truth. If it isn't recorded on an issue, 
 ## 3. Verify the claim before working
 
 - Read the issue body **and every comment** (`gh issue view N --comments`). Prior sessions record completed work there.
-- Never redo a checked DoD item. Re-verify it instead (run its named test/gate) and note the result.
+- Never redo a checked DoD item. Re-verify it instead (re-run its named manual FSV against the real artifact) and note the result.
 
 ## 4. Work in scope
 
@@ -38,7 +38,7 @@ GitHub issues are the single source of truth. If it isn't recorded on an issue, 
 
 ## 5. Prove, then check the box
 
-A DoD checkbox may be checked only in the same session that ran its verification, with the test name + result pasted in a comment (kind `evidence`).
+A DoD checkbox may be checked only in the same session that ran its verification, with the manual FSV command + persisted readback pasted in a comment (kind `evidence`). Tests are never evidence (owner directive 2026-07-14).
 
 ## 6. Verify (FSV)
 

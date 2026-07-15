@@ -1,6 +1,6 @@
 ---
 name: astro-fsv
-description: Full State Verification doctrine for ASTROLABE — identify the source of truth, execute, then independently read back the persisted bytes (SQLite artifact, vault, ledger, files), run the edge-case triad, use the smallest sufficient dataset, and format evidence for issue comments. Use when writing or reviewing tests, verifying any change/tool/gate result, deciding whether something "worked", or preparing closing evidence. Return values, API echoes, green checkmarks, and log lines are never evidence on their own.
+description: Manual Full State Verification doctrine for ASTROLABE — identify the source of truth, exercise the real artifact yourself, then independently read back the persisted bytes (SQLite artifact, vault, ledger, files), run the edge-case triad, use the smallest sufficient dataset, and format evidence for issue comments. Use when verifying any change/tool result, deciding whether something "worked", or preparing closing evidence. Tests, return values, API echoes, green checkmarks, and log lines are never evidence — only manually observed reality is.
 user-invocable: true
 ---
 
@@ -25,8 +25,8 @@ A result is real only after direct verification against the real artifact, proce
 
 - **Trigger→X→Y:** every process has an observable trigger and an intended persisted outcome. If Y can be physically checked, checking it is mandatory.
 - **Smallest sufficient data:** before running the big dataset, ask what the smallest input is that would 100% prove the behavior — run that. Scale only when scale itself is the claim.
-- **No mocks, no cover-ups:** tests use real data and real stores. Never write a test that passes while the project is broken. Determinism is seeded and worker-count-invariant.
-- **FSV-only (owner directive 2026-07-13):** the aggregate gate/check-script suite is retired and deleted; do not rebuild it. FSV against real artifacts and persisted state is the only verification doctrine. In-crate tests may be run ad hoc when they are the cheapest FSV instrument, but no suite is required for closure.
+- **No mocks, no cover-ups:** verification uses real data and real stores. Determinism is proven by repeated real runs compared byte-for-byte.
+- **Manual FSV only — NO TESTS (owner directive 2026-07-14; extends the 2026-07-13 gate-deletion directive):** all test code was deleted from the repo (`#[cfg(test)]` modules, `tests/` dirs, the cbm C suite, trybuild, test scripts). Passing tests prove nothing; never write, run, or cite one — for verification, evidence, measurement, or closure. Verify by running the real artifact yourself (real binary, real corpus — this repo's own trees always qualify) and reading back persisted state by hand. Measurements are taken against the real running binary/server, never a test harness. `cargo check`/`cargo build` remain valid as buildability evidence.
 - **Pre-existing vs mine:** before attributing a failure to your change, check `git log --oneline -S "<string>" -- <path>` and `git merge-base --is-ancestor <sha> HEAD`. File pre-existing failures as issues (astro-new-issue); never absorb them silently.
 - **Exit codes:** in bash, `cmd | tail` masks failure — capture `${PIPESTATUS[0]}`.
 - Native Windows execution from `C:/code/Astrolabe` only, via the `scripts/windows-gnu-toolchain.ps1` launcher for builds.

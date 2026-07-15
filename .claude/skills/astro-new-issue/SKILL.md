@@ -36,7 +36,7 @@ Blocks: #M (omit if none)
 
 ## DoD
 - [ ] <fix implemented, fail-closed {code, message, remediation} on error paths>
-- [ ] <named test/gate proving it, with FSV readback of persisted state>
+- [ ] <named manual FSV proving it: real-artifact command + independent readback of persisted state (never a test)>
 - [ ] Native gate evidence recorded here; target/ cleaned and verified absent
 ```
 
