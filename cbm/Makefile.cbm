@@ -1,11 +1,11 @@
 # Makefile.cbm — Build system for pure C rewrite
 #
 # Usage:
-#   make -f Makefile.cbm test           # Build + run all tests (ASan + UBSan)
-#   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
-#   make -f Makefile.cbm test-tsan      # Thread sanitizer build
 #   make -f Makefile.cbm cbm            # Production binary
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
+#
+# The C test suite was deleted under the manual-FSV-only doctrine (#397); this
+# Makefile builds only production artifacts (cbm, cbm-with-ui).
 
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
@@ -99,17 +99,6 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
 CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
-# Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
-SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
-CFLAGS_TEST = $(CFLAGS_COMMON) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
-
-# TSan (can't combine with ASan)
-CFLAGS_TSAN = $(CFLAGS_COMMON) -g -O1 \
-              -fsanitize=thread -fno-omit-frame-pointer
-CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
-                -fsanitize=thread -fno-omit-frame-pointer
-
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
 # --allow-multiple-definition (MinGW CRT symbol clashes).
@@ -128,8 +117,6 @@ STATIC_FLAGS := -static
 endif
 
 LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -315,17 +302,12 @@ MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/src \
                   -DMI_OVERRIDE=1 \
                   $(MIMALLOC_OVERRIDE_DEFINE)
-MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
-                       -Ivendored/mimalloc/include \
-                       -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
 SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -339,181 +321,6 @@ PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOV
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
-# ── Test sources ─────────────────────────────────────────────────
-
-TEST_FOUNDATION_SRCS = \
-    tests/test_main.c \
-    tests/test_arena.c \
-    tests/test_hash_table.c \
-    tests/test_dyn_array.c \
-    tests/test_str_intern.c \
-    tests/test_log.c \
-    tests/test_str_util.c \
-    tests/test_platform.c \
-    tests/test_dump_verify.c \
-    tests/test_subprocess.c
-
-TEST_EXTRACTION_SRCS = \
-    tests/test_extraction.c \
-    tests/test_extraction_inheritance.c \
-    tests/test_extraction_imports.c \
-    tests/test_grammar_regression.c \
-    tests/test_grammar_labels.c \
-    tests/test_grammar_imports.c \
-    tests/test_ac.c
-
-TEST_STORE_SRCS = \
-    tests/test_store_nodes.c \
-    tests/test_store_edges.c \
-    tests/test_store_search.c \
-    tests/test_store_arch.c \
-    tests/test_store_bulk.c \
-    tests/test_store_pragmas.c \
-    tests/test_store_checkpoint.c \
-    tests/test_dump_verify_io.c
-
-TEST_CYPHER_SRCS = \
-    tests/test_cypher.c
-
-TEST_MCP_SRCS = \
-    tests/test_mcp.c
-
-TEST_DISCOVER_SRCS = \
-    tests/test_language.c \
-    tests/test_userconfig.c \
-    tests/test_gitignore.c \
-    tests/test_git_context.c \
-    tests/test_discover.c
-
-TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
-
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
-
-TEST_WATCHER_SRCS = tests/test_watcher.c
-
-TEST_LZ4_SRCS = tests/test_lz4.c
-TEST_ZSTD_SRCS = tests/test_zstd.c
-TEST_ARTIFACT_SRCS = tests/test_artifact.c
-
-TEST_SQLITE_WRITER_SRCS = tests/test_sqlite_writer.c
-
-TEST_GO_LSP_SRCS = tests/test_go_lsp.c
-
-TEST_C_LSP_SRCS = tests/test_c_lsp.c
-
-TEST_PHP_LSP_SRCS = tests/test_php_lsp.c
-
-TEST_CS_LSP_SRCS = tests/test_cs_lsp.c
-
-TEST_CS_LSP_BENCH_SRCS = tests/test_cs_lsp_bench.c
-
-TEST_SCOPE_SRCS = tests/test_scope.c
-
-TEST_TYPE_REP_SRCS = tests/test_type_rep.c
-
-TEST_PY_LSP_SRCS = tests/test_py_lsp.c
-
-TEST_PY_LSP_BENCH_SRCS = tests/test_py_lsp_bench.c
-
-TEST_PY_LSP_STRESS_SRCS = tests/test_py_lsp_stress.c
-
-TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
-
-TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
-TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
-TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
-TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
-
-TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c
-
-TEST_TRACES_SRCS = tests/test_traces.c
-TEST_TRACE_INGEST_SRCS = tests/test_trace_ingest.c
-TEST_TRACE_E2E_SRCS = tests/test_trace_e2e.c
-
-
-TEST_CLI_SRCS = tests/test_cli.c
-
-TEST_MEM_SRCS = tests/test_mem.c
-
-TEST_UI_SRCS = tests/test_ui.c
-TEST_HTTPD_SRCS = tests/test_httpd.c
-
-TEST_SECURITY_SRCS = tests/test_security.c
-
-TEST_YAML_SRCS = tests/test_yaml.c
-
-TEST_SEMANTIC_SRCS = tests/test_semantic.c
-TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
-TEST_SLAB_ALLOC_SRCS = tests/test_slab_alloc.c
-
-TEST_SIMHASH_SRCS = tests/test_simhash.c
-
-TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
-
-# Cumulative BUG-REPRODUCTION suite (separate runner, NOT in ALL_TEST_SRCS).
-# These cases are RED by design (one open bug each) — see tests/repro/repro_main.c.
-# Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
-TEST_REPRO_SRCS = \
-    tests/repro/repro_main.c \
-    tests/repro/repro_parallel_determinism.c \
-    tests/repro/repro_extraction.c \
-    tests/repro/repro_issue495.c \
-    tests/repro/repro_issue521.c \
-    tests/repro/repro_issue382.c \
-    tests/repro/repro_issue408.c \
-    tests/repro/repro_issue56.c \
-    tests/repro/repro_issue480.c \
-    tests/repro/repro_issue571.c \
-    tests/repro/repro_issue523.c \
-    tests/repro/repro_issue546.c \
-    tests/repro/repro_issue627.c \
-    tests/repro/repro_issue514.c \
-    tests/repro/repro_issue510.c \
-    tests/repro/repro_issue557.c \
-    tests/repro/repro_issue520.c \
-    tests/repro/repro_issue333.c \
-    tests/repro/repro_issue570.c \
-    tests/repro/repro_issue409.c \
-    tests/repro/repro_issue431.c \
-    tests/repro/repro_issue607.c \
-    tests/repro/repro_issue403.c \
-    tests/repro/repro_issue434.c \
-    tests/repro/repro_issue471.c \
-    tests/repro/repro_issue221.c \
-    tests/repro/repro_issue548.c \
-    tests/repro/repro_new_ts_class_field_arrow.c \
-    tests/repro/repro_new_py_tuple_unpack.c \
-    tests/repro/repro_new_cypher_limit_zero.c \
-    tests/repro/repro_issue363.c \
-    tests/repro/repro_issue581.c \
-    tests/repro/repro_issue787.c \
-    tests/repro/repro_invariant_calls.c \
-    tests/repro/repro_invariant_graph.c \
-    tests/repro/repro_invariant_breadth.c \
-    tests/repro/repro_invariant_enclosing_parity.c \
-    tests/repro/repro_invariant_lsp_rescue.c \
-    tests/repro/repro_invariant_discovery_fqn.c \
-    tests/repro/repro_grammar_core.c \
-    tests/repro/repro_grammar_scripting.c \
-    tests/repro/repro_grammar_functional.c \
-    tests/repro/repro_grammar_systems.c \
-    tests/repro/repro_grammar_web.c \
-    tests/repro/repro_grammar_config.c \
-    tests/repro/repro_grammar_build.c \
-    tests/repro/repro_grammar_shells.c \
-    tests/repro/repro_grammar_scientific.c \
-    tests/repro/repro_grammar_markup.c \
-    tests/repro/repro_grammar_misc.c \
-    tests/repro/repro_lsp_c_cpp.c \
-    tests/repro/repro_lsp_go_py.c \
-    tests/repro/repro_lsp_ts.c \
-    tests/repro/repro_ts_inherited_method.c \
-    tests/repro/repro_lsp_java_cs.c \
-    tests/repro/repro_lsp_kt_php_rust.c
-
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_TRACE_INGEST_SRCS) $(TEST_TRACE_E2E_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
-
-
 # ── Build directories ────────────────────────────────────────────
 
 BUILD_DIR = build/c
@@ -522,144 +329,41 @@ BUILD_DIR = build/c
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
-GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZE)
-GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      -fsanitize=thread -fno-omit-frame-pointer
-
-# Object files for grammars + ts_runtime + lsp_all + preprocessor
-GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))
-TS_RUNTIME_OBJ_TEST = $(BUILD_DIR)/ts_runtime.o
-LSP_OBJ_TEST = $(BUILD_DIR)/lsp_all.o
-PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# ── Foundation-only test (fast, no extraction) ───────────────────
+# ── Production vendored object files ──────────────────────────────
 
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
-
-test-foundation: $(BUILD_DIR)/test-foundation
-	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
-
-# ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
-
-$(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
--include $(GRAMMAR_OBJS_TEST:.o=.d)
-
-$(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -c -o $@ $<
--include $(BUILD_DIR)/ts_runtime.d
-
-$(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
-
-$(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
-
-# ── Full test binary ─────────────────────────────────────────────
-
-# mimalloc object files
-MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
+# mimalloc object file
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
-
-$(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
-	$(CC) $(MIMALLOC_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
-# sqlite3 object files (vendored amalgamation)
-SQLITE3_OBJ_TEST = $(BUILD_DIR)/sqlite3.o
+# sqlite3 object file (vendored amalgamation)
 SQLITE3_OBJ_PROD = $(BUILD_DIR)/prod_sqlite3.o
-
-$(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
-	$(CC) $(SQLITE3_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
-TRE_OBJ_TEST :=
 TRE_OBJ_PROD :=
 ifeq ($(IS_MINGW),yes)
-TRE_OBJ_TEST = $(BUILD_DIR)/tre.o
 TRE_OBJ_PROD = $(BUILD_DIR)/prod_tre.o
-
-$(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
-	$(CC) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -c -o $@ $<
 
 $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
-# Vendored LZ4 (test build)
-LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
-$(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
-$(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
-
-# Vendored zstd (test build)
-ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
-$(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
-
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
 	$(CC) -c -o $@ $<
-
-OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
-
-# ── #280: per-TU objects for the test runner ────────────────────
-# The historical rule compiled every product + test TU in ONE gcc command
-# (~117s serial on 32 threads — a single compiler process that -j cannot
-# parallelize). Per-TU objects make the cold build parallel and an edit
-# incremental (changed TU + link). -MMD/-MP dep files make a header edit
-# rebuild its dependents, so a persistent build dir is mtime-correct without
-# a clean. Objects mirror the source tree under $(BUILD_DIR)/tu/.
-TEST_TU_SRCS = $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
-TEST_TU_OBJS = $(patsubst %.c,$(BUILD_DIR)/tu/%.o,$(TEST_TU_SRCS))
-
-$(BUILD_DIR)/tu/%.o: %.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS_TEST) -MMD -MP -Itests -Itests/repro -c -o $@ $<
-
--include $(TEST_TU_OBJS:.o=.d)
-
-$(BUILD_DIR)/test-runner: $(TEST_TU_OBJS) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
-	$(file >$@.rsp,$(TEST_TU_OBJS) $(OBJS_VENDORED_TEST))
-	$(CC) $(CFLAGS_TEST) -o $@ @$@.rsp $(LDFLAGS_TEST)
-
-test: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner
-
-# ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
-# Mirrors test-runner's link line but uses repro_main.c (own main + counters)
-# and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
-# still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
-		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TEST) \
-		$(LDFLAGS_TEST)
-
-test-repro: $(BUILD_DIR)/test-repro-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-repro-runner
-
-# ── TSan full test ───────────────────────────────────────────────
-
-test-tsan:
-	@echo "TSan not yet wired for full extraction tests"
 
 # ── Production binary ────────────────────────────────────────────
 
@@ -697,8 +401,9 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-# #280: per-TU objects (see the test-runner rule above for the rationale;
-# same -MMD dep tracking, separate object tree because CFLAGS_PROD differ).
+# #280: per-TU objects with -MMD dep tracking make the cold build parallel and
+# an edit incremental (changed TU + link); objects mirror the source tree under
+# $(BUILD_DIR)/tuprod/.
 PROD_TU_SRCS = $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 PROD_TU_OBJS = $(patsubst %.c,$(BUILD_DIR)/tuprod/%.o,$(PROD_TU_SRCS))
 
@@ -761,7 +466,6 @@ LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
-LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 
 # clang-tidy: deep static analysis (config in .clang-tidy)
 lint-tidy:
