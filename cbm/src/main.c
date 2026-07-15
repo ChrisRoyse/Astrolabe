@@ -419,6 +419,34 @@ static int run_cli(int argc, char **argv) {
     const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
     cbm_index_set_worker_role(index_worker, response_out);
 
+    if (index_worker) {
+        /* #435: an index worker's stderr is redirected to the parent-tailed log
+         * file (subprocess.c sets hStdError=hStdOutput=hlog, or dup2s the log fd on
+         * POSIX). On the Windows CRT a redirected (non-console) stderr is opened
+         * FULLY BUFFERED with a ~4 KB buffer — it is NOT line-buffered, because
+         * Win32 treats _IOLBF as _IOFBF (MS setvbuf docs; mingw-w64 crt note). So
+         * the pipeline's cbm_log_info progress lines (pass.start/done,
+         * parallel.extract.progress, …) sit in the worker's CRT buffer and never
+         * reach the log the UI tails until the buffer fills or the process exits —
+         * and this worker exits via _Exit (the fast-exit below skips the multi-GB
+         * kernel-graph teardown), which per C/POSIX does NOT flush stdio. Net
+         * effect: GET /api/logs stayed blind to the whole indexing phase (#435).
+         *
+         * Class fix, from the start: force the worker's log stream unbuffered so
+         * every emitted line is written straight through to the tailed log the
+         * instant it is produced (the durable, measurement-checked choice — one
+         * tiny write per log line is negligible vs the teardown _Exit avoids, and
+         * far cheaper than losing live visibility). This mirrors how CPython
+         * unbuffers child stdio on MS_WINDOWS (setvbuf(_IONBF)) and the mingw-w64
+         * fix that keeps stderr non-fully-buffered. _IONBF (not _IOLBF, which is
+         * full buffering on Win32) is the only mode that actually streams here. The
+         * existing fflush(NULL) immediately before _Exit is kept as belt-and-braces
+         * for anything still buffered (e.g. the final result on stdout). No-op-ish
+         * on POSIX, where stderr is already unbuffered. Placed before any worker
+         * stderr I/O so setvbuf's "no I/O since open" precondition holds. */
+        (void)setvbuf(stderr, NULL, _IONBF, 0);
+    }
+
 #ifndef _WIN32
     /* #845: a supervised worker must not outlive its supervisor. If the parent
      * dies without reaping us (agent killed, supervisor crashed), an orphaned

@@ -262,8 +262,23 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * stdout/stderr and the exit-capture the reap surfaces on failure. */
         wchar_t *wlog = cbm_utf8_to_wide_path(opts->log_file);
         if (wlog) {
-            hlog = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL, NULL);
+            /* #435: the log handle MUST be created inheritable, or the child never
+             * receives it. CreateProcessW hands a handle to the child as a std
+             * handle (STARTF_USESTDHANDLES) only when the handle itself is
+             * inheritable AND bInheritHandles=TRUE. With NULL security attributes
+             * this handle was NON-inheritable, so the worker's stdout/stderr were
+             * wired to an invalid child handle: the log file stayed 0 bytes and
+             * GET /api/logs never showed a single worker pipeline line (indexing
+             * still succeeded because the graph is written straight to the store,
+             * not via the log — which is why the empty log went unnoticed until
+             * #435). bInheritHandle=TRUE fixes the actual defect. FILE_SHARE_WRITE
+             * additionally lets the parent open the file for reading to tail it
+             * while the worker still holds it open for write, so progress streams
+             * live instead of only surfacing after the worker exits. */
+            SECURITY_ATTRIBUTES sa = {
+                .nLength = sizeof(sa), .lpSecurityDescriptor = NULL, .bInheritHandle = TRUE};
+            hlog = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             free(wlog);
         }
         if (hlog != INVALID_HANDLE_VALUE) {
