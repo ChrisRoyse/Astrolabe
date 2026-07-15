@@ -204,23 +204,51 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE                                                       \
-    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> " \
-    "[--args-file <path> | (JSON on stdin)]\n"
+#define CLI_USAGE                                                             \
+    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> "       \
+    "[--args-file <path> | (JSON on stdin)]\n"                                 \
+    "  --json prints the raw tool result JSON on stdout and exits 1 when the " \
+    "result is isError:true (0 otherwise), so RC-based callers see tool "      \
+    "failures (#419).\n"
 
-/* Extract text content from MCP tool result envelope and print it.
+/* Exit code for an MCP tool result string: SKIP_ONE (1) for isError:true, else 0.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
- * Returns 1 if the result was an error, 0 otherwise. */
-static int cli_print_mcp_result(const char *result) {
+ *
+ * Single source of truth for the CLI exit code, shared by BOTH the pretty
+ * (cli_print_mcp_result) and the raw `--json` paths so the two never diverge
+ * — the whole point of #425 / #419. Unparseable results count as success (0),
+ * matching the astrolabe host's `mcp_result_exit_code`
+ * (crates/astrolabe-server/src/lib.rs, #419) and this file's pretty path, so
+ * the standalone and host CLI surfaces expose one identical exit-code contract.
+ * (A tool that ran produces a well-formed MCP envelope; an unparseable string
+ * is not a tool-reported error and is treated as the host treats it.) */
+static int cli_mcp_result_exit_code(const char *result) {
     yyjson_doc *doc = yyjson_read(result, strlen(result), 0);
     if (!doc) {
-        printf("%s\n", result);
         return 0;
     }
-
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *err_val = yyjson_obj_get(root, "isError");
     bool is_error = err_val && yyjson_get_bool(err_val);
+    yyjson_doc_free(doc);
+    return is_error ? SKIP_ONE : 0;
+}
+
+/* Extract text content from MCP tool result envelope and print it.
+ * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
+ * Returns 1 if the result was an error, 0 otherwise (via the shared
+ * cli_mcp_result_exit_code detector — no separate isError logic here). */
+static int cli_print_mcp_result(const char *result) {
+    int exit_code = cli_mcp_result_exit_code(result);
+    bool is_error = (exit_code != 0);
+
+    yyjson_doc *doc = yyjson_read(result, strlen(result), 0);
+    if (!doc) {
+        printf("%s\n", result);
+        return exit_code;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
 
     const char *text = NULL;
     yyjson_val *content = yyjson_obj_get(root, "content");
@@ -236,7 +264,7 @@ static int cli_print_mcp_result(const char *result) {
     }
 
     yyjson_doc_free(doc);
-    return is_error ? SKIP_ONE : 0;
+    return exit_code;
 }
 
 /* Strip a flag from argv, returning true if found. */
@@ -473,7 +501,15 @@ static int run_cli(int argc, char **argv) {
             }
         }
         if (raw_json) {
+            /* #425: the JSON payload is unchanged (byte-for-byte on stdout),
+             * but the process exit code now reflects the tool outcome —
+             * isError:true exits 1 so any RC-based caller (scripts, FSV
+             * drivers, agents checking $?) sees the failure instead of reading
+             * a `--json` success. Mirrors the astrolabe host's #419 fix and
+             * shares the exact detector the pretty path uses; stdout format is
+             * the only thing `--json` changes, never the failure signal. */
             printf("%s\n", result);
+            exit_code = cli_mcp_result_exit_code(result);
         } else {
             exit_code = cli_print_mcp_result(result);
         }
@@ -506,6 +542,8 @@ static void print_help(void) {
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [--args-file <path> | (JSON on stdin)]  Run a single "
            "tool\n");
+    printf("      codebase-memory-mcp cli --json <tool> prints the raw result JSON on stdout and "
+           "exits 1 when the result is isError:true, else 0 (#419).\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
