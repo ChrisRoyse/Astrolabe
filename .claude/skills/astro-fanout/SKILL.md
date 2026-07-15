@@ -34,3 +34,13 @@ Proven pattern (Wave-1: 17 issues closed, 6 agents, 0 errors; see #65 history). 
 ## Sizing
 
 Worker tasks should be small and exact (issue number + crate + base commit); a worker that needs repo-wide context is a sign the issue belongs in the sequential lane.
+
+## Batch everything (owner directive 2026-07-15)
+
+Never run N passes where one combined pass serves all. Concretely:
+
+- **One consolidated build serves every close-gate.** Workers PRESERVE their built binaries, fixtures, and driver scripts to the session scratchpad (`<scratchpad>/<lane>/`) so the orchestrator re-verifies by re-running preserved artifacts — a lane that cleans its binary forces a redundant rebuild.
+- **One combined probe script.** The orchestrator's independent readbacks for ALL pending closes run as a single script in a single pass (all issues' probes together), never sequential per-issue rounds.
+- **Batch GitHub mutations.** All claims in one shell invocation; all closes/evidence comments of a round in one invocation; label swaps bundled.
+- **Inside a lane:** build once, then run the full measurement matrix + edge triad against that one binary; rebuild only when code changed.
+- **Reuse proven drivers.** Before writing a new FSV driver, check the scratchpad and prior-issue comments for an existing one (measure.sh / drive.sh pattern).
