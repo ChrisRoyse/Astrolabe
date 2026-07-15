@@ -17,25 +17,26 @@
 //!    bucket-floor snapshot ([`lower_cbm_sqlite_at`], a pure function of the
 //!    seqno). Every `t` in a bucket reuses that one lowered artifact
 //!    byte-for-byte; crossing into a new bucket re-lowers (a boundary miss).
-//! 3. The CBM store is pointed at the bucket's store directory
-//!    ([`astrolabe_bridge::set_cbm_cache_dir`]) only for the duration of the one
-//!    Cypher call, then restored to the live store — success or error. The
-//!    process-global store switch is serialized by a mutex; the CBM tool runner is
-//!    itself driven single-threaded per request, so no concurrent tool call
-//!    observes the switched store.
+//! 3. The Cypher read runs against the bucket's `<project>.db` in a **child
+//!    process** ([`run_as_of_child`]) that owns its own `CBM_CACHE_DIR=store_dir`.
+//!    The parent server's process-global CBM store is NEVER repointed on the
+//!    `as_of` path, so no concurrent live `query_graph` on another thread can ever
+//!    observe a historical store — and a leaked switch can never serve historical
+//!    bytes to a live query (#395 root-cause fix; the former process-global
+//!    `set_cbm_cache_dir` switch under a serialize-mutex is gone). Child
+//!    infrastructure failure (spawn/crash/timeout/no-response) fails closed with
+//!    [`ASTRO_QUERY_GRAPH_AS_OF_CHILD_FAILED`]; the live store is never a fallback.
 //!
 //! The Cypher read subset is unchanged: the same query runs, only against the
 //! historical `<project>.db`. Every `as_of` response carries a labeled `as_of`
 //! block plus `trust`/`freshness`/`provenance` (invariant 1).
-//!
-//! SERVER-PENDING (lane/w15-43): the pure-Rust `as_of` lowering engine
-//! (`astrolabe-lower::lower_cbm_sqlite_at` + the per-t-bucket cache) is FSV-verified
-//! natively; this server routing (arg plumbing, CBM store-dir override, envelope
-//! labeling) compiles and is exercised by the pure-JSON unit tests below, but the
-//! end-to-end CBM Cypher-against-the-historical-store path must be verified on the
-//! native pass with libcbm linked (the occupied C toolchain blocked it in-lane).
 
 use super::*;
+use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Surface schema tag for the `as_of` envelope block.
 pub(crate) const QUERY_GRAPH_AS_OF_SCHEMA: &str = "astrolabe.query_graph.as_of.v1";
@@ -49,10 +50,34 @@ pub(crate) const ASTRO_QUERY_GRAPH_AS_OF_PROJECT: &str = "ASTRO_QUERY_GRAPH_AS_O
 /// Stable refusal code: the project is not shadow-indexed, so there is no vault
 /// history to time-travel.
 pub(crate) const ASTRO_QUERY_GRAPH_AS_OF_SHADOW: &str = "ASTRO_QUERY_GRAPH_AS_OF_SHADOW";
+/// Stable refusal code: the isolated historical-store child process failed as
+/// infrastructure (spawn error, crash, non-zero exit with no response, timeout,
+/// or unparseable output). The live store is NEVER consulted as a fallback.
+pub(crate) const ASTRO_QUERY_GRAPH_AS_OF_CHILD_FAILED: &str =
+    "ASTRO_QUERY_GRAPH_AS_OF_CHILD_FAILED";
 
-/// Serializes the process-global CBM store switch so an `as_of` Cypher call
-/// never overlaps another tool call's view of the store.
-static AS_OF_STORE_SWITCH: Mutex<()> = Mutex::new(());
+/// Wall-clock ceiling for the historical-store child `query_graph`. The bucket's
+/// `<project>.db` is already lowered by the parent before the child spawns, so
+/// the child only runs the Cypher read; this ceiling is generous enough for a
+/// large-graph read yet bounded so a wedged child can never hang the serving
+/// thread. No registry knob governs per-tool timeouts today (the timeout
+/// constants in this tree — `CONFIG_DB_BUSY_TIMEOUT_MS`, `DEFAULT_FUSION_TIMEOUT_MS`
+/// — are all named consts), so this follows the same pattern; promote it to a
+/// knob if a tool-timeout registry family is introduced.
+const AS_OF_CHILD_TIMEOUT_MS: u64 = 120_000;
+/// Poll cadence while waiting for the historical-store child to exit.
+const AS_OF_CHILD_POLL_MS: u64 = 20;
+/// Windows `CREATE_NO_WINDOW`: the astrolabe binary is a console app, so a
+/// parent with no console of its own (an stdio MCP server) would otherwise
+/// allocate one for the child. The child's stdio is fully redirected here, so
+/// suppressing the console is always correct.
+#[cfg(windows)]
+const AS_OF_CHILD_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Monotonic disambiguator for per-request child scratch files, so concurrent
+/// `as_of` queries against the same bucket never collide on the args/response
+/// temp paths.
+static AS_OF_CHILD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// True when the request opted into an `as_of` historical read.
 pub(crate) fn query_graph_as_of_requested(args: &Map<String, Value>) -> bool {
@@ -127,24 +152,20 @@ pub(crate) fn handle_query_graph(
     let (store_dir, resolved_seq, cache_hit) =
         prepare_as_of_store(&cache_dir, &project, bucket, canonical_millis)?;
 
-    // Strip the Astrolabe-only `as_of` knob before the CBM tool sees it.
+    // Strip the Astrolabe-only `as_of` knob before the CBM tool sees it. The
+    // child receives the plain query, so it takes the byte-identical live
+    // passthrough against ITS store (the historical `<project>.db`) and never
+    // re-enters this `as_of` branch (no recursion).
     let mut sanitized = args_obj.clone();
     sanitized.remove("as_of");
     let sanitized_json = serde_json::to_string(&Value::Object(sanitized))?;
 
-    // Point CBM at the historical store for exactly this one Cypher call, then
-    // restore the live store on any outcome. The switch is process-global, so it
-    // is serialized; restoration is unconditional (before `?` propagation).
-    let guard = AS_OF_STORE_SWITCH
-        .lock()
-        .map_err(|_| "as_of store-switch mutex poisoned")?;
-    let original = astrolabe_bridge::cbm_cache_dir()?;
-    astrolabe_bridge::set_cbm_cache_dir(&store_dir)?;
-    let raw_result = runner.handle_tool_raw("query_graph", &sanitized_json);
-    let restore = astrolabe_bridge::set_cbm_cache_dir(&original);
-    drop(guard);
-    let raw = raw_result?;
-    restore?;
+    // Run the historical Cypher in a child process that owns its own
+    // `CBM_CACHE_DIR`. The parent's process-global CBM store is untouched, so a
+    // concurrent live `query_graph` can never observe the historical store
+    // (#395); the read is served by the child, not the parent's in-process CBM
+    // store, so `runner` is not consulted on this branch.
+    let raw = run_as_of_child(&store_dir, &sanitized_json)?;
 
     let meta = AsOfMeta {
         requested_millis: as_of_millis,
@@ -156,6 +177,210 @@ pub(crate) fn handle_query_graph(
         store: store_dir.display().to_string(),
     };
     label_as_of_result(&raw, &meta)
+}
+
+/// Runs the sanitized (no-`as_of`) `query_graph` against the prepared historical
+/// store `store_dir` in a **child process** that owns its own `CBM_CACHE_DIR`,
+/// returning the child's raw MCP tool-result JSON string.
+///
+/// This is the #395 root-cause fix: isolating the historical read in a child
+/// means the parent's process-global CBM store is never repointed, so a
+/// concurrent live `query_graph` on another thread can never observe a historical
+/// store (and a leaked switch can never serve historical bytes to a live query).
+/// The child resolves its store purely from the inherited `CBM_CACHE_DIR=store_dir`
+/// — `set_cbm_cache_dir`'s in-process override buffer is C process-global state
+/// that a fresh child does NOT inherit, so the environment variable is the only
+/// channel that survives the process boundary — so it touches only the bucket's
+/// `<project>.db`.
+///
+/// The child is invoked as
+/// `<self> cli query_graph --args-file <req> --response-out <resp>`, reading the
+/// plain query from a file and writing the exact raw tool result to `<resp>`
+/// (`run_cli` writes `--response-out` byte-for-byte before any stdout shaping),
+/// which keeps the served envelope byte-compatible with the in-process path.
+///
+/// Failure semantics (invariant 3 — never a silent live fallback):
+/// * A child **infrastructure** failure (spawn error, crash, timeout, or a
+///   missing/empty/unparseable response file) fails closed with a
+///   [`ASTRO_QUERY_GRAPH_AS_OF_CHILD_FAILED`] `{code, message, remediation}`
+///   envelope (returned as `Ok`, matching this module's other refusals; it
+///   carries `isError: true` so [`label_as_of_result`] surfaces it verbatim).
+/// * A tool-level Cypher error is NOT an infrastructure failure: the child still
+///   writes a valid `isError` envelope to `--response-out` and exits `1`, which is
+///   returned verbatim for [`label_as_of_result`] to surface unrelabelled.
+fn run_as_of_child(store_dir: &Path, sanitized_json: &str) -> Result<String, DynError> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            return as_of_child_error(format!(
+                "cannot resolve the astrolabe binary (current_exe) to spawn the as_of child: {e}"
+            ));
+        }
+    };
+
+    // Per-request scratch files inside the bucket store dir (created with the
+    // store, cleaned with it and by the RAII guard below); unique across
+    // concurrent requests via pid + a monotonic counter.
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        AS_OF_CHILD_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let args_path = store_dir.join(format!(".asof-req-{unique}.json"));
+    let resp_path = store_dir.join(format!(".asof-resp-{unique}.json"));
+    let _scratch = AsOfChildScratch {
+        args: args_path.clone(),
+        resp: resp_path.clone(),
+    };
+
+    if let Err(e) = fs::write(&args_path, sanitized_json) {
+        return as_of_child_error(format!(
+            "cannot stage as_of child args at {}: {e}",
+            args_path.display()
+        ));
+    }
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("cli")
+        .arg("query_graph")
+        .arg("--args-file")
+        .arg(&args_path)
+        .arg("--response-out")
+        .arg(&resp_path)
+        .env("CBM_CACHE_DIR", store_dir)
+        .stdin(Stdio::null())
+        // The result is read back from `--response-out`; stdout is discarded so
+        // the child cannot block on a full stdout pipe while we poll for exit.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(AS_OF_CHILD_CREATE_NO_WINDOW);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return as_of_child_error(format!(
+                "cannot spawn the as_of query_graph child {}: {e}",
+                exe.display()
+            ));
+        }
+    };
+
+    // Drain stderr on a helper thread so a chatty child can never block on a full
+    // stderr pipe while the poll loop waits for it to exit.
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(AS_OF_CHILD_TIMEOUT_MS);
+    let poll = Duration::from_millis(AS_OF_CHILD_POLL_MS);
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(poll);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let tail = as_of_stderr_tail(&stderr_handle.join().unwrap_or_default());
+                return as_of_child_error(format!(
+                    "failed while waiting on the as_of query_graph child: {e}{tail}"
+                ));
+            }
+        }
+    };
+    let tail = as_of_stderr_tail(&stderr_handle.join().unwrap_or_default());
+
+    let Some(status) = exit_status else {
+        return as_of_child_error(format!(
+            "as_of query_graph child exceeded the {AS_OF_CHILD_TIMEOUT_MS}ms ceiling and was killed{tail}"
+        ));
+    };
+
+    // A non-empty, parseable response file is the child's success channel:
+    // `run_cli` writes `--response-out` only after the tool produced a result, so
+    // its presence means the read completed and a non-zero exit merely mirrors an
+    // `isError` envelope (surfaced verbatim). Absence/garbage => infrastructure
+    // failure, and the live store is never consulted as a fallback.
+    match fs::read_to_string(&resp_path) {
+        Ok(raw) if !raw.trim().is_empty() && serde_json::from_str::<Value>(&raw).is_ok() => Ok(raw),
+        Ok(_) => as_of_child_error(format!(
+            "as_of query_graph child ({}) wrote no parseable response{tail}",
+            describe_child_exit(&status)
+        )),
+        Err(e) => as_of_child_error(format!(
+            "as_of query_graph child ({}) left no readable response file ({e}){tail}",
+            describe_child_exit(&status)
+        )),
+    }
+}
+
+/// The fail-closed `{code, message, remediation}` result for a historical-store
+/// child infrastructure failure. Returned as `Ok` (like this module's other
+/// refusals) with `isError: true` so [`label_as_of_result`] surfaces it verbatim.
+fn as_of_child_error(message: impl Into<String>) -> Result<String, DynError> {
+    coded_error(
+        ASTRO_QUERY_GRAPH_AS_OF_CHILD_FAILED,
+        message,
+        "The as_of (historical) read runs in an isolated child process and failed as \
+         infrastructure; retry, and if it persists inspect the reported stderr tail. The live \
+         query_graph path is unaffected and is never used as a fallback for a failed as_of read.",
+    )
+}
+
+/// Human-readable child-exit description for the failure message.
+fn describe_child_exit(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated without an exit code".to_string(),
+    }
+}
+
+/// The last bounded chunk of the child's stderr, appended to a failure message.
+/// Empty (and appends nothing) when the child was silent.
+fn as_of_stderr_tail(stderr: &str) -> String {
+    /// Max stderr bytes carried into the error message.
+    const MAX: usize = 600;
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tail = if trimmed.len() > MAX {
+        let start = trimmed.len() - MAX;
+        // Advance to the next char boundary so slicing never splits a UTF-8 code point.
+        let boundary = (start..trimmed.len())
+            .find(|&i| trimmed.is_char_boundary(i))
+            .unwrap_or(trimmed.len());
+        &trimmed[boundary..]
+    } else {
+        trimmed
+    };
+    format!("; stderr tail: {tail}")
+}
+
+/// Deletes the per-request child scratch files (args + response) on drop, so a
+/// historical read leaves no residue in the bucket store dir on any exit path.
+struct AsOfChildScratch {
+    args: PathBuf,
+    resp: PathBuf,
+}
+
+impl Drop for AsOfChildScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.args);
+        let _ = fs::remove_file(&self.resp);
+    }
 }
 
 /// Ensures the bucket's historical store directory holds a `<project>.db` lowered
