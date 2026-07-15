@@ -239,8 +239,60 @@ pub(crate) fn handle_delete_project(
     });
 
     if complete {
-        // Success: fold the cleanup report into the C result so the caller sees
-        // both the store deletion outcome and exactly which sidecars were removed.
+        let base_was_error = tool_result_is_error(&base_result).unwrap_or(false);
+        if !base_was_error {
+            // Happy path: the C store delete succeeded ("deleted"). Fold the
+            // cleanup report into the C result so the caller sees both the store
+            // deletion outcome and exactly which sidecars were removed. Unchanged.
+            return augment_tool_result(
+                &base_result,
+                json!({ "astrolabe_sidecar_cleanup": cleanup }),
+            );
+        }
+
+        // The C store delete reported an error. Only a "not_found" is eligible
+        // for the residue-recovery remap (#429): a genuine "delete_failed" means
+        // `<name>.db` is present but its unlink failed — that MUST stay an error,
+        // never masked. Read the C status (absent from structuredContent on an
+        // error result, so `tool_result_c_status` also parses content[0].text).
+        let c_status = tool_result_c_status(&base_result);
+        // Did THIS call actually erase host-owned residue? Use the file/dir sidecar
+        // removals (`removed`) as the signal: every ASTRO_DELETE_PROJECT_SIDECAR_
+        // RESIDUE partial delete leaves at least one file/dir survivor (the locked
+        // vault dir / lowered mirror), so on recovery it lands in `removed`. Config
+        // rows are deliberately NOT part of this signal: `delete_config_value` is
+        // idempotent and succeeds on an absent key, and `project_config_keys`
+        // always prepends the dial key, so `config_cleared` is non-empty even for a
+        // name that never existed — using it would misreport a genuine not-found as
+        // a recovery. `removed` only ever contains artifacts that truly existed.
+        let sidecars_cleaned_this_call = !removed.is_empty();
+
+        if c_status.as_deref() == Some("not_found") && sidecars_cleaned_this_call {
+            // #429 residue-recovery re-run: an earlier partial delete already
+            // erased `<name>.db` (locked-vault residue left the sidecars behind),
+            // so the C handler now legitimately reports not-found — but the host
+            // sidecars really existed and were cleaned THIS call, so the documented
+            // recovery SUCCEEDED. Report isError:false, carrying the C not-found as
+            // data (`store_delete_status`) rather than letting it mask the success.
+            let mut cleanup = cleanup;
+            if let Some(object) = cleanup.as_object_mut() {
+                object.insert("store_delete_status".to_string(), json!("not_found"));
+                object.insert("recovered_from_residue".to_string(), json!(true));
+            }
+            return tool_json_result(json!({
+                "project": project,
+                // The resource as a whole no longer exists (db erased earlier +
+                // sidecars erased now): the delete's intended effect is achieved.
+                "status": "deleted",
+                "store_delete_status": "not_found",
+                "astrolabe_sidecar_cleanup": cleanup,
+            }));
+        }
+
+        // Genuine full not-found (C not-found AND nothing to clean this call) or
+        // any other C error (e.g. delete_failed): surface the C result unchanged,
+        // augmented with the cleanup report so `removed_count` is visible.
+        // `augment_tool_result` preserves the base isError, so the error stands.
         augment_tool_result(
             &base_result,
             json!({ "astrolabe_sidecar_cleanup": cleanup }),

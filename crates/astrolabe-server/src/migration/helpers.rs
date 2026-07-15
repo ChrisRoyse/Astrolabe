@@ -163,6 +163,35 @@ pub(crate) fn project_from_tool_result(result: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Read the libcbm `delete_project` `status` field ("deleted" / "not_found" /
+/// "delete_failed") out of a wrapped tool result. On an *error* result the C
+/// handler emits no `structuredContent` (see `cbm_mcp_text_result` — it only
+/// mirrors the payload into `structuredContent` when `is_error` is false), so
+/// the status then lives ONLY in the `content[0].text` JSON. Probe both, so this
+/// works for the success ("deleted") and error ("not_found"/"delete_failed")
+/// results alike. Returns `None` when the field is absent or unparseable.
+pub(crate) fn tool_result_c_status(result: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(result).ok()?;
+    if let Some(status) = value
+        .get("structuredContent")
+        .and_then(|content| content.get("status"))
+        .and_then(Value::as_str)
+    {
+        return Some(status.to_string());
+    }
+    let text = value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)?;
+    let text_value: Value = serde_json::from_str(text).ok()?;
+    text_value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn tool_result_is_error(result: &str) -> Result<bool, DynError> {
     let value: Value = serde_json::from_str(result)?;
     Ok(value

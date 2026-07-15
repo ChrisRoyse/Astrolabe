@@ -47,6 +47,14 @@ bool cbm_mkdir_p(const char *path, int mode);
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
 
+/* Test whether a filesystem entry (file or directory) exists at path.
+ * Long-path safe on Windows: GetFileAttributesW with extended-length "\\?\"
+ * widening via cbm_utf8_to_wide_path, so a store-family path deeper than
+ * MAX_PATH (260) — e.g. <deep-store>/<project>.db — is probed correctly instead
+ * of reporting a false "not found" the way MAX_PATH-bound access()/stat() does.
+ * POSIX uses access(F_OK). Returns true iff the path exists. */
+bool cbm_path_exists(const char *path);
+
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
