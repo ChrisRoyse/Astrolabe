@@ -2170,6 +2170,13 @@ where
             "absent_by_kind": absent_by_kind,
             "xterm_dump_hash": xterm.xterm_dump_hash,
             "fsv": xterm.fsv.as_ref().map(fsv_ack_envelope),
+            // #433 neighborhood peer sample-cap disclosure (invariant 3): the
+            // applied `weave_neighborhood_sample_cap` and how many (symbol, kind)
+            // neighborhood agreements were scored over a seeded peer subsample of
+            // the cap instead of every comparable peer. Zero capped evaluations
+            // means the plan is byte-identical to the uncapped path.
+            "neighborhood_sample_cap": xterm_plan.neighborhood_sample_cap,
+            "neighborhood_capped_evaluations": xterm_plan.neighborhood_capped_evaluations,
         },
     }))
 }

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod kernel_index;
+pub mod knobs;
 pub mod search;
 pub mod search_eval;
 pub mod search_index;
@@ -159,6 +160,11 @@ pub const DEFAULT_SIM_SEMANTIC_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIM_API_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIM_PROFILE_MIN_SCORE: f32 = 0.80;
 pub const DEFAULT_SIMILARITY_PER_NODE_CAP: usize = 10;
+/// Superseded by the registry-declared `weave_similarity_workers` knob (#433):
+/// [`SimilarityPlannerConfig::default`] now resolves the worker count via
+/// [`crate::knobs::weave_similarity_workers`] (host parallelism), not this bare
+/// `1`. Retained only as the explicit single-shard reference an operator may pin
+/// for a reproducible serial bench.
 pub const DEFAULT_SIMILARITY_WORKERS: usize = 1;
 pub const DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT: usize = 50_000;
 /// MinHash signature length for LSH banding candidate generation.
@@ -759,7 +765,13 @@ impl Default for SimilarityPlannerConfig {
         Self {
             thresholds: SimilarityThresholds::default(),
             per_node_cap: DEFAULT_SIMILARITY_PER_NODE_CAP,
-            worker_count: DEFAULT_SIMILARITY_WORKERS,
+            // #433: resolve to the measured host parallelism instead of the bare
+            // serial `1` (registry-declared `weave_similarity_workers` knob). The
+            // exact-cosine rescoring shards are proven byte-identical to the serial
+            // plan (worker-count invariant), so this changes only wall-clock — the
+            // largest weave sub-stage (`similarity_plan`) no longer runs serial on a
+            // many-core host.
+            worker_count: crate::knobs::weave_similarity_workers(),
             disabled_families: BTreeSet::new(),
             exact_pair_node_limit: Some(DEFAULT_SIMILARITY_EXACT_PAIR_NODE_LIMIT),
             candidate_strategies: BTreeMap::new(),
@@ -1170,6 +1182,16 @@ pub struct EagerCrossTermPlan {
     pub rows: Vec<EagerCrossTermRow>,
     pub agreement_graph: Vec<AgreementGraphEdge>,
     pub abundance: CrossTermAbundance,
+    /// #433 neighborhood peer sample-cap accounting. `neighborhood_sample_cap` is
+    /// the applied `weave_neighborhood_sample_cap` knob value;
+    /// `neighborhood_capped_evaluations` counts the (symbol, kind) neighborhood
+    /// agreements whose profile was scored over a seeded peer subsample of the cap
+    /// rather than every comparable peer (loud disclosure of the labeled
+    /// degradation — invariant 3). Zero when the corpus has no more comparable
+    /// peers than the cap, in which case the plan is byte-identical to the
+    /// uncapped path.
+    pub neighborhood_sample_cap: usize,
+    pub neighborhood_capped_evaluations: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2725,17 +2747,30 @@ fn plan_eager_cross_terms_selected(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut rows = Vec::with_capacity(selected_indices.len() * EagerAgreementKind::ALL.len());
+    // #433 neighborhood peer sample-cap: the five NeighborhoodAgreement kinds score
+    // each symbol's agreement as the cosine between its two per-slot similarity
+    // neighborhood profiles, each built against every comparable peer — an O(n²)
+    // per-kind pass that measurement shows re-dominating the cold index at monorepo
+    // scale. Capping the peer set to a seeded without-replacement subsample bounds
+    // it to O(n·cap); a corpus with no more comparable peers than the cap is scored
+    // whole (byte-identical to the uncapped plan).
+    let sample_cap = crate::knobs::weave_neighborhood_sample_cap();
+    let sample_seed = crate::knobs::WEAVE_NEIGHBORHOOD_SAMPLE_SEED;
     // Each kind's value pass is independent of the others, so computing the six
     // kinds on scoped threads cannot change any value (#23); rows are still
     // appended in `EagerAgreementKind::ALL` order and sorted below, keeping the
     // plan byte-identical to the sequential shape.
     let selected = &selected_indices;
-    let values_by_kind = std::thread::scope(|scope| {
+    let counted_values_by_kind = std::thread::scope(|scope| {
         EagerAgreementKind::ALL
-            .map(|kind| scope.spawn(move || cross_term_values(nodes, kind, selected)))
+            .map(|kind| {
+                scope.spawn(move || cross_term_values(nodes, kind, selected, sample_cap, sample_seed))
+            })
             .map(|handle| handle.join().expect("cross-term kind worker panicked"))
     });
-    for (kind, values) in EagerAgreementKind::ALL.into_iter().zip(values_by_kind) {
+    let mut neighborhood_capped_evaluations = 0usize;
+    for (kind, (values, capped)) in EagerAgreementKind::ALL.into_iter().zip(counted_values_by_kind) {
+        neighborhood_capped_evaluations += capped;
         let (left_slot, right_slot) = kind.slots();
         for (&node_index, value) in selected_indices.iter().zip(values) {
             let node = &nodes[node_index];
@@ -2774,14 +2809,22 @@ fn plan_eager_cross_terms_selected(
             lazy_pair_count: symbol_count
                 * (PANEL_CROSS_PAIR_COUNT_FOR_ABUNDANCE - EagerAgreementKind::ALL.len()),
         },
+        neighborhood_sample_cap: sample_cap,
+        neighborhood_capped_evaluations,
     }
 }
 
+/// Computes one kind's cross-term values for the selected symbols, returning the
+/// values plus the count of neighborhood evaluations that scored over a capped
+/// peer subsample (#433; always zero for the DirectAgreement kind and for any
+/// corpus with no more comparable peers than `sample_cap`).
 fn cross_term_values(
     nodes: &[SimilarityNode],
     kind: EagerAgreementKind,
     selected_indices: &[usize],
-) -> Vec<CrossTermValue> {
+    sample_cap: usize,
+    sample_seed: u64,
+) -> (Vec<CrossTermValue>, usize) {
     let (left_slot, right_slot) = kind.slots();
     let operands = nodes
         .iter()
@@ -2794,16 +2837,32 @@ fn cross_term_values(
         .collect::<Vec<_>>();
 
     match kind.comparator() {
-        EagerCrossTermComparator::DirectAgreement => selected_indices
-            .iter()
-            .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
-            .collect(),
-        EagerCrossTermComparator::NeighborhoodAgreement => selected_indices
-            .iter()
-            .map(|&node_index| {
-                neighborhood_cross_term_value(node_index, left_slot, right_slot, &operands)
-            })
-            .collect(),
+        EagerCrossTermComparator::DirectAgreement => (
+            selected_indices
+                .iter()
+                .map(|&index| direct_cross_term_value(&operands[index].0, &operands[index].1))
+                .collect(),
+            0,
+        ),
+        EagerCrossTermComparator::NeighborhoodAgreement => {
+            let mut capped = 0usize;
+            let values = selected_indices
+                .iter()
+                .map(|&node_index| {
+                    neighborhood_cross_term_value(
+                        node_index,
+                        &nodes[node_index].qualified_name,
+                        left_slot,
+                        right_slot,
+                        &operands,
+                        sample_cap,
+                        sample_seed,
+                        &mut capped,
+                    )
+                })
+                .collect();
+            (values, capped)
+        }
     }
 }
 
@@ -2835,11 +2894,37 @@ fn direct_cross_term_value(
     }
 }
 
+/// Seeded without-replacement subsample of `cap` peer indices from `[0, n)` (#433).
+///
+/// A partial Fisher–Yates shuffle keyed by a [`DeterministicRng`] labeled with the
+/// source symbol's identity, then sorted so the chosen peers are visited in index
+/// order (a stable readback independent of shuffle order). This mirrors the #422
+/// estimator sample-cap subsample exactly; it is a pure function of
+/// `(seed, label, n, cap)`, so a byte-identical corpus yields byte-identical
+/// sampled profiles. Callers invoke it only when `n - 1 > cap`.
+fn seeded_peer_indices(n: usize, cap: usize, seed: u64, label: &str) -> Vec<usize> {
+    let m = cap.min(n);
+    let mut rng = astrolabe_assay::rng::DeterministicRng::from_u64_labeled(seed, label);
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in 0..m {
+        let j = i + (rng.next_u64() % (n - i) as u64) as usize;
+        indices.swap(i, j);
+    }
+    let mut chosen = indices[..m].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
+#[allow(clippy::too_many_arguments)]
 fn neighborhood_cross_term_value(
     node_index: usize,
+    source_qualified_name: &str,
     left_slot: SlotId,
     right_slot: SlotId,
     operands: &[CrossTermOperandPair],
+    sample_cap: usize,
+    sample_seed: u64,
+    capped: &mut usize,
 ) -> CrossTermValue {
     let (left, right) = &operands[node_index];
     let left = match left {
@@ -2859,12 +2944,35 @@ fn neighborhood_cross_term_value(
         }
     };
 
-    let mut left_scores = Vec::with_capacity(operands.len().saturating_sub(1));
-    let mut right_scores = Vec::with_capacity(operands.len().saturating_sub(1));
-    for (peer_index, (peer_left, peer_right)) in operands.iter().enumerate() {
+    // #433: bound the O(n) per-symbol peer scan to a seeded subsample of the cap
+    // when the corpus has more comparable peers than the cap. The peer profile
+    // cosine is a Monte-Carlo estimate whose variance is O(1/m); at the declared
+    // cap it is pinned within its noise band, so further peers buy no accuracy
+    // while costing O(n). A corpus with `n - 1 <= cap` peers is scored whole and
+    // is byte-identical to the uncapped path.
+    let n = operands.len();
+    let sampled;
+    let peer_indices: &[usize] = if n.saturating_sub(1) > sample_cap {
+        *capped += 1;
+        sampled = seeded_peer_indices(
+            n,
+            sample_cap,
+            sample_seed,
+            &format!("{source_qualified_name}:{n}"),
+        );
+        &sampled
+    } else {
+        sampled = (0..n).collect();
+        &sampled
+    };
+
+    let mut left_scores = Vec::with_capacity(peer_indices.len().saturating_sub(1));
+    let mut right_scores = Vec::with_capacity(peer_indices.len().saturating_sub(1));
+    for &peer_index in peer_indices {
         if peer_index == node_index {
             continue;
         }
+        let (peer_left, peer_right) = &operands[peer_index];
         let (Ok(peer_left), Ok(peer_right)) = (peer_left, peer_right) else {
             continue;
         };
