@@ -7,6 +7,7 @@ pub fn handle_tool_raw(
 ) -> Result<String, DynError> {
     match tool_name {
         "index_repository" => handle_index_repository(runner, args_json),
+        "delete_project" => handle_delete_project(runner, args_json),
         "index_status" => handle_index_status(runner, args_json),
         "get_architecture" => handle_get_architecture(runner, args_json),
         "detect_anomalies" => handle_detect_anomalies(args_json),
@@ -95,6 +96,7 @@ pub(crate) fn should_intercept_tool_call(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "index_repository"
+            | "delete_project"
             | "index_status"
             | "get_architecture"
             | "detect_changes"
@@ -221,6 +223,11 @@ pub(crate) fn should_wrap_tool(
     args: &Map<String, Value>,
 ) -> Result<bool, DynError> {
     match tool_name {
+        // Always wrap delete_project: the Astrolabe host-side sidecar family
+        // (lowered mirror, vault, locks, search index, per-project config rows)
+        // can outlive a dial-off project, so cleanup must run regardless of the
+        // current dial — never gate it on read_dial (#417).
+        "delete_project" => Ok(true),
         "index_repository" => {
             if args.contains_key("calyx")
                 || args.contains_key("calyx_search")
