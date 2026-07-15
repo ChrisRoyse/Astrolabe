@@ -546,43 +546,10 @@ fn sweep_orphan_worktrees(repo: &Path, home: &Path) {
 }
 
 /// Whether `pid` currently names a live process. Gates the orphan-worktree sweep
-/// only: a definitively-absent PID is dead (its crashed worktree is safe to
-/// remove); every ambiguous outcome — access-denied, transient failure, or a
-/// non-Windows port target — is treated as ALIVE so a possibly-live worktree is
-/// never swept (fail-closed toward preservation, #427). PID recycling can at worst
-/// leave one orphan uncollected; it can never cause a wrongful deletion.
-#[cfg(windows)]
+/// only (#427); the probe itself lives in `astrolabe_bridge::process_is_alive`
+/// because this crate is `#![forbid(unsafe_code)]` and the bridge owns all FFI.
 fn process_is_alive(pid: u32) -> bool {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const ERROR_INVALID_PARAMETER: u32 = 87;
-    // SAFETY: OpenProcess takes only scalars and returns a handle or null; nothing
-    // is dereferenced. A non-null handle is closed exactly once via CloseHandle.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        // SAFETY: GetLastError reads thread-local error state, no preconditions.
-        let code = unsafe { GetLastError() };
-        // Only "no such PID" proves death; any other failure stays conservatively alive.
-        return code != ERROR_INVALID_PARAMETER;
-    }
-    // SAFETY: handle is a valid, open process handle from the OpenProcess above.
-    unsafe { CloseHandle(handle) };
-    true
-}
-
-/// Port-deferred (`ASTRO_PORT_PHASE`): the Windows `chdir` cap this sweep serves
-/// does not exist off-Windows and no portable liveness probe is wired yet, so every
-/// PID is treated as alive — the sweep then removes nothing rather than risk
-/// deleting a live worktree. Never reached on the shipping Windows target.
-#[cfg(not(windows))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
+    astrolabe_bridge::process_is_alive(pid)
 }
 
 fn path_str(path: &Path) -> Result<&str, DynError> {
