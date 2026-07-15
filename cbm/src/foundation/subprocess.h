@@ -44,6 +44,12 @@ typedef struct {
  * runs. A completed line also resets the quiet-timeout (it is progress). */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
+/* Called once, immediately after the child is successfully spawned, with the
+ * child's OS process id (POSIX pid / Windows PID). Lets a supervisor record the
+ * live child for out-of-band control — e.g. the UI "kill job" endpoint validating
+ * that a kill target is a server-spawned index job. Optional; NULL => not called. */
+typedef void (*cbm_proc_spawn_cb)(long child_pid, void *ud);
+
 typedef struct {
     const char *bin;             /* executable path; also argv[0] when argv is NULL */
     const char *const *argv;     /* NULL-terminated argv; NULL => { bin, NULL } */
@@ -51,6 +57,8 @@ typedef struct {
                                   * NULL => discard child output, no tailing */
     cbm_proc_log_cb on_log_line; /* optional per-line callback */
     void *log_ud;                /* user data for on_log_line */
+    cbm_proc_spawn_cb on_spawn;  /* optional: called with the child PID right after spawn */
+    void *spawn_ud;              /* user data for on_spawn */
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
                                   * ms with no new completed log line */
     bool delete_log_on_exit;     /* unlink log_file after reaping */

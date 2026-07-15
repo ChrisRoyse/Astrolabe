@@ -343,7 +343,12 @@ static char *cli_slurp_stream(FILE *f) {
 
 /* Slurp a file path into a heap, NUL-terminated string. Caller frees. */
 static char *cli_slurp_file(const char *path) {
-    FILE *f = fopen(path, "rb");
+    /* #426: cbm_fopen widens + "\\?\"-prefixes the path so a --args-file handed to
+     * the index worker under a deep %TEMP% (UI spawn) or a deep store's logs/ dir
+     * (index_supervisor.c) opens instead of failing at MAX_PATH with raw fopen —
+     * the last link in the one long-path-safe spawn chain. Short paths are
+     * unaffected (cbm_fopen handles them identically). */
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
