@@ -75,6 +75,54 @@ const ARCHAEOLOGY_WORKTREE_PREFIX: &str = "astrolabe-archaeology-worktree-";
 /// `git checkout` die mid-pass. This is a platform limit, not a tunable knob.
 const ARCHAEOLOGY_WORKTREE_CWD_BUDGET: usize = 240;
 
+/// #439 registry-declared decision: index ONLY the implicated files per evidence
+/// commit (file-scoped historical index) instead of checking out and Fast-indexing
+/// the WHOLE member subtree per commit.
+///
+/// MEASURED lever (#439): after the #434 mass-change diff fix (39.9s → 0.6s), the
+/// per-evidence-commit historical-reindex loop became the largest git_archaeology
+/// sub-phase — ~8.3s for 4 distinct commits on the `cbm/` corpus (ASTRO_ARCH_TIMING).
+/// Each commit checked out and Fast-indexed the entire ~5,500-file member subtree even
+/// though `select_implicated_rows` afterwards keeps only the handful of nodes that
+/// overlap the evidence ranges. File-scoped indexing materializes and parses only the
+/// implicated files, so both the historical checkout and the CBM parse shrink from the
+/// whole subtree to a few files per commit.
+///
+/// BYTE-PARITY ARGUMENT (proven by the #439 probe, not assumed): CBM derives each
+/// node's CxId from `rel_file_path` + content (`astrolabe_domain::canonical_input_bytes`).
+/// The file-scoped checkout materializes each implicated file at the SAME
+/// subtree-relative path (same `scoped_root` base, only fewer files under it) with the
+/// SAME content, so every implicated node's CxId is identical to the whole-subtree
+/// index. `select_implicated_rows` already discards every non-implicated node, so the
+/// files skipped here are exactly the files whose rows would have been thrown away —
+/// the retained rows, and thus the persisted anchors/constellations, are unchanged.
+/// The known differences are all NON-outcomes and stay byte-parity:
+///   * an implicated file DELETED at the evidence commit is not materialized (probed
+///     with `git cat-file -e`), so CBM finds no node → `evidence_without_symbol` —
+///     identical to whole-subtree, which indexes the subtree without that file;
+///   * an implicated file CBM skips as oversized yields no node in either mode;
+///   * multiple ranges hitting one file are de-duplicated to one checkout of that file.
+///
+/// `true` = file-scoped (default, the measured lever). `false` = pre-#439 whole-subtree
+/// behavior. The env override `ASTRO_ARCH_FILE_SCOPED_INDEX` (`0`/`false` → whole
+/// subtree, `1`/`true` → file-scoped) flips the mode on one binary so a measurement can
+/// compare both against the same store, mirroring the ASTRO_ARCH_TIMING env gate
+/// (invariant 4: a registry-declared decision with an explicit measurement override, not
+/// a silent constant).
+pub(crate) const HISTORICAL_INDEX_FILE_SCOPED_DEFAULT: bool = true;
+
+/// Reads the effective #439 file-scoped-historical-index decision: the
+/// [`HISTORICAL_INDEX_FILE_SCOPED_DEFAULT`] registry default, overridable per run via
+/// `ASTRO_ARCH_FILE_SCOPED_INDEX` so the parity/timing probe can exercise both modes on
+/// one binary. An unrecognized value falls back to the default (never a silent flip).
+fn historical_index_file_scoped() -> bool {
+    match std::env::var("ASTRO_ARCH_FILE_SCOPED_INDEX") {
+        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+        _ => HISTORICAL_INDEX_FILE_SCOPED_DEFAULT,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Evidence {
     commit: String,
@@ -197,7 +245,30 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         });
     }
     let force_observed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    // #440 mass-change cap on the force_removed path: mirror the #434 fix/revert caps
+    // that `mine_git_archaeology` already applies. `changed_new_ranges(repo, removed)`
+    // below generates the WHOLE-commit `git diff --unified=0` for each force-removed
+    // commit; a force-move that made a mass-change (relocation / bulk rename / tree
+    // delete) commit unreachable would otherwise pay that full uncapped
+    // diff-and-parse cost here — the exact cost the #434 cap removes on the fix/revert
+    // paths, left uncapped on this one only because `force_removed=0` on the measured
+    // cbm/ corpus. Gate it with the cheap `git diff --name-only` pre-count, scoped to
+    // the WHOLE commit (`None`) to match the whole-commit `changed_new_ranges` it
+    // precedes so the count reflects exactly the work being gated. Over the cap => the
+    // commit is excluded from the reverted-anchor evidence set and counted as a labeled
+    // skip (invariant 3), never silent. `0` disables the cap (pre-#440 behavior — mine
+    // every force-removed commit regardless of size). The `config` built above already
+    // carries the registry-declared `max_commit_changed_files`.
+    let file_cap = config.max_commit_changed_files;
+    let mut force_removed_skipped_large = 0usize;
     for removed in &mined.force_removed_commits {
+        if file_cap != 0
+            && astrolabe_anchors::archaeology::changed_file_count_for_commit(repo, removed, None)?
+                > file_cap
+        {
+            force_removed_skipped_large += 1;
+            continue;
+        }
         for range in astrolabe_anchors::archaeology::changed_new_ranges(repo, removed)? {
             evidence.push(Evidence {
                 commit: removed.clone(),
@@ -208,6 +279,14 @@ pub(crate) fn run_git_archaeology<C: Clock>(
                 label: "reverted",
             });
         }
+    }
+    if arch_timing && !mined.force_removed_commits.is_empty() {
+        eprintln!(
+            "astro.arch.timing phase=force_removed commits={} skipped_large_commits={} file_cap={}",
+            mined.force_removed_commits.len(),
+            force_removed_skipped_large,
+            file_cap,
+        );
     }
     evidence.sort_by(|left, right| {
         left.commit
@@ -273,7 +352,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         mode: mode_name,
         evidence: evidence.len(),
         skipped_merge_fixes: mined.skipped_merge_fixes,
-        skipped_large_commits: mined.skipped_large_commits,
+        // #434 mine-side (fix/revert) mass-change skips PLUS #440 force_removed-path
+        // mass-change skips — both surfaced in one labeled counter on the persisted
+        // git_archaeology summary (invariant 3: every skip counted, never silent).
+        skipped_large_commits: mined.skipped_large_commits + force_removed_skipped_large,
         archaeology_source,
         git_root,
         pathspec,
@@ -299,10 +381,20 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // pass — its own live PID stamped in the name — is never disturbed.
     sweep_orphan_worktrees(repo, &worktree_home);
 
+    let file_scoped = historical_index_file_scoped();
     let index_loop_start = std::time::Instant::now();
     let mut index_calls = 0usize;
     let mut index_ms_total = 0u128;
     for (commit, group) in group_evidence_by_commit(&evidence) {
+        // #439 file-scoped historical index: the DISTINCT set of subtree-relative
+        // implicated files this evidence group touches. Multiple ranges hitting one
+        // file collapse to a single checkout (BTreeSet de-dup); an empty set never
+        // occurs because `group_evidence_by_commit` yields only non-empty groups.
+        // Ignored entirely when `file_scoped` is false (pre-#439 whole-subtree path).
+        let implicated_files: BTreeSet<String> = group
+            .iter()
+            .map(|item| item.range.path.clone())
+            .collect();
         let one_index_start = std::time::Instant::now();
         let indexed = index_historical_commit(
             repo,
@@ -311,6 +403,8 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             project,
             commit,
             &corpus_rel,
+            file_scoped,
+            &implicated_files,
         )?;
         if arch_timing {
             index_calls += 1;
@@ -370,9 +464,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     }
     if arch_timing {
         eprintln!(
-            "astro.arch.timing phase=index_loop ms={} distinct_commits={index_calls} \
-             sum_per_commit_ms={index_ms_total} evidence={} constellations_written={} \
-             constellations_reused={} evidence_without_symbol={}",
+            "astro.arch.timing phase=index_loop file_scoped={file_scoped} ms={} \
+             distinct_commits={index_calls} sum_per_commit_ms={index_ms_total} evidence={} \
+             constellations_written={} constellations_reused={} evidence_without_symbol={}",
             index_loop_start.elapsed().as_millis(),
             report.evidence,
             report.historical_constellations_written,
@@ -411,6 +505,7 @@ struct HistoricalCommitIndex {
     cleanup_remnants: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_historical_commit(
     repo: &Path,
     cache_dir: &Path,
@@ -418,6 +513,8 @@ fn index_historical_commit(
     project: &str,
     commit: &str,
     corpus_rel: &str,
+    file_scoped: bool,
+    implicated_files: &BTreeSet<String>,
 ) -> Result<HistoricalCommitIndex, DynError> {
     let nonce = format!(
         "{}-{}",
@@ -441,7 +538,14 @@ fn index_historical_commit(
         .into());
     }
     let database = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}{nonce}.db"));
-    add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
+    // #439: materialize ONLY the implicated files (file-scoped) or the whole member
+    // subtree (pre-#439). Both leave `scoped_root` (below) at the same base, so CBM
+    // emits byte-identical subtree-relative node paths in either mode.
+    if file_scoped {
+        add_historical_worktree_files(repo, &worktree, commit, corpus_rel, implicated_files)?;
+    } else {
+        add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
+    }
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
         // Scope the historical index to the requested corpus subtree within the
         // whole-repo worktree (#403). A git worktree is always the full repository
@@ -729,6 +833,95 @@ fn add_historical_worktree(
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Adds a scratch worktree that materializes ONLY the implicated files of one
+/// evidence commit (#439 file-scoped historical index), instead of the whole member
+/// subtree.
+///
+/// `implicated_files` are the DISTINCT subtree-relative paths the evidence group hits
+/// (already stripped of the corpus prefix and, via the `run_git_archaeology` retain,
+/// confined to the corpus). Each is rejoined to `corpus_rel` to form the toplevel
+/// pathspec git checks out; an empty `corpus_rel` (corpus IS the toplevel) uses the
+/// path as-is. The worktree is added `--no-checkout` (index only, no working files),
+/// then a SINGLE `checkout <commit> -- <present files…>` materializes exactly those
+/// files at their real subtree-relative locations under `worktree/<corpus_rel>` — so
+/// `scoped_root` (in [`index_historical_commit`]) and every emitted node path are
+/// byte-identical to the whole-subtree mode; only the non-implicated files CBM would
+/// parse and then discard are absent.
+///
+/// A pathspec that would escape the corpus is skipped defensively (the retain upstream
+/// already guarantees in-corpus paths; this never silently materializes out-of-corpus
+/// files). An implicated file ABSENT at this commit (deleted/created later, or the
+/// subtree itself absent) is filtered by [`git_tree_has_path`] before checkout, so a
+/// "pathspec did not match" never aborts the pass — the file simply is not materialized
+/// and its evidence lands as `evidence_without_symbol`, exactly as whole-subtree mode
+/// (which indexes the subtree without that file). When no implicated file is present
+/// at the commit, nothing is checked out and `scoped_root.exists()` is false, yielding
+/// zero rows — the same graceful zero-evidence outcome as an absent subtree.
+fn add_historical_worktree_files(
+    repo: &Path,
+    worktree: &Path,
+    commit: &str,
+    corpus_rel: &str,
+    implicated_files: &BTreeSet<String>,
+) -> Result<(), DynError> {
+    git_checked(
+        repo,
+        &[
+            "-c",
+            "core.longpaths=true",
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            path_str(worktree)?,
+            commit,
+        ],
+    )?;
+    // Build the toplevel pathspec for each implicated file, dropping any that would
+    // escape the corpus and any not present in this commit's tree.
+    let mut present: Vec<String> = Vec::new();
+    for rel in implicated_files {
+        let toplevel_path = if corpus_rel.is_empty() {
+            rel.clone()
+        } else {
+            format!("{corpus_rel}/{rel}")
+        };
+        // Defense-in-depth: never let a `..`/absolute/empty path escape the corpus into
+        // the enclosing worktree. The upstream retain already scopes evidence to the
+        // corpus, so this only ever drops a malformed residue — counted by absence, not
+        // silently indexed.
+        if toplevel_path.is_empty()
+            || toplevel_path.starts_with('/')
+            || toplevel_path.split('/').any(|component| component == "..")
+        {
+            continue;
+        }
+        if git_tree_has_path(repo, commit, &toplevel_path)? {
+            present.push(toplevel_path);
+        }
+    }
+    if present.is_empty() {
+        // No implicated file exists at this commit: materialize nothing. The caller's
+        // `scoped_root.exists()` gate then yields zero rows (evidence_without_symbol),
+        // matching the absent-subtree path — never an aborting empty checkout.
+        return Ok(());
+    }
+    // One batched checkout of exactly the present implicated files. All pathspecs are
+    // pre-filtered to exist, so git never errors on an unmatched pathspec.
+    let mut args: Vec<&str> = vec![
+        "-c",
+        "core.longpaths=true",
+        "checkout",
+        commit,
+        "--",
+    ];
+    for path in &present {
+        args.push(path.as_str());
+    }
+    git_checked(worktree, &args)?;
     Ok(())
 }
 
