@@ -269,6 +269,134 @@ pub(crate) fn kernel_context_with_persisted_labels(
     kernel_context_json(label_propagation, scope_summaries)
 }
 
+/// #400 index-time hook: builds the served `kernel_context.scope_summaries` block
+/// from the persisted `KernelArtifact` for `project`, read back **independently**
+/// of the write path.
+///
+/// The base `scope_summaries` (from [`scope_summaries_from_row_sink_rows`]) is
+/// derived from the CBM row-sink node properties `kernel_scopes`/`summary_scopes`/
+/// `scopes`, which a real corpus like `cbm/` never emits — so it always resolved
+/// to the labeled `unavailable` block, and both `get_kernel mode=read` and the
+/// `grounding_gaps` architecture aspect refused fail-closed even on a fully
+/// indexed corpus (#400). This derives the scope summary from data that genuinely
+/// exists after an index: the persisted `KernelArtifact` members — the measured
+/// kernel core, each carrying a real kernel weight (`score_permille`), a
+/// per-member groundedness flag, and artifact provenance. Member qualified names
+/// are resolved from the persisted node map ([`read_node_map_cx_ids`]), falling
+/// back to the member's `CxId` hex when a name is ambiguous/absent — never
+/// invented. The single scope is the whole-repo kernel scope (`repo:<project>`),
+/// the same scope `get_kernel mode=gaps`/`quadrant` already serve from the
+/// artifact.
+///
+/// Returns the labeled `unavailable` block (preserving the fail-closed refusal)
+/// when no artifact is persisted or it carries zero members: a genuinely
+/// scope-less corpus still refuses.
+pub(crate) fn scope_summaries_from_persisted_kernel_artifact<C>(
+    vault: &AsterVault<C>,
+    project: &str,
+) -> Value
+where
+    C: Clock,
+{
+    let scope_id = kernel_artifact_scope_id(project);
+    let artifact = match astrolabe_ingest::read_persisted_kernel_artifact(vault, &scope_id) {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            return scope_summaries_unavailable_json(
+                "no persisted kernel artifact for this project; index_repository built no kernel scope",
+            );
+        }
+        Err(error) => {
+            return scope_summaries_unavailable_json(&format!(
+                "persisted kernel artifact read failed: {error}"
+            ));
+        }
+    };
+    if artifact.members.is_empty() {
+        return scope_summaries_unavailable_json(
+            "persisted kernel artifact carries no members; scope is empty",
+        );
+    }
+    // Resolve each member CxId to its real qualified name from the persisted node
+    // map; ambiguous/absent names fall back to the durable CxId hex (never guessed).
+    let qn_by_cx = astrolabe_ingest::read_node_map_cx_ids(vault, project)
+        .map(|by_qn| {
+            by_qn
+                .into_iter()
+                .map(|(qualified_name, cx_id)| (cx_id, qualified_name))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let members = artifact
+        .members
+        .iter()
+        .map(|member| {
+            let symbol_id = member.id.to_string();
+            let qualified_name = qn_by_cx
+                .get(&member.id)
+                .cloned()
+                .unwrap_or_else(|| symbol_id.clone());
+            let provenance = format!(
+                "kernel-artifact:scope={};member={symbol_id};members_hash={}",
+                artifact.scope_id, artifact.members_hash
+            );
+            ScopeSummaryMember::new(
+                symbol_id,
+                qualified_name,
+                member.score_permille,
+                member.grounded,
+                provenance,
+            )
+        })
+        .collect::<Vec<_>>();
+    let recall = Some(ScopeRecallMeasurement {
+        recalled: artifact.recall.recalled,
+        total: artifact.recall.total,
+    });
+    let input = ScopeSummaryInput::new(
+        artifact.scope_id.clone(),
+        artifact.members_hash.clone(),
+        artifact.anchor_grounded,
+        members,
+        recall,
+    );
+    let summary = summarize_scope_kernel(&input);
+    scope_summaries_json(&[summary], 0)
+}
+
+/// #400: replace the row-sink-derived `scope_summaries` on `base_kernel_context`
+/// with the persisted-`KernelArtifact`-derived block, keeping the existing
+/// `label_propagation`, and recompute the rolled-up kernel_context status/trust.
+/// Keeps the base block when the persisted one is not `built` (never downgrade a
+/// served surface, and preserve the honest `unavailable` refusal on a truly
+/// scope-less corpus).
+pub(crate) fn kernel_context_with_persisted_scope_summaries(
+    base_kernel_context: Value,
+    persisted_scope_summaries: Value,
+) -> Value {
+    let use_persisted = persisted_scope_summaries
+        .get("status")
+        .and_then(Value::as_str)
+        == Some("built");
+    let scope_summaries = if use_persisted {
+        persisted_scope_summaries
+    } else {
+        base_kernel_context
+            .get("scope_summaries")
+            .cloned()
+            .unwrap_or(persisted_scope_summaries)
+    };
+    let label_propagation = base_kernel_context
+        .get("label_propagation")
+        .cloned()
+        .unwrap_or_else(|| {
+            label_propagation_unavailable_json(
+                "label propagation missing during scope-summary merge",
+            )
+        });
+    kernel_context_json(label_propagation, scope_summaries)
+}
+
 pub(crate) fn kernel_context_from_row_sink_rows(rows: &CbmPipelineRows) -> Value {
     let label_propagation = label_propagation_from_row_sink_rows(rows);
     let scope_summaries = scope_summaries_from_row_sink_rows(rows);

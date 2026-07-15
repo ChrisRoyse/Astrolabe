@@ -1698,6 +1698,19 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         shadow_import.kernel_context,
         index_time_label_propagation,
     );
+    // #400 index-time hook: the served `kernel_context.scope_summaries` was derived
+    // from the CBM row-sink node properties (`kernel_scopes`/`summary_scopes`/
+    // `scopes`), which a real corpus like `cbm/` never emits — so it stayed the
+    // labeled `unavailable` block and both `get_kernel mode=read` and the
+    // `grounding_gaps` architecture aspect refused fail-closed even on a fully
+    // indexed corpus. Rebuild scope_summaries from the persisted KernelArtifact
+    // members (persisted immediately above), read back independently, so those two
+    // surfaces serve grounded scope data. A scope-less corpus (no artifact / no
+    // members) keeps the honest `unavailable` refusal.
+    let index_time_scope_summaries =
+        scope_summaries_from_persisted_kernel_artifact(&vault, project);
+    let kernel_context =
+        kernel_context_with_persisted_scope_summaries(kernel_context, index_time_scope_summaries);
     if let Some(object) = weave.as_object_mut() {
         object.insert("invalidations".to_string(), invalidations);
         object.insert("layout_frames".to_string(), layout_frames);
