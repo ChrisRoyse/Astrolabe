@@ -1272,6 +1272,54 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
 
 /* ── Tool handler implementations ─────────────────────────────── */
 
+/* True when `name` (length `len`) ends with the NUL-terminated `suffix`. Exact
+ * byte suffix match — a name that merely CONTAINS the suffix mid-string is not
+ * matched (so a real project "my-astrolabe-lowered-tools" is untouched). */
+static bool name_has_suffix(const char *name, size_t len, const char *suffix) {
+    size_t slen = strlen(suffix);
+    return len >= slen && memcmp(name + len - slen, suffix, slen) == 0;
+}
+
+/* Reserved Astrolabe sidecar-artifact suffixes for files that live in the store
+ * (cache) dir but are NOT project stores (#414). Every entry is a full filename
+ * suffix and is matched exactly against the whole filename by
+ * is_astrolabe_reserved_sidecar_db(). Kept as a table so future ".db"-tailed
+ * sidecar families route through the one contract. See
+ * CBM_ASTRO_LOWERED_DB_SUFFIX in mcp/mcp.h for the drift contract with the Rust
+ * host's write-side constants. */
+static const char *const CBM_ASTRO_RESERVED_DB_SUFFIXES[] = {
+    CBM_ASTRO_LOWERED_DB_SUFFIX,
+};
+
+/* Reserved Astrolabe sidecar-artifact PREFIXES: families whose filenames carry
+ * a varying nonce tail, so they are matched by prefix instead. Currently the
+ * git-archaeology scratch store ".astrolabe-archaeology-<nonce>.db". */
+static const char *const CBM_ASTRO_RESERVED_DB_PREFIXES[] = {
+    CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX,
+};
+
+/* True when `name` is an Astrolabe reserved store-dir sidecar (e.g. the
+ * per-project lowered-SQLite mirror or an archaeology scratch store), which
+ * must never be enumerated or resolved as a project store. */
+static bool is_astrolabe_reserved_sidecar_db(const char *name, size_t len) {
+    for (size_t i = 0;
+         i < sizeof(CBM_ASTRO_RESERVED_DB_SUFFIXES) / sizeof(CBM_ASTRO_RESERVED_DB_SUFFIXES[0]);
+         i++) {
+        if (name_has_suffix(name, len, CBM_ASTRO_RESERVED_DB_SUFFIXES[i])) {
+            return true;
+        }
+    }
+    for (size_t i = 0;
+         i < sizeof(CBM_ASTRO_RESERVED_DB_PREFIXES) / sizeof(CBM_ASTRO_RESERVED_DB_PREFIXES[0]);
+         i++) {
+        const char *prefix = CBM_ASTRO_RESERVED_DB_PREFIXES[i];
+        if (strncmp(name, prefix, strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Return true if filename is a valid project .db file (not temp/internal).
  *
  * Project names derived from /tmp/... source roots legitimately begin with
@@ -1284,6 +1332,14 @@ static bool is_project_db_file(const char *name, size_t len) {
         return false;
     }
     if (strncmp(name, "_", SLEN("_")) == 0 || strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
+        return false;
+    }
+    /* #414: Astrolabe sidecar artifacts (e.g. "<name>.astrolabe-lowered.db",
+     * written by the Rust host into the same store dir) end in ".db" but are not
+     * project stores — skip them so they never appear as phantom projects or get
+     * adopted by resolve_store. This is the single reserved-suffix filter; all
+     * store-dir walks route through here. */
+    if (is_astrolabe_reserved_sidecar_db(name, len)) {
         return false;
     }
     return true;
