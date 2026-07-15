@@ -68,4 +68,3 @@ fn perf_budget_error(message: impl Into<String>) -> CliError {
     }
     .into()
 }
-

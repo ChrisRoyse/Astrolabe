@@ -141,4 +141,3 @@ fn graph_node_count(agreements: &[AgreementEdge], frequencies: &[FrequencyEntry]
     }
     nodes.len()
 }
-

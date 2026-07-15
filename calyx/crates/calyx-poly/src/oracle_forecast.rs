@@ -311,4 +311,3 @@ fn oracle_error(code: &'static str, domain: &DomainId, err: OracleError) -> Poly
         ),
     )
 }
-

@@ -430,4 +430,3 @@ fn absent_vectors(input_len: usize) -> Vec<SlotVector> {
 fn is_lens_timeout_like(error: &CalyxError) -> bool {
     error.code == "CALYX_LENS_UNREACHABLE"
 }
-

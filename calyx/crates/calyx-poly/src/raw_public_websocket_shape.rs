@@ -55,4 +55,3 @@ fn sports_result_shape(map: &serde_json::Map<String, Value>) -> bool {
         .count()
         >= 2
 }
-

@@ -43,4 +43,3 @@ fn validate_non_negative_bits(value: f32, field: &str) -> Result<()> {
         )))
     }
 }
-

@@ -263,4 +263,3 @@ fn parse_detail(value: &str) -> CliResult<(String, String)> {
     };
     Ok((key.to_string(), val.to_string()))
 }
-

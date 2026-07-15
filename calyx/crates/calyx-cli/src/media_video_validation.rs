@@ -36,4 +36,3 @@ pub(crate) fn run(topic: &str, args: &[String]) -> crate::error::CliResult {
         }
     }
 }
-

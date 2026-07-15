@@ -199,4 +199,3 @@ struct Status<'a> {
     latency_us: &'a Value,
     report_path: Option<String>,
 }
-

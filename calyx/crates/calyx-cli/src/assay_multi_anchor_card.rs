@@ -4,7 +4,6 @@ mod readback;
 mod request;
 mod write;
 
-
 use calyx_core::CalyxError;
 
 use crate::error::{CliError, CliResult};

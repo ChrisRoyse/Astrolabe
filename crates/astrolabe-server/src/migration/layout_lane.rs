@@ -170,8 +170,6 @@ fn layout_enforcement_row_bytes(
     .expect("encode layout enforcement row")
 }
 
-
-
 /// Derives the directory path of a symbol's source file (parent components,
 /// separator-normalized). Root-level files map to `"."` — a labeled directory,
 /// never an empty key.
@@ -541,7 +539,6 @@ pub(crate) fn read_layout_enforcement_row(
 pub(crate) fn layout_enforcement_project_scope() -> &'static str {
     LAYOUT_ENFORCE_PROJECT_SCOPE
 }
-
 
 fn layout_ledger_payload(
     project: &str,

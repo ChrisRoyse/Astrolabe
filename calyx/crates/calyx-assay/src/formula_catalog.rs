@@ -480,4 +480,3 @@ const FORMULA_ROWS: &[FormulaRowSpec] = &[
         "calyx-assay::formula_coverage_fsv",
     ),
 ];
-

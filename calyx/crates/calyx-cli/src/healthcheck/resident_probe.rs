@@ -105,4 +105,3 @@ pub(super) fn check_resident_parallelism(addr: SocketAddr) -> HealthCheck {
         ),
     )
 }
-

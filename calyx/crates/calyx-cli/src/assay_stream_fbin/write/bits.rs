@@ -153,4 +153,3 @@ fn load_a37_admission_bits(args: &Args) -> CliResult<BTreeMap<String, BitsLens>>
     }
     Ok(out)
 }
-

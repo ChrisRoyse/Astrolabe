@@ -218,4 +218,3 @@ fn bundle_error(
         remediation,
     })
 }
-

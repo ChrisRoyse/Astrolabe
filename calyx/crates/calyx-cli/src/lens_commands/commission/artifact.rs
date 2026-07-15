@@ -247,5 +247,3 @@ fn hash_artifact_into(
         hasher.update_chunk(chunk);
     }
 }
-
-

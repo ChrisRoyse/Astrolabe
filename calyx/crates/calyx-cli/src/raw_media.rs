@@ -491,4 +491,3 @@ fn hex_digit(value: u8) -> char {
         _ => unreachable!("nibble out of range"),
     }
 }
-

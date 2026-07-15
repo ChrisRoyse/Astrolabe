@@ -319,7 +319,6 @@ fn measure_command(args: MeasureArgs) -> CliResult {
     print_json(&cx)
 }
 
-
 fn ingest_texts_with_resident(
     resolved: &ResolvedVault,
     texts: &[String],
@@ -445,4 +444,3 @@ mod batch_stream;
 mod batch_support;
 mod media;
 mod replay;
-

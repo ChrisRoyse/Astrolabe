@@ -240,4 +240,3 @@ fn boost_hits(
     }
     Ok(boosted)
 }
-

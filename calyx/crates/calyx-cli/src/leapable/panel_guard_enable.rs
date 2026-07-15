@@ -29,9 +29,7 @@ impl Default for PanelSpec {
     }
 }
 
-impl PanelSpec {
-
-}
+impl PanelSpec {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PanelEnableReport {
@@ -127,7 +125,6 @@ impl PanelGuardEnable {
         }
         Ok(())
     }
-
 }
 
 fn cli_to_calyx(error: crate::error::CliError) -> CalyxError {

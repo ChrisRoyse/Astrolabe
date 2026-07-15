@@ -29,5 +29,3 @@ pub(crate) fn readback_config(name: &str, vault: &Path) -> CliResult {
         _ => Err(CliError::usage(format!("unknown config readback: {name}"))),
     }
 }
-
-

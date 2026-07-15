@@ -477,4 +477,3 @@ pub(super) fn file_evidence(home: &Path, path: &Path) -> CliResult<(FileEvidence
         bytes,
     ))
 }
-

@@ -221,7 +221,6 @@ fn run_worker_process(
         .map_err(io_error)
 }
 
-
 pub(crate) fn run_worker(args: &Args) -> CliResult<StreamWorkerReport> {
     let report_path = args.worker_report.as_ref().ok_or_else(|| {
         local_error(
@@ -406,7 +405,6 @@ fn add_admission_args(command: &mut Command, args: &Args) {
     }
 }
 
-
 fn remove_stale(path: &Path) -> CliResult {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -418,4 +416,3 @@ fn remove_stale(path: &Path) -> CliResult {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-

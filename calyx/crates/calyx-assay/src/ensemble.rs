@@ -13,4 +13,3 @@ pub use model::{
     EnsembleDecision, EnsembleLensInput, EnsembleLensValue, EnsemblePairValue,
     MIN_ENSEMBLE_PANEL_LENSES, PidBits,
 };
-

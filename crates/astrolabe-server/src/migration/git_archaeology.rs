@@ -79,7 +79,6 @@ pub(crate) struct GitArchaeologyImportReport {
     pub(crate) cleanup_remnants: usize,
 }
 
-
 pub(crate) fn run_git_archaeology<C: Clock>(
     repo: &Path,
     project: &str,

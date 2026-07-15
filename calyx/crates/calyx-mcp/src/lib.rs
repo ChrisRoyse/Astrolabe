@@ -22,4 +22,3 @@ pub use server::{
     CALYX_MCP_TOOL_DUPLICATE, MCP_PROTOCOL_VERSION, McpServer, SERVER_NAME, Tool, ToolError,
     ToolResult,
 };
-

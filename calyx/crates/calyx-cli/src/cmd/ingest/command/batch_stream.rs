@@ -16,9 +16,6 @@ use super::*;
 
 type BatchSummaryEmitter<'a> = &'a mut dyn FnMut(&BatchIngestSummary) -> CliResult<()>;
 
-
-
-
 pub(crate) fn ingest_validated_batch_streaming_with_output(
     resolved: &ResolvedVault,
     path: &std::path::Path,

@@ -444,4 +444,3 @@ pub(super) fn hex_sha256(bytes: &[u8]) -> String {
 fn hex_from_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-

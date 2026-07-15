@@ -348,4 +348,3 @@ fn st_error(code: &'static str, message: impl Into<String>, remediation: &'stati
         remediation,
     })
 }
-

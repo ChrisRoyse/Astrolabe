@@ -175,4 +175,3 @@ pub fn selection_rationale() -> &'static str {
      backfill) to prove the ingest→associate→ground→predict loop on real data fastest; then compare \
      Politics (strongest calibration edge, sparser data) against the proven engine."
 }
-

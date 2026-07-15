@@ -7,7 +7,6 @@ mod remove;
 mod scale_audit;
 pub(crate) mod support;
 
-
 use crate::error::{CliError, CliResult};
 
 pub(crate) fn run(topic: &str, rest: &[String]) -> CliResult {

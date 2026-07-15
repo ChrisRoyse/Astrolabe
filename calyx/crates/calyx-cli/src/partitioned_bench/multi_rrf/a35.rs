@@ -156,4 +156,3 @@ fn a35_error(
         remediation,
     })
 }
-

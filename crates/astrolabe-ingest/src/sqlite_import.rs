@@ -4677,7 +4677,6 @@ where
     Ok(counts)
 }
 
-
 pub fn read_cbm_graph_snapshot<C>(
     vault: &AsterVault<C>,
     project: &str,
@@ -5507,7 +5506,6 @@ fn graph_key_with_digest(
     key.extend_from_slice(&node_id.to_be_bytes());
     Ok(key)
 }
-
 
 /// The project-only Graph CF key from a precomputed project digest (#380).
 fn project_key_with_digest(prefix: &[u8], project_digest: &[u8; 32]) -> Vec<u8> {

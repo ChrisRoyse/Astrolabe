@@ -144,4 +144,3 @@ fn require_file(path: &Path, label: &'static str) -> CliResult {
     }
     Ok(())
 }
-

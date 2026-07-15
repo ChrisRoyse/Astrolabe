@@ -64,4 +64,3 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         )
     })
 }
-

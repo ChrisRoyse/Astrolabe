@@ -328,4 +328,3 @@ fn parse_tei_rank_response(body: &str, expected_scores: usize) -> Result<RerankR
     }
     Ok(RerankResponse { scores })
 }
-

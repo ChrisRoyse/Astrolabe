@@ -341,4 +341,3 @@ fn gpu_error(detail: String) -> ForgeError {
 fn driver_gpu_err(err: cudarc::driver::DriverError) -> ForgeError {
     gpu_error(format!("CUDA stream priority operation failed: {err}"))
 }
-

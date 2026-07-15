@@ -71,4 +71,3 @@ fn gain(relevance: u32) -> f64 {
 fn discount(rank: usize) -> f64 {
     ((rank + 1) as f64).log2()
 }
-

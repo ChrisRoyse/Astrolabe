@@ -293,4 +293,3 @@ impl Drop for GroundingRead<'_> {
         let _ = self.vault.release_reader(self.snapshot.lease().id());
     }
 }
-

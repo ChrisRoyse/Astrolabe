@@ -88,4 +88,3 @@ pub fn temporal_search_pipeline(
     let boosted = apply_temporal_boost(filtered, policy, clock.now_secs(), tz_offset_secs)?;
     apply_causal_gate(boosted, &policy.boost)
 }
-

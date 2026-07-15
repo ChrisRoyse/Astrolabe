@@ -1324,8 +1324,8 @@ static bool is_astrolabe_reserved_sidecar_db(const char *name, size_t len) {
 /* Return true if filename is a valid project .db file (not temp/internal).
  *
  * Project names derived from /tmp/... source roots legitimately begin with
- * "tmp-" (cbm_project_name_from_path: "/tmp/bench/..." → "tmp-bench-...";
- * see tests/test_pipeline.c fixtures), so the prefix must NOT be excluded.
+ * "tmp-" (cbm_project_name_from_path: "/tmp/bench/..." → "tmp-bench-..."),
+ * so the prefix must NOT be excluded.
  * The "_" prefix is reserved for internal/hidden DBs, and ":memory:" is the
  * SQLite in-memory marker (defensive — never appears as a real file). */
 static bool is_project_db_file(const char *name, size_t len) {

@@ -53,4 +53,3 @@ fn detail_u128(detail: Option<&str>, field: &str) -> Option<u128> {
         .find_map(|part| part.strip_prefix(field)?.strip_prefix('='))
         .and_then(|value| value.parse::<u128>().ok())
 }
-

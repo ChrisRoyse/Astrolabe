@@ -281,4 +281,3 @@ impl HttpEndpoint {
         format!("http://{}/info", self.authority())
     }
 }
-

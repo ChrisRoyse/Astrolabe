@@ -271,8 +271,3 @@ fn parse_f32(raw: &str, flag: &str) -> CliResult<f32> {
 fn is_guard_subcommand(value: &str) -> bool {
     matches!(value, "calibrate" | "check" | "generate")
 }
-
-
-
-
-

@@ -55,7 +55,6 @@ mod parallel;
 mod server;
 mod stream;
 
-
 pub(crate) use client::{measure_batch_at, ready_value_at};
 pub(crate) fn run(args: &[String]) -> CliResult {
     let Some(command) = args.first().map(String::as_str) else {

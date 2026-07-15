@@ -211,4 +211,3 @@ fn nvml_library_name() -> &'static str {
         "libnvidia-ml.so.1"
     }
 }
-

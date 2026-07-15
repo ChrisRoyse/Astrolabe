@@ -248,4 +248,3 @@ pub(crate) fn f_upper_tail_p(f: f64, df1: f64, df2: f64) -> Result<f64> {
 fn domain(message: impl Into<String>) -> CalyxError {
     CalyxError::assay_insufficient_samples(message)
 }
-

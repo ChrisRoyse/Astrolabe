@@ -409,4 +409,3 @@ fn expected_error(mode: &str) -> &'static str {
         _ => "CALYX_INDEX_INVALID_PARAMS",
     }
 }
-

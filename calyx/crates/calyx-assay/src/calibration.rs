@@ -125,4 +125,3 @@ pub fn degenerate_entropy(message: impl Into<String>) -> CalyxError {
         remediation: "use a target with enough outcome entropy to support an MI verdict",
     }
 }
-

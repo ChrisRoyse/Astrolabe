@@ -17,7 +17,6 @@ pub const VENDORED_MIMALLOC_VERSION: &str = env!("CBM_MIMALLOC_VERSION");
 
 include!("bindings.rs");
 
-
 #[cfg(not(cbm_sys_asan))]
 #[global_allocator]
 static ASTROLABE_MIMALLOC: CbmMiMalloc = CbmMiMalloc;

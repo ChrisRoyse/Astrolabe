@@ -476,4 +476,3 @@ fn run_search_synthetic(args: &SearchArgs) -> CliResult {
     );
     Ok(())
 }
-

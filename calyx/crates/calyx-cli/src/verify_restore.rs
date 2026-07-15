@@ -88,4 +88,3 @@ fn print_text(report: &VerifyRestoreReport) {
     );
     println!("RESULT {}", if report.success() { "OK" } else { "FAIL" });
 }
-

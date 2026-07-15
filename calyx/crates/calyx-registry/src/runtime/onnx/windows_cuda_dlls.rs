@@ -233,4 +233,3 @@ fn format_dirs(dirs: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(";")
 }
-

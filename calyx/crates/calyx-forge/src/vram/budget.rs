@@ -381,4 +381,3 @@ fn parse_soft_cap_strict(raw: Option<&str>) -> Result<usize> {
         }),
     }
 }
-

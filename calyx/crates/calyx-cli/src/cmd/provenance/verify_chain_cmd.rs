@@ -326,4 +326,3 @@ fn value<'a>(args: &'a [String], index: usize, flag: &str) -> CliResult<&'a str>
         .map(String::as_str)
         .ok_or_else(|| CliError::usage(format!("{flag} requires a value")))
 }
-

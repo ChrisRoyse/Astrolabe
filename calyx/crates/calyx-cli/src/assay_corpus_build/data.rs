@@ -385,4 +385,3 @@ fn validate_loaded_rows(request: &CorpusBuildRequest, rows: &[LabeledRow]) -> Re
     }
     Ok(())
 }
-

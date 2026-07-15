@@ -118,7 +118,6 @@ impl ReadFlip {
     }
 }
 
-
 pub(crate) fn run_read_flip(args: &[String]) -> CliResult {
     let args = parse_flip_args(args)?;
     PanelGuardEnable::validate_guard_tau(args.tau)?;

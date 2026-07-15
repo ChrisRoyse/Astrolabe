@@ -365,4 +365,3 @@ fn push_len_prefixed(key: &mut Vec<u8>, value: &[u8]) {
 fn default_anchor() -> AnchorKind {
     AnchorKind::Reward
 }
-

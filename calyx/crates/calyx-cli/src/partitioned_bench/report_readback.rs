@@ -306,4 +306,3 @@ fn parse_positive(value: &str, flag: &str) -> CliResult<usize> {
     }
     Ok(parsed)
 }
-

@@ -353,4 +353,3 @@ fn read_full_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> Result<ReadState,
     }
     Ok(ReadState::Filled)
 }
-

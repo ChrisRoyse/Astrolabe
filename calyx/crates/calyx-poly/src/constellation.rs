@@ -221,4 +221,3 @@ fn resolution_anchor_source(r: &Resolution, label: Option<&str>) -> String {
         None => format!("{RESOLVED_SOURCE_PREFIX}{source}"),
     }
 }
-

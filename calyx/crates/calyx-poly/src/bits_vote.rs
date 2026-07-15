@@ -172,4 +172,3 @@ pub fn bits_vote(
         reliability,
     })
 }
-

@@ -257,4 +257,3 @@ fn parse_args(args: Vec<String>) -> Result<Config, DaemonError> {
 fn require_value(flag: &str, value: Option<String>) -> Result<String, DaemonError> {
     value.ok_or_else(|| DaemonError::config_invalid(format!("{flag} requires a value")))
 }
-

@@ -16,7 +16,6 @@ struct KernelDirtyScc {
     removed_members: Vec<String>,
 }
 
-
 // Self-reading convenience wrapper: production always passes the shared
 // post-import snapshot (#23), so only tests exercise this shape. Gated to test
 // builds rather than shipped as dead code (invariant 6).

@@ -114,4 +114,3 @@ fn unrecognized_vault(vault: &Path) -> CliError {
                       beginning with CXSHDW1!",
     })
 }
-

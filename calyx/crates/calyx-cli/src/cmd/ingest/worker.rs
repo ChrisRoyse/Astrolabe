@@ -87,7 +87,6 @@ mod cleanup_job;
 mod frame;
 mod resident;
 
-
 use frame::{decode_binary, encode_binary, read_frame_or_eof, write_frame};
 pub(crate) use resident::measure_lens_in_worker;
 

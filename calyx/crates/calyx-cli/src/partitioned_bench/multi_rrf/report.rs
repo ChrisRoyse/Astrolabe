@@ -52,4 +52,3 @@ pub(super) fn grounded_phase_exit_contract() -> Value {
         "temporal_role": "time manipulation sidecar for walking state forward/backward/as-of; not a content lens and not a grounding substitute",
     })
 }
-

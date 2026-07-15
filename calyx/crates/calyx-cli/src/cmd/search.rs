@@ -208,5 +208,3 @@ pub(crate) fn parse_search(rest: &[String]) -> CliResult<Subcommand> {
 pub(crate) fn parse_kernel_answer(rest: &[String]) -> CliResult<Subcommand> {
     parse::parse_kernel_answer(rest)
 }
-
-

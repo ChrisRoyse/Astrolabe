@@ -348,4 +348,3 @@ fn fatal(error: DaemonError) -> ExitCode {
     eprintln!("calyxd: {error}");
     ExitCode::from(1)
 }
-

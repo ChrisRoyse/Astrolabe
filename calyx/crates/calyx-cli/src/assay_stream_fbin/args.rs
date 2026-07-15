@@ -278,4 +278,3 @@ fn parse_mode(value: &str) -> CliResult<StreamMode> {
         ))),
     }
 }
-

@@ -134,4 +134,3 @@ fn parse_action(value: &str) -> crate::error::CliResult<AnnealLedgerAction> {
         ))),
     }
 }
-

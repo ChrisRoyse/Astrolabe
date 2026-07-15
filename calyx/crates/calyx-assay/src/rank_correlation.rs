@@ -290,4 +290,3 @@ fn atanh(r: f64) -> f64 {
 fn tanh(z: f64) -> f64 {
     z.tanh()
 }
-

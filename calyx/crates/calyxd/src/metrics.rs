@@ -181,4 +181,3 @@ impl ChainVerifyMetrics {
         self.runs_total.with_label_values(&[vault, outcome]).get()
     }
 }
-

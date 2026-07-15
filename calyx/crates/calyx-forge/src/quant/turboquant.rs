@@ -336,4 +336,3 @@ fn derive_rademacher_seed(seed: &RotationSeed) -> RotationSeed {
     entropy.push(seed.version);
     new_seed(seed.dim, &entropy)
 }
-

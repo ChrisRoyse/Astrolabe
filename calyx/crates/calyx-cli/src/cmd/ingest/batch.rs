@@ -180,4 +180,3 @@ fn parse_anchor_spec(index: usize, spec: AnchorSpec) -> CliResult<Anchor> {
         confidence,
     })
 }
-

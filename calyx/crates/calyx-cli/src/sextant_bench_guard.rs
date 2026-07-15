@@ -54,4 +54,3 @@ fn format_bytes(bytes: u128) -> String {
         format!("{bytes} bytes")
     }
 }
-

@@ -341,4 +341,3 @@ fn validate_cost_basis(cost: &RuntimeCostBasis<'_>) -> Result<(), String> {
 fn lens_error(error: calyx_core::CalyxError) -> String {
     format!("{}: {}", error.code, error.message)
 }
-

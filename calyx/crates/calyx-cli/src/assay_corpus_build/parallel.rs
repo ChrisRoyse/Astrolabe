@@ -275,4 +275,3 @@ fn is_cpu_heavy(manifest: &PathBuf) -> bool {
         }
     }
 }
-

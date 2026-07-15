@@ -493,4 +493,3 @@ fn write_fsv_readback(output: &serde_json::Value) -> CliResult {
     eprintln!("WEAVE_LOOM_READBACK={}", path.display());
     Ok(())
 }
-

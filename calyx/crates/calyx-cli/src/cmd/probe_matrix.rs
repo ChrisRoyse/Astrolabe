@@ -326,4 +326,3 @@ fn ensure_useful_log(log: &ProbeMatrixLog) -> CliResult {
     }
     Ok(())
 }
-

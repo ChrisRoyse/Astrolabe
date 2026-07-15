@@ -249,8 +249,13 @@ pub fn mine_git_archaeology(
                 // Force-removed scan (#381): scope the unreachable-commit walk to the
                 // member subtree so a force move that only rewrote out-of-subtree
                 // history never manufactures reverted-anchor evidence for this corpus.
-                let mut args =
-                    vec!["rev-list", "--reverse", previous_head.as_str(), "--not", head.as_str()];
+                let mut args = vec![
+                    "rev-list",
+                    "--reverse",
+                    previous_head.as_str(),
+                    "--not",
+                    head.as_str(),
+                ];
                 if let Some(prefix) = pathspec {
                     args.push("--");
                     args.push(prefix);

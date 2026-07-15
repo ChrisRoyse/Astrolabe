@@ -385,4 +385,3 @@ fn require_gpu_content_lenses(
         remediation: "replace every content lens with a GPU resident runtime before starting the service",
     }))
 }
-

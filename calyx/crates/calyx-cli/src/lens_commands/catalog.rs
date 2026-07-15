@@ -23,7 +23,6 @@ pub(crate) use store::LensCatalogDbReadback;
 
 use budget::placement_budget_from_catalog;
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LensCatalog {
     pub(crate) lenses: Vec<LensCatalogEntry>,
@@ -404,4 +403,3 @@ fn batch_ceiling(ms_per_input: f32) -> u32 {
     }
     (1_000.0 / ms_per_input).floor().clamp(1.0, u32::MAX as f32) as u32
 }
-

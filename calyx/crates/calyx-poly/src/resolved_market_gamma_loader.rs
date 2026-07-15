@@ -324,4 +324,3 @@ fn iso8601_to_unix(s: &str) -> Option<u64> {
     let secs = days * 86_400 + h * 3_600 + mi * 60 + se;
     u64::try_from(secs).ok()
 }
-

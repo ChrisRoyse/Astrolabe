@@ -354,4 +354,3 @@ fn crash_exit(pause_ms: Option<u64>) -> ! {
     }
     process::exit(1);
 }
-

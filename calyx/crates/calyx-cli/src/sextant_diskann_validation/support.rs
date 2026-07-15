@@ -276,4 +276,3 @@ fn value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .find(|window| window[0] == flag)
         .map(|window| window[1].as_str())
 }
-

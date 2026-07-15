@@ -288,7 +288,6 @@ impl CommissionFlags {
     }
 }
 
-
 fn require_nonempty(value: Option<String>, flag: &str) -> CliResult<String> {
     let value = value.ok_or_else(|| CliError::usage(format!("{flag} is required")))?;
     if value.trim().is_empty() {
@@ -337,4 +336,3 @@ fn sanitize_path_token(raw: &str) -> String {
         })
         .collect()
 }
-

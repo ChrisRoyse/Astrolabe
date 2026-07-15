@@ -358,4 +358,3 @@ fn injected_post_rename_failure(_path: &Path) -> Result<()> {
 fn io_error(path: &Path, err: std::io::Error) -> CalyxError {
     CalyxError::stale_derived(format!("{}: {err}", path.display()))
 }
-

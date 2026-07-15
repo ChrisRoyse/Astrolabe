@@ -202,7 +202,6 @@ impl ShadowVault {
         }
         Ok(())
     }
-
 }
 
 pub(crate) fn read_shadow_manifest(vault: &Path) -> Result<ShadowManifestReadback, CalyxError> {

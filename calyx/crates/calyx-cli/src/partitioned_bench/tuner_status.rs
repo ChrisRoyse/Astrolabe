@@ -152,4 +152,3 @@ struct Status<'a> {
     queries: usize,
     k: usize,
 }
-

@@ -487,4 +487,3 @@ impl Lens for DeclaredLens {
         )))
     }
 }
-

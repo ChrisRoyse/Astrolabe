@@ -299,4 +299,3 @@ fn run_command(program: &str, args: &[&str]) -> Result<CommandRead, String> {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
-

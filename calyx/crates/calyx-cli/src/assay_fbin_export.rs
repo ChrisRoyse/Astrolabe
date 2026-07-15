@@ -92,4 +92,3 @@ pub(super) fn local_error(
 pub(super) fn io_error(error: std::io::Error) -> CliError {
     CliError::io(error.to_string())
 }
-

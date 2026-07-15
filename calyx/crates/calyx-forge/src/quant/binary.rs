@@ -235,4 +235,3 @@ fn binary_error(op: &str, level: QuantLevel, detail: impl Into<String>) -> Forge
         remediation: BINARY_REMEDIATION.to_string(),
     }
 }
-

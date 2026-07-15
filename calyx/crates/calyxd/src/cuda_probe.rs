@@ -68,4 +68,3 @@ fn probe_real_device() -> Result<CudaDeviceInfo, DaemonError> {
          on an NVIDIA GPU host (server mode requires a working GPU and will not start without one)",
     ))
 }
-

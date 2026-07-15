@@ -241,7 +241,10 @@ pub(crate) fn handle_delete_project(
     if complete {
         // Success: fold the cleanup report into the C result so the caller sees
         // both the store deletion outcome and exactly which sidecars were removed.
-        augment_tool_result(&base_result, json!({ "astrolabe_sidecar_cleanup": cleanup }))
+        augment_tool_result(
+            &base_result,
+            json!({ "astrolabe_sidecar_cleanup": cleanup }),
+        )
     } else {
         // Fail closed: the project store was erased but at least one host artifact
         // could not be removed. Name every survivor so partial deletion is never

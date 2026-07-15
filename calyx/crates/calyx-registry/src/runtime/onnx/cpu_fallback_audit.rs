@@ -287,4 +287,3 @@ pub(super) fn audit_from_trace(
     }
     Ok(audit)
 }
-

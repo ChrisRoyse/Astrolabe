@@ -112,4 +112,3 @@ pub fn dpi_ceiling_from_bits(panel_bits: f64, anchor_entropy_bits: f64) -> f64 {
     let ratio = (panel_bits.max(0.0) / anchor_entropy_bits).min(1.0);
     (0.5 + 0.5 * ratio).min(CONFIDENCE_HARD_CAP)
 }
-

@@ -41,4 +41,3 @@ fn reject_text(text: &str, path: &str) -> Result<(), String> {
     }
     Ok(())
 }
-

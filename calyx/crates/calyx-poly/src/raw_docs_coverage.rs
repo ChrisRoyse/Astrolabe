@@ -338,4 +338,3 @@ fn accepted_blocked_runtime_row(row: &RawDocsCoverageRow) -> bool {
     row.source_family == "websocket-sports"
         && row.related_issues.iter().any(|issue| issue == "#187")
 }
-

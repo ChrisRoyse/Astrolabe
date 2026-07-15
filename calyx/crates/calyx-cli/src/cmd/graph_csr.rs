@@ -263,4 +263,3 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
     out
 }
-

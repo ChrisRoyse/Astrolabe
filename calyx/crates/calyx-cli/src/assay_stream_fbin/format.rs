@@ -170,4 +170,3 @@ fn canonical_f32(value: f32) -> f32 {
     let rounded = (value * 1_000.0).round() / 1_000.0;
     if rounded == 0.0 { 0.0 } else { rounded }
 }
-

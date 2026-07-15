@@ -323,4 +323,3 @@ pub(super) fn calyx_home() -> CliResult<PathBuf> {
         .map(PathBuf::from)
         .ok_or_else(|| CliError::usage("CALYX_HOME is required or pass --home <dir>"))
 }
-

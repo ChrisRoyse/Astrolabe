@@ -352,4 +352,3 @@ fn anchor_bool(anchor: &Anchor) -> Result<bool> {
         )),
     }
 }
-

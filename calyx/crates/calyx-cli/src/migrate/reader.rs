@@ -464,4 +464,3 @@ fn decode_embedding(bytes: Vec<u8>, row_num: u64) -> CliResult<Vec<f32>> {
     }
     Ok(values)
 }
-

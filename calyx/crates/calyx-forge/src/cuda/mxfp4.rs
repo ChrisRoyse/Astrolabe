@@ -106,4 +106,3 @@ fn nibble_at(codes: &[u8; MXFP4_PACKED_BYTES], idx: usize) -> u8 {
         byte >> 4
     }
 }
-

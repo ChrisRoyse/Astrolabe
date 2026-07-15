@@ -452,4 +452,3 @@ fn readback_report(
         readback_matches,
     }
 }
-

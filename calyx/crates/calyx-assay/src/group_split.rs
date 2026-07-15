@@ -150,4 +150,3 @@ struct GroupBucket {
     label: bool,
     indices: Vec<usize>,
 }
-

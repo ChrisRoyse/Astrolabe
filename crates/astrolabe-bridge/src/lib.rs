@@ -349,8 +349,7 @@ pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeEr
     // SAFETY: both CStrings outlive the call; the C function only reads the two
     // NUL-terminated strings and writes formatted help to stdout, returning 0
     // when the tool is known and non-zero (printing nothing) when it is not.
-    let rc =
-        unsafe { cbm_sys::cbm_cli_print_tool_help_prog(prog.as_ptr(), tool_name.as_ptr()) };
+    let rc = unsafe { cbm_sys::cbm_cli_print_tool_help_prog(prog.as_ptr(), tool_name.as_ptr()) };
     // The C formatter flushes stdout before returning, so the help is emitted
     // regardless of how the process later exits.
     Ok(rc == 0)

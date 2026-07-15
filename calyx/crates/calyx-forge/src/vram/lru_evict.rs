@@ -283,4 +283,3 @@ impl<'b, P: VramProbe, D: BlockDeallocator> GpuBlockRegistry<'b, P, D> {
         size
     }
 }
-

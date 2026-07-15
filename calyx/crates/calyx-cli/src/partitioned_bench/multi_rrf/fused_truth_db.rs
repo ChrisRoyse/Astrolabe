@@ -402,4 +402,3 @@ fn hex_sha256(bytes: &[u8]) -> String {
     }
     out
 }
-

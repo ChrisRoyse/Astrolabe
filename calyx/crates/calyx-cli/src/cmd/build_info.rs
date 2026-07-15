@@ -50,4 +50,3 @@ fn run(rest: &[String]) -> CliResult {
         executable: executable.display().to_string(),
     })
 }
-

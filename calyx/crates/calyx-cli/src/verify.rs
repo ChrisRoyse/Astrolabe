@@ -103,4 +103,3 @@ fn print_verify_result(result: VerifyResult) -> crate::error::CliResult {
         .into()),
     }
 }
-

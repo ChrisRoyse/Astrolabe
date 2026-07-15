@@ -1,5 +1,6 @@
 /* SHA-256 per FIPS 180-4. Straightforward reference implementation; validated
- * against the NIST test vectors in tests/test_cli.c. */
+ * manually against the NIST FIPS 180-4 known-answer vectors (abc /
+ * two-block message) at adoption. */
 
 #include "foundation/sha256.h"
 

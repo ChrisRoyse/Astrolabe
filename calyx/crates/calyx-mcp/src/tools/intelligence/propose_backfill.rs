@@ -178,4 +178,3 @@ fn backfill_error(message: impl Into<String>) -> CalyxError {
         remediation: "repair proposal backfill state before admitting the lens",
     }
 }
-

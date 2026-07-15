@@ -250,4 +250,3 @@ pub(super) fn fetch(repo: &hf_hub::api::sync::ApiRepo, filename: &str) -> Result
 fn normalized(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
-

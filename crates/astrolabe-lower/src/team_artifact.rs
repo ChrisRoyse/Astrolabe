@@ -544,7 +544,6 @@ fn ensure_graph_bound_to_ledger(rows: &[LedgerRow], graph_hash: &str) -> LowerRe
     Err(refuse(TeamArtifactRefusal::GraphAttestation, message))
 }
 
-
 fn ensure_manifest_head_matches(
     manifest: &TeamArtifactManifest,
     rows: &[LedgerRow],

@@ -385,4 +385,3 @@ fn sync_parent_dir(path: &Path) -> CliResult {
 fn sync_parent_dir(_path: &Path) -> CliResult {
     Ok(())
 }
-

@@ -487,4 +487,3 @@ impl LensFlags {
         Ok(())
     }
 }
-

@@ -485,4 +485,3 @@ fn gate_scale_truth(
 ) -> bool {
     db_fused_truth_scale_suitable || db_slot_truth_scale_suitable
 }
-

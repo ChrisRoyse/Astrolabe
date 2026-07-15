@@ -174,4 +174,3 @@ pub fn default_gte_lens_id() -> LensId {
 pub fn default_base_lens_id() -> String {
     default_gte_lens_id().to_string()
 }
-

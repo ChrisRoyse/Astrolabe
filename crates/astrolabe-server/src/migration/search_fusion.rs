@@ -701,7 +701,6 @@ fn parse_slot_name(name: &str) -> Option<SlotId> {
     }
 }
 
-
 /// The Astrolabe-side extension properties overlaid onto the CBM `search_graph`
 /// tool schema in tools/list (#328). Documents the `propagated_label` filter
 /// (#69) and the `fusion` engine (#42) truthfully — every property here maps to

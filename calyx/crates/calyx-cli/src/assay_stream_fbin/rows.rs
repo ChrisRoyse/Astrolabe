@@ -387,4 +387,3 @@ impl TimelineAccumulator {
         self.stats
     }
 }
-

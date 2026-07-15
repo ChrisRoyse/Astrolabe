@@ -251,4 +251,3 @@ pub(crate) fn parse_bridge_evaluate_rank(rest: &[String]) -> CliResult<EvaluateR
         .validate_for_command("bridge-evaluate-rank")?;
     Ok(args)
 }
-

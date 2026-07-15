@@ -215,4 +215,3 @@ fn mean_product(p: &[f64], q: &[f64], n: usize) -> f64 {
     }
     acc / (n as f64 * n as f64)
 }
-

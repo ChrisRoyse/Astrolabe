@@ -174,4 +174,3 @@ impl Ord for OrdF32 {
         self.0.total_cmp(&other.0)
     }
 }
-

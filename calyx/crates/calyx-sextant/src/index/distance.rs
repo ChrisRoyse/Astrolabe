@@ -216,4 +216,3 @@ mod x86 {
         lanes.into_iter().sum()
     }
 }
-

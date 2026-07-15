@@ -25,4 +25,3 @@ pub(crate) fn run(args: &[String]) -> CliResult {
     let evidence = write::write_outputs(&request, &rows, &measured).map_err(CliError::runtime)?;
     print_json(&evidence)
 }
-

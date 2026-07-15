@@ -170,4 +170,3 @@ pub(crate) fn write_line_allow_broken_pipe<W: Write>(
         Err(error) => Err(CliError::io(format!("flush stdout: {error}"))),
     }
 }
-

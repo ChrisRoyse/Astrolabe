@@ -316,4 +316,3 @@ fn hex_value(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
-

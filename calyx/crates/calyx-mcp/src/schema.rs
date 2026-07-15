@@ -51,4 +51,3 @@ pub fn object_schema(props: &[(&str, Value, bool)]) -> Value {
         "required": Value::Array(required),
     })
 }
-

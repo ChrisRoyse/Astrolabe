@@ -377,4 +377,3 @@ fn read_bandit_status(vault: &Path, shape_key: &str) -> CliResult<Value> {
         "physical_rows": physical_rows,
     }))
 }
-

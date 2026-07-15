@@ -4,7 +4,6 @@ mod args;
 mod convert;
 mod report;
 
-
 use calyx_core::CalyxError;
 
 use crate::error::{CliError, CliResult};

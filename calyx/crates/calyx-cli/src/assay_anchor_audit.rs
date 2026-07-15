@@ -186,4 +186,3 @@ fn extend_unique(target: &mut Vec<String>, values: &[String]) {
         }
     }
 }
-

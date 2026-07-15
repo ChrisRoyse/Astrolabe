@@ -92,4 +92,3 @@ pub(crate) fn rerank_hits(
         })
         .collect())
 }
-

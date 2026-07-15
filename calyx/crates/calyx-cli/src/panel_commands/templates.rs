@@ -435,4 +435,3 @@ fn modality_name(value: Modality) -> &'static str {
         Modality::Mixed => "mixed",
     }
 }
-

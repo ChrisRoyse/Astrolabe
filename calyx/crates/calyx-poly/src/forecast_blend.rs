@@ -75,4 +75,3 @@ pub fn blend_components(components: &[ForecastComponent]) -> Result<BlendResult>
         pooled_logit,
     })
 }
-

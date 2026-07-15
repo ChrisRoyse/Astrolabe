@@ -155,4 +155,3 @@ where
 {
     pairs.iter().map(value).sum::<f32>() / pairs.len().max(1) as f32
 }
-

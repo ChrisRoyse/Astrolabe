@@ -254,4 +254,3 @@ fn timeline_error(
         remediation,
     })
 }
-

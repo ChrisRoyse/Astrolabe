@@ -467,4 +467,3 @@ impl ReadbackContext {
         Ok(())
     }
 }
-

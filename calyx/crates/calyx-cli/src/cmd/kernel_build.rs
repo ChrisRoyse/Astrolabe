@@ -394,4 +394,3 @@ fn parse_unit(raw: &str, flag: &str) -> CliResult<f32> {
     }
     Ok(value)
 }
-

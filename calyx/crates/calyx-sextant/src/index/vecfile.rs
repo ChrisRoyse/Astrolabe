@@ -315,4 +315,3 @@ impl I32BinMatrix {
             .collect()
     }
 }
-

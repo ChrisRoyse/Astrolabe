@@ -175,7 +175,11 @@ impl GraphProjectionCsrEdge {
         if self.ledger_seq == 0 && self.ledger_hash == [0_u8; 32] {
             return None;
         }
-        Some(format!("{}:{}", self.ledger_seq, hex_lower(&self.ledger_hash)))
+        Some(format!(
+            "{}:{}",
+            self.ledger_seq,
+            hex_lower(&self.ledger_hash)
+        ))
     }
 }
 
@@ -444,7 +448,6 @@ where
         }
     }
 }
-
 
 fn materialize_graph_projection_from_source<C>(
     vault: &AsterVault<C>,

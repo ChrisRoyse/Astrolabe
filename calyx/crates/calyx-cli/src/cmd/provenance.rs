@@ -391,4 +391,3 @@ impl QuarantineLookup for NoQuarantine {
         Ok(false)
     }
 }
-

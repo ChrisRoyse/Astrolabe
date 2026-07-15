@@ -105,7 +105,6 @@ impl A38BundleStore {
             .collect()
     }
 
-
     pub(super) fn read_catalog(&self) -> CliResult<A38BundleCatalog> {
         let path = self.index_path();
         if !path.exists() {

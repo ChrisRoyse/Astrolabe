@@ -27,7 +27,6 @@ use super::errors;
 use super::manifest::{now_ms, panel_path, scheduler_path};
 use super::reader::ChunkRow;
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackfillMode {
     RealTei,

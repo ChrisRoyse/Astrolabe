@@ -125,4 +125,3 @@ where
 fn recurrence_read_error(message: impl Into<String>) -> calyx_core::CalyxError {
     sextant_error(CALYX_SEXTANT_RECURRENCE_READ_ERROR, message)
 }
-

@@ -381,4 +381,3 @@ pub(super) fn guard_zero_hit_reason(
         _ => None,
     }
 }
-

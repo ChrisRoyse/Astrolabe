@@ -167,4 +167,3 @@ pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Re
         reliability,
     })
 }
-

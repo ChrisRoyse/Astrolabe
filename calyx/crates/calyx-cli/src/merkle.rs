@@ -43,4 +43,3 @@ pub fn parse_range(value: &str) -> crate::error::CliResult<Range<u64>> {
     }
     Ok(start..end)
 }
-

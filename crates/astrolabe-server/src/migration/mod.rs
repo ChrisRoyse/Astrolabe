@@ -218,7 +218,6 @@ mod dispatch;
 // glob is needed by the colocated tests, which drive the gate internals directly.
 pub use dispatch::{handle_jsonrpc_raw, handle_tool_raw};
 
-
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
 /// Write-side name for the per-project lowered-SQLite mirror the Rust host
 /// places in the CBM store dir. This file ends in `.db` but is NOT a project

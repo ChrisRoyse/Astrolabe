@@ -413,4 +413,3 @@ fn provenance_hash(
     }
     hasher.finalize().to_hex().to_string()
 }
-

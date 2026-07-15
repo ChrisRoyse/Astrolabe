@@ -30,4 +30,3 @@ pub(crate) fn read_abundance_report(vault: &Path) -> CliResult<Value> {
 fn abundance_report_path(vault: &Path) -> PathBuf {
     vault.join("intelligence").join("abundance.json")
 }
-

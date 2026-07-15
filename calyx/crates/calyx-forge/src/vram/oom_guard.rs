@@ -248,4 +248,3 @@ fn driver_alloc_error(err: cudarc::driver::result::DriverError) -> CudaAllocErro
         }
     }
 }
-

@@ -154,4 +154,3 @@ fn first_failing_tier(tiers: &[TierResult]) -> Option<Tier> {
             .any(|tier| tier.tier == *ordered && !tier.passed)
     })
 }
-

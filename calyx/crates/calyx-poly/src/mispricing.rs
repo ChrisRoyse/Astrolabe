@@ -80,4 +80,3 @@ pub fn detect_mispricing(
         n_neighbors: base_rate.k,
     })
 }
-

@@ -181,4 +181,3 @@ fn latency_budget(sqlite_p99_us: u64) -> u64 {
     let relative = sqlite_p99_us.div_ceil(LATENCY_REGRESSION_DIVISOR);
     sqlite_p99_us.saturating_add(relative.max(LATENCY_JITTER_BUDGET_US))
 }
-

@@ -286,4 +286,3 @@ impl CalyxMetrics {
 fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
-

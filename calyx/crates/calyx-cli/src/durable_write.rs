@@ -108,4 +108,3 @@ fn sync_parent_dir(parent: &Path, label: &str) -> CliResult {
         ))
     })
 }
-

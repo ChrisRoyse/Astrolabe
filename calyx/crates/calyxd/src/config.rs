@@ -191,4 +191,3 @@ fn resolve_home(path: &Path, home: Option<String>) -> PathBuf {
         None => path.to_path_buf(),
     }
 }
-

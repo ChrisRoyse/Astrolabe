@@ -20,12 +20,8 @@ pub(crate) const REQUIRED_TABLES: &[&str] = &[
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PgConn {
-    ReadOnlyPsql {
-        conninfo: String,
-    },
-    DumpDir {
-        root: PathBuf,
-    },
+    ReadOnlyPsql { conninfo: String },
+    DumpDir { root: PathBuf },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

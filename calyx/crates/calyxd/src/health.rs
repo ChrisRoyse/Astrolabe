@@ -283,4 +283,3 @@ fn iso8601_from_unix_secs(secs: u64) -> String {
 
     format!("{civil_year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
-

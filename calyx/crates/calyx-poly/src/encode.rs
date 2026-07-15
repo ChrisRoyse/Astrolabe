@@ -190,4 +190,3 @@ impl QuantileEncoder {
         out
     }
 }
-

@@ -133,4 +133,3 @@ impl fmt::Display for DaemonError {
 }
 
 impl std::error::Error for DaemonError {}
-

@@ -40,4 +40,3 @@ pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     );
     Ok(())
 }
-

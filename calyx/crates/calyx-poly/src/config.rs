@@ -337,4 +337,3 @@ fn parse_domain_env(name: &str, value: &str) -> Result<Domain> {
         )),
     }
 }
-

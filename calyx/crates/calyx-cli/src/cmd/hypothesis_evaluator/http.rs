@@ -242,5 +242,3 @@ fn auth_failed(message: impl Into<String>) -> CliError {
         remediation: "verify the evaluator bearer token, endpoint, and model authorization",
     })
 }
-
-

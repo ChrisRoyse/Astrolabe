@@ -234,4 +234,3 @@ fn entropy_bits(counts: &[f64], n: f64) -> f64 {
     }
     h
 }
-

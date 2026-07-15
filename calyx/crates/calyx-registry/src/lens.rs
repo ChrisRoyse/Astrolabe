@@ -492,4 +492,3 @@ fn ensure_finite(lens_id: LensId, data: &[f32]) -> Result<()> {
         "lens {lens_id} emitted NaN or Inf"
     )))
 }
-

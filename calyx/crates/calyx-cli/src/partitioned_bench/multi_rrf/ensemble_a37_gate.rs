@@ -30,4 +30,3 @@ pub(super) fn validate(gate: &A37DiversityGate, required: bool) -> CliResult {
         remediation: "pass an A37 gate_passed EnsembleCard before using partitioned-rrf recall/SLO as gate evidence",
     }))
 }
-

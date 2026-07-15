@@ -325,4 +325,3 @@ fn anchor_value_payload(value: &AnchorValue) -> serde_json::Value {
         AnchorValue::Vector(value) => serde_json::json!({"type": "vector", "value": value}),
     }
 }
-

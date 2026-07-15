@@ -490,4 +490,3 @@ fn lifecycle_def(name: &str, description: &str, use_when: &str) -> ToolDef {
 fn enum_string(values: &[&str]) -> Value {
     json!({ "type": "string", "enum": values })
 }
-

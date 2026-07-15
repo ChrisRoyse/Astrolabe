@@ -462,4 +462,3 @@ fn ground_truth_source(req: &Request<'_>) -> Value {
             })
         })
 }
-

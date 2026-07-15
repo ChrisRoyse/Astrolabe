@@ -341,4 +341,3 @@ fn read_manifest(path: &Path) -> CliResult<LensForgeManifest> {
         ))
     })
 }
-

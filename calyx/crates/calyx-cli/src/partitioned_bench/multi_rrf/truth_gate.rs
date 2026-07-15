@@ -14,4 +14,3 @@ pub(super) fn enforce(required: bool, truth_n: usize, has_scale_truth: bool) -> 
         remediation: "pass --slot-ground-truth-cf-root with its DB association key, or legacy fused/slot file truth only as migration diagnostics; CPU brute force is diagnostic-only",
     }))
 }
-

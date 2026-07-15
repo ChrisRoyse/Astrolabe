@@ -42,7 +42,3 @@ pub(crate) fn parse_abundance(rest: &[String]) -> CliResult<Subcommand> {
 pub(crate) fn parse_propose_lens(rest: &[String]) -> CliResult<Subcommand> {
     parse::parse_propose_lens(rest)
 }
-
-
-
-

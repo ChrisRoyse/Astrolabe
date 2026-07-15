@@ -102,4 +102,3 @@ pub fn spread(best_bid: f64, best_ask: f64) -> Option<f64> {
     }
     Some((best_ask - best_bid).max(0.0))
 }
-

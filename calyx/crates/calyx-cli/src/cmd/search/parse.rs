@@ -206,7 +206,3 @@ impl SearchGuardArg {
         }
     }
 }
-
-
-
-

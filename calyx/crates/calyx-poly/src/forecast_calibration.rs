@@ -143,4 +143,3 @@ fn brier(pairs: impl Iterator<Item = (f64, bool)>) -> f64 {
     }
     if n > 0.0 { sum / n } else { 0.0 }
 }
-

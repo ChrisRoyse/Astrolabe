@@ -285,4 +285,3 @@ fn error(code: &'static str, message: impl Into<String>, remediation: &'static s
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-

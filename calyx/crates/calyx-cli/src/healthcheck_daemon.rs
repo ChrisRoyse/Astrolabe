@@ -131,4 +131,3 @@ fn value<'a>(flag: &str, next: Option<&'a String>) -> Result<&'a str, String> {
     next.map(String::as_str)
         .ok_or_else(|| format!("{USAGE}\n{flag} requires a value"))
 }
-

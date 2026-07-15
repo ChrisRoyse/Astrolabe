@@ -284,4 +284,3 @@ fn mvcc_constellation(vault_id: VaultId) -> Constellation {
         },
     }
 }
-

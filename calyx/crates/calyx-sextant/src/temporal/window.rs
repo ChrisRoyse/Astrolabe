@@ -149,4 +149,3 @@ fn hit_matches_window(hit: &Hit, window: &TimeWindow) -> bool {
 fn invalid_window(message: impl Into<String>) -> calyx_core::CalyxError {
     sextant_error(CALYX_TEMPORAL_INVALID_WINDOW, message)
 }
-

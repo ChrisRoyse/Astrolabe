@@ -364,4 +364,3 @@ fn config_invalid(message: impl Into<String>) -> CalyxError {
         remediation: "fix the lensforge manifest or regenerated artifacts",
     }
 }
-

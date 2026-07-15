@@ -187,4 +187,3 @@ fn parse_limit(args: &[String], idx: usize, flag: &str) -> Result<usize, String>
     }
     Ok(parsed)
 }
-

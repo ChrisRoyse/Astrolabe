@@ -232,4 +232,3 @@ impl From<calyx_search::SearchError> for CliError {
         }
     }
 }
-

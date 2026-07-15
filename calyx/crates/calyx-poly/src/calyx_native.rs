@@ -234,4 +234,3 @@ fn provenance_hash(
     hasher.update(&[u8::from(admissible)]);
     hasher.finalize().to_hex().to_string()
 }
-
