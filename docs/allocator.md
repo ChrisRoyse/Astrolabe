@@ -40,7 +40,8 @@ ordering is a correctness contract, not an optimization. Two mechanisms enforce
 it: the C-side `assert(sqlite_rc == SQLITE_OK)` inside `cbm_alloc_init()` aborts
 fail-closed if SQLite initialized first, and `cbm_alloc_bindings_active()`
 (Rust: `cbm_sys::allocator_bindings_active()`) reads the binding flag back so a
-test can prove the binding is live *before* it opens a store.
+manual Full State Verification can prove the binding is live *before* it opens a
+store.
 
 ## MinGW-only global override
 

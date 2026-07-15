@@ -14,7 +14,7 @@
     multi-session lock discipline (#197): a session's cleanup can never stomp another live
     session's PIDs, because this code path has no capability to stop any PID at all.
 
-    Both the launcher (against the workspace lock) and its tests (against isolated fixture
+    Both the launcher (against the workspace lock) and its manual FSV (against isolated fixture
     locks, never the live workspace -- #197) route through these functions.
 #>
 

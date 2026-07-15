@@ -33,9 +33,9 @@
         structured DETACH_RUN[...] line with the real run PID, and EXITS. The caller (and its
         whole process tree) may then die with no effect on the run.
 
-    FSV of the mechanism itself lives in scripts/test-detach-run.ps1 (isolated fixture paths):
-    launch a long dummy run, kill the launching shell tree, prove the run completes and the
-    lock lifecycle stays correct.
+    FSV of the mechanism itself is performed manually against isolated fixture paths: launch a
+    long dummy run, kill the launching shell tree, prove the run completes and the lock lifecycle
+    stays correct.
 
 .NOTES
     Refs #391, #197. No elevation required: a one-time task in the current user's \ folder is
