@@ -463,10 +463,13 @@ pub(crate) struct KernelAnswerInputs {
 /// weight come from the persisted kernel artifact; per-node provenance references
 /// come from the persisted provenance store, joined by `CxId`.
 ///
-/// Association edges carry no persisted per-hop ledger reference in the projection
-/// yet, so a multi-hop answer fails closed at the answer engine's ledger-required
-/// gate ([`CALYX_KERNEL_ANSWER_LEDGER_REQUIRED`]) until the graph producer emits
-/// them; a single grounded, provenanced entry still serves and records. No
+/// Association edges now carry the per-hop ledger reference the graph producer
+/// emits into the persisted projection CSR (#393): each projection edge renders the
+/// attesting source edge row's Ledger CF pointer via
+/// [`astrolabe_ingest::GraphProjectionCsrEdge::ledger_ref`], so a multi-hop answer
+/// whose traversed edges and destination nodes are all attributed serves grounded.
+/// An edge or node that genuinely lacks attribution still fails closed at the answer
+/// engine's ledger-required gate ([`CALYX_KERNEL_ANSWER_LEDGER_REQUIRED`]); no
 /// reference is ever fabricated — a node the provenance store does not cover stays
 /// unprovenanced and the engine refuses to serve it as an entry.
 ///
@@ -531,11 +534,16 @@ pub(crate) fn build_kernel_answer_inputs(
     for (src_index, window) in csr.offsets.windows(2).enumerate() {
         let src = csr.nodes[src_index].id;
         for edge in &csr.edges[window[0]..window[1]] {
+            // #393: the per-edge ledger reference is now persisted in the projection
+            // CSR (the attesting source edge row's Ledger CF pointer). An edge that
+            // carries no attestation renders `None`, so a multi-hop answer traversing
+            // it still fails closed at the engine's ledger-required gate — the
+            // reference is never fabricated.
             edges.push(astrolabe_kernel::AnswerEdge::new(
                 src,
                 edge.dst,
                 astrolabe_kernel::weight_to_permille(edge.weight),
-                None,
+                edge.ledger_ref(),
             ));
         }
     }

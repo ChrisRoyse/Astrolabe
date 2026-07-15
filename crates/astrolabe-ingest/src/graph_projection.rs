@@ -26,7 +26,9 @@ const PROJECTION_REMEDIATION: &str =
 const PROJECTION_SCHEMA: &str = "astrolabe-graph-projection-csr-v1";
 const MANIFEST_VERSION: u32 = 1;
 const SEGMENT_MAGIC: &[u8; 8] = b"ASTROCSR";
-const SEGMENT_VERSION: u32 = 1;
+// v2 (#393): each CSR edge additionally carries its source edge row's ledger
+// attestation (`ledger_seq` u64 LE + `ledger_hash` 32 bytes) after the weight.
+const SEGMENT_VERSION: u32 = 2;
 const CXID_BYTES: usize = 16;
 const ASTROLABE_PROJECTION_ACTOR: &str = "astrolabe-graph-projection";
 
@@ -151,6 +153,30 @@ pub struct GraphProjectionCsrEdge {
     pub etype: u16,
     /// Projection edge weight in `[0, 1]`.
     pub weight: f32,
+    /// Ledger sequence of the source Graph CF edge row that attests this edge
+    /// (#393). `0` with an all-zero [`Self::ledger_hash`] denotes an edge carrying
+    /// no ledger attestation, which a multi-hop kernel answer refuses to traverse.
+    #[serde(default)]
+    pub ledger_seq: u64,
+    /// Hash-chain entry hash of the attesting ledger entry (#393). All-zero with a
+    /// `0` [`Self::ledger_seq`] denotes an unattested edge.
+    #[serde(default)]
+    pub ledger_hash: [u8; 32],
+}
+
+impl GraphProjectionCsrEdge {
+    /// Renders this edge's persisted ledger attestation as a `seq:hex(hash)`
+    /// reference, or `None` when the edge carries no attestation (a zero ledger
+    /// pointer) — the shape the kernel answer engine's per-hop ledger-required gate
+    /// consumes (#393). The reference points at a real, persisted Ledger CF entry:
+    /// the `provenance` [`calyx_core::LedgerRef`] of the source edge row this
+    /// projection edge was materialized from.
+    pub fn ledger_ref(&self) -> Option<String> {
+        if self.ledger_seq == 0 && self.ledger_hash == [0_u8; 32] {
+            return None;
+        }
+        Some(format!("{}:{}", self.ledger_seq, hex_lower(&self.ledger_hash)))
+    }
 }
 
 /// Decoded graph projection CSR.
@@ -822,7 +848,12 @@ fn build_projection_csr(
     source: &SourceEdges,
 ) -> IngestResult<GraphProjectionCsr> {
     let mut node_weights = BTreeMap::<CxId, f32>::new();
-    let mut edges = BTreeMap::<(CxId, CxId, u16), f32>::new();
+    // Per deduped (src, dst, etype): the max projected weight, plus the strongest
+    // ledger attestation (greatest (seq, hash)) among the source rows that produced
+    // it (#393). Every source edge row carries a real `provenance` LedgerRef pointing
+    // at a persisted Ledger CF entry; picking the greatest deterministically pairs a
+    // real attestation with the projection edge without fabricating a reference.
+    let mut edges = BTreeMap::<(CxId, CxId, u16), (f32, u64, [u8; 32])>::new();
     for source_edge in &source.rows {
         let Some(weight) = kind.projected_weight(source_edge.kind, source_edge.row.weight) else {
             continue;
@@ -833,14 +864,22 @@ fn build_projection_csr(
         if kind == GraphProjectionKind::KernelGraph {
             apply_kernel_node_weight(&mut node_weights, &source_edge.row)?;
         }
+        let seq = source_edge.row.provenance.seq;
+        let hash = source_edge.row.provenance.hash;
         edges
             .entry((
                 source_edge.row.src,
                 source_edge.row.dst,
                 source_edge.row.etype,
             ))
-            .and_modify(|current| *current = current.max(weight))
-            .or_insert(weight);
+            .and_modify(|current| {
+                current.0 = current.0.max(weight);
+                if (seq, hash) > (current.1, current.2) {
+                    current.1 = seq;
+                    current.2 = hash;
+                }
+            })
+            .or_insert((weight, seq, hash));
     }
 
     let nodes = node_weights
@@ -854,11 +893,17 @@ fn build_projection_csr(
     }
     let mut by_src = vec![Vec::<GraphProjectionCsrEdge>::new(); nodes.len()];
     let mut association_edges = BTreeSet::<(CxId, CxId)>::new();
-    for ((src, dst, etype), weight) in edges {
+    for ((src, dst, etype), (weight, ledger_seq, ledger_hash)) in edges {
         let src_index = *node_index
             .get(&src)
             .ok_or_else(|| projection_corrupt("projection edge source has no node row"))?;
-        by_src[src_index].push(GraphProjectionCsrEdge { dst, etype, weight });
+        by_src[src_index].push(GraphProjectionCsrEdge {
+            dst,
+            etype,
+            weight,
+            ledger_seq,
+            ledger_hash,
+        });
         association_edges.insert((src, dst));
     }
     let mut offsets = Vec::with_capacity(nodes.len() + 1);
@@ -1202,6 +1247,8 @@ fn encode_segment(segment: &DecodedSegment) -> IngestResult<Vec<u8>> {
         out.extend_from_slice(edge.dst.as_bytes());
         out.extend_from_slice(&edge.etype.to_le_bytes());
         out.extend_from_slice(&edge.weight.to_le_bytes());
+        out.extend_from_slice(&edge.ledger_seq.to_le_bytes());
+        out.extend_from_slice(&edge.ledger_hash);
     }
     Ok(out)
 }
@@ -1247,7 +1294,15 @@ fn decode_segment(bytes: &[u8]) -> IngestResult<DecodedSegment> {
         let etype = reader.read_u16("CSR edge etype")?;
         let weight = reader.read_f32("CSR edge weight")?;
         validate_edge_weight(weight, "CSR edge weight")?;
-        edges.push(GraphProjectionCsrEdge { dst, etype, weight });
+        let ledger_seq = reader.read_u64("CSR edge ledger seq")?;
+        let ledger_hash = reader.read_hash32("CSR edge ledger hash")?;
+        edges.push(GraphProjectionCsrEdge {
+            dst,
+            etype,
+            weight,
+            ledger_seq,
+            ledger_hash,
+        });
     }
     reader.finish()?;
     Ok(DecodedSegment {
@@ -1315,6 +1370,13 @@ impl<'a> SegmentReader<'a> {
         let mut out = [0_u8; CXID_BYTES];
         out.copy_from_slice(bytes);
         Ok(CxId::from_bytes(out))
+    }
+
+    fn read_hash32(&mut self, field: &str) -> IngestResult<[u8; 32]> {
+        let bytes = self.take(32, field)?;
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(bytes);
+        Ok(out)
     }
 
     fn take(&mut self, len: usize, field: &str) -> IngestResult<&'a [u8]> {
