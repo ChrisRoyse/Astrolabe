@@ -2869,29 +2869,43 @@ fn cross_term_values(
             0,
         ),
         EagerCrossTermComparator::NeighborhoodAgreement => {
-            // #433: the peer loop skips any peer whose operands are not both
-            // measurable, so the comparable pool — computed once per kind — is the
-            // exact iteration domain of the uncapped path. Sampling *from the
-            // pool* (rather than from all indices) guarantees a capped profile
-            // still scores up to `cap` genuinely comparable peers, so capping can
-            // never flip a symbol to `InsufficientNeighborhood` that the uncapped
-            // path would have scored.
-            let comparable_pool = operands
-                .iter()
-                .enumerate()
-                .filter(|(_, (left, right))| left.is_ok() && right.is_ok())
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
+            // #433: a peer contributes to a source's neighborhood profile iff BOTH
+            // its operand vectors match the source's shapes exactly (`cosine` is
+            // Some only for equal-kind, equal-dim pairs). Grouping the measurable
+            // pool by that (left, right) shape signature — once per kind — makes
+            // each source's group the *exact* contributor domain of the uncapped
+            // peer loop. Sampling from the source's own group therefore preserves
+            // the contributing-peer count at min(cap, group-1): capping can never
+            // flip a symbol to `InsufficientNeighborhood` that the uncapped path
+            // would have scored, so the persisted scalar-row set is count-preserved
+            // and only the profile membership (values within Monte-Carlo noise)
+            // changes.
+            let mut sig_groups: BTreeMap<(VectorSig, VectorSig), Vec<usize>> = BTreeMap::new();
+            for (index, (left, right)) in operands.iter().enumerate() {
+                if let (Ok(left), Ok(right)) = (left, right) {
+                    sig_groups
+                        .entry((vector_sig(left), vector_sig(right)))
+                        .or_default()
+                        .push(index);
+                }
+            }
             let mut capped = 0usize;
             let values = selected_indices
                 .iter()
                 .map(|&node_index| {
+                    let group = match &operands[node_index] {
+                        (Ok(left), Ok(right)) => sig_groups
+                            .get(&(vector_sig(left), vector_sig(right)))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        _ => &[],
+                    };
                     neighborhood_cross_term_value(
                         node_index,
                         &nodes[node_index].qualified_name,
                         kind,
                         &operands,
-                        &comparable_pool,
+                        group,
                         sample_cap,
                         sample_seed,
                         &mut capped,
@@ -2900,6 +2914,17 @@ fn cross_term_values(
                 .collect();
             (values, capped)
         }
+    }
+}
+
+/// Shape signature deciding pairwise [`cosine`] comparability: two vectors score
+/// `Some` iff their signatures are equal (same kind, same dim).
+type VectorSig = (bool, u32);
+
+fn vector_sig(vector: &NormalizedVector) -> VectorSig {
+    match vector {
+        NormalizedVector::Dense { dim, .. } => (true, *dim),
+        NormalizedVector::Sparse { dim, .. } => (false, *dim),
     }
 }
 
@@ -2983,14 +3008,15 @@ fn neighborhood_cross_term_value(
     };
 
     // #433: bound the O(n) per-symbol peer scan to a seeded without-replacement
-    // subsample of the cap when the corpus has more comparable peers than the cap.
-    // The subsample is drawn from the comparable pool (the exact iteration domain
-    // of the uncapped path once non-measurable peers are skipped), so a capped
-    // profile still scores up to `cap` genuinely comparable peers. The profile
-    // cosine is a Monte-Carlo estimate whose variance is O(1/m); at the declared
-    // cap it is pinned within its noise band, so further peers buy no accuracy
-    // while costing O(n). A corpus with no more comparable peers than the cap is
-    // scored whole and is byte-identical to the uncapped path.
+    // subsample of the cap when the source's shape-signature group holds more
+    // comparable peers than the cap. `comparable_pool` is the source's OWN
+    // signature group — the exact contributor domain of the uncapped peer loop
+    // (every member scores `Some` on both slots) — so a capped profile always
+    // scores exactly min(cap, group-1) contributing peers and the scalar-row set
+    // is count-preserved. The profile cosine is a Monte-Carlo estimate whose
+    // variance is O(1/m); at the declared cap it is pinned within its noise band,
+    // so further peers buy no accuracy while costing O(n). A group at or below
+    // the cap is scored whole and is byte-identical to the uncapped path.
     let comparable_peers =
         comparable_pool.len() - usize::from(comparable_pool.binary_search(&node_index).is_ok());
     let sampled;
