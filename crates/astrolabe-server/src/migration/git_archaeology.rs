@@ -14,6 +14,43 @@ use calyx_core::{AnchorKind, AnchorValue};
 
 const ARCHAEOLOGY_ACTOR: &str = "astrolabe-git-archaeology";
 
+/// Write-side prefix for the transient git-archaeology scratch artifacts this
+/// module drops into the CBM store dir: the historical-index scratch store
+/// `".astrolabe-archaeology-<pid>-<nanos>.db"` and its sibling worktree
+/// `".astrolabe-archaeology-worktree-<nonce>"`. The scratch store ends in `.db`
+/// but is NOT a project store — it is live during an archaeology pass and can
+/// survive a crash — so the C enumerator (`is_project_db_file` in
+/// `cbm/src/mcp/mcp.c`) skips the family by this reserved prefix (#414).
+///
+/// DRIFT CONTRACT: MUST byte-match the C-side `CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX`
+/// (declared in `cbm/src/mcp/mcp.h`); the compile-time assertion below binds
+/// the two.
+const ARCHAEOLOGY_DB_PREFIX: &str = ".astrolabe-archaeology-";
+
+/// #414 drift guard — see `LOWERED_SQLITE_SUFFIX`'s twin assertion in
+/// `migration/mod.rs`. `astrolabe_bridge::CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX` is
+/// the bindgen-surfaced C macro (NUL-terminated byte array).
+const _: () = {
+    let rust = ARCHAEOLOGY_DB_PREFIX.as_bytes();
+    let c = astrolabe_bridge::CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX;
+    assert!(
+        c.len() == rust.len() + 1,
+        "C CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX and Rust ARCHAEOLOGY_DB_PREFIX have drifted (length)"
+    );
+    let mut i = 0;
+    while i < rust.len() {
+        assert!(
+            c[i] == rust[i],
+            "C CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX and Rust ARCHAEOLOGY_DB_PREFIX have drifted (bytes)"
+        );
+        i += 1;
+    }
+    assert!(
+        c[rust.len()] == 0,
+        "C reserved prefix is not NUL-terminated"
+    );
+};
+
 #[derive(Debug, Clone)]
 struct Evidence {
     commit: String,
@@ -232,8 +269,8 @@ fn index_historical_commit(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    let worktree = cache_dir.join(format!(".astrolabe-archaeology-worktree-{nonce}"));
-    let database = cache_dir.join(format!(".astrolabe-archaeology-{nonce}.db"));
+    let worktree = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}worktree-{nonce}"));
+    let database = cache_dir.join(format!("{ARCHAEOLOGY_DB_PREFIX}{nonce}.db"));
     add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
         // Scope the historical index to the requested corpus subtree within the

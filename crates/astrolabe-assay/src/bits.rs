@@ -538,15 +538,35 @@ fn bootstrap_interval(prepared: &Prepared, seed: u64, cfg: &BitsConfig) -> BitsI
     let m = raw.clamp((cfg.k + 2).min(n), n.saturating_sub(1).max(1));
     let mut rng = DeterministicRng::from_u64_labeled(seed, "subsample");
     let mut indices: Vec<usize> = (0..n).collect();
-    let mut stats = Vec::with_capacity(cfg.bootstrap_resamples);
+    // #401: this seeded subsample bootstrap is the dominant cold-index cost. Each
+    // draw's KSG point estimate is O(m^2), run `bootstrap_resamples` (default 200)
+    // times per slot/axis, and the index-time signal-card pass invokes it for every
+    // dense slot — making it the top wall-clock phase of a plain shadow index. The
+    // draws are independent GIVEN their subsample index sets, so generate every
+    // index set SEQUENTIALLY first (the partial Fisher–Yates mutates one shared
+    // permutation across draws, so the RNG stream and each snapshot must be produced
+    // in the exact serial order to stay byte-identical), then evaluate the O(m^2)
+    // point estimates in parallel over rayon's pre-attached global pool. An indexed
+    // parallel collect preserves order, and the interval reads sorted stats, so the
+    // result is identical to the serial computation regardless of worker count
+    // (ad-hoc thread::spawn is unsafe in the mingw + static-libcbm server binary —
+    // see astrolabe-ingest #349 — so the shared rayon pool is the only safe route).
+    let mut subsamples: Vec<Vec<usize>> = Vec::with_capacity(cfg.bootstrap_resamples);
     for _ in 0..cfg.bootstrap_resamples {
         // Partial Fisher–Yates: randomize the first m positions of a permutation.
         for i in 0..m {
             let j = i + (rng.next_u64() % (n - i) as u64) as usize;
             indices.swap(i, j);
         }
-        stats.push(prepared.resample(&indices[..m]).point_bits(cfg.k));
+        subsamples.push(indices[..m].to_vec());
     }
+    let mut stats: Vec<f64> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        subsamples
+            .into_par_iter()
+            .map(|idx| prepared.resample(&idx).point_bits(cfg.k))
+            .collect()
+    };
     stats.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let alpha = 1.0 - cfg.ci_confidence_permille as f64 / 1000.0;
     BitsInterval {

@@ -51833,10 +51833,10 @@ static SYSTEM_INFO winSysInfo;
 static void *winConvertFromUtf8Filename(const char *zFilename){
   void *zConverted = 0;
   if( osIsNT() ){
-#ifdef __CYGWIN__
     int nChar;
     LPWSTR zWideFilename;
 
+#ifdef __CYGWIN__
     if( osCygwin_conv_path && !(winIsDriveLetterAndColon(zFilename)
         && winIsDirSep(zFilename[2])) ){
       i64 nByte;
@@ -51869,6 +51869,17 @@ static void *winConvertFromUtf8Filename(const char *zFilename){
         sqlite3_free(zConverted);
       }
     }
+#endif /* __CYGWIN__ */
+    /* ASTROLABE #412: the extended-length "\\?\" prefix for paths over MAX_PATH
+     * was upstream gated behind __CYGWIN__, so a normal x86_64-pc-windows-gnu
+     * build handed CreateFileW a MAX_PATH-bound path and deep store-family
+     * databases (<store>/<project>.db and the .astrolabe-asof bucket dbs) failed
+     * to open. Convert UTF-8 -> UTF-16 and add the same "\\?\" (drive) /
+     * "\\?\UNC" (UNC) prefix the Cygwin branch uses whenever the path exceeds
+     * MAX_PATH. Paths at or under MAX_PATH are byte-identical to the historical
+     * winUtf8ToUnicode() output, and an already-"\\?\"-prefixed path (e.g. one
+     * handed in by a caller) is never double-prefixed because winIsDirSep guards
+     * require a bare drive letter or bare "\\" prefix. */
     nChar = osMultiByteToWideChar(CP_UTF8, 0, zFilename, -1, NULL, 0);
     if( nChar==0 ){
       return 0;
@@ -51895,9 +51906,6 @@ static void *winConvertFromUtf8Filename(const char *zFilename){
       memcpy(zWideFilename, L"\\\\?\\UNC", 14);
     }
     zConverted = zWideFilename;
-#else
-    zConverted = winUtf8ToUnicode(zFilename);
-#endif /* __CYGWIN__ */
   }
 #if defined(SQLITE_WIN32_HAS_ANSI) && defined(_WIN32)
   else{

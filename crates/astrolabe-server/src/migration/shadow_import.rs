@@ -1603,9 +1603,34 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }
         Err(err) => return Err(err.into()),
     };
+    // #401 shadow-import phase telemetry: opt-in, labeled, permanent (mirrors the
+    // libcbm CBM_PROFILE pattern). Silent unless the operator sets ASTRO_SHADOW_TIMING,
+    // so a normal index prints nothing; when set, each corpus-wide phase's wall-clock
+    // is emitted to stderr so cold-index throughput can be attributed to a real phase
+    // instead of guessed. Low volume (one line per phase per index), never per-row spew.
+    let shadow_timing = std::env::var_os("ASTRO_SHADOW_TIMING").is_some();
+    let mut _shadow_mark = std::time::Instant::now();
+    macro_rules! shadow_phase {
+        ($name:expr) => {{
+            if shadow_timing {
+                eprintln!(
+                    "astro.shadow.timing phase={} ms={}",
+                    $name,
+                    _shadow_mark.elapsed().as_millis()
+                );
+            }
+            _shadow_mark = std::time::Instant::now();
+        }};
+    }
     let shadow_import =
         import_shadow_vault_report(&sqlite_path, &vault, &ShadowSlotRuntime, &options, row_sink)?;
     let report = shadow_import.report;
+    if shadow_timing {
+        for (label, ms) in &report.timing_ms.0 {
+            eprintln!("astro.shadow.timing phase=import_raw.{label} ms={ms}");
+        }
+    }
+    shadow_phase!("import_raw_total");
     let git_archaeology = match git_repo {
         Some(repo) => {
             let mode = match read_config_value(
@@ -1628,6 +1653,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             "provenance": "unavailable",
         }),
     };
+    shadow_phase!("git_archaeology");
     let import_changed = report.new_cx_ids > 0
         || report.graph_rows_written > 0
         || report.edge_rows_written > 0
@@ -1636,6 +1662,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // invalidation lane below (#23): re-reading the full graph in each phase
     // tripled the largest fixed cost of the delta path at M scale.
     let after_snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
+    shadow_phase!("after_snapshot_read");
     let after_cx_by_qn = after_snapshot
         .nodes
         .iter()
@@ -1663,6 +1690,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
             .map(|(_, cx_id)| *cx_id)
             .collect(),
     });
+    shadow_phase!("weave_delta_prepare");
     let mut weave = run_live_weave_with_snapshot(
         &vault,
         project,
@@ -1670,6 +1698,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         delta.as_ref(),
         Some(&after_snapshot),
     )?;
+    shadow_phase!("weave");
     let invalidations = persist_delta_invalidations_with_snapshot(
         &vault,
         project,
@@ -1678,8 +1707,11 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         &weave,
         Some(&after_snapshot),
     )?;
+    shadow_phase!("invalidations");
     let layout_frames = persist_layout_frames(&vault, project, import_changed)?;
+    shadow_phase!("layout_frames");
     let drift = index_time_drift_summary(&vault, project, &vault_dir);
+    shadow_phase!("drift");
     // #365 index-time hook (lane F): persist the real KernelArtifact for this
     // project into the vault Kernel CF via build_and_persist_kernel, grounded on
     // the promotion-aware anchor trust map (#352). Single post-import call — placed
@@ -1689,6 +1721,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // build a kernel is a labeled surface, never an index failure. (Overlaps lane
     // A's shadow_import.rs — keep this to exactly this one call.)
     let kernel_artifact = persist_index_time_kernel_artifact(&vault, project);
+    shadow_phase!("kernel_artifact");
     // #379 index-time hook (lane A/w15): produce and persist the per-axis
     // signal-ranking cards the get_architecture signal_ranking aspect reads, so
     // that aspect serves real measured bits instead of labeled-unavailable
@@ -1699,6 +1732,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // failure. (Shares shadow_import.rs with lane D/E/F index-time hooks — keep
     // this to exactly this one call.)
     let signal_cards = index_time_signal_cards_summary(cache_dir, &vault, project, &vault_dir);
+    shadow_phase!("signal_cards");
     // #390 index-time hook (lane E): grounded-label SEED PRODUCER + live
     // propagation. ── EXACT INSERTION POINT ── one post-import call, placed
     // immediately AFTER the kernel artifact persist above (its members are the
@@ -1709,6 +1743,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // persisted propagated-label rows so a real corpus (cbm/) serves label data
     // instead of the starved zero_seed_scope.
     let index_time_label_propagation = persist_index_time_label_propagation(&vault, project);
+    shadow_phase!("label_propagation");
     let kernel_context = kernel_context_with_persisted_labels(
         shadow_import.kernel_context,
         index_time_label_propagation,
@@ -1724,6 +1759,7 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
     // members) keeps the honest `unavailable` refusal.
     let index_time_scope_summaries =
         scope_summaries_from_persisted_kernel_artifact(&vault, project);
+    shadow_phase!("scope_summaries");
     let kernel_context =
         kernel_context_with_persisted_scope_summaries(kernel_context, index_time_scope_summaries);
     if let Some(object) = weave.as_object_mut() {
@@ -1746,7 +1782,9 @@ pub(crate) fn import_shadow_vault_with_archaeology_at(
         }
         _ => ShadowLowerState::from(lower_shadow_sqlite(cache_dir, project, &vault)?),
     };
+    shadow_phase!("lowering");
     let verify = verify_chain(&vault)?;
+    shadow_phase!("verify_chain");
     if !verify.is_intact() {
         return Err(format!(
             "shadow vault ledger verification failed after import/lower: {}",

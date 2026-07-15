@@ -571,8 +571,12 @@ fn fingerprint_prefix(fingerprint: &str) -> &str {
 }
 
 fn read_astro_meta(path: &Path) -> LowerResult<AstroMetaRow> {
+    // #412: hand SQLite the extended-length (`\\?\`) form so a lowered artifact
+    // under a deep store (total path > MAX_PATH) opens instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(path)
+        .map_err(|error| meta_invalid(format!("normalize lowered artifact path: {error}")))?;
     let connection = Connection::open_with_flags(
-        path,
+        &open_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| {
@@ -807,8 +811,20 @@ fn lower_edge(id: i64, edge: CbmGraphEdge, source_id: i64, target_id: i64) -> Lo
 /// #76 SQLITE_BUSY retry window. Kept as a named helper so the busy-timeout
 /// contract is directly asserted by `lowered_connection_sets_busy_timeout`.
 fn open_lowered_connection(output_path: &Path) -> LowerResult<Connection> {
+    // #412: extended-length (`\\?\`) normalization so a lowered artifact under a
+    // deep store (total path > MAX_PATH) is created instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(output_path).map_err(|error| {
+        LowerError::refused(
+            ASTRO_LOWER_ARTIFACT_OPEN_FAILED,
+            format!(
+                "normalize lowered artifact path {}: {error}",
+                output_path.display()
+            ),
+            ARTIFACT_OPEN_REMEDIATION,
+        )
+    })?;
     let connection = Connection::open_with_flags(
-        output_path,
+        &open_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,

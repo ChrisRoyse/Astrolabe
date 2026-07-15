@@ -217,7 +217,46 @@ pub use dispatch::{handle_jsonrpc_raw, handle_tool_raw};
 
 
 const VAULT_SUFFIX: &str = ".astrolabe-vault";
+/// Write-side name for the per-project lowered-SQLite mirror the Rust host
+/// places in the CBM store dir. This file ends in `.db` but is NOT a project
+/// store; the C enumerator (`is_project_db_file` in `cbm/src/mcp/mcp.c`) skips
+/// it via the reserved-suffix contract so it never surfaces in `list_projects`
+/// or gets adopted by `resolve_store` (#414).
+///
+/// DRIFT CONTRACT: this string MUST byte-match the C-side reserved suffix
+/// `CBM_ASTRO_LOWERED_DB_SUFFIX` (declared in `cbm/src/mcp/mcp.h`), which the C
+/// enumerator uses to skip this file. The compile-time assertion in
+/// [`assert_lowered_suffix_matches_c`] binds the two: editing either without the
+/// other fails this crate's compile.
 const LOWERED_SQLITE_SUFFIX: &str = ".astrolabe-lowered.db";
+
+/// #414 drift guard — compile-time proof that the Rust write-side suffix and the
+/// C read-side reserved suffix are one and the same string.
+/// `astrolabe_bridge::CBM_ASTRO_LOWERED_DB_SUFFIX` re-exports the bindgen-
+/// surfaced C macro (a NUL-terminated byte array); it is compared to
+/// `LOWERED_SQLITE_SUFFIX` byte-for-byte. Drift in either definition breaks the
+/// build here rather than silently resurrecting the phantom-project bug.
+const _: () = {
+    let rust = LOWERED_SQLITE_SUFFIX.as_bytes();
+    let c = astrolabe_bridge::CBM_ASTRO_LOWERED_DB_SUFFIX;
+    // The C array includes the trailing NUL; the Rust &str does not.
+    assert!(
+        c.len() == rust.len() + 1,
+        "C CBM_ASTRO_LOWERED_DB_SUFFIX and Rust LOWERED_SQLITE_SUFFIX have drifted (length)"
+    );
+    let mut i = 0;
+    while i < rust.len() {
+        assert!(
+            c[i] == rust[i],
+            "C CBM_ASTRO_LOWERED_DB_SUFFIX and Rust LOWERED_SQLITE_SUFFIX have drifted (bytes)"
+        );
+        i += 1;
+    }
+    assert!(
+        c[rust.len()] == 0,
+        "C reserved suffix is not NUL-terminated"
+    );
+};
 
 fn sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}.db"))

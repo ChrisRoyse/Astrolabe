@@ -13,6 +13,34 @@
 
 #include "graph_buffer/row_sink.h"
 
+/* ── Astrolabe reserved store-dir sidecar suffixes (#414) ─────────
+ *
+ * The Astrolabe Rust host writes per-project sidecar artifacts into the SAME
+ * CBM store (cache) directory that holds the "<name>.db" project stores. The
+ * lowered-SQLite mirror is written as "<name>.astrolabe-lowered.db": it ends in
+ * ".db" but is NOT a project store. Without a filter it surfaces in
+ * list_projects as a phantom 0-node project and can be adopted by resolve_store
+ * as a stand-in for the real store. Every store-dir walk routes through
+ * is_project_db_file() (mcp.c), which rejects any file ending in a suffix listed
+ * here — the single reserved-suffix contract.
+ *
+ * DRIFT CONTRACT: this string MUST byte-match the Rust host's write-side
+ * constant LOWERED_SQLITE_SUFFIX in
+ * crates/astrolabe-server/src/migration/mod.rs. It is placed in this
+ * bindgen-visible header (crates/cbm-sys parses via astro_ffi.h → mcp/mcp.h) so
+ * the Rust side binds the two with a compile-time assertion; editing either
+ * without the other fails the astrolabe-server build. */
+#define CBM_ASTRO_LOWERED_DB_SUFFIX ".astrolabe-lowered.db"
+
+/* Second reserved family: the git-archaeology scratch store
+ * ".astrolabe-archaeology-<pid>-<nanos>.db" (written by the Rust host's
+ * historical-commit indexer into the same store dir; transient, but live during
+ * an archaeology pass and left behind by a crash). Its nonce tail varies, so
+ * this family is matched by PREFIX. Same drift contract: MUST byte-match
+ * ARCHAEOLOGY_DB_PREFIX in
+ * crates/astrolabe-server/src/migration/git_archaeology.rs. */
+#define CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX ".astrolabe-archaeology-"
+
 /* ── Forward declarations ─────────────────────────────────────── */
 
 typedef struct cbm_store cbm_store_t; /* from store/store.h */

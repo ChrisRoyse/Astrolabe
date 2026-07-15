@@ -4769,33 +4769,7 @@ int cbm_cmd_update(int argc, char **argv) {
     return 0;
 }
 
-/* ── CLI tool arguments (flags / --args-file / --help) ────────────── */
-
-/* Flag-name normalization: kebab-case CLI flags map to snake_case JSON keys
- * (--name-pattern -> name_pattern). In-place; buffer is NUL-terminated. */
-static void cli_kebab_to_snake(char *s) {
-    for (; *s; s++) {
-        if (*s == '-') {
-            *s = '_';
-        }
-    }
-}
-
-/* snake_case JSON key -> kebab-case flag name (for --help display). In-place. */
-static void cli_snake_to_kebab(char *s) {
-    for (; *s; s++) {
-        if (*s == '_') {
-            *s = '-';
-        }
-    }
-}
-
-/* Heap-format a one-argument error message for *err_out. Caller frees. */
-static char *cli_heap_msgf(const char *fmt, const char *arg) {
-    char buf[CLI_BUF_512];
-    snprintf(buf, sizeof(buf), fmt, arg);
-    return cbm_strdup(buf);
-}
+/* ── CLI tool arguments (--args-file / stdin / --help) ────────────── */
 
 /* True if the schema's required[] array contains `key`. */
 static bool cli_schema_required_has(yyjson_val *required, const char *key) {
@@ -4813,155 +4787,6 @@ static bool cli_schema_required_has(yyjson_val *required, const char *key) {
     return false;
 }
 
-/* Look up a property's JSON-schema "type" string (string/integer/number/
- * boolean/array). Returns NULL when the schema or property is unknown — the
- * caller then treats the value as a plain string. */
-static const char *cli_schema_type(yyjson_val *props, const char *key) {
-    if (!props || !yyjson_is_obj(props)) {
-        return NULL;
-    }
-    yyjson_val *p = yyjson_obj_get(props, key);
-    if (!p || !yyjson_is_obj(p)) {
-        return NULL;
-    }
-    yyjson_val *t = yyjson_obj_get(p, "type");
-    return (t && yyjson_is_str(t)) ? yyjson_get_str(t) : NULL;
-}
-
-/* Append a typed value to the output object under `key`. For array-typed
- * properties, repeated flags accumulate into a single JSON array. */
-static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
-                          const char *type, const char *value, bool have_value) {
-    if (type && strcmp(type, "array") == 0) {
-        yyjson_mut_val *arr = yyjson_mut_obj_get(obj, key);
-        if (!arr || !yyjson_mut_is_arr(arr)) {
-            arr = yyjson_mut_arr(out);
-            yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
-        }
-        yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
-        return;
-    }
-
-    yyjson_mut_val *vv;
-    if (type && strcmp(type, "boolean") == 0) {
-        bool b = !have_value || strcmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
-                 strcmp(value, "yes") == 0;
-        vv = yyjson_mut_bool(out, b);
-    } else if (type && strcmp(type, "integer") == 0) {
-        char *endp = NULL;
-        const char *v = have_value ? value : "";
-        long n = strtol(v, &endp, CLI_STRTOL_BASE);
-        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_int(out, (int64_t)n)
-                                                  : yyjson_mut_strcpy(out, v);
-    } else if (type && strcmp(type, "number") == 0) {
-        char *endp = NULL;
-        const char *v = have_value ? value : "";
-        double d = strtod(v, &endp);
-        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_real(out, d)
-                                                  : yyjson_mut_strcpy(out, v);
-    } else {
-        /* string or unknown type */
-        vv = yyjson_mut_strcpy(out, have_value ? value : "");
-    }
-    yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
-}
-
-char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {
-    if (err_out) {
-        *err_out = NULL;
-    }
-
-    /* The tool's input_schema (may be NULL for an unknown tool — then every
-     * value is treated as a string). Static lifetime; do not free. */
-    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
-    yyjson_doc *schema_doc = NULL;
-    yyjson_val *props = NULL;
-    if (schema_str) {
-        schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
-        if (schema_doc) {
-            props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
-        }
-    }
-
-    yyjson_mut_doc *out = yyjson_mut_doc_new(NULL);
-    if (!out) {
-        if (schema_doc) {
-            yyjson_doc_free(schema_doc);
-        }
-        return NULL;
-    }
-    yyjson_mut_val *obj = yyjson_mut_obj(out);
-    yyjson_mut_doc_set_root(out, obj);
-
-    bool ok = true;
-    for (int i = 0; i < argc && ok; i++) {
-        const char *arg = argv[i];
-        if (strcmp(arg, "--") == 0) {
-            break; /* end of flag parsing */
-        }
-        if (strncmp(arg, "--", CLI_PAIR_LEN) != 0) {
-            if (err_out) {
-                *err_out = cli_heap_msgf("unexpected argument '%s' (expected --flag value)", arg);
-            }
-            ok = false;
-            break;
-        }
-
-        const char *body = arg + CLI_PAIR_LEN; /* skip leading "--" */
-        const char *eq = strchr(body, '=');
-        char key[CLI_BUF_256];
-        const char *value = NULL;
-        bool have_value = false;
-
-        if (eq) {
-            /* --key=value : split on the FIRST '='; value may contain '='/spaces. */
-            size_t klen = (size_t)(eq - body);
-            if (klen >= sizeof(key)) {
-                klen = sizeof(key) - CLI_SKIP_ONE;
-            }
-            memcpy(key, body, klen);
-            key[klen] = '\0';
-            value = eq + CLI_SKIP_ONE;
-            have_value = true;
-        } else {
-            snprintf(key, sizeof(key), "%s", body);
-            /* Consume the next token as the value unless it is itself a flag
-             * (then this is a bare boolean/string flag). */
-            if (i + CLI_SKIP_ONE < argc &&
-                strncmp(argv[i + CLI_SKIP_ONE], "--", CLI_PAIR_LEN) != 0) {
-                value = argv[i + CLI_SKIP_ONE];
-                have_value = true;
-                i++;
-            }
-        }
-
-        cli_kebab_to_snake(key);
-        const char *type = cli_schema_type(props, key);
-
-        if (type && strcmp(type, "array") == 0 && !have_value) {
-            if (err_out) {
-                *err_out = cli_heap_msgf("flag --%s requires a value", key);
-            }
-            ok = false;
-            break;
-        }
-
-        cli_add_typed(out, obj, key, type, value, have_value);
-    }
-
-    char *result = NULL;
-    if (ok) {
-        size_t len = 0;
-        result = yyjson_mut_write(out, 0, &len); /* malloc'd; caller frees */
-    }
-
-    yyjson_mut_doc_free(out);
-    if (schema_doc) {
-        yyjson_doc_free(schema_doc);
-    }
-    return result;
-}
-
 int cbm_cli_print_tool_help(const char *tool_name) {
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
@@ -4973,13 +4798,14 @@ int cbm_cli_print_tool_help(const char *tool_name) {
     yyjson_val *props = root ? yyjson_obj_get(root, "properties") : NULL;
     yyjson_val *required = root ? yyjson_obj_get(root, "required") : NULL;
 
+    /* Only the supported input forms (one contract with the Rust host,
+     * #378/#411): --args-file <path> and piped stdin. The removed raw-JSON argv
+     * and `--flag value` forms are NOT advertised. */
     printf("Usage:\n");
-    printf("  codebase-memory-mcp cli %s --flag value [--flag2 value2 ...]\n", tool_name);
     printf("  codebase-memory-mcp cli %s --args-file <path-to-json>\n", tool_name);
     printf("  echo '<json>' | codebase-memory-mcp cli %s\n", tool_name);
-    printf("  codebase-memory-mcp cli %s '<raw-json-args>'\n", tool_name);
 
-    printf("\nFlags:\n");
+    printf("\nArguments (JSON object keys):\n");
     if (props && yyjson_is_obj(props)) {
         yyjson_obj_iter iter;
         yyjson_obj_iter_init(props, &iter);
@@ -5002,11 +4828,8 @@ int cbm_cli_print_tool_help(const char *tool_name) {
                     desc = yyjson_get_str(d);
                 }
             }
-            char flag[CLI_BUF_256];
-            snprintf(flag, sizeof(flag), "%s", name);
-            cli_snake_to_kebab(flag);
             bool req = cli_schema_required_has(required, name);
-            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            printf("  %s <%s>%s", name, type, req ? " [required]" : "");
             if (desc[0]) {
                 printf("  %s", desc);
             }

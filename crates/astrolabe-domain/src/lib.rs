@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod fsv;
 pub mod knobs;
 pub mod lowering_trigger;
+pub mod winpath;
 
 /// Re-export of the Calyx core crate used for vault identities and content addressing.
 pub use calyx_core as calyx;

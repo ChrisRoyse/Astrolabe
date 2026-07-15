@@ -14,6 +14,21 @@ use std::thread::{self, ThreadId};
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
+/// The C-side reserved store-dir sidecar suffix, re-exported from the
+/// bindgen-surfaced libcbm macro (`CBM_ASTRO_LOWERED_DB_SUFFIX` in
+/// `cbm/src/mcp/mcp.h`). The value is a NUL-terminated byte array
+/// (`b".astrolabe-lowered.db\0"`). Downstream crates bind their write-side
+/// suffix constant to this at compile time so the two halves of the reserved-
+/// suffix contract cannot drift and re-open the phantom-project bug (#414).
+pub use cbm_sys::CBM_ASTRO_LOWERED_DB_SUFFIX;
+
+/// The C-side reserved store-dir sidecar PREFIX for the transient
+/// git-archaeology scratch stores (`.astrolabe-archaeology-<nonce>.db`),
+/// re-exported from the bindgen-surfaced libcbm macro
+/// (`CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX` in `cbm/src/mcp/mcp.h`). Same drift
+/// contract as [`CBM_ASTRO_LOWERED_DB_SUFFIX`] (#414).
+pub use cbm_sys::CBM_ASTRO_ARCHAEOLOGY_DB_PREFIX;
+
 pub fn parent_roots() -> (&'static str, &'static str) {
     (
         astrolabe_domain::calyx_vendor_root(),

@@ -1006,8 +1006,12 @@ where
 /// Kept as a named helper so the busy-timeout contract is directly asserted by
 /// `cbm_source_connection_sets_busy_timeout`.
 fn open_cbm_source_connection(sqlite_path: &Path) -> IngestResult<Connection> {
+    // #412: extended-length (`\\?\`) normalization so the CBM `<project>.db` under
+    // a deep store (total path > MAX_PATH) is read back instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(sqlite_path)
+        .map_err(|error| invalid_sqlite(format!("normalize SQLite input path: {error}")))?;
     let connection = Connection::open_with_flags(
-        sqlite_path,
+        &open_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| invalid_sqlite(format!("open SQLite input: {error}")))?;
@@ -1600,7 +1604,11 @@ where
 
 fn write_cbm_graph_snapshot_sqlite(snapshot: &CbmGraphSnapshot, path: &Path) -> IngestResult<()> {
     cleanup_sqlite_path(path);
-    let connection = Connection::open(path)
+    // #412: extended-length (`\\?\`) normalization so a row-sink snapshot under a
+    // deep store (total path > MAX_PATH) is created instead of failing closed.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(path)
+        .map_err(|error| invalid_sqlite(format!("normalize row-sink SQLite path: {error}")))?;
+    let connection = Connection::open(&open_path)
         .map_err(|error| invalid_sqlite(format!("create row-sink SQLite: {error}")))?;
     connection
         .execute_batch(
@@ -2705,6 +2713,23 @@ fn read_token_vectors(
     Ok(out)
 }
 
+/// Deterministic content bytes for a symbol whose substrate (libcbm) emits no raw
+/// source snippet (#413). Frames the signature and the exact extracted-property bytes so
+/// the canonical identity bytes (and thus CxId) vary with every body-derived attribute
+/// the panel measures -- `properties_json` is libcbm's per-definition attribute set
+/// (`st`, `bt`, `fp`, `sp`, `callees`, complexity, docstring, type surface, ...), which
+/// is deterministic for a given body and produced identically on the live and historical
+/// extract paths by the one linked libcbm archive. The length-prefixed frame keeps the
+/// signature and property bytes from bleeding into each other so no two distinct
+/// (signature, properties) pairs can alias.
+fn symbol_content_fingerprint(properties_json: &str, signature: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(signature.len() + properties_json.len() + 8);
+    out.extend_from_slice(&(signature.len() as u64).to_be_bytes());
+    out.extend_from_slice(signature.as_bytes());
+    out.extend_from_slice(properties_json.as_bytes());
+    out
+}
+
 fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>> {
     let mut out = Vec::with_capacity(raw_nodes.len());
     for raw in raw_nodes {
@@ -2717,13 +2742,28 @@ fn extract_nodes(raw_nodes: Vec<RawNodeRow>) -> IngestResult<Vec<ExtractedNode>>
         let signature = string_property(&raw.properties, &["signature", "definition"])
             .unwrap_or(raw.name.as_str())
             .to_string();
-        let source_snippet = string_property(
+        // #413: content-address identity on the exact symbol content. libcbm emits no
+        // raw `source`/`body`/`snippet` property, so when one is absent we must NOT fall
+        // back to the body-independent `signature` alone: two historically distinct
+        // bodies of the same symbol (identical file/line-span/signature) would then
+        // collide on one CxId while their panel slots -- encoded from the body-derived
+        // libcbm properties (`st`, `bt`, `fp`, `sp`, `callees`, complexity, ...) --
+        // diverge, tripping the immutable-Base readback mismatch
+        // (ASTRO_INGEST_READBACK_MISMATCH: preexisting historical slot N differs) during
+        // historical admission. Folding the full extracted property set into the
+        // canonical content bytes makes CxId a complete content address over exactly the
+        // inputs that determine the constellation: equal CxId => equal properties =>
+        // equal slot inputs => equal slots, so an unchanged body legitimately reuses one
+        // immutable row and any body change mints a distinct version. Applied uniformly
+        // to the live and historical extract paths (both route through this function),
+        // so the same body always derives the same CxId across HEAD and every commit.
+        let source_snippet = match string_property(
             &raw.properties,
             &["source_snippet", "source", "body", "snippet"],
-        )
-        .unwrap_or(signature.as_str())
-        .as_bytes()
-        .to_vec();
+        ) {
+            Some(source) => source.as_bytes().to_vec(),
+            None => symbol_content_fingerprint(&raw.properties_json, &signature),
+        };
 
         let mut symbol = SymbolRecord::new(
             raw.project,

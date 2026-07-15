@@ -212,7 +212,17 @@ pub(crate) fn open_config(cache_dir: &Path) -> Result<Connection, DynError> {
 /// held before the caller backs off, guaranteeing a lock-free window can open for the
 /// conversion.
 fn try_open_config(db_path: &Path) -> Result<Option<Connection>, rusqlite::Error> {
-    let conn = Connection::open(db_path)?;
+    // #412: extended-length (`\\?\`) normalization so the config store under a deep
+    // CBM_CACHE_DIR (total path > MAX_PATH) opens instead of failing closed. A
+    // normalization failure is surfaced as a rusqlite CANTOPEN so the caller's
+    // fail-closed path handles it exactly like any other open error.
+    let open_path = astrolabe_domain::winpath::sqlite_open_path(db_path).map_err(|error| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!("normalize config store path: {error}")),
+        )
+    })?;
+    let conn = Connection::open(&open_path)?;
     conn.busy_timeout(std::time::Duration::from_millis(CONFIG_DB_BUSY_TIMEOUT_MS))?;
     // Per-connection (not persisted), so set on every open.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
