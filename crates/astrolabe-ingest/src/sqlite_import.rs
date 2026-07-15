@@ -2422,6 +2422,128 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
     Ok(out)
 }
 
+/// A CBM pipeline node row read back from a persisted CBM SQLite `nodes` table.
+///
+/// These fields mirror exactly the ones the in-process graph-buffer row sink
+/// emitted (`cbm_gbuf_row_node_t`): the SQLite `nodes` table and the row-sink
+/// stream are two serializations of the identical in-memory dump-node array
+/// (`cbm_gbuf_dump_to_sqlite` writes the same `dump_nodes` array the sink drains,
+/// with the same final ids), so a readback reproduces the row-sink node stream
+/// byte-for-byte. #405 reads this back after running the CBM pipeline
+/// out-of-process, instead of forcing the pipeline in-process to carry an FFI
+/// row-sink callback that cannot cross the supervisor's process boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmSqlitePipelineNode {
+    pub id: i64,
+    pub project: String,
+    pub label: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub properties_json: String,
+}
+
+/// A CBM pipeline edge row read back from a persisted CBM SQLite `edges` table.
+///
+/// Mirrors `cbm_gbuf_row_edge_t`. `local_name_gen` is derived exactly as both the
+/// SQLite `local_name_gen` generated column and the graph-buffer sink derive it
+/// (the `local_name` property of an `IMPORTS` edge, empty otherwise);
+/// `url_path_gen` mirrors the `url_path_gen` generated column (`$.url_path`). Each
+/// edge's `source_id`/`target_id` are the persisted node ids, matching the ids the
+/// sink emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmSqlitePipelineEdge {
+    pub id: i64,
+    pub project: String,
+    pub source_id: i64,
+    pub target_id: i64,
+    pub edge_type: String,
+    pub properties_json: String,
+    pub url_path_gen: String,
+    pub local_name_gen: String,
+}
+
+/// The full CBM pipeline row stream for one project, read back from its persisted
+/// CBM SQLite (`<project>.db`) — the out-of-process equivalent of the in-process
+/// FFI row sink (#405).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbmSqlitePipelineRows {
+    pub project: String,
+    pub nodes: Vec<CbmSqlitePipelineNode>,
+    pub edges: Vec<CbmSqlitePipelineEdge>,
+}
+
+/// Reads the CBM pipeline row stream for `project` back from a persisted CBM SQLite
+/// dump (`<project>.db`), reproducing the graph-buffer row sink's output from real
+/// persisted bytes (#405).
+///
+/// This is the out-of-process equivalent of the in-process FFI row sink: the CBM
+/// pipeline is run in a supervised child (which writes `<project>.db` from the same
+/// in-memory `dump_nodes`/`dump_edges` arrays the sink would have drained), and the
+/// parent rebuilds the identical row stream from the persisted `nodes`/`edges`
+/// tables here. Node `id` equals the SQLite node rowid and each edge's
+/// `source_id`/`target_id` equal those node ids — exactly as the sink emitted them —
+/// so the row-sink-derived shadow surfaces built from these rows are byte-identical
+/// to the old in-process row-sink path. Node vectors are intentionally not read: the
+/// row sink never carried them either (`CbmPipelineNodeRow` has no vector field), so
+/// omitting them preserves parity. Fails closed with a labeled
+/// `ASTRO_INGEST_SQLITE_INVALID` error on any malformed input (missing tables,
+/// non-object properties JSON).
+pub fn read_cbm_sqlite_pipeline_rows(
+    sqlite_path: &Path,
+    project: &str,
+) -> IngestResult<CbmSqlitePipelineRows> {
+    let connection = open_cbm_source_connection(sqlite_path)?;
+    let raw_nodes = read_nodes(&connection, project)?;
+    let raw_edges = read_edges(&connection, project)?;
+    let nodes = raw_nodes
+        .into_iter()
+        .map(|node| CbmSqlitePipelineNode {
+            id: node.id,
+            project: node.project,
+            label: node.label,
+            name: node.name,
+            qualified_name: node.qualified_name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+            properties_json: node.properties_json,
+        })
+        .collect();
+    let edges = raw_edges
+        .into_iter()
+        .map(|edge| {
+            // url_path_gen mirrors the SQLite `url_path_gen` generated column
+            // (json_extract properties '$.url_path'). It is captured for row-shape
+            // fidelity with the sink even though the shadow import does not consume
+            // it (the downstream `CbmGraphEdge` carries only `local_name_gen`).
+            let url_path_gen = edge
+                .properties
+                .get("url_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            CbmSqlitePipelineEdge {
+                id: edge.id,
+                project: edge.project,
+                source_id: edge.source_id,
+                target_id: edge.target_id,
+                edge_type: edge.edge_type,
+                properties_json: edge.properties_json,
+                url_path_gen,
+                local_name_gen: edge.local_name_gen,
+            }
+        })
+        .collect();
+    Ok(CbmSqlitePipelineRows {
+        project: project.to_string(),
+        nodes,
+        edges,
+    })
+}
+
 fn table_exists(connection: &Connection, table: &str) -> IngestResult<bool> {
     connection
         .query_row(

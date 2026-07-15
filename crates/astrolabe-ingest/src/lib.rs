@@ -82,7 +82,8 @@ pub use sqlite_import::{
     ASTRO_EDGE_DANGLING, ASTRO_INGEST_READBACK_MISMATCH, ASTRO_INGEST_SQLITE_INVALID,
     ASTRO_LEGACY_CBM_EDGE_ROWS, ASTRO_MISSING_CBM_PROJECT_ROW, ASTRO_QUANTIZATION_GATE_INVALID,
     CbmFileHashRow, CbmGraphEdge, CbmGraphNode, CbmGraphSnapshot, CbmProjectRow,
-    CbmProjectSummaryRow, CbmRawEdgeRow, CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
+    CbmProjectSummaryRow, CbmRawEdgeRow, CbmSqlitePipelineEdge, CbmSqlitePipelineNode,
+    CbmSqlitePipelineRows, CbmTokenVectorRow, CxGraphErasureReport, EdgeSkipCounters,
     HISTORICAL_SYMBOL_INGEST_LEDGER_SCHEMA, HistoricalSymbolAdmissionReport,
     HistoricalSymbolLocation, InjectedNodeFault, QuantizationGateConfig,
     QuantizationGateMeasurement, QuantizationGatePolicyReport, QuantizationSlotDecision,
@@ -90,7 +91,8 @@ pub use sqlite_import::{
     SqliteImportReadback, SqliteImportReport, admit_historical_symbol_snapshot,
     erase_imported_cx_graph_rows, fingerprint_sqlite_hex, import_cbm_graph_snapshot_to_vault,
     import_cbm_graph_snapshot_to_vault_direct, import_sqlite_to_vault, inject_node_property_fault,
-    read_cbm_graph_snapshot, read_cbm_graph_snapshot_at, read_node_map_cx_ids,
+    read_cbm_graph_snapshot, read_cbm_graph_snapshot_at, read_cbm_sqlite_pipeline_rows,
+    read_node_map_cx_ids,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

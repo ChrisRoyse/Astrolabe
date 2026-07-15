@@ -3799,6 +3799,32 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
     return true;
 }
 
+/* #405: fail-closed structured result for the strict (shadow) supervised index
+ * path when the pipeline pass could NOT be run with out-of-process isolation — a
+ * spawn failure, an unavailable supervisor, or a clean-but-empty worker exit.
+ * Unlike build_worker_failure_response (a CONTAINED crash *after* the child ran),
+ * these are pre-run refusals; both carry `outcome` so the Rust caller maps them to
+ * a fail-closed {code, message, remediation} without ever touching the vault. */
+static char *build_strict_supervised_error(const char *args, const char *outcome,
+                                           const char *message) {
+    char *repo_path = args ? cbm_mcp_get_string_arg(args, "repo_path") : NULL;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", outcome);
+    yyjson_mut_obj_add_strcpy(doc, root, "message", message);
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(repo_path);
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
  * (Stage 3c). Returns the response string (caller frees):
  *   - the worker's own response on a clean first run (the common path);
@@ -3808,9 +3834,14 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
  *     loop cannot converge but at least one file was quarantined;
  *   - a contained-failure response only if even that cannot produce a clean run.
- * Returns NULL only when the worker could not be spawned at all, so the caller
- * degrades to the in-process path. */
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+ * When `strict` is false, returns NULL if the worker could not be spawned at all,
+ * so the caller degrades to the in-process path (the watcher/auto-index contract).
+ * When `strict` is true (the #405 shadow full-index path), NEVER returns NULL and
+ * NEVER degrades: a spawn failure or a clean-but-empty exit is returned as a
+ * fail-closed structured error result so the caller refuses before touching the
+ * vault. A contained crash/hang still returns build_worker_failure_response in
+ * both modes. */
+static char *index_run_supervised_ex(cbm_mcp_server_t *srv, const char *args, bool strict) {
     supervisor_invalidate_store(srv);
 
     /* First attempt: normal parallel run. */
@@ -3820,6 +3851,15 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
+        if (strict) {
+            /* #405: the shadow index pass REQUIRES out-of-process isolation. A
+             * spawn failure is a hard error, not a license to silently lose crash
+             * isolation by degrading in-process. */
+            return build_strict_supervised_error(
+                args, "spawn_failed",
+                "the index worker subprocess could not be spawned, so the shadow "
+                "index pass could not run with out-of-process crash isolation");
+        }
         return NULL; /* degrade to in-process */
     }
     if (wr.outcome == CBM_PROC_CLEAN) {
@@ -3832,6 +3872,14 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
+        if (strict && !resp) {
+            /* #405: a clean exit with no index result is not a usable shadow pass;
+             * fail closed rather than degrade in-process. */
+            return build_strict_supervised_error(
+                args, "exit_nonzero",
+                "the index worker exited cleanly but wrote no index_repository "
+                "response, so the shadow index pass produced no usable result");
+        }
         return resp;
     }
 
@@ -4026,6 +4074,41 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
 #else
     return build_worker_failure_response(args, last_outcome);
 #endif
+}
+
+/* Non-strict supervised runner: the watcher/auto-index contract that degrades to
+ * the in-process path (returns NULL) when the worker cannot be spawned. */
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+    return index_run_supervised_ex(srv, args, /*strict=*/false);
+}
+
+/* Public entry (see mcp.h): the shadow full-index path (#405) runs the CBM
+ * pipeline OUT OF PROCESS and FAILS CLOSED rather than degrading to in-process,
+ * so a hard pass abort is contained in the child and the caller refuses before it
+ * touches the vault. No row sink is registered on the way in — the child rebuilds
+ * nothing for the parent; the parent reads the child's persisted <project>.db. */
+char *cbm_mcp_index_repository_supervised_strict(cbm_mcp_server_t *srv, const char *args) {
+    if (!args) {
+        return build_strict_supervised_error(NULL, "spawn_failed",
+                                             "index_repository args are required");
+    }
+    char *early_repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    if (!early_repo_path) {
+        return cbm_mcp_text_result("repo_path is required", true);
+    }
+    free(early_repo_path);
+    if (!cbm_index_supervisor_should_wrap()) {
+        /* The shadow path REQUIRES out-of-process isolation. If the supervisor is
+         * unavailable (embedder host not marked, the CBM_INDEX_SUPERVISOR=0 kill
+         * switch, or this process is already the worker), fail closed rather than
+         * silently indexing in-process and forgoing crash isolation. */
+        return build_strict_supervised_error(
+            args, "spawn_failed",
+            "the index supervisor is unavailable (host not marked, kill switch set, "
+            "or already running as an index worker), so the shadow index pass cannot "
+            "run with out-of-process crash isolation");
+    }
+    return index_run_supervised_ex(srv, args, /*strict=*/true);
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
