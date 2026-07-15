@@ -242,8 +242,14 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     sweep_orphan_worktrees(repo, &worktree_home);
 
     for (commit, group) in group_evidence_by_commit(&evidence) {
-        let indexed =
-            index_historical_commit(repo, cache_dir, &worktree_home, project, commit, &corpus_rel)?;
+        let indexed = index_historical_commit(
+            repo,
+            cache_dir,
+            &worktree_home,
+            project,
+            commit,
+            &corpus_rel,
+        )?;
         report.cleanup_remnants += indexed.cleanup_remnants;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
