@@ -365,6 +365,43 @@ static bool cli_first_nonspace_is_brace(const char *s) {
     return *s == '{';
 }
 
+/* Minimal JSON string-body escaper for embedding an untrusted argv token (the
+ * tool name) into the `--json` NULL-result diagnostic (#431). Writes an escaped
+ * copy of `src` into `dst` (capacity `cap`, always NUL-terminated), escaping the
+ * two structural characters (" and \) and control bytes < 0x20 as \uXXXX, and
+ * truncating on a code-point boundary if the escaped form would overflow. Kept
+ * allocation-free by design: the NULL-result guard's whole point is to stay
+ * usable when the most likely cause of the NULL is an allocation failure, so it
+ * must not itself depend on the heap. */
+static void cli_json_escape(char *dst, size_t cap, const char *src) {
+    if (cap == 0) {
+        return;
+    }
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        char esc[8];
+        size_t need;
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)c;
+            need = 2;
+        } else if (c < 0x20) {
+            (void)snprintf(esc, sizeof(esc), "\\u%04x", c);
+            need = 6;
+        } else {
+            esc[0] = (char)c;
+            need = 1;
+        }
+        if (o + need >= cap) { /* keep room for the terminating NUL */
+            break;
+        }
+        memcpy(dst + o, esc, need);
+        o += need;
+    }
+    dst[o] = '\0';
+}
+
 static int run_cli(int argc, char **argv) {
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -493,6 +530,80 @@ static int run_cli(int argc, char **argv) {
 
     char *result = cbm_mcp_handle_tool(srv, tool_name, args_json);
     int exit_code = 0;
+
+    if (!result) {
+        /* Fail closed (#431): cbm_mcp_handle_tool returned NULL — it produced NO
+         * result envelope at all. In the current dispatcher this is reachable only
+         * as an allocation failure inside the JSON serializer (cbm_mcp_text_result
+         * / yy_doc_to_str → yyjson_mut_write returns NULL); every ordinary and
+         * malformed-input path — unknown tool, missing/blank args, missing project
+         * — instead returns a well-formed isError:true envelope, whose exit-code
+         * contract #425 owns. A NULL is therefore categorically an INTERNAL error,
+         * distinct from a tool-reported failure. Before this guard the `if (result)`
+         * block below was simply skipped: the CLI printed nothing and returned 0,
+         * so a scripted / agent / FSV caller saw silent success with empty stdout
+         * on a dispatch failure — on BOTH the pretty and `--json` paths. The guard
+         * also stands as defense-in-depth for any future dispatch path that
+         * returns NULL.
+         *
+         * The diagnostic is emitted with a fixed-format fprintf (no heap, no JSON
+         * builder) precisely because the likeliest cause of a NULL is that
+         * allocation is already failing — a guard that itself allocated could die
+         * the same way. stdout stays EMPTY so a `--json` consumer never mistakes
+         * the diagnostic for a tool payload (data→stdout, diagnostics→stderr);
+         * under `--json` the diagnostic is a single-line JSON object with stable
+         * {code,message,remediation} fields so scripted callers branch on `code`,
+         * and a human-readable block otherwise. */
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            /* Supervised index worker (#832 path): the parent gates success
+             * strictly on this worker exiting 0 (CBM_PROC_CLEAN) and reads back the
+             * --response-out file. Remove any file at that path so the parent can
+             * NEVER read a stale/prior response as this run's success, and let the
+             * non-zero exit below be the honest signal that this worker produced no
+             * index result — the parent then degrades in-process (non-strict) or
+             * fails closed (strict, #405) through its existing outcome handling. */
+            (void)cbm_unlink(ro);
+        }
+        if (raw_json) {
+            char esc_tool[CBM_SZ_256];
+            cli_json_escape(esc_tool, sizeof(esc_tool), tool_name);
+            (void)fprintf(stderr,
+                          "{\"code\":\"CBM_E_TOOL_NULL_RESULT\","
+                          "\"message\":\"tool '%s' produced no result (internal error: "
+                          "the dispatcher returned no result envelope, most likely an "
+                          "allocation failure)\","
+                          "\"remediation\":\"retry the call; if it persists the host is "
+                          "likely out of memory — free memory or reduce the workload "
+                          "(e.g. index a smaller path), and report the tool name if the "
+                          "failure reproduces\"}\n",
+                          esc_tool);
+        } else {
+            (void)fprintf(stderr,
+                          "error: CBM_E_TOOL_NULL_RESULT: tool '%s' produced no result\n"
+                          "  the dispatcher returned no result envelope, most likely an "
+                          "allocation failure.\n"
+                          "  remediation: retry; if it persists the host is likely out of "
+                          "memory — free memory or reduce the workload and report the tool "
+                          "name if it reproduces.\n",
+                          tool_name);
+        }
+        exit_code = SKIP_ONE;
+        if (cbm_index_worker_active()) {
+            /* Supervised worker: mirror the non-NULL fast-exit — skip teardown, let
+             * the OS reclaim — but propagate the non-zero code so the parent sees a
+             * non-CLEAN outcome instead of a false success. */
+            cbm_log_error("index.worker.null_result", "tool", tool_name);
+            fflush(NULL);
+            _Exit(exit_code);
+        }
+        cbm_mcp_server_free(srv);
+        if (progress) {
+            cbm_progress_sink_fini();
+        }
+        free(heap_args);
+        return exit_code;
+    }
 
     if (result) {
         /* Supervised worker: hand the full result string to the parent via the
