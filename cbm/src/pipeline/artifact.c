@@ -49,6 +49,7 @@ enum {
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
+#include "foundation/win_utf8.h" /* cbm_utf8_to_wide_path — #415 long-path-safe atomic swap */
 #endif
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -171,7 +172,9 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = fopen(tmp, "wb");
+    /* #415: cbm_fopen widens + adds "\\?\" so a temp artifact under a deep cache
+     * dir is writable instead of failing at MAX_PATH. */
+    FILE *fp = cbm_fopen(tmp, "wb");
     if (!fp) {
         file_error_set(out_err, "open_temp", errno);
         return CBM_NOT_FOUND;
@@ -194,9 +197,18 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
     }
 
 #ifdef _WIN32
-    /* MoveFileEx replace approach suggested by @Ayush7Ranjan in #492. */
-    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DWORD saved_error = GetLastError();
+    /* MoveFileEx replace approach suggested by @Ayush7Ranjan in #492.
+     * #415: widen both paths ("\\?\") via cbm_utf8_to_wide_path so the swap is not
+     * MAX_PATH-bound; the inline widen (vs cbm_rename_replace) preserves the exact
+     * GetLastError code in the fail-closed labeled error. */
+    wchar_t *wtmp = cbm_utf8_to_wide_path(tmp);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
+    BOOL moved =
+        wtmp && wpath && MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    DWORD saved_error = moved ? 0 : GetLastError();
+    free(wtmp);
+    free(wpath);
+    if (!moved) {
         cbm_unlink(tmp);
         file_error_set(out_err, "rename_temp", (int)saved_error);
         return CBM_NOT_FOUND;
@@ -767,8 +779,8 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     cbm_store_close(store);
 
-    /* Atomic rename to final path */
-    if (rename(tmp_path, cache_db_path) != 0) {
+    /* Atomic rename to final path (#415: long-path-safe replace swap). */
+    if (cbm_rename_replace(tmp_path, cache_db_path) != 0) {
         cbm_log_error("artifact.import", "err", "rename_to_cache");
         cbm_unlink(tmp_path);
         return CBM_NOT_FOUND;

@@ -210,6 +210,9 @@ use query_graph_as_of::*;
 mod architecture_aspects;
 use architecture_aspects::*;
 
+mod delete_project;
+use delete_project::*;
+
 mod dispatch;
 // Non-test code reaches dispatch only through the two public entry points; the
 // glob is needed by the colocated tests, which drive the gate internals directly.
@@ -262,11 +265,11 @@ fn sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}.db"))
 }
 
-fn lowered_sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
+pub(crate) fn lowered_sqlite_path(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{LOWERED_SQLITE_SUFFIX}"))
 }
 
-fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
+pub(crate) fn vault_dir(cache_dir: &Path, project: &str) -> PathBuf {
     cache_dir.join(format!("{project}{VAULT_SUFFIX}"))
 }
 

@@ -1265,7 +1265,10 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    if (unlink(db_path) != 0) {
+    /* #415: cbm_unlink widens + adds "\\?\" so a project DB under a deep cache
+     * dir is deletable instead of failing at MAX_PATH; _wunlink still sets errno
+     * (ENOENT preserved for the not-found reply). */
+    if (cbm_unlink(db_path) != 0) {
         if (errno == ENOENT) {
             unwatch_project(srv, name);
             cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
@@ -1279,8 +1282,8 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
     char wal_path[1040], shm_path[1040];
     snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
     snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
-    (void)unlink(wal_path);
-    (void)unlink(shm_path);
+    (void)cbm_unlink(wal_path);
+    (void)cbm_unlink(shm_path);
 
     unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);

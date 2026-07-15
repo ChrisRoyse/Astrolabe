@@ -334,6 +334,28 @@ pub fn cbm_project_name_from_path(path: &str) -> Result<String, BridgeError> {
     unsafe { take_c_string(ptr) }
 }
 
+/// Print per-tool `--help` for a CLI surface (#416) by delegating to the single
+/// shared C formatter `cbm_cli_print_tool_help_prog`, so the help text and the
+/// tool's JSON argument schema have one source of truth across both the
+/// standalone cbm binary and the astrolabe host CLI. The C function writes the
+/// help directly to this process's stdout, using `prog` as the program name in
+/// the Usage lines. Returns `Ok(true)` when the tool is known (help printed),
+/// `Ok(false)` when the tool name is unknown (nothing was printed) so the caller
+/// can fail closed with a labeled error.
+pub fn cbm_print_tool_help(prog: &str, tool_name: &str) -> Result<bool, BridgeError> {
+    cbm_sys::initialize_allocator_bindings_first();
+    let prog = CString::new(prog)?;
+    let tool_name = CString::new(tool_name)?;
+    // SAFETY: both CStrings outlive the call; the C function only reads the two
+    // NUL-terminated strings and writes formatted help to stdout, returning 0
+    // when the tool is known and non-zero (printing nothing) when it is not.
+    let rc =
+        unsafe { cbm_sys::cbm_cli_print_tool_help_prog(prog.as_ptr(), tool_name.as_ptr()) };
+    // The C formatter flushes stdout before returning, so the help is emitted
+    // regardless of how the process later exits.
+    Ok(rc == 0)
+}
+
 pub fn route_cbm_logs_to_tracing() {
     cbm_sys::initialize_allocator_bindings_first();
     // SAFETY: the callback is a static extern function and remains valid for

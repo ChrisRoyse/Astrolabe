@@ -5,8 +5,9 @@
  */
 #include "subprocess.h"
 
-#include "compat.h"   /* cbm_nanosleep */
-#include "platform.h" /* cbm_now_ms */
+#include "compat.h"    /* cbm_nanosleep */
+#include "compat_fs.h" /* cbm_fopen — #415 long-path-safe worker-log tail */
+#include "platform.h"  /* cbm_now_ms */
 
 #include <stdio.h>
 #include <string.h>
@@ -95,7 +96,9 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
     if (!log_file) {
         return false;
     }
-    FILE *lf = fopen(log_file, "r");
+    /* #415: cbm_fopen widens + adds "\\?\" so a worker log under a deep store
+     * (<store>/logs/.worker-<pid>.log) is tailable instead of failing at MAX_PATH. */
+    FILE *lf = cbm_fopen(log_file, "r");
     if (!lf) {
         return false;
     }
@@ -253,8 +256,16 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     HANDLE hlog = INVALID_HANDLE_VALUE;
     STARTUPINFOW si = {.cb = sizeof(si)};
     if (opts->log_file) {
-        hlog = CreateFileA(opts->log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
+        /* #415: create the worker log via CreateFileW with an extended-length
+         * ("\\?\") widened path so a log under a deep store (<store>/logs/…)
+         * opens instead of failing at MAX_PATH — which would drop the worker's
+         * stdout/stderr and the exit-capture the reap surfaces on failure. */
+        wchar_t *wlog = cbm_utf8_to_wide_path(opts->log_file);
+        if (wlog) {
+            hlog = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+            free(wlog);
+        }
         if (hlog != INVALID_HANDLE_VALUE) {
             si.dwFlags = STARTF_USESTDHANDLES;
             si.hStdError = hlog;
@@ -300,7 +311,8 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (opts->log_file && opts->delete_log_on_exit) {
-        DeleteFileA(opts->log_file);
+        /* #415: long-path-safe delete of the worker log under a deep store. */
+        (void)cbm_unlink(opts->log_file);
     }
 
     out->exit_code = (int)code;

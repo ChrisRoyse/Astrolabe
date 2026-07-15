@@ -1687,6 +1687,17 @@ unsafe extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    // #416: per-tool `--help` printer. Prints the supported input forms and the
+    // tool's JSON argument schema to stdout using `prog` as the program name in
+    // the Usage lines. Returns 0 if the tool is known, non-zero (and prints
+    // nothing) if it is not. Shared single formatter/source-of-truth between the
+    // standalone cbm binary and the astrolabe host CLI surface.
+    pub fn cbm_cli_print_tool_help_prog(
+        prog: *const ::std::os::raw::c_char,
+        tool_name: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn cbm_mcp_initialize_response(
         params_json: *const ::std::os::raw::c_char,
     ) -> *mut ::std::os::raw::c_char;

@@ -160,9 +160,35 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // normalization corner the git pathspec and this string prefix disagree on),
     // so `index_historical_commit` below is never handed out-of-corpus evidence.
     // Empty `corpus_rel` (corpus IS the toplevel) is behavior-neutral.
+    //
+    // Unify the identity path convention (#418): the mine emits TOPLEVEL-relative
+    // evidence paths (git blame/SZZ speak the repo-root namespace), but both the
+    // historical CBM index — scoped to the member subtree — and the LIVE shadow
+    // import emit SUBTREE-relative paths, and `rel_file_path` is framed into
+    // `canonical_input_bytes` → the CxId (see `astrolabe_domain::canonical_input_bytes`).
+    // If evidence stayed toplevel-relative while nodes are subtree-relative, attribution
+    // would miss; if — as #403 did — historical nodes were re-anchored UP to the toplevel
+    // namespace to match the evidence, their CxIds would diverge from the live graph and an
+    // unchanged member symbol could never reuse its live constellation (reused == 0). We
+    // therefore re-anchor the evidence DOWN into the one convention the live graph uses
+    // (strip the corpus prefix) and leave historical nodes subtree-relative. Attribution
+    // (`node_overlaps`/`location_overlaps`) and identity then both live in the
+    // subtree-relative namespace, so anchors attach to live-graph CxIds. The corpus_rel
+    // prefix survives ONLY on disk (the worktree checkout / `scoped_root`), never in the
+    // in-memory paths that derive identity. Empty `corpus_rel` (toplevel corpus) skips this
+    // block entirely, so the #413 whole-repo control path is byte-identical.
     if !corpus_rel.is_empty() {
         let corpus_prefix = format!("{corpus_rel}/");
         evidence.retain(|item| normalized_path(&item.range.path).starts_with(&corpus_prefix));
+        for item in &mut evidence {
+            // `retain` above guarantees the prefix is present; `unwrap_or` keeps this
+            // fail-safe (never a silent mis-anchor) rather than assuming it.
+            let normalized = normalized_path(&item.range.path);
+            item.range.path = normalized
+                .strip_prefix(&corpus_prefix)
+                .map(str::to_string)
+                .unwrap_or(normalized);
+        }
     }
 
     let mut report = GitArchaeologyImportReport {
@@ -302,24 +328,23 @@ fn index_historical_commit(
             CbmIndexMode::Fast,
         )?;
         pipeline.set_project_name(project)?;
-        let mut rows = pipeline.collect_rows()?;
+        let rows = pipeline.collect_rows()?;
         // Drop the pipeline (and with it CBM's SQLite handle) explicitly before
         // cleanup so the removals below race only Windows' async handle release,
         // which the bounded retry absorbs — not a still-open handle.
         drop(pipeline);
-        // Re-anchor node paths to the toplevel namespace. When scoped to the
-        // corpus subtree, CBM emits paths relative to `scoped_root`; the mined
-        // evidence (and thus `node_overlaps`/`select_implicated_rows`) is
-        // toplevel-relative. Prepending `corpus_rel` makes the two namespaces
-        // coincide again, so attribution and historical-constellation CxId
-        // derivation are byte-identical to the pre-#403 whole-worktree paths for
-        // every node inside the corpus.
-        if !corpus_rel.is_empty() {
-            for node in &mut rows.nodes {
-                node.file_path =
-                    format!("{corpus_rel}/{}", normalized_path(&node.file_path));
-            }
-        }
+        // Keep historical node paths SUBTREE-relative — exactly as CBM emits them from
+        // `scoped_root`, and byte-for-byte what the LIVE shadow import records as
+        // `rel_file_path` when it indexes the member corpus directory directly (both go
+        // through the same `extract_nodes` → `canonical_input_bytes` identity path). Because
+        // `rel_file_path` is framed into the CxId, the historical and live conventions MUST
+        // coincide or an unchanged member symbol can never share a CxId — the #403
+        // re-anchoring UP to the toplevel namespace broke exactly this (#418). Attribution
+        // still lines up because the mined evidence is re-anchored DOWN into this same
+        // subtree-relative namespace in `run_git_archaeology`. The corpus_rel prefix lives
+        // only on disk (the worktree checkout / `scoped_root`), never in identity-bearing
+        // paths. Empty `corpus_rel` (toplevel corpus) never re-anchored either side, so that
+        // #413 control path stays byte-identical.
         Ok(rows)
     })();
     // Ask git to release and remove its worktree registration first; retries below

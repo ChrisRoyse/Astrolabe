@@ -28,6 +28,14 @@ const char *cbm_cli_get_version(void);
  * raw-JSON argv and `--flag value` forms are neither accepted nor advertised. */
 int cbm_cli_print_tool_help(const char *tool_name);
 
+/* Same as cbm_cli_print_tool_help but with an explicit invoking-program name for
+ * the Usage lines (#416). The astrolabe host calls this with "astrolabe" so the
+ * two documented CLI surfaces share one help formatter and one schema source of
+ * truth instead of mirroring the text in Rust. A NULL prog falls back to
+ * "codebase-memory-mcp". Returns 0 if the tool is known, non-zero (prints
+ * nothing) if it is not. */
+int cbm_cli_print_tool_help_prog(const char *prog, const char *tool_name);
+
 /* ── Self-update: version comparison ──────────────────────────── */
 
 /* Compare two semver strings (e.g. "0.2.1" vs "0.2.0").

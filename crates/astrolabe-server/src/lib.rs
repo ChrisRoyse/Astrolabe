@@ -165,7 +165,7 @@ fn cli_stderr_tracing_level() -> LevelFilter {
 
 fn print_usage() {
     eprintln!(
-        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token is no longer supported and is refused (ASTRO_CLI_RAW_JSON_ARGV_REMOVED).\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
+        "Usage: astrolabe [cli <tool> --args-file <path> | cli <tool> (JSON on stdin) | cli verify_chain --args-file <path> | hook-augment | install|uninstall|update | verify --deep --vault <dir> --vault-id <id> --vault-salt <salt>]\nSupply cli tool arguments via --args-file <path> or piped stdin; passing raw JSON as an argv token is no longer supported and is refused (ASTRO_CLI_RAW_JSON_ARGV_REMOVED).\n`astrolabe cli <tool> --help` (or -h) prints the tool's arguments from its schema and exits without running the tool (#416).\n`astrolabe cli --json <tool>` prints the raw result JSON on stdout and exits 1 when the result is isError:true, else 0 (#419).\nverify --deep exits 0 when verified and 1 on a named failure such as ASTRO_VERIFY_DEEP_FAILED."
     );
 }
 
@@ -361,7 +361,7 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     let index_worker = strip_flag(&mut args, "--index-worker");
     let response_out = strip_flag_value(&mut args, "--response-out");
     if args.is_empty() {
-        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin)] (raw '<json>' argv is no longer supported)".into());
+        return Err("Usage: astrolabe cli [--json] [--progress] <tool_name> [--args-file <path> | (JSON on stdin)] (raw '<json>' argv is no longer supported).\n  --json prints the raw tool result JSON on stdout and exits 1 when the result is isError:true (0 otherwise), so RC-based callers see tool failures (#419).\n  <tool_name> --help prints the tool's arguments and exits without running it (#416).".into());
     }
 
     let _worker_watchdog = index_worker.then(ParentWatchdog::start);
@@ -373,6 +373,18 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
         None
     };
     let tool_name = args.remove(0);
+
+    // #416: a per-tool `--help`/`-h` anywhere in the tool's argument tail prints
+    // help and exits WITHOUT running the tool — the shipped host previously
+    // swallowed `--help` into the empty-args path and silently executed the tool
+    // (a silent-fallback-shaped defect). The scan is over the args AFTER the tool
+    // name, matching the standalone cbm binary's contract exactly (both `--help`
+    // and `-h`). Help is resolved before argument resolution so it never blocks on
+    // stdin and before any store work, so no store is opened or mutated.
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return run_cli_tool_help(&tool_name);
+    }
+
     let args_json = resolve_cli_args(&args)?;
     if progress {
         eprintln!("astrolabe cli progress: start tool={tool_name}");
@@ -405,11 +417,19 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
     }
 
     if raw_json {
+        // #419: the JSON payload is unchanged (byte-for-byte on stdout), but the
+        // process exit code now reflects the tool outcome — `isError: true` exits
+        // 1 so any RC-based caller (scripts, FSV drivers, agents checking `$?`)
+        // sees the failure instead of reading a `--json` success. This matches the
+        // non-`--json` path (`print_mcp_tool_result`) and the wider CLI convention
+        // (git/gh/kubectl) that command failure is signalled by a non-zero exit,
+        // with `--json` changing only stdout format, not the failure signal.
         println!("{result}");
+        let code = mcp_result_exit_code(&result);
         if progress {
-            eprintln!("astrolabe cli progress: done tool={tool_name} exit=0");
+            eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
         }
-        return Ok(0);
+        return Ok(code);
     }
 
     let code = print_mcp_tool_result(&result)?;
@@ -417,6 +437,36 @@ fn run_cli(args: &[String]) -> Result<i32, DynError> {
         eprintln!("astrolabe cli progress: done tool={tool_name} exit={code}");
     }
     Ok(code)
+}
+
+/// Print per-tool `--help` for `astrolabe cli <tool> --help` (#416) and return 0
+/// WITHOUT running the tool. cbm MCP tools are described by the single shared C
+/// help formatter (one schema source of truth, branded `astrolabe`).
+/// `verify_chain` is an astrolabe-host-only tool with no cbm input schema, so its
+/// supported form is printed here directly. An unknown tool is refused fail-closed
+/// with a labeled error rather than silently executed.
+fn run_cli_tool_help(tool_name: &str) -> Result<i32, DynError> {
+    if tool_name == "verify_chain" {
+        println!("Usage:");
+        println!("  astrolabe cli verify_chain --args-file <path-to-json>");
+        println!("  echo '<json>' | astrolabe cli verify_chain");
+        println!();
+        println!("Arguments (JSON object keys):");
+        println!(
+            "  vault <string> [required]  Path to the vault directory whose ledger chain is verified (alias: vault_dir)"
+        );
+        return Ok(0);
+    }
+    let known = astrolabe_bridge::cbm_print_tool_help("astrolabe", tool_name)?;
+    if !known {
+        return Err(format!(
+            "ASTRO_CLI_UNKNOWN_TOOL: no such tool '{tool_name}', cannot print --help. \
+             remediation: run `astrolabe cli <tool> --help` with a valid tool name; list the \
+             available tools by running the server (`astrolabe`) and calling `tools/list`."
+        )
+        .into());
+    }
+    Ok(0)
 }
 
 fn run_verify_chain_cli(
