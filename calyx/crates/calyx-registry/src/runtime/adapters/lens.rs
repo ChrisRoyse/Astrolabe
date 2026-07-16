@@ -13,9 +13,10 @@ use super::config::{
     MultimodalAdapterConfig, MultimodalAdapterProvider, config_invalid, load_adapter_config,
 };
 use super::validate::validate_input;
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, contract_from_facts, multimodal_adapter_corpus_hash};
 use crate::lens::ensure_input_modality;
-use crate::runtime::common::{hash_files, normalize_unit};
+use crate::runtime::common::{hash_files, normalize_unit, validate_contract_covers_loaded_paths};
 use crate::spec::{LensRuntime, LensSpec};
 
 pub const CALYX_LICENSE_DENIED: &str = "CALYX_LICENSE_DENIED";
@@ -82,20 +83,22 @@ impl MultimodalAdapterLens {
             &spec.model_id,
             Some(spec.dim),
         )?;
+        let loaded_paths = adapter_config.contract_paths();
         let contract_paths = if spec.files.is_empty() {
-            adapter_config.contract_paths()
+            loaded_paths.clone()
         } else {
             spec.files.clone()
         };
+        validate_contract_covers_loaded_paths(
+            "multimodal-adapter",
+            &loaded_paths,
+            &contract_paths,
+        )?;
         let weights_sha256 = hash_files(&contract_paths).map_err(|err| {
             config_invalid(format!("hash multimodal adapter files failed: {err}"))
         })?;
-        let corpus_hash = sha256_digest(&[
-            b"multimodal-onnx-adapter-v2",
-            spec.name.as_bytes(),
-            spec.axis.as_str().as_bytes(),
-            spec.model_id.as_bytes(),
-        ]);
+        let corpus_hash =
+            multimodal_adapter_corpus_hash(&spec.name, spec.axis.as_str(), &spec.model_id);
         Self::from_parts(AdapterParts {
             name: spec.name,
             axis: spec.axis,
@@ -136,28 +139,46 @@ impl MultimodalAdapterLens {
             .as_deref()
             .ok_or_else(|| config_invalid("multimodal adapter config is required"))?;
         let adapter_config = load_adapter_config(adapter_config_path, axis, model_id, Some(dim))?;
+        let loaded_paths = adapter_config.contract_paths();
+        let contract_paths = if files.is_empty() {
+            loaded_paths.clone()
+        } else {
+            files.clone()
+        };
+        validate_contract_covers_loaded_paths(
+            "multimodal-adapter",
+            &loaded_paths,
+            &contract_paths,
+        )?;
+        let weights_sha256 = hash_files(&contract_paths).map_err(|err| {
+            config_invalid(format!("hash multimodal adapter files failed: {err}"))
+        })?;
+        if weights_sha256 != spec.weights_sha256 {
+            return Err(CalyxError::lens_frozen_violation(
+                "multimodal adapter artifact hash does not match LensSpec",
+            ));
+        }
         Self::from_parts(AdapterParts {
             name: spec.name.clone(),
             axis,
             model_id: model_id.clone(),
             dim,
             adapter_config,
-            files: files.clone(),
-            weights_sha256: spec.weights_sha256,
-            corpus_hash: spec.corpus_hash,
+            files: contract_paths,
+            weights_sha256,
+            corpus_hash: multimodal_adapter_corpus_hash(&spec.name, axis.as_str(), model_id),
         })
     }
 
     pub fn contract(&self) -> FrozenLensContract {
-        FrozenLensContract::new(
-            self.name.clone(),
-            self.weights_sha256,
-            self.corpus_hash,
-            SlotShape::Dense(self.dim),
-            self.axis.modality(),
-            LensDType::F32,
-            NormPolicy::unit(),
-        )
+        contract_from_facts(ContractFacts {
+            name: self.name.clone(),
+            weights_sha256: self.weights_sha256,
+            corpus_hash: self.corpus_hash,
+            shape: SlotShape::Dense(self.dim),
+            modality: self.axis.modality(),
+            norm: NormPolicy::unit(),
+        })
     }
 
     pub fn lens_spec(&self) -> LensSpec {
@@ -201,15 +222,14 @@ impl MultimodalAdapterLens {
         if parts.dim == 0 {
             return Err(config_invalid("multimodal adapter dim must be > 0"));
         }
-        let contract = FrozenLensContract::new(
-            parts.name.clone(),
-            parts.weights_sha256,
-            parts.corpus_hash,
-            SlotShape::Dense(parts.dim),
-            parts.axis.modality(),
-            LensDType::F32,
-            NormPolicy::unit(),
-        );
+        let contract = contract_from_facts(ContractFacts {
+            name: parts.name.clone(),
+            weights_sha256: parts.weights_sha256,
+            corpus_hash: parts.corpus_hash,
+            shape: SlotShape::Dense(parts.dim),
+            modality: parts.axis.modality(),
+            norm: NormPolicy::unit(),
+        });
         Ok(Self {
             name: parts.name,
             axis: parts.axis,

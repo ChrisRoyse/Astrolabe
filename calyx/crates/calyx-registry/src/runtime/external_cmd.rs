@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
 use serde::{Deserialize, Serialize};
 
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::identity::{
+    ContractFacts, contract_from_facts, external_command_corpus_hash, external_command_weights_hash,
+};
 use crate::lens::ensure_input_modality;
 
 #[derive(Clone, Debug)]
@@ -41,18 +43,14 @@ impl ExternalCmdLens {
     ) -> Self {
         let name = name.into();
         let cmd = cmd.into();
-        let args_text = args.join("\0");
-        let weights = sha256_digest(&[cmd.as_bytes(), args_text.as_bytes()]);
-        let corpus = sha256_digest(&[b"external-cmd-runtime-v1"]);
-        let contract = FrozenLensContract::new(
+        let contract = contract_from_facts(ContractFacts {
             name,
-            weights,
-            corpus,
-            SlotShape::Dense(dim),
+            weights_sha256: external_command_weights_hash(&cmd, &args),
+            corpus_hash: external_command_corpus_hash(),
+            shape: SlotShape::Dense(dim),
             modality,
-            LensDType::F32,
-            NormPolicy::None,
-        );
+            norm: crate::frozen::NormPolicy::None,
+        });
         Self {
             id: contract.lens_id(),
             cmd,

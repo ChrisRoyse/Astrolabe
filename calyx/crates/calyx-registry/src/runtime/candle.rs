@@ -8,7 +8,8 @@ use tokenizers::Tokenizer;
 use crate::commission::{
     LensForgeSourceTensorDtypeProfile, profile_safetensors_source, resolve_safetensors_weight_set,
 };
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, candle_execution_corpus_hash, contract_from_facts};
 use crate::runtime::common::{
     DEFAULT_MAX_TOKENS, LocalModelExecutionAttestation, default_hf_cache_root, hash_files,
     text_from_input, validate_contract_covers_loaded_paths,
@@ -248,15 +249,14 @@ impl CandleLens {
             spec.norm_policy,
             &source_tensor_dtype_profile,
         );
-        let contract = FrozenLensContract::new(
-            spec.name,
+        let contract = contract_from_facts(ContractFacts {
+            name: spec.name,
             weights_sha256,
             corpus_hash,
-            SlotShape::Dense(dim),
-            Modality::Text,
-            LensDType::F32,
-            spec.norm_policy,
-        );
+            shape: SlotShape::Dense(dim),
+            modality: Modality::Text,
+            norm: spec.norm_policy,
+        });
         let id = contract.lens_id();
         Ok(Self {
             id,
@@ -449,19 +449,15 @@ pub(crate) fn candle_corpus_hash(
     norm_policy: NormPolicy,
     source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
 ) -> [u8; 32] {
-    let max_tokens = max_tokens.to_string();
-    let norm = format!("{norm_policy:?}");
-    sha256_digest(&[
-        CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
-        model_id.as_bytes(),
-        max_tokens.as_bytes(),
-        execution_device.as_bytes(),
-        precision.as_str().as_bytes(),
-        pooling.as_str().as_bytes(),
-        norm.as_bytes(),
-        source_tensor_dtype_profile.fingerprint_sha256.as_bytes(),
-        b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output,source-dtype-profile-v1",
-    ])
+    candle_execution_corpus_hash(
+        model_id,
+        max_tokens,
+        execution_device,
+        precision.as_str(),
+        pooling.as_str(),
+        norm_policy,
+        &source_tensor_dtype_profile.fingerprint_sha256,
+    )
 }
 
 impl CandleLens {

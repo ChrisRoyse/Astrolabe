@@ -1,5 +1,4 @@
 use std::cell::Cell;
-#[cfg(feature = "ml-runtime")]
 use std::collections::BTreeSet;
 #[cfg(feature = "ml-runtime")]
 use std::env;
@@ -90,7 +89,6 @@ fn dtype_token(dtype: DType) -> Result<&'static str> {
     }
 }
 
-#[cfg(feature = "ml-runtime")]
 pub(crate) fn validate_contract_covers_loaded_paths(
     runtime: &str,
     loaded_paths: &[PathBuf],

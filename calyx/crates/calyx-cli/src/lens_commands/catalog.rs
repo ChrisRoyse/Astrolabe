@@ -7,7 +7,8 @@ use calyx_core::{Input, Lens, LensCost, Placement};
 use calyx_registry::{
     CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, PlacementBudget,
     StaticLookupLens, choose_resolved_placement, frozen_device_policy,
-    lens_spec_from_manifest_path, lens_spec_metadata_from_manifest_path,
+    legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest_path,
+    lens_spec_metadata_from_manifest_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,8 @@ use crate::output::print_json;
 
 mod budget;
 mod store;
+
+const LENS_IDENTITY_MIGRATION_REQUIRED: &str = "CALYX_LENS_IDENTITY_MIGRATION_REQUIRED";
 
 pub(crate) use store::LensCatalogDbReadback;
 
@@ -120,6 +123,7 @@ pub(crate) fn migrate_catalog(args: &[String]) -> CliResult {
         .from
         .unwrap_or_else(|| store::legacy_catalog_path(&catalog_path));
     let catalog = read_legacy_catalog(&source)?;
+    validate_catalog_migration(&catalog)?;
     let readback = write_catalog(&catalog_path, &catalog)?;
     print_json(&MigrateReport {
         source,
@@ -127,6 +131,47 @@ pub(crate) fn migrate_catalog(args: &[String]) -> CliResult {
         count: catalog.lenses.len(),
         readback,
     })
+}
+
+fn validate_catalog_migration(catalog: &LensCatalog) -> CliResult {
+    for entry in &catalog.lenses {
+        let spec = lens_spec_from_manifest_path(&entry.manifest).map_err(|error| {
+            CliError::from(calyx_core::CalyxError {
+                code: LENS_IDENTITY_MIGRATION_REQUIRED,
+                message: format!(
+                    "legacy catalog row name={} manifest={} lens_id={} cannot be reconstructed canonically: {}: {}",
+                    entry.name,
+                    entry.manifest.display(),
+                    entry.lens_id,
+                    error.code,
+                    error.message
+                ),
+                remediation: "preserve the legacy catalog bytes and perform an explicit lineage migration before writing the catalog database",
+            })
+        })?;
+        let collisions = catalog
+            .lenses
+            .iter()
+            .filter(|candidate| {
+                catalog_identity_collides(
+                    candidate,
+                    &spec.lens_id().to_string(),
+                    &spec.name,
+                    &entry.manifest,
+                )
+            })
+            .collect::<Vec<_>>();
+        if collisions.len() != 1
+            || !canonical_catalog_identity_matches(entry, &spec, &entry.manifest)?
+        {
+            return Err(identity_migration_required(
+                &collisions,
+                &spec,
+                &entry.manifest,
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn add_manifest_to_catalog(
@@ -137,7 +182,28 @@ pub(crate) fn add_manifest_to_catalog(
     let catalog_path = catalog_path(home)?;
     let mut catalog = read_catalog(&catalog_path)?;
     let lens_id = spec.lens_id().to_string();
-    retain_unrelated_entries(&mut catalog, &lens_id, &spec.name, &manifest);
+    let collisions = catalog
+        .lenses
+        .iter()
+        .filter(|entry| catalog_identity_collides(entry, &lens_id, &spec.name, &manifest))
+        .collect::<Vec<_>>();
+    if !collisions.is_empty() {
+        if collisions.len() == 1
+            && canonical_catalog_identity_matches(collisions[0], &spec, &manifest)?
+        {
+            let existing = collisions[0];
+            return Ok(AddReport {
+                catalog: catalog_path,
+                lens_id: existing.lens_id.clone(),
+                name: existing.name.clone(),
+                manifest: existing.manifest.clone(),
+                cost: existing.cost,
+                placement: existing.placement,
+                count: catalog.lenses.len(),
+            });
+        }
+        return Err(identity_migration_required(&collisions, &spec, &manifest));
+    }
     let mut cost = estimate_lens_cost(&spec)?;
     let resolved_placement = resolved_runtime_placement(&spec)?;
     if resolved_placement == Placement::Cpu {
@@ -148,7 +214,6 @@ pub(crate) fn add_manifest_to_catalog(
         resolved_placement == Placement::Gpu && cost.vram_bytes > 0,
     )?;
     let entry = entry_from_spec(&spec, manifest, cost, budget, resolved_placement)?;
-    retain_unrelated_entries(&mut catalog, &entry.lens_id, &entry.name, &entry.manifest);
     catalog.lenses.push(entry.clone());
     catalog
         .lenses
@@ -165,19 +230,146 @@ pub(crate) fn add_manifest_to_catalog(
     })
 }
 
-fn retain_unrelated_entries(catalog: &mut LensCatalog, lens_id: &str, name: &str, manifest: &Path) {
-    catalog
-        .lenses
-        .retain(|item| !same_catalog_identity(item, lens_id, name, manifest));
-}
-
-fn same_catalog_identity(
+fn catalog_identity_collides(
     entry: &LensCatalogEntry,
     lens_id: &str,
     name: &str,
     manifest: &Path,
 ) -> bool {
     entry.lens_id == lens_id || entry.name == name || entry.manifest == manifest
+}
+
+pub(crate) fn canonical_catalog_identity_matches(
+    entry: &LensCatalogEntry,
+    spec: &LensSpec,
+    manifest: &Path,
+) -> CliResult<bool> {
+    Ok(entry.lens_id == spec.lens_id().to_string()
+        && entry.name == spec.name
+        && entry.manifest == manifest
+        && entry.modality == format!("{:?}", spec.modality).to_lowercase()
+        && entry.runtime == runtime_name(&spec.runtime)
+        && entry.dim == dim(spec.output)
+        && entry.retrieval_only == spec.retrieval_only
+        && entry.excluded_from_dedup == spec.excluded_from_dedup
+        && entry.weights_sha256 == hex_from_bytes(&spec.weights_sha256)
+        && entry.placement == resolved_runtime_placement(spec)?
+        && catalog_cost_matches(spec, entry.cost)?)
+}
+
+pub(crate) fn catalog_cost_matches(spec: &LensSpec, cost: LensCost) -> CliResult<bool> {
+    if !cost.total_ms.is_finite()
+        || cost.total_ms < 0.0
+        || !cost.ms_per_input.is_finite()
+        || cost.ms_per_input < 0.0
+    {
+        return Ok(false);
+    }
+    match &spec.runtime {
+        LensRuntime::Algorithmic { .. }
+        | LensRuntime::ExternalCmd { .. }
+        | LensRuntime::TeiHttp { .. } => Ok(cost == LensCost::zero()),
+        LensRuntime::StaticLookup {
+            embeddings_file,
+            tokenizer,
+            ..
+        } => {
+            let ram_bytes = path_size(embeddings_file)?.saturating_add(path_size(tokenizer)?);
+            Ok(cost.total_ms == cost.ms_per_input
+                && cost.vram_bytes == 0
+                && cost.ram_bytes == ram_bytes
+                && cost.batch_ceiling == batch_ceiling(cost.ms_per_input))
+        }
+        LensRuntime::MultimodalAdapter { files, .. } => {
+            let bytes = files_size(files)?;
+            let placement = resolved_runtime_placement(spec)?;
+            Ok(cost.total_ms == 0.0
+                && cost.ms_per_input == 0.0
+                && cost.vram_bytes
+                    == if placement == Placement::Gpu {
+                        bytes
+                    } else {
+                        0
+                    }
+                && cost.ram_bytes == bytes
+                && cost.batch_ceiling == u32::MAX)
+        }
+        LensRuntime::CandleLocal { files, .. }
+        | LensRuntime::Onnx { files, .. }
+        | LensRuntime::OnnxColbert { files, .. }
+        | LensRuntime::FastembedSparse { files, .. }
+        | LensRuntime::FastembedBgem3 { files, .. }
+        | LensRuntime::FastembedReranker { files, .. }
+        | LensRuntime::FastembedQwen3 { files, .. } => {
+            let bytes = files_size(files)?;
+            let placement = resolved_runtime_placement(spec)?;
+            Ok(cost.total_ms == 0.0
+                && cost.ms_per_input == 0.0
+                && cost.vram_bytes
+                    == if placement == Placement::Gpu {
+                        bytes
+                    } else {
+                        0
+                    }
+                && cost.ram_bytes == bytes
+                && cost.batch_ceiling == u32::MAX)
+        }
+    }
+}
+
+fn identity_migration_required(
+    collisions: &[&LensCatalogEntry],
+    spec: &LensSpec,
+    manifest: &Path,
+) -> CliError {
+    let entry = collisions.first().copied();
+    let mut legacy_errors = Vec::new();
+    let recognized_legacy = collisions.iter().any(|entry| {
+        match legacy_lensforge_manifest_v1_ids_from_path(&entry.manifest) {
+            Ok(candidates) => candidates
+                .iter()
+                .any(|candidate| candidate.to_string() == entry.lens_id),
+            Err(error) => {
+                legacy_errors.push(format!(
+                    "{}: {}: {}",
+                    entry.manifest.display(),
+                    error.code,
+                    error.message
+                ));
+                false
+            }
+        }
+    });
+    let classification = if recognized_legacy {
+        "recognized lensforge-manifest-v1 spec-side identity".to_string()
+    } else if collisions.len() > 1 {
+        "multiple persisted rows collide with the canonical identity".to_string()
+    } else {
+        "conflicting or ambiguous persisted identity".to_string()
+    };
+    let legacy_diagnostics = if legacy_errors.is_empty() {
+        "none".to_string()
+    } else {
+        legacy_errors.join(" | ")
+    };
+    CliError::from(calyx_core::CalyxError {
+        code: LENS_IDENTITY_MIGRATION_REQUIRED,
+        message: format!(
+            "{} catalog row(s) collide; first row name={} manifest={} lens_id={} conflicts with canonical name={} manifest={} lens_id={}: {classification}; legacy_reconstruction_errors={legacy_diagnostics}",
+            collisions.len(),
+            entry.map(|value| value.name.as_str()).unwrap_or("<none>"),
+            entry
+                .map(|value| value.manifest.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            entry
+                .map(|value| value.lens_id.as_str())
+                .unwrap_or("<none>"),
+            spec.name,
+            manifest.display(),
+            spec.lens_id()
+        ),
+        remediation: "preserve the catalog bytes, inspect the legacy row, and perform an explicit lineage migration before admitting the canonical lens",
+    })
 }
 
 impl MigrateFlags {
@@ -243,13 +435,22 @@ fn read_legacy_catalog(path: &Path) -> CliResult<LensCatalog> {
 }
 
 fn list_entry(entry: LensCatalogEntry) -> ListLensEntry {
-    let health = health_from_manifest(&entry.manifest);
+    let health = health_from_manifest(&entry);
     ListLensEntry { entry, health }
 }
 
-fn health_from_manifest(path: &Path) -> LensHealth {
-    match lens_spec_metadata_from_manifest_path(path) {
-        Ok(spec) => spec.health(),
+fn health_from_manifest(entry: &LensCatalogEntry) -> LensHealth {
+    match lens_spec_metadata_from_manifest_path(&entry.manifest) {
+        Ok(spec) if spec.lens_id().to_string() == entry.lens_id => spec.health(),
+        Ok(spec) => LensHealth::Failing {
+            code: LENS_IDENTITY_MIGRATION_REQUIRED.to_string(),
+            reason: format!(
+                "catalog lens_id {} != canonical manifest lens_id {} for {}",
+                entry.lens_id,
+                spec.lens_id(),
+                entry.manifest.display()
+            ),
+        },
         Err(error) => LensHealth::Failing {
             code: error.code.to_string(),
             reason: error.message,
@@ -308,7 +509,7 @@ fn placement_from_spec(
     )
 }
 
-fn resolved_runtime_placement(spec: &LensSpec) -> CliResult<Placement> {
+pub(crate) fn resolved_runtime_placement(spec: &LensSpec) -> CliResult<Placement> {
     match &spec.runtime {
         LensRuntime::Algorithmic { .. }
         | LensRuntime::StaticLookup { .. }

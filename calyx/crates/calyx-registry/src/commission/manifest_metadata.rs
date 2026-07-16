@@ -1,18 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{Asymmetry, CalyxError, Result};
+use calyx_core::{CalyxError, Result};
 
 use crate::frozen::{NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
 use crate::spec::{FastembedBgem3Output, LensRuntime, LensSpec};
 
-use super::algorithmic_manifest::{
-    algorithmic_kind, frozen_contract as algorithmic_frozen_contract, is_algorithmic_runtime,
-};
+use super::algorithmic_manifest::{algorithmic_kind, is_algorithmic_runtime};
 use super::manifest::{LensForgeFile, LensForgeManifest};
+use super::manifest_identity::spec_from_manifest_identity;
 use super::manifest_runtime::{
-    canonical_local_model_device, canonical_local_model_dtype, validate_local_model_execution,
+    canonical_local_model_device, canonical_local_model_dtype, requires_artifact_set,
+    validate_local_model_execution,
 };
 use super::source_tensor_profile::validate_manifest_source_tensor_profile;
 
@@ -47,54 +47,10 @@ pub fn lens_spec_metadata_from_manifest(
         allow_noncommercial_from_env(),
     )?;
     let output = manifest.output_shape()?;
-    let algorithmic_contract =
-        algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?;
-    let (output, weights_sha256, corpus_hash, norm_policy) =
-        if let Some(contract) = algorithmic_contract {
-            (
-                contract.shape(),
-                contract.weights_sha256(),
-                contract.corpus_hash(),
-                contract.norm_policy(),
-            )
-        } else {
-            (
-                output,
-                metadata_weights_sha256(manifest)?,
-                sha256_digest(&[
-                    b"lensforge-manifest-v1",
-                    manifest.name.as_bytes(),
-                    manifest.source_hf_id.as_bytes(),
-                    manifest.runtime.as_bytes(),
-                    modality_token(manifest.modality).as_bytes(),
-                    manifest.pooling.as_bytes(),
-                    manifest.norm.as_bytes(),
-                ]),
-                norm_policy(&manifest.norm)?,
-            )
-        };
-    let retrieval_only = is_retrieval_only_runtime(&manifest.runtime);
-    Ok(LensSpec {
-        name: manifest.name.clone(),
-        runtime: metadata_runtime_from_manifest(manifest, base_dir)?,
-        output,
-        modality: manifest.modality,
-        weights_sha256,
-        corpus_hash,
-        norm_policy,
-        max_batch: manifest.max_batch,
-        axis: Some(manifest.name.clone()),
-        asymmetry: Asymmetry::None,
-        quant_default: manifest.quant_default,
-        truncate_dim: manifest.truncate_dim,
-        recall_delta: manifest.recall_delta,
-        retrieval_only,
-        excluded_from_dedup: retrieval_only,
-    })
-}
-
-fn is_retrieval_only_runtime(runtime: &str) -> bool {
-    matches!(runtime, "fastembed-reranker")
+    let weights_sha256 = metadata_weights_sha256(manifest)?;
+    let norm_policy = norm_policy(&manifest.norm)?;
+    let runtime = metadata_runtime_from_manifest(manifest, base_dir)?;
+    spec_from_manifest_identity(manifest, runtime, output, weights_sha256, norm_policy)
 }
 
 fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
@@ -180,27 +136,20 @@ fn validate_declared_artifact_identity(manifest: &LensForgeManifest) -> Result<(
             manifest.weights_sha256, anchor.sha256
         )));
     }
-    if is_local_learned_runtime(&manifest.runtime)
+    if requires_artifact_set(&manifest.runtime)
         && manifest
             .artifact_set_sha256
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
     {
         return Err(config_invalid(
-            "local learned manifest requires artifact_set_sha256 covering every executable artifact",
+            "artifact-backed manifest requires artifact_set_sha256 covering every executable artifact",
         ));
     }
     if let Some(artifact_set) = manifest.artifact_set_sha256.as_deref() {
         let _ = parse_hex_32(artifact_set)?;
     }
     Ok(())
-}
-
-fn is_local_learned_runtime(runtime: &str) -> bool {
-    matches!(
-        runtime,
-        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
-    )
 }
 
 fn is_adapter_runtime(runtime: &str) -> bool {

@@ -5,7 +5,8 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Result, SlotShape, SlotVector,
 use fastembed::SparseEmbedding;
 
 use super::super::{OnnxModelFiles, OnnxProviderPolicy};
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, contract_from_facts};
 use crate::runtime::common::{fastembed_cache_root, hash_files, normalize_unit, text_from_input};
 use crate::spec::LensSpec;
 
@@ -29,17 +30,16 @@ pub(super) fn contract(
     files: &OnnxModelFiles,
     shape: SlotShape,
     norm: NormPolicy,
-    corpus_parts: &[&[u8]],
+    corpus_hash: [u8; 32],
 ) -> Result<FrozenLensContract> {
-    Ok(FrozenLensContract::new(
+    Ok(contract_from_facts(ContractFacts {
         name,
-        hash_files(&files.artifact_paths())?,
-        sha256_digest(corpus_parts),
+        weights_sha256: hash_files(&files.artifact_paths())?,
+        corpus_hash,
         shape,
-        calyx_core::Modality::Text,
-        LensDType::F32,
+        modality: calyx_core::Modality::Text,
         norm,
-    ))
+    }))
 }
 
 pub(super) fn ensure_spec_match(

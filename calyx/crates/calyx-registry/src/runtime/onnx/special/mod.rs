@@ -10,6 +10,9 @@ use fastembed::{
 use super::cuda_guard::CudaDropGuard;
 use super::{OnnxModelFiles, OnnxProviderPolicy};
 use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{
+    fastembed_bgem3_corpus_hash, fastembed_reranker_corpus_hash, fastembed_sparse_corpus_hash,
+};
 use crate::spec::{FastembedBgem3Output, LensRuntime, LensSpec};
 
 mod models;
@@ -92,7 +95,7 @@ impl FastembedSparseLens {
             &files,
             shape,
             NormPolicy::Finite,
-            &[b"fastembed-sparse-v1", info.model_code.as_bytes()],
+            fastembed_sparse_corpus_hash(&info.model_code),
         )?;
         Ok(Self::new(
             contract,
@@ -190,11 +193,7 @@ impl FastembedBgem3Lens {
             &files,
             bgem3_shape(output),
             bgem3_norm(output),
-            &[
-                b"fastembed-bgem3-v1",
-                info.model_code.as_bytes(),
-                bgem3_corpus_token(output),
-            ],
+            fastembed_bgem3_corpus_hash(&info.model_code, bgem3_corpus_token(output)),
         )?;
         Ok(Self::new(
             contract,
@@ -301,7 +300,7 @@ impl FastembedRerankerLens {
             &files,
             SlotShape::Dense(1),
             NormPolicy::Finite,
-            &[b"fastembed-reranker-v1", info.model_code.as_bytes()],
+            fastembed_reranker_corpus_hash(&info.model_code),
         )?;
         Ok(Self::new(
             contract,

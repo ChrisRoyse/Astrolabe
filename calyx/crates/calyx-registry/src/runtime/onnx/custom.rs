@@ -16,7 +16,7 @@ use super::cuda_guard::CudaDropGuard;
 use super::io_binding::OnnxRunPlan;
 use super::session::{ManagedOnnxSession, build_session};
 use super::{OnnxFileSpec, OnnxLens, OnnxModelFiles, config_invalid};
-use crate::frozen::{FrozenLensContract, LensDType, sha256_digest};
+use crate::identity::{ContractFacts, contract_from_facts, onnx_custom_corpus_hash};
 use crate::runtime::common::hash_files;
 use batch::{TokenBatch, session_inputs, stream_token_batches, token_batches};
 pub(in crate::runtime::onnx) use output::pooling_from_config;
@@ -185,16 +185,19 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
     let shape = output.shape();
     let tokenizer = Tokenizer::from_file(&spec.tokenizer)
         .map_err(|err| config_invalid(format!("load tokenizer failed: {err}")))?;
-    let corpus_hash = custom_corpus_hash(&spec, output);
-    let contract = FrozenLensContract::new(
-        spec.name,
+    let contract = contract_from_facts(ContractFacts {
+        name: spec.name,
         weights_sha256,
-        corpus_hash,
+        corpus_hash: onnx_custom_corpus_hash(
+            &spec.model_id,
+            shape,
+            spec.pooling.as_str(),
+            spec.norm_policy,
+        ),
         shape,
-        spec.modality,
-        LensDType::F32,
-        spec.norm_policy,
-    );
+        modality: spec.modality,
+        norm: spec.norm_policy,
+    });
     let runtime = CustomOnnxRuntime {
         session: session.into_inner(),
         run_plan,
@@ -209,22 +212,6 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
         spec.max_batch,
         runtime,
     ))
-}
-
-fn custom_corpus_hash(spec: &OnnxFileSpec, output: CustomOutput) -> [u8; 32] {
-    match output {
-        CustomOutput::Dense { .. } => sha256_digest(&[
-            b"onnx-custom-v1",
-            spec.model_id.as_bytes(),
-            spec.pooling.as_str().as_bytes(),
-            format!("{:?}", spec.norm_policy).as_bytes(),
-        ]),
-        CustomOutput::Sparse { .. } => sha256_digest(&[
-            b"onnx-custom-splade-v1",
-            spec.model_id.as_bytes(),
-            b"sparse-positive-f32",
-        ]),
-    }
 }
 
 impl CustomOnnxRuntime {

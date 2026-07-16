@@ -1,13 +1,15 @@
 use calyx_core::{CalyxError, Lens, Modality, Placement};
 use calyx_registry::{
-    AlgorithmicLens, CandleDevicePolicy, CandleLens, FastembedBgem3Lens, FastembedBgem3Output,
-    FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec,
-    MultimodalAdapterLens, OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
+    CandleDevicePolicy, CandleLens, FastembedBgem3Lens, FastembedBgem3Output, FastembedQwen3Lens,
+    FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec, MultimodalAdapterLens,
+    OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
     runtime::tei_http::DEFAULT_TEI_MAX_BATCH,
 };
 
+use super::super::support::algorithmic_lens;
 use super::super::support::dim;
 use super::super::support::hex_from_bytes;
+use super::super::support::require_runtime_lens_id;
 use super::model::{
     GEMM_ACCUMULATION_DTYPE, LocalExecutionAttestationAudit, NOT_APPLICABLE_DTYPE, OUTPUT_DTYPE,
     UNKNOWN_DTYPE,
@@ -29,7 +31,7 @@ pub(super) struct RuntimeLens {
 }
 
 pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
-    match &spec.runtime {
+    let runtime = match &spec.runtime {
         LensRuntime::Onnx { .. } => {
             let lens = OnnxLens::from_lens_spec(spec)?;
             let provider = lens.provider_policy().to_string();
@@ -237,7 +239,7 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
             })
         }
         LensRuntime::Algorithmic { kind } => {
-            let lens = algorithmic_lens(spec, kind)?;
+            let lens = algorithmic_lens(&spec.name, spec.modality, kind, spec.output)?;
             Ok(RuntimeLens {
                 lens: Box::new(lens),
                 detail: format!("algorithmic:{kind};cpu_explicit"),
@@ -284,7 +286,9 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
         LensRuntime::ExternalCmd { .. } => Err(CalyxError::lens_unreachable(
             "external-cmd lenses are not accepted for PH68 scale-audit",
         )),
-    }
+    }?;
+    require_runtime_lens_id(spec, runtime.lens.as_ref())?;
+    Ok(runtime)
 }
 
 fn candle_device_proof(policy: CandleDevicePolicy) -> String {
@@ -357,61 +361,4 @@ pub(super) fn is_content_modality(modality: Modality) -> bool {
         modality,
         Modality::Text | Modality::Code | Modality::Image | Modality::Audio | Modality::Video
     )
-}
-
-fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Result<AlgorithmicLens, CalyxError> {
-    match kind {
-        "byte" | "byte-features" => Ok(AlgorithmicLens::byte_features(&spec.name, spec.modality)),
-        "scalar" => Ok(AlgorithmicLens::scalar(&spec.name, spec.modality)),
-        "ast-style" => Ok(AlgorithmicLens::ast_style(&spec.name, spec.modality)),
-        "gdelt-cameo" | "gdelt_cameo" => {
-            Ok(AlgorithmicLens::gdelt_cameo(&spec.name, spec.modality))
-        }
-        "gdelt-actor-geo" | "gdelt_actor_geo" => Ok(AlgorithmicLens::gdelt_actor_geo(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-source-domain" | "gdelt_source_domain" => Ok(AlgorithmicLens::gdelt_source_domain(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-event-geo" | "gdelt_event_geo" => Ok(AlgorithmicLens::gdelt_event_geo(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-actor-pair" | "gdelt_actor_pair" => Ok(AlgorithmicLens::gdelt_actor_pair(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-event-actor" | "gdelt_event_actor" => Ok(AlgorithmicLens::gdelt_event_actor(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-tone-signal" | "gdelt_tone_signal" => Ok(AlgorithmicLens::gdelt_tone_signal(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "gdelt-source-event" | "gdelt_source_event" => Ok(AlgorithmicLens::gdelt_source_event(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "sparse" | "sparse-keywords" => Ok(AlgorithmicLens::sparse_keywords(
-            &spec.name,
-            spec.modality,
-            dim(spec.output),
-        )),
-        "token-hash" | "token_hash" | "multi-hash" | "multi_hash" => Ok(
-            AlgorithmicLens::token_hash(&spec.name, spec.modality, dim(spec.output)),
-        ),
-        other => Err(CalyxError::lens_unreachable(format!(
-            "scale-audit does not support algorithmic kind {other}"
-        ))),
-    }
 }

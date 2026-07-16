@@ -150,6 +150,7 @@ fn prepare_warm_lens(
     let started = Instant::now();
     let result = (|| {
         let spec = lens_spec_from_manifest_path(Path::new(&task.lens.manifest))?;
+        template_store::validate_lens_ref_against_spec(&task.lens, &spec)?;
         let spec_lens_id = spec.lens_id();
         if spec_lens_id != task.lens.lens_id {
             return Err(template_store::template_error(
@@ -296,6 +297,18 @@ fn register_prepared_warm_lenses(
     let mut added = 0;
     for item in prepared {
         let lens = &mut template.lenses[item.task.template_idx];
+        if let Some(runtime_lens_id) = lens.runtime_lens_id {
+            if runtime_lens_id != lens.lens_id {
+                return Err(template_store::template_error(
+                    "CALYX_LENS_IDENTITY_MIGRATION_REQUIRED",
+                    format!(
+                        "template lens {} stores catalog id {} and conflicting runtime id {}",
+                        lens.lens_name, lens.lens_id, runtime_lens_id
+                    ),
+                    "preserve the template bytes and perform an explicit lineage migration",
+                ));
+            }
+        }
         let spec_lens_id = item.prepared.spec.lens_id();
         if let Some(existing) = registry.find_lens_by_spec_id(spec_lens_id) {
             if registry.lens_spec(existing) != Some(&item.prepared.spec) {
@@ -308,16 +321,14 @@ fn register_prepared_warm_lenses(
                     "recommission the lens so the registry snapshot and manifest are identical",
                 ));
             }
-            if let Some(expected) = lens.runtime_lens_id
-                && existing != expected
-            {
+            if existing != lens.lens_id {
                 return Err(template_store::template_error(
                     template_store::TEMPLATE_INVALID,
-                    format!("runtime resolved {existing}, expected {expected}"),
+                    format!("runtime resolved {existing}, expected {}", lens.lens_id),
                     "recommission the lens so runtime and manifest contracts agree",
                 ));
             }
-            lens.runtime_lens_id = Some(existing);
+            lens.runtime_lens_id = None;
             emit_registration_progress_shared(
                 progress_log,
                 selector,
@@ -339,26 +350,25 @@ fn register_prepared_warm_lenses(
             Some(item.prepare_ms),
         )?;
         let runtime_lens_id = item.prepared.contract.lens_id();
-        if let Some(expected) = lens.runtime_lens_id
-            && runtime_lens_id != expected
-        {
+        if runtime_lens_id != lens.lens_id {
             return Err(template_store::template_error(
                 template_store::TEMPLATE_INVALID,
-                format!("runtime registered {runtime_lens_id}, expected {expected}"),
+                format!(
+                    "runtime registered {runtime_lens_id}, expected {}",
+                    lens.lens_id
+                ),
                 "recommission the lens so runtime and manifest contracts agree",
             ));
         }
         let registered = register_prepared_manifest_runtime(registry, item.prepared)?;
-        if let Some(expected) = lens.runtime_lens_id
-            && registered != expected
-        {
+        if registered != lens.lens_id {
             return Err(template_store::template_error(
                 template_store::TEMPLATE_INVALID,
-                format!("runtime registered {registered}, expected {expected}"),
+                format!("runtime registered {registered}, expected {}", lens.lens_id),
                 "recommission the lens so runtime and manifest contracts agree",
             ));
         }
-        lens.runtime_lens_id = Some(registered);
+        lens.runtime_lens_id = None;
         emit_registration_progress_shared(
             progress_log,
             selector,

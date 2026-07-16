@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::flags::Flags;
 use super::support::{
-    dim, hex_from_bytes, runtime_name, slot_norm, slot_prefix, validate_vector_contract,
+    dim, hex_from_bytes, require_runtime_lens_id, runtime_name, slot_norm, slot_prefix,
+    validate_vector_contract,
 };
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
@@ -335,6 +336,7 @@ fn input_bytes(flags: &Flags) -> CliResult<Vec<u8>> {
 
 fn measure_static_lookup(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = StaticLookupLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -359,6 +361,7 @@ fn measure_tei(
     repeat: usize,
 ) -> CliResult<Measurement> {
     let lens = TeiHttpLens::new(&spec.name, endpoint, spec.modality, dim(spec.output));
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -376,6 +379,7 @@ fn measure_tei(
 
 fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = CandleLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -402,6 +406,7 @@ fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Me
 
 fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = OnnxLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -419,6 +424,7 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
 
 fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = OnnxColbertLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -439,6 +445,7 @@ fn measure_fastembed_sparse(
     repeat: usize,
 ) -> CliResult<Measurement> {
     let lens = FastembedSparseLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -459,6 +466,7 @@ fn measure_fastembed_bgem3(
     repeat: usize,
 ) -> CliResult<Measurement> {
     let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -479,6 +487,7 @@ fn measure_fastembed_reranker(
     repeat: usize,
 ) -> CliResult<Measurement> {
     let lens = FastembedRerankerLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -499,6 +508,7 @@ fn measure_fastembed_qwen3(
     repeat: usize,
 ) -> CliResult<Measurement> {
     let lens = calyx_registry::FastembedQwen3Lens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
@@ -529,6 +539,7 @@ fn measure_fastembed_qwen3(
 
 fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
+    require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
     let artifact_bytes = match &spec.runtime {
         LensRuntime::MultimodalAdapter { files, .. } => artifact_files_size(files)?,

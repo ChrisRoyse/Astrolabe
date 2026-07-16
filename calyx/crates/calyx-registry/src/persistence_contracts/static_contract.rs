@@ -2,7 +2,6 @@
 use std::fs::{self, File};
 #[cfg(feature = "ml-runtime")]
 use std::io::Read;
-#[cfg(feature = "ml-runtime")]
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "ml-runtime")]
@@ -28,16 +27,21 @@ use crate::commission::{
     profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::identity::{
+    ContractFacts, contract_from_facts, external_command_corpus_hash,
+    external_command_weights_hash, multimodal_adapter_corpus_hash, onnx_colbert_corpus_hash,
+    onnx_custom_corpus_hash, static_lookup_corpus_hash,
+};
+use crate::runtime::adapters::{MultimodalAxis, load_adapter_config};
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision, candle_corpus_hash};
+use crate::runtime::common::validate_contract_covers_loaded_paths;
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::common::{DEFAULT_MAX_TOKENS, hash_files};
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::qwen3::qwen3_corpus_hash;
 use crate::{AlgorithmicEncoder, LensRuntime, LensSpec};
 
-#[cfg(feature = "ml-runtime")]
-const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
 #[cfg(feature = "ml-runtime")]
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 #[cfg(feature = "ml-runtime")]
@@ -100,7 +104,12 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         | LensRuntime::FastembedReranker { .. }
         | LensRuntime::FastembedQwen3 { .. }
         | LensRuntime::StaticLookup { .. } => Err(ml_runtime_disabled(spec)),
-        LensRuntime::MultimodalAdapter { .. } => Ok(spec.declared_contract()),
+        LensRuntime::MultimodalAdapter {
+            axis,
+            model_id,
+            adapter_config,
+            files,
+        } => multimodal_adapter_contract(spec, axis, model_id, adapter_config.as_deref(), files),
     }
 }
 
@@ -219,16 +228,14 @@ fn external_contract(spec: &LensSpec, cmd: &str, args: &[String]) -> Result<Froz
             spec.name, spec.output
         ))
     })?;
-    let args_text = args.join("\0");
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        sha256_digest(&[cmd.as_bytes(), args_text.as_bytes()]),
-        sha256_digest(&[b"external-cmd-runtime-v1"]),
-        SlotShape::Dense(dim),
-        spec.modality,
-        LensDType::F32,
-        NormPolicy::None,
-    ))
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: external_command_weights_hash(cmd, args),
+        corpus_hash: external_command_corpus_hash(),
+        shape: SlotShape::Dense(dim),
+        modality: spec.modality,
+        norm: NormPolicy::None,
+    }))
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -295,15 +302,14 @@ fn candle_contract(
         spec.norm_policy,
         &source_tensor_dtype_profile,
     );
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
         corpus_hash,
-        SlotShape::Dense(dim),
-        Modality::Text,
-        LensDType::F32,
-        spec.norm_policy,
-    ))
+        shape: SlotShape::Dense(dim),
+        modality: Modality::Text,
+        norm: spec.norm_policy,
+    }))
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -316,22 +322,22 @@ fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<F
     for path in files {
         ensure_file("ONNX contract artifact", path)?;
     }
+    let observed_hash = hash_files(&files.to_vec())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "ONNX static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
     let pooling = onnx_pooling_from_config(config)?;
-    let norm_text = format!("{:?}", spec.norm_policy);
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
-        sha256_digest(&[
-            b"onnx-custom-v1",
-            model_id.as_bytes(),
-            pooling.as_bytes(),
-            norm_text.as_bytes(),
-        ]),
-        spec.output,
-        spec.modality,
-        LensDType::F32,
-        spec.norm_policy,
-    ))
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash: onnx_custom_corpus_hash(model_id, spec.output, pooling, spec.norm_policy),
+        shape: spec.output,
+        modality: spec.modality,
+        norm: spec.norm_policy,
+    }))
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -348,20 +354,21 @@ fn onnx_colbert_contract(
     for path in files {
         ensure_file("ONNX ColBERT contract artifact", path)?;
     }
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
-        sha256_digest(&[
-            b"onnx-colbert-token-v1",
-            model_id.as_bytes(),
-            DEFAULT_COLBERT_ONNX.as_bytes(),
-            b"attention-mask-unpooled-finite",
-        ]),
-        spec.output,
-        Modality::Text,
-        LensDType::F32,
-        NormPolicy::Finite,
-    ))
+    let observed_hash = hash_files(&files.to_vec())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "ONNX ColBERT static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash: onnx_colbert_corpus_hash(model_id),
+        shape: spec.output,
+        modality: Modality::Text,
+        norm: NormPolicy::Finite,
+    }))
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -396,21 +403,20 @@ fn qwen3_contract(
     }
     let dim = dense_hidden_size(&files.config, "Qwen3")?;
     let source_tensor_dtype_profile = profile_safetensors_sources(&files.weights)?;
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
-        qwen3_corpus_hash(
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash: qwen3_corpus_hash(
             &model_id,
             &execution_device,
             precision,
             32_768,
             &source_tensor_dtype_profile,
         ),
-        SlotShape::Dense(dim),
-        Modality::Text,
-        LensDType::F32,
-        NormPolicy::unit(),
-    ))
+        shape: SlotShape::Dense(dim),
+        modality: Modality::Text,
+        norm: NormPolicy::unit(),
+    }))
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -427,19 +433,88 @@ fn static_lookup_contract(
         )));
     }
     ensure_file("static lookup tokenizer", tokenizer)?;
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
-        sha256_digest(&[
-            b"static-lookup-model2vec-v1",
-            dim.to_string().as_bytes(),
-            dtype.as_bytes(),
-        ]),
-        SlotShape::Dense(dim),
-        Modality::Text,
-        LensDType::F32,
-        spec.norm_policy,
-    ))
+    let observed_hash = hash_files(&[embeddings_file.to_path_buf(), tokenizer.to_path_buf()])?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "static lookup contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash: static_lookup_corpus_hash(dim, dtype),
+        shape: SlotShape::Dense(dim),
+        modality: Modality::Text,
+        norm: spec.norm_policy,
+    }))
+}
+
+fn multimodal_adapter_contract(
+    spec: &LensSpec,
+    axis: &str,
+    model_id: &str,
+    adapter_config: Option<&Path>,
+    files: &[PathBuf],
+) -> Result<FrozenLensContract> {
+    let adapter_config = adapter_config.ok_or_else(|| {
+        lens_config_invalid("multimodal adapter static contract requires adapter_config")
+    })?;
+    ensure_file("multimodal adapter config", adapter_config)?;
+    if files.is_empty() {
+        return Err(lens_config_invalid(
+            "multimodal adapter static contract requires persisted artifact files",
+        ));
+    }
+    for path in files {
+        ensure_file("multimodal adapter contract artifact", path)?;
+    }
+    let parsed_axis = MultimodalAxis::parse(axis)?;
+    let expected_axis = modality_axis(spec.modality);
+    if parsed_axis.as_str() != expected_axis {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "multimodal adapter axis {axis} does not match modality {:?}",
+            spec.modality
+        )));
+    }
+    let dim = dense_dim(spec.output).ok_or_else(|| {
+        lens_config_invalid(format!(
+            "multimodal adapter {} requires dense output shape, got {:?}",
+            spec.name, spec.output
+        ))
+    })?;
+    let config = load_adapter_config(adapter_config, parsed_axis, model_id, Some(dim))?;
+    validate_contract_covers_loaded_paths("multimodal-adapter", &config.contract_paths(), files)?;
+    let observed_hash = crate::runtime::common::hash_files(&files.to_vec())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "multimodal adapter static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash: multimodal_adapter_corpus_hash(&spec.name, parsed_axis.as_str(), model_id),
+        shape: SlotShape::Dense(dim),
+        modality: spec.modality,
+        norm: NormPolicy::unit(),
+    }))
+}
+
+fn modality_axis(modality: calyx_core::Modality) -> &'static str {
+    match modality {
+        calyx_core::Modality::Text => "text",
+        calyx_core::Modality::Code => "code",
+        calyx_core::Modality::Image => "image",
+        calyx_core::Modality::Audio => "audio",
+        calyx_core::Modality::Video => "video",
+        calyx_core::Modality::Protein => "protein",
+        calyx_core::Modality::Dna => "dna",
+        calyx_core::Modality::Molecule => "molecule",
+        calyx_core::Modality::Structured => "structured",
+        calyx_core::Modality::Mixed => "mixed",
+    }
 }
 
 #[cfg(feature = "ml-runtime")]
@@ -570,7 +645,6 @@ fn token_dim(shape: SlotShape) -> Option<u32> {
     }
 }
 
-#[cfg(feature = "ml-runtime")]
 pub(super) fn ensure_file(label: &str, path: &Path) -> Result<()> {
     if path.is_file() {
         return Ok(());

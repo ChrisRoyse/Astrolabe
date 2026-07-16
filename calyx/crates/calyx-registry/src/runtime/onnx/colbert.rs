@@ -13,7 +13,8 @@ use super::custom::batch::{TokenBatch, max_tokens_from_config, session_inputs, t
 use super::io_binding::OnnxRunPlan;
 use super::session::{ManagedOnnxSession, build_session};
 use super::{OnnxModelFiles, OnnxProviderPolicy, config_invalid};
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, contract_from_facts, onnx_colbert_corpus_hash};
 use crate::runtime::common::hash_files;
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
@@ -170,21 +171,14 @@ impl OnnxColbertLens {
         }
         let tokenizer = Tokenizer::from_file(&spec.tokenizer)
             .map_err(|err| config_invalid(format!("load tokenizer failed: {err}")))?;
-        let corpus_hash = sha256_digest(&[
-            b"onnx-colbert-token-v1",
-            spec.model_id.as_bytes(),
-            DEFAULT_COLBERT_ONNX.as_bytes(),
-            b"attention-mask-unpooled-finite",
-        ]);
-        let contract = FrozenLensContract::new(
-            spec.name,
+        let contract = contract_from_facts(ContractFacts {
+            name: spec.name,
             weights_sha256,
-            corpus_hash,
+            corpus_hash: onnx_colbert_corpus_hash(&spec.model_id),
             shape,
-            Modality::Text,
-            LensDType::F32,
-            NormPolicy::Finite,
-        );
+            modality: Modality::Text,
+            norm: NormPolicy::Finite,
+        });
         let runtime = OnnxColbertRuntime {
             session: Some(session.into_inner()),
             run_plan,

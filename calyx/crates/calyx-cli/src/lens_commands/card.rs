@@ -16,12 +16,10 @@ pub(crate) fn card(args: &[String]) -> CliResult {
         .clone()
         .ok_or_else(|| CliError::usage("calyx lens card requires --manifest <path>"))?;
     let spec = lens_spec_from_manifest_path(&manifest)?;
-    let catalog_lens_id = spec.lens_id();
     let probes = probes_for(&flags, spec.modality)?;
     let mut registry = Registry::new();
     let runtime_lens_id = register_manifest_runtime(&mut registry, spec)?;
-    let mut card = profile_lens(&registry, runtime_lens_id, &probes)?;
-    card.lens_id = catalog_lens_id;
+    let card = profile_lens(&registry, runtime_lens_id, &probes)?;
     print_json(&card)
 }
 

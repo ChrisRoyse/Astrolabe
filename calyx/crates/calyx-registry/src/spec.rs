@@ -3,9 +3,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use calyx_core::{
-    Asymmetry, CalyxError, LensId, Modality, QuantPolicy, Result, SlotShape, content_address,
-};
+use calyx_core::{Asymmetry, CalyxError, LensId, Modality, QuantPolicy, Result, SlotShape};
 use serde::{Deserialize, Serialize};
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy};
@@ -151,16 +149,7 @@ impl LensSpec {
     }
 
     pub fn lens_id(&self) -> LensId {
-        let output = format!(
-            "shape={:?};norm={:?};runtime={:?}",
-            self.output, self.norm_policy, self.runtime
-        );
-        LensId::from_bytes(content_address([
-            self.name.as_bytes(),
-            &self.weights_sha256,
-            &self.corpus_hash,
-            output.as_bytes(),
-        ]))
+        self.declared_contract().lens_id()
     }
 
     pub fn health(&self) -> LensHealth {

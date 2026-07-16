@@ -11,6 +11,7 @@ pub mod compression;
 pub mod drift;
 pub mod explain;
 pub mod frozen;
+mod identity;
 pub mod ingest_microbatch;
 pub mod lens;
 pub mod measure;
@@ -35,9 +36,9 @@ pub use commission::{
     CommissionRequest, CommissionedLens, CommissionedLensArtifact, LensForgeBatchPolicy,
     LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest, LensForgeShape,
     LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile, commission_lens,
-    lens_spec_from_manifest, lens_spec_from_manifest_path,
-    lens_spec_from_manifest_with_license_override, lens_spec_metadata_from_manifest,
-    lens_spec_metadata_from_manifest_path, register_commissioned,
+    legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest,
+    lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
+    lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path, register_commissioned,
 };
 #[cfg(feature = "ml-runtime")]
 pub use commission::{
@@ -53,6 +54,7 @@ pub use compression::{
 pub use drift::{DriftDecision, RuntimeGolden};
 pub use explain::{LensExplanation, explain_lens, explain_lens_from_card};
 pub use frozen::{FrozenLensContract, LensDType, NormPolicy};
+pub use identity::CANDLE_BERT_EXECUTION_REVISION;
 pub use ingest_microbatch::{
     DEFAULT_INGEST_MICROBATCH_CAP_BYTES, INGEST_MICROBATCH_INPUT_OVERHEAD_BYTES, IngestLensOutcome,
     IngestLensOutcomeStatus, IngestMicrobatchConfig, IngestMicrobatchController,
@@ -83,9 +85,8 @@ pub use persistence_contracts::{
     RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,
     RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
     VaultRegistryContractRepairWrite, audit_registry_snapshot_contracts,
-    audit_vault_registry_contracts, lens_spec_with_frozen_contract,
-    repair_vault_registry_contracts_from_specs, repair_vault_registry_slot_from_spec,
-    require_vault_registry_contracts,
+    audit_vault_registry_contracts, repair_vault_registry_contracts_from_specs,
+    repair_vault_registry_slot_from_spec, require_vault_registry_contracts,
 };
 pub use placement::{
     CALYX_RAM_BUDGET_EXCEEDED, CALYX_VRAM_BUDGET_EXCEEDED, CpuLensPool, CpuPoolAdmission,
@@ -110,11 +111,10 @@ pub use runtime::adapters::{
 pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
 #[cfg(feature = "ml-runtime")]
 pub use runtime::candle::{
-    CANDLE_BERT_EXECUTION_REVISION, CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV,
-    CandleDeviceMode, CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles,
-    CandlePoolingPolicy, CandlePrecision, DEFAULT_CANDLE_MODEL, configured_device_mode,
-    configured_device_policy, default_cuda_fail_loud_policy, device_policy_for_mode,
-    frozen_device_policy,
+    CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV, CandleDeviceMode, CandleDevicePolicy,
+    CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
+    DEFAULT_CANDLE_MODEL, configured_device_mode, configured_device_policy,
+    default_cuda_fail_loud_policy, device_policy_for_mode, frozen_device_policy,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]

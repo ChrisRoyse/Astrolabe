@@ -14,6 +14,7 @@ pub(super) use super::template_model::{
     PanelTemplateIndexEntry, PanelTemplateVersionRef, SavedPanelTemplate, TEMPLATE_INVALID,
     TEMPLATE_NOT_FOUND, TemplateDraft, TemplateEnsembleCard, TemplateLensRef,
     default_time_controls, id_for_loaded, lens_ref_from_catalog, object_bytes, template_error,
+    validate_lens_ref_against_spec,
 };
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::support::{prepare_manifest_runtime, register_prepared_manifest_runtime};
@@ -378,14 +379,38 @@ pub(super) fn register_template_lenses_with_progress(
     let total = template.lenses.len();
     for (idx, lens) in template.lenses.iter_mut().enumerate() {
         emit_progress(&mut progress, lens_progress("load_start", idx, total, lens))?;
-        if lens.runtime_lens_id.is_some_and(|id| registry.contains(id)) {
+        if let Some(runtime_lens_id) = lens.runtime_lens_id {
+            if runtime_lens_id != lens.lens_id {
+                return Err(template_error(
+                    "CALYX_LENS_IDENTITY_MIGRATION_REQUIRED",
+                    format!(
+                        "template lens {} stores catalog id {} and conflicting runtime id {}",
+                        lens.lens_name, lens.lens_id, runtime_lens_id
+                    ),
+                    "preserve the template bytes and perform an explicit lineage migration",
+                ));
+            }
+        }
+        let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
+        validate_lens_ref_against_spec(lens, &spec)?;
+        if registry.contains(lens.lens_id) {
+            if registry.lens_spec(lens.lens_id) != Some(&spec) {
+                return Err(template_error(
+                    TEMPLATE_INVALID,
+                    format!(
+                        "registered lens {} does not match canonical manifest {}",
+                        lens.lens_id, lens.manifest
+                    ),
+                    "recommission the registry lens and rebuild the template from the canonical catalog",
+                ));
+            }
+            lens.runtime_lens_id = None;
             emit_progress(
                 &mut progress,
                 lens_progress("already_registered", idx, total, lens),
             )?;
             continue;
         }
-        let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
         let spec_lens_id = spec.lens_id();
         if spec_lens_id != lens.lens_id {
             return Err(template_error(
@@ -411,28 +436,27 @@ pub(super) fn register_template_lenses_with_progress(
                     "recommission the lens so the registry snapshot and manifest are identical",
                 ));
             }
-            if let Some(expected) = lens.runtime_lens_id
-                && existing != expected
-            {
+            if existing != lens.lens_id {
                 return Err(template_error(
                     TEMPLATE_INVALID,
-                    format!("runtime resolved {existing}, expected {expected}"),
+                    format!("runtime resolved {existing}, expected {}", lens.lens_id),
                     "recommission the lens so runtime and manifest contracts agree",
                 ));
             }
-            lens.runtime_lens_id = Some(existing);
+            lens.runtime_lens_id = None;
             emit_progress(
                 &mut progress,
                 lens_progress("existing_matched", idx, total, lens),
             )?;
             continue;
         }
-        if let Some(expected) = lens.runtime_lens_id
-            && runtime_lens_id != expected
-        {
+        if runtime_lens_id != lens.lens_id {
             return Err(template_error(
                 TEMPLATE_INVALID,
-                format!("runtime registered {runtime_lens_id}, expected {expected}"),
+                format!(
+                    "runtime registered {runtime_lens_id}, expected {}",
+                    lens.lens_id
+                ),
                 "recommission the lens so runtime and manifest contracts agree",
             ));
         }
@@ -441,7 +465,14 @@ pub(super) fn register_template_lenses_with_progress(
             lens_progress("runtime_register_start", idx, total, lens),
         )?;
         let registered = register_prepared_manifest_runtime(registry, prepared)?;
-        lens.runtime_lens_id = Some(registered);
+        if registered != lens.lens_id {
+            return Err(template_error(
+                TEMPLATE_INVALID,
+                format!("runtime registered {registered}, expected {}", lens.lens_id),
+                "recommission the lens so runtime and manifest contracts agree",
+            ));
+        }
+        lens.runtime_lens_id = None;
         emit_progress(
             &mut progress,
             lens_progress("runtime_register_ok", idx, total, lens),

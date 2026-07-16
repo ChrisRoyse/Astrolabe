@@ -94,6 +94,33 @@ pub(super) fn validate_local_model_execution(
     Ok(())
 }
 
+pub(super) fn requires_artifact_set(runtime: &str) -> bool {
+    matches!(
+        runtime,
+        "candle"
+            | "candle-fp16"
+            | "candle-local"
+            | "fastembed-qwen3"
+            | "onnx"
+            | "onnx-int8"
+            | "onnx-custom"
+            | "onnx-fastembed"
+            | "onnx-splade"
+            | "onnx-colbert"
+            | "fastembed-sparse"
+            | "fastembed-bgem3-dense"
+            | "fastembed-bgem3-sparse"
+            | "fastembed-bgem3-colbert"
+            | "fastembed-reranker"
+            | "model2vec"
+            | "static_lookup"
+            | "static-lookup"
+            | "adapter"
+            | "multimodal-adapter"
+            | "multimodal_adapter"
+    )
+}
+
 pub(super) fn runtime_from_manifest(
     manifest: &LensForgeManifest,
     artifacts: &[VerifiedFile],

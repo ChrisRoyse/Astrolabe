@@ -4,10 +4,13 @@ use calyx_core::{
     Asymmetry, CalyxError, LensCost, LensId, Modality, Panel, Placement, QuantPolicy, Slot, SlotId,
     SlotKey, SlotResource, SlotShape, SlotState, content_address,
 };
-use calyx_registry::{LensHealth, lens_spec_metadata_from_manifest_path};
+use calyx_registry::{LensHealth, LensSpec, lens_spec_from_manifest_path};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, CliResult};
+use crate::lens_commands::catalog::{
+    canonical_catalog_identity_matches, catalog_cost_matches, resolved_runtime_placement,
+};
 use crate::lens_commands::support::runtime_name;
 
 pub(super) const MIN_CONTENT_LENSES: usize = 10;
@@ -222,7 +225,7 @@ impl SavedPanelTemplate {
             slots.push(Slot {
                 slot_id,
                 slot_key: SlotKey::new(slot_id, lens.slot_key.clone()),
-                lens_id: lens.runtime_lens_id.unwrap_or(lens.lens_id),
+                lens_id: lens.lens_id,
                 shape: lens.shape,
                 modality: lens.modality,
                 asymmetry: Asymmetry::None,
@@ -297,7 +300,7 @@ pub(super) fn default_time_controls() -> Vec<TemplateTimeControl> {
 }
 
 pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResult<TemplateLensRef> {
-    let spec = lens_spec_metadata_from_manifest_path(&entry.manifest)?;
+    let spec = lens_spec_from_manifest_path(&entry.manifest)?;
     let catalog_lens_id: LensId = entry
         .lens_id
         .parse()
@@ -314,6 +317,16 @@ pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResul
                 manifest_lens_id
             ),
             "repair the lens catalog with `calyx lens add --manifest <manifest> --home <dir>` before saving templates",
+        ));
+    }
+    if !canonical_catalog_identity_matches(entry, &spec, &entry.manifest)? {
+        return Err(template_error(
+            TEMPLATE_INVALID,
+            format!(
+                "lens catalog entry {} does not match the canonical manifest identity, placement, or resource contract",
+                entry.name
+            ),
+            "preserve the catalog bytes, resolve the identity conflict explicitly, and rebuild the template from a canonical catalog row",
         ));
     }
     Ok(TemplateLensRef {
@@ -344,9 +357,43 @@ pub(super) fn template_error(
     })
 }
 
+pub(super) fn validate_lens_ref_against_spec(lens: &TemplateLensRef, spec: &LensSpec) -> CliResult {
+    let expected_weights = crate::lens_commands::support::hex_from_bytes(&spec.weights_sha256);
+    let expected_runtime = runtime_name(&spec.runtime);
+    let expected_placement = resolved_runtime_placement(spec)?;
+    let resource_matches =
+        lens.placement == expected_placement && catalog_cost_matches(spec, lens.cost)?;
+    let fields_match = lens.lens_name == spec.name
+        && lens.lens_id == spec.lens_id()
+        && lens.weights_sha256.eq_ignore_ascii_case(&expected_weights)
+        && lens.runtime == expected_runtime
+        && lens.modality == spec.modality
+        && lens.shape == spec.output
+        && resource_matches;
+    if !fields_match {
+        return Err(template_error(
+            TEMPLATE_INVALID,
+            format!(
+                "template lens {} does not match canonical manifest {}: template_id={} manifest_id={} template_runtime={} manifest_runtime={} template_shape={:?} manifest_shape={:?} template_placement={:?} manifest_placement={:?} resource_matches={resource_matches}",
+                lens.lens_name,
+                lens.manifest,
+                lens.lens_id,
+                spec.lens_id(),
+                lens.runtime,
+                expected_runtime,
+                lens.shape,
+                spec.output,
+                lens.placement,
+                expected_placement
+            ),
+            "preserve the template bytes and rebuild a new template version from the canonical catalog",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_lenses(template: &SavedPanelTemplate) -> CliResult {
     let mut ids = BTreeSet::new();
-    let mut runtime_ids = BTreeSet::new();
     for lens in &template.lenses {
         if !ids.insert(lens.lens_id) {
             return Err(template_error(
@@ -356,15 +403,15 @@ fn validate_lenses(template: &SavedPanelTemplate) -> CliResult {
             ));
         }
         if let Some(runtime_lens_id) = lens.runtime_lens_id
-            && !runtime_ids.insert(runtime_lens_id)
+            && runtime_lens_id != lens.lens_id
         {
             return Err(template_error(
-                TEMPLATE_INVALID,
+                "CALYX_LENS_IDENTITY_MIGRATION_REQUIRED",
                 format!(
-                    "template {} repeats runtime lens {}",
-                    template.name, runtime_lens_id
+                    "template {} stores catalog lens {} and conflicting runtime lens {}",
+                    template.name, lens.lens_id, runtime_lens_id
                 ),
-                "remove duplicate runtime lens ids from the template",
+                "preserve the template bytes and perform an explicit lineage migration before loading it",
             ));
         }
         validate_weight_hash(&lens.weights_sha256)?;

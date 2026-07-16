@@ -9,14 +9,14 @@ use calyx_registry::{
 };
 
 use super::BuildLens;
-use super::algorithmic::algorithmic_lens;
-use crate::lens_commands::support::{dim, runtime_name};
+use crate::lens_commands::support::{algorithmic_lens, dim, require_runtime_lens_id, runtime_name};
 
 pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<BuildLens, String> {
     let runtime = runtime_name(&spec.runtime).to_string();
-    match spec.runtime.clone() {
+    let built = match spec.runtime.clone() {
         LensRuntime::Algorithmic { kind } => {
-            let lens = algorithmic_lens(&spec, &kind)?;
+            let lens = algorithmic_lens(&spec.name, spec.modality, &kind, spec.output)
+                .map_err(lens_error)?;
             Ok(cpu_build_lens(manifest, spec, runtime, Box::new(lens), 0.0))
         }
         LensRuntime::Onnx { files, .. } => {
@@ -118,7 +118,9 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
             spec.name,
             runtime_name(&other)
         )),
-    }
+    }?;
+    require_runtime_lens_id(&built.spec, built.lens.as_ref()).map_err(lens_error)?;
+    Ok(built)
 }
 
 fn cpu_build_lens(

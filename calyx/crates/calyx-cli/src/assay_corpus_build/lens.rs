@@ -11,7 +11,6 @@ use super::data::BuildRows;
 use super::request::CorpusBuildRequest;
 use crate::assay_bits_validation::cost::LensCost;
 use crate::lens_commands::support::{dim, validate_vector_contract};
-mod algorithmic;
 mod progress;
 pub(crate) mod projection;
 mod runtime;

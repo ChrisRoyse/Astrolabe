@@ -12,7 +12,7 @@ pub use repair_all::{
     VaultRegistryContractRepairAllWrite, repair_vault_registry_contracts_from_specs,
 };
 pub(crate) use runtime::load_runtime_lens_from_spec;
-use static_contract::derive_runtime_contract_from_spec;
+pub(crate) use static_contract::derive_runtime_contract_from_spec;
 
 use crate::frozen::FrozenLensContract;
 use crate::persistence::{
@@ -215,10 +215,6 @@ pub fn repair_vault_registry_slot_from_spec(
         new_lens_id,
         changes,
     })
-}
-
-pub fn lens_spec_with_frozen_contract(spec: LensSpec, contract: &FrozenLensContract) -> LensSpec {
-    spec_from_runtime_contract(spec, contract)
 }
 
 fn audit_registry_lens_contract(lens: &RegistryLensSnapshot) -> Option<RegistryContractDiff> {

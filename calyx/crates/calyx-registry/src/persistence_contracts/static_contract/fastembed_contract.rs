@@ -7,7 +7,12 @@ use fastembed::{
 };
 
 use super::{ensure_file, lens_config_invalid};
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{
+    ContractFacts, contract_from_facts, fastembed_bgem3_corpus_hash,
+    fastembed_reranker_corpus_hash, fastembed_sparse_corpus_hash,
+};
+use crate::runtime::common::hash_files;
 use crate::{FastembedBgem3Output, LensSpec};
 
 pub(super) fn fastembed_sparse_contract(
@@ -26,7 +31,7 @@ pub(super) fn fastembed_sparse_contract(
         files,
         shape,
         NormPolicy::Finite,
-        &[b"fastembed-sparse-v1", info.model_code.as_bytes()],
+        fastembed_sparse_corpus_hash(&info.model_code),
     )
 }
 
@@ -52,7 +57,7 @@ pub(super) fn fastembed_bgem3_contract(
         files,
         shape,
         norm,
-        &[b"fastembed-bgem3-v1", info.model_code.as_bytes(), token],
+        fastembed_bgem3_corpus_hash(&info.model_code, token),
     )
 }
 
@@ -68,7 +73,7 @@ pub(super) fn fastembed_reranker_contract(
         files,
         SlotShape::Dense(1),
         NormPolicy::Finite,
-        &[b"fastembed-reranker-v1", info.model_code.as_bytes()],
+        fastembed_reranker_corpus_hash(&info.model_code),
     )
 }
 
@@ -77,7 +82,7 @@ fn fastembed_contract(
     files: &[PathBuf],
     shape: SlotShape,
     norm: NormPolicy,
-    corpus_parts: &[&[u8]],
+    corpus_hash: [u8; 32],
 ) -> Result<FrozenLensContract> {
     if files.is_empty() {
         return Err(lens_config_invalid(format!(
@@ -88,15 +93,21 @@ fn fastembed_contract(
     for path in files {
         ensure_file("fastembed contract artifact", path)?;
     }
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        spec.weights_sha256,
-        sha256_digest(corpus_parts),
+    let observed_hash = hash_files(&files.to_vec())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
+    Ok(contract_from_facts(ContractFacts {
+        name: spec.name.clone(),
+        weights_sha256: observed_hash,
+        corpus_hash,
         shape,
-        Modality::Text,
-        LensDType::F32,
+        modality: Modality::Text,
         norm,
-    ))
+    }))
 }
 
 fn sparse_model_from_name(raw: &str) -> Result<SparseModel> {

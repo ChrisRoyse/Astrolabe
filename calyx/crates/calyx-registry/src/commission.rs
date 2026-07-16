@@ -9,14 +9,15 @@ use crate::{Registry, ensure_input_modality};
 
 mod algorithmic_manifest;
 mod manifest;
+mod manifest_identity;
 mod manifest_metadata;
 mod manifest_runtime;
 mod source_tensor_profile;
 
 pub use manifest::{
     LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest,
-    LensForgeShape, lens_spec_from_manifest, lens_spec_from_manifest_path,
-    lens_spec_from_manifest_with_license_override,
+    LensForgeShape, legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest,
+    lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
 };
 pub use manifest_metadata::{
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,

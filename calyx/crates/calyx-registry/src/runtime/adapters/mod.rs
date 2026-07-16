@@ -8,6 +8,7 @@ mod pack;
 mod validate;
 
 pub use axis::MultimodalAxis;
+pub(crate) use config::load_adapter_config;
 pub use config::{MultimodalAdapterConfig, MultimodalAdapterProvider};
 pub use lens::{
     CALYX_ALLOW_NONCOMMERCIAL_LENSES_ENV, CALYX_LICENSE_DENIED, MultimodalAdapterLens,

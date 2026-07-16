@@ -5,7 +5,8 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, S
 use fastembed::Qwen3TextEmbedding;
 
 use crate::commission::{LensForgeSourceTensorDtypeProfile, profile_safetensors_sources};
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, contract_from_facts, qwen3_execution_corpus_hash};
 use crate::runtime::candle::{
     CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation, frozen_device_policy,
     verify_f32_gemm_accumulation,
@@ -140,15 +141,14 @@ impl FastembedQwen3Lens {
             spec.max_tokens,
             &source_tensor_dtype_profile,
         );
-        let contract = FrozenLensContract::new(
-            spec.name,
+        let contract = contract_from_facts(ContractFacts {
+            name: spec.name,
             weights_sha256,
             corpus_hash,
-            SlotShape::Dense(dim),
-            Modality::Text,
-            LensDType::F32,
-            NormPolicy::unit(),
-        );
+            shape: SlotShape::Dense(dim),
+            modality: Modality::Text,
+            norm: NormPolicy::unit(),
+        });
         Ok(Self {
             id: contract.lens_id(),
             dim,
@@ -397,16 +397,13 @@ pub(crate) fn qwen3_corpus_hash(
     max_tokens: usize,
     source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
 ) -> [u8; 32] {
-    let max_tokens = max_tokens.to_string();
-    sha256_digest(&[
-        b"fastembed-qwen3-text-v4",
-        model_id.as_bytes(),
-        execution_device.as_bytes(),
-        precision.as_str().as_bytes(),
-        max_tokens.as_bytes(),
-        source_tensor_dtype_profile.fingerprint_sha256.as_bytes(),
-        b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output,source-dtype-profile-v1,full-forward-dtype-attestation",
-    ])
+    qwen3_execution_corpus_hash(
+        model_id,
+        execution_device,
+        precision.as_str(),
+        max_tokens,
+        &source_tensor_dtype_profile.fingerprint_sha256,
+    )
 }
 
 pub(crate) fn config_invalid(message: impl Into<String>) -> CalyxError {

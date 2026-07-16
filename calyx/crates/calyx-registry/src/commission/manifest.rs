@@ -2,19 +2,22 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use calyx_core::{Asymmetry, CalyxError, Modality, QuantPolicy, Result, SlotShape};
+use calyx_core::{CalyxError, LensId, Modality, QuantPolicy, Result, SlotShape, content_address};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::frozen::{LengthDelimitedSha256, NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
-use crate::spec::LensSpec;
+use crate::spec::{LensRuntime, LensSpec};
 
 use super::algorithmic_manifest::{
     frozen_contract as algorithmic_frozen_contract, is_algorithmic_runtime,
     output_shape as algorithmic_output_shape,
 };
-use super::manifest_runtime::{runtime_from_manifest, validate_local_model_execution};
+use super::manifest_identity::spec_from_manifest_identity;
+use super::manifest_runtime::{
+    requires_artifact_set, runtime_from_manifest, validate_local_model_execution,
+};
 use super::source_tensor_profile::{
     LensForgeSourceTensorDtypeProfile, validate_manifest_source_tensor_profile,
 };
@@ -182,6 +185,95 @@ pub fn lens_spec_from_manifest_path(path: impl AsRef<Path>) -> Result<LensSpec> 
     lens_spec_from_manifest(&manifest, base)
 }
 
+/// Reconstructs IDs written by the retired spec-side manifest formulas.
+///
+/// These candidates are diagnostic-only. They must never be registered or
+/// persisted as current frozen identities.
+pub fn legacy_lensforge_manifest_v1_ids_from_path(path: impl AsRef<Path>) -> Result<Vec<LensId>> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|err| {
+        config_invalid(format!(
+            "read legacy lensforge manifest {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    let manifest: LensForgeManifest = serde_json::from_slice(&bytes).map_err(|err| {
+        config_invalid(format!(
+            "parse legacy lensforge manifest {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    legacy_lensforge_manifest_v1_ids(&manifest, base)
+}
+
+fn legacy_lensforge_manifest_v1_ids(
+    manifest: &LensForgeManifest,
+    base_dir: &Path,
+) -> Result<Vec<LensId>> {
+    let artifacts = read_and_verify_files(manifest, base_dir)?;
+    let output = manifest.output_shape()?;
+    let (output, weights_sha256, corpus_hash, norm_policy) = if let Some(contract) =
+        algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?
+    {
+        (
+            contract.shape(),
+            contract.weights_sha256(),
+            contract.corpus_hash(),
+            contract.norm_policy(),
+        )
+    } else {
+        (
+            output,
+            spec_weights_sha256(manifest, &artifacts)?,
+            sha256_digest(&[
+                b"lensforge-manifest-v1",
+                manifest.name.as_bytes(),
+                manifest.source_hf_id.as_bytes(),
+                manifest.runtime.as_bytes(),
+                modality_token(manifest.modality).as_bytes(),
+                manifest.pooling.as_bytes(),
+                manifest.norm.as_bytes(),
+            ]),
+            norm_policy(&manifest.norm)?,
+        )
+    };
+    let runtime = runtime_from_manifest(manifest, &artifacts)?;
+    let mut runtime_debugs = vec![format!("{runtime:?}")];
+    let files = artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let pre_gpu_runtime = match &runtime {
+        LensRuntime::CandleLocal { .. } => Some(format!(
+            "CandleLocal {{ model_id: {:?}, files: {:?}, dtype: {:?}, pooling: {:?} }}",
+            manifest.source_hf_id, files, manifest.dtype, manifest.pooling
+        )),
+        LensRuntime::FastembedQwen3 { .. } => Some(format!(
+            "FastembedQwen3 {{ model_id: {:?}, files: {:?}, dtype: {:?} }}",
+            manifest.source_hf_id, files, manifest.dtype
+        )),
+        _ => None,
+    };
+    if let Some(debug) = pre_gpu_runtime {
+        if !runtime_debugs.contains(&debug) {
+            runtime_debugs.push(debug);
+        }
+    }
+    Ok(runtime_debugs
+        .into_iter()
+        .map(|runtime_debug| {
+            let output = format!("shape={output:?};norm={norm_policy:?};runtime={runtime_debug}");
+            LensId::from_bytes(content_address([
+                manifest.name.as_bytes(),
+                &weights_sha256,
+                &corpus_hash,
+                output.as_bytes(),
+            ]))
+        })
+        .collect())
+}
+
 pub fn lens_spec_from_manifest(manifest: &LensForgeManifest, base_dir: &Path) -> Result<LensSpec> {
     lens_spec_from_manifest_with_license_override(
         manifest,
@@ -208,54 +300,21 @@ pub fn lens_spec_from_manifest_with_license_override(
     #[cfg(feature = "ml-runtime")]
     validate_source_tensor_profile_bytes(manifest, &artifacts)?;
     let output = manifest.output_shape()?;
-    let algorithmic_contract =
-        algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?;
-    let (output, weights_sha256, corpus_hash, norm_policy) =
-        if let Some(contract) = algorithmic_contract {
-            (
-                contract.shape(),
-                contract.weights_sha256(),
-                contract.corpus_hash(),
-                contract.norm_policy(),
-            )
-        } else {
-            (
-                output,
-                spec_weights_sha256(manifest, &artifacts)?,
-                sha256_digest(&[
-                    b"lensforge-manifest-v1",
-                    manifest.name.as_bytes(),
-                    manifest.source_hf_id.as_bytes(),
-                    manifest.runtime.as_bytes(),
-                    modality_token(manifest.modality).as_bytes(),
-                    manifest.pooling.as_bytes(),
-                    manifest.norm.as_bytes(),
-                ]),
-                norm_policy(&manifest.norm)?,
-            )
-        };
-    let retrieval_only = is_retrieval_only_runtime(&manifest.runtime);
-    Ok(LensSpec {
-        name: manifest.name.clone(),
-        runtime: runtime_from_manifest(manifest, &artifacts)?,
-        output,
-        modality: manifest.modality,
-        weights_sha256,
-        corpus_hash,
-        norm_policy,
-        max_batch: manifest.max_batch,
-        axis: Some(manifest.name.clone()),
-        asymmetry: Asymmetry::None,
-        quant_default: manifest.quant_default,
-        truncate_dim: manifest.truncate_dim,
-        recall_delta: manifest.recall_delta,
-        retrieval_only,
-        excluded_from_dedup: retrieval_only,
-    })
-}
-
-fn is_retrieval_only_runtime(runtime: &str) -> bool {
-    matches!(runtime, "fastembed-reranker")
+    let weights_sha256 = spec_weights_sha256(manifest, &artifacts)?;
+    let norm_policy = norm_policy(&manifest.norm)?;
+    let runtime = runtime_from_manifest(manifest, &artifacts)?;
+    let spec = spec_from_manifest_identity(manifest, runtime, output, weights_sha256, norm_policy)?;
+    let declared = spec.declared_contract();
+    let observed = crate::persistence_contracts::derive_runtime_contract_from_spec(&spec)?;
+    if declared != observed {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "manifest {} declares lens {} but non-loading artifact inspection derives {}; recommission instead of persisting conflicting identity",
+            manifest.name,
+            declared.lens_id(),
+            observed.lens_id()
+        )));
+    }
+    Ok(spec)
 }
 
 fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
@@ -279,16 +338,14 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
         &manifest.runtime,
         manifest.source_tensor_dtype_profile.as_ref(),
     )?;
-    if matches!(
-        manifest.runtime.as_str(),
-        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
-    ) && manifest
-        .artifact_set_sha256
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty())
+    if requires_artifact_set(&manifest.runtime)
+        && manifest
+            .artifact_set_sha256
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Err(config_invalid(
-            "local learned manifest requires artifact_set_sha256 covering every executable artifact",
+            "artifact-backed manifest requires artifact_set_sha256 covering every executable artifact",
         ));
     }
     if is_tei_runtime(&manifest.runtime)

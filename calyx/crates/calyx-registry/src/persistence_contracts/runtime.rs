@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use calyx_core::{CalyxError, Lens, Result, SlotShape};
 
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::FrozenLensContract;
+use crate::identity::{
+    ContractFacts, contract_from_facts, external_command_corpus_hash, external_command_weights_hash,
+};
 use crate::{
     AlgorithmicLens, ExternalCmdLens, LensRuntime, LensSpec, MultimodalAdapterLens, TeiHttpLens,
 };
@@ -45,16 +48,14 @@ pub(crate) fn load_runtime_lens_from_spec(
                 ))
             })?;
             let lens = ExternalCmdLens::new(&spec.name, cmd, args.clone(), spec.modality, dim);
-            let args_text = args.join("\0");
-            let contract = FrozenLensContract::new(
-                spec.name.clone(),
-                sha256_digest(&[cmd.as_bytes(), args_text.as_bytes()]),
-                sha256_digest(&[b"external-cmd-runtime-v1"]),
-                SlotShape::Dense(dim),
-                spec.modality,
-                LensDType::F32,
-                NormPolicy::None,
-            );
+            let contract = contract_from_facts(ContractFacts {
+                name: spec.name.clone(),
+                weights_sha256: external_command_weights_hash(cmd, args),
+                corpus_hash: external_command_corpus_hash(),
+                shape: SlotShape::Dense(dim),
+                modality: spec.modality,
+                norm: crate::frozen::NormPolicy::None,
+            });
             Ok((Arc::new(lens), contract))
         }
         #[cfg(feature = "ml-runtime")]

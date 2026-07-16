@@ -5,7 +5,8 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, S
 use memmap2::Mmap;
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, NormPolicy};
+use crate::identity::{ContractFacts, contract_from_facts, static_lookup_corpus_hash};
 use crate::runtime::common::{DEFAULT_MAX_TOKENS, hash_files, normalize_unit, text_from_input};
 use crate::spec::{LensRuntime, LensSpec};
 
@@ -97,22 +98,14 @@ impl StaticLookupLens {
                 "static lookup matrix/tokenizer hash does not match LensSpec",
             ));
         }
-        let dim_text = matrix.dim.to_string();
-        let dtype_text = matrix.dtype.as_str();
-        let corpus_hash = sha256_digest(&[
-            b"static-lookup-model2vec-v1",
-            dim_text.as_bytes(),
-            dtype_text.as_bytes(),
-        ]);
-        let contract = FrozenLensContract::new(
-            spec.name,
+        let contract = contract_from_facts(ContractFacts {
+            name: spec.name,
             weights_sha256,
-            corpus_hash,
-            SlotShape::Dense(matrix.dim),
-            Modality::Text,
-            LensDType::F32,
-            spec.norm_policy,
-        );
+            corpus_hash: static_lookup_corpus_hash(matrix.dim, matrix.dtype.as_str()),
+            shape: SlotShape::Dense(matrix.dim),
+            modality: Modality::Text,
+            norm: spec.norm_policy,
+        });
         let id = contract.lens_id();
         Ok(Self {
             id,
