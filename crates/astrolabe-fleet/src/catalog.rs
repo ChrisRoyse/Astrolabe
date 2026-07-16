@@ -40,6 +40,8 @@ pub const ASTRO_FLEET_QUARANTINE_REASON_REQUIRED: &str = "ASTRO_FLEET_QUARANTINE
 pub const ASTRO_FLEET_DEPARTED_REASON_REQUIRED: &str = "ASTRO_FLEET_DEPARTED_REASON_REQUIRED";
 /// Refusal code when the post-commit readback diverges from the claim.
 pub const ASTRO_FLEET_FSV_MISMATCH: &str = "ASTRO_FLEET_FSV_MISMATCH";
+/// Returned when a fleet report is recorded with an empty/invalid kind or id.
+pub const ASTRO_FLEET_REPORT_INVALID: &str = "ASTRO_FLEET_REPORT_INVALID";
 /// Refusal code for a transition timestamp of zero.
 pub const ASTRO_FLEET_TIMESTAMP_REQUIRED: &str = "ASTRO_FLEET_TIMESTAMP_REQUIRED";
 /// Refusal code for an `update_facts` call that would change nothing (#451).
@@ -519,6 +521,108 @@ impl FleetCatalog {
         Ok((commit_seq, entry.seq))
     }
 
+    /// Persists a kind-scoped fleet report (#458 and later fleet artifacts):
+    /// full report bytes as a Blob-CF row under the `fleetreport:v1:` keyspace,
+    /// paired with an `Admin` ledger entry carrying `summary_payload`, committed
+    /// atomically and independently read back before returning — the same
+    /// fail-closed discipline as [`Self::record_run_report`].
+    ///
+    /// Returns `(commit_seq, ledger_seq)`.
+    pub fn record_fleet_report(
+        &self,
+        kind: &str,
+        report_id: &str,
+        report_bytes: Vec<u8>,
+        summary_payload: Vec<u8>,
+    ) -> Result<(Seq, u64), CalyxError> {
+        if kind.is_empty()
+            || report_id.is_empty()
+            || !kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_REPORT_INVALID,
+                message: format!(
+                    "fleet report kind must be non-empty kebab/snake ascii and report_id non-empty; got kind={kind:?} report_id={report_id:?}"
+                ),
+                remediation: "pass --kind like language-coverage and a non-empty --id",
+            });
+        }
+        RedactionPolicy::check_payload(&summary_payload)?;
+        let key = fleet_report_key(kind, report_id);
+        let subject = SubjectId::Query(format!("fleet-report:{kind}:{report_id}").into_bytes());
+        let actor = ActorId::Service(FLEET_ACTOR.to_string());
+        let commit_seq = self.vault.write_cf_batch_with_ledger_entry(
+            vec![(ColumnFamily::Blob, key.clone(), report_bytes.clone())],
+            EntryKind::Admin,
+            subject.clone(),
+            summary_payload.clone(),
+            actor.clone(),
+        )?;
+        self.vault.flush()?;
+        let mismatch = |what: String| CalyxError {
+            code: ASTRO_FLEET_FSV_MISMATCH,
+            message: format!("fleet report readback mismatch for {kind}:{report_id}: {what}"),
+            remediation: "the committed report does not match the claim; audit the catalog vault before trusting it",
+        };
+        let persisted = self
+            .vault
+            .read_cf_at(commit_seq, ColumnFamily::Blob, &key)?
+            .ok_or_else(|| mismatch("report row absent after commit".to_string()))?;
+        if persisted != report_bytes {
+            return Err(mismatch(
+                "report row bytes diverge from the claim".to_string(),
+            ));
+        }
+        let mut found = None;
+        for (_key, bytes) in self.vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)? {
+            let entry = calyx_ledger::decode(&bytes)?;
+            if entry.subject == subject {
+                found = Some(entry);
+            }
+        }
+        let entry = found.ok_or_else(|| mismatch("no ledger entry for this report".to_string()))?;
+        if entry.payload != summary_payload {
+            return Err(mismatch(format!(
+                "ledger entry {} payload diverges from the report summary",
+                entry.seq
+            )));
+        }
+        Ok((commit_seq, entry.seq))
+    }
+
+    /// Reads back a kind-scoped fleet report's bytes, or `None` if absent.
+    pub fn read_fleet_report(
+        &self,
+        kind: &str,
+        report_id: &str,
+    ) -> Result<Option<Vec<u8>>, CalyxError> {
+        let snapshot = self.vault.latest_seq();
+        self.vault.read_cf_at(
+            snapshot,
+            ColumnFamily::Blob,
+            &fleet_report_key(kind, report_id),
+        )
+    }
+
+    /// Lists the report ids persisted under `kind`, ascending (report ids sort
+    /// lexicographically, so timestamp-prefixed ids list oldest-first).
+    pub fn list_fleet_reports(&self, kind: &str) -> Result<Vec<String>, CalyxError> {
+        let mut prefix = fleet_report_key(kind, "");
+        let marker = prefix.clone();
+        prefix.truncate(marker.len());
+        let snapshot = self.vault.latest_seq();
+        let mut ids = Vec::new();
+        for (key, _val) in self.vault.scan_cf_at(snapshot, ColumnFamily::Blob)? {
+            if key.starts_with(&marker) {
+                ids.push(String::from_utf8_lossy(&key[marker.len()..]).into_owned());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Commits `row` and its ledger entry in one atomic batch, then re-reads
     /// both from the committed snapshot and compares before returning.
     fn commit_row(
@@ -630,6 +734,24 @@ impl FleetCatalog {
 pub const RUN_REPORT_DISC: u8 = 0xFD;
 /// Versioned namespace tag for run-report rows.
 pub const RUN_REPORT_NAMESPACE: &[u8] = b"fleetrun:v1:";
+
+/// Versioned namespace tag for kind-scoped fleet report rows (#458): shares the
+/// `0xFD` discriminant with run reports but a distinct namespace, so the two
+/// keyspaces never collide and both stay disjoint from the collection blob layer.
+pub const FLEET_REPORT_NAMESPACE: &[u8] = b"fleetreport:v1:";
+
+/// Blob-CF key of a kind-scoped fleet report row: `0xFD ++ "fleetreport:v1:" ++
+/// kind ++ ":" ++ report_id`.
+pub fn fleet_report_key(kind: &str, report_id: &str) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(1 + FLEET_REPORT_NAMESPACE.len() + kind.len() + 1 + report_id.len());
+    key.push(RUN_REPORT_DISC);
+    key.extend_from_slice(FLEET_REPORT_NAMESPACE);
+    key.extend_from_slice(kind.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(report_id.as_bytes());
+    key
+}
 
 /// Blob-CF key of a discovery run report row.
 pub fn run_report_key(run_id: &str) -> Vec<u8> {
