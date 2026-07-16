@@ -46,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -490,6 +490,71 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!(
                 "{}",
                 serde_json::json!({ "kind": kind, "total": ids.len(), "report_ids": ids })
+            );
+            Ok(())
+        }
+        "dedup-census" => {
+            opts.reject_unknown(&["root", "store-root", "project", "id"])?;
+            let store_root = PathBuf::from(opts.get("store-root").ok_or_else(|| {
+                usage("dedup-census needs --store-root <dir> (the fleet store root)")
+            })?);
+            let report_id = opts
+                .get("id")
+                .ok_or_else(|| usage("dedup-census needs --id <report-id>"))?;
+            let named = opts.get_all("project");
+            let projects: Vec<String> = if named.is_empty() {
+                let mut projects: Vec<String> = catalog
+                    .query(Some(RepoState::Kerneled), None)?
+                    .into_iter()
+                    .map(|row| row.record.full_name.replace('/', "__"))
+                    .collect();
+                projects.sort();
+                if projects.is_empty() {
+                    return Err(CalyxError {
+                        code: "ASTRO_FLEET_DEDUP_EMPTY",
+                        message: "no kerneled repos in the catalog and no --project named".to_string(),
+                        remediation: "kernel at least one repo or name --project <org__repo> explicitly",
+                    });
+                }
+                projects
+            } else {
+                named.into_iter().map(str::to_string).collect()
+            };
+            let mut per_project = Vec::with_capacity(projects.len());
+            for project in &projects {
+                let atoms = astrolabe_fleet::dedup::project_atoms(&store_root, project)?;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "project": project, "atoms": atoms.len() })
+                );
+                per_project.push((project.clone(), atoms));
+            }
+            let artifact = astrolabe_fleet::dedup::census_artifact(&per_project);
+            let bytes = serde_json::to_vec_pretty(&artifact).expect("census serializes");
+            let summary = serde_json::to_vec(&serde_json::json!({
+                "event": "fleet_dedup_census",
+                "report_id": report_id,
+                "projects": projects.len(),
+                "atoms_total": artifact["atoms_total"],
+                "distinct_contents": artifact["distinct_contents"],
+                "cross_repo_classes": artifact["cross_repo_classes"],
+            }))
+            .expect("census summary serializes");
+            let (commit_seq, ledger_seq) =
+                catalog.record_fleet_report("dedup-census", report_id, bytes, summary)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "dedup-census",
+                    "report_id": report_id,
+                    "commit_seq": commit_seq,
+                    "ledger_seq": ledger_seq,
+                    "atoms_total": artifact["atoms_total"],
+                    "distinct_contents": artifact["distinct_contents"],
+                    "dedup_ratio": artifact["dedup_ratio"],
+                    "cross_repo_classes": artifact["cross_repo_classes"],
+                    "projects": artifact["projects"],
+                })
             );
             Ok(())
         }
