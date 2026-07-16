@@ -78,8 +78,10 @@ use crate::orchestrator::{SHADOW_VAULT_ID, kernel_scope_id, shadow_vault_salt};
 
 /// Report kind under which the compose sidecar persists in the fleet catalog.
 pub const FLEET_KERNEL_REPORT_KIND: &str = "fleet-kernel";
-/// Sidecar artifact schema tag.
-pub const FLEET_KERNEL_SIDECAR_SCHEMA: &str = "fleet-kernel-compose/v1";
+/// Sidecar artifact schema tag. Bumped to v2 for the #477 declared candidacy
+/// policy block (`candidacy`) — the artifact now records which policy rule
+/// filtered each excluded fleet node, with per-rule counts.
+pub const FLEET_KERNEL_SIDECAR_SCHEMA: &str = "fleet-kernel-compose/v2";
 /// Knob registry version for fleet composition.
 pub const FLEET_COMPOSE_KNOB_REGISTRY_VERSION: &str = "astro.fleet.compose_knobs.v1";
 /// Framing tag for a fleet node identity preimage.
@@ -101,11 +103,16 @@ pub const ASTRO_FLEET_KERNEL_MISSING: &str = "ASTRO_FLEET_KERNEL_MISSING";
 pub const ASTRO_FLEET_KERNEL_READBACK: &str = "ASTRO_FLEET_KERNEL_READBACK";
 /// Refusal: provenance verification found a sidecar claim reality contradicts.
 pub const ASTRO_FLEET_PROVENANCE_MISMATCH: &str = "ASTRO_FLEET_PROVENANCE_MISMATCH";
+/// Refusal: the declared candidacy policy excluded every fleet node, so there
+/// is no code-bearing candidate to compose a kernel from.
+pub const ASTRO_FLEET_COMPOSE_NO_CANDIDATES: &str = "ASTRO_FLEET_COMPOSE_NO_CANDIDATES";
 
 // Knob names.
 pub const KNOB_SIMILARITY_MIN: &str = "fleet.compose.similarity_min_permille";
 pub const KNOB_SIMILARITY_TOP_K: &str = "fleet.compose.similarity_top_k";
 pub const KNOB_PER_REPO_RECALL_MIN: &str = "fleet.compose.per_repo_recall_min_permille";
+pub const KNOB_CROSS_REPO_SUPPORT_WEIGHT: &str =
+    "fleet.candidacy.cross_repo_support_weight_permille";
 
 const SOURCE: &str = "https://github.com/ChrisRoyse/Astrolabe/issues/456";
 
@@ -144,7 +151,51 @@ pub const FLEET_COMPOSE_KNOBS: &[U64KnobDeclaration] = &[
                     by the fleet kernel within the answer radius (mirrors the #37 gate); \
                     a fleet kernel below gate persists only as provisional",
     },
+    U64KnobDeclaration {
+        registry_version: FLEET_CANDIDACY_KNOB_REGISTRY_VERSION,
+        name: KNOB_CROSS_REPO_SUPPORT_WEIGHT,
+        default: 1000,
+        min: 0,
+        max: 10_000,
+        unit: "permille",
+        source: SOURCE_477,
+        rationale: "cross-repo support up-weight (#477): a surviving candidate present in \
+                    K distinct repos scales its frequency weight by (1 + w·(K−1)); direct \
+                    fleet-wide-relevance evidence, so shared code outranks single-repo code \
+                    in the FVS frequency bonus. Bounded so no single hub saturates the graph",
+    },
 ];
+
+/// Knob registry version for fleet candidacy (#477).
+pub const FLEET_CANDIDACY_KNOB_REGISTRY_VERSION: &str = "astro.fleet.candidacy_knobs.v1";
+/// Declared candidacy policy version, recorded in every compose sidecar so
+/// consumers can distinguish the member-set semantics (#477). This is the
+/// *policy* version; the scope id (`fleet:rust:v1`) is an operator-chosen
+/// corpus/lineage identifier and is intentionally NOT bumped by a policy change.
+pub const FLEET_CANDIDACY_POLICY_VERSION: &str = "astro.fleet.candidacy.v1";
+
+/// Candidacy exclusion rule: the class carries no snippet fingerprint at all.
+pub const CANDIDACY_RULE_EMPTY_FINGERPRINT: &str = "empty_fingerprint";
+/// Candidacy exclusion rule: the class label is a declared structural label.
+pub const CANDIDACY_RULE_STRUCTURAL_LABEL: &str = "structural_label";
+
+/// Declared structural / content-free labels excluded from fleet kernel
+/// candidacy (#477). These labels name atoms that carry no reusable code body,
+/// so they crowd the member set without contributing code-graph value:
+/// - `File`   — a filesystem node; its "snippet" is only the #413 name+extension
+///   property fingerprint (content-free; already `content_free` in dedup #455).
+/// - `Decorator` — an attribute/annotation marker (`<decorator:test>`,
+///   `<decorator:#[cfg>`); no body, no path, `lang=unknown`.
+/// - `Section` — a documentation heading (`README.License`); prose navigation,
+///   not code.
+///
+/// Measured motivation (fleet:rust:v1, 67 members before this policy): File 5,
+/// Decorator 5, Section 10 — 20/67 (30%) content-free structural members, all at
+/// or near the score floor. The denylist is a declared categorical policy (not a
+/// tunable threshold), mirroring the dedup census's `content_free` predicate.
+pub const FLEET_STRUCTURAL_LABELS: &[&str] = &["File", "Decorator", "Section"];
+
+const SOURCE_477: &str = "https://github.com/ChrisRoyse/Astrolabe/issues/477";
 
 /// Fully resolved fleet compose knobs.
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +206,10 @@ pub struct ComposeConfig {
     pub similarity_top_k: u64,
     /// Per-repo held-out recall gate in permille.
     pub per_repo_recall_min_permille: u64,
+    /// Cross-repo support up-weight in permille (#477 candidacy policy): a
+    /// surviving candidate present in K distinct repos scales its frequency
+    /// weight by `(1000 + w·(K−1)) / 1000`.
+    pub cross_repo_support_weight_permille: u64,
 }
 
 impl ComposeConfig {
@@ -164,6 +219,7 @@ impl ComposeConfig {
             similarity_min_permille: knob_default(KNOB_SIMILARITY_MIN),
             similarity_top_k: knob_default(KNOB_SIMILARITY_TOP_K),
             per_repo_recall_min_permille: knob_default(KNOB_PER_REPO_RECALL_MIN),
+            cross_repo_support_weight_permille: knob_default(KNOB_CROSS_REPO_SUPPORT_WEIGHT),
         }
     }
 
@@ -172,6 +228,10 @@ impl ComposeConfig {
         check_range(KNOB_SIMILARITY_MIN, self.similarity_min_permille)?;
         check_range(KNOB_SIMILARITY_TOP_K, self.similarity_top_k)?;
         check_range(KNOB_PER_REPO_RECALL_MIN, self.per_repo_recall_min_permille)?;
+        check_range(
+            KNOB_CROSS_REPO_SUPPORT_WEIGHT,
+            self.cross_repo_support_weight_permille,
+        )?;
         Ok(())
     }
 }
@@ -229,6 +289,11 @@ pub struct MemberOccurrence {
     pub content_key: [u8; 32],
     /// True for File-label or snippetless atoms (#473 proxy) — never merged.
     pub content_free: bool,
+    /// True when the atom carries no snippet fingerprint bytes at all (#473
+    /// proxy). Distinct from `content_free`, which also folds in the `File`
+    /// label; kept separate so the candidacy policy can attribute each exclusion
+    /// to exactly one declared rule.
+    pub snippet_empty: bool,
     /// Whether the member was grounded (Trusted anchor within hop limit) at home.
     pub grounded: bool,
     /// Per-repo measured member stats, carried for provenance + degenerate path.
@@ -378,6 +443,7 @@ pub fn load_repo_kernel(
             language: frames.language.clone(),
             content_key: frames.content_key,
             content_free: frames.snippet_empty || frames.label == "File",
+            snippet_empty: frames.snippet_empty,
             grounded: member.grounded,
             score_permille: member.score_permille,
             degree: member.degree,
@@ -530,6 +596,134 @@ fn build_fleet_nodes(scope: &str, loads: &[RepoKernelLoad]) -> Result<Vec<FleetN
     Ok(nodes)
 }
 
+impl FleetNode {
+    /// The class label. Every occurrence of a content-equivalence class shares
+    /// one label (the content key frames it); a content-free node holds a single
+    /// occurrence.
+    fn label(&self) -> &str {
+        self.occurrences
+            .first()
+            .map(|occurrence| occurrence.label.as_str())
+            .unwrap_or("")
+    }
+
+    /// Distinct repos supporting this node (cross-repo support).
+    fn repo_count(&self) -> u64 {
+        self.occurrences
+            .iter()
+            .map(|occurrence| occurrence.project.as_str())
+            .collect::<BTreeSet<_>>()
+            .len() as u64
+    }
+
+    /// Cross-repo-support-weighted frequency (#477): `freq · (1000 + w·(K−1))/1000`,
+    /// clamped to at least 1. `w` is the declared support-weight knob.
+    fn weighted_frequency(&self, weight_permille: u64) -> u64 {
+        let extra = self.repo_count().saturating_sub(1);
+        let scale = 1000_u128 + u128::from(weight_permille) * u128::from(extra);
+        let scaled = u128::from(self.frequency_sum).saturating_mul(scale) / 1000;
+        u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
+    }
+
+    /// Declared candidacy verdict (#477): `Some(rule)` = excluded by that rule,
+    /// `None` = eligible. Rules are evaluated in a fixed order; each excluded
+    /// node is attributed to exactly the first matching rule.
+    fn candidacy_exclusion(&self) -> Option<&'static str> {
+        if self.occurrences.iter().all(|occurrence| occurrence.snippet_empty) {
+            return Some(CANDIDACY_RULE_EMPTY_FINGERPRINT);
+        }
+        if FLEET_STRUCTURAL_LABELS.contains(&self.label()) {
+            return Some(CANDIDACY_RULE_STRUCTURAL_LABEL);
+        }
+        None
+    }
+}
+
+/// Per-rule tally of the declared candidacy policy (#477), recorded verbatim in
+/// the compose sidecar so every exclusion is counted (invariant 3) and the
+/// before/after member-set shift is auditable.
+#[derive(Default)]
+struct CandidacyCensus {
+    total_nodes: usize,
+    candidates: usize,
+    excluded_total: usize,
+    excluded_by_rule: BTreeMap<&'static str, u64>,
+    excluded_by_label: BTreeMap<String, u64>,
+    surviving_by_label: BTreeMap<String, u64>,
+}
+
+impl CandidacyCensus {
+    /// The declared candidacy policy block for the sidecar: every rule named,
+    /// its per-rule exclusion count, and the surviving/excluded label tallies.
+    fn to_sidecar(&self, weight_permille: u64) -> Value {
+        let rule_count = |rule: &str| self.excluded_by_rule.get(rule).copied().unwrap_or(0);
+        json!({
+            "policy_version": FLEET_CANDIDACY_POLICY_VERSION,
+            "knob_registry_version": FLEET_CANDIDACY_KNOB_REGISTRY_VERSION,
+            "rules": [
+                {
+                    "rule": CANDIDACY_RULE_EMPTY_FINGERPRINT,
+                    "kind": "exclusion",
+                    "description": "class carries no snippet fingerprint bytes at all (#473 proxy); \
+                                    no content to reuse — mirrors the dedup census content_free predicate",
+                    "excluded": rule_count(CANDIDACY_RULE_EMPTY_FINGERPRINT),
+                },
+                {
+                    "rule": CANDIDACY_RULE_STRUCTURAL_LABEL,
+                    "kind": "exclusion",
+                    "description": "class label is a declared structural/content-free label: no reusable code body",
+                    "structural_labels": FLEET_STRUCTURAL_LABELS,
+                    "excluded": rule_count(CANDIDACY_RULE_STRUCTURAL_LABEL),
+                },
+                {
+                    "rule": "cross_repo_support_weight",
+                    "kind": "weight",
+                    "description": "surviving candidates' graph frequency up-weighted by distinct-repo \
+                                    support: freq·(1000 + w·(K−1))/1000 (not an exclusion)",
+                    "weight_permille": weight_permille,
+                    "excluded": 0,
+                },
+            ],
+            "nodes_before_policy": self.total_nodes,
+            "candidates": self.candidates,
+            "excluded_total": self.excluded_total,
+            "excluded_by_rule": self.excluded_by_rule,
+            "excluded_by_label": self.excluded_by_label,
+            "surviving_by_label": self.surviving_by_label,
+        })
+    }
+}
+
+/// Applies the declared candidacy policy (#477): every fleet node is classified
+/// eligible or excluded; excluded nodes are dropped from the kernel graph — so
+/// they can be neither kernel members nor coverage targets nor similarity hubs —
+/// and counted per declared rule. Content-bearing code atoms survive; content-
+/// free structural atoms (File/Decorator/Section labels, snippetless classes)
+/// do not. The census is returned for verbatim persistence in the sidecar.
+fn apply_candidacy_policy(nodes: Vec<FleetNode>) -> (Vec<FleetNode>, CandidacyCensus) {
+    let mut census = CandidacyCensus {
+        total_nodes: nodes.len(),
+        ..CandidacyCensus::default()
+    };
+    let mut candidates = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let label = node.label().to_string();
+        match node.candidacy_exclusion() {
+            Some(rule) => {
+                *census.excluded_by_rule.entry(rule).or_default() += 1;
+                *census.excluded_by_label.entry(label).or_default() += 1;
+                census.excluded_total += 1;
+            }
+            None => {
+                *census.surviving_by_label.entry(label).or_default() += 1;
+                candidates.push(node);
+            }
+        }
+    }
+    census.candidates = candidates.len();
+    (candidates, census)
+}
+
 /// Builds deterministic top-k min-thresholded cosine similarity edges over the
 /// node centroids. Returns `(edges, similarity_permille_histogram)`.
 fn build_similarity_edges(
@@ -619,13 +813,24 @@ fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Compose input hash: `blake3` over the sorted `(project, members_hash)`
-/// frame pairs — the composition's exact input identity.
-pub fn compose_input_hash(pairs: &[(String, String)]) -> String {
+/// Compose input hash: `blake3` over the candidacy policy identity and the
+/// sorted `(project, members_hash)` frame pairs — the composition's exact input
+/// identity. The policy version and support-weight knob are folded in (#477) so
+/// a candidacy-policy change is a structural [`GraphDelta`] that forces a
+/// rebuild even when the corpus (repo set + per-repo members) is unchanged;
+/// otherwise a policy revision would silently never apply on a stable fleet.
+/// Preimage tag bumped to v2 for the added policy identity.
+pub fn compose_input_hash(
+    pairs: &[(String, String)],
+    policy_version: &str,
+    cross_repo_support_weight_permille: u64,
+) -> String {
     let mut sorted: Vec<&(String, String)> = pairs.iter().collect();
     sorted.sort();
     let mut preimage = Vec::new();
-    preimage.extend_from_slice(&frame(b"astrolabe.fleet.compose-input.v1"));
+    preimage.extend_from_slice(&frame(b"astrolabe.fleet.compose-input.v2"));
+    preimage.extend_from_slice(&frame(policy_version.as_bytes()));
+    preimage.extend_from_slice(&frame(&cross_repo_support_weight_permille.to_be_bytes()));
     for (project, members_hash) in sorted {
         preimage.extend_from_slice(&frame(project.as_bytes()));
         preimage.extend_from_slice(&frame(members_hash.as_bytes()));
@@ -678,7 +883,11 @@ pub fn compose_fleet_kernel(
         .iter()
         .map(|load| (load.project.clone(), load.members_hash.clone()))
         .collect();
-    let input_hash = compose_input_hash(&input_pairs);
+    let input_hash = compose_input_hash(
+        &input_pairs,
+        FLEET_CANDIDACY_POLICY_VERSION,
+        compose_config.cross_repo_support_weight_permille,
+    );
 
     // Growth semantics: unchanged input is a topology-preserving no-op; any
     // change is structural and escalates to an explicit full rebuild (the
@@ -719,15 +928,31 @@ pub fn compose_fleet_kernel(
         // rebuild — never trust a sidecar over the primary artifact.
     }
 
-    // Fleet graph.
-    let nodes = build_fleet_nodes(scope, &loads)?;
+    // Fleet graph. The declared candidacy policy (#477) filters content-free
+    // structural atoms out of the graph before the kernel is built, so they can
+    // be neither members nor coverage targets; every exclusion is counted per
+    // rule in `candidacy` and the surviving graph is code-bearing only.
+    let all_nodes = build_fleet_nodes(scope, &loads)?;
+    let (nodes, candidacy) = apply_candidacy_policy(all_nodes);
+    if nodes.is_empty() {
+        return Err(CalyxError {
+            code: ASTRO_FLEET_COMPOSE_NO_CANDIDATES,
+            message: format!(
+                "the {} candidacy policy excluded all {} fleet nodes ({} content-free structural): \
+                 no code-bearing candidate remains to compose a kernel",
+                FLEET_CANDIDACY_POLICY_VERSION, candidacy.total_nodes, candidacy.excluded_total
+            ),
+            remediation: "index at least one repo carrying content-bearing symbols \
+                          (functions/structs/methods), then re-run compose",
+        });
+    }
     let (edges, sim_histogram) = build_similarity_edges(&nodes, compose_config);
     let graph_nodes: Vec<KernelGraphNode> = nodes
         .iter()
         .map(|node| {
             KernelGraphNode::new(
                 node.fleet_cx,
-                node.frequency_sum,
+                node.weighted_frequency(compose_config.cross_repo_support_weight_permille),
                 if node.grounded_any {
                     Some(TrustTag::Trusted)
                 } else {
@@ -918,8 +1143,11 @@ pub fn compose_fleet_kernel(
         "repos": repos_summary,
         "skipped_no_kernel": skipped,
         "skipped_no_kernel_count": skipped.len(),
+        "candidacy": candidacy.to_sidecar(compose_config.cross_repo_support_weight_permille),
         "nodes": {
             "total": nodes.len(),
+            "nodes_before_candidacy": candidacy.total_nodes,
+            "excluded_by_candidacy": candidacy.excluded_total,
             "merged_class_nodes": merged_class_nodes,
             "cross_repo_nodes": cross_repo_nodes,
             "content_free_nodes_unmerged": content_free_nodes,
@@ -980,6 +1208,9 @@ pub fn compose_fleet_kernel(
         "repos": loads.len(),
         "skipped_no_kernel": skipped.len(),
         "nodes_total": nodes.len(),
+        "nodes_before_candidacy": candidacy.total_nodes,
+        "excluded_by_candidacy": candidacy.excluded_total,
+        "candidacy_policy_version": FLEET_CANDIDACY_POLICY_VERSION,
         "cross_repo_nodes": cross_repo_nodes,
         "similarity_edges_directed": edge_count,
         "member_count": artifact.member_count,
@@ -1222,6 +1453,7 @@ pub fn read_fleet_kernel(
             "compose_input_hash": value.get("compose_input_hash"),
             "verdict": value.get("verdict"),
             "gate": value.get("gate"),
+            "candidacy": value.get("candidacy"),
             "nodes": value.get("nodes"),
             "edges": value.get("edges"),
             "skipped_no_kernel_count": value.get("skipped_no_kernel_count"),
