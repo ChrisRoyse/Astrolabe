@@ -148,6 +148,10 @@ pub(crate) struct GitArchaeologyImportReport {
     /// measured perf lever that removes the dominant M-scale diff cost. Counted
     /// and surfaced in the summary, never a silent skip (invariant 3).
     pub(crate) skipped_large_commits: usize,
+    /// Revert commits whose message-mined target hash does not resolve in this
+    /// clone (#467) — squash-merge reverts routinely cite PR-only commits. Each
+    /// is a counted, labeled mining skip (invariant 3), never an import failure.
+    pub(crate) skipped_unresolvable_reverts: usize,
     /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
     /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
     /// a cleanup that cannot complete degrades to a counted remnant, never a
@@ -356,6 +360,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // mass-change skips — both surfaced in one labeled counter on the persisted
         // git_archaeology summary (invariant 3: every skip counted, never silent).
         skipped_large_commits: mined.skipped_large_commits + force_removed_skipped_large,
+        skipped_unresolvable_reverts: mined.skipped_unresolvable_reverts,
         archaeology_source,
         git_root,
         pathspec,
@@ -391,10 +396,8 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // file collapse to a single checkout (BTreeSet de-dup); an empty set never
         // occurs because `group_evidence_by_commit` yields only non-empty groups.
         // Ignored entirely when `file_scoped` is false (pre-#439 whole-subtree path).
-        let implicated_files: BTreeSet<String> = group
-            .iter()
-            .map(|item| item.range.path.clone())
-            .collect();
+        let implicated_files: BTreeSet<String> =
+            group.iter().map(|item| item.range.path.clone()).collect();
         let one_index_start = std::time::Instant::now();
         let indexed = index_historical_commit(
             repo,
@@ -911,13 +914,7 @@ fn add_historical_worktree_files(
     }
     // One batched checkout of exactly the present implicated files. All pathspecs are
     // pre-filtered to exist, so git never errors on an unmatched pathspec.
-    let mut args: Vec<&str> = vec![
-        "-c",
-        "core.longpaths=true",
-        "checkout",
-        commit,
-        "--",
-    ];
+    let mut args: Vec<&str> = vec!["-c", "core.longpaths=true", "checkout", commit, "--"];
     for path in &present {
         args.push(path.as_str());
     }
@@ -1050,6 +1047,7 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "evidence_without_symbol": report.evidence_without_symbol,
         "skipped_merge_fixes": report.skipped_merge_fixes,
         "skipped_large_commits": report.skipped_large_commits,
+        "skipped_unresolvable_reverts": report.skipped_unresolvable_reverts,
         "cleanup_remnants": report.cleanup_remnants,
         "trust": "mixed",
         "provenance": "git_history",

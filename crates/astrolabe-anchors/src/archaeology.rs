@@ -202,6 +202,11 @@ pub struct GitArchaeologyReport {
     /// changes (relocation, bulk rename/delete, mass reformat) whose blame is
     /// meaningless (#434). Counted and surfaced, never a silent skip (invariant 3).
     pub skipped_large_commits: usize,
+    /// Revert commits whose message-mined target hash does not resolve to a
+    /// commit in this clone (#467) — squash-merged reverts routinely reference
+    /// commits that only ever existed on a PR branch. The revert is skipped for
+    /// mining (its target's diff cannot be read), counted here per invariant 3.
+    pub skipped_unresolvable_reverts: usize,
 }
 
 /// Coded, remediable archaeology error.
@@ -315,32 +320,40 @@ pub fn mine_git_archaeology(
     let mut reverts = BTreeSet::new();
     let mut skipped_merge_fixes = 0usize;
     let mut skipped_large_commits = 0usize;
+    let mut skipped_unresolvable_reverts = 0usize;
     // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
     let file_cap = config.max_commit_changed_files;
     for commit in commits {
         if let Some(target) = canonical_revert_target(&commit.message) {
             validate_oid(&target)?;
-            // Mass-change cap (#434): a revert whose TARGET touched more than the
-            // cap of files within the pathspec is a bulk revert; its per-line
-            // blame/range mining is meaningless and, as with the relocation fix
-            // commit, dominated by diff generation+parse cost. Gate with the cheap
-            // `--name-only` pre-count before the expensive content diff, and count
-            // the skip (invariant 3). The target's parent is the diff old side that
-            // `changed_new_ranges_impl` derives, so count against that same pair.
-            let target_over_cap = file_cap != 0
-                && changed_file_count_for_commit(repo, &target, pathspec)? > file_cap;
-            if target_over_cap {
-                skipped_large_commits += 1;
-            } else if git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])?
-                && revert_patch_matches(repo, &target, &commit.sha)?
-            {
-                for target_range in changed_new_ranges_impl(repo, &target, pathspec)? {
-                    reverts.insert(RevertFinding {
-                        revert_commit: commit.sha.clone(),
-                        target_commit: target.clone(),
-                        target_range,
-                        observed_at: commit.timestamp,
-                    });
+            // Existence gate FIRST (#467): the target hash is mined from prose and
+            // may not exist in this clone at all (squash-merged reverts reference
+            // commits that only ever lived on a PR branch). Every query below —
+            // the cap pre-count's `%P` lookup included — fails fatally on a
+            // missing object, so resolve existence before touching the target.
+            if !git_status(repo, &["cat-file", "-e", &format!("{target}^{{commit}}")])? {
+                skipped_unresolvable_reverts += 1;
+            } else {
+                // Mass-change cap (#434): a revert whose TARGET touched more than the
+                // cap of files within the pathspec is a bulk revert; its per-line
+                // blame/range mining is meaningless and, as with the relocation fix
+                // commit, dominated by diff generation+parse cost. Gate with the cheap
+                // `--name-only` pre-count before the expensive content diff, and count
+                // the skip (invariant 3). The target's parent is the diff old side that
+                // `changed_new_ranges_impl` derives, so count against that same pair.
+                let target_over_cap = file_cap != 0
+                    && changed_file_count_for_commit(repo, &target, pathspec)? > file_cap;
+                if target_over_cap {
+                    skipped_large_commits += 1;
+                } else if revert_patch_matches(repo, &target, &commit.sha)? {
+                    for target_range in changed_new_ranges_impl(repo, &target, pathspec)? {
+                        reverts.insert(RevertFinding {
+                            revert_commit: commit.sha.clone(),
+                            target_commit: target.clone(),
+                            target_range,
+                            observed_at: commit.timestamp,
+                        });
+                    }
                 }
             }
         }
@@ -389,7 +402,8 @@ pub fn mine_git_archaeology(
             "astro.arch.timing phase=mine_internal read_commits_ms={read_commits_ms} \
              commits={commit_count} diff_ms={diff_ms} blame_ms={blame_ms} \
              blame_calls={blame_calls} skipped_merge_fixes={skipped_merge_fixes} \
-             skipped_large_commits={skipped_large_commits} file_cap={file_cap}"
+             skipped_large_commits={skipped_large_commits} \
+             skipped_unresolvable_reverts={skipped_unresolvable_reverts} file_cap={file_cap}"
         );
     }
     Ok(GitArchaeologyReport {
@@ -399,6 +413,7 @@ pub fn mine_git_archaeology(
         force_removed_commits,
         skipped_merge_fixes,
         skipped_large_commits,
+        skipped_unresolvable_reverts,
     })
 }
 
