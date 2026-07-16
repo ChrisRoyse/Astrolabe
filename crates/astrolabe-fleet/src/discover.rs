@@ -700,8 +700,13 @@ pub fn run_discovery(
             "departed": lr.departed,
             "reappeared": lr.reappeared,
         })).collect::<Vec<_>>(),
-        "incomplete_ranges": incomplete_ranges,
-        "report_file": report_path.display().to_string(),
+        // The ledger summary carries the COUNT; the named ranges (which may
+        // embed arbitrary API error text) live in the full report row + file.
+        "incomplete_count": incomplete_ranges.len(),
+        "report_file": report_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     }))
     .expect("run summary serializes");
     let (commit_seq, ledger_seq) = catalog.record_run_report(&run_id, report_bytes, summary)?;

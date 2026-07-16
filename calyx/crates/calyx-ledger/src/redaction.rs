@@ -234,6 +234,17 @@ const IDENTIFIER_FIELD_REGISTRY: &[IdentifierFieldRule] = &[
         FieldMatcher::AnyOf(&[METADATA_CHUNK_ID, METADATA_DATABASE_NAME]),
         IdentifierShape::SourceMetadata,
     ),
+    // GitHub `owner/name` repo slug recorded by the fleet discovery writer
+    // (#450): bounded alnum + `_-.:/`, provably a public repository name.
+    IdentifierFieldRule::new(
+        FieldMatcher::Exact("full_name"),
+        IdentifierShape::SourceMetadata,
+    ),
+    // Fleet discovery run-report file name (#450): `discovery-<ts>-<pid>.json`.
+    IdentifierFieldRule::new(
+        FieldMatcher::Exact("report_file"),
+        IdentifierShape::ManifestSlug,
+    ),
     // Stable `CALYX_*` diagnostic code.
     IdentifierFieldRule::new(FieldMatcher::Exact("code"), IdentifierShape::CalyxCode),
     // Ed25519 signature (64 bytes -> 128 hex).
