@@ -96,6 +96,26 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         opts.get("root")
             .unwrap_or(astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT),
     );
+    // Farm lock (#527): every MUTATING verb takes the single-writer kernel lock
+    // for the whole pass; read verbs stay lock-free. A second mutating pass on
+    // the same root refuses fail-closed (ASTRO_FLEET_FARM_LOCKED) instead of
+    // racing the store the way the 2026-07-16 dual retry-release did (#460).
+    const MUTATING_VERBS: [&str; 10] = [
+        "catalog-init",
+        "register",
+        "set-state",
+        "discover",
+        "clone",
+        "pipeline",
+        "grow",
+        "report",
+        "dedup-census",
+        "compose",
+    ];
+    let _farm_lock = MUTATING_VERBS
+        .contains(&verb)
+        .then(|| astrolabe_fleet::farm_lock::FarmLock::acquire(&root, verb))
+        .transpose()?;
     let catalog = FleetCatalog::open(&root)?;
     match verb {
         "catalog-init" => {

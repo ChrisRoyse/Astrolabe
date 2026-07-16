@@ -27,6 +27,7 @@ pub mod clone_farm;
 pub mod compose;
 pub mod dedup;
 pub mod discover;
+pub mod farm_lock;
 pub mod grow;
 pub mod orchestrator;
 pub mod record;
