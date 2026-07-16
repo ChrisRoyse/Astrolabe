@@ -18,6 +18,7 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
     let mut resident_addr = None;
     let mut allow_cold_gpu_workers = false;
     let mut session_id = None;
+    let mut input_retention = None;
     let mut idx = 1;
     while idx < rest.len() {
         match rest[idx].as_str() {
@@ -61,6 +62,17 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
                 resident_addr = Some(parse_resident_addr(value(rest, idx, "--resident-addr")?)?);
             }
             "--allow-cold-gpu-workers" => allow_cold_gpu_workers = true,
+            "--input-retention" => {
+                idx += 1;
+                input_retention = Some(
+                    calyx_aster::vault::input_store::InputRetention::parse(value(
+                        rest,
+                        idx,
+                        "--input-retention",
+                    )?)
+                    .map_err(CliError::from)?,
+                );
+            }
             "--session-id" => {
                 idx += 1;
                 let value = value(rest, idx, "--session-id")?;
@@ -105,6 +117,7 @@ pub(crate) fn parse_ingest(rest: &[String]) -> CliResult<Subcommand> {
         resident_addr,
         allow_cold_gpu_workers,
         session_id,
+        input_retention,
     }))
 }
 

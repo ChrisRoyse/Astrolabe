@@ -5,6 +5,7 @@ mod quarantine;
 use crate::dedup::DedupPolicy;
 use crate::sst::SstReader;
 use crate::timetravel::RetentionHorizon;
+use crate::vault::input_store::InputRetention;
 use crate::wal::{ReplayRecord, TornTail, replay_dir_after};
 use calyx_core::{CalyxError, Result, TemporalPolicy};
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,10 @@ pub struct VaultManifest {
     pub dedup_policy: Option<DedupPolicy>,
     #[serde(default)]
     pub retention_horizon: RetentionHorizon,
+    /// Raw-input retention policy for this vault (issue #446). `#[serde(default)]`
+    /// decodes older manifests as [`InputRetention::Persist`].
+    #[serde(default)]
+    pub input_retention: InputRetention,
     pub degraded_rebuildable: bool,
     #[serde(default)]
     pub quarantines: Vec<QuarantineRecord>,
@@ -180,6 +185,7 @@ impl VaultManifest {
             temporal_policy,
             dedup_policy,
             retention_horizon: RetentionHorizon::default(),
+            input_retention: InputRetention::default(),
             degraded_rebuildable: false,
             quarantines: Vec::new(),
         };

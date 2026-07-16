@@ -5,7 +5,10 @@ use calyx_aster::cf::{ColumnFamily, anchor_key, base_key};
 use calyx_aster::dedup::{AnchorConflictResult, check_anchor_conflict};
 use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::{self, decode_constellation_base};
-use calyx_core::{Anchor, AnchorKind, Constellation, CxId, Input, InputRef, Modality, VaultStore};
+use calyx_aster::vault::input_store::{self, InputRetention};
+use calyx_core::{
+    Anchor, AnchorKind, CalyxError, Constellation, CxId, Input, InputRef, Modality, VaultStore,
+};
 use calyx_ledger::EntryKind;
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 
@@ -268,7 +271,9 @@ fn ingest_command(args: IngestArgs) -> CliResult {
                 print_json(&report)?;
             }
         } else if let Some(text) = args.text {
-            for report in ingest_texts_with_resident(&resolved, &[text], gpu_route)? {
+            for report in
+                ingest_texts_with_resident(&resolved, &[text], gpu_route, args.input_retention)?
+            {
                 print_json(&report)?;
             }
         }

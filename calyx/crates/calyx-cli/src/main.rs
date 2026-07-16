@@ -38,6 +38,7 @@ mod capabilities;
 mod cf_read;
 mod cli_support;
 mod cmd;
+mod input_store_cmd;
 mod crash;
 mod dedup_audit_readback;
 mod dedup_readback;
