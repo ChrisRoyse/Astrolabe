@@ -212,6 +212,10 @@ pub struct RepoVerdict {
     pub kernel_member_count: Option<u64>,
     /// Top-level pipeline stage timings (ms) parsed from the timing stream.
     pub stage_ms: BTreeMap<String, u64>,
+    /// A torn partial store dir from a crashed prior run was removed and the
+    /// pipeline redone from scratch (the documented resume semantic) — labeled
+    /// here so recovery is never a silent fallback (invariant 3).
+    pub wiped_partial_store: bool,
     /// Wall seconds spent on this repo.
     pub secs: f64,
 }
@@ -276,6 +280,7 @@ pub fn run_pipeline_pass(
                         kernel_members_hash: None,
                         kernel_member_count: None,
                         stage_ms: BTreeMap::new(),
+                        wiped_partial_store: false,
                         secs: 0.0,
                     });
                 }
@@ -474,7 +479,9 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     let started = Instant::now();
     let project = project_name(&row.record.full_name);
     let store_dir = config.store_root.join(&project);
-    let verdict_base = |outcome: Outcome, stage: Option<&str>, detail: String| RepoVerdict {
+    let wiped_partial_store = std::cell::Cell::new(false);
+    let wiped_partial_store = &wiped_partial_store;
+    let verdict_base = move |outcome: Outcome, stage: Option<&str>, detail: String| RepoVerdict {
         full_name: row.record.full_name.clone(),
         github_id: row.record.github_id,
         outcome,
@@ -487,9 +494,10 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         kernel_members_hash: None,
         kernel_member_count: None,
         stage_ms: BTreeMap::new(),
+        wiped_partial_store: wiped_partial_store.get(),
         secs: started.elapsed().as_secs_f64(),
     };
-    let fail = |stage: &str, detail: String, rejection: Option<String>| JobResult {
+    let fail = move |stage: &str, detail: String, rejection: Option<String>| JobResult {
         row: row.clone(),
         verdict: RepoVerdict {
             secs: started.elapsed().as_secs_f64(),
@@ -564,18 +572,20 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         }
     } else if row.state == RepoState::Cloned {
         // Never-transitioned record: a leftover store dir is a torn partial
-        // run — remove and redo (documented resume semantic).
-        if store_dir.exists()
-            && let Err(error) = fs::remove_dir_all(&store_dir)
-        {
-            return fail(
-                "preflight",
-                format!(
-                    "partial store dir {} could not be removed for a clean re-run: {error}",
-                    store_dir.display()
-                ),
-                None,
-            );
+        // run — remove and redo (documented resume semantic, labeled in the
+        // verdict via `wiped_partial_store`).
+        if store_dir.exists() {
+            if let Err(error) = fs::remove_dir_all(&store_dir) {
+                return fail(
+                    "preflight",
+                    format!(
+                        "partial store dir {} could not be removed for a clean re-run: {error}",
+                        store_dir.display()
+                    ),
+                    None,
+                );
+            }
+            wiped_partial_store.set(true);
         }
     }
 
@@ -884,6 +894,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             kernel_members_hash: Some(reported_members_hash),
             kernel_member_count: Some(kernel_member_count),
             stage_ms,
+            wiped_partial_store: wiped_partial_store.get(),
             secs: started.elapsed().as_secs_f64(),
         },
         rejection_text: None,
