@@ -84,7 +84,7 @@ pub struct BucketNode {
     pub range: String,
     /// `total_count` GitHub reported for this bucket at probe time.
     pub total_count: u64,
-    /// `leaf`, `split`, `split_created`, or `zero`.
+    /// `leaf`, `split`, `split_created`, `zero`, or `incomplete`.
     pub action: &'static str,
     /// Pages fetched (leaves only).
     pub pages: u64,
@@ -546,20 +546,25 @@ pub fn run_discovery(
             0,
             &mut raw_items,
         );
+        // ANY enumeration failure — bisection depth, API failure after bounded
+        // retries — marks the run incomplete naming the range; the run report
+        // still persists below, and the fail-closed error is raised at the end.
         let buckets = match bucket_result {
             Ok(node) => node,
-            Err(error) if error.code == ASTRO_FLEET_DISCOVERY_INCOMPLETE => {
-                incomplete_ranges.push(error.message.clone());
+            Err(error) => {
+                incomplete_ranges.push(format!(
+                    "language:{language} stars:>={star_floor}: [{}] {}",
+                    error.code, error.message
+                ));
                 BucketNode {
                     range: format!(">={star_floor}"),
                     total_count: top_level_total,
-                    action: "split",
+                    action: "incomplete",
                     pages: 0,
                     items: 0,
                     children: Vec::new(),
                 }
             }
-            Err(error) => return Err(error),
         };
         let leaf_sum = sum_leaves(&buckets);
 
