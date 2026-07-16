@@ -369,6 +369,7 @@ fn demo_constellation(vault: &AsterVault, vault_id: VaultId) -> Constellation {
 pub(crate) fn parse_cf(value: &str) -> Result<ColumnFamily, String> {
     match value {
         "base" => Ok(ColumnFamily::Base),
+        "blob" => Ok(ColumnFamily::Blob),
         "collections" => Ok(ColumnFamily::Collections),
         "relational" => Ok(ColumnFamily::Relational),
         "anchors" => Ok(ColumnFamily::Anchors),
