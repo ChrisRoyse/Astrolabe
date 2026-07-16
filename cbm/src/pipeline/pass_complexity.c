@@ -99,8 +99,55 @@ static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursi
     node->properties_json = neu;
 }
 
+/* Determinism (#513): the memoized DFS below breaks call-graph cycles at their
+ * entry point (a back edge contributes 0), so the tld/recursive result for cycle
+ * members depends on the ORDER in which nodes and their callees are visited. That
+ * order was previously node/edge *id* order, but ids are assigned by a shared
+ * counter during PARALLEL extraction/resolution, so the same corpus produced
+ * different tld values run-to-run — a nondeterministic node property that leaked
+ * (via the CxId content fingerprint and the S18 body-embedding fallback over that
+ * fingerprint) into nondeterministic persisted similarity edges. Both traversal
+ * orders are now keyed on the stable qualified name instead: DFS roots are visited
+ * in qualified-name order (see the driver), and each node's CALLS-callees are
+ * visited in target-qualified-name order (see `sort_callees_by_qn`). Node ids stay
+ * nondeterministic but no result derived from this pass does. The gbuf pointer for
+ * the comparators is held in a file-static because this pass is single-threaded
+ * (the DFS is a sequential recursion); it is set once at pass entry. */
+static const cbm_gbuf_t *s_tld_gb;
+
+/* Stable qualified name for a node id, or "" when the id has no node. */
+static const char *tld_qn(int64_t id) {
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_id(s_tld_gb, id);
+    return (n && n->qualified_name) ? n->qualified_name : "";
+}
+
+/* qsort comparator: order CALLS edges by target qualified name, then target id as
+ * a total tie-break (equal-qn only for duplicate calls to the same target). */
+static int tld_edge_cmp(const void *a, const void *b) {
+    const cbm_gbuf_edge_t *ea = *(const cbm_gbuf_edge_t *const *)a;
+    const cbm_gbuf_edge_t *eb = *(const cbm_gbuf_edge_t *const *)b;
+    int c = strcmp(tld_qn(ea->target_id), tld_qn(eb->target_id));
+    if (c != 0) {
+        return c;
+    }
+    return (ea->target_id > eb->target_id) - (ea->target_id < eb->target_id);
+}
+
+/* qsort comparator: order DFS root ids by qualified name, then id tie-break. */
+static int tld_root_cmp(const void *a, const void *b) {
+    int64_t ia = *(const int64_t *)a;
+    int64_t ib = *(const int64_t *)b;
+    int c = strcmp(tld_qn(ia), tld_qn(ib));
+    if (c != 0) {
+        return c;
+    }
+    return (ia > ib) - (ia < ib);
+}
+
 /* Memoized DFS: tld(id) = loop_depth(id) + max over CALLS-callees of tld(callee).
- * state: 0=unvisited, 1=in-progress (back-edge → cycle), 2=done. */
+ * state: 0=unvisited, 1=in-progress (back-edge → cycle), 2=done. Callees are
+ * visited in a qualified-name-stable order so the cycle-entry point (and thus the
+ * result) is independent of nondeterministic id/edge insertion order (#513). */
 static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int *tld, char *state,
                    bool *recursive, int64_t maxid, int depth) {
     if (id < 1 || id > maxid) {
@@ -121,8 +168,19 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
     const cbm_gbuf_edge_t **edges = NULL;
     int ne = 0;
     cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &ne);
+    /* Copy the internal edge array (owned by the gbuf) so we can sort our view
+     * into a deterministic callee order without mutating shared state. */
+    const cbm_gbuf_edge_t **ordered = NULL;
+    if (ne > 1) {
+        ordered = malloc((size_t)ne * sizeof(*ordered));
+        if (ordered) {
+            memcpy(ordered, edges, (size_t)ne * sizeof(*ordered));
+            qsort(ordered, (size_t)ne, sizeof(*ordered), tld_edge_cmp);
+        }
+    }
+    const cbm_gbuf_edge_t **walk = ordered ? ordered : edges;
     for (int i = 0; i < ne; i++) {
-        int64_t c = edges[i]->target_id;
+        int64_t c = walk[i]->target_id;
         if (c == id) {
             recursive[id] = true; /* direct self-recursion */
             continue;
@@ -132,6 +190,7 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
             best = ct;
         }
     }
+    free(ordered);
     tld[id] = loop_depth[id] + best;
     state[id] = 2;
     return tld[id];
@@ -185,17 +244,56 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
     seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
 
-    int updated = 0;
-    for (int64_t id = 1; id <= maxid; id++) {
-        if (!nptr[id]) {
-            continue; /* only Function/Method nodes */
+    /* #513: gbuf handle for the qualified-name comparators (pass is single-threaded). */
+    s_tld_gb = gb;
+
+    /* Collect the Function/Method root ids and visit them in qualified-name order
+     * rather than nondeterministic id order, so cycle-entry (and thus every
+     * transitive_loop_depth / recursive result) is a deterministic function of the
+     * graph content, not of parallel id assignment (#513). */
+    int64_t *roots = malloc((size_t)sz * sizeof(*roots));
+    int root_count = 0;
+    if (roots) {
+        for (int64_t id = 1; id <= maxid; id++) {
+            if (nptr[id]) {
+                roots[root_count++] = id;
+            }
         }
+        qsort(roots, (size_t)root_count, sizeof(*roots), tld_root_cmp);
+    }
+
+    int updated = 0;
+    for (int r = 0; r < root_count; r++) {
+        int64_t id = roots[r];
         if (state[id] != 2) {
             tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
         }
-        append_complexity_props(nptr[id], tld[id], recursive[id]);
-        updated++;
     }
+    /* Write-back is order-independent (per-node), but keep it in a stable id walk. */
+    if (roots) {
+        for (int64_t id = 1; id <= maxid; id++) {
+            if (!nptr[id]) {
+                continue; /* only Function/Method nodes */
+            }
+            append_complexity_props(nptr[id], tld[id], recursive[id]);
+            updated++;
+        }
+    } else {
+        /* Allocation failure: fall back to the legacy id-order traversal so the
+         * pass still produces (nondeterministic) output rather than none. */
+        for (int64_t id = 1; id <= maxid; id++) {
+            if (!nptr[id]) {
+                continue;
+            }
+            if (state[id] != 2) {
+                tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
+            }
+            append_complexity_props(nptr[id], tld[id], recursive[id]);
+            updated++;
+        }
+    }
+    free(roots);
+    s_tld_gb = NULL;
 
     cbm_log_info("pass.complexity", "functions", itoa_cx(updated));
 

@@ -1494,7 +1494,11 @@ static int format_call_arg(char *buf, size_t bufsize, const CBMCallArg *a, const
     return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", a->index, esc_e);
 }
 
-static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
+/* Exposed (non-static) so the sequential CALLS finalizer (pass_calls.c, the
+ * <50-file path) serializes args through this exact code — same per-arg caps,
+ * same #493 UTF-8-boundary truncation, same keyword handling, same buffer-budget
+ * cutoff — so both pipelines emit byte-identical "args" arrays (#516). */
+size_t cbm_pipeline_append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
     if (call->arg_count == 0 || pos >= bufsize - PP_ARGS_MARGIN) {
         return pos;
     }
@@ -1584,7 +1588,7 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
 static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
                               const char *edge_type, char *props, int n, const CBMCall *call) {
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
-        size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
+        size_t pos = cbm_pipeline_append_args_json(props, CBM_SZ_2K, (size_t)n, call);
         if (call->start_line > 0 && strcmp(edge_type, "CALLS") == 0 &&
             pos < CBM_SZ_2K - PP_LINE_MARGIN) {
             int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);

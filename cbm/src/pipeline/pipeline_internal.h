@@ -529,6 +529,14 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 int cbm_pipeline_build_def_callees(const CBMCallArray *calls, const char *def_qn, char *buf,
                                    int bufsize);
 
+/* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto an edge's
+ * JSON props (buffer content with NO trailing '}'; caller closes the object).
+ * Returns the new write position. Defined in pass_parallel.c; shared with the
+ * sequential CALLS finalizer (pass_calls.c) so the <50-file and >=50-file
+ * pipelines emit byte-identical "args" arrays — same caps, same #493
+ * UTF-8-boundary truncation, same buffer-budget cutoff (#516). */
+size_t cbm_pipeline_append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call);
+
 /* ── Pass function prototypes ────────────────────────────────────── */
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
