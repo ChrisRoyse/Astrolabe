@@ -12,6 +12,11 @@
 #include "foundation/constants.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
+/* Byte budget reserved for the ,"line":<int> field (comma + "line" key (7) +
+ * colon + up to 10 digits + NUL). Mirrors PP_LINE_MARGIN in pass_parallel.c so
+ * the sequential CALLS finalizer reserves identical room as the parallel path
+ * (#516). */
+enum { CC_LINE_MARGIN = 24 };
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
@@ -257,70 +262,41 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
     return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
 }
 
-/* Insert an edge, splicing the call-site line (,"line":N) in before the closing
- * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Restricted
- * to CALLS: route/config edge props feed full-only predump passes
- * (create_route_nodes/create_data_flows), so altering them desyncs full vs
- * incremental indexing. */
-/* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
- * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
- * this, so data_flow mode had no argument expressions to surface for small
- * (< 50 file) repos that take the sequential path (#514). Mirrors the parallel
- * path's append_args_json shape so both pipelines agree. */
-static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
-    if (!call || call->arg_count <= 0) {
-        return;
-    }
-    size_t len = strlen(props);
-    if (len < SKIP_ONE || props[len - SKIP_ONE] != '}') {
-        return;
-    }
-    /* Overwrite the trailing '}' and rebuild it after the args array. */
-    size_t pos = len - SKIP_ONE;
-    int n = snprintf(props + pos, cap - pos, ",\"args\":[");
-    if (n <= 0 || (size_t)n >= cap - pos) {
-        return;
-    }
-    pos += (size_t)n;
-    for (int i = 0; i < call->arg_count; i++) {
-        const CBMCallArg *a = &call->args[i];
-        char esc_e[CBM_SZ_256];
-        cbm_json_escape(esc_e, sizeof(esc_e), a->expr ? a->expr : "");
-        char one[CBM_SZ_512];
-        if (a->value) {
-            char esc_v[CBM_SZ_256];
-            cbm_json_escape(esc_v, sizeof(esc_v), a->value);
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
-                         i > 0 ? "," : "", a->index, esc_e, esc_v);
-        } else {
-            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
-                         esc_e);
-        }
-        if (n <= 0 || (size_t)n >= cap - pos - PAIR_LEN) {
-            break; /* not enough room — close the array with what fits */
-        }
-        memcpy(props + pos, one, (size_t)n);
-        pos += (size_t)n;
-    }
-    if (pos + PAIR_LEN < cap) {
-        props[pos++] = ']';
-        props[pos++] = '}';
-        props[pos] = '\0';
-    }
-}
-
+/* Finalize an edge's props and emit it. Mirrors finalize_and_emit() on the
+ * parallel path (pass_parallel.c) byte-for-byte so an edge carries identical
+ * args + call-site-line evidence regardless of which pipeline produced it —
+ * the sequential <50-file path (this file) or the parallel >=50-file path
+ * (#514/#516). The base object arrives closed ("...}"); we strip the trailing
+ * '}', append ,"args":[...] through the shared serializer (same per-arg caps,
+ * same #493 UTF-8-boundary truncation, same buffer-budget cutoff), append
+ * ,"line":N for CALLS edges, then restore '}'.
+ *
+ * Correctness depends on `props` being a CBM_SZ_2K buffer (matching the parallel
+ * path's finalize buffer): the args-array truncation budget is bounded by the
+ * buffer size, so a smaller buffer would truncate a many-arg call at a different
+ * point and break byte-parity. The prior sequential serializer capped each arg
+ * through a 512-byte intermediate (`one[512]`) and DROPPED any arg whose escaped
+ * expr+value overflowed it wholesale — so a >512-byte string argument vanished on
+ * the sequential path while the parallel path kept it capped+truncated (#516). */
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
                             char *props, size_t cap, const CBMCall *call) {
-    if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
+    if (call) {
         size_t len = strlen(props);
-        if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}' && len + CBM_SZ_32 < cap) {
-            snprintf(props + len - SKIP_ONE, cap - (len - SKIP_ONE), ",\"line\":%d}",
-                     call->start_line);
+        if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}') {
+            /* Overwrite the trailing '}'; append_args_json / the line field and
+             * the restored '}' rebuild the object from there. */
+            size_t pos = cbm_pipeline_append_args_json(props, cap, len - SKIP_ONE, call);
+            if (call->start_line > 0 && strcmp(type, "CALLS") == 0 && pos < cap - CC_LINE_MARGIN) {
+                int ln = snprintf(props + pos, cap - pos, ",\"line\":%d", call->start_line);
+                if (ln > 0) {
+                    pos += (size_t)ln;
+                }
+            }
+            if (pos < cap - SKIP_ONE) {
+                props[pos] = '}';
+                props[pos + SKIP_ONE] = '\0';
+            }
         }
-    }
-    if (call && strcmp(type, "CALLS") == 0) {
-        calls_append_args(props, cap, call);
     }
     cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
 }
@@ -344,7 +320,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         }
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
-        char props[CBM_SZ_512];
+        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
         snprintf(props, sizeof(props),
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -362,7 +338,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
-    char props[CBM_SZ_512];
+    char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
              esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
              broker ? ",\"broker\":\"" : "", broker ? broker : "");
@@ -399,7 +375,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         char esc_k[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_k, sizeof(esc_k), call->first_string_arg ? call->first_string_arg : "");
-        char props[CBM_SZ_512];
+        char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
         snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
                  esc_c, esc_k, res->confidence);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
@@ -411,7 +387,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CBM_SZ_512];
+    char props[CBM_SZ_2K]; /* 2K: match the parallel finalize buffer so args truncate alike (#516) */
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
