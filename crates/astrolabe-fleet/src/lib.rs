@@ -24,6 +24,7 @@
 
 pub mod catalog;
 pub mod clone_farm;
+pub mod dedup;
 pub mod discover;
 pub mod orchestrator;
 pub mod record;
