@@ -164,9 +164,18 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     }
     let mut classes: BTreeMap<[u8; 32], Class> = BTreeMap::new();
     let mut snippetless_total = 0_u64;
+    // libcbm emits no raw source property, so stored "snippets" are the #413
+    // body-derived property fingerprints — a valid content proxy for
+    // body-bearing symbols, but for `File` atoms the fingerprint is just
+    // name+extension (content-free): every `mod.rs` fleet-wide would collapse
+    // into one fake class (found live: a 134-occurrence 10-repo class).
+    // File atoms are therefore excluded from content equivalence, explicitly
+    // counted, never silently classed. True byte-content dedup needs CBM to
+    // retain raw snippets — tracked as its own issue.
+    let content_free = |atom: &AtomFrames| atom.snippet_empty || atom.label == "File";
     for (project, atoms) in per_project {
         for atom in atoms {
-            if atom.snippet_empty {
+            if content_free(atom) {
                 snippetless_total += 1;
                 continue;
             }
@@ -196,18 +205,16 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     let projects: Vec<Value> = per_project
         .iter()
         .map(|(project, atoms)| {
-            let snippetless = atoms.iter().filter(|atom| atom.snippet_empty).count() as u64;
+            let snippetless = atoms.iter().filter(|atom| content_free(atom)).count() as u64;
             let total = atoms.len() as u64 - snippetless;
             let shared = atoms
                 .iter()
-                .filter(|atom| {
-                    !atom.snippet_empty && classes[&atom.content_key].repos.len() > 1
-                })
+                .filter(|atom| !content_free(atom) && classes[&atom.content_key].repos.len() > 1)
                 .count() as u64;
             json!({
                 "project": project,
                 "atoms": total,
-                "snippetless_atoms": snippetless,
+                "content_free_atoms": snippetless,
                 "atoms_in_cross_repo_classes": shared,
                 "uniqueness_fraction": if total > 0 {
                     (total - shared) as f64 / total as f64
@@ -226,9 +233,9 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     json!({
         "artifact": "fleet-dedup-census/v1",
         "policy": "linked-not-skipped: per-repo constellations untouched; classes weight fleet composition (#456)",
-        "join_key": "blake3(frame(label)+frame(language)+frame(source_snippet_bytes)) — content-only (design correction recorded on #455)",
+        "join_key": "blake3(frame(label)+frame(language)+frame(source_snippet_bytes)) — content-only (design correction on #455); snippet bytes are the #413 body-derived property fingerprint (libcbm retains no raw source), a content PROXY: File-label atoms are excluded as content-free, and fingerprints embedding project-qualified callee names undercount cross-repo equality (bounded on #455)",
         "atoms_total": atoms_total,
-        "snippetless_atoms_excluded": snippetless_total,
+        "content_free_atoms_excluded": snippetless_total,
         "distinct_contents": distinct,
         "dedup_ratio": if distinct > 0 { atoms_total as f64 / distinct as f64 } else { 0.0 },
         "cross_repo_classes": cross.len(),
