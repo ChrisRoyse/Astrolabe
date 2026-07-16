@@ -8,9 +8,10 @@
 //! (#450), the clone farm (#451), the batch orchestrator (#452), cross-repo
 //! dedup (#455), kernel composition (#456), the growth scheduler (#457), and
 //! fleet-scope serving (#459). None of those atoms import SQLite rows or run
-//! panels; coupling them to `astrolabe-ingest` would drag the whole import
-//! machinery into every fleet tool. This crate depends only on the Calyx vault
-//! engine and the ledger.
+//! panels; coupling them to the server would drag the C half into every fleet
+//! tool. This crate depends on the Calyx vault engine, the ledger, and (since
+//! #452, for the orchestrator's independent readbacks only) the pure-Rust
+//! `astrolabe-ingest` kernel-artifact codec plus `rusqlite` — never `cbm-sys`.
 //!
 //! # Where the data lives
 //!
@@ -24,6 +25,7 @@
 pub mod catalog;
 pub mod clone_farm;
 pub mod discover;
+pub mod orchestrator;
 pub mod record;
 pub mod state;
 
@@ -40,6 +42,11 @@ pub use clone_farm::{
 pub use discover::{
     ASTRO_FLEET_DISCOVERY_INCOMPLETE, ASTRO_FLEET_GH_API, DEFAULT_CATALOG_ROOT, DEFAULT_LANGUAGES,
     DEFAULT_STAR_FLOOR, run_discovery,
+};
+pub use orchestrator::{
+    ASTRO_FLEET_PIPELINE_INCOMPLETE, ASTRO_FLEET_PIPELINE_SPAWN, DEFAULT_NOMIC_DIR,
+    DEFAULT_PIPELINE_PARALLELISM, DEFAULT_PIPELINE_TIMEOUT_SECS, DEFAULT_STORE_ROOT,
+    PipelineConfig, run_pipeline_pass,
 };
 pub use record::{
     FLEET_PANEL_VERSION, FleetRepoRow, RepoRecord, TransitionContext, repo_cx_id,

@@ -17,6 +17,10 @@
 //!                              (--repo <owner/name> ... | --all-discovered) [--limit <n>]
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--parallelism <n>] [--timeout-secs <n>] [--at <unix-secs>]
+//! astrolabe-fleet pipeline     [--root <dir>] [--store-root <dir>] [--astrolabe-bin <exe>]
+//!                              [--nomic-dir <dir>] (--repo <owner/name> ... | --all-cloned)
+//!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
+//!                              [--force] [--at <unix-secs>]
 //! ```
 //!
 //! `--root` defaults to the declared production catalog root
@@ -42,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -302,6 +306,221 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!("{report}");
             Ok(())
         }
+        "pipeline" => {
+            opts.reject_unknown(&[
+                "root",
+                "store-root",
+                "astrolabe-bin",
+                "nomic-dir",
+                "repo",
+                "all-cloned",
+                "limit",
+                "parallelism",
+                "timeout-secs",
+                "force",
+                "at",
+            ])?;
+            let mut config =
+                astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(opts.at_or_now()?);
+            if let Some(store_root) = opts.get("store-root") {
+                config.store_root = PathBuf::from(store_root);
+            }
+            if let Some(bin) = opts.get("astrolabe-bin") {
+                config.astrolabe_bin = PathBuf::from(bin);
+            }
+            if let Some(nomic) = opts.get("nomic-dir") {
+                config.nomic_dir = PathBuf::from(nomic);
+            }
+            if let Some(raw) = opts.get("parallelism") {
+                config.parallelism = raw
+                    .parse::<usize>()
+                    .map_err(|error| usage(&format!("--parallelism must be a usize: {error}")))?;
+            }
+            if let Some(raw) = opts.get("timeout-secs") {
+                config.timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+            }
+            config.force = opts.flag("force");
+            let repos = opts.get_all("repo");
+            let selection = if !repos.is_empty() {
+                if opts.flag("all-cloned") {
+                    return Err(usage("pass either --repo ... or --all-cloned, not both"));
+                }
+                astrolabe_fleet::clone_farm::Selection::Repos(
+                    repos.into_iter().map(str::to_string).collect(),
+                )
+            } else if opts.flag("all-cloned") {
+                let limit = opts
+                    .get("limit")
+                    .map(|raw| {
+                        raw.parse::<usize>()
+                            .map_err(|error| usage(&format!("--limit must be a usize: {error}")))
+                    })
+                    .transpose()?;
+                astrolabe_fleet::clone_farm::Selection::All { limit }
+            } else {
+                return Err(usage(
+                    "pipeline needs --repo <owner/name> (repeatable) or --all-cloned",
+                ));
+            };
+            let report =
+                astrolabe_fleet::orchestrator::run_pipeline_pass(&catalog, &config, &selection)?;
+            println!("{report}");
+            Ok(())
+        }
+        "report" => {
+            opts.reject_unknown(&["root", "kind", "id", "file", "summary"])?;
+            let kind = opts
+                .get("kind")
+                .ok_or_else(|| usage("report needs --kind <slug>"))?;
+            let id = opts.get("id").ok_or_else(|| usage("report needs --id"))?;
+            let file = opts
+                .get("file")
+                .ok_or_else(|| usage("report needs --file <json path>"))?;
+            let bytes = std::fs::read(file).map_err(|error| CalyxError {
+                code: "ASTRO_FLEET_REPORT_READ",
+                message: format!("read report file {file}: {error}"),
+                remediation: "pass a readable JSON file as --file",
+            })?;
+            // The payload must be JSON: reports are queryable data, not opaque blobs.
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| CalyxError {
+                code: "ASTRO_FLEET_REPORT_PARSE",
+                message: format!("report file {file} is not valid JSON: {error}"),
+                remediation: "fleet reports are queryable JSON; fix the file",
+            })?;
+            let summary = opts
+                .get("summary")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("fleet report {kind}:{id} recorded"));
+            let summary_payload = serde_json::json!({
+                "event": "fleet_report_recorded",
+                "kind": kind,
+                "report_id": id,
+                "bytes": bytes.len(),
+                "summary": summary,
+            })
+            .to_string()
+            .into_bytes();
+            let (commit_seq, ledger_seq) =
+                catalog.record_fleet_report(kind, id, bytes.clone(), summary_payload)?;
+            // Post-commit readback (FSV in the write path, beyond record's own).
+            let persisted = catalog.read_fleet_report(kind, id)?.ok_or(CalyxError {
+                code: astrolabe_fleet::catalog::ASTRO_FLEET_FSV_MISMATCH,
+                message: format!("fleet report {kind}:{id} absent immediately after commit"),
+                remediation: "audit the catalog vault; do not trust this write",
+            })?;
+            if persisted != bytes {
+                return Err(CalyxError {
+                    code: astrolabe_fleet::catalog::ASTRO_FLEET_FSV_MISMATCH,
+                    message: format!("fleet report {kind}:{id} readback diverges from the file"),
+                    remediation: "audit the catalog vault; do not trust this write",
+                });
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": kind,
+                    "report_id": id,
+                    "bytes": bytes.len(),
+                    "commit_seq": commit_seq,
+                    "ledger_seq": ledger_seq,
+                    "readback": "byte-identical",
+                })
+            );
+            Ok(())
+        }
+        "report-read" => {
+            opts.reject_unknown(&["root", "kind", "id", "latest"])?;
+            let kind = opts
+                .get("kind")
+                .ok_or_else(|| usage("report-read needs --kind <slug>"))?;
+            let id = if opts.flag("latest") {
+                catalog
+                    .list_fleet_reports(kind)?
+                    .pop()
+                    .ok_or_else(|| CalyxError {
+                        code: "ASTRO_FLEET_REPORT_MISSING",
+                        message: format!("no fleet reports recorded under kind {kind:?}"),
+                        remediation: "record one with the report verb first",
+                    })?
+            } else {
+                opts.get("id")
+                    .ok_or_else(|| usage("report-read needs --id or --latest"))?
+                    .to_string()
+            };
+            let bytes = catalog
+                .read_fleet_report(kind, &id)?
+                .ok_or_else(|| CalyxError {
+                    code: "ASTRO_FLEET_REPORT_MISSING",
+                    message: format!("no fleet report {kind}:{id}"),
+                    remediation: "list ids with report-list --kind",
+                })?;
+            use std::io::Write as _;
+            std::io::stdout()
+                .write_all(&bytes)
+                .map_err(|error| CalyxError {
+                    code: "ASTRO_FLEET_REPORT_READ",
+                    message: format!("write report bytes to stdout: {error}"),
+                    remediation: "retry with a writable stdout",
+                })?;
+            Ok(())
+        }
+        "report-list" => {
+            opts.reject_unknown(&["root", "kind"])?;
+            let kind = opts
+                .get("kind")
+                .ok_or_else(|| usage("report-list needs --kind <slug>"))?;
+            let ids = catalog.list_fleet_reports(kind)?;
+            println!(
+                "{}",
+                serde_json::json!({ "kind": kind, "total": ids.len(), "report_ids": ids })
+            );
+            Ok(())
+        }
+        "run-report-read" => {
+            opts.reject_unknown(&["root", "run-id", "raw"])?;
+            let run_id = opts
+                .get("run-id")
+                .ok_or_else(|| usage("run-report-read needs --run-id <id>"))?;
+            let readback = catalog
+                .read_run_report(run_id)?
+                .ok_or_else(|| CalyxError {
+                    code: "ASTRO_FLEET_REPORT_MISSING",
+                    message: format!("no run report persisted for run id {run_id:?}"),
+                    remediation: "run ids come from the discover/pipeline run output",
+                })?;
+            let (bytes, ledger_seq, ledger_payload) = (
+                readback.report_bytes,
+                readback.ledger_seq,
+                readback.ledger_payload,
+            );
+            if opts.flag("raw") {
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(&bytes)
+                    .map_err(|error| CalyxError {
+                        code: "ASTRO_FLEET_REPORT_READ",
+                        message: format!("write report bytes to stdout: {error}"),
+                        remediation: "retry with a writable stdout",
+                    })?;
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "blob_bytes": bytes.len(),
+                        "blob_blake3": blake3::hash(&bytes).to_hex().as_str(),
+                        "ledger_seq": ledger_seq,
+                        "ledger_payload": serde_json::from_slice::<serde_json::Value>(&ledger_payload)
+                            .unwrap_or_else(|_| serde_json::Value::String(
+                                String::from_utf8_lossy(&ledger_payload).into_owned()
+                            )),
+                    })
+                );
+            }
+            Ok(())
+        }
         other => Err(usage(&format!("unknown verb {other:?}"))),
     }
 }
@@ -329,7 +548,17 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 5] = ["stdin", "counts", "refresh", "update", "all-discovered"];
+    const SWITCHES: [&'static str; 9] = [
+        "stdin",
+        "counts",
+        "refresh",
+        "update",
+        "all-discovered",
+        "all-cloned",
+        "force",
+        "latest",
+        "raw",
+    ];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
         let mut pairs = Vec::new();

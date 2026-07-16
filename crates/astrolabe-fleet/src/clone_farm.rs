@@ -665,10 +665,10 @@ fn run_git(
 /// hard-killed farm left an orphaned `git.exe` writing into a torn clone dir,
 /// racing the next pass's recovery. Guarding is fail-closed — a git that
 /// cannot be tied to the job is killed rather than left to run unguarded.
-struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
 
 impl JobGuard {
-    fn assign(child: &std::process::Child) -> Result<Self, String> {
+    pub(crate) fn assign(child: &std::process::Child) -> Result<Self, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
@@ -721,7 +721,7 @@ impl Drop for JobGuard {
 /// shell), and Git Credential Manager's interactive mode are all disabled;
 /// `credential.helper=` (set per-invocation) resets config-declared helpers.
 /// Caught live by FSV: a ghost-repo clone hung on a GUI credential prompt.
-fn silence_credential_prompts(command: &mut Command) {
+pub(crate) fn silence_credential_prompts(command: &mut Command) {
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
@@ -730,7 +730,8 @@ fn silence_credential_prompts(command: &mut Command) {
 }
 
 /// Captured-output git helper for short read-only commands (rev-parse etc.).
-fn git_capture(args: &[&str], cwd: &Path) -> Result<(bool, String, String), CalyxError> {
+/// Shared with the pipeline orchestrator (#452).
+pub(crate) fn git_capture(args: &[&str], cwd: &Path) -> Result<(bool, String, String), CalyxError> {
     let mut command = Command::new("git");
     command
         .args(["-c", "credential.helper="])
