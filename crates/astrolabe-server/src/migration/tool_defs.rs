@@ -39,7 +39,7 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\". Required unless scope is a fleet scope (fleet:*)."
                 },
                 "mode": {
                     "type": "string",
@@ -48,14 +48,18 @@ pub(crate) fn get_kernel_tool_definition() -> Value {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Optional scope id to restrict the kernel to (read/gaps modes). Omit for every persisted scope. An unknown scope refuses fail-closed."
+                    "description": "Optional scope id to restrict the kernel to (read/gaps modes). Omit for every persisted scope. An unknown scope refuses fail-closed. A fleet scope (e.g. \"fleet:rust:v1\") serves the composed fleet kernel from the fleet catalog vault with per-repo provenance citations (#459); project is not required for fleet scopes."
+                },
+                "fleet_catalog_root": {
+                    "type": "string",
+                    "description": "Fleet catalog vault root for fleet scopes. Defaults to the declared production catalog root."
                 },
                 "budget": {
                     "type": "integer",
                     "description": "Optional member budget hint for mode=build. The on-demand build currently uses the registry-default kernel budget; a per-request budget override is a future refinement (this hint is not yet applied)."
                 }
             },
-            "required": ["project"],
+            "required": [],
             "additionalProperties": false
         },
         "outputSchema": {
@@ -75,13 +79,13 @@ pub(crate) fn kernel_answer_tool_definition() -> Value {
     json!({
         "name": "kernel_answer",
         "title": "Kernel Answer",
-        "description": "Grounded kernel-first Q&A for a shadow-indexed project: kernel-first search resolves an anchored (Trusted-grounded) entry point, then a hop-attenuated answer path walks association edges outward with hop_score = edge_weight * 0.9^hop, every hop carrying its ledger reference and every node its provenance. The answer is assembled from the path nodes with a total score, ordered provenance, and a rolled-up trust tag; an ungrounded scope or an unanswerable query refuses with a per-lens deficit rather than an empty answer, and a multi-hop answer without complete ledger wiring fails closed with CALYX_KERNEL_ANSWER_LEDGER_REQUIRED (never served unprovenanced). The answer-path algorithm is implemented in astrolabe_kernel::answer; the association graph is assembled from the persisted GraphProjectionCsr->KernelGraph projection and kernel artifact read back out of the vault. When neither is persisted the tool fails closed and directs the caller to build the kernel first with get_kernel mode=\"build\". Fails closed with {code,message,remediation} on a missing project/query or a non-shadow project.",
+        "description": "Grounded kernel-first Q&A for a shadow-indexed project: kernel-first search resolves an anchored (Trusted-grounded) entry point, then a hop-attenuated answer path walks association edges outward with hop_score = edge_weight * 0.9^hop, every hop carrying its ledger reference and every node its provenance. The answer is assembled from the path nodes with a total score, ordered provenance, and a rolled-up trust tag; an ungrounded scope or an unanswerable query refuses with a per-lens deficit rather than an empty answer, and a multi-hop answer without complete ledger wiring fails closed with CALYX_KERNEL_ANSWER_LEDGER_REQUIRED (never served unprovenanced). The answer-path algorithm is implemented in astrolabe_kernel::answer; the association graph is assembled from the persisted GraphProjectionCsr->KernelGraph projection and kernel artifact read back out of the vault. When neither is persisted the tool fails closed and directs the caller to build the kernel first with get_kernel mode=\"build\". Fails closed with {code,message,remediation} on a missing project/query or a non-shadow project. A fleet scope (fleet:*) serves cross-repo exemplar citations from the composed fleet kernel instead (see scope).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "CBM project name for a project indexed with calyx=\"shadow\"."
+                    "description": "CBM project name for a project indexed with calyx=\"shadow\". Required unless scope is a fleet scope (fleet:*)."
                 },
                 "query": {
                     "type": "string",
@@ -89,10 +93,18 @@ pub(crate) fn kernel_answer_tool_definition() -> Value {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Optional scope id to restrict the kernel-first search to."
+                    "description": "Optional scope id to restrict the kernel-first search to. A fleet scope (e.g. \"fleet:rust:v1\") answers from the composed fleet kernel via declared token-containment exemplar retrieval with per-repo citations, refusing with a structured deficit when no member grounds the query (#459); project is not required for fleet scopes."
+                },
+                "fleet_catalog_root": {
+                    "type": "string",
+                    "description": "Fleet catalog vault root for fleet scopes. Defaults to the declared production catalog root."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Fleet scopes only: maximum citations served (declared bounds 1..=64, default 8)."
                 }
             },
-            "required": ["project", "query"],
+            "required": ["query"],
             "additionalProperties": false
         },
         "outputSchema": {

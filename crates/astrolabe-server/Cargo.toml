@@ -11,6 +11,7 @@ astrolabe-anchors.workspace = true
 astrolabe-assay.workspace = true
 astrolabe-bridge = { path = "../astrolabe-bridge" }
 astrolabe-domain.workspace = true
+astrolabe-fleet.workspace = true
 astrolabe-guard = { path = "../astrolabe-guard" }
 astrolabe-ingest.workspace = true
 astrolabe-kernel.workspace = true

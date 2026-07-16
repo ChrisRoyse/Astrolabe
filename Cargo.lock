@@ -225,6 +225,7 @@ dependencies = [
  "astrolabe-assay",
  "astrolabe-bridge",
  "astrolabe-domain",
+ "astrolabe-fleet",
  "astrolabe-guard",
  "astrolabe-ingest",
  "astrolabe-kernel",
