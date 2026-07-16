@@ -409,12 +409,10 @@ impl FleetCatalog {
             .read_cf_at(commit_seq, ColumnFamily::Base, &base_key(cx_id))?
             .ok_or_else(|| mismatch("Base row absent after commit".to_string()))?;
         let mut persisted = decode_constellation_base(&bytes)?;
+        // NOTE: seq 0 is a legitimate ledger seq (the first entry of a fresh
+        // vault) — the stub-vs-real distinction is proven by the hash pairing
+        // below, never by the seq value.
         let stamped = persisted.provenance.clone();
-        if stamped.seq == 0 {
-            return Err(mismatch(
-                "persisted row carries no ledger ref (seq 0)".to_string(),
-            ));
-        }
         persisted.provenance = LedgerRef {
             seq: 0,
             hash: [0; 32],
