@@ -16,16 +16,29 @@ use super::*;
 
 type BatchSummaryEmitter<'a> = &'a mut dyn FnMut(&BatchIngestSummary) -> CliResult<()>;
 
+/// Per-invocation parameters of the streaming batch ingest.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchStreamRequest {
+    pub(crate) output: IngestOutput,
+    pub(crate) validated_row_count: usize,
+    pub(crate) gpu_route: IngestGpuRoute,
+    /// Per-ingest override of the vault's raw-input retention policy (#446).
+    pub(crate) retention_override: Option<InputRetention>,
+}
+
 pub(crate) fn ingest_validated_batch_streaming_with_output(
     resolved: &ResolvedVault,
     path: &std::path::Path,
-    output: IngestOutput,
-    validated_row_count: usize,
-    gpu_route: IngestGpuRoute,
-    retention_override: Option<InputRetention>,
+    request: BatchStreamRequest,
     mut summary_emitter: Option<BatchSummaryEmitter<'_>>,
     mut session: Option<&mut BatchIngestSession>,
 ) -> CliResult<BatchIngestSummary> {
+    let BatchStreamRequest {
+        output,
+        validated_row_count,
+        gpu_route,
+        retention_override,
+    } = request;
     use std::io::BufRead;
     let file = std::fs::File::open(path)
         .map_err(|err| CliError::io(format!("open batch {}: {err}", path.display())))?;

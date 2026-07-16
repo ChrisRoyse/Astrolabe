@@ -231,10 +231,12 @@ fn ingest_command(args: IngestArgs) -> CliResult {
             batch_stream::ingest_validated_batch_streaming_with_output(
                 &resolved,
                 batch_path,
-                args.output,
-                validation.row_count,
-                gpu_route,
-                args.input_retention,
+                batch_stream::BatchStreamRequest {
+                    output: args.output,
+                    validated_row_count: validation.row_count,
+                    gpu_route,
+                    retention_override: args.input_retention,
+                },
                 Some(&mut emit_summary),
                 Some(&mut session),
             )
@@ -242,10 +244,12 @@ fn ingest_command(args: IngestArgs) -> CliResult {
             batch_stream::ingest_validated_batch_streaming_with_output(
                 &resolved,
                 batch_path,
-                args.output,
-                validation.row_count,
-                gpu_route,
-                args.input_retention,
+                batch_stream::BatchStreamRequest {
+                    output: args.output,
+                    validated_row_count: validation.row_count,
+                    gpu_route,
+                    retention_override: args.input_retention,
+                },
                 None,
                 Some(&mut session),
             )
