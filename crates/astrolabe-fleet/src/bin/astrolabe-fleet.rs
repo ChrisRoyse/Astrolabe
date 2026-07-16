@@ -483,13 +483,18 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let run_id = opts
                 .get("run-id")
                 .ok_or_else(|| usage("run-report-read needs --run-id <id>"))?;
-            let (bytes, ledger_seq, ledger_payload) = catalog
+            let readback = catalog
                 .read_run_report(run_id)?
                 .ok_or_else(|| CalyxError {
                     code: "ASTRO_FLEET_REPORT_MISSING",
                     message: format!("no run report persisted for run id {run_id:?}"),
                     remediation: "run ids come from the discover/pipeline run output",
                 })?;
+            let (bytes, ledger_seq, ledger_payload) = (
+                readback.report_bytes,
+                readback.ledger_seq,
+                readback.ledger_payload,
+            );
             if opts.flag("raw") {
                 use std::io::Write as _;
                 std::io::stdout()

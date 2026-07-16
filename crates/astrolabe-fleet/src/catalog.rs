@@ -530,7 +530,7 @@ impl FleetCatalog {
     pub fn read_run_report(
         &self,
         run_id: &str,
-    ) -> Result<Option<(Vec<u8>, u64, Vec<u8>)>, CalyxError> {
+    ) -> Result<Option<RunReportReadback>, CalyxError> {
         let snapshot = self.vault.latest_seq();
         let Some(bytes) =
             self.vault
@@ -553,7 +553,11 @@ impl FleetCatalog {
             ),
             remediation: "the catalog vault violated the row+ledger pairing; audit it before trusting this run",
         })?;
-        Ok(Some((bytes, entry.seq, entry.payload)))
+        Ok(Some(RunReportReadback {
+            report_bytes: bytes,
+            ledger_seq: entry.seq,
+            ledger_payload: entry.payload,
+        }))
     }
 
     /// Persists a kind-scoped fleet report (#458 and later fleet artifacts):
@@ -766,6 +770,18 @@ impl FleetCatalog {
 /// Reserved Blob-CF keyspace for discovery run reports: a `0xFD` discriminant
 /// (disjoint from the collection blob layer's `0x05`) followed by a versioned
 /// namespace and the run id.
+/// Independent readback of a persisted run report: the exact Blob-CF bytes
+/// plus the paired `Admin` ledger entry's sequence and payload.
+#[derive(Clone, Debug)]
+pub struct RunReportReadback {
+    /// Exact report bytes read back from the Blob CF.
+    pub report_bytes: Vec<u8>,
+    /// Sequence of the paired `Admin` ledger entry.
+    pub ledger_seq: u64,
+    /// Payload of the paired `Admin` ledger entry (the run summary).
+    pub ledger_payload: Vec<u8>,
+}
+
 pub const RUN_REPORT_DISC: u8 = 0xFD;
 /// Versioned namespace tag for run-report rows.
 pub const RUN_REPORT_NAMESPACE: &[u8] = b"fleetrun:v1:";
