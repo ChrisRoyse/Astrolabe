@@ -569,6 +569,48 @@ bool cbm_validate_project_name(const char *name) {
     return true;
 }
 
+enum {
+    UTF8_REPLACEMENT_LEN = 3, /* U+FFFD encodes as EF BF BD */
+};
+
+/* Length of the UTF-8 sequence starting at src[0] under RFC 3629 (overlong
+ * encodings, UTF-16 surrogates, and code points above U+10FFFF are invalid).
+ * Returns the sequence length (2-4) when valid, 0 when invalid. Never reads
+ * past a NUL: a NUL continuation byte fails the range checks first (#493). */
+static int utf8_sequence_len(const unsigned char *src) {
+    unsigned char lead = src[0];
+    unsigned char lo = 0x80, hi = 0xBF;
+    int len;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        len = 2;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        len = 3;
+        if (lead == 0xE0) {
+            lo = 0xA0; /* reject overlong */
+        } else if (lead == 0xED) {
+            hi = 0x9F; /* reject UTF-16 surrogates */
+        }
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        len = 4;
+        if (lead == 0xF0) {
+            lo = 0x90; /* reject overlong */
+        } else if (lead == 0xF4) {
+            hi = 0x8F; /* reject > U+10FFFF */
+        }
+    } else {
+        return 0; /* 0x80-0xC1, 0xF5-0xFF: never a valid lead byte */
+    }
+    if (src[1] < lo || src[1] > hi) {
+        return 0;
+    }
+    for (int k = 2; k < len; k++) {
+        if ((src[k] & 0xC0) != 0x80) {
+            return 0;
+        }
+    }
+    return len;
+}
+
 int cbm_json_escape(char *buf, int bufsize, const char *src) {
     if (!buf || bufsize <= 0) {
         return 0;
@@ -610,8 +652,31 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
                 break;
             }
             pos += snprintf(buf + pos, 7, "\\u%04x", c);
-        } else {
+        } else if (c < 0x80) {
             buf[pos++] = (char)c;
+        } else {
+            /* Multi-byte UTF-8 (#493): a valid sequence is copied atomically, so
+             * buffer-cap truncation can only land on a character boundary; any
+             * invalid byte (bad lead/continuation, overlong, surrogate, out of
+             * range) becomes U+FFFD. The emitted JSON is therefore always valid
+             * UTF-8 — the write contract the vault importer's fail-closed UTF-8
+             * boundary depends on. */
+            int seq = utf8_sequence_len((const unsigned char *)src + i);
+            if (seq > 0) {
+                if (pos + seq > bufsize - JSON_NUL_RESERVE) {
+                    break;
+                }
+                memcpy(buf + pos, src + i, (size_t)seq);
+                pos += seq;
+                i += seq - 1; /* the loop's i++ consumes the final byte */
+            } else {
+                if (pos + UTF8_REPLACEMENT_LEN > bufsize - JSON_NUL_RESERVE) {
+                    break;
+                }
+                buf[pos++] = (char)0xEF;
+                buf[pos++] = (char)0xBF;
+                buf[pos++] = (char)0xBD;
+            }
         }
     }
     buf[pos] = '\0';

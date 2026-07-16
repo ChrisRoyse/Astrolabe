@@ -83,7 +83,13 @@ bool cbm_validate_project_name(const char *name);
 
 /* Escape a string for safe embedding in JSON: escapes " \ and control chars.
  * Writes into buf (including NUL). Returns number of chars written (excl NUL).
- * If buf is too small, output is truncated but always NUL-terminated. */
+ * If buf is too small, output is truncated but always NUL-terminated.
+ *
+ * UTF-8 write contract (#493): the output is always valid UTF-8. Valid
+ * multi-byte sequences are copied atomically (truncation lands only on
+ * character boundaries); invalid bytes (bad lead/continuation, overlong,
+ * surrogate, > U+10FFFF) are replaced with U+FFFD. The vault importer's
+ * fail-closed UTF-8 boundary depends on this contract. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
 
 #endif /* CBM_STR_UTIL_H */

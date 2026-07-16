@@ -2350,7 +2350,14 @@ fn read_nodes(connection: &Connection, project: &str) -> IngestResult<Vec<RawNod
             start_line,
             end_line,
             properties_json,
-        ) = row.map_err(|error| invalid_sqlite(format!("read nodes row: {error}")))?;
+        ) = row.map_err(|error| {
+            invalid_sqlite(format!(
+                "read nodes row: {error}; a non-UTF-8 text column violates the \
+                 cbm_json_escape UTF-8 write contract (#493) — the DB was written \
+                 by a pre-contract indexer; delete the store and re-index with a \
+                 current binary"
+            ))
+        })?;
         let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("node {id} properties JSON is invalid: {error}"))
         })?;
@@ -2435,7 +2442,14 @@ fn read_edges(connection: &Connection, project: &str) -> IngestResult<Vec<RawEdg
     let mut out = Vec::new();
     for row in rows {
         let (id, project, source_id, target_id, edge_type, properties_json, local_name_gen) =
-            row.map_err(|error| invalid_sqlite(format!("read edges row: {error}")))?;
+            row.map_err(|error| {
+                invalid_sqlite(format!(
+                    "read edges row: {error}; a non-UTF-8 text column violates the \
+                     cbm_json_escape UTF-8 write contract (#493) — the DB was written \
+                     by a pre-contract indexer; delete the store and re-index with a \
+                     current binary"
+                ))
+            })?;
         let properties = serde_json::from_str::<Value>(&properties_json).map_err(|error| {
             invalid_sqlite(format!("edge {id} properties JSON is invalid: {error}"))
         })?;
