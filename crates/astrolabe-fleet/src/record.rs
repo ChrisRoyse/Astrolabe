@@ -47,6 +47,9 @@ pub const SCALAR_GITHUB_ID: &str = "github_id";
 pub const SCALAR_STARS: &str = "stars";
 /// Repository size in KiB as reported by the GitHub API.
 pub const SCALAR_SIZE_KB: &str = "size_kb";
+/// Measured on-disk bytes of the local clone, recorded at `cloned` and on
+/// update fetches (issue #451). Absent until first measured.
+pub const SCALAR_CLONE_BYTES: &str = "clone_bytes";
 
 // Metadata keys (verbatim string facts). `head_commit` deliberately carries a
 // `_hash` suffix: the ledger secret-scanner allowlists `*_hash` fields, and a
@@ -177,6 +180,9 @@ pub struct TransitionContext {
     /// [`RepoState::Departed`] (#450).
     #[serde(default)]
     pub departed_reason: Option<String>,
+    /// Measured on-disk bytes of the local clone (#451).
+    #[serde(default)]
+    pub clone_bytes: Option<u64>,
 }
 
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.
@@ -202,6 +208,8 @@ pub struct FleetRepoRow {
     pub quarantine_reason: Option<String>,
     /// Recorded departure reason, if departed (#450).
     pub departed_reason: Option<String>,
+    /// Measured on-disk bytes of the local clone (#451).
+    pub clone_bytes: Option<u64>,
 }
 
 /// Canonical identity bytes of a repository record:
@@ -236,6 +244,9 @@ pub fn encode_repo_constellation(
     scalars.insert(SCALAR_GITHUB_ID.to_string(), row.record.github_id as f64);
     scalars.insert(SCALAR_STARS.to_string(), row.record.stars as f64);
     scalars.insert(SCALAR_SIZE_KB.to_string(), row.record.size_kb as f64);
+    if let Some(bytes) = row.clone_bytes {
+        scalars.insert(SCALAR_CLONE_BYTES.to_string(), bytes as f64);
+    }
 
     let mut metadata = BTreeMap::new();
     metadata.insert(META_FULL_NAME.to_string(), row.record.full_name.clone());
@@ -342,6 +353,17 @@ pub fn decode_repo_constellation(
             .ok_or_else(|| corrupt(format!("missing metadata {key:?}")))
     };
     let meta_opt = |key: &str| constellation.metadata.get(key).cloned();
+    let scalar_opt = |key: &str| -> Result<Option<u64>, CalyxError> {
+        match constellation.scalars.get(key) {
+            None => Ok(None),
+            Some(value) => {
+                if !(value.is_finite() && *value >= 0.0 && value.fract() == 0.0) {
+                    return Err(corrupt(format!("scalar {key:?} is not a whole number")));
+                }
+                Ok(Some(*value as u64))
+            }
+        }
+    };
 
     let state = RepoState::parse(&meta(META_STATE)?)?;
     let mut state_timestamps = BTreeMap::new();
@@ -380,5 +402,6 @@ pub fn decode_repo_constellation(
         kernel_scope_id: meta_opt(META_KERNEL_SCOPE_ID),
         quarantine_reason: meta_opt(META_QUARANTINE_REASON),
         departed_reason: meta_opt(META_DEPARTED_REASON),
+        clone_bytes: scalar_opt(SCALAR_CLONE_BYTES)?,
     })
 }

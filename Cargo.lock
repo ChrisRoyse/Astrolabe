@@ -115,6 +115,7 @@ dependencies = [
  "calyx-ledger",
  "serde",
  "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

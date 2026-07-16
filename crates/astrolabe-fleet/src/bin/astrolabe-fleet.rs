@@ -13,6 +13,10 @@
 //! astrolabe-fleet list         [--root <dir>] [--state <state>] [--language <lang>] [--counts]
 //! astrolabe-fleet discover     [--root <dir>] [--language <csv>] [--star-floor <n>]
 //!                              [--refresh] [--at <unix-secs>]
+//! astrolabe-fleet clone        [--root <dir>] [--farm-root <dir>] [--update]
+//!                              (--repo <owner/name> ... | --all-discovered) [--limit <n>]
+//!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
+//!                              [--parallelism <n>] [--timeout-secs <n>] [--at <unix-secs>]
 //! ```
 //!
 //! `--root` defaults to the declared production catalog root
@@ -38,7 +42,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -117,6 +121,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "index-watermark",
                 "kernel-scope-id",
                 "reason",
+                "clone-bytes",
             ])?;
             let github_id = opts.require_u64("github-id")?;
             let full_name = opts.require("repo")?;
@@ -134,6 +139,14 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 departed_reason: (to == RepoState::Departed)
                     .then(|| reason.clone())
                     .flatten(),
+                clone_bytes: opts
+                    .get("clone-bytes")
+                    .map(|raw| {
+                        raw.parse::<u64>().map_err(|error| {
+                            usage(&format!("--clone-bytes must be a u64: {error}"))
+                        })
+                    })
+                    .transpose()?,
             };
             let report = catalog.transition(github_id, full_name, to, ctx)?;
             println!(
@@ -215,6 +228,80 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!("{report}");
             Ok(())
         }
+        "clone" => {
+            opts.reject_unknown(&[
+                "root",
+                "farm-root",
+                "update",
+                "repo",
+                "all-discovered",
+                "limit",
+                "size-cap-bytes",
+                "budget-bytes",
+                "parallelism",
+                "timeout-secs",
+                "at",
+            ])?;
+            let mut config = astrolabe_fleet::clone_farm::FarmConfig {
+                at_unix_secs: opts.at_or_now()?,
+                ..astrolabe_fleet::clone_farm::FarmConfig::default()
+            };
+            if let Some(farm_root) = opts.get("farm-root") {
+                config.farm_root = PathBuf::from(farm_root);
+            }
+            if let Some(raw) = opts.get("size-cap-bytes") {
+                config.size_cap_bytes = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--size-cap-bytes must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("budget-bytes") {
+                config.budget_bytes = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--budget-bytes must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("parallelism") {
+                config.parallelism = raw
+                    .parse::<usize>()
+                    .map_err(|error| usage(&format!("--parallelism must be a usize: {error}")))?;
+            }
+            if let Some(raw) = opts.get("timeout-secs") {
+                config.timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+            }
+            let repos = opts.get_all("repo");
+            let selection = if !repos.is_empty() {
+                if opts.flag("all-discovered") {
+                    return Err(usage(
+                        "pass either --repo ... or --all-discovered, not both",
+                    ));
+                }
+                astrolabe_fleet::clone_farm::Selection::Repos(
+                    repos.into_iter().map(str::to_string).collect(),
+                )
+            } else if opts.flag("all-discovered") || opts.flag("update") {
+                let limit = opts
+                    .get("limit")
+                    .map(|raw| {
+                        raw.parse::<usize>()
+                            .map_err(|error| usage(&format!("--limit must be a usize: {error}")))
+                    })
+                    .transpose()?;
+                astrolabe_fleet::clone_farm::Selection::All { limit }
+            } else {
+                return Err(usage(
+                    "clone needs --repo <owner/name> (repeatable) or --all-discovered (or --update for the update pass)",
+                ));
+            };
+            let report = astrolabe_fleet::clone_farm::run_clone_pass(
+                &catalog,
+                &config,
+                &selection,
+                opts.flag("update"),
+            )?;
+            println!("{report}");
+            Ok(())
+        }
         other => Err(usage(&format!("unknown verb {other:?}"))),
     }
 }
@@ -242,7 +329,7 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 3] = ["stdin", "counts", "refresh"];
+    const SWITCHES: [&'static str; 5] = ["stdin", "counts", "refresh", "update", "all-discovered"];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
         let mut pairs = Vec::new();
@@ -274,6 +361,14 @@ impl Options {
 
     fn flag(&self, name: &str) -> bool {
         self.pairs.iter().any(|(flag, _)| flag == name)
+    }
+
+    fn get_all(&self, name: &str) -> Vec<&str> {
+        self.pairs
+            .iter()
+            .filter(|(flag, _)| flag == name)
+            .filter_map(|(_, value)| value.as_deref())
+            .collect()
     }
 
     fn require(&self, name: &str) -> Result<&str, CalyxError> {
