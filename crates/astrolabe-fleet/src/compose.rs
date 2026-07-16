@@ -521,7 +521,7 @@ fn build_fleet_nodes(scope: &str, loads: &[RepoKernelLoad]) -> Result<Vec<FleetN
             centroid,
         });
     }
-    nodes.sort_by(|left, right| left.fleet_cx.cmp(&right.fleet_cx));
+    nodes.sort_by_key(|node| node.fleet_cx);
     Ok(nodes)
 }
 
