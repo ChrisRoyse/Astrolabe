@@ -322,14 +322,16 @@ pub fn run_pipeline_pass(
     // completed repo's measured store bytes — the walk stays O(store) once
     // per pass instead of once per repo.
     let mut store_total_bytes = match config.store_budget_bytes {
-        Some(_) => Some(dir_size_bytes(&config.store_root).map_err(|error| CalyxError {
-            code: ASTRO_FLEET_STORE_UNAVAILABLE,
-            message: format!(
-                "cannot measure store root {} for budget accounting: {error}",
-                config.store_root.display()
-            ),
-            remediation: "the store root must be readable when --store-budget-bytes is set",
-        })?),
+        Some(_) => Some(
+            dir_size_bytes(&config.store_root).map_err(|error| CalyxError {
+                code: ASTRO_FLEET_STORE_UNAVAILABLE,
+                message: format!(
+                    "cannot measure store root {} for budget accounting: {error}",
+                    config.store_root.display()
+                ),
+                remediation: "the store root must be readable when --store-budget-bytes is set",
+            })?,
+        ),
         None => None,
     };
     let mut budget_exhausted_at: Option<u64> = None;
@@ -1023,7 +1025,9 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
 /// the vault ULID is shared; intersecting two projects' key dumps proves (or
 /// falsifies) that independently of the writer.
 pub fn vault_base_keys(store_root: &Path, project: &str) -> Result<Vec<String>, CalyxError> {
-    let vault_dir = store_root.join(project).join(format!("{project}.astrolabe-vault"));
+    let vault_dir = store_root
+        .join(project)
+        .join(format!("{project}.astrolabe-vault"));
     let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
         code: ASTRO_FLEET_STORE_UNAVAILABLE,
         message: format!("shadow vault id failed to parse: {error:?}"),

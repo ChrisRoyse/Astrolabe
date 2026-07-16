@@ -540,10 +540,7 @@ impl FleetCatalog {
     /// snapshot. Returns `None` when no report row exists for `run_id`; a row
     /// without its paired ledger entry is a fail-closed mismatch, never a
     /// silent partial read.
-    pub fn read_run_report(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<RunReportReadback>, CalyxError> {
+    pub fn read_run_report(&self, run_id: &str) -> Result<Option<RunReportReadback>, CalyxError> {
         let snapshot = self.vault.latest_seq();
         let Some(bytes) =
             self.vault

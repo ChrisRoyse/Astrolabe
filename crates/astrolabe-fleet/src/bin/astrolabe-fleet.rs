@@ -512,7 +512,8 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 if projects.is_empty() {
                     return Err(CalyxError {
                         code: "ASTRO_FLEET_DEDUP_EMPTY",
-                        message: "no kerneled repos in the catalog and no --project named".to_string(),
+                        message: "no kerneled repos in the catalog and no --project named"
+                            .to_string(),
                         remediation: "kernel at least one repo or name --project <org__repo> explicitly",
                     });
                 }
@@ -566,8 +567,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let project = opts
                 .get("project")
                 .ok_or_else(|| usage("probe-vault-keys needs --project <org__repo>"))?;
-            let keys =
-                astrolabe_fleet::orchestrator::vault_base_keys(&store_root, project)?;
+            let keys = astrolabe_fleet::orchestrator::vault_base_keys(&store_root, project)?;
             for key in &keys {
                 println!("{key}");
             }
@@ -582,13 +582,11 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let run_id = opts
                 .get("run-id")
                 .ok_or_else(|| usage("run-report-read needs --run-id <id>"))?;
-            let readback = catalog
-                .read_run_report(run_id)?
-                .ok_or_else(|| CalyxError {
-                    code: "ASTRO_FLEET_REPORT_MISSING",
-                    message: format!("no run report persisted for run id {run_id:?}"),
-                    remediation: "run ids come from the discover/pipeline run output",
-                })?;
+            let readback = catalog.read_run_report(run_id)?.ok_or_else(|| CalyxError {
+                code: "ASTRO_FLEET_REPORT_MISSING",
+                message: format!("no run report persisted for run id {run_id:?}"),
+                remediation: "run ids come from the discover/pipeline run output",
+            })?;
             let (bytes, ledger_seq, ledger_payload) = (
                 readback.report_bytes,
                 readback.ledger_seq,

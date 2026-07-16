@@ -742,7 +742,10 @@ pub fn refine_kernel_with_recall_support(
         // `kernel.json`), halving the outer coverage BFS per refine sweep.
         let covered = coverage(indexed, members, radius);
         let recalled = covered.iter().filter(|&&flag| flag).count() as u64;
-        let permille = recalled.saturating_mul(1000).checked_div(total).unwrap_or(0);
+        let permille = recalled
+            .saturating_mul(1000)
+            .checked_div(total)
+            .unwrap_or(0);
         if permille >= config.recall_min_permille {
             break;
         }

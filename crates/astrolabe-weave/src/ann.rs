@@ -341,9 +341,22 @@ fn dense_candidates(
         .collect();
 
     if crate::knobs::weave_dense_ann_exact() {
-        return Ok(exact_dense_candidates(&approximations, group, span, per_source));
+        return Ok(exact_dense_candidates(
+            &approximations,
+            group,
+            span,
+            per_source,
+        ));
     }
-    hnsw_dense_candidates(family, dim, &approximations, config, span, group, per_source)
+    hnsw_dense_candidates(
+        family,
+        dim,
+        &approximations,
+        config,
+        span,
+        group,
+        per_source,
+    )
 }
 
 /// Sequential seeded-HNSW dense candidate build (#433) — the byte-parity default.
