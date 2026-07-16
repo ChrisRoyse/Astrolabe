@@ -1,5 +1,14 @@
 # THE CALYX AI CODING AGENT DOCTRINE
 
+> **ARCHIVED, NON-AUTHORITATIVE SNAPSHOT.** This file describes the former
+> `Calyx-Dev` repository, Linux `aiwonder` operations, retired tests/gates, and
+> obsolete GPU precision defaults. It is not an operating manual for Astrolabe.
+> In `C:\code\Astrolabe`, root `AGENTS.md`, `CLAUDE.md`, and the driving GitHub
+> issue are authoritative. In particular, do not infer FP16 from GPU presence:
+> current Candle/Qwen runtimes require explicit artifact-calibrated dtype,
+> placement-only auto selection, verified safetensors source profiles, and real
+> full-forward activation/device attestation with no dtype or CPU replay.
+
 **For:** any AI agent (including Synapse-driven Claude `cldy` / Codex `codex --yolo` workers) writing, reviewing, debugging, hardening, verifying, or shipping **Calyx** — the universal, association-native, self-optimizing database that bakes in the Royse Calculus of Association.
 **Reading mode:** reference — grep the section, then act. Density beats brevity.
 **Status:** this doc **operationalizes** `docs/dbprdplans/DOCTRINE.md`; it never overrides it. Binding order: **`DOCTRINE.md` (canonical charter) → this doc → the PRD set (`docs/dbprdplans/`) → the implementation plan (`docs/implementation/`)**. Where this conflicts with `DOCTRINE.md`, the charter wins; where it conflicts with any *other* instruction, this wins. Companion protocols: `docs2/modulateprompt.md` (≤500-line modularization) and `docs2/compressionprompt.md` (writing density).

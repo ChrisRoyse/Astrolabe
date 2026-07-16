@@ -5,9 +5,13 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, S
 use candle_core::{DType, Tensor};
 use tokenizers::Tokenizer;
 
+use crate::commission::{
+    LensForgeSourceTensorDtypeProfile, profile_safetensors_source, resolve_safetensors_weight_set,
+};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::common::{
-    DEFAULT_MAX_TOKENS, default_hf_cache_root, hash_files, text_from_input,
+    DEFAULT_MAX_TOKENS, LocalModelExecutionAttestation, default_hf_cache_root, hash_files,
+    text_from_input, validate_contract_covers_loaded_paths,
 };
 use crate::spec::{LensRuntime, LensSpec};
 
@@ -23,13 +27,12 @@ use bert::CalyxBertModel;
 
 use load::{
     candle_error, config_invalid, ensure_file, fetch_files, read_config, read_model,
-    read_tokenizer, with_runtime_context,
+    read_tokenizer, with_attested_runtime_context,
 };
 pub use options::{
     CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV, CandleDeviceMode, CandleDevicePolicy,
-    CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
-    GPU_DEFAULT_CANDLE_PRECISION, configured_device_mode, configured_device_policy,
-    default_cuda_fail_loud_policy, default_precision_for_policy, device_policy_for_mode,
+    CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision, configured_device_mode,
+    configured_device_policy, default_cuda_fail_loud_policy, device_policy_for_mode,
     frozen_device_policy,
 };
 pub(crate) use options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
@@ -43,32 +46,48 @@ pub struct CandleLens {
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
     pooling: CandlePoolingPolicy,
+    source_tensor_dtype_profile: LensForgeSourceTensorDtypeProfile,
+    execution_attestation: LocalModelExecutionAttestation,
     max_tokens: usize,
     tokenizer: Tokenizer,
     model: Mutex<CalyxBertModel>,
 }
 
 impl CandleLens {
-    pub fn all_minilm_l6_v2(name: impl Into<String>) -> Result<Self> {
-        Self::from_hf_cache(name, default_hf_cache_root())
+    pub fn all_minilm_l6_v2(name: impl Into<String>, precision: CandlePrecision) -> Result<Self> {
+        Self::from_hf_cache(name, default_hf_cache_root(), precision)
     }
 
-    pub fn all_minilm_l6_v2_cuda_fail_loud(name: impl Into<String>) -> Result<Self> {
+    pub fn all_minilm_l6_v2_cuda_fail_loud(
+        name: impl Into<String>,
+        precision: CandlePrecision,
+    ) -> Result<Self> {
         Self::from_hf_cache_with_device_policy(
             name,
             default_hf_cache_root(),
             default_cuda_fail_loud_policy()?,
+            precision,
         )
     }
 
-    pub fn from_hf_cache(name: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::from_hf_cache_with_device_policy(name, cache_dir, configured_device_policy()?)
+    pub fn from_hf_cache(
+        name: impl Into<String>,
+        cache_dir: impl Into<PathBuf>,
+        precision: CandlePrecision,
+    ) -> Result<Self> {
+        Self::from_hf_cache_with_device_policy(
+            name,
+            cache_dir,
+            configured_device_policy()?,
+            precision,
+        )
     }
 
     pub fn from_hf_cache_with_device_policy(
         name: impl Into<String>,
         cache_dir: impl Into<PathBuf>,
         device_policy: CandleDevicePolicy,
+        precision: CandlePrecision,
     ) -> Result<Self> {
         Self::from_model(
             name,
@@ -76,6 +95,7 @@ impl CandleLens {
             cache_dir.into(),
             DEFAULT_MAX_TOKENS,
             device_policy,
+            precision,
         )
     }
 
@@ -85,14 +105,14 @@ impl CandleLens {
         cache_dir: PathBuf,
         max_tokens: usize,
         device_policy: CandleDevicePolicy,
+        precision: CandlePrecision,
     ) -> Result<Self> {
         let model_id = model_id.into();
         if model_id != DEFAULT_CANDLE_MODEL {
             return Err(config_invalid(format!(
-                "Candle model {model_id} has no measured default precision; use from_model_with_options with an explicit model-specific precision and pooling policy"
+                "Candle model {model_id} has no measured pooling policy; use from_model_with_options with explicit model-specific precision and pooling"
             )));
         }
-        let precision = default_precision_for_policy(device_policy);
         Self::from_model_with_options(
             name,
             model_id,
@@ -157,6 +177,7 @@ impl CandleLens {
         for path in &contract_paths {
             ensure_file("contract artifact", path)?;
         }
+        validate_contract_covers_loaded_paths("candle", &required_paths, &contract_paths)?;
         let weights_sha256 = hash_files(&contract_paths)?;
         if let Some(expected) = spec.expected_weights_sha256
             && weights_sha256 != expected
@@ -166,6 +187,27 @@ impl CandleLens {
                 spec.model_id
             )));
         }
+        let weight_set = resolve_safetensors_weight_set("candle-local", &contract_paths)?;
+        let canonical_weight = std::fs::canonicalize(&spec.weights).map_err(|error| {
+            config_invalid(format!(
+                "canonicalize candle weight {} failed: {error}",
+                spec.weights.display()
+            ))
+        })?;
+        let resolved_weight = std::fs::canonicalize(&weight_set[0]).map_err(|error| {
+            config_invalid(format!(
+                "canonicalize resolved candle weight {} failed: {error}",
+                weight_set[0].display()
+            ))
+        })?;
+        if resolved_weight != canonical_weight {
+            return Err(config_invalid(format!(
+                "candle declared weight {} does not match the resolved safetensors contract {}",
+                canonical_weight.display(),
+                resolved_weight.display()
+            )));
+        }
+        let source_tensor_dtype_profile = profile_safetensors_source(&weight_set[0])?;
         let config = read_config(&spec.config)?;
         let dim = u32::try_from(config.hidden_size).map_err(|_| {
             CalyxError::lens_dim_mismatch(format!(
@@ -181,7 +223,13 @@ impl CandleLens {
             )));
         }
         let tokenizer = read_tokenizer(&spec.tokenizer, spec.max_tokens)?;
-        let model = read_model(&spec.weights, &config, spec.device_policy, spec.precision)?;
+        let (model, execution_attestation) = read_model(
+            &spec.weights,
+            &config,
+            spec.device_policy,
+            spec.precision,
+            &source_tensor_dtype_profile,
+        )?;
         let files = CandleModelFiles {
             cache_dir: spec.cache_dir,
             model_id: spec.model_id,
@@ -190,19 +238,16 @@ impl CandleLens {
             weights: spec.weights,
             contract_paths,
         };
-        let max_tokens_text = spec.max_tokens.to_string();
-        let norm_text = format!("{:?}", spec.norm_policy);
         let execution_device = spec.device_policy.frozen_token();
-        let corpus_hash = sha256_digest(&[
-            CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
-            files.model_id.as_bytes(),
-            max_tokens_text.as_bytes(),
-            execution_device.as_bytes(),
-            spec.precision.as_str().as_bytes(),
-            spec.pooling.as_str().as_bytes(),
-            norm_text.as_bytes(),
-            b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output",
-        ]);
+        let corpus_hash = candle_corpus_hash(
+            &files.model_id,
+            spec.max_tokens,
+            &execution_device,
+            spec.precision,
+            spec.pooling,
+            spec.norm_policy,
+            &source_tensor_dtype_profile,
+        );
         let contract = FrozenLensContract::new(
             spec.name,
             weights_sha256,
@@ -221,6 +266,8 @@ impl CandleLens {
             device_policy: spec.device_policy,
             precision: spec.precision,
             pooling: spec.pooling,
+            source_tensor_dtype_profile,
+            execution_attestation,
             max_tokens: spec.max_tokens,
             tokenizer,
             model: Mutex::new(model),
@@ -290,6 +337,31 @@ impl CandleLens {
         self.pooling
     }
 
+    /// Canonical dtype/count profile recomputed from the loaded safetensors weight set.
+    pub fn source_tensor_dtype_profile(&self) -> &LensForgeSourceTensorDtypeProfile {
+        &self.source_tensor_dtype_profile
+    }
+
+    /// Frozen dtype requested from the Candle safetensors loader.
+    pub fn loader_target_dtype(&self) -> &'static str {
+        self.execution_attestation.loader_target_dtype
+    }
+
+    /// Dtype observed from a real full-forward primary hidden activation.
+    pub fn observed_primary_activation_dtype(&self) -> &'static str {
+        self.execution_attestation.observed_primary_activation_dtype
+    }
+
+    /// Frozen device on which the full-forward attestation tensor was observed.
+    pub fn observed_execution_device(&self) -> &str {
+        &self.execution_attestation.observed_device
+    }
+
+    /// Method used to obtain the dtype and device observation.
+    pub fn dtype_attestation_evidence(&self) -> &'static str {
+        self.execution_attestation.evidence_kind
+    }
+
     pub const fn max_tokens(&self) -> usize {
         self.max_tokens
     }
@@ -348,17 +420,48 @@ impl Lens for CandleLens {
         })();
         let accumulation = verify_f32_gemm_accumulation(self.device_policy, self.precision);
         if let Err(error) = accumulation {
-            return Err(with_runtime_context(
+            return Err(with_attested_runtime_context(
                 error,
                 "gemm_accumulation_verify",
                 self.device_policy,
-                self.precision,
+                &self.source_tensor_dtype_profile,
+                &self.execution_attestation,
             ));
         }
         result.map_err(|error| {
-            with_runtime_context(error, "inference", self.device_policy, self.precision)
+            with_attested_runtime_context(
+                error,
+                "inference",
+                self.device_policy,
+                &self.source_tensor_dtype_profile,
+                &self.execution_attestation,
+            )
         })
     }
+}
+
+pub(crate) fn candle_corpus_hash(
+    model_id: &str,
+    max_tokens: usize,
+    execution_device: &str,
+    precision: CandlePrecision,
+    pooling: CandlePoolingPolicy,
+    norm_policy: NormPolicy,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+) -> [u8; 32] {
+    let max_tokens = max_tokens.to_string();
+    let norm = format!("{norm_policy:?}");
+    sha256_digest(&[
+        CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
+        model_id.as_bytes(),
+        max_tokens.as_bytes(),
+        execution_device.as_bytes(),
+        precision.as_str().as_bytes(),
+        pooling.as_str().as_bytes(),
+        norm.as_bytes(),
+        source_tensor_dtype_profile.fingerprint_sha256.as_bytes(),
+        b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output,source-dtype-profile-v1",
+    ])
 }
 
 impl CandleLens {
@@ -387,6 +490,15 @@ impl CandleLens {
         let hidden = model
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
             .map_err(candle_error)?;
+        if hidden.dtype() != self.precision.dtype() || !hidden.device().same_device(&model.device) {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "candle inference dtype/device drift: loader_target_dtype={} observed_primary_activation_dtype={:?} expected_device={} observed_device={:?}",
+                self.loader_target_dtype(),
+                hidden.dtype(),
+                self.observed_execution_device(),
+                hidden.device().location()
+            )));
+        }
         let hidden = hidden.to_dtype(DType::F32).map_err(candle_error)?;
         let rows = hidden.to_vec3::<f32>().map_err(candle_error)?;
         let first = rows.first().ok_or_else(|| {

@@ -1,5 +1,7 @@
 use std::cell::Cell;
 #[cfg(feature = "ml-runtime")]
+use std::collections::BTreeSet;
+#[cfg(feature = "ml-runtime")]
 use std::env;
 use std::fs;
 use std::io::{BufReader, Read};
@@ -8,6 +10,8 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CalyxError, Result};
 #[cfg(feature = "ml-runtime")]
 use calyx_core::{Input, Lens};
+#[cfg(feature = "ml-runtime")]
+use candle_core::{DType, Device, Tensor};
 
 use crate::frozen::LengthDelimitedSha256;
 #[cfg(feature = "ml-runtime")]
@@ -16,6 +20,125 @@ use crate::lens::ensure_input_modality;
 #[cfg(feature = "ml-runtime")]
 pub const DEFAULT_MAX_TOKENS: usize = 512;
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "ml-runtime")]
+#[derive(Clone, Debug)]
+pub(crate) struct LocalModelExecutionAttestation {
+    pub(crate) loader_target_dtype: &'static str,
+    pub(crate) observed_primary_activation_dtype: &'static str,
+    pub(crate) observed_device: String,
+    pub(crate) evidence_kind: &'static str,
+}
+
+#[cfg(feature = "ml-runtime")]
+pub(crate) fn attest_primary_activation(
+    runtime: &str,
+    hidden: &Tensor,
+    expected_dtype: DType,
+    expected_device: &Device,
+    expected_device_token: &str,
+) -> Result<LocalModelExecutionAttestation> {
+    let loader_target_dtype = dtype_token(expected_dtype)?;
+    let observed_primary_activation_dtype = dtype_token(hidden.dtype())?;
+    if hidden.dtype() != expected_dtype {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "{runtime} dtype attestation failed: loader_target_dtype={loader_target_dtype} observed_primary_activation_dtype={observed_primary_activation_dtype}"
+        )));
+    }
+    if !hidden.device().same_device(expected_device) {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "{runtime} device attestation failed: expected={expected_device_token} observed={:?}",
+            hidden.device().location()
+        )));
+    }
+    let values = hidden
+        .flatten_all()
+        .and_then(|tensor| tensor.to_dtype(DType::F32))
+        .and_then(|tensor| tensor.to_vec1::<f32>())
+        .map_err(|error| {
+            CalyxError::lens_numerical_invariant(format!(
+                "{runtime} full-forward dtype attestation readback failed: {error}"
+            ))
+        })?;
+    if values.is_empty() {
+        return Err(CalyxError::lens_numerical_invariant(format!(
+            "{runtime} full-forward dtype attestation produced an empty primary activation"
+        )));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(CalyxError::lens_numerical_invariant(format!(
+            "{runtime} full-forward dtype attestation produced NaN or Inf"
+        )));
+    }
+    Ok(LocalModelExecutionAttestation {
+        loader_target_dtype,
+        observed_primary_activation_dtype,
+        observed_device: expected_device_token.to_string(),
+        evidence_kind: "full_forward_hidden_tensor",
+    })
+}
+
+#[cfg(feature = "ml-runtime")]
+fn dtype_token(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F16 => Ok("f16"),
+        DType::BF16 => Ok("bf16"),
+        DType::F32 => Ok("f32"),
+        other => Err(CalyxError::lens_frozen_violation(format!(
+            "local model dtype attestation does not support {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "ml-runtime")]
+pub(crate) fn validate_contract_covers_loaded_paths(
+    runtime: &str,
+    loaded_paths: &[PathBuf],
+    contract_paths: &[PathBuf],
+) -> Result<()> {
+    let mut contract = BTreeSet::new();
+    for path in contract_paths {
+        let canonical = fs::canonicalize(path).map_err(|error| CalyxError {
+            code: "CALYX_LENS_CONFIG_INVALID",
+            message: format!(
+                "canonicalize {runtime} contract artifact {} failed: {error}",
+                path.display()
+            ),
+            remediation: "commission a complete immutable artifact set and preserve every loaded path in the frozen contract",
+        })?;
+        if !contract.insert(canonical.clone()) {
+            return Err(CalyxError {
+                code: "CALYX_LENS_CONFIG_INVALID",
+                message: format!(
+                    "{runtime} contract contains duplicate artifact {}",
+                    canonical.display()
+                ),
+                remediation: "remove duplicate artifact paths and recommission the frozen lens",
+            });
+        }
+    }
+    for path in loaded_paths {
+        let canonical = fs::canonicalize(path).map_err(|error| CalyxError {
+            code: "CALYX_LENS_CONFIG_INVALID",
+            message: format!(
+                "canonicalize {runtime} loaded artifact {} failed: {error}",
+                path.display()
+            ),
+            remediation: "restore the exact commissioned artifact and retry",
+        })?;
+        if !contract.contains(&canonical) {
+            return Err(CalyxError {
+                code: "CALYX_LENS_CONFIG_INVALID",
+                message: format!(
+                    "{runtime} loads artifact {} outside its frozen artifact set",
+                    canonical.display()
+                ),
+                remediation: "include every loaded weight, tokenizer, and config artifact in artifact_set_sha256 and recommission",
+            });
+        }
+    }
+    Ok(())
+}
 
 thread_local! {
     static SCOPED_RUNTIME_BATCH_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };

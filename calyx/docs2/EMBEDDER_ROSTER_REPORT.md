@@ -1,29 +1,30 @@
 # Calyx Embedder (Lens) Roster — Full Report
 
 > **Generated:** 2026-06-22
-> **Historical source readback:** this 2026-06-22 snapshot was generated from the then-live `/home/croyse/calyx/lenses/registry.json` + `panels/templates/` bytes on aiwonder. Current authority for lens catalog, roster, admission, cost, dtype, device placement, bits, and gate verdicts is Calyx/Aster DB rows; `registry.json` is migration/import input only.
-> **Current catalog readback:** on 2026-07-06, `/home/croyse/calyx/lenses/registry.json` was imported into the authoritative Calyx/Aster catalog DB at `/home/croyse/calyx/lenses/catalog-db`. Graph CF readback: 34 rows, 33 lenses, 10,053 value bytes, catalog sha256 `b53f387a0855714d5f3cb477fd6ad8b36f9588c7916ce0c67e9360a5576eb022`, `readback_matches=true`.
+> **ARCHIVED DESIGN EVIDENCE, NOT CURRENT ADMISSION AUTHORITY.** This snapshot was generated from the then-live `/home/croyse/calyx/lenses/registry.json` + `panels/templates/` bytes on the former Linux `aiwonder` host. The later 2026-07-06 import into `/home/croyse/calyx/lenses/catalog-db` is also historical evidence from that host. Neither source establishes current Windows artifact availability, dtype, provider placement, activation execution, VRAM residency, bits, or panel admission.
+> **Current-use boundary:** there is no Windows-local admission authority established by this report. Every candidate must be commissioned and admitted again from the canonical `C:\code\Astrolabe` artifact, with verified source bytes/profile, explicit dtype/device identity, real provider and full-forward activation readback, measured VRAM, and persisted Calyx/Aster state. GitHub issue #486 owns that local multi-domain panel proof; issue state, not this report, records progress.
 > **Doctrine refs:** `docs/dbprdplans/05_EMBEDDER_REGISTRY.md`, `docs/dbprdplans/05a_EMBEDDER_ROSTER_VRAM_BUDGET.md`, epic #814 (A38), #796/#787/#802 (A35/A36/A37 mandate).
 
 ---
 
-## Headline numbers
+## Historical snapshot numbers
 
 | Metric | Value |
 |---|---|
-| **Current authoritative catalog DB** | **33 lenses** (`/home/croyse/calyx/lenses/catalog-db`, Graph CF, read back 2026-07-06) |
-| Current DB GPU-placed / CPU-placed | 15 / 18 |
-| Current DB declared GPU VRAM | 9,164,805,385 bytes (~8,740.2 MiB), under the 20 GB Constellation budget |
+| **Historical 2026-07-06 imported catalog DB** | **33 lenses** (`/home/croyse/calyx/lenses/catalog-db`, Graph CF) |
+| Historical imported DB GPU-placed / CPU-placed | 15 / 18 declared placements; provider execution was not re-proven on Windows |
+| Historical imported DB declared GPU VRAM | 9,164,805,385 bytes (~8,740.2 MiB); declared cost, not current measured Windows residency |
 | Historical commissioned lenses snapshot (2026-06-22 registry file) | 42 |
 | Historical GPU-placed / CPU-placed | 24 / 18 |
 | Historical resident GPU VRAM | ~13.5 GB |
-| **Admitted default panel** (`constellation-24`, A37 `gate_passed`) | **10 content lenses + 3 temporal sidecars**, 4 association families |
+| **Historically admitted default panel** (`constellation-24`, A37 `gate_passed`) | **10 content lenses + 3 temporal sidecars**, 4 association families on the former host |
 | Historical registered panel templates | 8 |
 | Roster epic **#814** / acquisition backlog **#836** | **CLOSED** (the A38 sprint landed) |
 
-## Verification readback
+## Historical verification readback
 
-Verified against aiwonder source-of-truth bytes on 2026-06-22:
+Verified against the former `aiwonder` bytes on 2026-06-22. These hashes prove
+what that historical host contained; they do not prove current Windows state:
 
 | Source | Evidence |
 |---|---|
@@ -31,7 +32,13 @@ Verified against aiwonder source-of-truth bytes on 2026-06-22:
 | `/home/croyse/calyx/panels/templates/index.json` | 10,335 bytes, sha256 `81361c10dfbc49c0539199122beb6660b6c7ffb9cfc4f87ee6ea81e6001db252`; 8 registered templates; `constellation-24` active template `15d0fd0a648da6686c72471d103b5fbc20e26a44e87c0c204c45a8df69af6149` |
 | `/home/croyse/calyx/fsv/issue832-bgem3-colbert-roster-20260621T141356Z/issue822_final_admission_readback.json` | 13,990 bytes, sha256 `6dd4361e91bb01d5d7ca7fe351ea78ffa5a65e7d000a9fc66d5fa21a054a863c`; A37 gate status `gate_passed` |
 
-**Key distinction:** the current authority is the 33-lens Calyx/Aster catalog DB readback. The older 42-lens table below is a historical 2026-06-22 roster snapshot retained for context; file-backed counts are not admission authority. Only *10* lenses were in the historical gate-passed diverse **default** panel (`constellation-24`); the remaining rows were available lenses (image / audio / bio / extra text) that vaults and other templates could draw on after database admission.
+**Key distinction:** all catalog, template, admission, cost, and panel claims in
+this report are historical. The 33-row imported database proves only that the
+old import persisted those bytes; the older 42-lens table proves only the
+2026-06-22 roster snapshot. Neither is current Windows admission authority.
+Only *10* lenses were in the former host's gate-passed diverse default panel
+(`constellation-24`); the remaining rows were historical candidates available
+to its other templates.
 
 A lens earns a slot by **measured `bits / VRAM-MB`** and **associational diversity (A37)**, not raw benchmark rank. Ten dense-semantic clones fail the gate; admission requires ≥10 learned-encoder content lenses spanning ≥2 families, `n_eff ≥ 0.6×count`, mean corr/NMI ≤ 0.6, every lens ≥ 0.05 marginal bits, Σ resident VRAM ≤ 20 GB, and fused-RRF beating the best 1–2-lens control.
 
@@ -124,9 +131,9 @@ A lens earns a slot by **measured `bits / VRAM-MB`** and **associational diversi
 
 ---
 
-## 2. The admitted default panel — `constellation-24` (A37 `gate_passed`)
+## 2. The historically admitted panel — `constellation-24` (A37 `gate_passed`)
 
-Object `15d0fd0a648da6686c72471d103b5fbc20e26a44e87c0c204c45a8df69af6149`, v2. The proven diverse default: 10 of the 42 commissioned lenses, gated on measured diversity — **4 association families**, family span ✓, redundancy bound ✓, no-collapse ✓.
+Historical object `15d0fd0a648da6686c72471d103b5fbc20e26a44e87c0c204c45a8df69af6149`, v2. On the former host, 10 of the 42 commissioned lenses passed its measured-diversity gate: **4 association families**, family span, redundancy bound, and no-collapse. This verdict has not been transferred to or re-proven on Windows.
 
 | # | Slot | Family |
 |---|---|---|
@@ -146,7 +153,7 @@ Object `15d0fd0a648da6686c72471d103b5fbc20e26a44e87c0c204c45a8df69af6149`, v2. T
 
 ---
 
-## 3. Other registered panel templates (8 total)
+## 3. Other historical panel templates (8 total)
 
 | Template | Content lenses | A37 status |
 |---|---|---|
@@ -159,13 +166,19 @@ Object `15d0fd0a648da6686c72471d103b5fbc20e26a44e87c0c204c45a8df69af6149`, v2. T
 | issue798-manual-text-fork | 10 | not gated |
 | issue798-manual-text-fork-final | 10 | not gated |
 
-Only `constellation-24` is currently A37-gate-eligible; the others are registered scaffolds awaiting their own EnsembleCards.
+At the snapshot date, only `constellation-24` was A37-gate-eligible; the others
+were registered scaffolds without their own EnsembleCards. None of these rows
+constitutes current Windows admission.
 
 ---
 
-## 4. Planned / future
+## 4. Plans recorded by the historical snapshot
 
-The A38 roster epic **#814** and the Tier-2/3 acquisition backlog **#836** are now **CLOSED** — the bulk of planned commissioning landed (image multi-family, audio four-family, protein/DNA/molecule, document-image, MedCPT/BioLORD all admitted since the prior snapshot). Remaining forward work falls into three buckets.
+The former project recorded A38 roster epic **#814** and Tier-2/3 acquisition
+backlog **#836** as closed after its commissioning run. That historical issue
+state and the following candidate list do not establish current Astrolabe
+availability or admission. The snapshot divided its remaining work into three
+buckets.
 
 ### A. Tier-3 "heavy" candidates
 Catalogued in `05a §3`, admitted one-at-a-time under budget-watch, not yet commissioned:
@@ -185,7 +198,7 @@ Catalogued in `05a §3`, admitted one-at-a-time under budget-watch, not yet comm
 - **Unified MM:** `ImageBind` (6-modality joint space)
 
 ### C. Open-ended self-extension (binding A30/A31/A38 doctrine)
-The roster is a **living set**, not a fixed list. Any uncovered modality/domain is a coverage gap → `propose_lens` (#725) → measure bits → A35/A37/A38 gate → hot-add (A5), all under the fits-in-24 GB / max `bits/VRAM-MB` budget. Standing-policy epics remain open:
+The roster is a **living set**, not a fixed list. Any uncovered modality/domain is a coverage gap → `propose_lens` (#725) → measure bits → A35/A37/A38 gate → hot-add (A5), all under the fits-in-24 GB / max `bits/VRAM-MB` budget. The former project recorded these standing-policy epics as open at the snapshot date:
 - **#796** — 10+ embedder panels, templates & ensemble signal measurement (A35/A36)
 - **#802** — associational diversity gate (A37): count to 10 is necessary, not sufficient
 - **#787** — multi-embedder testing mandate: floor ≥10 lenses; value is associational; <10 fails closed
@@ -194,7 +207,7 @@ The roster is a **living set**, not a fixed list. Any uncovered modality/domain 
 
 ## Caveats
 
-1. The 42-count is the live registry on aiwonder as of 2026-06-22; it drifts as lenses are commissioned/retired.
-2. "VRAM MB" is per-lens resident weight cost; CPU-placed adapters (most image/audio/bio) report 0 GPU VRAM.
-3. Templates other than `constellation-24` are registered but not yet A37-proven.
-4. aiwonder is the runtime source-of-truth; the Windows checkout is authoring-only.
+1. The 42-count is a frozen 2026-06-22 Linux-host snapshot, not a live registry.
+2. "VRAM MB" is historical declared per-lens weight cost, not PID-bound measured Windows residency or activation peak.
+3. Only the former host's `constellation-24` artifact carried an A37 verdict; no template inherits that verdict across artifacts, providers, dtypes, or machines.
+4. The canonical Windows checkout and its persisted local Calyx/Aster bytes are the only valid execution/admission evidence for Astrolabe. This report is design evidence only.

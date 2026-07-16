@@ -6,10 +6,10 @@
 //! freshly commissioned runtime (doubling probe with single-vs-batch
 //! stability checks), records the evidence in the manifest `batch_policy`,
 //! and refuses an unjustified batch-1 commission of a GPU-policy runtime
-//! unless the operator supplies `--allow-batch-1 <reason>`. Skipping the
-//! probe entirely (`--skip-batch-preflight <reason>`, e.g. commissioning on
-//! a box without the runtime's GPU) is recorded as `operator-unverified` —
-//! an auditable operator decision, never a silent fallback.
+//! unless the operator supplies `--allow-batch-1 <reason>`. Skipping only the
+//! batch probe (`--skip-batch-preflight <reason>`) is recorded as
+//! `operator-unverified`, but never waives the mandatory local full-forward
+//! dtype/device attestation required before catalog registration.
 
 use std::path::Path;
 use std::time::Instant;

@@ -725,6 +725,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "ort",
+ "safetensors 0.7.0",
  "serde",
  "serde_json",
  "sha2",

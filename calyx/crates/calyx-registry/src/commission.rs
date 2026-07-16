@@ -11,6 +11,7 @@ mod algorithmic_manifest;
 mod manifest;
 mod manifest_metadata;
 mod manifest_runtime;
+mod source_tensor_profile;
 
 pub use manifest::{
     LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest,
@@ -21,6 +22,11 @@ pub use manifest_metadata::{
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
 };
 pub(crate) use manifest_runtime::canonical_local_model_device;
+pub use source_tensor_profile::{LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile};
+#[cfg(feature = "ml-runtime")]
+pub use source_tensor_profile::{
+    profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommissionRequest {

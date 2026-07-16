@@ -2,9 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 use calyx_registry::{
-    CandleDeviceMode, CandleDevicePolicy, CandlePoolingPolicy, CandlePrecision,
-    DEFAULT_CANDLE_MODEL, configured_device_policy, default_precision_for_policy,
-    device_policy_for_mode,
+    CandleDeviceMode, CandleDevicePolicy, CandlePoolingPolicy, DEFAULT_CANDLE_MODEL,
+    configured_device_policy, device_policy_for_mode,
 };
 
 use crate::error::{CliError, CliResult};
@@ -69,20 +68,19 @@ impl CommissionRuntime {
         }
     }
 
-    pub(super) const fn default_dtype(self) -> &'static str {
+    pub(super) const fn fixed_dtype(self) -> Option<&'static str> {
         match self {
-            Self::OnnxInt8 => "int8",
-            Self::OnnxFp32 => "f32",
-            Self::OnnxColbert => "f16",
+            Self::OnnxInt8 => Some("int8"),
+            Self::OnnxFp32 => Some("f32"),
+            Self::OnnxColbert => Some("f16"),
             Self::FastembedOnnx
             | Self::FastembedSparse
             | Self::FastembedBgem3Dense
             | Self::FastembedBgem3Sparse
             | Self::FastembedBgem3Colbert
             | Self::FastembedReranker
-            | Self::Tei => "f32",
-            Self::FastembedQwen3 => "f16",
-            Self::Candle => "f16",
+            | Self::Tei => Some("f32"),
+            Self::FastembedQwen3 | Self::Candle => None,
         }
     }
 
@@ -124,20 +122,12 @@ impl CommissionPrecision {
             Self::F32 => "f32",
         }
     }
-
-    const fn from_candle(value: CandlePrecision) -> Self {
-        match value {
-            CandlePrecision::F16 => Self::F16,
-            CandlePrecision::BF16 => Self::BF16,
-            CandlePrecision::F32 => Self::F32,
-        }
-    }
 }
 
 pub(super) struct CommissionFlags {
     pub(super) hf: String,
     pub(super) runtime: CommissionRuntime,
-    model_precision: Option<CommissionPrecision>,
+    manifest_dtype: &'static str,
     device_policy: Option<CandleDevicePolicy>,
     pub(super) home: Option<PathBuf>,
     pub(super) out: Option<PathBuf>,
@@ -281,16 +271,21 @@ impl CommissionFlags {
         let runtime = runtime.ok_or_else(|| CliError::usage("--runtime is required"))?;
         if runtime == CommissionRuntime::Candle {
             CandlePoolingPolicy::parse(&pooling)?;
-            if hf != DEFAULT_CANDLE_MODEL && (model_precision.is_none() || !pooling_explicit) {
+            if model_precision.is_none() {
+                return Err(CliError::usage(
+                    "candle requires an explicit calibrated --dtype <f16|bf16|f32>",
+                ));
+            }
+            if hf != DEFAULT_CANDLE_MODEL && !pooling_explicit {
                 return Err(CliError::usage(format!(
-                    "Candle model {hf} has no measured defaults; arbitrary models require explicit --dtype <f16|bf16|f32> and --pooling <mean|cls>"
+                    "Candle model {hf} has no measured pooling policy; arbitrary models require explicit --pooling <mean|cls>"
                 )));
             }
         }
         if runtime == CommissionRuntime::FastembedQwen3 {
             if model_precision.is_none() {
                 return Err(CliError::usage(
-                    "fastembed-qwen3 requires an explicit measured --dtype <f16|bf16|f32>",
+                    "fastembed-qwen3 requires an explicit calibrated --dtype <f16|bf16|f32>",
                 ));
             }
             if pooling_explicit && pooling != "last-token" {
@@ -331,25 +326,30 @@ impl CommissionFlags {
         } else {
             None
         };
-        let model_precision = if let Some(policy) = device_policy {
-            let precision = model_precision.unwrap_or_else(|| {
-                CommissionPrecision::from_candle(default_precision_for_policy(policy))
-            });
+        let manifest_dtype = if let Some(policy) = device_policy {
+            let precision = model_precision.ok_or_else(|| {
+                CliError::usage(format!(
+                    "{} requires an explicit calibrated --dtype <f16|bf16|f32>",
+                    runtime.manifest_runtime()
+                ))
+            })?;
             if !policy.is_gpu() && precision != CommissionPrecision::F32 {
                 return Err(CliError::usage(format!(
                     "{} placement requires --dtype f32; half-precision CPU execution would violate the frozen lens contract",
                     policy.detail()
                 )));
             }
-            Some(precision)
+            precision.as_str()
         } else {
-            None
+            runtime.fixed_dtype().ok_or_else(|| {
+                CliError::runtime("commission runtime produced no resolved dtype contract")
+            })?
         };
         validate_quant_target(&quant_target)?;
         Ok(Self {
             hf,
             runtime,
-            model_precision,
+            manifest_dtype,
             device_policy,
             home,
             out,
@@ -406,9 +406,7 @@ impl CommissionFlags {
     }
 
     pub(super) fn manifest_dtype(&self) -> &'static str {
-        self.model_precision
-            .map(CommissionPrecision::as_str)
-            .unwrap_or_else(|| self.runtime.default_dtype())
+        self.manifest_dtype
     }
 
     pub(super) fn execution_device(&self) -> Option<String> {

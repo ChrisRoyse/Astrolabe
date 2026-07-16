@@ -185,6 +185,13 @@ fn collect_by_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
+pub(super) fn find_all_by_extension(root: &Path, extension: &str) -> CliResult<Vec<PathBuf>> {
+    let mut matches = Vec::new();
+    collect_by_extension(root, extension, &mut matches)?;
+    matches.sort();
+    Ok(matches)
+}
+
 struct FileDigest {
     sha256: String,
     bytes: u64,

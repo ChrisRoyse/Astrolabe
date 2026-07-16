@@ -33,10 +33,15 @@ pub use backfill::{
 pub use calyx_core::{Input, Lens};
 pub use commission::{
     CommissionRequest, CommissionedLens, CommissionedLensArtifact, LensForgeBatchPolicy,
-    LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest, LensForgeShape, commission_lens,
+    LensForgeBatchProbeLevel, LensForgeFile, LensForgeManifest, LensForgeShape,
+    LensForgeSourceDtypeSummary, LensForgeSourceTensorDtypeProfile, commission_lens,
     lens_spec_from_manifest, lens_spec_from_manifest_path,
     lens_spec_from_manifest_with_license_override, lens_spec_metadata_from_manifest,
     lens_spec_metadata_from_manifest_path, register_commissioned,
+};
+#[cfg(feature = "ml-runtime")]
+pub use commission::{
+    profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 pub use compression::{
     CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
@@ -107,9 +112,9 @@ pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
 pub use runtime::candle::{
     CANDLE_BERT_EXECUTION_REVISION, CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV,
     CandleDeviceMode, CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles,
-    CandlePoolingPolicy, CandlePrecision, DEFAULT_CANDLE_MODEL, GPU_DEFAULT_CANDLE_PRECISION,
-    configured_device_mode, configured_device_policy, default_cuda_fail_loud_policy,
-    default_precision_for_policy, device_policy_for_mode, frozen_device_policy,
+    CandlePoolingPolicy, CandlePrecision, DEFAULT_CANDLE_MODEL, configured_device_mode,
+    configured_device_policy, default_cuda_fail_loud_policy, device_policy_for_mode,
+    frozen_device_policy,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]

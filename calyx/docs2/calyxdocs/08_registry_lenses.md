@@ -1,5 +1,15 @@
 # 08 — Registry & Lenses (calyx-registry)
 
+> **ARCHIVED SOURCE SNAPSHOT, NOT THE CURRENT RUNTIME CONTRACT.** This document
+> was generated from the former `Calyx-Dev` tree at commit `2e7b9a2`. Current
+> Astrolabe behavior is documented in
+> `calyx/docs/systemspecs/07_registry_lenses.md`. The `finite_replay_model`, F32
+> precision replay, old Candle hash preimage, runtime roster, and constructor
+> signatures below are historical and must not be used to implement or operate
+> the current system. Current Candle/Qwen execution requires explicit dtype,
+> placement-only auto selection, verified source profiles, full-forward
+> dtype/device attestation, and no dtype or CPU retry.
+
 `calyx-registry` is the lens (frozen embedder) registry. Each lens is a frozen
 measurement instrument that turns a raw `Input` into a `SlotVector`. A lens is
 content-addressed by a `FrozenLensContract`, registered fail-closed, validated on

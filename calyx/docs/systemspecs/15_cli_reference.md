@@ -477,16 +477,37 @@ paths also include the resolved device and dtype), writes
 `conversion-log.jsonl`, writes `lensforge.manifest.json`, then registers it via
 the same hash-verified catalog path as `lens add`. Optional flags: `--name`,
 `--endpoint` (TEI), `--dim`, `--license`, `--non-commercial`, `--pooling`,
-`--norm`, `--quant-target`, `--max-batch`, plus `--dtype <f16|bf16|f32>` and
-`--device <auto|cuda|cpu>` for Candle/Qwen. The output directory must be empty;
+`--norm`, `--quant-target`, `--max-batch`, plus required
+`--dtype <f16|bf16|f32>` and optional `--device <auto|cuda|cpu>` for
+Candle/Qwen. There is no GPU-, model-name-, or device-derived precision
+default. The output directory must be empty;
 frozen and failed artifact trees are never overwritten. Device `auto` resolves
-once to `cuda:<ordinal>` when CUDA is usable, or to a distinct CPU/F32 contract
-only when the binary has no CUDA feature or the driver reports no device. Once
-CUDA is selected, initialization/inference errors fail closed without a CPU
-retry. The report and conversion log retain the resolved policy reason while
-the frozen identity stores only `cpu` or `cuda:<ordinal>`. Arbitrary Candle
-model ids require explicit dtype and pooling. Qwen
-requires an explicit measured dtype and has fixed last-token pooling.
+placement only: it selects `cuda:<ordinal>` when CUDA is usable, or CPU only
+when the binary has no CUDA feature or the driver reports no device. It never
+changes the requested dtype. An auto-selected CPU placement therefore succeeds
+only with explicit `--dtype f32`; F16/BF16 returns a usage error before output
+mutation. Once CUDA is selected, initialization, load, attestation, and
+inference errors fail closed without a second-dtype replay or CPU retry. The
+report and conversion log retain the resolved policy reason while frozen
+identity stores the resolved `cpu` or `cuda:<ordinal>`, explicit dtype, and
+source-profile fingerprint. Every Candle/Qwen local manifest records a
+canonical `source_tensor_dtype_profile` over all applicable safetensors shards,
+with per-dtype tensor/element counts and a fingerprint; `lens add` recomputes it
+from the hash-verified bytes before runtime construction. Other runtimes reject
+that field as inert. Arbitrary Candle model ids additionally require explicit
+pooling. Qwen has fixed last-token pooling.
+Every local commission performs a real full-forward hidden-tensor attestation
+before catalog registration. Its report and `local_execution_attested` log event
+record `local_execution_attestation {executable_lens_id,
+executable_corpus_hash, loader_target_dtype, observed_primary_activation_dtype,
+observed_execution_device, evidence_kind}`,
+`gemm_accumulation_dtype=f32`, and `output_dtype=f32`.
+The registered/catalog `lens_id` remains a separately named manifest-spec
+identity until the explicit migration tracked by Astrolabe #507. The executable
+fields are read from the constructed model's frozen contract, never copied from
+that catalog id.
+`--skip-batch-preflight <reason>` skips only batch-size measurement; it never
+waives this execution attestation or permits an unavailable declared device.
 `--max-batch` writes the manifest batch ceiling that later scale runs clamp to
 after it is proven. `onnx-int8` runs Optimum export plus ONNX Runtime
 quantization. `onnx-fp32` runs the same feature-extraction export without
@@ -501,12 +522,35 @@ runtimes. `--repeat` default 1 (must be > 0);
 for media lenses and is mutually exclusive with `--input`. Read-only;
 instantiates the real runtime, measures the probe, validates finite/dim/norm
 against the frozen spec, and prints
-`ExplainReport` with runtime detail, declared model dtype, executed model dtype,
-GEMM accumulation dtype, output dtype, vector hash, timing, norm, and artifact
-bytes. Artifact bytes are not reported as VRAM. `--full-vector` adds the
-complete dense vector (or sparse entries) after validation for FSV readback; it
-fails closed where the requested full representation is unavailable. `--home`
-is not used by `explain`.
+`ExplainReport` with runtime detail, optional `source_tensor_dtype_profile`,
+declared model dtype, optional `local_execution_attestation`, GEMM accumulation
+dtype, output dtype, vector hash, timing, norm, and artifact bytes. For
+Candle/Qwen, `local_execution_attestation` is
+`{executable_lens_id, executable_corpus_hash, loader_target_dtype,
+observed_primary_activation_dtype, observed_execution_device, evidence_kind}`
+and
+`evidence_kind=full_forward_hidden_tensor`: it comes from a real model forward,
+not from relabeling the requested enum. Runtimes without this executable
+contract omit the object rather than inventing an executed dtype. Artifact bytes
+are not reported as VRAM. `--full-vector` adds the complete dense vector (or
+sparse entries) after validation for FSV readback; it fails closed where the
+requested full representation is unavailable. `--home` is not used by
+`explain`.
+
+### `lens scale-audit --manifest <manifest.json> ... --out <report.json> [flags]`
+
+Runs real per-lens workers over one or more manifests and writes a
+`calyx-lens-scale-audit-v3` report. Flags include `--batch-size`,
+`--min-content-lenses`, `--min-gpu-content-lenses`,
+`--min-effective-batch`, `--lens-timeout-secs`, `--probe`, and `--probe-file`.
+Each `LensAudit` records declared model dtype, optional
+`local_execution_attestation {executable_lens_id, executable_corpus_hash,
+loader_target_dtype, observed_primary_activation_dtype,
+observed_execution_device, evidence_kind}`,
+GEMM accumulation/output dtype, provider/placement evidence, batch stability,
+throughput, and rejection state. Candle/Qwen attestation is captured from the
+same real full-forward hidden tensor used during runtime construction; there is
+no inferred `executed_model_dtype` field.
 
 ### `panel status [--home <dir>] | [--vault <dir>]`
 

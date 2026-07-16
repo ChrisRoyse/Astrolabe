@@ -3,7 +3,7 @@ use candle_nn::{Embedding, LayerNorm, Module, VarBuilder, embedding, layer_norm}
 use candle_transformers::models::bert::{BertEncoder, Config};
 
 /// Changes whenever Calyx's owned BERT execution semantics change.
-pub const CANDLE_BERT_EXECUTION_REVISION: &str = "calyx-candle-bert-v4,candle-core=0.10.2,candle-nn=0.10.2,candle-transformers=0.10.2,finite-native-mask,conditional-selection";
+pub const CANDLE_BERT_EXECUTION_REVISION: &str = "calyx-candle-bert-v6,candle-core=0.10.2,candle-nn=0.10.2,candle-transformers=0.10.2,finite-native-mask,conditional-selection,source-dtype-profile-v1,full-forward-dtype-attestation";
 
 pub(super) struct CalyxBertModel {
     embeddings: CalyxBertEmbeddings,
@@ -52,6 +52,13 @@ impl CalyxBertModel {
         let attention_mask =
             finite_additive_attention_mask(&attention_mask, embedding_output.dtype())?;
         self.encoder.forward(&embedding_output, &attention_mask)
+    }
+
+    pub(super) fn full_forward_dtype_probe(&self) -> Result<Tensor> {
+        let input_ids = Tensor::zeros((1, 1), DType::U32, &self.device)?;
+        let token_type_ids = Tensor::zeros((1, 1), DType::U32, &self.device)?;
+        let attention_mask = Tensor::ones((1, 1), DType::U32, &self.device)?;
+        self.forward(&input_ids, &token_type_ids, Some(&attention_mask))
     }
 }
 

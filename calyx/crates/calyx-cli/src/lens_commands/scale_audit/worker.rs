@@ -208,7 +208,7 @@ fn rejected_worker_audit(
         runtime_detail: "worker_timeout_or_missing_report".to_string(),
         provider: "unproven".to_string(),
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         placement: Placement::Cpu,

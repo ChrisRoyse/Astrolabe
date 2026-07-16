@@ -14,6 +14,7 @@ use super::manifest::{LensForgeFile, LensForgeManifest};
 use super::manifest_runtime::{
     canonical_local_model_device, canonical_local_model_dtype, validate_local_model_execution,
 };
+use super::source_tensor_profile::validate_manifest_source_tensor_profile;
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
 
@@ -113,6 +114,10 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
         &manifest.dtype,
         manifest.execution_device.as_deref(),
     )?;
+    validate_manifest_source_tensor_profile(
+        &manifest.runtime,
+        manifest.source_tensor_dtype_profile.as_ref(),
+    )?;
     if is_tei_runtime(&manifest.runtime)
         && manifest
             .endpoint
@@ -148,7 +153,61 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
     if manifest.files.is_empty() && !is_algorithmic_runtime(&manifest.runtime) {
         return Err(config_invalid("lensforge manifest files are required"));
     }
+    validate_declared_artifact_identity(manifest)?;
     Ok(())
+}
+
+fn validate_declared_artifact_identity(manifest: &LensForgeManifest) -> Result<()> {
+    if is_algorithmic_runtime(&manifest.runtime) && manifest.files.is_empty() {
+        return Ok(());
+    }
+    let ordered = ordered_manifest_files(&manifest.files);
+    let anchor = ordered
+        .iter()
+        .copied()
+        .find(|file| is_model_role(&file.role))
+        .or_else(|| {
+            is_adapter_runtime(&manifest.runtime)
+                .then(|| ordered.iter().copied().find(|file| file.role == "adapter"))
+                .flatten()
+        })
+        .ok_or_else(|| config_invalid("lensforge manifest requires a model file"))?;
+    let declared = parse_hex_32(&manifest.weights_sha256)?;
+    let anchored = parse_hex_32(&anchor.sha256)?;
+    if declared != anchored {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "lensforge declared model weights sha256 {} != manifest file {}",
+            manifest.weights_sha256, anchor.sha256
+        )));
+    }
+    if is_local_learned_runtime(&manifest.runtime)
+        && manifest
+            .artifact_set_sha256
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(config_invalid(
+            "local learned manifest requires artifact_set_sha256 covering every executable artifact",
+        ));
+    }
+    if let Some(artifact_set) = manifest.artifact_set_sha256.as_deref() {
+        let _ = parse_hex_32(artifact_set)?;
+    }
+    Ok(())
+}
+
+fn is_local_learned_runtime(runtime: &str) -> bool {
+    matches!(
+        runtime,
+        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
+    )
+}
+
+fn is_adapter_runtime(runtime: &str) -> bool {
+    matches!(
+        runtime,
+        "adapter" | "multimodal-adapter" | "multimodal_adapter"
+    )
 }
 
 fn metadata_weights_sha256(manifest: &LensForgeManifest) -> Result<[u8; 32]> {

@@ -10,6 +10,8 @@ use tokenizers::{Tokenizer, TruncationParams};
 use super::bert::{CANDLE_BERT_EXECUTION_REVISION, CalyxBertModel};
 use super::options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
 use super::{CandleDevicePolicy, CandleModelFiles, CandlePrecision};
+use crate::commission::LensForgeSourceTensorDtypeProfile;
+use crate::runtime::common::{LocalModelExecutionAttestation, attest_primary_activation};
 
 pub(super) fn fetch_files(cache_dir: &Path, model_id: &str) -> Result<CandleModelFiles> {
     let api = ApiBuilder::new()
@@ -62,28 +64,87 @@ pub(super) fn read_model(
     config: &Config,
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
-) -> Result<CalyxBertModel> {
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+) -> Result<(CalyxBertModel, LocalModelExecutionAttestation)> {
     configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
         with_runtime_context(
             error,
             "gemm_accumulation_configure",
             device_policy,
             precision,
+            source_tensor_dtype_profile,
         )
     })?;
-    let device = candle_device(device_policy)
-        .map_err(|error| with_runtime_context(error, "device_init", device_policy, precision))?;
+    let device = candle_device(device_policy).map_err(|error| {
+        with_runtime_context(
+            error,
+            "device_init",
+            device_policy,
+            precision,
+            source_tensor_dtype_profile,
+        )
+    })?;
     let paths = [weights];
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, precision.dtype(), &device) }
         .map_err(candle_error)
-        .map_err(|error| with_runtime_context(error, "weights_mmap", device_policy, precision))?;
+        .map_err(|error| {
+            with_runtime_context(
+                error,
+                "weights_mmap",
+                device_policy,
+                precision,
+                source_tensor_dtype_profile,
+            )
+        })?;
     let model = CalyxBertModel::load(vb, config)
         .map_err(candle_error)
-        .map_err(|error| with_runtime_context(error, "model_load", device_policy, precision))?;
-    verify_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
-        with_runtime_context(error, "gemm_accumulation_verify", device_policy, precision)
+        .map_err(|error| {
+            with_runtime_context(
+                error,
+                "model_load",
+                device_policy,
+                precision,
+                source_tensor_dtype_profile,
+            )
+        })?;
+    let hidden = model
+        .full_forward_dtype_probe()
+        .map_err(candle_error)
+        .map_err(|error| {
+            with_runtime_context(
+                error,
+                "dtype_attestation",
+                device_policy,
+                precision,
+                source_tensor_dtype_profile,
+            )
+        })?;
+    let attestation = attest_primary_activation(
+        "candle",
+        &hidden,
+        precision.dtype(),
+        &device,
+        &device_policy.frozen_token(),
+    )
+    .map_err(|error| {
+        with_runtime_context(
+            error,
+            "dtype_attestation",
+            device_policy,
+            precision,
+            source_tensor_dtype_profile,
+        )
     })?;
-    Ok(model)
+    verify_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
+        with_attested_runtime_context(
+            error,
+            "gemm_accumulation_verify",
+            device_policy,
+            source_tensor_dtype_profile,
+            &attestation,
+        )
+    })?;
+    Ok((model, attestation))
 }
 
 pub(super) fn candle_device(policy: CandleDevicePolicy) -> Result<Device> {
@@ -129,14 +190,38 @@ pub(super) fn with_runtime_context(
     stage: &str,
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
 ) -> CalyxError {
     CalyxError {
         code: error.code,
         message: format!(
-            "candle stage={stage} execution_revision={CANDLE_BERT_EXECUTION_REVISION} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            "candle stage={stage} execution_revision={CANDLE_BERT_EXECUTION_REVISION} device_policy={} source_tensor_dtype_profile={} loader_target_dtype={} observed_primary_activation_dtype=unattested observed_execution_device=unattested dtype_attestation_evidence=unattested gemm_accumulation_dtype=f32 output_dtype=f32: {}",
             device_policy.detail(),
+            source_tensor_dtype_profile.summary(),
             precision.as_str(),
-            precision.as_str(),
+            error.message
+        ),
+        remediation: error.remediation,
+    }
+}
+
+pub(super) fn with_attested_runtime_context(
+    error: CalyxError,
+    stage: &str,
+    device_policy: CandleDevicePolicy,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+    attestation: &LocalModelExecutionAttestation,
+) -> CalyxError {
+    CalyxError {
+        code: error.code,
+        message: format!(
+            "candle stage={stage} execution_revision={CANDLE_BERT_EXECUTION_REVISION} device_policy={} source_tensor_dtype_profile={} loader_target_dtype={} observed_primary_activation_dtype={} observed_execution_device={} dtype_attestation_evidence={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            device_policy.detail(),
+            source_tensor_dtype_profile.summary(),
+            attestation.loader_target_dtype,
+            attestation.observed_primary_activation_dtype,
+            attestation.observed_device,
+            attestation.evidence_kind,
             error.message
         ),
         remediation: error.remediation,

@@ -28,6 +28,7 @@ ml-runtime = [
     "dep:hf-hub",
     "dep:memmap2",
     "dep:ort",
+    "dep:safetensors",
     "dep:tokenizers",
 ]
 cuda = ["ml-runtime", "candle-cuda", "calyx-forge/cuda"]
@@ -48,6 +49,7 @@ half = { workspace = true, optional = true }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 memmap2 = { workspace = true, optional = true }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
+safetensors = { version = "=0.7.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

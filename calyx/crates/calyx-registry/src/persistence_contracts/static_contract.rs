@@ -23,13 +23,17 @@ use fastembed_contract::{
 use crate::Qwen3ModelFiles;
 #[cfg(feature = "ml-runtime")]
 use crate::commission::canonical_local_model_device;
+#[cfg(feature = "ml-runtime")]
+use crate::commission::{
+    profile_safetensors_source, profile_safetensors_sources, resolve_safetensors_weight_set,
+};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 #[cfg(feature = "ml-runtime")]
-use crate::runtime::candle::{
-    CANDLE_BERT_EXECUTION_REVISION, CandlePoolingPolicy, CandlePrecision,
-};
+use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision, candle_corpus_hash};
 #[cfg(feature = "ml-runtime")]
-use crate::runtime::common::DEFAULT_MAX_TOKENS;
+use crate::runtime::common::{DEFAULT_MAX_TOKENS, hash_files};
+#[cfg(feature = "ml-runtime")]
+use crate::runtime::qwen3::qwen3_corpus_hash;
 use crate::{AlgorithmicEncoder, LensRuntime, LensSpec};
 
 #[cfg(feature = "ml-runtime")]
@@ -244,6 +248,31 @@ fn candle_contract(
     ensure_file("candle weights", weights)?;
     ensure_file("candle tokenizer", tokenizer)?;
     ensure_file("candle config", config)?;
+    let observed_hash = hash_files(&files.to_vec())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "candle static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
+    let weight_set = resolve_safetensors_weight_set("candle-local", files)?;
+    let canonical_weight = fs::canonicalize(weights).map_err(|error| {
+        lens_config_invalid(format!(
+            "canonicalize candle contract weight {} failed: {error}",
+            weights.display()
+        ))
+    })?;
+    let resolved_weight = fs::canonicalize(&weight_set[0]).map_err(|error| {
+        lens_config_invalid(format!(
+            "canonicalize resolved candle contract weight {} failed: {error}",
+            weight_set[0].display()
+        ))
+    })?;
+    if resolved_weight != canonical_weight {
+        return Err(lens_config_invalid(
+            "candle static contract weight does not match the resolved safetensors set",
+        ));
+    }
     let dim = dense_hidden_size(config, "candle")?;
     let precision = CandlePrecision::parse(dtype)?;
     let execution_device = canonical_local_model_device("candle-local", Some(device))?
@@ -256,18 +285,16 @@ fn candle_contract(
         )));
     }
     let pooling = CandlePoolingPolicy::parse(pooling)?;
-    let max_tokens = DEFAULT_MAX_TOKENS.to_string();
-    let norm_text = format!("{:?}", spec.norm_policy);
-    let corpus_hash = sha256_digest(&[
-        CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
-        model_id.as_bytes(),
-        max_tokens.as_bytes(),
-        execution_device.as_bytes(),
-        precision.as_str().as_bytes(),
-        pooling.as_str().as_bytes(),
-        norm_text.as_bytes(),
-        b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output",
-    ]);
+    let source_tensor_dtype_profile = profile_safetensors_source(&weight_set[0])?;
+    let corpus_hash = candle_corpus_hash(
+        model_id,
+        DEFAULT_MAX_TOKENS,
+        &execution_device,
+        precision,
+        pooling,
+        spec.norm_policy,
+        &source_tensor_dtype_profile,
+    );
     Ok(FrozenLensContract::new(
         spec.name.clone(),
         spec.weights_sha256,
@@ -350,6 +377,13 @@ fn qwen3_contract(
     for path in files.artifact_paths() {
         ensure_file("fastembed-qwen3 contract artifact", &path)?;
     }
+    let observed_hash = hash_files(&files.artifact_paths())?;
+    if observed_hash != spec.weights_sha256 {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed-qwen3 static contract artifact hash drift for {}",
+            spec.name
+        )));
+    }
     let precision = CandlePrecision::parse(dtype)?;
     let execution_device = canonical_local_model_device("fastembed-qwen3", Some(device))?
         .ok_or_else(|| lens_config_invalid("fastembed-qwen3 produced no execution device"))?;
@@ -360,19 +394,18 @@ fn qwen3_contract(
             precision.as_str()
         )));
     }
-    let max_tokens = "32768".to_string();
     let dim = dense_hidden_size(&files.config, "Qwen3")?;
+    let source_tensor_dtype_profile = profile_safetensors_sources(&files.weights)?;
     Ok(FrozenLensContract::new(
         spec.name.clone(),
         spec.weights_sha256,
-        sha256_digest(&[
-            b"fastembed-qwen3-text-v2",
-            model_id.as_bytes(),
-            execution_device.as_bytes(),
-            precision.as_str().as_bytes(),
-            max_tokens.as_bytes(),
-            b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output",
-        ]),
+        qwen3_corpus_hash(
+            &model_id,
+            &execution_device,
+            precision,
+            32_768,
+            &source_tensor_dtype_profile,
+        ),
         SlotShape::Dense(dim),
         Modality::Text,
         LensDType::F32,

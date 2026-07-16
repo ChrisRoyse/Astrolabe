@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use calyx_core::{Modality, Placement};
 use serde::{Deserialize, Serialize};
 
-pub(super) const SCHEMA: &str = "calyx-lens-scale-audit-v2";
+pub(super) const SCHEMA: &str = "calyx-lens-scale-audit-v3";
 pub(super) const DEFAULT_MIN_CONTENT_LENSES: usize = 10;
 pub(super) const DEFAULT_MIN_GPU_CONTENT_LENSES: usize = 10;
 pub(super) const DEFAULT_BATCH_SIZE: usize = 64;
@@ -65,7 +65,7 @@ pub(super) struct LensAudit {
     pub(super) runtime_detail: String,
     pub(super) provider: String,
     pub(super) declared_model_dtype: String,
-    pub(super) executed_model_dtype: String,
+    pub(super) local_execution_attestation: Option<LocalExecutionAttestationAudit>,
     pub(super) gemm_accumulation_dtype: String,
     pub(super) output_dtype: String,
     pub(super) placement: Placement,
@@ -85,6 +85,16 @@ pub(super) struct LensAudit {
     pub(super) batch_stability: Option<BatchStability>,
     pub(super) accepted: bool,
     pub(super) rejections: Vec<Rejection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct LocalExecutionAttestationAudit {
+    pub(super) executable_lens_id: String,
+    pub(super) executable_corpus_hash: String,
+    pub(super) loader_target_dtype: String,
+    pub(super) observed_primary_activation_dtype: String,
+    pub(super) observed_execution_device: String,
+    pub(super) evidence_kind: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -304,16 +304,6 @@ impl CandlePrecision {
     }
 }
 
-pub const GPU_DEFAULT_CANDLE_PRECISION: CandlePrecision = CandlePrecision::F16;
-
-pub const fn default_precision_for_policy(policy: CandleDevicePolicy) -> CandlePrecision {
-    if policy.is_gpu() {
-        GPU_DEFAULT_CANDLE_PRECISION
-    } else {
-        CandlePrecision::F32
-    }
-}
-
 pub(crate) fn configure_f32_gemm_accumulation(
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,

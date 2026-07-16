@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -5,6 +6,7 @@ use calyx_core::{CalyxError, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 
 use super::{OPTIONAL_QWEN3_FILES, config_invalid};
+use crate::commission::resolve_safetensors_weight_set;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen3ModelFiles {
@@ -55,7 +57,26 @@ impl Qwen3ModelFiles {
         if files.is_empty() {
             return Err(config_invalid("fastembed-qwen3 requires manifest files"));
         }
-        let weights = weight_paths(&files)?;
+        let mut files = files;
+        files.sort();
+        let mut identities = BTreeMap::<PathBuf, PathBuf>::new();
+        for path in &files {
+            let canonical = std::fs::canonicalize(path).map_err(|error| {
+                config_invalid(format!(
+                    "canonicalize fastembed-qwen3 artifact {} failed: {error}",
+                    path.display()
+                ))
+            })?;
+            if let Some(previous) = identities.insert(canonical.clone(), path.clone()) {
+                return Err(config_invalid(format!(
+                    "duplicate fastembed-qwen3 artifact identity {} is declared through {} and {}",
+                    canonical.display(),
+                    previous.display(),
+                    path.display()
+                )));
+            }
+        }
+        let weights = resolve_safetensors_weight_set("fastembed-qwen3", &files)?;
         let tokenizer = required_file(
             &files,
             |path| file_name_eq(path, "tokenizer.json"),
@@ -147,32 +168,6 @@ fn fetch_weights(repo: &ApiRepo) -> Result<Vec<PathBuf>> {
 fn fetch(repo: &ApiRepo, filename: &str) -> Result<PathBuf> {
     repo.get(filename)
         .map_err(|err| CalyxError::lens_unreachable(format!("fetch {filename} failed: {err}")))
-}
-
-fn weight_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut weights = paths
-        .iter()
-        .filter(|path| {
-            path.extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("safetensors"))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    weights.sort();
-    if let Some(index) = weights
-        .iter()
-        .position(|path| file_name_eq(path, "model.safetensors"))
-    {
-        let first = weights.remove(index);
-        weights.insert(0, first);
-    }
-    if weights.is_empty() {
-        return Err(config_invalid(
-            "fastembed-qwen3 requires safetensors weights",
-        ));
-    }
-    Ok(weights)
 }
 
 fn config_path(paths: &[PathBuf]) -> Result<PathBuf> {

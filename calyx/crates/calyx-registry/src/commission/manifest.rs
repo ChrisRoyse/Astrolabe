@@ -15,6 +15,11 @@ use super::algorithmic_manifest::{
     output_shape as algorithmic_output_shape,
 };
 use super::manifest_runtime::{runtime_from_manifest, validate_local_model_execution};
+use super::source_tensor_profile::{
+    LensForgeSourceTensorDtypeProfile, validate_manifest_source_tensor_profile,
+};
+#[cfg(feature = "ml-runtime")]
+use super::source_tensor_profile::{profile_safetensors_sources, resolve_safetensors_weight_set};
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -70,6 +75,8 @@ pub struct LensForgeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<LensForgeShape>,
     pub dtype: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_device: Option<String>,
     pub weights_sha256: String,
@@ -198,6 +205,8 @@ pub fn lens_spec_from_manifest_with_license_override(
         allow_non_commercial,
     )?;
     let artifacts = read_and_verify_files(manifest, base_dir)?;
+    #[cfg(feature = "ml-runtime")]
+    validate_source_tensor_profile_bytes(manifest, &artifacts)?;
     let output = manifest.output_shape()?;
     let algorithmic_contract =
         algorithmic_frozen_contract(&manifest.name, &manifest.runtime, manifest.modality, output)?;
@@ -266,6 +275,22 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
         &manifest.dtype,
         manifest.execution_device.as_deref(),
     )?;
+    validate_manifest_source_tensor_profile(
+        &manifest.runtime,
+        manifest.source_tensor_dtype_profile.as_ref(),
+    )?;
+    if matches!(
+        manifest.runtime.as_str(),
+        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
+    ) && manifest
+        .artifact_set_sha256
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(config_invalid(
+            "local learned manifest requires artifact_set_sha256 covering every executable artifact",
+        ));
+    }
     if is_tei_runtime(&manifest.runtime)
         && manifest
             .endpoint
@@ -295,6 +320,64 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
     }
     if manifest.files.is_empty() && !is_algorithmic_runtime(&manifest.runtime) {
         return Err(config_invalid("lensforge manifest files are required"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ml-runtime")]
+fn validate_source_tensor_profile_bytes(
+    manifest: &LensForgeManifest,
+    artifacts: &[VerifiedFile],
+) -> Result<()> {
+    if !matches!(
+        manifest.runtime.as_str(),
+        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
+    ) {
+        return Ok(());
+    }
+    let declared = manifest
+        .source_tensor_dtype_profile
+        .as_ref()
+        .ok_or_else(|| {
+            config_invalid("local learned manifest source tensor dtype profile is required")
+        })?;
+    let safetensors = artifacts
+        .iter()
+        .filter(|file| {
+            file.path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("safetensors"))
+        })
+        .collect::<Vec<_>>();
+    if safetensors.is_empty() {
+        return Err(config_invalid(
+            "local learned manifest has no safetensors model/weights artifacts",
+        ));
+    }
+    if let Some(file) = safetensors
+        .iter()
+        .find(|file| !matches!(file.role.as_str(), "model" | "weights"))
+    {
+        return Err(config_invalid(format!(
+            "local learned manifest safetensors artifact {} has inert role {}; use model or weights",
+            file.path.display(),
+            file.role
+        )));
+    }
+    let paths = safetensors
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let weights = resolve_safetensors_weight_set(&manifest.runtime, &paths)?;
+    let observed = profile_safetensors_sources(&weights)?;
+    if &observed != declared {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "{} source tensor dtype profile does not match verified safetensors artifacts: declared={} observed={}",
+            manifest.runtime,
+            declared.summary(),
+            observed.summary()
+        )));
     }
     Ok(())
 }

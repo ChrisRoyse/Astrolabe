@@ -3,13 +3,16 @@ use std::path::{Path, PathBuf};
 
 use calyx_core::{Input, Lens, Modality, QuantPolicy, SlotShape};
 use calyx_registry::{
-    DEFAULT_TEI_ENDPOINT, LensForgeManifest, LensForgeShape, NormPolicy, TeiHttpLens,
+    DEFAULT_TEI_ENDPOINT, LensForgeManifest, LensForgeShape, LensForgeSourceTensorDtypeProfile,
+    NormPolicy, TeiHttpLens, profile_safetensors_sources, resolve_safetensors_weight_set,
 };
 use serde::Serialize;
 use serde_json::json;
 
 mod artifact;
+mod attestation;
 mod batch_preflight;
+mod candle;
 mod fastembed;
 mod fastembed_special;
 mod log;
@@ -21,6 +24,7 @@ use artifact::{
     Artifact, FileReport, add_optional, artifact, artifact_set_sha256, file_report, find_preferred,
     manifest_files, read_hidden_size, require_named, require_named_fallback,
 };
+use attestation::{LocalExecutionAttestationReport, attest_local_execution};
 use log::{ConversionLog, run_command, write_json_file};
 use options::{CommissionFlags, CommissionRuntime};
 
@@ -45,6 +49,13 @@ struct CommissionReport {
     conversion_log: PathBuf,
     max_batch: Option<usize>,
     batch_policy: calyx_registry::LensForgeBatchPolicy,
+    source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_execution_attestation: Option<LocalExecutionAttestationReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gemm_accumulation_dtype: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dtype: Option<&'static str>,
     files: Vec<FileReport>,
     registered: AddReport,
 }
@@ -53,6 +64,7 @@ struct CommissionOutput {
     artifacts: Vec<Artifact>,
     dim_override: Option<u32>,
     source_hf_id: Option<String>,
+    source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
 }
 
 impl CommissionOutput {
@@ -61,6 +73,7 @@ impl CommissionOutput {
             artifacts,
             dim_override: None,
             source_hf_id: None,
+            source_tensor_dtype_profile: None,
         }
     }
 
@@ -69,6 +82,7 @@ impl CommissionOutput {
             artifacts,
             dim_override: Some(dim),
             source_hf_id: None,
+            source_tensor_dtype_profile: None,
         }
     }
 
@@ -77,7 +91,16 @@ impl CommissionOutput {
             artifacts,
             dim_override: None,
             source_hf_id: Some(source_hf_id),
+            source_tensor_dtype_profile: None,
         }
+    }
+
+    fn with_source_tensor_dtype_profile(
+        mut self,
+        profile: LensForgeSourceTensorDtypeProfile,
+    ) -> Self {
+        self.source_tensor_dtype_profile = Some(profile);
+        self
     }
 }
 
@@ -96,13 +119,13 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         "device_policy": flags.device_policy_detail(),
         "output_dir": out,
     }))?;
-    let output = match flags.runtime {
+    let mut output = match flags.runtime {
         CommissionRuntime::Tei => {
             let commissioned = commission_tei(&flags, &out, &mut log)?;
             CommissionOutput::with_source_hf_id(commissioned.artifacts, commissioned.source_hf_id)
         }
         CommissionRuntime::Candle => {
-            CommissionOutput::new(commission_candle(&flags, &out, &mut log)?)
+            CommissionOutput::new(candle::commission(&flags, &out, &mut log)?)
         }
         CommissionRuntime::OnnxInt8 => {
             CommissionOutput::new(commission_onnx_int8(&flags, &out, &mut log)?)
@@ -128,12 +151,31 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
             CommissionOutput::with_dim(commissioned.artifacts, commissioned.dim)
         }
     };
+    if matches!(
+        flags.runtime,
+        CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+    ) {
+        let artifact_paths = output
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect::<Vec<_>>();
+        let sources =
+            resolve_safetensors_weight_set(flags.runtime.manifest_runtime(), &artifact_paths)?;
+        let profile = profile_safetensors_sources(&sources)?;
+        log.event(json!({
+            "event": "source_tensor_dtype_profile_verified",
+            "profile": profile,
+        }))?;
+        output = output.with_source_tensor_dtype_profile(profile);
+    }
     let manifest_path = write_manifest(
         &flags,
         &out,
         &output.artifacts,
         output.dim_override,
         output.source_hf_id.as_deref(),
+        output.source_tensor_dtype_profile.as_ref(),
         &mut log,
     )?;
     let (max_batch, batch_policy) = match batch_preflight::apply(&flags, &manifest_path, &mut log) {
@@ -151,6 +193,29 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
             return Err(error);
         }
     };
+    let local_execution_attestation = match attest_local_execution(
+        &manifest_path,
+        output.source_tensor_dtype_profile.as_ref(),
+        &mut log,
+    ) {
+        Ok(attestation) => attestation,
+        Err(error) => {
+            let removed = fs::remove_file(&manifest_path);
+            log.event(json!({
+                "event": "local_execution_attestation_failed_manifest_removed",
+                "manifest": manifest_path,
+                "removed": removed.is_ok(),
+                "code": error.code(),
+                "message": error.message(),
+            }))?;
+            return Err(error);
+        }
+    };
+    let local_numeric_dtype = matches!(
+        flags.runtime,
+        CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+    )
+    .then_some("f32");
     let registered = add_manifest_to_catalog(flags.home.as_deref(), manifest_path.clone())?;
     log.event(json!({
         "event": "registered",
@@ -168,6 +233,10 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         conversion_log: log.path,
         max_batch,
         batch_policy,
+        source_tensor_dtype_profile: output.source_tensor_dtype_profile,
+        local_execution_attestation,
+        gemm_accumulation_dtype: local_numeric_dtype,
+        output_dtype: local_numeric_dtype,
         files: output.artifacts.iter().map(file_report).collect(),
         registered,
     })
@@ -197,56 +266,6 @@ fn commission_tei(
         "dim": dim,
     }))?;
     Ok(commissioned)
-}
-
-fn commission_candle(
-    flags: &CommissionFlags,
-    out: &Path,
-    log: &mut ConversionLog,
-) -> CliResult<Vec<Artifact>> {
-    let artifact_dir = out.join("hf-candle");
-    fs::create_dir_all(&artifact_dir)?;
-    run_command(
-        log,
-        "hf",
-        &[
-            "download",
-            &flags.hf,
-            "--local-dir",
-            &artifact_dir.display().to_string(),
-            "--include",
-            "config.json",
-            "--include",
-            "tokenizer.json",
-            "--include",
-            "tokenizer_config.json",
-            "--include",
-            "special_tokens_map.json",
-            "--include",
-            "*.safetensors",
-        ],
-    )?;
-    let weights = find_preferred(&artifact_dir, &["model.safetensors"], "safetensors")?;
-    let tokenizer = require_named(&artifact_dir, "tokenizer.json")?;
-    let config = require_named(&artifact_dir, "config.json")?;
-    let dim = flags.dim.unwrap_or(read_hidden_size(&config)?);
-    log.event(json!({"event": "candle_artifacts_ready", "dim": dim}))?;
-    let mut artifacts = vec![
-        artifact("model", weights)?,
-        artifact("tokenizer", tokenizer)?,
-        artifact("config", config)?,
-    ];
-    add_optional(
-        &mut artifacts,
-        "tokenizer_config",
-        artifact_dir.join("tokenizer_config.json"),
-    )?;
-    add_optional(
-        &mut artifacts,
-        "special_tokens_map",
-        artifact_dir.join("special_tokens_map.json"),
-    )?;
-    Ok(artifacts)
 }
 
 fn commission_onnx_int8(
@@ -360,6 +379,7 @@ fn write_manifest(
     artifacts: &[Artifact],
     dim_override: Option<u32>,
     source_hf_id: Option<&str>,
+    source_tensor_dtype_profile: Option<&LensForgeSourceTensorDtypeProfile>,
     log: &mut ConversionLog,
 ) -> CliResult<PathBuf> {
     let model = artifacts
@@ -394,6 +414,7 @@ fn write_manifest(
             inferred_dim,
         ))),
         dtype: flags.manifest_dtype().to_string(),
+        source_tensor_dtype_profile: source_tensor_dtype_profile.cloned(),
         execution_device: flags.execution_device(),
         weights_sha256: model.sha256.clone(),
         artifact_set_sha256: Some(artifact_set_sha256(artifacts)?),

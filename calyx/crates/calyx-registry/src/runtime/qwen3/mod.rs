@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
 use fastembed::Qwen3TextEmbedding;
 
+use crate::commission::{LensForgeSourceTensorDtypeProfile, profile_safetensors_sources};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::candle::{
     CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation, frozen_device_policy,
     verify_f32_gemm_accumulation,
 };
+use crate::runtime::common::LocalModelExecutionAttestation;
 use crate::runtime::common::{hash_files, text_from_input};
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
@@ -51,6 +53,8 @@ pub struct FastembedQwen3Lens {
     files: Qwen3ModelFiles,
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
+    source_tensor_dtype_profile: LensForgeSourceTensorDtypeProfile,
+    execution_attestation: LocalModelExecutionAttestation,
     max_tokens: usize,
     model: Mutex<Qwen3TextEmbedding>,
 }
@@ -78,6 +82,10 @@ impl FastembedQwen3Lens {
     }
 
     pub fn from_files(spec: Qwen3FileSpec) -> Result<Self> {
+        let mut spec = spec;
+        spec.model_id = qwen3_model_id(&spec.model_id)?;
+        spec.files =
+            Qwen3ModelFiles::from_paths(spec.model_id.clone(), spec.files.artifact_paths())?;
         if !spec.device_policy.is_gpu() && spec.precision != CandlePrecision::F32 {
             return Err(config_invalid(format!(
                 "fastembed-qwen3 CPU placement {} requires f32, but the frozen lens declares {}; commission/select a distinct f32 lens for CPU execution",
@@ -100,6 +108,7 @@ impl FastembedQwen3Lens {
                 spec.model_id
             )));
         }
+        let source_tensor_dtype_profile = profile_safetensors_sources(&spec.files.weights)?;
         let config = read_config(&spec.files.config)?;
         let dim = u32::try_from(config.hidden_size).map_err(|_| {
             CalyxError::lens_dim_mismatch(format!(
@@ -115,23 +124,22 @@ impl FastembedQwen3Lens {
             )));
         }
         let tokenizer = read_tokenizer(&spec.files.tokenizer, spec.max_tokens)?;
-        let model = read_model(
+        let (model, execution_attestation) = read_model(
             &spec.files.weights,
             config,
             tokenizer,
             spec.device_policy,
             spec.precision,
+            &source_tensor_dtype_profile,
         )?;
-        let max_tokens = spec.max_tokens.to_string();
         let execution_device = spec.device_policy.frozen_token();
-        let corpus_hash = sha256_digest(&[
-            b"fastembed-qwen3-text-v2",
-            spec.model_id.as_bytes(),
-            execution_device.as_bytes(),
-            spec.precision.as_str().as_bytes(),
-            max_tokens.as_bytes(),
-            b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output",
-        ]);
+        let corpus_hash = qwen3_corpus_hash(
+            &spec.model_id,
+            &execution_device,
+            spec.precision,
+            spec.max_tokens,
+            &source_tensor_dtype_profile,
+        );
         let contract = FrozenLensContract::new(
             spec.name,
             weights_sha256,
@@ -148,6 +156,8 @@ impl FastembedQwen3Lens {
             files: spec.files,
             device_policy: spec.device_policy,
             precision: spec.precision,
+            source_tensor_dtype_profile,
+            execution_attestation,
             max_tokens: spec.max_tokens,
             model: Mutex::new(model),
         })
@@ -194,6 +204,31 @@ impl FastembedQwen3Lens {
 
     pub const fn max_tokens(&self) -> usize {
         self.max_tokens
+    }
+
+    /// Canonical dtype/count profile recomputed from the loaded safetensors weight set.
+    pub fn source_tensor_dtype_profile(&self) -> &LensForgeSourceTensorDtypeProfile {
+        &self.source_tensor_dtype_profile
+    }
+
+    /// Frozen dtype requested from the Qwen safetensors loader.
+    pub fn loader_target_dtype(&self) -> &'static str {
+        self.execution_attestation.loader_target_dtype
+    }
+
+    /// Dtype observed from a real full-forward primary hidden activation.
+    pub fn observed_primary_activation_dtype(&self) -> &'static str {
+        self.execution_attestation.observed_primary_activation_dtype
+    }
+
+    /// Frozen device on which the full-forward attestation tensor was observed.
+    pub fn observed_execution_device(&self) -> &str {
+        &self.execution_attestation.observed_device
+    }
+
+    /// Method used to obtain the dtype and device observation.
+    pub fn dtype_attestation_evidence(&self) -> &'static str {
+        self.execution_attestation.evidence_kind
     }
 
     pub const fn runtime_name(&self) -> &'static str {
@@ -269,15 +304,22 @@ impl Lens for FastembedQwen3Lens {
         })();
         let accumulation = verify_f32_gemm_accumulation(self.device_policy, self.precision);
         if let Err(error) = accumulation {
-            return Err(qwen3_runtime_context(
+            return Err(qwen3_attested_runtime_context(
                 error,
                 "gemm_accumulation_verify",
                 self.device_policy,
-                self.precision,
+                &self.source_tensor_dtype_profile,
+                &self.execution_attestation,
             ));
         }
         result.map_err(|error| {
-            qwen3_runtime_context(error, "inference", self.device_policy, self.precision)
+            qwen3_attested_runtime_context(
+                error,
+                "inference",
+                self.device_policy,
+                &self.source_tensor_dtype_profile,
+                &self.execution_attestation,
+            )
         })
     }
 }
@@ -310,18 +352,61 @@ pub(crate) fn qwen3_runtime_context(
     stage: &str,
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
 ) -> CalyxError {
     CalyxError {
         code: error.code,
         message: format!(
-            "qwen3 stage={stage} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            "qwen3 stage={stage} device_policy={} source_tensor_dtype_profile={} loader_target_dtype={} observed_primary_activation_dtype=unattested observed_execution_device=unattested dtype_attestation_evidence=unattested gemm_accumulation_dtype=f32 output_dtype=f32: {}",
             device_policy.detail(),
-            precision.as_str(),
+            source_tensor_dtype_profile.summary(),
             precision.as_str(),
             error.message
         ),
         remediation: error.remediation,
     }
+}
+
+fn qwen3_attested_runtime_context(
+    error: CalyxError,
+    stage: &str,
+    device_policy: CandleDevicePolicy,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+    attestation: &LocalModelExecutionAttestation,
+) -> CalyxError {
+    CalyxError {
+        code: error.code,
+        message: format!(
+            "qwen3 stage={stage} device_policy={} source_tensor_dtype_profile={} loader_target_dtype={} observed_primary_activation_dtype={} observed_execution_device={} dtype_attestation_evidence={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            device_policy.detail(),
+            source_tensor_dtype_profile.summary(),
+            attestation.loader_target_dtype,
+            attestation.observed_primary_activation_dtype,
+            attestation.observed_device,
+            attestation.evidence_kind,
+            error.message
+        ),
+        remediation: error.remediation,
+    }
+}
+
+pub(crate) fn qwen3_corpus_hash(
+    model_id: &str,
+    execution_device: &str,
+    precision: CandlePrecision,
+    max_tokens: usize,
+    source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+) -> [u8; 32] {
+    let max_tokens = max_tokens.to_string();
+    sha256_digest(&[
+        b"fastembed-qwen3-text-v4",
+        model_id.as_bytes(),
+        execution_device.as_bytes(),
+        precision.as_str().as_bytes(),
+        max_tokens.as_bytes(),
+        source_tensor_dtype_profile.fingerprint_sha256.as_bytes(),
+        b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output,source-dtype-profile-v1,full-forward-dtype-attestation",
+    ])
 }
 
 pub(crate) fn config_invalid(message: impl Into<String>) -> CalyxError {

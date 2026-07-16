@@ -5,15 +5,17 @@ use std::time::Instant;
 
 use calyx_core::{Input, Lens, SlotShape, SlotVector, SparseEntry};
 use calyx_registry::{
-    CandleLens, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens, LensRuntime,
-    LensSpec, MultimodalAdapterLens, OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
-    lens_spec_from_manifest_path,
+    CandleLens, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
+    LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, MultimodalAdapterLens,
+    OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens, lens_spec_from_manifest_path,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::flags::Flags;
-use super::support::{dim, runtime_name, slot_norm, slot_prefix, validate_vector_contract};
+use super::support::{
+    dim, hex_from_bytes, runtime_name, slot_norm, slot_prefix, validate_vector_contract,
+};
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
 
@@ -24,8 +26,11 @@ struct ExplainReport {
     name: String,
     runtime: String,
     runtime_detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     declared_model_dtype: String,
-    executed_model_dtype: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_execution_attestation: Option<LocalExecutionAttestationReport>,
     gemm_accumulation_dtype: String,
     output_dtype: String,
     shape: ShapeReport,
@@ -67,10 +72,21 @@ struct ShapeReport {
     token_dim: Option<u32>,
 }
 
+#[derive(Serialize)]
+struct LocalExecutionAttestationReport {
+    executable_lens_id: String,
+    executable_corpus_hash: String,
+    loader_target_dtype: String,
+    observed_primary_activation_dtype: String,
+    observed_execution_device: String,
+    evidence_kind: String,
+}
+
 struct Measurement {
     vector: SlotVector,
+    source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     declared_model_dtype: String,
-    executed_model_dtype: String,
+    local_execution_attestation: Option<LocalExecutionAttestationReport>,
     gemm_accumulation_dtype: String,
     output_dtype: String,
     rows: Option<u32>,
@@ -107,8 +123,9 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         name: spec.name,
         runtime: runtime_name(&spec.runtime).to_string(),
         runtime_detail: measurement.runtime_detail,
+        source_tensor_dtype_profile: measurement.source_tensor_dtype_profile,
         declared_model_dtype: measurement.declared_model_dtype,
-        executed_model_dtype: measurement.executed_model_dtype,
+        local_execution_attestation: measurement.local_execution_attestation,
         gemm_accumulation_dtype: measurement.gemm_accumulation_dtype,
         output_dtype: measurement.output_dtype,
         shape: shape_report(spec.output),
@@ -321,8 +338,9 @@ fn measure_static_lookup(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRe
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: lens.dtype().as_str().to_string(),
-        executed_model_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: NOT_APPLICABLE_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: Some(lens.row_count()),
@@ -344,9 +362,10 @@ fn measure_tei(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         // TEI does not attest model or execution dtype in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -360,11 +379,19 @@ fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Me
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: Some(lens.source_tensor_dtype_profile().clone()),
         declared_model_dtype: match &spec.runtime {
             LensRuntime::CandleLocal { dtype, .. } => dtype.clone(),
             _ => UNKNOWN_DTYPE.to_string(),
         },
-        executed_model_dtype: lens.precision().as_str().to_string(),
+        local_execution_attestation: Some(LocalExecutionAttestationReport {
+            executable_lens_id: lens.id().to_string(),
+            executable_corpus_hash: hex_from_bytes(&lens.contract().corpus_hash()),
+            loader_target_dtype: lens.loader_target_dtype().to_string(),
+            observed_primary_activation_dtype: lens.observed_primary_activation_dtype().to_string(),
+            observed_execution_device: lens.observed_execution_device().to_string(),
+            evidence_kind: lens.dtype_attestation_evidence().to_string(),
+        }),
         gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -378,9 +405,10 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         // ONNX graph and execution dtype are not preserved in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -394,8 +422,9 @@ fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRes
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -413,8 +442,9 @@ fn measure_fastembed_sparse(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -432,8 +462,9 @@ fn measure_fastembed_bgem3(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -451,8 +482,9 @@ fn measure_fastembed_reranker(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -470,11 +502,19 @@ fn measure_fastembed_qwen3(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: Some(lens.source_tensor_dtype_profile().clone()),
         declared_model_dtype: match &spec.runtime {
             LensRuntime::FastembedQwen3 { dtype, .. } => dtype.clone(),
             _ => UNKNOWN_DTYPE.to_string(),
         },
-        executed_model_dtype: lens.precision().as_str().to_string(),
+        local_execution_attestation: Some(LocalExecutionAttestationReport {
+            executable_lens_id: lens.id().to_string(),
+            executable_corpus_hash: hex_from_bytes(&lens.contract().corpus_hash()),
+            loader_target_dtype: lens.loader_target_dtype().to_string(),
+            observed_primary_activation_dtype: lens.observed_primary_activation_dtype().to_string(),
+            observed_execution_device: lens.observed_execution_device().to_string(),
+            evidence_kind: lens.dtype_attestation_evidence().to_string(),
+        }),
         gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -496,8 +536,9 @@ fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResul
     };
     Ok(Measurement {
         vector,
+        source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
-        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        local_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
