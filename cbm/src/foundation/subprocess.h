@@ -7,8 +7,9 @@
  * Beyond a plain spawn+wait it adds the two things a supervisor needs and the
  * ad-hoc harness lacked:
  *   1. Exit CLASSIFICATION — {clean, exit-nonzero, crash, hang, killed} — from
- *      POSIX WIFSIGNALED/WTERMSIG and the Windows NTSTATUS exception exit codes
- *      (0xC0000005 access-violation, 0xC00000FD stack-overflow, …).
+ *      POSIX WIFSIGNALED/WTERMSIG, Windows NTSTATUS exception exit codes
+ *      (0xC0000005 access-violation, 0xC00000FD stack-overflow, …), and
+ *      GCC/MinGW SEH C++ exception markers (0x20474343 / 0x21474343).
  *   2. A quiet-timeout — kill + report HANG when the child makes no progress
  *      (emits no new log line) for a configurable window. This catches external
  *      tree-sitter scanners that infinite-loop (a hang, not a crash).
@@ -28,7 +29,8 @@ typedef enum {
     CBM_PROC_CLEAN = 0,    /* exited with code 0 */
     CBM_PROC_EXIT_NONZERO, /* exited with a nonzero code (a graceful failure) */
     CBM_PROC_CRASH,        /* died from a fault: POSIX SIGSEGV/BUS/ILL/FPE/ABRT/SYS,
-                            * or a Windows NTSTATUS exception exit code (>= 0xC0000000) */
+                            * a Windows NTSTATUS exception exit code (>= 0xC0000000),
+                            * or a GCC/MinGW SEH C++ exception marker */
     CBM_PROC_HANG,         /* made no progress within the quiet-timeout; we killed it */
     CBM_PROC_KILLED,       /* terminated by a non-fault signal we did not initiate */
     CBM_PROC_SPAWN_FAILED  /* fork/exec/CreateProcess failed — no child ever ran */
@@ -70,7 +72,7 @@ typedef struct {
 int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out);
 
 /* Pure outcome classifier — exposed so the platform-specific exit-code mapping
- * (notably the Windows NTSTATUS crash codes) is unit-testable on every platform.
+ * (notably the Windows NTSTATUS/GCC-SEH crash codes) is unit-testable on every platform.
  *   exited_normally: the child returned an exit code (POSIX WIFEXITED; always true
  *                    on Windows, which has no signals — crashes surface as codes).
  *   exit_code:       the exit / exception code (meaningful when exited_normally).

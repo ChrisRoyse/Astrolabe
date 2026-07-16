@@ -16,6 +16,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
+#include "foundation/log.h"        // cbm_log_warn — explicit preprocessor diagnostics
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -917,8 +918,15 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
+        CBMPreprocessStatus pp_status = CBM_PREPROCESS_NO_DIRECTIVES;
+        char *pp_diagnostic = NULL;
         char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
-                                        language != CBM_LANG_C);
+                                        language != CBM_LANG_C, &pp_status, &pp_diagnostic);
+        if (pp_status == CBM_PREPROCESS_FAILED) {
+            cbm_log_warn("preprocessor.failed", "reason",
+                         pp_diagnostic ? pp_diagnostic : "unknown", "file",
+                         rel_path ? rel_path : "<input>");
+        }
         if (expanded) {
             int expanded_len = (int)strlen(expanded);
             // Record calls count before second pass
@@ -971,6 +979,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             atomic_fetch_add(&total_files_preprocessed, 1);
             (void)calls_before; // used for future logging
         }
+        cbm_preprocess_diagnostic_free(pp_diagnostic);
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
     }
 

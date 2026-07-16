@@ -28,8 +28,20 @@
 
 /* NTSTATUS severity ERROR (top two bits set) covers the Windows crash exception
  * exit codes: 0xC0000005 (access violation), 0xC00000FD (stack overflow),
- * 0xC000001D (illegal instruction), 0xC0000094 (integer divide by zero), … */
+ * 0xC000001D (illegal instruction), 0xC0000094 (integer divide by zero), …
+ *
+ * GCC/MinGW SEH C++ exception markers are user-defined exception codes with a
+ * success severity nibble, so they do not satisfy >= 0xC0000000 even though a
+ * worker terminating with one is an unhandled C++ exception, not a graceful
+ * application exit. */
 #define CBM_WIN_CRASH_CODE_MIN 0xC0000000u
+#define CBM_WIN_GCC_THROW 0x20474343u
+#define CBM_WIN_GCC_UNWIND 0x21474343u
+
+static bool cbm_is_windows_crash_exit(unsigned code) {
+    return code >= CBM_WIN_CRASH_CODE_MIN || code == CBM_WIN_GCC_THROW ||
+           code == CBM_WIN_GCC_UNWIND;
+}
 
 #ifndef _WIN32
 static bool cbm_is_fault_signal(int sig) {
@@ -63,9 +75,9 @@ cbm_proc_outcome_t cbm_proc_classify(bool exited_normally, int exit_code, int te
 #endif
         return CBM_PROC_KILLED;
     }
-    /* Exited with a code. A Windows NTSTATUS exception code is a crash; on POSIX
+    /* Exited with a code. A Windows exception/GCC-SEH marker code is a crash; on POSIX
      * exit codes are 0..255 so this branch never misfires there. */
-    if ((unsigned)exit_code >= CBM_WIN_CRASH_CODE_MIN) {
+    if (cbm_is_windows_crash_exit((unsigned)exit_code)) {
         return CBM_PROC_CRASH;
     }
     return (exit_code == 0) ? CBM_PROC_CLEAN : CBM_PROC_EXIT_NONZERO;

@@ -2707,10 +2707,8 @@ static void simplifyHasInclude(simplecpp::TokenList &expr, const simplecpp::DUI 
     }
 }
 
-/** Evaluate name
- * @throws std::runtime_error thrown on undefined function-like macro
- */
-static void simplifyName(simplecpp::TokenList &expr)
+/** Evaluate name. Returns false with error on an undefined function-like macro. */
+static bool simplifyName(simplecpp::TokenList &expr, std::string *error)
 {
     for (simplecpp::Token *tok = expr.front(); tok; tok = tok->next) {
         if (tok->name) {
@@ -2725,11 +2723,15 @@ static void simplifyName(simplecpp::TokenList &expr)
                 if (alt)
                     continue;
             }
-            if (tok->next && tok->next->str() == "(")
-                throw std::runtime_error("undefined function-like macro invocation: " + tok->str() + "( ... )");
+            if (tok->next && tok->next->str() == "(") {
+                if (error)
+                    *error = "undefined function-like macro invocation: " + tok->str() + "( ... )";
+                return false;
+            }
             tok->setstr("0");
         }
     }
+    return true;
 }
 
 /*
@@ -2979,19 +2981,24 @@ static void simplifyComments(simplecpp::TokenList &expr)
 
 /**
  * @throws std::runtime_error thrown on invalid literals, missing sizeof arguments or invalid expressions,
- * missing __has_include() arguments or expressions, undefined function-like macros, invalid number literals
+ * missing __has_include() arguments or expressions, invalid number literals
  * @throws std::overflow_error thrown on overflow or division by zero
  */
-static long long evaluate(simplecpp::TokenList &expr, const simplecpp::DUI &dui, const std::map<std::string, std::size_t> &sizeOfType)
+static bool evaluate(simplecpp::TokenList &expr, const simplecpp::DUI &dui, const std::map<std::string, std::size_t> &sizeOfType, long long *result, std::string *error)
 {
+    if (result)
+        *result = 0;
     simplifyComments(expr);
     simplifySizeof(expr, sizeOfType);
     simplifyHasInclude(expr, dui);
-    simplifyName(expr);
+    if (!simplifyName(expr, error))
+        return false;
     simplifyNumbers(expr);
     expr.constFold();
     // TODO: handle invalid expressions
-    return expr.cfront() && expr.cfront() == expr.cback() && expr.cfront()->number ? stringToLL(expr.cfront()->str()) : 0LL;
+    if (result)
+        *result = expr.cfront() && expr.cfront() == expr.cback() && expr.cfront()->number ? stringToLL(expr.cfront()->str()) : 0LL;
+    return true;
 }
 
 static const simplecpp::Token *gotoNextLine(const simplecpp::Token *tok)
@@ -3718,15 +3725,45 @@ void simplecpp::preprocess(simplecpp::TokenList &output, const simplecpp::TokenL
                         tok = tmp->previous;
                     }
                     try {
+                        std::string eval_error;
+                        long long result = 0;
                         if (ifCond) {
                             std::string E;
                             for (const simplecpp::Token *tok = expr.cfront(); tok; tok = tok->next)
                                 E += (E.empty() ? "" : " ") + tok->str();
-                            const long long result = evaluate(expr, dui, sizeOfType);
+                            if (!evaluate(expr, dui, sizeOfType, &result, &eval_error)) {
+                                if (outputList) {
+                                    std::string msg = "failed to evaluate " + std::string(rawtok->str() == IF ? "#if" : "#elif") + " condition";
+                                    if (!eval_error.empty())
+                                        msg += std::string(", ") + eval_error;
+                                    Output out{
+                                        Output::SYNTAX_ERROR,
+                                        rawtok->location,
+                                        std::move(msg)
+                                    };
+                                    outputList->emplace_back(std::move(out));
+                                }
+                                output.clear();
+                                return;
+                            }
                             conditionIsTrue = (result != 0);
                             ifCond->emplace_back(rawtok->location, E, result);
                         } else {
-                            const long long result = evaluate(expr, dui, sizeOfType);
+                            if (!evaluate(expr, dui, sizeOfType, &result, &eval_error)) {
+                                if (outputList) {
+                                    std::string msg = "failed to evaluate " + std::string(rawtok->str() == IF ? "#if" : "#elif") + " condition";
+                                    if (!eval_error.empty())
+                                        msg += std::string(", ") + eval_error;
+                                    Output out{
+                                        Output::SYNTAX_ERROR,
+                                        rawtok->location,
+                                        std::move(msg)
+                                    };
+                                    outputList->emplace_back(std::move(out));
+                                }
+                                output.clear();
+                                return;
+                            }
                             conditionIsTrue = (result != 0);
                         }
                     } catch (const std::runtime_error &e) {
