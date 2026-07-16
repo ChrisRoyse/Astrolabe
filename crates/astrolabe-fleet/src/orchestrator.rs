@@ -86,6 +86,13 @@ pub const ASTRO_FLEET_PIPELINE_SPAWN: &str = "ASTRO_FLEET_PIPELINE_SPAWN";
 pub const ASTRO_FLEET_PIPELINE_INCOMPLETE: &str = "ASTRO_FLEET_PIPELINE_INCOMPLETE";
 /// Refusal code when the fleet store root cannot be prepared.
 pub const ASTRO_FLEET_STORE_UNAVAILABLE: &str = "ASTRO_FLEET_STORE_UNAVAILABLE";
+/// Refusal code when the fleet store total exceeds the declared byte budget
+/// (#454): the pass stops launching new repos and fails closed with an
+/// eviction remediation — never a silent stop.
+pub const ASTRO_FLEET_STORE_BUDGET: &str = "ASTRO_FLEET_STORE_BUDGET";
+/// Refusal code when a repo's store directory pre-exists with content the
+/// pipeline does not recognize as its own (#454): refuse, never overwrite.
+pub const ASTRO_FLEET_STORE_FOREIGN: &str = "ASTRO_FLEET_STORE_FOREIGN";
 
 /// Declared default fleet store root (per-repo CBM cache/vault sets).
 pub const DEFAULT_STORE_ROOT: &str = r"D:\astrolabe-fleet\store";
@@ -138,6 +145,11 @@ pub struct PipelineConfig {
     pub timeout_secs: u64,
     /// Re-run repos already `kerneled` and refresh their recorded facts.
     pub force: bool,
+    /// Declared fleet store byte budget (#454). `None` = unbudgeted. When the
+    /// measured store-root total reaches this, the pass stops launching new
+    /// repos, drains in-flight work, and fails closed with an eviction
+    /// remediation naming the largest stores.
+    pub store_budget_bytes: Option<u64>,
     /// Mutation timestamp (unix seconds).
     pub at_unix_secs: u64,
 }
@@ -157,6 +169,7 @@ impl PipelineConfig {
             parallelism: DEFAULT_PIPELINE_PARALLELISM,
             timeout_secs: DEFAULT_PIPELINE_TIMEOUT_SECS,
             force: false,
+            store_budget_bytes: None,
             at_unix_secs,
         }
     }
@@ -216,6 +229,9 @@ pub struct RepoVerdict {
     /// pipeline redone from scratch (the documented resume semantic) — labeled
     /// here so recovery is never a silent fallback (invariant 3).
     pub wiped_partial_store: bool,
+    /// Measured on-disk bytes of the repo's store directory after the
+    /// pipeline (#454); recorded on the catalog row at `kerneled`.
+    pub store_bytes: Option<u64>,
     /// Wall seconds spent on this repo.
     pub secs: f64,
 }
@@ -281,6 +297,7 @@ pub fn run_pipeline_pass(
                         kernel_member_count: None,
                         stage_ms: BTreeMap::new(),
                         wiped_partial_store: false,
+                        store_bytes: None,
                         secs: 0.0,
                     });
                 }
@@ -301,11 +318,35 @@ pub fn run_pipeline_pass(
     let verdicts_dir = runs_dir.join(format!("verdicts-{}", config.at_unix_secs));
     let rejections_dir = runs_dir.join(format!("rejections-{}", config.at_unix_secs));
 
+    // #454 disk budget: measured once at pass start, then advanced by each
+    // completed repo's measured store bytes — the walk stays O(store) once
+    // per pass instead of once per repo.
+    let mut store_total_bytes = match config.store_budget_bytes {
+        Some(_) => Some(dir_size_bytes(&config.store_root).map_err(|error| CalyxError {
+            code: ASTRO_FLEET_STORE_UNAVAILABLE,
+            message: format!(
+                "cannot measure store root {} for budget accounting: {error}",
+                config.store_root.display()
+            ),
+            remediation: "the store root must be readable when --store-budget-bytes is set",
+        })?),
+        None => None,
+    };
+    let mut budget_exhausted_at: Option<u64> = None;
+
     let mut queue: std::collections::VecDeque<FleetRepoRow> = selected.into();
     let mut in_flight = 0_usize;
     let (tx, rx) = mpsc::channel::<JobResult>();
     loop {
         while in_flight < config.parallelism.max(1) {
+            if let (Some(budget), Some(total)) = (config.store_budget_bytes, store_total_bytes)
+                && total >= budget
+            {
+                // Stop launching; in-flight repos drain and are recorded, the
+                // pass then fails closed below (nothing silent).
+                budget_exhausted_at = Some(total);
+                break;
+            }
             let Some(row) = queue.pop_front() else { break };
             let tx = tx.clone();
             let config_for_job = config.clone();
@@ -400,9 +441,19 @@ pub fn run_pipeline_pass(
             "json",
             &serde_json::to_string_pretty(&verdict).expect("verdict serializes"),
         );
+        // Advance the budget total by freshly created stores. Wiped-partial
+        // and resumed stores make this a conservative overestimate (their torn
+        // bytes were counted in the pass-start walk too) — the budget is a
+        // guardrail, so overestimating is the safe direction.
+        if let (Some(total), Some(bytes)) = (store_total_bytes.as_mut(), verdict.store_bytes)
+            && matches!(verdict.outcome, Outcome::Kerneled | Outcome::Resumed)
+        {
+            *total += bytes;
+        }
         verdicts.push(verdict);
     }
     drop(tx);
+    let unattempted_budget = queue.len();
 
     let count = |outcome: Outcome| verdicts.iter().filter(|v| v.outcome == outcome).count();
     let wall_secs = started.elapsed().as_secs_f64();
@@ -416,6 +467,7 @@ pub fn run_pipeline_pass(
         "stale": count(Outcome::Stale),
         "skipped_state": count(Outcome::SkippedState),
         "quarantined": count(Outcome::Quarantined),
+        "unattempted_budget": if budget_exhausted_at.is_some() { unattempted_budget } else { 0 },
         "total": verdicts.len(),
     });
     let repos_per_hour = if wall_secs > 0.0 {
@@ -455,6 +507,33 @@ pub fn run_pipeline_pass(
     let (commit_seq, ledger_seq) = catalog.record_run_report(&run_id, report_bytes, summary)?;
 
     let failed = count(Outcome::Quarantined);
+    if let Some(total) = budget_exhausted_at {
+        let budget = config.store_budget_bytes.unwrap_or(0);
+        let mut largest: Vec<(&str, u64)> = all_rows
+            .iter()
+            .filter_map(|row| {
+                row.store_bytes
+                    .map(|bytes| (row.record.full_name.as_str(), bytes))
+            })
+            .collect();
+        largest.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        largest.truncate(3);
+        let largest_text = largest
+            .iter()
+            .map(|(name, bytes)| format!("{name}={bytes}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CalyxError {
+            code: ASTRO_FLEET_STORE_BUDGET,
+            message: format!(
+                "fleet store total {total} bytes reached the declared budget {budget}; \
+                 {unattempted_budget} selected repo(s) were not attempted ({failed} quarantined this pass); \
+                 largest recorded stores: [{largest_text}]; report {}",
+                report_path.display()
+            ),
+            remediation: "evict or archive the largest stores (catalog store_bytes, named in the message) or raise --store-budget-bytes, then re-run — completed repos are idempotent",
+        });
+    }
     if failed > 0 {
         return Err(CalyxError {
             code: ASTRO_FLEET_PIPELINE_INCOMPLETE,
@@ -495,6 +574,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         kernel_member_count: None,
         stage_ms: BTreeMap::new(),
         wiped_partial_store: wiped_partial_store.get(),
+        store_bytes: None,
         secs: started.elapsed().as_secs_f64(),
     };
     let fail = move |stage: &str, detail: String, rejection: Option<String>| JobResult {
@@ -573,8 +653,20 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     } else if row.state == RepoState::Cloned {
         // Never-transitioned record: a leftover store dir is a torn partial
         // run — remove and redo (documented resume semantic, labeled in the
-        // verdict via `wiped_partial_store`).
+        // verdict via `wiped_partial_store`). But only a dir this pipeline
+        // recognizes as its own may be wiped: anything else is foreign
+        // content and the job refuses rather than overwrite (#454).
         if store_dir.exists() {
+            if let Some(foreign) = foreign_store_entry(&store_dir, &project) {
+                return fail(
+                    "preflight",
+                    format!(
+                        "{ASTRO_FLEET_STORE_FOREIGN}: store dir {} pre-exists with unrecognized entry {foreign:?}; refusing to remove it — move the foreign content aside or point --store-root elsewhere",
+                        store_dir.display()
+                    ),
+                    None,
+                );
+            }
             if let Err(error) = fs::remove_dir_all(&store_dir) {
                 return fail(
                     "preflight",
@@ -819,6 +911,23 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         }
     };
 
+    // #454 disk accounting: the store's measured on-disk bytes ride the
+    // `kerneled` transition (or the `--force` fact refresh) onto the catalog
+    // row. Measured after verification so the number covers the final store.
+    let store_bytes = match dir_size_bytes(&store_dir) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return fail(
+                "verify",
+                format!(
+                    "cannot measure store dir {} for disk accounting: {error}",
+                    store_dir.display()
+                ),
+                None,
+            );
+        }
+    };
+
     // Stage the catalog mutations for the main thread.
     let watermark = format!("vault:{vault_fingerprint}");
     let mut transitions = Vec::new();
@@ -839,6 +948,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                 TransitionContext {
                     at_unix_secs: config.at_unix_secs,
                     kernel_scope_id: Some(scope.clone()),
+                    store_bytes: Some(store_bytes),
                     ..TransitionContext::default()
                 },
             ));
@@ -852,6 +962,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                     head_commit_hash: Some(head.clone()),
                     index_watermark: Some(watermark.clone()),
                     kernel_scope_id: Some(scope.clone()),
+                    store_bytes: Some(store_bytes),
                     ..TransitionContext::default()
                 },
             ));
@@ -863,6 +974,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                 head_commit_hash: Some(head.clone()),
                 index_watermark: Some(watermark.clone()),
                 kernel_scope_id: Some(scope.clone()),
+                store_bytes: Some(store_bytes),
                 ..TransitionContext::default()
             });
             Outcome::Refreshed
@@ -895,12 +1007,105 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             kernel_member_count: Some(kernel_member_count),
             stage_ms,
             wiped_partial_store: wiped_partial_store.get(),
+            store_bytes: Some(store_bytes),
             secs: started.elapsed().as_secs_f64(),
         },
         rejection_text: None,
         transitions,
         fact_refresh,
     }
+}
+
+/// Reads back every Base-CF key of a project's shadow vault as lowercase hex,
+/// sorted — the #454 SHADOW_VAULT_ID soundness probe primitive. Two projects
+/// holding a byte-identical file must still produce disjoint key sets, because
+/// CxId derivation is salted per project ([`shadow_vault_salt`]) even though
+/// the vault ULID is shared; intersecting two projects' key dumps proves (or
+/// falsifies) that independently of the writer.
+pub fn vault_base_keys(store_root: &Path, project: &str) -> Result<Vec<String>, CalyxError> {
+    let vault_dir = store_root.join(project).join(format!("{project}.astrolabe-vault"));
+    let vault_id = VaultId::from_str(SHADOW_VAULT_ID).map_err(|error| CalyxError {
+        code: ASTRO_FLEET_STORE_UNAVAILABLE,
+        message: format!("shadow vault id failed to parse: {error:?}"),
+        remediation: "internal defect: SHADOW_VAULT_ID must be a valid ULID",
+    })?;
+    let vault = AsterVault::open(
+        &vault_dir,
+        vault_id,
+        shadow_vault_salt(project).into_bytes(),
+        VaultOptions {
+            read_only: true,
+            ..VaultOptions::default()
+        },
+    )?;
+    let mut keys: Vec<String> = vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Base)?
+        .into_iter()
+        .map(|(key, _)| {
+            key.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// Recursive on-disk byte count of `dir` (regular files only; reparse points
+/// are not followed). Used for #454 disk accounting and budget enforcement.
+fn dir_size_bytes(dir: &Path) -> Result<u64, String> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current)
+            .map_err(|error| format!("read_dir {}: {error}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("read_dir entry: {error}"))?;
+            let meta = entry
+                .metadata()
+                .map_err(|error| format!("metadata {}: {error}", entry.path().display()))?;
+            if meta.is_dir() && !meta.is_symlink() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Returns the first entry of `store_dir` this pipeline does not recognize as
+/// its own output for `project`, or `None` when every entry is recognized
+/// (#454: only a recognized store may be wiped for a clean re-run).
+fn foreign_store_entry(store_dir: &Path, project: &str) -> Option<String> {
+    const FIXED: [&str; 5] = [
+        "_config.db",
+        "index-args.json",
+        "pipeline-stdout.json",
+        "pipeline-stderr.txt",
+        "logs",
+    ];
+    let entries = match fs::read_dir(store_dir) {
+        Ok(entries) => entries,
+        // Unreadable = unknown = foreign; the caller refuses.
+        Err(error) => return Some(format!("<unreadable store dir: {error}>")),
+    };
+    for entry in entries {
+        let name = match entry {
+            Ok(entry) => entry.file_name().to_string_lossy().into_owned(),
+            Err(error) => return Some(format!("<unreadable entry: {error}>")),
+        };
+        let recognized = FIXED.contains(&name.as_str())
+            || name.starts_with(&format!("{project}."))
+            || name.starts_with("_config.db");
+        if !recognized {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Independent persisted-state readback: CBM sqlite counts, shadow-vault Base
