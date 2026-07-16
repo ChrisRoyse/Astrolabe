@@ -9,6 +9,9 @@ use astrolabe_anchors::{
     OutcomeAnchorRequest, OutcomeKind, OutcomeSubject, ingest_outcome_anchors,
 };
 use astrolabe_bridge::{CbmIndexMode, CbmPipeline, CbmPipelineNodeRow, CbmPipelineRows};
+// #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
+// checkout and the farm never disagree on what NTFS can hold.
+use astrolabe_fleet::clone_farm::windows_invalid_path;
 use astrolabe_ingest::{HistoricalSymbolLocation, admit_historical_symbol_snapshot};
 use calyx_core::{AnchorKind, AnchorValue};
 
@@ -157,6 +160,14 @@ pub(crate) struct GitArchaeologyImportReport {
     /// a cleanup that cannot complete degrades to a counted remnant, never a
     /// silently swallowed `let _`.
     pub(crate) cleanup_remnants: usize,
+    /// Implicated files excluded from the file-scoped historical checkout because the
+    /// committed filename is not representable on NTFS (#502) — control bytes, reserved
+    /// characters/device names, trailing dot/space (the
+    /// [`astrolabe_fleet::clone_farm::windows_invalid_path`] class). A labeled, counted
+    /// degradation (invariant 3): the excluded file's evidence lands as
+    /// `evidence_without_symbol`, and the pass never aborts repo-fatally the way an
+    /// unfiltered `git checkout` of such a path did before the fix.
+    pub(crate) historical_paths_windows_invalid: usize,
     /// Provenance label for the git history this pass mined (#434, invariant 1/3:
     /// no unlabeled claim, no silent fallback). `own_repo` when the corpus IS its
     /// own git toplevel (`.git` at the corpus root); `parent_repo` when the corpus
@@ -414,6 +425,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             index_ms_total += one_index_start.elapsed().as_millis();
         }
         report.cleanup_remnants += indexed.cleanup_remnants;
+        report.historical_paths_windows_invalid += indexed.windows_invalid_excluded;
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
             report.evidence_without_symbol += group.len();
@@ -501,11 +513,13 @@ const ARCHAEOLOGY_CLEANUP_ATTEMPTS: u32 = 6;
 /// 160 ms), bounded so a genuinely stuck handle never blocks the import.
 const ARCHAEOLOGY_CLEANUP_BACKOFF_BASE: Duration = Duration::from_millis(10);
 
-/// Outcome of indexing one historical commit: the pipeline rows plus the count
-/// of scratch paths that could not be removed after the bounded retry budget.
+/// Outcome of indexing one historical commit: the pipeline rows, the count of
+/// scratch paths that could not be removed after the bounded retry budget, and the
+/// count of implicated files excluded as Windows-invalid (#502) at this commit.
 struct HistoricalCommitIndex {
     rows: CbmPipelineRows,
     cleanup_remnants: usize,
+    windows_invalid_excluded: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -544,11 +558,15 @@ fn index_historical_commit(
     // #439: materialize ONLY the implicated files (file-scoped) or the whole member
     // subtree (pre-#439). Both leave `scoped_root` (below) at the same base, so CBM
     // emits byte-identical subtree-relative node paths in either mode.
-    if file_scoped {
-        add_historical_worktree_files(repo, &worktree, commit, corpus_rel, implicated_files)?;
+    // #502: the file-scoped path filters out committed filenames NTFS cannot represent
+    // and returns how many it excluded at this commit; the whole-subtree path materializes
+    // a full checkout git already validated, so it excludes none.
+    let windows_invalid_excluded = if file_scoped {
+        add_historical_worktree_files(repo, &worktree, commit, corpus_rel, implicated_files)?
     } else {
         add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
-    }
+        0
+    };
     let indexed = (|| -> Result<CbmPipelineRows, DynError> {
         // Scope the historical index to the requested corpus subtree within the
         // whole-repo worktree (#403). A git worktree is always the full repository
@@ -619,6 +637,7 @@ fn index_historical_commit(
         (Ok(rows), Ok(())) => Ok(HistoricalCommitIndex {
             rows,
             cleanup_remnants,
+            windows_invalid_excluded,
         }),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -863,13 +882,27 @@ fn add_historical_worktree(
 /// (which indexes the subtree without that file). When no implicated file is present
 /// at the commit, nothing is checked out and `scoped_root.exists()` is false, yielding
 /// zero rows — the same graceful zero-evidence outcome as an absent subtree.
+///
+/// A committed filename NTFS cannot represent — control bytes, reserved characters
+/// (`: < > " | ? *`), reserved device names, trailing dot/space (exactly the class
+/// [`astrolabe_fleet::clone_farm::windows_invalid_path`] detects, shared with the
+/// clone farm's #480 checkout classifier) — can never be checked out on Windows: a
+/// batched `git checkout` that includes it dies with `error: invalid path`, which
+/// before #502 aborted the whole historical-index pass (repo-fatal). Such paths are
+/// filtered out here and returned as a LABELED, COUNTED exclusion (invariant 3), never
+/// a quarantine and never a silent drop: the excluded file simply is not materialized,
+/// its evidence lands as `evidence_without_symbol` upstream exactly as an absent file,
+/// and the remaining representable implicated files still check out and mine normally.
+/// A genuine `git checkout` failure on a REPRESENTABLE path stays fail-closed.
+///
+/// Returns the number of implicated paths excluded as Windows-invalid at this commit.
 fn add_historical_worktree_files(
     repo: &Path,
     worktree: &Path,
     commit: &str,
     corpus_rel: &str,
     implicated_files: &BTreeSet<String>,
-) -> Result<(), DynError> {
+) -> Result<usize, DynError> {
     git_checked(
         repo,
         &[
@@ -884,8 +917,10 @@ fn add_historical_worktree_files(
         ],
     )?;
     // Build the toplevel pathspec for each implicated file, dropping any that would
-    // escape the corpus and any not present in this commit's tree.
+    // escape the corpus, any NTFS cannot represent (#502), and any not present in this
+    // commit's tree.
     let mut present: Vec<String> = Vec::new();
+    let mut windows_invalid_excluded = 0usize;
     for rel in implicated_files {
         let toplevel_path = if corpus_rel.is_empty() {
             rel.clone()
@@ -902,24 +937,40 @@ fn add_historical_worktree_files(
         {
             continue;
         }
+        // #502: a committed filename NTFS cannot represent can never materialize on this
+        // host, so a `git checkout` that names it aborts the entire pass. Exclude it as a
+        // labeled, counted degradation (never a repo-fatal abort, never a quarantine); the
+        // dropped file's evidence lands as `evidence_without_symbol` upstream, matching the
+        // absent-file path. This mirrors the clone farm's #480 tree classifier, sharing the
+        // exact same predicate so the two never disagree on what Windows can hold.
+        if let Some(reason) = windows_invalid_path(toplevel_path.as_bytes()) {
+            eprintln!(
+                "astro.archaeology.windows_invalid_path commit={commit} path={toplevel_path:?} \
+                 reason={reason}"
+            );
+            windows_invalid_excluded += 1;
+            continue;
+        }
         if git_tree_has_path(repo, commit, &toplevel_path)? {
             present.push(toplevel_path);
         }
     }
     if present.is_empty() {
-        // No implicated file exists at this commit: materialize nothing. The caller's
-        // `scoped_root.exists()` gate then yields zero rows (evidence_without_symbol),
-        // matching the absent-subtree path — never an aborting empty checkout.
-        return Ok(());
+        // No representable implicated file exists at this commit: materialize nothing. The
+        // caller's `scoped_root.exists()` gate then yields zero rows (evidence_without_symbol),
+        // matching the absent-subtree path — never an aborting empty checkout. Any
+        // Windows-invalid exclusions are still surfaced through the returned count.
+        return Ok(windows_invalid_excluded);
     }
     // One batched checkout of exactly the present implicated files. All pathspecs are
-    // pre-filtered to exist, so git never errors on an unmatched pathspec.
+    // pre-filtered to exist and to be Windows-representable, so git never errors on an
+    // unmatched pathspec or an invalid path.
     let mut args: Vec<&str> = vec!["-c", "core.longpaths=true", "checkout", commit, "--"];
     for path in &present {
         args.push(path.as_str());
     }
     git_checked(worktree, &args)?;
-    Ok(())
+    Ok(windows_invalid_excluded)
 }
 
 /// Whether `commit`'s tree contains `path` (a toplevel-relative directory or file).
@@ -1049,6 +1100,10 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "skipped_large_commits": report.skipped_large_commits,
         "skipped_unresolvable_reverts": report.skipped_unresolvable_reverts,
         "cleanup_remnants": report.cleanup_remnants,
+        // #502 labeled degradation: implicated committed filenames NTFS cannot represent,
+        // excluded from the historical checkout and counted here instead of aborting the
+        // whole pass repo-fatally (invariant 3: every skip counted, never silent).
+        "historical_paths_windows_invalid": report.historical_paths_windows_invalid,
         "trust": "mixed",
         "provenance": "git_history",
         // #434 provenance labeling: the discovered git root, whether it is the
