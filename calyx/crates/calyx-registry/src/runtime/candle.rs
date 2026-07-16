@@ -19,13 +19,17 @@ mod options;
 mod pooling;
 
 use load::{
-    candle_error, config_invalid, ensure_file, fetch_files, needs_f32_finite_replay, read_config,
-    read_model, read_tokenizer,
+    candle_error, config_invalid, ensure_file, fetch_files, read_config, read_model,
+    read_tokenizer, with_runtime_context,
 };
 pub use options::{
-    CandleDevicePolicy, CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
-    default_cuda_fail_loud_policy,
+    CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV, CandleDeviceMode, CandleDevicePolicy,
+    CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
+    GPU_DEFAULT_CANDLE_PRECISION, configured_device_mode, configured_device_policy,
+    default_cuda_fail_loud_policy, default_precision_for_policy, device_policy_for_mode,
+    frozen_device_policy,
 };
+pub(crate) use options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
 use pooling::{apply_norm, pool_tokens};
 
 pub struct CandleLens {
@@ -39,8 +43,6 @@ pub struct CandleLens {
     max_tokens: usize,
     tokenizer: Tokenizer,
     model: Mutex<BertModel>,
-    finite_replay_model: Option<Mutex<BertModel>>,
-    finite_replay_precision: Option<CandlePrecision>,
 }
 
 impl CandleLens {
@@ -57,7 +59,7 @@ impl CandleLens {
     }
 
     pub fn from_hf_cache(name: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::from_hf_cache_with_device_policy(name, cache_dir, default_cuda_fail_loud_policy()?)
+        Self::from_hf_cache_with_device_policy(name, cache_dir, configured_device_policy()?)
     }
 
     pub fn from_hf_cache_with_device_policy(
@@ -81,13 +83,20 @@ impl CandleLens {
         max_tokens: usize,
         device_policy: CandleDevicePolicy,
     ) -> Result<Self> {
+        let model_id = model_id.into();
+        if model_id != DEFAULT_CANDLE_MODEL {
+            return Err(config_invalid(format!(
+                "Candle model {model_id} has no measured default precision; use from_model_with_options with an explicit model-specific precision and pooling policy"
+            )));
+        }
+        let precision = default_precision_for_policy(device_policy);
         Self::from_model_with_options(
             name,
             model_id,
             cache_dir,
             max_tokens,
             device_policy,
-            CandlePrecision::F32,
+            precision,
             CandlePoolingPolicy::Mean,
         )
     }
@@ -122,6 +131,13 @@ impl CandleLens {
     }
 
     pub fn from_files(spec: CandleFileSpec) -> Result<Self> {
+        if !spec.device_policy.is_gpu() && spec.precision != CandlePrecision::F32 {
+            return Err(config_invalid(format!(
+                "candle CPU placement {} requires f32, but the frozen lens declares {}; commission/select a distinct f32 lens for CPU execution",
+                spec.device_policy.detail(),
+                spec.precision.as_str()
+            )));
+        }
         ensure_file("config", &spec.config)?;
         ensure_file("tokenizer", &spec.tokenizer)?;
         ensure_file("weights", &spec.weights)?;
@@ -147,7 +163,7 @@ impl CandleLens {
                 spec.model_id
             )));
         }
-        let config = read_config(&spec.config, spec.device_policy, spec.precision)?;
+        let config = read_config(&spec.config)?;
         let dim = u32::try_from(config.hidden_size).map_err(|_| {
             CalyxError::lens_dim_mismatch(format!(
                 "candle hidden size {} exceeds u32",
@@ -163,20 +179,6 @@ impl CandleLens {
         }
         let tokenizer = read_tokenizer(&spec.tokenizer, spec.max_tokens)?;
         let model = read_model(&spec.weights, &config, spec.device_policy, spec.precision)?;
-        let (finite_replay_model, finite_replay_precision) =
-            if needs_f32_finite_replay(spec.device_policy, spec.precision) {
-                (
-                    Some(Mutex::new(read_model(
-                        &spec.weights,
-                        &config,
-                        spec.device_policy,
-                        CandlePrecision::F32,
-                    )?)),
-                    Some(CandlePrecision::F32),
-                )
-            } else {
-                (None, None)
-            };
         let files = CandleModelFiles {
             cache_dir: spec.cache_dir,
             model_id: spec.model_id,
@@ -187,17 +189,16 @@ impl CandleLens {
         };
         let max_tokens_text = spec.max_tokens.to_string();
         let norm_text = format!("{:?}", spec.norm_policy);
-        let finite_replay_text = finite_replay_precision
-            .map(CandlePrecision::as_str)
-            .unwrap_or("none");
+        let execution_device = spec.device_policy.frozen_token();
         let corpus_hash = sha256_digest(&[
-            b"candle-local-bert-v2",
+            b"candle-local-bert-v3",
             files.model_id.as_bytes(),
             max_tokens_text.as_bytes(),
+            execution_device.as_bytes(),
             spec.precision.as_str().as_bytes(),
             spec.pooling.as_str().as_bytes(),
             norm_text.as_bytes(),
-            finite_replay_text.as_bytes(),
+            b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output",
         ]);
         let contract = FrozenLensContract::new(
             spec.name,
@@ -220,8 +221,6 @@ impl CandleLens {
             max_tokens: spec.max_tokens,
             tokenizer,
             model: Mutex::new(model),
-            finite_replay_model,
-            finite_replay_precision,
         })
     }
 
@@ -229,6 +228,7 @@ impl CandleLens {
         let LensRuntime::CandleLocal {
             model_id,
             files,
+            device,
             dtype,
             pooling,
         } = &spec.runtime
@@ -257,7 +257,7 @@ impl CandleLens {
             tokenizer: tokenizer.clone(),
             weights: weights.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            device_policy: default_cuda_fail_loud_policy()?,
+            device_policy: frozen_device_policy(device)?,
             precision: CandlePrecision::parse(dtype)?,
             pooling: CandlePoolingPolicy::parse(pooling)?,
             norm_policy: spec.norm_policy,
@@ -291,16 +291,13 @@ impl CandleLens {
         self.max_tokens
     }
 
-    pub const fn finite_replay_precision(&self) -> Option<CandlePrecision> {
-        self.finite_replay_precision
-    }
-
     pub fn lens_spec(&self) -> LensSpec {
         LensSpec {
             name: self.contract.name().to_string(),
             runtime: LensRuntime::CandleLocal {
                 model_id: self.files.model_id.clone(),
                 files: self.files.artifact_paths(),
+                device: self.device_policy.frozen_token(),
                 dtype: self.precision.as_str().to_string(),
                 pooling: self.pooling.as_str().to_string(),
             },
@@ -335,27 +332,29 @@ impl Lens for CandleLens {
     }
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
-        let text = text_from_input(self, input)?;
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|err| CalyxError::lens_dim_mismatch(format!("tokenize failed: {err}")))?;
-        let ids = encoding.get_ids().to_vec();
-        let mask = encoding.get_attention_mask().to_vec();
-        match self.measure_with_model(&self.model, &ids, &mask) {
-            Ok(vector) => Ok(vector),
-            Err(error)
-                if error.code == "CALYX_LENS_NUMERICAL_INVARIANT"
-                    && self.finite_replay_model.is_some() =>
-            {
-                let model = self
-                    .finite_replay_model
-                    .as_ref()
-                    .expect("checked finite replay model presence");
-                self.measure_with_model(model, &ids, &mask)
-            }
-            Err(error) => Err(error),
+        let result = (|| {
+            configure_f32_gemm_accumulation(self.device_policy, self.precision)?;
+            let text = text_from_input(self, input)?;
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|err| CalyxError::lens_dim_mismatch(format!("tokenize failed: {err}")))?;
+            let ids = encoding.get_ids().to_vec();
+            let mask = encoding.get_attention_mask().to_vec();
+            self.measure_with_model(&self.model, &ids, &mask)
+        })();
+        let accumulation = verify_f32_gemm_accumulation(self.device_policy, self.precision);
+        if let Err(error) = accumulation {
+            return Err(with_runtime_context(
+                error,
+                "gemm_accumulation_verify",
+                self.device_policy,
+                self.precision,
+            ));
         }
+        result.map_err(|error| {
+            with_runtime_context(error, "inference", self.device_policy, self.precision)
+        })
     }
 }
 

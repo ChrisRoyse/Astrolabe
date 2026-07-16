@@ -28,11 +28,11 @@ The frozen contract hash is the Calyx length-delimited SHA-256 of `embeddings.cs
 - Empty input or all-OOV input returns a stable unit fallback vector `[1, 0, ...]`.
 - Dimension mismatch fails with `CALYX_LENS_DIM_MISMATCH`.
 - Matrix/tokenizer byte drift fails with `CALYX_LENS_FROZEN_VIOLATION`.
-- Static lookup uses CPU/RAM only; `calyx lens explain` reports `vram_bytes=0`.
+- Static lookup uses CPU/RAM only; `calyx lens explain` reports artifact bytes and does not mislabel them as VRAM.
 
 ## CLI Readback
 
-`calyx lens explain --manifest <manifest.json> --input <text> --repeat <n>` loads the static lens, measures the probe, and prints JSON with `runtime=static_lookup`, actual matrix dtype, row count, output norm, a short `first_values` vector prefix, timing, and VRAM bytes.
+`calyx lens explain --manifest <manifest.json> --input <text> --repeat <n>` loads the static lens, measures the probe, and prints JSON with `runtime=static_lookup`, actual matrix dtype, row count, output norm, a short `first_values` vector prefix, timing, and artifact bytes.
 
 ## Verification
 
@@ -54,4 +54,4 @@ Manual FSV source of truth:
 - manifest `artifact_set_sha256` equals the static runtime contract bytes
 - `$CALYX_HOME/lenses/catalog-db` persists the `static_lookup` lens as
   Calyx/Aster rows after `calyx lens add`
-- `calyx lens explain` reads the actual matrix/tokenizer, emits norm near `1.0`, dtype `int8`, and `vram_bytes=0`
+- `calyx lens explain` reads the actual matrix/tokenizer, emits norm near `1.0`, dtype `int8`, and reports artifact bytes separately from physical residency

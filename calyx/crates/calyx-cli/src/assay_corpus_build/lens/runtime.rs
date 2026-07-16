@@ -73,11 +73,33 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
         }
         LensRuntime::CandleLocal { files, .. } => {
             let lens = CandleLens::from_lens_spec(&spec).map_err(lens_error)?;
-            gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+            if lens.device_policy().placement() == Placement::Gpu {
+                gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+            } else {
+                let ram_mb = paths_mb(&files)?;
+                Ok(cpu_build_lens(
+                    manifest,
+                    spec,
+                    runtime,
+                    Box::new(lens),
+                    ram_mb,
+                ))
+            }
         }
         LensRuntime::FastembedQwen3 { files, .. } => {
             let lens = FastembedQwen3Lens::from_lens_spec(&spec).map_err(lens_error)?;
-            gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+            if lens.device_policy().placement() == Placement::Gpu {
+                gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+            } else {
+                let ram_mb = paths_mb(&files)?;
+                Ok(cpu_build_lens(
+                    manifest,
+                    spec,
+                    runtime,
+                    Box::new(lens),
+                    ram_mb,
+                ))
+            }
         }
         LensRuntime::FastembedSparse { files, .. } => {
             let lens = FastembedSparseLens::from_lens_spec(&spec).map_err(lens_error)?;

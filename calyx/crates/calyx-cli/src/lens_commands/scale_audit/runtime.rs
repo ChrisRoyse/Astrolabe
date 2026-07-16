@@ -1,17 +1,22 @@
 use calyx_core::{CalyxError, Lens, Modality, Placement};
 use calyx_registry::{
-    AlgorithmicLens, CandleLens, FastembedBgem3Lens, FastembedBgem3Output, FastembedQwen3Lens,
-    FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec, MultimodalAdapterLens,
-    OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
+    AlgorithmicLens, CandleDevicePolicy, CandleLens, FastembedBgem3Lens, FastembedBgem3Output,
+    FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec,
+    MultimodalAdapterLens, OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
     runtime::tei_http::DEFAULT_TEI_MAX_BATCH,
 };
 
 use super::super::support::dim;
+use super::model::{GEMM_ACCUMULATION_DTYPE, NOT_APPLICABLE_DTYPE, OUTPUT_DTYPE, UNKNOWN_DTYPE};
 
 pub(super) struct RuntimeLens {
     pub(super) lens: Box<dyn Lens>,
     pub(super) detail: String,
     pub(super) provider: String,
+    pub(super) declared_model_dtype: String,
+    pub(super) executed_model_dtype: String,
+    pub(super) gemm_accumulation_dtype: String,
+    pub(super) output_dtype: String,
     pub(super) placement: Placement,
     pub(super) native_batching: bool,
     pub(super) max_batch: Option<usize>,
@@ -29,6 +34,11 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail,
                 provider: provider.clone(),
+                // LensRuntime does not preserve ONNX graph dtype yet; tracked by #485.
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: true,
                 max_batch: spec.max_batch,
@@ -44,6 +54,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail,
                 provider: provider.clone(),
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: true,
                 max_batch: spec.max_batch,
@@ -58,6 +72,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail: format!("fastembed_sparse;{provider}"),
                 provider: provider.clone(),
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: true,
                 max_batch: spec.max_batch,
@@ -73,6 +91,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail,
                 provider: provider.clone(),
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: true,
                 max_batch: spec.max_batch,
@@ -87,6 +109,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail: format!("fastembed_reranker;{provider}"),
                 provider: provider.clone(),
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: false,
                 max_batch: Some(1),
@@ -94,38 +120,56 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 gpu_process_required: true,
             })
         }
-        LensRuntime::FastembedQwen3 { .. } => {
+        LensRuntime::FastembedQwen3 { dtype, .. } => {
             let lens = FastembedQwen3Lens::from_lens_spec(spec)?;
-            let provider = lens.device_policy().as_str().to_string();
+            let device_policy = lens.device_policy();
+            let provider = device_policy.detail();
+            let executed_model_dtype = lens.precision().as_str().to_string();
             let detail = format!(
-                "fastembed_qwen3;{};max_tokens={}",
-                lens.precision().as_str(),
+                "fastembed_qwen3;provider={provider};declared_model_dtype={dtype};\
+                 executed_model_dtype={executed_model_dtype};\
+                 gemm_accumulation_dtype={GEMM_ACCUMULATION_DTYPE};output_dtype={OUTPUT_DTYPE};\
+                 max_tokens={}",
                 lens.max_tokens()
             );
             Ok(RuntimeLens {
                 lens: Box::new(lens),
                 detail,
                 provider: provider.clone(),
-                placement: Placement::Gpu,
+                declared_model_dtype: dtype.clone(),
+                executed_model_dtype,
+                gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
+                placement: device_policy.placement(),
                 native_batching: true,
                 max_batch: spec.max_batch,
-                proof: format!("candle_device_initialized:{provider}"),
-                gpu_process_required: true,
+                proof: candle_device_proof(device_policy),
+                gpu_process_required: device_policy.is_gpu(),
             })
         }
-        LensRuntime::CandleLocal { .. } => {
+        LensRuntime::CandleLocal { dtype, .. } => {
             let lens = CandleLens::from_lens_spec(spec)?;
-            let provider = lens.device_policy().as_str().to_string();
-            let detail = format!("candle_local;{};{}", provider, lens.precision().as_str());
+            let device_policy = lens.device_policy();
+            let provider = device_policy.detail();
+            let executed_model_dtype = lens.precision().as_str().to_string();
+            let detail = format!(
+                "candle_local;provider={provider};declared_model_dtype={dtype};\
+                 executed_model_dtype={executed_model_dtype};\
+                 gemm_accumulation_dtype={GEMM_ACCUMULATION_DTYPE};output_dtype={OUTPUT_DTYPE}"
+            );
             Ok(RuntimeLens {
                 lens: Box::new(lens),
                 detail,
                 provider: provider.clone(),
-                placement: Placement::Gpu,
+                declared_model_dtype: dtype.clone(),
+                executed_model_dtype,
+                gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
+                placement: device_policy.placement(),
                 native_batching: false,
                 max_batch: Some(1),
-                proof: format!("candle_device_initialized:{provider}"),
-                gpu_process_required: true,
+                proof: candle_device_proof(device_policy),
+                gpu_process_required: device_policy.is_gpu(),
             })
         }
         LensRuntime::TeiHttp { endpoint } => {
@@ -134,6 +178,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail: endpoint.clone(),
                 provider: "resident_tei_gpu_service".to_string(),
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Gpu,
                 native_batching: true,
                 max_batch: spec.max_batch.or(Some(DEFAULT_TEI_MAX_BATCH)),
@@ -143,10 +191,15 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
         }
         LensRuntime::StaticLookup { .. } => {
             let lens = StaticLookupLens::from_lens_spec(spec)?;
+            let declared_model_dtype = lens.dtype().as_str().to_string();
             Ok(RuntimeLens {
                 lens: Box::new(lens),
                 detail: "static_lookup_mmap;cpu_explicit".to_string(),
                 provider: "cpu_explicit".to_string(),
+                declared_model_dtype,
+                executed_model_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+                gemm_accumulation_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Cpu,
                 native_batching: false,
                 max_batch: Some(1),
@@ -160,6 +213,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail: format!("algorithmic:{kind};cpu_explicit"),
                 provider: "cpu_explicit".to_string(),
+                declared_model_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+                executed_model_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+                gemm_accumulation_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Cpu,
                 native_batching: false,
                 max_batch: Some(1),
@@ -184,6 +241,10 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
                 lens: Box::new(lens),
                 detail: format!("multimodal_adapter;{provider}"),
                 provider,
+                declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement,
                 native_batching: true,
                 max_batch: spec.max_batch,
@@ -195,6 +256,14 @@ pub(super) fn runtime_lens(spec: &LensSpec) -> Result<RuntimeLens, CalyxError> {
             "external-cmd lenses are not accepted for PH68 scale-audit",
         )),
     }
+}
+
+fn candle_device_proof(policy: CandleDevicePolicy) -> String {
+    format!(
+        "candle_device_initialized:{};placement={:?}",
+        policy.detail(),
+        policy.placement()
+    )
 }
 
 pub(super) fn association_family(spec: &LensSpec) -> &'static str {

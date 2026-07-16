@@ -10,7 +10,7 @@ use calyx_registry::LensForgeManifest;
 use sha2::{Digest, Sha256};
 
 use super::measure::audit_lens;
-use super::model::{Flags, LensAudit, reject};
+use super::model::{Flags, LensAudit, OUTPUT_DTYPE, UNKNOWN_DTYPE, reject};
 use super::report::{ProgressUpdate, write_lens_audit, write_progress};
 use super::runtime::is_content_modality;
 use crate::error::{CliError, CliResult};
@@ -207,6 +207,10 @@ fn rejected_worker_audit(
         runtime: runtime.clone(),
         runtime_detail: "worker_timeout_or_missing_report".to_string(),
         provider: "unproven".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         placement: Placement::Cpu,
         association_family: metadata_family(&runtime, temporal),
         temporal_sidecar: temporal,

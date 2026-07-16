@@ -5,7 +5,10 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, S
 use fastembed::Qwen3TextEmbedding;
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
-use crate::runtime::candle::{CandleDevicePolicy, CandlePrecision, default_cuda_fail_loud_policy};
+use crate::runtime::candle::{
+    CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation, frozen_device_policy,
+    verify_f32_gemm_accumulation,
+};
 use crate::runtime::common::{hash_files, text_from_input};
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
@@ -75,6 +78,13 @@ impl FastembedQwen3Lens {
     }
 
     pub fn from_files(spec: Qwen3FileSpec) -> Result<Self> {
+        if !spec.device_policy.is_gpu() && spec.precision != CandlePrecision::F32 {
+            return Err(config_invalid(format!(
+                "fastembed-qwen3 CPU placement {} requires f32, but the frozen lens declares {}; commission/select a distinct f32 lens for CPU execution",
+                spec.device_policy.detail(),
+                spec.precision.as_str()
+            )));
+        }
         if spec.max_tokens == 0 {
             return Err(config_invalid("fastembed-qwen3 max_tokens must be > 0"));
         }
@@ -113,12 +123,14 @@ impl FastembedQwen3Lens {
             spec.precision,
         )?;
         let max_tokens = spec.max_tokens.to_string();
+        let execution_device = spec.device_policy.frozen_token();
         let corpus_hash = sha256_digest(&[
-            b"fastembed-qwen3-text-v1",
+            b"fastembed-qwen3-text-v2",
             spec.model_id.as_bytes(),
+            execution_device.as_bytes(),
             spec.precision.as_str().as_bytes(),
             max_tokens.as_bytes(),
-            b"left-padding,last-token,l2",
+            b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output",
         ]);
         let contract = FrozenLensContract::new(
             spec.name,
@@ -145,6 +157,7 @@ impl FastembedQwen3Lens {
         let LensRuntime::FastembedQwen3 {
             model_id,
             files,
+            device,
             dtype,
         } = &spec.runtime
         else {
@@ -156,7 +169,7 @@ impl FastembedQwen3Lens {
             model_id: model_id.clone(),
             files: Qwen3ModelFiles::from_paths(model_id, files.clone())?,
             max_tokens: DEFAULT_QWEN3_MAX_TOKENS,
-            device_policy: default_cuda_fail_loud_policy()?,
+            device_policy: frozen_device_policy(device)?,
             precision: CandlePrecision::parse(dtype)?,
             expected_shape: Some(spec.output),
             expected_weights_sha256: Some(spec.weights_sha256),
@@ -193,6 +206,7 @@ impl FastembedQwen3Lens {
             runtime: LensRuntime::FastembedQwen3 {
                 model_id: self.files.model_id.clone(),
                 files: self.files.artifact_paths(),
+                device: self.device_policy.frozen_token(),
                 dtype: self.precision.as_str().to_string(),
             },
             output: self.contract.shape(),
@@ -236,20 +250,35 @@ impl Lens for FastembedQwen3Lens {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let texts = inputs
-            .iter()
-            .map(|input| text_from_input(self, input).map(str::to_string))
-            .collect::<Result<Vec<_>>>()?;
-        let model = self
-            .model
-            .lock()
-            .map_err(|_| CalyxError::lens_unreachable("Qwen3 model mutex was poisoned"))?;
-        let rows = model.embed(&texts).map_err(qwen3_error)?;
-        let vectors = dense_batch(self.dim, rows, inputs.len())?;
-        for vector in &vectors {
-            self.contract.verify_vector(self.id, vector)?;
+        let result = (|| {
+            configure_f32_gemm_accumulation(self.device_policy, self.precision)?;
+            let texts = inputs
+                .iter()
+                .map(|input| text_from_input(self, input).map(str::to_string))
+                .collect::<Result<Vec<_>>>()?;
+            let model = self
+                .model
+                .lock()
+                .map_err(|_| CalyxError::lens_unreachable("Qwen3 model mutex was poisoned"))?;
+            let rows = model.embed(&texts).map_err(qwen3_error)?;
+            let vectors = dense_batch(self.dim, rows, inputs.len())?;
+            for vector in &vectors {
+                self.contract.verify_vector(self.id, vector)?;
+            }
+            Ok(vectors)
+        })();
+        let accumulation = verify_f32_gemm_accumulation(self.device_policy, self.precision);
+        if let Err(error) = accumulation {
+            return Err(qwen3_runtime_context(
+                error,
+                "gemm_accumulation_verify",
+                self.device_policy,
+                self.precision,
+            ));
         }
-        Ok(vectors)
+        result.map_err(|error| {
+            qwen3_runtime_context(error, "inference", self.device_policy, self.precision)
+        })
     }
 }
 
@@ -274,6 +303,25 @@ pub(crate) fn qwen3_error(err: candle_core::Error) -> CalyxError {
         };
     }
     CalyxError::lens_unreachable(message)
+}
+
+pub(crate) fn qwen3_runtime_context(
+    error: CalyxError,
+    stage: &str,
+    device_policy: CandleDevicePolicy,
+    precision: CandlePrecision,
+) -> CalyxError {
+    CalyxError {
+        code: error.code,
+        message: format!(
+            "qwen3 stage={stage} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            device_policy.detail(),
+            precision.as_str(),
+            precision.as_str(),
+            error.message
+        ),
+        remediation: error.remediation,
+    }
 }
 
 pub(crate) fn config_invalid(message: impl Into<String>) -> CalyxError {

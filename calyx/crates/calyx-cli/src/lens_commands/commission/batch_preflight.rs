@@ -22,7 +22,7 @@ use serde_json::json;
 
 use super::super::support::{prepare_manifest_runtime, validate_vector_contract};
 use super::log::{ConversionLog, write_json_file};
-use super::options::{CommissionFlags, CommissionRuntime};
+use super::options::CommissionFlags;
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::scale_audit::compare_vectors;
 
@@ -268,7 +268,7 @@ fn enforce_batch_1_gate(
     requested: Option<usize>,
     measured_largest: Option<usize>,
 ) -> CliResult<()> {
-    if !is_gpu_policy_runtime(flags.runtime) || flags.allow_batch_1.is_some() {
+    if !flags.runs_on_local_gpu() || flags.allow_batch_1.is_some() {
         return Ok(());
     }
     let effective = requested.or(measured_largest);
@@ -284,12 +284,6 @@ fn enforce_batch_1_gate(
         }));
     }
     Ok(())
-}
-
-/// Every commissionable runtime except the remote TEI service runs its ONNX /
-/// Candle graph on the local GPU under fail-loud CUDA policy.
-pub(super) const fn is_gpu_policy_runtime(runtime: CommissionRuntime) -> bool {
-    !matches!(runtime, CommissionRuntime::Tei)
 }
 
 fn probe_cap(flags: &CommissionFlags) -> usize {

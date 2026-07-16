@@ -85,6 +85,7 @@ pub use persistence_contracts::{
 pub use placement::{
     CALYX_RAM_BUDGET_EXCEEDED, CALYX_VRAM_BUDGET_EXCEEDED, CpuLensPool, CpuPoolAdmission,
     LENS_RAM_REMEDIATION, LENS_VRAM_REMEDIATION, PlacementBudget, PlacementPlan, choose_placement,
+    choose_resolved_placement,
 };
 pub use profile::{
     CAPABILITY_MAX_PAIRWISE_CORR_ENV, CAPABILITY_MIN_SIGNAL_BITS_ENV, CapabilityCard,
@@ -104,8 +105,11 @@ pub use runtime::adapters::{
 pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
 #[cfg(feature = "ml-runtime")]
 pub use runtime::candle::{
-    CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,
-    CandlePrecision, DEFAULT_CANDLE_MODEL, default_cuda_fail_loud_policy,
+    CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV, CandleDeviceMode, CandleDevicePolicy,
+    CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
+    DEFAULT_CANDLE_MODEL, GPU_DEFAULT_CANDLE_PRECISION, configured_device_mode,
+    configured_device_policy, default_cuda_fail_loud_policy, default_precision_for_policy,
+    device_policy_for_mode, frozen_device_policy,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]

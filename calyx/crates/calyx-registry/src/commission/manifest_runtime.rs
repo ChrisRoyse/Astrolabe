@@ -6,6 +6,94 @@ use super::algorithmic_manifest::algorithmic_kind;
 use super::manifest::{LensForgeManifest, VerifiedFile, modality_token};
 use crate::spec::{FastembedBgem3Output, LensRuntime};
 
+pub(super) fn canonical_local_model_dtype(
+    runtime: &str,
+    dtype: &str,
+) -> Result<Option<&'static str>> {
+    if !matches!(
+        runtime,
+        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
+    ) {
+        return Ok(None);
+    }
+    let canonical = match dtype.trim().to_ascii_lowercase().as_str() {
+        "f16" | "fp16" | "float16" => "f16",
+        "bf16" | "bfloat16" => "bf16",
+        "f32" | "fp32" | "float32" => "f32",
+        other => {
+            return Err(config_invalid(format!(
+                "unsupported {runtime} dtype {other}; expected f16, bf16, or f32"
+            )));
+        }
+    };
+    if runtime == "candle-fp16" && canonical != "f16" {
+        return Err(config_invalid(format!(
+            "legacy candle-fp16 runtime conflicts with dtype {canonical}; use runtime candle for bf16 or f32"
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+pub(crate) fn canonical_local_model_device(
+    runtime: &str,
+    device: Option<&str>,
+) -> Result<Option<String>> {
+    if !matches!(
+        runtime,
+        "candle" | "candle-fp16" | "candle-local" | "fastembed-qwen3"
+    ) {
+        return Ok(None);
+    }
+    let raw = device
+        .ok_or_else(|| {
+            config_invalid(format!(
+                "{runtime} requires an explicit execution_device; migrate legacy manifests from evidence instead of inventing cuda:0"
+            ))
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    if raw == "cpu" {
+        return Ok(Some(raw));
+    }
+    if raw == "cuda" {
+        return Ok(Some("cuda:0".to_string()));
+    }
+    let Some(ordinal) = raw.strip_prefix("cuda:") else {
+        return Err(config_invalid(format!(
+            "unsupported {runtime} execution_device {raw}; expected cpu or cuda:<ordinal>"
+        )));
+    };
+    let ordinal = ordinal.parse::<usize>().map_err(|_| {
+        config_invalid(format!(
+            "{runtime} execution_device {raw} has an invalid CUDA ordinal"
+        ))
+    })?;
+    Ok(Some(format!("cuda:{ordinal}")))
+}
+
+pub(super) fn validate_local_model_execution(
+    runtime: &str,
+    dtype: &str,
+    device: Option<&str>,
+) -> Result<()> {
+    let Some(dtype) = canonical_local_model_dtype(runtime, dtype)? else {
+        if device.is_some() {
+            return Err(config_invalid(format!(
+                "runtime {runtime} does not consume execution_device; remove the inert declaration so the manifest cannot claim unbound placement"
+            )));
+        }
+        return Ok(());
+    };
+    let device = canonical_local_model_device(runtime, device)?
+        .ok_or_else(|| config_invalid("local model runtime produced no execution device"))?;
+    if device == "cpu" && dtype != "f32" {
+        return Err(config_invalid(format!(
+            "{runtime} CPU execution requires f32, but the frozen manifest declares {dtype}; commission a distinct CPU f32 lens"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn runtime_from_manifest(
     manifest: &LensForgeManifest,
     artifacts: &[VerifiedFile],
@@ -56,12 +144,26 @@ pub(super) fn runtime_from_manifest(
         "fastembed-qwen3" => Ok(LensRuntime::FastembedQwen3 {
             model_id: manifest.source_hf_id.clone(),
             files,
-            dtype: manifest.dtype.clone(),
+            device: canonical_local_model_device(
+                &manifest.runtime,
+                manifest.execution_device.as_deref(),
+            )?
+            .ok_or_else(|| config_invalid("matched Qwen3 runtime produced no execution device"))?,
+            dtype: canonical_local_model_dtype(&manifest.runtime, &manifest.dtype)?
+                .ok_or_else(|| config_invalid("matched Qwen3 runtime produced no dtype"))?
+                .to_string(),
         }),
         "candle" | "candle-fp16" | "candle-local" => Ok(LensRuntime::CandleLocal {
             model_id: manifest.source_hf_id.clone(),
             files,
-            dtype: manifest.dtype.clone(),
+            device: canonical_local_model_device(
+                &manifest.runtime,
+                manifest.execution_device.as_deref(),
+            )?
+            .ok_or_else(|| config_invalid("matched Candle runtime produced no execution device"))?,
+            dtype: canonical_local_model_dtype(&manifest.runtime, &manifest.dtype)?
+                .ok_or_else(|| config_invalid("matched Candle runtime produced no dtype"))?
+                .to_string(),
             pooling: manifest.pooling.clone(),
         }),
         "tei" | "tei-http" | "tei_http" => Ok(LensRuntime::TeiHttp {

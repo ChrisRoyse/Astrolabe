@@ -21,6 +21,8 @@ use fastembed_contract::{
 
 #[cfg(feature = "ml-runtime")]
 use crate::Qwen3ModelFiles;
+#[cfg(feature = "ml-runtime")]
+use crate::commission::canonical_local_model_device;
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision};
@@ -46,9 +48,10 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         LensRuntime::CandleLocal {
             model_id,
             files,
+            device,
             dtype,
             pooling,
-        } => candle_contract(spec, model_id, files, dtype, pooling),
+        } => candle_contract(spec, model_id, files, device, dtype, pooling),
         #[cfg(feature = "ml-runtime")]
         LensRuntime::Onnx { model_id, files } => onnx_contract(spec, model_id, files),
         #[cfg(feature = "ml-runtime")]
@@ -73,8 +76,9 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         LensRuntime::FastembedQwen3 {
             model_id,
             files,
+            device,
             dtype,
-        } => qwen3_contract(spec, model_id, files, dtype),
+        } => qwen3_contract(spec, model_id, files, device, dtype),
         #[cfg(feature = "ml-runtime")]
         LensRuntime::StaticLookup {
             embeddings_file,
@@ -226,6 +230,7 @@ fn candle_contract(
     spec: &LensSpec,
     model_id: &str,
     files: &[PathBuf],
+    device: &str,
     dtype: &str,
     pooling: &str,
 ) -> Result<FrozenLensContract> {
@@ -239,21 +244,27 @@ fn candle_contract(
     ensure_file("candle config", config)?;
     let dim = dense_hidden_size(config, "candle")?;
     let precision = CandlePrecision::parse(dtype)?;
+    let execution_device = canonical_local_model_device("candle-local", Some(device))?
+        .ok_or_else(|| lens_config_invalid("candle-local produced no execution device"))?;
+    if execution_device == "cpu" && precision != CandlePrecision::F32 {
+        return Err(lens_config_invalid(format!(
+            "candle CPU execution requires f32, but {} declares {}",
+            spec.name,
+            precision.as_str()
+        )));
+    }
     let pooling = CandlePoolingPolicy::parse(pooling)?;
-    let finite_replay_text = match precision {
-        CandlePrecision::F16 | CandlePrecision::BF16 => precision.as_str(),
-        CandlePrecision::F32 => "none",
-    };
     let max_tokens = DEFAULT_MAX_TOKENS.to_string();
     let norm_text = format!("{:?}", spec.norm_policy);
     let corpus_hash = sha256_digest(&[
-        b"candle-local-bert-v2",
+        b"candle-local-bert-v3",
         model_id.as_bytes(),
         max_tokens.as_bytes(),
+        execution_device.as_bytes(),
         precision.as_str().as_bytes(),
         pooling.as_str().as_bytes(),
         norm_text.as_bytes(),
-        finite_replay_text.as_bytes(),
+        b"exact-config,no-rewrite,single-execution-precision,no-replay,f32-gemm-accumulation,f32-output",
     ]);
     Ok(FrozenLensContract::new(
         spec.name.clone(),
@@ -329,6 +340,7 @@ fn qwen3_contract(
     spec: &LensSpec,
     model_id: &str,
     files: &[PathBuf],
+    device: &str,
     dtype: &str,
 ) -> Result<FrozenLensContract> {
     let model_id = qwen3_model_id(model_id)?;
@@ -337,17 +349,27 @@ fn qwen3_contract(
         ensure_file("fastembed-qwen3 contract artifact", &path)?;
     }
     let precision = CandlePrecision::parse(dtype)?;
+    let execution_device = canonical_local_model_device("fastembed-qwen3", Some(device))?
+        .ok_or_else(|| lens_config_invalid("fastembed-qwen3 produced no execution device"))?;
+    if execution_device == "cpu" && precision != CandlePrecision::F32 {
+        return Err(lens_config_invalid(format!(
+            "fastembed-qwen3 CPU execution requires f32, but {} declares {}",
+            spec.name,
+            precision.as_str()
+        )));
+    }
     let max_tokens = "32768".to_string();
     let dim = dense_hidden_size(&files.config, "Qwen3")?;
     Ok(FrozenLensContract::new(
         spec.name.clone(),
         spec.weights_sha256,
         sha256_digest(&[
-            b"fastembed-qwen3-text-v1",
+            b"fastembed-qwen3-text-v2",
             model_id.as_bytes(),
+            execution_device.as_bytes(),
             precision.as_str().as_bytes(),
             max_tokens.as_bytes(),
-            b"left-padding,last-token,l2",
+            b"exact-config,no-rewrite,left-padding,last-token,l2,f32-gemm-accumulation,f32-output",
         ]),
         SlotShape::Dense(dim),
         Modality::Text,

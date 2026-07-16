@@ -37,6 +37,8 @@ const CONVERSION_LOG_NAME: &str = "conversion-log.jsonl";
 struct CommissionReport {
     hf: String,
     runtime: String,
+    dtype: String,
+    execution_device: Option<String>,
     output_dir: PathBuf,
     manifest: PathBuf,
     conversion_log: PathBuf,
@@ -81,12 +83,15 @@ impl CommissionOutput {
 pub(crate) fn commission(args: &[String]) -> CliResult {
     let flags = CommissionFlags::parse(args)?;
     let out = flags.output_dir()?;
+    reject_nonempty_output(&out)?;
     fs::create_dir_all(&out)?;
     let mut log = ConversionLog::create(out.join(CONVERSION_LOG_NAME))?;
     log.event(json!({
         "event": "commission_start",
         "hf": flags.hf,
         "runtime": flags.runtime.manifest_runtime(),
+        "dtype": flags.manifest_dtype(),
+        "execution_device": flags.execution_device(),
         "output_dir": out,
     }))?;
     let output = match flags.runtime {
@@ -94,7 +99,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
             let commissioned = commission_tei(&flags, &out, &mut log)?;
             CommissionOutput::with_source_hf_id(commissioned.artifacts, commissioned.source_hf_id)
         }
-        CommissionRuntime::CandleFp16 => {
+        CommissionRuntime::Candle => {
             CommissionOutput::new(commission_candle(&flags, &out, &mut log)?)
         }
         CommissionRuntime::OnnxInt8 => {
@@ -151,8 +156,10 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         "lens_id": registered.lens_id,
     }))?;
     print_json(&CommissionReport {
-        hf: flags.hf,
         runtime: flags.runtime.manifest_runtime().to_string(),
+        dtype: flags.manifest_dtype().to_string(),
+        execution_device: flags.execution_device(),
+        hf: flags.hf,
         output_dir: out,
         manifest: manifest_path,
         conversion_log: log.path,
@@ -383,7 +390,8 @@ fn write_manifest(
             flags.runtime,
             inferred_dim,
         ))),
-        dtype: flags.runtime.default_dtype().to_string(),
+        dtype: flags.manifest_dtype().to_string(),
+        execution_device: flags.execution_device(),
         weights_sha256: model.sha256.clone(),
         artifact_set_sha256: Some(artifact_set_sha256(artifacts)?),
         files: manifest_files(out, artifacts)?,
@@ -406,6 +414,26 @@ fn write_manifest(
     Ok(path)
 }
 
+fn reject_nonempty_output(out: &Path) -> CliResult {
+    if !out.exists() {
+        return Ok(());
+    }
+    if !out.is_dir() {
+        return Err(CliError::usage(format!(
+            "commission output {} exists and is not a directory",
+            out.display()
+        )));
+    }
+    let Some(existing) = fs::read_dir(out)?.next().transpose()? else {
+        return Ok(());
+    };
+    Err(CliError::usage(format!(
+        "refusing to commission into non-empty output {}; first existing entry is {}; choose a new empty --out directory so frozen or failed artifact bytes and logs cannot be overwritten",
+        out.display(),
+        existing.path().display()
+    )))
+}
+
 fn manifest_shape(runtime: CommissionRuntime, dim: u32) -> SlotShape {
     match runtime {
         CommissionRuntime::FastembedSparse | CommissionRuntime::FastembedBgem3Sparse => {
@@ -419,6 +447,9 @@ fn manifest_shape(runtime: CommissionRuntime, dim: u32) -> SlotShape {
 }
 
 fn manifest_pooling(flags: &CommissionFlags) -> String {
+    if matches!(flags.runtime, CommissionRuntime::FastembedQwen3) {
+        return "last-token".to_string();
+    }
     if matches!(
         flags.runtime,
         CommissionRuntime::OnnxColbert | CommissionRuntime::FastembedBgem3Colbert

@@ -20,6 +20,7 @@ pub use manifest::{
 pub use manifest_metadata::{
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
 };
+pub(crate) use manifest_runtime::canonical_local_model_device;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommissionRequest {

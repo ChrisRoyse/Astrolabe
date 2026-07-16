@@ -3,9 +3,12 @@ use std::process::Command;
 use std::time::Instant;
 
 use calyx_core::{CalyxError, Input, Lens, Placement, SlotVector, SparseEntry};
-use calyx_registry::LensSpec;
+use calyx_registry::{LensRuntime, LensSpec};
 
-use super::model::{BatchStability, Flags, LensAudit, ProbeEvidence, reject};
+use super::model::{
+    BatchStability, Flags, LensAudit, NOT_APPLICABLE_DTYPE, OUTPUT_DTYPE, ProbeEvidence,
+    UNKNOWN_DTYPE, reject,
+};
 use super::probe::{probe_set, supports_probe_measurement};
 use super::runtime::{association_family, is_content_modality, is_temporal_sidecar, runtime_lens};
 use crate::lens_commands::support::{dim, hex_from_bytes, runtime_name, validate_vector_contract};
@@ -18,6 +21,7 @@ pub(super) fn audit_lens(manifest: PathBuf, spec: LensSpec, flags: &Flags) -> Le
     let lens_id = spec.lens_id().to_string();
     let weights_sha256 = hex_from_bytes(&spec.weights_sha256);
     let shape_dim = dim(spec.output);
+    let declared_model_dtype = declared_model_dtype(&spec.runtime);
     let mut rejections = Vec::new();
 
     let runtime_lens = match runtime_lens(&spec) {
@@ -35,6 +39,10 @@ pub(super) fn audit_lens(manifest: PathBuf, spec: LensSpec, flags: &Flags) -> Le
                 runtime,
                 runtime_detail: "runtime_load_failed".to_string(),
                 provider: "unproven".to_string(),
+                declared_model_dtype,
+                executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+                gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+                output_dtype: OUTPUT_DTYPE.to_string(),
                 placement: Placement::Cpu,
                 association_family: family,
                 temporal_sidecar: temporal,
@@ -148,6 +156,10 @@ pub(super) fn audit_lens(manifest: PathBuf, spec: LensSpec, flags: &Flags) -> Le
         runtime,
         runtime_detail: runtime_lens.detail,
         provider: runtime_lens.provider,
+        declared_model_dtype: runtime_lens.declared_model_dtype,
+        executed_model_dtype: runtime_lens.executed_model_dtype,
+        gemm_accumulation_dtype: runtime_lens.gemm_accumulation_dtype,
+        output_dtype: runtime_lens.output_dtype,
         placement: runtime_lens.placement,
         association_family: family,
         temporal_sidecar: temporal,
@@ -165,6 +177,25 @@ pub(super) fn audit_lens(manifest: PathBuf, spec: LensSpec, flags: &Flags) -> Le
         batch_stability,
         accepted: rejections.is_empty(),
         rejections,
+    }
+}
+
+fn declared_model_dtype(runtime: &LensRuntime) -> String {
+    match runtime {
+        LensRuntime::CandleLocal { dtype, .. } | LensRuntime::FastembedQwen3 { dtype, .. } => {
+            dtype.clone()
+        }
+        LensRuntime::Algorithmic { .. } => NOT_APPLICABLE_DTYPE.to_string(),
+        // ONNX and TEI dtype are not retained by their runtime contracts; tracked by #485.
+        LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::TeiHttp { .. }
+        | LensRuntime::StaticLookup { .. }
+        | LensRuntime::MultimodalAdapter { .. }
+        | LensRuntime::ExternalCmd { .. } => UNKNOWN_DTYPE.to_string(),
     }
 }
 

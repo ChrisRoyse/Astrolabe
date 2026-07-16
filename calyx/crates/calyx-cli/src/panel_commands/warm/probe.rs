@@ -350,10 +350,11 @@ pub(super) fn runtime_detail(runtime: &LensRuntime) -> String {
         LensRuntime::TeiHttp { endpoint } => endpoint.clone(),
         LensRuntime::CandleLocal {
             model_id,
+            device,
             dtype,
             pooling,
             ..
-        } => format!("{model_id};dtype={dtype};pooling={pooling}"),
+        } => format!("{model_id};device={device};dtype={dtype};pooling={pooling}"),
         LensRuntime::Onnx { model_id, .. }
         | LensRuntime::OnnxColbert { model_id, .. }
         | LensRuntime::FastembedSparse { model_id, .. }
@@ -362,8 +363,11 @@ pub(super) fn runtime_detail(runtime: &LensRuntime) -> String {
             model_id, output, ..
         } => format!("{model_id};output={output:?}"),
         LensRuntime::FastembedQwen3 {
-            model_id, dtype, ..
-        } => format!("{model_id};dtype={dtype}"),
+            model_id,
+            device,
+            dtype,
+            ..
+        } => format!("{model_id};device={device};dtype={dtype}"),
         LensRuntime::StaticLookup {
             embeddings_file,
             tokenizer,

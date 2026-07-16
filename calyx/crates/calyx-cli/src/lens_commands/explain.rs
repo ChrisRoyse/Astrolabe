@@ -24,7 +24,10 @@ struct ExplainReport {
     name: String,
     runtime: String,
     runtime_detail: String,
-    dtype: String,
+    declared_model_dtype: String,
+    executed_model_dtype: String,
+    gemm_accumulation_dtype: String,
+    output_dtype: String,
     shape: ShapeReport,
     dim: u32,
     retrieval_only: bool,
@@ -46,8 +49,8 @@ struct ExplainReport {
     full_sparse: Option<Vec<SparseEntryReport>>,
     total_ms: f32,
     ms_per_input: f32,
-    vram_bytes: u64,
-    vram_mb: f32,
+    artifact_bytes: u64,
+    artifact_mib: f32,
 }
 
 #[derive(Serialize)]
@@ -66,11 +69,19 @@ struct ShapeReport {
 
 struct Measurement {
     vector: SlotVector,
-    dtype: String,
+    declared_model_dtype: String,
+    executed_model_dtype: String,
+    gemm_accumulation_dtype: String,
+    output_dtype: String,
     rows: Option<u32>,
-    vram_bytes: u64,
+    artifact_bytes: u64,
     runtime_detail: String,
 }
+
+const UNKNOWN_DTYPE: &str = "unknown";
+const NOT_APPLICABLE_DTYPE: &str = "not_applicable";
+const GEMM_ACCUMULATION_DTYPE: &str = "f32";
+const OUTPUT_DTYPE: &str = "f32";
 
 pub(crate) fn explain(args: &[String]) -> CliResult {
     let flags = Flags::parse(args)?;
@@ -96,7 +107,10 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         name: spec.name,
         runtime: runtime_name(&spec.runtime).to_string(),
         runtime_detail: measurement.runtime_detail,
-        dtype: measurement.dtype,
+        declared_model_dtype: measurement.declared_model_dtype,
+        executed_model_dtype: measurement.executed_model_dtype,
+        gemm_accumulation_dtype: measurement.gemm_accumulation_dtype,
+        output_dtype: measurement.output_dtype,
         shape: shape_report(spec.output),
         dim: dim(spec.output),
         retrieval_only: spec.retrieval_only,
@@ -113,8 +127,8 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         full_sparse: full_sparse(&measurement.vector, flags.full_vector)?,
         total_ms,
         ms_per_input: total_ms / repeat as f32,
-        vram_bytes: measurement.vram_bytes,
-        vram_mb: measurement.vram_bytes as f32 / (1024.0 * 1024.0),
+        artifact_bytes: measurement.artifact_bytes,
+        artifact_mib: measurement.artifact_bytes as f32 / (1024.0 * 1024.0),
     })
 }
 
@@ -307,9 +321,15 @@ fn measure_static_lookup(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRe
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: lens.dtype().as_str().to_string(),
+        declared_model_dtype: lens.dtype().as_str().to_string(),
+        executed_model_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+        gemm_accumulation_dtype: NOT_APPLICABLE_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: Some(lens.row_count()),
-        vram_bytes: 0,
+        artifact_bytes: artifact_files_size(&[
+            lens.files().embeddings_file.clone(),
+            lens.files().tokenizer.clone(),
+        ])?,
         runtime_detail: "static_lookup_mmap".to_string(),
     })
 }
@@ -324,9 +344,13 @@ fn measure_tei(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        // TEI does not attest model or execution dtype in LensRuntime; #485 owns that contract.
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: 0,
+        artifact_bytes: 0,
         runtime_detail: endpoint.to_string(),
     })
 }
@@ -336,10 +360,16 @@ fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Me
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: lens.precision().as_str().to_string(),
+        declared_model_dtype: match &spec.runtime {
+            LensRuntime::CandleLocal { dtype, .. } => dtype.clone(),
+            _ => UNKNOWN_DTYPE.to_string(),
+        },
+        executed_model_dtype: lens.precision().as_str().to_string(),
+        gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
-        runtime_detail: lens.device_policy().as_str().to_string(),
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
+        runtime_detail: lens.device_policy().detail(),
     })
 }
 
@@ -348,9 +378,13 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        // ONNX graph and execution dtype are not preserved in LensRuntime; #485 owns that contract.
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!("{};{}", lens.runtime_name(), lens.provider_policy()),
     })
 }
@@ -360,9 +394,12 @@ fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRes
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!("onnx-colbert;{}", lens.provider_policy()),
     })
 }
@@ -376,9 +413,12 @@ fn measure_fastembed_sparse(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!("fastembed-sparse;{}", lens.provider_policy()),
     })
 }
@@ -392,9 +432,12 @@ fn measure_fastembed_bgem3(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!("{};{}", lens.runtime_name(), lens.provider_policy()),
     })
 }
@@ -408,9 +451,12 @@ fn measure_fastembed_reranker(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!("fastembed-reranker;{}", lens.provider_policy()),
     })
 }
@@ -424,12 +470,18 @@ fn measure_fastembed_qwen3(
     let vector = measure_repeated(&lens, probe, repeat)?;
     Ok(Measurement {
         vector,
-        dtype: lens.precision().as_str().to_string(),
+        declared_model_dtype: match &spec.runtime {
+            LensRuntime::FastembedQwen3 { dtype, .. } => dtype.clone(),
+            _ => UNKNOWN_DTYPE.to_string(),
+        },
+        executed_model_dtype: lens.precision().as_str().to_string(),
+        gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes: files_size(&lens.files().artifact_paths())?,
+        artifact_bytes: artifact_files_size(&lens.files().artifact_paths())?,
         runtime_detail: format!(
             "fastembed-qwen3;{};max_tokens={}",
-            lens.device_policy().as_str(),
+            lens.device_policy().detail(),
             lens.max_tokens()
         ),
     })
@@ -438,17 +490,18 @@ fn measure_fastembed_qwen3(
 fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Measurement> {
     let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
-    let vram_bytes = match &spec.runtime {
-        LensRuntime::MultimodalAdapter { files, .. } if lens.provider().is_gpu() => {
-            files_size(files)?
-        }
+    let artifact_bytes = match &spec.runtime {
+        LensRuntime::MultimodalAdapter { files, .. } => artifact_files_size(files)?,
         _ => 0,
     };
     Ok(Measurement {
         vector,
-        dtype: "f32".to_string(),
+        declared_model_dtype: UNKNOWN_DTYPE.to_string(),
+        executed_model_dtype: UNKNOWN_DTYPE.to_string(),
+        gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
+        output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
-        vram_bytes,
+        artifact_bytes,
         runtime_detail: format!(
             "multimodal_adapter_onnx_external;{}",
             lens.provider_detail()
@@ -464,7 +517,7 @@ fn measure_repeated(lens: &dyn Lens, probe: &Input, repeat: usize) -> CliResult<
     last.ok_or_else(|| CliError::usage("repeat produced no vector"))
 }
 
-fn files_size(files: &[PathBuf]) -> CliResult<u64> {
+fn artifact_files_size(files: &[PathBuf]) -> CliResult<u64> {
     files
         .iter()
         .try_fold(0_u64, |acc, path| Ok(acc.saturating_add(path_size(path)?)))

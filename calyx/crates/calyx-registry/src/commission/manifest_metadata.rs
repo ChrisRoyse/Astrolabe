@@ -11,6 +11,9 @@ use super::algorithmic_manifest::{
     algorithmic_kind, frozen_contract as algorithmic_frozen_contract, is_algorithmic_runtime,
 };
 use super::manifest::{LensForgeFile, LensForgeManifest};
+use super::manifest_runtime::{
+    canonical_local_model_device, canonical_local_model_dtype, validate_local_model_execution,
+};
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
 
@@ -105,6 +108,11 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
     if manifest.runtime.trim().is_empty() {
         return Err(config_invalid("lensforge manifest runtime is required"));
     }
+    validate_local_model_execution(
+        &manifest.runtime,
+        &manifest.dtype,
+        manifest.execution_device.as_deref(),
+    )?;
     if is_tei_runtime(&manifest.runtime)
         && manifest
             .endpoint
@@ -218,12 +226,26 @@ fn metadata_runtime_from_manifest(
         "fastembed-qwen3" => Ok(LensRuntime::FastembedQwen3 {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
-            dtype: manifest.dtype.clone(),
+            device: canonical_local_model_device(
+                &manifest.runtime,
+                manifest.execution_device.as_deref(),
+            )?
+            .ok_or_else(|| config_invalid("matched Qwen3 runtime produced no execution device"))?,
+            dtype: canonical_local_model_dtype(&manifest.runtime, &manifest.dtype)?
+                .ok_or_else(|| config_invalid("matched Qwen3 runtime produced no dtype"))?
+                .to_string(),
         }),
         "candle" | "candle-fp16" | "candle-local" => Ok(LensRuntime::CandleLocal {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
-            dtype: manifest.dtype.clone(),
+            device: canonical_local_model_device(
+                &manifest.runtime,
+                manifest.execution_device.as_deref(),
+            )?
+            .ok_or_else(|| config_invalid("matched Candle runtime produced no execution device"))?,
+            dtype: canonical_local_model_dtype(&manifest.runtime, &manifest.dtype)?
+                .ok_or_else(|| config_invalid("matched Candle runtime produced no dtype"))?
+                .to_string(),
             pooling: manifest.pooling.clone(),
         }),
         "tei" | "tei-http" | "tei_http" => Ok(LensRuntime::TeiHttp {

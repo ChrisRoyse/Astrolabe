@@ -127,7 +127,7 @@ pub(super) fn write_progress(
         fs::create_dir_all(parent)?;
     }
     let snapshot = ProgressSnapshot {
-        schema: "calyx-lens-scale-audit-progress-v1",
+        schema: "calyx-lens-scale-audit-progress-v2",
         event: update.event,
         current_index,
         lens_total: flags.manifests.len(),

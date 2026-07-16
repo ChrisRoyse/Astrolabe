@@ -75,6 +75,19 @@ pub fn choose_placement(
     )))
 }
 
+pub fn choose_resolved_placement(
+    cost: LensCost,
+    budget: PlacementBudget,
+    placement: Placement,
+    reason: &str,
+) -> Result<PlacementPlan, CalyxError> {
+    match placement {
+        Placement::Cpu => ensure_cpu_budget(cost, budget)?,
+        Placement::Gpu => ensure_gpu_budget(cost, budget)?,
+    }
+    Ok(plan(cost, placement, budget, reason))
+}
+
 fn plan(
     cost: LensCost,
     placement: Placement,
@@ -117,6 +130,19 @@ fn ensure_cpu_budget(cost: LensCost, budget: PlacementBudget) -> Result<(), Caly
         )));
     }
     Ok(())
+}
+
+fn ensure_gpu_budget(cost: LensCost, budget: PlacementBudget) -> Result<(), CalyxError> {
+    if cost.vram_bytes <= budget.available_vram_bytes() {
+        return Ok(());
+    }
+    Err(vram_budget_error(format!(
+        "lens requires {} VRAM bytes, available {} after TEI reservation {} and allocated {}",
+        cost.vram_bytes,
+        budget.available_vram_bytes(),
+        budget.tei_reserved_bytes,
+        budget.vram_allocated_bytes
+    )))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

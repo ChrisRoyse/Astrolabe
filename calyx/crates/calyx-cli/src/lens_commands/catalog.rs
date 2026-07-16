@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use calyx_core::{Input, Lens, LensCost, Placement};
 use calyx_registry::{
-    CALYX_VRAM_BUDGET_EXCEEDED, LENS_VRAM_REMEDIATION, LensHealth, LensRuntime, LensSpec,
-    MultimodalAdapterLens, PlacementBudget, StaticLookupLens, choose_placement,
+    CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, PlacementBudget,
+    StaticLookupLens, choose_resolved_placement, frozen_device_policy,
     lens_spec_from_manifest_path, lens_spec_metadata_from_manifest_path,
 };
 use serde::{Deserialize, Serialize};
@@ -138,8 +138,16 @@ pub(crate) fn add_manifest_to_catalog(
     let mut catalog = read_catalog(&catalog_path)?;
     let lens_id = spec.lens_id().to_string();
     retain_unrelated_entries(&mut catalog, &lens_id, &spec.name, &manifest);
-    let budget = placement_budget_from_catalog(&catalog)?;
-    let entry = entry_from_spec(&spec, manifest, budget)?;
+    let mut cost = estimate_lens_cost(&spec)?;
+    let resolved_placement = resolved_runtime_placement(&spec)?;
+    if resolved_placement == Placement::Cpu {
+        cost.vram_bytes = 0;
+    }
+    let budget = placement_budget_from_catalog(
+        &catalog,
+        resolved_placement == Placement::Gpu && cost.vram_bytes > 0,
+    )?;
+    let entry = entry_from_spec(&spec, manifest, cost, budget, resolved_placement)?;
     retain_unrelated_entries(&mut catalog, &entry.lens_id, &entry.name, &entry.manifest);
     catalog.lenses.push(entry.clone());
     catalog
@@ -259,10 +267,11 @@ pub(crate) fn write_catalog(
 fn entry_from_spec(
     spec: &LensSpec,
     manifest: PathBuf,
+    cost: LensCost,
     budget: PlacementBudget,
+    resolved_placement: Placement,
 ) -> CliResult<LensCatalogEntry> {
-    let cost = estimate_lens_cost(spec)?;
-    let placement = placement_from_spec(spec, cost, budget)?;
+    let placement = placement_from_spec(spec, cost, budget, resolved_placement)?;
     Ok(LensCatalogEntry {
         lens_id: spec.lens_id().to_string(),
         name: spec.name.clone(),
@@ -282,35 +291,62 @@ fn placement_from_spec(
     spec: &LensSpec,
     cost: LensCost,
     budget: PlacementBudget,
+    resolved_placement: Placement,
 ) -> CliResult<Placement> {
-    if let LensRuntime::MultimodalAdapter { .. } = &spec.runtime {
-        let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
-        if lens.provider().is_gpu() {
-            ensure_vram_available(cost, budget)?;
-            return Ok(Placement::Gpu);
+    let reason = match (&spec.runtime, resolved_placement) {
+        (LensRuntime::CandleLocal { .. } | LensRuntime::FastembedQwen3 { .. }, _) => {
+            "resolved Candle-family device policy"
         }
-    }
-    Ok(choose_placement(&spec.runtime, cost, budget)?
-        .resource
-        .placement)
+        (LensRuntime::MultimodalAdapter { .. }, _) => "resolved multimodal provider policy",
+        (_, Placement::Cpu) => "CPU-native runtime",
+        (_, Placement::Gpu) => "GPU-required runtime",
+    };
+    Ok(
+        choose_resolved_placement(cost, budget, resolved_placement, reason)?
+            .resource
+            .placement,
+    )
 }
 
-fn ensure_vram_available(cost: LensCost, budget: PlacementBudget) -> CliResult {
-    if cost.vram_bytes <= budget.available_vram_bytes() {
-        return Ok(());
+fn resolved_runtime_placement(spec: &LensSpec) -> CliResult<Placement> {
+    match &spec.runtime {
+        LensRuntime::Algorithmic { .. }
+        | LensRuntime::StaticLookup { .. }
+        | LensRuntime::ExternalCmd { .. } => Ok(Placement::Cpu),
+        LensRuntime::CandleLocal { device, dtype, .. }
+        | LensRuntime::FastembedQwen3 { device, dtype, .. } => {
+            let policy = frozen_device_policy(device)?;
+            let precision = CandlePrecision::parse(dtype)?;
+            if !policy.is_gpu() && precision != CandlePrecision::F32 {
+                return Err(calyx_core::CalyxError {
+                    code: "CALYX_LENS_CONFIG_INVALID",
+                    message: format!(
+                        "catalog admission refuses {} {} on {}; CPU companions require a distinct f32 frozen identity",
+                        spec.name,
+                        precision.as_str(),
+                        policy.detail()
+                    ),
+                    remediation: "commission a CPU f32 companion manifest, or select the frozen CUDA manifest on its declared CUDA device",
+                }
+                .into());
+            }
+            Ok(policy.placement())
+        }
+        LensRuntime::MultimodalAdapter { .. } => {
+            let lens = MultimodalAdapterLens::from_lens_spec(spec)?;
+            Ok(if lens.provider().is_gpu() {
+                Placement::Gpu
+            } else {
+                Placement::Cpu
+            })
+        }
+        LensRuntime::TeiHttp { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. } => Ok(Placement::Gpu),
     }
-    Err(calyx_core::CalyxError {
-        code: CALYX_VRAM_BUDGET_EXCEEDED,
-        message: format!(
-            "lens requires {} VRAM bytes, available {} after TEI reservation {} and allocated {}",
-            cost.vram_bytes,
-            budget.available_vram_bytes(),
-            budget.tei_reserved_bytes,
-            budget.vram_allocated_bytes
-        ),
-        remediation: LENS_VRAM_REMEDIATION,
-    }
-    .into())
 }
 
 fn estimate_lens_cost(spec: &LensSpec) -> CliResult<LensCost> {

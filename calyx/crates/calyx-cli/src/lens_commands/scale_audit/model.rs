@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use calyx_core::{Modality, Placement};
 use serde::{Deserialize, Serialize};
 
-pub(super) const SCHEMA: &str = "calyx-lens-scale-audit-v1";
+pub(super) const SCHEMA: &str = "calyx-lens-scale-audit-v2";
 pub(super) const DEFAULT_MIN_CONTENT_LENSES: usize = 10;
 pub(super) const DEFAULT_MIN_GPU_CONTENT_LENSES: usize = 10;
 pub(super) const DEFAULT_BATCH_SIZE: usize = 64;
@@ -12,6 +12,10 @@ pub(super) const DEFAULT_MIN_BATCH_COSINE: f32 = 0.999;
 pub(super) const DEFAULT_MAX_ABS_DELTA: f32 = 0.02;
 pub(super) const DEFAULT_LENS_TIMEOUT_SECS: u64 = 180;
 pub(super) const TEMPORAL_LANE_ROLE: &str = "time_manipulation_walk_forward_backward_as_of_sidecar";
+pub(super) const UNKNOWN_DTYPE: &str = "unknown";
+pub(super) const NOT_APPLICABLE_DTYPE: &str = "not_applicable";
+pub(super) const GEMM_ACCUMULATION_DTYPE: &str = "f32";
+pub(super) const OUTPUT_DTYPE: &str = "f32";
 
 #[derive(Clone, Debug)]
 pub(super) struct Flags {
@@ -60,6 +64,10 @@ pub(super) struct LensAudit {
     pub(super) runtime: String,
     pub(super) runtime_detail: String,
     pub(super) provider: String,
+    pub(super) declared_model_dtype: String,
+    pub(super) executed_model_dtype: String,
+    pub(super) gemm_accumulation_dtype: String,
+    pub(super) output_dtype: String,
     pub(super) placement: Placement,
     pub(super) association_family: String,
     pub(super) temporal_sidecar: bool,

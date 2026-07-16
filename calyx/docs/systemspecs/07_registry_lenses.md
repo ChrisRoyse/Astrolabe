@@ -66,7 +66,7 @@ Defined in `calyx-core` at `crates/calyx-core/src/traits.rs:38`. Every registry 
 |----------------|------|-------|----------|------------------|--------------------|
 | `AlgorithmicLens` | `runtime/algorithmic.rs:42` | `Dense(encoder.dim())` | constructor-set | local feature extraction (byte/char-class histogram + FNV-1a hashing, scalar mean, one-hot bucket, AST-style keyword counts) | fully deterministic, in-process, no I/O |
 | `TeiHttpLens` | `runtime/tei_http.rs:17` | `Dense(dim)` | constructor-set | POSTs `{"inputs":[texts]}` over raw TCP HTTP/1.1 to an embedding server, parses JSON float arrays | network; deterministic per server state |
-| `CandleLens` | `runtime/candle.rs:36` | `Dense(dim)` | `Text` | tokenizes, runs a `BertModel` forward (mutex-guarded), pools, normalizes | local CPU/GPU; deterministic within precision; F32 finite-replay fallback on numerical error |
+| `CandleLens` | `runtime/candle.rs:36` | `Dense(dim)` | `Text` | tokenizes, runs one `BertModel` forward (mutex-guarded), converts output to F32, pools, normalizes | frozen CPU/GPU device and model dtype; no replay or CPU retry |
 | `OnnxLens` | `runtime/onnx.rs:18` | `Dense(dim)` | contract modality | FastEmbed `TextEmbedding::embed()` or a custom `ort` session run, then unit-normalizes | local CPU/GPU; deterministic |
 | `StaticLookupLens` | `runtime/static_lookup.rs:20` | `Dense(matrix.dim)` | `Text` | tokenizes, averages mmap'd per-token embedding rows, normalizes | local mmap read; deterministic |
 | `ExternalCmdLens` | `runtime/external_cmd.rs:14` | `Dense(dim)` | constructor-set | spawns subprocess, frames a length-prefixed JSON request/response over stdin/stdout | subprocess; deterministic per subprocess output |
@@ -78,7 +78,7 @@ Defined in `calyx-core` at `crates/calyx-core/src/traits.rs:38`. Every registry 
 
 **TeiHttpLens** — fields `endpoint`, `dim`, `timeout` (default 30 s), `max_batch` (default 64). `DEFAULT_TEI_ENDPOINT = "http://127.0.0.1:18190/embed"` (`tei_http.rs:13`) for the Calyx-owned FP16 multilingual E5 service; `LEGACY_TEI_8088_ENDPOINT` remains for explicit shared-service FSV. Constructors `new`, `resident_8088`, `resident_calyx_e5_18190`; builders `with_timeout`, `with_max_batch`. `measure_batch` chunks by `max_batch`, POSTs JSON as transient TEI wire protocol only, parses raw `[[...]]`, OpenAI `{"data":[...]}`, requires HTTP `" 200 "`, handles chunked transfer encoding. Contract from `FrozenLensContract::tei_http` (`NormPolicy::unit()`).
 
-**CandleLens** — `DEFAULT_CANDLE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"` (`candle.rs:15`). Enums in `candle/options.rs`: `CandleDevicePolicy { CpuExplicit, CudaFailLoud { ordinal } }`; `CandlePrecision { F32, F16, BF16 }`; `CandlePoolingPolicy { Mean, Cls }`. Constructors include `all_minilm_l6_v2`, `all_minilm_l6_v2_cuda_fail_loud`, `from_hf_cache`, `from_model[_with_options]`, `from_files`, `from_lens_spec`. `candle/load.rs` raises layer-norm eps to `1.0e-5` for half-precision CUDA. Pooling/normalization in `candle/pooling.rs` (`pool_tokens`, `apply_norm`). Corpus hash seeds with `b"candle-local-bert-v2"` over model id/tokens/precision/pooling/norm.
+**CandleLens** — `DEFAULT_CANDLE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"` (`candle.rs:15`). Enums in `candle/options.rs`: `CandleDeviceMode { Auto, Cuda, Cpu }`; `CandleDevicePolicy { CpuExplicit, CpuNoCudaFeature, CpuNoCudaDevice, CudaFailLoud { ordinal } }`; `CandlePrecision { F32, F16, BF16 }`; `CandlePoolingPolicy { Mean, Cls }`. Auto selects CPU only when CUDA was not compiled or the CUDA driver reports no device; any CUDA initialization, ordinal, load, or inference failure after CUDA is selected is fatal. Persisted specs freeze `cpu` or `cuda:<ordinal>` and CPU contracts require F32. Model config bytes are used exactly: there is no layer-norm epsilon rewrite, precision replay, or CPU retry. All three CUDA GEMM reduced-precision switches are centrally held false and verified before/after load and inference, so F16/BF16/F32 model execution uses F32 accumulation and emits F32 slot vectors. Pooling/normalization live in `candle/pooling.rs`. The v3 contract hashes model id, max tokens, device, model precision, pooling, norm, and the exact-execution policy.
 
 **OnnxLens** — backend is `FastEmbed(Mutex<TextEmbedding>)` or `Custom(Mutex<CustomOnnxRuntime>)`. `OnnxProviderPolicy { CudaFailLoud, CpuExplicit }`; persisted `LensSpec`/LensForge manifest reload defaults to `CudaFailLoud` so GPU-capable production manifests use CUDA and fail loudly if the CUDA/ORT stack is unavailable. `CpuExplicit` remains an explicit constructor/test policy only. CUDA fail-loud ONNX backends are retained for process lifetime to avoid unsafe ORT CUDA provider teardown after successful inference; CPU-explicit backends drop normally. `PoolingPolicy { Mean, Cls, LastToken }`. `OnnxModelFiles` lists cache dir, model code/file, tokenizer, config, and `contract_paths` override. FastEmbed corpus hash seeds `b"onnx-fastembed-mean-pool-v1"`. Custom path (`onnx/custom.rs`) runs an `ort::session::Session`, pools, normalizes.
 
@@ -259,11 +259,14 @@ Persistence is atomic: write `.{file}.tmp-{pid}`, fsync, rename, fsync parent di
 
 ### 4.3 Placement & drift
 
-`choose_placement(runtime, cost, budget)` (`src/placement.rs:46`):
+`choose_placement(runtime, cost, budget)` handles runtimes whose placement is
+derived from runtime class. `choose_resolved_placement(cost, budget, placement,
+reason)` handles a frozen Candle/Qwen device or resolved adapter provider:
 1. Zero-cost algorithmic → CPU.
 2. CPU-native runtimes (Algorithmic, MultimodalAdapter, StaticLookup, ExternalCmd) → `ensure_cpu_budget` → CPU.
-3. GPU fit: `cost.vram_bytes <= available_vram_bytes()` → GPU.
-4. GPU overflow for a GPU-capable runtime hard-fails → `CALYX_VRAM_BUDGET_EXCEEDED` (remediation `LENS_VRAM_REMEDIATION`); no hidden CPU fallback is selected.
+3. Frozen CPU Candle/Qwen stays CPU and must declare F32; it never probes NVML.
+4. Frozen GPU fit: `cost.vram_bytes <= available_vram_bytes()` → GPU.
+5. GPU overflow hard-fails → `CALYX_VRAM_BUDGET_EXCEEDED` (remediation `LENS_VRAM_REMEDIATION`); no hidden CPU fallback is selected.
 
 `PlacementBudget.available_vram_bytes()` = `vram_soft_cap − tei_reserved − vram_allocated` (saturating); `available_ram_bytes()` = `ram_soft_cap − ram_used`. `ensure_cpu_budget` fails with `CALYX_RAM_BUDGET_EXCEEDED` (remediation `LENS_RAM_REMEDIATION`) when the resident count is at limit or RAM is insufficient.
 
@@ -349,9 +352,9 @@ Assay exposes `PanelResourceBudget { max_vram_mb, max_ram_mb, max_ms_per_input }
 
 `CommissionRequest { name, base_model, corpus, output_dim, modality, axis }`. `commission_lens(request, artifact_dir)`: compute `corpus_hash = sha256(corpus)`, `weights_sha256 = sha256("commissioned-lens-v1", base_model, corpus_hash)`, build a `FrozenLensContract`, derive `lens_id`, write `{artifact_dir}/{lens_id}.commissioned.json`, return `CommissionedLensArtifact`.
 
-`LensForgeManifest` describes a forged embedder: `name, modality, runtime (string), dim (>0), dtype, weights_sha256, artifact_set_sha256?, files: Vec<LensForgeFile>, pooling, norm, source_hf_id, license?, non_commercial, quant_default, truncate_dim?, recall_delta`. `LensForgeFile { role, path, sha256, bytes }`.
+`LensForgeManifest` describes a forged embedder: `name, modality, runtime (string), dim (>0), shape?, dtype, execution_device?, weights_sha256, artifact_set_sha256?, files: Vec<LensForgeFile>, pooling, norm, source_hf_id, license?, non_commercial, quant_default, truncate_dim?, recall_delta, max_batch?, batch_policy`. `LensForgeFile { role, path, sha256, bytes }`. Candle/Qwen require an explicit `cpu` or `cuda:<ordinal>` execution device; other runtimes reject that field until their runtime contract consumes it. Missing legacy device bytes are a migration error, never defaulted to CUDA.
 
-`lens_spec_from_manifest` (and `_path`, `_with_license_override`): validate fields, check license allowance, verify every file against its SHA-256, derive the artifact weight hash and a corpus hash seeded `b"lensforge-manifest-v1"` over name/source/runtime/modality/pooling/norm, and return a `LensSpec` with runtime parsed from `manifest.runtime`. `register_commissioned` registers the result.
+`lens_spec_from_manifest` (and `_path`, `_with_license_override`): validate fields and runtime execution compatibility, check license allowance, verify every file against its SHA-256, derive the artifact weight hash and the runtime-specific frozen contract, and return a `LensSpec`. Candle/Qwen identity includes exact device and model dtype while the stored slot dtype remains F32. `register_commissioned` registers the result.
 
 ### 6.2 Compression (`src/compression/`)
 

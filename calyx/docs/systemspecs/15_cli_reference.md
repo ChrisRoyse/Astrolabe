@@ -469,32 +469,42 @@ Reads a legacy JSON catalog as import input, writes authoritative Calyx/Aster
 catalog rows under `lenses/catalog-db`, and verifies DB readback. Normal catalog
 operations never use the JSON file as authority.
 
-### `lens commission --hf <id> --runtime <onnx-int8|onnx-fp32|candle-fp16|tei> [flags]`
+### `lens commission --hf <id> --runtime <onnx-int8|onnx-fp32|onnx-colbert|fastembed-*|candle|tei> [flags]`
 
 First-class LensForge commissioning pipeline. Writes artifacts under `--out`
-or `<CALYX_HOME|--home>/lenses/commissioned/<hf>-<runtime>`, writes
+or `<CALYX_HOME|--home>/lenses/commissioned/<hf>-<runtime>` (local Candle/Qwen
+paths also include the resolved device and dtype), writes
 `conversion-log.jsonl`, writes `lensforge.manifest.json`, then registers it via
 the same hash-verified catalog path as `lens add`. Optional flags: `--name`,
 `--endpoint` (TEI), `--dim`, `--license`, `--non-commercial`, `--pooling`,
-`--norm`, `--quant-target`, `--max-batch`. `--max-batch` writes the manifest
-batch ceiling that later scale runs clamp to after it is proven. `onnx-int8`
-runs Optimum export plus ONNX Runtime quantization. `onnx-fp32` runs the same
-Optimum feature-extraction export without the quantization step and writes an
-`onnx`/`f32` manifest for strict batch-stable GPU lenses when dynamic int8
-quantization drifts.
+`--norm`, `--quant-target`, `--max-batch`, plus `--dtype <f16|bf16|f32>` and
+`--device <auto|cuda|cpu>` for Candle/Qwen. The output directory must be empty;
+frozen and failed artifact trees are never overwritten. Device `auto` resolves
+once to `cuda:<ordinal>` when CUDA is usable, or to a distinct CPU/F32 contract
+only when the binary has no CUDA feature or the driver reports no device. Once
+CUDA is selected, initialization/inference errors fail closed without a CPU
+retry. Arbitrary Candle model ids require explicit dtype and pooling. Qwen
+requires an explicit measured dtype and has fixed last-token pooling.
+`--max-batch` writes the manifest batch ceiling that later scale runs clamp to
+after it is proven. `onnx-int8` runs Optimum export plus ONNX Runtime
+quantization. `onnx-fp32` runs the same feature-extraction export without
+quantization.
 
 ### `lens explain --manifest <manifest.json> [--input <text>|--input-file <path>] [--repeat <n>] [--full-vector]`
 
-Not in the top-level usage string but present in `lens_commands.rs::run`.
-Supports `static_lookup`, `tei`, `candle-fp16`, `onnx-int8`, `onnx-fp32`, and
-`multimodal-adapter` LensForge manifests. `--repeat` default 1 (must be > 0);
+Supports the commissioned static, TEI, Candle, Qwen, ONNX/FastEmbed dense,
+sparse, reranker, ColBERT multi-vector, and multimodal-adapter manifest
+runtimes. `--repeat` default 1 (must be > 0);
 `--input` default `Calyx lens explain probe`; `--input-file` reads binary bytes
 for media lenses and is mutually exclusive with `--input`. Read-only;
 instantiates the real runtime, measures the probe, validates finite/dim/norm
 against the frozen spec, and prints
-`ExplainReport` (timing/norm/first values/runtime detail). `--full-vector`
-adds the complete dense vector to the report after validation for FSV cosine
-readback; it fails closed for non-dense outputs. `--home` not used by `explain`.
+`ExplainReport` with runtime detail, declared model dtype, executed model dtype,
+GEMM accumulation dtype, output dtype, vector hash, timing, norm, and artifact
+bytes. Artifact bytes are not reported as VRAM. `--full-vector` adds the
+complete dense vector (or sparse entries) after validation for FSV readback; it
+fails closed where the requested full representation is unavailable. `--home`
+is not used by `explain`.
 
 ### `panel status [--home <dir>] | [--vault <dir>]`
 

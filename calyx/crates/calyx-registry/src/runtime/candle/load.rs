@@ -7,9 +7,8 @@ use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::{Tokenizer, TruncationParams};
 
+use super::options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
 use super::{CandleDevicePolicy, CandleModelFiles, CandlePrecision};
-
-pub(super) const HALF_CUDA_MIN_LAYER_NORM_EPS: f64 = 1.0e-5;
 
 pub(super) fn fetch_files(cache_dir: &Path, model_id: &str) -> Result<CandleModelFiles> {
     let api = ApiBuilder::new()
@@ -37,39 +36,12 @@ pub(super) fn fetch_files(cache_dir: &Path, model_id: &str) -> Result<CandleMode
     })
 }
 
-pub(super) fn read_config(
-    path: &Path,
-    device_policy: CandleDevicePolicy,
-    precision: CandlePrecision,
-) -> Result<Config> {
+pub(super) fn read_config(path: &Path) -> Result<Config> {
     let bytes = std::fs::read(path).map_err(|err| {
         CalyxError::lens_unreachable(format!("read BERT config {} failed: {err}", path.display()))
     })?;
-    let mut config: Config = serde_json::from_slice(&bytes)
-        .map_err(|err| CalyxError::lens_unreachable(format!("parse BERT config failed: {err}")))?;
-    stabilize_half_cuda_config(&mut config, device_policy, precision);
-    Ok(config)
-}
-
-pub(super) fn stabilize_half_cuda_config(
-    config: &mut Config,
-    device_policy: CandleDevicePolicy,
-    precision: CandlePrecision,
-) {
-    if matches!(device_policy, CandleDevicePolicy::CudaFailLoud { .. })
-        && matches!(precision, CandlePrecision::F16 | CandlePrecision::BF16)
-        && config.layer_norm_eps < HALF_CUDA_MIN_LAYER_NORM_EPS
-    {
-        config.layer_norm_eps = HALF_CUDA_MIN_LAYER_NORM_EPS;
-    }
-}
-
-pub(super) fn needs_f32_finite_replay(
-    device_policy: CandleDevicePolicy,
-    precision: CandlePrecision,
-) -> bool {
-    matches!(device_policy, CandleDevicePolicy::CudaFailLoud { .. })
-        && matches!(precision, CandlePrecision::F16 | CandlePrecision::BF16)
+    serde_json::from_slice(&bytes)
+        .map_err(|err| CalyxError::lens_unreachable(format!("parse BERT config failed: {err}")))
 }
 
 pub(super) fn read_tokenizer(path: &Path, max_tokens: usize) -> Result<Tokenizer> {
@@ -90,16 +62,34 @@ pub(super) fn read_model(
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
 ) -> Result<BertModel> {
-    let device = candle_device(device_policy)?;
+    configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
+        with_runtime_context(
+            error,
+            "gemm_accumulation_configure",
+            device_policy,
+            precision,
+        )
+    })?;
+    let device = candle_device(device_policy)
+        .map_err(|error| with_runtime_context(error, "device_init", device_policy, precision))?;
     let paths = [weights];
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, precision.dtype(), &device) }
-        .map_err(candle_error)?;
-    BertModel::load(vb, config).map_err(candle_error)
+        .map_err(candle_error)
+        .map_err(|error| with_runtime_context(error, "weights_mmap", device_policy, precision))?;
+    let model = BertModel::load(vb, config)
+        .map_err(candle_error)
+        .map_err(|error| with_runtime_context(error, "model_load", device_policy, precision))?;
+    verify_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
+        with_runtime_context(error, "gemm_accumulation_verify", device_policy, precision)
+    })?;
+    Ok(model)
 }
 
 pub(super) fn candle_device(policy: CandleDevicePolicy) -> Result<Device> {
     match policy {
-        CandleDevicePolicy::CpuExplicit => Ok(Device::Cpu),
+        CandleDevicePolicy::CpuExplicit
+        | CandleDevicePolicy::CpuNoCudaFeature
+        | CandleDevicePolicy::CpuNoCudaDevice => Ok(Device::Cpu),
         CandleDevicePolicy::CudaFailLoud { ordinal } => candle_cuda_device(ordinal),
     }
 }
@@ -131,6 +121,25 @@ pub(super) fn candle_error_message(message: String) -> CalyxError {
         };
     }
     CalyxError::lens_unreachable(message)
+}
+
+pub(super) fn with_runtime_context(
+    error: CalyxError,
+    stage: &str,
+    device_policy: CandleDevicePolicy,
+    precision: CandlePrecision,
+) -> CalyxError {
+    CalyxError {
+        code: error.code,
+        message: format!(
+            "candle stage={stage} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            device_policy.detail(),
+            precision.as_str(),
+            precision.as_str(),
+            error.message
+        ),
+        remediation: error.remediation,
+    }
 }
 
 pub(super) fn ensure_file(label: &str, path: &Path) -> Result<()> {

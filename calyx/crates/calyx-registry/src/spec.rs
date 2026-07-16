@@ -35,9 +35,8 @@ pub enum LensRuntime {
     CandleLocal {
         model_id: String,
         files: Vec<PathBuf>,
-        #[serde(default = "default_candle_dtype")]
+        device: String,
         dtype: String,
-        #[serde(default = "default_candle_pooling")]
         pooling: String,
     },
     Onnx {
@@ -64,7 +63,7 @@ pub enum LensRuntime {
     FastembedQwen3 {
         model_id: String,
         files: Vec<PathBuf>,
-        #[serde(default = "default_qwen3_dtype")]
+        device: String,
         dtype: String,
     },
     StaticLookup {
@@ -173,13 +172,15 @@ impl LensSpec {
                 ..
             } => multimodal_adapter_health(adapter_config.as_ref(), files),
             LensRuntime::TeiHttp { endpoint } => probe_http(endpoint),
-            LensRuntime::CandleLocal { files, .. } => candle_local_health(files),
+            LensRuntime::CandleLocal { files, device, .. }
+            | LensRuntime::FastembedQwen3 { files, device, .. } => {
+                candle_local_health(files, device)
+            }
             LensRuntime::Onnx { files, .. }
             | LensRuntime::OnnxColbert { files, .. }
             | LensRuntime::FastembedSparse { files, .. }
             | LensRuntime::FastembedBgem3 { files, .. }
-            | LensRuntime::FastembedReranker { files, .. }
-            | LensRuntime::FastembedQwen3 { files, .. } => files_runtime_health(files),
+            | LensRuntime::FastembedReranker { files, .. } => files_runtime_health(files),
             LensRuntime::StaticLookup {
                 embeddings_file,
                 tokenizer,
@@ -213,18 +214,6 @@ impl LensSpec {
     }
 }
 
-fn default_candle_dtype() -> String {
-    "f32".to_string()
-}
-
-fn default_candle_pooling() -> String {
-    "mean".to_string()
-}
-
-fn default_qwen3_dtype() -> String {
-    "f16".to_string()
-}
-
 pub const fn default_quant_default() -> QuantPolicy {
     QuantPolicy::turboquant_default()
 }
@@ -233,8 +222,9 @@ pub const fn default_recall_delta() -> f32 {
     0.02
 }
 
-fn candle_local_health(files: &[PathBuf]) -> LensHealth {
+fn candle_local_health(files: &[PathBuf], device: &str) -> LensHealth {
     match files_runtime_health(files) {
+        LensHealth::Loaded if device == "cpu" => LensHealth::Loaded,
         LensHealth::Loaded => candle_cuda_runtime_health(),
         health => health,
     }

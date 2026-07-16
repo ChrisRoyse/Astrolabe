@@ -14,7 +14,7 @@ use super::algorithmic_manifest::{
     frozen_contract as algorithmic_frozen_contract, is_algorithmic_runtime,
     output_shape as algorithmic_output_shape,
 };
-use super::manifest_runtime::runtime_from_manifest;
+use super::manifest_runtime::{runtime_from_manifest, validate_local_model_execution};
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -70,6 +70,8 @@ pub struct LensForgeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<LensForgeShape>,
     pub dtype: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_device: Option<String>,
     pub weights_sha256: String,
     #[serde(default)]
     pub artifact_set_sha256: Option<String>,
@@ -259,6 +261,11 @@ fn validate_required(manifest: &LensForgeManifest) -> Result<()> {
     if manifest.runtime.trim().is_empty() {
         return Err(config_invalid("lensforge manifest runtime is required"));
     }
+    validate_local_model_execution(
+        &manifest.runtime,
+        &manifest.dtype,
+        manifest.execution_device.as_deref(),
+    )?;
     if is_tei_runtime(&manifest.runtime)
         && manifest
             .endpoint

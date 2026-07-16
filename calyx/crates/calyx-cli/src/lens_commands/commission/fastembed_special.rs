@@ -5,7 +5,6 @@ use calyx_core::{Input, Lens, Modality, SlotShape};
 use calyx_registry::{
     CandlePrecision, FastembedBgem3Lens, FastembedBgem3Output, FastembedQwen3Lens,
     FastembedRerankerLens, FastembedSparseLens, NormPolicy, OnnxProviderPolicy, Qwen3ModelFiles,
-    default_cuda_fail_loud_policy,
 };
 use serde_json::json;
 
@@ -136,8 +135,8 @@ fn commission_qwen3(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
-        default_cuda_fail_loud_policy()?,
-        CandlePrecision::F16,
+        flags.local_device_policy()?,
+        CandlePrecision::parse(flags.manifest_dtype())?,
     )?;
     let probe = Input::new(Modality::Text, b"Calyx Qwen3 commission probe".to_vec());
     let vector = lens.measure(&probe)?;
@@ -147,7 +146,7 @@ fn commission_qwen3(
     log.event(json!({
         "event": "fastembed_qwen3_verified",
         "model_id": lens.files().model_id,
-        "device_policy": lens.device_policy().as_str(),
+        "device_policy": lens.device_policy().detail(),
         "precision": lens.precision().as_str(),
         "max_tokens": lens.max_tokens(),
         "runtime": lens.runtime_name(),

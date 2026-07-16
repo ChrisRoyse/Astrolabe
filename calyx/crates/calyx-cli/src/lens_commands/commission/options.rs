@@ -1,6 +1,12 @@
 use std::env;
 use std::path::PathBuf;
 
+use calyx_registry::{
+    CandleDeviceMode, CandleDevicePolicy, CandlePoolingPolicy, CandlePrecision,
+    DEFAULT_CANDLE_MODEL, configured_device_policy, default_precision_for_policy,
+    device_policy_for_mode,
+};
+
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::flags::value;
 
@@ -16,7 +22,7 @@ pub(super) enum CommissionRuntime {
     FastembedBgem3Colbert,
     FastembedReranker,
     FastembedQwen3,
-    CandleFp16,
+    Candle,
     Tei,
 }
 
@@ -35,10 +41,13 @@ impl CommissionRuntime {
             }
             "fastembed-reranker" => Ok(Self::FastembedReranker),
             "fastembed-qwen3" | "qwen3" => Ok(Self::FastembedQwen3),
-            "candle-fp16" => Ok(Self::CandleFp16),
+            "candle" | "candle-local" => Ok(Self::Candle),
+            "candle-fp16" => Err(CliError::usage(
+                "--runtime candle-fp16 is read-only legacy syntax; use --runtime candle --dtype f16 with a new empty output directory",
+            )),
             "tei" | "tei-http" | "tei_http" => Ok(Self::Tei),
             other => Err(CliError::usage(format!(
-                "unsupported --runtime {other}; expected onnx-int8, onnx-fp32, onnx-colbert, fastembed-onnx, fastembed-sparse, fastembed-bgem3-*, fastembed-reranker, fastembed-qwen3, candle-fp16, or tei"
+                "unsupported --runtime {other}; expected onnx-int8, onnx-fp32, onnx-colbert, fastembed-onnx, fastembed-sparse, fastembed-bgem3-*, fastembed-reranker, fastembed-qwen3, candle, or tei"
             ))),
         }
     }
@@ -55,7 +64,7 @@ impl CommissionRuntime {
             Self::FastembedBgem3Colbert => "fastembed-bgem3-colbert",
             Self::FastembedReranker => "fastembed-reranker",
             Self::FastembedQwen3 => "fastembed-qwen3",
-            Self::CandleFp16 => "candle-fp16",
+            Self::Candle => "candle",
             Self::Tei => "tei",
         }
     }
@@ -73,7 +82,7 @@ impl CommissionRuntime {
             | Self::FastembedReranker
             | Self::Tei => "f32",
             Self::FastembedQwen3 => "f16",
-            Self::CandleFp16 => "f16",
+            Self::Candle => "f16",
         }
     }
 
@@ -89,9 +98,47 @@ impl CommissionRuntime {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommissionPrecision {
+    F16,
+    BF16,
+    F32,
+}
+
+impl CommissionPrecision {
+    fn parse(raw: &str) -> CliResult<Self> {
+        match raw {
+            "f16" => Ok(Self::F16),
+            "bf16" => Ok(Self::BF16),
+            "f32" => Ok(Self::F32),
+            other => Err(CliError::usage(format!(
+                "unsupported local model --dtype {other}; expected f16, bf16, or f32"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+            Self::F32 => "f32",
+        }
+    }
+
+    const fn from_candle(value: CandlePrecision) -> Self {
+        match value {
+            CandlePrecision::F16 => Self::F16,
+            CandlePrecision::BF16 => Self::BF16,
+            CandlePrecision::F32 => Self::F32,
+        }
+    }
+}
+
 pub(super) struct CommissionFlags {
     pub(super) hf: String,
     pub(super) runtime: CommissionRuntime,
+    model_precision: Option<CommissionPrecision>,
+    device_policy: Option<CandleDevicePolicy>,
     pub(super) home: Option<PathBuf>,
     pub(super) out: Option<PathBuf>,
     pub(super) name: Option<String>,
@@ -113,6 +160,8 @@ impl CommissionFlags {
     pub(super) fn parse(args: &[String]) -> CliResult<Self> {
         let mut hf = None;
         let mut runtime = None;
+        let mut model_precision = None;
+        let mut device_mode = None;
         let mut home = None;
         let mut out = None;
         let mut name = None;
@@ -121,6 +170,7 @@ impl CommissionFlags {
         let mut license = None;
         let mut non_commercial = false;
         let mut pooling = "mean".to_string();
+        let mut pooling_explicit = false;
         let mut norm = "unit".to_string();
         let mut norm_explicit = false;
         let mut quant_target = "avx2".to_string();
@@ -137,7 +187,17 @@ impl CommissionFlags {
                 }
                 "--runtime" => {
                     idx += 1;
-                    runtime = Some(CommissionRuntime::parse(value(args, idx, "--runtime")?)?);
+                    let raw = value(args, idx, "--runtime")?;
+                    runtime = Some(CommissionRuntime::parse(raw)?);
+                }
+                "--dtype" => {
+                    idx += 1;
+                    model_precision =
+                        Some(CommissionPrecision::parse(value(args, idx, "--dtype")?)?);
+                }
+                "--device" => {
+                    idx += 1;
+                    device_mode = Some(CandleDeviceMode::parse(value(args, idx, "--device")?)?);
                 }
                 "--home" => {
                     idx += 1;
@@ -170,6 +230,7 @@ impl CommissionFlags {
                 "--pooling" => {
                     idx += 1;
                     pooling = value(args, idx, "--pooling")?.to_string();
+                    pooling_explicit = true;
                 }
                 "--norm" => {
                     idx += 1;
@@ -218,10 +279,78 @@ impl CommissionFlags {
         }
         let hf = require_nonempty(hf, "--hf")?;
         let runtime = runtime.ok_or_else(|| CliError::usage("--runtime is required"))?;
+        if runtime == CommissionRuntime::Candle {
+            CandlePoolingPolicy::parse(&pooling)?;
+            if hf != DEFAULT_CANDLE_MODEL && (model_precision.is_none() || !pooling_explicit) {
+                return Err(CliError::usage(format!(
+                    "Candle model {hf} has no measured defaults; arbitrary models require explicit --dtype <f16|bf16|f32> and --pooling <mean|cls>"
+                )));
+            }
+        }
+        if runtime == CommissionRuntime::FastembedQwen3 {
+            if model_precision.is_none() {
+                return Err(CliError::usage(
+                    "fastembed-qwen3 requires an explicit measured --dtype <f16|bf16|f32>",
+                ));
+            }
+            if pooling_explicit && pooling != "last-token" {
+                return Err(CliError::usage(
+                    "fastembed-qwen3 has a frozen last-token pooling contract; omit --pooling or pass --pooling last-token",
+                ));
+            }
+        }
+        if model_precision.is_some()
+            && !matches!(
+                runtime,
+                CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+            )
+        {
+            return Err(CliError::usage(
+                "--dtype is supported only with --runtime candle or fastembed-qwen3",
+            ));
+        }
+        if device_mode.is_some()
+            && !matches!(
+                runtime,
+                CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+            )
+        {
+            return Err(CliError::usage(
+                "--device is supported only with --runtime candle or fastembed-qwen3",
+            ));
+        }
+        let local_model = matches!(
+            runtime,
+            CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+        );
+        let device_policy = if local_model {
+            Some(match device_mode {
+                Some(mode) => device_policy_for_mode(mode)?,
+                None => configured_device_policy()?,
+            })
+        } else {
+            None
+        };
+        let model_precision = if let Some(policy) = device_policy {
+            let precision = model_precision.unwrap_or_else(|| {
+                CommissionPrecision::from_candle(default_precision_for_policy(policy))
+            });
+            if !policy.is_gpu() && precision != CommissionPrecision::F32 {
+                return Err(CliError::usage(format!(
+                    "{} placement requires --dtype f32; half-precision CPU execution would violate the frozen lens contract",
+                    policy.detail()
+                )));
+            }
+            Some(precision)
+        } else {
+            None
+        };
         validate_quant_target(&quant_target)?;
         Ok(Self {
             hf,
             runtime,
+            model_precision,
+            device_policy,
             home,
             out,
             name,
@@ -253,18 +382,53 @@ impl CommissionFlags {
         Ok(home.join("lenses").join("commissioned").join(format!(
             "{}-{}",
             sanitize_path_token(&self.hf),
-            self.runtime.manifest_runtime()
+            self.identity_runtime_token()
         )))
     }
 
     pub(super) fn lens_name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| {
-            format!(
+        match (&self.name, self.runtime) {
+            (Some(name), CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3) => {
+                let suffix = format!("-{}", self.local_identity_suffix());
+                if name.ends_with(suffix.as_str()) {
+                    name.clone()
+                } else {
+                    format!("{name}{suffix}")
+                }
+            }
+            (Some(name), _) => name.clone(),
+            (None, _) => format!(
                 "{}-{}",
                 sanitize_path_token(&self.hf),
-                self.runtime.manifest_runtime()
-            )
+                self.identity_runtime_token()
+            ),
+        }
+    }
+
+    pub(super) fn manifest_dtype(&self) -> &'static str {
+        self.model_precision
+            .map(CommissionPrecision::as_str)
+            .unwrap_or_else(|| self.runtime.default_dtype())
+    }
+
+    pub(super) fn execution_device(&self) -> Option<String> {
+        self.device_policy.map(CandleDevicePolicy::frozen_token)
+    }
+
+    pub(super) fn local_device_policy(&self) -> CliResult<CandleDevicePolicy> {
+        self.device_policy.ok_or_else(|| {
+            CliError::runtime("local model commission is missing its resolved device policy")
         })
+    }
+
+    pub(super) fn runs_on_local_gpu(&self) -> bool {
+        match self.runtime {
+            CommissionRuntime::Tei => false,
+            CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3 => {
+                self.device_policy.is_some_and(CandleDevicePolicy::is_gpu)
+            }
+            _ => true,
+        }
     }
 
     pub(super) fn endpoint_for_manifest(&self) -> Option<String> {
@@ -285,6 +449,28 @@ impl CommissionFlags {
         } else {
             self.runtime.default_norm().to_string()
         }
+    }
+
+    fn identity_runtime_token(&self) -> String {
+        if matches!(
+            self.runtime,
+            CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
+        ) {
+            return format!(
+                "{}-{}",
+                self.runtime.manifest_runtime(),
+                self.local_identity_suffix()
+            );
+        }
+        self.runtime.manifest_runtime().to_string()
+    }
+
+    fn local_identity_suffix(&self) -> String {
+        let device = self
+            .execution_device()
+            .unwrap_or_else(|| "unresolved".to_string())
+            .replace(':', "");
+        format!("{device}-{}", self.manifest_dtype())
     }
 }
 

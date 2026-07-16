@@ -7,7 +7,10 @@ use calyxd::vram::{NvmlVramUsage, VramUsage};
 use super::LensCatalog;
 use crate::error::{CliError, CliResult};
 
-pub(super) fn placement_budget_from_catalog(catalog: &LensCatalog) -> CliResult<PlacementBudget> {
+pub(super) fn placement_budget_from_catalog(
+    catalog: &LensCatalog,
+    require_gpu_budget: bool,
+) -> CliResult<PlacementBudget> {
     let vram_allocated_bytes = catalog
         .lenses
         .iter()
@@ -25,7 +28,11 @@ pub(super) fn placement_budget_from_catalog(catalog: &LensCatalog) -> CliResult<
         .iter()
         .filter(|entry| entry.placement == Placement::Cpu)
         .count();
-    let (vram_soft_cap_bytes, tei_reserved_bytes) = resolve_gpu_vram_budget()?;
+    let (vram_soft_cap_bytes, tei_reserved_bytes) = if require_gpu_budget {
+        resolve_gpu_vram_budget()?
+    } else {
+        (0, 0)
+    };
     let available = vram_soft_cap_bytes
         .saturating_sub(tei_reserved_bytes)
         .saturating_sub(vram_allocated_bytes);

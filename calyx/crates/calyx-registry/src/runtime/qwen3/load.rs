@@ -6,8 +6,11 @@ use candle_nn::VarBuilder;
 use fastembed::{Qwen3Config, Qwen3Model, Qwen3TextEmbedding};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use super::{DEFAULT_QWEN3_MODEL, config_invalid, qwen3_error};
-use crate::runtime::candle::{CandleDevicePolicy, CandlePrecision};
+use super::{DEFAULT_QWEN3_MODEL, config_invalid, qwen3_error, qwen3_runtime_context};
+use crate::runtime::candle::{
+    CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation,
+    verify_f32_gemm_accumulation,
+};
 use crate::runtime::common::normalize_unit;
 
 pub fn read_config(path: &Path) -> Result<Qwen3Config> {
@@ -46,10 +49,25 @@ pub fn read_model(
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
 ) -> Result<Qwen3TextEmbedding> {
-    let device = qwen3_device(device_policy)?;
+    configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
+        qwen3_runtime_context(
+            error,
+            "gemm_accumulation_configure",
+            device_policy,
+            precision,
+        )
+    })?;
+    let device = qwen3_device(device_policy)
+        .map_err(|error| qwen3_runtime_context(error, "device_init", device_policy, precision))?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(weights, precision.dtype(), &device) }
-        .map_err(qwen3_error)?;
-    let model = Qwen3Model::new(config, vb).map_err(qwen3_error)?;
+        .map_err(qwen3_error)
+        .map_err(|error| qwen3_runtime_context(error, "weights_mmap", device_policy, precision))?;
+    let model = Qwen3Model::new(config, vb)
+        .map_err(qwen3_error)
+        .map_err(|error| qwen3_runtime_context(error, "model_load", device_policy, precision))?;
+    verify_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
+        qwen3_runtime_context(error, "gemm_accumulation_verify", device_policy, precision)
+    })?;
     Ok(Qwen3TextEmbedding::new(model, tokenizer))
 }
 
@@ -87,7 +105,9 @@ pub fn qwen3_model_id(raw: &str) -> Result<String> {
 
 fn qwen3_device(policy: CandleDevicePolicy) -> Result<Device> {
     match policy {
-        CandleDevicePolicy::CpuExplicit => Ok(Device::Cpu),
+        CandleDevicePolicy::CpuExplicit
+        | CandleDevicePolicy::CpuNoCudaFeature
+        | CandleDevicePolicy::CpuNoCudaDevice => Ok(Device::Cpu),
         CandleDevicePolicy::CudaFailLoud { ordinal } => qwen3_cuda_device(ordinal),
     }
 }
