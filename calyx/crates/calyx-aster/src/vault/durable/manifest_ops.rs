@@ -86,6 +86,10 @@ impl DurableVault {
             self.temporal_policy,
             self.dedup_policy.clone(),
         )?;
+        manifest.input_retention = current
+            .as_ref()
+            .map(|manifest| manifest.input_retention)
+            .unwrap_or_default();
         // The local atomic only knows about content THIS handle checkpointed.
         // A foreign writer (second handle/process) may have recorded a higher
         // watermark in the current manifest; a content-neutral write from this

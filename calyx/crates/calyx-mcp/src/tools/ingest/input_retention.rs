@@ -1,26 +1,18 @@
+//! Retained artifact-file helpers for media ingest.
+//!
+//! Plain text ingest does not use this module. `calyx.ingest` stores retained
+//! text bytes in Aster's content-addressed `cxinput:v1:` Blob-CF keyspace in
+//! the same atomic batch as the Base row.
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use calyx_aster::cf::full_content_hash;
-use calyx_core::{CalyxError, Input, Modality};
+use calyx_core::CalyxError;
 
 use crate::server::{ToolError, ToolResult};
-use crate::tools::vault::store::ResolvedVault;
 
 pub(super) const INPUT_POINTER_PREFIX: &str = "calyx-vault://";
-
-pub(super) fn retained_text_input(resolved: &ResolvedVault, text: &str) -> ToolResult<Input> {
-    let bytes = text.as_bytes().to_vec();
-    let hash = full_content_hash([bytes.as_slice()]);
-    let rel = format!("inputs/{}.bin", hex32(&hash));
-    write_input_blob(&resolved.path.join(&rel), &bytes)?;
-    Ok(Input::new(Modality::Text, bytes).with_pointer(format!("{INPUT_POINTER_PREFIX}{rel}")))
-}
-
-pub(super) fn input_hash(bytes: &[u8]) -> [u8; 32] {
-    full_content_hash([bytes])
-}
 
 pub(super) fn write_input_blob(path: &Path, bytes: &[u8]) -> ToolResult<()> {
     if let Ok(existing) = fs::read(path) {
@@ -57,10 +49,6 @@ pub(super) fn write_input_blob(path: &Path, bytes: &[u8]) -> ToolResult<()> {
         ))
     })?;
     Ok(())
-}
-
-fn hex32(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn input_blob_error(message: impl Into<String>) -> ToolError {

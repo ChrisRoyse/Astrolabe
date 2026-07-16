@@ -9,12 +9,14 @@ mod report;
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{ColumnFamily, base_key};
+use calyx_aster::vault::input_store::{self, InputRetention};
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
     AbsentReason, Anchor, CalyxError, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef,
     Modality, Slot, SlotState, SlotVector, VaultStore,
 };
 use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use calyx_registry::measure::input_hash;
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -27,7 +29,6 @@ use crate::server::{McpServer, Tool, ToolError, ToolResult};
 use self::anchor::{
     append_anchor_ledger, parse_anchor_kind, parse_anchor_value, validate_confidence,
 };
-use self::input_retention::{input_hash, retained_text_input};
 use self::report::constellation_report;
 use super::vault::now_ms;
 use super::vault::store::{ResolvedVault, home_dir, resolve_vault_info, vault_salt};
@@ -233,13 +234,11 @@ fn ingest_texts_arg(input: Option<String>, batch: Option<Vec<String>>) -> ToolRe
 fn ingest_texts(resolved: &ResolvedVault, texts: &[String]) -> ToolResult<Vec<IngestReport>> {
     let inputs = texts
         .iter()
-        .map(|text| {
-            Ok(PreparedInput {
-                input: retained_text_input(resolved, text)?,
-                metadata: BTreeMap::new(),
-            })
+        .map(|text| PreparedInput {
+            input: text_input(text.clone()),
+            metadata: BTreeMap::new(),
         })
-        .collect::<ToolResult<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     ingest_prepared_inputs(resolved, inputs)
 }
 
@@ -248,34 +247,58 @@ fn ingest_prepared_inputs(
     inputs: Vec<PreparedInput>,
 ) -> ToolResult<Vec<IngestReport>> {
     let vault = open_vault(resolved)?;
+    let retention = vault.input_retention()?;
     let state = load_vault_panel_state(&resolved.path)?;
     let mut staged = Vec::new();
+    let mut staged_inputs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut first_new = BTreeSet::new();
-    for input in inputs {
-        let mut measured = measure_constellation(&vault, &state, input.input, now_ms())?;
-        measured.constellation.metadata = input.metadata;
+    for prepared_input in inputs {
+        let PreparedInput { input, metadata } = prepared_input;
+        let input_bytes = input.bytes.clone();
+        let mut measured = measure_constellation(&vault, &state, input, now_ms())?;
+        measured.constellation.metadata = metadata;
         let cx_id = measured.constellation.cx_id;
         let new = !base_exists(&vault, cx_id)? && first_new.insert(cx_id);
         if new {
-            staged.push(measured.constellation);
+            match retention {
+                InputRetention::Persist => {
+                    measured.constellation.input_ref.pointer = Some(input_store::input_pointer(
+                        &measured.constellation.input_ref.hash,
+                    ));
+                    measured.constellation.input_ref.redacted = false;
+                    staged_inputs.push((measured.constellation.input_ref.hash, input_bytes));
+                }
+                InputRetention::Redact => {
+                    measured.constellation.input_ref.redacted = true;
+                    measured.constellation.flags.redacted_input = true;
+                }
+            }
+            staged.push(measured.constellation.clone());
         }
         prepared.push((cx_id, new));
+    }
+    let mut input_rows = Vec::new();
+    for (input_hash, bytes) in &staged_inputs {
+        input_rows.extend(input_store::encode_input_rows(input_hash, bytes)?);
     }
     match staged.len() {
         0 => {}
         1 => {
-            vault.put(staged.pop().expect("one staged constellation"))?;
+            vault
+                .put_with_input_rows(staged.pop().expect("one staged constellation"), input_rows)?;
         }
         _ => {
-            vault.put_batch(staged)?;
+            vault.put_batch_with_input_rows(staged, input_rows)?;
         }
     }
     vault.flush()?;
+    verify_persisted_inputs(&vault, &staged_inputs)?;
     let snapshot = vault.snapshot();
     let mut reports = Vec::with_capacity(prepared.len());
     for (cx_id, new) in prepared {
         let stored = vault.get(cx_id, snapshot)?;
+        verify_stored_text_input_state(&vault, &stored)?;
         let ledger_seq = if new {
             stored.provenance.seq
         } else {
@@ -289,6 +312,64 @@ fn ingest_prepared_inputs(
     }
     vault.flush()?;
     Ok(reports)
+}
+
+fn verify_persisted_inputs(
+    vault: &AsterVault,
+    persisted: &[([u8; 32], Vec<u8>)],
+) -> ToolResult<()> {
+    for (expected_hash, expected_bytes) in persisted {
+        let readback = input_store::read_input_bytes(vault, expected_hash)?;
+        if &readback != expected_bytes {
+            return Err(CalyxError {
+                code: input_store::CALYX_INPUT_STORE_CORRUPT,
+                message: format!(
+                    "post-commit MCP input-store readback of {} returned {} bytes, expected {} bytes",
+                    hex_hash(expected_hash),
+                    readback.len(),
+                    expected_bytes.len()
+                ),
+                remediation:
+                    "the MCP input-store commit path is inconsistent; do not trust this vault",
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_text_input_state(vault: &AsterVault, stored: &Constellation) -> ToolResult<()> {
+    if stored.input_ref.redacted || stored.flags.redacted_input {
+        if stored.input_ref.redacted && stored.flags.redacted_input {
+            return Ok(());
+        }
+        return Err(CalyxError {
+            code: "CALYX_MCP_INPUT_RETENTION_INCONSISTENT",
+            message: format!(
+                "cx {} has inconsistent redaction labels: input_ref.redacted={} flags.redacted_input={}",
+                stored.cx_id, stored.input_ref.redacted, stored.flags.redacted_input
+            ),
+            remediation:
+                "repair or rebuild the vault record so redaction is explicit on both stored labels",
+        }
+        .into());
+    }
+
+    let expected_pointer = input_store::input_pointer(&stored.input_ref.hash);
+    if stored.input_ref.pointer.as_deref() != Some(expected_pointer.as_str()) {
+        return Err(CalyxError {
+            code: "CALYX_MCP_INPUT_RETENTION_INCONSISTENT",
+            message: format!(
+                "cx {} text input pointer {:?} does not resolve to the required {expected_pointer}",
+                stored.cx_id, stored.input_ref.pointer
+            ),
+            remediation:
+                "re-ingest from a source vault that writes cxinput rows, or run a dedicated input-store backfill before treating this record as retained",
+        }
+        .into());
+    }
+    let _ = input_store::read_input_bytes(vault, &stored.input_ref.hash)?;
+    Ok(())
 }
 
 fn measure_constellation(
@@ -453,6 +534,10 @@ fn validate_text(value: &str) -> ToolResult<()> {
 
 fn text_input(text: String) -> Input {
     Input::new(Modality::Text, text.into_bytes())
+}
+
+fn hex_hash(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn absent(reason: AbsentReason) -> SlotVector {
