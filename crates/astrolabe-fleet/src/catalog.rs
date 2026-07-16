@@ -209,6 +209,7 @@ impl FleetCatalog {
             clone_path: None,
             head_commit_hash: None,
             index_watermark: None,
+            indexed_commit_hash: None,
             kernel_scope_id: None,
             quarantine_reason: None,
             departed_reason: None,
@@ -281,6 +282,9 @@ impl FleetCatalog {
         if let Some(watermark) = ctx.index_watermark {
             row.index_watermark = Some(watermark);
         }
+        if let Some(grounded) = ctx.indexed_commit_hash {
+            row.indexed_commit_hash = Some(grounded);
+        }
         if let Some(scope) = ctx.kernel_scope_id {
             row.kernel_scope_id = Some(scope);
         }
@@ -301,6 +305,11 @@ impl FleetCatalog {
             // absence; the ledger keeps that history, the live row does not.
             row.departed_reason = None;
         }
+        if from == RepoState::Quarantined && to == RepoState::Discovered {
+            // Retry release (#457): the quarantine reason described the
+            // failure being retried; the ledger keeps that history.
+            row.quarantine_reason = None;
+        }
         row.state = to;
         row.state_timestamps
             .insert(to.as_str().to_string(), ctx.at_unix_secs);
@@ -315,6 +324,9 @@ impl FleetCatalog {
         });
         if let Some(head) = &row.head_commit_hash {
             payload["head_commit_hash"] = json!(head);
+        }
+        if let Some(grounded) = &row.indexed_commit_hash {
+            payload["indexed_commit_hash"] = json!(grounded);
         }
         if let Some(reason) = &row.quarantine_reason {
             payload["quarantine_reason"] = json!(reason);
@@ -362,6 +374,9 @@ impl FleetCatalog {
         }
         if let Some(watermark) = ctx.index_watermark {
             row.index_watermark = Some(watermark);
+        }
+        if let Some(grounded) = ctx.indexed_commit_hash {
+            row.indexed_commit_hash = Some(grounded);
         }
         if let Some(scope) = ctx.kernel_scope_id {
             row.kernel_scope_id = Some(scope);

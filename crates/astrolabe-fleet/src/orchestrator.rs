@@ -247,6 +247,21 @@ struct JobResult {
     fact_refresh: Option<TransitionContext>,
 }
 
+/// One pass's persisted report plus its would-be fail-closed refusal, for
+/// callers (the growth cycle, #457) that must contain per-repo failures
+/// without losing the report. `refusal` is exactly the error
+/// [`run_pipeline_pass`] would have returned; a caller that swallows it must
+/// count and surface it — never drop it silently (invariant 3).
+pub struct PassOutcome {
+    /// The run report (already persisted to the store root and the catalog
+    /// vault), with `commit_seq`/`ledger_seq`/`report_file` attached.
+    pub report: Value,
+    /// Repos that hard-failed this pass (quarantined).
+    pub failed: usize,
+    /// The fail-closed refusal the pass would have raised, if any.
+    pub refusal: Option<CalyxError>,
+}
+
 /// Runs one pipeline pass. Returns the run report on success; a pass with
 /// quarantines persists its report and then fails closed naming the counts.
 pub fn run_pipeline_pass(
@@ -254,6 +269,21 @@ pub fn run_pipeline_pass(
     config: &PipelineConfig,
     selection: &Selection,
 ) -> Result<Value, CalyxError> {
+    let outcome = run_pipeline_pass_outcome(catalog, config, selection)?;
+    match outcome.refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(outcome.report),
+    }
+}
+
+/// Runs one pipeline pass and returns its [`PassOutcome`]: the persisted
+/// report together with the pass's would-be refusal instead of failing
+/// closed. Hard errors (catalog/store unavailable, worker loss) still refuse.
+pub fn run_pipeline_pass_outcome(
+    catalog: &FleetCatalog,
+    config: &PipelineConfig,
+    selection: &Selection,
+) -> Result<PassOutcome, CalyxError> {
     let started = Instant::now();
     let runs_dir = config.store_root.join("runs");
     fs::create_dir_all(&runs_dir).map_err(|error| CalyxError {
@@ -509,7 +539,7 @@ pub fn run_pipeline_pass(
     let (commit_seq, ledger_seq) = catalog.record_run_report(&run_id, report_bytes, summary)?;
 
     let failed = count(Outcome::Quarantined);
-    if let Some(total) = budget_exhausted_at {
+    let refusal = if let Some(total) = budget_exhausted_at {
         let budget = config.store_budget_bytes.unwrap_or(0);
         let mut largest: Vec<(&str, u64)> = all_rows
             .iter()
@@ -525,7 +555,7 @@ pub fn run_pipeline_pass(
             .map(|(name, bytes)| format!("{name}={bytes}"))
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(CalyxError {
+        Some(CalyxError {
             code: ASTRO_FLEET_STORE_BUDGET,
             message: format!(
                 "fleet store total {total} bytes reached the declared budget {budget}; \
@@ -534,24 +564,29 @@ pub fn run_pipeline_pass(
                 report_path.display()
             ),
             remediation: "evict or archive the largest stores (catalog store_bytes, named in the message) or raise --store-budget-bytes, then re-run — completed repos are idempotent",
-        });
-    }
-    if failed > 0 {
-        return Err(CalyxError {
+        })
+    } else if failed > 0 {
+        Some(CalyxError {
             code: ASTRO_FLEET_PIPELINE_INCOMPLETE,
             message: format!(
                 "pipeline pass {run_id} finished with {failed} quarantined repo(s); report {}",
                 report_path.display()
             ),
             remediation: "inspect the run report, per-repo verdicts, and rejection files; quarantine reasons are on the catalog rows",
-        });
-    }
+        })
+    } else {
+        None
+    };
 
     let mut out = report;
     out["commit_seq"] = json!(commit_seq);
     out["ledger_seq"] = json!(ledger_seq);
     out["report_file"] = json!(report_path.display().to_string());
-    Ok(out)
+    Ok(PassOutcome {
+        report: out,
+        failed,
+        refusal,
+    })
 }
 
 /// One repo's pipeline job, run on a worker thread. Catalog mutations are
@@ -614,26 +649,32 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
         );
     }
 
-    // Idempotent skip / stale / force on already-kerneled records.
+    // Idempotent skip / stale / force on already-kerneled records. Grounding
+    // (#457): the skip/stale verdict keys on `indexed_commit_hash` — the head
+    // the persisted kernel was actually built at — because an update fetch
+    // advances both the clone and `head_commit_hash`, which made a stale
+    // kernel indistinguishable from a current one. A kerneled row without a
+    // grounding fact (written before the fact existed and not yet backfilled
+    // from the ledger) is treated as stale, never silently skipped.
     if row.state == RepoState::Kerneled {
         if !config.force {
-            return if row.head_commit_hash.as_deref() == Some(head.as_str()) {
-                JobResult {
+            return match row.indexed_commit_hash.as_deref() {
+                Some(grounded) if grounded == head.as_str() => JobResult {
                     row: row.clone(),
                     verdict: RepoVerdict {
                         head_commit_hash: Some(head),
                         ..verdict_base(
                             Outcome::Skipped,
                             None,
-                            "already kerneled at this clone HEAD".to_string(),
+                            "already kerneled at this clone HEAD (grounding verified)"
+                                .to_string(),
                         )
                     },
                     rejection_text: None,
                     transitions: Vec::new(),
                     fact_refresh: None,
-                }
-            } else {
-                JobResult {
+                },
+                Some(grounded) => JobResult {
                     row: row.clone(),
                     verdict: RepoVerdict {
                         head_commit_hash: Some(head.clone()),
@@ -641,15 +682,28 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                             Outcome::Stale,
                             None,
                             format!(
-                                "kerneled at {} but clone HEAD is {head}; re-index belongs to the growth cycle (#457) or --force",
-                                row.head_commit_hash.as_deref().unwrap_or("<unset>")
+                                "kernel grounded at {grounded} but clone HEAD is {head}; re-index belongs to the growth cycle (#457) or --force"
                             ),
                         )
                     },
                     rejection_text: None,
                     transitions: Vec::new(),
                     fact_refresh: None,
-                }
+                },
+                None => JobResult {
+                    row: row.clone(),
+                    verdict: RepoVerdict {
+                        head_commit_hash: Some(head.clone()),
+                        ..verdict_base(
+                            Outcome::Stale,
+                            None,
+                            "kernel grounding unknown (row predates indexed_commit_hash and has no ledger backfill); run the growth cycle's backfill or --force".to_string(),
+                        )
+                    },
+                    rejection_text: None,
+                    transitions: Vec::new(),
+                    fact_refresh: None,
+                },
             };
         }
     } else if row.state == RepoState::Cloned {
@@ -942,6 +996,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                     at_unix_secs: config.at_unix_secs,
                     head_commit_hash: Some(head.clone()),
                     index_watermark: Some(watermark.clone()),
+                    indexed_commit_hash: Some(head.clone()),
                     ..TransitionContext::default()
                 },
             ));
@@ -963,6 +1018,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                     at_unix_secs: config.at_unix_secs,
                     head_commit_hash: Some(head.clone()),
                     index_watermark: Some(watermark.clone()),
+                    indexed_commit_hash: Some(head.clone()),
                     kernel_scope_id: Some(scope.clone()),
                     store_bytes: Some(store_bytes),
                     ..TransitionContext::default()
@@ -975,6 +1031,7 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
                 at_unix_secs: config.at_unix_secs,
                 head_commit_hash: Some(head.clone()),
                 index_watermark: Some(watermark.clone()),
+                indexed_commit_hash: Some(head.clone()),
                 kernel_scope_id: Some(scope.clone()),
                 store_bytes: Some(store_bytes),
                 ..TransitionContext::default()

@@ -193,6 +193,35 @@ pub fn run_clone_pass(
     selection: &Selection,
     update: bool,
 ) -> Result<Value, CalyxError> {
+    let outcome = run_clone_pass_outcome(catalog, config, selection, update)?;
+    match outcome.refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(outcome.report),
+    }
+}
+
+/// One clone pass's persisted report plus its would-be fail-closed refusal,
+/// for callers (the growth cycle, #457) that must contain per-repo failures
+/// without losing the report. A caller that swallows `refusal` must count and
+/// surface it — never drop it silently (invariant 3).
+pub struct ClonePassOutcome {
+    /// The run report (already persisted to the farm root and the catalog
+    /// vault), with `commit_seq`/`ledger_seq`/`report_file` attached.
+    pub report: Value,
+    /// Repos that hard-failed this pass (quarantined/conflict/update_failed).
+    pub failed: usize,
+    /// The fail-closed refusal the pass would have raised, if any.
+    pub refusal: Option<CalyxError>,
+}
+
+/// Runs one clone pass and returns its [`ClonePassOutcome`] instead of
+/// failing closed on per-repo failures. Hard errors still refuse.
+pub fn run_clone_pass_outcome(
+    catalog: &FleetCatalog,
+    config: &FarmConfig,
+    selection: &Selection,
+    update: bool,
+) -> Result<ClonePassOutcome, CalyxError> {
     let started = Instant::now();
     fs::create_dir_all(config.farm_root.join("runs")).map_err(|error| CalyxError {
         code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
@@ -475,8 +504,8 @@ pub fn run_clone_pass(
     let refused = count(Outcome::RefusedBudget);
     let failed =
         count(Outcome::Quarantined) + count(Outcome::Conflict) + count(Outcome::UpdateFailed);
-    if refused > 0 {
-        return Err(CalyxError {
+    let refusal = if refused > 0 {
+        Some(CalyxError {
             code: ASTRO_FLEET_FARM_BUDGET_EXCEEDED,
             message: format!(
                 "clone pass {run_id}: {refused} clone(s) refused by the {}-byte farm budget ({farm_bytes} bytes recorded); report {}",
@@ -484,24 +513,29 @@ pub fn run_clone_pass(
                 report_path.display()
             ),
             remediation: "raise --budget-bytes, or evict repos (delete clone dirs and quarantine/depart their records) before re-running",
-        });
-    }
-    if failed > 0 {
-        return Err(CalyxError {
+        })
+    } else if failed > 0 {
+        Some(CalyxError {
             code: ASTRO_FLEET_CLONE_PASS_INCOMPLETE,
             message: format!(
                 "clone pass {run_id} finished with {failed} failed repo(s) (quarantined/conflict/update_failed); report {}",
                 report_path.display()
             ),
             remediation: "inspect the run report and rejection files; quarantines are recorded on the catalog rows",
-        });
-    }
+        })
+    } else {
+        None
+    };
 
     let mut out = report;
     out["commit_seq"] = json!(commit_seq);
     out["ledger_seq"] = json!(ledger_seq);
     out["report_file"] = json!(report_path.display().to_string());
-    Ok(out)
+    Ok(ClonePassOutcome {
+        report: out,
+        failed,
+        refusal,
+    })
 }
 
 /// `<farm_root>\<org>__<repo>`.

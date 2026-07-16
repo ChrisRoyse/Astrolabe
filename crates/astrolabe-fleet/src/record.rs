@@ -78,6 +78,11 @@ pub const META_STATE: &str = "state";
 pub const META_CLONE_PATH: &str = "clone_path";
 /// 40-hex commit SHA the clone/index/kernel work was grounded on.
 pub const META_HEAD_COMMIT_HASH: &str = "head_commit_hash";
+/// Metadata key: 40-hex commit SHA the persisted index/kernel was grounded on
+/// (#457). Distinct from [`META_HEAD_COMMIT_HASH`], which the clone farm
+/// advances at fetch time: without this fact an update fetch makes a stale
+/// kernel indistinguishable from a current one.
+pub const META_INDEXED_COMMIT_HASH: &str = "indexed_commit_hash";
 /// Fingerprint of the indexed SQLite artifact, once indexed.
 pub const META_INDEX_WATERMARK: &str = "index_watermark";
 /// Kernel scope id, once kerneled.
@@ -173,6 +178,10 @@ pub struct TransitionContext {
     /// Fingerprint of the indexed SQLite artifact (normally set at `indexed`).
     #[serde(default)]
     pub index_watermark: Option<String>,
+    /// 40-hex commit SHA the index/kernel was grounded on (#457; set by the
+    /// pipeline at `indexed`/`kerneled`/`--force` refresh, never by fetches).
+    #[serde(default)]
+    pub indexed_commit_hash: Option<String>,
     /// Kernel scope id (normally set at `kerneled`).
     #[serde(default)]
     pub kernel_scope_id: Option<String>,
@@ -209,6 +218,10 @@ pub struct FleetRepoRow {
     pub head_commit_hash: Option<String>,
     /// Fingerprint of the indexed SQLite artifact, once indexed.
     pub index_watermark: Option<String>,
+    /// 40-hex commit SHA the persisted index/kernel was grounded on (#457).
+    /// `None` on rows written before the fact existed; the growth scheduler's
+    /// ledger-grounded backfill converges them.
+    pub indexed_commit_hash: Option<String>,
     /// Kernel scope id, once kerneled.
     pub kernel_scope_id: Option<String>,
     /// Recorded quarantine reason, if quarantined.
@@ -284,6 +297,9 @@ pub fn encode_repo_constellation(
     }
     if let Some(watermark) = &row.index_watermark {
         metadata.insert(META_INDEX_WATERMARK.to_string(), watermark.clone());
+    }
+    if let Some(grounded) = &row.indexed_commit_hash {
+        metadata.insert(META_INDEXED_COMMIT_HASH.to_string(), grounded.clone());
     }
     if let Some(scope) = &row.kernel_scope_id {
         metadata.insert(META_KERNEL_SCOPE_ID.to_string(), scope.clone());
@@ -411,6 +427,7 @@ pub fn decode_repo_constellation(
         clone_path: meta_opt(META_CLONE_PATH),
         head_commit_hash: meta_opt(META_HEAD_COMMIT_HASH),
         index_watermark: meta_opt(META_INDEX_WATERMARK),
+        indexed_commit_hash: meta_opt(META_INDEXED_COMMIT_HASH),
         kernel_scope_id: meta_opt(META_KERNEL_SCOPE_ID),
         quarantine_reason: meta_opt(META_QUARANTINE_REASON),
         departed_reason: meta_opt(META_DEPARTED_REASON),

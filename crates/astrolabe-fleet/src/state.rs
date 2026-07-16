@@ -13,11 +13,12 @@
 //! (with a recorded reason), a jump to [`RepoState::Departed`] from any
 //! pipeline state (issue #450: a repo absent from a complete discovery
 //! re-enumeration — deleted, private, renamed, or fallen below the star floor
-//! — is labeled, never silently dropped), or `departed → discovered` when a
-//! departed repo reappears in a later complete enumeration. Everything else
-//! refuses fail-closed with [`ASTRO_FLEET_ILLEGAL_TRANSITION`]. Quarantine is
-//! terminal in v1: releasing a quarantined repo is a deliberate operator
-//! action that belongs to a future atom, not an implicit edge here.
+//! — is labeled, never silently dropped), `departed → discovered` when a
+//! departed repo reappears in a later complete enumeration, or
+//! `quarantined → discovered` as the deliberate retry release owned by the
+//! growth scheduler (issue #457: the repo re-enters the pipeline from the
+//! start; the quarantine reason stays in the ledger history). Everything else
+//! refuses fail-closed with [`ASTRO_FLEET_ILLEGAL_TRANSITION`].
 
 use calyx_core::CalyxError;
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,8 @@ pub enum RepoState {
     Kerneled,
     /// The repo's kernel participates in fleet-scope serving.
     Serving,
-    /// Pulled out of the pipeline for a recorded reason; terminal in v1.
+    /// Pulled out of the pipeline for a recorded reason; released only by the
+    /// deliberate `quarantined → discovered` retry edge (#457).
     Quarantined,
     /// Absent from a complete discovery re-enumeration (deleted, private,
     /// renamed, or below the star floor); returns to `discovered` if it
@@ -120,7 +122,8 @@ impl RepoState {
 /// Validates that `from → to` is a legal lifecycle edge, refusing fail-closed
 /// otherwise. Legal edges: exactly one forward pipeline step, any pipeline
 /// state → [`RepoState::Quarantined`], any pipeline state →
-/// [`RepoState::Departed`], or `departed → discovered` (reappearance).
+/// [`RepoState::Departed`], `departed → discovered` (reappearance), or
+/// `quarantined → discovered` (deliberate retry release, #457).
 pub fn check_transition(from: RepoState, to: RepoState) -> Result<(), CalyxError> {
     let from_pipeline = PIPELINE.contains(&from);
     if to == RepoState::Quarantined && from_pipeline {
@@ -130,6 +133,11 @@ pub fn check_transition(from: RepoState, to: RepoState) -> Result<(), CalyxError
         return Ok(());
     }
     if from == RepoState::Departed && to == RepoState::Discovered {
+        return Ok(());
+    }
+    if from == RepoState::Quarantined && to == RepoState::Discovered {
+        // Deliberate retry release (#457): the repo re-enters the pipeline
+        // from the start; the quarantine reason survives in the ledger.
         return Ok(());
     }
     if from.pipeline_successor() == Some(to) {
@@ -144,7 +152,7 @@ pub fn check_transition(from: RepoState, to: RepoState) -> Result<(), CalyxError
             from.as_str(),
             legal_targets(from),
         ),
-        remediation: "advance one pipeline step at a time (discovered→cloned→indexed→kerneled→serving), quarantine or depart with a reason, or re-discover a departed repo; quarantined is terminal in v1",
+        remediation: "advance one pipeline step at a time (discovered→cloned→indexed→kerneled→serving), quarantine or depart with a reason, re-discover a departed repo, or release a quarantined repo to discovered for a retry (#457)",
     })
 }
 
@@ -157,7 +165,7 @@ fn legal_targets(from: RepoState) -> String {
         targets.push(RepoState::Quarantined.as_str());
         targets.push(RepoState::Departed.as_str());
     }
-    if from == RepoState::Departed {
+    if from == RepoState::Departed || from == RepoState::Quarantined {
         targets.push(RepoState::Discovered.as_str());
     }
     if targets.is_empty() {

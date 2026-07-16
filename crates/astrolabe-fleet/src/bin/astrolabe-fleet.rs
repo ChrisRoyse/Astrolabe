@@ -8,7 +8,8 @@
 //! astrolabe-fleet register     [--root <dir>] (--json <record> | --stdin) [--at <unix-secs>]
 //! astrolabe-fleet set-state    [--root <dir>] --github-id <id> --repo <owner/name> --to <state>
 //!                              [--at <unix-secs>] [--clone-path <p>] [--head-commit-hash <sha>]
-//!                              [--index-watermark <w>] [--kernel-scope-id <k>] [--reason <r>]
+//!                              [--index-watermark <w>] [--indexed-commit-hash <sha>]
+//!                              [--kernel-scope-id <k>] [--reason <r>]
 //! astrolabe-fleet get          [--root <dir>] (--github-id <id> --repo <owner/name> | --cx <hex>)
 //! astrolabe-fleet list         [--root <dir>] [--state <state>] [--language <lang>] [--counts]
 //! astrolabe-fleet discover     [--root <dir>] [--language <csv>] [--star-floor <n>]
@@ -21,7 +22,25 @@
 //!                              [--nomic-dir <dir>] (--repo <owner/name> ... | --all-cloned)
 //!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
 //!                              [--force] [--at <unix-secs>]
+//! astrolabe-fleet grow         [--root <dir>] (--once | --cycles <n>) [--interval-secs <n>]
+//!                              [--scope <fleet-scope>] [--discovery] [--language <csv>]
+//!                              [--star-floor <n>] [--acquire] [--retry-quarantined]
+//!                              [--force-repo <owner/name> ...] [--max-repos-per-cycle <n>]
+//!                              [--debt-threshold-repos <n>] [--farm-root <dir>]
+//!                              [--store-root <dir>] [--astrolabe-bin <exe>] [--nomic-dir <dir>]
+//!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
+//!                              [--store-budget-bytes <n>] [--parallelism <n>]
+//!                              [--timeout-secs <n>] [--at <unix-secs>]
 //! ```
+//!
+//! `grow` (#457) runs growth cycles: ledger-grounded backfill → optional
+//! discovery refresh → optional quarantine retry release → update fetch →
+//! bounded selection (forced > stale > resume > acquire) → pipeline re-index
+//! → debt-gated fleet recomposition → reconciliation → persisted cycle
+//! report. `--once` is the Task-Scheduler-friendly single cycle; `--cycles N
+//! --interval-secs S` is the supervised loop. `--parallelism`/`--timeout-secs`
+//! apply to the pipeline phase (the clone farm keeps its own defaults except
+//! `--timeout-secs`, which bounds both).
 //!
 //! `--root` defaults to the declared production catalog root
 //! [`astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT`] (`D:\astrolabe-fleet\catalog`).
@@ -46,7 +65,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|grow|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -123,6 +142,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "clone-path",
                 "head-commit-hash",
                 "index-watermark",
+                "indexed-commit-hash",
                 "kernel-scope-id",
                 "reason",
                 "clone-bytes",
@@ -137,6 +157,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 clone_path: opts.get("clone-path").map(str::to_string),
                 head_commit_hash: opts.get("head-commit-hash").map(str::to_string),
                 index_watermark: opts.get("index-watermark").map(str::to_string),
+                indexed_commit_hash: opts.get("indexed-commit-hash").map(str::to_string),
                 kernel_scope_id: opts.get("kernel-scope-id").map(str::to_string),
                 quarantine_reason: (to == RepoState::Quarantined)
                     .then(|| reason.clone())
@@ -381,6 +402,174 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             };
             let report =
                 astrolabe_fleet::orchestrator::run_pipeline_pass(&catalog, &config, &selection)?;
+            println!("{report}");
+            Ok(())
+        }
+        "grow" => {
+            opts.reject_unknown(&[
+                "root",
+                "farm-root",
+                "store-root",
+                "astrolabe-bin",
+                "nomic-dir",
+                "scope",
+                "language",
+                "star-floor",
+                "once",
+                "cycles",
+                "interval-secs",
+                "discovery",
+                "acquire",
+                "retry-quarantined",
+                "force-repo",
+                "max-repos-per-cycle",
+                "debt-threshold-repos",
+                "size-cap-bytes",
+                "budget-bytes",
+                "store-budget-bytes",
+                "parallelism",
+                "timeout-secs",
+                "at",
+            ])?;
+            let once = opts.flag("once");
+            let cycles = match (once, opts.get("cycles")) {
+                (true, None) => 1,
+                (false, Some(raw)) => {
+                    let n = raw
+                        .parse::<u64>()
+                        .map_err(|error| usage(&format!("--cycles must be a u64: {error}")))?;
+                    if n == 0 {
+                        return Err(usage("--cycles must be at least 1"));
+                    }
+                    n
+                }
+                (true, Some(_)) => {
+                    return Err(usage("pass either --once or --cycles <n>, not both"));
+                }
+                (false, None) => {
+                    return Err(usage(
+                        "grow needs --once (single cycle) or --cycles <n> (supervised loop)",
+                    ));
+                }
+            };
+            if opts.get("at").is_some() && cycles != 1 {
+                return Err(usage(
+                    "--at pins one deterministic timestamp and is only valid with --once",
+                ));
+            }
+            let interval_secs = match opts.get("interval-secs") {
+                Some(raw) => raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--interval-secs must be a u64: {error}")))?,
+                None => {
+                    astrolabe_fleet::grow::FLEET_GROW_KNOBS
+                        .iter()
+                        .find(|knob| knob.name == astrolabe_fleet::grow::KNOB_INTERVAL_SECS)
+                        .expect("interval knob is declared")
+                        .default
+                }
+            };
+            let at_override = opts
+                .get("at")
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|error| usage(&format!("--at must be unix seconds: {error}")))
+                })
+                .transpose()?;
+
+            let mut farm = astrolabe_fleet::clone_farm::FarmConfig::default();
+            if let Some(farm_root) = opts.get("farm-root") {
+                farm.farm_root = PathBuf::from(farm_root);
+            }
+            if let Some(raw) = opts.get("size-cap-bytes") {
+                farm.size_cap_bytes = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--size-cap-bytes must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("budget-bytes") {
+                farm.budget_bytes = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--budget-bytes must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("timeout-secs") {
+                farm.timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+            }
+            let mut pipeline = astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(0);
+            if let Some(store_root) = opts.get("store-root") {
+                pipeline.store_root = PathBuf::from(store_root);
+            }
+            if let Some(bin) = opts.get("astrolabe-bin") {
+                pipeline.astrolabe_bin = PathBuf::from(bin);
+            }
+            if let Some(nomic) = opts.get("nomic-dir") {
+                pipeline.nomic_dir = PathBuf::from(nomic);
+            }
+            if let Some(raw) = opts.get("parallelism") {
+                pipeline.parallelism = raw
+                    .parse::<usize>()
+                    .map_err(|error| usage(&format!("--parallelism must be a usize: {error}")))?;
+            }
+            if let Some(raw) = opts.get("timeout-secs") {
+                pipeline.timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("store-budget-bytes") {
+                pipeline.store_budget_bytes = Some(raw.parse::<u64>().map_err(|error| {
+                    usage(&format!("--store-budget-bytes must be a u64: {error}"))
+                })?);
+            }
+
+            let mut config = astrolabe_fleet::grow::GrowConfig::with_registry_defaults(
+                root.clone(),
+                farm,
+                pipeline,
+            );
+            if let Some(scope) = opts.get("scope") {
+                config.scope = scope.to_string();
+            }
+            if let Some(languages) = opts.get("language") {
+                config.languages = languages
+                    .split(',')
+                    .map(|part| part.trim().to_lowercase())
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                if config.languages.is_empty() {
+                    return Err(usage("--language must name at least one language"));
+                }
+            }
+            if let Some(raw) = opts.get("star-floor") {
+                config.star_floor = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--star-floor must be a u64: {error}")))?;
+            }
+            config.discovery = opts.flag("discovery");
+            config.acquire = opts.flag("acquire");
+            config.retry_quarantined = opts.flag("retry-quarantined");
+            config.force_repos = opts
+                .get_all("force-repo")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if let Some(raw) = opts.get("max-repos-per-cycle") {
+                config.max_repos_per_cycle = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!("--max-repos-per-cycle must be a u64: {error}"))
+                })?;
+            }
+            if let Some(raw) = opts.get("debt-threshold-repos") {
+                config.debt_threshold_repos = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!("--debt-threshold-repos must be a u64: {error}"))
+                })?;
+            }
+            let report = astrolabe_fleet::grow::run_grow(
+                &catalog,
+                &config,
+                cycles,
+                interval_secs,
+                at_override,
+            )?;
             println!("{report}");
             Ok(())
         }
@@ -745,7 +934,7 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 9] = [
+    const SWITCHES: [&'static str; 13] = [
         "stdin",
         "counts",
         "refresh",
@@ -755,6 +944,10 @@ impl Options {
         "force",
         "latest",
         "raw",
+        "once",
+        "discovery",
+        "acquire",
+        "retry-quarantined",
     ];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
