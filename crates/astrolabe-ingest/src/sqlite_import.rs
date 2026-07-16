@@ -1420,16 +1420,6 @@ where
             .metadata
             .insert("historical_commit".to_string(), options.commit.clone());
     }
-    let mut seen_cx_ids = BTreeSet::new();
-    for symbol in &prepared {
-        if !seen_cx_ids.insert(symbol.identity.cx_id) {
-            return Err(invalid_sqlite(format!(
-                "historical snapshot maps more than one node to CxId {}; filter duplicate symbol rows before admission",
-                symbol.identity.cx_id
-            )));
-        }
-    }
-
     let locations = prepared
         .iter()
         .map(|symbol| HistoricalSymbolLocation {
@@ -1449,13 +1439,42 @@ where
     // #446: mirrors the live import path — input rows commit atomically with
     // their historical Base records under the vault's declared retention knob.
     let mut staged_input_hashes = BTreeSet::new();
+    // #497: content-addressed intra-batch dedup. Two implicated nodes in one
+    // historical commit can canonicalize to a single CxId (in shadow/fast mode the
+    // canonical inputs carry no body content, so the same symbol observed as two
+    // libcbm nodes at one span shares an identity). A CxId is a content address:
+    // equal CxId => equal `canonical_input_bytes` (BLAKE3) => equal measured
+    // constellation; the two observations differ only in per-observation provenance
+    // metadata (`source_node_id`, node-vector digest) that is NOT part of the
+    // identity. Staging both Base rows under `base_key(cx_id)` is a last-write-wins
+    // collision that clobbers the earlier row and breaks its group-commit FSV
+    // readback (ASTRO_FSV_READBACK_MISMATCH). Admit the content once and count the
+    // rest as reused. Fail closed only on a genuine hash collision — a shared CxId
+    // whose canonical bytes actually differ — which must never be silently merged.
+    let mut staged_canonical: BTreeMap<CxId, [u8; 32]> = BTreeMap::new();
     for symbol in &prepared {
-        let key = base_key(symbol.identity.cx_id);
+        let cx_id = symbol.identity.cx_id;
+        let key = base_key(cx_id);
+        let canonical_hash = *blake3::hash(&symbol.identity.canonical_input_bytes).as_bytes();
+        // Cross-batch reuse: an earlier commit already persisted this content.
         if vault
             .read_cf_at(snapshot_seq, ColumnFamily::Base, &key)?
             .is_some()
         {
             verify_existing_historical_constellation(vault, snapshot_seq, symbol)?;
+            constellations_reused += 1;
+            continue;
+        }
+        // Intra-batch dedup (#497): this content is already staged in this commit.
+        if let Some(prior_hash) = staged_canonical.get(&cx_id) {
+            if *prior_hash != canonical_hash {
+                return Err(invalid_sqlite(format!(
+                    "historical CxId {cx_id} maps two distinct canonical inputs in one snapshot \
+                     (BLAKE3 {} vs {}); refusing to clobber the first write",
+                    hex_lower(prior_hash),
+                    hex_lower(&canonical_hash),
+                )));
+            }
             constellations_reused += 1;
             continue;
         }
@@ -1481,6 +1500,7 @@ where
                 rows.push((row.cf, row.key, row.value));
             }
         }
+        staged_canonical.insert(cx_id, canonical_hash);
         constellations_written += 1;
     }
     let rows_written = rows.len();
