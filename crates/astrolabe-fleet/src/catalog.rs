@@ -521,6 +521,41 @@ impl FleetCatalog {
         Ok((commit_seq, entry.seq))
     }
 
+    /// Independently reads back a persisted run report: the Blob-CF bytes under
+    /// the `fleetrun:` keyspace plus the paired `Admin` ledger entry for the
+    /// run's subject (`fleet-discovery-run:<run_id>`), from the latest
+    /// snapshot. Returns `None` when no report row exists for `run_id`; a row
+    /// without its paired ledger entry is a fail-closed mismatch, never a
+    /// silent partial read.
+    pub fn read_run_report(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64, Vec<u8>)>, CalyxError> {
+        let snapshot = self.vault.latest_seq();
+        let Some(bytes) =
+            self.vault
+                .read_cf_at(snapshot, ColumnFamily::Blob, &run_report_key(run_id))?
+        else {
+            return Ok(None);
+        };
+        let subject = SubjectId::Query(format!("fleet-discovery-run:{run_id}").into_bytes());
+        let mut found = None;
+        for (_key, entry_bytes) in self.vault.scan_cf_at(snapshot, ColumnFamily::Ledger)? {
+            let entry = calyx_ledger::decode(&entry_bytes)?;
+            if entry.subject == subject {
+                found = Some(entry);
+            }
+        }
+        let entry = found.ok_or_else(|| CalyxError {
+            code: ASTRO_FLEET_FSV_MISMATCH,
+            message: format!(
+                "run report {run_id} has a Blob row but no paired Admin ledger entry"
+            ),
+            remediation: "the catalog vault violated the row+ledger pairing; audit it before trusting this run",
+        })?;
+        Ok(Some((bytes, entry.seq, entry.payload)))
+    }
+
     /// Persists a kind-scoped fleet report (#458 and later fleet artifacts):
     /// full report bytes as a Blob-CF row under the `fleetreport:v1:` keyspace,
     /// paired with an `Admin` ledger entry carrying `summary_payload`, committed

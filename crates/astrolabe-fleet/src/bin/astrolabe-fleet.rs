@@ -46,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -478,6 +478,44 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             );
             Ok(())
         }
+        "run-report-read" => {
+            opts.reject_unknown(&["root", "run-id", "raw"])?;
+            let run_id = opts
+                .get("run-id")
+                .ok_or_else(|| usage("run-report-read needs --run-id <id>"))?;
+            let (bytes, ledger_seq, ledger_payload) = catalog
+                .read_run_report(run_id)?
+                .ok_or_else(|| CalyxError {
+                    code: "ASTRO_FLEET_REPORT_MISSING",
+                    message: format!("no run report persisted for run id {run_id:?}"),
+                    remediation: "run ids come from the discover/pipeline run output",
+                })?;
+            if opts.flag("raw") {
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(&bytes)
+                    .map_err(|error| CalyxError {
+                        code: "ASTRO_FLEET_REPORT_READ",
+                        message: format!("write report bytes to stdout: {error}"),
+                        remediation: "retry with a writable stdout",
+                    })?;
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "blob_bytes": bytes.len(),
+                        "blob_blake3": blake3::hash(&bytes).to_hex().as_str(),
+                        "ledger_seq": ledger_seq,
+                        "ledger_payload": serde_json::from_slice::<serde_json::Value>(&ledger_payload)
+                            .unwrap_or_else(|_| serde_json::Value::String(
+                                String::from_utf8_lossy(&ledger_payload).into_owned()
+                            )),
+                    })
+                );
+            }
+            Ok(())
+        }
         other => Err(usage(&format!("unknown verb {other:?}"))),
     }
 }
@@ -505,7 +543,7 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 8] = [
+    const SWITCHES: [&'static str; 9] = [
         "stdin",
         "counts",
         "refresh",
@@ -514,6 +552,7 @@ impl Options {
         "all-cloned",
         "force",
         "latest",
+        "raw",
     ];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
