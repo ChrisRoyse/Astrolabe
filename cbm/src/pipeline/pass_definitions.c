@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
+enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_SPACE = 2 };
 /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
  * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
@@ -111,60 +111,121 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Append a JSON-escaped string value to buf at position *pos.
- * Writes: ,"key":"escaped_value"
- * Handles: \, ", \n, \r, \t */
-static int def_json_escape_char(char *buf, size_t avail, char ch) {
-    char esc = 0;
-    switch (ch) {
-    case '"':
-        esc = '"';
-        break;
-    case '\\':
-        esc = '\\';
-        break;
-    case '\n':
-        esc = 'n';
-        break;
-    case '\r':
-        esc = 'r';
-        break;
-    case '\t':
-        esc = 't';
-        break;
-    default:
-        if (avail >= SKIP_ONE) {
-            /* Any other raw control byte (e.g. form feed) is invalid inside a
-             * JSON string — degrade to a space. */
-            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
-        }
-        return SKIP_ONE;
-    }
-    if (avail >= PD_ESC_SPACE) {
-        buf[0] = '\\';
-        buf[SKIP_ONE] = esc;
-    }
-    return PD_ESC_SPACE;
-}
+/* U+FFFD ("replacement character") encodes as the three bytes EF BF BD — the
+ * largest expansion any single input byte can produce under the UTF-8-safe
+ * escaper below. Mirrors str_util.c's UTF8_REPLACEMENT_LEN (#493/#503). */
+enum { PD_UTF8_REPL_LEN = 3 };
 
-/* Escaped length of a string under def_json_escape_char's rules: escaped
- * characters expand to 2 bytes, everything else stays 1. */
+/* Escaped length of a string value under def_json_emit_value's rules (#511):
+ *   - JSON meta-chars (" \ \n \r \t) expand to 2 bytes (backslash + escape)
+ *   - other control bytes (< 0x20) degrade to a single space
+ *   - ASCII (0x20-0x7F) stays 1 byte
+ *   - a valid multi-byte UTF-8 sequence is copied verbatim (its own 2-4 bytes)
+ *   - any invalid byte (bad lead/continuation, overlong, surrogate, > U+10FFFF)
+ *     becomes U+FFFD (3 bytes)
+ * Must stay byte-for-byte in step with def_json_emit_value so the whole-field-
+ * or-nothing atomic cap check in the append helpers stays exact. Before #511
+ * this walked byte-by-byte and passed raw high bytes straight through, so a
+ * non-UTF-8 byte in a decorator/route_path literal reached the properties JSON
+ * unescaped and made the vault importer refuse the whole repository. */
 static size_t def_json_escaped_len(const char *s) {
     size_t n = 0;
-    for (; *s; s++) {
-        switch (*s) {
-        case '"':
-        case '\\':
-        case '\n':
-        case '\r':
-        case '\t':
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
             n += PD_ESC_SPACE;
-            break;
-        default:
+            p++;
+        } else if (c < 0x80) {
             n += SKIP_ONE;
+            p++;
+        } else {
+            int seq = cbm_utf8_sequence_len(p);
+            if (seq > 0) {
+                n += (size_t)seq;
+                p += seq;
+            } else {
+                n += PD_UTF8_REPL_LEN;
+                p++;
+            }
         }
     }
     return n;
+}
+
+/* Emit the JSON-escaped bytes of `val` into buf at *pos (no key, no surrounding
+ * quotes), bounded by bufsize with PD_ESC_SPACE reserved for the caller's
+ * closing quote/brace + NUL. Byte-for-byte mirror of def_json_escaped_len so a
+ * field whose measured length already fit is emitted whole; the per-branch cap
+ * checks are defensive belt-and-braces for that guarantee. UTF-8-safe (#511):
+ * valid multi-byte sequences are copied atomically so a truncation can only land
+ * on a character boundary, and any invalid byte becomes U+FFFD — the same write
+ * contract cbm_json_escape (#493) gives the parser-derived property columns. */
+static void def_json_emit_value(char *buf, size_t bufsize, size_t *pos, const char *val) {
+    size_t p = *pos;
+    for (const unsigned char *s = (const unsigned char *)val; *s;) {
+        unsigned char c = *s;
+        char esc = 0;
+        switch (c) {
+        case '"':
+            esc = '"';
+            break;
+        case '\\':
+            esc = '\\';
+            break;
+        case '\n':
+            esc = 'n';
+            break;
+        case '\r':
+            esc = 'r';
+            break;
+        case '\t':
+            esc = 't';
+            break;
+        default:
+            break;
+        }
+        if (esc) {
+            if (p + PD_ESC_SPACE > bufsize - PD_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = '\\';
+            buf[p++] = esc;
+            s++;
+        } else if (c < 0x20) {
+            /* Other raw control byte (e.g. form feed) is invalid inside a JSON
+             * string — degrade to a space, as the pre-#511 escaper did. */
+            if (p + SKIP_ONE > bufsize - PD_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = ' ';
+            s++;
+        } else if (c < 0x80) {
+            if (p + SKIP_ONE > bufsize - PD_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = (char)c;
+            s++;
+        } else {
+            int seq = cbm_utf8_sequence_len(s);
+            if (seq > 0) {
+                if (p + (size_t)seq > bufsize - PD_ESC_SPACE) {
+                    break;
+                }
+                memcpy(buf + p, s, (size_t)seq);
+                p += (size_t)seq;
+                s += seq;
+            } else {
+                if (p + PD_UTF8_REPL_LEN > bufsize - PD_ESC_SPACE) {
+                    break;
+                }
+                buf[p++] = (char)0xEF;
+                buf[p++] = (char)0xBF;
+                buf[p++] = (char)0xBD;
+                s++;
+            }
+        }
+    }
+    *pos = p;
 }
 
 /* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
@@ -189,9 +250,7 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     p += (size_t)w;
-    for (const char *s = val; *s && p < bufsize - PD_ESC_MARGIN; s++) {
-        p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
-    }
+    def_json_emit_value(buf, bufsize, &p, val);
     if (p < bufsize - SKIP_ONE) {
         buf[p++] = '"';
     }
@@ -229,10 +288,9 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
         }
         /* Full escaping (not just quote/backslash): items like C param types
          * sliced from multi-line declarations carry raw \n/\t bytes, which are
-         * invalid inside JSON strings. */
-        for (const char *s = arr[i]; *s && p < bufsize - PD_ESC_SPACE; s++) {
-            p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
-        }
+         * invalid inside JSON strings; and decorator/route literals may carry a
+         * non-UTF-8 byte that must degrade to U+FFFD (#511). */
+        def_json_emit_value(buf, bufsize, &p, arr[i]);
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }

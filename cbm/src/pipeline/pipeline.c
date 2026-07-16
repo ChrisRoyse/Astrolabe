@@ -654,8 +654,14 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", sr->value);
     char route_props[CBM_SZ_512];
     if (sr->key_path) {
+        /* key_path is raw parser-derived config-key text: route it through the
+         * UTF-8-safe JSON escaper so a quote/control/non-UTF-8 byte cannot make
+         * the Route node's properties JSON invalid and get the repo refused —
+         * same bypass class as #511. */
+        char esc_kp[CBM_SZ_256];
+        cbm_json_escape(esc_kp, sizeof(esc_kp), sr->key_path);
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\",\"key_path\":\"%s\"}",
-                 sr->key_path);
+                 esc_kp);
     } else {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\"}");
     }
