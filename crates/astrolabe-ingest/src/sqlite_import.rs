@@ -4463,18 +4463,19 @@ fn expected_group_commit_bytes(
 
 /// Recovers the ledger reference for the group commit that produced `commit_seq`.
 ///
-/// The read is pinned to `commit_seq`, so the newest Ledger CF row at that snapshot is the
-/// entry this commit staged, regardless of concurrent cross-process appends that land at
-/// later snapshots. Fails closed if the ledger key and encoded entry seq disagree.
+/// The read is pinned to `commit_seq`, so the newest *pairable* Ledger CF row at that
+/// snapshot is the entry this commit staged, regardless of concurrent cross-process appends
+/// that land at later snapshots. Periodic system checkpoint entries interleaving inside the
+/// same commit at checkpoint-interval boundaries are skipped exactly (#495). Fails closed if
+/// the ledger key and encoded entry seq disagree.
 fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: Seq) -> IngestResult<LedgerRef>
 where
     C: Clock,
 {
-    let (key, value) = vault
-        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
-        .into_iter()
-        .max_by(|left, right| left.0.cmp(&right.0))
-        .ok_or_else(|| readback_mismatch("Ledger CF empty at import commit snapshot"))?;
+    let (key, value) = calyx_aster::ledger_view::newest_pairable_ledger(
+        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
+    )?
+    .ok_or_else(|| readback_mismatch("Ledger CF empty at import commit snapshot"))?;
     let key_seq = parse_aster_ledger_seq(&key)?;
     let entry = decode(&value)?;
     if entry.seq != key_seq {

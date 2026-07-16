@@ -652,13 +652,10 @@ where
         rows_verified += 1;
     }
 
-    let (_key, ledger_bytes) = vault
-        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
-        .into_iter()
-        .max_by(|left, right| left.0.cmp(&right.0))
-        .ok_or_else(|| {
-            projection_readback(kind, "Ledger CF empty at projection commit snapshot")
-        })?;
+    let (_key, ledger_bytes) = calyx_aster::ledger_view::newest_pairable_ledger(
+        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
+    )?
+    .ok_or_else(|| projection_readback(kind, "Ledger CF empty at projection commit snapshot"))?;
     let entry = decode(&ledger_bytes)?;
     if entry.kind != EntryKind::Kernel {
         return Err(projection_readback(

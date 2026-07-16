@@ -373,3 +373,34 @@ pub fn parse_aster_ledger_seq(key: &[u8]) -> CalyxResult<u64> {
     })?;
     Ok(u64::from_be_bytes(key))
 }
+
+/// Newest Ledger CF row of a commit-snapshot scan that is **pairable** — not
+/// a periodic system checkpoint entry (issue #495).
+///
+/// A group commit whose ledger write crosses the checkpoint interval
+/// ([`calyx_ledger::DEFAULT_CHECKPOINT_INTERVAL`]) appends the checkpoint
+/// entry (`kind=Admin`, `actor=System`,
+/// `subject=Query(`[`calyx_ledger::CHECKPOINT_TAG`]`)`) **after** the
+/// commit's own entry inside the same snapshot, so "newest entry at the
+/// snapshot" mispairs deterministically at every interval boundary (seen
+/// live at seq 2001 on two independent corpus imports). Callers pass the raw
+/// `scan_cf_at(commit_seq, ColumnFamily::Ledger)` rows and get back the
+/// newest non-checkpoint `(key, bytes)` to run their own kind/actor/subject
+/// validation against — the skip is exact (all three checkpoint fields must
+/// match), so a genuinely mispaired commit still fails closed downstream.
+pub fn newest_pairable_ledger(
+    mut rows: Vec<(Vec<u8>, Vec<u8>)>,
+) -> CalyxResult<Option<(Vec<u8>, Vec<u8>)>> {
+    use calyx_ledger::{ActorId, CHECKPOINT_TAG, EntryKind, SubjectId, decode};
+    rows.sort_by(|left, right| right.0.cmp(&left.0));
+    for (key, bytes) in rows {
+        let entry = decode(&bytes)?;
+        let is_checkpoint = entry.kind == EntryKind::Admin
+            && entry.actor == ActorId::System
+            && entry.subject == SubjectId::Query(CHECKPOINT_TAG.as_bytes().to_vec());
+        if !is_checkpoint {
+            return Ok(Some((key, bytes)));
+        }
+    }
+    Ok(None)
+}

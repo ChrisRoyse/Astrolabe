@@ -188,10 +188,11 @@ fn newest_ledger_readback<C>(
 where
     C: Clock,
 {
-    let newest = vault
-        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
-        .into_iter()
-        .max_by(|left, right| left.0.cmp(&right.0));
+    // Newest *pairable* entry: periodic system checkpoints interleave after
+    // the commit's own entry at every checkpoint-interval boundary (#495).
+    let newest = calyx_aster::ledger_view::newest_pairable_ledger(
+        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
+    )?;
     let Some((_key, bytes)) = newest else {
         return Ok(None);
     };

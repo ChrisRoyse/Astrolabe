@@ -327,11 +327,10 @@ where
     // The paired Kernel ledger entry must exist at the commit snapshot, name the
     // kernel-build actor and scope subject, and carry the same members-hash
     // payload bytes as the persisted members-hash row (one serializer).
-    let (_key, entry_bytes) = vault
-        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
-        .into_iter()
-        .max_by(|left, right| left.0.cmp(&right.0))
-        .ok_or_else(|| readback_refused("Ledger CF empty at kernel artifact commit snapshot"))?;
+    let (_key, entry_bytes) = calyx_aster::ledger_view::newest_pairable_ledger(
+        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
+    )?
+    .ok_or_else(|| readback_refused("Ledger CF empty at kernel artifact commit snapshot"))?;
     let entry = decode(&entry_bytes)?;
     if entry.kind != EntryKind::Kernel {
         return Err(readback_refused(

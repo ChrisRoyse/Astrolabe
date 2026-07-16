@@ -1046,11 +1046,10 @@ fn ledger_ref_at_commit<C>(vault: &AsterVault<C>, commit_seq: u64) -> calyx_core
 where
     C: Clock,
 {
-    let (key, value) = vault
-        .scan_cf_at(commit_seq, ColumnFamily::Ledger)?
-        .into_iter()
-        .max_by(|left, right| left.0.cmp(&right.0))
-        .ok_or_else(|| CalyxError {
+    let (key, value) = calyx_aster::ledger_view::newest_pairable_ledger(
+        vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)?,
+    )?
+    .ok_or_else(|| CalyxError {
             code: ASTRO_ORACLE_LEDGER_MISSING,
             message: "Ledger CF empty at oracle corpus commit snapshot".to_string(),
             remediation: ORACLE_REMEDIATION,
