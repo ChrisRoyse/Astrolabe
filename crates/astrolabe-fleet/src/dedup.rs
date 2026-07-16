@@ -50,6 +50,12 @@ pub struct AtomFrames {
     pub language: String,
     /// Content key: `blake3(frame(label) ‖ frame(language) ‖ frame(snippet))`.
     pub content_key: [u8; 32],
+    /// True when the atom carries no snippet bytes (e.g. `File` nodes). Such
+    /// atoms have no content to be equivalent on: they are counted explicitly
+    /// and excluded from equivalence classes — otherwise every snippetless
+    /// atom fleet-wide collapses into one degenerate "duplicate" class (found
+    /// live on the pilot census: one 134-occurrence 10-repo `File` class).
+    pub snippet_empty: bool,
 }
 
 fn take_frame<'a>(bytes: &'a [u8], cursor: &mut usize, what: &str) -> Result<&'a [u8], CalyxError> {
@@ -104,6 +110,7 @@ pub fn parse_atom_frames(bytes: &[u8]) -> Result<AtomFrames, CalyxError> {
         rel_file_path: String::from_utf8_lossy(rel_file_path).into_owned(),
         language: String::from_utf8_lossy(language).into_owned(),
         content_key: *blake3::hash(&keyed).as_bytes(),
+        snippet_empty: snippet.is_empty(),
     })
 }
 
@@ -156,8 +163,13 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
         sample: Option<(String, String, String, String)>,
     }
     let mut classes: BTreeMap<[u8; 32], Class> = BTreeMap::new();
+    let mut snippetless_total = 0_u64;
     for (project, atoms) in per_project {
         for atom in atoms {
+            if atom.snippet_empty {
+                snippetless_total += 1;
+                continue;
+            }
             let class = classes.entry(atom.content_key).or_default();
             class.occurrences += 1;
             *class.repos.entry(project.clone()).or_default() += 1;
@@ -184,14 +196,18 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
     let projects: Vec<Value> = per_project
         .iter()
         .map(|(project, atoms)| {
-            let total = atoms.len() as u64;
+            let snippetless = atoms.iter().filter(|atom| atom.snippet_empty).count() as u64;
+            let total = atoms.len() as u64 - snippetless;
             let shared = atoms
                 .iter()
-                .filter(|atom| classes[&atom.content_key].repos.len() > 1)
+                .filter(|atom| {
+                    !atom.snippet_empty && classes[&atom.content_key].repos.len() > 1
+                })
                 .count() as u64;
             json!({
                 "project": project,
                 "atoms": total,
+                "snippetless_atoms": snippetless,
                 "atoms_in_cross_repo_classes": shared,
                 "uniqueness_fraction": if total > 0 {
                     (total - shared) as f64 / total as f64
@@ -212,6 +228,7 @@ pub fn census_artifact(per_project: &[(String, Vec<AtomFrames>)]) -> Value {
         "policy": "linked-not-skipped: per-repo constellations untouched; classes weight fleet composition (#456)",
         "join_key": "blake3(frame(label)+frame(language)+frame(source_snippet_bytes)) — content-only (design correction recorded on #455)",
         "atoms_total": atoms_total,
+        "snippetless_atoms_excluded": snippetless_total,
         "distinct_contents": distinct,
         "dedup_ratio": if distinct > 0 { atoms_total as f64 / distinct as f64 } else { 0.0 },
         "cross_repo_classes": cross.len(),
