@@ -7,7 +7,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+astrolabe-domain.workspace = true
 astrolabe-ingest.workspace = true
+astrolabe-kernel.workspace = true
+astrolabe-panel.workspace = true
+astrolabe-weave.workspace = true
 blake3 = "1"
 calyx-aster.workspace = true
 calyx-core.workspace = true

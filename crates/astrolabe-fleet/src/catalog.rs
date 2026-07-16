@@ -102,6 +102,14 @@ pub struct FleetCatalog {
 }
 
 impl FleetCatalog {
+    /// The underlying catalog vault — the persistence root for fleet-scope
+    /// kernel artifacts (#456): `persist_kernel_artifact` writes its Kernel CF
+    /// rows and paired Kernel ledger entry here, and `kernel-read` reads them
+    /// back independently.
+    pub fn vault(&self) -> &AsterVault {
+        &self.vault
+    }
+
     /// Creates or opens the fleet catalog vault rooted at `root`.
     pub fn open(root: &Path) -> Result<Self, CalyxError> {
         std::fs::create_dir_all(root).map_err(|error| CalyxError {

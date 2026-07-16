@@ -24,6 +24,7 @@
 
 pub mod catalog;
 pub mod clone_farm;
+pub mod compose;
 pub mod dedup;
 pub mod discover;
 pub mod orchestrator;
@@ -39,6 +40,11 @@ pub use clone_farm::{
     ASTRO_FLEET_FARM_BUDGET_EXCEEDED, DEFAULT_FARM_BUDGET_BYTES, DEFAULT_FARM_ROOT,
     DEFAULT_GIT_TIMEOUT_SECS, DEFAULT_PARALLELISM, DEFAULT_SIZE_CAP_BYTES, FarmConfig, Selection,
     run_clone_pass, target_dir,
+};
+pub use compose::{
+    ASTRO_FLEET_COMPOSE_NO_KERNELS, ASTRO_FLEET_KERNEL_MISSING, ComposeConfig,
+    FLEET_COMPOSE_KNOB_REGISTRY_VERSION, FLEET_COMPOSE_KNOBS, FLEET_KERNEL_REPORT_KIND,
+    compose_fleet_kernel, read_fleet_kernel, verify_member_provenance,
 };
 pub use discover::{
     ASTRO_FLEET_DISCOVERY_INCOMPLETE, ASTRO_FLEET_GH_API, DEFAULT_CATALOG_ROOT, DEFAULT_LANGUAGES,
