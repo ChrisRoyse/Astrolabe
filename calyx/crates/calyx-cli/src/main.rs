@@ -55,6 +55,7 @@ mod fsv_vault_health_quarantine;
 mod healthcheck;
 mod healthcheck_daemon;
 mod htap_validation;
+mod input_store_cmd;
 mod intelligence_commands;
 mod kernel_health_readback;
 mod leapable;

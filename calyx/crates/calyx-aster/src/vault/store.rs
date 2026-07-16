@@ -99,11 +99,27 @@ where
     }
 }
 
-impl<C> VaultStore for AsterVault<C>
+impl<C> AsterVault<C>
 where
     C: Clock,
 {
-    fn put(&self, constellation: Constellation) -> Result<CxId> {
+    /// Persists `constellation` together with `input_rows` in the SAME atomic
+    /// group commit as the base record (issue #446): the content-addressed
+    /// input-store rows produced by
+    /// [`crate::vault::input_store::encode_input_rows`] join the staged base,
+    /// slot, anchor, and ledger rows in one batch, so a constellation is never
+    /// durable without its retained input bytes and vice versa. Pass an empty
+    /// vec for the plain [`VaultStore::put`] behavior.
+    ///
+    /// Idempotent: if the base row already exists (identical bytes, or an
+    /// anchor-merge), the `input_rows` are not re-staged — the input store is
+    /// content-addressed, so the first ingest already committed byte-identical
+    /// rows under the same keys.
+    pub fn put_with_input_rows(
+        &self,
+        constellation: Constellation,
+        input_rows: Vec<encode::WriteRow>,
+    ) -> Result<CxId> {
         if constellation.vault_id != self.vault_id {
             return Err(CalyxError::vault_access_denied(
                 "constellation belongs to another vault",
@@ -176,6 +192,8 @@ where
                     value: encode::encode_anchor(anchor)?,
                 });
             }
+            // Input-store rows ride the same atomic batch as the base record.
+            rows.extend(input_rows);
             self.commit_rows_locked(&rows)?;
             if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
             {
@@ -183,6 +201,30 @@ where
             }
             Ok(id)
         })
+    }
+
+    /// Commits input-store rows for `bytes` (addressed by `input_hash`) as a
+    /// standalone atomic batch, independent of any constellation. Idempotent:
+    /// if a matching manifest already exists, this is a no-op that returns the
+    /// current latest seq (content-address dedup). Used by the CLI `input-write`
+    /// surface and available to Astrolabe's shadow-import row sink.
+    pub fn commit_input_bytes(&self, input_hash: &[u8; 32], bytes: &[u8]) -> Result<Seq> {
+        if let Some(existing) = crate::vault::input_store::input_manifest(self, input_hash)?
+            && &existing.content_hash == input_hash
+        {
+            return Ok(self.latest_seq());
+        }
+        let rows = crate::vault::input_store::encode_input_rows(input_hash, bytes)?;
+        self.write_cf_batch(rows.into_iter().map(|row| (row.cf, row.key, row.value)))
+    }
+}
+
+impl<C> VaultStore for AsterVault<C>
+where
+    C: Clock,
+{
+    fn put(&self, constellation: Constellation) -> Result<CxId> {
+        self.put_with_input_rows(constellation, Vec::new())
     }
 
     fn get(&self, id: CxId, snapshot: Seq) -> Result<Constellation> {

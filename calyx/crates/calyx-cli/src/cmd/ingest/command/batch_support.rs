@@ -7,6 +7,32 @@ pub(crate) struct IdentityFields<'a> {
     pub(crate) modality: Modality,
     pub(crate) metadata: &'a BTreeMap<String, String>,
 }
+
+/// #446: whether a stored `input_ref` matches an incoming measure-time ref for
+/// idempotent replay. The content identity is the `hash`; the stored
+/// `pointer`/`redacted` pair may legitimately differ from the measure-time
+/// default (`pointer: None, redacted: false`) when the stored record declares
+/// its retention outcome — `pointer = cxinput:v1:<hash>` with `redacted: false`
+/// (bytes retained in the input store) or `redacted: true` with an unchanged
+/// pointer (explicit policy opt-out). Anything else — a hash divergence, a
+/// foreign pointer change, an unlabeled redaction flip — is a real identity
+/// mismatch and stays fail-closed.
+pub(crate) fn input_ref_matches_replay(existing: &InputRef, incoming: &InputRef) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    if existing.hash != incoming.hash {
+        return false;
+    }
+    if !existing.redacted
+        && !incoming.redacted
+        && incoming.pointer.is_none()
+        && existing.pointer.as_deref() == Some(input_store::input_pointer(&existing.hash).as_str())
+    {
+        return true;
+    }
+    existing.redacted && !incoming.redacted && existing.pointer == incoming.pointer
+}
 pub(crate) fn append_idempotent_batch_ledger(
     vault: &AsterVault,
     order: &[BatchOrderRow],
@@ -35,7 +61,7 @@ pub(crate) fn verify_existing_batch_replay_identity(
 ) -> CliResult<Constellation> {
     let existing = vault.get(row.cx_id, vault.snapshot())?;
     if existing.panel_version != state.panel.version
-        || existing.input_ref != row.input_ref
+        || !input_ref_matches_replay(&existing.input_ref, &row.input_ref)
         || existing.modality != row.modality
         || existing.metadata != row.metadata
     {
@@ -82,7 +108,7 @@ pub(crate) fn ensure_idempotent_batch_replay(
 ) -> CliResult<calyx_core::Constellation> {
     let existing = vault.get(cx.cx_id, vault.snapshot())?;
     if existing.panel_version != cx.panel_version
-        || existing.input_ref != cx.input_ref
+        || !input_ref_matches_replay(&existing.input_ref, &cx.input_ref)
         || existing.modality != cx.modality
         || existing.metadata != cx.metadata
     {

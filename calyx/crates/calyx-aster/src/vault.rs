@@ -15,6 +15,7 @@ mod failpoints;
 mod gc_bridge;
 pub mod grant;
 mod htap;
+pub mod input_store;
 mod key;
 pub mod keyspace;
 mod layer_commit;
@@ -54,6 +55,11 @@ pub use failpoints::{
 };
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use htap::HtapDualRead;
+pub use input_store::{
+    CALYX_INPUT_STORE_CORRUPT, CALYX_INPUT_STORE_MISSING, CALYX_INPUT_STORE_TOO_LARGE,
+    INPUT_POINTER_PREFIX, InputManifest, InputRetention, encode_input_rows, input_manifest,
+    input_pointer, read_input_bytes,
+};
 pub use key::{CALYX_DECRYPTION_FAILED, CALYX_ENCRYPTION_FAILED, CALYX_VAULT_KEY_MISSING};
 pub use keyspace::{
     CALYX_VAULT_KEYSPACE_MISMATCH, KeyspaceGuard, VaultWriteLock, VaultWriteLockGuard, vault_prefix,

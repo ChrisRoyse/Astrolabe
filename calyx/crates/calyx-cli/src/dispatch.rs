@@ -466,6 +466,32 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
                 .map_err(|error| CliError::usage(format!("invalid --requests: {error}")))?;
             ops::wal_batch_demo(Path::new(vault), requests)
         }
+        [command, vault_flag, vault, selector_flag, selector_value]
+            if command == "input-read"
+                && vault_flag == "--vault"
+                && (selector_flag == "--cx" || selector_flag == "--hash") =>
+        {
+            crate::input_store_cmd::run_input_read(vault, selector_flag, selector_value, false)
+        }
+        [
+            command,
+            vault_flag,
+            vault,
+            selector_flag,
+            selector_value,
+            meta_flag,
+        ] if command == "input-read"
+            && vault_flag == "--vault"
+            && (selector_flag == "--cx" || selector_flag == "--hash")
+            && meta_flag == "--meta" =>
+        {
+            crate::input_store_cmd::run_input_read(vault, selector_flag, selector_value, true)
+        }
+        [command, vault_flag, vault, file_flag, file]
+            if command == "input-write" && vault_flag == "--vault" && file_flag == "--file" =>
+        {
+            crate::input_store_cmd::run_input_write(vault, Path::new(file))
+        }
         [] | [_]
             if args
                 .first()

@@ -14,7 +14,8 @@ use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots}
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
-use calyx_aster::vault::{AsterVault, encode};
+use calyx_aster::vault::input_store::InputRetention;
+use calyx_aster::vault::{AsterVault, encode, input_store};
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
     SlotVector,
@@ -1384,8 +1385,17 @@ where
     }
 
     let driver = PanelDriver::new(options.panel_version)?;
-    let mut prepared =
-        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural)?;
+    // #446: historical symbols retain their canonical input bytes under the
+    // same vault-manifest knob as the live import path.
+    let retention = vault.input_retention()?;
+    let mut prepared = prepare_constellations_parallel(
+        vault,
+        runtime,
+        options,
+        &driver,
+        non_structural,
+        retention,
+    )?;
     prepared.sort_by(|left, right| {
         left.symbol
             .rel_file_path
@@ -1436,6 +1446,9 @@ where
     let mut rows = Vec::new();
     let mut constellations_written = 0usize;
     let mut constellations_reused = 0usize;
+    // #446: mirrors the live import path — input rows commit atomically with
+    // their historical Base records under the vault's declared retention knob.
+    let mut staged_input_hashes = BTreeSet::new();
     for symbol in &prepared {
         let key = base_key(symbol.identity.cx_id);
         if vault
@@ -1457,6 +1470,16 @@ where
                 slot_key(symbol.identity.cx_id),
                 encode::encode_slot_vector(vector)?,
             ));
+        }
+        if retention == InputRetention::Persist
+            && staged_input_hashes.insert(symbol.constellation.input_ref.hash)
+        {
+            for row in input_store::encode_input_rows(
+                &symbol.constellation.input_ref.hash,
+                &symbol.identity.canonical_input_bytes,
+            )? {
+                rows.push((row.cf, row.key, row.value));
+            }
         }
         constellations_written += 1;
     }
@@ -2847,6 +2870,9 @@ where
         .partition(|node| node.label.is_structural());
     let mut timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut phase_start = std::time::Instant::now();
+    // #446: resolved once per import from the vault manifest (declared knob,
+    // persist default) and applied to every symbol prepared below.
+    let retention = vault.input_retention()?;
     let mut constellations = prepare_live_symbols_parallel(
         vault,
         runtime,
@@ -2854,6 +2880,7 @@ where
         &driver,
         non_structural,
         digest_reuse,
+        retention,
     )?;
     constellations.sort_by_key(|prepared| prepared.node_id);
     timing_ms.push((
@@ -3538,6 +3565,7 @@ fn prepare_live_symbols_parallel<C, R>(
     driver: &PanelDriver,
     nodes: Vec<ExtractedNode>,
     digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    retention: InputRetention,
 ) -> IngestResult<Vec<PreparedLiveSymbol>>
 where
     C: Clock,
@@ -3550,7 +3578,17 @@ where
     if worker_count == 1 {
         return nodes
             .into_iter()
-            .map(|node| prepare_live_symbol(vault, runtime, options, driver, node, digest_reuse))
+            .map(|node| {
+                prepare_live_symbol(
+                    vault,
+                    runtime,
+                    options,
+                    driver,
+                    node,
+                    digest_reuse,
+                    retention,
+                )
+            })
             .collect();
     }
     let chunk_size = nodes.len().div_ceil(worker_count);
@@ -3571,7 +3609,15 @@ where
                     chunk
                         .into_iter()
                         .map(|node| {
-                            prepare_live_symbol(vault, runtime, options, driver, node, digest_reuse)
+                            prepare_live_symbol(
+                                vault,
+                                runtime,
+                                options,
+                                driver,
+                                node,
+                                digest_reuse,
+                                retention,
+                            )
                         })
                         .collect::<IngestResult<Vec<_>>>()
                 })
@@ -3594,6 +3640,7 @@ fn prepare_live_symbol<C, R>(
     driver: &PanelDriver,
     node: ExtractedNode,
     digest_reuse: &HashMap<i64, (CxId, SeriesId)>,
+    retention: InputRetention,
 ) -> IngestResult<PreparedLiveSymbol>
 where
     C: Clock,
@@ -3643,7 +3690,7 @@ where
             measured: None,
         });
     }
-    let prepared = prepare_constellation(vault, runtime, options, driver, node)?;
+    let prepared = prepare_constellation(vault, runtime, options, driver, node, retention)?;
     Ok(PreparedLiveSymbol {
         node_id: prepared.node_id,
         name: prepared.name,
@@ -3716,6 +3763,7 @@ fn prepare_constellations_parallel<C, R>(
     options: &SqliteImportOptions,
     driver: &PanelDriver,
     nodes: Vec<ExtractedNode>,
+    retention: InputRetention,
 ) -> IngestResult<Vec<PreparedConstellation>>
 where
     C: Clock,
@@ -3728,7 +3776,7 @@ where
     if worker_count == 1 {
         return nodes
             .into_iter()
-            .map(|node| prepare_constellation(vault, runtime, options, driver, node))
+            .map(|node| prepare_constellation(vault, runtime, options, driver, node, retention))
             .collect();
     }
 
@@ -3755,7 +3803,9 @@ where
             handles.push(scope.spawn(move || {
                 chunk
                     .into_iter()
-                    .map(|node| prepare_constellation(vault, runtime, options, driver, node))
+                    .map(|node| {
+                        prepare_constellation(vault, runtime, options, driver, node, retention)
+                    })
                     .collect::<IngestResult<Vec<_>>>()
             }));
         }
@@ -3777,6 +3827,7 @@ fn prepare_constellation<C, R>(
     options: &SqliteImportOptions,
     driver: &PanelDriver,
     node: ExtractedNode,
+    retention: InputRetention,
 ) -> IngestResult<PreparedConstellation>
 where
     C: Clock,
@@ -3808,16 +3859,28 @@ where
         hex_lower(blake3::hash(&identity.canonical_input_bytes).as_bytes()),
     );
     let degraded = readout.slots.values().any(slot_is_degraded);
+    let input_hash = *blake3::hash(&identity.canonical_input_bytes).as_bytes();
+    // #446: a persisted symbol either carries its retained canonical input bytes
+    // (typed `cxinput:v1:` pointer, rows committed in the same atomic batch by
+    // `write_import_rows`) or an explicit redaction label — never a silent drop.
+    let input_ref = match retention {
+        InputRetention::Persist => InputRef {
+            hash: input_hash,
+            pointer: Some(input_store::input_pointer(&input_hash)),
+            redacted: false,
+        },
+        InputRetention::Redact => InputRef {
+            hash: input_hash,
+            pointer: Some(format!("cbm-sqlite://nodes/{}", node.id)),
+            redacted: true,
+        },
+    };
     let constellation = Constellation {
         cx_id: identity.cx_id,
         vault_id: vault.vault_id(),
         panel_version: options.panel_version,
         created_at: 0,
-        input_ref: InputRef {
-            hash: *blake3::hash(&identity.canonical_input_bytes).as_bytes(),
-            pointer: Some(format!("cbm-sqlite://nodes/{}", node.id)),
-            redacted: false,
-        },
+        input_ref,
         modality: modality_for_label(node.label),
         slots: readout.slots,
         scalars: readout.scalars,
@@ -3831,7 +3894,7 @@ where
             ungrounded: true,
             degraded,
             novel_region: false,
-            redacted_input: false,
+            redacted_input: retention == InputRetention::Redact,
         },
     };
     constellation.validate_schema()?;
@@ -4206,6 +4269,17 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
+/// Outcome of [`write_import_rows`]: the paired ledger ref, the committed-state
+/// FSV ack (absent when no rows were staged), graph rows written, edge rows
+/// written, and labeled sub-phase timings.
+type ImportWriteOutcome = (
+    LedgerRef,
+    Option<FsvAck>,
+    usize,
+    usize,
+    Vec<(&'static str, u64)>,
+);
+
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
@@ -4213,13 +4287,7 @@ fn write_import_rows<C>(
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
     changes: &GraphRowChanges,
-) -> IngestResult<(
-    LedgerRef,
-    Option<FsvAck>,
-    usize,
-    usize,
-    Vec<(&'static str, u64)>,
-)>
+) -> IngestResult<ImportWriteOutcome>
 where
     C: Clock,
 {
@@ -4230,6 +4298,11 @@ where
     let mut write_timing_ms: Vec<(&'static str, u64)> = Vec::new();
     let mut sub_phase = std::time::Instant::now();
     let snapshot = vault.latest_seq();
+    // #446: input-store rows for newly measured symbols ride the same atomic
+    // group commit as their Base records; a symbol is never durable without its
+    // retained canonical input bytes (or an explicit redaction label).
+    let retention = vault.input_retention()?;
+    let mut staged_input_hashes = BTreeSet::new();
     let mut rows = Vec::new();
     for prepared_cx in &prepared.constellations {
         if let Some(constellation) = &prepared_cx.measured {
@@ -4244,6 +4317,16 @@ where
                     slot_key(constellation.cx_id),
                     encode::encode_slot_vector(vector)?,
                 ));
+            }
+            if retention == InputRetention::Persist
+                && staged_input_hashes.insert(constellation.input_ref.hash)
+            {
+                for row in input_store::encode_input_rows(
+                    &constellation.input_ref.hash,
+                    &prepared_cx.identity.canonical_input_bytes,
+                )? {
+                    rows.push((row.cf, row.key, row.value));
+                }
             }
         }
         if let (Some(gate), Some(constellation)) = (quantization_gate, &prepared_cx.measured) {

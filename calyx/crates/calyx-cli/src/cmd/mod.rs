@@ -40,6 +40,7 @@ mod typed_association_miner;
 pub(crate) mod vault;
 mod vault_retire;
 mod weave;
+use calyx_aster::vault::input_store::InputRetention;
 use calyx_core::Modality;
 pub(crate) use ingest::run_lens_worker as run_ingest_lens_worker;
 use ingest::{IngestOutput, IngestStatusArgs};
@@ -146,6 +147,9 @@ pub(crate) struct IngestArgs {
     pub resident_addr: Option<SocketAddr>,
     pub allow_cold_gpu_workers: bool,
     pub session_id: Option<String>,
+    /// Per-ingest override of the vault's raw-input retention policy (#446).
+    /// `None` = use the vault manifest's policy (default persist).
+    pub input_retention: Option<InputRetention>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
