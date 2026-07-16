@@ -17,6 +17,10 @@
 //!                              (--repo <owner/name> ... | --all-discovered) [--limit <n>]
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--parallelism <n>] [--timeout-secs <n>] [--at <unix-secs>]
+//! astrolabe-fleet pipeline     [--root <dir>] [--store-root <dir>] [--astrolabe-bin <exe>]
+//!                              [--nomic-dir <dir>] (--repo <owner/name> ... | --all-cloned)
+//!                              [--limit <n>] [--parallelism <n>] [--timeout-secs <n>]
+//!                              [--force] [--at <unix-secs>]
 //! ```
 //!
 //! `--root` defaults to the declared production catalog root
@@ -42,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -302,6 +306,69 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!("{report}");
             Ok(())
         }
+        "pipeline" => {
+            opts.reject_unknown(&[
+                "root",
+                "store-root",
+                "astrolabe-bin",
+                "nomic-dir",
+                "repo",
+                "all-cloned",
+                "limit",
+                "parallelism",
+                "timeout-secs",
+                "force",
+                "at",
+            ])?;
+            let mut config =
+                astrolabe_fleet::orchestrator::PipelineConfig::with_default_bin(opts.at_or_now()?);
+            if let Some(store_root) = opts.get("store-root") {
+                config.store_root = PathBuf::from(store_root);
+            }
+            if let Some(bin) = opts.get("astrolabe-bin") {
+                config.astrolabe_bin = PathBuf::from(bin);
+            }
+            if let Some(nomic) = opts.get("nomic-dir") {
+                config.nomic_dir = PathBuf::from(nomic);
+            }
+            if let Some(raw) = opts.get("parallelism") {
+                config.parallelism = raw
+                    .parse::<usize>()
+                    .map_err(|error| usage(&format!("--parallelism must be a usize: {error}")))?;
+            }
+            if let Some(raw) = opts.get("timeout-secs") {
+                config.timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
+            }
+            config.force = opts.flag("force");
+            let repos = opts.get_all("repo");
+            let selection = if !repos.is_empty() {
+                if opts.flag("all-cloned") {
+                    return Err(usage("pass either --repo ... or --all-cloned, not both"));
+                }
+                astrolabe_fleet::clone_farm::Selection::Repos(
+                    repos.into_iter().map(str::to_string).collect(),
+                )
+            } else if opts.flag("all-cloned") {
+                let limit = opts
+                    .get("limit")
+                    .map(|raw| {
+                        raw.parse::<usize>()
+                            .map_err(|error| usage(&format!("--limit must be a usize: {error}")))
+                    })
+                    .transpose()?;
+                astrolabe_fleet::clone_farm::Selection::All { limit }
+            } else {
+                return Err(usage(
+                    "pipeline needs --repo <owner/name> (repeatable) or --all-cloned",
+                ));
+            };
+            let report =
+                astrolabe_fleet::orchestrator::run_pipeline_pass(&catalog, &config, &selection)?;
+            println!("{report}");
+            Ok(())
+        }
         other => Err(usage(&format!("unknown verb {other:?}"))),
     }
 }
@@ -329,7 +396,15 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 5] = ["stdin", "counts", "refresh", "update", "all-discovered"];
+    const SWITCHES: [&'static str; 7] = [
+        "stdin",
+        "counts",
+        "refresh",
+        "update",
+        "all-discovered",
+        "all-cloned",
+        "force",
+    ];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
         let mut pairs = Vec::new();

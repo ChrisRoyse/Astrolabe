@@ -109,10 +109,12 @@ dependencies = [
 name = "astrolabe-fleet"
 version = "0.1.0"
 dependencies = [
+ "astrolabe-ingest",
  "blake3",
  "calyx-aster",
  "calyx-core",
  "calyx-ledger",
+ "rusqlite",
  "serde",
  "serde_json",
  "windows-sys",
