@@ -25,7 +25,9 @@ use crate::Qwen3ModelFiles;
 use crate::commission::canonical_local_model_device;
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 #[cfg(feature = "ml-runtime")]
-use crate::runtime::candle::{CandlePoolingPolicy, CandlePrecision};
+use crate::runtime::candle::{
+    CANDLE_BERT_EXECUTION_REVISION, CandlePoolingPolicy, CandlePrecision,
+};
 #[cfg(feature = "ml-runtime")]
 use crate::runtime::common::DEFAULT_MAX_TOKENS;
 use crate::{AlgorithmicEncoder, LensRuntime, LensSpec};
@@ -257,7 +259,7 @@ fn candle_contract(
     let max_tokens = DEFAULT_MAX_TOKENS.to_string();
     let norm_text = format!("{:?}", spec.norm_policy);
     let corpus_hash = sha256_digest(&[
-        b"candle-local-bert-v3",
+        CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
         model_id.as_bytes(),
         max_tokens.as_bytes(),
         execution_device.as_bytes(),

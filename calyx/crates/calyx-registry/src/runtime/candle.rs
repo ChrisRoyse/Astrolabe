@@ -3,7 +3,6 @@ use std::sync::Mutex;
 
 use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
 use candle_core::{DType, Tensor};
-use candle_transformers::models::bert::BertModel;
 use tokenizers::Tokenizer;
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
@@ -14,9 +13,13 @@ use crate::spec::{LensRuntime, LensSpec};
 
 pub const DEFAULT_CANDLE_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
+mod bert;
 mod load;
 mod options;
 mod pooling;
+
+pub use bert::CANDLE_BERT_EXECUTION_REVISION;
+use bert::CalyxBertModel;
 
 use load::{
     candle_error, config_invalid, ensure_file, fetch_files, read_config, read_model,
@@ -42,7 +45,7 @@ pub struct CandleLens {
     pooling: CandlePoolingPolicy,
     max_tokens: usize,
     tokenizer: Tokenizer,
-    model: Mutex<BertModel>,
+    model: Mutex<CalyxBertModel>,
 }
 
 impl CandleLens {
@@ -191,7 +194,7 @@ impl CandleLens {
         let norm_text = format!("{:?}", spec.norm_policy);
         let execution_device = spec.device_policy.frozen_token();
         let corpus_hash = sha256_digest(&[
-            b"candle-local-bert-v3",
+            CANDLE_BERT_EXECUTION_REVISION.as_bytes(),
             files.model_id.as_bytes(),
             max_tokens_text.as_bytes(),
             execution_device.as_bytes(),
@@ -361,7 +364,7 @@ impl Lens for CandleLens {
 impl CandleLens {
     fn measure_with_model(
         &self,
-        model: &Mutex<BertModel>,
+        model: &Mutex<CalyxBertModel>,
         ids: &[u32],
         mask: &[u32],
     ) -> Result<SlotVector> {

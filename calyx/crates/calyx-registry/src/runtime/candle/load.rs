@@ -3,10 +3,11 @@ use std::path::Path;
 use calyx_core::{CalyxError, Result};
 use candle_core::Device;
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
+use candle_transformers::models::bert::Config;
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::{Tokenizer, TruncationParams};
 
+use super::bert::{CANDLE_BERT_EXECUTION_REVISION, CalyxBertModel};
 use super::options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
 use super::{CandleDevicePolicy, CandleModelFiles, CandlePrecision};
 
@@ -61,7 +62,7 @@ pub(super) fn read_model(
     config: &Config,
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
-) -> Result<BertModel> {
+) -> Result<CalyxBertModel> {
     configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
         with_runtime_context(
             error,
@@ -76,7 +77,7 @@ pub(super) fn read_model(
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, precision.dtype(), &device) }
         .map_err(candle_error)
         .map_err(|error| with_runtime_context(error, "weights_mmap", device_policy, precision))?;
-    let model = BertModel::load(vb, config)
+    let model = CalyxBertModel::load(vb, config)
         .map_err(candle_error)
         .map_err(|error| with_runtime_context(error, "model_load", device_policy, precision))?;
     verify_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
@@ -132,7 +133,7 @@ pub(super) fn with_runtime_context(
     CalyxError {
         code: error.code,
         message: format!(
-            "candle stage={stage} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
+            "candle stage={stage} execution_revision={CANDLE_BERT_EXECUTION_REVISION} device_policy={} declared_model_dtype={} executed_model_dtype={} gemm_accumulation_dtype=f32 output_dtype=f32: {}",
             device_policy.detail(),
             precision.as_str(),
             precision.as_str(),
