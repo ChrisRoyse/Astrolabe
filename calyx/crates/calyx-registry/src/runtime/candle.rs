@@ -34,7 +34,7 @@ pub use options::{
     CANDLE_CUDA_DEVICE_ENV, CANDLE_DEVICE_MODE_ENV, CandleDeviceMode, CandleDevicePolicy,
     CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision, configured_device_mode,
     configured_device_policy, default_cuda_fail_loud_policy, device_policy_for_mode,
-    frozen_device_policy,
+    frozen_device_policy, parse_frozen_device_policy,
 };
 pub(crate) use options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
 use pooling::{apply_norm, pool_tokens};
