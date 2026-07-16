@@ -13,9 +13,9 @@
 //!   clean trees take the porcelain `git reset --hard` checkout, trees
 //!   carrying invalid paths are materialized through index plumbing minus
 //!   exactly the invalid entries (see below). Before the record transitions
-//!   to `cloned` the clone must pass the integrity gate (`git rev-parse HEAD`
-//!   + `git fsck --connectivity-only`); failures quarantine with the git
-//!   stderr captured to a rejection report file.
+//!   to `cloned` the clone must pass the integrity gate (`git rev-parse
+//!   HEAD` plus `git fsck --connectivity-only`); failures quarantine with
+//!   the git stderr captured to a rejection report file.
 //! - **Update** (`--update`): records at `cloned` or beyond are fetched
 //!   (`git fetch origin <default_branch>`); an unchanged head is an explicit
 //!   counted no-op, a moved head is applied with `git reset --hard FETCH_HEAD`
@@ -955,13 +955,14 @@ pub fn windows_invalid_path(path: &[u8]) -> Option<String> {
     None
 }
 
+/// One tree scan's split: materializable entries plus Windows-invalid
+/// offenders as `(display_path, why)` pairs.
+type TreeScan = (Vec<TreeEntry>, Vec<(String, String)>);
+
 /// Enumerates `commit`'s full tree from the object store (never the
 /// filesystem) and splits it into materializable entries and Windows-invalid
-/// offenders `(display_path, why)` (#480).
-fn scan_tree(
-    dir: &Path,
-    commit: &str,
-) -> Result<(Vec<TreeEntry>, Vec<(String, String)>), String> {
+/// offenders (#480).
+fn scan_tree(dir: &Path, commit: &str) -> Result<TreeScan, String> {
     let (ok, stdout, stderr) =
         git_capture_raw(&["ls-tree", "-r", "-z", commit], dir).map_err(|error| error.message)?;
     if !ok {
