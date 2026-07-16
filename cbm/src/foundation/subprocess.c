@@ -38,6 +38,13 @@
 #define CBM_WIN_GCC_THROW 0x20474343u
 #define CBM_WIN_GCC_UNWIND 0x21474343u
 
+#ifdef _WIN32
+static bool cbm_env_truthy(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+#endif
+
 static bool cbm_is_windows_crash_exit(unsigned code) {
     return code >= CBM_WIN_CRASH_CODE_MIN || code == CBM_WIN_GCC_THROW ||
            code == CBM_WIN_GCC_UNWIND;
@@ -318,14 +325,28 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
             (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size); /* sizing call */
             bool attr_inited = false;
             bool attr_ok = false;
+            const char *attr_stage = "size";
+            DWORD attr_error = GetLastError();
             if (attr_size > 0) {
                 attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
-                if (attr_list && InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+                if (!attr_list) {
+                    attr_stage = "alloc";
+                    attr_error = ERROR_OUTOFMEMORY;
+                } else if (InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
                     attr_inited = true;
-                    if (UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                                  &hlog, sizeof(HANDLE), NULL, NULL)) {
+                    if (cbm_env_truthy("CBM_DEBUG_HANDLE_SCOPE_FAIL")) {
+                        attr_stage = "forced_debug";
+                        attr_error = ERROR_INVALID_PARAMETER;
+                    } else if (UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                         &hlog, sizeof(HANDLE), NULL, NULL)) {
                         attr_ok = true;
+                    } else {
+                        attr_stage = "update";
+                        attr_error = GetLastError();
                     }
+                } else {
+                    attr_stage = "init";
+                    attr_error = GetLastError();
                 }
             }
             if (!attr_ok) {
@@ -333,7 +354,10 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
                  * Surface a structured {code, message, remediation} through the
                  * subprocess spawn-error surface (CBM_PROC_SPAWN_FAILED); the caller
                  * turns it into the user-facing index-worker spawn error. */
+                char win32_error[16];
+                snprintf(win32_error, sizeof(win32_error), "%lu", (unsigned long)attr_error);
                 cbm_log_warn("subprocess.win.handle_scope_failed", "code", "handle_scope_failed",
+                             "stage", attr_stage, "win32_error", win32_error,
                              "message",
                              "could not build per-spawn PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
                              "remediation",
@@ -345,6 +369,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
                 }
                 free(attr_list);
                 CloseHandle(hlog);
+                if (opts->log_file && opts->delete_log_on_exit) {
+                    (void)cbm_unlink(opts->log_file);
+                }
                 free(wcmd);
                 out->outcome = CBM_PROC_SPAWN_FAILED;
                 out->exit_code = -1;

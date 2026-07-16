@@ -149,6 +149,8 @@ struct cbm_http_server {
 typedef struct {
     char root_path[1024];
     char project_name[256];
+    int slot;
+    unsigned int run_id;
     atomic_int status; /* 0=idle, 1=running, 2=done, 3=error */
     char error_msg[256];
 #ifndef _WIN32
@@ -157,6 +159,7 @@ typedef struct {
 } index_job_t;
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
+static atomic_uint g_index_job_run_seq;
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
@@ -1043,12 +1046,29 @@ static void *index_thread_fn(void *arg) {
 #ifdef _WIN32
     const char *tmp_dir = getenv("TEMP");
     const char *tdir = tmp_dir && tmp_dir[0] ? tmp_dir : ".";
-    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log", tdir, (int)_getpid());
-    snprintf(args_file, sizeof(args_file), "%s\\cbm_index_%d.args.json", tdir, (int)_getpid());
+    int log_n = snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d_%d_%u.log", tdir,
+                         (int)_getpid(), job->slot, job->run_id);
+    int args_n = snprintf(args_file, sizeof(args_file), "%s\\cbm_index_%d_%d_%u.args.json", tdir,
+                          (int)_getpid(), job->slot, job->run_id);
 #else
-    snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d.log", (int)getpid());
-    snprintf(args_file, sizeof(args_file), "/tmp/cbm_index_%d.args.json", (int)getpid());
+    int log_n = snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d_%d_%u.log", (int)getpid(),
+                         job->slot, job->run_id);
+    int args_n = snprintf(args_file, sizeof(args_file), "/tmp/cbm_index_%d_%d_%u.args.json",
+                          (int)getpid(), job->slot, job->run_id);
 #endif
+    if (log_n < 0 || args_n < 0 || (size_t)log_n >= sizeof(log_file) ||
+        (size_t)args_n >= sizeof(args_file)) {
+        snprintf(job->error_msg, sizeof(job->error_msg),
+                 "index worker temp path construction failed; remediation: shorten %s",
+#ifdef _WIN32
+                 "%TEMP%");
+#else
+                 "/tmp");
+#endif
+        atomic_store(&job->status, 3);
+        cbm_log_info("ui.index.done", "path", job->root_path, "rc", "temp_path_failed");
+        return NULL;
+    }
 
     /* Hand the tool JSON to the worker via --args-file — the public CLI argument
      * contract (#378/#411 removed raw-JSON argv). This is exactly how the primary
@@ -1083,7 +1103,12 @@ static void *index_thread_fn(void *arg) {
     const char *const idx_argv[] = {bin,          "cli",     "--index-worker", "index_repository",
                                     "--args-file", args_file, NULL};
 
-    cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
+    char slot_buf[16];
+    char run_id_buf[16];
+    snprintf(slot_buf, sizeof(slot_buf), "%d", job->slot);
+    snprintf(run_id_buf, sizeof(run_id_buf), "%u", job->run_id);
+    cbm_log_info("ui.index.spawn", "project", job->project_name, "slot", slot_buf, "run_id",
+                 run_id_buf, "bin", bin, "log", log_file, "args", args_file);
 
     cbm_proc_opts_t opts = {0};
     opts.bin = bin;
@@ -1179,6 +1204,8 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     index_job_t *job = &g_index_jobs[slot];
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
     snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
+    job->slot = slot;
+    job->run_id = atomic_fetch_add(&g_index_job_run_seq, 1) + 1;
     job->error_msg[0] = '\0';
     atomic_store(&job->status, 1);
     yyjson_doc_free(doc);
@@ -1193,24 +1220,41 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
     cbm_thread_detach(&tid); /* Don't leak thread handle */
 
+    char escaped_path[2048];
+    cbm_json_escape(escaped_path, (int)sizeof(escaped_path), job->root_path);
     cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
-                    slot, job->root_path);
+                    slot, escaped_path);
 }
 
 /* GET /api/index-status — returns status of all index jobs */
 static void handle_index_status(cbm_http_conn_t *c) {
-    char buf[2048] = "[";
+    char buf[12288] = "[";
     int pos = 1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
         int st = atomic_load(&g_index_jobs[i].status);
         if (st == 0)
             continue;
+        if ((size_t)pos >= sizeof(buf) - 2) {
+            cbm_http_replyf(c, 500, g_cors_json,
+                            "{\"error\":\"index status response too large\"}");
+            return;
+        }
         if (pos > 1)
             buf[pos++] = ',';
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
+        char escaped_path[2048];
+        char escaped_error[512];
+        cbm_json_escape(escaped_path, (int)sizeof(escaped_path), g_index_jobs[i].root_path);
+        cbm_json_escape(escaped_error, (int)sizeof(escaped_error),
+                        st == 3 ? g_index_jobs[i].error_msg : "");
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");
+                     escaped_path, escaped_error);
+        if ((size_t)pos >= sizeof(buf) - 2) {
+            cbm_http_replyf(c, 500, g_cors_json,
+                            "{\"error\":\"index status response too large\"}");
+            return;
+        }
     }
     buf[pos++] = ']';
     buf[pos] = '\0';
