@@ -728,6 +728,20 @@ pub fn refine_kernel_with_recall_support(
     let total = n as u64;
     let radius = config.recall_answer_radius_hops;
     let mut added = BTreeSet::new();
+    // #443 refine hot-loop lever (output-equivalent by construction): the greedy
+    // gain probe is the dominant kernel_artifact sub-stage at scale (measured
+    // ~O(n²): refine ms 3 → 355 → 685 at n = 460 → 4,348 → 5,395, exponent ~2.1).
+    // The prior `new_coverage_gain` did a fresh `coverage` BFS that allocated two
+    // length-`n` buffers and then scanned all `n` nodes per call, and `max_by`
+    // recomputed both operands' gains on every comparison. Both are pure O(n)
+    // overhead when a node's radius-`r` ball is tiny (the common case). This reuses
+    // one generation-stamped scratch BFS that visits only the ball and counts
+    // uncovered reach inline, and evaluates each candidate's gain exactly once per
+    // sweep. The selected member set — hence the persisted `members_hash` — is
+    // byte-identical (the gain integer and the `(gain desc, CxId asc)` tie-break
+    // are unchanged); only the per-probe constant factor and the redundant
+    // recomputation are removed.
+    let mut scratch = BallGainScratch::new(n);
 
     loop {
         // #443 redundant-recomputation removal (output-equivalent by
@@ -758,16 +772,19 @@ pub fn refine_kernel_with_recall_support(
             ));
         }
         // Choose the uncovered node whose radius reaches the most uncovered nodes.
+        // Each candidate's gain is computed exactly once per sweep (the previous
+        // `max_by` closure recomputed both operands on every comparison); the
+        // `(gain desc, CxId asc)` selection is preserved bit-for-bit.
         let chosen = uncovered
             .iter()
             .copied()
-            .max_by(|&left, &right| {
-                let left_gain = new_coverage_gain(indexed, left, radius, &covered);
-                let right_gain = new_coverage_gain(indexed, right, radius, &covered);
+            .map(|node| (node, scratch.uncovered_reach(indexed, node, radius, &covered)))
+            .max_by(|&(left, left_gain), &(right, right_gain)| {
                 left_gain
                     .cmp(&right_gain)
                     .then_with(|| indexed.id(right).cmp(&indexed.id(left)))
             })
+            .map(|(node, _)| node)
             .expect("uncovered set is non-empty");
         members.insert(chosen);
         added.insert(chosen);
@@ -775,18 +792,78 @@ pub fn refine_kernel_with_recall_support(
     Ok(added)
 }
 
-fn new_coverage_gain(
-    indexed: &crate::kernel_graph::IndexedGraph,
-    source: usize,
-    radius: u64,
-    covered: &[bool],
-) -> usize {
-    let mut single = BTreeSet::new();
-    single.insert(source);
-    let reach = coverage(indexed, &single, radius);
-    (0..indexed.len())
-        .filter(|&index| reach[index] && !covered[index])
-        .count()
+/// Reusable generation-stamped scratch for the refine greedy's per-candidate
+/// coverage-gain probe. A single-source bounded BFS visits only the source's
+/// radius ball and never re-zeroes its buffers between probes, so a probe costs
+/// O(ball) instead of the O(n) alloc-and-scan of a fresh `coverage` vector.
+struct BallGainScratch {
+    /// Visit generation stamped per node; a node is "seen this probe" when its
+    /// stamp equals the current generation.
+    stamp: Vec<u32>,
+    /// Shortest hop depth from the probe source, valid only for stamped nodes.
+    depth: Vec<u32>,
+    /// Current probe generation.
+    generation: u32,
+    /// BFS frontier, cleared and reused each probe.
+    queue: VecDeque<usize>,
+}
+
+impl BallGainScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            stamp: vec![0; n],
+            depth: vec![0; n],
+            generation: 0,
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// Counts the nodes within `radius` undirected hops of `source` (inclusive)
+    /// that are not yet `covered` — identical to counting `reach ∧ ¬covered` over
+    /// a `coverage(indexed, {source}, radius)` vector, but touching only the ball.
+    fn uncovered_reach(
+        &mut self,
+        indexed: &crate::kernel_graph::IndexedGraph,
+        source: usize,
+        radius: u64,
+        covered: &[bool],
+    ) -> usize {
+        // Advance the generation; on the (astronomically rare) u32 wrap, hard-reset
+        // the stamps so a stale stamp can never masquerade as the current probe.
+        self.generation = match self.generation.checked_add(1) {
+            Some(next) => next,
+            None => {
+                for stamp in &mut self.stamp {
+                    *stamp = 0;
+                }
+                1
+            }
+        };
+        let generation = self.generation;
+        self.queue.clear();
+        self.stamp[source] = generation;
+        self.depth[source] = 0;
+        self.queue.push_back(source);
+        let mut count = usize::from(!covered[source]);
+        let radius = radius.min(u32::MAX as u64) as u32;
+        while let Some(node) = self.queue.pop_front() {
+            let node_depth = self.depth[node];
+            if node_depth >= radius {
+                continue;
+            }
+            for &neighbor in indexed.undirected_neighbors(node) {
+                if self.stamp[neighbor] != generation {
+                    self.stamp[neighbor] = generation;
+                    self.depth[neighbor] = node_depth + 1;
+                    self.queue.push_back(neighbor);
+                    if !covered[neighbor] {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
 }
 
 /// Marks every node within `radius` undirected hops of any member.
