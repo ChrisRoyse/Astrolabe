@@ -473,11 +473,17 @@ pub(crate) fn run(args: Vec<String>) -> CliResult {
         {
             crate::input_store_cmd::run_input_read(vault, selector_flag, selector_value, false)
         }
-        [command, vault_flag, vault, selector_flag, selector_value, meta_flag]
-            if command == "input-read"
-                && vault_flag == "--vault"
-                && (selector_flag == "--cx" || selector_flag == "--hash")
-                && meta_flag == "--meta" =>
+        [
+            command,
+            vault_flag,
+            vault,
+            selector_flag,
+            selector_value,
+            meta_flag,
+        ] if command == "input-read"
+            && vault_flag == "--vault"
+            && (selector_flag == "--cx" || selector_flag == "--hash")
+            && meta_flag == "--meta" =>
         {
             crate::input_store_cmd::run_input_read(vault, selector_flag, selector_value, true)
         }

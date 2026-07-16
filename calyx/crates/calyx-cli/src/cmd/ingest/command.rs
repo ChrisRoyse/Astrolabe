@@ -493,10 +493,8 @@ fn ingest_prepared_inputs(
     match staged.len() {
         0 => {}
         1 => {
-            vault.put_with_input_rows(
-                staged.pop().expect("one staged constellation"),
-                input_rows,
-            )?;
+            vault
+                .put_with_input_rows(staged.pop().expect("one staged constellation"), input_rows)?;
         }
         _ => {
             vault.put_batch_with_input_rows(staged, input_rows)?;

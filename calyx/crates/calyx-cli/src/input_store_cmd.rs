@@ -108,7 +108,10 @@ pub(crate) fn run_input_read(
         let manifest = input_store::input_manifest(&vault, &input_hash)?.ok_or_else(|| {
             CliError::from(calyx_core::CalyxError {
                 code: input_store::CALYX_INPUT_STORE_MISSING,
-                message: format!("no input-store manifest for input_hash {}", hex(&input_hash)),
+                message: format!(
+                    "no input-store manifest for input_hash {}",
+                    hex(&input_hash)
+                ),
                 remediation: "ingest with input_retention=persist, or read a persisted hash",
             })
         })?;

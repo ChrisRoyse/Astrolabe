@@ -95,7 +95,9 @@ impl InputRetention {
             "redact" => Ok(Self::Redact),
             other => Err(CalyxError {
                 code: "CALYX_INPUT_RETENTION_INVALID",
-                message: format!("unknown input retention policy {other:?}; expected persist|redact"),
+                message: format!(
+                    "unknown input retention policy {other:?}; expected persist|redact"
+                ),
                 remediation: "pass --input-retention persist or --input-retention redact",
             }),
         }
@@ -243,10 +245,7 @@ pub fn reassemble_and_verify(
     let Some(manifest_bytes) = fetch(&manifest_key)? else {
         return Err(CalyxError {
             code: CALYX_INPUT_STORE_MISSING,
-            message: format!(
-                "no input-store manifest for input_hash {}",
-                hex(input_hash)
-            ),
+            message: format!("no input-store manifest for input_hash {}", hex(input_hash)),
             remediation: "ingest the input with input_retention=persist, or read a hash that was persisted",
         });
     };
@@ -314,7 +313,11 @@ pub fn input_manifest<C: Clock>(
 ) -> Result<Option<InputManifest>> {
     let snapshot = vault.latest_seq();
     vault
-        .read_cf_at(snapshot, ColumnFamily::Blob, &input_manifest_key(input_hash))?
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Blob,
+            &input_manifest_key(input_hash),
+        )?
         .map(|bytes| decode_manifest(&bytes))
         .transpose()
 }

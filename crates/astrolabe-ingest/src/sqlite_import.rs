@@ -14,8 +14,8 @@ use astrolabe_panel::{PanelDriver, PanelInput, SlotRuntime, default_panel_slots}
 use calyx_aster::cf::{ColumnFamily, base_key, ledger_key, ledger_range, prefix_range, slot_key};
 use calyx_aster::ledger_view::parse_aster_ledger_seq;
 use calyx_aster::mvcc::tombstone_value;
-use calyx_aster::vault::{AsterVault, encode, input_store};
 use calyx_aster::vault::input_store::InputRetention;
+use calyx_aster::vault::{AsterVault, encode, input_store};
 use calyx_core::{
     AbsentReason, Clock, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, Seq, SlotId,
     SlotVector,
@@ -1388,8 +1388,14 @@ where
     // #446: historical symbols retain their canonical input bytes under the
     // same vault-manifest knob as the live import path.
     let retention = vault.input_retention()?;
-    let mut prepared =
-        prepare_constellations_parallel(vault, runtime, options, &driver, non_structural, retention)?;
+    let mut prepared = prepare_constellations_parallel(
+        vault,
+        runtime,
+        options,
+        &driver,
+        non_structural,
+        retention,
+    )?;
     prepared.sort_by(|left, right| {
         left.symbol
             .rel_file_path
@@ -3573,7 +3579,15 @@ where
         return nodes
             .into_iter()
             .map(|node| {
-                prepare_live_symbol(vault, runtime, options, driver, node, digest_reuse, retention)
+                prepare_live_symbol(
+                    vault,
+                    runtime,
+                    options,
+                    driver,
+                    node,
+                    digest_reuse,
+                    retention,
+                )
             })
             .collect();
     }

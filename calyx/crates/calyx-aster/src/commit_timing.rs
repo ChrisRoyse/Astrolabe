@@ -26,8 +26,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 #[inline]
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CALYX_COMMIT_TIMING")
-            .is_some_and(|value| value == "1" || value == "true")
+        std::env::var_os("CALYX_COMMIT_TIMING").is_some_and(|value| value == "1" || value == "true")
     })
 }
 

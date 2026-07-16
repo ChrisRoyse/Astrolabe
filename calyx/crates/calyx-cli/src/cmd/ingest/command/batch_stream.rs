@@ -331,8 +331,7 @@ fn flush_measure_batch(
                             cx_new.input_ref.pointer =
                                 Some(input_store::input_pointer(&cx_new.input_ref.hash));
                             cx_new.input_ref.redacted = false;
-                            staged_inputs
-                                .push((cx_new.input_ref.hash, text.clone().into_bytes()));
+                            staged_inputs.push((cx_new.input_ref.hash, text.clone().into_bytes()));
                         }
                         InputRetention::Redact => {
                             cx_new.input_ref.redacted = true;

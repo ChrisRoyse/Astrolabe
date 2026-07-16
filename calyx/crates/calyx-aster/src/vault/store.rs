@@ -215,10 +215,7 @@ where
             return Ok(self.latest_seq());
         }
         let rows = crate::vault::input_store::encode_input_rows(input_hash, bytes)?;
-        self.write_cf_batch(
-            rows.into_iter()
-                .map(|row| (row.cf, row.key, row.value)),
-        )
+        self.write_cf_batch(rows.into_iter().map(|row| (row.cf, row.key, row.value)))
     }
 }
 

@@ -111,10 +111,7 @@ where
     /// import write time and every full-batch copy in that path is linear in
     /// rows). Byte-equivalence is structural, not incidental: `commit_prepared_rows`
     /// observes the same slice contents either way.
-    pub(crate) fn commit_rows_locked_owned(
-        &self,
-        mut rows: Vec<encode::WriteRow>,
-    ) -> Result<Seq> {
+    pub(crate) fn commit_rows_locked_owned(&self, mut rows: Vec<encode::WriteRow>) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
             return self.commit_prepared_rows(&rows);
