@@ -205,6 +205,7 @@ impl FleetCatalog {
             quarantine_reason: None,
             departed_reason: None,
             clone_bytes: None,
+            store_bytes: None,
         };
         let payload = serde_json::to_vec(&json!({
             "event": "fleet_repo_registered",
@@ -284,6 +285,9 @@ impl FleetCatalog {
         if let Some(bytes) = ctx.clone_bytes {
             row.clone_bytes = Some(bytes);
         }
+        if let Some(bytes) = ctx.store_bytes {
+            row.store_bytes = Some(bytes);
+        }
         if from == RepoState::Departed && to == RepoState::Discovered {
             // Reappearance: the departure reason described the previous
             // absence; the ledger keeps that history, the live row does not.
@@ -312,6 +316,9 @@ impl FleetCatalog {
         }
         if let Some(bytes) = row.clone_bytes {
             payload["clone_bytes"] = json!(bytes);
+        }
+        if let Some(bytes) = row.store_bytes {
+            payload["store_bytes"] = json!(bytes);
         }
         let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
@@ -354,6 +361,9 @@ impl FleetCatalog {
         if let Some(bytes) = ctx.clone_bytes {
             row.clone_bytes = Some(bytes);
         }
+        if let Some(bytes) = ctx.store_bytes {
+            row.store_bytes = Some(bytes);
+        }
         if row == before {
             return Err(CalyxError {
                 code: ASTRO_FLEET_FACTS_UNCHANGED,
@@ -373,6 +383,9 @@ impl FleetCatalog {
         }
         if let Some(bytes) = row.clone_bytes {
             payload["clone_bytes"] = json!(bytes);
+        }
+        if let Some(bytes) = row.store_bytes {
+            payload["store_bytes"] = json!(bytes);
         }
         let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;

@@ -46,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -126,6 +126,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "kernel-scope-id",
                 "reason",
                 "clone-bytes",
+                "store-bytes",
             ])?;
             let github_id = opts.require_u64("github-id")?;
             let full_name = opts.require("repo")?;
@@ -148,6 +149,14 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     .map(|raw| {
                         raw.parse::<u64>().map_err(|error| {
                             usage(&format!("--clone-bytes must be a u64: {error}"))
+                        })
+                    })
+                    .transpose()?,
+                store_bytes: opts
+                    .get("store-bytes")
+                    .map(|raw| {
+                        raw.parse::<u64>().map_err(|error| {
+                            usage(&format!("--store-bytes must be a u64: {error}"))
                         })
                     })
                     .transpose()?,
@@ -318,6 +327,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "parallelism",
                 "timeout-secs",
                 "force",
+                "store-budget-bytes",
                 "at",
             ])?;
             let mut config =
@@ -342,6 +352,11 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     .map_err(|error| usage(&format!("--timeout-secs must be a u64: {error}")))?;
             }
             config.force = opts.flag("force");
+            if let Some(raw) = opts.get("store-budget-bytes") {
+                config.store_budget_bytes = Some(raw.parse::<u64>().map_err(|error| {
+                    usage(&format!("--store-budget-bytes must be a u64: {error}"))
+                })?);
+            }
             let repos = opts.get_all("repo");
             let selection = if !repos.is_empty() {
                 if opts.flag("all-cloned") {
@@ -475,6 +490,25 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             println!(
                 "{}",
                 serde_json::json!({ "kind": kind, "total": ids.len(), "report_ids": ids })
+            );
+            Ok(())
+        }
+        "probe-vault-keys" => {
+            opts.reject_unknown(&["root", "store-root", "project"])?;
+            let store_root = PathBuf::from(opts.get("store-root").ok_or_else(|| {
+                usage("probe-vault-keys needs --store-root <dir> (the fleet store root)")
+            })?);
+            let project = opts
+                .get("project")
+                .ok_or_else(|| usage("probe-vault-keys needs --project <org__repo>"))?;
+            let keys =
+                astrolabe_fleet::orchestrator::vault_base_keys(&store_root, project)?;
+            for key in &keys {
+                println!("{key}");
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({ "project": project, "base_keys": keys.len() })
             );
             Ok(())
         }

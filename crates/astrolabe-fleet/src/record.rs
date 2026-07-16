@@ -50,6 +50,10 @@ pub const SCALAR_SIZE_KB: &str = "size_kb";
 /// Measured on-disk bytes of the local clone, recorded at `cloned` and on
 /// update fetches (issue #451). Absent until first measured.
 pub const SCALAR_CLONE_BYTES: &str = "clone_bytes";
+/// Measured on-disk bytes of the repo's fleet store directory (CBM sqlite +
+/// shadow vault + lowered artifact + logs), recorded at `kerneled` and on
+/// `--force` refreshes (issue #454). Absent until first measured.
+pub const SCALAR_STORE_BYTES: &str = "store_bytes";
 
 // Metadata keys (verbatim string facts). `head_commit` deliberately carries a
 // `_hash` suffix: the ledger secret-scanner allowlists `*_hash` fields, and a
@@ -183,6 +187,9 @@ pub struct TransitionContext {
     /// Measured on-disk bytes of the local clone (#451).
     #[serde(default)]
     pub clone_bytes: Option<u64>,
+    /// Measured on-disk bytes of the repo's fleet store directory (#454).
+    #[serde(default)]
+    pub store_bytes: Option<u64>,
 }
 
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.
@@ -210,6 +217,8 @@ pub struct FleetRepoRow {
     pub departed_reason: Option<String>,
     /// Measured on-disk bytes of the local clone (#451).
     pub clone_bytes: Option<u64>,
+    /// Measured on-disk bytes of the repo's fleet store directory (#454).
+    pub store_bytes: Option<u64>,
 }
 
 /// Canonical identity bytes of a repository record:
@@ -246,6 +255,9 @@ pub fn encode_repo_constellation(
     scalars.insert(SCALAR_SIZE_KB.to_string(), row.record.size_kb as f64);
     if let Some(bytes) = row.clone_bytes {
         scalars.insert(SCALAR_CLONE_BYTES.to_string(), bytes as f64);
+    }
+    if let Some(bytes) = row.store_bytes {
+        scalars.insert(SCALAR_STORE_BYTES.to_string(), bytes as f64);
     }
 
     let mut metadata = BTreeMap::new();
@@ -403,5 +415,6 @@ pub fn decode_repo_constellation(
         quarantine_reason: meta_opt(META_QUARANTINE_REASON),
         departed_reason: meta_opt(META_DEPARTED_REASON),
         clone_bytes: scalar_opt(SCALAR_CLONE_BYTES)?,
+        store_bytes: scalar_opt(SCALAR_STORE_BYTES)?,
     })
 }
