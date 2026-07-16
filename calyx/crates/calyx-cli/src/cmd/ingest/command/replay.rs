@@ -1,7 +1,7 @@
 use super::batch_support::{
     BatchOrderRow, IdentityFields, append_idempotent_batch_ledger, append_missing_batch_anchors,
     append_oracle_events, current_anchor_kinds, existing_replay_incoming, identity_mismatch_reason,
-    verify_existing_batch_replay_identity,
+    input_ref_matches_replay, verify_existing_batch_replay_identity,
 };
 use super::*;
 
@@ -177,7 +177,7 @@ fn verify_existing_base_replay_row(
     };
     let existing = decode_constellation_base(&bytes)?;
     if existing.panel_version != row.panel_version
-        || existing.input_ref != row.input_ref
+        || !input_ref_matches_replay(&existing.input_ref, &row.input_ref)
         || existing.modality != row.modality
         || existing.metadata != row.metadata
     {

@@ -1,6 +1,7 @@
 use super::{DurableVault, storage_error};
 use crate::manifest::{ImmutableRef, ManifestStore, VaultManifest};
 use crate::timetravel::RetentionHorizon;
+use crate::vault::input_store::InputRetention;
 use calyx_core::{CalyxError, Panel, Result};
 use std::fs::{self, File};
 use std::io;
@@ -109,6 +110,16 @@ impl DurableVault {
         } else {
             Ok(None)
         }
+    }
+
+    /// Raw-input retention policy declared by this vault's manifest (#446).
+    /// A vault without a written manifest retains inputs: `Persist` is the
+    /// declared default, and redaction is always an explicit opt-out.
+    pub(in crate::vault) fn manifest_input_retention(&self) -> Result<InputRetention> {
+        Ok(self
+            .current_manifest()?
+            .map(|manifest| manifest.input_retention)
+            .unwrap_or_default())
     }
 }
 

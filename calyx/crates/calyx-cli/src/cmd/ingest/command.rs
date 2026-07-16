@@ -66,6 +66,8 @@ struct BatchFlushOptions {
     output: IngestOutput,
     runtime_batch_limit: usize,
     gpu_route: IngestGpuRoute,
+    /// Resolved raw-input retention policy for this batch (#446).
+    input_retention: InputRetention,
 }
 
 pub(crate) fn ingest_runtime_log(args: std::fmt::Arguments<'_>) {
@@ -232,6 +234,7 @@ fn ingest_command(args: IngestArgs) -> CliResult {
                 args.output,
                 validation.row_count,
                 gpu_route,
+                args.input_retention,
                 Some(&mut emit_summary),
                 Some(&mut session),
             )
@@ -242,6 +245,7 @@ fn ingest_command(args: IngestArgs) -> CliResult {
                 args.output,
                 validation.row_count,
                 gpu_route,
+                args.input_retention,
                 None,
                 Some(&mut session),
             )
@@ -328,18 +332,20 @@ fn ingest_texts_with_resident(
     resolved: &ResolvedVault,
     texts: &[String],
     gpu_route: IngestGpuRoute,
+    retention_override: Option<InputRetention>,
 ) -> CliResult<Vec<IngestReport>> {
     let rows = texts
         .iter()
         .map(|text| (text.clone(), BTreeMap::new()))
         .collect();
-    ingest_text_rows_with_resident(resolved, rows, gpu_route)
+    ingest_text_rows_with_resident(resolved, rows, gpu_route, retention_override)
 }
 
 fn ingest_text_rows_with_resident(
     resolved: &ResolvedVault,
     rows: Vec<(String, BTreeMap<String, String>)>,
     gpu_route: IngestGpuRoute,
+    retention_override: Option<InputRetention>,
 ) -> CliResult<Vec<IngestReport>> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -354,7 +360,54 @@ fn ingest_text_rows_with_resident(
             })
         })
         .collect::<CliResult<Vec<_>>>()?;
-    ingest_prepared_inputs(resolved, prepared, gpu_route)
+    ingest_prepared_inputs(resolved, prepared, gpu_route, retention_override)
+}
+
+/// Resolves the effective raw-input retention policy (#446): the per-ingest
+/// CLI override wins, otherwise the vault manifest's declared knob (default
+/// [`InputRetention::Persist`]).
+pub(crate) fn resolve_input_retention(
+    vault: &AsterVault,
+    retention_override: Option<InputRetention>,
+) -> CliResult<InputRetention> {
+    match retention_override {
+        Some(policy) => Ok(policy),
+        None => Ok(vault.input_retention()?),
+    }
+}
+
+/// Post-commit FSV of persisted input bytes (#446): reads every stored input
+/// back through the fail-closed input-store reader and byte-compares against
+/// the canonical bytes that were staged. Any divergence is a structured
+/// corruption error — never a silent success.
+pub(crate) fn verify_persisted_inputs(
+    vault: &AsterVault,
+    persisted: &[([u8; 32], Vec<u8>)],
+) -> CliResult {
+    for (input_hash, bytes) in persisted {
+        let readback = input_store::read_input_bytes(vault, input_hash)?;
+        if &readback != bytes {
+            return Err(CliError::from(CalyxError {
+                code: input_store::CALYX_INPUT_STORE_CORRUPT,
+                message: format!(
+                    "post-commit readback of input {} returned {} bytes that do not match the {} canonical source bytes",
+                    hex_hash(input_hash),
+                    readback.len(),
+                    bytes.len()
+                ),
+                remediation: "the input store write path is inconsistent; do not trust this vault",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn hex_hash(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 struct PreparedInput {
@@ -366,11 +419,13 @@ fn ingest_prepared_inputs(
     resolved: &ResolvedVault,
     inputs: Vec<PreparedInput>,
     gpu_route: IngestGpuRoute,
+    retention_override: Option<InputRetention>,
 ) -> CliResult<Vec<IngestReport>> {
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
     let vault = open_vault(resolved)?;
+    let retention = resolve_input_retention(&vault, retention_override)?;
     ingest_runtime_log(format_args!(
         "phase=load_vault_panel_state_start vault={}",
         resolved.path.display()
@@ -383,6 +438,7 @@ fn ingest_prepared_inputs(
         state.panel.slots.len()
     ));
     let mut staged = Vec::new();
+    let mut staged_inputs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut first_new = BTreeSet::new();
     for prepared_input in inputs {
@@ -398,6 +454,19 @@ fn ingest_prepared_inputs(
         ensure_content_panel_floor(&cx, &state)?;
         let new = !base_exists(&vault, cx.cx_id)? && first_new.insert(cx.cx_id);
         if new {
+            match retention {
+                InputRetention::Persist => {
+                    cx.input_ref.pointer = Some(input_store::input_pointer(&cx.input_ref.hash));
+                    cx.input_ref.redacted = false;
+                    staged_inputs.push((cx.input_ref.hash, prepared_input.input.bytes.clone()));
+                }
+                InputRetention::Redact => {
+                    // Explicit, labeled opt-out: the omission of input bytes is
+                    // declared on the record itself, never silent (#446).
+                    cx.input_ref.redacted = true;
+                    cx.flags.redacted_input = true;
+                }
+            }
             staged.push(cx.clone());
         }
         prepared.push((cx.cx_id, new));
@@ -413,16 +482,26 @@ fn ingest_prepared_inputs(
         None,
         None,
     )?;
+    let mut input_rows = Vec::new();
+    for (input_hash, bytes) in &staged_inputs {
+        input_rows.extend(input_store::encode_input_rows(input_hash, bytes)?);
+    }
     match staged.len() {
         0 => {}
         1 => {
-            vault.put(staged.pop().expect("one staged constellation"))?;
+            vault.put_with_input_rows(
+                staged.pop().expect("one staged constellation"),
+                input_rows,
+            )?;
         }
         _ => {
-            vault.put_batch(staged)?;
+            vault.put_batch_with_input_rows(staged, input_rows)?;
         }
     }
     vault.flush()?;
+    // FSV in the write path (#446): the persisted input bytes are read back
+    // through the fail-closed store reader and byte-compared before reporting.
+    verify_persisted_inputs(&vault, &staged_inputs)?;
     rebuild_persistent_indexes(&resolved.path, &vault)?;
     let snapshot = vault.snapshot();
     let mut reports = Vec::with_capacity(prepared.len());

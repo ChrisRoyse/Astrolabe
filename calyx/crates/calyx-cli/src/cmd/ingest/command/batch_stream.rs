@@ -22,6 +22,7 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
     output: IngestOutput,
     validated_row_count: usize,
     gpu_route: IngestGpuRoute,
+    retention_override: Option<InputRetention>,
     mut summary_emitter: Option<BatchSummaryEmitter<'_>>,
     mut session: Option<&mut BatchIngestSession>,
 ) -> CliResult<BatchIngestSummary> {
@@ -84,6 +85,7 @@ pub(crate) fn ingest_validated_batch_streaming_with_output(
         output,
         runtime_batch_limit,
         gpu_route,
+        input_retention: resolve_input_retention(&vault, retention_override)?,
     };
     ingest_runtime_log(format_args!(
         "phase=batch_ingest_plan rows={} runtime_batch_limit={} measure_window={} put_chunk={} output={:?} resident_addr={:?} allow_cold_gpu_workers={}",
@@ -262,7 +264,7 @@ fn flush_measure_batch(
         options.gpu_route,
     )?;
     let mut measured = Vec::with_capacity(constellations.len());
-    for (mut cx, (_, mut metadata, anchors, oracle)) in constellations.into_iter().zip(rows) {
+    for (mut cx, (text, mut metadata, anchors, oracle)) in constellations.into_iter().zip(rows) {
         if let Some(event) = &oracle {
             event.apply_metadata(&mut metadata)?;
         }
@@ -272,18 +274,19 @@ fn flush_measure_batch(
         // so the flag reflects reality rather than the measure-time default of true.
         cx.flags.ungrounded = anchors.is_empty();
         cx.anchors = anchors;
-        measured.push((cx, oracle));
+        measured.push((cx, oracle, text));
     }
     // Doctrine #1273 rule 3: validate the whole flush before any put so a fully
     // degraded constellation aborts the batch loudly instead of being persisted.
-    for (cx, _) in &measured {
+    for (cx, _, _) in &measured {
         ensure_content_panel_floor(cx, state)?;
     }
     for sub in measured.chunks(PUT_CHUNK) {
         let mut staged = Vec::new();
+        let mut staged_inputs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
         let mut order = Vec::with_capacity(sub.len());
         let mut known_anchor_kinds = BTreeMap::<CxId, BTreeSet<AnchorKind>>::new();
-        for (cx, oracle) in sub {
+        for (cx, oracle, text) in sub {
             let exists = base_exists(vault, cx.cx_id)?;
             let new = !exists && seen.insert(cx.cx_id);
             let existing = if exists {
@@ -306,8 +309,25 @@ fn flush_measure_batch(
             let mut expected_readback = existing.as_ref().cloned().unwrap_or_else(|| cx.clone());
             if should_stage_batch_constellation(new, &marker_kinds) {
                 if new {
-                    staged.push(cx.clone());
-                    expected_readback = cx.clone();
+                    // #446: a newly persisted constellation carries its retained
+                    // input (typed pointer + bytes in the same atomic commit) or
+                    // an explicit redaction label — never a silent drop.
+                    let mut cx_new = cx.clone();
+                    match options.input_retention {
+                        InputRetention::Persist => {
+                            cx_new.input_ref.pointer =
+                                Some(input_store::input_pointer(&cx_new.input_ref.hash));
+                            cx_new.input_ref.redacted = false;
+                            staged_inputs
+                                .push((cx_new.input_ref.hash, text.clone().into_bytes()));
+                        }
+                        InputRetention::Redact => {
+                            cx_new.input_ref.redacted = true;
+                            cx_new.flags.redacted_input = true;
+                        }
+                    }
+                    staged.push(cx_new.clone());
+                    expected_readback = cx_new;
                 } else if let Some(existing) = existing.as_ref() {
                     expected_readback =
                         append_missing_batch_anchors(vault, existing, cx, &marker_kinds)?;
@@ -321,16 +341,26 @@ fn flush_measure_batch(
                 oracle: oracle.clone(),
             });
         }
+        let mut input_rows = Vec::new();
+        for (input_hash, bytes) in &staged_inputs {
+            input_rows.extend(input_store::encode_input_rows(input_hash, bytes)?);
+        }
         match staged.len() {
             0 => {}
             1 => {
-                vault.put(staged.pop().expect("one staged constellation"))?;
+                vault.put_with_input_rows(
+                    staged.pop().expect("one staged constellation"),
+                    input_rows,
+                )?;
             }
             _ => {
-                vault.put_batch(staged)?;
+                vault.put_batch_with_input_rows(staged, input_rows)?;
             }
         }
         vault.flush()?;
+        // FSV in the write path (#446): persisted input bytes are read back and
+        // byte-compared before this chunk's reports are emitted.
+        verify_persisted_inputs(vault, &staged_inputs)?;
         let snapshot = vault.snapshot();
         for row in &order {
             verify_base_readback(

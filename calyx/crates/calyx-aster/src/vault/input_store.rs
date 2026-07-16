@@ -290,6 +290,22 @@ pub fn reassemble_and_verify(
     Ok(data)
 }
 
+impl<C> AsterVault<C>
+where
+    C: Clock,
+{
+    /// Effective raw-input retention policy for this vault (#446): the durable
+    /// manifest's declared `input_retention` knob, or [`InputRetention::Persist`]
+    /// for an in-memory vault, which has no manifest to declare otherwise.
+    /// Redaction is always an explicit opt-out, never an implicit state.
+    pub fn input_retention(&self) -> Result<InputRetention> {
+        match &self.durable {
+            Some(durable) => durable.manifest_input_retention(),
+            None => Ok(InputRetention::default()),
+        }
+    }
+}
+
 /// Reads the input-store manifest for `input_hash` from a live vault, or `None`
 /// if the input was never stored (e.g. `input_retention=redact`).
 pub fn input_manifest<C: Clock>(

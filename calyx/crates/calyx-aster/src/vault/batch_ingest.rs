@@ -26,11 +26,31 @@ where
     where
         I: IntoIterator<Item = Constellation>,
     {
+        self.put_batch_with_input_rows(constellations, Vec::new())
+    }
+
+    /// [`AsterVault::put_batch`] plus content-addressed input-store rows (#446)
+    /// committed in the SAME atomic group commit as the batch's base records,
+    /// so no constellation of the batch is durable without its retained input
+    /// bytes. `input_rows` come from
+    /// [`crate::vault::input_store::encode_input_rows`]; rows addressing inputs
+    /// whose constellations dedup against existing records are harmless
+    /// re-writes of byte-identical content-addressed rows. If the entire batch
+    /// dedups (no accepted constellation), the input rows are not committed —
+    /// the first ingest of each input already committed identical rows.
+    pub fn put_batch_with_input_rows<I>(
+        &self,
+        constellations: I,
+        input_rows: Vec<encode::WriteRow>,
+    ) -> Result<Vec<CxId>>
+    where
+        I: IntoIterator<Item = Constellation>,
+    {
         let input = constellations.into_iter().collect::<Vec<_>>();
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_durable_commit_lock(|| self.put_batch_locked(input))
+        self.with_durable_commit_lock(|| self.put_batch_locked(input, input_rows))
     }
 
     pub fn put_batch_with_ingest_ledger<I>(
@@ -56,6 +76,7 @@ where
                     payload,
                     actor,
                 }),
+                Vec::new(),
             )
         })
     }
@@ -82,6 +103,7 @@ where
                     actor,
                 }),
                 Some(artifact),
+                Vec::new(),
             )?;
             let artifact = commit.artifact.ok_or_else(|| {
                 CalyxError::aster_corrupt_shard(
@@ -95,16 +117,21 @@ where
         })
     }
 
-    fn put_batch_locked(&self, input: Vec<Constellation>) -> Result<Vec<CxId>> {
-        self.put_batch_locked_with_ledger(input, None)
+    fn put_batch_locked(
+        &self,
+        input: Vec<Constellation>,
+        input_rows: Vec<encode::WriteRow>,
+    ) -> Result<Vec<CxId>> {
+        self.put_batch_locked_with_ledger(input, None, input_rows)
     }
 
     fn put_batch_locked_with_ledger(
         &self,
         input: Vec<Constellation>,
         ledger_entry: Option<BatchLedgerEntry>,
+        input_rows: Vec<encode::WriteRow>,
     ) -> Result<Vec<CxId>> {
-        self.put_batch_locked_with_options(input, ledger_entry, None)
+        self.put_batch_locked_with_options(input, ledger_entry, None, input_rows)
             .map(|commit| commit.ids)
     }
 
@@ -113,6 +140,7 @@ where
         input: Vec<Constellation>,
         ledger_entry: Option<BatchLedgerEntry>,
         artifact: Option<DerivedMediaArtifactDraft>,
+        input_rows: Vec<encode::WriteRow>,
     ) -> Result<BatchIngestCommit> {
         let latest = self.snapshot();
         let snapshot = self.snapshot_handle(latest);
@@ -231,6 +259,8 @@ where
             constellation.provenance = ledger_ref.clone();
             self.stage_constellation_rows(&mut rows, &constellation)?;
         }
+        // Input-store rows (#446) ride the same atomic batch as the base records.
+        rows.extend(input_rows);
         self.commit_rows_locked(&rows)?;
         if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref()) {
             ledger_hook::commit_staged(hook, staged)?;

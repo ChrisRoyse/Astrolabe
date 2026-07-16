@@ -19,7 +19,7 @@ use calyx_aster::cf::{ColumnFamily, base_key};
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_aster::vault::input_store::{self, InputManifest};
 use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::CxId;
+use calyx_core::{CxId, VaultStore};
 
 use crate::cmd::vault::{home_dir, vault_salt};
 use crate::error::{CliError, CliResult};
