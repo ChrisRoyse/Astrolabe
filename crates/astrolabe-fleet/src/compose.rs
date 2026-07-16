@@ -294,7 +294,12 @@ fn input_atoms_by_cx(
     let probe = input_store::input_manifest_key(&[0_u8; 32]);
     let prefix = probe[..probe.len() - 32].to_vec();
     let snapshot = vault.latest_seq();
-    let salt = shadow_vault_salt(project).into_bytes();
+    // Symbol CxIds derive from the DOMAIN identity salt (`astrolabe-v1:<project>`,
+    // `SymbolRecord::identity`), not the shadow vault-open salt
+    // (`astrolabe-shadow-v1:<project>`) — two distinct salts by design.
+    let salt = astrolabe_domain::vault_salt(project)
+        .map_err(|error| inner_err("derive domain identity salt", error))?
+        .into_bytes();
     let mut by_cx = BTreeMap::new();
     for (key, _value) in vault.scan_cf_at(snapshot, ColumnFamily::Blob)? {
         if !key.starts_with(&prefix) || key.len() != prefix.len() + 32 {
