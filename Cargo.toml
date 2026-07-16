@@ -30,6 +30,7 @@ publish = false
 astrolabe-anchors = { path = "crates/astrolabe-anchors" }
 astrolabe-assay = { path = "crates/astrolabe-assay" }
 astrolabe-domain = { path = "crates/astrolabe-domain" }
+astrolabe-fleet = { path = "crates/astrolabe-fleet" }
 astrolabe-ingest = { path = "crates/astrolabe-ingest" }
 astrolabe-kernel = { path = "crates/astrolabe-kernel" }
 astrolabe-lower = { path = "crates/astrolabe-lower" }
