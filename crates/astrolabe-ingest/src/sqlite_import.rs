@@ -4255,6 +4255,17 @@ where
     Ok(entry.entry_hash == reference.hash)
 }
 
+/// Outcome of [`write_import_rows`]: the paired ledger ref, the committed-state
+/// FSV ack (absent when no rows were staged), graph rows written, edge rows
+/// written, and labeled sub-phase timings.
+type ImportWriteOutcome = (
+    LedgerRef,
+    Option<FsvAck>,
+    usize,
+    usize,
+    Vec<(&'static str, u64)>,
+);
+
 fn write_import_rows<C>(
     vault: &AsterVault<C>,
     prepared: &PreparedBatch,
@@ -4262,13 +4273,7 @@ fn write_import_rows<C>(
     payload: Vec<u8>,
     quantization_gate: Option<&QuantizationGateConfig>,
     changes: &GraphRowChanges,
-) -> IngestResult<(
-    LedgerRef,
-    Option<FsvAck>,
-    usize,
-    usize,
-    Vec<(&'static str, u64)>,
-)>
+) -> IngestResult<ImportWriteOutcome>
 where
     C: Clock,
 {
