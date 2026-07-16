@@ -786,6 +786,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "sim-min-permille",
                 "sim-top-k",
                 "repo-recall-min-permille",
+                "cross-repo-support-weight-permille",
             ])?;
             let store_root =
                 PathBuf::from(opts.get("store-root").ok_or_else(|| {
@@ -830,6 +831,14 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                         "--repo-recall-min-permille must be a u64: {error}"
                     ))
                 })?;
+            }
+            if let Some(raw) = opts.get("cross-repo-support-weight-permille") {
+                config.cross_repo_support_weight_permille =
+                    raw.parse::<u64>().map_err(|error| {
+                        usage(&format!(
+                            "--cross-repo-support-weight-permille must be a u64: {error}"
+                        ))
+                    })?;
             }
             let summary = astrolabe_fleet::compose::compose_fleet_kernel(
                 &catalog,

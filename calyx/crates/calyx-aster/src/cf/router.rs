@@ -357,8 +357,22 @@ impl CfRouter {
     }
 
     pub(super) fn ensure_cf(&mut self, cf: ColumnFamily) -> Result<()> {
-        fs::create_dir_all(self.cf_dir(cf))
-            .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
+        // The on-disk CF directory only needs creating the first time this
+        // router handle sees the CF. `create_dir_all` was previously run on
+        // EVERY put, and on Windows that filesystem syscall (~40 us/row) was
+        // the dominant `mvcc_commit` cost of a bulk import: #433 attributed
+        // 88-89% of `write_import_rows` to `group_commit`, and this per-row
+        // syscall was that path's linear-in-rows term (issue #444). The
+        // directory is idempotent, so creating it once per CF is byte-identical
+        // to creating it per row. `self.memtables` is the create-once marker —
+        // an entry is inserted here alongside the directory and is never
+        // removed (a flush swaps the memtable in place, keeping the key), so
+        // its presence proves the directory already exists. The remaining entry
+        // ensures below are cheap map lookups kept for robustness.
+        if !self.memtables.contains_key(&cf) {
+            fs::create_dir_all(self.cf_dir(cf))
+                .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
+        }
         self.memtables
             .entry(cf)
             .or_insert_with(|| Memtable::new(self.memtable_byte_cap));

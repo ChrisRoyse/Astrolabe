@@ -97,6 +97,36 @@ static int bind_text(sqlite3_stmt *s, int col, const char *v) {
     return sqlite3_bind_text(s, col, v, CBM_NOT_FOUND, BIND_TRANSIENT);
 }
 
+/* U+FFFD encodes as three bytes, the largest expansion of any single input byte
+ * under cbm_utf8_sanitize; a sanitized copy is therefore at most 3x the input. */
+enum { STORE_UTF8_REPLACEMENT_LEN = 3 };
+
+/* Bind a parser-derived text value after enforcing the UTF-8 write contract
+ * (#503): any non-UTF-8 byte in an identifier or path is replaced with U+FFFD
+ * (via cbm_utf8_sanitize) so the persisted `nodes`/`edges`/`projects`/
+ * `file_hashes`/`project_summaries` text columns are always valid UTF-8. This
+ * matches the guarantee cbm_json_escape already gives the JSON `properties`
+ * columns (#493); together they close every text column the Rust vault importer
+ * reads as a fail-closed `String`, so one bad byte can no longer make it refuse
+ * the whole repository. A NULL binds the empty string. The sanitized copy is
+ * bound transiently (SQLite copies it immediately), so the scratch buffer is
+ * freed as soon as the bind returns. */
+static int bind_text_utf8(sqlite3_stmt *s, int col, const char *v) {
+    if (!v) {
+        return sqlite3_bind_text(s, col, "", 0, BIND_TRANSIENT);
+    }
+    size_t len = strlen(v);
+    size_t cap = len * STORE_UTF8_REPLACEMENT_LEN + SKIP_ONE;
+    char *tmp = malloc(cap);
+    if (!tmp) {
+        return SQLITE_NOMEM;
+    }
+    cbm_utf8_sanitize(tmp, (int)cap, v);
+    int rc = sqlite3_bind_text(s, col, tmp, CBM_NOT_FOUND, BIND_TRANSIENT);
+    free(tmp);
+    return rc;
+}
+
 /* ── Internal store structure ───────────────────────────────────── */
 
 struct cbm_store {
@@ -1108,9 +1138,11 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     char ts[CBM_SZ_64];
     iso_now(ts, sizeof(ts));
 
-    bind_text(stmt, SKIP_ONE, name);
+    /* #503: name and root_path are caller-supplied text; sanitize to valid UTF-8.
+     * `indexed_at` (ts) is machine-generated ISO-8601, always ASCII. */
+    bind_text_utf8(stmt, SKIP_ONE, name);
     bind_text(stmt, ST_COL_2, ts);
-    bind_text(stmt, ST_COL_3, root_path);
+    bind_text_utf8(stmt, ST_COL_3, root_path);
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -1199,11 +1231,14 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, SKIP_ONE, safe_str(n->project));
-    bind_text(stmt, ST_COL_2, safe_str(n->label));
-    bind_text(stmt, ST_COL_3, safe_str(n->name));
-    bind_text(stmt, ST_COL_4, safe_str(n->qualified_name));
-    bind_text(stmt, ST_COL_5, safe_str(n->file_path));
+    /* #503: name/qualified_name/file_path/label/project are raw parser buffers
+     * that bypass cbm_json_escape, so sanitize them to valid UTF-8 at the insert
+     * boundary. `properties` is already UTF-8-safe via cbm_json_escape (#493). */
+    bind_text_utf8(stmt, SKIP_ONE, safe_str(n->project));
+    bind_text_utf8(stmt, ST_COL_2, safe_str(n->label));
+    bind_text_utf8(stmt, ST_COL_3, safe_str(n->name));
+    bind_text_utf8(stmt, ST_COL_4, safe_str(n->qualified_name));
+    bind_text_utf8(stmt, ST_COL_5, safe_str(n->file_path));
     sqlite3_bind_int(stmt, ST_COL_6, n->start_line);
     sqlite3_bind_int(stmt, ST_COL_7, n->end_line);
     bind_text(stmt, ST_COL_8, safe_props(n->properties_json));
@@ -1523,10 +1558,12 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, SKIP_ONE, safe_str(e->project));
+    /* #503: project and type are raw parser buffers — sanitize to valid UTF-8.
+     * `properties` is already UTF-8-safe via cbm_json_escape (#493). */
+    bind_text_utf8(stmt, SKIP_ONE, safe_str(e->project));
     sqlite3_bind_int64(stmt, PAIR_LEN, e->source_id);
     sqlite3_bind_int64(stmt, CBM_SZ_3, e->target_id);
-    bind_text(stmt, ST_COL_4, safe_str(e->type));
+    bind_text_utf8(stmt, ST_COL_4, safe_str(e->type));
     bind_text(stmt, ST_COL_5, safe_props(e->properties_json));
 
     int rc = sqlite3_step(stmt);
@@ -1756,9 +1793,11 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
         return CBM_STORE_ERR;
     }
 
-    bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, rel_path);
-    bind_text(stmt, ST_COL_3, sha256);
+    /* #503: project/rel_path/sha256 are caller-supplied text (rel_path is a raw
+     * filesystem path); sanitize to valid UTF-8 at the insert boundary. */
+    bind_text_utf8(stmt, SKIP_ONE, project);
+    bind_text_utf8(stmt, ST_COL_2, rel_path);
+    bind_text_utf8(stmt, ST_COL_3, sha256);
     sqlite3_bind_int64(stmt, CBM_SZ_4, mtime_ns);
     sqlite3_bind_int64(stmt, CBM_SZ_5, size);
 
@@ -5915,8 +5954,10 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
         store_set_error_sqlite(s, "adr_store");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, content);
+    /* #503: project and summary content are caller-supplied text; sanitize to
+     * valid UTF-8. `created_at`/`updated_at` (now) are ASCII ISO-8601. */
+    bind_text_utf8(stmt, SKIP_ONE, project);
+    bind_text_utf8(stmt, ST_COL_2, content);
     bind_text(stmt, ST_COL_3, now);
     bind_text(stmt, ST_COL_4, now);
     int rc = sqlite3_step(stmt);

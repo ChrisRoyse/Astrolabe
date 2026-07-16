@@ -28,6 +28,7 @@ enum {
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/str_util.h" /* cbm_utf8_sanitize — #503 dump UTF-8 write contract */
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
@@ -584,6 +585,11 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
     return 0;
 }
 
+/* Defined with the dump-array builders below; declared here so the token-vector
+ * store (a source-derived semantic token, read as a String by the importer) is
+ * sanitized to valid UTF-8 at its single population point (#503). */
+static char *gbuf_utf8_dup(const char *s);
+
 int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
                                 int vector_len, float idf) {
     if (!gb || !token || !vector || vector_len <= 0) {
@@ -611,7 +617,10 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
         .id = idx + SKIP_ONE, /* 1-based sequential ID */
         .project = gb->project,
-        .token = strdup(token),
+        /* #503: token is a source-derived semantic-corpus term the importer reads
+         * as a String; sanitize to valid UTF-8 (free-compatible with the prior
+         * strdup — both malloc'd, freed with free() in the token-vec cleanup). */
+        .token = gbuf_utf8_dup(token),
         .vector = vec_copy,
         .vector_len = vector_len,
         .idf = idf,
@@ -1427,6 +1436,38 @@ static int cmp_dump_vectors_by_id(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
+/* #503: return a heap copy of `s` with every non-UTF-8 byte replaced by U+FFFD so
+ * the dumped nodes-table text columns (name/qualified_name/file_path) are always
+ * valid UTF-8 — the same write contract cbm_json_escape gives JSON properties
+ * (#493), and the one the Rust vault importer's fail-closed rusqlite String
+ * columns depend on (a single invalid byte otherwise makes it refuse the whole
+ * repository). Sanitizing HERE, once, before the table record, every node index
+ * (idx_nodes_name/idx_nodes_file/qn), the FTS backfill, and the row-sink all read
+ * the field, keeps table and index byte-identical so the dumped DB's
+ * integrity_check still holds. The bulk-dump SQLite page writer (sqlite_writer.c)
+ * builds records as raw byte payloads and never passes through cbm_store_upsert_node,
+ * so this is the enforcement point for that path. Returns an owned empty string for
+ * NULL; every consumer already tolerates a NULL field, so an OOM returning NULL only
+ * degrades that one field to empty. */
+static char *gbuf_utf8_dup(const char *s) {
+    if (!s) {
+        char *empty = malloc(1);
+        if (empty) {
+            empty[0] = '\0';
+        }
+        return empty;
+    }
+    size_t len = strlen(s);
+    /* U+FFFD encodes as three bytes — the largest expansion of any single byte. */
+    size_t cap = len * 3 + 1;
+    char *out = malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+    cbm_utf8_sanitize(out, (int)cap, s);
+    return out;
+}
+
 static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *temp_to_final,
                                      int64_t max_temp_id, int *out_count,
                                      cbm_gbuf_node_t ***src_out) {
@@ -1451,13 +1492,19 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
 
         const char *fp = n->file_path ? n->file_path : "";
         const char *props = n->properties_json ? n->properties_json : "{}";
+        /* #503: name/qualified_name/file_path are raw parser-derived buffers that
+         * the bulk SQLite page writer binds without cbm_json_escape; sanitize them
+         * to valid UTF-8 in owned copies (freed in free_dump_resources) so the
+         * dumped nodes table cannot make the Rust importer refuse the repo. label
+         * and project are cbm-internal constants / caller-supplied ASCII, and
+         * properties are already UTF-8-safe via cbm_json_escape (#493). */
         dump_nodes[idx] = (CBMDumpNode){
             .id = final_id,
             .project = gb->project,
             .label = n->label,
-            .name = n->name,
-            .qualified_name = n->qualified_name,
-            .file_path = fp,
+            .name = gbuf_utf8_dup(n->name),
+            .qualified_name = gbuf_utf8_dup(n->qualified_name),
+            .file_path = gbuf_utf8_dup(fp),
             .start_line = n->start_line,
             .end_line = n->end_line,
             .properties = props,
@@ -1580,11 +1627,20 @@ static void log_dump_summary(int node_count, int edge_count) {
 }
 
 static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
-                                CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
+                                CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes, int node_count,
                                 int64_t *temp_to_final) {
     for (int i = 0; i < edge_count; i++) {
         free(url_paths[i]);
         free(local_names[i]);
+    }
+    /* #503: name/qualified_name/file_path are the sanitized owned copies built in
+     * build_dump_nodes (properties/label/project stay borrowed from the gbuf). */
+    if (dump_nodes) {
+        for (int i = 0; i < node_count; i++) {
+            free((void *)dump_nodes[i].name);
+            free((void *)dump_nodes[i].qualified_name);
+            free((void *)dump_nodes[i].file_path);
+        }
     }
     free(url_paths);
     free(local_names);
@@ -1726,7 +1782,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
             sink_rc = emit_row_sink_edges(gb, dump_edges, edge_idx);
         }
         if (sink_rc != 0) {
-            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes,
+            free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
                                 temp_to_final);
             free(src_nodes);
             return sink_rc;
@@ -1741,7 +1797,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
-        free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes,
+        free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
                             temp_to_final);
         free(src_nodes);
         return CBM_NOT_FOUND;
@@ -1792,7 +1848,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
 
     log_dump_summary(node_idx, edge_idx);
-    free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
+    free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, node_idx,
+                        temp_to_final);
     free(src_nodes);
     return rc;
 }

@@ -289,15 +289,21 @@ fn minhash_params(seed: u64, family: SimilarityFamily, permutation: usize) -> (u
 /// (built in qualified-name order with ordinal `CxId`s), so the measured scale and
 /// the candidate breadth (`per_node_cap × candidate_multiplier + 1` neighbors, self
 /// included) are strategy-invariant. The registry-declared `weave_dense_ann_strategy`
-/// knob (#441) then selects the build:
+/// knob (#441) then selects the build, routing on this group's `dim` via
+/// [`crate::knobs::weave_dense_ann_use_exact`]:
 ///
-/// - **Sequential seeded HNSW** ([`hnsw_dense_candidates`], default): the #433
-///   build/query — deterministic because inserts run once per ordinal and mutate
-///   the shared graph in that fixed order.
+/// - **Sequential seeded HNSW** ([`hnsw_dense_candidates`]): the #433 build/query —
+///   deterministic because inserts run once per ordinal and mutate the shared graph
+///   in that fixed order. Selected for high-dim groups under the dim-aware default
+///   (e.g. `SIM_SEMANTIC` dim=768, where the wave-24 matrix measured exact kNN
+///   regressing ~9% at bevy n=41,311), or globally under strategy `0`.
 /// - **Exact blocked kNN** ([`exact_dense_candidates`]): a deterministic, parallel,
 ///   graph-free per-source exact top-k scan over the identical quantized pool —
 ///   byte-identical across runs and worker counts, and a strict recall improvement
-///   over the approximate HNSW graph search on the same pool (see the knob).
+///   over the approximate HNSW graph search on the same pool (see the knob). Selected
+///   for low-dim groups under the dim-aware default (e.g. `SIM_PROFILE` dim=24, the
+///   dominant #441 cost, measured 7.7–20× faster than HNSW), or globally under
+///   strategy `1`.
 #[expect(
     clippy::too_many_arguments,
     reason = "single private call site; splitting into a context struct adds indirection without reuse"
@@ -340,7 +346,7 @@ fn dense_candidates(
         })
         .collect();
 
-    if crate::knobs::weave_dense_ann_exact() {
+    if crate::knobs::weave_dense_ann_use_exact(dim) {
         return Ok(exact_dense_candidates(
             &approximations,
             group,

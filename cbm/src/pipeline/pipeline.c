@@ -756,7 +756,20 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         int rc = passes[i].fn(ctx);
         cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
-        if (rc != 0) {
+        /* Predump pass return contract: NEGATIVE == hard failure (CBM_NOT_FOUND
+         * and friends are -1), ZERO/POSITIVE == success. Several passes return a
+         * non-negative COUNT of work done on success rather than a bare 0 —
+         * decorator_tags returns the number of nodes tagged and configlink the
+         * number of edges created — so a `rc != 0` gate misreads a productive
+         * pass (e.g. a Rust repo where 2+ nodes share a derive/decorator word)
+         * as CBM_PREDUMP_PASS_FAILED and aborts the whole index before the
+         * database dump. Gate on `rc < 0` so only a real negative error code
+         * fails the pass while a legitimate success-count is allowed through.
+         * Every pass that can return a negative code (similarity, semantic_edges)
+         * logs its own structured {code,message,remediation} before returning it,
+         * so the gate's "inspect the preceding structured pass error" remediation
+         * always has a real error to point at — never a swallowed one. */
+        if (rc < 0) {
             cbm_log_error("pipeline.predump.failed", "pass", passes[i].name, "code",
                           "CBM_PREDUMP_PASS_FAILED", "message",
                           "predump pass failed before database dump", "remediation",

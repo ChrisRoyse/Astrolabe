@@ -92,4 +92,22 @@ bool cbm_validate_project_name(const char *name);
  * fail-closed UTF-8 boundary depends on this contract. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
 
+/* Length of the UTF-8 sequence starting at src[0] under RFC 3629. Returns the
+ * sequence length (2-4) when valid, 0 when the lead/continuation bytes form an
+ * invalid, overlong, surrogate, or out-of-range encoding. Never reads past a
+ * NUL. Shared (#503) by the JSON escaper and the raw-text sanitizer below. */
+int cbm_utf8_sequence_len(const unsigned char *src);
+
+/* Sanitize raw text into a valid-UTF-8 copy for a non-JSON SQLite text column
+ * (#503): valid multi-byte sequences are copied atomically (truncation lands
+ * only on a character boundary) and every invalid byte becomes U+FFFD, so the
+ * persisted bytes are always valid UTF-8. ASCII and control characters pass
+ * through verbatim (this is raw text, not JSON). Writes into buf including the
+ * terminating NUL and returns the byte count written (excl. NUL); a NULL src
+ * yields an empty string. This enforces the same UTF-8 write contract
+ * cbm_json_escape gives JSON properties for the parser-derived identifier/path
+ * columns (nodes.name/qualified_name/file_path/label, edges.type, ...) that are
+ * bound raw into SQLite, which the Rust vault importer reads fail-closed. */
+int cbm_utf8_sanitize(char *buf, int bufsize, const char *src);
+
 #endif /* CBM_STR_UTIL_H */
