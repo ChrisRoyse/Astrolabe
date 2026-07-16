@@ -6,8 +6,10 @@ use std::path::Path;
 
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn head_status(vault: &Path, kind_label: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let kind = HeadKind::from_label(kind_label)?;
     let cf = ColumnFamily::AnnealHeads;
     let wanted_key = head_key(kind);

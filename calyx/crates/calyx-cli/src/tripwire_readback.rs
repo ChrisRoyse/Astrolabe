@@ -5,8 +5,10 @@ use calyx_anneal::{read_tripwire_config_from_vault, tripwire_config_path};
 use serde_json::json;
 
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_tripwire_config(vault: &Path) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let config_path = tripwire_config_path(vault);
     let bytes = fs::read(&config_path)
         .map_err(|error| CliError::io(format!("read {}: {error}", config_path.display())))?;

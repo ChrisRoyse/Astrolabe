@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::{CliError, CliResult};
 use crate::output::{WriteLineResult, print_line_result, print_table};
+use crate::readback_vault::ensure_native_aster_vault;
 
 mod compact;
 pub use compact::compact;
@@ -30,6 +31,7 @@ pub use compact::compact;
 const SOAK_VALUE_BYTES: usize = 256;
 
 pub fn readback_cf(vault: &Path, cf_name: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cf = parse_cf(cf_name).map_err(CliError::usage)?;
     let files = list_sst_files(&vault.join("cf").join(cf.name()))?;
     for file in files {
@@ -51,6 +53,7 @@ pub fn readback_cf(vault: &Path, cf_name: &str) -> crate::error::CliResult {
 }
 
 pub fn readback_wal(vault: &Path) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let replay = replay_dir(vault.join("wal"))?;
     for record in replay.records {
         if print_line_result(&format!(

@@ -5,6 +5,7 @@ use calyx_ledger::{EntryKind, LedgerCfStore, decode};
 use serde_json::json;
 
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 use crate::{cf_read::hex_bytes, ledger_store::AsterLedgerCfStore};
 
 pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
@@ -14,6 +15,7 @@ pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
             "readback ledger --kind currently supports only Anneal",
         ));
     }
+    ensure_native_aster_vault(&request.vault)?;
     let store = AsterLedgerCfStore::open(&request.vault)?;
     let mut matches = Vec::new();
     for row in store.scan()? {

@@ -15,6 +15,7 @@ use crate::bounded_progress::{Deadline, ProgressSink, parse_nonzero_u64, parse_n
 use crate::cf_read::{hex_bytes, latest_cf_row, latest_cf_rows, vault_id_from_base};
 use crate::error::{CliError, CliResult};
 use crate::output::print_line;
+use crate::readback_vault::ensure_native_aster_vault;
 
 const CX_LIST_UNBOUNDED_ROW_LIMIT: usize = 100;
 
@@ -38,6 +39,7 @@ struct CxListArgs {
 }
 
 pub fn readback_dedup_audit(vault: &Path, cx_id: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cx_id = CxId::from_str(cx_id)
         .map_err(|error| CliError::usage(format!("invalid --cx-id: {error}")))?;
     let vault_id = vault_id_from_base(vault)?;
@@ -57,6 +59,7 @@ pub fn readback_dedup_audit(vault: &Path, cx_id: &str) -> crate::error::CliResul
 }
 
 pub fn readback_dedup_undo(vault: &Path, token: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let token: ReversalToken = serde_json::from_str(token)
         .map_err(|error| CliError::usage(format!("invalid --token: {error}")))?;
     let vault_id = vault_id_from_base(vault)?;
@@ -86,6 +89,7 @@ pub fn readback_dedup_undo(vault: &Path, token: &str) -> crate::error::CliResult
 
 pub fn readback_cx_list_args(rest: &[String]) -> CliResult {
     let args = parse_cx_list_args(rest)?;
+    ensure_native_aster_vault(&args.vault)?;
     let mut progress = ProgressSink::from_arg(args.progress_jsonl.as_deref())?;
     let deadline = Deadline::new(args.time_budget_ms);
     progress.emit(json!({

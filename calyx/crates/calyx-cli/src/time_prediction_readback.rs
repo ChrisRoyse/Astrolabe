@@ -8,12 +8,14 @@ use serde_json::json;
 
 use crate::cf_read::vault_id_from_base;
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_time_prediction(
     vault: &Path,
     cx_id: &str,
     ceiling: &str,
 ) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cx_id = CxId::from_str(cx_id)
         .map_err(|error| CliError::usage(format!("invalid --cx-id: {error}")))?;
     let confidence_ceiling = ceiling

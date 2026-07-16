@@ -4,14 +4,10 @@ use calyx_anneal::{FileWardTauStore, WardTauStore};
 use calyx_core::SlotId;
 
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub(crate) fn readback_ward_tau(vault: &Path, slot: &str) -> crate::error::CliResult {
-    if !vault.is_dir() {
-        return Err(CliError::usage(format!(
-            "--vault path {} is not a directory",
-            vault.display()
-        )));
-    }
+    ensure_native_aster_vault(vault)?;
     let slot_id = slot
         .parse::<SlotId>()
         .map_err(|error| CliError::usage(format!("invalid --slot: {error}")))?;

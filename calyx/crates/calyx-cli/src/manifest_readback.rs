@@ -3,11 +3,11 @@ use std::io::Read;
 use std::path::Path;
 
 use calyx_aster::manifest::ManifestStore;
-use calyx_core::CalyxError;
 use serde_json::json;
 
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
+use crate::readback_vault::{ensure_native_aster_vault, not_a_vault};
 
 /// Native Aster vaults carry a `CURRENT` pointer file naming the live
 /// immutable `manifest-<seq>.json`; a Leapable shadow vault has no `CURRENT`.
@@ -16,11 +16,6 @@ const NATIVE_CURRENT_FILE: &str = "CURRENT";
 /// Leapable shadow vaults carry this binary magic at the start of `MANIFEST`.
 const SHADOW_MANIFEST_MAGIC: &[u8] = b"CXSHDW1!";
 const SHADOW_MANIFEST_FILE: &str = "MANIFEST";
-
-/// Stable code for a `--show-manifest` target that is neither a native Aster
-/// vault nor a Leapable shadow vault (issue #1262). Not a PRD 18 catalog entry;
-/// constructed locally with a fixed remediation so an agent can dispatch on it.
-const CALYX_VAULT_FORMAT_UNRECOGNIZED: &str = "CALYX_VAULT_FORMAT_UNRECOGNIZED";
 
 /// `readback --vault <dir> --show-manifest`.
 ///
@@ -32,8 +27,8 @@ const CALYX_VAULT_FORMAT_UNRECOGNIZED: &str = "CALYX_VAULT_FORMAT_UNRECOGNIZED";
 ///    manifest (and surface any shadow-specific corruption verbatim).
 /// 2. Otherwise, if a native `CURRENT` pointer exists, read the native Aster
 ///    manifest via [`ManifestStore::load_current`].
-/// 3. Otherwise fail closed with [`CALYX_VAULT_FORMAT_UNRECOGNIZED`]; the target
-///    is not a materialized vault of either kind.
+/// 3. Otherwise fail closed with `CALYX_NOT_A_VAULT`; the target is not a
+///    materialized vault of either kind.
 ///
 /// Before this routed by format, a valid native vault reported the misleading
 /// `CALYX_MANIFEST_CORRUPT: shadow manifest magic mismatch` because the shadow
@@ -43,9 +38,13 @@ pub fn readback_vault_manifest(vault: &Path) -> CliResult {
         return crate::leapable::readback_shadow_manifest(vault);
     }
     if vault.join(NATIVE_CURRENT_FILE).is_file() {
+        ensure_native_aster_vault(vault)?;
         return readback_native_manifest(vault);
     }
-    Err(unrecognized_vault(vault))
+    Err(not_a_vault(
+        vault,
+        "missing native CURRENT pointer and shadow MANIFEST magic",
+    ))
 }
 
 /// Content-based detection of a Leapable shadow vault (issue #1262).
@@ -92,6 +91,7 @@ fn readback_native_manifest(vault: &Path) -> CliResult {
 
 /// `readback vault-manifest --field <name> --vault <dir>` - one native field.
 pub fn readback_vault_manifest_field(vault: &Path, field: &str) -> CliResult {
+    ensure_native_aster_vault(vault)?;
     let manifest = ManifestStore::open(vault).load_current()?;
     let manifest_json = serde_json::to_value(&manifest)
         .map_err(|error| CliError::runtime(format!("serialize vault manifest: {error}")))?;
@@ -99,18 +99,4 @@ pub fn readback_vault_manifest_field(vault: &Path, field: &str) -> CliResult {
         .get(field)
         .ok_or_else(|| CliError::usage(format!("manifest field `{field}` not found")))?;
     print_json(value)
-}
-
-fn unrecognized_vault(vault: &Path) -> CliError {
-    CliError::Calyx(CalyxError {
-        code: CALYX_VAULT_FORMAT_UNRECOGNIZED,
-        message: format!(
-            "{} is neither a native Aster vault (no CURRENT pointer) nor a Leapable \
-             shadow vault (MANIFEST does not begin with CXSHDW1!)",
-            vault.display()
-        ),
-        remediation: "point --show-manifest at a materialized vault directory: a native \
-                      Aster vault has a CURRENT file, a Leapable shadow vault has a MANIFEST \
-                      beginning with CXSHDW1!",
-    })
 }

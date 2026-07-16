@@ -5,8 +5,10 @@ use calyx_anneal::{budget_config_path, read_budget_config_from_vault};
 use serde_json::json;
 
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_budget_config(vault: &Path) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let config_path = budget_config_path(vault);
     let bytes = fs::read(&config_path)
         .map_err(|error| CliError::io(format!("read {}: {error}", config_path.display())))?;

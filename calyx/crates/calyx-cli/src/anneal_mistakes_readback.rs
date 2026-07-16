@@ -7,8 +7,10 @@ use std::path::Path;
 
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_mistakes(vault: &Path, last: usize) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     if last == 0 {
         return Err(CliError::usage(
             "anneal mistakes readback requires --last > 0",

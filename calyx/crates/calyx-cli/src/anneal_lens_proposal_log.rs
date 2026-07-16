@@ -22,6 +22,7 @@ use serde_json::json;
 use crate::cf_read::hex_bytes as hex;
 use crate::error::{CliError, CliResult};
 use crate::ledger_store::AsterLedgerCfStore;
+use crate::readback_vault::ensure_native_aster_vault;
 
 const CALYX_ASSAY_INVALID_METRIC: &str = "CALYX_ASSAY_INVALID_METRIC";
 
@@ -135,6 +136,7 @@ fn read_fixture_entries(fixture_path: PathBuf, last: usize) -> CliResult<serde_j
 }
 
 fn read_vault_entries(vault: PathBuf, last: usize) -> CliResult<serde_json::Value> {
+    ensure_native_aster_vault(&vault)?;
     let store = AsterLedgerCfStore::open(&vault)?;
     let mut entries = Vec::new();
     for row in store.scan()? {

@@ -11,6 +11,7 @@ use crate::cf_read::{hex_bytes, latest_cf_row};
 use crate::cmd::vault::{home_dir, resolve_vault_info};
 use crate::ledger_store::AsterLedgerCfStore;
 use crate::merkle::parse_range;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn verify_ledger_dir(ledger: &Path, range: Range<u64>) -> crate::error::CliResult {
     let store = DirectoryLedgerStore::open(ledger)?;
@@ -48,6 +49,7 @@ pub fn verify_vault_ref(vault: &str, range: Range<u64>) -> crate::error::CliResu
 }
 
 pub fn readback_ledger_seq(vault: &Path, seq: u64) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     if is_vault_seq_quarantined(vault, seq)? {
         return Err(
             CalyxError::ledger_chain_broken(format!("ledger seq {seq} is quarantined")).into(),

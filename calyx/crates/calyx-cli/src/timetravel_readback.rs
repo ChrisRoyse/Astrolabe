@@ -25,6 +25,7 @@ use serde_json::json;
 
 use crate::cf_read::vault_id_from_base;
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 /// `readback time-index --vault <PATH>`: print every `time_index` entry in
 /// `(millis, seqno)` order.
@@ -97,6 +98,7 @@ pub fn readback_as_of(vault: &Path, t_millis: &str) -> crate::error::CliResult {
 /// (a vault cannot be opened without its id because of the per-vault keyspace
 /// guard). Fails loud if the vault has no constellations to infer the id from.
 fn open_vault(vault: &Path) -> crate::error::CliResult<AsterVault<impl Clock>> {
+    ensure_native_aster_vault(vault)?;
     let vault_id = vault_id_from_base(vault)?;
     Ok(AsterVault::open(
         vault,

@@ -10,8 +10,10 @@ use serde_json::json;
 use crate::cf_read::{hex_bytes, latest_cf_rows};
 use crate::error::CliError;
 use crate::output::print_json;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_trigger_audit(vault: &Path, sub_id: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let trigger_id: calyx_loom::TriggerId = sub_id
         .parse()
         .map_err(|error| CliError::usage(format!("invalid trigger id: {error}")))?;
@@ -40,6 +42,7 @@ pub fn readback_trigger_audit(vault: &Path, sub_id: &str) -> crate::error::CliRe
 }
 
 pub fn readback_trigger_fired(vault: &Path) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let mut rows = Vec::new();
     for (key, value) in latest_cf_rows(vault, ColumnFamily::Reactive)? {
         let parts = reactive_row_key(&key)?;

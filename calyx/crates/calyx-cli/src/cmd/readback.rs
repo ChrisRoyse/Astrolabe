@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_aster::manifest::ManifestStore;
 use calyx_aster::sst::SstReader;
 use calyx_aster::storage_names::wal_segment_index;
 use calyx_aster::vault::encode::decode_write_batch;
@@ -11,6 +10,7 @@ use calyx_core::CalyxError;
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::{CliError, CliResult};
 use crate::output::{WriteLineResult, print_hex_dump, print_line_result};
+use crate::readback_vault::ensure_native_aster_vault;
 use crate::{ops, vault_tree};
 
 const WAL_MAGIC: u32 = u32::from_le_bytes(*b"CXW1");
@@ -275,14 +275,7 @@ fn wal_payload_crc(seq: u64, len: u32, payload: &[u8]) -> u32 {
 }
 
 fn ensure_manifested_vault(vault: &Path) -> CliResult {
-    if !vault.is_dir() || !vault.join("CURRENT").is_file() || !vault.join("MANIFEST").is_file() {
-        return Err(CliError::usage(format!(
-            "vault path {} is not a valid Calyx vault (missing manifest)",
-            vault.display()
-        )));
-    }
-    ManifestStore::open(vault).load_current()?;
-    Ok(())
+    ensure_native_aster_vault(vault)
 }
 
 fn parse_seq(value: &str) -> CliResult<u64> {

@@ -7,6 +7,7 @@ use serde_json::json;
 use crate::cf_read::hex_bytes as hex;
 use crate::error::CliError;
 use crate::ledger_store::AsterLedgerCfStore;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     let request = ABLogRequest::parse(args)?;
@@ -65,6 +66,7 @@ impl ABLogRequest {
 }
 
 fn read_ab_entries(vault: &Path, last: usize) -> crate::error::CliResult<Vec<serde_json::Value>> {
+    ensure_native_aster_vault(vault)?;
     let store = AsterLedgerCfStore::open(vault)?;
     let mut entries = Vec::new();
     for row in store.scan()? {

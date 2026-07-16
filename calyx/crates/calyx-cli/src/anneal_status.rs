@@ -11,14 +11,10 @@ use calyx_ledger::{EntryKind, LedgerCfStore, decode};
 use crate::cf_read::list_sst_files;
 use crate::error::{CliError, CliResult};
 use crate::ledger_store::AsterLedgerCfStore;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub(crate) fn status_health(vault: &Path) -> crate::error::CliResult {
-    if !vault.is_dir() {
-        return Err(CliError::io(format!(
-            "--vault path {} is not a directory",
-            vault.display()
-        )));
-    }
+    ensure_native_aster_vault(vault)?;
     let mut rows = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     read_sst_rows(vault, &mut rows)?;
     read_wal_rows(vault, &mut rows)?;
@@ -35,6 +31,7 @@ pub(crate) fn status_health(vault: &Path) -> crate::error::CliResult {
 }
 
 pub(crate) fn status_faults(vault: &Path, last: usize) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     if last == 0 {
         return Err(CliError::usage("--last must be positive"));
     }

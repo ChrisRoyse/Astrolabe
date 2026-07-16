@@ -8,9 +8,11 @@ use serde_json::json;
 
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::{CliError, CliResult};
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     let request = SoakReportRequest::parse(args)?;
+    ensure_native_aster_vault(&request.vault)?;
     let readback = read_soak_rows(&request.vault, request.last)?;
     println!(
         "{}",

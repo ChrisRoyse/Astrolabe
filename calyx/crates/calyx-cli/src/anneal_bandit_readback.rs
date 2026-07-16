@@ -6,8 +6,10 @@ use std::path::Path;
 
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn bandit_status(vault: &Path, shape_key: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cf = ColumnFamily::AnnealBandit;
     let shape_hash = shape_key_hash(shape_key);
     let wanted_key = bandit_key(shape_hash);

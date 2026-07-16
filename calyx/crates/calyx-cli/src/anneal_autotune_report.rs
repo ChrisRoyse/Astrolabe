@@ -14,10 +14,12 @@ use serde_json::{Value, json};
 use crate::cf_read::{hex_bytes as hex, list_sst_files};
 use crate::error::{CliError, CliResult};
 use crate::ledger_store::AsterLedgerCfStore;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     let request = ReportRequest::parse(args)?;
     request.validate()?;
+    ensure_native_aster_vault(&request.vault)?;
     let cache = read_cache(&request.cache, &request)?;
     let promotions = read_promotions(&request.vault, &request)?;
     let recent_ab = read_recent_ab(&request.vault, &request)?;

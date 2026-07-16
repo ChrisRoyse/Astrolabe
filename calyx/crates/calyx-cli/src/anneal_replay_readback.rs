@@ -6,8 +6,10 @@ use std::path::Path;
 
 use crate::cf_read::{hex_bytes, list_sst_files};
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn replay_status(vault: &Path) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cf = ColumnFamily::AnnealReplay;
     let snapshot_key = replay_snapshot_key();
     let mut physical_rows = Vec::new();

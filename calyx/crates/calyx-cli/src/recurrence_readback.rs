@@ -13,8 +13,10 @@ use serde_json::{Value, json};
 
 use crate::cf_read::{hex_bytes, latest_cf_rows};
 use crate::error::{CliError, CliResult};
+use crate::readback_vault::ensure_native_aster_vault;
 
 pub fn readback_recurrence_series(vault: &Path, cx_id: &str) -> crate::error::CliResult {
+    ensure_native_aster_vault(vault)?;
     let cx_id = CxId::from_str(cx_id)
         .map_err(|error| CliError::usage(format!("invalid --cx-id: {error}")))?;
     let recurrence_rows = latest_cf_rows(vault, ColumnFamily::Recurrence)?;
@@ -32,6 +34,7 @@ pub fn readback_recurrence_series(vault: &Path, cx_id: &str) -> crate::error::Cl
 
 pub fn readback_periodic_recall(args: &[String]) -> crate::error::CliResult {
     let args = PeriodicRecallArgs::parse(args)?;
+    ensure_native_aster_vault(&args.vault)?;
     let recurrence_rows = latest_cf_rows(&args.vault, ColumnFamily::Recurrence)?;
     let base_rows = latest_cf_rows(&args.vault, ColumnFamily::Base)?;
     let query = PeriodicRecallQuery::new(args.hour, args.day)?;

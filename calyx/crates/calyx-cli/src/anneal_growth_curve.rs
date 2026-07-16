@@ -7,6 +7,7 @@ use calyx_core::{SystemClock, VaultId};
 use serde_json::json;
 
 use crate::error::CliError;
+use crate::readback_vault::ensure_native_aster_vault;
 
 const GROWTH_VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const GROWTH_VAULT_SALT: &[u8] = b"calyx-anneal-intelligence-report";
@@ -14,6 +15,7 @@ const DEFAULT_LAST: usize = 20;
 
 pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     let request = GrowthCurveRequest::parse(args)?;
+    ensure_native_aster_vault(&request.vault)?;
     let vault_id = GROWTH_VAULT_ID.parse::<VaultId>().map_err(|error| {
         CliError::runtime(format!("CALYX_ANNEAL_GROWTH_INVALID_CONFIG: {error}"))
     })?;

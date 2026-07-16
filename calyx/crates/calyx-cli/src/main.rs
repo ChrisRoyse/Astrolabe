@@ -85,6 +85,7 @@ mod ph42_readback;
 mod provenance;
 mod provenance_read;
 mod raw_media;
+mod readback_vault;
 mod recurrence_readback;
 mod resource_drill;
 mod resource_status;
