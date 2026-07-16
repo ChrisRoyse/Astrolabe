@@ -126,6 +126,7 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 "kernel-scope-id",
                 "reason",
                 "clone-bytes",
+                "store-bytes",
             ])?;
             let github_id = opts.require_u64("github-id")?;
             let full_name = opts.require("repo")?;
@@ -148,6 +149,14 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     .map(|raw| {
                         raw.parse::<u64>().map_err(|error| {
                             usage(&format!("--clone-bytes must be a u64: {error}"))
+                        })
+                    })
+                    .transpose()?,
+                store_bytes: opts
+                    .get("store-bytes")
+                    .map(|raw| {
+                        raw.parse::<u64>().map_err(|error| {
+                            usage(&format!("--store-bytes must be a u64: {error}"))
                         })
                     })
                     .transpose()?,
