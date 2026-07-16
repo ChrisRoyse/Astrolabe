@@ -299,6 +299,13 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     cbm_lsh_index_t *lsh = cbm_lsh_new();
     cbm_lsh_entry_t *lsh_entries = malloc((size_t)entry_count * sizeof(cbm_lsh_entry_t));
     if (!lsh_entries) {
+        /* Fail closed with a structured error so the predump gate's remediation
+         * ("inspect the preceding structured pass error") always has a real
+         * error to surface — a bare negative return here would be swallowed. */
+        cbm_log_error("pass.similarity.lsh_alloc_failed", "code", "CBM_SIM_LSH_ALLOC_FAILED",
+                      "message", "similarity LSH entry buffer could not be allocated",
+                      "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
         free(entries);
         cbm_lsh_free(lsh);
         return CBM_NOT_FOUND;
