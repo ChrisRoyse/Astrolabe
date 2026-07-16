@@ -27,8 +27,14 @@
 //!    backfill could not ground — they fail toward re-work, never toward a
 //!    silent skip);
 //! 3. **resume** — `cloned`/`indexed` rows a crashed run left mid-pipeline;
-//! 4. **acquire** — `discovered` rows, only with `--acquire` (scale-wave
-//!    intake is #460's go/no-go decision, not an implicit side effect).
+//! 4. **re-entrant** — `discovered` rows that already carry a clone
+//!    investment (`clone_path` set: quarantine retry releases and reappeared
+//!    repos). Selected without `--acquire`: production FSV showed a retried
+//!    repo otherwise competes against the entire discovered backlog on stars
+//!    (or, without `--acquire`, can never re-enter at all);
+//! 5. **acquire** — fresh `discovered` rows, only with `--acquire`
+//!    (scale-wave intake is #460's go/no-go decision, not an implicit side
+//!    effect).
 //!
 //! Within each class repos order by stars descending; the whole worklist is
 //! bounded by the `fleet.grow.max_repos_per_cycle` knob and every deferred
@@ -597,6 +603,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     let mut forced: Vec<(u64, String)> = Vec::new();
     let mut stale: Vec<(u64, String, Value)> = Vec::new();
     let mut resume: Vec<(u64, String)> = Vec::new();
+    let mut reentrant: Vec<(u64, String)> = Vec::new();
     let mut acquire: Vec<(u64, String)> = Vec::new();
     for row in &rows {
         let name = row.record.full_name.clone();
@@ -625,13 +632,21 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             RepoState::Cloned | RepoState::Indexed => {
                 resume.push((row.record.stars, name));
             }
+            // Re-entrant: a `discovered` row that already carries a clone
+            // investment (quarantine retry release, or a reappeared repo).
+            // Selected WITHOUT --acquire — production FSV showed a retried
+            // repo otherwise competes against the whole discovered backlog
+            // (and loses on stars) or, without --acquire, can never re-enter.
+            RepoState::Discovered if row.clone_path.is_some() => {
+                reentrant.push((row.record.stars, name));
+            }
             RepoState::Discovered if config.acquire => {
                 acquire.push((row.record.stars, name));
             }
             _ => {}
         }
     }
-    for class in [&mut forced, &mut resume, &mut acquire] {
+    for class in [&mut forced, &mut resume, &mut reentrant, &mut acquire] {
         class.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     }
     stale.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -656,6 +671,10 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
         resume.iter().map(|(_, n)| n.clone()).collect(),
         &mut remaining,
     );
+    let (selected_reentrant, deferred_reentrant) = take_within(
+        reentrant.iter().map(|(_, n)| n.clone()).collect(),
+        &mut remaining,
+    );
     let (selected_acquire, deferred_acquire) = take_within(
         acquire.iter().map(|(_, n)| n.clone()).collect(),
         &mut remaining,
@@ -665,6 +684,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             "forced": forced.len(),
             "stale": stale.len(),
             "resume": resume.len(),
+            "reentrant": reentrant.len(),
             "acquire": acquire.len(),
         },
         "stale_detail": stale.iter().map(|(_, name, why)| json!({"full_name": name, "why": why})).collect::<Vec<_>>(),
@@ -672,30 +692,39 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
             "forced": selected_forced,
             "stale": selected_stale,
             "resume": selected_resume,
+            "reentrant": selected_reentrant,
             "acquire": selected_acquire,
         },
         "deferred": {
             "forced": deferred_forced,
             "stale": deferred_stale,
             "resume": deferred_resume,
+            "reentrant": deferred_reentrant,
             "acquire": deferred_acquire,
-            "total": deferred_forced + deferred_stale + deferred_resume + deferred_acquire,
+            "total": deferred_forced
+                + deferred_stale
+                + deferred_resume
+                + deferred_reentrant
+                + deferred_acquire,
         },
         "max_repos_per_cycle": config.max_repos_per_cycle,
     });
 
-    // Phase 5: acquire clones for selected `discovered` rows.
+    // Phase 5: acquire clones for selected `discovered` rows (re-entrants
+    // adopt or recover their existing clone; fresh acquires download).
     let mut clone_attribution: BTreeMap<u64, RepoState> = BTreeMap::new();
-    let acquire_report = if selection["selected"]["acquire"]
-        .as_array()
-        .is_some_and(|list| !list.is_empty())
-    {
-        let names: Vec<String> = selection["selected"]["acquire"]
-            .as_array()
-            .expect("just checked")
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+    let clone_names: Vec<String> = ["reentrant", "acquire"]
+        .iter()
+        .flat_map(|class| {
+            selection["selected"][*class]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let acquire_report = if !clone_names.is_empty() {
+        let names = clone_names;
         match run_clone_pass_outcome(catalog, &config.farm, &Selection::Repos(names), false) {
             Ok(outcome) => {
                 if let Some(refusal) = &outcome.refusal {
@@ -731,7 +760,7 @@ pub fn run_growth_cycle(catalog: &FleetCatalog, config: &GrowConfig) -> Result<V
     // stale/forced ones that must re-run.
     let mut pipeline_attribution: BTreeMap<u64, RepoState> = BTreeMap::new();
     let mut worklist: Vec<String> = Vec::new();
-    for list in ["forced", "stale", "resume", "acquire"] {
+    for list in ["forced", "stale", "resume", "reentrant", "acquire"] {
         if let Some(names) = selection["selected"][list].as_array() {
             worklist.extend(names.iter().filter_map(|v| v.as_str().map(str::to_string)));
         }

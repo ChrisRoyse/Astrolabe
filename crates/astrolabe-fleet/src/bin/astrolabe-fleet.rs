@@ -36,7 +36,7 @@
 //!
 //! `grow` (#457) runs growth cycles: ledger-grounded backfill → optional
 //! discovery refresh → optional quarantine retry release → update fetch →
-//! bounded selection (forced > stale > resume > acquire) → pipeline re-index
+//! bounded selection (forced > stale > resume > reentrant > acquire) → pipeline re-index
 //! → debt-gated fleet recomposition → reconciliation → persisted cycle
 //! report. `--once` is the Task-Scheduler-friendly single cycle; `--cycles N
 //! --interval-secs S` is the supervised loop. `--parallelism`/`--timeout-secs`
