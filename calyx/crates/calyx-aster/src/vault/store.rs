@@ -106,10 +106,10 @@ where
     /// Persists `constellation` together with `input_rows` in the SAME atomic
     /// group commit as the base record (issue #446): the content-addressed
     /// input-store rows produced by
-    /// [`crate::vault::input_store::encode_input_rows`] are appended to the base
-    /// + slot + anchor + ledger batch, so a constellation is never durable
-    /// without its retained input bytes and vice versa. Pass an empty vec for
-    /// the plain [`VaultStore::put`] behavior.
+    /// [`crate::vault::input_store::encode_input_rows`] join the staged base,
+    /// slot, anchor, and ledger rows in one batch, so a constellation is never
+    /// durable without its retained input bytes and vice versa. Pass an empty
+    /// vec for the plain [`VaultStore::put`] behavior.
     ///
     /// Idempotent: if the base row already exists (identical bytes, or an
     /// anchor-merge), the `input_rows` are not re-staged — the input store is
@@ -209,10 +209,10 @@ where
     /// current latest seq (content-address dedup). Used by the CLI `input-write`
     /// surface and available to Astrolabe's shadow-import row sink.
     pub fn commit_input_bytes(&self, input_hash: &[u8; 32], bytes: &[u8]) -> Result<Seq> {
-        if let Some(existing) = crate::vault::input_store::input_manifest(self, input_hash)? {
-            if &existing.content_hash == input_hash {
-                return Ok(self.latest_seq());
-            }
+        if let Some(existing) = crate::vault::input_store::input_manifest(self, input_hash)?
+            && &existing.content_hash == input_hash
+        {
+            return Ok(self.latest_seq());
         }
         let rows = crate::vault::input_store::encode_input_rows(input_hash, bytes)?;
         self.write_cf_batch(
