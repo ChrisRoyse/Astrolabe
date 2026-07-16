@@ -155,6 +155,16 @@ pub(crate) struct GitArchaeologyImportReport {
     /// clone (#467) — squash-merge reverts routinely cite PR-only commits. Each
     /// is a counted, labeled mining skip (invariant 3), never an import failure.
     pub(crate) skipped_unresolvable_reverts: usize,
+    /// Diffed files excluded from range mining because the mined side is a
+    /// gitlink (mode 160000) — submodule pointer bumps are tree entries, not
+    /// blamable blobs, and are never line evidence (#514). A counted, labeled
+    /// mining skip (invariant 3), never an import failure.
+    pub(crate) skipped_gitlink_paths: usize,
+    /// Blame targets git refused with `no such path` at the blamed parent —
+    /// paths the diff names that the parent commit does not contain (#514).
+    /// Each is a counted, labeled mining skip (invariant 3); every other blame
+    /// failure stays repo-fatal.
+    pub(crate) skipped_unblamable_paths: usize,
     /// Scratch worktrees / SQLite files that survived the bounded cleanup retry
     /// budget and were left on disk. Surfaced as a labeled count (invariant 3):
     /// a cleanup that cannot complete degrades to a counted remnant, never a
@@ -276,6 +286,7 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     // carries the registry-declared `max_commit_changed_files`.
     let file_cap = config.max_commit_changed_files;
     let mut force_removed_skipped_large = 0usize;
+    let mut force_removed_skipped_gitlink = 0usize;
     for removed in &mined.force_removed_commits {
         if file_cap != 0
             && astrolabe_anchors::archaeology::changed_file_count_for_commit(repo, removed, None)?
@@ -284,7 +295,9 @@ pub(crate) fn run_git_archaeology<C: Clock>(
             force_removed_skipped_large += 1;
             continue;
         }
-        for range in astrolabe_anchors::archaeology::changed_new_ranges(repo, removed)? {
+        let changed = astrolabe_anchors::archaeology::changed_new_ranges(repo, removed)?;
+        force_removed_skipped_gitlink += changed.skipped_gitlink_paths;
+        for range in changed.ranges {
             evidence.push(Evidence {
                 commit: removed.clone(),
                 range,
@@ -372,6 +385,10 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         // git_archaeology summary (invariant 3: every skip counted, never silent).
         skipped_large_commits: mined.skipped_large_commits + force_removed_skipped_large,
         skipped_unresolvable_reverts: mined.skipped_unresolvable_reverts,
+        // #514 mine-side gitlink skips PLUS this path's force_removed-side gitlink
+        // skips — one labeled counter on the persisted summary (invariant 3).
+        skipped_gitlink_paths: mined.skipped_gitlink_paths + force_removed_skipped_gitlink,
+        skipped_unblamable_paths: mined.skipped_unblamable_paths,
         archaeology_source,
         git_root,
         pathspec,
@@ -1099,6 +1116,11 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         "skipped_merge_fixes": report.skipped_merge_fixes,
         "skipped_large_commits": report.skipped_large_commits,
         "skipped_unresolvable_reverts": report.skipped_unresolvable_reverts,
+        // #514 labeled degradations: gitlink (submodule pointer) diff files excluded
+        // from line mining, and blame targets absent at the blamed parent — both
+        // counted here instead of aborting the whole pass repo-fatally (invariant 3).
+        "skipped_gitlink_paths": report.skipped_gitlink_paths,
+        "skipped_unblamable_paths": report.skipped_unblamable_paths,
         "cleanup_remnants": report.cleanup_remnants,
         // #502 labeled degradation: implicated committed filenames NTFS cannot represent,
         // excluded from the historical checkout and counted here instead of aborting the

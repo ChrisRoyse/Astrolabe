@@ -520,9 +520,9 @@ pub(crate) fn produce_commit_ood_request(
         return Ok(json!({"status": "unchanged", "head": head}));
     }
 
-    let ranges =
+    let changed =
         match astrolabe_anchors::archaeology::changed_new_ranges_between(repo, &last, &head) {
-            Ok(ranges) => ranges,
+            Ok(changed) => changed,
             Err(err) => {
                 // A diff we cannot compute (e.g. the old sha was garbage-collected):
                 // advance the baseline so we do not wedge, and report the degradation.
@@ -557,9 +557,12 @@ pub(crate) fn produce_commit_ood_request(
     let snapshot = astrolabe_ingest::read_cbm_graph_snapshot(&vault, project)?;
     drop(vault);
 
+    // Gitlink diff files never contribute line ranges (#514) — surfaced as a
+    // labeled count in both producer outcomes below (invariant 3).
+    let skipped_gitlink_paths = changed.skipped_gitlink_paths;
     // Index the changed ranges by (normalized) file for overlap lookup.
     let mut changed_files: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
-    for range in &ranges {
+    for range in &changed.ranges {
         let end = range.start_line.saturating_add(range.line_count);
         changed_files
             .entry(normalize_repo_path(&range.path))
@@ -634,6 +637,7 @@ pub(crate) fn produce_commit_ood_request(
             "to": head,
             "changed_files": changed_files.len(),
             "underivable": underivable,
+            "skipped_gitlink_paths": skipped_gitlink_paths,
         }));
     }
 
@@ -658,6 +662,7 @@ pub(crate) fn produce_commit_ood_request(
         "changed_files": changed_files.len(),
         "enqueued": enqueued,
         "underivable": underivable,
+        "skipped_gitlink_paths": skipped_gitlink_paths,
     }))
 }
 

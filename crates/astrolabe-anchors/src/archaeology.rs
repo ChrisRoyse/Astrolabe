@@ -187,6 +187,18 @@ pub struct RevertFinding {
     pub observed_at: u64,
 }
 
+/// Line ranges parsed from one unified diff, with gitlink exclusions counted.
+///
+/// `skipped_gitlink_paths` is the number of diffed files whose mined side is a
+/// submodule pointer (mode 160000) — excluded from `ranges` because a gitlink
+/// is a tree entry, not a blamable blob, and a pointer bump is never line
+/// evidence (#514). Surfaced so no consumer drops them silently (invariant 3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangedRanges {
+    pub ranges: Vec<GitLineRange>,
+    pub skipped_gitlink_paths: usize,
+}
+
 /// Deterministic result of one mining pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GitArchaeologyReport {
@@ -207,6 +219,17 @@ pub struct GitArchaeologyReport {
     /// commits that only ever existed on a PR branch. The revert is skipped for
     /// mining (its target's diff cannot be read), counted here per invariant 3.
     pub skipped_unresolvable_reverts: usize,
+    /// Diff files excluded from range mining because the mined side is a gitlink
+    /// (mode 160000) — a submodule pointer bump diffs as `-Subproject commit …`
+    /// and its path is a tree entry, not a blamable blob, so it is never line
+    /// evidence (#514: mise `aqua-registry`, spacedrive `apps/cloud`). Counted
+    /// per invariant 3, never a silent drop.
+    pub skipped_gitlink_paths: usize,
+    /// Blame targets refused by git as `no such path` at the blamed parent —
+    /// a path the diff names but the parent commit does not contain (rename/move
+    /// history, directory↔file swaps) (#514). Each is a counted, labeled skip;
+    /// every other git blame failure stays fail-closed.
+    pub skipped_unblamable_paths: usize,
 }
 
 /// Coded, remediable archaeology error.
@@ -321,6 +344,8 @@ pub fn mine_git_archaeology(
     let mut skipped_merge_fixes = 0usize;
     let mut skipped_large_commits = 0usize;
     let mut skipped_unresolvable_reverts = 0usize;
+    let mut skipped_gitlink_paths = 0usize;
+    let mut skipped_unblamable_paths = 0usize;
     // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
     let file_cap = config.max_commit_changed_files;
     for commit in commits {
@@ -357,7 +382,9 @@ pub fn mine_git_archaeology(
                 if target_over_cap {
                     skipped_large_commits += 1;
                 } else if revert_patch_matches(repo, &target, &commit.sha)? {
-                    for target_range in changed_new_ranges_impl(repo, &target, pathspec)? {
+                    let changed = changed_new_ranges_impl(repo, &target, pathspec)?;
+                    skipped_gitlink_paths += changed.skipped_gitlink_paths;
+                    for target_range in changed.ranges {
                         reverts.insert(RevertFinding {
                             revert_commit: commit.sha.clone(),
                             target_commit: target.clone(),
@@ -389,13 +416,21 @@ pub fn mine_git_archaeology(
             continue;
         }
         let diff_start = std::time::Instant::now();
-        let old_ranges = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
+        let old_changed = changed_old_ranges(repo, parent, &commit.sha, pathspec)?;
+        skipped_gitlink_paths += old_changed.skipped_gitlink_paths;
         diff_ms += diff_start.elapsed().as_millis();
-        for range in old_ranges {
+        for range in old_changed.ranges {
             let blame_start = std::time::Instant::now();
-            let blamed = blame_range(repo, parent, &range)?;
+            let outcome = blame_range(repo, parent, &range)?;
             blame_ms += blame_start.elapsed().as_millis();
             blame_calls += 1;
+            let blamed = match outcome {
+                BlameOutcome::Blamed(findings) => findings,
+                BlameOutcome::PathAbsent => {
+                    skipped_unblamable_paths += 1;
+                    continue;
+                }
+            };
             for (blamed_commit, line) in blamed {
                 szz.insert(SzzFinding {
                     fix_commit: commit.sha.clone(),
@@ -414,7 +449,9 @@ pub fn mine_git_archaeology(
              commits={commit_count} diff_ms={diff_ms} blame_ms={blame_ms} \
              blame_calls={blame_calls} skipped_merge_fixes={skipped_merge_fixes} \
              skipped_large_commits={skipped_large_commits} \
-             skipped_unresolvable_reverts={skipped_unresolvable_reverts} file_cap={file_cap}"
+             skipped_unresolvable_reverts={skipped_unresolvable_reverts} \
+             skipped_gitlink_paths={skipped_gitlink_paths} \
+             skipped_unblamable_paths={skipped_unblamable_paths} file_cap={file_cap}"
         );
     }
     Ok(GitArchaeologyReport {
@@ -425,6 +462,8 @@ pub fn mine_git_archaeology(
         skipped_merge_fixes,
         skipped_large_commits,
         skipped_unresolvable_reverts,
+        skipped_gitlink_paths,
+        skipped_unblamable_paths,
     })
 }
 
@@ -541,11 +580,9 @@ pub fn git_source_fingerprint(repo: &Path) -> Result<String, ArchaeologyError> {
     ))
 }
 
-/// Returns the new-side ranges introduced by `commit` for exact version lookup.
-pub fn changed_new_ranges(
-    repo: &Path,
-    commit: &str,
-) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+/// Returns the new-side ranges introduced by `commit` for exact version lookup,
+/// with gitlink exclusions counted ([`ChangedRanges`], #514).
+pub fn changed_new_ranges(repo: &Path, commit: &str) -> Result<ChangedRanges, ArchaeologyError> {
     changed_new_ranges_impl(repo, commit, None)
 }
 
@@ -558,11 +595,11 @@ fn changed_new_ranges_impl(
     repo: &Path,
     commit: &str,
     pathspec: Option<&str>,
-) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+) -> Result<ChangedRanges, ArchaeologyError> {
     validate_oid(commit)?;
     let parents = git_text(repo, &["show", "-s", "--format=%P", commit])?;
     let Some(parent) = parents.split_whitespace().next() else {
-        return Ok(Vec::new());
+        return Ok(ChangedRanges::default());
     };
     changed_ranges(repo, parent, commit, false, pathspec)
 }
@@ -578,7 +615,7 @@ pub fn changed_new_ranges_between(
     repo: &Path,
     old: &str,
     new: &str,
-) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+) -> Result<ChangedRanges, ArchaeologyError> {
     validate_oid(old)?;
     validate_oid(new)?;
     changed_ranges(repo, old, new, false, None)
@@ -589,7 +626,7 @@ fn changed_old_ranges(
     parent: &str,
     commit: &str,
     pathspec: Option<&str>,
-) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+) -> Result<ChangedRanges, ArchaeologyError> {
     changed_ranges(repo, parent, commit, true, pathspec)
 }
 
@@ -645,7 +682,7 @@ fn changed_ranges(
     commit: &str,
     old_side: bool,
     pathspec: Option<&str>,
-) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+) -> Result<ChangedRanges, ArchaeologyError> {
     // The trailing `--` separates the two revisions from any pathspec. When a
     // member-subtree pathspec is supplied (#381) it is appended after `--`, so the
     // diff — and thus every range the SZZ/revert miners derive — is confined to the
@@ -668,10 +705,69 @@ fn changed_ranges(
     parse_unified_ranges(&output, old_side)
 }
 
-fn parse_unified_ranges(diff: &str, old_side: bool) -> Result<Vec<GitLineRange>, ArchaeologyError> {
+fn parse_unified_ranges(diff: &str, old_side: bool) -> Result<ChangedRanges, ArchaeologyError> {
     let mut path = None::<String>;
+    // Per-file mode headers (#514): `index a..b <mode>` carries the mode only when
+    // it did not change; a type change emits explicit `old mode`/`new mode` lines,
+    // and creation/deletion emit `new file mode`/`deleted file mode`. The mined
+    // side's mode decides whether the file is a gitlink (160000).
+    let mut index_mode = None::<String>;
+    let mut explicit_side_mode = None::<String>;
+    let mut gitlink_counted = false;
+    let mut skipped_gitlink_paths = 0usize;
+    // Hunk-body extents (#514, the vibe-kanban forgery): after `@@ -a,b +c,d @@`
+    // exactly b removed (`-`) and d added (`+`) lines follow (`--unified=0` emits
+    // no context lines), optionally interleaved with `\ No newline at end of
+    // file` markers. While any body line is still owed, NOTHING is a header — a
+    // removed SQL comment `-- NOTE: …` renders as `--- NOTE: …` and would
+    // otherwise be swallowed as a file path and handed to `git blame` as prose.
+    let mut pending_old = 0u32;
+    let mut pending_new = 0u32;
     let mut ranges = BTreeSet::new();
     for line in diff.lines() {
+        if pending_old > 0 || pending_new > 0 {
+            match line.as_bytes().first() {
+                Some(b'-') if pending_old > 0 => pending_old -= 1,
+                Some(b'+') if pending_new > 0 => pending_new -= 1,
+                // "\ No newline at end of file" — a marker, not a counted line.
+                Some(b'\\') => {}
+                _ => {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!(
+                            "Git hunk body ended early at {line:?} \
+                             (still owed {pending_old} removed / {pending_new} added lines)"
+                        ),
+                    ));
+                }
+            }
+            continue;
+        }
+        if line.strip_prefix("diff --git ").is_some() {
+            path = None;
+            index_mode = None;
+            explicit_side_mode = None;
+            gitlink_counted = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("index ") {
+            // `index <oid>..<oid> <mode>` — the trailing mode is present only when
+            // both sides share it.
+            index_mode = rest.rsplit_once(' ').map(|(_, mode)| mode.to_string());
+            continue;
+        }
+        let side_mode_prefix = if old_side {
+            ["old mode ", "deleted file mode "]
+        } else {
+            ["new mode ", "new file mode "]
+        };
+        if let Some(mode) = side_mode_prefix
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        {
+            explicit_side_mode = Some(mode.to_string());
+            continue;
+        }
         if let Some(raw) = line.strip_prefix("--- ") {
             path = Some(parse_diff_path(raw)?);
             continue;
@@ -695,7 +791,15 @@ fn parse_unified_ranges(diff: &str, old_side: bool) -> Result<Vec<GitLineRange>,
                 format!("malformed Git hunk header {line:?}"),
             ));
         };
-        let (start_line, line_count) = parse_range(if old_side { old } else { new })?;
+        let (old_start, old_count) = parse_range(old)?;
+        let (new_start, new_count) = parse_range(new)?;
+        pending_old = old_count;
+        pending_new = new_count;
+        let (start_line, line_count) = if old_side {
+            (old_start, old_count)
+        } else {
+            (new_start, new_count)
+        };
         if line_count == 0 {
             continue;
         }
@@ -705,15 +809,38 @@ fn parse_unified_ranges(diff: &str, old_side: bool) -> Result<Vec<GitLineRange>,
                 "Git hunk appeared before a file path",
             ));
         };
-        if path != "/dev/null" {
-            ranges.insert(GitLineRange {
-                path,
-                start_line,
-                line_count,
-            });
+        if path == "/dev/null" {
+            continue;
         }
+        // Gitlink exclusion (#514): the mined side is a submodule pointer, not a
+        // blob — `-Subproject commit …` is never line evidence and `git blame`
+        // refuses the path. Counted once per file, never a silent drop.
+        if explicit_side_mode.as_deref().or(index_mode.as_deref()) == Some("160000") {
+            if !gitlink_counted {
+                skipped_gitlink_paths += 1;
+                gitlink_counted = true;
+            }
+            continue;
+        }
+        ranges.insert(GitLineRange {
+            path,
+            start_line,
+            line_count,
+        });
     }
-    Ok(ranges.into_iter().collect())
+    if pending_old > 0 || pending_new > 0 {
+        return Err(ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "Git diff ended mid-hunk \
+                 (still owed {pending_old} removed / {pending_new} added lines)"
+            ),
+        ));
+    }
+    Ok(ChangedRanges {
+        ranges: ranges.into_iter().collect(),
+        skipped_gitlink_paths,
+    })
 }
 
 fn parse_diff_path(raw: &str) -> Result<String, ArchaeologyError> {
@@ -834,24 +961,49 @@ fn parse_range(raw: &str) -> Result<(u32, u32), ArchaeologyError> {
     Ok((start, count))
 }
 
+/// Outcome of one blame leg (#514): findings, or a counted absent-path skip.
+enum BlameOutcome {
+    Blamed(Vec<(String, u32)>),
+    /// git refused the path with `no such path` at the blamed revision — the
+    /// diff names a path the parent commit does not contain (rename/move
+    /// history, directory↔file swaps). A counted, labeled skip for the caller;
+    /// every OTHER blame failure still fails closed.
+    PathAbsent,
+}
+
 fn blame_range(
     repo: &Path,
     parent: &str,
     range: &GitLineRange,
-) -> Result<Vec<(String, u32)>, ArchaeologyError> {
+) -> Result<BlameOutcome, ArchaeologyError> {
     let line_arg = format!("{},+{}", range.start_line, range.line_count);
-    let output = git_text(
-        repo,
-        &[
-            "blame",
-            "--line-porcelain",
-            "-L",
-            &line_arg,
-            parent,
-            "--",
-            &range.path,
-        ],
-    )?;
+    let args = [
+        "blame",
+        "--line-porcelain",
+        "-L",
+        &line_arg,
+        parent,
+        "--",
+        &range.path,
+    ];
+    let raw = git_command(repo, &args)
+        .output()
+        .map_err(|error| git_spawn_error(&args, error))?;
+    if !raw.status.success() {
+        // Narrow containment (#514): `fatal: no such path <p> in <rev>` is the
+        // one blame refusal that means "this path does not exist at the blamed
+        // revision" — reality, not a fault. Everything else stays fail-closed.
+        if String::from_utf8_lossy(&raw.stderr).contains("no such path") {
+            return Ok(BlameOutcome::PathAbsent);
+        }
+        return Err(git_exit_error(&args, &raw.stderr));
+    }
+    let output = String::from_utf8(raw.stdout).map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!("Git output is not UTF-8: {error}"),
+        )
+    })?;
     let mut findings = BTreeSet::new();
     for line in output.lines() {
         let mut fields = line.split_whitespace();
@@ -870,7 +1022,7 @@ fn blame_range(
         };
         findings.insert((oid.to_string(), final_line));
     }
-    Ok(findings.into_iter().collect())
+    Ok(BlameOutcome::Blamed(findings.into_iter().collect()))
 }
 
 fn read_commits(
