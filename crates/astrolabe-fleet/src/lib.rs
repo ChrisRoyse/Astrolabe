@@ -22,12 +22,17 @@
 //! (fail-closed write-path FSV).
 
 pub mod catalog;
+pub mod discover;
 pub mod record;
 pub mod state;
 
 pub use catalog::{
     FLEET_ACTOR, FLEET_VAULT_ID, FLEET_VAULT_SALT, FleetCatalog, RegisterOutcome, RegisterReport,
     TransitionReport,
+};
+pub use discover::{
+    ASTRO_FLEET_DISCOVERY_INCOMPLETE, ASTRO_FLEET_GH_API, DEFAULT_CATALOG_ROOT, DEFAULT_LANGUAGES,
+    DEFAULT_STAR_FLOOR, run_discovery,
 };
 pub use record::{
     FLEET_PANEL_VERSION, FleetRepoRow, RepoRecord, TransitionContext, repo_cx_id,

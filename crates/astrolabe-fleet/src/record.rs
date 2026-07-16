@@ -77,6 +77,8 @@ pub const META_INDEX_WATERMARK: &str = "index_watermark";
 pub const META_KERNEL_SCOPE_ID: &str = "kernel_scope_id";
 /// Recorded reason, required when quarantining.
 pub const META_QUARANTINE_REASON: &str = "quarantine_reason";
+/// Recorded reason, required when marking a repo departed (#450).
+pub const META_DEPARTED_REASON: &str = "departed_reason";
 /// Prefix of per-transition timestamp keys: `ts_<state>` = unix seconds the
 /// record entered `<state>`.
 pub const META_TS_PREFIX: &str = "ts_";
@@ -171,6 +173,10 @@ pub struct TransitionContext {
     /// [`RepoState::Quarantined`].
     #[serde(default)]
     pub quarantine_reason: Option<String>,
+    /// Reason for departure; required when the target state is
+    /// [`RepoState::Departed`] (#450).
+    #[serde(default)]
+    pub departed_reason: Option<String>,
 }
 
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.
@@ -194,6 +200,8 @@ pub struct FleetRepoRow {
     pub kernel_scope_id: Option<String>,
     /// Recorded quarantine reason, if quarantined.
     pub quarantine_reason: Option<String>,
+    /// Recorded departure reason, if departed (#450).
+    pub departed_reason: Option<String>,
 }
 
 /// Canonical identity bytes of a repository record:
@@ -259,6 +267,9 @@ pub fn encode_repo_constellation(
     }
     if let Some(reason) = &row.quarantine_reason {
         metadata.insert(META_QUARANTINE_REASON.to_string(), reason.clone());
+    }
+    if let Some(reason) = &row.departed_reason {
+        metadata.insert(META_DEPARTED_REASON.to_string(), reason.clone());
     }
     for (key, at) in &row.state_timestamps {
         metadata.insert(format!("{META_TS_PREFIX}{key}"), at.to_string());
@@ -368,5 +379,6 @@ pub fn decode_repo_constellation(
         index_watermark: meta_opt(META_INDEX_WATERMARK),
         kernel_scope_id: meta_opt(META_KERNEL_SCOPE_ID),
         quarantine_reason: meta_opt(META_QUARANTINE_REASON),
+        departed_reason: meta_opt(META_DEPARTED_REASON),
     })
 }

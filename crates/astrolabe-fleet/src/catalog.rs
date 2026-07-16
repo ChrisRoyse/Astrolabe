@@ -36,6 +36,8 @@ pub const ASTRO_FLEET_RECORD_MISSING: &str = "ASTRO_FLEET_RECORD_MISSING";
 pub const ASTRO_FLEET_IDENTITY_CONFLICT: &str = "ASTRO_FLEET_IDENTITY_CONFLICT";
 /// Refusal code when quarantining without a recorded reason.
 pub const ASTRO_FLEET_QUARANTINE_REASON_REQUIRED: &str = "ASTRO_FLEET_QUARANTINE_REASON_REQUIRED";
+/// Refusal code when departing a repo without a recorded reason (#450).
+pub const ASTRO_FLEET_DEPARTED_REASON_REQUIRED: &str = "ASTRO_FLEET_DEPARTED_REASON_REQUIRED";
 /// Refusal code when the post-commit readback diverges from the claim.
 pub const ASTRO_FLEET_FSV_MISMATCH: &str = "ASTRO_FLEET_FSV_MISMATCH";
 /// Refusal code for a transition timestamp of zero.
@@ -197,6 +199,7 @@ impl FleetCatalog {
             index_watermark: None,
             kernel_scope_id: None,
             quarantine_reason: None,
+            departed_reason: None,
         };
         let payload = serde_json::to_vec(&json!({
             "event": "fleet_repo_registered",
@@ -242,6 +245,18 @@ impl FleetCatalog {
                 remediation: "pass the concrete failure being quarantined for (e.g. clone integrity failure, license gate)",
             });
         }
+        if to == RepoState::Departed
+            && ctx
+                .departed_reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+        {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_DEPARTED_REASON_REQUIRED,
+                message: format!("departing {full_name} requires a non-empty departed_reason"),
+                remediation: "pass why the repo left the enumeration (deleted, private, renamed, below star floor)",
+            });
+        }
 
         if let Some(clone_path) = ctx.clone_path {
             row.clone_path = Some(clone_path);
@@ -257,6 +272,14 @@ impl FleetCatalog {
         }
         if let Some(reason) = ctx.quarantine_reason.clone() {
             row.quarantine_reason = Some(reason);
+        }
+        if let Some(reason) = ctx.departed_reason.clone() {
+            row.departed_reason = Some(reason);
+        }
+        if from == RepoState::Departed && to == RepoState::Discovered {
+            // Reappearance: the departure reason described the previous
+            // absence; the ledger keeps that history, the live row does not.
+            row.departed_reason = None;
         }
         row.state = to;
         row.state_timestamps
@@ -275,6 +298,9 @@ impl FleetCatalog {
         }
         if let Some(reason) = &row.quarantine_reason {
             payload["quarantine_reason"] = json!(reason);
+        }
+        if let Some(reason) = &row.departed_reason {
+            payload["departed_reason"] = json!(reason);
         }
         let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
@@ -356,6 +382,71 @@ impl FleetCatalog {
                 .expect("ALL_STATES covers every parsed state") += 1;
         }
         Ok(counts)
+    }
+
+    /// Persists a discovery run report (#450): the full report bytes as a
+    /// Blob-CF row under the reserved `fleetrun:` keyspace, paired with an
+    /// `Admin` ledger entry carrying `summary_payload`, committed atomically
+    /// and independently read back before returning.
+    ///
+    /// Returns `(commit_seq, ledger_seq)`.
+    pub fn record_run_report(
+        &self,
+        run_id: &str,
+        report_bytes: Vec<u8>,
+        summary_payload: Vec<u8>,
+    ) -> Result<(Seq, u64), CalyxError> {
+        RedactionPolicy::check_payload(&summary_payload)?;
+        let key = run_report_key(run_id);
+        let subject = SubjectId::Query(format!("fleet-discovery-run:{run_id}").into_bytes());
+        let actor = ActorId::Service(FLEET_ACTOR.to_string());
+        let commit_seq = self.vault.write_cf_batch_with_ledger_entry(
+            vec![(ColumnFamily::Blob, key.clone(), report_bytes.clone())],
+            EntryKind::Admin,
+            subject.clone(),
+            summary_payload.clone(),
+            actor.clone(),
+        )?;
+        self.vault.flush()?;
+
+        let mismatch = |what: String| CalyxError {
+            code: ASTRO_FLEET_FSV_MISMATCH,
+            message: format!("fleet run report readback mismatch for {run_id}: {what}"),
+            remediation: "the committed run report does not match the claim; audit the catalog vault before trusting this run",
+        };
+        let persisted = self
+            .vault
+            .read_cf_at(commit_seq, ColumnFamily::Blob, &key)?
+            .ok_or_else(|| mismatch("report row absent after commit".to_string()))?;
+        if persisted != report_bytes {
+            return Err(mismatch(
+                "report row bytes diverge from the claim".to_string(),
+            ));
+        }
+        // The report row is not a Base constellation, so no ledger ref is
+        // stamped into it; find the paired entry by scanning the ledger CF at
+        // the commit snapshot for this run's subject — an independent readback.
+        let mut found = None;
+        for (_key, bytes) in self.vault.scan_cf_at(commit_seq, ColumnFamily::Ledger)? {
+            let entry = calyx_ledger::decode(&bytes)?;
+            if entry.subject == subject {
+                found = Some(entry);
+            }
+        }
+        let entry = found.ok_or_else(|| mismatch("no ledger entry for this run".to_string()))?;
+        if entry.payload != summary_payload {
+            return Err(mismatch(format!(
+                "ledger entry {} payload diverges from the run summary",
+                entry.seq
+            )));
+        }
+        if entry.actor != actor {
+            return Err(mismatch(format!(
+                "ledger entry {} actor diverges from {FLEET_ACTOR}",
+                entry.seq
+            )));
+        }
+        Ok((commit_seq, entry.seq))
     }
 
     /// Commits `row` and its ledger entry in one atomic batch, then re-reads
@@ -461,6 +552,22 @@ impl FleetCatalog {
         }
         Ok(stamped.seq)
     }
+}
+
+/// Reserved Blob-CF keyspace for discovery run reports: a `0xFD` discriminant
+/// (disjoint from the collection blob layer's `0x05`) followed by a versioned
+/// namespace and the run id.
+pub const RUN_REPORT_DISC: u8 = 0xFD;
+/// Versioned namespace tag for run-report rows.
+pub const RUN_REPORT_NAMESPACE: &[u8] = b"fleetrun:v1:";
+
+/// Blob-CF key of a discovery run report row.
+pub fn run_report_key(run_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + RUN_REPORT_NAMESPACE.len() + run_id.len());
+    key.push(RUN_REPORT_DISC);
+    key.extend_from_slice(RUN_REPORT_NAMESPACE);
+    key.extend_from_slice(run_id.as_bytes());
+    key
 }
 
 fn require_timestamp(at_unix_secs: u64) -> Result<(), CalyxError> {
