@@ -589,16 +589,14 @@ fn run_git(
         remediation: "the farm scratch area must be writable",
     })?;
     let mut command = Command::new("git");
-    // Never prompt: a nonexistent/private repo must fail, not hang on
-    // credentials; the farm clones public repos only.
     command
-        .env("GIT_TERMINAL_PROMPT", "0")
         .args(["-c", "credential.helper="])
         .args(["-c", "core.longpaths=true"])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
+    silence_credential_prompts(&mut command);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -646,20 +644,34 @@ fn run_git(
     }
 }
 
+/// Never prompt, anywhere: a nonexistent/private repo must fail fast, not
+/// hang on credentials — the farm clones public repos only. Terminal prompts,
+/// the askpass GUI channel (Git for Windows exports `GIT_ASKPASS` into every
+/// shell), and Git Credential Manager's interactive mode are all disabled;
+/// `credential.helper=` (set per-invocation) resets config-declared helpers.
+/// Caught live by FSV: a ghost-repo clone hung on a GUI credential prompt.
+fn silence_credential_prompts(command: &mut Command) {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
+        .env("SSH_ASKPASS", "echo")
+        .env("GCM_INTERACTIVE", "never");
+}
+
 /// Captured-output git helper for short read-only commands (rev-parse etc.).
 fn git_capture(args: &[&str], cwd: &Path) -> Result<(bool, String, String), CalyxError> {
-    let output = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut command = Command::new("git");
+    command
         .args(["-c", "credential.helper="])
         .args(["-c", "core.longpaths=true"])
         .current_dir(cwd)
-        .args(args)
-        .output()
-        .map_err(|error| CalyxError {
-            code: ASTRO_FLEET_GIT_SPAWN,
-            message: format!("failed to spawn git {}: {error}", args.join(" ")),
-            remediation: "git must be installed and on PATH for the clone farm",
-        })?;
+        .args(args);
+    silence_credential_prompts(&mut command);
+    let output = command.output().map_err(|error| CalyxError {
+        code: ASTRO_FLEET_GIT_SPAWN,
+        message: format!("failed to spawn git {}: {error}", args.join(" ")),
+        remediation: "git must be installed and on PATH for the clone farm",
+    })?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
