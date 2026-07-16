@@ -324,7 +324,18 @@ pub fn mine_git_archaeology(
     // #434 mass-change cap: 0 disables the cap (pre-#434 behavior — mine every commit).
     let file_cap = config.max_commit_changed_files;
     for commit in commits {
-        if let Some(target) = canonical_revert_target(&commit.message) {
+        let revert_target = match canonical_revert_target(&commit.message) {
+            RevertTarget::Absent => None,
+            // A revert line whose object id we cannot extract (abbreviated,
+            // reworded) is prose, not malformed git output: count it with the
+            // unresolvable reverts (invariant 3) and keep mining the repo (#496).
+            RevertTarget::Unparseable => {
+                skipped_unresolvable_reverts += 1;
+                None
+            }
+            RevertTarget::Oid(target) => Some(target),
+        };
+        if let Some(target) = revert_target {
             validate_oid(&target)?;
             // Existence gate FIRST (#467): the target hash is mined from prose and
             // may not exist in this clone at all (squash-merged reverts reference
@@ -709,16 +720,101 @@ fn parse_diff_path(raw: &str) -> Result<String, ArchaeologyError> {
     if raw == "/dev/null" {
         return Ok(raw.to_string());
     }
-    // `--no-prefix` makes ordinary paths lossless, including spaces. Git quotes
-    // paths containing control bytes; refusing those is safer than blaming a
-    // decoded-looking but different path.
-    if raw.starts_with('"') || raw.contains('\t') || raw.contains('\r') {
+    // GNU-patch compatibility: git appends exactly one TAB after a `---`/`+++`
+    // name that contains spaces, and neither `-z` nor `core.quotePath=false`
+    // suppresses it (#496 — tauri's `…{{ plugin_name }}.xcodeproj/project.pbxproj`).
+    let raw = raw.strip_suffix('\t').unwrap_or(raw);
+    // `core.quotePath` quoting: names containing control bytes, `"`, `\` or (by
+    // default) non-ASCII bytes are emitted as one C-quoted string covering the
+    // whole path. Decode it losslessly instead of refusing well-formed reality;
+    // malformed quoting still fails closed inside `unquote_c_style`.
+    if let Some(quoted) = raw.strip_prefix('"') {
+        let inner = quoted.strip_suffix('"').ok_or_else(|| {
+            ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("unterminated quoted diff path {raw:?}"),
+            )
+        })?;
+        return unquote_c_style(inner);
+    }
+    // An unquoted name can never carry raw control bytes — git would have quoted
+    // them — so their presence means the output is malformed, not unusual.
+    if raw.contains('\t') || raw.contains('\r') {
         return Err(ArchaeologyError::new(
             ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
-            format!("Git emitted a quoted or control-character diff path {raw:?}"),
+            format!("Git emitted an unquoted control-character diff path {raw:?}"),
         ));
     }
     Ok(raw.to_string())
+}
+
+/// Decodes git's `core.quotePath` C-style quoting: the standard escapes
+/// (`\a \b \t \n \v \f \r \" \\`) plus 1–3-digit octal byte escapes. Fails
+/// closed on malformed escapes and on decoded bytes that are not valid UTF-8 —
+/// the mined path must round-trip into `git blame`/pathspec arguments, which
+/// this crate passes as UTF-8 strings.
+fn unquote_c_style(inner: &str) -> Result<String, ArchaeologyError> {
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut input = inner.bytes().peekable();
+    while let Some(byte) = input.next() {
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some(escape) = input.next() else {
+            return Err(ArchaeologyError::new(
+                ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                format!("truncated escape in quoted diff path {inner:?}"),
+            ));
+        };
+        match escape {
+            b'a' => bytes.push(0x07),
+            b'b' => bytes.push(0x08),
+            b't' => bytes.push(b'\t'),
+            b'n' => bytes.push(b'\n'),
+            b'v' => bytes.push(0x0b),
+            b'f' => bytes.push(0x0c),
+            b'r' => bytes.push(b'\r'),
+            b'"' => bytes.push(b'"'),
+            b'\\' => bytes.push(b'\\'),
+            b'0'..=b'7' => {
+                let mut value = u32::from(escape - b'0');
+                for _ in 0..2 {
+                    let Some(&digit) = input.peek() else { break };
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    value = value * 8 + u32::from(digit - b'0');
+                    input.next();
+                }
+                if value > 0xFF {
+                    return Err(ArchaeologyError::new(
+                        ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                        format!("octal escape out of byte range in quoted diff path {inner:?}"),
+                    ));
+                }
+                bytes.push(value as u8);
+            }
+            other => {
+                return Err(ArchaeologyError::new(
+                    ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+                    format!(
+                        "unsupported escape \\{} in quoted diff path {inner:?}",
+                        char::from(other)
+                    ),
+                ));
+            }
+        }
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        ArchaeologyError::new(
+            ASTRO_ARCHAEOLOGY_OUTPUT_INVALID,
+            format!(
+                "quoted diff path decodes to non-UTF-8 bytes {:?} (from {inner:?})",
+                error.as_bytes()
+            ),
+        )
+    })
 }
 
 fn parse_range(raw: &str) -> Result<(u32, u32), ArchaeologyError> {
@@ -871,13 +967,32 @@ fn classify_fix_confidence(message: &str, config: &GitArchaeologyConfig) -> Opti
     })
 }
 
-fn canonical_revert_target(message: &str) -> Option<String> {
-    message.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("This reverts commit ")
-            .and_then(|value| value.strip_suffix('.'))
-            .map(str::to_string)
-    })
+/// Outcome of scanning a commit message for a canonical revert reference.
+enum RevertTarget {
+    /// No "This reverts commit" line in the message.
+    Absent,
+    /// The first revert line named a full 40/64-hex object id. Any prose after
+    /// the id — git's own trailing `.`, the ` (#NNNN)` suffix GitHub squash
+    /// merges fold into the line (#496 — uv's `(#19890)`) — is opaque.
+    Oid(String),
+    /// A revert line was present but named no full object id (abbreviated,
+    /// truncated, or reworded by hand). Commit messages are prose, not machine
+    /// output: this is a counted skip, never a fatal refusal.
+    Unparseable,
+}
+
+fn canonical_revert_target(message: &str) -> RevertTarget {
+    for line in message.lines() {
+        let Some(value) = line.trim().strip_prefix("This reverts commit ") else {
+            continue;
+        };
+        let hex_len = value.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if matches!(hex_len, 40 | 64) {
+            return RevertTarget::Oid(value[..hex_len].to_string());
+        }
+        return RevertTarget::Unparseable;
+    }
+    RevertTarget::Absent
 }
 
 fn revert_patch_matches(repo: &Path, target: &str, revert: &str) -> Result<bool, ArchaeologyError> {
