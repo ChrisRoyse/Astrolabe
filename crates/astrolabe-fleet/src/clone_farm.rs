@@ -605,6 +605,20 @@ fn run_git(
         message: format!("failed to spawn git {}: {error}", args.join(" ")),
         remediation: "git must be installed and on PATH for the clone farm",
     })?;
+    let _job = match JobGuard::assign(&child) {
+        Ok(guard) => guard,
+        Err(why) => {
+            // Fail closed: never run an unguarded git that could outlive the
+            // farm and race a later recovery pass.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CalyxError {
+                code: ASTRO_FLEET_GIT_SPAWN,
+                message: format!("could not tie git to the farm's job object: {why}"),
+                remediation: "internal defect: Windows job-object assignment failed; re-run the pass",
+            });
+        }
+    };
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -641,6 +655,63 @@ fn run_git(
                 timeout.as_secs()
             ),
         )),
+    }
+}
+
+/// Ties a spawned git child to a Windows Job Object configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the farm process exits for any
+/// reason — including a hard kill — the job's last handle closes and the git
+/// child (with its own helper children) dies with it. Caught live by FSV: a
+/// hard-killed farm left an orphaned `git.exe` writing into a torn clone dir,
+/// racing the next pass's recovery. Guarding is fail-closed — a git that
+/// cannot be tied to the job is killed rather than left to run unguarded.
+struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
+
+impl JobGuard {
+    fn assign(child: &std::process::Child) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: plain Win32 handle plumbing — the job handle is owned by
+        // the returned guard and closed exactly once in Drop; the child
+        // handle is borrowed from a live `Child` for the duration of the
+        // call; the info struct is a zeroed POD written before use.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err("CreateJobObjectW failed".to_string());
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                CloseHandle(job);
+                return Err("SetInformationJobObject failed".to_string());
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                CloseHandle(job);
+                return Err("AssignProcessToJobObject failed".to_string());
+            }
+            Ok(Self(job))
+        }
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard exclusively owns the job handle.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 
@@ -939,8 +1010,24 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             };
         }
         last_stderr = stderr;
-        // A failed attempt may leave a partial dir; remove before retrying.
-        let _ = fs::remove_dir_all(&dir);
+        // A failed attempt may leave a partial dir; a remove that itself
+        // fails must surface, not silently feed the next attempt a dirty dir.
+        if dir.exists()
+            && let Err(error) = fs::remove_dir_all(&dir)
+        {
+            return done(
+                Outcome::Quarantined,
+                safe_reason(&format!(
+                    "failed clone left remains that could not be removed: {error}"
+                )),
+                None,
+                None,
+                Some(format!(
+                    "repo: {}\nphase: post-failure cleanup\nremove_dir_all: {error}\nclone stderr:\n{last_stderr}\n",
+                    row.record.full_name
+                )),
+            );
+        }
         if attempt == 1 {
             thread::sleep(Duration::from_secs(2));
         }
