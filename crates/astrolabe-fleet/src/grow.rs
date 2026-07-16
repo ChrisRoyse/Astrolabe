@@ -316,6 +316,54 @@ fn latest_grounding_from_ledger(
     Ok(out)
 }
 
+/// Read-only catalog-ledger scan for FSV readbacks: every decodable ledger
+/// entry whose JSON payload matches the optional `github_id`/`event` filters,
+/// in ledger order. This is the independent no-double-processing probe the
+/// growth cycle's DoD names — one mutation, one entry, countable.
+pub fn scan_ledger_events(
+    catalog: &FleetCatalog,
+    github_id: Option<u64>,
+    event: Option<&str>,
+) -> Result<Vec<Value>, CalyxError> {
+    let vault = catalog.vault();
+    let mut out = Vec::new();
+    for (index, (_key, bytes)) in vault
+        .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)?
+        .into_iter()
+        .enumerate()
+    {
+        let entry = calyx_ledger::decode(&bytes)?;
+        let Ok(payload) = serde_json::from_slice::<Value>(&entry.payload) else {
+            // Non-JSON payloads (e.g. raw kernel members-hash pairings) are
+            // still countable rows; surface them labeled, never dropped.
+            if github_id.is_none() && event.is_none() {
+                out.push(json!({
+                    "ledger_index": index,
+                    "kind": format!("{:?}", entry.kind),
+                    "payload": "<non-json>",
+                }));
+            }
+            continue;
+        };
+        if let Some(wanted) = github_id
+            && payload["github_id"].as_u64() != Some(wanted)
+        {
+            continue;
+        }
+        if let Some(wanted) = event
+            && payload["event"].as_str() != Some(wanted)
+        {
+            continue;
+        }
+        out.push(json!({
+            "ledger_index": index,
+            "kind": format!("{:?}", entry.kind),
+            "payload": payload,
+        }));
+    }
+    Ok(out)
+}
+
 /// Grounds every `indexed`/`kerneled`/`serving` row lacking
 /// `indexed_commit_hash` from the catalog's own ledger (see module docs).
 /// Idempotent; a row the ledger cannot ground is counted `ungrounded` and

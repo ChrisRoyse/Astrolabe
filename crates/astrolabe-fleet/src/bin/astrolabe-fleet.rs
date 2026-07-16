@@ -31,6 +31,7 @@
 //!                              [--size-cap-bytes <n>] [--budget-bytes <n>]
 //!                              [--store-budget-bytes <n>] [--parallelism <n>]
 //!                              [--timeout-secs <n>] [--at <unix-secs>]
+//! astrolabe-fleet ledger-scan  [--root <dir>] [--github-id <id>] [--event <name>] [--limit <n>]
 //! ```
 //!
 //! `grow` (#457) runs growth cycles: ledger-grounded backfill → optional
@@ -65,7 +66,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|grow|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|grow|ledger-scan|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -571,6 +572,31 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                 at_override,
             )?;
             println!("{report}");
+            Ok(())
+        }
+        "ledger-scan" => {
+            opts.reject_unknown(&["root", "github-id", "event", "limit"])?;
+            let github_id = opts
+                .get("github-id")
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|error| usage(&format!("--github-id must be a u64: {error}")))
+                })
+                .transpose()?;
+            let event = opts.get("event");
+            let mut entries =
+                astrolabe_fleet::grow::scan_ledger_events(&catalog, github_id, event)?;
+            if let Some(raw) = opts.get("limit") {
+                let limit = raw
+                    .parse::<usize>()
+                    .map_err(|error| usage(&format!("--limit must be a usize: {error}")))?;
+                let skip = entries.len().saturating_sub(limit);
+                entries.drain(..skip);
+            }
+            println!("{}", json!({"total": entries.len()}));
+            for entry in entries {
+                println!("{entry}");
+            }
             Ok(())
         }
         "report" => {
