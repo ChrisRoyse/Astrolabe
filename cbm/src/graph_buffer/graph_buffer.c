@@ -585,6 +585,11 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
     return 0;
 }
 
+/* Defined with the dump-array builders below; declared here so the token-vector
+ * store (a source-derived semantic token, read as a String by the importer) is
+ * sanitized to valid UTF-8 at its single population point (#503). */
+static char *gbuf_utf8_dup(const char *s);
+
 int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
                                 int vector_len, float idf) {
     if (!gb || !token || !vector || vector_len <= 0) {
@@ -612,7 +617,10 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
     gb->dump_token_vecs[idx] = (CBMDumpTokenVec){
         .id = idx + SKIP_ONE, /* 1-based sequential ID */
         .project = gb->project,
-        .token = strdup(token),
+        /* #503: token is a source-derived semantic-corpus term the importer reads
+         * as a String; sanitize to valid UTF-8 (free-compatible with the prior
+         * strdup — both malloc'd, freed with free() in the token-vec cleanup). */
+        .token = gbuf_utf8_dup(token),
         .vector = vec_copy,
         .vector_len = vector_len,
         .idf = idf,
