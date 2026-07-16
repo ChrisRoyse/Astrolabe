@@ -505,7 +505,7 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 7] = [
+    const SWITCHES: [&'static str; 8] = [
         "stdin",
         "counts",
         "refresh",
@@ -513,6 +513,7 @@ impl Options {
         "all-discovered",
         "all-cloned",
         "force",
+        "latest",
     ];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
