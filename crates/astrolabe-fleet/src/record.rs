@@ -89,6 +89,13 @@ pub const META_INDEX_WATERMARK: &str = "index_watermark";
 pub const META_KERNEL_SCOPE_ID: &str = "kernel_scope_id";
 /// Recorded reason, required when quarantining.
 pub const META_QUARANTINE_REASON: &str = "quarantine_reason";
+/// Committed paths excluded from the working-tree checkout because they are
+/// Windows/NTFS-invalid (#480) — a JSON string array. A labeled degradation
+/// fact (invariant 3): the clone farm materializes the tree minus exactly
+/// these paths via index plumbing (never `core.protectNTFS=false`), so any
+/// consumer of the clone can see precisely which committed files its view of
+/// the repository is missing. Absent/empty means the checkout is complete.
+pub const META_CHECKOUT_EXCLUSIONS: &str = "checkout_exclusions";
 /// Recorded reason, required when marking a repo departed (#450).
 pub const META_DEPARTED_REASON: &str = "departed_reason";
 /// Prefix of per-transition timestamp keys: `ts_<state>` = unix seconds the
@@ -199,6 +206,12 @@ pub struct TransitionContext {
     /// Measured on-disk bytes of the repo's fleet store directory (#454).
     #[serde(default)]
     pub store_bytes: Option<u64>,
+    /// Windows-invalid committed paths excluded from the checkout (#480).
+    /// `None` leaves the row's fact untouched; `Some(vec![])` clears it
+    /// (checkout complete again); a non-empty list sets it. The clone farm
+    /// passes reason-annotated, ledger-safe entries built via `safe_reason`.
+    #[serde(default)]
+    pub checkout_exclusions: Option<Vec<String>>,
 }
 
 /// One decoded catalog row: the discovery facts plus the lifecycle fields.
@@ -232,6 +245,10 @@ pub struct FleetRepoRow {
     pub clone_bytes: Option<u64>,
     /// Measured on-disk bytes of the repo's fleet store directory (#454).
     pub store_bytes: Option<u64>,
+    /// Windows-invalid committed paths excluded from the working-tree
+    /// checkout (#480), reason-annotated. Empty means the checkout is
+    /// complete — the normal case.
+    pub checkout_exclusions: Vec<String>,
 }
 
 /// Canonical identity bytes of a repository record:
@@ -309,6 +326,13 @@ pub fn encode_repo_constellation(
     }
     if let Some(reason) = &row.departed_reason {
         metadata.insert(META_DEPARTED_REASON.to_string(), reason.clone());
+    }
+    if !row.checkout_exclusions.is_empty() {
+        metadata.insert(
+            META_CHECKOUT_EXCLUSIONS.to_string(),
+            serde_json::to_string(&row.checkout_exclusions)
+                .expect("string array serializes"),
+        );
     }
     for (key, at) in &row.state_timestamps {
         metadata.insert(format!("{META_TS_PREFIX}{key}"), at.to_string());
@@ -433,5 +457,13 @@ pub fn decode_repo_constellation(
         departed_reason: meta_opt(META_DEPARTED_REASON),
         clone_bytes: scalar_opt(SCALAR_CLONE_BYTES)?,
         store_bytes: scalar_opt(SCALAR_STORE_BYTES)?,
+        checkout_exclusions: match constellation.metadata.get(META_CHECKOUT_EXCLUSIONS) {
+            None => Vec::new(),
+            Some(raw) => serde_json::from_str(raw).map_err(|error| {
+                corrupt(format!(
+                    "metadata {META_CHECKOUT_EXCLUSIONS:?} is not a JSON string array: {error}"
+                ))
+            })?,
+        },
     })
 }

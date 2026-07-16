@@ -182,6 +182,9 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                         })
                     })
                     .transpose()?,
+                // Farm-owned fact (#480): set only by real clone/update passes,
+                // never by hand — set-state leaves it untouched.
+                checkout_exclusions: None,
             };
             let report = catalog.transition(github_id, full_name, to, ctx)?;
             println!(

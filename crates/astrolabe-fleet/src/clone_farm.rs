@@ -5,17 +5,41 @@
 //! farm root (`D:\astrolabe-fleet\repos\<org>__<repo>` by default):
 //!
 //! - **Acquire** (default): records at [`RepoState::Discovered`] are cloned
-//!   with `git clone --single-branch --branch <default_branch>` and FULL
-//!   history — no shallow, no blobless: git archaeology (SZZ) needs the commit
-//!   graph and blobs. Before the record transitions to `cloned` the clone must
-//!   pass the integrity gate (`git rev-parse HEAD` + `git fsck
-//!   --connectivity-only`); failures quarantine with the git stderr captured
-//!   to a rejection report file.
+//!   with `git clone --no-checkout --single-branch --branch <default_branch>`
+//!   and FULL history — no shallow, no blobless: git archaeology (SZZ) needs
+//!   the commit graph and blobs. The committed tree is then enumerated from
+//!   the object store (`git ls-tree -r -z`) and classified for Windows-invalid
+//!   paths (#480) **before** anything touches the index or the working tree;
+//!   clean trees take the porcelain `git reset --hard` checkout, trees
+//!   carrying invalid paths are materialized through index plumbing minus
+//!   exactly the invalid entries (see below). Before the record transitions
+//!   to `cloned` the clone must pass the integrity gate (`git rev-parse HEAD`
+//!   + `git fsck --connectivity-only`); failures quarantine with the git
+//!   stderr captured to a rejection report file.
 //! - **Update** (`--update`): records at `cloned` or beyond are fetched
 //!   (`git fetch origin <default_branch>`); an unchanged head is an explicit
 //!   counted no-op, a moved head is applied with `git reset --hard FETCH_HEAD`
 //!   (farm clones are never locally modified) and recorded through
 //!   [`FleetCatalog::update_facts`].
+//!
+//! # Windows-invalid committed paths (#480)
+//!
+//! Some repositories commit paths NTFS cannot represent — reserved characters
+//! (`: < > " | ? *`), reserved device names (`CON`, `AUX`, `NUL`, `COM1`…),
+//! trailing dots/spaces, `:Zone.Identifier` ADS remnants. A plain checkout of
+//! such a tree fails on Windows (`error: invalid path`), and the widely-cited
+//! workaround (`core.protectNTFS=false`) disables git's defense against
+//! CVE-2019-1353-class hostile-repo attacks — unacceptable for a farm cloning
+//! arbitrary third-party code. Instead the farm keeps `core.protectNTFS` at
+//! its secure default and never lets an invalid path near the index: the tree
+//! is rebuilt entry-by-entry (`git read-tree --empty` + `git update-index
+//! --index-info`) with the invalid paths omitted, then materialized with
+//! `git checkout-index --all`. The omissions are a **labeled degradation**
+//! (invariant 3): recorded on the catalog row (`checkout_exclusions`), in the
+//! ledger payload, in the run report, and in full in
+//! `runs/exclusions-<github_id>.txt`. If the classifier ever under-detects,
+//! git itself still refuses at the plumbing step and the repo quarantines
+//! with the full stderr — never a silent partial tree.
 //!
 //! # Pre-existing directories
 //!
@@ -170,6 +194,11 @@ pub struct RepoOutcome {
     pub clone_bytes: Option<u64>,
     /// Wall seconds spent on this repo.
     pub secs: f64,
+    /// Windows-invalid committed paths excluded from the checkout (#480):
+    /// `None` = fact untouched, `Some(vec![])` = verified complete,
+    /// non-empty = the labeled degradation applied to the catalog row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusions: Option<Vec<String>>,
 }
 
 /// What the git phase of one job produced (thread → main).
@@ -181,6 +210,8 @@ struct JobResult {
     bytes: Option<u64>,
     rejection_text: Option<String>,
     secs: f64,
+    /// Checkout-exclusions fact to apply (#480); `None` leaves it untouched.
+    exclusions: Option<Vec<String>>,
 }
 
 /// Runs one clone-farm pass. `update` selects update mode; otherwise acquire.
@@ -266,6 +297,7 @@ pub fn run_clone_pass_outcome(
                             head_commit_hash: row.head_commit_hash.clone(),
                             clone_bytes: row.clone_bytes,
                             secs: 0.0,
+                            exclusions: None,
                         });
                     }
                 }
@@ -329,6 +361,7 @@ pub fn run_clone_pass_outcome(
                         head_commit_hash: None,
                         clone_bytes: None,
                         secs: 0.0,
+                        exclusions: None,
                     });
                     continue;
                 }
@@ -345,6 +378,7 @@ pub fn run_clone_pass_outcome(
                         head_commit_hash: None,
                         clone_bytes: None,
                         secs: 0.0,
+                        exclusions: None,
                     });
                     continue;
                 }
@@ -402,6 +436,7 @@ pub fn run_clone_pass_outcome(
                         ),
                         head_commit_hash: Some(head),
                         clone_bytes: Some(bytes),
+                        checkout_exclusions: result.exclusions.clone(),
                         ..TransitionContext::default()
                     },
                 )?;
@@ -420,6 +455,7 @@ pub fn run_clone_pass_outcome(
                         at_unix_secs: config.at_unix_secs,
                         head_commit_hash: Some(head),
                         clone_bytes: Some(bytes),
+                        checkout_exclusions: result.exclusions.clone(),
                         ..TransitionContext::default()
                     },
                 )?;
@@ -443,6 +479,7 @@ pub fn run_clone_pass_outcome(
             head_commit_hash: result.head,
             clone_bytes: result.bytes,
             secs: result.secs,
+            exclusions: result.exclusions,
         });
     }
     drop(tx);
@@ -460,6 +497,10 @@ pub fn run_clone_pass_outcome(
         "refused_budget": count(Outcome::RefusedBudget),
         "conflict": count(Outcome::Conflict),
         "update_failed": count(Outcome::UpdateFailed),
+        "with_exclusions": outcomes
+            .iter()
+            .filter(|o| o.exclusions.as_ref().is_some_and(|e| !e.is_empty()))
+            .count(),
         "total": outcomes.len(),
     });
     let run_id = format!("clone-{}-{}", config.at_unix_secs, std::process::id());
@@ -785,6 +826,293 @@ pub(crate) fn git_capture(args: &[&str], cwd: &Path) -> Result<(bool, String, St
     ))
 }
 
+/// Raw-bytes variant of [`git_capture`] for output that is path data, not
+/// text: `git ls-tree -z` paths are arbitrary bytes and a lossy UTF-8 pass
+/// would corrupt them before they can be fed back to `update-index` (#480).
+fn git_capture_raw(args: &[&str], cwd: &Path) -> Result<(bool, Vec<u8>, String), CalyxError> {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "credential.helper="])
+        .args(["-c", "core.longpaths=true"])
+        .current_dir(cwd)
+        .args(args);
+    silence_credential_prompts(&mut command);
+    let output = command.output().map_err(|error| CalyxError {
+        code: ASTRO_FLEET_GIT_SPAWN,
+        message: format!("failed to spawn git {}: {error}", args.join(" ")),
+        remediation: "git must be installed and on PATH for the clone farm",
+    })?;
+    Ok((
+        output.status.success(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
+/// Runs a git plumbing command feeding `input` on stdin (#480:
+/// `update-index --index-info`). Job-object guarded like every farm git; a
+/// writer thread avoids the stdin/stderr pipe deadlock on large trees.
+fn run_git_feed(args: &[&str], cwd: &Path, input: &[u8]) -> Result<(bool, String), CalyxError> {
+    use std::io::Write;
+    let spawn_err = |error: String| CalyxError {
+        code: ASTRO_FLEET_GIT_SPAWN,
+        message: format!("failed to run git {}: {error}", args.join(" ")),
+        remediation: "git must be installed and on PATH for the clone farm",
+    };
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "credential.helper="])
+        .args(["-c", "core.longpaths=true"])
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    silence_credential_prompts(&mut command);
+    let mut child = command.spawn().map_err(|error| spawn_err(error.to_string()))?;
+    let job = match JobGuard::assign(&child) {
+        Ok(guard) => guard,
+        Err(why) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(spawn_err(format!(
+                "could not tie git to the farm's job object: {why}"
+            )));
+        }
+    };
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let input = input.to_vec();
+    let writer = thread::spawn(move || {
+        // A write error here means git exited early; its stderr carries why.
+        let _ = stdin.write_all(&input);
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| spawn_err(error.to_string()))?;
+    let _ = writer.join();
+    drop(job);
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
+/// Maximum invalid-path entries recorded on the catalog row; the full list
+/// always lives in `runs/exclusions-<github_id>.txt`.
+const MAX_EXCLUSIONS_ON_ROW: usize = 32;
+
+/// One blob/gitlink entry of `git ls-tree -r -z`: mode, object id, and the
+/// raw path bytes (never lossy-decoded — they round-trip to `update-index`).
+struct TreeEntry {
+    mode: Vec<u8>,
+    sha: Vec<u8>,
+    path: Vec<u8>,
+}
+
+/// Why one slash-separated repo path cannot exist on a Windows filesystem,
+/// or `None` when it can. Mirrors the Win32 naming rules that make
+/// `git checkout` fail with `error: invalid path` under the secure
+/// `core.protectNTFS=true` default: reserved characters, control bytes,
+/// reserved device basenames (bare or with an extension), and components
+/// ending in a dot or space (silently renamed by Win32 file creation).
+/// Git itself remains the enforcer — anything this classifier misses still
+/// fails closed at the plumbing step with the git stderr captured.
+pub fn windows_invalid_path(path: &[u8]) -> Option<String> {
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() {
+            return Some("empty path component".to_string());
+        }
+        for &byte in component {
+            if byte < 0x20 {
+                return Some(format!("control byte 0x{byte:02x}"));
+            }
+            if matches!(byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' | b'\\') {
+                return Some(format!("reserved character '{}'", byte as char));
+            }
+        }
+        match component[component.len() - 1] {
+            b'.' => return Some("component ends with a dot".to_string()),
+            b' ' => return Some("component ends with a space".to_string()),
+            _ => {}
+        }
+        let base = component
+            .split(|&byte| byte == b'.')
+            .next()
+            .unwrap_or(component);
+        let upper = base.to_ascii_uppercase();
+        let device = matches!(upper.as_slice(), b"CON" | b"PRN" | b"AUX" | b"NUL")
+            || (upper.len() == 4
+                && (upper.starts_with(b"COM") || upper.starts_with(b"LPT"))
+                && upper[3].is_ascii_digit()
+                && upper[3] != b'0');
+        if device {
+            return Some(format!(
+                "reserved device name {}",
+                String::from_utf8_lossy(&upper)
+            ));
+        }
+    }
+    None
+}
+
+/// Enumerates `commit`'s full tree from the object store (never the
+/// filesystem) and splits it into materializable entries and Windows-invalid
+/// offenders `(display_path, why)` (#480).
+fn scan_tree(
+    dir: &Path,
+    commit: &str,
+) -> Result<(Vec<TreeEntry>, Vec<(String, String)>), String> {
+    let (ok, stdout, stderr) =
+        git_capture_raw(&["ls-tree", "-r", "-z", commit], dir).map_err(|error| error.message)?;
+    if !ok {
+        return Err(format!("git ls-tree -r {commit} failed: {stderr}"));
+    }
+    let mut entries = Vec::new();
+    let mut offenders = Vec::new();
+    for record in stdout.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let malformed = || {
+            format!(
+                "malformed ls-tree record: {:?}",
+                String::from_utf8_lossy(record)
+            )
+        };
+        let tab = record
+            .iter()
+            .position(|&byte| byte == b'\t')
+            .ok_or_else(malformed)?;
+        let (head, tail) = record.split_at(tab);
+        let path = &tail[1..];
+        let mut fields = head.split(|&byte| byte == b' ');
+        let mode = fields.next().ok_or_else(malformed)?;
+        let _object_type = fields.next().ok_or_else(malformed)?;
+        let sha = fields.next().ok_or_else(malformed)?;
+        if let Some(why) = windows_invalid_path(path) {
+            offenders.push((String::from_utf8_lossy(path).into_owned(), why));
+        } else {
+            entries.push(TreeEntry {
+                mode: mode.to_vec(),
+                sha: sha.to_vec(),
+                path: path.to_vec(),
+            });
+        }
+    }
+    Ok((entries, offenders))
+}
+
+/// Materializes the working tree of a clone whose index/worktree may not yet
+/// exist (#480). A clean tree takes the porcelain path (`git reset --hard
+/// <commit>`, exactly what a plain clone's checkout does, ref move included);
+/// a tree with offenders is rebuilt through index plumbing so the invalid
+/// paths never reach the index: empty the index, feed every valid entry,
+/// write out the worktree, then drop worktree files the filtered index no
+/// longer tracks (upstream deletions on the update path).
+fn materialize(
+    dir: &Path,
+    config: &FarmConfig,
+    commit: &str,
+    entries: &[TreeEntry],
+    offenders: &[(String, String)],
+    stderr_file: &Path,
+) -> Result<(), String> {
+    let timeout = Duration::from_secs(config.timeout_secs);
+    if offenders.is_empty() {
+        let (ok, stderr) = run_git(&["reset", "--hard", commit], Some(dir), timeout, stderr_file)
+            .map_err(|error| error.message)?;
+        if !ok {
+            return Err(format!("git reset --hard {commit} failed: {stderr}"));
+        }
+        return Ok(());
+    }
+    let (ok, _out, stderr) =
+        git_capture(&["read-tree", "--empty"], dir).map_err(|error| error.message)?;
+    if !ok {
+        return Err(format!("git read-tree --empty failed: {stderr}"));
+    }
+    // `<mode> SP <sha> TAB <path>` NUL-terminated — update-index --index-info
+    // stage-0 form, raw path bytes preserved end-to-end.
+    let mut input = Vec::new();
+    for entry in entries {
+        input.extend_from_slice(&entry.mode);
+        input.push(b' ');
+        input.extend_from_slice(&entry.sha);
+        input.push(b'\t');
+        input.extend_from_slice(&entry.path);
+        input.push(0);
+    }
+    let (ok, stderr) = run_git_feed(&["update-index", "-z", "--index-info"], dir, &input)
+        .map_err(|error| error.message)?;
+    if !ok {
+        return Err(format!(
+            "git update-index --index-info refused the filtered tree ({} entries, {} excluded): {stderr}",
+            entries.len(),
+            offenders.len()
+        ));
+    }
+    let (ok, stderr) = run_git(
+        &["checkout-index", "--all", "--force"],
+        Some(dir),
+        timeout,
+        stderr_file,
+    )
+    .map_err(|error| error.message)?;
+    if !ok {
+        return Err(format!("git checkout-index --all failed: {stderr}"));
+    }
+    let (ok, stderr) = run_git(&["clean", "-q", "-f", "-d", "-x"], Some(dir), timeout, stderr_file)
+        .map_err(|error| error.message)?;
+    if !ok {
+        return Err(format!("git clean -fdx failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// The catalog-row form of the exclusions: reason-annotated, ledger-safe
+/// ([`safe_reason`]), capped at [`MAX_EXCLUSIONS_ON_ROW`] with an explicit
+/// counted remainder. An empty offender list yields an empty vec, which
+/// **clears** the row fact.
+fn exclusions_row_fact(offenders: &[(String, String)], github_id: u64) -> Vec<String> {
+    let mut fact: Vec<String> = offenders
+        .iter()
+        .take(MAX_EXCLUSIONS_ON_ROW)
+        .map(|(path, why)| safe_reason(&format!("{path} ({why})")))
+        .collect();
+    if offenders.len() > MAX_EXCLUSIONS_ON_ROW {
+        fact.push(format!(
+            "… and {} more; full list in runs/exclusions-{github_id}.txt",
+            offenders.len() - MAX_EXCLUSIONS_ON_ROW
+        ));
+    }
+    fact
+}
+
+/// Persists the full, uncapped exclusion list beside the rejection files.
+/// Evidence, not the gate: a write failure is reported and the (capped)
+/// catalog-row fact still records the degradation.
+fn write_exclusions_file(runs_dir: &Path, github_id: u64, offenders: &[(String, String)]) {
+    let mut text = String::new();
+    for (path, why) in offenders {
+        text.push_str(path);
+        text.push('\t');
+        text.push_str(why);
+        text.push('\n');
+    }
+    if let Err(error) = fs::create_dir_all(runs_dir).and_then(|()| {
+        fs::write(runs_dir.join(format!("exclusions-{github_id}.txt")), text)
+    }) {
+        eprintln!(
+            "{}",
+            json!({
+                "code": "ASTRO_FLEET_EXCLUSIONS_FILE_UNWRITABLE",
+                "message": format!("cannot write exclusions file for github_id {github_id}: {error}"),
+                "remediation": "the farm root must be writable; the capped exclusion fact is still on the catalog row",
+            })
+        );
+    }
+}
+
 /// Recursive on-disk byte measure of a clone directory.
 fn measure_dir_bytes(dir: &Path) -> u64 {
     let mut total = 0_u64;
@@ -851,7 +1179,8 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                 detail: String,
                 head: Option<String>,
                 bytes: Option<u64>,
-                rejection: Option<String>| {
+                rejection: Option<String>,
+                exclusions: Option<Vec<String>>| {
         JobResult {
             row: row.clone(),
             outcome,
@@ -860,6 +1189,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             bytes,
             rejection_text: rejection,
             secs: started.elapsed().as_secs_f64(),
+            exclusions,
         }
     };
 
@@ -874,6 +1204,60 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                     // Healthy candidate for adoption: gate it like a clone.
                     match integrity_gate(&dir) {
                         Ok(head) => {
+                            // #480: re-derive the exclusions fact from the
+                            // committed tree — a dir the farm materialized
+                            // with exclusions re-adopts with the fact intact,
+                            // and one carrying offenders (e.g. cloned
+                            // externally) is idempotently re-materialized.
+                            let (entries, offenders) = match scan_tree(&dir, "HEAD") {
+                                Ok(pair) => pair,
+                                Err(why) => {
+                                    return done(
+                                        Outcome::Quarantined,
+                                        safe_reason(&format!(
+                                            "adopted clone tree scan failed; rejection file {}.txt has details",
+                                            row.record.github_id
+                                        )),
+                                        None,
+                                        None,
+                                        Some(format!(
+                                            "repo: {}\nphase: adoption tree scan\n{why}\n",
+                                            row.record.full_name
+                                        )),
+                                        None,
+                                    );
+                                }
+                            };
+                            if !offenders.is_empty() {
+                                if let Err(why) = materialize(
+                                    &dir,
+                                    config,
+                                    "HEAD",
+                                    &entries,
+                                    &offenders,
+                                    &stderr_file,
+                                ) {
+                                    return done(
+                                        Outcome::Quarantined,
+                                        safe_reason(&format!(
+                                            "adopted clone re-materialization failed; rejection file {}.txt has details",
+                                            row.record.github_id
+                                        )),
+                                        None,
+                                        None,
+                                        Some(format!(
+                                            "repo: {}\nphase: adoption filtered materialization\n{why}\n",
+                                            row.record.full_name
+                                        )),
+                                        None,
+                                    );
+                                }
+                                write_exclusions_file(
+                                    &config.farm_root.join("runs"),
+                                    row.record.github_id,
+                                    &offenders,
+                                );
+                            }
                             let bytes = measure_dir_bytes(&dir);
                             if bytes > config.size_cap_bytes {
                                 return done(
@@ -885,14 +1269,27 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                                     None,
                                     None,
                                     None,
+                                    None,
                                 );
                             }
+                            let detail = if offenders.is_empty() {
+                                "pre-existing healthy clone with matching origin adopted".to_string()
+                            } else {
+                                format!(
+                                    "pre-existing healthy clone adopted; {} windows-invalid path(s) excluded from checkout (labeled)",
+                                    offenders.len()
+                                )
+                            };
                             return done(
                                 Outcome::Adopted,
-                                "pre-existing healthy clone with matching origin adopted".into(),
+                                detail,
                                 Some(head),
                                 Some(bytes),
                                 None,
+                                Some(exclusions_row_fact(
+                                    &offenders,
+                                    row.record.github_id,
+                                )),
                             );
                         }
                         Err(_gate_fail) => {
@@ -902,6 +1299,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                                 return done(
                                     Outcome::Quarantined,
                                     "torn clone dir could not be removed for recovery".into(),
+                                    None,
                                     None,
                                     None,
                                     None,
@@ -925,6 +1323,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                             dir.display(),
                             row.record.clone_url
                         )),
+                        None,
                     );
                 }
                 _ => {
@@ -933,6 +1332,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                         return done(
                             Outcome::Quarantined,
                             "torn clone dir could not be removed for recovery".into(),
+                            None,
                             None,
                             None,
                             None,
@@ -956,6 +1356,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                         None,
                         None,
                         None,
+                        None,
                     );
                 }
                 recovered = true;
@@ -969,12 +1370,14 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                         "target: {}\nforeign non-git content present; farm will never delete it\n",
                         dir.display()
                     )),
+                    None,
                 );
             }
         }
     }
 
-    // Fresh clone, with one retry on timeout/transient failure.
+    // Fresh clone (checkout deferred, #480) with one retry on
+    // timeout/transient failure.
     let url = row.record.clone_url.clone();
     let branch = row.record.default_branch.clone();
     let dir_str = dir.display().to_string();
@@ -982,6 +1385,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
     for attempt in 1..=2 {
         let clone_args = [
             "clone",
+            "--no-checkout",
             "--single-branch",
             "--branch",
             branch.as_str(),
@@ -998,53 +1402,91 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             Err(error) => (false, error.message),
         };
         if ok {
-            // Post-clone measured size cap.
-            let bytes = measure_dir_bytes(&dir);
-            if bytes > config.size_cap_bytes {
-                let _ = fs::remove_dir_all(&dir);
-                return done(
-                    Outcome::Quarantined,
-                    format!(
-                        "too-large: measured {bytes} bytes > {}-byte cap (reported {} KiB); clone removed",
-                        config.size_cap_bytes, row.record.size_kb
-                    ),
-                    None,
-                    None,
-                    None,
-                );
-            }
-            return match integrity_gate(&dir) {
-                Ok(head) => done(
-                    if recovered {
-                        Outcome::Recovered
-                    } else {
-                        Outcome::Acquired
-                    },
-                    if recovered {
-                        "torn clone removed and re-cloned clean".into()
-                    } else {
-                        "fresh full-history clone".into()
-                    },
-                    Some(head),
-                    Some(bytes),
-                    None,
-                ),
-                Err(gate_fail) => {
-                    let detail = safe_reason(&format!("clone integrity failure: {gate_fail}"));
-                    done(
-                        Outcome::Quarantined,
-                        detail,
-                        None,
-                        None,
-                        Some(format!(
-                            "repo: {}\nphase: integrity gate\n{gate_fail}\n",
-                            row.record.full_name
-                        )),
-                    )
+            // #480: enumerate + classify the committed tree from the object
+            // store, then materialize — porcelain when clean, filtered index
+            // plumbing when Windows-invalid paths exist. A failure here is
+            // treated exactly like a clone failure: dir removed, one retry,
+            // then quarantine with the captured detail.
+            let materialized = scan_tree(&dir, "HEAD").and_then(|(entries, offenders)| {
+                materialize(&dir, config, "HEAD", &entries, &offenders, &stderr_file)
+                    .map(|()| offenders)
+            });
+            match materialized {
+                Ok(offenders) => {
+                    if !offenders.is_empty() {
+                        write_exclusions_file(
+                            &config.farm_root.join("runs"),
+                            row.record.github_id,
+                            &offenders,
+                        );
+                    }
+                    // Post-checkout measured size cap.
+                    let bytes = measure_dir_bytes(&dir);
+                    if bytes > config.size_cap_bytes {
+                        let _ = fs::remove_dir_all(&dir);
+                        return done(
+                            Outcome::Quarantined,
+                            format!(
+                                "too-large: measured {bytes} bytes > {}-byte cap (reported {} KiB); clone removed",
+                                config.size_cap_bytes, row.record.size_kb
+                            ),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                    return match integrity_gate(&dir) {
+                        Ok(head) => {
+                            let mut detail = if recovered {
+                                "torn clone removed and re-cloned clean".to_string()
+                            } else {
+                                "fresh full-history clone".to_string()
+                            };
+                            if !offenders.is_empty() {
+                                detail.push_str(&format!(
+                                    "; {} windows-invalid path(s) excluded from checkout (labeled; full list in runs/exclusions-{}.txt)",
+                                    offenders.len(),
+                                    row.record.github_id
+                                ));
+                            }
+                            done(
+                                if recovered {
+                                    Outcome::Recovered
+                                } else {
+                                    Outcome::Acquired
+                                },
+                                detail,
+                                Some(head),
+                                Some(bytes),
+                                None,
+                                Some(exclusions_row_fact(&offenders, row.record.github_id)),
+                            )
+                        }
+                        Err(gate_fail) => {
+                            let detail =
+                                safe_reason(&format!("clone integrity failure: {gate_fail}"));
+                            done(
+                                Outcome::Quarantined,
+                                detail,
+                                None,
+                                None,
+                                Some(format!(
+                                    "repo: {}\nphase: integrity gate\n{gate_fail}\n",
+                                    row.record.full_name
+                                )),
+                                None,
+                            )
+                        }
+                    };
                 }
-            };
+                Err(why) => {
+                    last_stderr = format!("tree scan / checkout materialization failed: {why}");
+                }
+            }
+        } else {
+            last_stderr = stderr;
         }
-        last_stderr = stderr;
         // A failed attempt may leave a partial dir; a remove that itself
         // fails must surface, not silently feed the next attempt a dirty dir.
         if dir.exists()
@@ -1061,6 +1503,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                     "repo: {}\nphase: post-failure cleanup\nremove_dir_all: {error}\nclone stderr:\n{last_stderr}\n",
                     row.record.full_name
                 )),
+                None,
             );
         }
         if attempt == 1 {
@@ -1076,20 +1519,26 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
         None,
         None,
         Some(format!(
-            "repo: {}\nphase: git clone\n{last_stderr}\n",
+            "repo: {}\nphase: git clone/materialize\n{last_stderr}\n",
             row.record.full_name
         )),
+        None,
     )
 }
 
-/// The update job for one repo: fetch, compare, fast-forward, gate.
+/// The update job for one repo: fetch, compare, fast-forward, gate. The new
+/// head's tree is scanned like a fresh clone's (#480): a head that gains
+/// Windows-invalid paths moves the branch with `reset --soft` and
+/// re-materializes through the filtered index plumbing; one whose offenders
+/// disappear clears the row's exclusions fact.
 fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
     let started = Instant::now();
     let done = |outcome: Outcome,
                 detail: String,
                 head: Option<String>,
                 bytes: Option<u64>,
-                rejection: Option<String>| {
+                rejection: Option<String>,
+                exclusions: Option<Vec<String>>| {
         JobResult {
             row: row.clone(),
             outcome,
@@ -1098,12 +1547,14 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             bytes,
             rejection_text: rejection,
             secs: started.elapsed().as_secs_f64(),
+            exclusions,
         }
     };
     let Some(clone_path) = row.clone_path.as_deref() else {
         return done(
             Outcome::UpdateFailed,
             "record has no clone_path; cannot update".into(),
+            None,
             None,
             None,
             None,
@@ -1136,6 +1587,7 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                 "repo: {}\nphase: git fetch\n{stderr}\n",
                 row.record.full_name
             )),
+            None,
         );
     }
     let (ok, fetched_head, stderr) = match git_capture(&["rev-parse", "FETCH_HEAD"], &dir) {
@@ -1149,6 +1601,7 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             None,
             None,
             None,
+            None,
         );
     }
     if Some(fetched_head.as_str()) == row.head_commit_hash.as_deref() {
@@ -1158,31 +1611,90 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             row.head_commit_hash.clone(),
             row.clone_bytes,
             None,
+            None,
         );
     }
-    // Farm clones are never locally modified: apply the new head exactly.
-    let (ok, _out, stderr) = match git_capture(&["reset", "--hard", "FETCH_HEAD"], &dir) {
-        Ok(triple) => triple,
-        Err(error) => (false, String::new(), error.message),
+    // #480: classify the NEW head's tree before it touches index/worktree.
+    let (entries, offenders) = match scan_tree(&dir, "FETCH_HEAD") {
+        Ok(pair) => pair,
+        Err(why) => {
+            return done(
+                Outcome::UpdateFailed,
+                safe_reason(&format!(
+                    "fetched-head tree scan failed; rejection file {}.txt has details",
+                    row.record.github_id
+                )),
+                None,
+                None,
+                Some(format!(
+                    "repo: {}\nphase: update tree scan\n{why}\n",
+                    row.record.full_name
+                )),
+                None,
+            );
+        }
     };
-    if !ok {
+    // Farm clones are never locally modified: apply the new head exactly.
+    // Offender trees first move the branch ref alone (`reset --soft`), then
+    // materialize minus the invalid paths; `materialize` handles the clean
+    // case with the porcelain `reset --hard`.
+    if !offenders.is_empty() {
+        let (ok, _out, stderr) = match git_capture(&["reset", "--soft", "FETCH_HEAD"], &dir) {
+            Ok(triple) => triple,
+            Err(error) => (false, String::new(), error.message),
+        };
+        if !ok {
+            return done(
+                Outcome::UpdateFailed,
+                safe_reason(&format!("reset --soft FETCH_HEAD failed: {stderr}")),
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    if let Err(why) = materialize(&dir, config, "FETCH_HEAD", &entries, &offenders, &stderr_file) {
         return done(
             Outcome::UpdateFailed,
-            safe_reason(&format!("reset --hard FETCH_HEAD failed: {stderr}")),
+            safe_reason(&format!(
+                "update materialization failed; rejection file {}.txt has details",
+                row.record.github_id
+            )),
             None,
             None,
+            Some(format!(
+                "repo: {}\nphase: update materialization\n{why}\n",
+                row.record.full_name
+            )),
             None,
+        );
+    }
+    if !offenders.is_empty() {
+        write_exclusions_file(
+            &config.farm_root.join("runs"),
+            row.record.github_id,
+            &offenders,
         );
     }
     match integrity_gate(&dir) {
         Ok(head) => {
             let bytes = measure_dir_bytes(&dir);
+            let detail = if offenders.is_empty() {
+                "head watermark advanced".to_string()
+            } else {
+                format!(
+                    "head watermark advanced; {} windows-invalid path(s) excluded from checkout (labeled)",
+                    offenders.len()
+                )
+            };
             done(
                 Outcome::Updated,
-                "head watermark advanced".into(),
+                detail,
                 Some(head),
                 Some(bytes),
                 None,
+                Some(exclusions_row_fact(&offenders, row.record.github_id)),
             )
         }
         Err(gate_fail) => done(
@@ -1194,6 +1706,7 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                 "repo: {}\nphase: post-update integrity gate\n{gate_fail}\n",
                 row.record.full_name
             )),
+            None,
         ),
     }
 }
