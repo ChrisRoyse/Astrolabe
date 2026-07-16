@@ -330,8 +330,7 @@ pub fn encode_repo_constellation(
     if !row.checkout_exclusions.is_empty() {
         metadata.insert(
             META_CHECKOUT_EXCLUSIONS.to_string(),
-            serde_json::to_string(&row.checkout_exclusions)
-                .expect("string array serializes"),
+            serde_json::to_string(&row.checkout_exclusions).expect("string array serializes"),
         );
     }
     for (key, at) in &row.state_timestamps {

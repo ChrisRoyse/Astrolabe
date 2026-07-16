@@ -869,7 +869,9 @@ fn run_git_feed(args: &[&str], cwd: &Path, input: &[u8]) -> Result<(bool, String
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     silence_credential_prompts(&mut command);
-    let mut child = command.spawn().map_err(|error| spawn_err(error.to_string()))?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| spawn_err(error.to_string()))?;
     let job = match JobGuard::assign(&child) {
         Ok(guard) => guard,
         Err(why) => {
@@ -1020,8 +1022,13 @@ fn materialize(
 ) -> Result<(), String> {
     let timeout = Duration::from_secs(config.timeout_secs);
     if offenders.is_empty() {
-        let (ok, stderr) = run_git(&["reset", "--hard", commit], Some(dir), timeout, stderr_file)
-            .map_err(|error| error.message)?;
+        let (ok, stderr) = run_git(
+            &["reset", "--hard", commit],
+            Some(dir),
+            timeout,
+            stderr_file,
+        )
+        .map_err(|error| error.message)?;
         if !ok {
             return Err(format!("git reset --hard {commit} failed: {stderr}"));
         }
@@ -1062,8 +1069,13 @@ fn materialize(
     if !ok {
         return Err(format!("git checkout-index --all failed: {stderr}"));
     }
-    let (ok, stderr) = run_git(&["clean", "-q", "-f", "-d", "-x"], Some(dir), timeout, stderr_file)
-        .map_err(|error| error.message)?;
+    let (ok, stderr) = run_git(
+        &["clean", "-q", "-f", "-d", "-x"],
+        Some(dir),
+        timeout,
+        stderr_file,
+    )
+    .map_err(|error| error.message)?;
     if !ok {
         return Err(format!("git clean -fdx failed: {stderr}"));
     }
@@ -1100,9 +1112,9 @@ fn write_exclusions_file(runs_dir: &Path, github_id: u64, offenders: &[(String, 
         text.push_str(why);
         text.push('\n');
     }
-    if let Err(error) = fs::create_dir_all(runs_dir).and_then(|()| {
-        fs::write(runs_dir.join(format!("exclusions-{github_id}.txt")), text)
-    }) {
+    if let Err(error) = fs::create_dir_all(runs_dir)
+        .and_then(|()| fs::write(runs_dir.join(format!("exclusions-{github_id}.txt")), text))
+    {
         eprintln!(
             "{}",
             json!({
@@ -1274,7 +1286,8 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                                 );
                             }
                             let detail = if offenders.is_empty() {
-                                "pre-existing healthy clone with matching origin adopted".to_string()
+                                "pre-existing healthy clone with matching origin adopted"
+                                    .to_string()
                             } else {
                                 format!(
                                     "pre-existing healthy clone adopted; {} windows-invalid path(s) excluded from checkout (labeled)",
@@ -1287,10 +1300,7 @@ fn acquire_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
                                 Some(head),
                                 Some(bytes),
                                 None,
-                                Some(exclusions_row_fact(
-                                    &offenders,
-                                    row.record.github_id,
-                                )),
+                                Some(exclusions_row_fact(&offenders, row.record.github_id)),
                             );
                         }
                         Err(_gate_fail) => {
@@ -1655,7 +1665,14 @@ fn update_job(row: &FleetRepoRow, config: &FarmConfig) -> JobResult {
             );
         }
     }
-    if let Err(why) = materialize(&dir, config, "FETCH_HEAD", &entries, &offenders, &stderr_file) {
+    if let Err(why) = materialize(
+        &dir,
+        config,
+        "FETCH_HEAD",
+        &entries,
+        &offenders,
+        &stderr_file,
+    ) {
         return done(
             Outcome::UpdateFailed,
             safe_reason(&format!(
