@@ -1130,6 +1130,66 @@ pub fn read_fleet_kernel(
     let reserialized = artifact.kernel_json_bytes();
     let serializer_stable = reserialized == raw;
 
+    // Independent members-hash ledger pairing (invariant 5): the Kernel CF
+    // members-hash row and the latest Kernel ledger entry for this scope's
+    // subject must carry the same bytes, and that entry's members_hash must
+    // match the persisted artifact. Fail-closed on any divergence.
+    let mut members_key = Vec::new();
+    members_key.extend_from_slice(astrolabe_ingest::KERNEL_ARTIFACT_CF_PREFIX);
+    members_key.extend_from_slice(scope.as_bytes());
+    members_key.push(b':');
+    members_key.extend_from_slice(b"members-hash");
+    let members_row = vault
+        .read_cf_at(vault.latest_seq(), ColumnFamily::Kernel, &members_key)?
+        .ok_or_else(|| CalyxError {
+            code: ASTRO_FLEET_KERNEL_READBACK,
+            message: format!("no members-hash row persisted at scope {scope:?}"),
+            remediation: "recompose the fleet kernel; the artifact row set is torn",
+        })?;
+    let subject = format!("astrolabe-kernel:{scope}").into_bytes();
+    let mut paired_payload: Option<Vec<u8>> = None;
+    for (_key, bytes) in vault.scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)? {
+        let entry = calyx_ledger::decode(&bytes)?;
+        if entry.kind == calyx_ledger::EntryKind::Kernel
+            && matches!(&entry.subject, calyx_ledger::SubjectId::Query(s) if s.as_slice() == subject.as_slice())
+        {
+            // Scan order is ascending; the last match is the latest entry.
+            paired_payload = Some(entry.payload);
+        }
+    }
+    let ledger_payload = paired_payload.ok_or_else(|| CalyxError {
+        code: ASTRO_FLEET_KERNEL_READBACK,
+        message: format!("no Kernel ledger entry found for scope subject {scope:?}"),
+        remediation: "recompose the fleet kernel; the mutation lost its ledger pairing",
+    })?;
+    if ledger_payload != members_row {
+        return Err(CalyxError {
+            code: ASTRO_FLEET_KERNEL_READBACK,
+            message: format!(
+                "Kernel ledger payload ({} bytes) differs from the members-hash row ({} bytes) for scope {scope:?}",
+                ledger_payload.len(),
+                members_row.len()
+            ),
+            remediation: "recompose the fleet kernel; row and ledger diverged",
+        });
+    }
+    let ledger_entry: astrolabe_kernel::KernelLedgerEntry = serde_json::from_slice(&ledger_payload)
+        .map_err(|error| CalyxError {
+            code: ASTRO_FLEET_KERNEL_READBACK,
+            message: format!("Kernel ledger payload did not parse: {error}"),
+            remediation: "recompose the fleet kernel; the ledger payload is corrupt",
+        })?;
+    if ledger_entry.members_hash != artifact.members_hash {
+        return Err(CalyxError {
+            code: ASTRO_FLEET_KERNEL_READBACK,
+            message: format!(
+                "ledger members_hash {} differs from persisted kernel.json members_hash {}",
+                ledger_entry.members_hash, artifact.members_hash
+            ),
+            remediation: "recompose the fleet kernel; row and ledger diverged",
+        });
+    }
+
     let sidecar = catalog
         .read_fleet_report(FLEET_KERNEL_REPORT_KIND, scope)?
         .map(|bytes| {
@@ -1149,6 +1209,9 @@ pub fn read_fleet_kernel(
         "members_hash_persisted": artifact.members_hash,
         "members_hash_rederived": rederived,
         "serializer_stable": serializer_stable,
+        "ledger_paired": true,
+        "ledger_members_hash": ledger_entry.members_hash,
+        "ledger_member_count": ledger_entry.member_count,
         "member_count": artifact.member_count,
         "node_count": artifact.node_count,
         "recall_permille": artifact.recall.permille,
