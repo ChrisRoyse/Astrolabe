@@ -120,6 +120,39 @@ $RequiredTools = @(
     "mingw32-make.exe",
     "make.exe"
 )
+$NvccCcbinEnv = "NVCC_CCBIN"
+$ForgeCudaCcbinEnv = "FORGE_CUDA_CCBIN"
+$NvccAppendFlagsEnv = "NVCC_APPEND_FLAGS"
+$MsvcRuntimeArchiveName = "msvcrt.lib"
+$MsvcRuntimeSupportMembers = @(
+    "amdsecgs.obj",
+    "gshandler.obj",
+    "gshandlereh4.obj",
+    "gs_cookie.obj",
+    "gs_report.obj",
+    "thread_safe_statics.obj"
+)
+$MsvcRuntimeImportLibNames = @(
+    "vcruntime.lib",
+    "msvcprt.lib"
+)
+$MsvcVcStartupArchiveName = "libcmt.lib"
+$MsvcVcStartupSupportMembers = @(
+    "delete_scalar_size.obj",
+    "delete_array_size.obj",
+    "std_type_info_static.obj",
+    "ehvecdtr.obj",
+    "fltused.obj"
+)
+$WindowsKitUcrtImportLibName = "ucrt.lib"
+$CudaImportLibNames = @(
+    "cudart.lib",
+    "cuda.lib",
+    "nvrtc.lib",
+    "curand.lib",
+    "cublas.lib",
+    "cublasLt.lib"
+)
 $RuntimeDlls = @("libgcc_s_seh-1.dll", "libwinpthread-1.dll")
 $RequiredLlvmTools = @("clang-tidy.exe", "clang-format.exe")
 # #303: the lld linker ships in the same pinned LLVM 20.1.8 bundle as clang-tidy/clang-format.
@@ -650,6 +683,504 @@ function Get-SccacheServerPort {
     return [string]($SccacheServerPortBase + ([BitConverter]::ToUInt16($hash, 0) % $SccacheServerPortSpan))
 }
 
+function Resolve-CudaHostCompilerPath {
+    param([Parameter(Mandatory)][string]$RawPath, [Parameter(Mandatory)][string]$EnvName)
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($RawPath.Trim())
+    if ([string]::IsNullOrWhiteSpace($expanded)) {
+        throw "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN_INVALID]: $EnvName is empty; set it to cl.exe or the Hostx64\x64 directory containing cl.exe"
+    }
+    $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction SilentlyContinue).Path
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        throw "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN_INVALID]: $EnvName=$RawPath does not resolve to an existing path"
+    }
+    if (Test-Path -LiteralPath $resolved -PathType Container) {
+        $candidate = Join-Path $resolved "cl.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $resolved
+        }
+    }
+    if ((Test-Path -LiteralPath $resolved -PathType Leaf) -and
+        [string]::Equals([IO.Path]::GetFileName($resolved), "cl.exe", [StringComparison]::OrdinalIgnoreCase)) {
+        return Split-Path -Parent $resolved
+    }
+    throw "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN_INVALID]: $EnvName must point to cl.exe or a directory containing cl.exe"
+}
+
+function Get-MsvcVersionKey {
+    param([Parameter(Mandatory)][string]$Ccbin)
+
+    $parts = $Ccbin -split '[\\/]'
+    for ($i = 0; $i -lt $parts.Length - 1; $i++) {
+        if ([string]::Equals($parts[$i], "MSVC", [StringComparison]::OrdinalIgnoreCase)) {
+            try {
+                return [version]$parts[$i + 1]
+            }
+            catch {
+                return [version]"0.0"
+            }
+        }
+    }
+    return [version]"0.0"
+}
+
+function Get-MsvcCudaHostCompilerCandidates {
+    $roots = @()
+    if ($env:ProgramFiles) {
+        $roots += (Join-Path $env:ProgramFiles "Microsoft Visual Studio")
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $roots += (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio")
+    }
+
+    $candidates = @()
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+        Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue
+            } |
+            ForEach-Object {
+                $msvcRoot = Join-Path $_.FullName "VC\Tools\MSVC"
+                if (Test-Path -LiteralPath $msvcRoot -PathType Container) {
+                    Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue |
+                        ForEach-Object {
+                            $ccbin = Join-Path $_.FullName "bin\Hostx64\x64"
+                            if (Test-Path -LiteralPath (Join-Path $ccbin "cl.exe") -PathType Leaf) {
+                                $candidates += $ccbin
+                            }
+                        }
+                }
+            }
+    }
+    return $candidates | Sort-Object @{ Expression = { Get-MsvcVersionKey -Ccbin $_ } }, @{ Expression = { $_ } }
+}
+
+function Set-CudaHostCompilerEnvironment {
+    $nvccOverride = Get-Item -Path "Env:$NvccCcbinEnv" -ErrorAction SilentlyContinue
+    if ($null -ne $nvccOverride) {
+        $ccbin = Resolve-CudaHostCompilerPath -RawPath $nvccOverride.Value -EnvName $NvccCcbinEnv
+        $env:NVCC_CCBIN = $ccbin
+        $env:FORGE_CUDA_CCBIN = $ccbin
+        Write-Output "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN]: using $NvccCcbinEnv=$ccbin"
+        return
+    }
+
+    $forgeOverride = Get-Item -Path "Env:$ForgeCudaCcbinEnv" -ErrorAction SilentlyContinue
+    if ($null -ne $forgeOverride) {
+        $ccbin = Resolve-CudaHostCompilerPath -RawPath $forgeOverride.Value -EnvName $ForgeCudaCcbinEnv
+        $env:NVCC_CCBIN = $ccbin
+        $env:FORGE_CUDA_CCBIN = $ccbin
+        Write-Output "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN]: using $ForgeCudaCcbinEnv=$ccbin"
+        return
+    }
+
+    $pathCl = Get-Command "cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $pathCl) {
+        $ccbin = Resolve-CudaHostCompilerPath -RawPath $pathCl.Source -EnvName "PATH"
+        $env:NVCC_CCBIN = $ccbin
+        $env:FORGE_CUDA_CCBIN = $ccbin
+        Write-Output "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN]: using cl.exe from PATH at $ccbin"
+        return
+    }
+
+    $ccbin = @(Get-MsvcCudaHostCompilerCandidates | Select-Object -Last 1)
+    if ($ccbin.Count -gt 0) {
+        $env:NVCC_CCBIN = $ccbin[0]
+        $env:FORGE_CUDA_CCBIN = $ccbin[0]
+        Write-Output "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN]: discovered $($ccbin[0])"
+        return
+    }
+
+    if ($env:CUDA_PATH -and (Test-Path -LiteralPath (Join-Path $env:CUDA_PATH "bin\nvcc.exe") -PathType Leaf)) {
+        Write-Output "CUDA_HOST_COMPILER[ASTRO_CUDA_CCBIN_UNSET]: CUDA nvcc is installed but no cl.exe host compiler was found; CUDA crate builds that invoke nvcc will fail closed. Install Visual Studio Build Tools MSVC x64 tools or set NVCC_CCBIN."
+    }
+}
+
+function Add-NvccAppendFlag {
+    param([Parameter(Mandatory)][string]$Flag)
+
+    $existingItem = Get-Item -Path "Env:$NvccAppendFlagsEnv" -ErrorAction SilentlyContinue
+    $existing = if ($null -ne $existingItem) { $existingItem.Value } else { "" }
+    if ($existing -and $existing.Contains($Flag)) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        $env:NVCC_APPEND_FLAGS = $Flag
+    }
+    else {
+        $env:NVCC_APPEND_FLAGS = "$existing $Flag"
+    }
+}
+
+function Resolve-MsvcLibRootFromCudaCcbin {
+    param([Parameter(Mandatory)][string]$Ccbin)
+
+    $resolved = (Resolve-Path -LiteralPath $Ccbin -ErrorAction SilentlyContinue).Path
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_LIB_ROOT_INVALID]: CUDA host compiler directory does not resolve: $Ccbin"
+    }
+    $normalized = $resolved.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $match = [regex]::Match($normalized, '^(?<root>.+[\\/]VC[\\/]Tools[\\/]MSVC[\\/][^\\/]+)[\\/]bin[\\/]Hostx64[\\/]x64$')
+    if (-not $match.Success) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_LIB_ROOT_INVALID]: CUDA host compiler path must be an MSVC Hostx64\x64 directory, found $resolved"
+    }
+    $libRoot = Join-Path $match.Groups["root"].Value "lib\x64"
+    if (-not (Test-Path -LiteralPath $libRoot -PathType Container)) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_LIB_ROOT_MISSING]: MSVC x64 lib root is missing: $libRoot"
+    }
+    $archive = Join-Path $libRoot $MsvcRuntimeArchiveName
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_LIB_MISSING]: required $MsvcRuntimeArchiveName is missing from $libRoot"
+    }
+    return $libRoot
+}
+
+function Prepend-PathListEnv {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    $existingItem = Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue
+    $existing = if ($null -ne $existingItem) { $existingItem.Value } else { "" }
+    $parts = @($existing -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($part in $parts) {
+        if ([string]::Equals($part, $Value, [StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        Set-Item -Path "Env:$Name" -Value $Value
+    }
+    else {
+        Set-Item -Path "Env:$Name" -Value "$Value;$existing"
+    }
+}
+
+function Add-Rustflags {
+    param([Parameter(Mandatory)][string[]]$Tokens)
+
+    $addition = ($Tokens -join " ")
+    $existingItem = Get-Item -Path "Env:RUSTFLAGS" -ErrorAction SilentlyContinue
+    $existing = if ($null -ne $existingItem) { $existingItem.Value } else { "" }
+    if ($existing -and $existing.Contains($addition)) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        $env:RUSTFLAGS = $addition
+    }
+    else {
+        $env:RUSTFLAGS = "$existing $addition"
+    }
+}
+
+function Expand-MsvcRuntimeSupportObjects {
+    param(
+        [Parameter(Mandatory)][string]$MsvcLibRoot,
+        [Parameter(Mandatory)][string]$LlvmBin,
+        [Parameter(Mandatory)][string]$WorkspaceTemp
+    )
+
+    $archive = Join-Path $MsvcLibRoot $MsvcRuntimeArchiveName
+    Require-Path $archive "MSVC runtime archive is missing"
+    $llvmAr = Join-Path $LlvmBin "llvm-ar.exe"
+    Require-Path $llvmAr "pinned LLVM archiver is missing"
+
+    $outDir = Join-Path $WorkspaceTemp "cuda-msvc-runtime-support"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+    $list = Invoke-NativeCapture -Exe $llvmAr -Arguments @("t", $archive)
+    if ($list.ExitCode -ne 0) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_AR_LIST_FAILED]: llvm-ar could not list $archive (exit $($list.ExitCode)): $($list.Output -join ' | ')"
+    }
+
+    $members = @()
+    foreach ($required in $MsvcRuntimeSupportMembers) {
+        $member = @($list.Output | Where-Object {
+                [string]::Equals([IO.Path]::GetFileName($_), $required, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1)
+        if ($member.Count -eq 0) {
+            throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_MEMBER_MISSING]: $archive does not contain required support member $required"
+        }
+        $members += $member[0]
+    }
+
+    Push-Location $outDir
+    try {
+        $extract = Invoke-NativeCapture -Exe $llvmAr -Arguments (@("x", $archive) + $members)
+        if ($extract.ExitCode -ne 0) {
+            throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_AR_EXTRACT_FAILED]: llvm-ar could not extract CUDA/MSVC support members from $archive (exit $($extract.ExitCode)): $($extract.Output -join ' | ')"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    $paths = @()
+    foreach ($required in $MsvcRuntimeSupportMembers) {
+        $path = Join-Path $outDir $required
+        Require-Path $path "extracted CUDA/MSVC support object is missing"
+        $paths += $path
+    }
+    return $paths
+}
+
+function Expand-MsvcVcStartupSupportObjects {
+    param(
+        [Parameter(Mandatory)][string]$MsvcLibRoot,
+        [Parameter(Mandatory)][string]$LlvmBin,
+        [Parameter(Mandatory)][string]$WorkspaceTemp
+    )
+
+    $archive = Join-Path $MsvcLibRoot $MsvcVcStartupArchiveName
+    Require-Path $archive "MSVC VC startup archive is missing"
+    $llvmAr = Join-Path $LlvmBin "llvm-ar.exe"
+    Require-Path $llvmAr "pinned LLVM archiver is missing"
+
+    $outDir = Join-Path $WorkspaceTemp "cuda-msvc-vcstartup-support"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+    $list = Invoke-NativeCapture -Exe $llvmAr -Arguments @("t", $archive)
+    if ($list.ExitCode -ne 0) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_VCSTARTUP_AR_LIST_FAILED]: llvm-ar could not list $archive (exit $($list.ExitCode)): $($list.Output -join ' | ')"
+    }
+
+    $members = @()
+    foreach ($required in $MsvcVcStartupSupportMembers) {
+        $member = @($list.Output | Where-Object {
+                [string]::Equals([IO.Path]::GetFileName($_), $required, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1)
+        if ($member.Count -eq 0) {
+            throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_VCSTARTUP_MEMBER_MISSING]: $archive does not contain required support member $required"
+        }
+        $members += $member[0]
+    }
+
+    Push-Location $outDir
+    try {
+        $extract = Invoke-NativeCapture -Exe $llvmAr -Arguments (@("x", $archive) + $members)
+        if ($extract.ExitCode -ne 0) {
+            throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_VCSTARTUP_AR_EXTRACT_FAILED]: llvm-ar could not extract CUDA/MSVC VC startup members from $archive (exit $($extract.ExitCode)): $($extract.Output -join ' | ')"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    $paths = @()
+    foreach ($required in $MsvcVcStartupSupportMembers) {
+        $path = Join-Path $outDir $required
+        Require-Path $path "extracted CUDA/MSVC VC startup object is missing"
+        $paths += $path
+    }
+    return $paths
+}
+
+function Copy-MsvcRuntimeImportLibs {
+    param(
+        [Parameter(Mandatory)][string]$MsvcLibRoot,
+        [Parameter(Mandatory)][string]$WorkspaceTemp
+    )
+
+    $outDir = Join-Path $WorkspaceTemp "cuda-msvc-runtime-imports"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+    $paths = @()
+    foreach ($name in $MsvcRuntimeImportLibNames) {
+        $source = Join-Path $MsvcLibRoot $name
+        Require-Path $source "required MSVC runtime import library is missing"
+        $dest = Join-Path $outDir $name
+        Copy-Item -LiteralPath $source -Destination $dest -Force
+        Require-Path $dest "copied MSVC runtime import library is missing"
+        $paths += $dest
+    }
+    return $paths
+}
+
+function Resolve-WindowsKitUcrtLibPath {
+    $kitsLibRoot = "C:\Program Files (x86)\Windows Kits\10\Lib"
+    if (-not (Test-Path -LiteralPath $kitsLibRoot -PathType Container)) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_WINDOWS_KIT_UCRT_ROOT_MISSING]: Windows Kit Lib root is missing: $kitsLibRoot"
+    }
+
+    $candidates = @(Get-ChildItem -LiteralPath $kitsLibRoot -Directory | ForEach-Object {
+            $ucrt = Join-Path $_.FullName (Join-Path "ucrt\x64" $WindowsKitUcrtImportLibName)
+            if (Test-Path -LiteralPath $ucrt -PathType Leaf) {
+                [version]$parsed = "0.0"
+                [void][version]::TryParse($_.Name, [ref]$parsed)
+                [pscustomobject]@{
+                    Version = $parsed
+                    Path = $ucrt
+                }
+            }
+        })
+    if ($candidates.Count -eq 0) {
+        throw "CUDA_MSVC_RUNTIME_LINK[ASTRO_WINDOWS_KIT_UCRT_MISSING]: no $WindowsKitUcrtImportLibName found under $kitsLibRoot\*\ucrt\x64"
+    }
+
+    return @($candidates | Sort-Object -Property Version -Descending | Select-Object -First 1)[0].Path
+}
+
+function Copy-UcrtImportLib {
+    param([Parameter(Mandatory)][string]$WorkspaceTemp)
+
+    $source = Resolve-WindowsKitUcrtLibPath
+    $outDir = Join-Path $WorkspaceTemp "cuda-windowskit-ucrt-import"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    $dest = Join-Path $outDir $WindowsKitUcrtImportLibName
+    Copy-Item -LiteralPath $source -Destination $dest -Force
+    Require-Path $dest "copied Windows Kit UCRT import library is missing"
+    return $dest
+}
+
+function Resolve-CudaToolkitRoot {
+    if ([string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
+        throw "CUDA_IMPORT_LINK[ASTRO_CUDA_PATH_MISSING]: CUDA_PATH is not set; install CUDA Toolkit or set CUDA_PATH to the toolkit root before running CUDA-enabled builds"
+    }
+
+    $toolkitRoot = (Resolve-Path -LiteralPath $env:CUDA_PATH -ErrorAction SilentlyContinue).Path
+    if ([string]::IsNullOrWhiteSpace($toolkitRoot)) {
+        throw "CUDA_IMPORT_LINK[ASTRO_CUDA_PATH_INVALID]: CUDA_PATH does not resolve: $env:CUDA_PATH"
+    }
+    return $toolkitRoot
+}
+
+function Resolve-CudaToolkitLibRoot {
+    $toolkitRoot = Resolve-CudaToolkitRoot
+    $libRoot = Join-Path $toolkitRoot "lib\x64"
+    if (-not (Test-Path -LiteralPath $libRoot -PathType Container)) {
+        throw "CUDA_IMPORT_LINK[ASTRO_CUDA_LIB_ROOT_MISSING]: CUDA x64 library root is missing: $libRoot"
+    }
+    foreach ($name in $CudaImportLibNames) {
+        $source = Join-Path $libRoot $name
+        Require-Path $source "required CUDA import library is missing"
+    }
+    return $libRoot
+}
+
+function New-CudaToolkitNoSpaceView {
+    param([Parameter(Mandatory)][string]$WorkspaceTemp)
+
+    $toolkitRoot = Resolve-CudaToolkitRoot
+    $libRoot = Resolve-CudaToolkitLibRoot
+    $viewRoot = Join-Path $WorkspaceTemp "cuda-toolkit-root"
+    $viewBin = Join-Path $viewRoot "bin"
+    $viewInclude = Join-Path $viewRoot "include"
+    $viewLib = Join-Path $viewRoot "lib"
+    $viewLibRoot = Join-Path $viewLib "x64"
+    New-Item -ItemType Directory -Path $viewRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $viewLibRoot -Force | Out-Null
+
+    Get-ChildItem -LiteralPath $toolkitRoot -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $viewRoot $_.Name) -Force
+    }
+
+    $rootJunctionNames = @(
+        "bin",
+        "compute-sanitizer",
+        "extras",
+        "include",
+        "nvml",
+        "nvvm",
+        "src",
+        "tools"
+    )
+    foreach ($name in $rootJunctionNames) {
+        $target = Join-Path $toolkitRoot $name
+        if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+            continue
+        }
+        $path = Join-Path $viewRoot $name
+        if (-not (Test-Path -LiteralPath $path)) {
+            New-Item -ItemType Junction -Path $path -Target $target | Out-Null
+        }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_LINK_FAILED]: CUDA toolkit view link was not created: $path -> $target"
+        }
+    }
+
+    Get-ChildItem -LiteralPath (Join-Path $toolkitRoot "lib") -Directory -ErrorAction SilentlyContinue |
+        Where-Object { -not [string]::Equals($_.Name, "x64", [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object {
+            $path = Join-Path $viewLib $_.Name
+            if (-not (Test-Path -LiteralPath $path)) {
+                New-Item -ItemType Junction -Path $path -Target $_.FullName | Out-Null
+            }
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+                throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_LINK_FAILED]: CUDA toolkit lib view link was not created: $path -> $($_.FullName)"
+            }
+        }
+
+    foreach ($link in @(
+            @{ Path = $viewBin; Target = (Join-Path $toolkitRoot "bin") },
+            @{ Path = $viewInclude; Target = (Join-Path $toolkitRoot "include") },
+            @{ Path = (Join-Path $viewRoot "nvvm"); Target = (Join-Path $toolkitRoot "nvvm") }
+        )) {
+        if (-not (Test-Path -LiteralPath $link.Target -PathType Container)) {
+            throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_TARGET_MISSING]: CUDA toolkit view target is missing: $($link.Target)"
+        }
+        if (-not (Test-Path -LiteralPath $link.Path -PathType Container)) {
+            throw "CUDA_IMPORT_LINK[ASTRO_CUDA_TOOLKIT_VIEW_LINK_FAILED]: CUDA toolkit view link was not created: $($link.Path) -> $($link.Target)"
+        }
+    }
+
+    foreach ($name in $CudaImportLibNames) {
+        $source = Join-Path $libRoot $name
+        $dest = Join-Path $viewLibRoot $name
+        Copy-Item -LiteralPath $source -Destination $dest -Force
+        Require-Path $dest "copied CUDA import library is missing"
+    }
+
+    $env:CUDA_PATH = $viewRoot
+    $env:CUDA_HOME = $viewRoot
+    $env:PATH = "$viewBin;$env:PATH"
+    return $viewLibRoot
+}
+
+function Set-CudaMsvcRuntimeLinkEnvironment {
+    param(
+        [Parameter(Mandatory)][string]$LlvmBin,
+        [Parameter(Mandatory)][string]$WorkspaceTemp
+    )
+
+    if (-not $env:FORGE_CUDA_CCBIN) {
+        return
+    }
+
+    $libRoot = Resolve-MsvcLibRootFromCudaCcbin -Ccbin $env:FORGE_CUDA_CCBIN
+    $supportObjects = Expand-MsvcRuntimeSupportObjects -MsvcLibRoot $libRoot -LlvmBin $LlvmBin -WorkspaceTemp $WorkspaceTemp
+    $vcStartupObjects = Expand-MsvcVcStartupSupportObjects -MsvcLibRoot $libRoot -LlvmBin $LlvmBin -WorkspaceTemp $WorkspaceTemp
+    $importLibs = Copy-MsvcRuntimeImportLibs -MsvcLibRoot $libRoot -WorkspaceTemp $WorkspaceTemp
+    $ucrtImportLib = Copy-UcrtImportLib -WorkspaceTemp $WorkspaceTemp
+    $cudaImportLibDir = New-CudaToolkitNoSpaceView -WorkspaceTemp $WorkspaceTemp
+    $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $LlvmBin -ScratchDir $WorkspaceTemp
+    $lldPrefix = ($LlvmBin.TrimEnd('\', '/')) + '\'
+    $rustFlagTokens = @(
+        "-L", "native=$cudaImportLibDir",
+        "-C", "link-arg=-B$lldPrefix",
+        "-C", "link-arg=-fuse-ld=lld",
+        "-C", "link-arg=-Wl,/nodefaultlib:libcpmt",
+        "-C", "link-arg=-Wl,/nodefaultlib:LIBCMT",
+        "-C", "link-arg=-Wl,/nodefaultlib:OLDNAMES"
+    )
+    foreach ($object in $supportObjects) {
+        $rustFlagTokens += @("-C", "link-arg=$object")
+    }
+    foreach ($object in $vcStartupObjects) {
+        $rustFlagTokens += @("-C", "link-arg=$object")
+    }
+    foreach ($importLib in $importLibs) {
+        $rustFlagTokens += @("-C", "link-arg=$importLib")
+    }
+    $rustFlagTokens += @("-C", "link-arg=$ucrtImportLib")
+    $rustFlagTokens += @("-C", "link-arg=-lkernel32")
+    Add-Rustflags -Tokens $rustFlagTokens
+    Write-Output "CUDA_MSVC_RUNTIME_LINK[ASTRO_CUDA_MSVC_SUPPORT_OBJECTS]: verified pinned LLD at $pinnedLld; extracted $($supportObjects.Count) support object(s) from $MsvcRuntimeArchiveName, $($vcStartupObjects.Count) support object(s) from $MsvcVcStartupArchiveName, copied $($importLibs.Count + 1) MSVC/UCRT import lib(s), copied $($CudaImportLibNames.Count) CUDA import lib(s), set CUDA_PATH to no-space view $env:CUDA_PATH, and enabled MSVC defaultlib suppression under $WorkspaceTemp"
+}
+
 function Set-ToolchainEnvironment {
     param(
         [string]$MingwBin,
@@ -696,6 +1227,11 @@ function Set-ToolchainEnvironment {
     # inheritance keeps one consistent, cached, deterministic compile path.
     $env:SCCACHE_SERVER_PORT = $SccacheServerPort
     $env:SCCACHE_IDLE_TIMEOUT = $SccacheIdleTimeout
+    Set-CudaHostCompilerEnvironment
+    Add-NvccAppendFlag -Flag "-Xcompiler=/Zc:preprocessor"
+    Add-NvccAppendFlag -Flag "-DCCCL_DISABLE_NVTX"
+    Add-NvccAppendFlag -Flag "-DNVTX_DISABLE"
+    Write-Output "CUDA_HOST_COMPILER[ASTRO_NVCC_APPEND_FLAGS]: $NvccAppendFlagsEnv=$env:NVCC_APPEND_FLAGS"
 }
 
 function Set-WorkspaceTempEnvironment {
@@ -1605,6 +2141,7 @@ foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_N
 try {
     Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     New-Item -ItemType Directory -Path $workspaceTemp -Force | Out-Null
+    Set-CudaMsvcRuntimeLinkEnvironment -LlvmBin $llvmBin -WorkspaceTemp $workspaceTemp
     # #190: ensure the sccache server is up and zero its counters so --show-stats in
     # the finally reports THIS run's cold-vs-warm hit rate. The on-disk cache in
     # $sccacheDir persists across runs and the target/ wipe.

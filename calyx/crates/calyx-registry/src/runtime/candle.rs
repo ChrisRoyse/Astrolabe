@@ -24,6 +24,7 @@ use load::{
 };
 pub use options::{
     CandleDevicePolicy, CandleFileSpec, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
+    default_cuda_fail_loud_policy,
 };
 use pooling::{apply_norm, pool_tokens};
 
@@ -51,12 +52,12 @@ impl CandleLens {
         Self::from_hf_cache_with_device_policy(
             name,
             default_hf_cache_root(),
-            CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
+            default_cuda_fail_loud_policy()?,
         )
     }
 
     pub fn from_hf_cache(name: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::from_hf_cache_with_device_policy(name, cache_dir, CandleDevicePolicy::CpuExplicit)
+        Self::from_hf_cache_with_device_policy(name, cache_dir, default_cuda_fail_loud_policy()?)
     }
 
     pub fn from_hf_cache_with_device_policy(
@@ -256,7 +257,7 @@ impl CandleLens {
             tokenizer: tokenizer.clone(),
             weights: weights.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            device_policy: CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
+            device_policy: default_cuda_fail_loud_policy()?,
             precision: CandlePrecision::parse(dtype)?,
             pooling: CandlePoolingPolicy::parse(pooling)?,
             norm_policy: spec.norm_policy,

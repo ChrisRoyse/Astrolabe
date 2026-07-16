@@ -58,8 +58,8 @@ pub(super) fn configured_cuda_device() -> Result<i32> {
         })
 }
 
-pub(super) fn cpu_ep_fallback_disabled() -> bool {
-    env_flag(DISABLE_CPU_EP_FALLBACK_ENV)
+pub(super) fn cpu_ep_fallback_disabled(policy: OnnxProviderPolicy) -> bool {
+    matches!(policy, OnnxProviderPolicy::CudaFailLoud) || env_flag(DISABLE_CPU_EP_FALLBACK_ENV)
 }
 
 pub(super) fn configured_cuda_graphs() -> Result<bool> {
@@ -93,14 +93,12 @@ pub(super) fn build_session(
                 policy.as_str()
             ))
         })?;
-    if cpu_ep_fallback_disabled() {
-        builder = builder
-            .with_config_entry("session.disable_cpu_ep_fallback", "1")
-            .map_err(|err| {
-                config_invalid(format!(
-                    "ONNX disable_cpu_ep_fallback config failed for {label}: {err}"
-                ))
-            })?;
+    if cpu_ep_fallback_disabled(policy) {
+        builder = builder.with_disable_cpu_fallback().map_err(|err| {
+            config_invalid(format!(
+                "ONNX disable_cpu_ep_fallback config failed for {label}: {err}"
+            ))
+        })?;
     }
     if configured_audit_mode()?.enabled() {
         builder = builder

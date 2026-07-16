@@ -28,8 +28,9 @@
 //!   green-context user stream with an SM slice of at least `n` SMs and balanced
 //!   work queues. Invalid values, CPU-policy sessions, unsupported builds, or
 //!   `CALYX_ONNX_CUDA_GRAPHS=1` fail closed.
-//! - `CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1` — additionally set the ORT
-//!   session config that refuses node-level CPU placement at build time.
+//! - `CALYX_ONNX_DISABLE_CPU_EP_FALLBACK=1` — set the ORT session config that
+//!   refuses node-level CPU placement at build time for CPU-explicit sessions.
+//!   CUDA policy sessions always set it.
 //!
 //! Device-arena controls (#1143 — BFC arena growth across dynamic shapes):
 //! - `CALYX_ONNX_GPU_MEM_LIMIT_MIB` — hard cap (MiB) on the CUDA BFC arena;
@@ -138,7 +139,7 @@ impl OnnxRunPlan {
                 } else {
                     "ort_default_device_arena"
                 },
-                "refused_by_provider_list",
+                "disabled_by_session_config",
             )
         } else {
             ("host", "cpu_explicit_policy")
@@ -149,7 +150,7 @@ impl OnnxRunPlan {
             green_context_sms
                 .map(|count| count.to_string())
                 .unwrap_or_else(|| "off".to_string()),
-            cpu_ep_fallback_disabled(),
+            cpu_ep_fallback_disabled(policy),
             mem_limit
                 .map(|bytes| (bytes / (1024 * 1024)).to_string())
                 .unwrap_or_else(|| "none".to_string()),

@@ -105,7 +105,7 @@ pub use runtime::algorithmic::{AlgorithmicEncoder, AlgorithmicLens};
 #[cfg(feature = "ml-runtime")]
 pub use runtime::candle::{
     CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,
-    CandlePrecision, DEFAULT_CANDLE_MODEL,
+    CandlePrecision, DEFAULT_CANDLE_MODEL, default_cuda_fail_loud_policy,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]

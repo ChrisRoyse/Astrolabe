@@ -3,9 +3,9 @@ use std::path::Path;
 
 use calyx_core::{Input, Lens, Modality, SlotShape};
 use calyx_registry::{
-    CandleDevicePolicy, CandlePrecision, FastembedBgem3Lens, FastembedBgem3Output,
-    FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens, NormPolicy, OnnxProviderPolicy,
-    Qwen3ModelFiles,
+    CandlePrecision, FastembedBgem3Lens, FastembedBgem3Output, FastembedQwen3Lens,
+    FastembedRerankerLens, FastembedSparseLens, NormPolicy, OnnxProviderPolicy, Qwen3ModelFiles,
+    default_cuda_fail_loud_policy,
 };
 use serde_json::json;
 
@@ -136,7 +136,7 @@ fn commission_qwen3(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
-        CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
+        default_cuda_fail_loud_policy()?,
         CandlePrecision::F16,
     )?;
     let probe = Input::new(Modality::Text, b"Calyx Qwen3 commission probe".to_vec());

@@ -5,7 +5,7 @@ use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, S
 use fastembed::Qwen3TextEmbedding;
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
-use crate::runtime::candle::{CandleDevicePolicy, CandlePrecision};
+use crate::runtime::candle::{CandleDevicePolicy, CandlePrecision, default_cuda_fail_loud_policy};
 use crate::runtime::common::{hash_files, text_from_input};
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
@@ -156,7 +156,7 @@ impl FastembedQwen3Lens {
             model_id: model_id.clone(),
             files: Qwen3ModelFiles::from_paths(model_id, files.clone())?,
             max_tokens: DEFAULT_QWEN3_MAX_TOKENS,
-            device_policy: CandleDevicePolicy::CudaFailLoud { ordinal: 0 },
+            device_policy: default_cuda_fail_loud_policy()?,
             precision: CandlePrecision::parse(dtype)?,
             expected_shape: Some(spec.output),
             expected_weights_sha256: Some(spec.weights_sha256),

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use calyx_core::Result;
+use calyx_core::{CalyxError, Result};
 use candle_core::DType;
 
 use super::config_invalid;
 use crate::frozen::NormPolicy;
+
+pub const CANDLE_CUDA_DEVICE_ENV: &str = "CALYX_CANDLE_CUDA_DEVICE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandleModelFiles {
@@ -46,6 +48,30 @@ impl CandleDevicePolicy {
             Self::CudaFailLoud { .. } => "cuda,error_on_failure,no_cpu_fallback",
         }
     }
+}
+
+/// CUDA device ordinal used by default live Candle-family runtimes.
+pub fn configured_cuda_device() -> Result<usize> {
+    let Ok(raw) = std::env::var(CANDLE_CUDA_DEVICE_ENV) else {
+        return Ok(0);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    raw.parse::<usize>().map_err(|_| CalyxError {
+        code: "CALYX_CANDLE_CUDA_DEVICE_INVALID",
+        message: format!(
+            "{CANDLE_CUDA_DEVICE_ENV}={raw} is not a non-negative CUDA device ordinal"
+        ),
+        remediation: "set CALYX_CANDLE_CUDA_DEVICE to the integer ordinal reported by nvidia-smi, or unset it for device 0",
+    })
+}
+
+pub fn default_cuda_fail_loud_policy() -> Result<CandleDevicePolicy> {
+    Ok(CandleDevicePolicy::CudaFailLoud {
+        ordinal: configured_cuda_device()?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
