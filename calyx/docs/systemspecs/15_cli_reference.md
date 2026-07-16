@@ -483,7 +483,9 @@ frozen and failed artifact trees are never overwritten. Device `auto` resolves
 once to `cuda:<ordinal>` when CUDA is usable, or to a distinct CPU/F32 contract
 only when the binary has no CUDA feature or the driver reports no device. Once
 CUDA is selected, initialization/inference errors fail closed without a CPU
-retry. Arbitrary Candle model ids require explicit dtype and pooling. Qwen
+retry. The report and conversion log retain the resolved policy reason while
+the frozen identity stores only `cpu` or `cuda:<ordinal>`. Arbitrary Candle
+model ids require explicit dtype and pooling. Qwen
 requires an explicit measured dtype and has fixed last-token pooling.
 `--max-batch` writes the manifest batch ceiling that later scale runs clamp to
 after it is proven. `onnx-int8` runs Optimum export plus ONNX Runtime

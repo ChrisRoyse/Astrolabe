@@ -39,6 +39,7 @@ struct CommissionReport {
     runtime: String,
     dtype: String,
     execution_device: Option<String>,
+    device_policy: Option<String>,
     output_dir: PathBuf,
     manifest: PathBuf,
     conversion_log: PathBuf,
@@ -92,6 +93,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         "runtime": flags.runtime.manifest_runtime(),
         "dtype": flags.manifest_dtype(),
         "execution_device": flags.execution_device(),
+        "device_policy": flags.device_policy_detail(),
         "output_dir": out,
     }))?;
     let output = match flags.runtime {
@@ -159,6 +161,7 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         runtime: flags.runtime.manifest_runtime().to_string(),
         dtype: flags.manifest_dtype().to_string(),
         execution_device: flags.execution_device(),
+        device_policy: flags.device_policy_detail(),
         hf: flags.hf,
         output_dir: out,
         manifest: manifest_path,

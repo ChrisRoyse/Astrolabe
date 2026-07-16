@@ -415,6 +415,10 @@ impl CommissionFlags {
         self.device_policy.map(CandleDevicePolicy::frozen_token)
     }
 
+    pub(super) fn device_policy_detail(&self) -> Option<String> {
+        self.device_policy.map(CandleDevicePolicy::detail)
+    }
+
     pub(super) fn local_device_policy(&self) -> CliResult<CandleDevicePolicy> {
         self.device_policy.ok_or_else(|| {
             CliError::runtime("local model commission is missing its resolved device policy")
