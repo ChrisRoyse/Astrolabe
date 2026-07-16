@@ -20,6 +20,7 @@
 #include "xxhash/xxhash.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -103,6 +104,10 @@ enum { MAP_READY = 1 };
 
 /* Numeric conversion radix for strtol (base 10 decimal). */
 enum { BASE_DECIMAL = 10 };
+
+#define CBM_SEM_CORPUS_ALLOC_FAILED "CBM_SEM_CORPUS_ALLOC_FAILED"
+#define CBM_SEM_CORPUS_CAPACITY_OVERFLOW "CBM_SEM_CORPUS_CAPACITY_OVERFLOW"
+#define CBM_SEM_CORPUS_INVALID_INPUT "CBM_SEM_CORPUS_INVALID_INPUT"
 
 /* ── Configuration ───────────────────────────────────────────────── */
 
@@ -514,29 +519,198 @@ struct cbm_sem_corpus {
     int doc_cap;
 };
 
+static void corpus_log_error(const char *event, const char *code, const char *operation,
+                             const char *detail, int requested_cap) {
+    char cap_buf[CBM_SZ_32];
+    snprintf(cap_buf, sizeof(cap_buf), "%d", requested_cap);
+    cbm_log_error(event, "code", code, "operation", operation ? operation : "unknown", "detail",
+                  detail ? detail : "none", "requested_cap", cap_buf, "message",
+                  "semantic corpus mutation failed before commit", "remediation",
+                  "free memory or reduce the semantic corpus workload; retry after the allocation "
+                  "pressure is resolved");
+}
+
+static bool corpus_array_bytes(int count, size_t elem_size, size_t *out_bytes) {
+    if (count <= 0 || elem_size == 0) {
+        return false;
+    }
+    size_t n = (size_t)count;
+    if (n > SIZE_MAX / elem_size) {
+        return false;
+    }
+    *out_bytes = n * elem_size;
+    return true;
+}
+
+static int corpus_next_cap(int current, int required, int floor, const char *operation,
+                           int *out_cap) {
+    if (required <= current) {
+        *out_cap = current;
+        return 0;
+    }
+    int cap = current < floor ? floor : current;
+    while (cap < required) {
+        if (cap > INT_MAX / PAIR_LEN) {
+            corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                             operation, "capacity multiplication would overflow int", required);
+            return CBM_NOT_FOUND;
+        }
+        cap *= PAIR_LEN;
+    }
+    *out_cap = cap;
+    return 0;
+}
+
+static int corpus_grow_entries(cbm_sem_corpus_t *c, int required_cap) {
+    int new_cap = 0;
+    if (corpus_next_cap(c->entry_cap, required_cap, CORPUS_INIT_CAP, "grow_entries", &new_cap) !=
+        0) {
+        return CBM_NOT_FOUND;
+    }
+    if (new_cap <= c->entry_cap) {
+        return 0;
+    }
+    size_t bytes = 0;
+    if (!corpus_array_bytes(new_cap, sizeof(corpus_entry_t), &bytes)) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "grow_entries", "entry allocation size overflow", new_cap);
+        return CBM_NOT_FOUND;
+    }
+    corpus_entry_t *grown = realloc(c->entries, bytes);
+    if (!grown) {
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "grow_entries",
+                         "realloc entries failed", new_cap);
+        return CBM_NOT_FOUND;
+    }
+    c->entries = grown;
+    c->entry_cap = new_cap;
+    return 0;
+}
+
+static int corpus_grow_doc_slots(cbm_sem_corpus_t *c, int required_cap) {
+    int new_cap = 0;
+    if (corpus_next_cap(c->doc_cap, required_cap, DOC_TOKENS_INIT, "grow_doc_slots", &new_cap) !=
+        0) {
+        return CBM_NOT_FOUND;
+    }
+    if (new_cap <= c->doc_cap) {
+        return 0;
+    }
+
+    size_t ids_bytes = 0;
+    size_t counts_bytes = 0;
+    if (!corpus_array_bytes(new_cap, sizeof(int *), &ids_bytes) ||
+        !corpus_array_bytes(new_cap, sizeof(int), &counts_bytes)) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "grow_doc_slots", "document-table allocation size overflow", new_cap);
+        return CBM_NOT_FOUND;
+    }
+
+    int **new_ids = malloc(ids_bytes);
+    int *new_counts = malloc(counts_bytes);
+    if (!new_ids || !new_counts) {
+        free(new_ids);
+        free(new_counts);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "grow_doc_slots",
+                         "paired document-table allocation failed", new_cap);
+        return CBM_NOT_FOUND;
+    }
+
+    if (c->doc_count > 0) {
+        memcpy(new_ids, c->doc_token_ids, (size_t)c->doc_count * sizeof(int *));
+        memcpy(new_counts, c->doc_token_counts, (size_t)c->doc_count * sizeof(int));
+    }
+    if (new_cap > c->doc_count) {
+        size_t tail = (size_t)(new_cap - c->doc_count);
+        memset(new_ids + c->doc_count, 0, tail * sizeof(int *));
+        memset(new_counts + c->doc_count, 0, tail * sizeof(int));
+    }
+
+    int **old_ids = c->doc_token_ids;
+    int *old_counts = c->doc_token_counts;
+    c->doc_token_ids = new_ids;
+    c->doc_token_counts = new_counts;
+    c->doc_cap = new_cap;
+    free(old_ids);
+    free(old_counts);
+    return 0;
+}
+
+static void corpus_remove_token_map_entry(cbm_sem_corpus_t *c, const char *token) {
+    if (!c || !c->token_map || !token) {
+        return;
+    }
+    const char *stored_key = cbm_ht_get_key(c->token_map, token);
+    void *stored_value = cbm_ht_delete(c->token_map, token);
+    free((void *)stored_key);
+    free(stored_value);
+}
+
+static void corpus_rollback_entries(cbm_sem_corpus_t *c, int entry_count) {
+    if (!c || entry_count < 0 || entry_count > c->entry_count) {
+        return;
+    }
+    for (int i = entry_count; i < c->entry_count; i++) {
+        corpus_remove_token_map_entry(c, c->entries[i].token);
+        free(c->entries[i].token);
+        c->entries[i].token = NULL;
+        c->entries[i].doc_freq = 0;
+        memset(&c->entries[i].enriched_vec, 0, sizeof(cbm_sem_vec_t));
+    }
+    c->entry_count = entry_count;
+}
+
 static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
     char idx_buf[CBM_SZ_16];
+    if (!c || !c->token_map || !token) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                         "get_or_add_token", "null corpus, token map, or token", 0);
+        return CBM_NOT_FOUND;
+    }
     const char *existing = cbm_ht_get(c->token_map, token);
     if (existing) {
         char *end = NULL;
         long parsed = strtol(existing, &end, BASE_DECIMAL);
         return (end != existing) ? (int)parsed : CBM_NOT_FOUND;
     }
-    if (c->entry_count >= c->entry_cap) {
-        int new_cap = c->entry_cap < CORPUS_INIT_CAP ? CORPUS_INIT_CAP : c->entry_cap * PAIR_LEN;
-        corpus_entry_t *grown = realloc(c->entries, (size_t)new_cap * sizeof(corpus_entry_t));
-        if (!grown) {
-            return CBM_NOT_FOUND;
-        }
-        c->entries = grown;
-        c->entry_cap = new_cap;
+    if (c->entry_count == INT_MAX) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "get_or_add_token", "entry count reached int limit", c->entry_count);
+        return CBM_NOT_FOUND;
     }
-    int idx = c->entry_count++;
-    c->entries[idx].token = strdup(token);
+    if (corpus_grow_entries(c, c->entry_count + SKIP_ONE) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    int idx = c->entry_count;
     c->entries[idx].doc_freq = 0;
     memset(&c->entries[idx].enriched_vec, 0, sizeof(cbm_sem_vec_t));
     snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
-    cbm_ht_set(c->token_map, strdup(token), strdup(idx_buf));
+
+    char *entry_token = strdup(token);
+    char *map_key = strdup(token);
+    char *map_value = strdup(idx_buf);
+    if (!entry_token || !map_key || !map_value) {
+        free(entry_token);
+        free(map_key);
+        free(map_value);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "get_or_add_token",
+                         "token string duplication failed", c->entry_count + SKIP_ONE);
+        return CBM_NOT_FOUND;
+    }
+
+    (void)cbm_ht_set(c->token_map, map_key, map_value);
+    if (cbm_ht_get(c->token_map, token) != map_value) {
+        free(entry_token);
+        free(map_key);
+        free(map_value);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "get_or_add_token",
+                         "token map insertion failed", c->entry_count + SKIP_ONE);
+        return CBM_NOT_FOUND;
+    }
+
+    c->entries[idx].token = entry_token;
+    c->entry_count++;
     return idx;
 }
 
@@ -544,43 +718,75 @@ cbm_sem_corpus_t *cbm_sem_corpus_new(void) {
     cbm_sem_corpus_t *c = calloc(SKIP_ONE, sizeof(cbm_sem_corpus_t));
     if (c) {
         c->token_map = cbm_ht_create(CORPUS_INIT_CAP);
+        if (!c->token_map) {
+            corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "corpus_new",
+                             "token map allocation failed", CORPUS_INIT_CAP);
+            free(c);
+            return NULL;
+        }
     }
     return c;
 }
 
-void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count) {
-    if (!corpus || !tokens || count <= 0) {
-        return;
+int cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count) {
+    if (!corpus || !tokens) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT, "add_doc",
+                         "null corpus or token array", count);
+        return CBM_NOT_FOUND;
     }
-    /* Track document for co-occurrence pass */
-    if (corpus->doc_count >= corpus->doc_cap) {
-        int new_cap =
-            corpus->doc_cap < DOC_TOKENS_INIT ? DOC_TOKENS_INIT : corpus->doc_cap * PAIR_LEN;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
-        if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
-            return;
-        }
-        corpus->doc_token_ids = grown_ids;
-        corpus->doc_token_counts = grown_counts;
-        corpus->doc_cap = new_cap;
+    if (count < 0) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT, "add_doc",
+                         "negative document token count", count);
+        return CBM_NOT_FOUND;
     }
-    int doc_idx = corpus->doc_count++;
-    corpus->doc_token_ids[doc_idx] = malloc((size_t)count * sizeof(int));
-    corpus->doc_token_counts[doc_idx] = count;
+    if (count == 0) {
+        return 0;
+    }
+    if (corpus->doc_count == INT_MAX) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "add_doc", "document count reached int limit", corpus->doc_count);
+        return CBM_NOT_FOUND;
+    }
+    if (corpus_grow_doc_slots(corpus, corpus->doc_count + SKIP_ONE) != 0) {
+        return CBM_NOT_FOUND;
+    }
 
-    /* Per-doc unique set for IDF */
-    int *seen = calloc((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP, sizeof(int));
+    size_t ids_bytes = 0;
+    if (!corpus_array_bytes(count, sizeof(int), &ids_bytes)) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "add_doc", "document token allocation size overflow", count);
+        return CBM_NOT_FOUND;
+    }
+    int *doc_ids = malloc(ids_bytes);
+    int *seen = malloc(ids_bytes);
+    if (!doc_ids || !seen) {
+        free(doc_ids);
+        free(seen);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "add_doc",
+                         "document token or seen-set allocation failed", count);
+        return CBM_NOT_FOUND;
+    }
+
+    int base_entry_count = corpus->entry_count;
     int seen_count = 0;
 
     for (int i = 0; i < count; i++) {
-        int tid = corpus_get_or_add(corpus, tokens[i]);
-        corpus->doc_token_ids[doc_idx][i] = tid;
-        if (tid < 0) {
-            continue;
+        if (!tokens[i]) {
+            corpus_rollback_entries(corpus, base_entry_count);
+            free(doc_ids);
+            free(seen);
+            corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                             "add_doc", "null token in document", count);
+            return CBM_NOT_FOUND;
         }
+        int tid = corpus_get_or_add(corpus, tokens[i]);
+        if (tid < 0) {
+            corpus_rollback_entries(corpus, base_entry_count);
+            free(doc_ids);
+            free(seen);
+            return CBM_NOT_FOUND;
+        }
+        doc_ids[i] = tid;
         /* Check uniqueness for IDF (simple linear scan — tokens per doc is small) */
         bool is_new = true;
         for (int j = 0; j < seen_count; j++) {
@@ -591,10 +797,18 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
         }
         if (is_new) {
             seen[seen_count++] = tid;
-            corpus->entries[tid].doc_freq++;
         }
     }
+
+    for (int j = 0; j < seen_count; j++) {
+        corpus->entries[seen[j]].doc_freq++;
+    }
+    int doc_idx = corpus->doc_count;
+    corpus->doc_token_ids[doc_idx] = doc_ids;
+    corpus->doc_token_counts[doc_idx] = count;
+    corpus->doc_count++;
     free(seen);
+    return 0;
 }
 
 /* ── Parallel corpus batch build ──────────────────────────────────── */
@@ -617,20 +831,26 @@ typedef struct {
     int doc_count;
     _Atomic int *doc_freq_atomic; /* per-entry atomic counter (entry_count long) */
     _Atomic int next_idx;
+    _Atomic int failed;
 } batch_resolve_ctx_t;
 
 /* Resolve one document: look up each token's global ID, fill the corpus
  * doc_token_ids[d], and bump the per-token doc_freq counter atomically.  The
  * caller is responsible for ensuring `seen` has capacity for `count` ints
  * before calling (the worker grows its per-thread scratch buffer). */
-static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *seen) {
+static int batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *seen) {
     int count = bc->token_counts[doc_index];
     if (count <= 0) {
         bc->corpus->doc_token_ids[doc_index] = NULL;
         bc->corpus->doc_token_counts[doc_index] = 0;
-        return;
+        return 0;
     }
     int *ids = malloc((size_t)count * sizeof(int));
+    if (!ids) {
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "batch_resolve_doc",
+                         "document token-id allocation failed", count);
+        return CBM_NOT_FOUND;
+    }
     bc->corpus->doc_token_ids[doc_index] = ids;
     bc->corpus->doc_token_counts[doc_index] = count;
 
@@ -646,10 +866,15 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
                 tid = (int)parsed;
             }
         }
-        ids[i] = tid;
         if (tid < 0) {
-            continue;
+            free(ids);
+            bc->corpus->doc_token_ids[doc_index] = NULL;
+            bc->corpus->doc_token_counts[doc_index] = 0;
+            corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                             "batch_resolve_doc", "token missing from corpus map", count);
+            return CBM_NOT_FOUND;
         }
+        ids[i] = tid;
         /* Unique-per-doc check for IDF */
         bool is_new = true;
         for (int j = 0; j < seen_count; j++) {
@@ -664,6 +889,7 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
                                       memory_order_relaxed);
         }
     }
+    return 0;
 }
 
 static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
@@ -673,10 +899,16 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
     int local_seen_cap = CBM_SEM_SEEN_INIT_CAP;
     int *seen = malloc((size_t)local_seen_cap * sizeof(int));
     if (!seen) {
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "batch_resolve_seen",
+                         "initial seen-set scratch allocation failed", local_seen_cap);
+        atomic_store_explicit(&bc->failed, SKIP_ONE, memory_order_release);
         return;
     }
 
     while (true) {
+        if (atomic_load_explicit(&bc->failed, memory_order_acquire)) {
+            break;
+        }
         int start =
             atomic_fetch_add_explicit(&bc->next_idx, CBM_SEM_RESOLVE_CHUNK, memory_order_relaxed);
         if (start >= bc->doc_count) {
@@ -691,65 +923,113 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
             if (count > local_seen_cap) {
                 int *grown = realloc(seen, (size_t)count * sizeof(int));
                 if (!grown) {
-                    continue;
+                    corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED,
+                                     "batch_resolve_seen", "seen-set scratch growth failed",
+                                     count);
+                    atomic_store_explicit(&bc->failed, SKIP_ONE, memory_order_release);
+                    break;
                 }
                 seen = grown;
                 local_seen_cap = count;
             }
-            batch_resolve_one_doc(bc, d, seen);
+            if (batch_resolve_one_doc(bc, d, seen) != 0) {
+                atomic_store_explicit(&bc->failed, SKIP_ONE, memory_order_release);
+                break;
+            }
         }
     }
     free(seen);
 }
 
-void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc) {
-    if (!corpus || !all_tokens || !token_counts || doc_count <= 0) {
+static void corpus_clear_doc_range(cbm_sem_corpus_t *corpus, int first_doc, int doc_count) {
+    if (!corpus || !corpus->doc_token_ids || !corpus->doc_token_counts) {
         return;
+    }
+    for (int d = 0; d < doc_count; d++) {
+        int idx = first_doc + d;
+        free(corpus->doc_token_ids[idx]);
+        corpus->doc_token_ids[idx] = NULL;
+        corpus->doc_token_counts[idx] = 0;
+    }
+}
+
+int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
+                                  const int *token_counts, int doc_count, int max_tokens_per_doc) {
+    if (!corpus) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                         "add_docs_batch", "null corpus", doc_count);
+        return CBM_NOT_FOUND;
+    }
+    if (doc_count < 0) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                         "add_docs_batch", "negative document count", doc_count);
+        return CBM_NOT_FOUND;
+    }
+    if (doc_count == 0) {
+        return 0;
+    }
+    if (!all_tokens || !token_counts) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                         "add_docs_batch", "null token array or count array", doc_count);
+        return CBM_NOT_FOUND;
+    }
+    if (max_tokens_per_doc <= 0) {
+        corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                         "add_docs_batch", "max_tokens_per_doc must be positive",
+                         max_tokens_per_doc);
+        return CBM_NOT_FOUND;
     }
 
     /* Phase A (SEQUENTIAL): Build token_map and allocate doc arrays.
      * Hash table mutation can't be parallelized; strdup+insert is the cost. */
-    if (corpus->doc_cap < corpus->doc_count + doc_count) {
-        int new_cap = corpus->doc_count + doc_count;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
-        if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
-            return;
-        }
-        corpus->doc_token_ids = grown_ids;
-        corpus->doc_token_counts = grown_counts;
-        corpus->doc_cap = new_cap;
-    }
     int base_doc = corpus->doc_count;
-    corpus->doc_count += doc_count;
+    if (doc_count > INT_MAX - base_doc) {
+        corpus_log_error("semantic.corpus.capacity_overflow", CBM_SEM_CORPUS_CAPACITY_OVERFLOW,
+                         "add_docs_batch", "document count overflow", doc_count);
+        return CBM_NOT_FOUND;
+    }
+    int required_doc_cap = base_doc + doc_count;
+    if (corpus_grow_doc_slots(corpus, required_doc_cap) != 0) {
+        return CBM_NOT_FOUND;
+    }
 
+    int base_entry_count = corpus->entry_count;
     for (int d = 0; d < doc_count; d++) {
         int count = token_counts[d];
+        if (count < 0 || count > max_tokens_per_doc) {
+            corpus_rollback_entries(corpus, base_entry_count);
+            corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                             "add_docs_batch", "document token count outside batch layout",
+                             count);
+            return CBM_NOT_FOUND;
+        }
         char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
         for (int i = 0; i < count; i++) {
+            if (!tokens[i]) {
+                corpus_rollback_entries(corpus, base_entry_count);
+                corpus_log_error("semantic.corpus.invalid_input", CBM_SEM_CORPUS_INVALID_INPUT,
+                                 "add_docs_batch", "null token in batch document", count);
+                return CBM_NOT_FOUND;
+            }
             /* Inserts token into token_map if new; we discard return here —
              * Phase B will re-lookup in read-only mode to get the ID. */
-            (void)corpus_get_or_add(corpus, tokens[i]);
+            if (corpus_get_or_add(corpus, tokens[i]) < 0) {
+                corpus_rollback_entries(corpus, base_entry_count);
+                return CBM_NOT_FOUND;
+            }
         }
     }
 
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
-    _Atomic int *doc_freq_atomic = calloc((size_t)corpus->entry_count, sizeof(_Atomic int));
+    size_t atomic_count = corpus->entry_count > 0 ? (size_t)corpus->entry_count : (size_t)SKIP_ONE;
+    _Atomic int *doc_freq_atomic = calloc(atomic_count, sizeof(_Atomic int));
     if (!doc_freq_atomic) {
-        /* OOM fallback: sequential path. Roll back doc_count first since
-         * add_doc increments it itself. */
-        corpus->doc_count = base_doc;
-        for (int d = 0; d < doc_count; d++) {
-            int count = token_counts[d];
-            char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
-            cbm_sem_corpus_add_doc(corpus, (const char **)tokens, count);
-        }
-        return;
+        corpus_rollback_entries(corpus, base_entry_count);
+        corpus_log_error("semantic.corpus.oom", CBM_SEM_CORPUS_ALLOC_FAILED, "add_docs_batch",
+                         "document-frequency counter allocation failed", corpus->entry_count);
+        return CBM_NOT_FOUND;
     }
 
     int worker_count = cbm_default_worker_count(false);
@@ -762,6 +1042,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         .doc_freq_atomic = doc_freq_atomic,
     };
     atomic_init(&bc.next_idx, 0);
+    atomic_init(&bc.failed, 0);
     /* Temporarily re-base doc arrays so workers write to base_doc..base_doc+doc_count */
     corpus->doc_token_ids += base_doc;
     corpus->doc_token_counts += base_doc;
@@ -770,12 +1051,21 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     corpus->doc_token_ids -= base_doc;
     corpus->doc_token_counts -= base_doc;
 
+    if (atomic_load_explicit(&bc.failed, memory_order_acquire)) {
+        corpus_clear_doc_range(corpus, base_doc, doc_count);
+        corpus_rollback_entries(corpus, base_entry_count);
+        free(doc_freq_atomic);
+        return CBM_NOT_FOUND;
+    }
+
     /* Phase C (SEQUENTIAL reduce): atomic counters → entries[].doc_freq */
     for (int i = 0; i < corpus->entry_count; i++) {
         corpus->entries[i].doc_freq +=
             atomic_load_explicit(&doc_freq_atomic[i], memory_order_relaxed);
     }
+    corpus->doc_count = base_doc + doc_count;
     free(doc_freq_atomic);
+    return 0;
 }
 
 /* ── Parallel corpus_finalize ─────────────────────────────────────── */

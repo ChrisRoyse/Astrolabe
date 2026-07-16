@@ -710,27 +710,29 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */
-typedef void (*predump_pass_fn)(cbm_pipeline_ctx_t *);
-static void predump_deco(cbm_pipeline_ctx_t *ctx) {
-    cbm_pipeline_pass_decorator_tags(ctx->gbuf, ctx->project_name);
+typedef int (*predump_pass_fn)(cbm_pipeline_ctx_t *);
+static int predump_deco(cbm_pipeline_ctx_t *ctx) {
+    return cbm_pipeline_pass_decorator_tags(ctx->gbuf, ctx->project_name);
 }
-static void predump_route(cbm_pipeline_ctx_t *ctx) {
+static int predump_route(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_create_route_nodes(ctx->gbuf);
+    return 0;
 }
-static void predump_sim(cbm_pipeline_ctx_t *ctx) {
-    cbm_pipeline_pass_similarity(ctx);
+static int predump_sim(cbm_pipeline_ctx_t *ctx) {
+    return cbm_pipeline_pass_similarity(ctx);
 }
-static void predump_sem(cbm_pipeline_ctx_t *ctx) {
-    cbm_pipeline_pass_semantic_edges(ctx);
+static int predump_sem(cbm_pipeline_ctx_t *ctx) {
+    return cbm_pipeline_pass_semantic_edges(ctx);
 }
-static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
-    cbm_pipeline_pass_configlink(ctx);
+static int predump_cfg(cbm_pipeline_ctx_t *ctx) {
+    return cbm_pipeline_pass_configlink(ctx);
 }
-static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
+static int predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
+    return 0;
 }
 
-static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
@@ -751,10 +753,19 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
             continue;
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        passes[i].fn(ctx);
+        int rc = passes[i].fn(ctx);
         cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        if (rc != 0) {
+            cbm_log_error("pipeline.predump.failed", "pass", passes[i].name, "code",
+                          "CBM_PREDUMP_PASS_FAILED", "message",
+                          "predump pass failed before database dump", "remediation",
+                          "inspect the preceding structured pass error and retry after fixing the "
+                          "reported cause");
+            return rc;
+        }
     }
+    return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
 /* Adapter that lets cbm_pipeline_pass_lsp_cross slot into the seq_passes
@@ -1258,8 +1269,11 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
 
     CBM_PROF_START(t_predump);
-    run_predump_passes(p, ctx);
+    rc = run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
+    if (rc != 0) {
+        return rc;
+    }
 
     if (!check_cancel(p)) {
         struct timespec t;

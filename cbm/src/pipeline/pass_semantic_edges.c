@@ -1277,10 +1277,24 @@ static void free_lsh_buckets(sem_bucket_t **band_buckets) {
  * enriched token vectors to the graph buffer.  Returns the new corpus, which
  * the caller must cbm_sem_corpus_free() later. */
 static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens, int *token_counts,
-                                          int func_count) {
+                                           int func_count) {
     CBM_PROF_START(t_phase3a);
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
-    cbm_sem_corpus_add_docs_batch(corpus, all_tokens, token_counts, func_count, CBM_SEM_MAX_TOKENS);
+    if (!corpus) {
+        cbm_log_error("pass.semantic.corpus_failed", "code", "CBM_SEM_CORPUS_ALLOC_FAILED",
+                      "message", "semantic corpus allocation failed", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        return NULL;
+    }
+    if (cbm_sem_corpus_add_docs_batch(corpus, all_tokens, token_counts, func_count,
+                                      CBM_SEM_MAX_TOKENS) != 0) {
+        cbm_sem_corpus_free(corpus);
+        cbm_log_error("pass.semantic.corpus_failed", "code", "CBM_SEM_CORPUS_ADD_FAILED",
+                      "message", "semantic corpus batch add failed before commit",
+                      "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        return NULL;
+    }
     CBM_PROF_END_N("semantic_edges", "3a_corpus_batch", t_phase3a, func_count);
 
     CBM_PROF_START(t_phase3b);
@@ -1387,12 +1401,43 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     int worker_count = cbm_default_worker_count(false);
     char **all_tokens = malloc((size_t)func_count * sizeof(char *) * CBM_SEM_MAX_TOKENS);
     int *token_counts = calloc((size_t)func_count, sizeof(int));
+    if (!all_tokens || !token_counts) {
+        cbm_log_error("pass.semantic.tokenize_alloc_failed", "code",
+                      "CBM_SEM_TOKENIZE_ALLOC_FAILED", "message",
+                      "semantic tokenization buffers could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        free(all_tokens);
+        free(token_counts);
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
 
     CBM_PROF_START(t_phase2);
     CBMHashTable **token_pools = calloc((size_t)worker_count, sizeof(CBMHashTable *));
-    if (token_pools) {
-        for (int w = 0; w < worker_count; w++) {
-            token_pools[w] = cbm_ht_create(CBM_SZ_1K);
+    if (!token_pools) {
+        cbm_log_error("pass.semantic.tokenize_alloc_failed", "code",
+                      "CBM_SEM_TOKEN_POOL_ALLOC_FAILED", "message",
+                      "semantic token intern-pool table could not be allocated", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        free(all_tokens);
+        free(token_counts);
+        free(funcs);
+        free(node_ptrs);
+        return CBM_NOT_FOUND;
+    }
+    for (int w = 0; w < worker_count; w++) {
+        token_pools[w] = cbm_ht_create(CBM_SZ_1K);
+        if (!token_pools[w]) {
+            cbm_log_error("pass.semantic.tokenize_alloc_failed", "code",
+                          "CBM_SEM_TOKEN_POOL_ALLOC_FAILED", "message",
+                          "semantic token intern pool could not be allocated", "remediation",
+                          "free memory or reduce the indexed corpus size, then retry");
+            free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                                  worker_count);
+            free(token_counts);
+            free(node_ptrs);
+            return CBM_NOT_FOUND;
         }
     }
     phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
@@ -1402,6 +1447,12 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
 
     /* Phase 3: Build corpus (batch add), finalize, export enriched token vectors. */
     cbm_sem_corpus_t *corpus = run_corpus_phase(gbuf, all_tokens, token_counts, func_count);
+    if (!corpus) {
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return CBM_NOT_FOUND;
+    }
 
     /* Phase 4: Build per-function TF-IDF + RI vectors (PARALLEL) and store them. */
     CBM_PROF_START(t_phase4);

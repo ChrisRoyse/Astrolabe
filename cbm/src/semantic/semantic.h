@@ -162,15 +162,19 @@ typedef struct cbm_sem_corpus cbm_sem_corpus_t;
 /* Create a new corpus from function data. */
 cbm_sem_corpus_t *cbm_sem_corpus_new(void);
 
-/* Register a function's tokens in the corpus (for IDF counting). */
-void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
+/* Register a function's tokens in the corpus (for IDF counting).
+ * Returns 0 on success or -1 on allocation/validation failure. On failure,
+ * the previous readable corpus state is preserved and no document is committed. */
+int cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
 
 /* Batch-build the corpus from pre-tokenized documents (PARALLEL variant).
  * `all_tokens` layout: all_tokens[f * max_tokens_per_doc + t] = token pointer.
  * `token_counts[f]` = number of tokens in document f.
- * This replaces a loop of cbm_sem_corpus_add_doc() calls. */
-void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc);
+ * This replaces a loop of cbm_sem_corpus_add_doc() calls.
+ * Returns 0 on success or -1 on allocation/validation failure. On failure,
+ * the previous readable corpus state is preserved and no document is committed. */
+int cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
+                                  const int *token_counts, int doc_count, int max_tokens_per_doc);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
