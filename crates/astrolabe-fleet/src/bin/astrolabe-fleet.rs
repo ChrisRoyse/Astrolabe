@@ -4,17 +4,28 @@
 //! `{code,message,remediation}` JSON object on stderr and exit 1):
 //!
 //! ```text
-//! astrolabe-fleet catalog-init --root <dir>
-//! astrolabe-fleet register     --root <dir> (--json <record> | --stdin) [--at <unix-secs>]
-//! astrolabe-fleet set-state    --root <dir> --github-id <id> --repo <owner/name> --to <state>
+//! astrolabe-fleet catalog-init [--root <dir>]
+//! astrolabe-fleet register     [--root <dir>] (--json <record> | --stdin) [--at <unix-secs>]
+//! astrolabe-fleet set-state    [--root <dir>] --github-id <id> --repo <owner/name> --to <state>
 //!                              [--at <unix-secs>] [--clone-path <p>] [--head-commit-hash <sha>]
 //!                              [--index-watermark <w>] [--kernel-scope-id <k>] [--reason <r>]
-//! astrolabe-fleet get          --root <dir> (--github-id <id> --repo <owner/name> | --cx <hex>)
-//! astrolabe-fleet list         --root <dir> [--state <state>] [--language <lang>] [--counts]
+//! astrolabe-fleet get          [--root <dir>] (--github-id <id> --repo <owner/name> | --cx <hex>)
+//! astrolabe-fleet list         [--root <dir>] [--state <state>] [--language <lang>] [--counts]
+//! astrolabe-fleet discover     [--root <dir>] [--language <csv>] [--star-floor <n>]
+//!                              [--refresh] [--at <unix-secs>]
 //! ```
 //!
-//! `register --stdin` reads one JSON [`RepoRecord`] per line, so discovery
-//! (#450) can stream an enumeration straight into the catalog.
+//! `--root` defaults to the declared production catalog root
+//! [`astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT`] (`D:\astrolabe-fleet\catalog`).
+//!
+//! `register --stdin` reads one JSON [`RepoRecord`] per line, so external
+//! tools can stream records straight into the catalog. `discover` (#450) runs
+//! the star-bucket bisection enumeration against the live GitHub API via the
+//! authenticated `gh` CLI and registers everything it finds; `--refresh`
+//! additionally marks catalog repos absent from a complete enumeration as
+//! `departed` and returns reappeared repos to `discovered`.
+//! `set-state --to departed` records `--reason` as the departure reason;
+//! `--to quarantined` records it as the quarantine reason.
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -27,7 +38,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list> --root <dir> [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -53,8 +64,11 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
         .map(String::as_str)
         .ok_or_else(|| usage("missing verb"))?;
     let opts = Options::parse(&args[1..])?;
-    let root = opts.require("root")?;
-    let catalog = FleetCatalog::open(&PathBuf::from(root))?;
+    let root = PathBuf::from(
+        opts.get("root")
+            .unwrap_or(astrolabe_fleet::discover::DEFAULT_CATALOG_ROOT),
+    );
+    let catalog = FleetCatalog::open(&root)?;
     match verb {
         "catalog-init" => {
             opts.reject_unknown(&["root"])?;
@@ -107,13 +121,19 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             let github_id = opts.require_u64("github-id")?;
             let full_name = opts.require("repo")?;
             let to = RepoState::parse(opts.require("to")?)?;
+            let reason = opts.get("reason").map(str::to_string);
             let ctx = TransitionContext {
                 at_unix_secs: opts.at_or_now()?,
                 clone_path: opts.get("clone-path").map(str::to_string),
                 head_commit_hash: opts.get("head-commit-hash").map(str::to_string),
                 index_watermark: opts.get("index-watermark").map(str::to_string),
                 kernel_scope_id: opts.get("kernel-scope-id").map(str::to_string),
-                quarantine_reason: opts.get("reason").map(str::to_string),
+                quarantine_reason: (to == RepoState::Quarantined)
+                    .then(|| reason.clone())
+                    .flatten(),
+                departed_reason: (to == RepoState::Departed)
+                    .then(|| reason.clone())
+                    .flatten(),
             };
             let report = catalog.transition(github_id, full_name, to, ctx)?;
             println!(
@@ -158,6 +178,43 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
             }
             Ok(())
         }
+        "discover" => {
+            opts.reject_unknown(&["root", "language", "star-floor", "refresh", "at"])?;
+            let languages: Vec<String> = opts
+                .get("language")
+                .map(|csv| {
+                    csv.split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    astrolabe_fleet::discover::DEFAULT_LANGUAGES
+                        .iter()
+                        .map(|lang| (*lang).to_string())
+                        .collect()
+                });
+            if languages.is_empty() {
+                return Err(usage("--language must name at least one language"));
+            }
+            let star_floor = match opts.get("star-floor") {
+                Some(raw) => raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--star-floor must be a u64: {error}")))?,
+                None => astrolabe_fleet::discover::DEFAULT_STAR_FLOOR,
+            };
+            let report = astrolabe_fleet::discover::run_discovery(
+                &catalog,
+                &root,
+                &languages,
+                star_floor,
+                opts.flag("refresh"),
+                opts.at_or_now()?,
+            )?;
+            println!("{report}");
+            Ok(())
+        }
         other => Err(usage(&format!("unknown verb {other:?}"))),
     }
 }
@@ -185,7 +242,7 @@ struct Options {
 }
 
 impl Options {
-    const SWITCHES: [&'static str; 2] = ["stdin", "counts"];
+    const SWITCHES: [&'static str; 3] = ["stdin", "counts", "refresh"];
 
     fn parse(args: &[String]) -> Result<Self, CalyxError> {
         let mut pairs = Vec::new();
