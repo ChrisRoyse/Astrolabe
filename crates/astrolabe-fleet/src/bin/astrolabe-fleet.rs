@@ -46,7 +46,7 @@ use astrolabe_fleet::state::RepoState;
 use calyx_core::{CalyxError, CxId};
 use serde_json::json;
 
-const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census> [--root <dir>] [verb options]; see crate docs";
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list|discover|clone|pipeline|report|report-read|report-list|run-report-read|probe-vault-keys|dedup-census|compose|kernel-read> [--root <dir>] [verb options]; see crate docs";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -557,6 +557,106 @@ fn run(args: &[String]) -> Result<(), CalyxError> {
                     "projects": artifact["projects"],
                 })
             );
+            Ok(())
+        }
+        "compose" => {
+            opts.reject_unknown(&[
+                "root",
+                "store-root",
+                "scope",
+                "repo",
+                "sim-min-permille",
+                "sim-top-k",
+                "repo-recall-min-permille",
+            ])?;
+            let store_root =
+                PathBuf::from(opts.get("store-root").ok_or_else(|| {
+                    usage("compose needs --store-root <dir> (the fleet store root)")
+                })?);
+            let scope = opts
+                .get("scope")
+                .ok_or_else(|| usage("compose needs --scope <scope-id> (e.g. fleet:rust:v1)"))?;
+            let named = opts.get_all("repo");
+            let projects: Vec<String> = if named.is_empty() {
+                let mut projects: Vec<String> = catalog
+                    .query(Some(RepoState::Kerneled), None)?
+                    .into_iter()
+                    .map(|row| row.record.full_name.replace('/', "__"))
+                    .collect();
+                projects.sort();
+                if projects.is_empty() {
+                    return Err(CalyxError {
+                        code: "ASTRO_FLEET_COMPOSE_EMPTY",
+                        message: "no kerneled repos in the catalog and no --repo named".to_string(),
+                        remediation: "kernel at least one repo or name --repo <org__repo> explicitly",
+                    });
+                }
+                projects
+            } else {
+                named.into_iter().map(str::to_string).collect()
+            };
+            let mut config = astrolabe_fleet::compose::ComposeConfig::with_registry_defaults();
+            if let Some(raw) = opts.get("sim-min-permille") {
+                config.similarity_min_permille = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!("--sim-min-permille must be a u64: {error}"))
+                })?;
+            }
+            if let Some(raw) = opts.get("sim-top-k") {
+                config.similarity_top_k = raw
+                    .parse::<u64>()
+                    .map_err(|error| usage(&format!("--sim-top-k must be a u64: {error}")))?;
+            }
+            if let Some(raw) = opts.get("repo-recall-min-permille") {
+                config.per_repo_recall_min_permille = raw.parse::<u64>().map_err(|error| {
+                    usage(&format!(
+                        "--repo-recall-min-permille must be a u64: {error}"
+                    ))
+                })?;
+            }
+            let summary = astrolabe_fleet::compose::compose_fleet_kernel(
+                &catalog,
+                &store_root,
+                scope,
+                &projects,
+                &config,
+            )?;
+            println!("{summary}");
+            Ok(())
+        }
+        "kernel-read" => {
+            opts.reject_unknown(&["root", "scope", "raw", "verify-provenance", "store-root"])?;
+            let scope = opts
+                .get("scope")
+                .ok_or_else(|| usage("kernel-read needs --scope <scope-id>"))?;
+            let (summary, raw) = astrolabe_fleet::compose::read_fleet_kernel(&catalog, scope)?;
+            if opts.flag("raw") {
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(&raw)
+                    .map_err(|error| CalyxError {
+                        code: "ASTRO_FLEET_REPORT_READ",
+                        message: format!("write kernel.json bytes to stdout: {error}"),
+                        remediation: "retry with a writable stdout",
+                    })?;
+                return Ok(());
+            }
+            let mut out = summary;
+            if let Some(sample) = opts.get("verify-provenance") {
+                let sample_n = sample.parse::<usize>().map_err(|error| {
+                    usage(&format!("--verify-provenance must be a usize: {error}"))
+                })?;
+                let store_root = PathBuf::from(opts.get("store-root").ok_or_else(|| {
+                    usage("kernel-read --verify-provenance needs --store-root <dir>")
+                })?);
+                let verify = astrolabe_fleet::compose::verify_member_provenance(
+                    &catalog,
+                    &store_root,
+                    scope,
+                    sample_n,
+                )?;
+                out["provenance"] = verify;
+            }
+            println!("{out}");
             Ok(())
         }
         "probe-vault-keys" => {
