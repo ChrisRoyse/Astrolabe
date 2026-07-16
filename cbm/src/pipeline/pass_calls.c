@@ -237,24 +237,42 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
 /* Build route QN and upsert Route node for HTTP/async edge. */
 static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, cbm_svc_kind_t svc,
                                      const char *method, const char *broker) {
+    /* #512: a non-UTF-8 byte in the URL literal must not reach the Route QN raw.
+     * The post-merge route_edge_visitor (pass_route_nodes.c) builds its Route QN
+     * from the HTTP_CALLS edge's url_path property, which was written through
+     * cbm_json_escape (#493) and therefore already carries U+FFFD in place of any
+     * bad byte. If this path kept the raw byte in the QN, the two Route nodes
+     * would differ in the graph buffer yet collapse to one qualified_name once
+     * the #503 dump sanitizer runs — a duplicate that violates
+     * UNIQUE(project, qualified_name) and blocks the whole repo. Sanitizing the
+     * URL to the identical UTF-8-safe form here makes both paths upsert one QN,
+     * so the graph buffer dedups them into a single Route node before the dump. */
+    char sane_url[CBM_SZ_512];
+    cbm_utf8_sanitize(sane_url, sizeof(sane_url), url ? url : "");
     char route_qn[CBM_ROUTE_QN_SIZE];
     const char *prefix;
     char cpath[CBM_SZ_256];
-    const char *qpath = url;
+    const char *qpath = sane_url;
     if (svc == CBM_SVC_HTTP) {
         prefix = method ? method : "ANY";
-        qpath = cbm_route_canon_path(url, cpath, sizeof(cpath));
+        qpath = cbm_route_canon_path(sane_url, cpath, sizeof(cpath));
     } else {
         prefix = broker ? broker : "async";
     }
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CBM_SVC_HTTP) {
-        rp = method ? method : "{}";
+    /* Properties must be well-formed JSON on every path (#512): the pre-fix code
+     * passed the bare method/broker string (e.g. "GET") as the properties column,
+     * producing an unparseable Route node — mismatched with the well-formed
+     * {"method":...} the route_edge_visitor path emits for the same call. */
+    char route_props[CBM_SZ_256];
+    if (svc == CBM_SVC_HTTP && method) {
+        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
+    } else if (svc == CBM_SVC_ASYNC && broker) {
+        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
     } else {
-        rp = broker ? broker : "{}";
+        snprintf(route_props, sizeof(route_props), "{}");
     }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", sane_url, route_qn, "", 0, 0, route_props);
 }
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
