@@ -6,9 +6,9 @@ use std::time::Instant;
 use calyx_core::{Input, Lens, LensCost, Placement};
 use calyx_registry::{
     CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, PlacementBudget,
-    StaticLookupLens, choose_resolved_placement, frozen_device_policy,
-    legacy_lensforge_manifest_v1_ids_from_path, lens_spec_from_manifest_path,
-    lens_spec_metadata_from_manifest_path,
+    StaticLookupLens, choose_resolved_placement, legacy_lensforge_manifest_v1_ids_from_path,
+    lens_spec_from_manifest_path, lens_spec_metadata_from_manifest_path,
+    parse_frozen_device_policy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -516,7 +516,7 @@ pub(crate) fn resolved_runtime_placement(spec: &LensSpec) -> CliResult<Placement
         | LensRuntime::ExternalCmd { .. } => Ok(Placement::Cpu),
         LensRuntime::CandleLocal { device, dtype, .. }
         | LensRuntime::FastembedQwen3 { device, dtype, .. } => {
-            let policy = frozen_device_policy(device)?;
+            let policy = parse_frozen_device_policy(device)?;
             let precision = CandlePrecision::parse(dtype)?;
             if !policy.is_gpu() && precision != CandlePrecision::F32 {
                 return Err(calyx_core::CalyxError {

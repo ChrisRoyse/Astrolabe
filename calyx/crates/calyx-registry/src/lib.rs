@@ -115,6 +115,7 @@ pub use runtime::candle::{
     CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy, CandlePrecision,
     DEFAULT_CANDLE_MODEL, configured_device_mode, configured_device_policy,
     default_cuda_fail_loud_policy, device_policy_for_mode, frozen_device_policy,
+    parse_frozen_device_policy,
 };
 pub use runtime::external_cmd::ExternalCmdLens;
 #[cfg(feature = "ml-runtime")]

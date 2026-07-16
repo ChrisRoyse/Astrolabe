@@ -166,22 +166,45 @@ pub fn device_policy_for_mode(mode: CandleDeviceMode) -> Result<CandleDevicePoli
     }
 }
 
-pub fn frozen_device_policy(raw: &str) -> Result<CandleDevicePolicy> {
+/// Parses a frozen execution-device token without querying live CUDA state.
+///
+/// Manifest, catalog, and identity operations use this boundary because the token is persisted
+/// declarative state. Executable runtime construction must call [`frozen_device_policy`] instead,
+/// which additionally proves that the declared CUDA device is available.
+pub fn parse_frozen_device_policy(raw: &str) -> Result<CandleDevicePolicy> {
     let raw = raw.trim().to_ascii_lowercase();
     if raw == "cpu" {
         return Ok(CandleDevicePolicy::CpuExplicit);
     }
     let Some(ordinal) = raw.strip_prefix("cuda:") else {
-        return Err(device_mode_invalid(format!(
+        return Err(frozen_device_invalid(format!(
             "unsupported frozen Candle execution device {raw}; expected cpu or cuda:<ordinal>"
         )));
     };
     let ordinal = ordinal.parse::<usize>().map_err(|_| {
-        device_mode_invalid(format!(
+        frozen_device_invalid(format!(
             "frozen Candle execution device {raw} has an invalid CUDA ordinal"
         ))
     })?;
-    cuda_policy_for_ordinal(false, ordinal, "frozen execution_device")
+    Ok(CandleDevicePolicy::CudaFailLoud { ordinal })
+}
+
+/// Resolves a frozen execution-device token for executable runtime construction.
+pub fn frozen_device_policy(raw: &str) -> Result<CandleDevicePolicy> {
+    match parse_frozen_device_policy(raw)? {
+        CandleDevicePolicy::CudaFailLoud { ordinal } => {
+            cuda_policy_for_ordinal(false, ordinal, "frozen execution_device")
+        }
+        policy => Ok(policy),
+    }
+}
+
+fn frozen_device_invalid(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: "CALYX_LENS_CONFIG_INVALID",
+        message: message.into(),
+        remediation: "recommission the frozen manifest with execution_device set to cpu or cuda:<ordinal>",
+    }
 }
 
 #[cfg(feature = "candle-cuda")]
