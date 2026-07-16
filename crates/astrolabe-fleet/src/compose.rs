@@ -629,7 +629,11 @@ impl FleetNode {
     /// `None` = eligible. Rules are evaluated in a fixed order; each excluded
     /// node is attributed to exactly the first matching rule.
     fn candidacy_exclusion(&self) -> Option<&'static str> {
-        if self.occurrences.iter().all(|occurrence| occurrence.snippet_empty) {
+        if self
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.snippet_empty)
+        {
             return Some(CANDIDACY_RULE_EMPTY_FINGERPRINT);
         }
         if FLEET_STRUCTURAL_LABELS.contains(&self.label()) {
