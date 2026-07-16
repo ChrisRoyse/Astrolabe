@@ -42,6 +42,8 @@ pub const ASTRO_FLEET_DEPARTED_REASON_REQUIRED: &str = "ASTRO_FLEET_DEPARTED_REA
 pub const ASTRO_FLEET_FSV_MISMATCH: &str = "ASTRO_FLEET_FSV_MISMATCH";
 /// Refusal code for a transition timestamp of zero.
 pub const ASTRO_FLEET_TIMESTAMP_REQUIRED: &str = "ASTRO_FLEET_TIMESTAMP_REQUIRED";
+/// Refusal code for an `update_facts` call that would change nothing (#451).
+pub const ASTRO_FLEET_FACTS_UNCHANGED: &str = "ASTRO_FLEET_FACTS_UNCHANGED";
 
 /// Declared vault id of the fleet catalog (a fixed ULID so every open
 /// resolves the same vault identity).
@@ -200,6 +202,7 @@ impl FleetCatalog {
             kernel_scope_id: None,
             quarantine_reason: None,
             departed_reason: None,
+            clone_bytes: None,
         };
         let payload = serde_json::to_vec(&json!({
             "event": "fleet_repo_registered",
@@ -276,6 +279,9 @@ impl FleetCatalog {
         if let Some(reason) = ctx.departed_reason.clone() {
             row.departed_reason = Some(reason);
         }
+        if let Some(bytes) = ctx.clone_bytes {
+            row.clone_bytes = Some(bytes);
+        }
         if from == RepoState::Departed && to == RepoState::Discovered {
             // Reappearance: the departure reason described the previous
             // absence; the ledger keeps that history, the live row does not.
@@ -302,12 +308,76 @@ impl FleetCatalog {
         if let Some(reason) = &row.departed_reason {
             payload["departed_reason"] = json!(reason);
         }
+        if let Some(bytes) = row.clone_bytes {
+            payload["clone_bytes"] = json!(bytes);
+        }
         let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
         let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
         Ok(TransitionReport {
             cx_id,
             from,
             to,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Rewrites lifecycle facts on a record **without** changing its state
+    /// (issue #451: an update fetch advances `head_commit_hash`/`clone_bytes`
+    /// on a repo that stays `cloned`/`indexed`/…). Ledger-paired like every
+    /// other mutation (`fleet_facts_updated`), and refused when nothing would
+    /// change so no-op updates never mint ledger noise.
+    pub fn update_facts(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        ctx: TransitionContext,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(ctx.at_unix_secs)?;
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        let before = row.clone();
+        if let Some(clone_path) = ctx.clone_path {
+            row.clone_path = Some(clone_path);
+        }
+        if let Some(head) = ctx.head_commit_hash {
+            row.head_commit_hash = Some(head);
+        }
+        if let Some(watermark) = ctx.index_watermark {
+            row.index_watermark = Some(watermark);
+        }
+        if let Some(scope) = ctx.kernel_scope_id {
+            row.kernel_scope_id = Some(scope);
+        }
+        if let Some(bytes) = ctx.clone_bytes {
+            row.clone_bytes = Some(bytes);
+        }
+        if row == before {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_FACTS_UNCHANGED,
+                message: format!("update_facts for {full_name} would change nothing"),
+                remediation: "pass at least one changed fact, or treat the repo as an explicit no-op instead of updating it",
+            });
+        }
+        let mut payload = json!({
+            "event": "fleet_facts_updated",
+            "github_id": github_id,
+            "full_name": full_name,
+            "state": row.state.as_str(),
+            "at_unix_secs": ctx.at_unix_secs,
+        });
+        if let Some(head) = &row.head_commit_hash {
+            payload["head_commit_hash"] = json!(head);
+        }
+        if let Some(bytes) = row.clone_bytes {
+            payload["clone_bytes"] = json!(bytes);
+        }
+        let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from: row.state,
+            to: row.state,
             commit_seq,
             ledger_seq,
         })

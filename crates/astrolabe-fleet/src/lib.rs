@@ -22,6 +22,7 @@
 //! (fail-closed write-path FSV).
 
 pub mod catalog;
+pub mod clone_farm;
 pub mod discover;
 pub mod record;
 pub mod state;
@@ -29,6 +30,12 @@ pub mod state;
 pub use catalog::{
     FLEET_ACTOR, FLEET_VAULT_ID, FLEET_VAULT_SALT, FleetCatalog, RegisterOutcome, RegisterReport,
     TransitionReport,
+};
+pub use clone_farm::{
+    ASTRO_FLEET_CLONE_PASS_INCOMPLETE, ASTRO_FLEET_CLONE_TARGET_CONFLICT,
+    ASTRO_FLEET_FARM_BUDGET_EXCEEDED, DEFAULT_FARM_BUDGET_BYTES, DEFAULT_FARM_ROOT,
+    DEFAULT_GIT_TIMEOUT_SECS, DEFAULT_PARALLELISM, DEFAULT_SIZE_CAP_BYTES, FarmConfig, Selection,
+    run_clone_pass, target_dir,
 };
 pub use discover::{
     ASTRO_FLEET_DISCOVERY_INCOMPLETE, ASTRO_FLEET_GH_API, DEFAULT_CATALOG_ROOT, DEFAULT_LANGUAGES,
