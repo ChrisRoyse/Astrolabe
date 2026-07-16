@@ -576,8 +576,10 @@ enum {
 /* Length of the UTF-8 sequence starting at src[0] under RFC 3629 (overlong
  * encodings, UTF-16 surrogates, and code points above U+10FFFF are invalid).
  * Returns the sequence length (2-4) when valid, 0 when invalid. Never reads
- * past a NUL: a NUL continuation byte fails the range checks first (#493). */
-static int utf8_sequence_len(const unsigned char *src) {
+ * past a NUL: a NUL continuation byte fails the range checks first (#493).
+ * Exported (#503) so the raw-text UTF-8 sanitizer at the SQLite insert boundary
+ * reuses the identical RFC 3629 validation the JSON escaper uses. */
+int cbm_utf8_sequence_len(const unsigned char *src) {
     unsigned char lead = src[0];
     unsigned char lo = 0x80, hi = 0xBF;
     int len;
@@ -661,7 +663,54 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
              * range) becomes U+FFFD. The emitted JSON is therefore always valid
              * UTF-8 — the write contract the vault importer's fail-closed UTF-8
              * boundary depends on. */
-            int seq = utf8_sequence_len((const unsigned char *)src + i);
+            int seq = cbm_utf8_sequence_len((const unsigned char *)src + i);
+            if (seq > 0) {
+                if (pos + seq > bufsize - JSON_NUL_RESERVE) {
+                    break;
+                }
+                memcpy(buf + pos, src + i, (size_t)seq);
+                pos += seq;
+                i += seq - 1; /* the loop's i++ consumes the final byte */
+            } else {
+                if (pos + UTF8_REPLACEMENT_LEN > bufsize - JSON_NUL_RESERVE) {
+                    break;
+                }
+                buf[pos++] = (char)0xEF;
+                buf[pos++] = (char)0xBF;
+                buf[pos++] = (char)0xBD;
+            }
+        }
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+int cbm_utf8_sanitize(char *buf, int bufsize, const char *src) {
+    if (!buf || bufsize <= 0) {
+        return 0;
+    }
+    if (!src) {
+        buf[0] = '\0';
+        return 0;
+    }
+    int pos = 0;
+    /* Reserve one byte for the terminating NUL (JSON_NUL_RESERVE == 1). */
+    for (int i = 0; src[i] && pos < bufsize - JSON_NUL_RESERVE; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x80) {
+            /* ASCII (including control chars and NUL-free bytes) is always valid
+             * UTF-8; unlike cbm_json_escape this is raw text, not JSON, so control
+             * chars are copied verbatim rather than backslash-escaped. */
+            buf[pos++] = (char)c;
+        } else {
+            /* Multi-byte UTF-8 (#503): a valid sequence is copied atomically so a
+             * buffer-cap truncation can only land on a character boundary; any
+             * invalid byte (bad lead/continuation, overlong, surrogate, out of
+             * range) becomes U+FFFD. The emitted bytes are therefore always valid
+             * UTF-8 — the same write contract cbm_json_escape guarantees for JSON
+             * property columns, now enforced for the raw parser-derived identifier
+             * and path columns bound into the SQLite `nodes`/`edges` tables. */
+            int seq = cbm_utf8_sequence_len((const unsigned char *)src + i);
             if (seq > 0) {
                 if (pos + seq > bufsize - JSON_NUL_RESERVE) {
                     break;
