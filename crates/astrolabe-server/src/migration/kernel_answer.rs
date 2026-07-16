@@ -52,6 +52,14 @@ pub(crate) fn handle_get_kernel(args_json: &str) -> Result<String, DynError> {
     let Some(args_obj) = args.as_object() else {
         return tool_error_result("get_kernel arguments must be a JSON object");
     };
+    // #459: a fleet scope (fleet:<language>:<version>) is cross-project — it is
+    // served from the fleet catalog vault and needs neither project nor dial.
+    if let Some(scope_id) = string_arg(args_obj, "scope")
+        && is_fleet_scope(scope_id)
+    {
+        let scope_id = scope_id.to_owned();
+        return handle_get_kernel_fleet(args_obj, &scope_id);
+    }
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result("get_kernel requires project");
     };
@@ -491,6 +499,14 @@ pub(crate) fn handle_kernel_answer(args_json: &str) -> Result<String, DynError> 
     let Some(args_obj) = args.as_object() else {
         return tool_error_result("kernel_answer arguments must be a JSON object");
     };
+    // #459: fleet-scope answers serve from the fleet catalog vault (declared
+    // exemplar retrieval with per-repo citations); project/dial not required.
+    if let Some(scope_id) = string_arg(args_obj, "scope")
+        && is_fleet_scope(scope_id)
+    {
+        let scope_id = scope_id.to_owned();
+        return handle_kernel_answer_fleet(args_obj, &scope_id);
+    }
     let Some(project) = status_project_from_args(args_obj)? else {
         return tool_error_result("kernel_answer requires project");
     };

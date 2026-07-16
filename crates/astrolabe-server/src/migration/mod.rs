@@ -113,6 +113,9 @@ use kernel_gaps::*;
 mod kernel_answer;
 use kernel_answer::*;
 
+mod fleet_serving;
+use fleet_serving::*;
+
 mod anomalies;
 use anomalies::*;
 
