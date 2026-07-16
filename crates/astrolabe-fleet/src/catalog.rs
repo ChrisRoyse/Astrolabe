@@ -1,0 +1,475 @@
+//! The fleet catalog vault: durable repo records with a fail-closed lifecycle
+//! state machine, every mutation ledger-paired and readback-verified
+//! (issue #449).
+//!
+//! # Write-path FSV
+//!
+//! Every mutation commits through
+//! [`AsterVault::write_cf_batch_with_ledger_entry`] — one atomic batch holding
+//! the Base row and its ledger entry — and then, **before returning**,
+//! independently re-reads the committed row and the ledger entry at the commit
+//! snapshot and compares them field-for-field ([`ASTRO_FLEET_FSV_MISMATCH`] on
+//! any divergence). A catalog mutation that cannot prove itself persisted is
+//! an error, not a success.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::str::FromStr;
+
+use calyx_aster::cf::{ColumnFamily, base_key, ledger_key};
+use calyx_aster::vault::encode::{decode_constellation_base, encode_constellation_base};
+use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::{CalyxError, Constellation, CxId, LedgerRef, Seq, VaultId};
+use calyx_ledger::{ActorId, EntryKind, RedactionPolicy, SubjectId};
+use serde::Serialize;
+use serde_json::json;
+
+use crate::record::{
+    FleetRepoRow, RepoRecord, TransitionContext, decode_repo_constellation,
+    encode_repo_constellation, repo_cx_id,
+};
+use crate::state::{ALL_STATES, RepoState, check_transition};
+
+/// Refusal code when a requested record is not in the catalog.
+pub const ASTRO_FLEET_RECORD_MISSING: &str = "ASTRO_FLEET_RECORD_MISSING";
+/// Refusal code when a stored row's identity fields disagree with its CxId.
+pub const ASTRO_FLEET_IDENTITY_CONFLICT: &str = "ASTRO_FLEET_IDENTITY_CONFLICT";
+/// Refusal code when quarantining without a recorded reason.
+pub const ASTRO_FLEET_QUARANTINE_REASON_REQUIRED: &str = "ASTRO_FLEET_QUARANTINE_REASON_REQUIRED";
+/// Refusal code when the post-commit readback diverges from the claim.
+pub const ASTRO_FLEET_FSV_MISMATCH: &str = "ASTRO_FLEET_FSV_MISMATCH";
+/// Refusal code for a transition timestamp of zero.
+pub const ASTRO_FLEET_TIMESTAMP_REQUIRED: &str = "ASTRO_FLEET_TIMESTAMP_REQUIRED";
+
+/// Declared vault id of the fleet catalog (a fixed ULID so every open
+/// resolves the same vault identity).
+pub const FLEET_VAULT_ID: &str = "01K449FC00000000000000000A";
+/// Declared vault salt of the fleet catalog.
+pub const FLEET_VAULT_SALT: &[u8] = b"astrolabe-fleet-catalog:v1";
+/// Ledger actor recorded for every catalog mutation.
+pub const FLEET_ACTOR: &str = "astrolabe-fleet";
+
+/// What a registration call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegisterOutcome {
+    /// New record persisted at `discovered`.
+    Registered,
+    /// Existing record's discovery facts were updated in place.
+    Refreshed,
+    /// Existing record already carried identical discovery facts; no write.
+    Unchanged,
+}
+
+/// Report of one registration, including the commit it can be audited at.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegisterReport {
+    /// Content-addressed identity of the record.
+    pub cx_id: CxId,
+    /// What happened.
+    pub outcome: RegisterOutcome,
+    /// Commit sequence of the write (`None` for [`RegisterOutcome::Unchanged`]).
+    pub commit_seq: Option<Seq>,
+    /// Ledger entry paired with the write (`None` for unchanged).
+    pub ledger_seq: Option<u64>,
+}
+
+/// Report of one lifecycle transition.
+#[derive(Clone, Debug, Serialize)]
+pub struct TransitionReport {
+    /// Content-addressed identity of the record.
+    pub cx_id: CxId,
+    /// State before the transition.
+    pub from: RepoState,
+    /// State after the transition.
+    pub to: RepoState,
+    /// Commit sequence of the write.
+    pub commit_seq: Seq,
+    /// Ledger entry paired with the write.
+    pub ledger_seq: u64,
+}
+
+/// Handle over the fleet catalog vault.
+pub struct FleetCatalog {
+    vault: AsterVault,
+    vault_id: VaultId,
+}
+
+impl FleetCatalog {
+    /// Creates or opens the fleet catalog vault rooted at `root`.
+    pub fn open(root: &Path) -> Result<Self, CalyxError> {
+        std::fs::create_dir_all(root).map_err(|error| CalyxError {
+            code: "ASTRO_FLEET_ROOT_UNAVAILABLE",
+            message: format!(
+                "cannot create fleet catalog root {}: {error}",
+                root.display()
+            ),
+            remediation: "pass a writable --root directory for the fleet catalog vault",
+        })?;
+        let vault_id = VaultId::from_str(FLEET_VAULT_ID).map_err(|error| CalyxError {
+            code: "ASTRO_FLEET_VAULT_ID_INVALID",
+            message: format!("declared fleet vault id failed to parse: {error:?}"),
+            remediation: "internal defect: FLEET_VAULT_ID must be a valid ULID literal",
+        })?;
+        let vault = AsterVault::open(
+            root,
+            vault_id,
+            FLEET_VAULT_SALT.to_vec(),
+            VaultOptions {
+                read_only: false,
+                restore_ledger_hook: true,
+                ..VaultOptions::default()
+            },
+        )?;
+        Ok(Self { vault, vault_id })
+    }
+
+    /// Registers (or idempotently re-registers) a repository.
+    ///
+    /// A brand-new identity persists at [`RepoState::Discovered`] with an
+    /// `Ingest` ledger entry. Re-registration with identical discovery facts
+    /// writes nothing and reports [`RegisterOutcome::Unchanged`] with the same
+    /// CxId. Re-registration with changed discovery facts (a discovery
+    /// refresh: stars moved, new push, new etag) rewrites only the discovery
+    /// fields — lifecycle state and timestamps are preserved — with an `Admin`
+    /// ledger entry.
+    pub fn register(
+        &self,
+        record: RepoRecord,
+        at_unix_secs: u64,
+    ) -> Result<RegisterReport, CalyxError> {
+        record.validate()?;
+        require_timestamp(at_unix_secs)?;
+        let cx_id = repo_cx_id(record.github_id, &record.full_name, FLEET_VAULT_SALT);
+
+        if let Some(mut existing) = self.try_get(cx_id)? {
+            if existing.record.github_id != record.github_id
+                || existing.record.full_name != record.full_name
+            {
+                return Err(CalyxError {
+                    code: ASTRO_FLEET_IDENTITY_CONFLICT,
+                    message: format!(
+                        "catalog row {cx_id} holds identity {}#{} but registration computed it for {}#{}",
+                        existing.record.github_id,
+                        existing.record.full_name,
+                        record.github_id,
+                        record.full_name
+                    ),
+                    remediation: "the catalog vault is corrupt or the addressing scheme changed; audit the vault ledger before writing anything else",
+                });
+            }
+            if existing.record == record {
+                return Ok(RegisterReport {
+                    cx_id,
+                    outcome: RegisterOutcome::Unchanged,
+                    commit_seq: None,
+                    ledger_seq: None,
+                });
+            }
+            let payload = serde_json::to_vec(&json!({
+                "event": "fleet_repo_refreshed",
+                "github_id": record.github_id,
+                "full_name": record.full_name,
+                "stars": record.stars,
+                "state": existing.state.as_str(),
+                "at_unix_secs": at_unix_secs,
+            }))
+            .expect("static ledger payload serializes");
+            existing.record = record;
+            let (commit_seq, ledger_seq) = self.commit_row(&existing, EntryKind::Admin, payload)?;
+            return Ok(RegisterReport {
+                cx_id,
+                outcome: RegisterOutcome::Refreshed,
+                commit_seq: Some(commit_seq),
+                ledger_seq: Some(ledger_seq),
+            });
+        }
+
+        let mut state_timestamps = BTreeMap::new();
+        state_timestamps.insert(RepoState::Discovered.as_str().to_string(), at_unix_secs);
+        let row = FleetRepoRow {
+            cx_id,
+            record,
+            state: RepoState::Discovered,
+            state_timestamps,
+            clone_path: None,
+            head_commit_hash: None,
+            index_watermark: None,
+            kernel_scope_id: None,
+            quarantine_reason: None,
+        };
+        let payload = serde_json::to_vec(&json!({
+            "event": "fleet_repo_registered",
+            "github_id": row.record.github_id,
+            "full_name": row.record.full_name,
+            "stars": row.record.stars,
+            "language": row.record.language,
+            "state": row.state.as_str(),
+            "at_unix_secs": at_unix_secs,
+        }))
+        .expect("static ledger payload serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Ingest, payload)?;
+        Ok(RegisterReport {
+            cx_id,
+            outcome: RegisterOutcome::Registered,
+            commit_seq: Some(commit_seq),
+            ledger_seq: Some(ledger_seq),
+        })
+    }
+
+    /// Applies one lifecycle transition, fail-closed on any illegal edge.
+    pub fn transition(
+        &self,
+        github_id: u64,
+        full_name: &str,
+        to: RepoState,
+        ctx: TransitionContext,
+    ) -> Result<TransitionReport, CalyxError> {
+        require_timestamp(ctx.at_unix_secs)?;
+        let cx_id = repo_cx_id(github_id, full_name, FLEET_VAULT_SALT);
+        let mut row = self.get(cx_id)?;
+        let from = row.state;
+        check_transition(from, to)?;
+        if to == RepoState::Quarantined
+            && ctx
+                .quarantine_reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+        {
+            return Err(CalyxError {
+                code: ASTRO_FLEET_QUARANTINE_REASON_REQUIRED,
+                message: format!("quarantining {full_name} requires a non-empty quarantine_reason"),
+                remediation: "pass the concrete failure being quarantined for (e.g. clone integrity failure, license gate)",
+            });
+        }
+
+        if let Some(clone_path) = ctx.clone_path {
+            row.clone_path = Some(clone_path);
+        }
+        if let Some(head) = ctx.head_commit_hash {
+            row.head_commit_hash = Some(head);
+        }
+        if let Some(watermark) = ctx.index_watermark {
+            row.index_watermark = Some(watermark);
+        }
+        if let Some(scope) = ctx.kernel_scope_id {
+            row.kernel_scope_id = Some(scope);
+        }
+        if let Some(reason) = ctx.quarantine_reason.clone() {
+            row.quarantine_reason = Some(reason);
+        }
+        row.state = to;
+        row.state_timestamps
+            .insert(to.as_str().to_string(), ctx.at_unix_secs);
+
+        let mut payload = json!({
+            "event": "fleet_state_transition",
+            "github_id": github_id,
+            "full_name": full_name,
+            "from_state": from.as_str(),
+            "to_state": to.as_str(),
+            "at_unix_secs": ctx.at_unix_secs,
+        });
+        if let Some(head) = &row.head_commit_hash {
+            payload["head_commit_hash"] = json!(head);
+        }
+        if let Some(reason) = &row.quarantine_reason {
+            payload["quarantine_reason"] = json!(reason);
+        }
+        let payload = serde_json::to_vec(&payload).expect("static ledger payload serializes");
+        let (commit_seq, ledger_seq) = self.commit_row(&row, EntryKind::Admin, payload)?;
+        Ok(TransitionReport {
+            cx_id,
+            from,
+            to,
+            commit_seq,
+            ledger_seq,
+        })
+    }
+
+    /// Reads one record by content-addressed id, or `None` if absent.
+    pub fn try_get(&self, cx_id: CxId) -> Result<Option<FleetRepoRow>, CalyxError> {
+        let snapshot = self.vault.latest_seq();
+        let Some(bytes) = self
+            .vault
+            .read_cf_at(snapshot, ColumnFamily::Base, &base_key(cx_id))?
+        else {
+            return Ok(None);
+        };
+        let constellation = decode_constellation_base(&bytes)?;
+        Ok(Some(decode_repo_constellation(&constellation)?))
+    }
+
+    /// Reads one record by content-addressed id, refusing if absent.
+    pub fn get(&self, cx_id: CxId) -> Result<FleetRepoRow, CalyxError> {
+        self.try_get(cx_id)?.ok_or_else(|| CalyxError {
+            code: ASTRO_FLEET_RECORD_MISSING,
+            message: format!("no fleet catalog record for {cx_id}"),
+            remediation: "register the repository first (state=discovered), then transition it",
+        })
+    }
+
+    /// Reads one record by repository identity, refusing if absent.
+    pub fn get_by_identity(
+        &self,
+        github_id: u64,
+        full_name: &str,
+    ) -> Result<FleetRepoRow, CalyxError> {
+        self.get(repo_cx_id(github_id, full_name, FLEET_VAULT_SALT))
+    }
+
+    /// Lists records, optionally filtered by state and/or language, sorted by
+    /// `full_name` for deterministic output. An empty catalog yields an empty
+    /// list — an explicit zero, never an error.
+    pub fn query(
+        &self,
+        state: Option<RepoState>,
+        language: Option<&str>,
+    ) -> Result<Vec<FleetRepoRow>, CalyxError> {
+        let snapshot = self.vault.latest_seq();
+        let mut rows = Vec::new();
+        for (_key, bytes) in self.vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+            let row = decode_repo_constellation(&decode_constellation_base(&bytes)?)?;
+            if let Some(state) = state
+                && row.state != state
+            {
+                continue;
+            }
+            if let Some(language) = language
+                && !row.record.language.eq_ignore_ascii_case(language)
+            {
+                continue;
+            }
+            rows.push(row);
+        }
+        rows.sort_by(|left, right| left.record.full_name.cmp(&right.record.full_name));
+        Ok(rows)
+    }
+
+    /// Per-state record counts with an explicit zero for every state.
+    pub fn counts_by_state(&self) -> Result<BTreeMap<&'static str, u64>, CalyxError> {
+        let mut counts: BTreeMap<&'static str, u64> =
+            ALL_STATES.iter().map(|state| (state.as_str(), 0)).collect();
+        for row in self.query(None, None)? {
+            *counts
+                .get_mut(row.state.as_str())
+                .expect("ALL_STATES covers every parsed state") += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Commits `row` and its ledger entry in one atomic batch, then re-reads
+    /// both from the committed snapshot and compares before returning.
+    fn commit_row(
+        &self,
+        row: &FleetRepoRow,
+        kind: EntryKind,
+        payload: Vec<u8>,
+    ) -> Result<(Seq, u64), CalyxError> {
+        RedactionPolicy::check_payload(&payload)?;
+        let expected = encode_repo_constellation(self.vault_id, FLEET_VAULT_SALT, row)?;
+        let base_bytes = encode_constellation_base(&expected)?;
+        let subject = SubjectId::Cx(row.cx_id);
+        let actor = ActorId::Service(FLEET_ACTOR.to_string());
+        let commit_seq = self.vault.write_cf_batch_with_ledger_entry(
+            vec![(ColumnFamily::Base, base_key(row.cx_id), base_bytes)],
+            kind,
+            subject.clone(),
+            payload,
+            actor.clone(),
+        )?;
+        self.vault.flush()?;
+        let ledger_seq =
+            self.verify_committed(row.cx_id, &expected, commit_seq, kind, &subject, &actor)?;
+        Ok((commit_seq, ledger_seq))
+    }
+
+    /// Independent post-commit readback (invariant 5): the Base row must match
+    /// the claim byte-for-byte (modulo the ledger ref the commit stamped), and
+    /// that stamped ledger ref must resolve to a ledger entry of the expected
+    /// kind/subject/actor whose hash matches.
+    fn verify_committed(
+        &self,
+        cx_id: CxId,
+        expected: &Constellation,
+        commit_seq: Seq,
+        kind: EntryKind,
+        subject: &SubjectId,
+        actor: &ActorId,
+    ) -> Result<u64, CalyxError> {
+        let mismatch = |what: String| CalyxError {
+            code: ASTRO_FLEET_FSV_MISMATCH,
+            message: format!(
+                "fleet catalog readback mismatch for {cx_id} at seq {commit_seq}: {what}"
+            ),
+            remediation: "the committed state does not match the claim; do not trust this catalog write — audit the vault before continuing",
+        };
+        let bytes = self
+            .vault
+            .read_cf_at(commit_seq, ColumnFamily::Base, &base_key(cx_id))?
+            .ok_or_else(|| mismatch("Base row absent after commit".to_string()))?;
+        let mut persisted = decode_constellation_base(&bytes)?;
+        // NOTE: seq 0 is a legitimate ledger seq (the first entry of a fresh
+        // vault) — the stub-vs-real distinction is proven by the hash pairing
+        // below, never by the seq value.
+        let stamped = persisted.provenance.clone();
+        persisted.provenance = LedgerRef {
+            seq: 0,
+            hash: [0; 32],
+        };
+        let normalized_expected = encode_constellation_base(expected)?;
+        let normalized_persisted = encode_constellation_base(&persisted)?;
+        if normalized_expected != normalized_persisted {
+            return Err(mismatch(
+                "persisted Base row bytes diverge from the claim".to_string(),
+            ));
+        }
+
+        let ledger_bytes = self
+            .vault
+            .read_cf_at(commit_seq, ColumnFamily::Ledger, &ledger_key(stamped.seq))?
+            .ok_or_else(|| {
+                mismatch(format!(
+                    "ledger entry {} referenced by the row is absent",
+                    stamped.seq
+                ))
+            })?;
+        let entry = calyx_ledger::decode(&ledger_bytes)?;
+        if entry.entry_hash != stamped.hash {
+            return Err(mismatch(format!(
+                "ledger entry {} hash diverges from the row's ledger ref",
+                stamped.seq
+            )));
+        }
+        if entry.kind != kind {
+            return Err(mismatch(format!(
+                "ledger entry {} kind {:?} != expected {:?}",
+                stamped.seq, entry.kind, kind
+            )));
+        }
+        if &entry.subject != subject {
+            return Err(mismatch(format!(
+                "ledger entry {} subject diverges from the mutated row",
+                stamped.seq
+            )));
+        }
+        if &entry.actor != actor {
+            return Err(mismatch(format!(
+                "ledger entry {} actor diverges from {FLEET_ACTOR}",
+                stamped.seq
+            )));
+        }
+        Ok(stamped.seq)
+    }
+}
+
+fn require_timestamp(at_unix_secs: u64) -> Result<(), CalyxError> {
+    if at_unix_secs == 0 {
+        return Err(CalyxError {
+            code: ASTRO_FLEET_TIMESTAMP_REQUIRED,
+            message: "fleet catalog mutations require a real at_unix_secs timestamp".to_string(),
+            remediation: "pass the observation time in unix seconds (the CLI defaults to now)",
+        });
+    }
+    Ok(())
+}

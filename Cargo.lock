@@ -106,6 +106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrolabe-fleet"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "astrolabe-guard"
 version = "0.1.0"
 dependencies = [

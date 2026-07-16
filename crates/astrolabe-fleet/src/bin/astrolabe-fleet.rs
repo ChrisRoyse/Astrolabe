@@ -1,0 +1,253 @@
+//! `astrolabe-fleet` — CLI surface over the fleet catalog vault (issue #449).
+//!
+//! Verbs (all output is JSON lines on stdout; failures print one structured
+//! `{code,message,remediation}` JSON object on stderr and exit 1):
+//!
+//! ```text
+//! astrolabe-fleet catalog-init --root <dir>
+//! astrolabe-fleet register     --root <dir> (--json <record> | --stdin) [--at <unix-secs>]
+//! astrolabe-fleet set-state    --root <dir> --github-id <id> --repo <owner/name> --to <state>
+//!                              [--at <unix-secs>] [--clone-path <p>] [--head-commit-hash <sha>]
+//!                              [--index-watermark <w>] [--kernel-scope-id <k>] [--reason <r>]
+//! astrolabe-fleet get          --root <dir> (--github-id <id> --repo <owner/name> | --cx <hex>)
+//! astrolabe-fleet list         --root <dir> [--state <state>] [--language <lang>] [--counts]
+//! ```
+//!
+//! `register --stdin` reads one JSON [`RepoRecord`] per line, so discovery
+//! (#450) can stream an enumeration straight into the catalog.
+
+use std::io::BufRead;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use astrolabe_fleet::catalog::FleetCatalog;
+use astrolabe_fleet::record::{RepoRecord, TransitionContext};
+use astrolabe_fleet::state::RepoState;
+use calyx_core::{CalyxError, CxId};
+use serde_json::json;
+
+const USAGE: &str = "usage: astrolabe-fleet <catalog-init|register|set-state|get|list> --root <dir> [verb options]; see crate docs";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "remediation": error.remediation,
+                })
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: &[String]) -> Result<(), CalyxError> {
+    let verb = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| usage("missing verb"))?;
+    let opts = Options::parse(&args[1..])?;
+    let root = opts.require("root")?;
+    let catalog = FleetCatalog::open(&PathBuf::from(root))?;
+    match verb {
+        "catalog-init" => {
+            opts.reject_unknown(&["root"])?;
+            let counts = catalog.counts_by_state()?;
+            println!("{}", json!({"catalog": "open", "counts_by_state": counts}));
+            Ok(())
+        }
+        "register" => {
+            opts.reject_unknown(&["root", "json", "stdin", "at"])?;
+            let at = opts.at_or_now()?;
+            let mut records = Vec::new();
+            match (opts.get("json"), opts.flag("stdin")) {
+                (Some(line), false) => records.push(parse_record(line)?),
+                (None, true) => {
+                    for line in std::io::stdin().lock().lines() {
+                        let line = line.map_err(|error| usage(&format!("read stdin: {error}")))?;
+                        if !line.trim().is_empty() {
+                            records.push(parse_record(&line)?);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(usage(
+                        "register needs exactly one of --json <record> or --stdin",
+                    ));
+                }
+            }
+            for record in records {
+                let report = catalog.register(record, at)?;
+                println!(
+                    "{}",
+                    serde_json::to_value(&report).expect("register report serializes")
+                );
+            }
+            Ok(())
+        }
+        "set-state" => {
+            opts.reject_unknown(&[
+                "root",
+                "github-id",
+                "repo",
+                "to",
+                "at",
+                "clone-path",
+                "head-commit-hash",
+                "index-watermark",
+                "kernel-scope-id",
+                "reason",
+            ])?;
+            let github_id = opts.require_u64("github-id")?;
+            let full_name = opts.require("repo")?;
+            let to = RepoState::parse(opts.require("to")?)?;
+            let ctx = TransitionContext {
+                at_unix_secs: opts.at_or_now()?,
+                clone_path: opts.get("clone-path").map(str::to_string),
+                head_commit_hash: opts.get("head-commit-hash").map(str::to_string),
+                index_watermark: opts.get("index-watermark").map(str::to_string),
+                kernel_scope_id: opts.get("kernel-scope-id").map(str::to_string),
+                quarantine_reason: opts.get("reason").map(str::to_string),
+            };
+            let report = catalog.transition(github_id, full_name, to, ctx)?;
+            println!(
+                "{}",
+                serde_json::to_value(&report).expect("transition report serializes")
+            );
+            Ok(())
+        }
+        "get" => {
+            opts.reject_unknown(&["root", "github-id", "repo", "cx"])?;
+            let row = match (opts.get("cx"), opts.get("github-id"), opts.get("repo")) {
+                (Some(cx), None, None) => {
+                    let cx_id = cx
+                        .parse::<CxId>()
+                        .map_err(|error| usage(&format!("--cx {cx:?} is not a CxId: {error}")))?;
+                    catalog.get(cx_id)?
+                }
+                (None, Some(_), Some(_)) => catalog
+                    .get_by_identity(opts.require_u64("github-id")?, opts.require("repo")?)?,
+                _ => return Err(usage("get needs --cx <hex> or both --github-id and --repo")),
+            };
+            println!("{}", serde_json::to_value(&row).expect("row serializes"));
+            Ok(())
+        }
+        "list" => {
+            opts.reject_unknown(&["root", "state", "language", "counts"])?;
+            let state = opts.get("state").map(RepoState::parse).transpose()?;
+            let rows = catalog.query(state, opts.get("language"))?;
+            if opts.flag("counts") {
+                println!(
+                    "{}",
+                    json!({
+                        "total": rows.len(),
+                        "counts_by_state": catalog.counts_by_state()?,
+                    })
+                );
+                return Ok(());
+            }
+            println!("{}", json!({"total": rows.len()}));
+            for row in rows {
+                println!("{}", serde_json::to_value(&row).expect("row serializes"));
+            }
+            Ok(())
+        }
+        other => Err(usage(&format!("unknown verb {other:?}"))),
+    }
+}
+
+fn parse_record(line: &str) -> Result<RepoRecord, CalyxError> {
+    serde_json::from_str(line).map_err(|error| CalyxError {
+        code: "ASTRO_FLEET_RECORD_PARSE",
+        message: format!("repo record JSON did not parse: {error}"),
+        remediation: "pass one JSON object per record with the RepoRecord fields (github_id, full_name, clone_url, default_branch, stars, language, size_kb, pushed_at, optional license_spdx/etag)",
+    })
+}
+
+fn usage(what: &str) -> CalyxError {
+    CalyxError {
+        code: "ASTRO_FLEET_USAGE",
+        message: format!("{what}; {USAGE}"),
+        remediation: "invoke with a valid verb and its required flags",
+    }
+}
+
+/// Minimal declarative flag parser: `--name value` pairs plus bare `--name`
+/// switches (`stdin`, `counts`).
+struct Options {
+    pairs: Vec<(String, Option<String>)>,
+}
+
+impl Options {
+    const SWITCHES: [&'static str; 2] = ["stdin", "counts"];
+
+    fn parse(args: &[String]) -> Result<Self, CalyxError> {
+        let mut pairs = Vec::new();
+        let mut idx = 0;
+        while idx < args.len() {
+            let flag = args[idx]
+                .strip_prefix("--")
+                .ok_or_else(|| usage(&format!("expected --flag, got {:?}", args[idx])))?;
+            if Self::SWITCHES.contains(&flag) {
+                pairs.push((flag.to_string(), None));
+                idx += 1;
+                continue;
+            }
+            let value = args
+                .get(idx + 1)
+                .ok_or_else(|| usage(&format!("--{flag} needs a value")))?;
+            pairs.push((flag.to_string(), Some(value.clone())));
+            idx += 2;
+        }
+        Ok(Self { pairs })
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(flag, _)| flag == name)
+            .and_then(|(_, value)| value.as_deref())
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.pairs.iter().any(|(flag, _)| flag == name)
+    }
+
+    fn require(&self, name: &str) -> Result<&str, CalyxError> {
+        self.get(name)
+            .ok_or_else(|| usage(&format!("--{name} is required")))
+    }
+
+    fn require_u64(&self, name: &str) -> Result<u64, CalyxError> {
+        self.require(name)?
+            .parse::<u64>()
+            .map_err(|error| usage(&format!("--{name} must be a u64: {error}")))
+    }
+
+    fn at_or_now(&self) -> Result<u64, CalyxError> {
+        match self.get("at") {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|error| usage(&format!("--at must be unix seconds: {error}"))),
+            None => Ok(SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after 1970")
+                .as_secs()),
+        }
+    }
+
+    fn reject_unknown(&self, known: &[&str]) -> Result<(), CalyxError> {
+        for (flag, _) in &self.pairs {
+            if !known.contains(&flag.as_str()) {
+                return Err(usage(&format!("unknown flag --{flag} for this verb")));
+            }
+        }
+        Ok(())
+    }
+}
