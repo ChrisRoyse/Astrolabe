@@ -144,7 +144,7 @@ pub(crate) fn migrate_catalog(args: &[String]) -> CliResult {
                             source.display(),
                             catalog_path.display()
                         ),
-                        remediation: "rerun without --from to verify the in-place retired catalog, or import from a live source into an empty destination",
+                        remediation: "retired-v1 verification is in-place only: rerun without --from and point --home at the home that owns this catalog; a distinct empty destination requires a live-v1 catalog or a legacy registry.json source",
                     }));
                 }
                 validate_catalog_bindings(&catalog)?;
@@ -536,10 +536,26 @@ impl MigrateFlags {
         while idx < args.len() {
             match args[idx].as_str() {
                 "--home" => {
+                    if flags.home.is_some() {
+                        return Err(CliError::from(calyx_core::CalyxError {
+                            code: "CALYX_LENS_CATALOG_CLI_DUPLICATE_FLAG",
+                            message: "lens migrate-catalog received --home more than once"
+                                .to_string(),
+                            remediation: "provide exactly one --home <dir> selector so the authoritative destination is unambiguous",
+                        }));
+                    }
                     idx += 1;
                     flags.home = Some(value(args, idx, "--home")?.into());
                 }
                 "--from" => {
+                    if flags.from.is_some() {
+                        return Err(CliError::from(calyx_core::CalyxError {
+                            code: "CALYX_LENS_CATALOG_CLI_DUPLICATE_FLAG",
+                            message: "lens migrate-catalog received --from more than once"
+                                .to_string(),
+                            remediation: "provide exactly one --from <catalog-db|registry.json> selector so the attested source is unambiguous",
+                        }));
+                    }
                     idx += 1;
                     flags.from = Some(value(args, idx, "--from")?.into());
                 }
@@ -582,10 +598,16 @@ pub(crate) fn read_catalog_with_readback(
 fn read_legacy_catalog(path: &Path) -> CliResult<(LensCatalog, store::LegacyCatalogSource)> {
     let source = store::LegacyCatalogSource::open(path)?;
     let catalog = serde_json::from_slice(source.bytes()).map_err(|err| {
-        CliError::usage(format!(
-            "parse legacy lens catalog {}: {err}",
-            source.canonical_path().display()
-        ))
+        CliError::from(calyx_core::CalyxError {
+            code: "CALYX_LENS_CATALOG_IMPORT_SOURCE_INVALID",
+            message: format!(
+                "legacy catalog source {} is not valid catalog JSON at line {} column {}: {err}",
+                source.canonical_path().display(),
+                err.line(),
+                err.column()
+            ),
+            remediation: "preserve the exact source bytes for investigation, repair the JSON at the reported location without changing its intended catalog meaning, then rerun migration from that same source path",
+        })
     })?;
     Ok((catalog, source))
 }
