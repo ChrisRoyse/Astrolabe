@@ -55,15 +55,18 @@ pub fn from_model_with_policy(
         provider_policy,
         files.artifact_paths().iter().map(|path| path.as_path()),
     )?;
+    let label = format!("onnx-fastembed:{}", info.model_code);
+    let (execution_providers, bound_stream) = execution_providers(&label, provider_policy)?;
     let model = TextEmbedding::try_new(
         TextInitOptions::new(model_name.clone())
             .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(false)
             .with_intra_threads(1)
-            .with_execution_providers(execution_providers(provider_policy)?),
+            .with_execution_providers(execution_providers),
     )
     .map_err(|err| CalyxError::lens_unreachable(format!("ONNX runtime init failed: {err}")))?;
-    let model = CudaDropGuard::new(model, provider_policy);
+    let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
+    super::runtime_bundle::attest_after_model_constructor(provider_policy, model.bound_stream())?;
     let weights_sha256 = hash_files(&files.artifact_paths())?;
     let corpus_hash = sha256_digest(&[
         b"onnx-fastembed-mean-pool-v1",
@@ -82,13 +85,15 @@ pub fn from_model_with_policy(
         NormPolicy::unit(),
     );
     let id = contract.lens_id();
+    let (model, bound_stream) = model.into_parts();
     Ok(OnnxLens::from_fastembed_parts(
         id,
         dim,
         contract,
         files,
         provider_policy,
-        model.into_inner(),
+        model,
+        bound_stream,
     ))
 }
 
@@ -158,26 +163,44 @@ pub fn model_from_name(raw: &str) -> Result<EmbeddingModel> {
     }
 }
 
-pub fn execution_providers(
+pub(super) fn execution_providers(
+    label: &str,
     policy: OnnxProviderPolicy,
-) -> Result<Vec<fastembed::ExecutionProviderDispatch>> {
-    execution_providers_on_device(policy, 0)
+) -> Result<(
+    Vec<fastembed::ExecutionProviderDispatch>,
+    Option<super::green_context::GreenContextHandle>,
+)> {
+    let selected_device = super::runtime_bundle::selected_cuda_device(policy)?;
+    let bound_stream = super::green_context::create(label, policy, selected_device.as_ref())?;
+    let providers = execution_providers_for_attested_device(
+        policy,
+        selected_device.as_ref(),
+        bound_stream.as_ref().map(|stream| stream.stream_ptr()),
+    )?;
+    Ok((providers, bound_stream))
 }
 
-pub fn execution_providers_on_device(
+pub(super) fn execution_providers_for_attested_device(
     policy: OnnxProviderPolicy,
-    device_id: i32,
-) -> Result<Vec<fastembed::ExecutionProviderDispatch>> {
-    execution_providers_on_device_with_stream(policy, device_id, None)
-}
-
-pub fn execution_providers_on_device_with_stream(
-    policy: OnnxProviderPolicy,
-    device_id: i32,
+    selected_device: Option<&super::runtime_bundle::OnnxCudaDeviceAttestation>,
     compute_stream: Option<*mut ()>,
 ) -> Result<Vec<fastembed::ExecutionProviderDispatch>> {
+    let device_id = selected_device
+        .map(|device| i32::try_from(device.ordinal))
+        .transpose()
+        .map_err(|_| {
+            CalyxError::lens_unreachable(
+                "attested CUDA Runtime ordinal exceeds the ORT device-id ABI",
+            )
+        })?
+        .unwrap_or(0);
     match policy {
         OnnxProviderPolicy::CudaFailLoud => {
+            if selected_device.is_none() {
+                return Err(CalyxError::lens_unreachable(
+                    "CUDA provider construction requires a process-global attested device",
+                ));
+            }
             // #1143: the default kNextPowerOfTwo strategy over-reserves the
             // BFC device arena on every extension; dynamic (batch, seq)
             // workloads are our norm, so extend exactly as requested and let

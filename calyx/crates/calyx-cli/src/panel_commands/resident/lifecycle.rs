@@ -14,7 +14,8 @@ use super::discovery::unix_now_ms;
 use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
-pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v2";
+const LIFECYCLE_SCHEMA_V2: &str = "calyx-panel-resident-lifecycle-v2";
+pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v3";
 const LIFECYCLE_CORRUPT: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT";
 const LIFECYCLE_DURABILITY: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY";
 const SUPERVISOR_ALREADY_RUNNING: &str = "CALYX_PANEL_RESIDENT_ALREADY_RUNNING";
@@ -32,6 +33,38 @@ pub(super) enum LifecyclePhase {
     Faulted,
     Stopping,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RequestStage {
+    Queued,
+    WorkerStarted,
+    GpuSynchronized,
+    HostMaterialized,
+    TerminalReceived,
+    PublicFlushComplete,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RequestOutcome {
+    Succeeded,
+    Failed,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LifecycleRequestRecord {
+    pub(super) request_id: String,
+    pub(super) generation: Option<u64>,
+    pub(super) stage: RequestStage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) outcome: Option<RequestOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<LifecycleErrorRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,6 +95,7 @@ pub(super) struct LifecycleState {
     pub(super) worker_descendant_pids: Vec<u32>,
     pub(super) phase: LifecyclePhase,
     pub(super) generation: u64,
+    pub(super) queued_requests: u64,
     pub(super) in_flight: u64,
     pub(super) idle_ttl_ms: u64,
     pub(super) max_load_secs: u64,
@@ -96,6 +130,7 @@ impl LifecycleState {
             worker_descendant_pids: Vec::new(),
             phase: LifecyclePhase::Unloaded,
             generation: 0,
+            queued_requests: 0,
             in_flight: 0,
             idle_ttl_ms,
             max_load_secs,
@@ -128,6 +163,8 @@ pub(super) struct LifecycleProjection {
     pub(super) worker_descendant_pids: Vec<u32>,
     pub(super) phase: LifecyclePhase,
     pub(super) generation: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) queued_requests: u64,
     pub(super) in_flight: u64,
     pub(super) idle_ttl_ms: u64,
     pub(super) max_load_secs: u64,
@@ -145,6 +182,8 @@ pub(super) struct LifecycleProjection {
     #[cfg(windows)]
     pub(super) onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     pub(super) last_error: Option<LifecycleErrorRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) request: Option<LifecycleRequestRecord>,
     pub(super) recorded_at_unix_ms: u64,
     pub(super) previous_event_sha256: String,
     pub(super) event_sha256: String,
@@ -158,6 +197,7 @@ impl LifecycleProjection {
             worker_descendant_pids: self.worker_descendant_pids.clone(),
             phase: self.phase,
             generation: self.generation,
+            queued_requests: self.queued_requests,
             in_flight: self.in_flight,
             idle_ttl_ms: self.idle_ttl_ms,
             max_load_secs: self.max_load_secs,
@@ -304,6 +344,15 @@ impl LifecycleStore {
         event: impl Into<String>,
         state: &LifecycleState,
     ) -> CliResult<LifecycleProjection> {
+        self.append_request(event, state, None)
+    }
+
+    pub(super) fn append_request(
+        &mut self,
+        event: impl Into<String>,
+        state: &LifecycleState,
+        request: Option<LifecycleRequestRecord>,
+    ) -> CliResult<LifecycleProjection> {
         if self.poisoned {
             return Err(durability_error(format!(
                 "resident lifecycle store {} is faulted after an earlier durability failure",
@@ -334,8 +383,14 @@ impl LifecycleStore {
             || GENESIS_EVENT_SHA256.to_string(),
             |record| record.event_sha256.clone(),
         );
-        let mut projection =
-            projection_from_state(sequence, event, state, unix_now_ms(), previous_event_sha256);
+        let mut projection = projection_from_state(
+            sequence,
+            event,
+            state,
+            request,
+            unix_now_ms(),
+            previous_event_sha256,
+        );
         projection.event_sha256 = event_sha256(&projection).map_err(|error| {
             durability_error(format!(
                 "serialize resident lifecycle hash material failed: {error}"
@@ -536,13 +591,24 @@ fn validate_replayed_record(
     expected_sequence: u64,
     expected_previous: &str,
 ) -> CliResult {
-    if record.schema != LIFECYCLE_SCHEMA {
+    if record.schema != LIFECYCLE_SCHEMA && record.schema != LIFECYCLE_SCHEMA_V2 {
         return Err(corrupt_error(format!(
-            "resident lifecycle journal {} line {} schema is {:?}, expected {:?}",
+            "resident lifecycle journal {} line {} schema is {:?}, expected {:?} or legacy {:?}",
             path.display(),
             line_number,
             record.schema,
-            LIFECYCLE_SCHEMA
+            LIFECYCLE_SCHEMA,
+            LIFECYCLE_SCHEMA_V2,
+        )));
+    }
+    if record.schema == LIFECYCLE_SCHEMA_V2
+        && (record.queued_requests != 0 || record.request.is_some())
+    {
+        return Err(corrupt_error(format!(
+            "resident lifecycle journal {} line {} carries v3 request fields under legacy schema {}",
+            path.display(),
+            line_number,
+            LIFECYCLE_SCHEMA_V2
         )));
     }
     if record.sequence != expected_sequence {
@@ -593,6 +659,7 @@ fn projection_from_state(
     sequence: u64,
     event: String,
     state: &LifecycleState,
+    request: Option<LifecycleRequestRecord>,
     recorded_at_unix_ms: u64,
     previous_event_sha256: String,
 ) -> LifecycleProjection {
@@ -605,6 +672,7 @@ fn projection_from_state(
         worker_descendant_pids: state.worker_descendant_pids.clone(),
         phase: state.phase,
         generation: state.generation,
+        queued_requests: state.queued_requests,
         in_flight: state.in_flight,
         idle_ttl_ms: state.idle_ttl_ms,
         max_load_secs: state.max_load_secs,
@@ -622,6 +690,7 @@ fn projection_from_state(
         #[cfg(windows)]
         onnx_runtime_attestation: state.onnx_runtime_attestation.clone(),
         last_error: state.last_error.clone(),
+        request,
         recorded_at_unix_ms,
         previous_event_sha256,
         event_sha256: String::new(),
@@ -629,7 +698,7 @@ fn projection_from_state(
 }
 
 #[derive(Serialize)]
-struct LifecycleHashMaterial<'a> {
+struct LifecycleHashMaterialV2<'a> {
     schema: &'a str,
     sequence: u64,
     event: &'a str,
@@ -659,8 +728,73 @@ struct LifecycleHashMaterial<'a> {
     previous_event_sha256: &'a str,
 }
 
+#[derive(Serialize)]
+struct LifecycleHashMaterialV3<'a> {
+    schema: &'a str,
+    sequence: u64,
+    event: &'a str,
+    supervisor_pid: u32,
+    worker_pid: Option<u32>,
+    worker_descendant_pids: &'a [u32],
+    phase: LifecyclePhase,
+    generation: u64,
+    queued_requests: u64,
+    in_flight: u64,
+    idle_ttl_ms: u64,
+    max_load_secs: u64,
+    max_request_secs: u64,
+    idle_deadline_unix_ms: Option<u64>,
+    load_attempt_count: u64,
+    load_success_count: u64,
+    load_failure_count: u64,
+    unload_count: u64,
+    last_worker_start_unix_ms: Option<u64>,
+    last_completion_unix_ms: Option<u64>,
+    last_unload_unix_ms: Option<u64>,
+    frozen_panel_fingerprint: &'a str,
+    lens_attestations: &'a [ResidentLensAttestation],
+    #[cfg(windows)]
+    onnx_runtime_attestation: &'a Option<OnnxRuntimeAttestation>,
+    last_error: &'a Option<LifecycleErrorRecord>,
+    request: &'a Option<LifecycleRequestRecord>,
+    recorded_at_unix_ms: u64,
+    previous_event_sha256: &'a str,
+}
+
 fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Error> {
-    let material = LifecycleHashMaterial {
+    if record.schema == LIFECYCLE_SCHEMA_V2 {
+        return serde_json::to_vec(&LifecycleHashMaterialV2 {
+            schema: &record.schema,
+            sequence: record.sequence,
+            event: &record.event,
+            supervisor_pid: record.supervisor_pid,
+            worker_pid: record.worker_pid,
+            worker_descendant_pids: &record.worker_descendant_pids,
+            phase: record.phase,
+            generation: record.generation,
+            in_flight: record.in_flight,
+            idle_ttl_ms: record.idle_ttl_ms,
+            max_load_secs: record.max_load_secs,
+            max_request_secs: record.max_request_secs,
+            idle_deadline_unix_ms: record.idle_deadline_unix_ms,
+            load_attempt_count: record.load_attempt_count,
+            load_success_count: record.load_success_count,
+            load_failure_count: record.load_failure_count,
+            unload_count: record.unload_count,
+            last_worker_start_unix_ms: record.last_worker_start_unix_ms,
+            last_completion_unix_ms: record.last_completion_unix_ms,
+            last_unload_unix_ms: record.last_unload_unix_ms,
+            frozen_panel_fingerprint: &record.frozen_panel_fingerprint,
+            lens_attestations: &record.lens_attestations,
+            #[cfg(windows)]
+            onnx_runtime_attestation: &record.onnx_runtime_attestation,
+            last_error: &record.last_error,
+            recorded_at_unix_ms: record.recorded_at_unix_ms,
+            previous_event_sha256: &record.previous_event_sha256,
+        })
+        .map(|bytes| sha256_hex(&bytes));
+    }
+    let material = LifecycleHashMaterialV3 {
         schema: &record.schema,
         sequence: record.sequence,
         event: &record.event,
@@ -669,6 +803,7 @@ fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Erro
         worker_descendant_pids: &record.worker_descendant_pids,
         phase: record.phase,
         generation: record.generation,
+        queued_requests: record.queued_requests,
         in_flight: record.in_flight,
         idle_ttl_ms: record.idle_ttl_ms,
         max_load_secs: record.max_load_secs,
@@ -686,10 +821,15 @@ fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Erro
         #[cfg(windows)]
         onnx_runtime_attestation: &record.onnx_runtime_attestation,
         last_error: &record.last_error,
+        request: &record.request,
         recorded_at_unix_ms: record.recorded_at_unix_ms,
         previous_event_sha256: &record.previous_event_sha256,
     };
     serde_json::to_vec(&material).map(|bytes| sha256_hex(&bytes))
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

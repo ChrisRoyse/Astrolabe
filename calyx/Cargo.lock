@@ -547,6 +547,7 @@ dependencies = [
  "sha2",
  "tracing",
  "wide",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -724,13 +725,13 @@ dependencies = [
  "half",
  "hf-hub",
  "memmap2",
- "nvml-wrapper",
  "ort",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
  "sha2",
  "tokenizers",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -838,7 +839,6 @@ dependencies = [
  "calyx-loom",
  "calyx-mcp",
  "calyx-oracle",
- "calyx-registry",
  "calyx-ward",
  "nvml-wrapper",
  "prometheus",
@@ -874,8 +874,12 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokenizers",
+ "toml",
  "yoke 0.8.3",
  "zip",
 ]

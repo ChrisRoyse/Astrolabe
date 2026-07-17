@@ -8,7 +8,8 @@ publish.workspace = true
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda-runtime-boundary = ["dep:windows-sys"]
+cuda = ["dep:cudarc", "cuda-runtime-boundary"]
 
 [dependencies]
 calyx-core = { path = "../calyx-core" }
@@ -21,3 +22,18 @@ serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 wide.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+], optional = true }

@@ -11,6 +11,13 @@ pub mod compression_report;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+mod cuda_device;
+#[cfg(all(windows, feature = "cuda-runtime-boundary"))]
+#[path = "cuda/runtime_bundle.rs"]
+pub mod cuda_runtime;
+#[cfg(all(windows, feature = "cuda-runtime-boundary"))]
+#[path = "cuda/system_trust.rs"]
+mod cuda_system_trust;
 mod error;
 #[path = "cuda/mxfp4.rs"]
 pub mod mxfp4;
@@ -37,11 +44,24 @@ pub use compression_report::{
 pub use cpu::CpuBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    AbsentSlotSentinel, CudaBackend, CudaContext, CudaGreenContextStream, GemmProblem,
-    GroupedGemmExecutionMode, GroupedGemmPlan, RaggedBatch, build_grouped_gemm_plan,
-    build_ragged_batch, build_ragged_batch_from_slabs, execute_grouped_gemm,
-    execute_grouped_gemm_strict, extract_ragged_results, init_cuda, query_device_info,
-    read_grouped_gemm_output, try_extract_ragged_results,
+    AbsentSlotSentinel, CudaBackend, CudaContext, CudaGreenContextStream,
+    CudaPrimaryContextStream, GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, RaggedBatch,
+    attest_cuda_driver_ordinal,
+    attest_cudarc_context, build_grouped_gemm_plan, build_ragged_batch,
+    build_ragged_batch_from_slabs, driver_ordinal_for_pci_bus_id, execute_grouped_gemm,
+    execute_grouped_gemm_strict, extract_ragged_results, init_cuda, init_cuda_by_pci_bus_id,
+    query_device_info, read_grouped_gemm_output, try_extract_ragged_results,
+};
+pub use cuda_device::{
+    CUDA_DEVICE_ENV, PinnedCudaDeviceIdentity, configured_cuda_runtime_ordinal,
+};
+#[cfg(all(windows, feature = "cuda-runtime-boundary"))]
+pub use cuda_runtime::{
+    PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation, PinnedCudaRuntimeAttestation,
+    attest_pinned_cuda_dependencies, attest_pinned_cuda_driver_identity,
+    current_pinned_cuda_device,
+    initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
+    select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
 };
 pub use error::ForgeError;
 pub use mxfp4::{

@@ -572,14 +572,19 @@ fn require_managed_resident_runtimes(
 }
 
 fn is_unmanaged_resident_runtime(runtime: &LensRuntime) -> bool {
+    !matches!(
+        runtime,
+        LensRuntime::Algorithmic { .. } | LensRuntime::StaticLookup { .. }
+    ) && !is_managed_resident_neural_runtime(runtime)
+}
+
+pub(in crate::panel_commands) fn is_managed_resident_neural_runtime(runtime: &LensRuntime) -> bool {
     matches!(
         runtime,
-        LensRuntime::TeiHttp { .. }
-            | LensRuntime::ExternalCmd { .. }
-            | LensRuntime::FastembedSparse { .. }
-            | LensRuntime::FastembedBgem3 { .. }
-            | LensRuntime::FastembedReranker { .. }
-            | LensRuntime::MultimodalAdapter { .. }
+        LensRuntime::CandleLocal { .. }
+            | LensRuntime::Onnx { .. }
+            | LensRuntime::OnnxColbert { .. }
+            | LensRuntime::FastembedQwen3 { .. }
     )
 }
 

@@ -13,14 +13,12 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use calyx_core::{CalyxError, Result};
-use nvml_wrapper::{Nvml, cuda_driver_version_major, cuda_driver_version_minor};
 use ort::ep::{CUDA, ExecutionProvider};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{GetLastError, HMODULE};
+use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{
-    AddDllDirectory, GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS, LoadLibraryExW,
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleFileNameExW};
@@ -29,11 +27,8 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use super::OnnxProviderPolicy;
 
 const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
-const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v1";
-const LOCK_FILE: &str = "bundle.lock.json";
-const LOCK_DIGEST_FILE: &str = "bundle.lock.sha256";
+const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v2";
 const RECEIPT_FILE: &str = "bundle.receipt.json";
-const RECEIPT_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-receipt.v1";
 const EXPECTED_LAYOUT: &str = "flat-bin-v1";
 const EXPECTED_PLATFORM: &str = "windows-x86_64";
 const EXPECTED_ROOT_PREFIX: &str = "ort-cuda13.3-windows-x86_64";
@@ -88,6 +83,7 @@ pub struct OnnxLoadedModuleAttestation {
     pub sha256: String,
     pub file_version: Option<String>,
     pub source: String,
+    pub system_trust: Option<calyx_forge::cuda_runtime::SystemModuleTrustAttestation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,19 +99,7 @@ pub struct OnnxRuntimeArtifactAttestation {
     pub license_expression: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OnnxCudaDeviceAttestation {
-    pub ordinal: u32,
-    pub name: String,
-    pub uuid: String,
-    pub compute_capability: String,
-    pub total_vram_bytes: u64,
-    pub used_vram_bytes: u64,
-    pub free_vram_bytes: u64,
-    pub nvidia_driver_version: String,
-    pub cuda_driver_version: String,
-}
+pub type OnnxCudaDeviceAttestation = calyx_forge::PinnedCudaDeviceAttestation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,7 +131,7 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
     let Some(state) = RUNTIME_STATE.get() else {
         return Ok(None);
     };
-    let state = state.lock().map_err(|_| {
+    let mut state = state.lock().map_err(|_| {
         runtime_error(
             "CALYX_ONNX_RUNTIME_STATE_POISONED",
             "the process-global ONNX runtime state mutex was poisoned while reading attestation",
@@ -159,6 +143,20 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
     }
     if let Some(error) = &state.cuda_failure {
         return Err(error.clone());
+    }
+    if state
+        .live
+        .as_ref()
+        .is_some_and(|live| live.receipt.provider_available)
+    {
+        let refresh = refresh_cuda_module_attestation(
+            state.live.as_mut().expect("checked above"),
+            &sha256_bytes(LOCK_BYTES),
+        );
+        if let Err(error) = refresh {
+            state.cuda_failure = Some(error.clone());
+            return Err(error);
+        }
     }
     Ok(state.live.as_ref().map(|live| live.receipt.clone()))
 }
@@ -222,6 +220,90 @@ pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
         .clone())
 }
 
+pub(super) fn selected_cuda_device(
+    policy: OnnxProviderPolicy,
+) -> Result<Option<OnnxCudaDeviceAttestation>> {
+    if policy != OnnxProviderPolicy::CudaFailLoud {
+        return Ok(None);
+    }
+    let requested = super::session::configured_cuda_device()?;
+    let requested_u32 = u32::try_from(requested).map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_INVALID",
+            format!("configured CUDA Runtime ordinal {requested} exceeds u32"),
+            "set CALYX_CUDA_DEVICE to a CUDA Runtime-visible ordinal",
+        )
+    })?;
+    ensure_runtime(policy)?;
+    let shared = calyx_forge::select_pinned_cuda_device(requested_u32)
+        .map_err(forge_runtime_boundary_error)?;
+    let attestation = current_runtime_attestation()?.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
+            "CUDA device selection has no process-global runtime attestation",
+            "terminate the process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    let device = attestation.cuda_device.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISSING",
+            "CUDA policy is active but the runtime attestation has no selected device",
+            "terminate the process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    if !shared.same_stable_device(&device) {
+        return Err(runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISMATCH",
+            format!(
+                "ONNX receipt device {} differs from Forge process-global device {}",
+                device.frozen_execution_device(),
+                shared.frozen_execution_device()
+            ),
+            "terminate the process, preserve both attestations, and repair the shared CUDA device boundary",
+        ));
+    }
+    Ok(Some(device))
+}
+
+pub(super) fn attest_after_model_constructor(
+    policy: OnnxProviderPolicy,
+    bound_stream: Option<&super::green_context::GreenContextHandle>,
+) -> Result<()> {
+    if policy != OnnxProviderPolicy::CudaFailLoud {
+        if bound_stream.is_some() {
+            return Err(runtime_error(
+                "CALYX_ONNX_CPU_SESSION_HAS_CUDA_STREAM",
+                "CPU-policy ONNX constructor retained a CUDA execution stream",
+                "construct CPU and CUDA companion lenses through distinct provider policies",
+            ));
+        }
+        return Ok(());
+    }
+    ensure_runtime(policy)?;
+    let receipt = current_runtime_attestation()?.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
+            "CUDA model construction completed without a live runtime attestation",
+            "terminate the process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    let selected = receipt.cuda_device.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISSING",
+            "CUDA model construction completed without a selected physical-device receipt",
+            "terminate the process and restart from the pinned CUDA runtime boundary",
+        )
+    })?;
+    let stream = bound_stream.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_BOUND_STREAM_MISSING",
+            "CUDA model construction did not retain an Astrolabe-owned execution stream",
+            "construct the CUDA EP with an attested compute stream and retain it for the full model lifetime",
+        )
+    })?;
+    super::green_context::attest_selected_stream(stream, &selected)
+}
+
 #[derive(Default)]
 struct RuntimeState {
     live: Option<LiveRuntime>,
@@ -231,11 +313,52 @@ struct RuntimeState {
 
 struct LiveRuntime {
     lock: RuntimeLock,
-    root: PathBuf,
     core_path: PathBuf,
-    _dll_directory_cookie: usize,
-    _module_handles: Vec<usize>,
+    _module_handles: ModuleStack,
     receipt: OnnxRuntimeAttestation,
+}
+
+struct OwnedModule(usize);
+
+struct ModuleStack(Vec<OwnedModule>);
+
+impl ModuleStack {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn push(&mut self, module: OwnedModule) {
+        self.0.push(module);
+    }
+}
+
+impl Drop for ModuleStack {
+    fn drop(&mut self) {
+        while self.0.pop().is_some() {}
+    }
+}
+
+impl OwnedModule {
+    fn raw(&self) -> HMODULE {
+        self.0 as HMODULE
+    }
+}
+
+impl Drop for OwnedModule {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        let handle = std::mem::replace(&mut self.0, 0) as HMODULE;
+        if unsafe { FreeLibrary(handle) } == 0 {
+            let windows_error = unsafe { GetLastError() };
+            tracing::error!(
+                code = "CALYX_ONNX_RUNTIME_MODULE_CLEANUP_FAILED",
+                windows_error,
+                "FreeLibrary failed while releasing a registry-owned runtime module"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -272,8 +395,6 @@ struct OrtContract {
     ort_dll: String,
     provider_dll: String,
     direct_non_system_imports: Vec<String>,
-    forbidden_providers: Vec<String>,
-    forbidden_archive_dlls: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -325,8 +446,9 @@ struct NoticeContract {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoadedModulePolicy {
+    bundle_load_order: Vec<String>,
     bundle_module_globs: Vec<String>,
-    driver: DriverPolicy,
+    system_modules: Vec<SystemModulePolicy>,
     system_roots: Vec<String>,
     reject_application_dir: bool,
     reject_path_search: bool,
@@ -334,68 +456,33 @@ struct LoadedModulePolicy {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DriverPolicy {
+struct SystemModulePolicy {
     name: String,
     required_root: String,
-    publisher: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BundleReceipt {
-    schema: String,
-    bundle_id: String,
-    lock_sha256: String,
-    provisioned_at_utc: String,
-    artifacts: Vec<ReceiptArtifact>,
-    files: Vec<ReceiptFile>,
-    notices: Vec<ReceiptNotice>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReceiptArtifact {
-    id: String,
-    filename: String,
-    bytes: u64,
-    sha256: String,
-    archive_entries: u64,
-    record_entries: u64,
-    record_entries_verified: u64,
-    locked_record_entries_verified: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReceiptFile {
-    path: String,
-    bytes: u64,
-    sha256: String,
-    file_version: Option<String>,
-    authenticode: AuthenticodeContract,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReceiptNotice {
-    path: String,
-    bytes: u64,
-    sha256: String,
+    signature_kind: String,
+    signer_organization: String,
+    signed_company_name: String,
 }
 
 fn initialize_core() -> Result<LiveRuntime> {
     reject_legacy_environment()?;
     let lock = parse_and_validate_embedded_lock()?;
     let lock_sha256 = sha256_bytes(LOCK_BYTES);
-    let root = resolve_and_validate_root(&lock, &lock_sha256)?;
-    let (bundle_receipt, bundle_receipt_sha256) =
-        validate_installed_bundle(&root, &lock, &lock_sha256)?;
-    let bin = canonicalize_existing_dir(&root.join("bin"), "runtime bin")?;
+    let (root, bundle_receipt_sha256, provisioned_at_utc) = {
+        let boundary = calyx_forge::cuda_runtime::initialize_pinned_cuda_runtime_boundary()
+            .map_err(forge_runtime_boundary_error)?;
+        validate_forge_boundary(&boundary, &lock, &lock_sha256, false)?;
+        (
+            boundary.bundle_root,
+            boundary.bundle_receipt_sha256,
+            boundary.provisioned_at_utc,
+        )
+    };
     reject_ambient_managed_modules(&lock, &root, &enumerate_process_modules()?)?;
-    let cookie = configure_process_dll_search(&bin)?;
+    configure_process_dll_search()?;
     let core_path = locked_dll_path(&lock, &root, &lock.contract.ort_dll)?;
     let core_handle = load_exact_library(&core_path)?;
-    let api = preflight_ort_api(core_handle, &lock.contract)?;
+    let api = preflight_ort_api(core_handle.raw(), &lock.contract)?;
     let build_info = ort_build_info(api)?;
     let available_providers = available_providers(api)?;
     if !available_providers
@@ -410,18 +497,6 @@ fn initialize_core() -> Result<LiveRuntime> {
             ),
             BUNDLE_REMEDIATION,
         ));
-    }
-    for forbidden in &lock.contract.forbidden_providers {
-        if available_providers
-            .iter()
-            .any(|provider| provider.eq_ignore_ascii_case(forbidden))
-        {
-            return Err(runtime_error(
-                "CALYX_ONNX_RUNTIME_FORBIDDEN_PROVIDER",
-                format!("pinned ORT unexpectedly exposes forbidden provider {forbidden}"),
-                BUNDLE_REMEDIATION,
-            ));
-        }
     }
     let committed = ort::init_from(&core_path)
         .map_err(|error| {
@@ -442,20 +517,20 @@ fn initialize_core() -> Result<LiveRuntime> {
             "terminate the process and ensure every ONNX consumer calls the Calyx runtime boundary before any ort API",
         ));
     }
-    let modules = attest_loaded_modules(&lock, &root, false)?;
+    let modules = attest_loaded_modules(&lock, &root)?;
+    let mut module_handles = ModuleStack::with_capacity(2);
+    module_handles.push(core_handle);
     Ok(LiveRuntime {
         lock: lock.clone(),
-        root: root.clone(),
         core_path,
-        _dll_directory_cookie: cookie,
-        _module_handles: vec![core_handle as usize],
+        _module_handles: module_handles,
         receipt: OnnxRuntimeAttestation {
-            schema: "calyx-onnx-runtime-attestation-v1".to_string(),
+            schema: "calyx-onnx-runtime-attestation-v3".to_string(),
             contract: contract_attestation(&lock, &lock_sha256),
             bundle_root: root.clone(),
             bundle_receipt: root.join(RECEIPT_FILE),
             bundle_receipt_sha256,
-            provisioned_at_utc: bundle_receipt.provisioned_at_utc,
+            provisioned_at_utc,
             ort_build_info: build_info,
             api_non_null: lock.contract.api_non_null.clone(),
             first_api_null: lock.contract.first_api_null,
@@ -471,42 +546,33 @@ fn initialize_core() -> Result<LiveRuntime> {
 }
 
 fn initialize_cuda(live: &mut LiveRuntime) -> Result<()> {
-    let modules_before = enumerate_process_modules()?;
-    reject_ambient_managed_modules(&live.lock, &live.root, &modules_before)?;
-    reject_ambient_driver_modules(&live.lock.loaded_module_policy, &modules_before)?;
-    let driver_root = canonicalize_existing_dir(
-        &expand_windows_path(&live.lock.loaded_module_policy.driver.required_root),
-        "NVIDIA driver required root",
-    )?;
-    let driver_path = canonicalize_existing_file(
-        &driver_root.join(&live.lock.loaded_module_policy.driver.name),
-        "NVIDIA CUDA driver DLL",
-    )?;
-    let driver_handle = load_exact_library(&driver_path)?;
-    live._module_handles.push(driver_handle as usize);
-    let mut dlls: Vec<&FileContract> = live
-        .lock
-        .files
-        .iter()
-        .filter(|file| file.bundle_path.to_ascii_lowercase().ends_with(".dll"))
-        .filter(|file| !basename_eq(&file.bundle_path, &live.lock.contract.ort_dll))
-        .collect();
-    dlls.sort_by_key(|file| {
-        if basename_eq(&file.bundle_path, &live.lock.contract.provider_dll) {
-            (2u8, file.bundle_path.as_str())
-        } else if basename_eq(&file.bundle_path, "onnxruntime_providers_shared.dll") {
-            (1u8, file.bundle_path.as_str())
-        } else {
-            (0u8, file.bundle_path.as_str())
-        }
-    });
-    for file in dlls {
-        let path = canonicalize_existing_file(
-            &live.root.join(windows_relative_path(&file.bundle_path)?),
-            "managed CUDA runtime DLL",
-        )?;
-        let handle = load_exact_library(&path)?;
-        live._module_handles.push(handle as usize);
+    let lock_sha256 = sha256_bytes(LOCK_BYTES);
+    let boundary = calyx_forge::cuda_runtime::initialize_pinned_cuda_dependencies()
+        .map_err(forge_runtime_boundary_error)?;
+    validate_forge_boundary(&boundary, &live.lock, &lock_sha256, true)?;
+    let requested = super::session::configured_cuda_device()?;
+    let requested = u32::try_from(requested).map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_INVALID",
+            format!("configured CUDA Runtime ordinal {requested} exceeds u32"),
+            "set CALYX_CUDA_DEVICE to a CUDA Runtime-visible ordinal",
+        )
+    })?;
+    let device =
+        calyx_forge::select_pinned_cuda_device(requested).map_err(forge_runtime_boundary_error)?;
+    let observed_driver_ordinal = calyx_forge::attest_pinned_cuda_driver_identity(device.identity)
+        .map_err(forge_runtime_boundary_error)?;
+    if observed_driver_ordinal != device.cuda_driver_ordinal {
+        return Err(runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISMATCH",
+            format!(
+                "Forge selected runtime_ordinal={} driver_ordinal={} identity={}; independent exact-nvcuda PCI+UUID readback resolved driver_ordinal={observed_driver_ordinal}",
+                device.ordinal,
+                device.cuda_driver_ordinal,
+                device.frozen_execution_device()
+            ),
+            "terminate the process, preserve the device receipt, and repair the CUDA Runtime/Driver/NVML identity boundary",
+        ));
     }
     let available = CUDA::default().is_available().map_err(|error| {
         runtime_error(
@@ -525,19 +591,181 @@ fn initialize_cuda(live: &mut LiveRuntime) -> Result<()> {
             BUNDLE_REMEDIATION,
         ));
     }
-    let (device, nvml_path, nvml_handle) = attest_cuda_device(&live.lock.loaded_module_policy)?;
-    live._module_handles.push(nvml_handle);
-    let mut modules = attest_loaded_modules(&live.lock, &live.root, true)?;
-    modules.push(attest_exact_system_module(
-        "nvml.dll",
-        &nvml_path,
-        "system-driver:system32-path+sha256",
-        &enumerate_process_modules()?,
-    )?);
-    modules.sort_by(|left, right| left.name.cmp(&right.name));
+    refresh_cuda_module_attestation(live, &lock_sha256)?;
     live.receipt.provider_available = true;
-    live.receipt.modules = modules;
     live.receipt.cuda_device = Some(device);
+    Ok(())
+}
+
+fn refresh_cuda_module_attestation(live: &mut LiveRuntime, lock_sha256: &str) -> Result<()> {
+    let boundary = calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
+        .map_err(forge_runtime_boundary_error)?;
+    validate_forge_boundary(&boundary, &live.lock, lock_sha256, true)?;
+    live.receipt.modules = boundary
+        .modules
+        .into_iter()
+        .map(|module| OnnxLoadedModuleAttestation {
+            name: module.name,
+            path: module.path,
+            bytes: module.bytes,
+            sha256: module.sha256,
+            file_version: module.file_version,
+            source: module.source,
+            system_trust: module.system_trust,
+        })
+        .collect();
+    Ok(())
+}
+
+fn forge_runtime_boundary_error(error: calyx_forge::ForgeError) -> CalyxError {
+    match error {
+        calyx_forge::ForgeError::RuntimeBoundary {
+            code,
+            detail,
+            remediation,
+        } => CalyxError {
+            code,
+            message: detail,
+            remediation,
+        },
+        other => runtime_error(
+            "CALYX_ONNX_RUNTIME_BOUNDARY_FAILED",
+            other.to_string(),
+            "inspect the Forge CUDA runtime boundary failure and repair the pinned runtime before retrying",
+        ),
+    }
+}
+
+fn validate_forge_boundary(
+    boundary: &calyx_forge::cuda_runtime::PinnedCudaRuntimeAttestation,
+    lock: &RuntimeLock,
+    lock_sha256: &str,
+    require_cuda: bool,
+) -> Result<()> {
+    require_contract(
+        boundary.schema == "calyx-pinned-cuda-runtime-attestation-v2",
+        "Forge runtime attestation schema mismatch",
+    )?;
+    require_contract(
+        boundary.lock_sha256 == lock_sha256,
+        "Forge runtime lock digest mismatch",
+    )?;
+    require_contract(
+        boundary.bundle_id == lock.bundle.id,
+        "Forge runtime bundle id mismatch",
+    )?;
+    require_contract(
+        boundary.validated_file_count == lock.files.len()
+            && boundary.validated_notice_count == lock.notices.len(),
+        "Forge runtime validated-count mismatch",
+    )?;
+    require_contract(
+        !boundary.provisioned_at_utc.trim().is_empty()
+            && boundary.bundle_receipt_sha256.len() == 64,
+        "Forge runtime receipt provenance is incomplete",
+    )?;
+
+    let expected_root = resolve_and_validate_root(lock, lock_sha256)?;
+    let observed_root = canonicalize_existing_dir(&boundary.bundle_root, "Forge bundle root")?;
+    require_contract(
+        same_path(&observed_root, &expected_root),
+        "Forge runtime root differs from the registry runtime root",
+    )?;
+    let expected_receipt =
+        canonicalize_existing_file(&expected_root.join(RECEIPT_FILE), "bundle receipt")?;
+    let observed_receipt =
+        canonicalize_existing_file(&boundary.bundle_receipt, "Forge bundle receipt")?;
+    require_contract(
+        same_path(&observed_receipt, &expected_receipt),
+        "Forge runtime receipt path mismatch",
+    )?;
+
+    let locked = expected_dlls(lock, &expected_root)?;
+    let mut expected_names = locked
+        .keys()
+        .filter(|name| require_cuda || basename_eq(name, &lock.contract.ort_dll))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if require_cuda {
+        expected_names.insert("nvcuda.dll".to_string());
+        expected_names.insert("nvml.dll".to_string());
+    }
+    let observed = boundary
+        .modules
+        .iter()
+        .map(|module| (module.name.to_ascii_lowercase(), module))
+        .collect::<BTreeMap<_, _>>();
+    require_contract(
+        observed.len() == boundary.modules.len(),
+        "Forge runtime attestation contains duplicate module names",
+    )?;
+    require_contract(
+        observed.keys().cloned().collect::<BTreeSet<_>>() == expected_names,
+        "Forge runtime module set differs from the locked module set",
+    )?;
+    reject_reparse_entry(&boundary.system_module_root, "Forge OS system-module root")?;
+    let system32 =
+        canonicalize_existing_dir(&boundary.system_module_root, "Forge OS system-module root")?;
+    reject_reparse_entry(&system32, "canonical Forge OS system-module root")?;
+    for (name, module) in observed {
+        let observed_path = canonicalize_existing_file(&module.path, "Forge loaded module")?;
+        if let Some(file) = locked.get(&name) {
+            let expected_path = canonicalize_existing_file(
+                &expected_root.join(windows_relative_path(&file.bundle_path)?),
+                "locked managed module",
+            )?;
+            require_contract(
+                same_path(&observed_path, &expected_path)
+                    && module.bytes == file.bytes
+                    && module.sha256 == file.sha256
+                    && module.file_version == file.file_version
+                    && module.system_trust.is_none(),
+                &format!("Forge attestation differs from lock for {name}"),
+            )?;
+        } else {
+            let expected_path =
+                canonicalize_existing_file(&system32.join(&name), "NVIDIA system module")?;
+            let policy = lock
+                .loaded_module_policy
+                .system_modules
+                .iter()
+                .find(|policy| policy.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    runtime_error(
+                        "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                        format!("system module {name} has no trust policy"),
+                        CONTRACT_REMEDIATION,
+                    )
+                })?;
+            let trust = module.system_trust.as_ref().ok_or_else(|| {
+                runtime_error(
+                    "CALYX_ONNX_RUNTIME_SYSTEM_TRUST_MISSING",
+                    format!("Forge supplied no catalog trust proof for {name}"),
+                    BUNDLE_REMEDIATION,
+                )
+            })?;
+            require_contract(
+                same_path(&observed_path, &expected_path)
+                    && module.bytes > 0
+                    && module.sha256.len() == 64
+                    && trust.schema == "calyx-system-module-trust-v1"
+                    && trust.module_name.eq_ignore_ascii_case(&name)
+                    && same_path(&trust.module_path, &expected_path)
+                    && trust.file_bytes == module.bytes
+                    && trust.file_sha256 == module.sha256
+                    && trust.signature_kind == "windows-catalog-authenticode"
+                    && trust.winverifytrust_status == 0
+                    && trust.signer_organization == policy.signer_organization
+                    && !trust.signer_certificate_sha256.is_empty()
+                    && trust.signed_company_name == policy.signed_company_name
+                    && module.file_version.as_deref() == Some(trust.signed_file_version.as_str())
+                    && !trust.signed_file_version.trim().is_empty()
+                    && !trust.signed_product_name.trim().is_empty()
+                    && !trust.version_translations.is_empty(),
+                &format!("Forge system-module attestation is invalid for {name}"),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -615,17 +843,30 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
             && lock.loaded_module_policy.reject_path_search,
         "loaded-module policy must reject application-directory and PATH search",
     )?;
+    let system_modules = lock
+        .loaded_module_policy
+        .system_modules
+        .iter()
+        .map(|module| (module.name.to_ascii_lowercase(), module))
+        .collect::<BTreeMap<_, _>>();
     require_contract(
-        lock.loaded_module_policy
-            .driver
-            .name
-            .eq_ignore_ascii_case("nvcuda.dll"),
-        "driver policy must identify nvcuda.dll",
+        system_modules.len() == lock.loaded_module_policy.system_modules.len()
+            && system_modules.len() == 2
+            && system_modules.contains_key("nvcuda.dll")
+            && system_modules.contains_key("nvml.dll"),
+        "system module identity/cardinality mismatch",
     )?;
-    require_contract(
-        !lock.loaded_module_policy.driver.publisher.trim().is_empty(),
-        "driver publisher is empty",
-    )?;
+    for module in system_modules.values() {
+        require_contract(
+            module
+                .required_root
+                .eq_ignore_ascii_case("%SystemRoot%\\System32")
+                && module.signature_kind == "catalog"
+                && module.signer_organization == "Microsoft Corporation"
+                && module.signed_company_name == "NVIDIA Corporation",
+            "system module trust policy differs from the Windows NVIDIA driver contract",
+        )?;
+    }
     require_contract(
         !lock.loaded_module_policy.system_roots.is_empty(),
         "system_roots is empty",
@@ -633,8 +874,8 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
     require_contract(
         lock.loaded_module_policy.system_roots.len() == 1
             && lock.loaded_module_policy.system_roots[0]
-                .eq_ignore_ascii_case(&lock.loaded_module_policy.driver.required_root),
-        "system_roots must exactly identify the driver required_root",
+                .eq_ignore_ascii_case("%SystemRoot%\\System32"),
+        "system_roots must exactly identify System32",
     )?;
     require_contract(
         !lock.loaded_module_policy.bundle_module_globs.is_empty(),
@@ -730,6 +971,28 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
             )?;
         }
     }
+    let load_order = lock
+        .loaded_module_policy
+        .bundle_load_order
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    require_contract(
+        load_order.len() == lock.loaded_module_policy.bundle_load_order.len(),
+        "bundle load order contains duplicate paths",
+    )?;
+    require_contract(
+        load_order
+            == lock
+                .files
+                .iter()
+                .map(|file| file.bundle_path.to_ascii_lowercase())
+                .collect(),
+        "bundle load order must name every locked DLL exactly once",
+    )?;
+    for path in &lock.loaded_module_policy.bundle_load_order {
+        validate_relative_bundle_path(path, true)?;
+    }
     for notice in &lock.notices {
         require_contract(
             artifact_ids.contains(notice.artifact.as_str()),
@@ -758,15 +1021,6 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
         require_contract(
             dll_names.contains(&import.to_ascii_lowercase()),
             "direct provider import missing from files",
-        )?;
-    }
-    for forbidden in &lock.contract.forbidden_archive_dlls {
-        require_contract(
-            !lock
-                .files
-                .iter()
-                .any(|file| file.archive_path.eq_ignore_ascii_case(forbidden)),
-            "forbidden archive DLL present in bundle",
         )?;
     }
     Ok(())
@@ -832,310 +1086,6 @@ fn resolve_and_validate_root(lock: &RuntimeLock, lock_sha256: &str) -> Result<Pa
         ));
     }
     Ok(root)
-}
-
-fn validate_installed_bundle(
-    root: &Path,
-    lock: &RuntimeLock,
-    lock_sha256: &str,
-) -> Result<(BundleReceipt, String)> {
-    let copied_lock = fs::read(root.join(LOCK_FILE)).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_LOCK_MISSING",
-            format!("read {} failed: {error}", root.join(LOCK_FILE).display()),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    if copied_lock != LOCK_BYTES {
-        return Err(runtime_error(
-            "CALYX_ONNX_RUNTIME_LOCK_MISMATCH",
-            format!(
-                "{} is not byte-identical to the embedded lock",
-                root.join(LOCK_FILE).display()
-            ),
-            BUNDLE_REMEDIATION,
-        ));
-    }
-    let copied_digest = fs::read_to_string(root.join(LOCK_DIGEST_FILE)).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_LOCK_DIGEST_MISSING",
-            format!(
-                "read {} failed: {error}",
-                root.join(LOCK_DIGEST_FILE).display()
-            ),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    if copied_digest.trim() != lock_sha256 {
-        return Err(runtime_error(
-            "CALYX_ONNX_RUNTIME_LOCK_DIGEST_MISMATCH",
-            format!(
-                "{} records {}, expected {lock_sha256}",
-                root.join(LOCK_DIGEST_FILE).display(),
-                copied_digest.trim()
-            ),
-            BUNDLE_REMEDIATION,
-        ));
-    }
-    for file in &lock.files {
-        verify_locked_file(root, &file.bundle_path, file.bytes, &file.sha256)?;
-    }
-    for notice in &lock.notices {
-        verify_locked_file(root, &notice.bundle_path, notice.bytes, &notice.sha256)?;
-    }
-    let receipt_path = root.join(RECEIPT_FILE);
-    let receipt_bytes = fs::read(&receipt_path).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_RECEIPT_MISSING",
-            format!("read {} failed: {error}", receipt_path.display()),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    let receipt: BundleReceipt = serde_json::from_slice(&receipt_bytes).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_RECEIPT_INVALID",
-            format!("parse {} failed: {error}", receipt_path.display()),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    validate_bundle_receipt(&receipt, lock, lock_sha256)?;
-    reject_extra_bundle_entries(root, lock)?;
-    Ok((receipt, sha256_bytes(&receipt_bytes)))
-}
-
-fn validate_bundle_receipt(
-    receipt: &BundleReceipt,
-    lock: &RuntimeLock,
-    lock_sha256: &str,
-) -> Result<()> {
-    require_receipt(
-        receipt.schema == RECEIPT_SCHEMA,
-        "unexpected receipt schema",
-    )?;
-    require_receipt(
-        receipt.bundle_id == lock.bundle.id,
-        "receipt bundle_id mismatch",
-    )?;
-    require_receipt(
-        receipt.lock_sha256 == lock_sha256,
-        "receipt lock_sha256 mismatch",
-    )?;
-    require_receipt(
-        !receipt.provisioned_at_utc.trim().is_empty(),
-        "receipt provisioned_at_utc is empty",
-    )?;
-
-    let artifacts: BTreeMap<_, _> = receipt
-        .artifacts
-        .iter()
-        .map(|artifact| (artifact.id.as_str(), artifact))
-        .collect();
-    require_receipt(
-        artifacts.len() == receipt.artifacts.len() && artifacts.len() == lock.artifacts.len(),
-        "receipt artifact cardinality/identity mismatch",
-    )?;
-    for expected in &lock.artifacts {
-        let actual = artifacts
-            .get(expected.id.as_str())
-            .ok_or_else(|| receipt_error(format!("receipt omits artifact {}", expected.id)))?;
-        require_receipt(
-            actual.filename == expected.filename,
-            "receipt artifact filename mismatch",
-        )?;
-        require_receipt(
-            actual.bytes == expected.bytes,
-            "receipt artifact byte count mismatch",
-        )?;
-        require_receipt(
-            actual.sha256 == expected.sha256,
-            "receipt artifact SHA256 mismatch",
-        )?;
-        require_receipt(
-            actual.archive_entries > 0,
-            "receipt artifact archive_entries is zero",
-        )?;
-        require_receipt(
-            actual.archive_entries == actual.record_entries
-                && actual.record_entries_verified == actual.record_entries,
-            "receipt artifact RECORD/archive verification counts disagree",
-        )?;
-        require_receipt(
-            actual.locked_record_entries_verified > 0
-                && actual.locked_record_entries_verified <= actual.record_entries,
-            "receipt locked RECORD verification count is invalid",
-        )?;
-    }
-
-    let files: BTreeMap<_, _> = receipt
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect();
-    require_receipt(
-        files.len() == receipt.files.len() && files.len() == lock.files.len(),
-        "receipt file cardinality/identity mismatch",
-    )?;
-    for expected in &lock.files {
-        let actual = files
-            .get(expected.bundle_path.as_str())
-            .ok_or_else(|| receipt_error(format!("receipt omits file {}", expected.bundle_path)))?;
-        require_receipt(
-            actual.bytes == expected.bytes,
-            "receipt file byte count mismatch",
-        )?;
-        require_receipt(
-            actual.sha256 == expected.sha256,
-            "receipt file SHA256 mismatch",
-        )?;
-        require_receipt(
-            actual.file_version == expected.file_version,
-            "receipt file version mismatch",
-        )?;
-        require_receipt(
-            actual.authenticode.status == expected.authenticode.status
-                && actual.authenticode.subject == expected.authenticode.subject
-                && actual.authenticode.thumbprint == expected.authenticode.thumbprint,
-            "receipt file Authenticode facts mismatch",
-        )?;
-    }
-
-    let notices: BTreeMap<_, _> = receipt
-        .notices
-        .iter()
-        .map(|notice| (notice.path.as_str(), notice))
-        .collect();
-    require_receipt(
-        notices.len() == receipt.notices.len() && notices.len() == lock.notices.len(),
-        "receipt notice cardinality/identity mismatch",
-    )?;
-    for expected in &lock.notices {
-        let actual = notices.get(expected.bundle_path.as_str()).ok_or_else(|| {
-            receipt_error(format!("receipt omits notice {}", expected.bundle_path))
-        })?;
-        require_receipt(
-            actual.bytes == expected.bytes,
-            "receipt notice byte count mismatch",
-        )?;
-        require_receipt(
-            actual.sha256 == expected.sha256,
-            "receipt notice SHA256 mismatch",
-        )?;
-    }
-    Ok(())
-}
-
-fn reject_extra_bundle_entries(root: &Path, lock: &RuntimeLock) -> Result<()> {
-    let mut expected_files: BTreeSet<String> = lock
-        .files
-        .iter()
-        .map(|file| file.bundle_path.to_ascii_lowercase())
-        .chain(
-            lock.notices
-                .iter()
-                .map(|notice| notice.bundle_path.to_ascii_lowercase()),
-        )
-        .collect();
-    expected_files.extend(
-        [LOCK_FILE, LOCK_DIGEST_FILE, RECEIPT_FILE]
-            .into_iter()
-            .map(str::to_ascii_lowercase),
-    );
-    let mut expected_dirs = BTreeSet::new();
-    for file in &expected_files {
-        let mut path = Path::new(file);
-        while let Some(parent) = path.parent() {
-            if parent.as_os_str().is_empty() {
-                break;
-            }
-            expected_dirs.insert(parent.to_string_lossy().replace('\\', "/"));
-            path = parent;
-        }
-    }
-    inspect_bundle_directory(root, root, &expected_files, &expected_dirs)
-}
-
-fn inspect_bundle_directory(
-    root: &Path,
-    directory: &Path,
-    expected_files: &BTreeSet<String>,
-    expected_dirs: &BTreeSet<String>,
-) -> Result<()> {
-    let entries = fs::read_dir(directory).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_DIRECTORY_UNREADABLE",
-            format!(
-                "read runtime directory {} failed: {error}",
-                directory.display()
-            ),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            runtime_error(
-                "CALYX_ONNX_RUNTIME_DIRECTORY_UNREADABLE",
-                format!(
-                    "enumerate runtime directory {} failed: {error}",
-                    directory.display()
-                ),
-                BUNDLE_REMEDIATION,
-            )
-        })?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|_| {
-            runtime_error(
-                "CALYX_ONNX_RUNTIME_PATH_ESCAPE",
-                format!(
-                    "runtime entry {} is not below {}",
-                    path.display(),
-                    root.display()
-                ),
-                BUNDLE_REMEDIATION,
-            )
-        })?;
-        let key = relative
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            runtime_error(
-                "CALYX_ONNX_RUNTIME_DIRECTORY_UNREADABLE",
-                format!("read metadata for {} failed: {error}", path.display()),
-                BUNDLE_REMEDIATION,
-            )
-        })?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0 {
-            return Err(runtime_error(
-                "CALYX_ONNX_RUNTIME_REPARSE_ENTRY",
-                format!(
-                    "runtime bundle contains a symbolic/reparse entry at {}",
-                    path.display()
-                ),
-                BUNDLE_REMEDIATION,
-            ));
-        }
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            if !expected_dirs.contains(&key) {
-                return Err(runtime_error(
-                    "CALYX_ONNX_RUNTIME_UNLOCKED_ENTRY",
-                    format!(
-                        "runtime bundle contains unlocked directory {}",
-                        path.display()
-                    ),
-                    BUNDLE_REMEDIATION,
-                ));
-            }
-            inspect_bundle_directory(root, &path, expected_files, expected_dirs)?;
-        } else if !file_type.is_file() || !expected_files.contains(&key) {
-            return Err(runtime_error(
-                "CALYX_ONNX_RUNTIME_UNLOCKED_ENTRY",
-                format!("runtime bundle contains unlocked entry {}", path.display()),
-                BUNDLE_REMEDIATION,
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn verify_locked_file(
@@ -1205,29 +1155,18 @@ fn reject_legacy_environment() -> Result<()> {
     Ok(())
 }
 
-fn configure_process_dll_search(bin: &Path) -> Result<usize> {
-    let flags = LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS;
-    if unsafe { SetDefaultDllDirectories(flags) } == 0 {
+fn configure_process_dll_search() -> Result<()> {
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
         return Err(last_windows_error(
-            "SetDefaultDllDirectories(SYSTEM32|USER_DIRS)",
+            "SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)",
         ));
     }
-    let wide = wide_path(bin);
-    let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
-    if cookie.is_null() {
-        return Err(last_windows_error(format!(
-            "AddDllDirectory {}",
-            bin.display()
-        )));
-    }
-    Ok(cookie as usize)
+    Ok(())
 }
 
-fn load_exact_library(path: &Path) -> Result<HMODULE> {
+fn load_exact_library(path: &Path) -> Result<OwnedModule> {
     let wide = wide_path(path);
-    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
-        | LOAD_LIBRARY_SEARCH_SYSTEM32
-        | LOAD_LIBRARY_SEARCH_USER_DIRS;
+    let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), flags) };
     if module.is_null() {
         return Err(last_windows_error(format!(
@@ -1235,7 +1174,7 @@ fn load_exact_library(path: &Path) -> Result<HMODULE> {
             path.display()
         )));
     }
-    Ok(module)
+    Ok(OwnedModule(module as usize))
 }
 
 fn preflight_ort_api(module: HMODULE, contract: &OrtContract) -> Result<*const ort::sys::OrtApi> {
@@ -1465,7 +1404,6 @@ fn reject_ambient_managed_modules(
 fn attest_loaded_modules(
     lock: &RuntimeLock,
     root: &Path,
-    require_cuda: bool,
 ) -> Result<Vec<OnnxLoadedModuleAttestation>> {
     let modules = enumerate_process_modules()?;
     reject_ambient_managed_modules(lock, root, &modules)?;
@@ -1490,7 +1428,7 @@ fn attest_loaded_modules(
     let mut out = Vec::new();
     for (key, file) in expected {
         let core = basename_eq(&key, &lock.contract.ort_dll);
-        if !require_cuda && !core {
+        if !core {
             continue;
         }
         let path = loaded.get(&key).ok_or_else(|| {
@@ -1507,282 +1445,11 @@ fn attest_loaded_modules(
             sha256: file.sha256.clone(),
             file_version: file.file_version.clone(),
             source: format!("bundle:{}", file.artifact),
+            system_trust: None,
         });
-    }
-    if require_cuda {
-        let driver = attest_driver_module(lock, &enumerate_process_modules()?)?;
-        out.push(driver);
     }
     out.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(out)
-}
-
-fn attest_driver_module(
-    lock: &RuntimeLock,
-    modules: &[PathBuf],
-) -> Result<OnnxLoadedModuleAttestation> {
-    let policy = &lock.loaded_module_policy.driver;
-    let matches: Vec<_> = modules
-        .iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(&policy.name))
-        })
-        .collect();
-    if matches.len() != 1 {
-        return Err(runtime_error(
-            "CALYX_ONNX_CUDA_DRIVER_MODULE_INVALID",
-            format!(
-                "expected exactly one loaded {}, observed {}",
-                policy.name,
-                matches.len()
-            ),
-            "repair the NVIDIA driver installation and restart the process before loading any ONNX lens",
-        ));
-    }
-    let path = canonicalize_existing_file(matches[0], "NVIDIA CUDA driver module")?;
-    let required_root = canonicalize_existing_dir(
-        &expand_windows_path(&policy.required_root),
-        "driver required_root",
-    )?;
-    let required = canonicalize_existing_file(
-        &required_root.join(&policy.name),
-        "required NVIDIA CUDA driver module",
-    )?;
-    if !same_path(&path, &required) {
-        return Err(runtime_error(
-            "CALYX_ONNX_CUDA_DRIVER_PATH_MISMATCH",
-            format!(
-                "{} loaded from {}; exact required path is {}",
-                policy.name,
-                path.display(),
-                required.display()
-            ),
-            "repair the NVIDIA driver installation and remove ambient nvcuda.dll copies",
-        ));
-    }
-    let metadata = fs::metadata(&path).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_DRIVER_UNREADABLE",
-            format!("stat {} failed: {error}", path.display()),
-            "repair the NVIDIA driver installation and restart the process",
-        )
-    })?;
-    Ok(OnnxLoadedModuleAttestation {
-        name: policy.name.to_ascii_lowercase(),
-        path: path.clone(),
-        bytes: metadata.len(),
-        sha256: sha256_file(&path)?,
-        file_version: None,
-        source: "system-driver:system32-path+sha256+nvml".to_string(),
-    })
-}
-
-fn attest_exact_system_module(
-    name: &str,
-    expected_path: &Path,
-    source: &str,
-    modules: &[PathBuf],
-) -> Result<OnnxLoadedModuleAttestation> {
-    let matches: Vec<_> = modules
-        .iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
-        })
-        .collect();
-    if matches.len() != 1 {
-        return Err(runtime_error(
-            "CALYX_ONNX_SYSTEM_MODULE_INVALID",
-            format!(
-                "expected exactly one loaded {name} module, observed {}",
-                matches.len()
-            ),
-            "repair the NVIDIA driver and restart the process before loading any ONNX lens",
-        ));
-    }
-    let actual = canonicalize_existing_file(matches[0], "loaded NVIDIA system module")?;
-    let expected = canonicalize_existing_file(expected_path, "required NVIDIA system module")?;
-    if !same_path(&actual, &expected) {
-        return Err(runtime_error(
-            "CALYX_ONNX_SYSTEM_MODULE_PATH_MISMATCH",
-            format!(
-                "loaded {name} from {}; exact required path is {}",
-                actual.display(),
-                expected.display()
-            ),
-            "repair the NVIDIA driver, remove ambient NVIDIA DLL copies, and restart the process",
-        ));
-    }
-    let metadata = fs::metadata(&actual).map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_SYSTEM_MODULE_UNREADABLE",
-            format!("stat {} failed: {error}", actual.display()),
-            "repair the NVIDIA driver and restart the process",
-        )
-    })?;
-    Ok(OnnxLoadedModuleAttestation {
-        name: name.to_ascii_lowercase(),
-        path: actual.clone(),
-        bytes: metadata.len(),
-        sha256: sha256_file(&actual)?,
-        file_version: None,
-        source: source.to_string(),
-    })
-}
-
-fn reject_ambient_exact_system_module(
-    name: &str,
-    expected_path: &Path,
-    modules: &[PathBuf],
-) -> Result<()> {
-    let matches: Vec<_> = modules
-        .iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
-        })
-        .collect();
-    if matches.len() > 1 {
-        return Err(runtime_error(
-            "CALYX_ONNX_SYSTEM_MODULE_INVALID",
-            format!(
-                "process already contains {} loaded {name} modules",
-                matches.len()
-            ),
-            "terminate the process, remove ambient NVIDIA DLL copies, and restart",
-        ));
-    }
-    if let Some(path) = matches.first() {
-        let actual = canonicalize_existing_file(path, "preloaded NVIDIA system module")?;
-        if !same_path(&actual, expected_path) {
-            return Err(runtime_error(
-                "CALYX_ONNX_SYSTEM_MODULE_PATH_MISMATCH",
-                format!(
-                    "preloaded {name} is at {}; exact required path is {}",
-                    actual.display(),
-                    expected_path.display()
-                ),
-                "terminate the process, remove ambient NVIDIA DLL copies, and repair the NVIDIA driver",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn reject_ambient_driver_modules(policy: &LoadedModulePolicy, modules: &[PathBuf]) -> Result<()> {
-    let required_root = canonicalize_existing_dir(
-        &expand_windows_path(&policy.driver.required_root),
-        "NVIDIA driver required_root",
-    )?;
-    let required = canonicalize_existing_file(
-        &required_root.join(&policy.driver.name),
-        "required NVIDIA CUDA driver module",
-    )?;
-    let matches: Vec<_> = modules
-        .iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(&policy.driver.name))
-        })
-        .collect();
-    if matches.len() > 1 {
-        return Err(runtime_error(
-            "CALYX_ONNX_CUDA_DRIVER_MODULE_INVALID",
-            format!(
-                "process already contains {} loaded {} modules",
-                matches.len(),
-                policy.driver.name
-            ),
-            "terminate the process, remove ambient NVIDIA driver DLL copies, and restart",
-        ));
-    }
-    if let Some(path) = matches.first() {
-        let path = canonicalize_existing_file(path, "preloaded NVIDIA CUDA driver module")?;
-        if !same_path(&path, &required) {
-            return Err(runtime_error(
-                "CALYX_ONNX_CUDA_DRIVER_PATH_MISMATCH",
-                format!(
-                    "preloaded {} is at {}; exact required path is {}",
-                    policy.driver.name,
-                    path.display(),
-                    required.display()
-                ),
-                "terminate the process, remove ambient nvcuda.dll copies, and repair the NVIDIA driver",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn attest_cuda_device(
-    policy: &LoadedModulePolicy,
-) -> Result<(OnnxCudaDeviceAttestation, PathBuf, usize)> {
-    if env::var_os("CUDA_VISIBLE_DEVICES").is_some() {
-        return Err(runtime_error(
-            "CALYX_ONNX_CUDA_DEVICE_MAPPING_AMBIGUOUS",
-            "CUDA_VISIBLE_DEVICES is set, so the configured ORT ordinal cannot be proven against the physical NVML ordinal",
-            "unset CUDA_VISIBLE_DEVICES and select the physical GPU with CALYX_ONNX_CUDA_DEVICE before starting the resident worker",
-        ));
-    }
-    let ordinal = super::session::configured_cuda_device()? as u32;
-    let system_root = canonicalize_existing_dir(
-        &expand_windows_path(&policy.driver.required_root),
-        "NVIDIA driver system root",
-    )?;
-    let nvml_path = canonicalize_existing_file(&system_root.join("nvml.dll"), "NVML DLL")?;
-    reject_ambient_exact_system_module("nvml.dll", &nvml_path, &enumerate_process_modules()?)?;
-    let nvml_handle = load_exact_library(&nvml_path)? as usize;
-    let nvml = Nvml::builder()
-        .lib_path(nvml_path.as_os_str())
-        .init()
-        .map_err(|error| runtime_error(
-            "CALYX_ONNX_NVML_INIT_FAILED",
-            format!("load NVML from {} failed: {error}", nvml_path.display()),
-            "repair the NVIDIA driver installation and ensure nvml.dll exists in the locked system root",
-        ))?;
-    let device = nvml.device_by_index(ordinal).map_err(|error| runtime_error(
-        "CALYX_ONNX_CUDA_DEVICE_UNAVAILABLE",
-        format!("NVML device_by_index({ordinal}) failed: {error}"),
-        "set CALYX_ONNX_CUDA_DEVICE to an ordinal reported by nvidia-smi and restart the worker",
-    ))?;
-    let name = device.name().map_err(nvml_device_error("name"))?;
-    let uuid = device.uuid().map_err(nvml_device_error("uuid"))?;
-    let compute = device
-        .cuda_compute_capability()
-        .map_err(nvml_device_error("CUDA compute capability"))?;
-    let memory = device
-        .memory_info()
-        .map_err(nvml_device_error("memory info"))?;
-    let nvidia_driver_version = nvml
-        .sys_driver_version()
-        .map_err(nvml_system_error("driver version"))?;
-    let cuda_version = nvml
-        .sys_cuda_driver_version()
-        .map_err(nvml_system_error("CUDA driver version"))?;
-    Ok((
-        OnnxCudaDeviceAttestation {
-            ordinal,
-            name,
-            uuid,
-            compute_capability: format!("{}.{}", compute.major, compute.minor),
-            total_vram_bytes: memory.total,
-            used_vram_bytes: memory.used,
-            free_vram_bytes: memory.free,
-            nvidia_driver_version,
-            cuda_driver_version: format!(
-                "{}.{}",
-                cuda_driver_version_major(cuda_version),
-                cuda_driver_version_minor(cuda_version)
-            ),
-        },
-        nvml_path,
-        nvml_handle,
-    ))
 }
 
 fn enumerate_process_modules() -> Result<Vec<PathBuf>> {
@@ -2046,16 +1713,6 @@ fn current_application_dir() -> Result<PathBuf> {
     canonicalize_existing_dir(directory, "application directory")
 }
 
-fn expand_windows_path(raw: &str) -> PathBuf {
-    let mut value = raw.replace('/', "\\");
-    for name in ["SystemRoot", "WINDIR"] {
-        if let Some(replacement) = env::var_os(name).and_then(|value| value.into_string().ok()) {
-            value = value.replace(&format!("%{name}%"), &replacement);
-        }
-    }
-    PathBuf::from(value)
-}
-
 fn path_is_within(path: &Path, root: &Path) -> bool {
     let path = path
         .to_string_lossy()
@@ -2121,27 +1778,11 @@ fn require_contract(condition: bool, message: &str) -> Result<()> {
     }
 }
 
-fn require_receipt(condition: bool, message: &str) -> Result<()> {
-    if condition {
-        Ok(())
-    } else {
-        Err(receipt_error(message.to_string()))
-    }
-}
-
 fn contract_error(message: String) -> CalyxError {
     runtime_error(
         "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
         message,
         CONTRACT_REMEDIATION,
-    )
-}
-
-fn receipt_error(message: String) -> CalyxError {
-    runtime_error(
-        "CALYX_ONNX_RUNTIME_RECEIPT_INVALID",
-        message,
-        BUNDLE_REMEDIATION,
     )
 }
 
@@ -2164,30 +1805,6 @@ fn last_windows_error(context: impl Into<String>) -> CalyxError {
         }),
         BUNDLE_REMEDIATION,
     )
-}
-
-fn nvml_device_error(
-    operation: &'static str,
-) -> impl FnOnce(nvml_wrapper::error::NvmlError) -> CalyxError {
-    move |error| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_FAILED",
-            format!("NVML device {operation} query failed: {error}"),
-            "repair the NVIDIA driver, verify the selected GPU with nvidia-smi, and restart the worker",
-        )
-    }
-}
-
-fn nvml_system_error(
-    operation: &'static str,
-) -> impl FnOnce(nvml_wrapper::error::NvmlError) -> CalyxError {
-    move |error| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_DRIVER_ATTESTATION_FAILED",
-            format!("NVML system {operation} query failed: {error}"),
-            "repair the NVIDIA driver and restart the worker",
-        )
-    }
 }
 
 fn wide_path(path: &Path) -> Vec<u16> {

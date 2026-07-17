@@ -15,7 +15,9 @@ use crate::runtime::candle::{
     verify_f32_gemm_accumulation,
 };
 use crate::runtime::common::LocalModelExecutionAttestation;
-use crate::runtime::common::{hash_files, text_from_input};
+use crate::runtime::common::{
+    hash_files, synchronize_candle_gpu_after_host_materialization, text_from_input,
+};
 use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
 
 mod files;
@@ -299,6 +301,12 @@ impl Lens for FastembedQwen3Lens {
                 .lock()
                 .map_err(|_| CalyxError::lens_unreachable("Qwen3 model mutex was poisoned"))?;
             let rows = model.embed(&texts).map_err(qwen3_error)?;
+            if self.device_policy.is_gpu() {
+                synchronize_candle_gpu_after_host_materialization(
+                    "fastembed-qwen3",
+                    model.device(),
+                )?;
+            }
             let vectors = dense_batch(self.dim, rows, inputs.len())?;
             for vector in &vectors {
                 self.contract.verify_vector(self.id, vector)?;

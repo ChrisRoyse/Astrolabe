@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::lifecycle::{LifecycleErrorRecord, LifecyclePhase};
 use crate::panel_commands::warm::resident_support::ResidentLensAttestation;
 
-pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v3";
+pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v4";
 pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
 pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
 /// v2 (#1002): measure_batch responses stream as one header frame, one frame
@@ -48,6 +48,7 @@ pub(super) struct ReadyResponse {
     pub(super) worker_pid: Option<u32>,
     pub(super) worker_descendant_pids: Vec<u32>,
     pub(super) generation: u64,
+    pub(super) queued_requests: u64,
     pub(super) in_flight: u64,
     pub(super) bind: SocketAddr,
     pub(super) uptime_ms: u128,

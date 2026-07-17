@@ -101,6 +101,13 @@ impl CudaGraphRunConfig {
         if !is_new {
             binding.update_inputs(label, inputs)?;
         }
+        binding.binding.synchronize_inputs().map_err(|error| {
+            crate::runtime::common::gpu_synchronization_failed(
+                label,
+                "onnx_cuda_graph_inputs_before_run",
+                error,
+            )
+        })?;
         let mut outputs = match request.options {
             Some(options) => session.run_binding_with_options(&binding.binding, options),
             None => session.run_binding(&binding.binding),
@@ -110,6 +117,13 @@ impl CudaGraphRunConfig {
                 "ONNX CUDA graph inference failed for {label} batch={} seq={}: {err}",
                 shape.0, shape.1
             ))
+        })?;
+        binding.binding.synchronize_outputs().map_err(|error| {
+            crate::runtime::common::gpu_synchronization_failed(
+                label,
+                "onnx_cuda_graph_outputs_before_host_copy",
+                error,
+            )
         })?;
         copy_outputs_to_cpu(label, &mut outputs)?;
         let result = extract(&outputs)?;

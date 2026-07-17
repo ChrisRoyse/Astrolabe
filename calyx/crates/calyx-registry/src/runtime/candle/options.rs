@@ -69,7 +69,14 @@ pub enum CandleDevicePolicy {
     CpuExplicit,
     CpuNoCudaFeature,
     CpuNoCudaDevice,
-    CudaFailLoud { ordinal: usize },
+    CudaFrozen {
+        identity: calyx_forge::PinnedCudaDeviceIdentity,
+    },
+    CudaFailLoud {
+        runtime_ordinal: usize,
+        driver_ordinal: usize,
+        identity: calyx_forge::PinnedCudaDeviceIdentity,
+    },
 }
 
 impl CandleDevicePolicy {
@@ -78,12 +85,14 @@ impl CandleDevicePolicy {
             Self::CpuExplicit => "cpu_explicit,no_cuda",
             Self::CpuNoCudaFeature => "cpu_no_cuda_feature,no_cuda",
             Self::CpuNoCudaDevice => "cpu_no_cuda_device,no_cuda",
-            Self::CudaFailLoud { .. } => "cuda,error_on_failure,no_cpu_fallback",
+            Self::CudaFrozen { .. } | Self::CudaFailLoud { .. } => {
+                "cuda,error_on_failure,no_cpu_fallback"
+            }
         }
     }
 
     pub const fn is_gpu(self) -> bool {
-        matches!(self, Self::CudaFailLoud { .. })
+        matches!(self, Self::CudaFrozen { .. } | Self::CudaFailLoud { .. })
     }
 
     pub const fn placement(self) -> Placement {
@@ -96,7 +105,17 @@ impl CandleDevicePolicy {
 
     pub fn detail(self) -> String {
         match self {
-            Self::CudaFailLoud { ordinal } => format!("{};device={ordinal}", self.as_str()),
+            Self::CudaFrozen { identity } => {
+                format!("{};identity={identity};selectors=unresolved", self.as_str())
+            }
+            Self::CudaFailLoud {
+                runtime_ordinal,
+                driver_ordinal,
+                identity,
+            } => format!(
+                "{};runtime_ordinal={runtime_ordinal};driver_ordinal={driver_ordinal};identity={identity}",
+                self.as_str()
+            ),
             _ => self.as_str().to_string(),
         }
     }
@@ -104,7 +123,26 @@ impl CandleDevicePolicy {
     pub fn frozen_token(self) -> String {
         match self {
             Self::CpuExplicit | Self::CpuNoCudaFeature | Self::CpuNoCudaDevice => "cpu".to_string(),
-            Self::CudaFailLoud { ordinal } => format!("cuda:{ordinal}"),
+            Self::CudaFrozen { identity } | Self::CudaFailLoud { identity, .. } => {
+                identity.canonical_execution_token()
+            }
+        }
+    }
+
+    pub fn compact_identity_token(self) -> String {
+        match self {
+            Self::CpuExplicit | Self::CpuNoCudaFeature | Self::CpuNoCudaDevice => "cpu".to_string(),
+            Self::CudaFrozen { identity } | Self::CudaFailLoud { identity, .. } => {
+                let pci = identity
+                    .canonical_pci_bus_id()
+                    .replace(':', "")
+                    .replace('.', "");
+                let uuid = identity
+                    .canonical_uuid()
+                    .trim_start_matches("GPU-")
+                    .replace('-', "");
+                format!("cuda-{pci}-{uuid}")
+            }
         }
     }
 }
@@ -130,25 +168,14 @@ fn device_mode_invalid(message: impl Into<String>) -> CalyxError {
     }
 }
 
-/// CUDA device ordinal used by default live Candle-family runtimes.
+/// CUDA Runtime-visible device ordinal used by default live Candle-family runtimes.
 pub fn configured_cuda_device() -> Result<usize> {
-    let Ok(raw) = std::env::var(CANDLE_CUDA_DEVICE_ENV) else {
-        return Ok(0);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err(CalyxError {
-            code: "CALYX_CANDLE_CUDA_DEVICE_INVALID",
-            message: format!("{CANDLE_CUDA_DEVICE_ENV} must not be empty"),
-            remediation: "set CALYX_CANDLE_CUDA_DEVICE to the integer ordinal reported by nvidia-smi, or unset it for device 0",
-        });
-    }
-    raw.parse::<usize>().map_err(|_| CalyxError {
+    let ordinal = calyx_forge::configured_cuda_runtime_ordinal()
+        .map_err(crate::runtime::common::forge_runtime_boundary_error)?;
+    usize::try_from(ordinal).map_err(|_| CalyxError {
         code: "CALYX_CANDLE_CUDA_DEVICE_INVALID",
-        message: format!(
-            "{CANDLE_CUDA_DEVICE_ENV}={raw} is not a non-negative CUDA device ordinal"
-        ),
-        remediation: "set CALYX_CANDLE_CUDA_DEVICE to the integer ordinal reported by nvidia-smi, or unset it for device 0",
+        message: format!("shared CUDA Runtime-visible ordinal {ordinal} exceeds usize"),
+        remediation: "set CALYX_CUDA_DEVICE to a valid CUDA Runtime-visible ordinal",
     })
 }
 
@@ -172,38 +199,80 @@ pub fn device_policy_for_mode(mode: CandleDeviceMode) -> Result<CandleDevicePoli
 /// declarative state. Executable runtime construction must call [`frozen_device_policy`] instead,
 /// which additionally proves that the declared CUDA device is available.
 pub fn parse_frozen_device_policy(raw: &str) -> Result<CandleDevicePolicy> {
-    let raw = raw.trim().to_ascii_lowercase();
-    if raw == "cpu" {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("cpu") {
         return Ok(CandleDevicePolicy::CpuExplicit);
     }
-    let Some(ordinal) = raw.strip_prefix("cuda:") else {
+    if raw.eq_ignore_ascii_case("cuda")
+        || raw
+            .strip_prefix("cuda:")
+            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    {
         return Err(frozen_device_invalid(format!(
-            "unsupported frozen Candle execution device {raw}; expected cpu or cuda:<ordinal>"
+            "legacy ordinal-only execution device {raw:?} does not identify a physical GPU"
         )));
-    };
-    let ordinal = ordinal.parse::<usize>().map_err(|_| {
-        frozen_device_invalid(format!(
-            "frozen Candle execution device {raw} has an invalid CUDA ordinal"
-        ))
-    })?;
-    Ok(CandleDevicePolicy::CudaFailLoud { ordinal })
+    }
+    let identity = calyx_forge::PinnedCudaDeviceIdentity::parse_execution_token(raw)
+        .map_err(frozen_device_invalid)?;
+    Ok(CandleDevicePolicy::CudaFrozen { identity })
 }
 
 /// Resolves a frozen execution-device token for executable runtime construction.
 pub fn frozen_device_policy(raw: &str) -> Result<CandleDevicePolicy> {
     match parse_frozen_device_policy(raw)? {
-        CandleDevicePolicy::CudaFailLoud { ordinal } => {
-            cuda_policy_for_ordinal(false, ordinal, "frozen execution_device")
-        }
+        CandleDevicePolicy::CudaFrozen { identity } => cuda_policy_for_identity(identity),
         policy => Ok(policy),
     }
+}
+
+#[cfg(all(feature = "candle-cuda", windows))]
+pub(crate) fn attest_executable_cuda_policy(
+    policy: CandleDevicePolicy,
+) -> Result<calyx_forge::PinnedCudaDeviceAttestation> {
+    let CandleDevicePolicy::CudaFailLoud {
+        runtime_ordinal,
+        driver_ordinal,
+        identity,
+    } = policy
+    else {
+        return Err(CalyxError::lens_unreachable(format!(
+            "CUDA execution requires a resolved physical-device policy; observed {}",
+            policy.detail()
+        )));
+    };
+    let selected = calyx_forge::select_pinned_cuda_device_by_identity(identity)
+        .map_err(crate::runtime::common::forge_runtime_boundary_error)?;
+    let selected_runtime = usize::try_from(selected.ordinal)
+        .map_err(|_| frozen_device_invalid("attested CUDA Runtime ordinal exceeds usize"))?;
+    let selected_driver = usize::try_from(selected.cuda_driver_ordinal)
+        .map_err(|_| frozen_device_invalid("attested CUDA Driver ordinal exceeds usize"))?;
+    if selected_runtime != runtime_ordinal
+        || selected_driver != driver_ordinal
+        || selected.identity != identity
+    {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "resolved CUDA policy selectors drifted: policy runtime_ordinal={runtime_ordinal} driver_ordinal={driver_ordinal} identity={identity}; observed runtime_ordinal={selected_runtime} driver_ordinal={selected_driver} identity={}",
+            selected.identity
+        )));
+    }
+    Ok(selected)
+}
+
+#[cfg(not(all(feature = "candle-cuda", windows)))]
+pub(crate) fn attest_executable_cuda_policy(
+    policy: CandleDevicePolicy,
+) -> Result<calyx_forge::PinnedCudaDeviceAttestation> {
+    Err(CalyxError::lens_unreachable(format!(
+        "CUDA execution policy {} cannot be attested by this build",
+        policy.detail()
+    )))
 }
 
 fn frozen_device_invalid(message: impl Into<String>) -> CalyxError {
     CalyxError {
         code: "CALYX_LENS_CONFIG_INVALID",
         message: message.into(),
-        remediation: "recommission the frozen manifest with execution_device set to cpu or cuda:<ordinal>",
+        remediation: "recommission the frozen manifest so execution_device is cpu or the attested cuda:pci=<PCI>;uuid=GPU-<UUID> physical identity; never infer identity from an old ordinal",
     }
 }
 
@@ -216,58 +285,46 @@ fn cuda_policy(allow_absent: bool) -> Result<CandleDevicePolicy> {
     )
 }
 
-#[cfg(feature = "candle-cuda")]
+#[cfg(all(feature = "candle-cuda", windows))]
 fn cuda_policy_for_ordinal(
     allow_absent: bool,
     ordinal: usize,
     ordinal_source: &str,
 ) -> Result<CandleDevicePolicy> {
-    use candle_core::cuda::cudarc::driver::{result, sys};
+    let ordinal = u32::try_from(ordinal).map_err(|_| CalyxError {
+        code: "CALYX_CANDLE_CUDA_DEVICE_INVALID",
+        message: format!("{ordinal_source} ordinal {ordinal} exceeds u32"),
+        remediation: "select a valid CUDA Runtime-visible ordinal",
+    })?;
+    match calyx_forge::select_pinned_cuda_device(ordinal) {
+        Ok(device) => executable_cuda_policy(device),
+        Err(error) if allow_absent && error.code() == "CALYX_CUDA_NO_DEVICE" => {
+            Ok(CandleDevicePolicy::CpuNoCudaDevice)
+        }
+        Err(error) => Err(crate::runtime::common::forge_runtime_boundary_error(error)),
+    }
+}
 
-    if let Err(error) = result::init() {
-        if allow_absent && error.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE {
-            return Ok(CandleDevicePolicy::CpuNoCudaDevice);
-        }
-        return Err(CalyxError::lens_unreachable(format!(
-            "Candle CUDA driver initialization failed (mode={}, requested_device={ordinal}, error={error}); fix the CUDA driver/runtime rather than retrying on CPU",
-            if allow_absent { "auto" } else { "cuda" }
-        )));
-    }
-    let count = match result::device::get_count() {
-        Ok(count) => count,
-        Err(error) if allow_absent && error.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => {
-            return Ok(CandleDevicePolicy::CpuNoCudaDevice);
-        }
-        Err(error) => {
-            return Err(CalyxError::lens_unreachable(format!(
-                "Candle CUDA device enumeration failed (mode={}, requested_device={ordinal}, error={error}); CPU fallback is disabled after successful CUDA initialization",
-                if allow_absent { "auto" } else { "cuda" }
-            )));
-        }
-    };
-    if count <= 0 {
-        if allow_absent {
-            return Ok(CandleDevicePolicy::CpuNoCudaDevice);
-        }
-        return Err(CalyxError::lens_unreachable(
-            "Candle CUDA mode was requested but the CUDA driver reported zero devices",
-        ));
-    }
-    if ordinal >= count as usize {
-        return Err(CalyxError {
-            code: "CALYX_CANDLE_CUDA_DEVICE_INVALID",
-            message: format!(
-                "{ordinal_source} ordinal {ordinal} is outside the CUDA device range 0..{}",
-                count - 1
-            ),
-            remediation: if ordinal_source == CANDLE_CUDA_DEVICE_ENV {
-                "set CALYX_CANDLE_CUDA_DEVICE to an ordinal reported by nvidia-smi"
-            } else {
-                "recommission or select a frozen manifest whose execution_device names an ordinal reported by nvidia-smi"
-            },
-        });
-    }
-    Ok(CandleDevicePolicy::CudaFailLoud { ordinal })
+#[cfg(all(feature = "candle-cuda", windows))]
+fn cuda_policy_for_identity(
+    identity: calyx_forge::PinnedCudaDeviceIdentity,
+) -> Result<CandleDevicePolicy> {
+    calyx_forge::select_pinned_cuda_device_by_identity(identity)
+        .map_err(crate::runtime::common::forge_runtime_boundary_error)
+        .and_then(executable_cuda_policy)
+}
+
+#[cfg(all(feature = "candle-cuda", windows))]
+fn executable_cuda_policy(
+    device: calyx_forge::PinnedCudaDeviceAttestation,
+) -> Result<CandleDevicePolicy> {
+    Ok(CandleDevicePolicy::CudaFailLoud {
+        runtime_ordinal: usize::try_from(device.ordinal)
+            .map_err(|_| frozen_device_invalid("attested CUDA Runtime ordinal exceeds usize"))?,
+        driver_ordinal: usize::try_from(device.cuda_driver_ordinal)
+            .map_err(|_| frozen_device_invalid("attested CUDA Driver ordinal exceeds usize"))?,
+        identity: device.identity,
+    })
 }
 
 #[cfg(not(feature = "candle-cuda"))]
@@ -286,6 +343,35 @@ fn cuda_policy_for_ordinal(
     }
     Err(CalyxError::lens_unreachable(
         "Candle CUDA mode was requested but calyx-registry was built without feature `candle-cuda`",
+    ))
+}
+
+#[cfg(not(feature = "candle-cuda"))]
+fn cuda_policy_for_identity(
+    _identity: calyx_forge::PinnedCudaDeviceIdentity,
+) -> Result<CandleDevicePolicy> {
+    Err(CalyxError::lens_unreachable(
+        "a frozen CUDA lens was selected but calyx-registry was built without feature `candle-cuda`; select its explicit CPU companion LensId instead",
+    ))
+}
+
+#[cfg(all(feature = "candle-cuda", not(windows)))]
+fn cuda_policy_for_ordinal(
+    _allow_absent: bool,
+    _ordinal: usize,
+    _ordinal_source: &str,
+) -> Result<CandleDevicePolicy> {
+    Err(CalyxError::lens_unreachable(
+        "DEFERRED[ASTRO_PORT_PHASE]: the shared physical CUDA device boundary is currently Windows-only",
+    ))
+}
+
+#[cfg(all(feature = "candle-cuda", not(windows)))]
+fn cuda_policy_for_identity(
+    _identity: calyx_forge::PinnedCudaDeviceIdentity,
+) -> Result<CandleDevicePolicy> {
+    Err(CalyxError::lens_unreachable(
+        "DEFERRED[ASTRO_PORT_PHASE]: the shared physical CUDA device boundary is currently Windows-only",
     ))
 }
 

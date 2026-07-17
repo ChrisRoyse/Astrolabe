@@ -152,13 +152,13 @@ impl YieldPolicy {
 
     #[cfg(feature = "cuda")]
     pub fn create_anneal_stream(&self) -> Result<CudaStream> {
-        let ctx = crate::cuda::init_cuda(0, false)?;
+        let ctx = crate::cuda::init_cuda(crate::configured_cuda_runtime_ordinal()?, false)?;
         self.create_anneal_stream_for_context(&ctx)
     }
 
     #[cfg(feature = "cuda")]
     pub fn create_serving_stream(&self) -> Result<CudaStream> {
-        let ctx = crate::cuda::init_cuda(0, false)?;
+        let ctx = crate::cuda::init_cuda(crate::configured_cuda_runtime_ordinal()?, false)?;
         self.create_serving_stream_for_context(&ctx)
     }
 

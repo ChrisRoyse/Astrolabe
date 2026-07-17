@@ -50,25 +50,28 @@ pub(crate) fn canonical_local_model_device(
                 "{runtime} requires an explicit execution_device; migrate legacy manifests from evidence instead of inventing cuda:0"
             ))
         })?
-        .trim()
-        .to_ascii_lowercase();
-    if raw == "cpu" {
-        return Ok(Some(raw));
+        .trim();
+    if raw.eq_ignore_ascii_case("cpu") {
+        return Ok(Some("cpu".to_string()));
     }
-    if raw == "cuda" {
-        return Ok(Some("cuda:0".to_string()));
-    }
-    let Some(ordinal) = raw.strip_prefix("cuda:") else {
+    if raw.eq_ignore_ascii_case("cuda")
+        || raw
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("cuda:"))
+            .map(|_| &raw[5..])
+            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    {
         return Err(config_invalid(format!(
-            "unsupported {runtime} execution_device {raw}; expected cpu or cuda:<ordinal>"
+            "{runtime} execution_device {raw:?} is an ordinal-only legacy identity; recommission from live PCI and NVML UUID evidence"
         )));
-    };
-    let ordinal = ordinal.parse::<usize>().map_err(|_| {
-        config_invalid(format!(
-            "{runtime} execution_device {raw} has an invalid CUDA ordinal"
-        ))
-    })?;
-    Ok(Some(format!("cuda:{ordinal}")))
+    }
+    let identity =
+        calyx_forge::PinnedCudaDeviceIdentity::parse_execution_token(raw).map_err(|detail| {
+            config_invalid(format!(
+                "unsupported {runtime} execution_device {raw:?}: {detail}"
+            ))
+        })?;
+    Ok(Some(identity.canonical_execution_token()))
 }
 
 pub(super) fn validate_local_model_execution(

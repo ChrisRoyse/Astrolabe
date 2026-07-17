@@ -5,7 +5,6 @@ use super::cpu_fallback_audit::{configured_audit_mode, profiling_file_path};
 use super::green_context::GreenContextHandle;
 use super::{OnnxProviderPolicy, config_invalid};
 
-pub(super) const CUDA_DEVICE_ENV: &str = "CALYX_ONNX_CUDA_DEVICE";
 pub(super) const IO_BINDING_ENV: &str = "CALYX_ONNX_IO_BINDING";
 pub(super) const REQUIRE_STATIC_BINDING_ENV: &str = "CALYX_ONNX_REQUIRE_STATIC_BINDING";
 pub(super) const DISABLE_CPU_EP_FALLBACK_ENV: &str = "CALYX_ONNX_DISABLE_CPU_EP_FALLBACK";
@@ -13,6 +12,7 @@ pub(super) const DISABLE_CPU_EP_FALLBACK_ENV: &str = "CALYX_ONNX_DISABLE_CPU_EP_
 pub(super) struct ManagedOnnxSession {
     session: Session,
     _green_context: Option<GreenContextHandle>,
+    provider_policy: OnnxProviderPolicy,
 }
 
 impl ManagedOnnxSession {
@@ -22,6 +22,18 @@ impl ManagedOnnxSession {
 
     pub(super) fn as_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    pub(super) fn bound_stream(&self) -> Option<&GreenContextHandle> {
+        self._green_context.as_ref()
+    }
+
+    pub(super) fn synchronize_cuda_completion(&self, label: &str) -> Result<()> {
+        super::green_context::synchronize_owned_stream(
+            self._green_context.as_ref(),
+            self.provider_policy,
+            label,
+        )
     }
 }
 
@@ -39,23 +51,27 @@ impl std::ops::DerefMut for ManagedOnnxSession {
     }
 }
 
-/// CUDA device ordinal from the environment; fails closed on garbage input.
+/// CUDA Runtime-visible device ordinal from the environment; fails closed on garbage input.
 pub(super) fn configured_cuda_device() -> Result<i32> {
-    let Ok(raw) = std::env::var(CUDA_DEVICE_ENV) else {
-        return Ok(0);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(0);
-    }
-    raw.parse::<i32>()
-        .ok()
-        .filter(|device| *device >= 0)
-        .ok_or_else(|| CalyxError {
-            code: "CALYX_ONNX_CUDA_DEVICE_INVALID",
-            message: format!("{CUDA_DEVICE_ENV}={raw} is not a non-negative CUDA device ordinal"),
-            remediation: "set CALYX_ONNX_CUDA_DEVICE to the integer ordinal reported by nvidia-smi, or unset it for device 0",
-        })
+    let ordinal = calyx_forge::configured_cuda_runtime_ordinal().map_err(|error| match error {
+        calyx_forge::ForgeError::RuntimeBoundary {
+            code,
+            detail,
+            remediation,
+        } => CalyxError {
+            code,
+            message: detail,
+            remediation,
+        },
+        other => CalyxError::lens_unreachable(format!(
+            "shared CUDA Runtime device selection failed: {other}"
+        )),
+    })?;
+    i32::try_from(ordinal).map_err(|_| CalyxError {
+        code: "CALYX_ONNX_CUDA_DEVICE_INVALID",
+        message: format!("shared CUDA Runtime-visible ordinal {ordinal} exceeds i32"),
+        remediation: "set CALYX_CUDA_DEVICE to a valid CUDA Runtime-visible ordinal",
+    })
 }
 
 pub(super) fn cpu_ep_fallback_disabled(policy: OnnxProviderPolicy) -> bool {
@@ -73,17 +89,23 @@ pub(super) fn build_session(
     model_file: &std::path::Path,
     policy: OnnxProviderPolicy,
 ) -> Result<ManagedOnnxSession> {
-    let device_id = configured_cuda_device()?;
-    let green_context = super::green_context::create(label, policy, device_id)?;
+    let selected_device = super::runtime_bundle::selected_cuda_device(policy)?;
+    let device_id = selected_device
+        .as_ref()
+        .map(|device| i32::try_from(device.ordinal))
+        .transpose()
+        .map_err(|_| config_invalid("attested CUDA Runtime ordinal exceeds the ORT device-id ABI"))?
+        .unwrap_or(0);
+    let green_context = super::green_context::create(label, policy, selected_device.as_ref())?;
     let compute_stream = green_context.as_ref().map(GreenContextHandle::stream_ptr);
     let mut builder = Session::builder()
         .map_err(|err| config_invalid(format!("ONNX session builder failed: {err}")))?
         .with_intra_threads(1)
         .map_err(|err| config_invalid(format!("ONNX intra-thread config failed: {err}")))?
         .with_execution_providers(
-            super::fastembed_runtime::execution_providers_on_device_with_stream(
+            super::fastembed_runtime::execution_providers_for_attested_device(
                 policy,
-                device_id,
+                selected_device.as_ref(),
                 compute_stream,
             )?,
         )
@@ -116,6 +138,7 @@ pub(super) fn build_session(
     Ok(ManagedOnnxSession {
         session,
         _green_context: green_context,
+        provider_policy: policy,
     })
 }
 

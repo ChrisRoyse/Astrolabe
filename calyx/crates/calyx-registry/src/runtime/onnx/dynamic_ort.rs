@@ -49,9 +49,7 @@ fn resolve_ort_dylib_path() -> Result<PathBuf> {
     }
     Err(CalyxError::lens_unreachable(format!(
         "{ORT_DYLIB_PATH} must point to a sm_120-capable ONNX Runtime dynamic library; \
-         this build uses ort/load-dynamic and has no bundled ORT fallback. On Windows, \
-         set {ORT_DYLIB_PATH} directly or set {CALYX_ORT_CAPI} to the ONNX Runtime capi \
-         directory before starting GPU resident/search/ingest commands"
+         this non-Windows build uses ort/load-dynamic and has no bundled ORT fallback"
     )))
 }
 

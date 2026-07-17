@@ -162,6 +162,10 @@ impl OnnxColbertLens {
         )?;
         let session = build_session(&run_label, &spec.model_file, spec.provider_policy)?;
         let session = CudaDropGuard::new(session, spec.provider_policy);
+        super::runtime_bundle::attest_after_model_constructor(
+            spec.provider_policy,
+            session.as_ref().bound_stream(),
+        )?;
         let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
         let token_dim = output_token_dim(session.as_ref())?;
         let shape = SlotShape::Multi { token_dim };
@@ -360,7 +364,7 @@ impl OnnxColbertRuntime {
             .ok_or_else(|| CalyxError::lens_unreachable("ONNX ColBERT session is unavailable"))?;
         let input_tensors = session_inputs(session.as_ref(), batch)?;
         let token_dim = self.token_dim as usize;
-        self.run_plan.run_extract(
+        let rows = self.run_plan.run_extract(
             session.as_mut(),
             input_tensors,
             (batch.batch, batch.seq),
@@ -371,7 +375,9 @@ impl OnnxColbertRuntime {
                 })?;
                 multi_rows(shape, values, batch, token_dim)
             },
-        )
+        )?;
+        session.synchronize_cuda_completion("onnx-colbert")?;
+        Ok(rows)
     }
 }
 

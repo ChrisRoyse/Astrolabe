@@ -49,6 +49,7 @@ pub struct OnnxLens {
     provider_policy: OnnxProviderPolicy,
     max_batch: Option<usize>,
     backend: Option<OnnxBackend>,
+    bound_stream: Option<green_context::RetainedCudaStream>,
 }
 
 enum OnnxBackend {
@@ -289,13 +290,14 @@ impl OnnxLens {
         Self::from_files(OnnxFileSpec::from_lens_spec(spec)?)
     }
 
-    pub(crate) fn from_fastembed_parts(
+    pub(in crate::runtime::onnx) fn from_fastembed_parts(
         id: LensId,
         dim: u32,
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
         model: TextEmbedding,
+        bound_stream: Option<green_context::GreenContextHandle>,
     ) -> Self {
         Self {
             id,
@@ -305,6 +307,7 @@ impl OnnxLens {
             provider_policy,
             max_batch: None,
             backend: Some(OnnxBackend::FastEmbed(Box::new(Mutex::new(model)))),
+            bound_stream: green_context::retain_for_model(bound_stream),
         }
     }
 
@@ -323,6 +326,7 @@ impl OnnxLens {
             provider_policy,
             max_batch,
             backend: Some(OnnxBackend::Custom(Box::new(Mutex::new(runtime)))),
+            bound_stream: None,
         }
     }
 
@@ -445,6 +449,11 @@ impl OnnxLens {
         let embeddings = model
             .embed(texts, None)
             .map_err(|err| CalyxError::lens_unreachable(format!("ONNX inference failed: {err}")))?;
+        green_context::synchronize_retained_stream(
+            self.bound_stream.as_ref(),
+            self.provider_policy,
+            "onnx-fastembed-dense",
+        )?;
         if embeddings.len() != inputs.len() {
             return Err(CalyxError::lens_dim_mismatch(format!(
                 "ONNX returned {} vectors for {} inputs",
@@ -480,7 +489,8 @@ impl Drop for OnnxLens {
             // ORT CUDA provider teardown can corrupt glibc heap in a manual verification run after
             // successful inference. Keep CUDA sessions process-resident; setup and
             // inference still fail loudly, and the OS reclaims pages at exit.
-            std::mem::forget(backend);
+            let bound_stream = self.bound_stream.take();
+            std::mem::forget((backend, bound_stream));
         }
     }
 }

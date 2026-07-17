@@ -175,6 +175,10 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
     )?;
     let session = build_session(&run_label, &spec.model_file, spec.provider_policy)?;
     let session = CudaDropGuard::new(session, spec.provider_policy);
+    super::runtime_bundle::attest_after_model_constructor(
+        spec.provider_policy,
+        session.as_ref().bound_stream(),
+    )?;
     let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
     let output = output_from_session(
         session.as_ref(),
@@ -222,12 +226,14 @@ impl CustomOnnxRuntime {
     fn run_token_batch(&mut self, batch: &TokenBatch) -> Result<Vec<SlotVector>> {
         let input_tensors = session_inputs(self.session.as_ref(), batch)?;
         let output = self.output;
-        self.run_plan.run_extract(
+        let vectors = self.run_plan.run_extract(
             self.session.as_mut(),
             input_tensors,
             (batch.batch, batch.seq),
             |outputs| vectors_from_output(outputs, batch, output),
-        )
+        )?;
+        self.session.synchronize_cuda_completion("onnx-custom")?;
+        Ok(vectors)
     }
 }
 

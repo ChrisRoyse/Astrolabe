@@ -27,13 +27,26 @@ pub(super) fn register_and_prime_warm_lenses_parallel(
     load_limit: &WarmLoadLimit,
     load_parallelism: usize,
 ) -> CliResult<usize> {
-    let tasks = warm_lens_tasks(template);
+    let tasks = warm_lens_tasks(template)?;
     let prepared =
         prepare_warm_lenses_parallel(tasks, selector, load_limit, load_parallelism, progress_log)?;
     register_prepared_warm_lenses(registry, template, prepared, selector, progress_log)
 }
 
-fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> Vec<WarmLensTask> {
+fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> CliResult<Vec<WarmLensTask>> {
+    let mut unique_lens_ids = BTreeSet::new();
+    for lens in &template.lenses {
+        if !unique_lens_ids.insert(lens.lens_id) {
+            return Err(template_store::template_error(
+                template_store::TEMPLATE_INVALID,
+                format!(
+                    "template {} repeats frozen lens {} before warm construction",
+                    template.name, lens.lens_id
+                ),
+                "remove the duplicate lens entry; one frozen lens id may be registered and primed only once",
+            ));
+        }
+    }
     let total = template.lenses.len();
     let mut tasks = template
         .lenses
@@ -52,7 +65,7 @@ fn warm_lens_tasks(template: &template_store::SavedPanelTemplate) -> Vec<WarmLen
             .cmp(&warm_prepare_weight(&left.lens))
             .then_with(|| left.lens.slot_key.cmp(&right.lens.slot_key))
     });
-    tasks
+    Ok(tasks)
 }
 
 fn warm_prepare_weight(lens: &template_store::TemplateLensRef) -> (u8, u64) {

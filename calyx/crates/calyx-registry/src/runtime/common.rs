@@ -16,6 +16,75 @@ use crate::frozen::LengthDelimitedSha256;
 #[cfg(feature = "ml-runtime")]
 use crate::lens::ensure_input_modality;
 
+#[cfg(all(windows, feature = "candle-cuda"))]
+pub(crate) fn initialize_pinned_cuda_dependencies() -> Result<()> {
+    calyx_forge::cuda_runtime::initialize_pinned_cuda_dependencies()
+        .map(|_| ())
+        .map_err(forge_runtime_boundary_error)
+}
+
+#[cfg(all(windows, feature = "candle-cuda"))]
+pub(crate) fn attest_pinned_cuda_dependencies() -> Result<()> {
+    calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
+        .map(|_| ())
+        .map_err(forge_runtime_boundary_error)
+}
+
+#[cfg(all(windows, feature = "candle-cuda"))]
+pub(crate) fn attest_candle_cuda_device(
+    runtime: &str,
+    device: &Device,
+    selected: &calyx_forge::PinnedCudaDeviceAttestation,
+) -> Result<()> {
+    let expected_driver = usize::try_from(selected.cuda_driver_ordinal).map_err(|_| {
+        CalyxError::lens_frozen_violation(format!(
+            "{runtime} attested CUDA Driver ordinal {} exceeds usize",
+            selected.cuda_driver_ordinal
+        ))
+    })?;
+    match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } if gpu_id == expected_driver => {}
+        observed => {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "{runtime} constructed device location {observed:?}; expected CUDA Driver ordinal {expected_driver} for {}",
+                selected.identity
+            )));
+        }
+    }
+    let stream = device
+        .as_cuda_device()
+        .map_err(|error| {
+            CalyxError::lens_frozen_violation(format!(
+                "{runtime} constructed device cannot expose its CUDA stream for identity readback: {error}"
+            ))
+        })?
+        .cuda_stream();
+    calyx_forge::attest_cudarc_context(
+        stream.context().as_ref(),
+        selected.cuda_driver_ordinal,
+        selected.identity,
+    )
+    .map_err(forge_runtime_boundary_error)?;
+    attest_pinned_cuda_dependencies()
+}
+
+pub(crate) fn forge_runtime_boundary_error(error: calyx_forge::ForgeError) -> CalyxError {
+    match error {
+        calyx_forge::ForgeError::RuntimeBoundary {
+            code,
+            detail,
+            remediation,
+        } => CalyxError {
+            code,
+            message: detail,
+            remediation,
+        },
+        other => {
+            CalyxError::lens_unreachable(format!("pinned CUDA runtime boundary failed: {other}"))
+        }
+    }
+}
+
 #[cfg(feature = "ml-runtime")]
 pub const DEFAULT_MAX_TOKENS: usize = 512;
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -48,6 +117,29 @@ impl LocalModelExecutionAttestation {
             cpu_compute_nodes: None,
         }
     }
+}
+
+#[cfg(feature = "ml-runtime")]
+pub(crate) fn gpu_synchronization_failed(
+    runtime: &str,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> CalyxError {
+    CalyxError {
+        code: "CALYX_GPU_SYNCHRONIZATION_FAILED",
+        message: format!("{runtime} GPU synchronization failed at {stage}: {error}"),
+        remediation: "invalidate and reap the resident GPU worker, inspect the preceding CUDA/ORT logs and physical-device attestation, and repair the GPU runtime; never retry this failure on CPU",
+    }
+}
+
+#[cfg(feature = "ml-runtime")]
+pub(crate) fn synchronize_candle_gpu_after_host_materialization(
+    runtime: &str,
+    device: &Device,
+) -> Result<()> {
+    device
+        .synchronize()
+        .map_err(|error| gpu_synchronization_failed(runtime, "after_host_materialization", error))
 }
 
 #[cfg(feature = "ml-runtime")]

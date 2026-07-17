@@ -469,9 +469,10 @@ impl CommissionFlags {
 
     fn local_identity_suffix(&self) -> String {
         let device = self
-            .execution_device()
+            .device_policy
+            .map(CandleDevicePolicy::compact_identity_token)
             .unwrap_or_else(|| "unresolved".to_string())
-            .replace(':', "");
+            .to_ascii_lowercase();
         format!("{device}-{}", self.manifest_dtype())
     }
 }

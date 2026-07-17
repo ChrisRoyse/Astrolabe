@@ -15,7 +15,8 @@ use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{ContractFacts, candle_execution_corpus_hash, contract_from_facts};
 use crate::runtime::common::{
     DEFAULT_MAX_TOKENS, LocalModelExecutionAttestation, default_hf_cache_root, hash_files,
-    text_from_input, validate_contract_covers_loaded_paths,
+    synchronize_candle_gpu_after_host_materialization, text_from_input,
+    validate_contract_covers_loaded_paths,
 };
 use crate::spec::{LensRuntime, LensSpec};
 
@@ -39,7 +40,9 @@ pub use options::{
     configured_device_policy, default_cuda_fail_loud_policy, device_policy_for_mode,
     frozen_device_policy, parse_frozen_device_policy,
 };
-pub(crate) use options::{configure_f32_gemm_accumulation, verify_f32_gemm_accumulation};
+pub(crate) use options::{
+    attest_executable_cuda_policy, configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
+};
 use pooling::{apply_norm, pool_tokens};
 
 pub struct CandleLens {
@@ -507,6 +510,9 @@ impl CandleLens {
         }
         let hidden = hidden.to_dtype(DType::F32).map_err(candle_error)?;
         let rows = hidden.to_vec3::<f32>().map_err(candle_error)?;
+        if self.device_policy.is_gpu() {
+            synchronize_candle_gpu_after_host_materialization("candle-local", &device)?;
+        }
         let first = rows.first().ok_or_else(|| {
             CalyxError::lens_dim_mismatch("candle model returned empty batch output")
         })?;

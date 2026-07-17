@@ -220,7 +220,7 @@ fn declared_runtime(
         "candle" => Ok(LensRuntime::CandleLocal {
             model_id: endpoint.unwrap_or("declared-candle").to_string(),
             files,
-            device: "cuda:0".to_string(),
+            device: "cpu".to_string(),
             dtype: "f32".to_string(),
             pooling: "mean".to_string(),
         }),

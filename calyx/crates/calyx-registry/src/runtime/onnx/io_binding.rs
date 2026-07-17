@@ -9,8 +9,8 @@
 //! session that cannot bind or run fails with a structured error.
 //!
 //! Environment knobs (all logged at session readiness):
-//! - `CALYX_ONNX_CUDA_DEVICE` — CUDA device ordinal (default 0; non-integer
-//!   values fail closed, and an out-of-range ordinal fails provider
+//! - `CALYX_CUDA_DEVICE` — process-global CUDA Runtime-visible ordinal (default
+//!   0; compatibility selectors must agree, and an out-of-range ordinal fails provider
 //!   registration at session build because the CUDA dispatch is
 //!   `error_on_failure`).
 //! - `CALYX_ONNX_IO_BINDING=0` — explicitly disable I/O binding for GPU
@@ -65,8 +65,8 @@ use super::cpu_fallback_audit::{
 };
 use super::cuda_graphs::{CUDA_GRAPHS_ENV, CudaGraphRunConfig, CudaGraphRunRequest};
 use super::session::{
-    IO_BINDING_ENV, REQUIRE_STATIC_BINDING_ENV, configured_cuda_device, configured_cuda_graphs,
-    cpu_ep_fallback_disabled, env_flag,
+    IO_BINDING_ENV, REQUIRE_STATIC_BINDING_ENV, configured_cuda_graphs, cpu_ep_fallback_disabled,
+    env_flag,
 };
 use super::{OnnxProviderPolicy, config_invalid};
 
@@ -96,7 +96,15 @@ impl OnnxRunPlan {
     /// device id, allocator mode, io-binding state, CPU-fallback stance.
     pub(super) fn new(policy: OnnxProviderPolicy, label: impl Into<String>) -> Result<Self> {
         let label = label.into();
-        let device_id = configured_cuda_device()?;
+        let selected_device = super::runtime_bundle::selected_cuda_device(policy)?;
+        let device_id = selected_device
+            .as_ref()
+            .map(|device| i32::try_from(device.ordinal))
+            .transpose()
+            .map_err(|_| {
+                config_invalid("attested CUDA Runtime ordinal exceeds the ORT device-id ABI")
+            })?
+            .unwrap_or(0);
         let binding_env_off = std::env::var(IO_BINDING_ENV)
             .map(|raw| {
                 let raw = raw.trim();
@@ -314,6 +322,13 @@ impl OnnxRunPlan {
                     ))
                 })?;
         }
+        binding.synchronize_inputs().map_err(|error| {
+            crate::runtime::common::gpu_synchronization_failed(
+                &self.label,
+                "onnx_bound_inputs_before_run",
+                error,
+            )
+        })?;
         let outputs = match &run_options {
             Some(options) => session.run_binding_with_options(&binding, options),
             None => session.run_binding(&binding),
@@ -323,6 +338,13 @@ impl OnnxRunPlan {
                 "ONNX io-binding inference failed for {}: {err}",
                 self.label
             ))
+        })?;
+        binding.synchronize_outputs().map_err(|error| {
+            crate::runtime::common::gpu_synchronization_failed(
+                &self.label,
+                "onnx_bound_outputs_before_host_extraction",
+                error,
+            )
         })?;
         let result = extract(&outputs)?;
         drop(outputs);

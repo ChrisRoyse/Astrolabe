@@ -12,8 +12,8 @@ use super::{
 };
 use crate::commission::LensForgeSourceTensorDtypeProfile;
 use crate::runtime::candle::{
-    CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation,
-    verify_f32_gemm_accumulation,
+    CandleDevicePolicy, CandlePrecision, attest_executable_cuda_policy,
+    configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
 };
 use crate::runtime::common::normalize_unit;
 use crate::runtime::common::{LocalModelExecutionAttestation, attest_primary_activation};
@@ -183,19 +183,39 @@ fn qwen3_device(policy: CandleDevicePolicy) -> Result<Device> {
         CandleDevicePolicy::CpuExplicit
         | CandleDevicePolicy::CpuNoCudaFeature
         | CandleDevicePolicy::CpuNoCudaDevice => Ok(Device::Cpu),
-        CandleDevicePolicy::CudaFailLoud { ordinal } => qwen3_cuda_device(ordinal),
+        CandleDevicePolicy::CudaFrozen { identity } => Err(CalyxError::lens_unreachable(format!(
+            "Qwen3 physical device {identity} was parsed but not resolved through the pinned CUDA Runtime/Driver boundary"
+        ))),
+        CandleDevicePolicy::CudaFailLoud { driver_ordinal, .. } => {
+            qwen3_cuda_device(policy, driver_ordinal)
+        }
     }
 }
 
-#[cfg(feature = "candle-cuda")]
-fn qwen3_cuda_device(ordinal: usize) -> Result<Device> {
-    Device::new_cuda(ordinal)
-        .map_err(|err| CalyxError::lens_unreachable(format!("Qwen3 CUDA init failed: {err}")))
+#[cfg(all(feature = "candle-cuda", windows))]
+fn qwen3_cuda_device(policy: CandleDevicePolicy, driver_ordinal: usize) -> Result<Device> {
+    crate::runtime::common::initialize_pinned_cuda_dependencies()?;
+    let selected = attest_executable_cuda_policy(policy)?;
+    let selected_driver = usize::try_from(selected.cuda_driver_ordinal)
+        .map_err(|_| CalyxError::lens_unreachable("attested CUDA Driver ordinal exceeds usize"))?;
+    if selected_driver != driver_ordinal {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "Qwen3 CUDA Driver selector changed from {driver_ordinal} to {selected_driver} before construction"
+        )));
+    }
+    let device = Device::new_cuda(selected_driver).map_err(|err| {
+        CalyxError::lens_unreachable(format!(
+            "Qwen3 CUDA Driver device {selected_driver} init failed after shared physical-device attestation: {err}"
+        ))
+    })?;
+    crate::runtime::common::attest_candle_cuda_device("qwen3", &device, &selected)?;
+    attest_executable_cuda_policy(policy)?;
+    Ok(device)
 }
 
-#[cfg(not(feature = "candle-cuda"))]
-fn qwen3_cuda_device(_ordinal: usize) -> Result<Device> {
+#[cfg(not(all(feature = "candle-cuda", windows)))]
+fn qwen3_cuda_device(_policy: CandleDevicePolicy, _ordinal: usize) -> Result<Device> {
     Err(CalyxError::lens_unreachable(
-        "Qwen3 CUDA requested but calyx-registry was built without feature `candle-cuda`",
+        "Qwen3 CUDA execution is unavailable: build native Windows with feature `candle-cuda`; non-Windows support is DEFERRED[ASTRO_PORT_PHASE]",
     ))
 }

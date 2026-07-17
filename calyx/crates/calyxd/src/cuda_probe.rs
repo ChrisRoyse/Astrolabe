@@ -44,8 +44,13 @@ pub fn probe_cuda_device() -> Result<CudaDeviceInfo, DaemonError> {
 fn probe_real_device() -> Result<CudaDeviceInfo, DaemonError> {
     // Real `cudaSetDevice`/`cuInit` via calyx-forge. determinism=false: the
     // budgeter/probe don't need the deterministic-kernel mode here.
-    let ctx = calyx_forge::init_cuda(0, false).map_err(|err| {
-        DaemonError::device_unavailable(format!("CUDA init on device 0 failed: {err}"))
+    let runtime_ordinal = calyx_forge::configured_cuda_runtime_ordinal().map_err(|err| {
+        DaemonError::device_unavailable(format!("CUDA device selection failed: {err}"))
+    })?;
+    let ctx = calyx_forge::init_cuda(runtime_ordinal, false).map_err(|err| {
+        DaemonError::device_unavailable(format!(
+            "CUDA init on Runtime-visible ordinal {runtime_ordinal} failed: {err}"
+        ))
     })?;
     let (major, minor) = ctx.compute_capability();
     let total = ctx.total_mem_mib();

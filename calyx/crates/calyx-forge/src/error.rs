@@ -6,6 +6,11 @@ const SEED_VERSION_REMEDIATION: &str =
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForgeError {
+    RuntimeBoundary {
+        code: &'static str,
+        detail: String,
+        remediation: &'static str,
+    },
     NumericalInvariant {
         op: String,
         detail: String,
@@ -67,6 +72,7 @@ pub enum ForgeError {
 impl ForgeError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RuntimeBoundary { code, .. } => code,
             Self::NumericalInvariant { .. } => "CALYX_FORGE_NUMERICAL_INVARIANT",
             Self::DeviceUnavailable { .. } => "CALYX_FORGE_DEVICE_UNAVAILABLE",
             Self::GpuError { .. } => "CALYX_GPU_ERROR",
@@ -83,6 +89,7 @@ impl ForgeError {
 
     pub fn remediation(&self) -> &str {
         match self {
+            Self::RuntimeBoundary { remediation, .. } => remediation,
             Self::NumericalInvariant { remediation, .. }
             | Self::DeviceUnavailable { remediation, .. }
             | Self::GpuError { remediation, .. }
@@ -101,6 +108,9 @@ impl ForgeError {
 impl fmt::Display for ForgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let first_line = match self {
+            Self::RuntimeBoundary { code, detail, .. } => {
+                format!("{code} detail={detail}")
+            }
             Self::NumericalInvariant { op, detail, .. } => {
                 format!("{} op={} detail={}", self.code(), op, detail)
             }

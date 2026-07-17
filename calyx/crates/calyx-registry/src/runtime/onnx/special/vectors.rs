@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 use calyx_core::{CalyxError, Input, Lens, LensId, Result, SlotShape, SlotVector, SparseEntry};
 use fastembed::SparseEmbedding;
 
-use super::super::{OnnxModelFiles, OnnxProviderPolicy};
+use super::super::{OnnxModelFiles, OnnxProviderPolicy, green_context::RetainedCudaStream};
 use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{ContractFacts, contract_from_facts};
 use crate::runtime::common::{fastembed_cache_root, hash_files, normalize_unit, text_from_input};
@@ -202,13 +202,14 @@ pub(super) fn lock_model<'a, T>(
         .map_err(|_| CalyxError::lens_unreachable(format!("{label} model mutex was poisoned")))
 }
 
-pub(super) fn leak_cuda_model<T>(
+pub(super) fn leak_cuda_model_and_stream<T>(
     model: &mut Option<Mutex<T>>,
+    bound_stream: &mut Option<RetainedCudaStream>,
     provider_policy: OnnxProviderPolicy,
 ) {
-    if provider_policy == OnnxProviderPolicy::CudaFailLoud
-        && let Some(model) = model.take()
-    {
-        std::mem::forget(model);
+    if provider_policy == OnnxProviderPolicy::CudaFailLoud {
+        let model = model.take();
+        let bound_stream = bound_stream.take();
+        std::mem::forget((model, bound_stream));
     }
 }

@@ -214,15 +214,22 @@ function Resolve-PinnedCuda13Runtime {
     }
     $expectedRoot = [IO.Path]::GetFullPath((Join-Path $ToolchainsRoot "ort-cuda13.3-windows-x86_64-$lockDigest")).TrimEnd('\', '/')
 
+    $ambientModulePath = $env:PSModulePath
     try {
         # The provisioner owns download, extraction, and full bundle re-attestation. Its
         # stdout contract is deliberately machine-readable: exactly one canonical root.
-        # CUDA runtime directories are never added to PATH; the child receives only the
-        # capability root and the Rust loader constrains DLL resolution inside that root.
+        # Pin module discovery to the current PowerShell host. A pwsh parent can otherwise
+        # inject PowerShell 7 modules into a Windows PowerShell 5.1 launcher (or vice versa),
+        # making the security module discoverable but unloadable. Restore the caller's
+        # environment immediately after this in-process capability check.
+        $env:PSModulePath = Join-Path $PSHOME "Modules"
         $provisionerOutput = @(& $Provisioner -WorkspaceRoot $WorkspaceRoot -ToolchainsRoot $ToolchainsRoot)
     }
     catch {
         throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_PROVISION_FAILED]: {code=ASTRO_CUDA13_RUNTIME_PROVISION_FAILED; message=`"the pinned CUDA 13 runtime could not be provisioned or attested: $($_.Exception.Message)`"; remediation=`"repair the reported bundle fault, then rerun scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap from $WorkspaceRoot`"}"
+    }
+    finally {
+        $env:PSModulePath = $ambientModulePath
     }
 
     if ($provisionerOutput.Count -ne 1) {

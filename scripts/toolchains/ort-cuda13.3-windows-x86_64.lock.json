@@ -1,5 +1,5 @@
 {
-  "schema": "astrolabe.windows-ort-cuda-runtime-lock.v1",
+  "schema": "astrolabe.windows-ort-cuda-runtime-lock.v2",
   "bundle": {
     "id": "ort-1.26.0-cuda-13.3-cudnn-9.24.0.43-windows-x86_64",
     "platform": "windows-x86_64",
@@ -22,10 +22,6 @@
       "cufft64_12.dll",
       "onnxruntime_providers_shared.dll",
       "cudnn64_9.dll"
-    ],
-    "forbidden_providers": ["TensorrtExecutionProvider"],
-    "forbidden_archive_dlls": [
-      "onnxruntime/capi/onnxruntime_providers_tensorrt.dll"
     ]
   },
   "artifacts": [
@@ -382,6 +378,31 @@
     { "artifact": "nvjitlink", "archive_path": "nvidia_nvjitlink-13.3.33.dist-info/licenses/License.txt", "bundle_path": "licenses/nvjitlink/License.txt", "bytes": 59262, "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd" }
   ],
   "loaded_module_policy": {
+    "bundle_load_order": [
+      "bin/cublasLt64_13.dll",
+      "bin/cudart64_13.dll",
+      "bin/cudnn_graph64_9.dll",
+      "bin/cudnn_ext64_9.dll",
+      "bin/cudnn64_9.dll",
+      "bin/cufft64_12.dll",
+      "bin/curand64_10.dll",
+      "bin/nvJitLink_130_0.dll",
+      "bin/nvrtc-builtins64_133.dll",
+      "bin/onnxruntime_providers_shared.dll",
+      "bin/onnxruntime.dll",
+      "bin/cublas64_13.dll",
+      "bin/cudnn_ops64_9.dll",
+      "bin/cudnn_adv64_9.dll",
+      "bin/cudnn_cnn64_9.dll",
+      "bin/cudnn_engines_precompiled64_9.dll",
+      "bin/cudnn_engines_runtime_compiled64_9.dll",
+      "bin/cudnn_engines_tensor_ir64_9.dll",
+      "bin/cudnn_heuristic64_9.dll",
+      "bin/cufftw64_12.dll",
+      "bin/nvblas64_13.dll",
+      "bin/nvrtc64_130_0.dll",
+      "bin/onnxruntime_providers_cuda.dll"
+    ],
     "bundle_module_globs": [
       "onnxruntime*.dll",
       "cublas*.dll",
@@ -393,11 +414,22 @@
       "nvrtc*.dll",
       "nvJitLink*.dll"
     ],
-    "driver": {
-      "name": "nvcuda.dll",
-      "required_root": "%SystemRoot%\\System32",
-      "publisher": "NVIDIA Corporation"
-    },
+    "system_modules": [
+      {
+        "name": "nvcuda.dll",
+        "required_root": "%SystemRoot%\\System32",
+        "signature_kind": "catalog",
+        "signer_organization": "Microsoft Corporation",
+        "signed_company_name": "NVIDIA Corporation"
+      },
+      {
+        "name": "nvml.dll",
+        "required_root": "%SystemRoot%\\System32",
+        "signature_kind": "catalog",
+        "signer_organization": "Microsoft Corporation",
+        "signed_company_name": "NVIDIA Corporation"
+      }
+    ],
     "system_roots": ["%SystemRoot%\\System32"],
     "reject_application_dir": true,
     "reject_path_search": true

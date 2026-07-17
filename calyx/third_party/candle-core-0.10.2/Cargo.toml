@@ -12,7 +12,7 @@
 edition = "2021"
 name = "candle-core"
 version = "0.10.2"
-build = false
+build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
@@ -80,7 +80,7 @@ version = "0.10.2"
 optional = true
 
 [dependencies.cudarc]
-version = "0.19.4"
+version = "=0.19.8"
 features = [
     "std",
     "cublas",
@@ -90,11 +90,17 @@ features = [
     "nvrtc",
     "f16",
     "f8",
-    "cuda-version-from-build-system",
+    "cuda-13030",
     "dynamic-loading",
 ]
 optional = true
 default-features = false
+
+[build-dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+toml = "=0.8.23"
 
 [dependencies.float8]
 version = "0.7.0"

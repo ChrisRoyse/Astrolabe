@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use calyx_core::CalyxError;
+use ulid::Ulid;
 
 use super::codec::{decode_binary, read_frame, write_frame};
 use super::deadline::{
@@ -18,7 +19,8 @@ use super::discovery::{
 };
 use super::dispatch::{RequestClass, validate_request};
 use super::lifecycle::{
-    LifecycleErrorRecord, LifecyclePhase, LifecycleProjection, LifecycleState, LifecycleStore,
+    LifecycleErrorRecord, LifecyclePhase, LifecycleProjection, LifecycleRequestRecord,
+    LifecycleState, LifecycleStore, RequestOutcome, RequestStage,
 };
 use super::source::{FrozenResidentSource, freeze_source};
 use super::stream::{decode_binary_request, write_stream_frame};
@@ -76,6 +78,8 @@ struct WorkerEndpoint {
 struct ProductiveLease {
     supervisor: Arc<Supervisor>,
     endpoint: WorkerEndpoint,
+    request_id: String,
+    stage: RequestStage,
     completed: bool,
 }
 
@@ -84,28 +88,109 @@ impl ProductiveLease {
         self.endpoint.clone()
     }
 
-    fn complete(mut self) -> CliResult {
+    fn advance(&mut self, next: RequestStage) -> CliResult {
+        if !valid_stage_transition(self.stage, next) {
+            return Err(CliError::runtime(format!(
+                "resident request {} attempted invalid stage transition {:?} -> {:?}",
+                self.request_id, self.stage, next
+            )));
+        }
+        self.supervisor.record_request_stage(
+            &self.request_id,
+            Some(self.endpoint.generation),
+            next,
+            None,
+            None,
+        )?;
+        self.stage = next;
+        Ok(())
+    }
+
+    fn complete_success(mut self) -> CliResult {
+        if self.stage != RequestStage::PublicFlushComplete {
+            return Err(CliError::runtime(format!(
+                "resident request {} cannot complete from stage {:?}; public flush is not proven",
+                self.request_id, self.stage
+            )));
+        }
         // A failed durable append must not make Drop release this lease twice.
-        // `release` always performs the in-memory completion before returning.
+        // `release_success` always performs the in-memory completion first.
         self.completed = true;
-        self.supervisor.release(self.endpoint.generation)
+        self.supervisor.release_success(
+            self.endpoint.generation,
+            &self.request_id,
+            RequestOutcome::Succeeded,
+            None,
+        )
+    }
+
+    fn fail(mut self, error: &CliError, outcome: RequestOutcome) -> CliResult {
+        self.completed = true;
+        self.fail_inner(error, outcome)
+    }
+
+    fn fail_inner(&self, error: &CliError, outcome: RequestOutcome) -> CliResult {
+        let invalidation_error = self
+            .supervisor
+            .invalidate_generation(self.endpoint.generation, clone_cli_error(error))
+            .err();
+        let release_error = self
+            .supervisor
+            .release_failed(self.endpoint.generation, &self.request_id, outcome, error)
+            .err();
+        match invalidation_error.or(release_error) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for ProductiveLease {
     fn drop(&mut self) {
-        if !self.completed
-            && let Err(error) = self.supervisor.release(self.endpoint.generation)
-        {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let error = CliError::from(CalyxError {
+            code: CLIENT_ABORTED_GENERATION,
+            message: format!(
+                "resident request {} dropped unexpectedly at stage {:?} in generation {}",
+                self.request_id, self.stage, self.endpoint.generation
+            ),
+            remediation: "inspect the lifecycle request stages; retry the complete request after the supervisor reaps the abandoned generation",
+        });
+        if let Err(cleanup_error) = self.fail_inner(&error, RequestOutcome::Abandoned) {
             self.supervisor.accepting.store(false, Ordering::SeqCst);
             eprintln!(
-                "CALYX_PANEL_RESIDENT_RUNTIME phase=lease_release_error generation={} code={} message={}",
+                "CALYX_PANEL_RESIDENT_RUNTIME phase=lease_abandon_error generation={} request_id={} code={} message={}",
                 self.endpoint.generation,
-                error.code(),
-                error.message()
+                self.request_id,
+                cleanup_error.code(),
+                cleanup_error.message()
             );
         }
     }
+}
+
+fn valid_stage_transition(current: RequestStage, next: RequestStage) -> bool {
+    matches!(
+        (current, next),
+        (RequestStage::Queued, RequestStage::WorkerStarted)
+            | (RequestStage::WorkerStarted, RequestStage::GpuSynchronized)
+            | (
+                RequestStage::GpuSynchronized,
+                RequestStage::HostMaterialized
+            )
+            | (
+                RequestStage::HostMaterialized,
+                RequestStage::TerminalReceived
+            )
+            | (RequestStage::WorkerStarted, RequestStage::TerminalReceived)
+            | (
+                RequestStage::TerminalReceived,
+                RequestStage::PublicFlushComplete
+            )
+    )
 }
 
 pub(super) fn serve(args: &[String]) -> CliResult {
@@ -234,6 +319,59 @@ impl Supervisor {
     }
 
     fn acquire(self: &Arc<Self>) -> CliResult<ProductiveLease> {
+        let request_id = Ulid::new().to_string();
+        {
+            let mut inner = self.lock()?;
+            if !self.accepting.load(Ordering::SeqCst) {
+                return Err(stopping_error());
+            }
+            inner.state.queued_requests =
+                inner.state.queued_requests.checked_add(1).ok_or_else(|| {
+                    CliError::runtime("resident queued request counter overflowed")
+                })?;
+            inner.state.idle_deadline_unix_ms = None;
+            inner.idle_deadline = None;
+            if matches!(
+                inner.state.phase,
+                LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy
+            ) {
+                inner.state.phase = LifecyclePhase::LoadedBusy;
+            }
+            if let Err(error) = self.persist_request(
+                &mut inner,
+                "request_queued",
+                LifecycleRequestRecord {
+                    request_id: request_id.clone(),
+                    generation: None,
+                    stage: RequestStage::Queued,
+                    outcome: None,
+                    error: None,
+                },
+            ) {
+                inner.state.queued_requests -= 1;
+                self.changed.notify_all();
+                return Err(error);
+            }
+            self.changed.notify_all();
+        }
+
+        let acquired = self.acquire_queued(&request_id);
+        match acquired {
+            Ok(endpoint) => Ok(ProductiveLease {
+                supervisor: Arc::clone(self),
+                endpoint,
+                request_id,
+                stage: RequestStage::Queued,
+                completed: false,
+            }),
+            Err(error) => {
+                let cleanup_error = self.cancel_queued_request(&request_id, &error).err();
+                Err(cleanup_error.unwrap_or(error))
+            }
+        }
+    }
+
+    fn acquire_queued(self: &Arc<Self>, request_id: &str) -> CliResult<WorkerEndpoint> {
         loop {
             self.ensure_loaded()?;
             let mut inner = self.lock()?;
@@ -246,6 +384,10 @@ impl Supervisor {
             ) {
                 continue;
             }
+            if inner.state.in_flight != 0 {
+                drop(self.wait(inner)?);
+                continue;
+            }
             let endpoint = match inner.worker.as_ref() {
                 Some(worker) => WorkerEndpoint {
                     generation: worker.generation,
@@ -255,16 +397,34 @@ impl Supervisor {
                 },
                 None => continue,
             };
+            if inner.state.queued_requests == 0 {
+                return Err(CliError::runtime(format!(
+                    "resident request {request_id} reached admission with queued_requests=0"
+                )));
+            }
+            let prior_queued = inner.state.queued_requests;
             let prior_in_flight = inner.state.in_flight;
+            inner.state.queued_requests -= 1;
             inner.state.in_flight = prior_in_flight
                 .checked_add(1)
                 .ok_or_else(|| CliError::runtime("resident productive lease counter overflowed"))?;
             inner.state.phase = LifecyclePhase::LoadedBusy;
             inner.state.idle_deadline_unix_ms = None;
             inner.idle_deadline = None;
-            if let Err(error) = self.persist(&mut inner, "lease_acquired") {
+            if let Err(error) = self.persist_request(
+                &mut inner,
+                "lease_acquired",
+                LifecycleRequestRecord {
+                    request_id: request_id.to_string(),
+                    generation: Some(endpoint.generation),
+                    stage: RequestStage::Queued,
+                    outcome: None,
+                    error: None,
+                },
+            ) {
                 // No lease escapes this function, so the logical acquisition
                 // did not happen even if durability faulted mid-publication.
+                inner.state.queued_requests = prior_queued;
                 inner.state.in_flight = prior_in_flight;
                 inner.state.phase = LifecyclePhase::Faulted;
                 inner.state.idle_deadline_unix_ms = None;
@@ -272,11 +432,7 @@ impl Supervisor {
                 self.changed.notify_all();
                 return Err(error);
             }
-            return Ok(ProductiveLease {
-                supervisor: Arc::clone(self),
-                endpoint,
-                completed: false,
-            });
+            return Ok(endpoint);
         }
     }
 
@@ -403,15 +559,20 @@ impl Supervisor {
                 );
             }
         };
-        inner.state.phase = LifecyclePhase::LoadedIdle;
+        inner.state.phase = if inner.state.queued_requests == 0 {
+            LifecyclePhase::LoadedIdle
+        } else {
+            LifecyclePhase::LoadedBusy
+        };
         inner.state.worker_pid = Some(worker_pid);
         inner.state.worker_descendant_pids = members;
         inner.state.load_success_count = load_success_count;
         inner.state.last_worker_start_unix_ms = Some(now);
-        inner.state.idle_deadline_unix_ms = Some(now.saturating_add(IDLE_TTL_MS));
+        inner.state.idle_deadline_unix_ms =
+            (inner.state.queued_requests == 0).then_some(now.saturating_add(IDLE_TTL_MS));
         inner.state.lens_attestations = worker_ready.lens_attestations.clone();
         inner.state.onnx_runtime_attestation = worker_ready.onnx_runtime_attestation.clone();
-        inner.idle_deadline = Some(Instant::now() + IDLE_TTL);
+        inner.idle_deadline = (inner.state.queued_requests == 0).then(|| Instant::now() + IDLE_TTL);
         inner.last_worker_ready = Some(worker_ready);
         if let Err(error) = self.persist(&mut inner, "load_succeeded") {
             drop(inner);
@@ -511,7 +672,37 @@ impl Supervisor {
         Err(cleanup_error.unwrap_or(error))
     }
 
-    fn release(&self, generation: u64) -> CliResult {
+    fn cancel_queued_request(&self, request_id: &str, error: &CliError) -> CliResult {
+        let mut inner = self.lock()?;
+        if inner.state.queued_requests == 0 {
+            return Err(CliError::runtime(format!(
+                "resident request {request_id} cancelled with queued_requests=0"
+            )));
+        }
+        inner.state.queued_requests -= 1;
+        let generation = (inner.state.generation != 0).then_some(inner.state.generation);
+        let persisted = self.persist_request(
+            &mut inner,
+            "request_released",
+            LifecycleRequestRecord {
+                request_id: request_id.to_string(),
+                generation,
+                stage: RequestStage::Released,
+                outcome: Some(RequestOutcome::Failed),
+                error: Some(LifecycleErrorRecord::from_cli_error(error)),
+            },
+        );
+        self.changed.notify_all();
+        persisted
+    }
+
+    fn release_success(
+        &self,
+        generation: u64,
+        request_id: &str,
+        outcome: RequestOutcome,
+        error: Option<&CliError>,
+    ) -> CliResult {
         let mut inner = self.lock()?;
         if inner.state.generation != generation {
             return Err(CliError::runtime(format!(
@@ -533,9 +724,15 @@ impl Supervisor {
                     && inner.state.phase != LifecyclePhase::Faulted
                     && self.accepting.load(Ordering::SeqCst)
                 {
-                    inner.state.phase = LifecyclePhase::LoadedIdle;
-                    inner.state.idle_deadline_unix_ms = Some(now.saturating_add(IDLE_TTL_MS));
-                    inner.idle_deadline = Some(Instant::now() + IDLE_TTL);
+                    if inner.state.queued_requests == 0 {
+                        inner.state.phase = LifecyclePhase::LoadedIdle;
+                        inner.state.idle_deadline_unix_ms = Some(now.saturating_add(IDLE_TTL_MS));
+                        inner.idle_deadline = Some(Instant::now() + IDLE_TTL);
+                    } else {
+                        inner.state.phase = LifecyclePhase::LoadedBusy;
+                        inner.state.idle_deadline_unix_ms = None;
+                        inner.idle_deadline = None;
+                    }
                 } else if inner.worker.is_none() {
                     inner.state.phase = if self.accepting.load(Ordering::SeqCst) {
                         LifecyclePhase::Unloaded
@@ -551,7 +748,68 @@ impl Supervisor {
                 }
             }
         }
-        let persisted = self.persist(&mut inner, "lease_completed");
+        let persisted = self.persist_request(
+            &mut inner,
+            "request_released",
+            LifecycleRequestRecord {
+                request_id: request_id.to_string(),
+                generation: Some(generation),
+                stage: RequestStage::Released,
+                outcome: Some(outcome),
+                error: error.map(LifecycleErrorRecord::from_cli_error),
+            },
+        );
+        self.changed.notify_all();
+        persisted
+    }
+
+    fn release_failed(
+        &self,
+        generation: u64,
+        request_id: &str,
+        outcome: RequestOutcome,
+        error: &CliError,
+    ) -> CliResult {
+        let mut inner = self.lock()?;
+        if inner.state.generation != generation {
+            return Err(CliError::runtime(format!(
+                "resident failed lease generation {generation} does not match current generation {}",
+                inner.state.generation
+            )));
+        }
+        if inner.state.in_flight == 0 {
+            return Err(CliError::runtime(format!(
+                "resident generation {generation} released failed request {request_id} with in_flight=0"
+            )));
+        }
+        inner.state.in_flight -= 1;
+        inner.state.idle_deadline_unix_ms = None;
+        inner.idle_deadline = None;
+        if inner.state.in_flight == 0 && inner.worker_transition.is_none() {
+            if inner.worker.is_none() {
+                inner.state.phase = if self.accepting.load(Ordering::SeqCst) {
+                    LifecyclePhase::Unloaded
+                } else {
+                    LifecyclePhase::Stopping
+                };
+                inner.state.worker_pid = None;
+                inner.state.worker_descendant_pids.clear();
+            } else {
+                inner.state.phase = LifecyclePhase::Faulted;
+                self.accepting.store(false, Ordering::SeqCst);
+            }
+        }
+        let persisted = self.persist_request(
+            &mut inner,
+            "request_released",
+            LifecycleRequestRecord {
+                request_id: request_id.to_string(),
+                generation: Some(generation),
+                stage: RequestStage::Released,
+                outcome: Some(outcome),
+                error: Some(LifecycleErrorRecord::from_cli_error(error)),
+            },
+        );
         self.changed.notify_all();
         persisted
     }
@@ -644,7 +902,10 @@ impl Supervisor {
         let request_error = self.request_stop().err();
         let (worker, generation, prior_fault, unload_started_error) = {
             let mut inner = self.lock()?;
-            while inner.state.in_flight > 0 || inner.worker_transition.is_some() {
+            while inner.state.queued_requests > 0
+                || inner.state.in_flight > 0
+                || inner.worker_transition.is_some()
+            {
                 inner = self.wait(inner)?;
             }
             if inner.state.phase == LifecyclePhase::Stopped {
@@ -778,6 +1039,7 @@ impl Supervisor {
                 continue;
             };
             if inner.state.phase != LifecyclePhase::LoadedIdle
+                || inner.state.queued_requests != 0
                 || inner.state.in_flight != 0
                 || inner.worker_transition.is_some()
             {
@@ -897,6 +1159,7 @@ impl Supervisor {
             worker_pid: inner.state.worker_pid,
             worker_descendant_pids: inner.state.worker_descendant_pids.clone(),
             generation: inner.state.generation,
+            queued_requests: inner.state.queued_requests,
             in_flight: inner.state.in_flight,
             bind: self.bind,
             uptime_ms: self.started.elapsed().as_millis(),
@@ -975,6 +1238,59 @@ impl Supervisor {
                 Err(error)
             }
         }
+    }
+
+    fn persist_request(
+        &self,
+        inner: &mut SupervisorInner,
+        event: &str,
+        request: LifecycleRequestRecord,
+    ) -> CliResult {
+        let state = inner.state.clone();
+        match inner.store.append_request(event, &state, Some(request)) {
+            Ok(projection) => {
+                inner.projection = projection;
+                Ok(())
+            }
+            Err(error) => {
+                self.accepting.store(false, Ordering::SeqCst);
+                inner.state.phase = LifecyclePhase::Faulted;
+                inner.state.last_error = Some(LifecycleErrorRecord::from_cli_error(&error));
+                Err(error)
+            }
+        }
+    }
+
+    fn record_request_stage(
+        &self,
+        request_id: &str,
+        generation: Option<u64>,
+        stage: RequestStage,
+        outcome: Option<RequestOutcome>,
+        error: Option<&CliError>,
+    ) -> CliResult {
+        let mut inner = self.lock()?;
+        if let Some(generation) = generation
+            && inner.state.generation != generation
+        {
+            return Err(CliError::runtime(format!(
+                "resident request {request_id} stage {:?} names generation {generation}, current generation is {}",
+                stage, inner.state.generation
+            )));
+        }
+        let persisted = self.persist_request(
+            &mut inner,
+            "request_stage",
+            LifecycleRequestRecord {
+                request_id: request_id.to_string(),
+                generation,
+                stage,
+                outcome,
+                error: error.map(LifecycleErrorRecord::from_cli_error),
+            },
+        );
+        self.changed.notify_all();
+        persisted
     }
 
     fn lock(&self) -> CliResult<MutexGuard<'_, SupervisorInner>> {
@@ -1200,7 +1516,16 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
             Err(error) => write_json_response(&mut stream, &cli_error_value(&error)),
         },
         RequestClass::Productive => {
-            let lease = match supervisor.acquire() {
+            let modality = request
+                .modality
+                .expect("productive JSON request validation requires modality");
+            if let Err(error) = supervisor
+                .source
+                .require_applicable_neural_modality(modality)
+            {
+                return write_json_response(&mut stream, &cli_error_value(&error));
+            }
+            let mut lease = match supervisor.acquire() {
                 Ok(lease) => lease,
                 Err(error) => {
                     return write_json_response(&mut stream, &cli_error_value(&error));
@@ -1208,30 +1533,48 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
             };
             let endpoint = lease.endpoint();
             let request_deadline = deadline_after(endpoint.request_timeout)?;
-            let response = match proxy_json(&endpoint, &request, request_deadline) {
-                Ok(response) => response,
+            let response = match proxy_json(&endpoint, &request, request_deadline, &mut lease) {
+                Ok(JsonProxyResponse::Success(response)) => response,
+                Ok(JsonProxyResponse::WorkerFailure { response, error }) => {
+                    let cleanup = lease.fail(&error, RequestOutcome::Failed);
+                    let write = deadline_after(PUBLIC_SOCKET_TIMEOUT)
+                        .map_err(CliError::from)
+                        .and_then(|deadline| {
+                            write_json_bytes_before(&mut stream, &response, deadline)
+                        });
+                    write?;
+                    cleanup?;
+                    return Ok(());
+                }
                 Err(error) => {
-                    let invalidation_error = supervisor
-                        .invalidate_generation(endpoint.generation, clone_cli_error(&error))
-                        .err();
-                    let value = cli_error_value(invalidation_error.as_ref().unwrap_or(&error));
+                    let cleanup = lease.fail(&error, RequestOutcome::Failed);
+                    let value = cli_error_value(cleanup.as_ref().err().unwrap_or(&error));
                     let write = deadline_after(PUBLIC_SOCKET_TIMEOUT)
                         .map_err(CliError::from)
                         .and_then(|deadline| {
                             write_json_response_before(&mut stream, &value, deadline)
                         });
-                    let complete = lease.complete();
                     write?;
-                    complete?;
-                    return match invalidation_error {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    };
+                    cleanup?;
+                    return Ok(());
                 }
             };
-            let write = write_json_bytes_before(&mut stream, &response, request_deadline);
-            lease.complete()?;
-            write
+            match write_json_bytes_before(&mut stream, &response, request_deadline) {
+                Ok(()) => {
+                    lease.advance(RequestStage::PublicFlushComplete)?;
+                    lease.complete_success()
+                }
+                Err(write_error) => {
+                    let cancellation = client_aborted_error(
+                        endpoint.generation,
+                        &write_error,
+                        "JSON response flush",
+                    );
+                    let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
+                    cleanup?;
+                    Err(write_error)
+                }
+            }
         }
     }
 }
@@ -1274,7 +1617,17 @@ fn handle_binary(
             return Ok(());
         }
     };
-    if let Err(error) = decode_binary_request(&payload) {
+    let decoded_request = match decode_binary_request(&payload) {
+        Ok(request) => request,
+        Err(error) => {
+            write_binary_error(stream, &error)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = supervisor
+        .source
+        .require_applicable_neural_modality(decoded_request.modality)
+    {
         write_binary_error(stream, &error)?;
         return Ok(());
     }
@@ -1290,7 +1643,7 @@ fn handle_binary(
         write_binary_error(stream, &error)?;
         return Ok(());
     }
-    let lease = match supervisor.acquire() {
+    let mut lease = match supervisor.acquire() {
         Ok(lease) => lease,
         Err(error) => {
             write_binary_error(stream, &error)?;
@@ -1299,45 +1652,34 @@ fn handle_binary(
     };
     let endpoint = lease.endpoint();
     let request_deadline = deadline_after(endpoint.request_timeout)?;
-    let result = proxy_binary(&endpoint, &payload, stream, request_deadline);
-    let mut invalidation_error = None;
-    match &result {
+    match proxy_binary(&endpoint, &payload, stream, request_deadline, &mut lease) {
+        Ok(()) => {
+            lease.advance(RequestStage::PublicFlushComplete)?;
+            lease.complete_success()
+        }
         Err(BinaryProxyError::Worker(error)) => {
-            invalidation_error = supervisor
-                .invalidate_generation(endpoint.generation, clone_cli_error(error))
-                .err();
-            let response_error = invalidation_error.as_ref().unwrap_or(error);
+            let cleanup = lease.fail(&error, RequestOutcome::Failed);
+            let response_error = cleanup.as_ref().err().unwrap_or(&error);
             if let Ok(error_deadline) = deadline_after(PUBLIC_SOCKET_TIMEOUT) {
                 let _ = write_binary_error_before(stream, response_error, error_deadline);
             }
+            cleanup?;
+            Err(error)
+        }
+        Err(BinaryProxyError::WorkerReported(error)) => {
+            let cleanup = lease.fail(&error, RequestOutcome::Failed);
+            cleanup?;
+            Err(error)
         }
         Err(BinaryProxyError::Client(error)) => {
             // The supervisor cannot prove that the private worker stopped
             // computing merely because the public client stopped consuming a
             // stream. Reap the generation before releasing its lease.
-            let cancellation = CliError::from(CalyxError {
-                code: CLIENT_ABORTED_GENERATION,
-                message: format!(
-                    "public client transport failed during resident generation {} streaming: {}",
-                    endpoint.generation,
-                    error.message()
-                ),
-                remediation: "retry the complete atomic batch; the supervisor reaped the interrupted generation before releasing its lease",
-            });
-            invalidation_error = supervisor
-                .invalidate_generation(endpoint.generation, cancellation)
-                .err();
+            let cancellation = client_aborted_error(endpoint.generation, &error, "binary stream");
+            let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
+            cleanup?;
+            Err(error)
         }
-        Ok(()) => {}
-    }
-    let complete = lease.complete();
-    complete?;
-    if let Some(error) = invalidation_error {
-        return Err(error);
-    }
-    match result {
-        Ok(()) => Ok(()),
-        Err(BinaryProxyError::Worker(error) | BinaryProxyError::Client(error)) => Err(error),
     }
 }
 
@@ -1345,7 +1687,8 @@ fn proxy_json(
     endpoint: &WorkerEndpoint,
     request: &ResidentRequest,
     deadline: Instant,
-) -> CliResult<Vec<u8>> {
+    lease: &mut ProductiveLease,
+) -> CliResult<JsonProxyResponse> {
     let bind = endpoint.bind;
     let mut worker = connect_before(&bind, deadline).map_err(|error| {
         worker_error(
@@ -1359,20 +1702,57 @@ fn proxy_json(
         .map_err(|error| CliError::runtime(format!("serialize worker request: {error}")))?;
     worker_io.write_all(b"\n")?;
     worker_io.flush()?;
+    lease.advance(RequestStage::WorkerStarted)?;
     let mut worker_reader = BufReader::new(worker_io);
     let response = read_bounded_line(
         &mut worker_reader,
         MAX_RESIDENT_JSON_LINE_BYTES,
         "resident worker JSON response",
     )?;
-    serde_json::from_slice::<Value>(&response).map_err(|error| {
+    let value = serde_json::from_slice::<Value>(&response).map_err(|error| {
         worker_error(
             format!("loaded resident worker {bind} returned invalid JSON: {error}"),
             "preserve the worker response and restart from one native Calyx build",
         )
     })?;
     ensure_before(deadline, "resident worker JSON proxy")?;
-    Ok(response)
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        lease.advance(RequestStage::TerminalReceived)?;
+        return Ok(JsonProxyResponse::WorkerFailure {
+            error: worker_reported_json_error(endpoint.bind, &value),
+            response,
+        });
+    }
+    lease.advance(RequestStage::GpuSynchronized)?;
+    lease.advance(RequestStage::HostMaterialized)?;
+    lease.advance(RequestStage::TerminalReceived)?;
+    Ok(JsonProxyResponse::Success(response))
+}
+
+enum JsonProxyResponse {
+    Success(Vec<u8>),
+    WorkerFailure { response: Vec<u8>, error: CliError },
+}
+
+fn worker_reported_json_error(bind: SocketAddr, value: &Value) -> CliError {
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("CALYX_PANEL_RESIDENT_WORKER_MALFORMED_ERROR");
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("worker returned ok=false without a string message");
+    let remediation = value
+        .get("remediation")
+        .and_then(Value::as_str)
+        .unwrap_or("preserve the worker response and inspect its structured error envelope");
+    worker_error(
+        format!(
+            "loaded resident worker {bind} reported {code}: {message}; remediation={remediation}"
+        ),
+        "fix the reported model or CUDA failure, then retry on the clean generation reaped by the supervisor",
+    )
 }
 
 fn proxy_binary(
@@ -1380,6 +1760,7 @@ fn proxy_binary(
     payload: &[u8],
     client: &mut TcpStream,
     deadline: Instant,
+    lease: &mut ProductiveLease,
 ) -> Result<(), BinaryProxyError> {
     let bind = endpoint.bind;
     let mut worker = connect_before(&bind, deadline)
@@ -1405,6 +1786,9 @@ fn proxy_binary(
     worker_io.flush().map_err(|error| {
         BinaryProxyError::Worker(worker_transport_error(bind, "flush binary request", error))
     })?;
+    lease
+        .advance(RequestStage::WorkerStarted)
+        .map_err(BinaryProxyError::Worker)?;
     loop {
         let frame = read_frame(&mut worker_io)
             .map_err(CliError::from)
@@ -1412,24 +1796,57 @@ fn proxy_binary(
         let decoded = decode_binary::<ResidentMeasureBatchStreamFrame>(&frame)
             .map_err(CliError::from)
             .map_err(BinaryProxyError::Worker)?;
-        let terminal = matches!(
-            decoded,
-            ResidentMeasureBatchStreamFrame::End(_) | ResidentMeasureBatchStreamFrame::Err { .. }
-        );
+        match &decoded {
+            ResidentMeasureBatchStreamFrame::End(_) => {
+                lease
+                    .advance(RequestStage::GpuSynchronized)
+                    .map_err(BinaryProxyError::Worker)?;
+                lease
+                    .advance(RequestStage::HostMaterialized)
+                    .map_err(BinaryProxyError::Worker)?;
+                lease
+                    .advance(RequestStage::TerminalReceived)
+                    .map_err(BinaryProxyError::Worker)?;
+            }
+            ResidentMeasureBatchStreamFrame::Err { .. } => {
+                lease
+                    .advance(RequestStage::TerminalReceived)
+                    .map_err(BinaryProxyError::Worker)?;
+            }
+            ResidentMeasureBatchStreamFrame::Header(_)
+            | ResidentMeasureBatchStreamFrame::Row(_) => {}
+        }
         write_frame(&mut client_io, &frame)
             .map_err(CliError::from)
             .map_err(BinaryProxyError::Client)?;
-        if terminal {
+        if matches!(&decoded, ResidentMeasureBatchStreamFrame::End(_)) {
             client_io
                 .flush()
                 .map_err(|error| BinaryProxyError::Client(error.into()))?;
             return Ok(());
+        }
+        if let ResidentMeasureBatchStreamFrame::Err {
+            code,
+            message,
+            remediation,
+        } = decoded
+        {
+            client_io
+                .flush()
+                .map_err(|error| BinaryProxyError::Client(error.into()))?;
+            return Err(BinaryProxyError::WorkerReported(worker_error(
+                format!(
+                    "loaded resident worker {bind} reported {code}: {message}; remediation={remediation}"
+                ),
+                "fix the reported model or CUDA failure, then retry on the clean generation reaped by the supervisor",
+            )));
         }
     }
 }
 
 enum BinaryProxyError {
     Worker(CliError),
+    WorkerReported(CliError),
     Client(CliError),
 }
 
@@ -1497,6 +1914,17 @@ fn worker_error(message: impl Into<String>, remediation: &'static str) -> CliErr
         code: WORKER_LOST,
         message: message.into(),
         remediation,
+    })
+}
+
+fn client_aborted_error(generation: u64, error: &CliError, operation: &str) -> CliError {
+    CliError::from(CalyxError {
+        code: CLIENT_ABORTED_GENERATION,
+        message: format!(
+            "public client transport failed during resident generation {generation} {operation}: {}",
+            error.message()
+        ),
+        remediation: "retry the complete atomic request; the supervisor reaped the interrupted generation before releasing its lease",
     })
 }
 

@@ -51,22 +51,14 @@ struct Config {
     audit_vram: bool,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--build-info") {
         return print_build_info(&args);
     }
     #[cfg(all(feature = "cuda", windows))]
-    if let Err(error) = calyx_registry::initialize_pinned_cuda_runtime_boundary() {
-        let envelope = serde_json::to_string(&error)
-            .unwrap_or_else(|serialize_error| {
-                format!(
-                    "{{\"code\":\"CALYX_DAEMON_RUNTIME_ERROR\",\"message\":\"failed to serialize CUDA runtime error: {serialize_error}\",\"remediation\":\"inspect the original process logs and pinned runtime bundle\"}}"
-                )
-            });
-        eprintln!("{envelope}");
-        return ExitCode::from(2);
+    if let Err(error) = calyx_forge::cuda_runtime::initialize_pinned_cuda_runtime_boundary() {
+        return emit_cuda_runtime_error(error);
     }
     let config = match parse_args(args) {
         Ok(config) => config,
@@ -81,7 +73,24 @@ async fn main() -> ExitCode {
     // Server mode: a --config (without --validate-config) boots the config-driven
     // daemon, which begins with a fatal CUDA preflight before any other init.
     if let Some(path) = config.config_path.clone() {
-        return run_server(&path, config.once, config.audit_vram).await;
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "code": "CALYX_DAEMON_RUNTIME_ERROR",
+                        "message": format!("create Tokio multi-thread runtime: {error}"),
+                        "remediation": "inspect process resource limits and retry",
+                    })
+                );
+                return ExitCode::from(2);
+            }
+        };
+        return runtime.block_on(run_server(&path, config.once, config.audit_vram));
     }
     match run(config) {
         Ok(()) => ExitCode::SUCCESS,
@@ -90,6 +99,23 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[cfg(all(feature = "cuda", windows))]
+fn emit_cuda_runtime_error(error: calyx_forge::ForgeError) -> ExitCode {
+    let message = match &error {
+        calyx_forge::ForgeError::RuntimeBoundary { detail, .. } => detail.clone(),
+        _ => error.to_string(),
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "code": error.code(),
+            "message": message,
+            "remediation": error.remediation(),
+        })
+    );
+    ExitCode::from(2)
 }
 
 /// Resolved compile-time capabilities (#1130): calyxd's GPU surface is the

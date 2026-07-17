@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use calyx_registry::load_vault_panel_state;
+use calyx_core::{CalyxError, Modality, Placement, SlotState};
+use calyx_registry::{lens_spec_from_manifest_path, load_vault_panel_state};
 
 use super::flags::ServeFlags;
 use super::*;
-use crate::panel_commands::template_store::TemplateStore;
+use crate::panel_commands::template_store::{self, TemplateStore};
+use crate::panel_commands::warm::resident_support::is_managed_resident_neural_runtime;
+
+const NO_APPLICABLE_GPU_LENS: &str = "CALYX_PANEL_RESIDENT_NO_APPLICABLE_GPU_LENS";
 
 #[derive(Clone, Debug)]
 pub(super) struct FrozenResidentSource {
@@ -13,6 +17,25 @@ pub(super) struct FrozenResidentSource {
     pub(super) source_of_truth: String,
     pub(super) canonical_vault: Option<PathBuf>,
     pub(super) template: Option<String>,
+    applicable_neural_modalities: Vec<Modality>,
+}
+
+impl FrozenResidentSource {
+    /// Reject work that cannot execute an active, managed GPU neural lens.
+    /// This check is source-only and does not construct or wake a runtime.
+    pub(super) fn require_applicable_neural_modality(&self, modality: Modality) -> CliResult {
+        if self.applicable_neural_modalities.contains(&modality) {
+            return Ok(());
+        }
+        Err(CliError::from(CalyxError {
+            code: NO_APPLICABLE_GPU_LENS,
+            message: format!(
+                "resident source {} has no active managed GPU neural lens for modality {modality:?}",
+                self.selector
+            ),
+            remediation: "send a modality represented by an active managed GPU neural lens in the frozen panel, or commission that lens before retrying",
+        }))
+    }
 }
 
 /// Freeze the panel/registry identity without constructing any neural runtime.
@@ -38,6 +61,7 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
     if let Some(selector) = flags.template.as_deref() {
         let template = TemplateStore::open(home).load(selector)?;
         template.validate()?;
+        let mut applicable_neural_modalities = Vec::new();
         let template_bytes = serde_json::to_vec(&template).map_err(|error| {
             CliError::runtime(format!(
                 "serialize resident template {selector} for frozen fingerprint: {error}"
@@ -56,6 +80,12 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
             })?;
             hash_part(&mut hasher, lens.manifest.as_bytes());
             hash_part(&mut hasher, &manifest);
+            let spec = lens_spec_from_manifest_path(manifest_path)?;
+            template_store::validate_lens_ref_against_spec(lens, &spec)?;
+            if lens.placement == Placement::Gpu && is_managed_resident_neural_runtime(&spec.runtime)
+            {
+                push_unique_modality(&mut applicable_neural_modalities, lens.modality);
+            }
         }
         let fingerprint = hasher.finalize().to_hex().to_string();
         return Ok(FrozenResidentSource {
@@ -70,6 +100,7 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
             fingerprint,
             canonical_vault: None,
             template: Some(selector.to_string()),
+            applicable_neural_modalities,
         });
     }
 
@@ -83,6 +114,29 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
     // Vault registry restoration is lazy. Serializing its frozen snapshots
     // proves panel_ref/registry_ref identity without loading a model or CUDA.
     let state = load_vault_panel_state(&canonical_vault)?;
+    let applicable_neural_modalities = state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.state == SlotState::Active
+                && slot.resource.placement == Placement::Gpu
+                && (flags.slots.is_empty() || flags.slots.contains(&slot.slot_id))
+                && flags
+                    .modality
+                    .is_none_or(|modality| slot.modality == modality)
+        })
+        .filter_map(|slot| {
+            state
+                .registry
+                .lens_spec(slot.lens_id)
+                .filter(|spec| is_managed_resident_neural_runtime(&spec.runtime))
+                .map(|_| slot.modality)
+        })
+        .fold(Vec::new(), |mut modalities, modality| {
+            push_unique_modality(&mut modalities, modality);
+            modalities
+        });
     let panel_bytes = serde_json::to_vec(&state.panel).map_err(|error| {
         CliError::runtime(format!(
             "serialize resident vault panel {}: {error}",
@@ -110,7 +164,14 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
         fingerprint,
         canonical_vault: Some(canonical_vault),
         template: None,
+        applicable_neural_modalities,
     })
+}
+
+fn push_unique_modality(modalities: &mut Vec<Modality>, modality: Modality) {
+    if !modalities.contains(&modality) {
+        modalities.push(modality);
+    }
 }
 
 fn hash_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {

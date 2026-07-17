@@ -331,7 +331,7 @@ fn declared_runtime(
         "candle-local" => Ok(LensRuntime::CandleLocal {
             model_id: endpoint.unwrap_or("declared-candle-local").to_string(),
             files: weights.into_iter().map(Path::to_path_buf).collect(),
-            device: "cuda:0".to_string(),
+            device: "cpu".to_string(),
             dtype: "f32".to_string(),
             pooling: "mean".to_string(),
         }),

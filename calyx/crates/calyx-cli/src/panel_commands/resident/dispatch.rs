@@ -248,6 +248,7 @@ pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
         worker_pid: Some(std::process::id()),
         worker_descendant_pids: vec![std::process::id()],
         generation: service.generation,
+        queued_requests: 0,
         in_flight: 0,
         bind: service.bind,
         uptime_ms: service.started.elapsed().as_millis(),

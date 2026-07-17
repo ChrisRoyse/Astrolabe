@@ -11,7 +11,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
-$LockSchema = "astrolabe.windows-ort-cuda-runtime-lock.v1"
+$LockSchema = "astrolabe.windows-ort-cuda-runtime-lock.v2"
 $ReceiptSchema = "astrolabe.windows-ort-cuda-runtime-receipt.v1"
 $LockFileName = "ort-cuda13.3-windows-x86_64.lock.json"
 $CanonicalWorkspace = "C:\code\Astrolabe"
@@ -79,11 +79,10 @@ function Assert-NonBlankString {
 function Assert-PositiveInteger {
     param($Value, [string]$Context)
 
-    if (-not ($Value -is [ValueType])) {
+    if (-not ($Value -is [int]) -and -not ($Value -is [long])) {
         Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "$Context must be an integer" "restore the checked-in CUDA 13 runtime lock"
     }
-    $parsed = 0L
-    if (-not [long]::TryParse($Value.ToString(), [ref]$parsed) -or $parsed -le 0) {
+    if ([long]$Value -le 0) {
         Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "$Context must be a positive integer" "restore the checked-in CUDA 13 runtime lock"
     }
 }
@@ -178,7 +177,7 @@ function Read-Lock {
         Fail-Runtime "ASTRO_CUDA13_LOCK_PATH" "invalid bundle root_prefix $($lock.bundle.root_prefix)" "restore the checked-in lock"
     }
 
-    Assert-ExactFields $lock.contract @('ort_version', 'ort_file_version', 'ort_api', 'api_non_null', 'first_api_null', 'provider', 'ort_dll', 'provider_dll', 'direct_non_system_imports', 'forbidden_providers', 'forbidden_archive_dlls') 'lock.contract'
+    Assert-ExactFields $lock.contract @('ort_version', 'ort_file_version', 'ort_api', 'api_non_null', 'first_api_null', 'provider', 'ort_dll', 'provider_dll', 'direct_non_system_imports') 'lock.contract'
     foreach ($field in @('ort_version', 'ort_file_version', 'provider')) {
         Assert-NonBlankString $lock.contract.$field "lock.contract.$field"
     }
@@ -190,25 +189,58 @@ function Read-Lock {
     foreach ($name in @($lock.contract.direct_non_system_imports)) {
         Assert-SafeFileName $name 'lock.contract.direct_non_system_imports[]'
     }
-    foreach ($name in @($lock.contract.forbidden_providers)) {
-        Assert-NonBlankString $name 'lock.contract.forbidden_providers[]'
-    }
-    foreach ($name in @($lock.contract.forbidden_archive_dlls)) {
-        Assert-SafeRelativePath $name 'lock.contract.forbidden_archive_dlls[]'
-    }
     Assert-SafeRelativePath $lock.contract.ort_dll 'lock.contract.ort_dll'
     Assert-SafeRelativePath $lock.contract.provider_dll 'lock.contract.provider_dll'
 
-    Assert-ExactFields $lock.loaded_module_policy @('bundle_module_globs', 'driver', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
-    Assert-ExactFields $lock.loaded_module_policy.driver @('name', 'required_root', 'publisher') 'lock.loaded_module_policy.driver'
-    foreach ($field in @('name', 'required_root', 'publisher')) {
-        Assert-NonBlankString $lock.loaded_module_policy.driver.$field "lock.loaded_module_policy.driver.$field"
+    Assert-ExactFields $lock.loaded_module_policy @('bundle_load_order', 'bundle_module_globs', 'system_modules', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
+    $loadOrder = @($lock.loaded_module_policy.bundle_load_order)
+    $loadOrderSet = @{}
+    foreach ($path in $loadOrder) {
+        Assert-SafeRelativePath $path 'lock.loaded_module_policy.bundle_load_order[]'
+        if (-not $path.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load-order entry is not a DLL: $path" "restore the checked-in lock"
+        }
+        if ($loadOrderSet.ContainsKey($path)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "duplicate bundle load-order entry $path" "restore the checked-in lock"
+        }
+        $loadOrderSet.Add($path, $true)
+    }
+    $systemModules = @($lock.loaded_module_policy.system_modules)
+    if ($systemModules.Count -ne 2) {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_modules must contain exactly nvcuda.dll and nvml.dll" "restore the checked-in lock"
+    }
+    $systemModuleNames = @{}
+    foreach ($module in $systemModules) {
+        Assert-ExactFields $module @('name', 'required_root', 'signature_kind', 'signer_organization', 'signed_company_name') 'lock.loaded_module_policy.system_modules[]'
+        Assert-SafeFileName $module.name 'lock.loaded_module_policy.system_modules[].name'
+        foreach ($field in @('required_root', 'signature_kind', 'signer_organization', 'signed_company_name')) {
+            Assert-NonBlankString $module.$field "lock.loaded_module_policy.system_modules[].$field"
+        }
+        if ($module.signature_kind -cne 'catalog') {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system module $($module.name) must require catalog trust" "restore the checked-in lock"
+        }
+        if ($module.required_root -cne '%SystemRoot%\System32' -or $module.signer_organization -cne 'Microsoft Corporation' -or $module.signed_company_name -cne 'NVIDIA Corporation') {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system module $($module.name) trust identity differs from the Windows NVIDIA driver contract" "restore the checked-in lock"
+        }
+        $key = $module.name.ToLowerInvariant()
+        if ($systemModuleNames.ContainsKey($key)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "duplicate system module $($module.name)" "restore the checked-in lock"
+        }
+        $systemModuleNames.Add($key, $true)
+    }
+    foreach ($required in @('nvcuda.dll', 'nvml.dll')) {
+        if (-not $systemModuleNames.ContainsKey($required)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_modules omits $required" "restore the checked-in lock"
+        }
     }
     foreach ($glob in @($lock.loaded_module_policy.bundle_module_globs)) {
         Assert-NonBlankString $glob 'lock.loaded_module_policy.bundle_module_globs[]'
     }
     foreach ($root in @($lock.loaded_module_policy.system_roots)) {
         Assert-NonBlankString $root 'lock.loaded_module_policy.system_roots[]'
+    }
+    if (@($lock.loaded_module_policy.system_roots).Count -ne 1 -or $lock.loaded_module_policy.system_roots[0] -cne '%SystemRoot%\System32') {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_roots must contain only %SystemRoot%\System32" "restore the checked-in lock"
     }
     if (-not ($lock.loaded_module_policy.reject_application_dir -is [bool]) -or -not ($lock.loaded_module_policy.reject_path_search -is [bool]) -or -not $lock.loaded_module_policy.reject_application_dir -or -not $lock.loaded_module_policy.reject_path_search) {
         Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "loaded module policy must reject application-directory and PATH search" "restore the checked-in lock"
@@ -276,6 +308,15 @@ function Read-Lock {
         $bundlePaths.Add($file.bundle_path, $true)
     }
 
+    if ($loadOrderSet.Count -ne @($lock.files).Count) {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load order must name every locked DLL exactly once" "restore the checked-in lock"
+    }
+    foreach ($path in $loadOrderSet.Keys) {
+        if (-not $bundlePaths.ContainsKey($path)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load order names unlocked path $path" "restore the checked-in lock"
+        }
+    }
+
     foreach ($notice in @($lock.notices)) {
         Assert-ExactFields $notice @('artifact', 'archive_path', 'bundle_path', 'bytes', 'sha256') 'lock.notices[]'
         if (-not $artifacts.ContainsKey($notice.artifact)) {
@@ -327,7 +368,22 @@ function Assert-Authenticode {
         [Parameter(Mandatory = $true)]$File
     )
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $LiteralPath
+    $ambientModulePath = $env:PSModulePath
+    try {
+        # Resolve the security cmdlet from this host's own installation. Inheriting a mixed
+        # PowerShell 7 / Windows PowerShell 5.1 module path can discover an ABI-incompatible
+        # Microsoft.PowerShell.Security module and then fail while loading it.
+        $env:PSModulePath = Join-Path $PSHOME "Modules"
+        $securityManifest = Join-Path $PSHOME "Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"
+        if (-not (Test-Path -LiteralPath $securityManifest -PathType Leaf)) {
+            Fail-Runtime "ASTRO_CUDA13_SECURITY_MODULE_MISSING" "the current PowerShell host is missing its built-in security module at $securityManifest" "repair the current PowerShell installation before provisioning the CUDA runtime"
+        }
+        Import-Module -Name $securityManifest -ErrorAction Stop
+        $signature = Get-AuthenticodeSignature -LiteralPath $LiteralPath
+    }
+    finally {
+        $env:PSModulePath = $ambientModulePath
+    }
     $actualStatus = $signature.Status.ToString()
     if ($actualStatus -cne $File.authenticode.status -or $null -eq $signature.SignerCertificate) {
         Fail-Runtime "ASTRO_CUDA13_SIGNATURE" "Authenticode status for $LiteralPath is $actualStatus, expected $($File.authenticode.status)" "restore the pinned official artifact and rerun provisioning"

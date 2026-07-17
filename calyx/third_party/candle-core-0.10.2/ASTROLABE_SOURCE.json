@@ -1,5 +1,5 @@
 {
-  "schema": "astrolabe.owned-crate-source.v1",
+  "schema": "astrolabe.owned-crate-source.v2",
   "package": "candle-core",
   "version": "0.10.2",
   "crates_io_archive_sha256": "6bd9895436c1ba5dc1037a19935d084b838db066ff4e15ef7dded020b7c12a4a",
@@ -7,10 +7,344 @@
   "upstream_git_commit": "7c7a8c570e6a16ea24cc30a7501c8ffbbdb51680",
   "upstream_issue": "https://github.com/huggingface/candle/issues/3208",
   "license": "MIT OR Apache-2.0",
-  "owned_source_file_count": 61,
-  "owned_source_tree_sha256": "15f70f9a1c074e3207ce4c808794d40306453e370933b96850a806e55f99ef66",
+  "hash_algorithm": "sha256-domain-u64le-path-u64le-content-v1",
+  "attested_file_count": 66,
+  "attested_source_tree_sha256": "a7414c132e51d4002a4b128fd13ed209eab522e124daab032f15108fde02e9e6",
+  "files": [
+    {
+      "path": ".cargo_vcs_info.json",
+      "bytes": 105,
+      "sha256": "0e0b73eb2b9aaaba6865dfb471111abcbdac085e758c6d03210eba6359e1abd2"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 3312,
+      "sha256": "86436f98dd3d1e8388bb1f9c1c19bc4f7c1b963e3e8db4cd96950e28217330db"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "README.md",
+      "bytes": 42,
+      "sha256": "9b00007b1d568125e67d6f2ff5c40acd8227dec4c62681cbc87775768a125200"
+    },
+    {
+      "path": "build.rs",
+      "bytes": 15675,
+      "sha256": "1b2e98cd7c91996fe383002d2d750f5adf6d239f14702337bde6f368689772d9"
+    },
+    {
+      "path": "src/accelerate.rs",
+      "bytes": 12889,
+      "sha256": "9be99929bb6553d9baf6b6a5a56fa66bfdbee122f76c4792a00e09ac8a0d638a"
+    },
+    {
+      "path": "src/backend.rs",
+      "bytes": 5124,
+      "sha256": "822a96a62ef7d300141b7d439807482bd40bded3f592e9e72c1e108f43ff63cc"
+    },
+    {
+      "path": "src/backprop.rs",
+      "bytes": 39302,
+      "sha256": "4f370f420aaea68bf23976f807c9a47a97c36d46f17f18ef82132d43a9847a52"
+    },
+    {
+      "path": "src/conv.rs",
+      "bytes": 11619,
+      "sha256": "31b8870d37dad9d2962985657121e85bc350830555d20054700921ea689a0d9f"
+    },
+    {
+      "path": "src/convert.rs",
+      "bytes": 4765,
+      "sha256": "664562f7fc98008b1cbf4815aacf79311141a40d9a003f86ecdb8cebcf6abbae"
+    },
+    {
+      "path": "src/cpu/avx.rs",
+      "bytes": 6121,
+      "sha256": "d06f480b9ec3553568c0ef4b32e30d9f0dc7371f6db94473b42724f2b2519d45"
+    },
+    {
+      "path": "src/cpu/erf.rs",
+      "bytes": 9756,
+      "sha256": "e9d7e063b6e1b3af2b785b4b26ea038e512608a380edbb0d65d0253f0f70dbdc"
+    },
+    {
+      "path": "src/cpu/kernels.rs",
+      "bytes": 5713,
+      "sha256": "ad187fd28c7b491ae982e5e9c714331b89c91056c370f6a7417cc79dfda7aab1"
+    },
+    {
+      "path": "src/cpu/mod.rs",
+      "bytes": 7001,
+      "sha256": "667e12b8807e5b73cb3b84f4078029e1060fc2b4147122584c24dc0c083c3738"
+    },
+    {
+      "path": "src/cpu/neon.rs",
+      "bytes": 1688,
+      "sha256": "c180dffb8a342c2f026d8fdcc235c7d9e8f0aac8a5f6f03de4c2f4de8dda609c"
+    },
+    {
+      "path": "src/cpu/simd128.rs",
+      "bytes": 1541,
+      "sha256": "8ed8cff924086325c4d4af5a12746a7ce4a5a05f18cdeaa28bc0ff9c64060906"
+    },
+    {
+      "path": "src/cpu_backend/conv2d.rs",
+      "bytes": 16731,
+      "sha256": "7cce5919db374cc01593ec4b7d50da06c19e180ccfd3651053cb5dc20323e406"
+    },
+    {
+      "path": "src/cpu_backend/mod.rs",
+      "bytes": 129150,
+      "sha256": "441c9631f163d882ce6398fe8cd225b3c0cf1e52e3eb09cb3186c932696013da"
+    },
+    {
+      "path": "src/cpu_backend/utils.rs",
+      "bytes": 16969,
+      "sha256": "85b05a7f3d6934a115f72f1caf977d7bbdd680715939fb3bdfbbf24af5ac15b1"
+    },
+    {
+      "path": "src/cuda_backend/cudnn.rs",
+      "bytes": 8121,
+      "sha256": "3e3237559a6148567a369effe6e9616bbc12a6b67c13c09b2d52e6f6382f04b8"
+    },
+    {
+      "path": "src/cuda_backend/device.rs",
+      "bytes": 23961,
+      "sha256": "40f4bb9512f9001a983802129b6cfee16381a24b7876f13ba02cd49b6dfe1925"
+    },
+    {
+      "path": "src/cuda_backend/error.rs",
+      "bytes": 1682,
+      "sha256": "b60bce29f50ce640fb1932009bd447f0ff7fc0e293900befb05a9d8df0e43413"
+    },
+    {
+      "path": "src/cuda_backend/mod.rs",
+      "bytes": 102490,
+      "sha256": "bc2bd5fe3702bfccb49d64af07dc4197013d6617c720643cd2a14b718f4134e2"
+    },
+    {
+      "path": "src/cuda_backend/utils.rs",
+      "bytes": 7449,
+      "sha256": "24ceb7c9e50389a911e9aaf4d4f01e92ca3f2a06743adfa72981ba870a0574d9"
+    },
+    {
+      "path": "src/custom_op.rs",
+      "bytes": 16561,
+      "sha256": "c0a4953dad882f3a392070fa6bbabeaa582d2576d50bf349e12a97d680161ff1"
+    },
+    {
+      "path": "src/device.rs",
+      "bytes": 15213,
+      "sha256": "0929b7e72e83dea86a40f43f55a61eb2ca0dcb2d1c3c2d6e698bd18cf801754b"
+    },
+    {
+      "path": "src/display.rs",
+      "bytes": 17747,
+      "sha256": "17d38758a849310137f69069a0806224b9fdb682c0b44196b6d5885327515211"
+    },
+    {
+      "path": "src/dtype.rs",
+      "bytes": 8188,
+      "sha256": "75b91eb41b522e935e3a14d3ab27dca2232b7cfab54eb2e702e60a0c8830677c"
+    },
+    {
+      "path": "src/dummy_cuda_backend.rs",
+      "bytes": 8475,
+      "sha256": "842836efb0c1ca8097d1a5c11140207f185b7f877603e98091afdf7d494fee47"
+    },
+    {
+      "path": "src/dummy_dtype.rs",
+      "bytes": 8036,
+      "sha256": "50bcae6eeba464291a8d85020e967056b42cc7199658999de7159d0c4e8190e0"
+    },
+    {
+      "path": "src/dummy_metal_backend.rs",
+      "bytes": 7147,
+      "sha256": "e59c40e1aea0210adac21316af7b7e9b838d8357da9492045f530a139d35acd7"
+    },
+    {
+      "path": "src/error.rs",
+      "bytes": 10898,
+      "sha256": "e6605678f4093e0867e73a5579aa8d046d13d65bd609d5851edf42d44051927d"
+    },
+    {
+      "path": "src/indexer.rs",
+      "bytes": 7912,
+      "sha256": "2df921d3e8284540a34c197b692b384ed5d6a25047d3685535f01c227718a3e0"
+    },
+    {
+      "path": "src/layout.rs",
+      "bytes": 8632,
+      "sha256": "1bf7fca1aa8759cfe4663a63ed9cce5dcc7ae8da84fc5a2e043697a279980db7"
+    },
+    {
+      "path": "src/lib.rs",
+      "bytes": 5196,
+      "sha256": "9af681b32415683bc3adf3c57070b6a70cf363706881755edb306fba1de11a5f"
+    },
+    {
+      "path": "src/metal_backend/device.rs",
+      "bytes": 11319,
+      "sha256": "2d19cb39c3a36dc24ba0f3e8b94a4ff1c9497f6ccf73a2a745b8716ae4beba5c"
+    },
+    {
+      "path": "src/metal_backend/mod.rs",
+      "bytes": 84621,
+      "sha256": "e5652cc1620fece91cf41ba5f7a72175940b0bc1ff4a9d37e3654b8adac59a66"
+    },
+    {
+      "path": "src/mkl.rs",
+      "bytes": 11567,
+      "sha256": "c80564bd6139736e0e28336ba3130f386da963d62238eb45f2f1a15c506c2254"
+    },
+    {
+      "path": "src/npy.rs",
+      "bytes": 17096,
+      "sha256": "e02989479340152490be8d2f75103336675138e364dfe9036c49a0891d283ee7"
+    },
+    {
+      "path": "src/op.rs",
+      "bytes": 27977,
+      "sha256": "8787d8e941217e500b7f653aa4252c41a0e15459c31f7373d0dc896fce4c4521"
+    },
+    {
+      "path": "src/pickle.rs",
+      "bytes": 27360,
+      "sha256": "7fcb931fb616c35c7817e5461cc6173d7c6635339223c360a6c22fb077c07d63"
+    },
+    {
+      "path": "src/quantized/avx.rs",
+      "bytes": 28323,
+      "sha256": "69cb5408571eb64812cb6386f0e24a7ff39fdc16482d44ee9f31fb40e536665c"
+    },
+    {
+      "path": "src/quantized/cuda.rs",
+      "bytes": 31676,
+      "sha256": "5fd3910153ede34a3fdfa1c102f145b2ccd30949565bf1030cced8e9c33b8185"
+    },
+    {
+      "path": "src/quantized/dummy_cuda.rs",
+      "bytes": 2374,
+      "sha256": "534ff012566fea238b247715c278352fa1860202ea9c8db32636469769f6dd97"
+    },
+    {
+      "path": "src/quantized/dummy_metal.rs",
+      "bytes": 2161,
+      "sha256": "a9c727095f509046d1a50d131eee1529f9aa97ab306ceb1a44a1e827ea10109d"
+    },
+    {
+      "path": "src/quantized/ggml_file.rs",
+      "bytes": 9229,
+      "sha256": "dfc48f822e4393bc836efcf782f4a6bb36168ac9d641324a054f13ee862aadac"
+    },
+    {
+      "path": "src/quantized/gguf_file.rs",
+      "bytes": 18416,
+      "sha256": "a263c9076e3e233457cc3d7780e3240c6448c7b5b8c517e480353691be5ff186"
+    },
+    {
+      "path": "src/quantized/imatrix_file.rs",
+      "bytes": 2580,
+      "sha256": "4ad710e64a0c9d3e5c2be1f6ca0a760035babb66c5fb91774acd1d7a30288d66"
+    },
+    {
+      "path": "src/quantized/k_quants.rs",
+      "bytes": 87195,
+      "sha256": "736a4b74c26c8c3be2917ec4c4ca88cf87e892c6b3278f5a466726bdf84f21b1"
+    },
+    {
+      "path": "src/quantized/metal.rs",
+      "bytes": 14774,
+      "sha256": "cacf5336009a8f83e13fa32a3f1c5e28ab5a5d52fc91d9ec4ddc265a1bcc7eb4"
+    },
+    {
+      "path": "src/quantized/mod.rs",
+      "bytes": 32384,
+      "sha256": "132266be33d33dadce92ff8be68445681ccf3052af7fad411a7ab5f39a9e3c3e"
+    },
+    {
+      "path": "src/quantized/neon.rs",
+      "bytes": 22872,
+      "sha256": "2a46cd5cf8f296c3673f61380bac49fd98232472ae5db60dc7babc788fdd0be7"
+    },
+    {
+      "path": "src/quantized/simd128.rs",
+      "bytes": 17120,
+      "sha256": "5c8000c6dea9803de8befde33b15970c1b1dcbf83b914c6261a3e9c2b658c1da"
+    },
+    {
+      "path": "src/quantized/tokenizer.rs",
+      "bytes": 11226,
+      "sha256": "bffd78cafb82f4c33a4d39af79a78512c3781cd2d6ea25d30db3faf05c934b1a"
+    },
+    {
+      "path": "src/quantized/utils.rs",
+      "bytes": 16370,
+      "sha256": "33a4ff45fafb4baecbd6b95f68fd373d447283be19e38e63f1f4da3434f3a47b"
+    },
+    {
+      "path": "src/safetensors.rs",
+      "bytes": 23318,
+      "sha256": "6ff3c7a3a6a381c4ded94c3831557527e2e4288c1d02455938d12d4885adb33c"
+    },
+    {
+      "path": "src/scalar.rs",
+      "bytes": 3356,
+      "sha256": "d98ca484e6fd0580f2b8bb2c3c43283671496042aa9d58115829052532d6200c"
+    },
+    {
+      "path": "src/shape.rs",
+      "bytes": 18062,
+      "sha256": "cc658a486d3f993019335b48bd5cfc8061b6817223f34bd3cf0f49994b375e43"
+    },
+    {
+      "path": "src/sort.rs",
+      "bytes": 11046,
+      "sha256": "4c1263ab7b6f80a1acd05813a4afd4ef2aa98d44378458829dfc403bccfdbb92"
+    },
+    {
+      "path": "src/storage.rs",
+      "bytes": 29392,
+      "sha256": "6241271357ee152f0244e47053f40de811832fca89e8aece6420bbc1b5c485c4"
+    },
+    {
+      "path": "src/streaming.rs",
+      "bytes": 6138,
+      "sha256": "abd0de65d894b617e6e3fb0c0787f220582bcb1f8eb9341c33bb74aaa23bf165"
+    },
+    {
+      "path": "src/strided_index.rs",
+      "bytes": 2453,
+      "sha256": "b4884a6ad8d6fcb043b69b47b8203a035f40616057677802df32c4ee3799445b"
+    },
+    {
+      "path": "src/tensor.rs",
+      "bytes": 116067,
+      "sha256": "25b95a8deecffa87d55325d9ae258b9552778a7eb24a653b7c1438340aa21487"
+    },
+    {
+      "path": "src/tensor_cat.rs",
+      "bytes": 11055,
+      "sha256": "8c97ffbac8ca2fef78d5d1440e05df7915e6b1c2ae34ef891a36e6a6e989f497"
+    },
+    {
+      "path": "src/utils.rs",
+      "bytes": 888,
+      "sha256": "bdfc884fb12a14eb2b5a0dfafebd7951596ac9361f97c1cd93c4284507eec9e6"
+    },
+    {
+      "path": "src/variable.rs",
+      "bytes": 4731,
+      "sha256": "b9b10b5d2d4a81d1ab920f9337e556a634bae7e484a0b04ea855f9a903fc87ec"
+    }
+  ],
   "owned_deltas": [
-    "select cudarc/dynamic-loading instead of cudarc/dynamic-linking",
-    "exclude upstream examples, benches, tests, dev-dependencies, and inline test-only modules under Astrolabe's manual-FSV-only policy"
+    "select exact cudarc 0.19.8 with CUDA 13.3 and controlled dynamic-loading instead of host discovery/eager dynamic-linking",
+    "exclude upstream examples, benches, tests, dev-dependencies, and inline test-only modules under Astrolabe's manual-FSV-only policy",
+    "fail the native build when any owned package, source, license, provenance, or CUDA linkage byte drifts from this receipt"
   ]
 }

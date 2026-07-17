@@ -9,8 +9,19 @@ pub mod topk;
 
 use crate::{Backend, DeviceInfo, Result};
 
+#[cfg(windows)]
+pub use crate::cuda_runtime::{
+    PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation, PinnedCudaRuntimeAttestation,
+    attest_pinned_cuda_dependencies, attest_pinned_cuda_driver_identity,
+    current_pinned_cuda_device,
+    initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
+    select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
+};
 pub use crate::mxfp4;
-pub use context::{CudaContext, init_cuda, query_device_info};
+pub use context::{
+    CudaContext, CudaPrimaryContextStream, attest_cuda_driver_ordinal, attest_cudarc_context,
+    driver_ordinal_for_pci_bus_id, init_cuda, init_cuda_by_pci_bus_id, query_device_info,
+};
 pub use distance::{cosine_batch_gpu, dot_batch_gpu, l2_batch_gpu, normalize_rows_gpu};
 pub use gemm::{
     bench_gemm_cublas, bench_gemm_reference_cublas, gemm_cublas, gemm_mxfp4_fp32_accum,
@@ -35,7 +46,7 @@ pub struct CudaBackend {
 
 impl CudaBackend {
     pub fn new() -> Result<Self> {
-        init_cuda(0, false).map(|ctx| Self { ctx })
+        init_cuda(crate::configured_cuda_runtime_ordinal()?, false).map(|ctx| Self { ctx })
     }
 
     pub fn with_context(ctx: CudaContext) -> Self {
