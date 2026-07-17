@@ -1,5 +1,12 @@
 # PH14 — TurboQuant (rotate + scalar + QJL)
 
+> **Historical implementation plan — superseded.** This directory preserves the
+> retired pre-TQPR-v2 design and test-era checklist; it is not current API,
+> wire-format, operating-point, or verification guidance. Use
+> [`../../systemspecs/06_forge_math_runtime.md`](../../systemspecs/06_forge_math_runtime.md)
+> and [`../../systemspecs/07_registry_lenses.md`](../../systemspecs/07_registry_lenses.md)
+> as the source of truth. Current verification is manual real-artifact FSV only.
+
 **Stage:** S2 — Forge Math Runtime  ·  **Crate:** `calyx-forge`  ·
 **PRD roadmap:** P4b  ·  **Axioms:** A25, A13, A16
 

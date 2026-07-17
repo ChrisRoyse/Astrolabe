@@ -38,7 +38,7 @@ CUDA backend (`cuda` feature)
 
 Quantization
 - `src/quant/mod.rs` — `QuantLevel`, `Quantizer`, `QuantizedVec`
-- `src/quant/rotation.rs` — Hadamard + Rademacher rotation seed
+- `src/quant/rotation.rs` — deterministic implicit Haar-orthogonal rotation
 - `src/quant/turboquant.rs` — TurboQuant Bits3p5 / Bits2p5 codec
 - `src/quant/qjl.rs` — QJL unbiased dot residual
 - `src/quant/binary.rs` — 1-bit (Bits1) codec, Hamming prefilter
@@ -290,99 +290,122 @@ CUDA-gated tests are `#[ignore]` without the `cuda` feature.
 | `Bits8` | 8.0 | yes | Scalar INT8 (`ScalarInt8Codec`) |
 | `Bits8Fp` | 8.0 | yes | MXFP8 (`MxFp4Codec`) |
 | `Bits4Fp` | 4.0 | yes | MXFP4 (`MxFp4Codec`) |
-| `Bits3p5` | 3.5 | yes | TurboQuant (7-bit code) |
-| `Bits2p5` | 2.5 | yes | TurboQuant (base-5 code) |
+| `Bits3p5` | 3.5 | yes | TurboQuant (alternating 3/2-bit Lloyd–Max scalar codes + one QJL bit/coordinate) |
+| `Bits2p5` | 2.5 | yes | TurboQuant (alternating 2/1-bit Lloyd–Max scalar codes + one QJL bit/coordinate) |
 | `Bits1` | 1.0 | yes | `BinaryCodec` |
 
 `is_lossy()` returns false only for `F32`.
 
-`Quantizer` trait (`src/quant/mod.rs:70`): `encode(&[f32]) -> QuantizedVec`,
-`decode(&QuantizedVec) -> Vec<f32>`, `dot_estimate(a,b) -> f32`, `level()`, `dim()`.
+`Quantizer` trait (`src/quant/mod.rs`): `encode(&[f32]) -> QuantizedVec`,
+`decode(&QuantizedVec) -> Vec<f32>`, `dot_estimate(query,candidate) -> f32`, `level()`,
+`dim()`. TurboQuant's dot estimate is deliberately asymmetric: the query remains
+uncompressed and the candidate remains packed.
 
 `QuantizedVec` (`src/quant/mod.rs:78`):
 `{ level: QuantLevel, dim: usize, bytes: Vec<u8>, scale: f32, seed_id: [u8;32] }`.
 
-### 4.2 Rotation seed (Hadamard + Rademacher)
+### 4.2 Deterministic Haar rotation
 
-`RotationSeed` (`src/quant/rotation.rs:12`): `{ id: [u8;32], version: u8, dim,
-diagonal: Vec<f32> }`, where `diagonal` is a ±1 (Rademacher) sign vector.
-`CURRENT_SEED_VERSION = 1`.
+`RotationSeed` (`src/quant/rotation.rs`) persists only content-addressed geometry
+material: `{ id: [u8;32], version: u8, dim, entropy: [u8;32] }`.
+`CURRENT_SEED_VERSION = 2`; valid dimensions are `1..=4096`. `new_seed(dim,
+entropy)` domain-separates and hashes the caller entropy and dimension, and the
+persisted `id` binds that derived entropy, version, and dimension. A malformed ID,
+unsupported version, invalid dimension, shape mismatch, or non-finite coefficient is
+a typed error.
 
-- `new_seed(dim, entropy)` (line 32): seeds ChaCha8 from `SHA256(entropy ‖ dim_le)`,
-  draws the ±1 diagonal, and sets `id = SHA256(diagonal_le ‖ version ‖ dim_le)`.
-- `apply_rotation` (line 47): **block Hadamard transform** then per-element sign
-  multiply. `apply_block_hadamard` decomposes `dim` into power-of-two blocks
-  (largest-first) and runs an in-place Walsh–Hadamard butterfly, scaling each block
-  by `1/√block_len` so the transform is **orthonormal** (L2-preserving).
-- `apply_inverse_rotation` (line 61): signs first, then Hadamard (the transform is
-  its own inverse up to the scale). Round-trips to within `1e-6`.
+`HaarRotation` deterministically draws Gaussian columns from the seed and stores the
+normalized Householder factors plus column signs of the resulting orthogonal matrix
+`R`. `apply_rotation` applies the signs and Householder factors; the inverse applies
+the same factors in the opposite order and then the signs. The transform is
+orthogonal and therefore preserves L2 geometry. TurboQuant constructs this geometry
+once per codec instead of regenerating it for each vector. The binary codec uses the
+same public rotation contract but has its own packed representation.
 
-This rotation is the shared front-end of TurboQuant and the binary codec — it
-spreads vector energy across coordinates so per-coordinate scalar quantization
-behaves uniformly.
+### 4.3 TurboQuant codec and TQPR-v2 (Bits3p5 / Bits2p5)
 
-### 4.3 TurboQuant codec (Bits3p5 / Bits2p5)
+`TurboQuantCodec` owns one frozen rotation, Gaussian QJL projection, and pair of
+Lloyd–Max scalar codebooks. Only `Bits3p5` and `Bits2p5` are accepted. The codebooks
+are optimized for one coordinate of a uniformly distributed point on the unit
+sphere. The current solver substitutes `x = sin(theta)` and integrates the smooth
+weight `cos(theta)^(dim-2)` on 32,768 midpoint-quadrature samples, with at most 256
+Lloyd iterations and a `1e-13` convergence threshold. Codebooks are deterministic,
+symmetric, cached by `(dimension,bits)`, and restricted to 1–3 bits.
 
-`TurboQuantCodec` (`src/quant/turboquant.rs:16`) holds the rotation `seed`, a derived
-`rademacher` seed (for QJL, Section 4.4), and a `level` (only `Bits3p5` or `Bits2p5`
-accepted). Quantization constants:
+The scalar width alternates by coordinate, with the wider code on even coordinates:
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `BITS3P5_CODE_BITS` | `7` | bits per scalar code at Bits3p5 |
-| `BITS3P5_LEVELS` | `128` (`1<<7`) | code levels at Bits3p5 |
-| `BITS2P5_LEVELS` | `5` | base-5 levels at Bits2p5 |
+| Level | even scalar bits | odd scalar bits | QJL bits/coordinate | exact data bits for even `d` |
+|---|---:|---:|---:|---:|
+| `Bits3p5` | 3 | 2 | 1 | `3.5d` |
+| `Bits2p5` | 2 | 1 | 1 | `2.5d` |
 
-**Encode steps** (`rotate_quantize_scalar_parts` + `encode`, lines 58-85):
-1. Reject non-finite input (fail-closed).
-2. `rotated = apply_rotation(seed, vec)`.
-3. `scale = max(|rotated|)` (per-vector amplitude).
-4. `code = clamp(round((value/scale + 1)·(max_code/2)), 0, max_code)` where
-   `max_code = level_steps(level) − 1` (`quantize_codes`, line 199). This maps the
-   symmetric range `[−scale, scale]` onto `0..=max_code`.
-5. Pack codes (Section 4.3.1).
-6. Compute the scalar `decoded` and append a QJL residual section (Section 4.4).
-7. Emit `QuantizedVec { level, dim, bytes, scale, seed_id }`.
+For any `d`, `scalar_bits = d·low_bits + ceil(d/2)` and `data_bits = scalar_bits +
+d`. An odd dimension necessarily carries the final wider scalar code. The logical
+bit budget excludes byte padding and the authenticated format header; storage reports
+all three separately rather than calling the physical payload 2.5 or 3.5 bits/channel.
 
-**Decode** (`dequantize_scalar`, line 187): for `scale != 0`,
-`value = code·(2·scale)/max_code − scale`, then `apply_inverse_rotation`.
+**Encode** for a nonzero source vector `x`:
 
-#### 4.3.1 Bit packing
+1. Reject shape mismatches and non-finite input; require `1 <= d <= 4096`.
+2. Compute `rho = ||x||₂`, normalize `u = x/rho`, and rotate `z = R u`.
+3. Lloyd–Max-quantize each `z_i` with its coordinate's low/high codebook, producing
+   centroid vector `c` and residual `e = z - c`.
+4. Project `e` with the frozen dense Gaussian matrix `S`; retain one sign bit for
+   each coordinate of `S e` and `gamma = rho ||e||₂`.
+5. Pack the alternating scalar codes little-endian, followed by the QJL sign
+   bitstream. Zero vectors use the unique all-zero scalar/QJL/gamma representation.
 
-- **Bits3p5** (`pack_bits3p5`, line 228): one 7-bit code per coordinate written
-  little-endian into a bitstream, so 8 values occupy 56 bits = 7 bytes. Packed
-  length = `(dim·7).div_ceil(8)` bytes. `write_bits`/`read_bits` operate bit-by-bit.
-- **Bits2p5** (`pack_bits2p5`, line 244): four base-5 codes packed into one 10-bit
-  lane as `c0 + 5·c1 + 25·c2 + 125·c3`, stored in 2 bytes (upper 6 bits padding).
-  Packed length = `dim.div_ceil(4)·2` bytes → exactly 4 values per 2 bytes (2.5
-  bits/value nominal once the QJL residual amortizes).
+**TQPR-v2 payload.** Every encoded candidate has an 88-byte authenticated header:
 
-### 4.4 QJL unbiased dot residual
+```
+bytes  0..4   magic "TQPR"
+byte       4  format version = 2
+byte       5  level code (1=Bits2p5, 2=Bits3p5)
+bytes  6..8   reserved flags = 0 (little-endian)
+bytes  8..12  dimension
+bytes 12..16  scalar bit count
+bytes 16..20  QJL bit count (= dimension)
+bytes 20..24  gamma (finite, non-negative f32)
+bytes 24..56  complete geometry ID
+bytes 56..88  domain-separated SHA-256
+bytes 88..    scalar bitstream, then QJL sign bitstream
+```
 
-The scalar codes alone are biased; TurboQuant appends a 1-bit-per-coordinate QJL
-(Quantized Johnson–Lindenstrauss) residual section so `dot_estimate` is unbiased.
+The geometry ID hashes the format/level, rotation seed, every Householder factor and
+column sign, every Gaussian projection coefficient, and both codebooks. Parsing
+requires the exact calculated length, known level/version, matching geometry,
+canonical zero and padding bits, and a valid digest. TQPR-v1 remains readable only
+inside the explicit registry migration verifier; it is never a current write format.
 
-`QjlResidual` (`src/quant/qjl.rs:7`): `{ bits: Vec<u8>, rademacher_seed: [u8;32] }`.
+Decode reconstructs
+`R^T(rho·c + sqrt(pi/2)·gamma/d·S^T sign(S e))`. Decoding is available for readback,
+but primary recall does not reconstruct candidate vectors.
 
-**Encode** (`encode_qjl_residual`, line 12): for each coordinate compute
-`residual = (rotated − scalar_decoded)·sign` (sign from the Rademacher diagonal); set
-bit `idx` iff `residual > 0`. This stores the **sign of the quantization residual** in
-the Rademacher-rotated basis.
+The 2.5/3.5 names here describe Calyx's deterministic, data-oblivious alternating
+mixed-width specialization for arbitrary embedding search. They do not claim to
+reproduce a model-calibrated per-channel outlier split from a particular TurboQuant
+KV-cache profile. Any future channel-profile variant must persist and authenticate
+that profile as part of its geometry.
 
-**Section layout** (`append_qjl_section`, line 116): `[tag 0x01][32-byte rademacher
-seed][ceil(dim/8) residual bytes]`, appended after the scalar bytes. `read_qjl_section`
-(line 122) validates total length and the tag.
+### 4.4 Asymmetric QJL scoring
 
-**Unbiased dot** (`dot_estimate_unbiased`, line 84):
-1. Verify both vectors share `seed_id`; decode both to scalar fp32.
-2. `scalar_dot = Σ a·b` over the decoded scalars.
-3. Read both QJL residual sections; verify rademacher seed matches the codec.
-4. `correction = scale_a·scale_b·(Σ bipolar(a_i)·bipolar(b_i))/dim`, where
-   `bipolar(bit)` is `+1`/`−1` (`dot_qjl_correction`, line 49).
-5. Return `scalar_dot + correction`.
+QJL keeps the query at high precision and compresses only stored candidates.
+`prepare_query(y)` computes `R y` and `S R y` once. A validated candidate is then
+scored directly from its packed scalar codes and QJL sign bytes:
 
-Tests bound mean absolute dot error to ≤0.05 (Bits3p5) and ≤0.10 (Bits2p5) over 1000
-random unit pairs at dim 128.
+`score(y,x_hat) = rho <R y,c> + sqrt(pi/2)·gamma/d <S R y,sign(S e)>`.
+
+The scalar term reads centroid pairs directly from the little-endian bitstream; it
+does not allocate or reconstruct candidate coordinates. The QJL sign dot uses a
+256-entry byte lookup table with SIMD accumulation. Candidate-vs-candidate
+compressed scoring is not the TurboQuant contract. Prepared queries and validated
+candidates are bound to the same dimension, level, and complete geometry ID; a
+mismatch fails closed.
+
+Manual compression FSV exercises this actual packed path against durable real-vault
+rows, compares it with independently computed exact scores and persisted raw
+sidecars, reads physical payload/accounting state back from Aster, and verifies
+corruption, migration, dimension, empty-input, and ambiguous ranking boundaries.
 
 ### 4.5 Binary codec (Bits1)
 
@@ -632,10 +655,11 @@ separate on-disk artifacts.
 | `CUDA_ARCH` | `sm_120` | build.rs | nvcc target arch |
 | `MIN_FREE_VRAM_MIB` | 4096 | cuda/context.rs | min free VRAM floor |
 | `PARITY_TOL` / `PARITY_ABS_TOL` | 1e-3 / 1e-6 | tests/cuda_parity_support.rs | CPU/GPU parity tolerances |
-| `CURRENT_SEED_VERSION` | 1 | quant/rotation.rs | rotation seed version |
-| `BITS3P5_CODE_BITS` / `BITS3P5_LEVELS` | 7 / 128 | quant/turboquant.rs | Bits3p5 packing |
-| `BITS2P5_LEVELS` | 5 | quant/turboquant.rs | Bits2p5 base-5 packing |
-| `QJL_SECTION_TAG` | 0x01 | quant/qjl.rs | residual section marker |
+| `CURRENT_SEED_VERSION` | 2 | quant/rotation.rs | implicit Haar geometry seed version |
+| `TURBOQUANT_FORMAT_VERSION` / `TURBOQUANT_FORMAT_HEADER_BYTES` / `TURBOQUANT_MAX_DIM` | 2 / 88 / 4096 | quant/turboquant.rs | TQPR format and dimension bound |
+| scalar widths (`Bits3p5` / `Bits2p5`) | 3+2 / 2+1 alternating | quant/turboquant.rs | Lloyd–Max scalar packing before one QJL bit/coordinate |
+| `QUADRATURE_POINTS` / `MAX_LLOYD_ITERATIONS` / `CONVERGENCE` | 32768 / 256 / 1e-13 | quant/codebook.rs | sphere-coordinate Lloyd–Max solver |
+| `QJL_FACTOR` | `sqrt(pi/2)` | quant/qjl.rs | asymmetric Gaussian sign-correction factor |
 | `MXFP4_BLOCK_SIZE` / `MXFP4_PACKED_BYTES` | 32 / 16 | cuda/mxfp4.rs | MXFP4 block |
 | `MXFP4_EXP_BIAS` / `MXFP4_ZERO_CODE` / `MXFP4_NAN_CODE` | 127 / 7 / 15 | cuda/mxfp4.rs | MXFP4 codes |
 | `MXFP8_BLOCK_SIZE` / `MXFP8_BLOCK_BYTES` | 32 / 33 | cuda/mxfp8.rs | MXFP8 block; E4M3, bias 7 |

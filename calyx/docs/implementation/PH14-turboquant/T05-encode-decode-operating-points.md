@@ -1,5 +1,9 @@
 # PH14 · T05 — Encode / decode roundtrip + operating-point FSV
 
+> **Historical implementation card — superseded.** It records the retired
+> pre-TQPR-v2/test-era plan and is not current API, wire-format, or verification
+> guidance. See [`../../systemspecs/06_forge_math_runtime.md`](../../systemspecs/06_forge_math_runtime.md).
+
 | Field | Value |
 |---|---|
 | **Phase** | PH14 — TurboQuant (rotate + scalar + QJL) |
