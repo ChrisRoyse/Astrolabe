@@ -8,7 +8,9 @@ use astrolabe_anchors::archaeology::{
 use astrolabe_anchors::{
     OutcomeAnchorRequest, OutcomeKind, OutcomeSubject, ingest_outcome_anchors,
 };
-use astrolabe_bridge::{CbmIndexMode, CbmPipeline, CbmPipelineNodeRow, CbmPipelineRows};
+use astrolabe_bridge::{
+    CbmIndexMode, CbmPipeline, CbmPipelineEdgeRow, CbmPipelineNodeRow, CbmPipelineRows,
+};
 // #502: share the clone farm's #480 Windows-invalid-path classifier so the historical
 // checkout and the farm never disagree on what NTFS can hold.
 use astrolabe_fleet::clone_farm::windows_invalid_path;
@@ -178,6 +180,18 @@ pub(crate) struct GitArchaeologyImportReport {
     /// `evidence_without_symbol`, and the pass never aborts repo-fatally the way an
     /// unfiltered `git checkout` of such a path did before the fix.
     pub(crate) historical_paths_windows_invalid: usize,
+    /// #515 crash-isolation counter: historical evidence commits whose CBM
+    /// extraction ran in an isolated child process ([`extract_historical_rows_isolated`])
+    /// that died without producing rows — a C-level pipeline fault (abort/access
+    /// violation/heap-corruption class) on that commit's checkout. BEFORE #515 this
+    /// same fault ran IN-PROCESS and took the whole host `index_repository` down with
+    /// it: an empty-stdout `rc=127` silent hard-exit with no structured error (the
+    /// exact fail-closed violation this issue tracks). Now the fault is contained in
+    /// the child, the host survives, this commit's evidence lands as
+    /// `evidence_without_symbol`, and the count is surfaced here (invariant 3: every
+    /// degradation counted, never a silent skip). A nonzero value means the kernel
+    /// still completed but that many historical commits contributed no anchors.
+    pub(crate) historical_commits_crashed: usize,
     /// Provenance label for the git history this pass mined (#434, invariant 1/3:
     /// no unlabeled claim, no silent fallback). `own_repo` when the corpus IS its
     /// own git toplevel (`.git` at the corpus root); `parent_repo` when the corpus
@@ -443,6 +457,22 @@ pub(crate) fn run_git_archaeology<C: Clock>(
         }
         report.cleanup_remnants += indexed.cleanup_remnants;
         report.historical_paths_windows_invalid += indexed.windows_invalid_excluded;
+        // #515: the isolated extraction child died on a C-level pipeline fault for
+        // this commit's checkout. It is CONTAINED (the host process survives) instead
+        // of the pre-#515 in-process fault that hard-exited the whole index_repository
+        // with a silent empty-stdout rc=127. Count it, land this commit's evidence as
+        // evidence_without_symbol, log a labeled line (invariant 3: never a silent
+        // skip), and continue — the remaining commits and the kernel still complete.
+        if let Some(detail) = indexed.crashed {
+            report.historical_commits_crashed += 1;
+            report.evidence_without_symbol += group.len();
+            eprintln!(
+                "astro.archaeology.historical_index_crashed commit={commit} \
+                 evidence_in_group={} outcome=contained_child_fault detail={detail}",
+                group.len()
+            );
+            continue;
+        }
         let selected = select_implicated_rows(indexed.rows, group);
         if selected.nodes.is_empty() {
             report.evidence_without_symbol += group.len();
@@ -509,6 +539,337 @@ pub(crate) fn run_git_archaeology<C: Clock>(
     Ok(report)
 }
 
+/// #515 fail-closed ceiling for one isolated historical-commit extraction child.
+/// File-scoped historical indexing (#439) materializes only the handful of files an
+/// evidence group touches, so a single extraction is sub-second in practice; this
+/// bound is not a tuned throughput knob but a hang guard — a child still running
+/// after it is killed and reported as a contained fault rather than stalling the
+/// whole import on an unbounded wait (invariant 3: the degradation is labeled/counted,
+/// never a silent indefinite block).
+const ARCHAEOLOGY_EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// #515 poll granularity while waiting on the isolated extraction child. Short so a
+/// sub-second extraction is not padded, bounded so the wait loop never spins hot.
+const ARCHAEOLOGY_EXTRACT_POLL: Duration = Duration::from_millis(25);
+
+/// Runs one historical commit's CBM extraction in an ISOLATED CHILD PROCESS (#515).
+///
+/// This is the crash-isolation boundary for the git-archaeology per-commit
+/// historical re-index. The main shadow import already runs CBM out-of-process in a
+/// supervised worker (#405); this path did not, so a C-level pipeline fault (abort /
+/// access violation / heap-corruption class) on one of a large repo's historical
+/// checkouts hard-exited the ENTIRE host `index_repository` — an empty-stdout
+/// `rc=127` silent termination with no structured error (issue #515, reproduced on
+/// rtk-ai/rtk after the live CBM graph was already complete). The parent spawns
+/// `astrolabe cli --archaeology-extract`, which runs the identical `CbmPipeline`
+/// (same `scoped_root`, `database`, mode) and serializes the pipeline rows to
+/// `--response-out`. A child that exits cleanly with a readable rows response yields
+/// [`HistoricalExtract::Rows`]; a child that dies (nonzero exit / killed / no usable
+/// response) is CONTAINED as [`HistoricalExtract::Crashed`] carrying a structured
+/// `{code, exit, reason, phase, remediation, stderr_tail}` detail, so the host
+/// survives and the caller degrades exactly this one commit (labeled, counted).
+fn extract_historical_rows_isolated(
+    scoped_root: &Path,
+    database: &Path,
+    project: &str,
+    commit: &str,
+) -> Result<HistoricalExtract, DynError> {
+    let exe = std::env::current_exe().map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_EXTRACT_EXE_UNRESOLVED: could not resolve the running \
+             astrolabe executable to spawn the isolated historical-index child: {error}; \
+             remediation: this is an internal invariant of index_repository — retry the run"
+        )
+        .into()
+    })?;
+    // Scratch IO shares the scratch `.db`'s already-unique nonce and its `\\?\`-safe
+    // store-dir location, so a deep store never trips the sibling files past MAX_PATH.
+    let sidecar = |suffix: &str| -> PathBuf {
+        let mut name = database.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let args_path = sidecar(".extract-args.json");
+    let response_path = sidecar(".extract-rows.json");
+    let stderr_path = sidecar(".extract-stderr.txt");
+    let _ = fs::remove_file(&response_path);
+
+    let request = json!({
+        "scoped_root": path_str(scoped_root)?,
+        "database": path_str(database)?,
+        "project": project,
+        "mode": "fast",
+    });
+    fs::write(&args_path, serde_json::to_vec(&request)?)?;
+
+    let stderr_file = fs::File::create(&stderr_path)?;
+    let stdout_file = stderr_file.try_clone()?;
+    let spawn = Command::new(&exe)
+        .args(["cli", "--archaeology-extract", "--args-file"])
+        .arg(&args_path)
+        .arg("--response-out")
+        .arg(&response_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&args_path);
+            let _ = fs::remove_file(&stderr_path);
+            return Err(format!(
+                "ASTRO_ARCHAEOLOGY_EXTRACT_SPAWN_FAILED: could not spawn the isolated \
+                 historical-index child {}: {error}; remediation: ensure the astrolabe \
+                 binary is present and executable on this host",
+                exe.display()
+            )
+            .into());
+        }
+    };
+
+    let deadline = std::time::Instant::now() + ARCHAEOLOGY_EXTRACT_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(ARCHAEOLOGY_EXTRACT_POLL);
+            }
+        }
+    };
+
+    let outcome = match status {
+        Some(status) if status.success() => match fs::read(&response_path) {
+            Ok(bytes) => match parse_extract_response(&bytes, project) {
+                Ok(rows) => HistoricalExtract::Rows(rows),
+                Err(detail) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                    commit,
+                    status.code(),
+                    &stderr_path,
+                    &format!("child exited cleanly but its rows response was unreadable: {detail}"),
+                )),
+            },
+            Err(error) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+                commit,
+                status.code(),
+                &stderr_path,
+                &format!("child exited cleanly but wrote no readable rows response: {error}"),
+            )),
+        },
+        Some(status) => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+            commit,
+            status.code(),
+            &stderr_path,
+            "the isolated CBM extraction child exited nonzero \
+             (C-level pipeline fault: abort / access violation / heap-corruption class)",
+        )),
+        None => HistoricalExtract::Crashed(archaeology_extract_fault_detail(
+            commit,
+            None,
+            &stderr_path,
+            &format!(
+                "the isolated CBM extraction child did not finish within {}s and was killed as hung",
+                ARCHAEOLOGY_EXTRACT_TIMEOUT.as_secs()
+            ),
+        )),
+    };
+
+    // Best-effort scratch-IO cleanup; the fault detail already captured the stderr
+    // tail above, so deleting the log here loses nothing. The scratch `.db` itself is
+    // removed by the caller's cleanup_archaeology_database.
+    let _ = fs::remove_file(&args_path);
+    let _ = fs::remove_file(&response_path);
+    let _ = fs::remove_file(&stderr_path);
+    Ok(outcome)
+}
+
+/// Builds the structured, single-line fault detail for a contained isolated-extraction
+/// crash (#515): a fail-closed `{code, exit, reason, phase, remediation}` record plus a
+/// bounded child-stderr tail so the offending C-level fault is auditable on the driving
+/// issue without the host having died to surface it.
+fn archaeology_extract_fault_detail(
+    commit: &str,
+    exit_code: Option<i32>,
+    stderr_path: &Path,
+    reason: &str,
+) -> String {
+    let exit = match exit_code {
+        Some(code) => format!("{code} (0x{:08X})", code as u32),
+        None => "none (killed_as_hung)".to_string(),
+    };
+    let stderr_tail = fs::read_to_string(stderr_path)
+        .map(|text| {
+            let chars: Vec<char> = text.chars().collect();
+            let start = chars.len().saturating_sub(600);
+            chars[start..].iter().collect::<String>()
+        })
+        .unwrap_or_else(|_| "<child stderr unreadable>".to_string());
+    format!(
+        "ASTRO_ARCHAEOLOGY_HISTORICAL_INDEX_CRASHED commit={commit} exit={exit} \
+         phase=git_archaeology.historical_reindex reason=\"{reason}\" \
+         remediation=\"the fault was contained in the isolated extraction child; the host \
+         index_repository completed and this commit is counted in historical_commits_crashed; \
+         inspect the child stderr tail to find the offending input\" stderr_tail=<<{stderr_tail}>>"
+    )
+}
+
+/// Child-process entry (#515) for `astrolabe cli --archaeology-extract`: runs one
+/// historical checkout's CBM extraction in this isolated process and serializes the
+/// pipeline rows to `response_out`. A C-level pipeline fault here dies with THIS child,
+/// never the host — that is the whole point of the isolation boundary. Not a
+/// user-facing tool: it consumes an internal args file (`scoped_root`, `database`,
+/// `project`, `mode`) and writes only the rows JSON response.
+pub(crate) fn run_archaeology_extract_worker(
+    args_json: &str,
+    response_out: &str,
+) -> Result<i32, DynError> {
+    let request: Value = serde_json::from_str(args_json).map_err(|error| -> DynError {
+        format!(
+            "ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_INVALID: the --archaeology-extract args file is not \
+             valid JSON: {error}"
+        )
+        .into()
+    })?;
+    let field = |key: &str| -> Result<&str, DynError> {
+        request[key].as_str().ok_or_else(|| -> DynError {
+            format!(
+                "ASTRO_ARCHAEOLOGY_EXTRACT_ARGS_INVALID: the --archaeology-extract args file is \
+                 missing required string field '{key}'"
+            )
+            .into()
+        })
+    };
+    let scoped_root = field("scoped_root")?;
+    let database = field("database")?;
+    let project = field("project")?;
+    let mode = match request["mode"].as_str() {
+        Some("full") => CbmIndexMode::Full,
+        Some("moderate") => CbmIndexMode::Moderate,
+        // Historical re-index is always Fast; anything else (incl. absent) maps to it.
+        _ => CbmIndexMode::Fast,
+    };
+    let mut pipeline = CbmPipeline::new(scoped_root, database, mode)?;
+    pipeline.set_project_name(project)?;
+    let rows = pipeline.collect_rows()?;
+    // Drop the pipeline (and CBM's SQLite handle) before the parent removes the
+    // scratch db, mirroring the pre-#515 in-process ordering.
+    drop(pipeline);
+    fs::write(response_out, serde_json::to_vec(&serialize_pipeline_rows(&rows))?)?;
+    Ok(0)
+}
+
+/// Serializes [`CbmPipelineRows`] to the isolated-extraction wire JSON. Manual
+/// `json!` construction (no serde derive dependency) over the flat, string/i64-only
+/// row fields — the child writes it, [`parse_extract_response`] reads it, and both
+/// preserve every field verbatim so the isolated path is byte-parity with the old
+/// in-process rows.
+fn serialize_pipeline_rows(rows: &CbmPipelineRows) -> Value {
+    json!({
+        "project": rows.project,
+        "nodes": rows.nodes.iter().map(|n| json!({
+            "id": n.id,
+            "project": n.project,
+            "label": n.label,
+            "name": n.name,
+            "qualified_name": n.qualified_name,
+            "file_path": n.file_path,
+            "start_line": n.start_line,
+            "end_line": n.end_line,
+            "properties_json": n.properties_json,
+        })).collect::<Vec<_>>(),
+        "edges": rows.edges.iter().map(|e| json!({
+            "id": e.id,
+            "project": e.project,
+            "source_id": e.source_id,
+            "target_id": e.target_id,
+            "edge_type": e.edge_type,
+            "properties_json": e.properties_json,
+            "url_path_gen": e.url_path_gen,
+            "local_name_gen": e.local_name_gen,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Reconstructs [`CbmPipelineRows`] from the isolated-extraction child's response
+/// bytes (#515). A missing/mistyped field fails closed with a labeled `Err(String)`
+/// so a truncated or malformed response is reported as a contained fault, never
+/// silently treated as "no rows".
+fn parse_extract_response(bytes: &[u8], project: &str) -> Result<CbmPipelineRows, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("response JSON parse: {error}"))?;
+    let nodes = value["nodes"]
+        .as_array()
+        .ok_or_else(|| "response missing 'nodes' array".to_string())?
+        .iter()
+        .map(parse_extract_node)
+        .collect::<Result<Vec<_>, String>>()?;
+    let edges = value["edges"]
+        .as_array()
+        .ok_or_else(|| "response missing 'edges' array".to_string())?
+        .iter()
+        .map(parse_extract_edge)
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CbmPipelineRows {
+        project: value["project"].as_str().unwrap_or(project).to_string(),
+        nodes,
+        edges,
+    })
+}
+
+fn parse_extract_node(value: &Value) -> Result<CbmPipelineNodeRow, String> {
+    let str_field = |key: &str| -> Result<String, String> {
+        value[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("node row missing string field '{key}'"))
+    };
+    let i64_field = |key: &str| -> Result<i64, String> {
+        value[key]
+            .as_i64()
+            .ok_or_else(|| format!("node row missing integer field '{key}'"))
+    };
+    Ok(CbmPipelineNodeRow {
+        id: i64_field("id")?,
+        project: str_field("project")?,
+        label: str_field("label")?,
+        name: str_field("name")?,
+        qualified_name: str_field("qualified_name")?,
+        file_path: str_field("file_path")?,
+        start_line: i64_field("start_line")?,
+        end_line: i64_field("end_line")?,
+        properties_json: str_field("properties_json")?,
+    })
+}
+
+fn parse_extract_edge(value: &Value) -> Result<CbmPipelineEdgeRow, String> {
+    let str_field = |key: &str| -> Result<String, String> {
+        value[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("edge row missing string field '{key}'"))
+    };
+    let i64_field = |key: &str| -> Result<i64, String> {
+        value[key]
+            .as_i64()
+            .ok_or_else(|| format!("edge row missing integer field '{key}'"))
+    };
+    Ok(CbmPipelineEdgeRow {
+        id: i64_field("id")?,
+        project: str_field("project")?,
+        source_id: i64_field("source_id")?,
+        target_id: i64_field("target_id")?,
+        edge_type: str_field("edge_type")?,
+        properties_json: str_field("properties_json")?,
+        url_path_gen: str_field("url_path_gen")?,
+        local_name_gen: str_field("local_name_gen")?,
+    })
+}
+
 fn group_evidence_by_commit(evidence: &[Evidence]) -> Vec<(&str, &[Evidence])> {
     let mut groups = Vec::new();
     let mut start = 0;
@@ -537,6 +898,20 @@ struct HistoricalCommitIndex {
     rows: CbmPipelineRows,
     cleanup_remnants: usize,
     windows_invalid_excluded: usize,
+    /// #515: `Some(detail)` when the isolated CBM extraction child died without
+    /// producing rows (a contained C-level pipeline fault on this commit). The
+    /// caller counts it, lands the evidence as `evidence_without_symbol`, and
+    /// continues rather than the pre-#515 in-process fault killing the whole host.
+    /// `None` on a clean extraction (`rows` carries the real result).
+    crashed: Option<String>,
+}
+
+/// Outcome of the isolated historical CBM extraction ([`extract_historical_rows_isolated`]):
+/// either the extracted pipeline rows, or a contained child-process fault carrying the
+/// structured detail (exit code + stderr tail) for the labeled skip.
+enum HistoricalExtract {
+    Rows(CbmPipelineRows),
+    Crashed(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -584,7 +959,7 @@ fn index_historical_commit(
         add_historical_worktree(repo, &worktree, commit, corpus_rel)?;
         0
     };
-    let indexed = (|| -> Result<CbmPipelineRows, DynError> {
+    let indexed = (|| -> Result<HistoricalExtract, DynError> {
         // Scope the historical index to the requested corpus subtree within the
         // whole-repo worktree (#403). A git worktree is always the full repository
         // tree, so indexing `worktree` itself walked the entire enclosing
@@ -599,39 +974,31 @@ fn index_historical_commit(
         // The corpus subtree may not exist at this historical commit (created or
         // renamed later). CBM cannot index a path that is not there; treat it as
         // "no historical rows for this commit" (the evidence then lands as
-        // evidence_without_symbol) rather than letting CBM abort on a missing
-        // root — the in-process abort would take the whole shadow import with it.
+        // evidence_without_symbol) rather than letting CBM abort on a missing root.
         if !scoped_root.exists() {
-            return Ok(CbmPipelineRows {
+            return Ok(HistoricalExtract::Rows(CbmPipelineRows {
                 project: project.to_string(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
-            });
+            }));
         }
-        let mut pipeline = CbmPipeline::new(
-            path_str(&scoped_root)?,
-            path_str(&database)?,
-            CbmIndexMode::Fast,
-        )?;
-        pipeline.set_project_name(project)?;
-        let rows = pipeline.collect_rows()?;
-        // Drop the pipeline (and with it CBM's SQLite handle) explicitly before
-        // cleanup so the removals below race only Windows' async handle release,
-        // which the bounded retry absorbs — not a still-open handle.
-        drop(pipeline);
-        // Keep historical node paths SUBTREE-relative — exactly as CBM emits them from
-        // `scoped_root`, and byte-for-byte what the LIVE shadow import records as
-        // `rel_file_path` when it indexes the member corpus directory directly (both go
-        // through the same `extract_nodes` → `canonical_input_bytes` identity path). Because
-        // `rel_file_path` is framed into the CxId, the historical and live conventions MUST
-        // coincide or an unchanged member symbol can never share a CxId — the #403
-        // re-anchoring UP to the toplevel namespace broke exactly this (#418). Attribution
-        // still lines up because the mined evidence is re-anchored DOWN into this same
-        // subtree-relative namespace in `run_git_archaeology`. The corpus_rel prefix lives
-        // only on disk (the worktree checkout / `scoped_root`), never in identity-bearing
-        // paths. Empty `corpus_rel` (toplevel corpus) never re-anchored either side, so that
-        // #413 control path stays byte-identical.
-        Ok(rows)
+        // #515 crash isolation: run the CBM extraction pipeline in a CHILD PROCESS,
+        // not in-process. Unlike the main shadow import — already crash-isolated in a
+        // supervised out-of-process worker (#405) — this per-commit historical
+        // re-index used to call `CbmPipeline::collect_rows()` on THIS host thread. A
+        // C-level pipeline fault (abort / access violation / heap-corruption class) on
+        // one of a large repo's historical checkouts therefore terminated the ENTIRE
+        // host `index_repository` process: an empty-stdout `rc=127` silent hard-exit
+        // with no structured {code,message,remediation} (issue #515, reproduced on
+        // rtk-ai/rtk deep in this loop after the CBM graph was already complete). The
+        // child runs the exact same `CbmPipeline` (same `scoped_root`, same scratch
+        // `database`, same Fast mode) so the emitted subtree-relative node paths — and
+        // thus the CxIds framed from `rel_file_path` via `canonical_input_bytes` —
+        // are byte-identical to the old in-process path (#418/#439 identity contract).
+        // A fault is now CONTAINED as `HistoricalExtract::Crashed`, the host survives,
+        // and the caller degrades this one commit (labeled, counted) instead of the
+        // whole index dying silently.
+        extract_historical_rows_isolated(&scoped_root, &database, project, commit)
     })();
     // Ask git to release and remove its worktree registration first; retries below
     // sweep any file/dir it leaves behind under Windows handle latency.
@@ -651,10 +1018,25 @@ fn index_historical_commit(
         cleanup_remnants += 1;
     }
     match (indexed, cleanup) {
-        (Ok(rows), Ok(())) => Ok(HistoricalCommitIndex {
+        (Ok(HistoricalExtract::Rows(rows)), Ok(())) => Ok(HistoricalCommitIndex {
             rows,
             cleanup_remnants,
             windows_invalid_excluded,
+            crashed: None,
+        }),
+        // #515 contained child fault: the extraction child died without rows. Report
+        // it as a labeled skip (the caller counts it and continues); the host lives.
+        // Any cleanup error is subsumed — the child already released its handles when
+        // it died, and the crash detail is the headline, remnants counted separately.
+        (Ok(HistoricalExtract::Crashed(detail)), _) => Ok(HistoricalCommitIndex {
+            rows: CbmPipelineRows {
+                project: project.to_string(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            cleanup_remnants,
+            windows_invalid_excluded,
+            crashed: Some(detail),
         }),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -1126,6 +1508,11 @@ pub(crate) fn git_archaeology_summary(report: &GitArchaeologyImportReport) -> Va
         // excluded from the historical checkout and counted here instead of aborting the
         // whole pass repo-fatally (invariant 3: every skip counted, never silent).
         "historical_paths_windows_invalid": report.historical_paths_windows_invalid,
+        // #515 labeled degradation: historical evidence commits whose isolated CBM
+        // extraction child died on a C-level pipeline fault. Contained (the host
+        // survives with a structured result) instead of the pre-#515 silent rc=127
+        // host hard-exit; the commit's evidence lands as evidence_without_symbol.
+        "historical_commits_crashed": report.historical_commits_crashed,
         "trust": "mixed",
         "provenance": "git_history",
         // #434 provenance labeling: the discovered git root, whether it is the

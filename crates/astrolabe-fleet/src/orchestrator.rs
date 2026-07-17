@@ -75,7 +75,8 @@ use serde_json::{Value, json};
 
 use crate::catalog::FleetCatalog;
 use crate::clone_farm::{
-    JobGuard, Selection, git_capture, safe_reason, silence_credential_prompts,
+    JobGuard, Selection, child_working_set_bytes, git_capture, safe_reason,
+    silence_credential_prompts,
 };
 use crate::record::{FleetRepoRow, TransitionContext};
 use crate::state::RepoState;
@@ -811,12 +812,29 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
             );
         }
     };
+    // #515: track the peak resident working set (RSS) the child reached, sampled while
+    // it is ALIVE during the existing poll loop and kept as a running maximum. A
+    // Windows process's working set reads stale once it exits, so the peak MUST be
+    // captured live; keeping the max here means it survives the child's death and is
+    // available for the structured failure detail when a child vanishes without a tool
+    // result (the rc=127 case this issue tracks). One cheap GetProcessMemoryInfo per
+    // 500 ms poll — negligible against a multi-minute index.
+    let mut peak_ws: u64 = 0;
+    let mut peak_ws_seen = false;
     let deadline = Instant::now() + Duration::from_secs(config.timeout_secs);
     let status = loop {
+        if let Some(ws) = child_working_set_bytes(&child) {
+            peak_ws_seen = true;
+            peak_ws = peak_ws.max(ws);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    if let Some(ws) = child_working_set_bytes(&child) {
+                        peak_ws_seen = true;
+                        peak_ws = peak_ws.max(ws);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -834,15 +852,29 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     };
     let stderr_text = fs::read_to_string(&stderr_path).unwrap_or_default();
     let stage_ms = parse_stage_timings(&stderr_text);
+    // #515: the last pipeline phase the child announced before it died, plus the peak
+    // resident working set (RSS) sampled live above. Both are cheap and both survive a
+    // hard-exiting child — so a child that vanishes WITHOUT a tool result (the
+    // empty-stdout rc=127 this issue tracks) still yields a structured detail that NAMES
+    // the phase and the resource cost instead of an empty "stdout head:".
+    let last_phase = last_observed_pipeline_phase(&stderr_text);
+    let phase_label = last_phase
+        .as_deref()
+        .unwrap_or("<none emitted — died before the first phase line>");
+    let mem_label = if peak_ws_seen {
+        format!("{} MiB", peak_ws / (1024 * 1024))
+    } else {
+        "<unavailable>".to_string()
+    };
     let Some(status) = status else {
         return fail(
             "timeout",
             format!(
-                "pipeline exceeded {}s and was killed (job-object confined)",
+                "pipeline exceeded {}s and was killed (job-object confined); last phase={phase_label}; peak RSS={mem_label}",
                 config.timeout_secs
             ),
             Some(format!(
-                "repo: {}\nphase: timeout after {}s\nstderr tail:\n{}\n",
+                "repo: {}\nphase: timeout after {}s\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstderr tail:\n{}\n",
                 row.record.full_name,
                 config.timeout_secs,
                 tail(&stderr_text, 4000)
@@ -851,14 +883,21 @@ fn pipeline_job(row: &FleetRepoRow, config: &PipelineConfig) -> JobResult {
     };
     let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
     if !status.success() {
+        // The child exited without a usable tool result. Its stdout is frequently
+        // EMPTY here (a C-level pipeline fault hard-exits before the JSON is printed —
+        // e.g. the rc=127 silent termination deep in the vault/lowering/kernel phase on
+        // rtk-class repos, #515), so "stdout head:" carried nothing actionable. Lead
+        // with the exit code, the last phase the child announced, and its peak resident
+        // working set — a structured {code,message,remediation}-grade detail that names
+        // the phase and the resource cost even when the child produced no result at all.
         return fail(
             "pipeline",
             format!(
-                "pipeline child exited nonzero ({status}); stdout head: {}",
+                "pipeline child exited without a tool result ({status}); last phase={phase_label}; peak RSS={mem_label}; stdout head: {}",
                 safe_reason(&head_of(&stdout_text, 200))
             ),
             Some(format!(
-                "repo: {}\nphase: child exit {status}\nstdout head:\n{}\nstderr tail:\n{}\n",
+                "repo: {}\nphase: child exit {status}\nlast pipeline phase: {phase_label}\npeak RSS (working set): {mem_label}\nstdout head:\n{}\nstderr tail:\n{}\n",
                 row.record.full_name,
                 head_of(&stdout_text, 8000),
                 tail(&stderr_text, 8000)
@@ -1291,6 +1330,35 @@ fn parse_stage_timings(stderr_text: &str) -> BTreeMap<String, u64> {
         }
     }
     out
+}
+
+/// #515: the LAST pipeline phase the child announced on stderr before it died —
+/// the phase it was executing when a hard-exit (or timeout kill) cut it off. Scans
+/// both the shadow-import phase stream (`astro.shadow.timing phase=<p> ms=<n>`,
+/// emitted AFTER each phase completes) and the git-archaeology stream
+/// (`astro.arch.timing phase=<p> ...`), returning the phase name of the last such
+/// line — the completed phase immediately before the fatal one, i.e. the best
+/// available name for where the child was when it vanished. Returns `None` when the
+/// child emitted no phase line at all (died before the first one, or timing was not
+/// enabled). Used only for the structured failure detail on a child that produced no
+/// tool result, so it is fail-open: a parse miss yields `None`, never a fabrication.
+fn last_observed_pipeline_phase(stderr_text: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in stderr_text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("astro.shadow.timing phase=")
+            .or_else(|| trimmed.strip_prefix("astro.arch.timing phase="))
+        else {
+            continue;
+        };
+        // The phase token runs up to the first whitespace (before ` ms=` / ` szz=`).
+        let phase = rest.split_whitespace().next().unwrap_or(rest);
+        if !phase.is_empty() {
+            last = Some(phase.to_string());
+        }
+    }
+    last
 }
 
 fn write_side_file(dir: &Path, github_id: u64, ext: &str, text: &str) {
