@@ -10,8 +10,8 @@ use super::codec::{
 };
 use super::recall::prepare_dense;
 use super::{
-    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, StoredSlotEnvelope,
-    compression_error,
+    CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, StoredSlotCodec,
+    StoredSlotEnvelope, compression_error, verify_mxfp4_assay_attestation_at,
 };
 use crate::spec::LensSpec;
 
@@ -254,6 +254,34 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             }
             parsed_rows.push((cx_id, parsed));
         }
+        if manifest.codec == StoredSlotCodec::MxFp4 {
+            let attestation_id = parsed_rows
+                .first()
+                .map(|(_, parsed)| parsed.qv.seed_id)
+                .ok_or_else(|| {
+                    compression_error(
+                        CALYX_VECTOR_COMPRESSION_EMPTY,
+                        "MXFP4 generation contains no rows to attest",
+                    )
+                })?;
+            if parsed_rows
+                .iter()
+                .any(|(_, parsed)| parsed.qv.seed_id != attestation_id)
+            {
+                return Err(compression_error(
+                    CALYX_VECTOR_COMPRESSION_INVALID,
+                    "MXFP4 generation rows disagree on Assay attestation identity",
+                ));
+            }
+            verify_mxfp4_assay_attestation_at(
+                self.vault,
+                self.slot,
+                self.lens,
+                manifest.stored_dim,
+                snapshot,
+                attestation_id,
+            )?;
+        }
         let computed = generation_root(
             &self.codec_context_id,
             manifest.generation_rows,
@@ -333,11 +361,8 @@ impl<'a, C: Clock> CompressedSlotIndex<'a, C> {
             }
             validated.push((cx_id, bytes.as_slice()));
         }
-        let computed = raw_generation_root(
-            &self.codec_context_id,
-            manifest.generation_rows,
-            validated,
-        )?;
+        let computed =
+            raw_generation_root(&self.codec_context_id, manifest.generation_rows, validated)?;
         if computed != manifest.raw_generation_root {
             return Err(compression_error(
                 CALYX_VECTOR_COMPRESSION_INVALID,

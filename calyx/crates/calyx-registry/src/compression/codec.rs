@@ -3,9 +3,10 @@ use calyx_core::{
     Asymmetry, CalyxError, Modality, QuantPolicy, Result, Slot, SlotShape, SlotVector,
 };
 use calyx_forge::{
-    BinaryCodec, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer, ScalarInt8Codec,
-    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_MAX_DIM, TurboQuantCodec, TurboQuantPreparedQuery,
-    TurboQuantV1MigrationVerifier, new_seed, seed_id_hex,
+    BinaryCodec, MXFP_FORMAT_HEADER_BYTES, MxFp4Codec, MxFp8Codec, QuantLevel, QuantizedVec,
+    Quantizer, ScalarInt8Codec, TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_MAX_DIM,
+    TurboQuantCodec, TurboQuantPreparedQuery, TurboQuantV1MigrationVerifier, mxfp_payload_len,
+    new_seed, seed_id_hex,
 };
 use sha2::{Digest, Sha256};
 
@@ -127,8 +128,9 @@ pub(super) enum CodecContext {
         codec: MxFp4Codec,
         slot_key: String,
         safety: Option<calyx_forge::AssayQuantSafety>,
+        attestation_id: Option<[u8; 32]>,
     },
-    MxFp8(MxFp4Codec),
+    MxFp8(MxFp8Codec),
     Binary(BinaryCodec),
 }
 
@@ -185,16 +187,18 @@ pub(super) fn encode_rows(
         SlotShape::Dense(dim) => dim,
         _ => return Err(invalid("slot compression requires a dense slot")),
     };
-    let manifest_bytes = encode_manifest(
-        codec.stored_codec(),
-        codec.level(),
+    let manifest = CompressionManifest {
+        codec: codec.stored_codec(),
+        level: codec.level(),
         raw_dim,
-        u32::try_from(codec.dim()).map_err(|_| invalid("stored dimension exceeds u32"))?,
+        stored_dim: u32::try_from(codec.dim())
+            .map_err(|_| invalid("stored dimension exceeds u32"))?,
         codec_context_id,
         generation_root,
         raw_generation_root,
         generation_rows,
-    )?;
+    };
+    let manifest_bytes = encode_manifest(&manifest)?;
     let mut encoded_rows = Vec::with_capacity(pending.len());
     for row in pending {
         let payload_bytes = row.qv.bytes.len();
@@ -667,6 +671,25 @@ fn validate_payload_layout_before_clone(
     dim: usize,
     payload_len: usize,
 ) -> Result<()> {
+    if matches!(codec, StoredSlotCodec::MxFp4 | StoredSlotCodec::MxFp8) {
+        let max_dim = match codec {
+            StoredSlotCodec::MxFp4 => calyx_forge::MXFP4_MAX_DIM,
+            StoredSlotCodec::MxFp8 => calyx_forge::MXFP8_MAX_DIM,
+            _ => unreachable!(),
+        };
+        if dim == 0 || dim > max_dim {
+            return Err(invalid(format!(
+                "OCP MX dimension must be in 1..={max_dim} before payload allocation, got {dim}"
+            )));
+        }
+        let exact_payload_len = mxfp_payload_len(level, dim).map_err(forge_error)?;
+        if payload_len != exact_payload_len {
+            return Err(invalid(format!(
+                "OCP MX payload length is not canonical for its declared geometry before allocation: header={payload_len} exact={exact_payload_len} dim={dim} level={level:?} format_header={MXFP_FORMAT_HEADER_BYTES}"
+            )));
+        }
+        return Ok(());
+    }
     if !matches!(
         codec,
         StoredSlotCodec::TurboQuantBits2p5 | StoredSlotCodec::TurboQuantBits3p5
@@ -768,9 +791,10 @@ impl CodecContext {
                     codec: MxFp4Codec::new(dim),
                     slot_key: slot.slot_key.key().to_string(),
                     safety,
+                    attestation_id: evidence.map(MxFp4AssayEvidence::attestation_id),
                 })
             }
-            QuantPolicy::Float8 => Ok(Self::MxFp8(MxFp4Codec::new(dim))),
+            QuantPolicy::Float8 => Ok(Self::MxFp8(MxFp8Codec::new(dim))),
             QuantPolicy::Binary => {
                 let seed = shared_seed(slot, lens, dim, QuantLevel::Bits1, b"binary");
                 Ok(Self::Binary(BinaryCodec::new(seed).map_err(forge_error)?))
@@ -786,7 +810,8 @@ impl CodecContext {
             Self::RawF32 { dim } => *dim,
             Self::TurboQuant(codec) => codec.dim(),
             Self::ScalarInt8(codec) => codec.dim(),
-            Self::MxFp4 { codec, .. } | Self::MxFp8(codec) => codec.dim(),
+            Self::MxFp4 { codec, .. } => codec.dim(),
+            Self::MxFp8(codec) => codec.dim(),
             Self::Binary(codec) => codec.dim(),
         }
     }
@@ -834,6 +859,7 @@ impl CodecContext {
                 codec,
                 slot_key,
                 safety,
+                attestation_id,
             } => codec
                 .encode_assay_checked(
                     slot_key,
@@ -841,9 +867,12 @@ impl CodecContext {
                     safety.as_ref().ok_or_else(|| {
                         invalid("MXFP4 write context is missing validated assay evidence")
                     })?,
+                    attestation_id.ok_or_else(|| {
+                        invalid("MXFP4 write context is missing Assay attestation identity")
+                    })?,
                 )
                 .map_err(forge_error),
-            Self::MxFp8(codec) => codec.encode_mxfp8(prepared).map_err(forge_error),
+            Self::MxFp8(codec) => codec.encode(prepared).map_err(forge_error),
             Self::Binary(codec) => {
                 if l2_norm(prepared)? == 0.0 {
                     return Err(invalid(
@@ -861,9 +890,8 @@ impl CodecContext {
             Self::RawF32 { .. } => decode_raw_f32(&parsed.qv.bytes, parsed.qv.dim),
             Self::TurboQuant(codec) => codec.decode(&parsed.qv).map_err(forge_error),
             Self::ScalarInt8(codec) => codec.decode(&parsed.qv).map_err(forge_error),
-            Self::MxFp4 { codec, .. } | Self::MxFp8(codec) => {
-                codec.decode(&parsed.qv).map_err(forge_error)
-            }
+            Self::MxFp4 { codec, .. } => codec.decode(&parsed.qv).map_err(forge_error),
+            Self::MxFp8(codec) => codec.decode(&parsed.qv).map_err(forge_error),
             Self::Binary(codec) => codec.decode(&parsed.qv).map_err(forge_error),
         }
     }
@@ -910,9 +938,11 @@ impl CodecContext {
             (Self::ScalarInt8(codec), PreparedSlotQuery::Dense { values, norm }) => {
                 score_decoded(codec, values, *norm, &parsed.qv)
             }
-            (Self::MxFp4 { codec, .. }, PreparedSlotQuery::Dense { values, norm })
-            | (Self::MxFp8(codec), PreparedSlotQuery::Dense { values, norm }) => {
-                score_decoded(codec, values, *norm, &parsed.qv)
+            (Self::MxFp4 { codec, .. }, PreparedSlotQuery::Dense { values, norm }) => {
+                score_mxfp(codec.dot_and_norm(values, &parsed.qv), *norm)
+            }
+            (Self::MxFp8(codec), PreparedSlotQuery::Dense { values, norm }) => {
+                score_mxfp(codec.dot_and_norm(values, &parsed.qv), *norm)
             }
             (Self::Binary(codec), PreparedSlotQuery::Dense { values, norm }) => {
                 if *norm == 0.0 {
@@ -967,7 +997,14 @@ impl CodecContext {
                     return Err(invalid("persisted binary amplitude is not canonical"));
                 }
             }
-            Self::RawF32 { .. } | Self::ScalarInt8(_) | Self::MxFp4 { .. } | Self::MxFp8(_) => {
+            Self::MxFp4 { .. } => {
+                if parsed.qv.seed_id == ZERO_SEED {
+                    return Err(invalid(
+                        "persisted MXFP4 payload is missing its Assay attestation identity",
+                    ));
+                }
+            }
+            Self::RawF32 { .. } | Self::ScalarInt8(_) | Self::MxFp8(_) => {
                 if parsed.qv.seed_id != ZERO_SEED {
                     return Err(invalid(
                         "persisted non-rotating codec requires a zero seed id",
@@ -980,19 +1017,45 @@ impl CodecContext {
 
     pub(super) fn validate_payload(&self, parsed: &ParsedStoredSlot) -> Result<()> {
         self.validate_parsed(parsed)?;
-        if let Self::TurboQuant(codec) = self {
-            codec.storage(&parsed.qv).map_err(forge_error)?;
+        match self {
+            Self::TurboQuant(codec) => {
+                codec.storage(&parsed.qv).map_err(forge_error)?;
+            }
+            Self::MxFp4 { codec, .. } => {
+                codec.inspect(&parsed.qv).map_err(forge_error)?;
+            }
+            Self::MxFp8(codec) => {
+                codec.inspect(&parsed.qv).map_err(forge_error)?;
+            }
+            _ => {}
         }
         Ok(())
     }
 
     fn storage_metrics(&self, qv: &QuantizedVec) -> Result<StorageMetrics> {
-        if let Self::TurboQuant(codec) = self {
-            let metrics = codec.storage(qv).map_err(forge_error)?;
-            return Ok(StorageMetrics {
-                logical_data_bits: metrics.data_bits as u64,
-                codec_header_bytes: metrics.format_header_bytes,
-            });
+        match self {
+            Self::TurboQuant(codec) => {
+                let metrics = codec.storage(qv).map_err(forge_error)?;
+                return Ok(StorageMetrics {
+                    logical_data_bits: metrics.data_bits as u64,
+                    codec_header_bytes: metrics.format_header_bytes,
+                });
+            }
+            Self::MxFp4 { codec, .. } => {
+                let metrics = codec.inspect(qv).map_err(forge_error)?;
+                return Ok(StorageMetrics {
+                    logical_data_bits: (qv.dim as u64) * 4,
+                    codec_header_bytes: metrics.format_header_bytes + metrics.scale_bytes,
+                });
+            }
+            Self::MxFp8(codec) => {
+                let metrics = codec.inspect(qv).map_err(forge_error)?;
+                return Ok(StorageMetrics {
+                    logical_data_bits: (qv.dim as u64) * 8,
+                    codec_header_bytes: metrics.format_header_bytes + metrics.scale_bytes,
+                });
+            }
+            _ => {}
         }
         Ok(StorageMetrics {
             logical_data_bits: ((self.level().bits_per_channel() as f64) * qv.dim as f64).ceil()
@@ -1025,6 +1088,20 @@ fn score_decoded<Q: Quantizer>(
     finite_score(
         f64::from(dot) / (query_norm * candidate_norm),
         "decoded cosine score",
+    )
+}
+
+fn score_mxfp(packed: calyx_forge::Result<(f32, f64)>, query_norm: f64) -> Result<f32> {
+    if query_norm == 0.0 {
+        return Ok(0.0);
+    }
+    let (dot, candidate_norm_sq) = packed.map_err(forge_error)?;
+    if candidate_norm_sq == 0.0 {
+        return Ok(0.0);
+    }
+    finite_score(
+        f64::from(dot) / (query_norm * candidate_norm_sq.sqrt()),
+        "packed OCP MX cosine score",
     )
 }
 
@@ -1273,34 +1350,30 @@ pub(super) fn raw_generation_root<'a>(
     Ok(hasher.finalize().into())
 }
 
-fn encode_manifest(
-    codec: StoredSlotCodec,
-    level: QuantLevel,
-    raw_dim: u32,
-    stored_dim: u32,
-    codec_context_id: [u8; 32],
-    generation_root: [u8; 32],
-    raw_generation_root: [u8; 32],
-    generation_rows: u32,
-) -> Result<Vec<u8>> {
-    validate_codec_level(codec, level)?;
-    if raw_dim == 0 || stored_dim == 0 || stored_dim > raw_dim || generation_rows == 0 {
+fn encode_manifest(manifest: &CompressionManifest) -> Result<Vec<u8>> {
+    validate_codec_level(manifest.codec, manifest.level)?;
+    if manifest.raw_dim == 0
+        || manifest.stored_dim == 0
+        || manifest.stored_dim > manifest.raw_dim
+        || manifest.generation_rows == 0
+    {
         return Err(invalid(format!(
-            "invalid compression manifest geometry raw_dim={raw_dim} stored_dim={stored_dim} rows={generation_rows}"
+            "invalid compression manifest geometry raw_dim={} stored_dim={} rows={}",
+            manifest.raw_dim, manifest.stored_dim, manifest.generation_rows
         )));
     }
     let mut bytes = Vec::with_capacity(MANIFEST_BYTES);
     bytes.extend_from_slice(MANIFEST_MAGIC);
     bytes.push(MANIFEST_VERSION);
-    bytes.push(codec_code(codec));
-    bytes.push(level_code(level));
+    bytes.push(codec_code(manifest.codec));
+    bytes.push(level_code(manifest.level));
     bytes.push(0);
-    bytes.extend_from_slice(&raw_dim.to_be_bytes());
-    bytes.extend_from_slice(&stored_dim.to_be_bytes());
-    bytes.extend_from_slice(&codec_context_id);
-    bytes.extend_from_slice(&generation_root);
-    bytes.extend_from_slice(&raw_generation_root);
-    bytes.extend_from_slice(&generation_rows.to_be_bytes());
+    bytes.extend_from_slice(&manifest.raw_dim.to_be_bytes());
+    bytes.extend_from_slice(&manifest.stored_dim.to_be_bytes());
+    bytes.extend_from_slice(&manifest.codec_context_id);
+    bytes.extend_from_slice(&manifest.generation_root);
+    bytes.extend_from_slice(&manifest.raw_generation_root);
+    bytes.extend_from_slice(&manifest.generation_rows.to_be_bytes());
     if bytes.len() != MANIFEST_PREFIX_BYTES {
         return Err(invalid(
             "internal compression manifest prefix length mismatch",
@@ -1460,8 +1533,11 @@ fn validate_payload_without_context(
                 .decode(qv)
                 .map_err(forge_error)?;
         }
-        StoredSlotCodec::MxFp4 | StoredSlotCodec::MxFp8 => {
+        StoredSlotCodec::MxFp4 => {
             MxFp4Codec::new(qv.dim).decode(qv).map_err(forge_error)?;
+        }
+        StoredSlotCodec::MxFp8 => {
+            MxFp8Codec::new(qv.dim).decode(qv).map_err(forge_error)?;
         }
         StoredSlotCodec::Binary => {
             let expected = qv.dim.div_ceil(8);

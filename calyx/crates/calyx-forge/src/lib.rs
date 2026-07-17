@@ -41,41 +41,47 @@ pub use compression_report::{
     CompressionSlotMeasurement, CompressionSlotReport, CompressionTotals, IntelligenceDeltaReport,
     KernelCompressionMeasurement, KernelCompressionReport, compression_report,
 };
-pub use cpu::CpuBackend;
+pub use cpu::{CpuBackend, gemm_mxfp4_packed, gemm_mxfp8_packed};
 #[cfg(feature = "cuda")]
 pub use cuda::{
     AbsentSlotSentinel, CudaBackend, CudaContext, CudaGreenContextStream, CudaPrimaryContextStream,
-    GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, RaggedBatch,
-    attest_cuda_driver_ordinal, attest_cudarc_context, build_grouped_gemm_plan, build_ragged_batch,
-    build_ragged_batch_from_slabs, driver_ordinal_for_pci_bus_id, execute_grouped_gemm,
-    execute_grouped_gemm_strict, extract_ragged_results, init_cuda, init_cuda_by_pci_bus_id,
-    query_device_info, read_grouped_gemm_output, try_extract_ragged_results,
+    GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, MxFp4GemmPlan, MxFp8GemmPlan,
+    MxPackedGemmEvidence, RaggedBatch, attest_cuda_driver_ordinal, attest_cudarc_context,
+    build_grouped_gemm_plan, build_ragged_batch, build_ragged_batch_from_slabs,
+    driver_ordinal_for_pci_bus_id, execute_grouped_gemm, execute_grouped_gemm_strict,
+    extract_ragged_results, init_cuda, init_cuda_by_pci_bus_id, init_cuda_native_kernel,
+    pack_mxfp4_a_row_major, pack_mxfp4_b_column_major, pack_mxfp8_a_row_major,
+    pack_mxfp8_b_column_major, query_device_info, read_grouped_gemm_output,
+    try_extract_ragged_results,
 };
 pub use cuda_device::{CUDA_DEVICE_ENV, PinnedCudaDeviceIdentity, configured_cuda_runtime_ordinal};
 #[cfg(all(windows, feature = "cuda-runtime-boundary"))]
 pub use cuda_runtime::{
     CUDA_NO_DEVICE_ATTESTED_CODE, PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation,
     PinnedCudaRuntimeAttestation, attest_pinned_cuda_dependencies,
-    attest_pinned_cuda_driver_identity, current_pinned_cuda_device,
-    initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
-    select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
+    attest_pinned_cuda_driver_identity, attest_pinned_cuda_driver_identity_for_native_kernel,
+    current_pinned_cuda_device, initialize_pinned_cuda_dependencies,
+    initialize_pinned_cuda_runtime_boundary, select_pinned_cuda_device,
+    select_pinned_cuda_device_by_identity, select_pinned_cuda_device_for_native_kernel,
 };
 pub use error::ForgeError;
 pub use mxfp4::{
-    MXFP4_BLOCK_SIZE, MXFP4_PACKED_BYTES, MxFp4Block, decode_mxfp4, decode_mxfp4_block, e8m0_scale,
-    encode_mxfp4, encode_mxfp4_block,
+    MXFP4_BLOCK_BYTES, MXFP4_BLOCK_SIZE, MXFP4_MAX_DIM, MXFP4_PACKED_BYTES, MxFp4Block,
+    decode_e2m1, decode_e8m0, decode_mxfp4, decode_mxfp4_block, dot_norm_mxfp4, encode_mxfp4,
+    encode_mxfp4_block, nibble_at, validate_mxfp4_blocks,
 };
 pub use mxfp8::{
-    MXFP8_BLOCK_BYTES, MXFP8_BLOCK_SIZE, MxFp8Block, decode_mxfp8, decode_mxfp8_block,
-    encode_mxfp8, encode_mxfp8_block,
+    MXFP8_BLOCK_BYTES, MXFP8_BLOCK_SIZE, MXFP8_MAX_DIM, MxFp8Block, decode_e4m3, decode_mxfp8,
+    decode_mxfp8_block, dot_norm_mxfp8, encode_mxfp8, encode_mxfp8_block, validate_mxfp8_blocks,
 };
 pub use quant::{
-    AssayQuantSafety, BinaryCodec, CURRENT_SEED_VERSION, MxFp4Codec, QjlResidual, QuantLevel,
-    QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId, TURBOQUANT_FORMAT_HEADER_BYTES,
-    TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec, TurboQuantPreparedQuery,
-    TurboQuantStorage, TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate,
-    apply_inverse_rotation, apply_rotation, apply_rotation_batch, binary_prefilter,
-    hamming_dot_estimate, new_seed, seed_id_hex,
+    AssayQuantSafety, BinaryCodec, CURRENT_SEED_VERSION, MXFP_BODY_ALIGNMENT_BYTES,
+    MXFP_FORMAT_HEADER_BYTES, MXFP_FORMAT_VERSION, MxFp4Codec, MxFp8Codec, MxFpStorage,
+    QjlResidual, QuantLevel, QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId,
+    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
+    TurboQuantPreparedQuery, TurboQuantStorage, TurboQuantV1MigrationVerifier,
+    TurboQuantValidatedCandidate, apply_inverse_rotation, apply_rotation, apply_rotation_batch,
+    binary_prefilter, hamming_dot_estimate, mxfp_payload_len, new_seed, seed_id_hex,
 };
 #[cfg(feature = "cuda")]
 pub use vram::CudaStream;

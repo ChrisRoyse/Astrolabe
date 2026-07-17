@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_aster::vault::AsterVault;
-use calyx_core::{AnchorKind, CalyxError, Clock, Result, SlotId, VaultId, VaultStore};
+use calyx_core::{AnchorKind, CalyxError, Clock, Result, Seq, SlotId, VaultId, VaultStore};
 use serde::{Deserialize, Serialize};
 
 use crate::estimate::MiEstimate;
@@ -206,6 +206,75 @@ impl AssayStore {
         Ok(store)
     }
 
+    /// Loads the exact Assay CF state visible at an explicit MVCC snapshot.
+    pub fn load_from_vault_at<C>(vault: &AsterVault<C>, snapshot: Seq) -> Result<Self>
+    where
+        C: Clock,
+    {
+        let mut store = Self::default();
+        for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Assay)? {
+            store.insert_aster_row(key, value)?;
+        }
+        Ok(store)
+    }
+
+    /// Loads genuine Assay rows from the physically shared Assay CF at one
+    /// snapshot, while counting rows in disjoint key namespaces.
+    ///
+    /// A value under a key that has the canonical Assay key grammar must decode
+    /// and key-match as an [`AssayRow`] or the scan fails as corruption. Rows
+    /// whose keys cannot be Assay keys belong to another first-class namespace
+    /// (Bayesian posterior, anomaly, invalidation, etc.); they are skipped and
+    /// counted without interpreting their value. This avoids both extremes:
+    /// unrelated co-tenants cannot break an Assay reader, and malformed Assay
+    /// rows can never hide behind a generic "foreign" fallback.
+    pub fn load_from_shared_vault_at<C>(
+        vault: &AsterVault<C>,
+        snapshot: Seq,
+    ) -> Result<(Self, usize)>
+    where
+        C: Clock,
+    {
+        let mut store = Self::default();
+        let mut skipped_non_assay_rows = 0_usize;
+        for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Assay)? {
+            match serde_json::from_slice::<AssayRow>(&value) {
+                Ok(_) => store.insert_aster_row(key, value)?,
+                Err(error) if looks_like_assay_key(&key) => {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "decode Assay row in canonical Assay key namespace: {error}"
+                    )));
+                }
+                Err(_) => skipped_non_assay_rows += 1,
+            }
+        }
+        Ok((store, skipped_non_assay_rows))
+    }
+
+    /// Reads and key-verifies one exact Assay row independently of any write
+    /// return value.
+    pub fn read_row_from_vault_at<C>(
+        vault: &AsterVault<C>,
+        snapshot: Seq,
+        cache_key: &AssayCacheKey,
+        subject: &AssaySubject,
+    ) -> Result<Option<AssayRow>>
+    where
+        C: Clock,
+    {
+        cache_key.require_scoped()?;
+        let key = assay_key(cache_key, subject);
+        let Some(value) = vault.read_cf_at(snapshot, ColumnFamily::Assay, &key)? else {
+            return Ok(None);
+        };
+        match classify_aster_row(&key, &value, &BTreeSet::new())? {
+            AssayRowClass::Assay(row) => Ok(Some(*row)),
+            AssayRowClass::Foreign(schema) => Err(CalyxError::aster_corrupt_shard(format!(
+                "exact Assay key unexpectedly classified as foreign schema {schema}"
+            ))),
+        }
+    }
+
     /// Loads assay rows from a vault whose `ColumnFamily::Assay` is shared with
     /// co-tenant writers.
     ///
@@ -355,6 +424,50 @@ fn assay_key(cache_key: &AssayCacheKey, subject: &AssaySubject) -> Vec<u8> {
         AssaySubject::EnsembleCard => key.push(4),
     }
     key
+}
+
+fn looks_like_assay_key(key: &[u8]) -> bool {
+    fn take_len_prefixed<'a>(key: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+        let len_bytes = key.get(*cursor..*cursor + 4)?;
+        *cursor += 4;
+        let len = u32::from_be_bytes(len_bytes.try_into().ok()?) as usize;
+        let value = key.get(*cursor..(*cursor).checked_add(len)?)?;
+        *cursor += len;
+        Some(value)
+    }
+
+    if key.len() < 4 {
+        return false;
+    }
+    let mut cursor = 4;
+    let Some(vault) = take_len_prefixed(key, &mut cursor) else {
+        return false;
+    };
+    let Some(anchor) = take_len_prefixed(key, &mut cursor) else {
+        return false;
+    };
+    let Some(_shard) = take_len_prefixed(key, &mut cursor) else {
+        return false;
+    };
+    if std::str::from_utf8(vault)
+        .ok()
+        .and_then(|value| value.parse::<VaultId>().ok())
+        .is_none()
+        || serde_json::from_slice::<AnchorKind>(anchor).is_err()
+    {
+        return false;
+    }
+    let Some(tag) = key.get(cursor).copied() else {
+        return false;
+    };
+    cursor += 1;
+    let subject_bytes = match tag {
+        0 => 2,
+        1 => 4,
+        2..=4 => 0,
+        _ => return false,
+    };
+    cursor.checked_add(subject_bytes) == Some(key.len())
 }
 
 fn push_len_prefixed(key: &mut Vec<u8>, value: &[u8]) {

@@ -13,19 +13,23 @@ use crate::{Backend, DeviceInfo, Result};
 pub use crate::cuda_runtime::{
     CUDA_NO_DEVICE_ATTESTED_CODE, PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation,
     PinnedCudaRuntimeAttestation, attest_pinned_cuda_dependencies,
-    attest_pinned_cuda_driver_identity, current_pinned_cuda_device,
-    initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
-    select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
+    attest_pinned_cuda_driver_identity, attest_pinned_cuda_driver_identity_for_native_kernel,
+    current_pinned_cuda_device, initialize_pinned_cuda_dependencies,
+    initialize_pinned_cuda_runtime_boundary, select_pinned_cuda_device,
+    select_pinned_cuda_device_by_identity, select_pinned_cuda_device_for_native_kernel,
 };
 pub use crate::mxfp4;
 pub use context::{
     CudaContext, CudaPrimaryContextStream, attest_cuda_driver_ordinal, attest_cudarc_context,
-    driver_ordinal_for_pci_bus_id, init_cuda, init_cuda_by_pci_bus_id, query_device_info,
+    driver_ordinal_for_pci_bus_id, init_cuda, init_cuda_by_pci_bus_id, init_cuda_native_kernel,
+    query_device_info,
 };
 pub use distance::{cosine_batch_gpu, dot_batch_gpu, l2_batch_gpu, normalize_rows_gpu};
 pub use gemm::{
-    bench_gemm_cublas, bench_gemm_reference_cublas, gemm_cublas, gemm_mxfp4_fp32_accum,
-    gemm_mxfp8_fp32_accum, probe_allocation,
+    MxFp4GemmPlan, MxFp8GemmPlan, MxPackedGemmEvidence, bench_gemm_cublas,
+    bench_gemm_reference_cublas, gemm_cublas, gemm_mxfp4_fp32_accum, gemm_mxfp8_fp32_accum,
+    pack_mxfp4_a_row_major, pack_mxfp4_b_column_major, pack_mxfp8_a_row_major,
+    pack_mxfp8_b_column_major, probe_allocation,
 };
 pub use green_context::CudaGreenContextStream;
 pub use grouped_gemm::{

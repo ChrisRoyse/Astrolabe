@@ -2,6 +2,7 @@ mod codec;
 mod index;
 mod recall;
 
+use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag};
 use calyx_aster::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key, slot_key,
 };
@@ -9,6 +10,7 @@ use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{Clock, CxId, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
 use calyx_forge::AssayQuantSafety;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 use crate::spec::LensSpec;
@@ -117,15 +119,33 @@ pub struct StoredSlotEnvelope {
     pub record_digest_sha256: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+const MXFP4_ASSAY_SCHEMA: &str = "calyx.assay.mxfp4_safety.v1";
+const MXFP4_ASSAY_PROVENANCE: &str = "calyx_assay::mxfp4_quantization_safety/v1";
+const MXFP4_SOURCE_DOMAIN: &[u8] = b"calyx-registry-mxfp4-source-column-v1";
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MxFp4AssayEvidence {
-    pub slot_id: u16,
-    pub slot_key: String,
-    pub lens_id: LensId,
-    pub dim: u32,
-    pub written_at_seq: Seq,
-    pub current_seq: Seq,
-    pub safety: AssayQuantSafety,
+    slot_id: u16,
+    slot_key: String,
+    lens_id: LensId,
+    dim: u32,
+    written_at_seq: Seq,
+    current_seq: Seq,
+    source_column_sha256: [u8; 32],
+    assay_row_sha256: [u8; 32],
+    safety: AssayQuantSafety,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MxFp4AssayPayload {
+    schema: String,
+    slot_key: String,
+    lens_id: String,
+    dim: u32,
+    source_rows: u32,
+    source_slot_column_sha256: String,
+    safety: AssayQuantSafety,
 }
 
 impl MxFp4AssayEvidence {
@@ -175,6 +195,254 @@ impl MxFp4AssayEvidence {
         }
         Ok(&self.safety)
     }
+
+    fn attestation_id(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"calyx-registry-mxfp4-assay-attestation-v1");
+        hasher.update(self.assay_row_sha256);
+        hasher.update(self.source_column_sha256);
+        hasher.finalize().into()
+    }
+}
+
+/// Persists a measured MXFP4 safety card into the Assay source of truth and
+/// independently reads the exact row back before returning its MVCC sequence.
+pub fn persist_mxfp4_assay_evidence<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    cache_key: AssayCacheKey,
+    estimate: MiEstimate,
+    safety: AssayQuantSafety,
+) -> Result<Seq> {
+    cache_key.require_scoped()?;
+    if cache_key.vault_id != Some(vault.vault_id()) || cache_key.corpus_shard.trim().is_empty() {
+        return Err(mxfp4_evidence_error(
+            "MXFP4 Assay cache key must name this vault and a non-blank corpus shard",
+        ));
+    }
+    if estimate.trust != TrustTag::Trusted
+        || estimate.n_samples < calyx_assay::MIN_ASSAY_SAMPLES
+        || !estimate.bits.is_finite()
+        || !estimate.ci_low.is_finite()
+        || !estimate.ci_high.is_finite()
+        || estimate.bits.to_bits() != safety.quantized_bits.to_bits()
+        || !safety.passes()
+    {
+        return Err(mxfp4_evidence_error(
+            "MXFP4 evidence requires a trusted, finite, sufficiently sampled Assay estimate whose bits equal passing quantized safety bits",
+        ));
+    }
+    let current_seq = vault.latest_seq();
+    let (source_column_sha256, source_rows) =
+        source_slot_column_attestation(vault, slot, ColumnFamily::slot(slot.slot_id), current_seq)?;
+    let dim = match slot.shape {
+        calyx_core::SlotShape::Dense(raw_dim) => lens.truncate_dim.unwrap_or(raw_dim),
+        _ => return Err(mxfp4_evidence_error("MXFP4 evidence requires a dense slot")),
+    };
+    let subject = AssaySubject::Lens { slot: slot.slot_id };
+    let payload = MxFp4AssayPayload {
+        schema: MXFP4_ASSAY_SCHEMA.to_string(),
+        slot_key: slot.slot_key.key().to_string(),
+        lens_id: lens.lens_id().to_string(),
+        dim,
+        source_rows,
+        source_slot_column_sha256: encode_sha256(source_column_sha256),
+        safety,
+    };
+    let payload_value = serde_json::to_value(&payload).map_err(|error| {
+        mxfp4_evidence_error(format!("failed to encode MXFP4 Assay payload: {error}"))
+    })?;
+    let expected_seq = current_seq.checked_add(1).ok_or_else(|| {
+        mxfp4_evidence_error("vault sequence overflow while persisting MXFP4 evidence")
+    })?;
+    let mut store = AssayStore::default();
+    store.put_with_payload(
+        cache_key.clone(),
+        subject.clone(),
+        estimate,
+        MXFP4_ASSAY_PROVENANCE,
+        expected_seq,
+        payload_value.clone(),
+    );
+    store.persist_to_vault(vault)?;
+    let observed_seq = vault.latest_seq();
+    if observed_seq != expected_seq {
+        return Err(mxfp4_evidence_error(format!(
+            "MXFP4 Assay persistence sequence mismatch: expected {expected_seq}, observed {observed_seq}"
+        )));
+    }
+    let observed = AssayStore::read_row_from_vault_at(vault, observed_seq, &cache_key, &subject)?
+        .ok_or_else(|| {
+        mxfp4_evidence_error("persisted MXFP4 Assay row was absent on independent readback")
+    })?;
+    if observed.written_at_seq != expected_seq
+        || observed.provenance != MXFP4_ASSAY_PROVENANCE
+        || observed.payload.as_ref() != Some(&payload_value)
+    {
+        return Err(mxfp4_evidence_error(
+            "persisted MXFP4 Assay row did not match the independently read source-of-truth bytes",
+        ));
+    }
+    Ok(observed_seq)
+}
+
+/// Loads MXFP4 admission evidence from the real Assay CF and binds it to the
+/// exact persisted source slot generation. The returned type has no public
+/// constructor or mutable fields, so compression cannot accept caller-crafted
+/// evidence in place of a read-back Assay row.
+pub fn load_mxfp4_assay_evidence<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+) -> Result<MxFp4AssayEvidence> {
+    let current_seq = vault.latest_seq();
+    let (source_column_sha256, source_rows) =
+        source_slot_column_attestation(vault, slot, ColumnFamily::slot(slot.slot_id), current_seq)?;
+    let expected_dim = match slot.shape {
+        calyx_core::SlotShape::Dense(raw_dim) => lens.truncate_dim.unwrap_or(raw_dim),
+        _ => return Err(mxfp4_evidence_error("MXFP4 evidence requires a dense slot")),
+    };
+    let (store, _skipped_non_assay_rows) =
+        AssayStore::load_from_shared_vault_at(vault, current_seq)?;
+    let mut matches = Vec::new();
+    for row in store.rows() {
+        if row.cache_key.vault_id != Some(vault.vault_id())
+            || row.subject != (AssaySubject::Lens { slot: slot.slot_id })
+        {
+            continue;
+        }
+        let Some(payload_value) = &row.payload else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_value::<MxFp4AssayPayload>(payload_value.clone()) else {
+            continue;
+        };
+        if payload.schema != MXFP4_ASSAY_SCHEMA {
+            continue;
+        }
+        if row.provenance != MXFP4_ASSAY_PROVENANCE
+            || row.written_at_seq != current_seq
+            || row.estimate.trust != TrustTag::Trusted
+            || row.estimate.n_samples < calyx_assay::MIN_ASSAY_SAMPLES
+            || row.estimate.bits.to_bits() != payload.safety.quantized_bits.to_bits()
+        {
+            return Err(mxfp4_evidence_error(format!(
+                "MXFP4 Assay row is stale, provisional, under-sampled, or internally inconsistent: written_at_seq={} current_seq={current_seq} trust={:?} n_samples={} estimate_bits={} payload_bits={}",
+                row.written_at_seq,
+                row.estimate.trust,
+                row.estimate.n_samples,
+                row.estimate.bits,
+                payload.safety.quantized_bits
+            )));
+        }
+        if payload.slot_key != slot.slot_key.key()
+            || payload.lens_id != lens.lens_id().to_string()
+            || payload.dim != expected_dim
+            || payload.source_rows != source_rows
+            || decode_sha256(&payload.source_slot_column_sha256)? != source_column_sha256
+            || !payload.safety.passes()
+        {
+            return Err(mxfp4_evidence_error(
+                "MXFP4 Assay row does not bind the current slot key, lens, dimension, source generation, or passing safety metrics",
+            ));
+        }
+        let row_bytes = serde_json::to_vec(&row).map_err(|error| {
+            mxfp4_evidence_error(format!(
+                "failed to canonicalize Assay evidence row: {error}"
+            ))
+        })?;
+        matches.push(MxFp4AssayEvidence {
+            slot_id: slot.slot_id.get(),
+            slot_key: slot.slot_key.key().to_string(),
+            lens_id: lens.lens_id(),
+            dim: expected_dim,
+            written_at_seq: row.written_at_seq,
+            current_seq,
+            source_column_sha256,
+            assay_row_sha256: Sha256::digest(row_bytes).into(),
+            safety: payload.safety,
+        });
+    }
+    if matches.len() != 1 {
+        return Err(mxfp4_evidence_error(format!(
+            "expected exactly one current persisted MXFP4 Assay evidence row, found {}",
+            matches.len()
+        )));
+    }
+    Ok(matches.remove(0))
+}
+
+pub(super) fn verify_mxfp4_assay_attestation_at<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    stored_dim: u32,
+    snapshot: Seq,
+    expected_attestation_id: [u8; 32],
+) -> Result<()> {
+    if expected_attestation_id == [0; 32] {
+        return Err(mxfp4_evidence_error(
+            "persisted row carries a zero Assay attestation identity",
+        ));
+    }
+    let (source_column_sha256, source_rows) = source_slot_column_attestation(
+        vault,
+        slot,
+        ColumnFamily::slot_raw(slot.slot_id),
+        snapshot,
+    )?;
+    let (store, _skipped_non_assay_rows) = AssayStore::load_from_shared_vault_at(vault, snapshot)?;
+    let mut matched = 0_usize;
+    for row in store.rows() {
+        if row.cache_key.vault_id != Some(vault.vault_id())
+            || row.subject != (AssaySubject::Lens { slot: slot.slot_id })
+        {
+            continue;
+        }
+        let Some(payload_value) = &row.payload else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_value::<MxFp4AssayPayload>(payload_value.clone()) else {
+            continue;
+        };
+        if payload.schema != MXFP4_ASSAY_SCHEMA {
+            continue;
+        }
+        if row.provenance != MXFP4_ASSAY_PROVENANCE
+            || row.written_at_seq > snapshot
+            || row.estimate.trust != TrustTag::Trusted
+            || row.estimate.n_samples < calyx_assay::MIN_ASSAY_SAMPLES
+            || row.estimate.bits.to_bits() != payload.safety.quantized_bits.to_bits()
+            || payload.slot_key != slot.slot_key.key()
+            || payload.lens_id != lens.lens_id().to_string()
+            || payload.dim != stored_dim
+            || payload.source_rows != source_rows
+            || decode_sha256(&payload.source_slot_column_sha256)? != source_column_sha256
+            || !payload.safety.passes()
+        {
+            continue;
+        }
+        let row_bytes = serde_json::to_vec(&row).map_err(|error| {
+            mxfp4_evidence_error(format!(
+                "failed to canonicalize Assay evidence row: {error}"
+            ))
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"calyx-registry-mxfp4-assay-attestation-v1");
+        hasher.update(Sha256::digest(row_bytes));
+        hasher.update(source_column_sha256);
+        let candidate_id: [u8; 32] = hasher.finalize().into();
+        if candidate_id == expected_attestation_id {
+            matched += 1;
+        }
+    }
+    if matched != 1 {
+        return Err(mxfp4_evidence_error(format!(
+            "persisted MXFP4 attestation identity matched {matched} Assay rows at snapshot={snapshot}; expected exactly one"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn write_compressed_slot_batch<C: Clock>(
@@ -185,7 +453,20 @@ pub(crate) fn write_compressed_slot_batch<C: Clock>(
     queries: &[CompressionQuery],
     k: usize,
 ) -> Result<SlotCompressionReport> {
-    write_compressed_slot_batch_with_assay_evidence(vault, slot, lens, rows, queries, k, None)
+    let evidence = if lens.quant_default == QuantPolicy::MxFp4 {
+        Some(load_mxfp4_assay_evidence(vault, slot, lens)?)
+    } else {
+        None
+    };
+    write_compressed_slot_batch_with_assay_evidence(
+        vault,
+        slot,
+        lens,
+        rows,
+        queries,
+        k,
+        evidence.as_ref(),
+    )
 }
 
 pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
@@ -554,11 +835,12 @@ fn build_report(
         k,
         lens.truncate_dim,
     )?;
-    let stored_codec = encoded
-        .rows
-        .first()
-        .map(|row| row.codec)
-        .unwrap_or(StoredSlotCodec::RawF32);
+    let stored_codec = encoded.rows.first().map(|row| row.codec).ok_or_else(|| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_EMPTY,
+            "compression report has no physically encoded row from which to read the stored codec",
+        )
+    })?;
     Ok(SlotCompressionReport {
         slot_id: slot.slot_id.get(),
         slot_key: slot.slot_key.key().to_string(),
@@ -602,6 +884,61 @@ fn compression_error(code: &'static str, message: impl Into<String>) -> calyx_co
         message: message.into(),
         remediation: COMPRESSION_REMEDIATION,
     }
+}
+
+fn source_slot_column_attestation<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    column_family: ColumnFamily,
+    snapshot: Seq,
+) -> Result<([u8; 32], u32)> {
+    let mut rows = vault.scan_cf_at(snapshot, column_family)?;
+    if rows.is_empty() {
+        return Err(mxfp4_evidence_error(
+            "source slot column is empty and cannot be attested",
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let row_count = u32::try_from(rows.len())
+        .map_err(|_| mxfp4_evidence_error("source slot row count exceeds u32"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(MXFP4_SOURCE_DOMAIN);
+    hasher.update(vault.vault_id().as_ulid().to_bytes());
+    hasher.update(slot.slot_id.get().to_be_bytes());
+    hasher.update(row_count.to_be_bytes());
+    for (key, value) in rows {
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key);
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    Ok((hasher.finalize().into(), row_count))
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(mxfp4_evidence_error(
+            "source slot column SHA-256 must contain exactly 64 hexadecimal characters",
+        ));
+    }
+    let mut out = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair)
+            .map_err(|_| mxfp4_evidence_error("source slot column SHA-256 is not UTF-8"))?;
+        out[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| mxfp4_evidence_error("source slot column SHA-256 is not hexadecimal"))?;
+    }
+    Ok(out)
+}
+
+fn encode_sha256(value: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in value {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn mxfp4_evidence_error(message: impl Into<String>) -> calyx_core::CalyxError {

@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.3";
-const CUDA_ARCH: &str = "sm_120";
+// The OCP MX warp-MMA instructions are architecture-accelerated SM120
+// features. NVIDIA ptxas intentionally rejects them for the forward-compatible
+// `sm_120` target; `sm_120a` binds the CUBIN to the exact Blackwell contract.
+const CUDA_ARCH: &str = "sm_120a";
 const CUDA_CCBIN_ENV: &str = "FORGE_CUDA_CCBIN";
 
 struct Kernel {
@@ -27,10 +30,10 @@ const KERNELS: &[Kernel] = &[
         cubin_env: "FORGE_TOPK_CUBIN_PATH",
     },
     Kernel {
-        name: "mxfp4_gemm",
+        name: "mxfp_gemm",
         src: "src/cuda/kernels/mxfp4_gemm.cu",
-        ptx_env: "FORGE_MXFP4_GEMM_PTX_PATH",
-        cubin_env: "FORGE_MXFP4_GEMM_CUBIN_PATH",
+        ptx_env: "FORGE_MXFP_GEMM_PTX_PATH",
+        cubin_env: "FORGE_MXFP_GEMM_CUBIN_PATH",
     },
 ];
 

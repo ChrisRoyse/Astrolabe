@@ -14,7 +14,10 @@ use crate::Result;
 
 pub use binary::{BinaryCodec, binary_prefilter, hamming_dot_estimate};
 pub use int8::ScalarInt8Codec;
-pub use mxfp4_codec::{AssayQuantSafety, MxFp4Codec};
+pub use mxfp4_codec::{
+    AssayQuantSafety, MXFP_BODY_ALIGNMENT_BYTES, MXFP_FORMAT_HEADER_BYTES, MXFP_FORMAT_VERSION,
+    MxFp4Codec, MxFp8Codec, MxFpStorage, mxfp_payload_len,
+};
 pub use qjl::QjlResidual;
 pub use rotation::{
     CURRENT_SEED_VERSION, RotationSeed, apply_inverse_rotation, apply_rotation,

@@ -1,10 +1,7 @@
 use sha2::{Digest, Sha256};
 
-use crate::mxfp4::MXFP4_PACKED_BYTES;
 use crate::quant::turboquant;
-use crate::{
-    MXFP4_BLOCK_SIZE, MXFP8_BLOCK_BYTES, MXFP8_BLOCK_SIZE, QuantLevel, QuantizedVec, Result,
-};
+use crate::{MxFp4Codec, MxFp8Codec, QuantLevel, QuantizedVec, Result};
 
 use super::types::{
     COMPRESSION_REPORT_SCHEMA_VERSION, CompressionReport, CompressionReportInput,
@@ -16,8 +13,6 @@ use super::validate::{
     require_finite_f64, require_nonnegative_f64, require_positive_f64, require_positive_u64,
     require_range_f64, require_unit_interval, validate_slot_id, validate_vault,
 };
-
-const MXFP4_BLOCK_BYTES: usize = MXFP4_PACKED_BYTES + 1;
 
 pub fn compression_report(input: CompressionReportInput) -> Result<CompressionReport> {
     validate_vault(&input.vault_id)?;
@@ -165,12 +160,8 @@ fn validate_quantized_payload(qv: &QuantizedVec) -> Result<()> {
     match qv.level {
         QuantLevel::F32 => validate_raw_f32_payload(qv),
         QuantLevel::Bits8 => require_payload_len(qv, qv.dim),
-        QuantLevel::Bits8Fp => {
-            require_payload_len(qv, qv.dim.div_ceil(MXFP8_BLOCK_SIZE) * MXFP8_BLOCK_BYTES)
-        }
-        QuantLevel::Bits4Fp => {
-            require_payload_len(qv, qv.dim.div_ceil(MXFP4_BLOCK_SIZE) * MXFP4_BLOCK_BYTES)
-        }
+        QuantLevel::Bits8Fp => MxFp8Codec::new(qv.dim).inspect(qv).map(|_| ()),
+        QuantLevel::Bits4Fp => MxFp4Codec::new(qv.dim).inspect(qv).map(|_| ()),
         QuantLevel::Bits3p5 | QuantLevel::Bits2p5 => {
             turboquant::TurboQuantCodec::inspect(qv)?;
             Ok(())

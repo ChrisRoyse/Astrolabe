@@ -52,10 +52,10 @@ pub use commission::{
 pub use compression::{
     CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
     COMPRESSED_SLOT_VERSION, CompressedSlotHit, CompressedSlotIndex, CompressionQuery,
-    MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport,
-    SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope, compress_slot_batch,
+    MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport, SlotCompressionRow,
+    StoredSlotCodec, StoredSlotEnvelope, compress_slot_batch,
     compress_slot_batch_with_assay_evidence, inspect_unbound_stored_slot_envelope,
-    matryoshka_truncate_renormalize,
+    load_mxfp4_assay_evidence, matryoshka_truncate_renormalize, persist_mxfp4_assay_evidence,
 };
 pub use drift::{DriftDecision, RuntimeGolden};
 pub use explain::{LensExplanation, explain_lens, explain_lens_from_card};

@@ -8,8 +8,14 @@ use crate::{CudaContext, ForgeError, Result};
 
 mod mxfp4_path;
 mod mxfp8_path;
-pub use mxfp4_path::gemm_mxfp4_fp32_accum;
-pub use mxfp8_path::gemm_mxfp8_fp32_accum;
+mod mxfp_path;
+pub use mxfp_path::MxPackedGemmEvidence;
+pub use mxfp4_path::{
+    MxFp4GemmPlan, gemm_mxfp4_fp32_accum, pack_mxfp4_a_row_major, pack_mxfp4_b_column_major,
+};
+pub use mxfp8_path::{
+    MxFp8GemmPlan, gemm_mxfp8_fp32_accum, pack_mxfp8_a_row_major, pack_mxfp8_b_column_major,
+};
 
 const GEMM_REMEDIATION: &str =
     "Check CUDA/cuBLAS status, dimensions, and device memory; fail closed instead of CPU fallback";

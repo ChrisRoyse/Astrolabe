@@ -1,25 +1,66 @@
-use std::str;
-use std::sync::Arc;
+use cudarc::driver::CudaSlice;
 
-use cudarc::driver::{CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::Ptx;
+use super::mxfp_path::{
+    MxPackedGemmEvidence, PackedPlanStorage, check_block_count, packed_shape_error,
+    validate_geometry,
+};
+use crate::mxfp4::validate_mxfp4_block;
+use crate::{CudaContext, MXFP4_BLOCK_SIZE, MXFP4_PACKED_BYTES, MxFp4Block, Result, encode_mxfp4};
 
-use crate::cuda::kernels::MXFP4_GEMM_PTX;
-use crate::{CudaContext, ForgeError, MXFP4_BLOCK_SIZE, MXFP4_PACKED_BYTES, MxFp4Block, Result};
+const ELEMENT: &str = "OcpMxFp4E2M1Ue8M0";
+const KERNEL: &str = "gemm_mxfp4_e2m1_fp32_accum_kernel";
 
-const MXFP4_THREADS: u32 = 128;
-const MXFP4_DEVICE_REMEDIATION: &str =
-    "Run MXFP4 GEMM on Blackwell sm_120 with CUDA 13.3 and embedded Forge kernels";
-const MXFP4_NUMERICAL_REMEDIATION: &str =
-    "Reject invalid MXFP4 GEMM dimensions or kernel outputs before using scores";
-
-/// Runs the PH15 MXFP4 GEMM path with fp32 accumulation on Blackwell.
+/// A reusable packed OCP MXFP4 GEMM plan.
 ///
-/// CUDA 13.3 in a manual verification run exposes FP4 storage/conversion headers, but the
-/// current cuBLAS C API surface used through `cudarc` does not expose a native
-/// FP4 GEMM entry point. The optimized tensor-core promotion path should use
-/// CUTLASS 3.x grouped GEMM with an MXFP4 dtype; see NVIDIA CUTLASS
-/// `examples/24_gemm_grouped/gemm_grouped.cu`.
+/// The plan owns resident device buffers for row-major A, column-major B, and
+/// their K-axis UE8M0 scales. Repeated executions reuse those buffers and the
+/// cached sm_120 CUBIN/function; operands are never decoded to F32.
+pub struct MxFp4GemmPlan {
+    inner: PackedPlanStorage,
+}
+
+impl MxFp4GemmPlan {
+    pub fn upload(
+        ctx: &CudaContext,
+        a_blocks: &[MxFp4Block],
+        b_blocks: &[MxFp4Block],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
+        let k_blocks = validate_mxfp4_matrix_blocks(a_blocks, b_blocks, m, k, n)?;
+        let (a_codes, a_scales) = flatten_blocks(a_blocks);
+        let (b_codes, b_scales) = flatten_blocks(b_blocks);
+        Ok(Self {
+            inner: PackedPlanStorage::upload(
+                ctx, ELEMENT, KERNEL, m, k, n, k_blocks, &a_codes, &a_scales, &b_codes, &b_scales,
+            )?,
+        })
+    }
+
+    pub fn execute(&mut self, ctx: &CudaContext, out: &mut CudaSlice<f32>) -> Result<()> {
+        self.inner.execute(ctx, out)
+    }
+
+    pub fn evidence(&self) -> MxPackedGemmEvidence {
+        self.inner.evidence()
+    }
+}
+
+/// Packs a row-major MxK F32 matrix into OCP MXFP4 K-axis blocks.
+pub fn pack_mxfp4_a_row_major(values: &[f32], m: usize, k: usize) -> Result<Vec<MxFp4Block>> {
+    pack_k_axis(values, m, k, "A row-major")
+}
+
+/// Packs a column-major KxN F32 matrix into OCP MXFP4 K-axis blocks.
+///
+/// Each B column is contiguous, so this has the same physical vector layout as
+/// A's rows while preserving the TN contract required by native SM120 MMA.
+pub fn pack_mxfp4_b_column_major(values: &[f32], k: usize, n: usize) -> Result<Vec<MxFp4Block>> {
+    pack_k_axis(values, n, k, "B column-major")
+}
+
+/// One-shot native MXFP4 dispatch. Use [`MxFp4GemmPlan`] for repeated GEMMs.
 pub fn gemm_mxfp4_fp32_accum(
     ctx: &CudaContext,
     a_blocks: &[MxFp4Block],
@@ -29,77 +70,89 @@ pub fn gemm_mxfp4_fp32_accum(
     n: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
-    ensure_mxfp4_sm120(ctx.compute_capability(), &device_label(ctx))?;
-    validate_shapes(a_blocks, b_blocks, m, k, n, out.len())?;
-    let stream = ctx.inner().default_stream();
-    if m == 0 || n == 0 || k == 0 {
-        stream
-            .memset_zeros(out)
-            .map_err(|err| device_unavailable(ctx, format!("zero MXFP4 output failed: {err}")))?;
-        stream
-            .synchronize()
-            .map_err(|err| device_unavailable(ctx, format!("zero MXFP4 sync failed: {err}")))?;
-        return Ok(());
-    }
-
-    let (a_codes, a_scales) = flatten_blocks(a_blocks);
-    let (b_codes, b_scales) = flatten_blocks(b_blocks);
-    let a_codes_dev = stream
-        .clone_htod(&a_codes)
-        .map_err(|err| device_unavailable(ctx, format!("copy MXFP4 A codes failed: {err}")))?;
-    let a_scales_dev = stream
-        .clone_htod(&a_scales)
-        .map_err(|err| device_unavailable(ctx, format!("copy MXFP4 A scales failed: {err}")))?;
-    let b_codes_dev = stream
-        .clone_htod(&b_codes)
-        .map_err(|err| device_unavailable(ctx, format!("copy MXFP4 B codes failed: {err}")))?;
-    let b_scales_dev = stream
-        .clone_htod(&b_scales)
-        .map_err(|err| device_unavailable(ctx, format!("copy MXFP4 B scales failed: {err}")))?;
-
-    launch_mxfp4_kernel(
-        ctx,
-        &a_codes_dev,
-        &a_scales_dev,
-        &b_codes_dev,
-        &b_scales_dev,
-        m,
-        k,
-        n,
-        out,
-    )?;
-    check_output_finite(ctx, out)
+    let mut plan = MxFp4GemmPlan::upload(ctx, a_blocks, b_blocks, m, k, n)?;
+    plan.execute(ctx, out)
 }
 
-fn ensure_mxfp4_sm120(compute: (i32, i32), device: &str) -> Result<()> {
-    if compute >= (12, 0) {
-        return Ok(());
-    }
-    Err(ForgeError::DeviceUnavailable {
-        device: device.to_string(),
-        detail: format!(
-            "MXFP4 requires sm_120 (Blackwell). Got sm_{}{}",
-            compute.0, compute.1
-        ),
-        remediation: MXFP4_DEVICE_REMEDIATION.to_string(),
-    })
-}
-
-fn validate_shapes(
+fn validate_mxfp4_matrix_blocks(
     a_blocks: &[MxFp4Block],
     b_blocks: &[MxFp4Block],
     m: usize,
     k: usize,
     n: usize,
-    out_len: usize,
+) -> Result<usize> {
+    let k_blocks = validate_geometry(ELEMENT, m, k, n)?;
+    let expected_a = m
+        .checked_mul(k_blocks)
+        .ok_or_else(|| packed_shape_error(ELEMENT, [m, k, n], "A block count overflow"))?;
+    let expected_b = n
+        .checked_mul(k_blocks)
+        .ok_or_else(|| packed_shape_error(ELEMENT, [m, k, n], "B block count overflow"))?;
+    check_block_count(ELEMENT, [m, k, n], "A", a_blocks.len(), expected_a)?;
+    check_block_count(ELEMENT, [m, k, n], "B", b_blocks.len(), expected_b)?;
+    validate_vectors(a_blocks, m, k, k_blocks, "A")?;
+    validate_vectors(b_blocks, n, k, k_blocks, "B")?;
+    Ok(k_blocks)
+}
+
+fn validate_vectors(
+    blocks: &[MxFp4Block],
+    vectors: usize,
+    k: usize,
+    k_blocks: usize,
+    side: &'static str,
 ) -> Result<()> {
-    check_len(a_blocks.len(), block_count(m, k)?, "MXFP4 A blocks")?;
-    check_len(b_blocks.len(), block_count(k, n)?, "MXFP4 B blocks")?;
-    check_len(out_len, checked_mul(m, n, "MXFP4 output")?, "MXFP4 output")?;
-    to_i32(m, "m")?;
-    to_i32(k, "k")?;
-    to_i32(n, "n")?;
+    for vector in 0..vectors {
+        for block in 0..k_blocks {
+            let valid = (k - block * MXFP4_BLOCK_SIZE).min(MXFP4_BLOCK_SIZE);
+            validate_mxfp4_block(
+                &blocks[vector * k_blocks + block],
+                valid,
+                block + 1 == k_blocks,
+            )
+            .map_err(|error| {
+                packed_shape_error(
+                    ELEMENT,
+                    [vectors, k, 0],
+                    format!("{side} vector {vector} block {block} is not canonical: {error}"),
+                )
+            })?;
+        }
+    }
     Ok(())
+}
+
+fn pack_k_axis(
+    values: &[f32],
+    vectors: usize,
+    k: usize,
+    side: &'static str,
+) -> Result<Vec<MxFp4Block>> {
+    if vectors == 0 || k == 0 {
+        return Err(packed_shape_error(
+            ELEMENT,
+            [vectors, k, 0],
+            format!("{side} dimensions must be non-empty"),
+        ));
+    }
+    let expected = vectors.checked_mul(k).ok_or_else(|| {
+        packed_shape_error(ELEMENT, [vectors, k, 0], format!("{side} length overflow"))
+    })?;
+    if values.len() != expected {
+        return Err(packed_shape_error(
+            ELEMENT,
+            [vectors, k, 0],
+            format!(
+                "{side} length mismatch: expected {expected}, got {}",
+                values.len()
+            ),
+        ));
+    }
+    let mut blocks = Vec::with_capacity(vectors * k.div_ceil(MXFP4_BLOCK_SIZE));
+    for vector in values.chunks_exact(k) {
+        blocks.extend(encode_mxfp4(vector)?);
+    }
+    Ok(blocks)
 }
 
 fn flatten_blocks(blocks: &[MxFp4Block]) -> (Vec<u8>, Vec<u8>) {
@@ -110,127 +163,4 @@ fn flatten_blocks(blocks: &[MxFp4Block]) -> (Vec<u8>, Vec<u8>) {
         scales.push(block.scale_e8m0);
     }
     (codes, scales)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn launch_mxfp4_kernel(
-    ctx: &CudaContext,
-    a_codes: &CudaSlice<u8>,
-    a_scales: &CudaSlice<u8>,
-    b_codes: &CudaSlice<u8>,
-    b_scales: &CudaSlice<u8>,
-    m: usize,
-    k: usize,
-    n: usize,
-    out: &mut CudaSlice<f32>,
-) -> Result<()> {
-    let module = mxfp4_module(ctx)?;
-    let func = module
-        .load_function("gemm_mxfp4_fp32_accum_kernel")
-        .map_err(|err| device_unavailable(ctx, format!("load MXFP4 GEMM kernel failed: {err}")))?;
-    let cells = checked_mul(m, n, "MXFP4 kernel cells")?;
-    let blocks = u32::try_from(cells.div_ceil(MXFP4_THREADS as usize)).map_err(|_| {
-        ForgeError::ShapeMismatch {
-            expected: vec![u32::MAX as usize],
-            got: vec![cells],
-            remediation: "MXFP4 GEMM grid exceeds CUDA u32 launch limit".to_string(),
-        }
-    })?;
-    let m_i32 = to_i32(m, "m")?;
-    let k_i32 = to_i32(k, "k")?;
-    let n_i32 = to_i32(n, "n")?;
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (MXFP4_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let stream = ctx.inner().default_stream();
-    let mut launch = stream.launch_builder(&func);
-    unsafe {
-        launch
-            .arg(a_codes)
-            .arg(a_scales)
-            .arg(b_codes)
-            .arg(b_scales)
-            .arg(&m_i32)
-            .arg(&k_i32)
-            .arg(&n_i32)
-            .arg(out)
-            .launch(cfg)
-    }
-    .map_err(|err| device_unavailable(ctx, format!("launch MXFP4 GEMM kernel failed: {err}")))?;
-    stream
-        .synchronize()
-        .map_err(|err| device_unavailable(ctx, format!("sync MXFP4 GEMM kernel failed: {err}")))?;
-    Ok(())
-}
-
-fn mxfp4_module(ctx: &CudaContext) -> Result<Arc<CudaModule>> {
-    let ptx = str::from_utf8(MXFP4_GEMM_PTX)
-        .map_err(|err| device_unavailable(ctx, format!("MXFP4 GEMM PTX is not UTF-8: {err}")))?;
-    ctx.inner()
-        .load_module(Ptx::from_src(ptx))
-        .map_err(|err| device_unavailable(ctx, format!("MXFP4 GEMM PTX load failed: {err}")))
-}
-
-fn check_output_finite(ctx: &CudaContext, out: &CudaSlice<f32>) -> Result<()> {
-    let values = ctx
-        .inner()
-        .default_stream()
-        .clone_dtoh(out)
-        .map_err(|err| device_unavailable(ctx, format!("read MXFP4 output failed: {err}")))?;
-    for (idx, value) in values.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(ForgeError::NumericalInvariant {
-                op: "gemm_mxfp4_fp32_accum".to_string(),
-                detail: format!("non-finite output at index {idx}: {value}"),
-                remediation: MXFP4_NUMERICAL_REMEDIATION.to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn block_count(rows: usize, cols: usize) -> Result<usize> {
-    Ok(checked_mul(rows, cols, "MXFP4 matrix")?.div_ceil(MXFP4_BLOCK_SIZE))
-}
-
-fn checked_mul(rows: usize, cols: usize, name: &str) -> Result<usize> {
-    rows.checked_mul(cols)
-        .ok_or_else(|| ForgeError::ShapeMismatch {
-            expected: vec![rows, cols],
-            got: vec![usize::MAX],
-            remediation: format!("{name} shape overflows usize"),
-        })
-}
-
-fn check_len(actual: usize, expected: usize, name: &str) -> Result<()> {
-    if actual == expected {
-        return Ok(());
-    }
-    Err(ForgeError::ShapeMismatch {
-        expected: vec![expected],
-        got: vec![actual],
-        remediation: format!("{name} length does not match encoded matrix shape"),
-    })
-}
-
-fn to_i32(value: usize, name: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| ForgeError::ShapeMismatch {
-        expected: vec![i32::MAX as usize],
-        got: vec![value],
-        remediation: format!("MXFP4 GEMM {name} exceeds i32 kernel argument limit"),
-    })
-}
-
-fn device_unavailable(ctx: &CudaContext, detail: String) -> ForgeError {
-    ForgeError::DeviceUnavailable {
-        device: device_label(ctx),
-        detail,
-        remediation: MXFP4_DEVICE_REMEDIATION.to_string(),
-    }
-}
-
-fn device_label(ctx: &CudaContext) -> String {
-    format!("cuda:{}", ctx.device_idx())
 }

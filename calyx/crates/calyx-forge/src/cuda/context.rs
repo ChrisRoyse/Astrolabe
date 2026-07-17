@@ -22,8 +22,25 @@ pub struct CudaContext {
     compute_capability: (i32, i32),
     total_mem_mib: u64,
     free_mem_mib_at_init: u64,
+    dependency_boundary: CudaDependencyBoundary,
     distance_module: Arc<OnceLock<Arc<CudaModule>>>,
     topk_module: Arc<OnceLock<Arc<CudaModule>>>,
+    mxfp_gemm_module: Arc<OnceLock<Arc<CudaModule>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CudaDependencyBoundary {
+    FullModelRuntime,
+    NativeKernel,
+}
+
+impl CudaDependencyBoundary {
+    const fn evidence(self) -> &'static str {
+        match self {
+            Self::FullModelRuntime => "pinned-cuda-runtime-nvml-driver+onnx-provider",
+            Self::NativeKernel => "pinned-cudart-nvml-driver-native-kernel",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -123,6 +140,44 @@ impl CudaContext {
         self.free_mem_mib_at_init
     }
 
+    /// Exact dependency/device authority used to construct this context.
+    pub fn selection_authority(&self) -> &'static str {
+        self.dependency_boundary.evidence()
+    }
+
+    /// Re-reads the context's Driver ordinal and PCI+UUID identity.
+    pub fn attest_physical_identity(&self) -> Result<()> {
+        match self.dependency_boundary {
+            CudaDependencyBoundary::FullModelRuntime => attest_cudarc_context(
+                self.inner.as_ref(),
+                self.driver_ordinal,
+                self.physical_identity,
+            ),
+            CudaDependencyBoundary::NativeKernel => attest_native_kernel_context(
+                self.inner.as_ref(),
+                self.driver_ordinal,
+                self.physical_identity,
+            ),
+        }
+    }
+
+    /// Re-reads only the live Driver context ordinal, PCI identity, and UUID.
+    ///
+    /// Context construction, packed-plan upload, and explicit post-run
+    /// verification use [`Self::attest_physical_identity`] to re-attest the
+    /// complete dependency boundary. A resident kernel dispatch uses this
+    /// direct check so every execution still fails closed on a changed CUDA
+    /// context without reloading and re-hashing the immutable runtime/NVML
+    /// libraries on its performance-critical path.
+    pub(crate) fn attest_execution_identity(&self) -> Result<()> {
+        attest_cudarc_context_identity(
+            self.inner.as_ref(),
+            self.driver_ordinal,
+            self.physical_identity,
+            "resident-kernel",
+        )
+    }
+
     /// Live free device VRAM in bytes via `cudaMemGetInfo` (in-process — never
     /// `nvidia-smi`). The returned value reflects *current* free memory and
     /// therefore accounts for every other resident process on the GPU (the TEI
@@ -152,6 +207,10 @@ impl CudaContext {
     pub(crate) fn topk_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
         &self.topk_module
     }
+
+    pub(crate) fn mxfp_gemm_module_cache(&self) -> &OnceLock<Arc<CudaModule>> {
+        &self.mxfp_gemm_module
+    }
 }
 
 /// Construct a CUDA context for one CUDA Runtime-visible ordinal.
@@ -163,27 +222,76 @@ pub fn init_cuda(runtime_ordinal: u32, determinism: bool) -> Result<CudaContext>
     #[cfg(windows)]
     {
         let selected = crate::cuda_runtime::select_pinned_cuda_device(runtime_ordinal)?;
-        return init_cuda_from_selected(&selected, determinism);
+        init_cuda_from_selected(
+            &selected,
+            determinism,
+            CudaDependencyBoundary::FullModelRuntime,
+        )
     }
 
     #[cfg(not(windows))]
     {
         let driver_ordinal = runtime_ordinal;
         let identity = driver_device_identity_for_ordinal(driver_ordinal)?;
-        init_cuda_driver_ordinal(driver_ordinal, identity, determinism, None)
+        init_cuda_driver_ordinal(
+            driver_ordinal,
+            identity,
+            determinism,
+            CudaDependencyBoundary::NativeKernel,
+            None,
+        )
     }
+}
+
+/// Constructs a CUDA context for embedded native kernels without initializing
+/// ONNX/cuDNN provider DLLs that the kernel cannot call.
+///
+/// Windows still resolves the requested Runtime ordinal through exact locked
+/// cudart PCI identity, signed NVML UUID, and exact nvcuda Driver enumeration.
+/// No ambient ordinal assumption or CPU/backend fallback is permitted.
+pub fn init_cuda_native_kernel(runtime_ordinal: u32, determinism: bool) -> Result<CudaContext> {
+    #[cfg(windows)]
+    {
+        let selected =
+            crate::cuda_runtime::select_pinned_cuda_device_for_native_kernel(runtime_ordinal)?;
+        init_cuda_from_selected(&selected, determinism, CudaDependencyBoundary::NativeKernel)
+    }
+
+    #[cfg(not(windows))]
+    init_cuda(runtime_ordinal, determinism)
 }
 
 #[cfg(windows)]
 fn init_cuda_from_selected(
     selected: &crate::cuda_runtime::PinnedCudaDeviceAttestation,
     determinism: bool,
+    dependency_boundary: CudaDependencyBoundary,
 ) -> Result<CudaContext> {
-    attest_cuda_driver_ordinal(selected.cuda_driver_ordinal, selected.identity)?;
+    match dependency_boundary {
+        CudaDependencyBoundary::FullModelRuntime => {
+            attest_cuda_driver_ordinal(selected.cuda_driver_ordinal, selected.identity)?;
+        }
+        CudaDependencyBoundary::NativeKernel => {
+            let observed =
+                crate::cuda_runtime::attest_pinned_cuda_driver_identity_for_native_kernel(
+                    selected.identity,
+                )?;
+            if observed != selected.cuda_driver_ordinal {
+                return Err(identity_mismatch(
+                    "CALYX_CUDA_DRIVER_ORDINAL_MISMATCH",
+                    format!(
+                        "native-kernel device contract resolved {} to Driver ordinal {observed}, but selection recorded {}",
+                        selected.identity, selected.cuda_driver_ordinal
+                    ),
+                ));
+            }
+        }
+    }
     init_cuda_driver_ordinal(
         selected.cuda_driver_ordinal,
         selected.identity,
         determinism,
+        dependency_boundary,
         Some(selected),
     )
 }
@@ -192,6 +300,7 @@ fn init_cuda_driver_ordinal(
     driver_ordinal: u32,
     physical_identity: PinnedCudaDeviceIdentity,
     determinism: bool,
+    dependency_boundary: CudaDependencyBoundary,
     #[cfg(windows)] selected: Option<&crate::cuda_runtime::PinnedCudaDeviceAttestation>,
     #[cfg(not(windows))] _selected: Option<&()>,
 ) -> Result<CudaContext> {
@@ -205,11 +314,18 @@ fn init_cuda_driver_ordinal(
 
     #[cfg(windows)]
     if let Some(selected) = selected {
-        attest_cudarc_context(
-            inner.as_ref(),
-            selected.cuda_driver_ordinal,
-            selected.identity,
-        )?;
+        match dependency_boundary {
+            CudaDependencyBoundary::FullModelRuntime => attest_cudarc_context(
+                inner.as_ref(),
+                selected.cuda_driver_ordinal,
+                selected.identity,
+            )?,
+            CudaDependencyBoundary::NativeKernel => attest_native_kernel_context(
+                inner.as_ref(),
+                selected.cuda_driver_ordinal,
+                selected.identity,
+            )?,
+        }
     }
 
     let name = inner.name().map_err(|err| {
@@ -233,7 +349,25 @@ fn init_cuda_driver_ordinal(
     let free_mem_mib = bytes_to_mib(free_bytes);
     ensure_min_free_vram(&device, free_mem_mib)?;
     #[cfg(windows)]
-    crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
+    match dependency_boundary {
+        CudaDependencyBoundary::FullModelRuntime => {
+            crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
+        }
+        CudaDependencyBoundary::NativeKernel => {
+            let observed =
+                crate::cuda_runtime::attest_pinned_cuda_driver_identity_for_native_kernel(
+                    physical_identity,
+                )?;
+            if observed != driver_ordinal {
+                return Err(identity_mismatch(
+                    "CALYX_CUDA_DRIVER_ORDINAL_MISMATCH",
+                    format!(
+                        "native-kernel post-construction attestation resolved {physical_identity} to Driver ordinal {observed}, expected {driver_ordinal}"
+                    ),
+                ));
+            }
+        }
+    }
 
     Ok(CudaContext {
         inner,
@@ -244,8 +378,10 @@ fn init_cuda_driver_ordinal(
         compute_capability,
         total_mem_mib: bytes_to_mib(total_bytes),
         free_mem_mib_at_init: free_mem_mib,
+        dependency_boundary,
         distance_module: Arc::new(OnceLock::new()),
         topk_module: Arc::new(OnceLock::new()),
+        mxfp_gemm_module: Arc::new(OnceLock::new()),
     })
 }
 
@@ -264,14 +400,24 @@ pub fn init_cuda_by_pci_bus_id(pci_bus_id: &str, determinism: bool) -> Result<Cu
                 ),
             ));
         }
-        return init_cuda_from_selected(&selected, determinism);
+        init_cuda_from_selected(
+            &selected,
+            determinism,
+            CudaDependencyBoundary::FullModelRuntime,
+        )
     }
 
     #[cfg(not(windows))]
     {
         let driver_ordinal = driver_ordinal_for_pci_bus_id(pci_bus_id)?;
         let identity = driver_device_identity_for_ordinal(driver_ordinal)?;
-        init_cuda_driver_ordinal(driver_ordinal, identity, determinism, None)
+        init_cuda_driver_ordinal(
+            driver_ordinal,
+            identity,
+            determinism,
+            CudaDependencyBoundary::NativeKernel,
+            None,
+        )
     }
 }
 
@@ -302,7 +448,7 @@ pub fn driver_ordinal_for_pci_bus_id(pci_bus_id: &str) -> Result<u32> {
             ));
         }
         crate::cuda_runtime::attest_pinned_cuda_dependencies()?;
-        return Ok(observed);
+        Ok(observed)
     }
 
     #[cfg(not(windows))]
@@ -448,6 +594,21 @@ pub fn attest_cudarc_context(
     expected_driver_ordinal: u32,
     expected_identity: PinnedCudaDeviceIdentity,
 ) -> Result<()> {
+    attest_cudarc_context_identity(
+        context,
+        expected_driver_ordinal,
+        expected_identity,
+        "cudarc",
+    )?;
+    attest_cuda_driver_ordinal(expected_driver_ordinal, expected_identity)
+}
+
+fn attest_cudarc_context_identity(
+    context: &CudarcContext,
+    expected_driver_ordinal: u32,
+    expected_identity: PinnedCudaDeviceIdentity,
+    boundary: &str,
+) -> Result<()> {
     let observed_ordinal = u32::try_from(context.ordinal()).map_err(|_| {
         identity_mismatch(
             "CALYX_CUDA_DRIVER_CONTEXT_IDENTITY_INVALID",
@@ -458,11 +619,10 @@ pub fn attest_cudarc_context(
         return Err(identity_mismatch(
             "CALYX_CUDA_DRIVER_CONTEXT_IDENTITY_MISMATCH",
             format!(
-                "cudarc context reports Driver ordinal {observed_ordinal}, expected {expected_driver_ordinal} for {expected_identity}"
+                "{boundary} context reports Driver ordinal {observed_ordinal}, expected {expected_driver_ordinal} for {expected_identity}"
             ),
         ));
     }
-    attest_cuda_driver_ordinal(expected_driver_ordinal, expected_identity)?;
     let observed_identity = driver_device_identity(
         context.cu_device(),
         i32::try_from(observed_ordinal).map_err(|_| {
@@ -476,11 +636,38 @@ pub fn attest_cudarc_context(
         return Err(identity_mismatch(
             "CALYX_CUDA_DRIVER_CONTEXT_IDENTITY_MISMATCH",
             format!(
-                "constructed cudarc context resolved to {observed_identity}, expected {expected_identity}"
+                "{boundary} context resolved to {observed_identity}, expected {expected_identity}"
             ),
         ));
     }
     Ok(())
+}
+
+fn attest_native_kernel_context(
+    context: &CudarcContext,
+    expected_driver_ordinal: u32,
+    expected_identity: PinnedCudaDeviceIdentity,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let attested = crate::cuda_runtime::attest_pinned_cuda_driver_identity_for_native_kernel(
+            expected_identity,
+        )?;
+        if attested != expected_driver_ordinal {
+            return Err(identity_mismatch(
+                "CALYX_CUDA_DRIVER_ORDINAL_MISMATCH",
+                format!(
+                    "native-kernel bundle attestation resolved {expected_identity} to Driver ordinal {attested}, expected {expected_driver_ordinal}"
+                ),
+            ));
+        }
+    }
+    attest_cudarc_context_identity(
+        context,
+        expected_driver_ordinal,
+        expected_identity,
+        "native-kernel",
+    )
 }
 
 fn driver_device_identity_for_ordinal(driver_ordinal: u32) -> Result<PinnedCudaDeviceIdentity> {

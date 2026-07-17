@@ -407,6 +407,21 @@ pub fn attest_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation>
 
 /// Select one CUDA Runtime-visible device and pin its physical identity process-wide.
 pub fn select_pinned_cuda_device(runtime_ordinal: u32) -> Result<PinnedCudaDeviceAttestation> {
+    initialize_pinned_cuda_dependencies()?;
+    select_pinned_cuda_device_request(CudaDeviceRequest::RuntimeOrdinal(runtime_ordinal))
+}
+
+/// Selects one device for an embedded native CUDA kernel without initializing
+/// the ONNX/cuDNN provider stack.
+///
+/// This is not a relaxed or ambient CUDA path. It validates the same immutable
+/// runtime bundle and maps exact locked `cudart64_13.dll` PCI identity through
+/// signed System32 NVML UUID and `nvcuda.dll` Driver enumeration. It merely
+/// avoids loading model-runtime DLLs that a CUBIN-only kernel does not consume.
+pub fn select_pinned_cuda_device_for_native_kernel(
+    runtime_ordinal: u32,
+) -> Result<PinnedCudaDeviceAttestation> {
+    initialize_pinned_cuda_runtime_boundary()?;
     select_pinned_cuda_device_request(CudaDeviceRequest::RuntimeOrdinal(runtime_ordinal))
 }
 
@@ -414,6 +429,7 @@ pub fn select_pinned_cuda_device(runtime_ordinal: u32) -> Result<PinnedCudaDevic
 pub fn select_pinned_cuda_device_by_identity(
     identity: PinnedCudaDeviceIdentity,
 ) -> Result<PinnedCudaDeviceAttestation> {
+    initialize_pinned_cuda_dependencies()?;
     select_pinned_cuda_device_request(CudaDeviceRequest::PhysicalIdentity(identity))
 }
 
@@ -441,6 +457,24 @@ pub fn attest_pinned_cuda_driver_identity(
     expected_identity: PinnedCudaDeviceIdentity,
 ) -> Result<u32> {
     initialize_pinned_cuda_dependencies()?;
+    let observed = attest_pinned_cuda_driver_identity_inner(expected_identity)?;
+    attest_pinned_cuda_dependencies()?;
+    Ok(observed)
+}
+
+/// Re-attests the native-kernel device contract without loading ONNX provider
+/// dependencies. The selected PCI+UUID must already have been pinned by
+/// [`select_pinned_cuda_device_for_native_kernel`].
+pub fn attest_pinned_cuda_driver_identity_for_native_kernel(
+    expected_identity: PinnedCudaDeviceIdentity,
+) -> Result<u32> {
+    initialize_pinned_cuda_runtime_boundary()?;
+    attest_pinned_cuda_driver_identity_inner(expected_identity)
+}
+
+fn attest_pinned_cuda_driver_identity_inner(
+    expected_identity: PinnedCudaDeviceIdentity,
+) -> Result<u32> {
     let selected = current_pinned_cuda_device()?.ok_or_else(|| {
         runtime_error(
             "CALYX_CUDA_DEVICE_ATTESTATION_MISSING",
@@ -474,7 +508,6 @@ pub fn attest_pinned_cuda_driver_identity(
             DEVICE_REMEDIATION,
         ));
     }
-    attest_pinned_cuda_dependencies()?;
     Ok(observed)
 }
 
@@ -541,7 +574,6 @@ fn select_pinned_cuda_device_request(
 }
 
 fn resolve_cuda_device(request: CudaDeviceRequest) -> Result<PinnedCudaDeviceAttestation> {
-    initialize_pinned_cuda_dependencies()?;
     let boundary = match BOUNDARY.get_or_init(initialize_boundary) {
         Ok(boundary) => boundary,
         Err(error) => return Err(error.clone()),

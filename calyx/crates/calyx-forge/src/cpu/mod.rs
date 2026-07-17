@@ -1,6 +1,7 @@
 pub mod distance;
 pub mod gemm;
 pub mod guard;
+pub mod mxfp;
 pub mod normalize;
 pub mod topk;
 
@@ -83,6 +84,7 @@ impl Backend for CpuBackend {
 pub use distance::{cosine_batch, dot_batch, l2_batch};
 pub use gemm::gemm_f32;
 pub use guard::{check_finite, check_norm_positive, check_shape_2d};
+pub use mxfp::{gemm_mxfp4_packed, gemm_mxfp8_packed};
 pub use normalize::normalize_f32;
 pub use topk::topk_f32;
 
