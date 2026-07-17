@@ -122,7 +122,10 @@ pub(super) enum CodecContext {
     RawF32 {
         dim: usize,
     },
-    TurboQuant(TurboQuantCodec),
+    /// One shared frozen geometry per (slot/lens seed, level); repeated codec
+    /// opens for the same registered slot reuse it via the process-wide
+    /// bounded (live-usage-weak) forge geometry cache.
+    TurboQuant(std::sync::Arc<TurboQuantCodec>),
     ScalarInt8(ScalarInt8Codec),
     MxFp4 {
         codec: MxFp4Codec,
@@ -767,7 +770,7 @@ impl CodecContext {
                 };
                 let seed = shared_seed(slot, lens, dim, level, b"turboquant-tqpr-v2");
                 Ok(Self::TurboQuant(
-                    TurboQuantCodec::new(seed, level).map_err(forge_error)?,
+                    TurboQuantCodec::shared(seed, level).map_err(forge_error)?,
                 ))
             }
             QuantPolicy::MxFp4 => {

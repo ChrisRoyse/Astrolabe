@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
 
@@ -47,11 +49,21 @@ pub struct TurboQuantStorage {
 
 #[derive(Clone, Debug)]
 /// Query geometry prepared once for repeated packed-candidate scans.
+///
+/// Besides the rotated/projected query, preparation materializes per-coordinate
+/// scalar lookup tables: `scalar_lut[i * lut_stride + code]` holds the exact
+/// `f64` product `rotated[i] * centroid(code)` for the coordinate's codebook,
+/// so the packed candidate scan is pure table lookups with no per-coordinate
+/// centroid fetch, canonicality branch, or multiply. The LUT sum is
+/// bit-identical to the reference per-coordinate walk because the identical
+/// `f64` products are accumulated in the identical order.
 pub struct TurboQuantPreparedQuery {
     dim: usize,
     seed_id: SeedId,
     rotated: Vec<f32>,
     projected: Vec<f32>,
+    scalar_lut: Vec<f64>,
+    lut_stride: usize,
 }
 
 /// Borrowed TQPR candidate whose digest, canonical bits, and codec geometry
@@ -340,7 +352,67 @@ impl TurboQuantV1MigrationVerifier {
     }
 }
 
+/// Process-wide shared TurboQuant geometry cache, keyed by rotation-seed
+/// identity and level code.
+///
+/// Entries are weak references: a geometry lives exactly as long as some user
+/// holds its `Arc`, so cache memory is bounded by live registered-slot usage —
+/// there is no tuned capacity constant and no unbounded retention. Dead entries
+/// are reaped on every insert.
+static SHARED_GEOMETRY_CACHE: OnceLock<Mutex<HashMap<(SeedId, u8), Weak<TurboQuantCodec>>>> =
+    OnceLock::new();
+
 impl TurboQuantCodec {
+    /// Returns the shared frozen geometry for `(seed, level)`, deriving the
+    /// dense rotation/projection/codebook material at most once per process
+    /// while any user retains it.
+    ///
+    /// Repeated codec opens for the same registered slot (streaming ingest,
+    /// column reads, searches) share one geometry instead of re-deriving the
+    /// O(d^2) material per open. Fail-closed: a cached entry whose seed
+    /// dimension or level disagrees with the request is a corruption error,
+    /// never silently replaced.
+    pub fn shared(seed: RotationSeed, level: QuantLevel) -> Result<Arc<Self>> {
+        let key = (seed.id, encode_level(level)?);
+        let cache = SHARED_GEOMETRY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().map_err(|_| {
+            quant_error("shared", level, "shared geometry cache lock poisoned")
+        })?;
+        if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
+            if existing.seed.dim != seed.dim || existing.level != level {
+                return Err(quant_error(
+                    "shared",
+                    level,
+                    format!(
+                        "shared geometry cache entry disagrees with request: cached dim={} level={}, requested dim={} level={level}",
+                        existing.seed.dim, existing.level, seed.dim
+                    ),
+                ));
+            }
+            return Ok(existing);
+        }
+        let codec = Arc::new(Self::new(seed, level)?);
+        guard.retain(|_, weak| weak.strong_count() > 0);
+        guard.insert(key, Arc::downgrade(&codec));
+        Ok(codec)
+    }
+
+    /// Number of live (still-referenced) entries in the shared geometry cache.
+    ///
+    /// Observability hook for FSV: proves the cache is bounded by live usage.
+    pub fn shared_geometry_cache_len() -> usize {
+        SHARED_GEOMETRY_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok())
+            .map(|guard| {
+                guard
+                    .values()
+                    .filter(|weak| weak.strong_count() > 0)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Constructs one reusable lens/slot geometry for the requested level.
     pub fn new(seed: RotationSeed, level: QuantLevel) -> Result<Self> {
         validate_level(level, "new")?;
@@ -420,17 +492,40 @@ impl TurboQuantCodec {
         })
     }
 
-    /// Applies the shared Haar rotation and Gaussian projection once per raw query.
+    /// Applies the shared Haar rotation and Gaussian projection once per raw
+    /// query, and builds the per-coordinate scalar lookup tables that make the
+    /// packed candidate scan multiplication-free.
     pub fn prepare_query(&self, query: &[f32]) -> Result<TurboQuantPreparedQuery> {
         validate_raw(query, self.seed.dim, "prepare_query", self.level)?;
         let mut rotated = query.to_vec();
         self.rotation.apply(&mut rotated)?;
         let projected = self.projection.project(&rotated)?;
+        let lut_stride = 1_usize << self.high_codebook.bits();
+        let lut_len = self.seed.dim.checked_mul(lut_stride).ok_or_else(|| {
+            quant_error("prepare_query", self.level, "scalar LUT length overflow")
+        })?;
+        let mut scalar_lut = vec![0.0_f64; lut_len];
+        for (index, value) in rotated.iter().enumerate() {
+            let codebook = self.codebook_for_index(index);
+            let base = index * lut_stride;
+            for code in 0..codebook.centroids().len() {
+                let centroid = codebook.centroid(code as u8).ok_or_else(|| {
+                    quant_error(
+                        "prepare_query",
+                        self.level,
+                        format!("scalar code {code} is invalid at coordinate {index}"),
+                    )
+                })?;
+                scalar_lut[base + code] = f64::from(*value) * f64::from(centroid);
+            }
+        }
         Ok(TurboQuantPreparedQuery {
             dim: self.seed.dim,
             seed_id: self.geometry_id,
             rotated,
             projected,
+            scalar_lut,
+            lut_stride,
         })
     }
 
@@ -470,7 +565,7 @@ impl TurboQuantCodec {
         if candidate.scale == 0.0 {
             return Ok(0.0);
         }
-        let scalar_dot = self.scalar_dot(&query.rotated, candidate.scalar, "score_prepared")?;
+        let scalar_dot = self.scalar_dot_lut(query, candidate.scalar, "score_prepared")?;
         let correction =
             self.projection
                 .correction_parts(&query.projected, candidate.qjl, candidate.gamma)?;
@@ -479,6 +574,83 @@ impl TurboQuantCodec {
             "score_prepared",
             self.level,
         )
+    }
+
+    /// Reference (non-LUT) scoring path: per-coordinate checked centroid walk.
+    ///
+    /// Kept as the exact verification oracle for the LUT scan — FSV asserts the
+    /// two paths return bit-identical scores over real candidates. Not used on
+    /// the hot search path.
+    pub fn dot_estimate_reference(
+        &self,
+        query: &TurboQuantPreparedQuery,
+        candidate: &TurboQuantValidatedCandidate<'_>,
+    ) -> Result<f32> {
+        if query.dim != self.seed.dim || query.seed_id != self.geometry_id {
+            return Err(quant_error(
+                "score_reference",
+                self.level,
+                "prepared query was produced by different codec geometry",
+            ));
+        }
+        if candidate.level != self.level
+            || candidate.dim != self.seed.dim
+            || candidate.geometry_id != self.geometry_id
+        {
+            return Err(quant_error(
+                "score_reference",
+                self.level,
+                "validated candidate belongs to different codec geometry",
+            ));
+        }
+        if candidate.scale == 0.0 {
+            return Ok(0.0);
+        }
+        let scalar_dot = self.scalar_dot(&query.rotated, candidate.scalar, "score_reference")?;
+        let correction =
+            self.projection
+                .correction_parts(&query.projected, candidate.qjl, candidate.gamma)?;
+        finite_f32(
+            f64::from(candidate.scale) * scalar_dot + correction,
+            "score_reference",
+            self.level,
+        )
+    }
+
+    /// LUT packed scan: sums the pre-multiplied per-coordinate query products
+    /// selected by each packed scalar code. Bit-identical to
+    /// [`Self::dot_estimate_reference`]'s scalar term (same `f64` products,
+    /// same accumulation order); candidate corruption was already refused by
+    /// `validate_candidate`/`ParsedPayload::parse`, outside this loop.
+    fn scalar_dot_lut(
+        &self,
+        query: &TurboQuantPreparedQuery,
+        scalar: &[u8],
+        op: &str,
+    ) -> Result<f64> {
+        let high_bits = self.high_codebook.bits();
+        let low_bits = self.low_codebook.bits();
+        let pair_bits = high_bits + low_bits;
+        let stride = query.lut_stride;
+        let lut = &query.scalar_lut;
+        let mut sum = 0.0_f64;
+        for pair in 0..self.seed.dim.div_ceil(2) {
+            let index = pair * 2;
+            let (high_code, low_code) =
+                read_code_pair(scalar, pair * pair_bits, high_bits, low_bits);
+            sum += lut[index * stride + usize::from(high_code)];
+            if index + 1 < self.seed.dim {
+                sum += lut[(index + 1) * stride + usize::from(low_code)];
+            }
+        }
+        if !sum.is_finite() {
+            return Err(quant_error(
+                op,
+                self.level,
+                "scalar dot product is non-finite",
+            ));
+        }
+        Ok(sum)
     }
 
     fn scalar_dot(&self, query: &[f32], scalar: &[u8], op: &str) -> Result<f64> {
