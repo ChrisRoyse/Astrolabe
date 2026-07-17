@@ -724,6 +724,7 @@ dependencies = [
  "half",
  "hf-hub",
  "memmap2",
+ "nvml-wrapper",
  "ort",
  "safetensors 0.7.0",
  "serde",

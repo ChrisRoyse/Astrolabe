@@ -1457,6 +1457,7 @@ fn attest_loaded_modules(
         let Some(name) = path.file_name().and_then(OsStr::to_str) else {
             continue;
         };
+        let name = name.to_string();
         let key = name.to_ascii_lowercase();
         if expected.contains_key(&key) {
             if loaded.insert(key, path).is_some() {
