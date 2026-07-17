@@ -781,6 +781,35 @@ impl JobGuard {
     }
 }
 
+/// Current resident working-set (RSS) bytes of a LIVE child, read from its process
+/// handle via `K32GetProcessMemoryInfo` (#515). A single cheap syscall on the handle
+/// the `Child` already owns. Must be sampled while the process is alive — a Windows
+/// process's working set is torn down at exit and reads stale afterward — so the
+/// caller polls this during its existing wait loop and keeps the running maximum;
+/// that captured peak then survives the child's death for the structured
+/// child-without-a-tool-result failure detail (the rc=127 case this issue tracks).
+/// `None` when the query fails (labeled degradation in the caller, never fabricated).
+pub(crate) fn child_working_set_bytes(child: &std::process::Child) -> Option<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    // SAFETY: the child handle is borrowed from a live `Child` for the duration of
+    // the call; `counters` is a zeroed POD the query fills; no handle is retained.
+    unsafe {
+        let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        if K32GetProcessMemoryInfo(
+            child.as_raw_handle(),
+            &raw mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ) == 0
+        {
+            return None;
+        }
+        Some(counters.WorkingSetSize as u64)
+    }
+}
+
 impl Drop for JobGuard {
     fn drop(&mut self) {
         // SAFETY: the guard exclusively owns the job handle.
