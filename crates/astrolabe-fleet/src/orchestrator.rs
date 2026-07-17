@@ -436,23 +436,32 @@ pub fn run_pipeline_pass_outcome(
                 "catalog mutation failed after pipeline success: {} — {}",
                 error.code, error.message
             ));
-            // Quarantine so the failure is durable; if even that fails the
-            // pass aborts with the structured error (nothing silent).
-            catalog.transition(
+            // Quarantine so the failure is durable. A refused quarantine
+            // transition is contained to THIS repo (appended to its verdict
+            // detail, counted in the run report) — one row's catalog fight
+            // must never abort the remaining repos of a multi-repo pass
+            // (2026-07-16: a concurrent pass's row write turned this `?` into
+            // a whole-pass abort with 8 repos never attempted).
+            verdict.outcome = Outcome::Quarantined;
+            verdict.stage = Some("catalog".to_string());
+            verdict.detail = detail.clone();
+            if let Err(record_error) = catalog.transition(
                 result.row.record.github_id,
                 &result.row.record.full_name,
                 RepoState::Quarantined,
                 TransitionContext {
                     at_unix_secs: config.at_unix_secs,
-                    quarantine_reason: Some(detail.clone()),
+                    quarantine_reason: Some(detail),
                     ..TransitionContext::default()
                 },
-            )?;
-            verdict.outcome = Outcome::Quarantined;
-            verdict.stage = Some("catalog".to_string());
-            verdict.detail = detail;
-        } else if verdict.outcome == Outcome::Quarantined {
-            catalog.transition(
+            ) {
+                verdict.detail = safe_reason(&format!(
+                    "{} — AND recording the quarantine was refused: {} — {}",
+                    verdict.detail, record_error.code, record_error.message
+                ));
+            }
+        } else if verdict.outcome == Outcome::Quarantined
+            && let Err(record_error) = catalog.transition(
                 result.row.record.github_id,
                 &result.row.record.full_name,
                 RepoState::Quarantined,
@@ -465,7 +474,14 @@ pub fn run_pipeline_pass_outcome(
                     )),
                     ..TransitionContext::default()
                 },
-            )?;
+            )
+        {
+            // Same containment: the verdict side-file + run report carry the
+            // full story (labeled, counted); the pass continues.
+            verdict.detail = safe_reason(&format!(
+                "{} — AND recording the quarantine was refused: {} — {}",
+                verdict.detail, record_error.code, record_error.message
+            ));
         }
 
         write_side_file(

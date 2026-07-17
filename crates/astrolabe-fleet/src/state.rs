@@ -140,6 +140,15 @@ pub fn check_transition(from: RepoState, to: RepoState) -> Result<(), CalyxError
         // from the start; the quarantine reason survives in the ledger.
         return Ok(());
     }
+    if from == RepoState::Quarantined && to == RepoState::Quarantined {
+        // Idempotent re-quarantine: observing a SECOND failure for an
+        // already-quarantined repo is a new fact (fresh reason, fresh ledger
+        // entry), not an illegal step. Without this edge, two passes racing
+        // one row (2026-07-16 collision, #460) turned the later verdict
+        // recording into ASTRO_FLEET_ILLEGAL_TRANSITION and aborted that
+        // pass wholesale mid-run.
+        return Ok(());
+    }
     if from.pipeline_successor() == Some(to) {
         return Ok(());
     }
@@ -167,6 +176,9 @@ fn legal_targets(from: RepoState) -> String {
     }
     if from == RepoState::Departed || from == RepoState::Quarantined {
         targets.push(RepoState::Discovered.as_str());
+    }
+    if from == RepoState::Quarantined {
+        targets.push(RepoState::Quarantined.as_str());
     }
     if targets.is_empty() {
         "none (terminal state)".to_string()
