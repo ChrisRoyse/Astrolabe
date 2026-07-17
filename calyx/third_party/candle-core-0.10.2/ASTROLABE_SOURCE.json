@@ -1,0 +1,16 @@
+{
+  "schema": "astrolabe.owned-crate-source.v1",
+  "package": "candle-core",
+  "version": "0.10.2",
+  "crates_io_archive_sha256": "6bd9895436c1ba5dc1037a19935d084b838db066ff4e15ef7dded020b7c12a4a",
+  "upstream_repository": "https://github.com/huggingface/candle",
+  "upstream_git_commit": "7c7a8c570e6a16ea24cc30a7501c8ffbbdb51680",
+  "upstream_issue": "https://github.com/huggingface/candle/issues/3208",
+  "license": "MIT OR Apache-2.0",
+  "owned_source_file_count": 61,
+  "owned_source_tree_sha256": "15f70f9a1c074e3207ce4c808794d40306453e370933b96850a806e55f99ef66",
+  "owned_deltas": [
+    "select cudarc/dynamic-loading instead of cudarc/dynamic-linking",
+    "exclude upstream examples, benches, tests, dev-dependencies, and inline test-only modules under Astrolabe's manual-FSV-only policy"
+  ]
+}

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["third_party/candle-core-0.10.2"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,6 +48,12 @@ uuid = { version = "1", features = ["serde"] }
 wide = "1"
 zeroize = "1"
 zstd = "0.13"
+
+[patch.crates-io]
+# Candle 0.10.2 hard-codes cudarc's eager PE linkage. The owned source keeps
+# the release implementation intact while selecting runtime loading so the
+# process can attest one exact CUDA dependency bundle before any GPU call.
+candle-core = { path = "third_party/candle-core-0.10.2" }
 
 # ── Build profiles ───────────────────────────────────────────────────────────
 # Tuned for this workspace's high-churn, multi-agent build cadence. The cargo
