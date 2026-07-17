@@ -778,6 +778,8 @@ dependencies = [
  "calyx-anneal",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
+ "calyx-ledger",
  "calyx-paths",
  "calyx-ward",
  "cudarc 0.19.8",
@@ -789,6 +791,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
  "zstd",
 ]

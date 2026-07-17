@@ -124,6 +124,7 @@ fn autotune_ledger_entry(event: &IndexPromotionRecord) -> AnnealLedgerEntry {
 
 fn quant_promotion_details(event: &IndexPromotionRecord) -> Option<Value> {
     let evidence = event.quant_evidence.as_ref()?;
+    let activation = event.served_artifact.as_ref()?;
     Some(json!({
         "tag": "quant_compression_promotion_v1",
         "scope": "index",
@@ -138,6 +139,18 @@ fn quant_promotion_details(event: &IndexPromotionRecord) -> Option<Value> {
         "max_cosine_error": evidence.max_cosine_error,
         "guard_far_before": evidence.guard_far_before,
         "guard_far_after": evidence.guard_far_after,
+        // Absolute paths remain only in the checksummed serving pointer. The
+        // append-only ledger records public digests/measurements, never host
+        // path material that the secret scanner must reject.
+        "prior_pointer_digest": activation.prior_pointer_digest,
+        "candidate_pointer_digest": activation.candidate_pointer_digest,
+        "observed_pointer_digest": activation.observed_pointer_digest,
+        "prior_artifact_digest": activation.prior_artifact_digest,
+        "candidate_artifact_digest": activation.candidate_artifact_digest,
+        "observed_artifact_digest": activation.observed_artifact_digest,
+        "candidate_artifact_bytes": activation.candidate_artifact_bytes,
+        "heldout_query_count": activation.heldout_query_count,
+        "served_quant_bits": activation.candidate_quant_bits,
     }))
 }
 

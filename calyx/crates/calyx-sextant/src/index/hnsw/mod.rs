@@ -1,24 +1,43 @@
 //! Deterministic in-RAM dense HNSW-style index.
 
+mod activation;
+mod artifact;
 mod graph;
 mod scored;
+
+pub use activation::{
+    HNSW_ACTIVE_POINTER_MAGIC, HNSW_ACTIVE_POINTER_VERSION, HnswActivePointer,
+    HnswArtifactActivator,
+};
+pub use artifact::{
+    HNSW_ARTIFACT_MAGIC, HNSW_ARTIFACT_VERSION, HnswArtifactExpectation, HnswArtifactMetadata,
+    HnswArtifactReceipt,
+};
+
+/// Largest dense dimension accepted by the in-memory and persisted HNSW
+/// contract. This matches Calyx's frozen vector/quantization ceiling and keeps
+/// artifact size arithmetic and per-query scratch bounded.
+pub const HNSW_MAX_DIM: u32 = 4_096;
 
 use std::collections::HashMap;
 
 use calyx_aster::gc::{AnnIndexGraph, AnnTombstoneStats};
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
+use super::quant_config::{PackedQuery, PackedVector, score_packed};
 use super::{IndexSearchHit, IndexStats, QuantConfig, SextantIndex, ranked};
 use crate::error::{
     CALYX_SEXTANT_DIM_MISMATCH, CALYX_SEXTANT_EF_TOO_SMALL, CALYX_SEXTANT_INDEX_EMPTY,
     CALYX_SEXTANT_VECTOR_SHAPE, sextant_error,
 };
-use crate::util::{cosine, dense, top_k};
+use crate::util::{dense, top_k};
 
 #[derive(Clone, Debug)]
 struct Row {
     cx_id: CxId,
-    vector: Vec<f32>,
+    /// Physically packed per-row storage: the configured quantizer changes
+    /// these bytes and the scoring kernel (layout v1, see `quant_config`).
+    stored: PackedVector,
     seq: u64,
     level: u8,
     neighbors: Vec<usize>,
@@ -60,6 +79,20 @@ impl HnswIndex {
     pub fn with_quant(mut self, quant: QuantConfig) -> Self {
         self.quant = quant;
         self
+    }
+
+    fn validate_configuration(&self) -> Result<()> {
+        self.quant.validate()?;
+        if self.dim == 0 || self.dim > HNSW_MAX_DIM {
+            return Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                format!(
+                    "hnsw dimension {} is outside the supported range 1..={HNSW_MAX_DIM}",
+                    self.dim
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn neighbor_counts(&self) -> Vec<usize> {
@@ -125,14 +158,60 @@ impl HnswIndex {
     }
 
     pub fn brute_force(&self, query: &[f32], k: usize) -> Vec<(CxId, f32)> {
+        let prepared = self.quant.prepare_query(query);
         top_k(
             self.rows
                 .iter()
-                .filter(|row| !row.deleted)
-                .map(|row| (row.cx_id, cosine(query, &row.vector)))
+                .enumerate()
+                .filter(|(_, row)| !row.deleted)
+                .map(|(idx, row)| (row.cx_id, self.score_row(&prepared, idx)))
                 .collect(),
             k,
         )
+    }
+
+    /// Total packed vector payload bytes physically held by this index.
+    pub fn physical_vector_bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|row| row.stored.physical_bytes())
+            .sum()
+    }
+
+    /// The quantization policy this index physically stores and scores with.
+    pub fn quant_config(&self) -> &QuantConfig {
+        &self.quant
+    }
+
+    /// Scores one prepared query against one packed row directly.
+    ///
+    /// The query is always prepared by this index's own `QuantConfig` and row
+    /// dimensions are validated at insert, so a pairing failure here is an
+    /// internal invariant violation, not a caller state.
+    pub(super) fn score_row(&self, query: &PackedQuery, idx: usize) -> f32 {
+        match score_packed(query, &self.rows[idx].stored) {
+            Ok(score) => score,
+            Err(error) => unreachable!(
+                "packed scoring invariant violated inside HnswIndex: {}",
+                error.message
+            ),
+        }
+    }
+
+    /// Builds the construction-time query for an already-inserted row from its
+    /// packed representation (no raw vector is retained).
+    pub(super) fn construction_query(&self, index: usize) -> PackedQuery {
+        match &self.rows[index].stored {
+            PackedVector::F32 { values } => self.quant.prepare_query(values),
+            PackedVector::Scalar8 { .. } => {
+                let approx = self.rows[index].stored.approx_f32();
+                self.quant.prepare_query(&approx)
+            }
+            PackedVector::Binary { bits, dim } => PackedQuery::Binary {
+                bits: bits.clone(),
+                dim: *dim,
+            },
+        }
     }
 
     pub fn recall_at(&self, queries: &[Vec<f32>], k: usize, ef: usize) -> f32 {
@@ -175,6 +254,7 @@ impl HnswIndex {
     }
 
     fn checked_query<'a>(&self, query: &'a SlotVector) -> Result<&'a [f32]> {
+        self.validate_configuration()?;
         let values = dense(query)?;
         if values.len() != self.dim as usize {
             return Err(sextant_error(
@@ -182,23 +262,36 @@ impl HnswIndex {
                 format!("query dim {} expected {}", values.len(), self.dim),
             ));
         }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                "hnsw query contains a non-finite coordinate",
+            ));
+        }
         Ok(values)
     }
 
-    fn exact_vector_hits(&self, query: &[f32]) -> Vec<(CxId, f32)> {
+    fn exact_vector_hits(
+        &self,
+        packed_query: &PackedVector,
+        prepared: &PackedQuery,
+    ) -> Vec<(CxId, f32)> {
+        let identity = packed_query.identity_bytes();
         self.fingerprints
-            .get(&vector_fingerprint(query))
+            .get(&packed_fingerprint(packed_query))
             .into_iter()
             .flat_map(|indices| indices.iter())
-            .filter_map(|idx| self.rows.get(*idx))
-            .filter(|row| !row.deleted)
-            .filter(|row| same_vector_bits(&row.vector, query))
-            .map(|row| (row.cx_id, cosine(query, &row.vector)))
+            .filter(|idx| {
+                self.rows
+                    .get(**idx)
+                    .is_some_and(|row| !row.deleted && row.stored.identity_bytes() == identity)
+            })
+            .map(|idx| (self.rows[*idx].cx_id, self.score_row(prepared, *idx)))
             .collect()
     }
 
     fn index_fingerprint(&mut self, index: usize) {
-        let fingerprint = vector_fingerprint(&self.rows[index].vector);
+        let fingerprint = packed_fingerprint(&self.rows[index].stored);
         self.fingerprints
             .entry(fingerprint)
             .or_default()
@@ -206,7 +299,7 @@ impl HnswIndex {
     }
 
     fn remove_fingerprint(&mut self, index: usize) {
-        let fingerprint = vector_fingerprint(&self.rows[index].vector);
+        let fingerprint = packed_fingerprint(&self.rows[index].stored);
         if let Some(indices) = self.fingerprints.get_mut(&fingerprint) {
             indices.retain(|idx| *idx != index);
             if indices.is_empty() {
@@ -235,6 +328,7 @@ impl SextantIndex for HnswIndex {
     }
 
     fn insert(&mut self, cx_id: CxId, vector: SlotVector, seq: u64) -> Result<()> {
+        self.validate_configuration()?;
         let values = dense(&vector)?;
         if values.len() != self.dim as usize {
             return Err(sextant_error(
@@ -242,10 +336,17 @@ impl SextantIndex for HnswIndex {
                 format!("dim {} expected {}", values.len(), self.dim),
             ));
         }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                "hnsw insert contains a non-finite coordinate",
+            ));
+        }
         self.quant.lock_after_first_insert();
+        let packed = self.quant.pack(values);
         if let Some(&index) = self.positions.get(&cx_id) {
             self.remove_fingerprint(index);
-            self.rows[index].vector = values.to_vec();
+            self.rows[index].stored = packed;
             self.rows[index].seq = seq;
             self.rows[index].deleted = false;
             self.index_fingerprint(index);
@@ -257,7 +358,7 @@ impl SextantIndex for HnswIndex {
         let level = self.level_for(cx_id, index);
         self.rows.push(Row {
             cx_id,
-            vector: values.to_vec(),
+            stored: packed,
             seq,
             level,
             neighbors: Vec::new(),
@@ -297,7 +398,9 @@ impl SextantIndex for HnswIndex {
                 "hnsw search requested on an empty index",
             ));
         }
-        let query = self.checked_query(query)?;
+        let raw_query = self.checked_query(query)?;
+        let prepared = self.quant.prepare_query(raw_query);
+        let packed_query = self.quant.pack(raw_query);
         let needed = k.min(live_len);
         let ef = ef
             .unwrap_or_else(|| needed.max(self.max_neighbors * 2))
@@ -314,10 +417,13 @@ impl SextantIndex for HnswIndex {
                 "hnsw search requested on an empty index",
             )
         })?;
-        let start = self.greedy_descent(query, entry);
-        let results = self.beam_search(query, start, ef);
+        let start = self.greedy_descent(&prepared, entry);
+        let results = self.beam_search(&prepared, start, ef);
         let mut merged = HashMap::<CxId, f32>::new();
-        for (cx_id, score) in results.into_iter().chain(self.exact_vector_hits(query)) {
+        for (cx_id, score) in results
+            .into_iter()
+            .chain(self.exact_vector_hits(&packed_query, &prepared))
+        {
             merged
                 .entry(cx_id)
                 .and_modify(|existing| *existing = existing.max(score))
@@ -342,10 +448,12 @@ impl SextantIndex for HnswIndex {
     }
 
     fn vector(&self, cx_id: CxId) -> Option<SlotVector> {
+        // Reconstruction from the packed representation: exact for
+        // QuantKind::None, the labeled representable approximation otherwise.
         self.positions.get(&cx_id).and_then(|&index| {
             (!self.rows[index].deleted).then(|| SlotVector::Dense {
                 dim: self.dim,
-                data: self.rows[index].vector.clone(),
+                data: self.rows[index].stored.approx_f32(),
             })
         })
     }
@@ -386,19 +494,10 @@ impl AnnIndexGraph for HnswIndex {
     }
 }
 
-fn vector_fingerprint(values: &[f32]) -> [u8; 32] {
+fn packed_fingerprint(packed: &PackedVector) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&(values.len() as u64).to_le_bytes());
-    for value in values {
-        hasher.update(&value.to_bits().to_le_bytes());
-    }
+    let identity = packed.identity_bytes();
+    hasher.update(&(identity.len() as u64).to_le_bytes());
+    hasher.update(&identity);
     *hasher.finalize().as_bytes()
-}
-
-fn same_vector_bits(left: &[f32], right: &[f32]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.to_bits() == right.to_bits())
 }

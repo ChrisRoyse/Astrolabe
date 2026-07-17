@@ -6,9 +6,10 @@
 //!   hashed-set shapes) — the CBM candidate generator retained as an O(n)
 //!   pass, re-derived deterministically from the configured seed.
 //! - **Seeded, scalar8-quantized HNSW** (`calyx-sextant`) for dense slot
-//!   vectors, where set-based LSH does not apply. The index is built over
-//!   quantized approximations (per-pool measured scale) in sorted-qualified-
-//!   name order, which makes construction and search fully deterministic.
+//!   vectors, where set-based LSH does not apply. The index receives raw input
+//!   once, physically stores one-byte scalar codes, and scores those codes
+//!   directly with the per-pool measured scale. Construction order is sorted
+//!   qualified name, which makes construction and search deterministic.
 //!
 //! Both generators only *propose* pairs; every proposed pair is re-scored with
 //! the exact cosine on the raw vectors and admitted under the same canonical
@@ -336,17 +337,24 @@ fn dense_candidates(
     });
 
     let quant = QuantConfig::scalar8(scale);
-    let approximations: Vec<Vec<f32>> = group
+    let dense_inputs: Vec<Vec<f32>> = group
         .iter()
         .map(|&index| {
             let NormalizedVector::Dense { data, .. } = &vectors[index].vector else {
                 unreachable!("dense group holds only dense vectors");
             };
-            quant.quantize(data).approx
+            data.clone()
         })
         .collect();
 
     if crate::knobs::weave_dense_ann_use_exact(dim) {
+        // The exact strategy has no persistent index object, so materialize the
+        // same scalar8 representable values it scans. The HNSW path below must
+        // receive raw values: Sextant owns packing and keeps no f32 copy.
+        let approximations: Vec<Vec<f32>> = dense_inputs
+            .iter()
+            .map(|data| quant.pack(data).approx_f32())
+            .collect();
         return Ok(exact_dense_candidates(
             &approximations,
             group,
@@ -357,7 +365,8 @@ fn dense_candidates(
     hnsw_dense_candidates(
         family,
         dim,
-        &approximations,
+        &dense_inputs,
+        quant,
         config,
         span,
         group,
@@ -375,7 +384,8 @@ fn dense_candidates(
 fn hnsw_dense_candidates(
     family: SimilarityFamily,
     dim: u32,
-    approximations: &[Vec<f32>],
+    dense_inputs: &[Vec<f32>],
+    quant: QuantConfig,
     config: &AnnCandidateConfig,
     span: usize,
     group: &[usize],
@@ -383,14 +393,14 @@ fn hnsw_dense_candidates(
 ) -> Result<usize, SimilarityPlanError> {
     let ann_failure =
         |message: String| SimilarityPlanError::AnnCandidateFailure { family, message };
-    let mut index = HnswIndex::new(family.slot(), dim, config.seed);
-    for (ordinal, approx) in approximations.iter().enumerate() {
+    let mut index = HnswIndex::new(family.slot(), dim, config.seed).with_quant(quant);
+    for (ordinal, input) in dense_inputs.iter().enumerate() {
         index
             .insert(
                 ordinal_cx_id(ordinal),
                 SlotVector::Dense {
                     dim,
-                    data: approx.clone(),
+                    data: input.clone(),
                 },
                 ordinal as u64,
             )
@@ -412,24 +422,24 @@ fn hnsw_dense_candidates(
     // query loop. Measurement drove this: `similarity_plan` was the largest weave
     // sub-stage and its cost is dominated by these queries, previously serial.
     let workers = crate::knobs::weave_similarity_workers()
-        .min(approximations.len())
+        .min(dense_inputs.len())
         .max(1);
-    let chunk_size = approximations.len().div_ceil(workers);
+    let chunk_size = dense_inputs.len().div_ceil(workers);
     let hit_lists: Vec<Result<Vec<Vec<usize>>, SimilarityPlanError>> = std::thread::scope(
         |scope| {
             let index = &index;
-            approximations
+            dense_inputs
                 .chunks(chunk_size.max(1))
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
                             .iter()
-                            .map(|approx| {
+                            .map(|input| {
                                 let hits = index
                                     .search(
                                         &SlotVector::Dense {
                                             dim,
-                                            data: approx.clone(),
+                                            data: input.clone(),
                                         },
                                         k,
                                         Some(ef),

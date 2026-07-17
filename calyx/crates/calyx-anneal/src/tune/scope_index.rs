@@ -14,11 +14,12 @@ use crate::{
 
 use types::metrics_are_valid;
 pub use types::{
-    DEFAULT_INDEX_RECALL_TARGET, DEFAULT_INDEX_VRAM_BUDGET_BYTES, IndexConfig,
-    IndexPromotionRecord, IndexTuneDecision, IndexTuneSkip, MAX_INDEX_CANDIDATES,
-    MIN_BITS_PER_ANCHOR, QuantPromotionEvidence, candidate_configs, decode_index_config,
-    encode_index_config, index_slot_label, quant_win_check, slot_autotune_key,
-    validate_index_config, validate_quant_promotion_evidence,
+    DEFAULT_INDEX_RECALL_TARGET, DEFAULT_INDEX_VRAM_BUDGET_BYTES, IndexArtifactActivation,
+    IndexArtifactPromotionRequest, IndexConfig, IndexPromotionRecord, IndexTuneDecision,
+    IndexTuneSkip, MAX_INDEX_CANDIDATES, MIN_BITS_PER_ANCHOR, QuantPromotionEvidence,
+    candidate_configs, decode_index_config, encode_index_config, index_slot_label, quant_win_check,
+    slot_autotune_key, validate_index_artifact_activation, validate_index_config,
+    validate_quant_promotion_evidence,
 };
 pub use writer::{
     IndexBanditPersistence, IndexPromotionWriter, NoopIndexBanditStore, NoopIndexPromotionWriter,
@@ -26,6 +27,8 @@ pub use writer::{
 
 pub const CALYX_INDEX_CACHE_WRITE_FAIL: &str = "CALYX_INDEX_CACHE_WRITE_FAIL";
 pub const CALYX_INDEX_SCOPE_INVALID_CONFIG: &str = "CALYX_INDEX_SCOPE_INVALID_CONFIG";
+pub const CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED: &str =
+    "CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED";
 
 const NEXT_CHANGE_ID_START: u64 = 414_000;
 const RECALL_EPSILON: f64 = 1e-12;
@@ -42,6 +45,45 @@ struct PromotionMetrics {
 
 pub trait IndexSlotHealth {
     fn is_slot_parked(&self, slot_id: SlotId) -> bool;
+}
+
+/// Serving owner for a prepared physical index artifact. Implementations must
+/// atomically move the active pointer, reopen the pointer and artifact bytes,
+/// and return that observation. `rollback` must restore and reread the prior
+/// pointer if a later cache/ledger mutation fails.
+pub trait IndexArtifactActivator {
+    fn activate(
+        &mut self,
+        request: &IndexArtifactPromotionRequest,
+    ) -> Result<IndexArtifactActivation>;
+
+    fn rollback(&mut self, activation: &IndexArtifactActivation) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct RefuseIndexArtifactActivator;
+
+impl IndexArtifactActivator for RefuseIndexArtifactActivator {
+    fn activate(
+        &mut self,
+        _request: &IndexArtifactPromotionRequest,
+    ) -> Result<IndexArtifactActivation> {
+        Err(CalyxError {
+            code: CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED,
+            message: "quantization promotion has no physical serving-artifact activator".into(),
+            remediation: "stage the measured candidate index artifact and configure an activator that atomically swaps and rereads the served pointer",
+        })
+    }
+
+    fn rollback(&mut self, _activation: &IndexArtifactActivation) -> Result<()> {
+        Err(CalyxError {
+            code: CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED,
+            message:
+                "cannot roll back a quantization promotion without a serving-artifact activator"
+                    .into(),
+            remediation: "repair the serving-artifact activator and restore the last independently verified pointer",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -87,10 +129,12 @@ pub struct IndexScopeTuner<
     W = NoopIndexPromotionWriter,
     B = NoopIndexBanditStore,
     H = NoopIndexSlotHealth,
+    A = RefuseIndexArtifactActivator,
 > where
     W: IndexPromotionWriter,
     B: IndexBanditPersistence,
     H: IndexSlotHealth,
+    A: IndexArtifactActivator,
 {
     pub bandits: HashMap<SlotId, ConfigBandit>,
     pub assay: Arc<dyn AssayMetrics>,
@@ -98,6 +142,7 @@ pub struct IndexScopeTuner<
     promotion_writer: W,
     bandit_store: B,
     health: H,
+    artifact_activator: A,
     pending_arms: HashMap<SlotId, usize>,
     incumbent_latency_ns: HashMap<SlotId, u64>,
     incumbent_recall: HashMap<SlotId, f64>,
@@ -118,7 +163,7 @@ impl IndexScopeTuner {
     }
 }
 
-impl<W, B, H> IndexScopeTuner<W, B, H>
+impl<W, B, H> IndexScopeTuner<W, B, H, RefuseIndexArtifactActivator>
 where
     W: IndexPromotionWriter,
     B: IndexBanditPersistence,
@@ -146,6 +191,49 @@ where
         bandit_store: B,
         health: H,
     ) -> Self {
+        Self::with_assay_artifact_parts(
+            cache,
+            assay,
+            promotion_writer,
+            bandit_store,
+            health,
+            RefuseIndexArtifactActivator,
+        )
+    }
+}
+
+impl<W, B, H, A> IndexScopeTuner<W, B, H, A>
+where
+    W: IndexPromotionWriter,
+    B: IndexBanditPersistence,
+    H: IndexSlotHealth,
+    A: IndexArtifactActivator,
+{
+    pub fn with_artifact_parts(
+        cache: AutotuneCache,
+        promotion_writer: W,
+        bandit_store: B,
+        health: H,
+        artifact_activator: A,
+    ) -> Self {
+        Self::with_assay_artifact_parts(
+            cache,
+            Arc::new(NoopIndexAssayMetrics),
+            promotion_writer,
+            bandit_store,
+            health,
+            artifact_activator,
+        )
+    }
+
+    pub fn with_assay_artifact_parts(
+        cache: AutotuneCache,
+        assay: Arc<dyn AssayMetrics>,
+        promotion_writer: W,
+        bandit_store: B,
+        health: H,
+        artifact_activator: A,
+    ) -> Self {
         Self {
             bandits: HashMap::new(),
             assay,
@@ -153,6 +241,7 @@ where
             promotion_writer,
             bandit_store,
             health,
+            artifact_activator,
             pending_arms: HashMap::new(),
             incumbent_latency_ns: HashMap::new(),
             incumbent_recall: HashMap::new(),
@@ -214,6 +303,7 @@ where
         self.ensure_bandit(slot_id)?;
         let prior_idx = self.bandits[&slot_id].incumbent_idx;
         let prior_config = self.config_for_arm(slot_id, prior_idx)?;
+        let prior_bandit = self.bandits[&slot_id].clone();
         let won = self.arm_won(
             slot_id,
             arm_idx,
@@ -226,8 +316,34 @@ where
             .get_mut(&slot_id)
             .expect("bandit ensured")
             .record_result(arm_idx, won)?;
-
         let new_idx = self.bandits[&slot_id].incumbent_idx;
+        let shadow_arm = match self
+            .bandits
+            .get_mut(&slot_id)
+            .expect("bandit ensured")
+            .select_arm()
+        {
+            Ok(arm) => arm,
+            Err(error) => {
+                self.bandits.insert(slot_id, prior_bandit);
+                return Err(error);
+            }
+        };
+        let shadow_candidate = match (shadow_arm != new_idx)
+            .then(|| self.config_for_arm(slot_id, shadow_arm))
+            .transpose()
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.bandits.insert(slot_id, prior_bandit);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.save_bandit(slot_id) {
+            self.bandits.insert(slot_id, prior_bandit);
+            return Err(error);
+        }
+
         let promoted = if new_idx != prior_idx {
             let new_config = self.config_for_arm(slot_id, new_idx)?;
             let metrics = PromotionMetrics {
@@ -251,8 +367,22 @@ where
                 bits_after: bits_per_anchor,
                 quant_evidence,
             };
-            self.record_incumbent_metrics(slot_id, p99_ns, recall_k, bits_per_anchor);
-            Some(self.promote_with_metrics(slot_id, prior_config, new_config, metrics)?)
+            match self.promote_with_metrics(slot_id, prior_config, new_config, metrics) {
+                Ok(record) => {
+                    self.record_incumbent_metrics(slot_id, p99_ns, recall_k, bits_per_anchor);
+                    Some(record)
+                }
+                Err(error) => {
+                    self.bandits.insert(slot_id, prior_bandit);
+                    if let Err(restore_error) = self.save_bandit(slot_id) {
+                        return Err(invalid_config(format!(
+                            "index promotion failed ({}) and restoring the prior bandit failed ({})",
+                            error.message, restore_error.message
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             if arm_idx == prior_idx && metrics_are_valid(recall_k, bits_per_anchor) {
                 self.record_incumbent_metrics(slot_id, p99_ns, recall_k, bits_per_anchor);
@@ -260,16 +390,7 @@ where
             None
         };
 
-        self.save_bandit(slot_id)?;
-        let shadow_arm = self
-            .bandits
-            .get_mut(&slot_id)
-            .expect("bandit ensured")
-            .select_arm()?;
         self.pending_arms.insert(slot_id, shadow_arm);
-        let shadow_candidate = (shadow_arm != new_idx)
-            .then(|| self.config_for_arm(slot_id, shadow_arm))
-            .transpose()?;
 
         Ok(IndexTuneDecision {
             evaluated_arm: arm_idx,
@@ -412,6 +533,30 @@ where
         self.next_change_id = self.next_change_id.saturating_add(1);
         let old_bytes = encode_index_config(&old_config)?;
         let new_bytes = encode_index_config(&new_config)?;
+        let old_config_hash = *blake3::hash(&old_bytes).as_bytes();
+        let new_config_hash = *blake3::hash(&new_bytes).as_bytes();
+        let activation = if old_config.quant_bits != new_config.quant_bits {
+            let request = IndexArtifactPromotionRequest {
+                slot_id,
+                prior_config_hash: old_config_hash,
+                candidate_config_hash: new_config_hash,
+                prior_quant_bits: old_config.quant_bits,
+                candidate_quant_bits: new_config.quant_bits,
+            };
+            let activation = self.artifact_activator.activate(&request)?;
+            if let Err(error) = validate_index_artifact_activation(&request, &activation) {
+                if let Err(rollback_error) = self.artifact_activator.rollback(&activation) {
+                    return Err(invalid_config(format!(
+                        "served artifact activation was invalid ({}) and rollback failed ({})",
+                        error.message, rollback_error.message
+                    )));
+                }
+                return Err(error);
+            }
+            Some(activation)
+        } else {
+            None
+        };
         let record = IndexPromotionRecord {
             slot_id,
             change_id,
@@ -424,14 +569,45 @@ where
             bits_before: metrics.bits_before,
             bits_after: metrics.bits_after,
             slot_key_hash: shape_key_hash(&index_slot_label(slot_id)),
-            old_config_hash: *blake3::hash(&old_bytes).as_bytes(),
-            new_config_hash: *blake3::hash(&new_bytes).as_bytes(),
+            old_config_hash,
+            new_config_hash,
             quant_evidence: metrics.quant_evidence,
+            served_artifact: activation,
         };
-        self.write_cache(&record)?;
-        self.promotion_writer.write_autotune_promote(&record)?;
+        if let Err(error) = self.write_cache(&record) {
+            self.rollback_activation_and_cache(&record, &error)?;
+            return Err(error);
+        }
+        if let Err(error) = self.promotion_writer.write_autotune_promote(&record) {
+            self.rollback_activation_and_cache(&record, &error)?;
+            return Err(error);
+        }
         self.promotions.push(record.clone());
         Ok(record)
+    }
+
+    fn rollback_activation_and_cache(
+        &mut self,
+        record: &IndexPromotionRecord,
+        cause: &CalyxError,
+    ) -> Result<()> {
+        if let Some(activation) = &record.served_artifact
+            && let Err(error) = self.artifact_activator.rollback(activation)
+        {
+            return Err(invalid_config(format!(
+                "promotion mutation failed ({}) and served artifact rollback failed ({})",
+                cause.message, error.message
+            )));
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| invalid_config("autotune cache lock poisoned during rollback"))?;
+        cache.insert(
+            slot_autotune_key(record.slot_id, self.recall_target),
+            record.old_config.to_best_config(record.slot_id),
+        );
+        cache.persist().map_err(cache_write_fail)
     }
 
     fn write_cache(&self, record: &IndexPromotionRecord) -> Result<()> {

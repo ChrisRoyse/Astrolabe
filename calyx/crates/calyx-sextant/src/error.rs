@@ -27,6 +27,14 @@ pub const CALYX_ANSWER_UNGROUNDED: &str = "CALYX_ANSWER_UNGROUNDED";
 pub const CALYX_ANSWER_SYNTHESIS_UNAVAILABLE: &str = "CALYX_ANSWER_SYNTHESIS_UNAVAILABLE";
 pub const CALYX_LENS_NOT_FOUND: &str = "CALYX_LENS_NOT_FOUND";
 pub const CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE: &str = "CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE";
+pub const CALYX_SEXTANT_HNSW_ARTIFACT_CORRUPT: &str = "CALYX_SEXTANT_HNSW_ARTIFACT_CORRUPT";
+pub const CALYX_SEXTANT_HNSW_ARTIFACT_IO: &str = "CALYX_SEXTANT_HNSW_ARTIFACT_IO";
+pub const CALYX_SEXTANT_HNSW_ARTIFACT_STALE: &str = "CALYX_SEXTANT_HNSW_ARTIFACT_STALE";
+pub const CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED: &str = "CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED";
+pub const CALYX_SEXTANT_HNSW_POINTER_CORRUPT: &str = "CALYX_SEXTANT_HNSW_POINTER_CORRUPT";
+pub const CALYX_SEXTANT_HNSW_POINTER_IO: &str = "CALYX_SEXTANT_HNSW_POINTER_IO";
+pub const CALYX_SEXTANT_HNSW_POINTER_STALE: &str = "CALYX_SEXTANT_HNSW_POINTER_STALE";
+pub const CALYX_SEXTANT_HNSW_POINTER_UNSTAGED: &str = "CALYX_SEXTANT_HNSW_POINTER_UNSTAGED";
 pub const CALYX_SEXTANT_POSTINGS_CORRUPT: &str = "CALYX_SEXTANT_POSTINGS_CORRUPT";
 pub const CALYX_SEXTANT_POSTINGS_NOT_SORTED: &str = "CALYX_SEXTANT_POSTINGS_NOT_SORTED";
 pub const CALYX_SEXTANT_PROVENANCE_MISSING: &str = "CALYX_SEXTANT_PROVENANCE_MISSING";
@@ -94,6 +102,30 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         CALYX_LENS_NOT_FOUND => "register or load a visible lens slot for ASK retrieval",
         CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE => {
             "wire a real Forge GPU path before claiming Sextant CPU/GPU parity"
+        }
+        CALYX_SEXTANT_HNSW_ARTIFACT_CORRUPT => {
+            "rebuild the packed HNSW artifact from the authoritative vault; never serve these bytes"
+        }
+        CALYX_SEXTANT_HNSW_ARTIFACT_IO => {
+            "repair the exact artifact path or permissions, then rebuild and independently read it back"
+        }
+        CALYX_SEXTANT_HNSW_ARTIFACT_STALE => {
+            "rebuild and activate an HNSW artifact at the current authoritative sequence"
+        }
+        CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED => {
+            "use the exact codec/layout version requested by the serving manifest or perform an explicit measured migration"
+        }
+        CALYX_SEXTANT_HNSW_POINTER_CORRUPT => {
+            "restore the last verified active pointer or rebuild it from a fully validated HNSW artifact"
+        }
+        CALYX_SEXTANT_HNSW_POINTER_IO => {
+            "repair the active-pointer path or permissions, then atomically publish and reopen it"
+        }
+        CALYX_SEXTANT_HNSW_POINTER_STALE => {
+            "reload current Anneal state and stage an artifact for the exact incumbent and candidate config hashes"
+        }
+        CALYX_SEXTANT_HNSW_POINTER_UNSTAGED => {
+            "build, measure, persist, and stage the exact candidate artifact before requesting promotion"
         }
         CALYX_SEXTANT_POSTINGS_CORRUPT => "discard/rebuild the sparse postings block",
         CALYX_SEXTANT_POSTINGS_NOT_SORTED => "sort postings by increasing document id",

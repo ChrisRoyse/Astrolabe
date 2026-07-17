@@ -43,7 +43,11 @@ pub use funnel::{
     KernelRegion, KernelRegionAnn, KernelRegionId, LocalCxId, RegionCandidate, RegionId,
     RegionPartitions,
 };
-pub use hnsw::HnswIndex;
+pub use hnsw::{
+    HNSW_ACTIVE_POINTER_MAGIC, HNSW_ACTIVE_POINTER_VERSION, HNSW_ARTIFACT_MAGIC,
+    HNSW_ARTIFACT_VERSION, HNSW_MAX_DIM, HnswActivePointer, HnswArtifactActivator,
+    HnswArtifactExpectation, HnswArtifactMetadata, HnswArtifactReceipt, HnswIndex,
+};
 pub use inverted::InvertedIndex;
 pub use multi::MaxSimIndex;
 pub use partitioned::{
@@ -56,7 +60,9 @@ pub use partitioned::{
     build_partitioned_vault_with_backend, gen_row, partitioned_manifest_db_exists,
     partitioned_manifest_db_readback,
 };
-pub use quant_config::{QuantConfig, QuantKind, QuantizedVector};
+pub use quant_config::{
+    PackedQuery, PackedVector, QuantConfig, QuantKind, SEXTANT_QUANT_LAYOUT_VERSION, score_packed,
+};
 pub use spann::{
     PostingListReader, PostingListWriter, PostingMember, SPANN_CENTROID_MAGIC, SpannCentroidIndex,
     SpannSearch, build_centroids,

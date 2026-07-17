@@ -91,6 +91,35 @@ pub struct IndexPromotionRecord {
     pub old_config_hash: [u8; 32],
     pub new_config_hash: [u8; 32],
     pub quant_evidence: Option<QuantPromotionEvidence>,
+    /// Physical served-artifact activation, required whenever quant_bits changes.
+    pub served_artifact: Option<IndexArtifactActivation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexArtifactPromotionRequest {
+    pub slot_id: SlotId,
+    pub prior_config_hash: [u8; 32],
+    pub candidate_config_hash: [u8; 32],
+    pub prior_quant_bits: u8,
+    pub candidate_quant_bits: u8,
+}
+
+/// Readback returned only after the candidate pointer and artifact bytes are
+/// both active and independently reopened by the serving owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexArtifactActivation {
+    pub prior_pointer: String,
+    pub candidate_pointer: String,
+    pub observed_pointer: String,
+    pub prior_pointer_digest: [u8; 32],
+    pub candidate_pointer_digest: [u8; 32],
+    pub observed_pointer_digest: [u8; 32],
+    pub prior_artifact_digest: [u8; 32],
+    pub candidate_artifact_digest: [u8; 32],
+    pub observed_artifact_digest: [u8; 32],
+    pub candidate_artifact_bytes: u64,
+    pub heldout_query_count: u64,
+    pub candidate_quant_bits: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -209,6 +238,60 @@ pub fn validate_quant_promotion_evidence(evidence: &QuantPromotionEvidence) -> R
     }
     if evidence.guard_far_after > evidence.guard_far_before + GUARD_FAR_EPSILON {
         return Err(invalid_config("quant guard FAR regressed"));
+    }
+    Ok(())
+}
+
+pub fn validate_index_artifact_activation(
+    request: &IndexArtifactPromotionRequest,
+    activation: &IndexArtifactActivation,
+) -> Result<()> {
+    if request.prior_quant_bits == request.candidate_quant_bits {
+        return Err(invalid_config(
+            "served artifact activation was supplied for a non-quant promotion",
+        ));
+    }
+    if activation.candidate_quant_bits != request.candidate_quant_bits {
+        return Err(invalid_config(format!(
+            "served artifact quant_bits {} do not match candidate {}",
+            activation.candidate_quant_bits, request.candidate_quant_bits
+        )));
+    }
+    if activation.prior_pointer.is_empty()
+        || activation.candidate_pointer.is_empty()
+        || activation.observed_pointer.is_empty()
+    {
+        return Err(invalid_config(
+            "served artifact activation requires non-empty prior/candidate/observed pointers",
+        ));
+    }
+    if activation.prior_pointer == activation.candidate_pointer
+        || activation.observed_pointer != activation.candidate_pointer
+    {
+        return Err(invalid_config(
+            "served artifact pointer did not atomically advance to the candidate",
+        ));
+    }
+    if activation.candidate_pointer_digest == [0_u8; 32]
+        || activation.observed_pointer_digest != activation.candidate_pointer_digest
+        || activation.prior_pointer_digest == activation.candidate_pointer_digest
+    {
+        return Err(invalid_config(
+            "served pointer digest readback is absent, unchanged, or disagrees with the candidate",
+        ));
+    }
+    if activation.candidate_artifact_digest == [0_u8; 32]
+        || activation.observed_artifact_digest != activation.candidate_artifact_digest
+        || activation.prior_artifact_digest == activation.candidate_artifact_digest
+    {
+        return Err(invalid_config(
+            "served artifact digest readback is absent, unchanged, or disagrees with the candidate",
+        ));
+    }
+    if activation.candidate_artifact_bytes == 0 || activation.heldout_query_count == 0 {
+        return Err(invalid_config(
+            "served artifact activation requires physical bytes and held-out search queries",
+        ));
     }
     Ok(())
 }

@@ -1,0 +1,1252 @@
+//! Manual Full State Verification driver for issue #553.
+//!
+//! This is not a test. It builds real packed HNSW indexes from byte-histogram
+//! vectors derived from this repository's own Sextant source, persists the
+//! actual serving artifacts, independently parses their physical headers and
+//! checksums, starts a second process to reload/search them, and emits explicit
+//! before/after state for boundary failures.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Instant;
+
+use calyx_anneal::{
+    AnnealLedger, AnnealLedgerAction, AsterAnnealLedgerStore, AsterBanditStorage, AsterHealthStore,
+    CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED, CALYX_INDEX_CACHE_WRITE_FAIL, ConfigBanditStore,
+    DegradeRegistry, IndexArtifactActivator, IndexArtifactPromotionRequest, IndexConfig,
+    IndexScopeTuner, QuantPromotionEvidence, bandit_key, decode_config_bandit, encode_index_config,
+    index_slot_label, shape_key_hash, slot_autotune_key,
+};
+use calyx_aster::cf::ColumnFamily;
+use calyx_aster::vault::{AsterVault, VaultOptions};
+use calyx_core::{CalyxError, CxId, SlotId, SlotVector, SystemClock, VaultId};
+use calyx_forge::AutotuneCache;
+use calyx_ledger::{ActorId, LedgerAppender};
+use calyx_sextant::{
+    CALYX_SEXTANT_HNSW_POINTER_CORRUPT, CALYX_SEXTANT_HNSW_POINTER_STALE,
+    CALYX_SEXTANT_HNSW_POINTER_UNSTAGED, HNSW_ACTIVE_POINTER_MAGIC, HNSW_ACTIVE_POINTER_VERSION,
+    HNSW_ARTIFACT_MAGIC, HNSW_ARTIFACT_VERSION, HNSW_MAX_DIM, HnswArtifactActivator,
+    HnswArtifactExpectation, HnswIndex, PackedQuery, PackedVector, QuantConfig, QuantKind,
+    SEXTANT_QUANT_LAYOUT_VERSION, SextantIndex, score_packed,
+};
+
+const DIM: usize = 128;
+const ROWS: usize = 200;
+const QUERIES: usize = 8;
+const K: usize = 10;
+const SLOT: SlotId = SlotId::new(7);
+const BASE_SEQ: u64 = 777;
+const HEADER_BYTES: usize = 86;
+const FOOTER_BYTES: usize = 32;
+const POINTER_HEADER_BYTES: usize = 112;
+const ANNEAL_VAULT_ID: &str = "01J00000000000000000000553";
+const ANNEAL_VAULT_SALT: &[u8] = b"calyx-553-anneal-fsv";
+
+fn main() {
+    let result = match std::env::args().nth(1).as_deref() {
+        Some("--reload") => child_reload(),
+        Some("--anneal-reload") => child_anneal_reload(),
+        _ => parent_run(),
+    };
+    if let Err(error) = result {
+        println!(
+            "{{\"event\":\"fsv_failure\",\"error\":\"{}\"}}",
+            json(&error.to_string())
+        );
+        std::process::exit(1);
+    }
+}
+
+fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
+    let output_root = std::env::var_os("CALYX_FSV_OUTPUT")
+        .map(PathBuf::from)
+        .ok_or("CALYX_FSV_OUTPUT must name the retained manual-evidence directory")?;
+    let run_dir = output_root.join(format!("hnsw-553-{}", std::process::id()));
+    let before_exists = run_dir.exists();
+    std::fs::create_dir_all(&run_dir)?;
+    println!(
+        "{{\"event\":\"source_of_truth\",\"path\":\"{}\",\"before_exists\":{},\"after_exists\":true,\"source\":\"persisted CLXHNSW1 files independently reopened from disk\"}}",
+        json(&run_dir.display().to_string()),
+        before_exists
+    );
+
+    let vectors = real_corpus_vectors(ROWS + QUERIES)?;
+    let (rows, queries) = vectors.split_at(ROWS);
+    let raw_truth: Vec<Vec<CxId>> = queries
+        .iter()
+        .map(|query| exact_top_k(query, rows, K))
+        .collect();
+    let scale = measured_scale(rows);
+    println!(
+        "{{\"event\":\"fsv_context\",\"platform\":\"{}\",\"arch\":\"{}\",\"artifact_version\":{},\"layout_version\":{},\"dim\":{},\"rows\":{},\"queries\":{},\"k\":{},\"corpus\":\"byte histograms of real calyx-sextant source bytes\"}}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        HNSW_ARTIFACT_VERSION,
+        SEXTANT_QUANT_LAYOUT_VERSION,
+        DIM,
+        ROWS,
+        QUERIES,
+        K
+    );
+
+    let mut artifacts = Vec::new();
+    for (name, config, expected_tag, expected_vector_bytes) in [
+        ("f32", QuantConfig::none(), 0_u8, ROWS * DIM * 4),
+        (
+            "scalar8",
+            QuantConfig::scalar8(scale),
+            1_u8,
+            ROWS * (DIM + 8),
+        ),
+        (
+            "binary",
+            QuantConfig::binary(),
+            2_u8,
+            ROWS * (DIM.div_ceil(8) + 4),
+        ),
+    ] {
+        let mut index = HnswIndex::new(SLOT, DIM as u32, 553).with_quant(config);
+        for (ordinal, data) in rows.iter().enumerate() {
+            index.insert(
+                cx(ordinal),
+                SlotVector::Dense {
+                    dim: DIM as u32,
+                    data: data.clone(),
+                },
+                ordinal as u64 + 1,
+            )?;
+        }
+        index.set_base_seq(BASE_SEQ);
+        if index.physical_vector_bytes() != expected_vector_bytes {
+            return Err(format!(
+                "{name}: held packed bytes {} != expected {expected_vector_bytes}",
+                index.physical_vector_bytes()
+            )
+            .into());
+        }
+
+        let started = Instant::now();
+        let mut raw_recall = 0.0_f64;
+        let mut packed_recall = 0.0_f64;
+        for (query, truth) in queries.iter().zip(&raw_truth) {
+            let hits = index.search(
+                &SlotVector::Dense {
+                    dim: DIM as u32,
+                    data: query.clone(),
+                },
+                K,
+                Some(64),
+            )?;
+            let got: Vec<CxId> = hits.iter().map(|hit| hit.cx_id).collect();
+            raw_recall += overlap(&got, truth) as f64 / K as f64;
+            let packed_truth: Vec<CxId> = index
+                .brute_force(query, K)
+                .into_iter()
+                .map(|(cx_id, _)| cx_id)
+                .collect();
+            packed_recall += overlap(&got, &packed_truth) as f64 / K as f64;
+        }
+        raw_recall /= QUERIES as f64;
+        packed_recall /= QUERIES as f64;
+        if packed_recall < 0.95 {
+            return Err(format!(
+                "{name}: HNSW recall {packed_recall:.3} below 0.95 against packed exact truth"
+            )
+            .into());
+        }
+        let search_us = started.elapsed().as_secs_f64() * 1_000_000.0 / QUERIES as f64;
+
+        let path = run_dir.join(format!("{name}.clxhnsw"));
+        println!(
+            "{{\"event\":\"happy_state_before\",\"kind\":\"{name}\",\"artifact_exists\":{},\"rows_in_memory\":{},\"packed_vector_bytes\":{}}}",
+            path.exists(),
+            index.total_nodes(),
+            index.physical_vector_bytes()
+        );
+        let receipt = index.persist_artifact(&path)?;
+        let physical = independent_artifact_read(&path)?;
+        if physical.magic != HNSW_ARTIFACT_MAGIC
+            || physical.version != HNSW_ARTIFACT_VERSION
+            || physical.layout != SEXTANT_QUANT_LAYOUT_VERSION
+            || physical.kind_tag != expected_tag
+            || physical.slot != SLOT.get()
+            || physical.dim != DIM as u32
+            || physical.base_seq != BASE_SEQ
+            || physical.row_count != ROWS as u64
+            || physical.packed_vector_bytes != expected_vector_bytes as u64
+            || physical.digest != receipt.metadata.digest
+        {
+            return Err(
+                format!("{name}: independent physical header does not match receipt").into(),
+            );
+        }
+        let reload = spawn_reload(&path, name)?;
+        if !reload.status.success() || !reload.stdout.contains("\"event\":\"reload_success\"") {
+            return Err(format!(
+                "{name}: process restart reload failed status={} stdout={} stderr={}",
+                reload.status, reload.stdout, reload.stderr
+            )
+            .into());
+        }
+        println!(
+            "{{\"event\":\"happy_state_after\",\"kind\":\"{name}\",\"artifact_exists\":true,\"artifact_bytes\":{},\"body_bytes\":{},\"packed_vector_bytes\":{},\"digest\":\"{}\",\"recall_at_{}_vs_raw\":{:.3},\"recall_at_{}_vs_packed\":{:.3},\"search_us_per_query\":{:.1},\"child_readback\":{}}}",
+            physical.artifact_bytes,
+            physical.body_bytes,
+            physical.packed_vector_bytes,
+            hex(&physical.digest),
+            K,
+            raw_recall,
+            K,
+            packed_recall,
+            search_us,
+            reload.stdout.trim()
+        );
+        artifacts.push((name, path, physical));
+    }
+    if artifacts[0].2.packed_vector_bytes == artifacts[1].2.packed_vector_bytes
+        || artifacts[1].2.packed_vector_bytes == artifacts[2].2.packed_vector_bytes
+    {
+        return Err("quantization did not alter persisted physical vector bytes".into());
+    }
+
+    anneal_activation_fsv(&run_dir, &artifacts[0].1, &artifacts[1].1, queries)?;
+
+    edge_empty(&run_dir, queries)?;
+    edge_limits(&run_dir, rows)?;
+    edge_invalid_config(rows)?;
+    edge_corrupt_stale_unsupported(&run_dir, &artifacts[1].1)?;
+
+    println!(
+        "{{\"event\":\"evidence_inventory\",\"path\":\"{}\",\"files\":{},\"bytes\":{}}}",
+        json(&run_dir.display().to_string()),
+        count_files(&run_dir)?,
+        count_bytes(&run_dir)?
+    );
+    println!("{{\"event\":\"fsv_success\",\"issue\":553}}");
+    Ok(())
+}
+
+fn child_reload() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(2);
+    let path = PathBuf::from(args.next().ok_or("reload path missing")?);
+    let name = args.next().ok_or("reload codec missing")?;
+    if args.next().is_some() {
+        return Err("unexpected reload arguments".into());
+    }
+    let kind = match name.as_str() {
+        "f32" => QuantKind::None,
+        "scalar8" => QuantKind::Scalar8,
+        "binary" => QuantKind::Binary,
+        _ => return Err(format!("unknown reload codec {name}").into()),
+    };
+    let expectation = HnswArtifactExpectation {
+        slot: SLOT,
+        dim: DIM as u32,
+        quant_kind: kind,
+        base_seq: BASE_SEQ,
+    };
+    let (index, metadata) = HnswIndex::load_artifact(&path, expectation)?;
+    let vectors = real_corpus_vectors(ROWS + QUERIES)?;
+    let (_, queries) = vectors.split_at(ROWS);
+    let mut packed_recall = 0.0_f64;
+    for query in queries {
+        let hits = index.search(
+            &SlotVector::Dense {
+                dim: DIM as u32,
+                data: query.clone(),
+            },
+            K,
+            Some(64),
+        )?;
+        let got: Vec<CxId> = hits.iter().map(|hit| hit.cx_id).collect();
+        let truth: Vec<CxId> = index
+            .brute_force(query, K)
+            .into_iter()
+            .map(|(cx_id, _)| cx_id)
+            .collect();
+        packed_recall += overlap(&got, &truth) as f64 / K as f64;
+    }
+    packed_recall /= QUERIES as f64;
+    if packed_recall < 0.95 {
+        return Err(format!("reloaded {name} recall {packed_recall:.3} below 0.95").into());
+    }
+    println!(
+        "{{\"event\":\"reload_success\",\"kind\":\"{name}\",\"rows\":{},\"packed_vector_bytes\":{},\"artifact_bytes\":{},\"digest\":\"{}\",\"recall_at_{}_vs_packed\":{:.3}}}",
+        metadata.row_count,
+        metadata.packed_vector_bytes,
+        metadata.artifact_bytes,
+        hex(&metadata.digest),
+        K,
+        packed_recall
+    );
+    Ok(())
+}
+
+fn anneal_activation_fsv(
+    run_dir: &Path,
+    f32_artifact: &Path,
+    scalar_artifact: &Path,
+    queries: &[Vec<f32>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pointer_path = run_dir.join("slot-7.active.clxhnpt");
+    let cache_path = run_dir.join("anneal-cache").join("autotune.json");
+    let unconfigured_cache_path = run_dir.join("unconfigured-autotune.json");
+    let missing_cache_path = run_dir
+        .join("deliberately-missing-cache-parent")
+        .join("autotune.json");
+    let vault_dir = run_dir.join("anneal-vault");
+    let (incumbent, candidate) = anneal_configs();
+    let incumbent_hash = config_hash(&incumbent)?;
+    let candidate_hash = config_hash(&candidate)?;
+    let f32_expectation = HnswArtifactExpectation {
+        slot: SLOT,
+        dim: DIM as u32,
+        quant_kind: QuantKind::None,
+        base_seq: BASE_SEQ,
+    };
+    let scalar_expectation = HnswArtifactExpectation {
+        quant_kind: QuantKind::Scalar8,
+        ..f32_expectation
+    };
+
+    let initializer = HnswArtifactActivator::new(&pointer_path, SLOT);
+    println!(
+        "{{\"event\":\"anneal_initial_pointer_before\",\"pointer_exists\":{},\"incumbent_quant_bits\":32}}",
+        pointer_path.exists()
+    );
+    let initialized = initializer.initialize_active(
+        incumbent_hash,
+        32,
+        f32_artifact,
+        f32_expectation,
+        QUERIES as u64,
+    )?;
+    let incumbent_pointer_bytes = std::fs::read(&pointer_path)?;
+    let incumbent_physical = independent_pointer_read(&pointer_path)?;
+    if initialized.config_hash != incumbent_hash
+        || initialized.quant_bits != 32
+        || incumbent_physical.config_hash != incumbent_hash
+        || incumbent_physical.quant_bits != 32
+    {
+        return Err("initial active pointer did not bind the F32 incumbent".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_initial_pointer_after\",\"pointer_exists\":true,\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_digest\":\"{}\",\"quant_bits\":32}}",
+        incumbent_physical.pointer_bytes,
+        hex(&incumbent_physical.pointer_digest),
+        json(&incumbent_physical.artifact_path),
+        hex(&incumbent_physical.artifact_digest)
+    );
+
+    let vault_id = ANNEAL_VAULT_ID.parse::<VaultId>()?;
+    let vault = AsterVault::open(
+        &vault_dir,
+        vault_id,
+        ANNEAL_VAULT_SALT.to_vec(),
+        VaultOptions::default(),
+    )?;
+
+    // Edge 1: the default tuner is deliberately incapable of turning a
+    // quant_bits metadata win into an administrative-only promotion.
+    println!(
+        "{{\"event\":\"anneal_unconfigured_before\",\"pointer_digest\":\"{}\",\"cache_exists\":{},\"ledger_rows\":{},\"bandit_rows\":{}}}",
+        hex(blake3::hash(&incumbent_pointer_bytes).as_bytes()),
+        unconfigured_cache_path.exists(),
+        vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::Ledger)?
+            .len(),
+        vault
+            .scan_cf_at(vault.latest_seq(), ColumnFamily::AnnealBandit)?
+            .len()
+    );
+    let unconfigured_error = {
+        let cache = AutotuneCache::load(&unconfigured_cache_path)?;
+        let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
+        let ledger = AnnealLedger::new(
+            appender,
+            ActorId::Service("calyx-553-unconfigured".to_string()),
+        )?;
+        let bandits = ConfigBanditStore::new(AsterBanditStorage::new(&vault));
+        let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
+        let mut tuner = IndexScopeTuner::with_parts(cache, ledger, bandits, health);
+        tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
+        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
+        for latency in [90_000, 80_000] {
+            let decision = tuner.on_search_for_arm_with_quant_evidence(
+                SLOT,
+                1,
+                latency,
+                1.0,
+                0.50,
+                Some(quant_evidence()),
+            )?;
+            if !decision.won || decision.promoted.is_some() {
+                return Err("unconfigured candidate did not remain in hysteresis".into());
+            }
+        }
+        require_error(tuner.on_search_for_arm_with_quant_evidence(
+            SLOT,
+            1,
+            70_000,
+            1.0,
+            0.50,
+            Some(quant_evidence()),
+        ))?
+    };
+    let after_unconfigured = std::fs::read(&pointer_path)?;
+    let unconfigured_bandit = persisted_bandit(&vault)?;
+    if unconfigured_error.code != CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED
+        || after_unconfigured != incumbent_pointer_bytes
+        || unconfigured_cache_path.exists()
+        || unconfigured_bandit.incumbent_idx != 0
+        || !read_anneal_entries(&vault)?.is_empty()
+    {
+        return Err("unconfigured Anneal promotion mutated physical state".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_unconfigured_after\",\"error\":\"{}\",\"pointer_unchanged\":true,\"cache_exists\":false,\"ledger_rows\":0,\"persisted_bandit_incumbent\":{}}}",
+        unconfigured_error.code, unconfigured_bandit.incumbent_idx
+    );
+
+    // Edge 2: a real filesystem cache-write failure happens after activation;
+    // the transaction must restore the exact prior pointer and bandit bytes.
+    println!(
+        "{{\"event\":\"anneal_cache_failure_before\",\"pointer_digest\":\"{}\",\"cache_parent_exists\":{},\"ledger_rows\":{}}}",
+        hex(blake3::hash(&incumbent_pointer_bytes).as_bytes()),
+        missing_cache_path
+            .parent()
+            .is_some_and(|parent| parent.exists()),
+        read_anneal_entries(&vault)?.len()
+    );
+    let cache_failure = {
+        let cache = AutotuneCache::load(&missing_cache_path)?;
+        let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
+        let ledger = AnnealLedger::new(
+            appender,
+            ActorId::Service("calyx-553-cache-failure".to_string()),
+        )?;
+        let bandits = ConfigBanditStore::new(AsterBanditStorage::new(&vault));
+        let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
+        let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
+        activator.stage_candidate(
+            candidate_hash,
+            8,
+            scalar_artifact,
+            scalar_expectation,
+            QUERIES as u64,
+        )?;
+        let mut tuner =
+            IndexScopeTuner::with_artifact_parts(cache, ledger, bandits, health, activator);
+        tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
+        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
+        for latency in [90_000, 80_000] {
+            tuner.on_search_for_arm_with_quant_evidence(
+                SLOT,
+                1,
+                latency,
+                1.0,
+                0.50,
+                Some(quant_evidence()),
+            )?;
+        }
+        require_error(tuner.on_search_for_arm_with_quant_evidence(
+            SLOT,
+            1,
+            70_000,
+            1.0,
+            0.50,
+            Some(quant_evidence()),
+        ))?
+    };
+    let after_cache_failure = std::fs::read(&pointer_path)?;
+    let cache_failure_bandit = persisted_bandit(&vault)?;
+    if cache_failure.code != CALYX_INDEX_CACHE_WRITE_FAIL
+        || after_cache_failure != incumbent_pointer_bytes
+        || missing_cache_path.exists()
+        || cache_failure_bandit.incumbent_idx != 0
+        || !read_anneal_entries(&vault)?.is_empty()
+    {
+        return Err("cache failure did not atomically roll back the promotion".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_cache_failure_after\",\"error\":\"{}\",\"pointer_rolled_back_exactly\":true,\"cache_exists\":false,\"ledger_rows\":0,\"persisted_bandit_incumbent\":{}}}",
+        cache_failure.code, cache_failure_bandit.incumbent_idx
+    );
+
+    // Happy path: physical pointer, persistent cache, persistent bandit, and
+    // append-only Anneal ledger all advance as one observed promotion.
+    std::fs::create_dir_all(cache_path.parent().ok_or("cache parent missing")?)?;
+    println!(
+        "{{\"event\":\"anneal_promotion_before\",\"pointer_quant_bits\":32,\"pointer_digest\":\"{}\",\"cache_exists\":{},\"ledger_rows\":{},\"bandit_incumbent\":{}}}",
+        hex(blake3::hash(&incumbent_pointer_bytes).as_bytes()),
+        cache_path.exists(),
+        read_anneal_entries(&vault)?.len(),
+        persisted_bandit(&vault)?.incumbent_idx
+    );
+    let promotion = {
+        let cache = AutotuneCache::load(&cache_path)?;
+        let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&vault), SystemClock)?;
+        let ledger = AnnealLedger::new(
+            appender,
+            ActorId::Service("calyx-553-production-activation".to_string()),
+        )?;
+        let bandits = ConfigBanditStore::new(AsterBanditStorage::new(&vault));
+        let health = DegradeRegistry::open(Arc::new(SystemClock), AsterHealthStore::new(&vault))?;
+        let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
+        activator.stage_candidate(
+            candidate_hash,
+            8,
+            scalar_artifact,
+            scalar_expectation,
+            QUERIES as u64,
+        )?;
+        let mut tuner =
+            IndexScopeTuner::with_artifact_parts(cache, ledger, bandits, health, activator);
+        tuner.install_candidates(SLOT, vec![incumbent.clone(), candidate.clone()])?;
+        tuner.on_search_for_arm(SLOT, 0, 100_000, 1.0, 0.50)?;
+        for latency in [90_000, 80_000] {
+            tuner.on_search_for_arm_with_quant_evidence(
+                SLOT,
+                1,
+                latency,
+                1.0,
+                0.50,
+                Some(quant_evidence()),
+            )?;
+        }
+        tuner
+            .on_search_for_arm_with_quant_evidence(
+                SLOT,
+                1,
+                70_000,
+                1.0,
+                0.50,
+                Some(quant_evidence()),
+            )?
+            .promoted
+            .ok_or("measured Scalar8 candidate did not promote")?
+    };
+    vault.flush()?;
+
+    let active_pointer_bytes = std::fs::read(&pointer_path)?;
+    let active_physical = independent_pointer_read(&pointer_path)?;
+    let cache_bytes = std::fs::read(&cache_path)?;
+    let cache_json: serde_json::Value = serde_json::from_slice(&cache_bytes)?;
+    let cache_has_quant8 = cache_json["entries"].as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry["config"]["extra"]["quant_bits"].as_str() == Some("8"))
+    });
+    let bandit = persisted_bandit(&vault)?;
+    let anneal_entries = read_anneal_entries(&vault)?;
+    let ledger_entry = anneal_entries
+        .last()
+        .ok_or("persisted Anneal promotion ledger row missing")?;
+    let ledger_activation = ledger_entry
+        .details
+        .as_ref()
+        .ok_or("persisted Anneal promotion activation details missing")?;
+    let served_bits = ledger_activation["served_quant_bits"].as_u64();
+    let (active_index, active) = HnswArtifactActivator::new(&pointer_path, SLOT).open_active()?;
+    let live_hits = active_index.search(
+        &SlotVector::Dense {
+            dim: DIM as u32,
+            data: queries[0].clone(),
+        },
+        K,
+        Some(64),
+    )?;
+    if active_pointer_bytes == incumbent_pointer_bytes
+        || active_physical.config_hash != candidate_hash
+        || active_physical.quant_bits != 8
+        || active.config_hash != candidate_hash
+        || active.quant_bits != 8
+        || promotion.served_artifact.is_none()
+        || !cache_has_quant8
+        || bandit.incumbent_idx != 1
+        || anneal_entries.len() != 1
+        || ledger_entry.action != AnnealLedgerAction::AutotunePromote
+        || served_bits != Some(8)
+        || live_hits.len() != K
+    {
+        return Err("successful Anneal promotion state is incomplete or inconsistent".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_promotion_after\",\"pointer_quant_bits\":8,\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_bytes\":{},\"cache_quant_bits\":8,\"persisted_bandit_incumbent\":{},\"ledger_rows\":{},\"ledger_action\":\"autotune_promote\",\"ledger_served_quant_bits\":{},\"live_search_hits\":{}}}",
+        active_physical.pointer_bytes,
+        hex(&active_physical.pointer_digest),
+        json(&active_physical.artifact_path),
+        active_physical.artifact_bytes,
+        hex(&active_physical.artifact_digest),
+        cache_bytes.len(),
+        bandit.incumbent_idx,
+        anneal_entries.len(),
+        served_bits.unwrap_or_default(),
+        live_hits.len()
+    );
+    drop(vault);
+
+    let restart = spawn_anneal_reload(run_dir)?;
+    if !restart.status.success()
+        || !restart
+            .stdout
+            .contains("\"event\":\"anneal_reload_success\"")
+    {
+        return Err(format!(
+            "Anneal child-process restart failed status={} stdout={} stderr={}",
+            restart.status, restart.stdout, restart.stderr
+        )
+        .into());
+    }
+    println!(
+        "{{\"event\":\"anneal_restart_readback\",\"child_readback\":{}}}",
+        restart.stdout.trim()
+    );
+
+    edge_pointer_state(
+        &pointer_path,
+        f32_artifact,
+        f32_expectation,
+        incumbent_hash,
+        candidate_hash,
+    )?;
+    Ok(())
+}
+
+fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
+    let run_dir = PathBuf::from(
+        std::env::args()
+            .nth(2)
+            .ok_or("Anneal reload run directory missing")?,
+    );
+    let pointer_path = run_dir.join("slot-7.active.clxhnpt");
+    let cache_path = run_dir.join("anneal-cache").join("autotune.json");
+    let vault_dir = run_dir.join("anneal-vault");
+    let (index, active) = HnswArtifactActivator::new(&pointer_path, SLOT).open_active()?;
+    let (_, candidate) = anneal_configs();
+    let candidate_hash = config_hash(&candidate)?;
+    let cache = AutotuneCache::load(&cache_path)?;
+    let cached = cache
+        .get(&slot_autotune_key(SLOT, 0.99))
+        .ok_or("restarted autotune cache has no slot-7 entry")?;
+    let cached_config = IndexConfig::from_best_config(cached)?;
+    let vault = AsterVault::open(
+        &vault_dir,
+        ANNEAL_VAULT_ID.parse::<VaultId>()?,
+        ANNEAL_VAULT_SALT.to_vec(),
+        VaultOptions::default(),
+    )?;
+    let bandit = persisted_bandit(&vault)?;
+    let entries = read_anneal_entries(&vault)?;
+    let vectors = real_corpus_vectors(ROWS + QUERIES)?;
+    let query = &vectors[ROWS];
+    let hits = index.search(
+        &SlotVector::Dense {
+            dim: DIM as u32,
+            data: query.clone(),
+        },
+        K,
+        Some(64),
+    )?;
+    if active.config_hash != candidate_hash
+        || active.quant_bits != 8
+        || cached_config.quant_bits != 8
+        || bandit.incumbent_idx != 1
+        || entries.len() != 1
+        || entries[0].action != AnnealLedgerAction::AutotunePromote
+        || hits.len() != K
+    {
+        return Err("restart did not recover the complete promoted state".into());
+    }
+    println!(
+        "{{\"event\":\"anneal_reload_success\",\"pointer_quant_bits\":{},\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_quant_bits\":{},\"bandit_incumbent\":{},\"ledger_rows\":{},\"search_hits\":{}}}",
+        active.quant_bits,
+        active.artifact_bytes,
+        hex(&active.artifact_digest),
+        cached_config.quant_bits,
+        bandit.incumbent_idx,
+        entries.len(),
+        hits.len()
+    );
+    Ok(())
+}
+
+fn edge_pointer_state(
+    pointer_path: &Path,
+    f32_artifact: &Path,
+    f32_expectation: HnswArtifactExpectation,
+    incumbent_hash: [u8; 32],
+    candidate_hash: [u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let valid = std::fs::read(pointer_path)?;
+    let valid_hash = *blake3::hash(&valid).as_bytes();
+    let active = HnswArtifactActivator::new(pointer_path, SLOT)
+        .open_active()?
+        .1;
+    println!(
+        "{{\"event\":\"edge_pointer_before\",\"pointer_hash\":\"{}\",\"quant_bits\":{},\"artifact_digest\":\"{}\"}}",
+        hex(&valid_hash),
+        active.quant_bits,
+        hex(&active.artifact_digest)
+    );
+
+    let unstaged_error = {
+        let mut activator = HnswArtifactActivator::new(pointer_path, SLOT);
+        require_error(activator.stage_candidate(
+            [0x55_u8; 32],
+            32,
+            f32_artifact,
+            f32_expectation,
+            0,
+        ))?
+    };
+    if std::fs::read(pointer_path)? != valid {
+        return Err("zero-heldout staging attempt mutated the active pointer".into());
+    }
+
+    let stale_error = {
+        let mut activator = HnswArtifactActivator::new(pointer_path, SLOT);
+        activator.stage_candidate(
+            incumbent_hash,
+            32,
+            f32_artifact,
+            f32_expectation,
+            QUERIES as u64,
+        )?;
+        require_error(activator.activate(&IndexArtifactPromotionRequest {
+            slot_id: SLOT,
+            prior_config_hash: incumbent_hash,
+            candidate_config_hash: incumbent_hash,
+            prior_quant_bits: 32,
+            candidate_quant_bits: 32,
+        }))?
+    };
+    if std::fs::read(pointer_path)? != valid {
+        return Err("stale activation attempt mutated the active pointer".into());
+    }
+
+    let mut corrupt = valid.clone();
+    corrupt[28] ^= 0x80;
+    std::fs::write(pointer_path, &corrupt)?;
+    let corrupt_error = require_error(
+        HnswArtifactActivator::new(pointer_path, SLOT)
+            .open_active()
+            .map(|_| ()),
+    )?;
+    std::fs::write(pointer_path, &valid)?;
+    let restored = HnswArtifactActivator::new(pointer_path, SLOT)
+        .open_active()?
+        .1;
+    let after = std::fs::read(pointer_path)?;
+    if unstaged_error.code != CALYX_SEXTANT_HNSW_POINTER_UNSTAGED
+        || stale_error.code != CALYX_SEXTANT_HNSW_POINTER_STALE
+        || corrupt_error.code != CALYX_SEXTANT_HNSW_POINTER_CORRUPT
+        || after != valid
+        || restored.config_hash != candidate_hash
+    {
+        return Err("active-pointer edge handling or restoration failed".into());
+    }
+    println!(
+        "{{\"event\":\"edge_pointer_after\",\"zero_heldout_error\":\"{}\",\"stale_error\":\"{}\",\"corrupt_error\":\"{}\",\"pointer_restored_exactly\":true,\"pointer_hash\":\"{}\",\"quant_bits\":{}}}",
+        unstaged_error.code,
+        stale_error.code,
+        corrupt_error.code,
+        hex(blake3::hash(&after).as_bytes()),
+        restored.quant_bits
+    );
+    Ok(())
+}
+
+fn anneal_configs() -> (IndexConfig, IndexConfig) {
+    let incumbent = IndexConfig {
+        hnsw_ef: 64,
+        hnsw_m: 16,
+        diskann_beamwidth: 32,
+        spann_cutoff: 1024,
+        quant_bits: 32,
+    };
+    let candidate = IndexConfig {
+        quant_bits: 8,
+        ..incumbent.clone()
+    };
+    (incumbent, candidate)
+}
+
+fn config_hash(config: &IndexConfig) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    Ok(*blake3::hash(&encode_index_config(config)?).as_bytes())
+}
+
+fn quant_evidence() -> QuantPromotionEvidence {
+    QuantPromotionEvidence {
+        cosine_error_before: 0.0,
+        cosine_error_after: 0.01,
+        max_cosine_error: 0.02,
+        guard_far_before: 0.0,
+        guard_far_after: 0.0,
+    }
+}
+
+fn persisted_bandit(
+    vault: &AsterVault,
+) -> Result<calyx_anneal::ConfigBandit, Box<dyn std::error::Error>> {
+    let key = bandit_key(shape_key_hash(&index_slot_label(SLOT)));
+    let bytes = vault
+        .read_cf_at(vault.latest_seq(), ColumnFamily::AnnealBandit, &key)?
+        .ok_or("persisted slot-7 Anneal bandit row missing")?;
+    Ok(decode_config_bandit(&bytes)?)
+}
+
+fn read_anneal_entries(
+    vault: &AsterVault,
+) -> Result<Vec<calyx_anneal::AnnealLedgerEntry>, Box<dyn std::error::Error>> {
+    let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(vault), SystemClock)?;
+    let ledger = AnnealLedger::new(
+        appender,
+        ActorId::Service("calyx-553-ledger-readback".to_string()),
+    )?;
+    Ok(ledger.read_recent(32)?)
+}
+
+fn spawn_anneal_reload(run_dir: &Path) -> Result<ChildOutput, Box<dyn std::error::Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--anneal-reload")
+        .arg(run_dir)
+        .output()?;
+    Ok(ChildOutput {
+        status: output.status,
+        stdout: String::from_utf8(output.stdout)?,
+        stderr: String::from_utf8(output.stderr)?,
+    })
+}
+
+fn edge_empty(run_dir: &Path, queries: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = run_dir.join("edge-empty.clxhnsw");
+    let mut index =
+        HnswIndex::new(SlotId::new(8), DIM as u32, 553).with_quant(QuantConfig::binary());
+    index.set_base_seq(800);
+    println!(
+        "{{\"event\":\"edge_empty_before\",\"artifact_exists\":{},\"rows_in_memory\":0}}",
+        path.exists()
+    );
+    index.persist_artifact(&path)?;
+    let readback = independent_artifact_read(&path)?;
+    let search_error = require_error(index.search(
+        &SlotVector::Dense {
+            dim: DIM as u32,
+            data: queries[0].clone(),
+        },
+        K,
+        None,
+    ))?;
+    println!(
+        "{{\"event\":\"edge_empty_after\",\"artifact_exists\":true,\"persisted_rows\":{},\"artifact_bytes\":{},\"search_error\":\"{}\"}}",
+        readback.row_count, readback.artifact_bytes, search_error.code
+    );
+    Ok(())
+}
+
+fn edge_limits(run_dir: &Path, rows: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = run_dir.join("edge-max-dim-binary.clxhnsw");
+    let mut max_data = Vec::with_capacity(HNSW_MAX_DIM as usize);
+    for index in 0..HNSW_MAX_DIM as usize {
+        max_data.push(rows[index % rows.len()][index % DIM]);
+    }
+    let mut max_index =
+        HnswIndex::new(SlotId::new(9), HNSW_MAX_DIM, 553).with_quant(QuantConfig::binary());
+    println!(
+        "{{\"event\":\"edge_limits_before\",\"max_dim_artifact_exists\":{},\"over_limit_rows\":0}}",
+        path.exists()
+    );
+    max_index.insert(
+        cx(90_000),
+        SlotVector::Dense {
+            dim: HNSW_MAX_DIM,
+            data: max_data,
+        },
+        1,
+    )?;
+    max_index.set_base_seq(900);
+    max_index.persist_artifact(&path)?;
+    let physical = independent_artifact_read(&path)?;
+    let over_dim = HNSW_MAX_DIM + 1;
+    let mut over = HnswIndex::new(SlotId::new(10), over_dim, 553).with_quant(QuantConfig::binary());
+    let over_error = require_error(over.insert(
+        cx(90_001),
+        SlotVector::Dense {
+            dim: over_dim,
+            data: vec![1.0; over_dim as usize],
+        },
+        1,
+    ))?;
+    println!(
+        "{{\"event\":\"edge_limits_after\",\"max_dim\":{},\"max_dim_rows\":{},\"max_dim_packed_vector_bytes\":{},\"over_dim\":{},\"over_limit_rows\":{},\"over_limit_error\":\"{}\"}}",
+        HNSW_MAX_DIM,
+        physical.row_count,
+        physical.packed_vector_bytes,
+        over_dim,
+        over.total_nodes(),
+        over_error.code
+    );
+    Ok(())
+}
+
+fn edge_invalid_config(rows: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut invalid =
+        HnswIndex::new(SlotId::new(11), DIM as u32, 553).with_quant(QuantConfig::scalar8(f32::NAN));
+    println!(
+        "{{\"event\":\"edge_invalid_config_before\",\"rows_in_memory\":{},\"scale\":\"NaN\"}}",
+        invalid.total_nodes()
+    );
+    let error = require_error(invalid.insert(
+        cx(91_000),
+        SlotVector::Dense {
+            dim: DIM as u32,
+            data: rows[0].clone(),
+        },
+        1,
+    ))?;
+    println!(
+        "{{\"event\":\"edge_invalid_config_after\",\"rows_in_memory\":{},\"error\":\"{}\"}}",
+        invalid.total_nodes(),
+        error.code
+    );
+    Ok(())
+}
+
+fn edge_corrupt_stale_unsupported(
+    run_dir: &Path,
+    valid_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let valid = std::fs::read(valid_path)?;
+    let valid_hash = blake3::hash(&valid);
+    let expected = HnswArtifactExpectation {
+        slot: SLOT,
+        dim: DIM as u32,
+        quant_kind: QuantKind::Scalar8,
+        base_seq: BASE_SEQ,
+    };
+    println!(
+        "{{\"event\":\"edge_bytes_before\",\"valid_path\":\"{}\",\"valid_hash\":\"{}\",\"valid_bytes\":{}}}",
+        json(&valid_path.display().to_string()),
+        valid_hash.to_hex(),
+        valid.len()
+    );
+
+    let corrupt_path = run_dir.join("edge-corrupt.clxhnsw");
+    let mut corrupt = valid.clone();
+    corrupt[HEADER_BYTES] ^= 0x40;
+    std::fs::write(&corrupt_path, &corrupt)?;
+    let corrupt_error = require_error(HnswIndex::load_artifact(&corrupt_path, expected))?;
+
+    let stale_error = require_error(HnswIndex::load_artifact(
+        valid_path,
+        HnswArtifactExpectation {
+            base_seq: BASE_SEQ + 1,
+            ..expected
+        },
+    ))?;
+
+    let wrong_dim_error = require_error(HnswIndex::load_artifact(
+        valid_path,
+        HnswArtifactExpectation {
+            dim: DIM as u32 - 1,
+            ..expected
+        },
+    ))?;
+
+    let unsupported_path = run_dir.join("edge-unsupported-version.clxhnsw");
+    let mut unsupported = valid.clone();
+    unsupported[8..10].copy_from_slice(&(HNSW_ARTIFACT_VERSION + 1).to_le_bytes());
+    reseal(&mut unsupported)?;
+    std::fs::write(&unsupported_path, &unsupported)?;
+    let unsupported_error = require_error(HnswIndex::load_artifact(&unsupported_path, expected))?;
+
+    let after_valid = std::fs::read(valid_path)?;
+    if after_valid != valid {
+        return Err("edge actions mutated the valid source artifact".into());
+    }
+    println!(
+        "{{\"event\":\"edge_bytes_after\",\"valid_hash\":\"{}\",\"valid_unchanged\":true,\"corrupt_file_exists\":{},\"corrupt_error\":\"{}\",\"stale_error\":\"{}\",\"wrong_dim_error\":\"{}\",\"unsupported_file_exists\":{},\"unsupported_error\":\"{}\"}}",
+        blake3::hash(&after_valid).to_hex(),
+        corrupt_path.exists(),
+        corrupt_error.code,
+        stale_error.code,
+        wrong_dim_error.code,
+        unsupported_path.exists(),
+        unsupported_error.code
+    );
+    Ok(())
+}
+
+struct ChildOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn spawn_reload(path: &Path, name: &str) -> Result<ChildOutput, Box<dyn std::error::Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--reload")
+        .arg(path)
+        .arg(name)
+        .output()?;
+    Ok(ChildOutput {
+        status: output.status,
+        stdout: String::from_utf8(output.stdout)?,
+        stderr: String::from_utf8(output.stderr)?,
+    })
+}
+
+struct PhysicalReadback {
+    magic: [u8; 8],
+    version: u16,
+    layout: u8,
+    kind_tag: u8,
+    slot: u16,
+    dim: u32,
+    base_seq: u64,
+    row_count: u64,
+    packed_vector_bytes: u64,
+    body_bytes: u64,
+    artifact_bytes: u64,
+    digest: [u8; 32],
+}
+
+struct PointerPhysicalReadback {
+    quant_bits: u8,
+    config_hash: [u8; 32],
+    artifact_digest: [u8; 32],
+    artifact_bytes: u64,
+    artifact_path: String,
+    pointer_bytes: u64,
+    pointer_digest: [u8; 32],
+}
+
+fn independent_pointer_read(
+    path: &Path,
+) -> Result<PointerPhysicalReadback, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < POINTER_HEADER_BYTES + FOOTER_BYTES {
+        return Err(format!("{} active pointer is truncated", path.display()).into());
+    }
+    if bytes[0..8] != HNSW_ACTIVE_POINTER_MAGIC
+        || u16::from_le_bytes(bytes[8..10].try_into()?) != HNSW_ACTIVE_POINTER_VERSION
+        || u16::from_le_bytes(bytes[10..12].try_into()?) != SLOT.get()
+    {
+        return Err(format!("{} active pointer identity mismatch", path.display()).into());
+    }
+    let payload_len = bytes.len() - FOOTER_BYTES;
+    let mut pointer_digest = [0_u8; 32];
+    pointer_digest.copy_from_slice(&bytes[payload_len..]);
+    if pointer_digest != *blake3::hash(&bytes[..payload_len]).as_bytes() {
+        return Err(format!("{} active pointer checksum mismatch", path.display()).into());
+    }
+    let path_len = u32::from_le_bytes(bytes[108..112].try_into()?) as usize;
+    if POINTER_HEADER_BYTES + path_len != payload_len {
+        return Err(format!("{} active pointer length mismatch", path.display()).into());
+    }
+    let artifact_path = std::str::from_utf8(&bytes[POINTER_HEADER_BYTES..payload_len])?.to_string();
+    let mut config_hash = [0_u8; 32];
+    config_hash.copy_from_slice(&bytes[28..60]);
+    let mut artifact_digest = [0_u8; 32];
+    artifact_digest.copy_from_slice(&bytes[60..92]);
+    let artifact_bytes = u64::from_le_bytes(bytes[92..100].try_into()?);
+    let artifact_physical = independent_artifact_read(Path::new(&artifact_path))?;
+    if artifact_physical.artifact_bytes != artifact_bytes
+        || artifact_physical.digest != artifact_digest
+    {
+        return Err("active pointer artifact digest/length readback mismatch".into());
+    }
+    Ok(PointerPhysicalReadback {
+        quant_bits: bytes[12],
+        config_hash,
+        artifact_digest,
+        artifact_bytes,
+        artifact_path,
+        pointer_bytes: bytes.len() as u64,
+        pointer_digest,
+    })
+}
+
+fn independent_artifact_read(path: &Path) -> Result<PhysicalReadback, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < HEADER_BYTES + FOOTER_BYTES {
+        return Err(format!("{} is truncated", path.display()).into());
+    }
+    let payload_len = bytes.len() - FOOTER_BYTES;
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(&bytes[payload_len..]);
+    let computed = *blake3::hash(&bytes[..payload_len]).as_bytes();
+    if digest != computed {
+        return Err(format!("{} independent checksum mismatch", path.display()).into());
+    }
+    let body_bytes = u64::from_le_bytes(bytes[78..86].try_into()?);
+    if HEADER_BYTES as u64 + body_bytes + FOOTER_BYTES as u64 != bytes.len() as u64 {
+        return Err(format!("{} independent length mismatch", path.display()).into());
+    }
+    Ok(PhysicalReadback {
+        magic: bytes[0..8].try_into()?,
+        version: u16::from_le_bytes(bytes[8..10].try_into()?),
+        layout: bytes[10],
+        kind_tag: bytes[11],
+        slot: u16::from_le_bytes(bytes[12..14].try_into()?),
+        dim: u32::from_le_bytes(bytes[14..18].try_into()?),
+        base_seq: u64::from_le_bytes(bytes[30..38].try_into()?),
+        row_count: u64::from_le_bytes(bytes[54..62].try_into()?),
+        packed_vector_bytes: u64::from_le_bytes(bytes[70..78].try_into()?),
+        body_bytes,
+        artifact_bytes: bytes.len() as u64,
+        digest,
+    })
+}
+
+fn reseal(bytes: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
+    if bytes.len() < FOOTER_BYTES {
+        return Err("cannot reseal a truncated artifact".into());
+    }
+    let payload_len = bytes.len() - FOOTER_BYTES;
+    let digest = blake3::hash(&bytes[..payload_len]);
+    bytes[payload_len..].copy_from_slice(digest.as_bytes());
+    Ok(())
+}
+
+fn require_error<T>(
+    result: Result<T, CalyxError>,
+) -> Result<CalyxError, Box<dyn std::error::Error>> {
+    match result {
+        Ok(_) => Err("operation unexpectedly succeeded".into()),
+        Err(error) => Ok(error),
+    }
+}
+
+fn cx(ordinal: usize) -> CxId {
+    CxId::from_bytes((ordinal as u128).to_be_bytes())
+}
+
+fn measured_scale(rows: &[Vec<f32>]) -> f32 {
+    rows.iter()
+        .flatten()
+        .fold(0.0_f32, |max_abs, value| max_abs.max(value.abs()))
+        / 127.0
+}
+
+fn exact_top_k(query: &[f32], rows: &[Vec<f32>], k: usize) -> Vec<CxId> {
+    let mut scored: Vec<(usize, f32)> = rows
+        .iter()
+        .enumerate()
+        .map(|(ordinal, row)| (ordinal, cosine(query, row)))
+        .collect();
+    scored.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+    scored.truncate(k);
+    scored.into_iter().map(|(ordinal, _)| cx(ordinal)).collect()
+}
+
+fn overlap(got: &[CxId], truth: &[CxId]) -> usize {
+    got.iter().filter(|cx_id| truth.contains(cx_id)).count()
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    let mut dot = 0.0_f64;
+    let mut left_norm = 0.0_f64;
+    let mut right_norm = 0.0_f64;
+    for (a, b) in left.iter().zip(right) {
+        dot += f64::from(*a) * f64::from(*b);
+        left_norm += f64::from(*a) * f64::from(*a);
+        right_norm += f64::from(*b) * f64::from(*b);
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        (dot / (left_norm.sqrt() * right_norm.sqrt())) as f32
+    }
+}
+
+fn real_corpus_vectors(count: usize) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::from("calyx/crates/calyx-sextant/src")];
+    if !stack[0].exists() {
+        stack = vec![PathBuf::from("src")];
+    }
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut vectors = Vec::with_capacity(count);
+    'files: for path in files {
+        let bytes = std::fs::read(path)?;
+        for chunk in bytes.chunks(2_048) {
+            if chunk.len() < 256 {
+                continue;
+            }
+            let mut histogram = [0.0_f32; DIM];
+            for byte in chunk {
+                histogram[usize::from(*byte) % DIM] += 1.0;
+            }
+            let mean = histogram.iter().sum::<f32>() / DIM as f32;
+            let vector: Vec<f32> = histogram.iter().map(|value| value - mean).collect();
+            if vector.iter().all(|value| *value == 0.0) {
+                continue;
+            }
+            vectors.push(vector);
+            if vectors.len() == count {
+                break 'files;
+            }
+        }
+    }
+    if vectors.len() != count {
+        return Err(format!("real corpus yielded {} of {count} vectors", vectors.len()).into());
+    }
+    Ok(vectors)
+}
+
+fn count_files(root: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut count = 0_u64;
+    for entry in std::fs::read_dir(root)? {
+        if entry?.file_type()?.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn count_bytes(root: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn json(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+// Direct kernel mismatch edge retained as part of the public packed API audit.
+#[allow(dead_code)]
+fn packed_kind_mismatch(query: &[f32]) -> Result<CalyxError, Box<dyn std::error::Error>> {
+    require_error(score_packed(
+        &PackedQuery::F32 {
+            values: query.to_vec(),
+            norm: 1.0,
+        },
+        &PackedVector::Binary {
+            bits: vec![0_u8; DIM.div_ceil(8)],
+            dim: DIM as u32,
+        },
+    ))
+}

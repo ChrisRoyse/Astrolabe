@@ -26,14 +26,16 @@ pub use scope_forge::{
     candidate_configs, decode_forge_config, encode_forge_config,
 };
 pub use scope_index::{
-    CALYX_INDEX_CACHE_WRITE_FAIL, CALYX_INDEX_SCOPE_INVALID_CONFIG, DEFAULT_INDEX_RECALL_TARGET,
-    DEFAULT_INDEX_VRAM_BUDGET_BYTES, IndexBanditPersistence, IndexConfig, IndexPromotionRecord,
-    IndexPromotionWriter, IndexScopeTuner, IndexSlotHealth, IndexTuneDecision, IndexTuneSkip,
-    MAX_INDEX_CANDIDATES, MIN_BITS_PER_ANCHOR, NoopIndexAssayMetrics, NoopIndexBanditStore,
-    NoopIndexPromotionWriter, NoopIndexSlotHealth, QuantPromotionEvidence,
+    CALYX_INDEX_ARTIFACT_ACTIVATION_REQUIRED, CALYX_INDEX_CACHE_WRITE_FAIL,
+    CALYX_INDEX_SCOPE_INVALID_CONFIG, DEFAULT_INDEX_RECALL_TARGET, DEFAULT_INDEX_VRAM_BUDGET_BYTES,
+    IndexArtifactActivation, IndexArtifactActivator, IndexArtifactPromotionRequest,
+    IndexBanditPersistence, IndexConfig, IndexPromotionRecord, IndexPromotionWriter,
+    IndexScopeTuner, IndexSlotHealth, IndexTuneDecision, IndexTuneSkip, MAX_INDEX_CANDIDATES,
+    MIN_BITS_PER_ANCHOR, NoopIndexAssayMetrics, NoopIndexBanditStore, NoopIndexPromotionWriter,
+    NoopIndexSlotHealth, QuantPromotionEvidence, RefuseIndexArtifactActivator,
     candidate_configs as index_candidate_configs, decode_index_config, encode_index_config,
-    index_slot_label, quant_win_check, slot_autotune_key, validate_index_config,
-    validate_quant_promotion_evidence,
+    index_slot_label, quant_win_check, slot_autotune_key, validate_index_artifact_activation,
+    validate_index_config, validate_quant_promotion_evidence,
 };
 pub use scope_loom::{
     CALYX_LOOM_PLAN_WRITE_FAIL, CALYX_LOOM_SCOPE_INVALID_CONFIG, ConcatKey,
