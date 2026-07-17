@@ -239,7 +239,7 @@ impl SavedPanelTemplate {
                 shape: lens.shape,
                 modality: lens.modality,
                 asymmetry: Asymmetry::None,
-                quant: QuantPolicy::turboquant_default(),
+                quant: calyx_registry::spec::default_quant_for_shape(lens.shape),
                 resource: SlotResource {
                     cost: lens.cost,
                     placement: lens.placement,

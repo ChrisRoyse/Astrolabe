@@ -141,6 +141,39 @@ fn validate_quantized(qv: &QuantizedVec, dim: usize, op: &str) -> Result<()> {
             "zero scale requires every encoded INT8 code to be zero",
         ));
     }
+    if qv.scale > 0.0 {
+        // Canonical positive-scale payload contract: the encoder clamps to
+        // [-127, 127] (so -128 is encoder-impossible), never emits an all-zero
+        // payload with a positive scale (a zero vector encodes with scale 0),
+        // and always maps max |value| to a ±127 extremum.
+        let mut max_abs_code = 0_u8;
+        for (index, byte) in qv.bytes.iter().enumerate() {
+            let code = *byte as i8;
+            if code == i8::MIN {
+                return Err(quant_error(
+                    op,
+                    format!("encoder-impossible INT8 code -128 at index {index}"),
+                ));
+            }
+            max_abs_code = max_abs_code.max(code.unsigned_abs());
+        }
+        if max_abs_code == 0 {
+            return Err(quant_error(
+                op,
+                "positive scale requires a non-zero payload; a zero vector encodes with \
+                 canonical scale +0.0",
+            ));
+        }
+        if max_abs_code != 127 {
+            return Err(quant_error(
+                op,
+                format!(
+                    "non-canonical positive-scale payload: max |code| {max_abs_code} != 127; \
+                     the encoder always maps max |value| to a ±127 extremum"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 

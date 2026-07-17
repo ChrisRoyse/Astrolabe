@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{
-    CalyxError, Input, Lens, LensId, Modality, Panel, QuantPolicy, Result as CalyxResult, Slot,
+    CalyxError, Input, Lens, LensId, Modality, Panel, Result as CalyxResult, Slot,
     SlotId, SlotKey, SlotShape, SlotState, SlotVector,
 };
 use calyx_registry::frozen::sha256_digest;
@@ -250,7 +250,7 @@ fn panel_slot(
         shape,
         modality: Modality::Structured,
         asymmetry: calyx_core::Asymmetry::None,
-        quant: QuantPolicy::turboquant_default(),
+        quant: calyx_registry::spec::default_quant_for_shape(shape),
         resource: Default::default(),
         axis: Some(key.to_string()),
         retrieval_only: is_temporal_lens_key(key),

@@ -244,6 +244,16 @@ pub const fn default_quant_default() -> QuantPolicy {
     QuantPolicy::turboquant_default()
 }
 
+/// Shape-aware storage-identity default: dense shapes take the TurboQuant
+/// default; sparse/multi shapes persist exact canonical rows
+/// (`QuantPolicy::None`) because every implemented codec is dense-only.
+pub const fn default_quant_for_shape(shape: SlotShape) -> QuantPolicy {
+    match shape {
+        SlotShape::Dense(_) => QuantPolicy::turboquant_default(),
+        SlotShape::Sparse(_) | SlotShape::Multi { .. } => QuantPolicy::None,
+    }
+}
+
 pub const fn default_recall_delta() -> f32 {
     0.02
 }

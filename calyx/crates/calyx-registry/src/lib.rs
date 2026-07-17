@@ -69,7 +69,7 @@ pub use ingest_microbatch::{
 };
 pub use lens::{
     DeterminismProof, DualMeasurement, FrozenLensSnapshot, Registry, RegistryLensSnapshot,
-    ensure_input_modality, ensure_vector_shape,
+    ensure_input_modality, ensure_vector_shape, validate_quant_policy_for_shape,
 };
 pub use panel_ops::{
     AppliedPanelTemplate, CALYX_PANEL_LENS_MISSING, PanelCapabilityGateOutcome, PanelDiff,

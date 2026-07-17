@@ -46,9 +46,11 @@ use crate::{AlgorithmicEncoder, LensRuntime, LensSpec};
 #[cfg(feature = "ml-runtime")]
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 #[cfg(feature = "ml-runtime")]
-const STATIC_LOOKUP_MAGIC: &[u8; 8] = b"CXLKUP1\0";
+const STATIC_LOOKUP_MAGIC: &[u8; 8] = b"CXLKUP2\0";
 #[cfg(feature = "ml-runtime")]
-const STATIC_LOOKUP_HEADER_LEN: usize = 24;
+const STATIC_LOOKUP_MAGIC_LEGACY_V1: &[u8; 8] = b"CXLKUP1\0";
+#[cfg(feature = "ml-runtime")]
+const STATIC_LOOKUP_HEADER_LEN: usize = 64;
 
 pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensContract> {
     match &spec.runtime {
@@ -579,6 +581,19 @@ fn static_lookup_header(path: &Path) -> Result<(u32, &'static str)> {
         ))
     })?;
     if len < STATIC_LOOKUP_HEADER_LEN || &header[..8] != STATIC_LOOKUP_MAGIC {
+        if &header[..8] == STATIC_LOOKUP_MAGIC_LEGACY_V1 {
+            return Err(CalyxError {
+                code: "CALYX_LENS_MATRIX_LEGACY",
+                message: format!(
+                    "static lookup matrix {} carries legacy magic CXLKUP1 (single global \
+                     scale, no vocabulary binding, no body digest); refusing to guess its \
+                     contents",
+                    path.display()
+                ),
+                remediation: "re-export the matrix in the CXLKUP2 format (per-row int8 \
+                              scales, vocab_size binding, sealed blake3 body digest)",
+            });
+        }
         return Err(lens_config_invalid(format!(
             "static lookup matrix {} has invalid magic/header",
             path.display()
@@ -587,19 +602,48 @@ fn static_lookup_header(path: &Path) -> Result<(u32, &'static str)> {
     let rows = u32::from_le_bytes(header[8..12].try_into().expect("rows"));
     let dim = u32::from_le_bytes(header[12..16].try_into().expect("dim"));
     let (dtype, width) = match header[16] {
-        1 => ("int8", 1usize),
-        2 => ("f16", 2usize),
-        3 => ("f32", 4usize),
+        1 => ("int8", 1u64),
+        2 => ("f16", 2u64),
+        3 => ("f32", 4u64),
         other => {
             return Err(lens_config_invalid(format!(
                 "unsupported static lookup dtype {other}"
             )));
         }
     };
-    let expected = STATIC_LOOKUP_HEADER_LEN
-        .checked_add(rows as usize * dim as usize * width)
+    if header[17..20] != [0, 0, 0] {
+        return Err(lens_config_invalid(
+            "static lookup matrix header pad bytes must be zero",
+        ));
+    }
+    let vocab_size = u32::from_le_bytes(header[20..24].try_into().expect("vocab"));
+    if vocab_size != rows {
+        return Err(lens_config_invalid(format!(
+            "static lookup matrix declares vocab_size {vocab_size} != rows {rows}"
+        )));
+    }
+    let declared_body_len = u64::from_le_bytes(header[24..32].try_into().expect("body len"));
+    let scale_table_len = if dtype == "int8" {
+        (rows as u64)
+            .checked_mul(4)
+            .ok_or_else(|| CalyxError::lens_dim_mismatch("static lookup scale table overflow"))?
+    } else {
+        0
+    };
+    let body_len = (rows as u64)
+        .checked_mul(dim as u64)
+        .and_then(|cells| cells.checked_mul(width))
+        .and_then(|values| values.checked_add(scale_table_len))
         .ok_or_else(|| CalyxError::lens_dim_mismatch("static lookup matrix size overflow"))?;
-    if len != expected {
+    if body_len != declared_body_len {
+        return Err(lens_config_invalid(format!(
+            "static lookup matrix declared body_len {declared_body_len} != computed {body_len}"
+        )));
+    }
+    let expected = (STATIC_LOOKUP_HEADER_LEN as u64)
+        .checked_add(body_len)
+        .ok_or_else(|| CalyxError::lens_dim_mismatch("static lookup matrix size overflow"))?;
+    if len as u64 != expected {
         return Err(CalyxError::lens_dim_mismatch(format!(
             "static lookup matrix byte length {len} != expected {expected}"
         )));

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use calyx_core::{
-    Asymmetry, CalyxError, Input, Lens, LensId, Modality, QuantPolicy, SlotShape, SlotVector,
+    Asymmetry, CalyxError, Input, Lens, LensId, Modality, SlotShape, SlotVector,
 };
 use calyx_registry::frozen::sha256_digest;
 use calyx_registry::{
@@ -363,7 +363,7 @@ fn spec_from_contract(name: &str, runtime: LensRuntime, contract: &FrozenLensCon
         max_batch: None,
         axis: Some(name.to_string()),
         asymmetry: Asymmetry::None,
-        quant_default: QuantPolicy::turboquant_default(),
+        quant_default: calyx_registry::spec::default_quant_for_shape(contract.shape()),
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
         retrieval_only: false,

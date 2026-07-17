@@ -94,7 +94,7 @@ impl LensHotAdder for RegistryHotAdder<'_> {
                     shape: artifact.contract.shape(),
                     modality: artifact.contract.modality(),
                     asymmetry: Asymmetry::None,
-                    quant: QuantPolicy::turboquant_default(),
+                    quant: calyx_registry::spec::default_quant_for_shape(artifact.contract.shape()),
                     axis: Some(target.axis),
                     retrieval_only: false,
                     excluded_from_dedup: false,

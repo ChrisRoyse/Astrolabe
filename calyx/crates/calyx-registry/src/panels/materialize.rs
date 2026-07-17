@@ -1,7 +1,7 @@
-use calyx_core::{CalyxError, Lens, Panel, QuantPolicy, Result, SlotShape, SlotState};
+use calyx_core::{CalyxError, Lens, Panel, Result, SlotShape, SlotState};
 
 use crate::frozen::FrozenLensContract;
-use crate::spec::{LensRuntime, LensSpec, default_recall_delta};
+use crate::spec::{LensRuntime, LensSpec, default_quant_for_shape, default_recall_delta};
 use crate::{AlgorithmicLens, Registry};
 
 use super::{
@@ -35,9 +35,12 @@ pub fn materialize_panel_template(
         let runtime = algorithmic_runtime(&spec.runtime)
             .expect("materialize_algorithmic_content_lens only returns algorithmic lenses");
         let lens_spec = spec_from_contract(spec, runtime, &contract);
+        // Shape-aware storage identity: sparse/multi slots persist exact
+        // canonical rows; only dense slots take the TurboQuant default.
+        let slot_quant = default_quant_for_shape(contract.shape());
         let lens_id = registry.register_frozen_with_spec(lens, contract, lens_spec)?;
         slot.lens_id = lens_id;
-        slot.quant = QuantPolicy::turboquant_default();
+        slot.quant = slot_quant;
     }
 
     ensure_active_slots_are_registered(&template.name, &instantiated.panel, &registry)?;
@@ -173,7 +176,7 @@ fn spec_from_contract(
         max_batch: None,
         axis: Some(spec.name.clone()),
         asymmetry: spec.asymmetry,
-        quant_default: QuantPolicy::turboquant_default(),
+        quant_default: default_quant_for_shape(contract.shape()),
         truncate_dim: None,
         recall_delta: default_recall_delta(),
         retrieval_only: spec.retrieval_only,

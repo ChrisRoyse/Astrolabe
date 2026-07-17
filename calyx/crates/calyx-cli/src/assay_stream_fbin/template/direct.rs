@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use calyx_core::{Asymmetry, Modality, QuantPolicy};
+use calyx_core::{Asymmetry, Modality};
 use calyx_registry::{AlgorithmicLens, FrozenLensContract, LensRuntime, LensSpec};
 use sha2::{Digest, Sha256};
 
@@ -244,7 +244,7 @@ fn spec_from_contract(name: &str, runtime: LensRuntime, contract: &FrozenLensCon
         max_batch: None,
         axis: Some(name.to_string()),
         asymmetry: Asymmetry::None,
-        quant_default: QuantPolicy::turboquant_default(),
+        quant_default: calyx_registry::spec::default_quant_for_shape(contract.shape()),
         truncate_dim: None,
         recall_delta: calyx_registry::spec::default_recall_delta(),
         retrieval_only: false,

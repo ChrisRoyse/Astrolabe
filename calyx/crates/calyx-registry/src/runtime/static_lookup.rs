@@ -14,8 +14,21 @@ use crate::identity::{ContractFacts, contract_from_facts, static_lookup_corpus_h
 use crate::runtime::common::{DEFAULT_MAX_TOKENS, hash_files, normalize_unit, text_from_input};
 use crate::spec::{LensRuntime, LensSpec};
 
-const MAGIC: &[u8; 8] = b"CXLKUP1\0";
-const HEADER_LEN: usize = 24;
+/// Current authenticated static-lookup matrix magic (format v2).
+///
+/// Layout (little-endian):
+/// `magic "CXLKUP2\0" (8 B) | u32 rows | u32 dim | u8 dtype | 3 B zero pad |
+/// u32 vocab_size | u64 body_len | body blake3 digest (32 B)` then the body.
+///
+/// Body per dtype: int8 = `f32 scale[rows]` (per-row dequantization
+/// multipliers) followed by `i8 codes[rows*dim]`; f16/f32 = raw values only.
+/// `vocab_size` binds the tokenizer vocabulary identity: it must equal `rows`
+/// and the loaded tokenizer's vocabulary size, so token ids and matrix rows can
+/// never silently drift apart.
+const MAGIC: &[u8; 8] = b"CXLKUP2\0";
+/// Legacy global-scale magic — refused fail-closed.
+const MAGIC_LEGACY_V1: &[u8; 8] = b"CXLKUP1\0";
+const HEADER_LEN: usize = 64;
 const DTYPE_I8: u8 = 1;
 const DTYPE_F16: u8 = 2;
 const DTYPE_F32: u8 = 3;
@@ -78,7 +91,8 @@ struct StaticLookupMatrix {
     rows: u32,
     dim: u32,
     dtype: StaticLookupDType,
-    scale: f32,
+    /// Byte offset where value codes begin (after the int8 per-row scale table).
+    codes_offset: usize,
 }
 
 impl StaticLookupLens {
@@ -95,6 +109,20 @@ impl StaticLookupLens {
             )));
         }
         let tokenizer = read_tokenizer(&spec.tokenizer)?;
+        let tokenizer_vocab = tokenizer.get_vocab_size(true);
+        if tokenizer_vocab as u64 != u64::from(matrix.rows) {
+            return Err(CalyxError {
+                code: "CALYX_LENS_VOCAB_BINDING_MISMATCH",
+                message: format!(
+                    "tokenizer {} vocabulary size {tokenizer_vocab} != matrix rows {}; the \
+                     CXLKUP2 vocab_size binding requires a one-to-one vocabulary",
+                    spec.tokenizer.display(),
+                    matrix.rows
+                ),
+                remediation: "commission the static lookup lens with the tokenizer the matrix \
+                              was exported against",
+            });
+        }
         let weights_sha256 = hash_files(&[spec.embeddings_file.clone(), spec.tokenizer.clone()])?;
         if let Some(expected) = spec.expected_weights_sha256
             && weights_sha256 != expected
@@ -200,15 +228,16 @@ impl Lens for StaticLookupLens {
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         let text = text_from_input(self, input)?;
-        let mut data = if text.trim().is_empty() {
-            zero_safe_unit(self.matrix.dim)
-        } else {
-            let encoding = self
-                .tokenizer
-                .encode(text, true)
-                .map_err(|err| CalyxError::lens_dim_mismatch(format!("tokenize failed: {err}")))?;
-            self.pool_encoding(&encoding)?
-        };
+        if text.trim().is_empty() {
+            return Err(empty_projection_refused(
+                "input text is empty after trimming",
+            ));
+        }
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|err| CalyxError::lens_dim_mismatch(format!("tokenize failed: {err}")))?;
+        let mut data = self.pool_encoding(&encoding)?;
         apply_norm(self.contract.norm_policy(), &mut data)?;
         let vector = SlotVector::Dense {
             dim: self.matrix.dim,
@@ -246,12 +275,13 @@ impl StaticLookupLens {
             if tokens.get(idx).is_some_and(|token| is_unknown_token(token)) {
                 continue;
             }
-            if self.matrix.add_row(token_id, &mut out)? {
-                count += 1;
-            }
+            self.matrix.add_row(token_id, &mut out)?;
+            count += 1;
         }
         if count == 0 {
-            return Ok(zero_safe_unit(self.matrix.dim));
+            return Err(empty_projection_refused(
+                "every token in the input is unknown to the bound vocabulary",
+            ));
         }
         let inv = 1.0 / count as f32;
         for value in &mut out {
@@ -277,10 +307,21 @@ impl StaticLookupMatrix {
                 ))
             })?
         };
-        if mmap.len() < HEADER_LEN || &mmap[..8] != MAGIC {
+        if mmap.len() < HEADER_LEN {
             return Err(config_invalid(format!(
-                "static lookup matrix {} has invalid magic/header",
-                path.display()
+                "static lookup matrix {} is {} B, smaller than the {HEADER_LEN} B v2 header",
+                path.display(),
+                mmap.len()
+            )));
+        }
+        if &mmap[..8] != MAGIC {
+            if &mmap[..8] == MAGIC_LEGACY_V1 {
+                return Err(legacy_matrix_refused(path));
+            }
+            return Err(config_invalid(format!(
+                "static lookup matrix {} has invalid magic {:02x?}",
+                path.display(),
+                &mmap[..8]
             )));
         }
         let rows = read_u32(&mmap[8..12]);
@@ -300,34 +341,150 @@ impl StaticLookupMatrix {
                 )));
             }
         };
-        let scale = f32::from_le_bytes(mmap[20..24].try_into().expect("header scale"));
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(CalyxError::lens_numerical_invariant(
-                "static lookup matrix scale must be finite and positive",
+        if mmap[17..20] != [0, 0, 0] {
+            return Err(config_invalid(
+                "static lookup matrix header pad bytes must be zero",
             ));
         }
-        let body_len = rows as usize * dim as usize * dtype.width();
-        let expected = HEADER_LEN
-            .checked_add(body_len)
-            .ok_or_else(|| CalyxError::lens_dim_mismatch("static lookup matrix size overflow"))?;
-        if mmap.len() != expected {
+        let vocab_size = read_u32(&mmap[20..24]);
+        if vocab_size != rows {
+            return Err(config_invalid(format!(
+                "static lookup matrix declares vocab_size {vocab_size} != rows {rows}; the \
+                 vocabulary identity must be bound one-to-one to matrix rows"
+            )));
+        }
+        let declared_body_len = u64::from_le_bytes(mmap[24..32].try_into().expect("body len"));
+        let digest: [u8; 32] = mmap[32..64].try_into().expect("digest");
+        let cells = (rows as u64).checked_mul(dim as u64).ok_or_else(|| {
+            CalyxError::lens_dim_mismatch("static lookup matrix cell count overflows u64")
+        })?;
+        let scale_table_len = match dtype {
+            StaticLookupDType::Int8 => (rows as u64).checked_mul(4).ok_or_else(|| {
+                CalyxError::lens_dim_mismatch("static lookup scale table overflows u64")
+            })?,
+            StaticLookupDType::F16 | StaticLookupDType::F32 => 0,
+        };
+        let body_len = cells
+            .checked_mul(dtype.width() as u64)
+            .and_then(|values| values.checked_add(scale_table_len))
+            .ok_or_else(|| {
+                CalyxError::lens_dim_mismatch("static lookup matrix body size overflows u64")
+            })?;
+        if body_len != declared_body_len {
+            return Err(config_invalid(format!(
+                "static lookup matrix declared body_len {declared_body_len} != computed \
+                 {body_len} (rows {rows} x dim {dim} dtype {})",
+                dtype.as_str()
+            )));
+        }
+        let expected_total = (HEADER_LEN as u64).checked_add(body_len).ok_or_else(|| {
+            CalyxError::lens_dim_mismatch("static lookup matrix total size overflows u64")
+        })?;
+        if mmap.len() as u64 != expected_total {
             return Err(CalyxError::lens_dim_mismatch(format!(
-                "static lookup matrix byte length {} != expected {expected}",
+                "static lookup matrix byte length {} != expected {expected_total}",
                 mmap.len()
             )));
         }
-        Ok(Self {
+        let body_len_usize = usize::try_from(body_len).map_err(|_| {
+            CalyxError::lens_dim_mismatch(
+                "static lookup matrix body exceeds this platform's address space",
+            )
+        })?;
+        let observed = blake3::hash(&mmap[HEADER_LEN..HEADER_LEN + body_len_usize]);
+        if *observed.as_bytes() != digest {
+            return Err(CalyxError {
+                code: "CALYX_LENS_MATRIX_DIGEST_MISMATCH",
+                message: format!(
+                    "static lookup matrix {} body does not match its sealed blake3 digest \
+                     (observed {})",
+                    path.display(),
+                    observed.to_hex()
+                ),
+                remediation:
+                    "regenerate the matrix from its source embeddings; never trust the corrupt copy",
+            });
+        }
+        let codes_offset = HEADER_LEN + scale_table_len as usize;
+        let matrix = Self {
             mmap,
             rows,
             dim,
             dtype,
-            scale,
-        })
+            codes_offset,
+        };
+        matrix.verify_body(path)?;
+        Ok(matrix)
     }
 
-    fn add_row(&self, row: u32, out: &mut [f32]) -> Result<bool> {
+    /// Validates every persisted cell once at load: int8 scales are finite and
+    /// positive with canonical codes; f16/f32 values are finite.
+    fn verify_body(&self, path: &Path) -> Result<()> {
+        match self.dtype {
+            StaticLookupDType::Int8 => {
+                for row in 0..self.rows {
+                    let scale = self.row_scale(row);
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return Err(CalyxError::lens_numerical_invariant(format!(
+                            "static lookup matrix {} row {row} scale {scale} is not finite and \
+                             positive",
+                            path.display()
+                        )));
+                    }
+                }
+                let codes = &self.mmap[self.codes_offset..];
+                if let Some(offset) = codes.iter().position(|raw| *raw as i8 == i8::MIN) {
+                    return Err(CalyxError::lens_numerical_invariant(format!(
+                        "static lookup matrix {} carries encoder-impossible int8 code -128 at \
+                         body offset {offset}",
+                        path.display()
+                    )));
+                }
+            }
+            StaticLookupDType::F16 => {
+                for (cell, chunk) in self.mmap[self.codes_offset..].chunks_exact(2).enumerate() {
+                    let value = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+                    if !value.is_finite() {
+                        return Err(CalyxError::lens_numerical_invariant(format!(
+                            "static lookup matrix {} contains non-finite f16 value at cell {cell}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            StaticLookupDType::F32 => {
+                for (cell, chunk) in self.mmap[self.codes_offset..].chunks_exact(4).enumerate() {
+                    let value = f32::from_le_bytes(chunk.try_into().expect("4B"));
+                    if !value.is_finite() {
+                        return Err(CalyxError::lens_numerical_invariant(format!(
+                            "static lookup matrix {} contains non-finite f32 value at cell {cell}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-row dequantization multiplier for the int8 dtype.
+    fn row_scale(&self, row: u32) -> f32 {
+        let pos = HEADER_LEN + row as usize * 4;
+        f32::from_le_bytes(self.mmap[pos..pos + 4].try_into().expect("scale bytes"))
+    }
+
+    fn add_row(&self, row: u32, out: &mut [f32]) -> Result<()> {
         if row >= self.rows {
-            return Ok(false);
+            return Err(CalyxError {
+                code: "CALYX_LENS_TOKEN_ID_OUT_OF_RANGE",
+                message: format!(
+                    "token id {row} is outside the bound vocabulary of {} rows; the tokenizer \
+                     and matrix identities have drifted apart",
+                    self.rows
+                ),
+                remediation: "recommission the static lookup lens with a tokenizer whose \
+                              vocabulary matches the matrix vocab_size binding",
+            });
         }
         let dim = self.dim as usize;
         if out.len() != dim {
@@ -336,18 +493,19 @@ impl StaticLookupMatrix {
                 out.len()
             )));
         }
-        let start = HEADER_LEN + row as usize * dim * self.dtype.width();
+        let start = self.codes_offset + row as usize * dim * self.dtype.width();
         match self.dtype {
             StaticLookupDType::Int8 => {
+                let scale = self.row_scale(row);
                 for (dst, raw) in out.iter_mut().zip(&self.mmap[start..start + dim]) {
-                    *dst += (*raw as i8) as f32 * self.scale;
+                    *dst += (*raw as i8) as f32 * scale;
                 }
             }
             StaticLookupDType::F16 => {
                 for (idx, dst) in out.iter_mut().enumerate() {
                     let pos = start + idx * 2;
                     let raw = u16::from_le_bytes([self.mmap[pos], self.mmap[pos + 1]]);
-                    *dst += f16_to_f32(raw) * self.scale;
+                    *dst += f16_to_f32(raw);
                 }
             }
             StaticLookupDType::F32 => {
@@ -356,11 +514,24 @@ impl StaticLookupMatrix {
                     let raw = f32::from_le_bytes(
                         self.mmap[pos..pos + 4].try_into().expect("f32 row bytes"),
                     );
-                    *dst += raw * self.scale;
+                    *dst += raw;
                 }
             }
         }
-        Ok(true)
+        Ok(())
+    }
+}
+
+fn legacy_matrix_refused(path: &Path) -> CalyxError {
+    CalyxError {
+        code: "CALYX_LENS_MATRIX_LEGACY",
+        message: format!(
+            "static lookup matrix {} carries legacy magic CXLKUP1 (single global scale, no \
+             vocabulary binding, no body digest); refusing to guess its contents",
+            path.display()
+        ),
+        remediation: "re-export the matrix in the CXLKUP2 format (per-row int8 scales, \
+                      vocab_size binding, sealed blake3 body digest)",
     }
 }
 
@@ -389,12 +560,16 @@ fn apply_norm(policy: NormPolicy, data: &mut [f32]) -> Result<()> {
     }
 }
 
-fn zero_safe_unit(dim: u32) -> Vec<f32> {
-    let mut data = vec![0.0_f32; dim as usize];
-    if let Some(first) = data.first_mut() {
-        *first = 1.0;
+/// Fail-closed refusal for inputs that would otherwise become a fabricated
+/// vector: a lookup lens must never invent a unit direction for content it
+/// cannot see.
+fn empty_projection_refused(reason: &str) -> CalyxError {
+    CalyxError {
+        code: "CALYX_LENS_EMPTY_PROJECTION",
+        message: format!("static lookup lens cannot measure this input: {reason}"),
+        remediation: "skip this input for the static lookup slot or record it as absent; a \
+                      fabricated unit vector would poison similarity measurements",
     }
-    data
 }
 
 fn is_unknown_token(token: &str) -> bool {
