@@ -108,17 +108,29 @@ fn send_request_with_timeout(
 
 fn reject_remote_json_error(addr: SocketAddr, response: Value) -> CliResult<Value> {
     let Some(object) = response.as_object() else {
-        return Ok(response);
+        return Err(remote_schema_error(
+            addr,
+            "response was not a JSON object with an explicit boolean ok field",
+        ));
     };
-    let ok_false = matches!(object.get("ok"), Some(Value::Bool(false)));
-    let invalid_ok = object
-        .get("ok")
-        .is_some_and(|value| !matches!(value, Value::Bool(_)));
     let has_error_field = ["code", "message", "remediation"]
         .iter()
         .any(|field| object.contains_key(*field));
-    if !ok_false && !invalid_ok && !has_error_field {
-        return Ok(response);
+    match object.get("ok") {
+        Some(Value::Bool(true)) if !has_error_field => return Ok(response),
+        Some(Value::Bool(true)) => {
+            return Err(remote_schema_error(
+                addr,
+                "response declared ok=true while also carrying failure-envelope fields",
+            ));
+        }
+        Some(Value::Bool(false)) => {}
+        Some(_) => {
+            return Err(remote_schema_error(addr, "ok field was not a boolean"));
+        }
+        None => {
+            return Err(remote_schema_error(addr, "required ok field was missing"));
+        }
     }
 
     let field = |name: &str| {
@@ -135,12 +147,17 @@ fn reject_remote_json_error(addr: SocketAddr, response: Value) -> CliResult<Valu
 }
 
 fn malformed_remote_error(addr: SocketAddr, field: &str) -> CliError {
+    remote_schema_error(
+        addr,
+        format!("response declared ok=false but {field} was missing, blank, or not a string"),
+    )
+}
+
+fn remote_schema_error(addr: SocketAddr, detail: impl std::fmt::Display) -> CliError {
     CliError::from(CalyxError {
         code: "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
-        message: format!(
-            "resident response from {addr} declared or resembled a failure but {field} was missing, blank, or not a string"
-        ),
-        remediation: "restart the resident supervisor from the same native Calyx build as the client",
+        message: format!("resident response from {addr} violated the JSON envelope: {detail}"),
+        remediation: "restart the resident supervisor and client from the same native Calyx build; preserve both process logs and the lifecycle journal",
     })
 }
 
@@ -170,6 +187,8 @@ pub(crate) fn measure_batch_at(
             .map(|input| input.bytes.clone())
             .collect::<Vec<_>>(),
         runtime_batch_limit,
+        supervisor_request_id: None,
+        supervisor_generation: None,
     })?;
     write_frame(&mut deadline_stream, &request_bytes)?;
     deadline_stream.flush()?;
@@ -205,6 +224,8 @@ fn measure_batch_summary_at(
             .map(|input| input.bytes.clone())
             .collect::<Vec<_>>(),
         runtime_batch_limit,
+        supervisor_request_id: None,
+        supervisor_generation: None,
     })?;
     write_frame(&mut deadline_stream, &request_bytes)?;
     deadline_stream.flush()?;
@@ -317,6 +338,7 @@ fn read_measure_batch_stream(
     }
     Ok(MeasureBatchAtResponse {
         response: MeasureBatchResponse {
+            ok: true,
             schema: header.schema,
             ready: header.ready,
             process_id: header.process_id,
@@ -326,6 +348,7 @@ fn read_measure_batch_stream(
             elapsed_ms: end.elapsed_ms,
             runtime_batch_limit: header.runtime_batch_limit,
             rows,
+            completion: end.completion,
         },
         request_bytes,
         response_bytes,
@@ -394,6 +417,7 @@ fn read_measure_batch_summary_stream(
         }));
     }
     Ok(MeasureBatchSummaryResponse {
+        ok: true,
         schema: header.schema,
         ready: header.ready,
         process_id: header.process_id,
@@ -408,6 +432,7 @@ fn read_measure_batch_summary_stream(
         response_rows_sha256: hex_digest(&hasher.finalize()),
         request_bytes,
         response_bytes,
+        completion: end.completion,
     })
 }
 
@@ -537,6 +562,12 @@ fn resident_remote_error_code(remote_code: &str) -> Option<&'static str> {
         "CALYX_PANEL_RESIDENT_WORKER_GATE" => "CALYX_PANEL_RESIDENT_WORKER_GATE",
         "CALYX_PANEL_RESIDENT_WORKER_UNAUTHORIZED" => "CALYX_PANEL_RESIDENT_WORKER_UNAUTHORIZED",
         "CALYX_PANEL_RESIDENT_WORKER_LOST" => "CALYX_PANEL_RESIDENT_WORKER_LOST",
+        "CALYX_PANEL_RESIDENT_WORKER_PROTOCOL_INVALID" => {
+            "CALYX_PANEL_RESIDENT_WORKER_PROTOCOL_INVALID"
+        }
+        "CALYX_PANEL_RESIDENT_WORKER_REPORTED_ERROR" => {
+            "CALYX_PANEL_RESIDENT_WORKER_REPORTED_ERROR"
+        }
         "CALYX_PANEL_RESIDENT_WORKER_START_FAILED" => "CALYX_PANEL_RESIDENT_WORKER_START_FAILED",
         "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED" => "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED",
         _ => return None,

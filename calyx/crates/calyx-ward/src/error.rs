@@ -25,6 +25,7 @@ pub const CALYX_WARD_MODEL_NOT_FOUND: &str = "CALYX_WARD_MODEL_NOT_FOUND";
 pub const CALYX_WARD_INVALID_INPUT: &str = "CALYX_WARD_INVALID_INPUT";
 pub const CALYX_WARD_MODEL_DIM_MISMATCH: &str = "CALYX_WARD_MODEL_DIM_MISMATCH";
 pub const CALYX_WARD_RUNTIME_ERROR: &str = "CALYX_WARD_RUNTIME_ERROR";
+pub const CALYX_WARD_ONNX_ERROR: &str = "CALYX_WARD_ONNX_ERROR";
 pub const CALYX_WARD_MISSING_FREQUENCY: &str = "CALYX_WARD_MISSING_FREQUENCY";
 pub const CALYX_WARD_INVALID_FREQUENCY: &str = "CALYX_WARD_INVALID_FREQUENCY";
 pub const CALYX_WARD_INVALID_DOMAIN: &str = "CALYX_WARD_INVALID_DOMAIN";
@@ -106,6 +107,19 @@ pub enum WardError {
     Runtime {
         reason: String,
     },
+    /// A staged ONNX failure retaining the exact model/provider context and
+    /// operator-facing remediation.
+    Onnx {
+        lens: &'static str,
+        stage: &'static str,
+        model: PathBuf,
+        model_sha256: String,
+        frozen_operators: String,
+        provider: &'static str,
+        device: &'static str,
+        reason: String,
+        remediation: &'static str,
+    },
     NoveltySink {
         reason: String,
     },
@@ -152,11 +166,23 @@ impl WardError {
             Self::InvalidInput { .. } => CALYX_WARD_INVALID_INPUT,
             Self::ModelDimMismatch { .. } => CALYX_WARD_MODEL_DIM_MISMATCH,
             Self::Runtime { .. } => CALYX_WARD_RUNTIME_ERROR,
+            Self::Onnx { .. } => CALYX_WARD_ONNX_ERROR,
             Self::NoveltySink { .. } => CALYX_GUARD_NOVELTY_SINK,
             Self::MissingFrequency { .. } => CALYX_WARD_MISSING_FREQUENCY,
             Self::InvalidFrequency { .. } => CALYX_WARD_INVALID_FREQUENCY,
             Self::InvalidDomain { .. } => CALYX_WARD_INVALID_DOMAIN,
             Self::LensFeatureDisabled { .. } => CALYX_WARD_LENS_FEATURE_DISABLED,
+        }
+    }
+
+    /// Returns actionable remediation without discarding structured ONNX
+    /// context when this error crosses the Calyx lens boundary.
+    pub const fn remediation(&self) -> &'static str {
+        match self {
+            Self::Onnx { remediation, .. } => remediation,
+            _ => {
+                "repair the Ward lens model, runtime, or input identified by this error before retrying"
+            }
         }
     }
 }
@@ -250,6 +276,21 @@ impl fmt::Display for WardError {
             Self::Runtime { reason } => {
                 write!(f, "{CALYX_WARD_RUNTIME_ERROR}: {reason}")
             }
+            Self::Onnx {
+                lens,
+                stage,
+                model,
+                model_sha256,
+                frozen_operators,
+                provider,
+                device,
+                reason,
+                remediation,
+            } => write!(
+                f,
+                "{CALYX_WARD_ONNX_ERROR}: lens={lens} stage={stage} model={} model_sha256={model_sha256} provider={provider} device={device} frozen_operators={frozen_operators}: {reason}; remediation: {remediation}",
+                model.display(),
+            ),
             Self::NoveltySink { reason } => {
                 write!(f, "{CALYX_GUARD_NOVELTY_SINK}: {reason}")
             }

@@ -1,5 +1,14 @@
 //! RoBERTa style lens adapter for PH39 identity slots.
 
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, RuntimeExecutionAttestation,
+    SlotShape, SlotVector,
+};
+#[cfg(feature = "onnx-lens")]
+use ort::session::Session;
+#[cfg(feature = "onnx-lens")]
+use ort::value::{Tensor, TensorElementType, ValueType};
+use sha2::{Digest, Sha256};
 use std::fmt;
 #[cfg(feature = "onnx-lens")]
 use std::fs::File;
@@ -7,22 +16,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "onnx-lens")]
-use std::sync::Mutex;
-
-use calyx_core::{
-    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, SlotShape, SlotVector,
-};
-#[cfg(feature = "onnx-lens")]
-use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
-#[cfg(feature = "onnx-lens")]
-use ort::session::{Session, builder::GraphOptimizationLevel};
-#[cfg(feature = "onnx-lens")]
-use ort::value::{Tensor, TensorElementType, ValueType};
-use sha2::{Digest, Sha256};
-#[cfg(feature = "onnx-lens")]
 use tokenizers::Tokenizer;
 
 use crate::error::WardError;
+#[cfg(feature = "onnx-lens")]
+use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
 
 pub const DEFAULT_STYLE_MODEL_PATH: &str = "/var/lib/calyx/models/style/style-embed-v1.onnx";
 pub const DEFAULT_STYLE_TOKENIZER_PATH: &str = "/var/lib/calyx/models/style/tokenizer.json";
@@ -43,8 +41,8 @@ pub enum StyleProviderPolicy {
 impl StyleProviderPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CudaFailLoud => "cuda:0,error_on_failure,no_cpu_fallback",
-            Self::CpuExplicit => "cpu_explicit,no_cuda",
+            Self::CudaFailLoud => crate::CUDA_ONNX_PROVIDER_POLICY,
+            Self::CpuExplicit => crate::CPU_ONNX_PROVIDER_POLICY,
         }
     }
 }
@@ -64,6 +62,12 @@ pub trait StyleEmbeddingBackend: Send + Sync {
 
     fn provider_policy(&self) -> &'static str {
         "test_backend"
+    }
+
+    /// Runtime placement from the exact committed session, available only
+    /// after a successful real inference.
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        Ok(None)
     }
 }
 
@@ -210,6 +214,10 @@ impl StyleLens {
     pub fn output_names(&self) -> Vec<String> {
         self.backend.output_names()
     }
+
+    pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        self.backend.execution_attestation()
+    }
 }
 
 impl Lens for StyleLens {
@@ -242,11 +250,15 @@ impl Lens for StyleLens {
             data,
         })
     }
+
+    fn execution_attestation(&self) -> CalyxResult<Option<RuntimeExecutionAttestation>> {
+        self.backend.execution_attestation().map_err(ward_as_calyx)
+    }
 }
 
 #[cfg(feature = "onnx-lens")]
 struct OnnxStyleBackend {
-    session: Mutex<Session>,
+    session: ManagedWardOnnxSession,
     tokenizer: Tokenizer,
     input_ids_name: String,
     attention_mask_name: String,
@@ -254,7 +266,6 @@ struct OnnxStyleBackend {
     input_names: Vec<String>,
     output_names: Vec<String>,
     output_dim: usize,
-    policy: StyleProviderPolicy,
 }
 
 #[cfg(feature = "onnx-lens")]
@@ -268,24 +279,35 @@ impl OnnxStyleBackend {
             Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
                 path: tokenizer_path.to_path_buf(),
             })?;
-        let session = build_session(model_path, policy)?;
-        let input_names = session
-            .inputs()
-            .iter()
-            .map(|input| input.name().to_string())
-            .collect::<Vec<_>>();
-        let output_names = session
-            .outputs()
-            .iter()
-            .map(|output| output.name().to_string())
-            .collect::<Vec<_>>();
-        let input_ids_name = choose_name(&input_names, "input_ids", "input")?;
-        let attention_mask_name = choose_name(&input_names, "attention_mask", "input")?;
-        let output_name = choose_name(&output_names, "last_hidden_state", "output")?;
-        let output_dim = output_dim(&session, &output_name)?;
+        let session = match policy {
+            StyleProviderPolicy::CudaFailLoud => build_cuda_session("style", model_path),
+            StyleProviderPolicy::CpuExplicit => build_cpu_session("style", model_path),
+        }?;
+        let (input_names, output_names) = session.inspect_session(|raw| {
+            Ok((
+                raw.inputs()
+                    .iter()
+                    .map(|input| input.name().to_string())
+                    .collect::<Vec<_>>(),
+                raw.outputs()
+                    .iter()
+                    .map(|output| output.name().to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        })?;
+        let input_ids_name = choose_name(&session, &input_names, "input_ids", "input")?;
+        let attention_mask_name = choose_name(&session, &input_names, "attention_mask", "input")?;
+        let output_name = choose_name(&session, &output_names, "last_hidden_state", "output")?;
+        let output_dim = session.inspect_session(|raw| output_dim(&session, raw, &output_name))?;
+        if output_dim != STYLE_DIM {
+            return Err(session.error(
+                "model_metadata",
+                format!("model output dim {output_dim} != expected {STYLE_DIM}"),
+            ));
+        }
 
         Ok(Self {
-            session: Mutex::new(session),
+            session,
             tokenizer,
             input_ids_name,
             attention_mask_name,
@@ -293,7 +315,6 @@ impl OnnxStyleBackend {
             input_names,
             output_names,
             output_dim,
-            policy,
         })
     }
 
@@ -326,26 +347,32 @@ impl StyleEmbeddingBackend for OnnxStyleBackend {
     fn embed(&self, text: &str) -> Result<Vec<f32>, WardError> {
         let (ids, attention) = self.tokenize(text)?;
         let seq_len = ids.len();
-        let ids_tensor = Tensor::from_array(([1usize, seq_len], ids)).map_err(runtime_error)?;
-        let mask_tensor =
-            Tensor::from_array(([1usize, seq_len], attention.clone())).map_err(runtime_error)?;
-        let mut session = self.session.lock().map_err(|_| WardError::Runtime {
-            reason: "style lens ORT session mutex poisoned".to_string(),
-        })?;
-        let outputs = session
-            .run(ort::inputs! {
-                self.input_ids_name.as_str() => ids_tensor,
-                self.attention_mask_name.as_str() => mask_tensor
-            })
-            .map_err(runtime_error)?;
-        let output = outputs
-            .get(&self.output_name)
-            .ok_or_else(|| WardError::Runtime {
-                reason: format!("ONNX output {} missing", self.output_name),
+        let ids_tensor = Tensor::from_array(([1usize, seq_len], ids))
+            .map_err(|error| self.session.error("input_tensor", error))?;
+        let mask_tensor = Tensor::from_array(([1usize, seq_len], attention.clone()))
+            .map_err(|error| self.session.error("attention_tensor", error))?;
+        let pooled = self.session.run_real_inference(|raw| {
+            let outputs = raw
+                .run(ort::inputs! {
+                    self.input_ids_name.as_str() => ids_tensor,
+                    self.attention_mask_name.as_str() => mask_tensor
+                })
+                .map_err(|error| self.session.error("inference", error))?;
+            let output = outputs.get(&self.output_name).ok_or_else(|| {
+                self.session.error(
+                    "output_lookup",
+                    format!("ONNX output {} missing", self.output_name),
+                )
             })?;
-        let (_, data) = output.try_extract_tensor::<f32>().map_err(runtime_error)?;
-        let flat = data.to_vec();
-        mean_pool(&flat, &attention, self.output_dim)
+            let (_, data) = output
+                .try_extract_tensor::<f32>()
+                .map_err(|error| self.session.error("output_extract", error))?;
+            let pooled = mean_pool(data, &attention, self.output_dim)
+                .map_err(|error| self.session.error("output_validation", error))?;
+            normalize_unit(pooled, self.output_dim)
+                .map_err(|error| self.session.error("output_semantic_validation", error))
+        })?;
+        Ok(pooled)
     }
 
     fn output_dim(&self) -> usize {
@@ -361,62 +388,48 @@ impl StyleEmbeddingBackend for OnnxStyleBackend {
     }
 
     fn provider_policy(&self) -> &'static str {
-        self.policy.as_str()
+        self.session.provider_policy()
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        self.session.execution_attestation()
     }
 }
 
 #[cfg(feature = "onnx-lens")]
-fn build_session(model_path: &Path, policy: StyleProviderPolicy) -> Result<Session, WardError> {
-    if !model_path.exists() {
-        return Err(WardError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        });
-    }
-    let _ort_dylib = crate::ort_runtime::ensure_dynamic_ort()?;
-    let builder = Session::builder()
-        .map_err(runtime_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(runtime_error)?;
-    let mut builder = builder
-        .with_execution_providers(execution_providers(policy))
-        .map_err(runtime_error)?;
-    builder.commit_from_file(model_path).map_err(runtime_error)
-}
-
-#[cfg(feature = "onnx-lens")]
-fn execution_providers(policy: StyleProviderPolicy) -> Vec<ExecutionProviderDispatch> {
-    match policy {
-        StyleProviderPolicy::CudaFailLoud => vec![
-            // #1143: kNextPowerOfTwo over-reserves the BFC device arena.
-            ep::CUDA::default()
-                .with_device_id(0)
-                .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-                .build()
-                .error_on_failure(),
-        ],
-        StyleProviderPolicy::CpuExplicit => vec![ep::CPU::default().build()],
-    }
-}
-
-#[cfg(feature = "onnx-lens")]
-fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
+fn choose_name(
+    session: &ManagedWardOnnxSession,
+    names: &[String],
+    preferred: &str,
+    kind: &str,
+) -> Result<String, WardError> {
     names
         .iter()
         .find(|name| name.as_str() == preferred)
         .cloned()
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX session has no {kind} named {preferred}"),
+        .ok_or_else(|| {
+            session.error(
+                "model_metadata",
+                format!("ONNX session has no {kind} named {preferred}"),
+            )
         })
 }
 
 #[cfg(feature = "onnx-lens")]
-fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> {
+fn output_dim(
+    managed: &ManagedWardOnnxSession,
+    session: &Session,
+    output_name: &str,
+) -> Result<usize, WardError> {
     let outlet = session
         .outputs()
         .iter()
         .find(|output| output.name() == output_name)
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX output {output_name} missing from metadata"),
+        .ok_or_else(|| {
+            managed.error(
+                "model_metadata",
+                format!("ONNX output {output_name} missing from metadata"),
+            )
         })?;
     match outlet.dtype() {
         ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => shape
@@ -425,12 +438,16 @@ fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> 
             .copied()
             .find(|dim| *dim > 0)
             .map(|dim| dim as usize)
-            .ok_or_else(|| WardError::Runtime {
-                reason: format!("ONNX output {output_name} has no static positive dim"),
+            .ok_or_else(|| {
+                managed.error(
+                    "model_metadata",
+                    format!("ONNX output {output_name} has no static positive dim"),
+                )
             }),
-        other => Err(WardError::Runtime {
-            reason: format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
-        }),
+        other => Err(managed.error(
+            "model_metadata",
+            format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
+        )),
     }
 }
 
@@ -523,9 +540,10 @@ fn runtime_error(error: impl fmt::Display) -> WardError {
 }
 
 fn ward_as_calyx(error: WardError) -> CalyxError {
+    let remediation = error.remediation();
     CalyxError {
         code: error.code(),
         message: error.to_string(),
-        remediation: "fix Ward style lens model/input and retry",
+        remediation,
     }
 }

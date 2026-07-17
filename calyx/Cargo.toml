@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["third_party/candle-core-0.10.2"]
+exclude = ["third_party/candle-core-0.10.2", "third_party/fastembed-5.16.0"]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,6 +54,10 @@ zstd = "0.13"
 # the release implementation intact while selecting runtime loading so the
 # process can attest one exact CUDA dependency bundle before any GPU call.
 candle-core = { path = "third_party/candle-core-0.10.2" }
+# FastEmbed 5.16 hides every ONNX SessionBuilder. The owned source applies
+# Astrolabe's explicit CUDA-no-CPU-fallback/CPU session policy at all builders
+# and exposes the exact committed Session for API-24 placement attestation.
+fastembed = { path = "third_party/fastembed-5.16.0" }
 
 # ── Build profiles ───────────────────────────────────────────────────────────
 # Tuned for this workspace's high-churn, multi-agent build cadence. The cargo

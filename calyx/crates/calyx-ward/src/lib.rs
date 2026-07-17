@@ -1,5 +1,8 @@
 //! Ward guard profile types for per-slot cosine policy enforcement.
 
+pub(crate) const CUDA_ONNX_PROVIDER_POLICY: &str = "cuda:0,error_on_failure,no_cpu_fallback";
+pub(crate) const CPU_ONNX_PROVIDER_POLICY: &str = "cpu_explicit,no_cuda";
+
 pub mod calibrate;
 pub mod drift;
 pub mod error;
@@ -9,6 +12,8 @@ pub mod identity;
 pub mod injection_lens;
 pub mod ledger;
 pub mod novelty;
+#[cfg(feature = "onnx-lens")]
+mod onnx_session;
 #[cfg(feature = "onnx-lens")]
 mod ort_runtime;
 pub mod polis;
@@ -35,7 +40,7 @@ pub use error::{
     CALYX_GUARD_POLICY_VIOLATION, CALYX_GUARD_PROVISIONAL, CALYX_WARD_INVALID_DOMAIN,
     CALYX_WARD_INVALID_FREQUENCY, CALYX_WARD_INVALID_INPUT, CALYX_WARD_LENS_FEATURE_DISABLED,
     CALYX_WARD_MISSING_FREQUENCY, CALYX_WARD_MODEL_DIM_MISMATCH, CALYX_WARD_MODEL_NOT_FOUND,
-    CALYX_WARD_RUNTIME_ERROR, WardError,
+    CALYX_WARD_ONNX_ERROR, CALYX_WARD_RUNTIME_ERROR, WardError,
 };
 pub use generate::{
     GUARDED_PASS_TAG, GUARDED_REJECT_TAG, GUARDED_REJECT_UNPROVENANCED_TAG, GenerateInput,

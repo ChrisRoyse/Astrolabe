@@ -6,21 +6,20 @@ use std::fs::File;
 #[cfg(feature = "onnx-lens")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "onnx-lens")]
-use std::sync::Mutex;
 
 use calyx_core::{
-    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, SlotShape, SlotVector,
+    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, RuntimeExecutionAttestation,
+    SlotShape, SlotVector,
 };
 #[cfg(feature = "onnx-lens")]
-use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
-#[cfg(feature = "onnx-lens")]
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::Session;
 #[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
 
 use crate::error::WardError;
+#[cfg(feature = "onnx-lens")]
+use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
 
 pub const DEFAULT_WAVLM_MODEL_PATH: &str = "/var/lib/calyx/models/wavlm/wavlm-base-plus-sv.onnx";
 pub const WAVLM_SAMPLE_RATE: u32 = 16_000;
@@ -40,8 +39,8 @@ pub enum SpeakerProviderPolicy {
 impl SpeakerProviderPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CudaFailLoud => "cuda:0,error_on_failure,no_cpu_fallback",
-            Self::CpuExplicit => "cpu_explicit,no_cuda",
+            Self::CudaFailLoud => crate::CUDA_ONNX_PROVIDER_POLICY,
+            Self::CpuExplicit => crate::CPU_ONNX_PROVIDER_POLICY,
         }
     }
 }
@@ -61,6 +60,10 @@ pub trait SpeakerEmbeddingBackend: Send + Sync {
 
     fn provider_policy(&self) -> &'static str {
         "test_backend"
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        Ok(None)
     }
 }
 
@@ -175,6 +178,10 @@ impl SpeakerLens {
     pub fn output_names(&self) -> Vec<String> {
         self.backend.output_names()
     }
+
+    pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        self.backend.execution_attestation()
+    }
 }
 
 impl Lens for SpeakerLens {
@@ -206,45 +213,58 @@ impl Lens for SpeakerLens {
             data,
         })
     }
+
+    fn execution_attestation(&self) -> CalyxResult<Option<RuntimeExecutionAttestation>> {
+        self.backend.execution_attestation().map_err(ward_as_calyx)
+    }
 }
 
 #[cfg(feature = "onnx-lens")]
 struct OnnxSpeakerBackend {
-    session: Mutex<Session>,
+    session: ManagedWardOnnxSession,
     input_name: String,
     output_name: String,
     input_names: Vec<String>,
     output_names: Vec<String>,
     output_dim: usize,
-    policy: SpeakerProviderPolicy,
 }
 
 #[cfg(feature = "onnx-lens")]
 impl OnnxSpeakerBackend {
     fn new(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Self, WardError> {
-        let session = build_session(model_path, policy)?;
-        let input_names = session
-            .inputs()
-            .iter()
-            .map(|input| input.name().to_string())
-            .collect::<Vec<_>>();
-        let output_names = session
-            .outputs()
-            .iter()
-            .map(|output| output.name().to_string())
-            .collect::<Vec<_>>();
-        let input_name = choose_name(&input_names, "input_values", "input")?;
-        let output_name = choose_name(&output_names, "embeddings", "output")?;
-        let output_dim = output_dim(&session, &output_name)?;
+        let session = match policy {
+            SpeakerProviderPolicy::CudaFailLoud => build_cuda_session("speaker", model_path),
+            SpeakerProviderPolicy::CpuExplicit => build_cpu_session("speaker", model_path),
+        }?;
+        let (input_names, output_names) = session.inspect_session(|raw| {
+            Ok((
+                raw.inputs()
+                    .iter()
+                    .map(|input| input.name().to_string())
+                    .collect::<Vec<_>>(),
+                raw.outputs()
+                    .iter()
+                    .map(|output| output.name().to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        })?;
+        let input_name = choose_name(&session, &input_names, "input_values", "input")?;
+        let output_name = choose_name(&session, &output_names, "embeddings", "output")?;
+        let output_dim = session.inspect_session(|raw| output_dim(&session, raw, &output_name))?;
+        if output_dim != WAVLM_DIM {
+            return Err(session.error(
+                "model_metadata",
+                format!("model output dim {output_dim} != expected {WAVLM_DIM}"),
+            ));
+        }
 
         Ok(Self {
-            session: Mutex::new(session),
+            session,
             input_name,
             output_name,
             input_names,
             output_names,
             output_dim,
-            policy,
         })
     }
 }
@@ -253,20 +273,34 @@ impl OnnxSpeakerBackend {
 impl SpeakerEmbeddingBackend for OnnxSpeakerBackend {
     fn embed_16khz(&self, audio_pcm: &[f32]) -> Result<Vec<f32>, WardError> {
         let tensor = Tensor::from_array(([1usize, audio_pcm.len()], audio_pcm.to_vec()))
-            .map_err(runtime_error)?;
-        let mut session = self.session.lock().map_err(|_| WardError::Runtime {
-            reason: "speaker lens ORT session mutex poisoned".to_string(),
-        })?;
-        let outputs = session
-            .run(ort::inputs! { self.input_name.as_str() => tensor })
-            .map_err(runtime_error)?;
-        let output = outputs
-            .get(&self.output_name)
-            .ok_or_else(|| WardError::Runtime {
-                reason: format!("ONNX output {} missing", self.output_name),
+            .map_err(|error| self.session.error("input_tensor", error))?;
+        let embedding = self.session.run_real_inference(|raw| {
+            let outputs = raw
+                .run(ort::inputs! { self.input_name.as_str() => tensor })
+                .map_err(|error| self.session.error("inference", error))?;
+            let output = outputs.get(&self.output_name).ok_or_else(|| {
+                self.session.error(
+                    "output_lookup",
+                    format!("ONNX output {} missing", self.output_name),
+                )
             })?;
-        let (_, data) = output.try_extract_tensor::<f32>().map_err(runtime_error)?;
-        Ok(data.to_vec())
+            let (_, data) = output
+                .try_extract_tensor::<f32>()
+                .map_err(|error| self.session.error("output_extract", error))?;
+            if data.len() != self.output_dim {
+                return Err(self.session.error(
+                    "output_validation",
+                    format!(
+                        "model output dim {} != expected {}",
+                        data.len(),
+                        self.output_dim
+                    ),
+                ));
+            }
+            normalize_unit(data.to_vec(), self.output_dim)
+                .map_err(|error| self.session.error("output_semantic_validation", error))
+        })?;
+        Ok(embedding)
     }
 
     fn output_dim(&self) -> usize {
@@ -282,64 +316,44 @@ impl SpeakerEmbeddingBackend for OnnxSpeakerBackend {
     }
 
     fn provider_policy(&self) -> &'static str {
-        self.policy.as_str()
+        self.session.provider_policy()
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        self.session.execution_attestation()
     }
 }
 
 #[cfg(feature = "onnx-lens")]
-fn build_session(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Session, WardError> {
-    if !model_path.exists() {
-        return Err(WardError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        });
-    }
-    let _ort_dylib = crate::ort_runtime::ensure_dynamic_ort()?;
-    let builder = Session::builder()
-        .map_err(runtime_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(runtime_error)?;
-    let mut builder = builder
-        .with_execution_providers(execution_providers(policy))
-        .map_err(runtime_error)?;
-    builder.commit_from_file(model_path).map_err(runtime_error)
-}
-
-#[cfg(feature = "onnx-lens")]
-fn execution_providers(policy: SpeakerProviderPolicy) -> Vec<ExecutionProviderDispatch> {
-    match policy {
-        SpeakerProviderPolicy::CudaFailLoud => vec![
-            // #1143: extend the BFC device arena exactly as requested;
-            // kNextPowerOfTwo over-reserves on dynamic-shape workloads.
-            ep::CUDA::default()
-                .with_device_id(0)
-                .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-                .build()
-                .error_on_failure(),
-        ],
-        SpeakerProviderPolicy::CpuExplicit => vec![ep::CPU::default().build()],
-    }
-}
-
-#[cfg(feature = "onnx-lens")]
-fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
+fn choose_name(
+    session: &ManagedWardOnnxSession,
+    names: &[String],
+    preferred: &str,
+    kind: &str,
+) -> Result<String, WardError> {
     names
         .iter()
         .find(|name| name.as_str() == preferred)
         .or_else(|| names.first())
         .cloned()
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX session has no {kind}s"),
-        })
+        .ok_or_else(|| session.error("model_metadata", format!("ONNX session has no {kind}s")))
 }
 
 #[cfg(feature = "onnx-lens")]
-fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> {
+fn output_dim(
+    managed: &ManagedWardOnnxSession,
+    session: &Session,
+    output_name: &str,
+) -> Result<usize, WardError> {
     let outlet = session
         .outputs()
         .iter()
         .find(|output| output.name() == output_name)
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX output {output_name} missing from metadata"),
+        .ok_or_else(|| {
+            managed.error(
+                "model_metadata",
+                format!("ONNX output {output_name} missing from metadata"),
+            )
         })?;
     match outlet.dtype() {
         ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => shape
@@ -348,12 +362,16 @@ fn output_dim(session: &Session, output_name: &str) -> Result<usize, WardError> 
             .copied()
             .find(|dim| *dim > 0)
             .map(|dim| dim as usize)
-            .ok_or_else(|| WardError::Runtime {
-                reason: format!("ONNX output {output_name} has no static positive dim"),
+            .ok_or_else(|| {
+                managed.error(
+                    "model_metadata",
+                    format!("ONNX output {output_name} has no static positive dim"),
+                )
             }),
-        other => Err(WardError::Runtime {
-            reason: format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
-        }),
+        other => Err(managed.error(
+            "model_metadata",
+            format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
+        )),
     }
 }
 
@@ -476,9 +494,10 @@ fn runtime_error(error: impl fmt::Display) -> WardError {
 }
 
 fn ward_as_calyx(error: WardError) -> CalyxError {
+    let remediation = error.remediation();
     CalyxError {
         code: error.code(),
         message: error.to_string(),
-        remediation: "fix Ward speaker lens model/input and retry",
+        remediation,
     }
 }

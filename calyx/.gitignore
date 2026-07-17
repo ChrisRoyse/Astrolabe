@@ -59,6 +59,11 @@ env/
 models/
 checkpoints/
 lenses/
+# The owned FastEmbed crate is source, including its model registry modules and
+# tiny upstream sparse-head fixture. Its byte-exact receipt guards this content.
+!third_party/fastembed-5.16.0/src/models/
+!third_party/fastembed-5.16.0/src/models/**
+!third_party/fastembed-5.16.0/src/sparse_text_embedding/weights/sparse_linear.safetensors
 # HuggingFace model cache (multi-GB downloads — never commit)
 .hf-cache/
 

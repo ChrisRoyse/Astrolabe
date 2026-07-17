@@ -1,0 +1,233 @@
+{
+  "schema": "astrolabe.owned-crate-source.v2",
+  "package": "fastembed",
+  "version": "5.16.0",
+  "crates_io_archive_sha256": "add59222e7bc3787285f993744b244cd454d78571845623606bdc45b22b23a4e",
+  "upstream_repository": "https://github.com/Anush008/fastembed-rs",
+  "upstream_git_commit": "a500072fbcd4f0d16ec4e50e44d3b3fb0b8a034a",
+  "upstream_issue": "https://github.com/ChrisRoyse/Astrolabe/issues/483",
+  "license": "Apache-2.0",
+  "hash_algorithm": "sha256-domain-u64le-path-u64le-content-v1",
+  "attested_file_count": 42,
+  "attested_source_tree_sha256": "1ffd9799a8d1e0e5f21aec921bbbc96c76b8b5f58e275932fb608ab9ebb6c0d5",
+  "files": [
+    {
+      "path": ".cargo_vcs_info.json",
+      "bytes": 113,
+      "sha256": "2d7a92845f95c567fbe08e488fac0fe172a85a08d4370cd49e305c70168ac579"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 3767,
+      "sha256": "4b1b459ee6ac7975dd9d8aea0878406754a0ba2654a4181f5451f797b4e7bdcb"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "README.md",
+      "bytes": 15644,
+      "sha256": "93f7f61981b9114e68497f76fd3b2858cda15e583cacb130dbce88056232685b"
+    },
+    {
+      "path": "build.rs",
+      "bytes": 16314,
+      "sha256": "3951b7ce5ec2ad29f587f9c10ed282067784df843764a80c1dfc5d19d1614c15"
+    },
+    {
+      "path": "src/bgem3_embedding/impl.rs",
+      "bytes": 13809,
+      "sha256": "e11b0e8cef123af00c5837c56e15fe6710157b97de44a1b53c58eeedc2b74ce8"
+    },
+    {
+      "path": "src/bgem3_embedding/init.rs",
+      "bytes": 1040,
+      "sha256": "3d2f47e60dcab103442d81f431bff5df5186ab65c548f31246dbcbe5c62670a1"
+    },
+    {
+      "path": "src/bgem3_embedding/mod.rs",
+      "bytes": 119,
+      "sha256": "861092c58bfaa840cc4ac417b1131d5af5d7583b8885aa34e987d60b6f809d7c"
+    },
+    {
+      "path": "src/common.rs",
+      "bytes": 6828,
+      "sha256": "1e6428605481814af42f1bc1f1cf6669a8e1d91c0284b499227162cdee6d6481"
+    },
+    {
+      "path": "src/image_embedding/impl.rs",
+      "bytes": 12268,
+      "sha256": "466b2afcd48a50c91417e6a0b7d840651e880923934b99bba58191ed82d40309"
+    },
+    {
+      "path": "src/image_embedding/init.rs",
+      "bytes": 2852,
+      "sha256": "bea6abe2f83c3b5b587edb9439903e0973d5ec7f422c3751d9eb3cf2c5fb711f"
+    },
+    {
+      "path": "src/image_embedding/mod.rs",
+      "bytes": 92,
+      "sha256": "e5bba73c7816f60fe741777cce46d177408897b1381cee63767cfcfd633959e6"
+    },
+    {
+      "path": "src/image_embedding/utils.rs",
+      "bytes": 14508,
+      "sha256": "792d6044f1f0a324d4cfa2cfa0f157f23638b92f6fe1194f93a7ab3be6faffda"
+    },
+    {
+      "path": "src/init.rs",
+      "bytes": 9969,
+      "sha256": "79d360c1433f8b534b7dc3ddc1400fbc483e53c878c7545f95c532271de10854"
+    },
+    {
+      "path": "src/lib.rs",
+      "bytes": 4784,
+      "sha256": "7b903134e942b3115b6dc4323ff0a113e453ae23957fe722893ec73ca01b8c75"
+    },
+    {
+      "path": "src/models/bgem3.rs",
+      "bytes": 1491,
+      "sha256": "2157bc181e91cf1b581226c3ac83a47918bbe7c596b0a55171f4aec01bf87ea2"
+    },
+    {
+      "path": "src/models/image_embedding.rs",
+      "bytes": 3534,
+      "sha256": "77044b7cdce5745fa5df97631541a51ba3b1622ab2493cca78854a578272c046"
+    },
+    {
+      "path": "src/models/mod.rs",
+      "bytes": 956,
+      "sha256": "6520924634b74edc7d239aa0306e7aeb2de1673b75b28f2fbc1f3775ae4280fe"
+    },
+    {
+      "path": "src/models/model_info.rs",
+      "bytes": 636,
+      "sha256": "8c28cd41dea7e5f7cd33c21256c2853f1932f8d5ba31eeab641b2c13a1923633"
+    },
+    {
+      "path": "src/models/nomic_v2_moe.rs",
+      "bytes": 27356,
+      "sha256": "c45cc814e098a28b699b093a45cabce9d0c8466599823fd2643074723d265073"
+    },
+    {
+      "path": "src/models/quantization.rs",
+      "bytes": 166,
+      "sha256": "e650b719a3f2a240472c81de9615cf52dba6d32d25c5d3de8093f63e212c6c9f"
+    },
+    {
+      "path": "src/models/qwen3.rs",
+      "bytes": 50846,
+      "sha256": "ace03a935ec99e4fe580c790ef865c4a5941cf99c7683addf1bb16d34f2bdcaa"
+    },
+    {
+      "path": "src/models/qwen3_vl.rs",
+      "bytes": 23339,
+      "sha256": "b1915fdde9985e3c397c23018086e691f4997901f0f7e7da69e7c1eeea08d03d"
+    },
+    {
+      "path": "src/models/reranking.rs",
+      "bytes": 2730,
+      "sha256": "6aacba6f38d918a1e7a4e0f008bd04faadb5d8d7a5a72be213e4a1b6323cb47b"
+    },
+    {
+      "path": "src/models/sparse.rs",
+      "bytes": 2007,
+      "sha256": "876a825b2675925927721f4a6f4e4a0a2201e909b90bdbcfb32027705a31ea63"
+    },
+    {
+      "path": "src/models/text_embedding.rs",
+      "bytes": 24450,
+      "sha256": "7f3ffd740d27cf4ed69ca399a8219c37676aad55033d4be4c555f1aa18c696e5"
+    },
+    {
+      "path": "src/output/embedding_output.rs",
+      "bytes": 4839,
+      "sha256": "dcd2787e2060bc3f372810da2895c870c263d639dee1fab94b63f8a73a7527fe"
+    },
+    {
+      "path": "src/output/mod.rs",
+      "bytes": 2227,
+      "sha256": "f7776484c70ba8e9301497e0a413850eb91be9409800f52cf9b764ae76216821"
+    },
+    {
+      "path": "src/output/output_precedence.rs",
+      "bytes": 1633,
+      "sha256": "86e7f20ffaaa5d728b3912809b25935c7d983a61bc685b292fd6f21f76a26696"
+    },
+    {
+      "path": "src/pooling.rs",
+      "bytes": 3012,
+      "sha256": "1caebf271e9f19dffa1c1543edcf40d97e3204aae64d57f024a35b8a0a48fac2"
+    },
+    {
+      "path": "src/reranking/impl.rs",
+      "bytes": 9390,
+      "sha256": "fbdcdb5f608df97c8b72c97408ebbc066fdc47a93d44a6e1ca8b21ed2f687924"
+    },
+    {
+      "path": "src/reranking/init.rs",
+      "bytes": 3956,
+      "sha256": "5c458c81d7b004b12102bed0de190a875789df3edc814ff75077a8adae87f9a6"
+    },
+    {
+      "path": "src/reranking/mod.rs",
+      "bytes": 119,
+      "sha256": "ff2e778b1ece1bf14fffbef181128168995e8b91a35ef7b01ae183ae10ad7704"
+    },
+    {
+      "path": "src/sparse_text_embedding/bgem3_weights.rs",
+      "bytes": 1342,
+      "sha256": "b41abb82e58ceddc7abca697b66098d0822646bac7832908a0df926b3ea5cc93"
+    },
+    {
+      "path": "src/sparse_text_embedding/impl.rs",
+      "bytes": 12948,
+      "sha256": "38f3d493d7d90f6b2ec938ad92d57b5719843410da5c177270bba95b020839ef"
+    },
+    {
+      "path": "src/sparse_text_embedding/init.rs",
+      "bytes": 1133,
+      "sha256": "d3232fecb59c0654348cc7ded7c47c60c31e27abef4d012359b5f5f544d63c0b"
+    },
+    {
+      "path": "src/sparse_text_embedding/mod.rs",
+      "bytes": 138,
+      "sha256": "c556af949a0cb58c77b4bd6f6a56c71cb2c1d90dbd5bef441850d92bd43f4efb"
+    },
+    {
+      "path": "src/sparse_text_embedding/weights/sparse_linear.safetensors",
+      "bytes": 4236,
+      "sha256": "a2601321f01abbb696d171a58a65ff35be1603d9cbc22c647dfe34b4568dd690"
+    },
+    {
+      "path": "src/text_embedding/impl.rs",
+      "bytes": 20196,
+      "sha256": "c3e29af67b5450138c22d0006d540c13dcc5e740ff079712b32427100a78c7af"
+    },
+    {
+      "path": "src/text_embedding/init.rs",
+      "bytes": 4900,
+      "sha256": "45b5eb4ed811c6b48dd8785cfc5a5e1fca695234a5ca1a485647aa59a99333e0"
+    },
+    {
+      "path": "src/text_embedding/mod.rs",
+      "bytes": 380,
+      "sha256": "8e339b5db18c8e43db8331b1435b4218f373bc300006f017b207546ac9ed829d"
+    },
+    {
+      "path": "src/text_embedding/output.rs",
+      "bytes": 2244,
+      "sha256": "f5f77dd3fc7a0460e3b6f8030eda0b13fb49c3618d4759490f5d0e2744451d55"
+    }
+  ],
+  "owned_deltas": [
+    "require and validate an explicit per-session CPU or fail-closed CUDA policy before every ONNX SessionBuilder",
+    "disable implicit CPU EP fallback and record graph assignment for every CUDA-policy session",
+    "document the mandatory provider-policy pair in every public ONNX construction example",
+    "expose immutable committed-session access and profile finalization for Calyx placement attestation",
+    "exclude upstream CI, doctests, and all test targets/modules under Astrolabe manual-FSV-only policy",
+    "fail the native build, including incrementally added files, when any owned package, source, license, provenance, ORT contract, or policy byte drifts from this receipt"
+  ]
+}

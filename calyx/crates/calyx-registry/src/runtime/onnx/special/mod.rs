@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use fastembed::{
     Bgem3Embedding, Bgem3InitOptions, Bgem3Model, RerankInitOptions, RerankerModel,
     SparseInitOptions, SparseModel, SparseTextEmbedding, TextRerank,
@@ -33,6 +36,7 @@ pub struct FastembedSparseLens {
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
     model: Option<Mutex<SparseTextEmbedding>>,
+    execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
 }
 
@@ -43,6 +47,7 @@ pub struct FastembedBgem3Lens {
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
     model: Option<Mutex<Bgem3Embedding>>,
+    execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
 }
 
@@ -52,6 +57,7 @@ pub struct FastembedRerankerLens {
     files: OnnxModelFiles,
     provider_policy: OnnxProviderPolicy,
     model: Option<Mutex<TextRerank>>,
+    execution: super::fastembed_attestation::FastembedExecutionState,
     bound_stream: Option<super::green_context::RetainedCudaStream>,
 }
 
@@ -76,21 +82,6 @@ impl FastembedSparseLens {
         let name = name.into();
         let info = SparseTextEmbedding::get_model_info(&model_name);
         let label = format!("onnx-fastembed-sparse:{}", info.model_code);
-        let (execution_providers, bound_stream) =
-            super::fastembed_runtime::execution_providers(&label, provider_policy)?;
-        let model = SparseTextEmbedding::try_new(
-            SparseInitOptions::new(model_name.clone())
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
-                .with_intra_threads(1)
-                .with_execution_providers(execution_providers),
-        )
-        .map_err(|err| CalyxError::lens_unreachable(format!("sparse init failed: {err}")))?;
-        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
-        super::runtime_bundle::attest_after_model_constructor(
-            provider_policy,
-            model.bound_stream(),
-        )?;
         let files = special_files(
             &cache_dir,
             &info.model_code,
@@ -105,11 +96,41 @@ impl FastembedSparseLens {
             NormPolicy::Finite,
             fastembed_sparse_corpus_hash(&info.model_code),
         )?;
+        let context = super::fastembed_attestation::FastembedModelContext::new(
+            label.clone(),
+            &info.model_code,
+            &files,
+            contract.weights_sha256(),
+            provider_policy,
+        )?;
+        let (execution_providers, bound_stream) =
+            super::fastembed_runtime::execution_providers(&label, provider_policy)
+                .map_err(|error| context.error("execution_provider_configuration", error))?;
+        let model = SparseTextEmbedding::try_new(
+            SparseInitOptions::new(model_name.clone())
+                .with_cache_dir(cache_dir.clone())
+                .with_show_download_progress(false)
+                .with_intra_threads(1)
+                .with_session_policy(context.session_policy())
+                .with_execution_providers(execution_providers),
+        )
+        .map_err(|err| context.error("model_constructor", err))?;
+        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
+        super::runtime_bundle::attest_after_model_constructor(
+            provider_policy,
+            model.bound_stream(),
+        )
+        .map_err(|error| context.error("runtime_bundle_attestation", error))?;
+        let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
+            model.as_ref().session(),
+            context,
+        )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(
             contract,
             files,
             provider_policy,
+            execution,
             model,
             bound_stream,
         ))
@@ -135,6 +156,7 @@ impl FastembedSparseLens {
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
+        execution: super::fastembed_attestation::FastembedExecutionState,
         model: SparseTextEmbedding,
         bound_stream: Option<super::green_context::GreenContextHandle>,
     ) -> Self {
@@ -144,6 +166,7 @@ impl FastembedSparseLens {
             files,
             provider_policy,
             model: Some(Mutex::new(model)),
+            execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
         }
     }
@@ -188,21 +211,6 @@ impl FastembedBgem3Lens {
             info.model_code,
             bgem3_runtime_name(output)
         );
-        let (execution_providers, bound_stream) =
-            super::fastembed_runtime::execution_providers(&label, provider_policy)?;
-        let model = Bgem3Embedding::try_new(
-            Bgem3InitOptions::new(model_name)
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
-                .with_intra_threads(1)
-                .with_execution_providers(execution_providers),
-        )
-        .map_err(|err| CalyxError::lens_unreachable(format!("BGE-M3 init failed: {err}")))?;
-        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
-        super::runtime_bundle::attest_after_model_constructor(
-            provider_policy,
-            model.bound_stream(),
-        )?;
         let files = special_files(
             &cache_dir,
             &info.model_code,
@@ -216,12 +224,42 @@ impl FastembedBgem3Lens {
             bgem3_norm(output),
             fastembed_bgem3_corpus_hash(&info.model_code, bgem3_corpus_token(output)),
         )?;
+        let context = super::fastembed_attestation::FastembedModelContext::new(
+            label.clone(),
+            &info.model_code,
+            &files,
+            contract.weights_sha256(),
+            provider_policy,
+        )?;
+        let (execution_providers, bound_stream) =
+            super::fastembed_runtime::execution_providers(&label, provider_policy)
+                .map_err(|error| context.error("execution_provider_configuration", error))?;
+        let model = Bgem3Embedding::try_new(
+            Bgem3InitOptions::new(model_name)
+                .with_cache_dir(cache_dir.clone())
+                .with_show_download_progress(false)
+                .with_intra_threads(1)
+                .with_session_policy(context.session_policy())
+                .with_execution_providers(execution_providers),
+        )
+        .map_err(|err| context.error("model_constructor", err))?;
+        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
+        super::runtime_bundle::attest_after_model_constructor(
+            provider_policy,
+            model.bound_stream(),
+        )
+        .map_err(|error| context.error("runtime_bundle_attestation", error))?;
+        let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
+            model.as_ref().session(),
+            context,
+        )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(
             contract,
             files,
             provider_policy,
             output,
+            execution,
             model,
             bound_stream,
         ))
@@ -252,6 +290,7 @@ impl FastembedBgem3Lens {
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
         output: FastembedBgem3Output,
+        execution: super::fastembed_attestation::FastembedExecutionState,
         model: Bgem3Embedding,
         bound_stream: Option<super::green_context::GreenContextHandle>,
     ) -> Self {
@@ -262,6 +301,7 @@ impl FastembedBgem3Lens {
             files,
             provider_policy,
             model: Some(Mutex::new(model)),
+            execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
         }
     }
@@ -304,21 +344,6 @@ impl FastembedRerankerLens {
         let name = name.into();
         let info = TextRerank::get_model_info(&model_name);
         let label = format!("onnx-fastembed-reranker:{}", info.model_code);
-        let (execution_providers, bound_stream) =
-            super::fastembed_runtime::execution_providers(&label, provider_policy)?;
-        let model = TextRerank::try_new(
-            RerankInitOptions::new(model_name)
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
-                .with_intra_threads(1)
-                .with_execution_providers(execution_providers),
-        )
-        .map_err(|err| CalyxError::lens_unreachable(format!("reranker init failed: {err}")))?;
-        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
-        super::runtime_bundle::attest_after_model_constructor(
-            provider_policy,
-            model.bound_stream(),
-        )?;
         let files = special_files(
             &cache_dir,
             &info.model_code,
@@ -332,11 +357,41 @@ impl FastembedRerankerLens {
             NormPolicy::Finite,
             fastembed_reranker_corpus_hash(&info.model_code),
         )?;
+        let context = super::fastembed_attestation::FastembedModelContext::new(
+            label.clone(),
+            &info.model_code,
+            &files,
+            contract.weights_sha256(),
+            provider_policy,
+        )?;
+        let (execution_providers, bound_stream) =
+            super::fastembed_runtime::execution_providers(&label, provider_policy)
+                .map_err(|error| context.error("execution_provider_configuration", error))?;
+        let model = TextRerank::try_new(
+            RerankInitOptions::new(model_name)
+                .with_cache_dir(cache_dir.clone())
+                .with_show_download_progress(false)
+                .with_intra_threads(1)
+                .with_session_policy(context.session_policy())
+                .with_execution_providers(execution_providers),
+        )
+        .map_err(|err| context.error("model_constructor", err))?;
+        let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
+        super::runtime_bundle::attest_after_model_constructor(
+            provider_policy,
+            model.bound_stream(),
+        )
+        .map_err(|error| context.error("runtime_bundle_attestation", error))?;
+        let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
+            model.as_ref().session(),
+            context,
+        )?;
         let (model, bound_stream) = model.into_parts();
         Ok(Self::new(
             contract,
             files,
             provider_policy,
+            execution,
             model,
             bound_stream,
         ))
@@ -362,6 +417,7 @@ impl FastembedRerankerLens {
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
+        execution: super::fastembed_attestation::FastembedExecutionState,
         model: TextRerank,
         bound_stream: Option<super::green_context::GreenContextHandle>,
     ) -> Self {
@@ -371,6 +427,7 @@ impl FastembedRerankerLens {
             files,
             provider_policy,
             model: Some(Mutex::new(model)),
+            execution,
             bound_stream: super::green_context::retain_for_model(bound_stream),
         }
     }
@@ -409,17 +466,26 @@ impl Lens for FastembedSparseLens {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        self.execution.ensure_usable()?;
         let texts = input_texts(self, inputs)?;
         let mut model = lock_model(&self.model, "sparse")?;
-        let embeddings = model.embed(texts, None).map_err(|err| {
-            CalyxError::lens_unreachable(format!("sparse inference failed: {err}"))
-        })?;
+        let embeddings = model
+            .embed(texts, None)
+            .map_err(|error| self.execution.error("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-sparse",
-        )?;
-        sparse_batch(embeddings, sparse_shape_dim(self.shape()), inputs.len())
+        )
+        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
+        let vectors = sparse_batch(embeddings, sparse_shape_dim(self.shape()), inputs.len())?;
+        self.execution
+            .complete_first_inference(|| model.end_profiling())?;
+        Ok(vectors)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        self.execution.execution_attestation()
     }
 }
 
@@ -444,17 +510,19 @@ impl Lens for FastembedBgem3Lens {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        self.execution.ensure_usable()?;
         let texts = input_texts(self, inputs)?;
         let mut model = lock_model(&self.model, "BGE-M3")?;
-        let output = model.embed(texts, None).map_err(|err| {
-            CalyxError::lens_unreachable(format!("BGE-M3 inference failed: {err}"))
-        })?;
+        let output = model
+            .embed(texts, None)
+            .map_err(|error| self.execution.error("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-bgem3",
-        )?;
-        match self.output {
+        )
+        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
+        let vectors = match self.output {
             FastembedBgem3Output::Dense => {
                 dense_batch(output.dense, BGE_M3_DENSE_DIM, inputs.len())
             }
@@ -464,7 +532,14 @@ impl Lens for FastembedBgem3Lens {
             FastembedBgem3Output::Colbert => {
                 multi_batch(output.colbert, BGE_M3_DENSE_DIM, inputs.len())
             }
-        }
+        }?;
+        self.execution
+            .complete_first_inference(|| model.end_profiling())?;
+        Ok(vectors)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        self.execution.execution_attestation()
     }
 }
 
@@ -486,14 +561,18 @@ impl Lens for FastembedRerankerLens {
     }
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.execution.ensure_usable()?;
         let mut out = Vec::with_capacity(inputs.len());
+        let mut model = lock_model(&self.model, "reranker")?;
         for input in inputs {
             let text = crate::runtime::common::text_from_input(self, input)?;
             let (query, doc) = rerank_pair(text);
-            let mut model = lock_model(&self.model, "reranker")?;
             let results = model
                 .rerank(query, [doc], false, Some(1))
-                .map_err(|err| CalyxError::lens_unreachable(format!("rerank failed: {err}")))?;
+                .map_err(|error| self.execution.error("inference", error))?;
             let score = results
                 .first()
                 .ok_or_else(|| CalyxError::lens_dim_mismatch("reranker returned no score"))?
@@ -508,8 +587,15 @@ impl Lens for FastembedRerankerLens {
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-reranker",
-        )?;
+        )
+        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
+        self.execution
+            .complete_first_inference(|| model.end_profiling())?;
         Ok(out)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        self.execution.execution_attestation()
     }
 }
 

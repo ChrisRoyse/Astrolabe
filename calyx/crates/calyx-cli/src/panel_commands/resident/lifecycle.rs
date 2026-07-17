@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
@@ -8,13 +9,14 @@ use calyx_core::CalyxError;
 use calyx_registry::OnnxRuntimeAttestation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use super::super::warm::resident_support::ResidentLensAttestation;
 use super::discovery::unix_now_ms;
 use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
-const LIFECYCLE_SCHEMA_V2: &str = "calyx-panel-resident-lifecycle-v2";
+pub(super) const LIFECYCLE_SCHEMA_V2: &str = "calyx-panel-resident-lifecycle-v2";
 pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v3";
 const LIFECYCLE_CORRUPT: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT";
 const LIFECYCLE_DURABILITY: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY";
@@ -39,6 +41,8 @@ pub(super) enum LifecyclePhase {
 #[serde(rename_all = "snake_case")]
 pub(super) enum RequestStage {
     Queued,
+    WorkerRequestFlushed,
+    /// Legacy v3 stage name retained so existing journals remain replayable.
     WorkerStarted,
     GpuSynchronized,
     HostMaterialized,
@@ -226,6 +230,8 @@ pub(super) struct LifecycleStore {
     journal: File,
     journal_len: u64,
     last: Option<LifecycleProjection>,
+    recovered_requests: Vec<LifecycleRequestRecord>,
+    request_states: BTreeMap<String, ReplayedRequest>,
     poisoned: bool,
 }
 
@@ -302,7 +308,7 @@ impl LifecycleStore {
                 )));
             }
         };
-        let last = replay_journal(&journal_path, &journal_bytes)?;
+        let replay = replay_journal(&journal_path, &journal_bytes)?;
         let journal = OpenOptions::new()
             .create(true)
             .read(true)
@@ -314,13 +320,19 @@ impl LifecycleStore {
                     journal_path.display()
                 ))
             })?;
+        let LifecycleReplay { last, requests } = replay;
+        let recovered_requests = requests.values().map(|state| state.last.clone()).collect();
         let store = Self {
             _supervisor_lock: supervisor_lock,
             journal_path,
             snapshot_path,
             journal,
-            journal_len: journal_bytes.len() as u64,
+            journal_len: u64::try_from(journal_bytes.len()).map_err(|_| {
+                corrupt_error("resident lifecycle journal length exceeds u64 capacity")
+            })?,
             last,
+            recovered_requests,
+            request_states: requests,
             poisoned: false,
         };
         store.reconcile_snapshot()?;
@@ -329,6 +341,10 @@ impl LifecycleStore {
 
     pub(super) fn last(&self) -> Option<&LifecycleProjection> {
         self.last.as_ref()
+    }
+
+    pub(super) fn take_recovered_requests(&mut self) -> Vec<LifecycleRequestRecord> {
+        std::mem::take(&mut self.recovered_requests)
     }
 
     pub(super) fn journal_path(&self) -> &Path {
@@ -365,20 +381,12 @@ impl LifecycleStore {
         }
         self.verify_journal_length()?;
 
-        let sequence = self
-            .last
-            .as_ref()
-            .map_or(1, |record| record.sequence.saturating_add(1));
-        if sequence == u64::MAX
-            && self
-                .last
-                .as_ref()
-                .is_some_and(|record| record.sequence == u64::MAX)
-        {
-            return Err(corrupt_error(
-                "resident lifecycle sequence exhausted u64 capacity",
-            ));
-        }
+        let sequence = match self.last.as_ref() {
+            Some(record) => record.sequence.checked_add(1).ok_or_else(|| {
+                corrupt_error("resident lifecycle sequence exhausted u64 capacity")
+            })?,
+            None => 1,
+        };
         let previous_event_sha256 = self.last.as_ref().map_or_else(
             || GENESIS_EVENT_SHA256.to_string(),
             |record| record.event_sha256.clone(),
@@ -389,19 +397,41 @@ impl LifecycleStore {
             state,
             request,
             unix_now_ms(),
-            previous_event_sha256,
+            previous_event_sha256.clone(),
         );
         projection.event_sha256 = event_sha256(&projection).map_err(|error| {
             durability_error(format!(
                 "serialize resident lifecycle hash material failed: {error}"
             ))
         })?;
+        let line_number = usize::try_from(sequence).unwrap_or(usize::MAX);
+        validate_replayed_record(
+            &self.journal_path,
+            line_number,
+            &projection,
+            sequence,
+            &previous_event_sha256,
+        )?;
+        let mut proposed_request_states = self.request_states.clone();
+        validate_replayed_request(
+            &self.journal_path,
+            line_number,
+            self.last.as_ref(),
+            &projection,
+            &mut proposed_request_states,
+        )?;
         let mut journal_record = serde_json::to_vec(&projection).map_err(|error| {
             durability_error(format!(
                 "serialize resident lifecycle journal event failed: {error}"
             ))
         })?;
         journal_record.push(b'\n');
+        let next_journal_len = self
+            .journal_len
+            .checked_add(u64::try_from(journal_record.len()).map_err(|_| {
+                corrupt_error("resident lifecycle journal record length exceeds u64 capacity")
+            })?)
+            .ok_or_else(|| corrupt_error("resident lifecycle journal length overflow"))?;
 
         if let Err(error) = self.journal.write_all(&journal_record) {
             self.poisoned = true;
@@ -431,15 +461,13 @@ impl LifecycleStore {
             )));
         }
 
-        self.journal_len = self
-            .journal_len
-            .checked_add(journal_record.len() as u64)
-            .ok_or_else(|| corrupt_error("resident lifecycle journal length overflow"))?;
-        self.last = Some(projection.clone());
         if let Err(error) = self.publish_and_verify_snapshot(&projection) {
             self.poisoned = true;
             return Err(error);
         }
+        self.journal_len = next_journal_len;
+        self.last = Some(projection.clone());
+        self.request_states = proposed_request_states;
         Ok(projection)
     }
 
@@ -512,9 +540,23 @@ impl LifecycleStore {
     }
 }
 
-fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<Option<LifecycleProjection>> {
+struct LifecycleReplay {
+    last: Option<LifecycleProjection>,
+    requests: BTreeMap<String, ReplayedRequest>,
+}
+
+#[derive(Clone)]
+struct ReplayedRequest {
+    last: LifecycleRequestRecord,
+    admitted: bool,
+}
+
+fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<LifecycleReplay> {
     if bytes.is_empty() {
-        return Ok(None);
+        return Ok(LifecycleReplay {
+            last: None,
+            requests: BTreeMap::new(),
+        });
     }
     if bytes.last() != Some(&b'\n') {
         return Err(corrupt_error(format!(
@@ -526,6 +568,7 @@ fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<Option<LifecycleProjec
     let mut expected_sequence = Some(1_u64);
     let mut expected_previous = GENESIS_EVENT_SHA256.to_string();
     let mut last = None;
+    let mut requests = BTreeMap::<String, ReplayedRequest>::new();
     let lines: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
     for (line_index, line) in lines.iter().enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -577,11 +620,238 @@ fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<Option<LifecycleProjec
             ))
         })?;
         validate_replayed_record(path, line_index + 1, &record, sequence, &expected_previous)?;
+        validate_replayed_request(path, line_index + 1, last.as_ref(), &record, &mut requests)?;
         expected_sequence = sequence.checked_add(1);
         expected_previous.clone_from(&record.event_sha256);
         last = Some(record);
     }
-    Ok(last)
+    Ok(LifecycleReplay { last, requests })
+}
+
+fn validate_replayed_request(
+    path: &Path,
+    line_number: usize,
+    previous: Option<&LifecycleProjection>,
+    record: &LifecycleProjection,
+    requests: &mut BTreeMap<String, ReplayedRequest>,
+) -> CliResult {
+    if record.schema == LIFECYCLE_SCHEMA_V2 {
+        return Ok(());
+    }
+    let previous_queued = previous.map_or(0, |previous| previous.queued_requests);
+    let previous_in_flight = previous.map_or(0, |previous| previous.in_flight);
+    if previous.is_some_and(|previous| previous.schema == LIFECYCLE_SCHEMA_V2)
+        && record.event == "legacy_requests_recovered_abandoned"
+        && previous_in_flight != 0
+        && record.request.is_none()
+        && record.queued_requests == 0
+        && record.in_flight == 0
+        && record.last_error.as_ref().is_some_and(|error| {
+            error.code == "CALYX_PANEL_RESIDENT_LEGACY_REQUESTS_ABANDONED_ON_RESTART"
+        })
+    {
+        return Ok(());
+    }
+    let Some(request) = record.request.as_ref() else {
+        if record.queued_requests != previous_queued || record.in_flight != previous_in_flight {
+            return Err(request_semantic_error(
+                path,
+                line_number,
+                format!(
+                    "event {:?} changed queued/in_flight from {previous_queued}/{previous_in_flight} to {}/{} without a request record",
+                    record.event, record.queued_requests, record.in_flight
+                ),
+            ));
+        }
+        return Ok(());
+    };
+    if !request
+        .request_id
+        .parse::<Ulid>()
+        .is_ok_and(|parsed| parsed.to_string() == request.request_id.as_str())
+    {
+        return Err(request_semantic_error(
+            path,
+            line_number,
+            format!(
+                "request_id {:?} is not a canonical ULID",
+                request.request_id
+            ),
+        ));
+    }
+    match record.event.as_str() {
+        "request_queued" => {
+            if requests.contains_key(&request.request_id)
+                || request.stage != RequestStage::Queued
+                || request.generation.is_some()
+                || request.outcome.is_some()
+                || request.error.is_some()
+                || previous_queued.checked_add(1) != Some(record.queued_requests)
+                || record.in_flight != previous_in_flight
+            {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!(
+                        "request_queued has invalid identity/stage/counters for {}",
+                        request.request_id
+                    ),
+                ));
+            }
+            requests.insert(
+                request.request_id.clone(),
+                ReplayedRequest {
+                    last: request.clone(),
+                    admitted: false,
+                },
+            );
+        }
+        "lease_acquired" => {
+            let Some(state) = requests.get_mut(&request.request_id) else {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!(
+                        "lease_acquired has no queued request {}",
+                        request.request_id
+                    ),
+                ));
+            };
+            if state.admitted
+                || state.last.stage != RequestStage::Queued
+                || request.stage != RequestStage::Queued
+                || request.generation != Some(record.generation)
+                || request.outcome.is_some()
+                || request.error.is_some()
+                || record.queued_requests.checked_add(1) != Some(previous_queued)
+                || previous_in_flight.checked_add(1) != Some(record.in_flight)
+            {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!("lease_acquired is inconsistent for {}", request.request_id),
+                ));
+            }
+            state.admitted = true;
+            state.last = request.clone();
+        }
+        "request_stage" => {
+            let Some(state) = requests.get_mut(&request.request_id) else {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!("request_stage has no active request {}", request.request_id),
+                ));
+            };
+            if !state.admitted
+                || request.generation != state.last.generation
+                || !valid_replayed_stage_transition(state.last.stage, request.stage)
+                || request.outcome.is_some()
+                || request.error.is_some()
+                || record.queued_requests != previous_queued
+                || record.in_flight != previous_in_flight
+            {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!(
+                        "request_stage {:?}->{:?} is inconsistent for {}",
+                        state.last.stage, request.stage, request.request_id
+                    ),
+                ));
+            }
+            state.last = request.clone();
+        }
+        "request_released" | "request_recovered_abandoned" | "request_recovered_succeeded" => {
+            let Some(state) = requests.get(&request.request_id) else {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!(
+                        "request release has no active request {}",
+                        request.request_id
+                    ),
+                ));
+            };
+            let succeeded = request.outcome == Some(RequestOutcome::Succeeded);
+            let recovered_abandoned = record.event == "request_recovered_abandoned";
+            let recovered_succeeded = record.event == "request_recovered_succeeded";
+            let recovery = recovered_abandoned || recovered_succeeded;
+            let counters_valid = if recovery {
+                record.queued_requests == 0 && record.in_flight == 0
+            } else if state.admitted {
+                record.queued_requests == previous_queued
+                    && record.in_flight.checked_add(1) == Some(previous_in_flight)
+            } else {
+                record.queued_requests.checked_add(1) == Some(previous_queued)
+                    && record.in_flight == previous_in_flight
+            };
+            if request.stage != RequestStage::Released
+                || request.outcome.is_none()
+                || (state.admitted && request.generation != state.last.generation)
+                || (succeeded
+                    && (state.last.stage != RequestStage::PublicFlushComplete
+                        || request.error.is_some()))
+                || (!succeeded && request.error.is_none())
+                || (recovered_abandoned && request.outcome != Some(RequestOutcome::Abandoned))
+                || (recovered_succeeded && request.outcome != Some(RequestOutcome::Succeeded))
+                || !counters_valid
+            {
+                return Err(request_semantic_error(
+                    path,
+                    line_number,
+                    format!("request release is inconsistent for {}", request.request_id),
+                ));
+            }
+            requests.remove(&request.request_id);
+        }
+        other => {
+            return Err(request_semantic_error(
+                path,
+                line_number,
+                format!("event {other:?} carries an unexpected request record"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_replayed_stage_transition(current: RequestStage, next: RequestStage) -> bool {
+    matches!(
+        (current, next),
+        (RequestStage::Queued, RequestStage::WorkerStarted)
+            | (RequestStage::Queued, RequestStage::WorkerRequestFlushed)
+            | (RequestStage::WorkerStarted, RequestStage::GpuSynchronized)
+            | (
+                RequestStage::WorkerRequestFlushed,
+                RequestStage::GpuSynchronized
+            )
+            | (
+                RequestStage::GpuSynchronized,
+                RequestStage::HostMaterialized
+            )
+            | (
+                RequestStage::HostMaterialized,
+                RequestStage::TerminalReceived
+            )
+            | (RequestStage::WorkerStarted, RequestStage::TerminalReceived)
+            | (
+                RequestStage::WorkerRequestFlushed,
+                RequestStage::TerminalReceived
+            )
+            | (
+                RequestStage::TerminalReceived,
+                RequestStage::PublicFlushComplete
+            )
+    )
+}
+
+fn request_semantic_error(path: &Path, line_number: usize, detail: String) -> CliError {
+    corrupt_error(format!(
+        "resident lifecycle journal {} line {} has an impossible request history: {detail}",
+        path.display(),
+        line_number
+    ))
 }
 
 fn validate_replayed_record(

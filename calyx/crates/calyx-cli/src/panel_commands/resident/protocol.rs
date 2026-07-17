@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use calyx_core::{AbsentReason, Modality, Placement, SlotVector};
+use calyx_core::{AbsentReason, Modality, Placement, SlotShape, SlotState, SlotVector};
 #[cfg(windows)]
 use calyx_registry::OnnxRuntimeAttestation;
 use serde::{Deserialize, Serialize};
@@ -9,13 +9,16 @@ use serde::{Deserialize, Serialize};
 use super::lifecycle::{LifecycleErrorRecord, LifecyclePhase};
 use crate::panel_commands::warm::resident_support::ResidentLensAttestation;
 
-pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v4";
-pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
-pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
-/// v2 (#1002): measure_batch responses stream as one header frame, one frame
+pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v5";
+pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v2";
+pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v2";
+pub(super) const COMPLETION_SCHEMA: &str = "calyx-panel-resident-completion-v1";
+/// v3 (#482): productive requests and terminal responses carry the exact
+/// supervisor request ULID and worker generation. v2 (#1002) introduced one
+/// header frame, one frame
 /// per measured input row, and one end frame — never a single response frame
 /// carrying every multi-vector payload at once.
-pub(super) const RESIDENT_BINARY_PROTOCOL_VERSION: u16 = 2;
+pub(super) const RESIDENT_BINARY_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug)]
 pub(super) enum ClientMeasureInput {
@@ -32,11 +35,26 @@ pub(super) struct ResidentRequest {
     pub(super) input_hex: Option<String>,
     pub(super) inputs_hex: Option<Vec<String>>,
     pub(super) runtime_batch_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) supervisor_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) supervisor_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResidentCompletionAttestation {
+    pub(super) schema: String,
+    pub(super) request_id: String,
+    pub(super) generation: u64,
+    pub(super) gpu_synchronized: bool,
+    pub(super) host_materialized: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReadyResponse {
+    pub(super) ok: bool,
     pub(super) schema: String,
     pub(super) ready: bool,
     pub(super) accepting_requests: bool,
@@ -80,6 +98,7 @@ pub(super) struct ReadyResponse {
     pub(super) load_ms: u128,
     pub(super) probe_ms: u128,
     pub(super) slot_count: usize,
+    pub(super) slot_contracts: Vec<ResidentSlotContract>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) slot_scope: Vec<u16>,
     pub(super) content_lens_count: usize,
@@ -94,8 +113,25 @@ pub(super) struct ReadyResponse {
     pub(super) cpu_content_lens_count: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResidentSlotContract {
+    pub(super) slot: u16,
+    pub(super) key: String,
+    pub(super) lens_id: String,
+    pub(super) shape: SlotShape,
+    pub(super) modality: Modality,
+    pub(super) placement: Placement,
+    pub(super) state: SlotState,
+    pub(super) registered: bool,
+    pub(super) retrieval_only: bool,
+    pub(super) excluded_from_dedup: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct MeasureResponse {
+    pub(super) ok: bool,
     pub(super) schema: String,
     pub(super) ready: bool,
     pub(super) process_id: u32,
@@ -106,10 +142,13 @@ pub(super) struct MeasureResponse {
     pub(super) measured_slot_count: usize,
     pub(super) absent_slot_count: usize,
     pub(super) slots: Vec<ResidentSlotMeasure>,
+    pub(super) completion: ResidentCompletionAttestation,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MeasureBatchResponse {
+    pub(crate) ok: bool,
     pub(crate) schema: String,
     pub(crate) ready: bool,
     pub(crate) process_id: u32,
@@ -119,6 +158,7 @@ pub(crate) struct MeasureBatchResponse {
     pub(crate) elapsed_ms: u128,
     pub(crate) runtime_batch_limit: Option<usize>,
     pub(crate) rows: Vec<ResidentMeasuredInput>,
+    pub(crate) completion: ResidentCompletionAttestation,
 }
 
 #[derive(Debug)]
@@ -130,6 +170,7 @@ pub(crate) struct MeasureBatchAtResponse {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MeasureBatchSummaryResponse {
+    pub(crate) ok: bool,
     pub(crate) schema: String,
     pub(crate) ready: bool,
     pub(crate) process_id: u32,
@@ -144,14 +185,17 @@ pub(crate) struct MeasureBatchSummaryResponse {
     pub(crate) response_rows_sha256: String,
     pub(crate) request_bytes: usize,
     pub(crate) response_bytes: usize,
+    pub(crate) completion: ResidentCompletionAttestation,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ResidentMeasureBatchBinaryRequest {
     pub(super) protocol_version: u16,
     pub(super) modality: Modality,
     pub(super) inputs: Vec<Vec<u8>>,
     pub(super) runtime_batch_limit: Option<usize>,
+    pub(super) supervisor_request_id: Option<String>,
+    pub(super) supervisor_generation: Option<u64>,
 }
 
 /// One length-prefixed bincode frame of the streamed measure_batch response.
@@ -183,9 +227,11 @@ pub(super) struct ResidentMeasureBatchStreamHeader {
 pub(super) struct ResidentMeasureBatchStreamEnd {
     pub(super) row_count: usize,
     pub(super) elapsed_ms: u128,
+    pub(super) completion: ResidentCompletionAttestation,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResidentMeasuredInput {
     pub(crate) input_index: usize,
     pub(crate) input_len: usize,
@@ -195,6 +241,7 @@ pub(crate) struct ResidentMeasuredInput {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResidentSlotMeasure {
     pub(crate) slot: u16,
     pub(crate) key: String,

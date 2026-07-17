@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::Shutdown;
@@ -5,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use calyx_core::CalyxError;
+use calyx_core::{CalyxError, SlotShape, SlotState};
 
 use super::deadline::{DeadlineStream, connect_before, deadline_after, read_bounded_line};
 use super::job::ResidentGenerationJob;
@@ -185,6 +186,9 @@ impl WorkerProcess {
             );
             return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
         }
+        if let Err(error) = validate_ready_slot_contracts(&ready) {
+            return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
+        }
         if let Err(error) = ensure_loopback(ready.bind) {
             return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
         }
@@ -313,6 +317,88 @@ impl WorkerProcess {
         wait_for_empty_job(&self.job)?;
         Ok(members_before)
     }
+}
+
+fn validate_ready_slot_contracts(ready: &ReadyResponse) -> CliResult {
+    if ready.slot_count == 0 || ready.slot_contracts.len() != ready.slot_count {
+        return Err(worker_error(
+            WORKER_START_FAILED,
+            format!(
+                "resident generation {} published slot_count={} with {} full-panel contracts",
+                ready.generation,
+                ready.slot_count,
+                ready.slot_contracts.len()
+            ),
+            "preserve the readiness artifact and rebuild the worker from the exact frozen panel",
+        ));
+    }
+    let mut slots = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    for contract in &ready.slot_contracts {
+        let shape_valid = match contract.shape {
+            SlotShape::Dense(dim) | SlotShape::Sparse(dim) => dim > 0,
+            SlotShape::Multi { token_dim } => token_dim > 0,
+        };
+        if contract.slot == 0
+            || contract.key.trim().is_empty()
+            || contract.lens_id.trim().is_empty()
+            || !slots.insert(contract.slot)
+            || !keys.insert(contract.key.as_str())
+            || !shape_valid
+        {
+            return Err(worker_error(
+                WORKER_START_FAILED,
+                format!(
+                    "resident generation {} published an invalid or duplicate full-panel contract for slot={} key={:?} lens={} shape={:?}",
+                    ready.generation, contract.slot, contract.key, contract.lens_id, contract.shape
+                ),
+                "preserve the readiness artifact and fix the frozen panel contract before loading a generation",
+            ));
+        }
+    }
+    let expected_attested_lenses = ready
+        .slot_contracts
+        .iter()
+        .filter(|contract| contract.state == SlotState::Active && contract.registered)
+        .map(|contract| contract.lens_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let observed_attested_lenses = ready
+        .lens_attestations
+        .iter()
+        .map(|attestation| attestation.lens_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_attested_lenses != observed_attested_lenses
+        || ready.slot_contracts.iter().any(|contract| {
+            contract.state == SlotState::Active
+                && contract.registered
+                && !ready.lens_attestations.iter().any(|attestation| {
+                    attestation.lens_id == contract.lens_id
+                        && attestation.modality == contract.modality
+                        && attestation.placement == contract.placement
+                })
+        })
+        || ready.lens_attestations.iter().any(|attestation| {
+            !ready.slot_contracts.iter().any(|contract| {
+                contract.slot == attestation.slot
+                    && contract.key == attestation.key
+                    && contract.lens_id == attestation.lens_id
+                    && contract.modality == attestation.modality
+                    && contract.placement == attestation.placement
+                    && contract.state == SlotState::Active
+                    && contract.registered
+            })
+        })
+    {
+        return Err(worker_error(
+            WORKER_START_FAILED,
+            format!(
+                "resident generation {} full-panel contracts do not match its active registered lens execution attestations",
+                ready.generation
+            ),
+            "preserve the readiness artifact and reject the generation until every active registered contract has matching execution evidence",
+        ));
+    }
+    Ok(())
 }
 
 impl WorkerAssignment {

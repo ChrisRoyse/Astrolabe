@@ -23,6 +23,7 @@ mod cuda_graphs;
 mod cuda_guard;
 mod custom;
 mod dynamic_ort;
+mod fastembed_attestation;
 mod fastembed_runtime;
 mod green_context;
 mod io_binding;
@@ -49,6 +50,7 @@ pub struct OnnxLens {
     provider_policy: OnnxProviderPolicy,
     max_batch: Option<usize>,
     backend: Option<OnnxBackend>,
+    fastembed_execution: Option<fastembed_attestation::FastembedExecutionState>,
     bound_stream: Option<green_context::RetainedCudaStream>,
 }
 
@@ -297,6 +299,7 @@ impl OnnxLens {
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
         model: TextEmbedding,
+        execution: fastembed_attestation::FastembedExecutionState,
         bound_stream: Option<green_context::GreenContextHandle>,
     ) -> Self {
         Self {
@@ -307,6 +310,7 @@ impl OnnxLens {
             provider_policy,
             max_batch: None,
             backend: Some(OnnxBackend::FastEmbed(Box::new(Mutex::new(model)))),
+            fastembed_execution: Some(execution),
             bound_stream: green_context::retain_for_model(bound_stream),
         }
     }
@@ -326,6 +330,7 @@ impl OnnxLens {
             provider_policy,
             max_batch,
             backend: Some(OnnxBackend::Custom(Box::new(Mutex::new(runtime)))),
+            fastembed_execution: None,
             bound_stream: None,
         }
     }
@@ -418,7 +423,7 @@ impl Lens for OnnxLens {
 
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
         match self.backend_ref() {
-            OnnxBackend::FastEmbed(_) => Ok(None),
+            OnnxBackend::FastEmbed(_) => self.fastembed_execution().execution_attestation(),
             OnnxBackend::Custom(runtime) => runtime
                 .lock()
                 .map_err(|_| CalyxError::lens_unreachable("custom ONNX session mutex was poisoned"))
@@ -439,6 +444,8 @@ impl OnnxLens {
         model: &Mutex<TextEmbedding>,
         inputs: &[Input],
     ) -> Result<Vec<SlotVector>> {
+        let execution = self.fastembed_execution();
+        execution.ensure_usable()?;
         let mut texts = Vec::with_capacity(inputs.len());
         for input in inputs {
             texts.push(text_from_input(self, input)?.to_string());
@@ -448,12 +455,13 @@ impl OnnxLens {
         })?;
         let embeddings = model
             .embed(texts, None)
-            .map_err(|err| CalyxError::lens_unreachable(format!("ONNX inference failed: {err}")))?;
+            .map_err(|err| execution.error("inference", err))?;
         green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-dense",
-        )?;
+        )
+        .map_err(|error| execution.error("cuda_synchronize", error))?;
         if embeddings.len() != inputs.len() {
             return Err(CalyxError::lens_dim_mismatch(format!(
                 "ONNX returned {} vectors for {} inputs",
@@ -461,7 +469,7 @@ impl OnnxLens {
                 inputs.len()
             )));
         }
-        embeddings
+        let vectors = embeddings
             .into_iter()
             .map(|mut data| {
                 if data.len() != self.dim as usize {
@@ -477,7 +485,15 @@ impl OnnxLens {
                     data,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        execution.complete_first_inference(|| model.end_profiling())?;
+        Ok(vectors)
+    }
+
+    fn fastembed_execution(&self) -> &fastembed_attestation::FastembedExecutionState {
+        self.fastembed_execution
+            .as_ref()
+            .expect("FastEmbed execution state accompanies the FastEmbed backend")
     }
 }
 

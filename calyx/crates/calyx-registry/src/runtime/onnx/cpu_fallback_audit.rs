@@ -133,6 +133,14 @@ impl ProviderNodeCounts {
             .sum()
     }
 
+    fn cuda_nodes(&self) -> usize {
+        self.counts
+            .iter()
+            .filter(|(provider, _)| provider.to_ascii_uppercase().contains("CUDA"))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
     fn render(&self) -> String {
         if self.counts.is_empty() {
             return "none".to_string();
@@ -219,6 +227,7 @@ pub(super) fn parse_profiling_nodes(trace_json: &str) -> Result<ProviderNodeCoun
 pub(super) struct CpuFallbackAudit {
     pub(super) total_nodes: usize,
     pub(super) cpu_nodes: usize,
+    pub(super) cuda_nodes: usize,
     pub(super) cpu_fraction: f64,
     pub(super) max_cpu_fraction: f64,
     pub(super) over_threshold: bool,
@@ -232,6 +241,7 @@ pub(super) fn evaluate_placement(
 ) -> CpuFallbackAudit {
     let total_nodes = counts.total();
     let cpu_nodes = counts.cpu_nodes();
+    let cuda_nodes = counts.cuda_nodes();
     let cpu_fraction = if total_nodes == 0 {
         0.0
     } else {
@@ -243,6 +253,7 @@ pub(super) fn evaluate_placement(
     CpuFallbackAudit {
         total_nodes,
         cpu_nodes,
+        cuda_nodes,
         cpu_fraction,
         max_cpu_fraction,
         over_threshold,
@@ -263,9 +274,10 @@ pub(super) fn audit_from_trace(
     let audit = evaluate_placement(&counts, gpu_policy, max_cpu_fraction);
     let verdict = if audit.over_threshold { "over" } else { "ok" };
     eprintln!(
-        "CALYX_ONNX_RUNTIME phase=cpu_fallback_audit label={label} mode={} gpu_policy={gpu_policy} total_nodes={} cpu_nodes={} cpu_fraction={:.4} max_cpu_fraction={:.4} providers={} verdict={verdict}",
+        "CALYX_ONNX_RUNTIME phase=cpu_fallback_audit label={label} mode={} gpu_policy={gpu_policy} total_nodes={} cuda_nodes={} cpu_nodes={} cpu_fraction={:.4} max_cpu_fraction={:.4} providers={} verdict={verdict}",
         mode.as_str(),
         audit.total_nodes,
+        audit.cuda_nodes,
         audit.cpu_nodes,
         audit.cpu_fraction,
         audit.max_cpu_fraction,

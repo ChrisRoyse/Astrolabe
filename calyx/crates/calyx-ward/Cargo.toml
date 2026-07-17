@@ -14,6 +14,7 @@ calyx-ledger = { path = "../calyx-ledger" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+memmap2 = { workspace = true, optional = true }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 uuid.workspace = true
@@ -27,4 +28,4 @@ uuid.workspace = true
 # actually runs the ONNX lenses; without it, the lens constructors fail closed
 # with CALYX_WARD_LENS_FEATURE_DISABLED.
 default = []
-onnx-lens = ["dep:ort", "dep:tokenizers"]
+onnx-lens = ["dep:memmap2", "dep:ort", "dep:tokenizers"]

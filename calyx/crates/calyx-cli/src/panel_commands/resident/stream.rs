@@ -11,7 +11,7 @@
 //! whole batch.
 
 use super::codec::{decode_binary, encode_binary, read_frame, write_frame};
-use super::dispatch::slot_measure;
+use super::dispatch::{productive_completion, slot_measure};
 use super::parallel::measure_chunk_lenses;
 use super::server::ResidentService;
 use super::*;
@@ -191,6 +191,23 @@ pub(super) fn serve_binary_measure_batch(
             );
         }
     };
+    let completion = match productive_completion(
+        &request.supervisor_request_id,
+        request.supervisor_generation,
+        service.generation,
+    ) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return write_stream_frame(
+                writer,
+                &ResidentMeasureBatchStreamFrame::Err {
+                    code: error.code().to_string(),
+                    message: error.message().to_string(),
+                    remediation: error.remediation().to_string(),
+                },
+            );
+        }
+    };
     eprintln!(
         "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_binary_request process_id={} protocol_version={} inputs={}",
         std::process::id(),
@@ -233,6 +250,7 @@ pub(super) fn serve_binary_measure_batch(
                 &ResidentMeasureBatchStreamFrame::End(ResidentMeasureBatchStreamEnd {
                     row_count,
                     elapsed_ms,
+                    completion,
                 }),
             )?;
             eprintln!(

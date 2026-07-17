@@ -16,7 +16,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{
-    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, SlotShape, SlotVector,
+    CalyxError, Input, Lens, LensId, Modality, Result as CalyxResult, RuntimeExecutionAttestation,
+    SlotShape, SlotVector,
 };
 
 use crate::error::WardError;
@@ -53,8 +54,8 @@ pub enum InjectionProviderPolicy {
 impl InjectionProviderPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CudaFailLoud => "cuda:0,error_on_failure,no_cpu_fallback",
-            Self::CpuExplicit => "cpu_explicit,no_cuda",
+            Self::CudaFailLoud => crate::CUDA_ONNX_PROVIDER_POLICY,
+            Self::CpuExplicit => crate::CPU_ONNX_PROVIDER_POLICY,
         }
     }
 }
@@ -74,6 +75,10 @@ pub trait InjectionScoreBackend: Send + Sync {
 
     fn provider_policy(&self) -> &'static str {
         "test_backend"
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        Ok(None)
     }
 }
 
@@ -229,6 +234,10 @@ impl InjectionLens {
     pub fn output_names(&self) -> Vec<String> {
         self.backend.output_names()
     }
+
+    pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
+        self.backend.execution_attestation()
+    }
 }
 
 impl Lens for InjectionLens {
@@ -261,12 +270,17 @@ impl Lens for InjectionLens {
             data: vec![score],
         })
     }
+
+    fn execution_attestation(&self) -> CalyxResult<Option<RuntimeExecutionAttestation>> {
+        self.backend.execution_attestation().map_err(ward_as_calyx)
+    }
 }
 
 fn ward_as_calyx(error: WardError) -> CalyxError {
+    let remediation = error.remediation();
     CalyxError {
         code: error.code(),
         message: error.to_string(),
-        remediation: "fix Ward injection lens model/input and retry",
+        remediation,
     }
 }

@@ -1,6 +1,7 @@
 use super::lifecycle::LifecyclePhase;
 use super::server::ResidentService;
 use super::*;
+use ulid::Ulid;
 
 pub(crate) fn dispatch_request(
     request: ResidentRequest,
@@ -12,8 +13,22 @@ pub(crate) fn dispatch_request(
     }
     match request.op.as_str() {
         "ready" => json!(readiness(service)),
-        "measure" => dispatch_measure(request, service),
-        "measure_batch" => dispatch_measure_batch(request, service),
+        "measure" => match productive_completion(
+            &request.supervisor_request_id,
+            request.supervisor_generation,
+            service.generation,
+        ) {
+            Ok(completion) => dispatch_measure(request, service, completion),
+            Err(error) => cli_error_value(&error),
+        },
+        "measure_batch" => match productive_completion(
+            &request.supervisor_request_id,
+            request.supervisor_generation,
+            service.generation,
+        ) {
+            Ok(completion) => dispatch_measure_batch(request, service, completion),
+            Err(error) => cli_error_value(&error),
+        },
         "shutdown" => {
             running.store(false, Ordering::SeqCst);
             json!({"ok": true, "schema": READY_SCHEMA, "ready": false, "stopping": true})
@@ -31,6 +46,17 @@ pub(super) enum RequestClass {
     Ready,
     Productive,
     Shutdown,
+}
+
+pub(super) fn validate_public_request(request: &ResidentRequest) -> Result<RequestClass, Value> {
+    if request.supervisor_request_id.is_some() || request.supervisor_generation.is_some() {
+        return Err(error_value(
+            "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+            "public resident requests must not provide private supervisor request identity",
+            "remove supervisor_request_id and supervisor_generation; the public supervisor assigns both after admission",
+        ));
+    }
+    validate_request(request)
 }
 
 /// Validate the complete semantic request before a productive request may
@@ -113,7 +139,11 @@ fn reject_control_payload(request: &ResidentRequest, operation: &str) -> Result<
     Ok(())
 }
 
-fn dispatch_measure(request: ResidentRequest, service: &ResidentService) -> Value {
+fn dispatch_measure(
+    request: ResidentRequest,
+    service: &ResidentService,
+    completion: ResidentCompletionAttestation,
+) -> Value {
     let Some(modality) = request.modality else {
         return error_value(
             "CALYX_PANEL_RESIDENT_BAD_REQUEST",
@@ -125,13 +155,17 @@ fn dispatch_measure(request: ResidentRequest, service: &ResidentService) -> Valu
         Ok(bytes) => bytes,
         Err(error) => return error,
     };
-    match measure(service, modality, bytes) {
+    match measure(service, modality, bytes, completion) {
         Ok(response) => json!(response),
         Err(error) => cli_error_value(&error),
     }
 }
 
-fn dispatch_measure_batch(request: ResidentRequest, service: &ResidentService) -> Value {
+fn dispatch_measure_batch(
+    request: ResidentRequest,
+    service: &ResidentService,
+    completion: ResidentCompletionAttestation,
+) -> Value {
     let Some(modality) = request.modality else {
         return error_value(
             "CALYX_PANEL_RESIDENT_BAD_REQUEST",
@@ -143,7 +177,13 @@ fn dispatch_measure_batch(request: ResidentRequest, service: &ResidentService) -
         Ok(bytes) => bytes,
         Err(error) => return error,
     };
-    match measure_batch(service, modality, bytes, request.runtime_batch_limit) {
+    match measure_batch(
+        service,
+        modality,
+        bytes,
+        request.runtime_batch_limit,
+        completion,
+    ) {
         Ok(response) => json!(response),
         Err(error) => cli_error_value(&error),
     }
@@ -237,6 +277,7 @@ fn request_inputs_bytes(inputs_hex: &Option<Vec<String>>) -> Result<Vec<Vec<u8>>
 pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
     let state = &service.state;
     ReadyResponse {
+        ok: true,
         schema: READY_SCHEMA.to_string(),
         ready: true,
         accepting_requests: true,
@@ -279,6 +320,24 @@ pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
         load_ms: state.load_ms,
         probe_ms: state.probe_ms,
         slot_count: state.build.panel.slots.len(),
+        slot_contracts: state
+            .build
+            .panel
+            .slots
+            .iter()
+            .map(|slot| ResidentSlotContract {
+                slot: slot.slot_id.get(),
+                key: slot.slot_key.key().to_string(),
+                lens_id: slot.lens_id.to_string(),
+                shape: slot.shape,
+                modality: slot.modality,
+                placement: slot.resource.placement,
+                state: slot.state,
+                registered: state.build.registry.contains(slot.lens_id),
+                retrieval_only: slot.retrieval_only,
+                excluded_from_dedup: slot.excluded_from_dedup,
+            })
+            .collect(),
         slot_scope: state.slot_scope.iter().map(|slot| slot.get()).collect(),
         content_lens_count: state.content_lens_count,
         registry_lens_count: state.build.registry.lens_snapshots().len(),
@@ -298,6 +357,7 @@ fn measure(
     service: &ResidentService,
     modality: Modality,
     bytes: Vec<u8>,
+    completion: ResidentCompletionAttestation,
 ) -> CliResult<MeasureResponse> {
     let started = Instant::now();
     let input = Input::new(modality, bytes);
@@ -311,6 +371,7 @@ fn measure(
     )?;
     let row = super::stream::assemble_row(service, modality, &measured_by_lens, 0, 0, &input)?;
     Ok(MeasureResponse {
+        ok: true,
         schema: MEASURE_SCHEMA.to_string(),
         ready: true,
         process_id: std::process::id(),
@@ -321,6 +382,7 @@ fn measure(
         measured_slot_count: row.measured_slot_count,
         absent_slot_count: row.absent_slot_count,
         slots: row.slots,
+        completion,
     })
 }
 
@@ -329,6 +391,7 @@ fn measure_batch(
     modality: Modality,
     input_bytes: Vec<Vec<u8>>,
     runtime_batch_limit: Option<usize>,
+    completion: ResidentCompletionAttestation,
 ) -> CliResult<MeasureBatchResponse> {
     let input_count = input_bytes.len();
     let mut rows = Vec::with_capacity(input_count);
@@ -343,6 +406,7 @@ fn measure_batch(
         },
     )?;
     Ok(MeasureBatchResponse {
+        ok: true,
         schema: MEASURE_BATCH_SCHEMA.to_string(),
         ready: true,
         process_id: std::process::id(),
@@ -352,6 +416,44 @@ fn measure_batch(
         elapsed_ms,
         runtime_batch_limit,
         rows,
+        completion,
+    })
+}
+
+pub(super) fn productive_completion(
+    request_id: &Option<String>,
+    generation: Option<u64>,
+    expected_generation: u64,
+) -> CliResult<ResidentCompletionAttestation> {
+    let request_id = request_id
+        .as_deref()
+        .filter(|request_id| {
+            request_id
+                .parse::<Ulid>()
+                .is_ok_and(|parsed| parsed.to_string() == *request_id)
+        })
+        .ok_or_else(|| {
+            CliError::from(CalyxError {
+                code: "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH",
+                message: "private productive request omitted a valid supervisor ULID".to_string(),
+                remediation: "route productive work through the public resident supervisor from the same native Calyx build",
+            })
+        })?;
+    if generation != Some(expected_generation) {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH",
+            message: format!(
+                "private productive request generation {generation:?} does not match worker generation {expected_generation}"
+            ),
+            remediation: "reap the mismatched worker generation and retry through the public supervisor",
+        }));
+    }
+    Ok(ResidentCompletionAttestation {
+        schema: COMPLETION_SCHEMA.to_string(),
+        request_id: request_id.to_string(),
+        generation: expected_generation,
+        gpu_synchronized: true,
+        host_materialized: true,
     })
 }
 

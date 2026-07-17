@@ -1572,8 +1572,6 @@ dependencies = [
 [[package]]
 name = "fastembed"
 version = "5.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "add59222e7bc3787285f993744b244cd454d78571845623606bdc45b22b23a4e"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1585,7 +1583,9 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers",
+ "toml",
 ]
 
 [[package]]

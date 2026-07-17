@@ -6,13 +6,9 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(feature = "onnx-lens")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "onnx-lens")]
-use std::sync::Mutex;
 
 #[cfg(feature = "onnx-lens")]
-use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
-#[cfg(feature = "onnx-lens")]
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::Session;
 #[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
@@ -21,6 +17,8 @@ use tokenizers::Tokenizer;
 
 #[cfg(any(feature = "onnx-lens", test))]
 use crate::error::WardError;
+#[cfg(feature = "onnx-lens")]
+use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
 
 #[cfg(feature = "onnx-lens")]
 use super::{
@@ -30,14 +28,13 @@ use super::{
 
 #[cfg(feature = "onnx-lens")]
 pub(super) struct OnnxInjectionBackend {
-    session: Mutex<Session>,
+    session: ManagedWardOnnxSession,
     tokenizer: Tokenizer,
     input_ids_name: String,
     attention_mask_name: String,
     output_name: String,
     input_names: Vec<String>,
     output_names: Vec<String>,
-    policy: InjectionProviderPolicy,
 }
 
 #[cfg(feature = "onnx-lens")]
@@ -51,30 +48,34 @@ impl OnnxInjectionBackend {
             Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
                 path: tokenizer_path.to_path_buf(),
             })?;
-        let session = build_session(model_path, policy)?;
-        let input_names = session
-            .inputs()
-            .iter()
-            .map(|input| input.name().to_string())
-            .collect::<Vec<_>>();
-        let output_names = session
-            .outputs()
-            .iter()
-            .map(|output| output.name().to_string())
-            .collect::<Vec<_>>();
-        let input_ids_name = choose_name(&input_names, "input_ids", "input")?;
-        let attention_mask_name = choose_name(&input_names, "attention_mask", "input")?;
-        let output_name = choose_name(&output_names, "logits", "output")?;
-        assert_logits_shape(&session, &output_name)?;
+        let session = match policy {
+            InjectionProviderPolicy::CudaFailLoud => build_cuda_session("injection", model_path),
+            InjectionProviderPolicy::CpuExplicit => build_cpu_session("injection", model_path),
+        }?;
+        let (input_names, output_names) = session.inspect_session(|raw| {
+            Ok((
+                raw.inputs()
+                    .iter()
+                    .map(|input| input.name().to_string())
+                    .collect::<Vec<_>>(),
+                raw.outputs()
+                    .iter()
+                    .map(|output| output.name().to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        })?;
+        let input_ids_name = choose_name(&session, &input_names, "input_ids", "input")?;
+        let attention_mask_name = choose_name(&session, &input_names, "attention_mask", "input")?;
+        let output_name = choose_name(&session, &output_names, "logits", "output")?;
+        session.inspect_session(|raw| assert_logits_shape(&session, raw, &output_name))?;
         Ok(Self {
-            session: Mutex::new(session),
+            session,
             tokenizer,
             input_ids_name,
             attention_mask_name,
             output_name,
             input_names,
             output_names,
-            policy,
         })
     }
 
@@ -107,31 +108,39 @@ impl InjectionScoreBackend for OnnxInjectionBackend {
     fn benign_score(&self, text: &str) -> Result<f32, WardError> {
         let (ids, attention) = self.tokenize(text)?;
         let seq_len = ids.len();
-        let ids_tensor = Tensor::from_array(([1usize, seq_len], ids)).map_err(runtime_error)?;
-        let mask_tensor =
-            Tensor::from_array(([1usize, seq_len], attention)).map_err(runtime_error)?;
-        let mut session = self.session.lock().map_err(|_| WardError::Runtime {
-            reason: "injection lens ORT session mutex poisoned".to_string(),
-        })?;
-        let outputs = session
-            .run(ort::inputs! {
-                self.input_ids_name.as_str() => ids_tensor,
-                self.attention_mask_name.as_str() => mask_tensor
-            })
-            .map_err(runtime_error)?;
-        let output = outputs
-            .get(&self.output_name)
-            .ok_or_else(|| WardError::Runtime {
-                reason: format!("ONNX output {} missing", self.output_name),
+        let ids_tensor = Tensor::from_array(([1usize, seq_len], ids))
+            .map_err(|error| self.session.error("input_tensor", error))?;
+        let mask_tensor = Tensor::from_array(([1usize, seq_len], attention))
+            .map_err(|error| self.session.error("attention_tensor", error))?;
+        let score = self.session.run_real_inference(|raw| {
+            let outputs = raw
+                .run(ort::inputs! {
+                    self.input_ids_name.as_str() => ids_tensor,
+                    self.attention_mask_name.as_str() => mask_tensor
+                })
+                .map_err(|error| self.session.error("inference", error))?;
+            let output = outputs.get(&self.output_name).ok_or_else(|| {
+                self.session.error(
+                    "output_lookup",
+                    format!("ONNX output {} missing", self.output_name),
+                )
             })?;
-        let (_, data) = output.try_extract_tensor::<f32>().map_err(runtime_error)?;
-        if data.len() != INJECTION_LABELS {
-            return Err(WardError::ModelDimMismatch {
-                expected: INJECTION_LABELS,
-                actual: data.len(),
-            });
-        }
-        softmax_benign(data[BENIGN_LABEL], data[INJECTION_LABEL])
+            let (_, data) = output
+                .try_extract_tensor::<f32>()
+                .map_err(|error| self.session.error("output_extract", error))?;
+            if data.len() != INJECTION_LABELS {
+                return Err(self.session.error(
+                    "output_validation",
+                    format!(
+                        "model output dim {} != expected {}",
+                        data.len(),
+                        INJECTION_LABELS
+                    ),
+                ));
+            }
+            softmax_benign(data[BENIGN_LABEL], data[INJECTION_LABEL])
+        })?;
+        Ok(score)
     }
 
     fn input_names(&self) -> Vec<String> {
@@ -143,7 +152,13 @@ impl InjectionScoreBackend for OnnxInjectionBackend {
     }
 
     fn provider_policy(&self) -> &'static str {
-        self.policy.as_str()
+        self.session.provider_policy()
+    }
+
+    fn execution_attestation(
+        &self,
+    ) -> Result<Option<calyx_core::RuntimeExecutionAttestation>, WardError> {
+        self.session.execution_attestation()
     }
 }
 
@@ -168,76 +183,58 @@ pub(super) fn softmax_benign(benign_logit: f32, injection_logit: f32) -> Result<
 }
 
 #[cfg(feature = "onnx-lens")]
-fn build_session(model_path: &Path, policy: InjectionProviderPolicy) -> Result<Session, WardError> {
-    if !model_path.exists() {
-        return Err(WardError::ModelNotFound {
-            path: model_path.to_path_buf(),
-        });
-    }
-    let _ort_dylib = crate::ort_runtime::ensure_dynamic_ort()?;
-    let builder = Session::builder()
-        .map_err(runtime_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(runtime_error)?;
-    let mut builder = builder
-        .with_execution_providers(execution_providers(policy))
-        .map_err(runtime_error)?;
-    builder.commit_from_file(model_path).map_err(runtime_error)
-}
-
-#[cfg(feature = "onnx-lens")]
-fn execution_providers(policy: InjectionProviderPolicy) -> Vec<ExecutionProviderDispatch> {
-    match policy {
-        InjectionProviderPolicy::CudaFailLoud => vec![
-            // #1143: extend the BFC device arena exactly as requested;
-            // kNextPowerOfTwo over-reserves on dynamic-shape workloads.
-            ep::CUDA::default()
-                .with_device_id(0)
-                .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-                .build()
-                .error_on_failure(),
-        ],
-        InjectionProviderPolicy::CpuExplicit => vec![ep::CPU::default().build()],
-    }
-}
-
-#[cfg(feature = "onnx-lens")]
-fn choose_name(names: &[String], preferred: &str, kind: &str) -> Result<String, WardError> {
+fn choose_name(
+    session: &ManagedWardOnnxSession,
+    names: &[String],
+    preferred: &str,
+    kind: &str,
+) -> Result<String, WardError> {
     names
         .iter()
         .find(|name| name.as_str() == preferred)
         .cloned()
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX session has no {kind} named {preferred}"),
+        .ok_or_else(|| {
+            session.error(
+                "model_metadata",
+                format!("ONNX session has no {kind} named {preferred}"),
+            )
         })
 }
 
 /// The injection head must be an f32 tensor whose last static dim is 2.
 #[cfg(feature = "onnx-lens")]
-fn assert_logits_shape(session: &Session, output_name: &str) -> Result<(), WardError> {
+fn assert_logits_shape(
+    managed: &ManagedWardOnnxSession,
+    session: &Session,
+    output_name: &str,
+) -> Result<(), WardError> {
     let outlet = session
         .outputs()
         .iter()
         .find(|output| output.name() == output_name)
-        .ok_or_else(|| WardError::Runtime {
-            reason: format!("ONNX output {output_name} missing from metadata"),
+        .ok_or_else(|| {
+            managed.error(
+                "model_metadata",
+                format!("ONNX output {output_name} missing from metadata"),
+            )
         })?;
     match outlet.dtype() {
         ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => {
             match shape.iter().rev().copied().find(|dim| *dim > 0) {
                 Some(dim) if dim as usize == INJECTION_LABELS => Ok(()),
-                Some(dim) => Err(WardError::ModelDimMismatch {
-                    expected: INJECTION_LABELS,
-                    actual: dim as usize,
-                }),
+                Some(dim) => Err(managed.error(
+                    "model_metadata",
+                    format!("model output dim {dim} != expected {INJECTION_LABELS}"),
+                )),
                 // Fully-dynamic logits dim: validated per-call against the
                 // extracted tensor length instead.
                 None => Ok(()),
             }
         }
-        other => Err(WardError::Runtime {
-            reason: format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
-        }),
+        other => Err(managed.error(
+            "model_metadata",
+            format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
+        )),
     }
 }
 

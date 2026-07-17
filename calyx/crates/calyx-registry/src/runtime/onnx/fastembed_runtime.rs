@@ -50,24 +50,39 @@ pub fn from_model_with_policy(
         &info.model_file,
         &info.additional_files,
     )?;
+    let weights_sha256 = hash_files(&files.artifact_paths())?;
+    let context = super::fastembed_attestation::FastembedModelContext::new(
+        format!("onnx-fastembed:{}", info.model_code),
+        &info.model_code,
+        &files,
+        weights_sha256,
+        provider_policy,
+    )?;
     super::arena::preflight_gpu_mem_limit_for_artifacts(
         &format!("onnx-fastembed:{}", info.model_code),
         provider_policy,
         files.artifact_paths().iter().map(|path| path.as_path()),
-    )?;
+    )
+    .map_err(|error| context.error("vram_preflight", error))?;
     let label = format!("onnx-fastembed:{}", info.model_code);
-    let (execution_providers, bound_stream) = execution_providers(&label, provider_policy)?;
+    let (execution_providers, bound_stream) = execution_providers(&label, provider_policy)
+        .map_err(|error| context.error("execution_provider_configuration", error))?;
     let model = TextEmbedding::try_new(
         TextInitOptions::new(model_name.clone())
             .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(false)
             .with_intra_threads(1)
+            .with_session_policy(context.session_policy())
             .with_execution_providers(execution_providers),
     )
-    .map_err(|err| CalyxError::lens_unreachable(format!("ONNX runtime init failed: {err}")))?;
+    .map_err(|err| context.error("model_constructor", err))?;
     let model = CudaDropGuard::new(model, provider_policy).with_bound_stream(bound_stream);
-    super::runtime_bundle::attest_after_model_constructor(provider_policy, model.bound_stream())?;
-    let weights_sha256 = hash_files(&files.artifact_paths())?;
+    super::runtime_bundle::attest_after_model_constructor(provider_policy, model.bound_stream())
+        .map_err(|error| context.error("runtime_bundle_attestation", error))?;
+    let execution = super::fastembed_attestation::FastembedExecutionState::inspect(
+        model.as_ref().session(),
+        context,
+    )?;
     let corpus_hash = sha256_digest(&[
         b"onnx-fastembed-mean-pool-v1",
         info.model_code.as_bytes(),
@@ -93,6 +108,7 @@ pub fn from_model_with_policy(
         files,
         provider_policy,
         model,
+        execution,
         bound_stream,
     ))
 }
