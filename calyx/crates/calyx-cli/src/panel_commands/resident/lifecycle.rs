@@ -4,6 +4,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use calyx_core::CalyxError;
+#[cfg(windows)]
+use calyx_registry::OnnxRuntimeAttestation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,7 +14,7 @@ use super::discovery::unix_now_ms;
 use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
-pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v1";
+pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v2";
 const LIFECYCLE_CORRUPT: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT";
 const LIFECYCLE_DURABILITY: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY";
 const SUPERVISOR_ALREADY_RUNNING: &str = "CALYX_PANEL_RESIDENT_ALREADY_RUNNING";
@@ -74,6 +76,8 @@ pub(super) struct LifecycleState {
     pub(super) last_unload_unix_ms: Option<u64>,
     pub(super) frozen_panel_fingerprint: String,
     pub(super) lens_attestations: Vec<ResidentLensAttestation>,
+    #[cfg(windows)]
+    pub(super) onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     pub(super) last_error: Option<LifecycleErrorRecord>,
 }
 
@@ -106,6 +110,8 @@ impl LifecycleState {
             last_unload_unix_ms: None,
             frozen_panel_fingerprint,
             lens_attestations,
+            #[cfg(windows)]
+            onnx_runtime_attestation: None,
             last_error: None,
         }
     }
@@ -136,6 +142,8 @@ pub(super) struct LifecycleProjection {
     pub(super) last_unload_unix_ms: Option<u64>,
     pub(super) frozen_panel_fingerprint: String,
     pub(super) lens_attestations: Vec<ResidentLensAttestation>,
+    #[cfg(windows)]
+    pub(super) onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     pub(super) last_error: Option<LifecycleErrorRecord>,
     pub(super) recorded_at_unix_ms: u64,
     pub(super) previous_event_sha256: String,
@@ -164,6 +172,8 @@ impl LifecycleProjection {
             last_unload_unix_ms: self.last_unload_unix_ms,
             frozen_panel_fingerprint: self.frozen_panel_fingerprint.clone(),
             lens_attestations: self.lens_attestations.clone(),
+            #[cfg(windows)]
+            onnx_runtime_attestation: self.onnx_runtime_attestation.clone(),
             last_error: self.last_error.clone(),
         }
     }
@@ -609,6 +619,8 @@ fn projection_from_state(
         last_unload_unix_ms: state.last_unload_unix_ms,
         frozen_panel_fingerprint: state.frozen_panel_fingerprint.clone(),
         lens_attestations: state.lens_attestations.clone(),
+        #[cfg(windows)]
+        onnx_runtime_attestation: state.onnx_runtime_attestation.clone(),
         last_error: state.last_error.clone(),
         recorded_at_unix_ms,
         previous_event_sha256,
@@ -640,6 +652,8 @@ struct LifecycleHashMaterial<'a> {
     last_unload_unix_ms: Option<u64>,
     frozen_panel_fingerprint: &'a str,
     lens_attestations: &'a [ResidentLensAttestation],
+    #[cfg(windows)]
+    onnx_runtime_attestation: &'a Option<OnnxRuntimeAttestation>,
     last_error: &'a Option<LifecycleErrorRecord>,
     recorded_at_unix_ms: u64,
     previous_event_sha256: &'a str,
@@ -669,6 +683,8 @@ fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Erro
         last_unload_unix_ms: record.last_unload_unix_ms,
         frozen_panel_fingerprint: &record.frozen_panel_fingerprint,
         lens_attestations: &record.lens_attestations,
+        #[cfg(windows)]
+        onnx_runtime_attestation: &record.onnx_runtime_attestation,
         last_error: &record.last_error,
         recorded_at_unix_ms: record.recorded_at_unix_ms,
         previous_event_sha256: &record.previous_event_sha256,

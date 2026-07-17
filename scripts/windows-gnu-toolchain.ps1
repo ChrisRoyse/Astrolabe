@@ -192,6 +192,71 @@ function Test-PathUnderRoot {
     return $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Resolve-PinnedCuda13Runtime {
+    param(
+        [string]$Provisioner,
+        [string]$LockManifest,
+        [string]$WorkspaceRoot,
+        [string]$ToolchainsRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $Provisioner -PathType Leaf)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_PROVISIONER_MISSING]: {code=ASTRO_CUDA13_RUNTIME_PROVISIONER_MISSING; message=`"the checked-in CUDA 13 runtime provisioner is missing: $Provisioner`"; remediation=`"restore scripts\windows-cuda13-runtime.ps1 from the repository before invoking the launcher`"}"
+    }
+    if (-not (Test-Path -LiteralPath $LockManifest -PathType Leaf)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_LOCK_MISSING]: {code=ASTRO_CUDA13_RUNTIME_LOCK_MISSING; message=`"the checked-in CUDA 13 runtime lock is missing: $LockManifest`"; remediation=`"restore scripts\toolchains\ort-cuda13.3-windows-x86_64.lock.json from the repository before invoking the launcher`"}"
+    }
+    try {
+        $lockDigest = (Get-Sha256Hex -LiteralPath $LockManifest).Hash.ToLowerInvariant()
+    }
+    catch {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_LOCK_UNREADABLE]: {code=ASTRO_CUDA13_RUNTIME_LOCK_UNREADABLE; message=`"the checked-in CUDA 13 runtime lock could not be hashed: $($_.Exception.Message)`"; remediation=`"restore a readable lock manifest from the repository, then rerun the launcher`"}"
+    }
+    $expectedRoot = [IO.Path]::GetFullPath((Join-Path $ToolchainsRoot "ort-cuda13.3-windows-x86_64-$lockDigest")).TrimEnd('\', '/')
+
+    try {
+        # The provisioner owns download, extraction, and full bundle re-attestation. Its
+        # stdout contract is deliberately machine-readable: exactly one canonical root.
+        # CUDA runtime directories are never added to PATH; the child receives only the
+        # capability root and the Rust loader constrains DLL resolution inside that root.
+        $provisionerOutput = @(& $Provisioner -WorkspaceRoot $WorkspaceRoot -ToolchainsRoot $ToolchainsRoot)
+    }
+    catch {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_PROVISION_FAILED]: {code=ASTRO_CUDA13_RUNTIME_PROVISION_FAILED; message=`"the pinned CUDA 13 runtime could not be provisioned or attested: $($_.Exception.Message)`"; remediation=`"repair the reported bundle fault, then rerun scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap from $WorkspaceRoot`"}"
+    }
+
+    if ($provisionerOutput.Count -ne 1) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_OUTPUT_INVALID]: {code=ASTRO_CUDA13_RUNTIME_OUTPUT_INVALID; message=`"the pinned CUDA 13 runtime provisioner emitted $($provisionerOutput.Count) stdout records; exactly one canonical bundle root is required`"; remediation=`"inspect $Provisioner and restore its one-path stdout contract; diagnostics belong on stderr or the Verbose stream`"}"
+    }
+
+    $reportedRoot = ([string]$provisionerOutput[0]).Trim()
+    if ([string]::IsNullOrWhiteSpace($reportedRoot) -or -not [IO.Path]::IsPathRooted($reportedRoot)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT_INVALID]: {code=ASTRO_CUDA13_RUNTIME_ROOT_INVALID; message=`"the pinned CUDA 13 runtime provisioner did not emit an absolute bundle root: '$reportedRoot'`"; remediation=`"rerun -Bootstrap; if the error persists, repair the provisioner's canonical-root output contract`"}"
+    }
+    if (-not (Test-Path -LiteralPath $reportedRoot -PathType Container)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT_MISSING]: {code=ASTRO_CUDA13_RUNTIME_ROOT_MISSING; message=`"the attested CUDA 13 runtime root does not exist as a directory: $reportedRoot`"; remediation=`"rerun scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Bootstrap from $WorkspaceRoot`"}"
+    }
+
+    $rootItem = Get-Item -LiteralPath $reportedRoot -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT_REPARSE_POINT]: {code=ASTRO_CUDA13_RUNTIME_ROOT_REPARSE_POINT; message=`"the attested CUDA 13 runtime root is a reparse point and may redirect outside the immutable bundle: $reportedRoot`"; remediation=`"remove the reparse point and rerun the canonical provisioner to materialize the locked bundle`"}"
+    }
+
+    $canonicalRoot = (Resolve-Path -LiteralPath $reportedRoot -ErrorAction Stop).Path.TrimEnd('\', '/')
+    $emittedRoot = [IO.Path]::GetFullPath($reportedRoot).TrimEnd('\', '/')
+    if (-not [string]::Equals($emittedRoot, $canonicalRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT_NOT_CANONICAL]: {code=ASTRO_CUDA13_RUNTIME_ROOT_NOT_CANONICAL; message=`"the provisioner emitted '$reportedRoot', but its canonical path is '$canonicalRoot'`"; remediation=`"repair the provisioner to emit the resolved canonical bundle root`"}"
+    }
+    if (-not [string]::Equals($canonicalRoot, $expectedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_LOCK_ROOT_MISMATCH]: {code=ASTRO_CUDA13_RUNTIME_LOCK_ROOT_MISMATCH; message=`"the provisioner emitted '$canonicalRoot', but raw lock digest $lockDigest requires '$expectedRoot'`"; remediation=`"remove the mismatched bundle and rerun the canonical provisioner; do not override CALYX_CUDA13_RUNTIME_ROOT`"}"
+    }
+    if (-not (Test-PathUnderRoot -Path $canonicalRoot -Root $ToolchainsRoot)) {
+        throw "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT_ESCAPE]: {code=ASTRO_CUDA13_RUNTIME_ROOT_ESCAPE; message=`"the attested CUDA 13 runtime root escapes the canonical toolchains directory: root=$canonicalRoot; toolchains=$ToolchainsRoot`"; remediation=`"remove ambient runtime overrides and rerun the canonical provisioner from $WorkspaceRoot`"}"
+    }
+
+    return $canonicalRoot
+}
+
 function Assert-AllowedBashCommand {
     param([string]$Command, [string]$GitRoot)
 
@@ -1936,6 +2001,15 @@ if ($isWorktreeRoot -and $Bootstrap) {
 if ($isWorktreeRoot) {
     Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
 }
+# The CUDA runtime provisioner owns concurrency through unique staging roots and
+# immutable content-addressed publication. Run it before claiming the local
+# launcher lock so a download or attestation failure cannot strand that lock.
+$toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
+$cuda13RuntimeProvisioner = Join-Path $ExpectedWorkspace "scripts\windows-cuda13-runtime.ps1"
+$cuda13RuntimeLock = Join-Path $ExpectedWorkspace "scripts\toolchains\ort-cuda13.3-windows-x86_64.lock.json"
+$cuda13RuntimeRoot = Resolve-PinnedCuda13Runtime -Provisioner $cuda13RuntimeProvisioner -LockManifest $cuda13RuntimeLock -WorkspaceRoot $ExpectedWorkspace -ToolchainsRoot $toolsRoot
+$env:CALYX_CUDA13_RUNTIME_ROOT = $cuda13RuntimeRoot
+Write-Output "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT]: attested pinned runtime root exported via CALYX_CUDA13_RUNTIME_ROOT=$cuda13RuntimeRoot (PATH unchanged)"
 # #226/#242: every root -- canonical AND worktree -- gets its own sccache server on a
 # deterministic, non-ephemeral port. #226 derived a port for worktrees only, which left the
 # canonical workspace on sccache's machine-wide default (127.0.0.1:4226): a stray default-port
@@ -2024,7 +2098,6 @@ catch {
 
 # #226: pinned tools always live in the canonical workspace so worktree sessions
 # reuse one bootstrapped bundle instead of re-downloading per worktree.
-$toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
 $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName

@@ -40,6 +40,8 @@ pub(in crate::panel_commands) struct ResidentWarmState {
     pub(in crate::panel_commands) warmed_lens_count: usize,
     pub(in crate::panel_commands) warmed_lens_scope: &'static str,
     pub(in crate::panel_commands) lens_attestations: Vec<ResidentLensAttestation>,
+    #[cfg(windows)]
+    pub(in crate::panel_commands) onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     pub(in crate::panel_commands) content_lens_count: usize,
     pub(in crate::panel_commands) gpu_content_lens_count: usize,
     _worker_shutdown: MultimodalGpuWorkerShutdownGuard,
@@ -116,6 +118,8 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
     let probe_ms = probe_started.elapsed().as_millis();
     let lens_attestations = resident_lens_attestations(&build)?;
     ensure_resident_count_parity(&build, probes.len(), lens_attestations.len())?;
+    #[cfg(windows)]
+    let onnx_runtime_attestation = resident_onnx_runtime_attestation(&build)?;
     let content_lens_count = content_slots(&build).count();
     let gpu_content_lens_count = content_slots(&build)
         .filter(|slot| slot.resource.placement == Placement::Gpu)
@@ -139,6 +143,8 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         warmed_lens_count: probes.len(),
         warmed_lens_scope: "unique_active_registered_lenses",
         lens_attestations,
+        #[cfg(windows)]
+        onnx_runtime_attestation,
         content_lens_count,
         gpu_content_lens_count,
         _worker_shutdown: worker_shutdown,
@@ -206,6 +212,8 @@ fn load_vault_resident_warm_state(
     let probe_ms = probe_started.elapsed().as_millis();
     let lens_attestations = resident_lens_attestations(&build)?;
     ensure_resident_count_parity(&build, probes.len(), lens_attestations.len())?;
+    #[cfg(windows)]
+    let onnx_runtime_attestation = resident_onnx_runtime_attestation(&build)?;
     let content_lens_count = content_slots(&build).count();
     let gpu_content_lens_count = content_slots(&build)
         .filter(|slot| slot.resource.placement == Placement::Gpu)
@@ -229,6 +237,8 @@ fn load_vault_resident_warm_state(
         warmed_lens_count: probes.len(),
         warmed_lens_scope: "unique_active_registered_lenses",
         lens_attestations,
+        #[cfg(windows)]
+        onnx_runtime_attestation,
         content_lens_count,
         gpu_content_lens_count,
         _worker_shutdown: worker_shutdown,
@@ -278,6 +288,45 @@ fn resident_lens_attestations(
             })
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn resident_onnx_runtime_attestation(
+    build: &SavedTemplatePanelBuild,
+) -> CliResult<Option<OnnxRuntimeAttestation>> {
+    for slot in active_registered_slots(build) {
+        let spec = build.registry.lens_spec(slot.lens_id).ok_or_else(|| {
+            CliError::from(CalyxError::registry_unavailable(format!(
+                "resident ONNX runtime attestation slot={} key={} lens={} has no LensSpec in registry",
+                slot.slot_id.get(),
+                slot.slot_key.key(),
+                slot.lens_id
+            )))
+        })?;
+        if is_in_process_onnx_runtime(&spec.runtime) {
+            let attestation = current_runtime_attestation()?.ok_or_else(|| {
+                resident_execution_error(
+                    slot,
+                    &spec.runtime,
+                    "successful ONNX measurement retained no pinned runtime attestation",
+                )
+            })?;
+            return Ok(Some(attestation));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn is_in_process_onnx_runtime(runtime: &LensRuntime) -> bool {
+    matches!(
+        runtime,
+        LensRuntime::Onnx { .. }
+            | LensRuntime::OnnxColbert { .. }
+            | LensRuntime::FastembedSparse { .. }
+            | LensRuntime::FastembedBgem3 { .. }
+            | LensRuntime::FastembedReranker { .. }
+    )
 }
 
 fn configure_resident_runtime_audits() {

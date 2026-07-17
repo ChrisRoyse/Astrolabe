@@ -197,6 +197,7 @@ impl Supervisor {
             state.last_unload_unix_ms = previous.last_unload_unix_ms;
             if previous.frozen_panel_fingerprint == source.fingerprint {
                 state.lens_attestations = previous.lens_attestations;
+                state.onnx_runtime_attestation = previous.onnx_runtime_attestation;
             }
         }
         let projection = store.append("supervisor_started", &state)?;
@@ -409,6 +410,7 @@ impl Supervisor {
         inner.state.last_worker_start_unix_ms = Some(now);
         inner.state.idle_deadline_unix_ms = Some(now.saturating_add(IDLE_TTL_MS));
         inner.state.lens_attestations = worker_ready.lens_attestations.clone();
+        inner.state.onnx_runtime_attestation = worker_ready.onnx_runtime_attestation.clone();
         inner.idle_deadline = Some(Instant::now() + IDLE_TTL);
         inner.last_worker_ready = Some(worker_ready);
         if let Err(error) = self.persist(&mut inner, "load_succeeded") {
@@ -949,6 +951,7 @@ impl Supervisor {
                 |ready| ready.warmed_lens_scope.clone(),
             ),
             lens_attestations: inner.state.lens_attestations.clone(),
+            onnx_runtime_attestation: inner.state.onnx_runtime_attestation.clone(),
             gpu_content_lens_count: warm
                 .as_ref()
                 .map_or(0, |ready| ready.gpu_content_lens_count),

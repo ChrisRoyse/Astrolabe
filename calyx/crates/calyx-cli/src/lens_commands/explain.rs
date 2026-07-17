@@ -1,14 +1,19 @@
+use std::env;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use calyx_core::{Input, Lens, SlotShape, SlotVector, SparseEntry};
+use calyx_core::{
+    CalyxError, Input, Lens, RuntimeExecutionAttestation, SlotShape, SlotVector, SparseEntry,
+};
 use calyx_registry::{
     CandleLens, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     LensForgeSourceTensorDtypeProfile, LensRuntime, LensSpec, MultimodalAdapterLens,
     OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens, lens_spec_from_manifest_path,
 };
+#[cfg(windows)]
+use calyx_registry::{OnnxRuntimeAttestation, current_runtime_attestation};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -32,6 +37,11 @@ struct ExplainReport {
     declared_model_dtype: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_execution_attestation: Option<LocalExecutionAttestationReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_execution_attestation: Option<RuntimeExecutionAttestation>,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     gemm_accumulation_dtype: String,
     output_dtype: String,
     shape: ShapeReport,
@@ -88,6 +98,7 @@ struct Measurement {
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
     declared_model_dtype: String,
     local_execution_attestation: Option<LocalExecutionAttestationReport>,
+    runtime_execution_attestation: Option<RuntimeExecutionAttestation>,
     gemm_accumulation_dtype: String,
     output_dtype: String,
     rows: Option<u32>,
@@ -99,6 +110,8 @@ const UNKNOWN_DTYPE: &str = "unknown";
 const NOT_APPLICABLE_DTYPE: &str = "not_applicable";
 const GEMM_ACCUMULATION_DTYPE: &str = "f32";
 const OUTPUT_DTYPE: &str = "f32";
+const ONNX_CPU_FALLBACK_AUDIT_ENV: &str = "CALYX_ONNX_CPU_FALLBACK_AUDIT";
+const ONNX_MAX_CPU_NODE_FRACTION_ENV: &str = "CALYX_ONNX_MAX_CPU_NODE_FRACTION";
 
 pub(crate) fn explain(args: &[String]) -> CliResult {
     let flags = Flags::parse(args)?;
@@ -111,10 +124,13 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         return Err(CliError::usage("--repeat must be > 0"));
     }
     let spec = lens_spec_from_manifest_path(&manifest)?;
+    configure_onnx_explain_audit(&spec.runtime);
     let input = input_bytes(&flags)?;
     let probe = Input::new(spec.modality, input);
     let started = Instant::now();
     let measurement = measure_runtime(&spec, &probe, repeat)?;
+    #[cfg(windows)]
+    let onnx_runtime_attestation = explain_onnx_runtime_attestation(&spec.runtime)?;
     let total_ms = started.elapsed().as_secs_f64() as f32 * 1000.0;
     validate_vector_contract(&measurement.vector, spec.output, spec.norm_policy)?;
     let norm = slot_norm(&measurement.vector);
@@ -127,6 +143,9 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         source_tensor_dtype_profile: measurement.source_tensor_dtype_profile,
         declared_model_dtype: measurement.declared_model_dtype,
         local_execution_attestation: measurement.local_execution_attestation,
+        runtime_execution_attestation: measurement.runtime_execution_attestation,
+        #[cfg(windows)]
+        onnx_runtime_attestation,
         gemm_accumulation_dtype: measurement.gemm_accumulation_dtype,
         output_dtype: measurement.output_dtype,
         shape: shape_report(spec.output),
@@ -148,6 +167,98 @@ pub(crate) fn explain(args: &[String]) -> CliResult {
         artifact_bytes: measurement.artifact_bytes,
         artifact_mib: measurement.artifact_bytes as f32 / (1024.0 * 1024.0),
     })
+}
+
+fn configure_onnx_explain_audit(runtime: &LensRuntime) {
+    if !is_in_process_onnx_runtime(runtime) {
+        return;
+    }
+    // `calyx lens explain` is a single-command process and no model/session has
+    // been constructed yet. Force the normal ONNX run to produce a placement
+    // trace and reject even one CPU compute node under the CUDA-fail-loud policy.
+    unsafe {
+        env::set_var(ONNX_CPU_FALLBACK_AUDIT_ENV, "fail");
+        env::set_var(ONNX_MAX_CPU_NODE_FRACTION_ENV, "0");
+    }
+}
+
+fn is_in_process_onnx_runtime(runtime: &LensRuntime) -> bool {
+    matches!(
+        runtime,
+        LensRuntime::Onnx { .. }
+            | LensRuntime::OnnxColbert { .. }
+            | LensRuntime::FastembedSparse { .. }
+            | LensRuntime::FastembedBgem3 { .. }
+            | LensRuntime::FastembedReranker { .. }
+    )
+}
+
+fn require_cuda_onnx_execution_attestation(
+    lens: &dyn Lens,
+    runtime_label: &str,
+) -> CliResult<RuntimeExecutionAttestation> {
+    let attestation = lens.execution_attestation()?.ok_or_else(|| {
+        CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED",
+            message: format!(
+                "{runtime_label} completed inference but retained no runtime provider/node-placement evidence"
+            ),
+            remediation: "use a Calyx-owned ONNX runtime that retains the fail-closed ORT provider profile; FastEmbed wrappers without execution attestation must not be used to claim GPU placement",
+        })
+    })?;
+    let total_nodes = attestation.total_compute_nodes.filter(|count| *count > 0);
+    let cpu_nodes = attestation.cpu_compute_nodes;
+    if attestation.runtime != runtime_label
+        || attestation.evidence != "onnx_runtime_provider_node_profile"
+    {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED",
+            message: format!(
+                "{runtime_label} returned incomplete ONNX execution evidence: {attestation:?}"
+            ),
+            remediation: "enable the fail-closed ONNX profiler before session construction and retain its provider, device, total-node, and CPU-node readback after inference",
+        }));
+    }
+    let (Some(total_nodes), Some(cpu_nodes)) = (total_nodes, cpu_nodes) else {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_UNATTESTED",
+            message: format!(
+                "{runtime_label} returned no positive total-node/CPU-node ONNX profile counts: {attestation:?}"
+            ),
+            remediation: "enable the fail-closed ONNX profiler before session construction and retain its total compute-node and CPU compute-node counts after inference",
+        }));
+    };
+    let provider_is_cuda = attestation.provider.to_ascii_uppercase().contains("CUDA");
+    let device_is_cuda = attestation.device == "cuda" || attestation.device.starts_with("cuda:");
+    if !provider_is_cuda || !device_is_cuda || cpu_nodes != 0 || cpu_nodes > total_nodes {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_ONNX_EXECUTION_PLACEMENT",
+            message: format!(
+                "{runtime_label} violated CUDA-fail-loud placement: provider={} device={} cpu_compute_nodes={cpu_nodes} total_compute_nodes={total_nodes}",
+                attestation.provider, attestation.device
+            ),
+            remediation: "use a CUDA-compatible fp16/fp32 ONNX graph and the pinned CUDA execution provider; do not accept mixed or CPU node placement",
+        }));
+    }
+    Ok(attestation)
+}
+
+#[cfg(windows)]
+fn explain_onnx_runtime_attestation(
+    runtime: &LensRuntime,
+) -> CliResult<Option<OnnxRuntimeAttestation>> {
+    if !is_in_process_onnx_runtime(runtime) {
+        return Ok(None);
+    }
+    let attestation = current_runtime_attestation()?.ok_or_else(|| {
+        CliError::from(CalyxError {
+            code: "CALYX_LENS_EXPLAIN_ONNX_RUNTIME_UNATTESTED",
+            message: "successful ONNX lens explain retained no pinned runtime attestation"
+                .to_string(),
+            remediation: "terminate the process and rerun through the pinned CUDA 13 runtime boundary; do not infer runtime identity from the lens manifest",
+        })
+    })?;
+    Ok(Some(attestation))
 }
 
 fn shape_report(shape: SlotShape) -> ShapeReport {
@@ -343,6 +454,7 @@ fn measure_static_lookup(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRe
         source_tensor_dtype_profile: None,
         declared_model_dtype: lens.dtype().as_str().to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: None,
         gemm_accumulation_dtype: NOT_APPLICABLE_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: Some(lens.row_count()),
@@ -369,6 +481,7 @@ fn measure_tei(
         // TEI does not attest model or execution dtype in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -396,6 +509,7 @@ fn measure_candle(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Me
             observed_execution_device: lens.observed_execution_device().to_string(),
             evidence_kind: lens.dtype_attestation_evidence().to_string(),
         }),
+        runtime_execution_attestation: None,
         gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -408,12 +522,15 @@ fn measure_onnx(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<Meas
     let lens = OnnxLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let runtime_execution_attestation =
+        require_cuda_onnx_execution_attestation(&lens, lens.runtime_name())?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
         // ONNX graph and execution dtype are not preserved in LensRuntime; #485 owns that contract.
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: Some(runtime_execution_attestation),
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -426,11 +543,14 @@ fn measure_onnx_colbert(spec: &LensSpec, probe: &Input, repeat: usize) -> CliRes
     let lens = OnnxColbertLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let runtime_execution_attestation =
+        require_cuda_onnx_execution_attestation(&lens, "onnx-colbert")?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: Some(runtime_execution_attestation),
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -447,11 +567,14 @@ fn measure_fastembed_sparse(
     let lens = FastembedSparseLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let runtime_execution_attestation =
+        require_cuda_onnx_execution_attestation(&lens, "fastembed-sparse")?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: Some(runtime_execution_attestation),
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -468,11 +591,14 @@ fn measure_fastembed_bgem3(
     let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let runtime_execution_attestation =
+        require_cuda_onnx_execution_attestation(&lens, lens.runtime_name())?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: Some(runtime_execution_attestation),
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -489,11 +615,14 @@ fn measure_fastembed_reranker(
     let lens = FastembedRerankerLens::from_lens_spec(spec)?;
     require_runtime_lens_id(spec, &lens)?;
     let vector = measure_repeated(&lens, probe, repeat)?;
+    let runtime_execution_attestation =
+        require_cuda_onnx_execution_attestation(&lens, "fastembed-reranker")?;
     Ok(Measurement {
         vector,
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: Some(runtime_execution_attestation),
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -525,6 +654,7 @@ fn measure_fastembed_qwen3(
             observed_execution_device: lens.observed_execution_device().to_string(),
             evidence_kind: lens.dtype_attestation_evidence().to_string(),
         }),
+        runtime_execution_attestation: None,
         gemm_accumulation_dtype: GEMM_ACCUMULATION_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,
@@ -550,6 +680,7 @@ fn measure_multimodal(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResul
         source_tensor_dtype_profile: None,
         declared_model_dtype: UNKNOWN_DTYPE.to_string(),
         local_execution_attestation: None,
+        runtime_execution_attestation: None,
         gemm_accumulation_dtype: UNKNOWN_DTYPE.to_string(),
         output_dtype: OUTPUT_DTYPE.to_string(),
         rows: None,

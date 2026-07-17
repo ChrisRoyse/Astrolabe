@@ -284,6 +284,8 @@ pub(crate) fn readiness(service: &ResidentService) -> ReadyResponse {
         warmed_lens_count: state.warmed_lens_count,
         warmed_lens_scope: state.warmed_lens_scope.to_string(),
         lens_attestations: state.lens_attestations.clone(),
+        #[cfg(windows)]
+        onnx_runtime_attestation: state.onnx_runtime_attestation.clone(),
         gpu_content_lens_count: state.gpu_content_lens_count,
         cpu_content_lens_count: state
             .content_lens_count

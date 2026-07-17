@@ -15,6 +15,8 @@ use calyx_registry::{
     LensRuntime, Registry, lens_spec_from_manifest_path, load_vault_panel_state,
     shutdown_multimodal_gpu_workers,
 };
+#[cfg(windows)]
+use calyx_registry::{OnnxRuntimeAttestation, current_runtime_attestation};
 use serde::{Deserialize, Serialize};
 
 use super::{

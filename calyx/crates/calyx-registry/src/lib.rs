@@ -5,6 +5,10 @@
 /// (#1130): deploy gates assert this resolved value, not a feature spelling.
 pub const CANDLE_CUDA_COMPILED: bool = cfg!(feature = "candle-cuda");
 
+/// True when the linked registry contains the pinned dynamic ONNX Runtime
+/// CUDA execution-provider path. Runtime availability is attested separately.
+pub const PINNED_ORT_CUDA13_RUNTIME_COMPILED: bool = cfg!(all(windows, feature = "ml-runtime"));
+
 pub mod backfill;
 pub mod commission;
 pub mod compression;
@@ -123,6 +127,12 @@ pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
     OnnxProviderPolicy, PoolingPolicy,
+};
+#[cfg(all(feature = "ml-runtime", windows))]
+pub use runtime::onnx::{
+    OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
+    OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
+    expected_runtime_contract,
 };
 #[cfg(feature = "ml-runtime")]
 pub use runtime::qwen3::{

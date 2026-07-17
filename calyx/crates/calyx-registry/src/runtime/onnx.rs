@@ -26,12 +26,19 @@ mod dynamic_ort;
 mod fastembed_runtime;
 mod green_context;
 mod io_binding;
+#[cfg(windows)]
+mod runtime_bundle;
 mod session;
 mod special;
-mod windows_cuda_dlls;
 
 pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
+#[cfg(windows)]
+pub use runtime_bundle::{
+    OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
+    OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
+    expected_runtime_contract,
+};
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
 
 pub struct OnnxLens {

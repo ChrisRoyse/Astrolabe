@@ -14,5 +14,9 @@
 pub(crate) const COMPILED: &[(&str, bool)] = &[
     ("forge-cuda", calyx_forge::CUDA_COMPILED),
     ("registry-candle-cuda", calyx_registry::CANDLE_CUDA_COMPILED),
+    (
+        "registry-pinned-ort-cuda13-runtime",
+        calyx_registry::PINNED_ORT_CUDA13_RUNTIME_COMPILED,
+    ),
     ("sextant-cuvs", calyx_sextant::CUVS_COMPILED),
 ];

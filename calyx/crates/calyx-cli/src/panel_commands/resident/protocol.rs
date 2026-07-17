@@ -2,12 +2,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use calyx_core::{AbsentReason, Modality, Placement, SlotVector};
+#[cfg(windows)]
+use calyx_registry::OnnxRuntimeAttestation;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{LifecycleErrorRecord, LifecyclePhase};
 use crate::panel_commands::warm::resident_support::ResidentLensAttestation;
 
-pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v2";
+pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v3";
 pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
 pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
 /// v2 (#1002): measure_batch responses stream as one header frame, one frame
@@ -84,6 +86,9 @@ pub(super) struct ReadyResponse {
     pub(super) warmed_lens_count: usize,
     pub(super) warmed_lens_scope: String,
     pub(super) lens_attestations: Vec<ResidentLensAttestation>,
+    #[cfg(windows)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) onnx_runtime_attestation: Option<OnnxRuntimeAttestation>,
     pub(super) gpu_content_lens_count: usize,
     pub(super) cpu_content_lens_count: usize,
 }

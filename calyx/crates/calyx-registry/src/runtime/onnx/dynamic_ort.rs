@@ -1,26 +1,34 @@
-use std::env;
-use std::fs;
 use std::path::PathBuf;
 
-use calyx_core::{CalyxError, Result};
+#[cfg(not(windows))]
+use std::{env, fs};
+
+#[cfg(not(windows))]
+use calyx_core::CalyxError;
+use calyx_core::Result;
 
 use super::OnnxProviderPolicy;
 
+#[cfg(not(windows))]
 const ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
+#[cfg(not(windows))]
 const CALYX_ORT_CAPI: &str = "CALYX_ORT_CAPI";
 
 pub(super) fn ensure_dynamic_ort(provider_policy: OnnxProviderPolicy) -> Result<PathBuf> {
-    let path = resolve_ort_dylib_path()?;
-    ensure_file(&path)?;
-    #[cfg(not(windows))]
-    let _ = provider_policy;
     #[cfg(windows)]
-    if provider_policy == OnnxProviderPolicy::CudaFailLoud {
-        super::windows_cuda_dlls::prepare_cuda_provider_dll_search(&path)?;
+    {
+        return super::runtime_bundle::ensure_runtime(provider_policy);
     }
-    Ok(path)
+    #[cfg(not(windows))]
+    {
+        let path = resolve_ort_dylib_path()?;
+        ensure_file(&path)?;
+        let _ = provider_policy;
+        Ok(path)
+    }
 }
 
+#[cfg(not(windows))]
 fn resolve_ort_dylib_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os(ORT_DYLIB_PATH) {
         return Ok(PathBuf::from(path));
@@ -47,6 +55,7 @@ fn resolve_ort_dylib_path() -> Result<PathBuf> {
     )))
 }
 
+#[cfg(not(windows))]
 fn ensure_file(path: &PathBuf) -> Result<()> {
     let metadata = fs::metadata(path).map_err(|err| {
         CalyxError::lens_unreachable(format!(
