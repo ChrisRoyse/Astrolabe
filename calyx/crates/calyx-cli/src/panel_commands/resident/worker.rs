@@ -67,7 +67,17 @@ impl WorkerProcess {
         generation: u64,
         max_load_secs: u64,
         max_request_secs: u64,
+        mut cancelled: impl FnMut() -> bool,
     ) -> CliResult<Self> {
+        if cancelled() {
+            return Err(worker_error(
+                "CALYX_PANEL_RESIDENT_LOAD_CANCELLED",
+                format!(
+                    "resident generation {generation} lost every queued requester before worker spawn"
+                ),
+                "retry with one live client and keep its single absolute productive deadline open through warm loading",
+            ));
+        }
         let generation_dir = home
             .join("resident")
             .join("generations")
@@ -145,6 +155,7 @@ impl WorkerProcess {
             Duration::from_secs(max_load_secs),
             &stdout_path,
             &stderr_path,
+            &mut cancelled,
         ) {
             Ok(ready) => ready,
             Err(error) => {
@@ -187,6 +198,9 @@ impl WorkerProcess {
             return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
         }
         if let Err(error) = validate_ready_slot_contracts(&ready) {
+            return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
+        }
+        if let Err(error) = validate_frozen_slot_contracts(source, &ready) {
             return Err(cleanup_spawn_failure(&job, &mut child, 85, error));
         }
         if let Err(error) = ensure_loopback(ready.bind) {
@@ -339,8 +353,7 @@ fn validate_ready_slot_contracts(ready: &ReadyResponse) -> CliResult {
             SlotShape::Dense(dim) | SlotShape::Sparse(dim) => dim > 0,
             SlotShape::Multi { token_dim } => token_dim > 0,
         };
-        if contract.slot == 0
-            || contract.key.trim().is_empty()
+        if contract.key.trim().is_empty()
             || contract.lens_id.trim().is_empty()
             || !slots.insert(contract.slot)
             || !keys.insert(contract.key.as_str())
@@ -396,6 +409,41 @@ fn validate_ready_slot_contracts(ready: &ReadyResponse) -> CliResult {
                 ready.generation
             ),
             "preserve the readiness artifact and reject the generation until every active registered contract has matching execution evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_frozen_slot_contracts(
+    source: &FrozenResidentSource,
+    ready: &ReadyResponse,
+) -> CliResult {
+    let expected = serde_json::to_vec(&source.slot_contracts).map_err(|error| {
+        worker_error(
+            WORKER_START_FAILED,
+            format!("serialize supervisor-derived frozen slot contracts: {error}"),
+            "preserve the frozen template/vault bytes and restart from one native Calyx build",
+        )
+    })?;
+    let observed = serde_json::to_vec(&ready.slot_contracts).map_err(|error| {
+        worker_error(
+            WORKER_START_FAILED,
+            format!("serialize worker-reported frozen slot contracts: {error}"),
+            "preserve the worker readiness artifact and restart from one native Calyx build",
+        )
+    })?;
+    if expected != observed || source.slot_scope != ready.slot_scope {
+        return Err(worker_error(
+            WORKER_FROZEN_VIOLATION,
+            format!(
+                "resident generation {} worker contract differs from the supervisor's independent frozen-source derivation: expected_slots={} observed_slots={} expected_scope={:?} observed_scope={:?}",
+                ready.generation,
+                source.slot_contracts.len(),
+                ready.slot_contracts.len(),
+                source.slot_scope,
+                ready.slot_scope
+            ),
+            "preserve the exact frozen template/vault bytes and readiness artifact; reject the generation until their canonical slot-contract bytes match",
         ));
     }
     Ok(())
@@ -786,9 +834,19 @@ fn wait_for_ready(
     timeout: Duration,
     stdout_path: &Path,
     stderr_path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
 ) -> CliResult<ReadyResponse> {
     let started = Instant::now();
     loop {
+        if cancelled() {
+            return Err(worker_error(
+                "CALYX_PANEL_RESIDENT_LOAD_CANCELLED",
+                format!(
+                    "resident generation {generation} lost every queued requester during warm load"
+                ),
+                "retry with one live client and keep its single absolute productive deadline open through warm loading",
+            ));
+        }
         match std::fs::read(ready_path) {
             Ok(bytes) => {
                 let ready: ReadyResponse = serde_json::from_slice(&bytes).map_err(|error| {

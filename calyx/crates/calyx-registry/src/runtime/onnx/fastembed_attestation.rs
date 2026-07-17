@@ -1,22 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
 use calyx_core::{CalyxError, Result, RuntimeExecutionAttestation};
 use fastembed::SessionPolicy;
-use memmap2::Mmap;
 use ort::session::Session;
 use ort::{AsPointer, Error as OrtError};
 use sha2::{Digest, Sha256};
 
 use super::cpu_fallback_audit::{AuditMode, audit_from_trace, profiling_file_path};
+use super::fastembed_artifacts::FrozenFastembedReceipt;
 use super::{OnnxModelFiles, OnnxProviderPolicy};
 
-const CUDA_REMEDIATION: &str = "verify ORT_DYLIB_PATH points to the pinned CUDA 13 ONNX Runtime, CUDA device 0 is usable, and every frozen model operator has a CUDA kernel; select the explicit CPU constructor only when CUDA is genuinely unavailable, and never retry a failed CUDA session on CPU";
-const CPU_REMEDIATION: &str = "verify ORT_DYLIB_PATH points to the pinned ONNX Runtime and repair the explicit CPU model/session configuration before retrying";
+const CUDA_REMEDIATION: &str = "verify the process-global pinned CUDA 13 ONNX Runtime identity, its attested selected physical device, and the CUDA kernel roster for every frozen operator; select the explicit CPU constructor only when CUDA is genuinely unavailable before session construction, and never retry a failed CUDA session on CPU";
+const CPU_REMEDIATION: &str = "verify the process-global pinned ONNX Runtime identity and repair the explicitly authorized CPU model/session configuration before retrying";
 const MAX_PROTO_RECURSION: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -25,6 +24,10 @@ pub(super) struct FastembedModelContext {
     model_code: String,
     model_path: PathBuf,
     weights_sha256: String,
+    artifact_bytes: u64,
+    model_sha256: String,
+    tokenizer_sha256: String,
+    external_sha256: String,
     provider_policy: OnnxProviderPolicy,
     device: String,
     profile_prefix: Option<PathBuf>,
@@ -36,7 +39,7 @@ impl FastembedModelContext {
         label: String,
         model_code: &str,
         files: &OnnxModelFiles,
-        weights_sha256: [u8; 32],
+        receipt: &FrozenFastembedReceipt,
         provider_policy: OnnxProviderPolicy,
     ) -> Result<Self> {
         let selected_device = super::runtime_bundle::selected_cuda_device(provider_policy)?;
@@ -45,20 +48,20 @@ impl FastembedModelContext {
             .unwrap_or_else(|| "cpu".to_string());
         let profile_prefix = (provider_policy == OnnxProviderPolicy::CudaFailLoud)
             .then(|| profiling_file_path(&label));
-        let mut context = Self {
+        Ok(Self {
             label,
             model_code: model_code.to_string(),
             model_path: files.model_file.clone(),
-            weights_sha256: hex_sha256(weights_sha256),
+            weights_sha256: hex_sha256(receipt.weights_sha256),
+            artifact_bytes: receipt.artifact_bytes,
+            model_sha256: receipt.model_sha256.clone(),
+            tokenizer_sha256: receipt.tokenizer_sha256.clone(),
+            external_sha256: receipt.external_sha256.clone(),
             provider_policy,
             device,
             profile_prefix,
-            frozen_operators: "unread".to_string(),
-        };
-        let frozen_operators = frozen_operator_inventory(&context.model_path)
-            .map_err(|reason| context.error("frozen_graph_operator_inventory", reason))?;
-        context.frozen_operators = frozen_operators;
-        Ok(context)
+            frozen_operators: receipt.frozen_operators.clone(),
+        })
     }
 
     pub(super) fn session_policy(&self) -> SessionPolicy {
@@ -77,10 +80,14 @@ impl FastembedModelContext {
         CalyxError {
             code: "CALYX_ONNX_FASTEMBED_EXECUTION_UNATTESTED",
             message: format!(
-                "fastembed model={} path={} weights_sha256={} provider={} device={} profile_prefix={} stage={} frozen_operators={} reason={}",
+                "fastembed model={} path={} weights_sha256={} artifact_bytes={} model_sha256={} tokenizer_sha256={} external_sha256={} provider={} device={} profile_prefix={} stage={} frozen_operators={} reason={}",
                 self.model_code,
                 self.model_path.display(),
                 self.weights_sha256,
+                self.artifact_bytes,
+                self.model_sha256,
+                self.tokenizer_sha256,
+                self.external_sha256,
                 self.provider_policy.as_str(),
                 self.device,
                 self.profile_prefix
@@ -129,11 +136,15 @@ impl FastembedExecutionState {
             .map_err(|error| context.error("api24_graph_assignment_readback", error))?;
         validate_assignment(&context, &assignment)?;
         eprintln!(
-            "CALYX_ONNX_RUNTIME phase=fastembed_api24_graph_assignment label={} model={} path={} weights_sha256={} provider={} device={} total_nodes={} cuda_nodes={} cpu_nodes={} providers={} assigned_operators={}",
+            "CALYX_ONNX_RUNTIME phase=fastembed_api24_graph_assignment label={} model={} path={} weights_sha256={} artifact_bytes={} model_sha256={} tokenizer_sha256={} external_sha256={} provider={} device={} total_nodes={} cuda_nodes={} cpu_nodes={} providers={} assigned_operators={}",
             context.label,
             context.model_code,
             context.model_path.display(),
             context.weights_sha256,
+            context.artifact_bytes,
+            context.model_sha256,
+            context.tokenizer_sha256,
+            context.external_sha256,
             context.provider_policy.as_str(),
             context.device,
             assignment.total_nodes,
@@ -149,8 +160,31 @@ impl FastembedExecutionState {
         })
     }
 
-    pub(super) fn error(&self, stage: &'static str, reason: impl ToString) -> CalyxError {
-        self.context.error(stage, reason)
+    /// Permanently poisons this committed session after any execution-path
+    /// failure. A later call observes the first terminal error instead of
+    /// retrying a CUDA session whose stream or provider state may be damaged.
+    pub(super) fn fail_terminal(&self, stage: &'static str, reason: impl ToString) -> CalyxError {
+        let error = self.context.error(stage, reason);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                let state_error = self.context.error(
+                    "execution_attestation_state",
+                    format!(
+                        "FastEmbed execution-attestation mutex is poisoned while latching terminal failure code={} message={}",
+                        error.code, error.message
+                    ),
+                );
+                self.log_terminal_failure(&state_error);
+                return state_error;
+            }
+        };
+        if let ExecutionState::Failed(existing) = &*state {
+            return existing.clone();
+        }
+        self.log_terminal_failure(&error);
+        *state = ExecutionState::Failed(error.clone());
+        error
     }
 
     pub(super) fn ensure_usable(&self) -> Result<()> {
@@ -175,10 +209,13 @@ impl FastembedExecutionState {
             ExecutionState::Attested(_) => return Ok(()),
             ExecutionState::Failed(error) => return Err(error.clone()),
             ExecutionState::Finalizing => {
-                return Err(self.context.error(
+                let error = self.context.error(
                     "first_inference_profile_state",
                     "profiling finalization is already in progress",
-                ));
+                );
+                self.log_terminal_failure(&error);
+                *state = ExecutionState::Failed(error.clone());
+                return Err(error);
             }
             ExecutionState::Pending => {}
         }
@@ -207,14 +244,7 @@ impl FastembedExecutionState {
                 Ok(())
             }
             Err(error) => {
-                eprintln!(
-                    "CALYX_ONNX_RUNTIME phase=fastembed_execution_attestation_failed label={} model={} code={} message={} remediation={}",
-                    self.context.label,
-                    self.context.model_code,
-                    error.code,
-                    error.message,
-                    error.remediation
-                );
+                self.log_terminal_failure(&error);
                 *state = ExecutionState::Failed(error.clone());
                 Err(error)
             }
@@ -334,11 +364,15 @@ impl FastembedExecutionState {
             loader_dtype: None,
             compute_dtype: None,
             evidence: format!(
-                "{};model={};path={};weights_sha256={};profile_prefix={};frozen_operators={};assigned_operators={}{}",
+                "{};model={};path={};weights_sha256={};artifact_bytes={};model_sha256={};tokenizer_sha256={};external_sha256={};profile_prefix={};frozen_operators={};assigned_operators={}{}",
                 evidence_mechanism,
                 self.context.model_code,
                 self.context.model_path.display(),
                 self.context.weights_sha256,
+                self.context.artifact_bytes,
+                self.context.model_sha256,
+                self.context.tokenizer_sha256,
+                self.context.external_sha256,
                 self.context
                     .profile_prefix
                     .as_ref()
@@ -360,6 +394,17 @@ impl FastembedExecutionState {
                 "FastEmbed execution-attestation mutex is poisoned",
             )
         })
+    }
+
+    fn log_terminal_failure(&self, error: &CalyxError) {
+        eprintln!(
+            "CALYX_ONNX_RUNTIME phase=fastembed_execution_terminal_failure label={} model={} code={} message={} remediation={}",
+            self.context.label,
+            self.context.model_code,
+            error.code,
+            error.message,
+            error.remediation
+        );
     }
 }
 
@@ -477,6 +522,13 @@ fn read_graph_assignment(session: &Session) -> std::result::Result<GraphAssignme
                     "EpAssignedNode_GetOperatorType returned an empty operator",
                 ));
             }
+            let domain =
+                assigned_string(|out| unsafe { (ort::api().EpAssignedNode_GetDomain)(node, out) })?;
+            let operator = if domain.is_empty() {
+                operator
+            } else {
+                format!("{domain}::{operator}")
+            };
             operators
                 .entry(provider.clone())
                 .or_default()
@@ -548,41 +600,126 @@ fn status_result(status: ort::sys::OrtStatusPtr) -> std::result::Result<(), OrtE
     unsafe { OrtError::result_from_status(status) }
 }
 
-fn frozen_operator_inventory(path: &Path) -> std::result::Result<String, String> {
-    let file =
-        File::open(path).map_err(|error| format!("open frozen ONNX graph failed: {error}"))?;
-    let map = unsafe { Mmap::map(&file) }
-        .map_err(|error| format!("memory-map frozen ONNX graph failed: {error}"))?;
-    if map.is_empty() {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FrozenModelInspection {
+    pub(super) operator_inventory: String,
+    pub(super) external_locations: BTreeSet<String>,
+    pub(super) external_references: Vec<ExternalTensorReference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExternalTensorReference {
+    pub(super) location: String,
+    pub(super) offset: Option<u64>,
+    pub(super) length: Option<u64>,
+    pub(super) checksum: Option<String>,
+}
+
+#[derive(Default)]
+struct InspectionBuilder {
+    operators: BTreeMap<String, u64>,
+    external_locations: BTreeSet<String>,
+    external_references: Vec<ExternalTensorReference>,
+}
+
+pub(super) fn inspect_frozen_model(
+    bytes: &[u8],
+) -> std::result::Result<FrozenModelInspection, String> {
+    if bytes.is_empty() {
         return Err("frozen ONNX graph is empty".to_string());
     }
-    let mut model = ProtoCursor::new(&map);
-    let mut graph = None;
+    let mut model = ProtoCursor::new(bytes);
+    let mut inspection = InspectionBuilder::default();
+    let mut has_main_graph = false;
     while let Some(field) = model.next_field()? {
-        if field.number == 7 {
-            let bytes = field.bytes("ModelProto.graph")?;
-            if graph.replace(bytes).is_some() {
-                return Err("ModelProto contains more than one graph field".to_string());
+        match field.number {
+            7 => {
+                if has_main_graph {
+                    return Err("ModelProto contains more than one graph field".to_string());
+                }
+                has_main_graph = true;
+                parse_graph(field.bytes("ModelProto.graph")?, 0, &mut inspection)?;
             }
+            20 => parse_training_info(field.bytes("ModelProto.training_info")?, &mut inspection)?,
+            25 => parse_function(field.bytes("ModelProto.functions")?, &mut inspection)?,
+            _ => {}
         }
     }
-    let graph = graph.ok_or_else(|| "ModelProto has no graph field".to_string())?;
-    let mut inventory = BTreeMap::<String, u64>::new();
-    parse_graph(graph, 0, &mut inventory)?;
-    if inventory.is_empty() {
+    if !has_main_graph {
+        return Err("ModelProto has no graph field".to_string());
+    }
+    if inspection.operators.is_empty() {
         return Err("frozen ONNX graph contains no operator nodes".to_string());
     }
-    Ok(inventory
+    let operator_inventory = inspection
+        .operators
         .into_iter()
         .map(|(operator, count)| format!("{operator}:{count}"))
         .collect::<Vec<_>>()
-        .join(","))
+        .join(",");
+    Ok(FrozenModelInspection {
+        operator_inventory,
+        external_locations: inspection.external_locations,
+        external_references: inspection.external_references,
+    })
+}
+
+fn parse_training_info(
+    bytes: &[u8],
+    inspection: &mut InspectionBuilder,
+) -> std::result::Result<(), String> {
+    let mut training_info = ProtoCursor::new(bytes);
+    let mut has_initialization = false;
+    let mut has_algorithm = false;
+    while let Some(field) = training_info.next_field()? {
+        match field.number {
+            1 => {
+                if has_initialization {
+                    return Err(
+                        "TrainingInfoProto contains more than one initialization graph".to_string(),
+                    );
+                }
+                has_initialization = true;
+                parse_graph(
+                    field.bytes("TrainingInfoProto.initialization")?,
+                    0,
+                    inspection,
+                )?;
+            }
+            2 => {
+                if has_algorithm {
+                    return Err(
+                        "TrainingInfoProto contains more than one algorithm graph".to_string()
+                    );
+                }
+                has_algorithm = true;
+                parse_graph(field.bytes("TrainingInfoProto.algorithm")?, 0, inspection)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_function(
+    bytes: &[u8],
+    inspection: &mut InspectionBuilder,
+) -> std::result::Result<(), String> {
+    let mut function = ProtoCursor::new(bytes);
+    while let Some(field) = function.next_field()? {
+        match field.number {
+            7 => parse_node(field.bytes("FunctionProto.node")?, 0, inspection)?,
+            11 => parse_attribute(field.bytes("FunctionProto.attribute_proto")?, 0, inspection)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_graph(
     bytes: &[u8],
     depth: usize,
-    inventory: &mut BTreeMap<String, u64>,
+    inspection: &mut InspectionBuilder,
 ) -> std::result::Result<(), String> {
     if depth > MAX_PROTO_RECURSION {
         return Err(format!(
@@ -591,8 +728,11 @@ fn parse_graph(
     }
     let mut graph = ProtoCursor::new(bytes);
     while let Some(field) = graph.next_field()? {
-        if field.number == 1 {
-            parse_node(field.bytes("GraphProto.node")?, depth, inventory)?;
+        match field.number {
+            1 => parse_node(field.bytes("GraphProto.node")?, depth, inspection)?,
+            5 => parse_tensor(field.bytes("GraphProto.initializer")?, inspection)?,
+            15 => parse_sparse_tensor(field.bytes("GraphProto.sparse_initializer")?, inspection)?,
+            _ => {}
         }
     }
     Ok(())
@@ -601,7 +741,7 @@ fn parse_graph(
 fn parse_node(
     bytes: &[u8],
     depth: usize,
-    inventory: &mut BTreeMap<String, u64>,
+    inspection: &mut InspectionBuilder,
 ) -> std::result::Result<(), String> {
     let mut node = ProtoCursor::new(bytes);
     let mut operator = None;
@@ -609,9 +749,20 @@ fn parse_node(
     let mut attributes = Vec::new();
     while let Some(field) = node.next_field()? {
         match field.number {
-            4 => operator = Some(field.string("NodeProto.op_type")?),
+            4 => {
+                if operator
+                    .replace(field.string("NodeProto.op_type")?)
+                    .is_some()
+                {
+                    return Err("NodeProto contains more than one op_type field".to_string());
+                }
+            }
             5 => attributes.push(field.bytes("NodeProto.attribute")?),
-            7 => domain = Some(field.string("NodeProto.domain")?),
+            7 => {
+                if domain.replace(field.string("NodeProto.domain")?).is_some() {
+                    return Err("NodeProto contains more than one domain field".to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -622,12 +773,12 @@ fn parse_node(
         .filter(|domain| !domain.is_empty())
         .map(|domain| format!("{domain}::{operator}"))
         .unwrap_or_else(|| operator.to_string());
-    let count = inventory.entry(key).or_default();
+    let count = inspection.operators.entry(key).or_default();
     *count = count
         .checked_add(1)
         .ok_or_else(|| "ONNX operator count exceeds u64".to_string())?;
     for attribute in attributes {
-        parse_attribute(attribute, depth + 1, inventory)?;
+        parse_attribute(attribute, depth, inspection)?;
     }
     Ok(())
 }
@@ -635,15 +786,241 @@ fn parse_node(
 fn parse_attribute(
     bytes: &[u8],
     depth: usize,
-    inventory: &mut BTreeMap<String, u64>,
+    inspection: &mut InspectionBuilder,
 ) -> std::result::Result<(), String> {
     let mut attribute = ProtoCursor::new(bytes);
     while let Some(field) = attribute.next_field()? {
-        if field.number == 6 || field.number == 11 {
-            parse_graph(field.bytes("AttributeProto.graph")?, depth, inventory)?;
+        match field.number {
+            5 => parse_tensor(field.bytes("AttributeProto.t")?, inspection)?,
+            6 => parse_graph(
+                field.bytes("AttributeProto.g")?,
+                next_graph_depth(depth)?,
+                inspection,
+            )?,
+            10 => parse_tensor(field.bytes("AttributeProto.tensors")?, inspection)?,
+            11 => parse_graph(
+                field.bytes("AttributeProto.graphs")?,
+                next_graph_depth(depth)?,
+                inspection,
+            )?,
+            22 => parse_sparse_tensor(field.bytes("AttributeProto.sparse_tensor")?, inspection)?,
+            23 => parse_sparse_tensor(field.bytes("AttributeProto.sparse_tensors")?, inspection)?,
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn next_graph_depth(depth: usize) -> std::result::Result<usize, String> {
+    depth
+        .checked_add(1)
+        .filter(|depth| *depth <= MAX_PROTO_RECURSION)
+        .ok_or_else(|| format!("ONNX nested graph depth exceeds {MAX_PROTO_RECURSION}"))
+}
+
+fn parse_sparse_tensor(
+    bytes: &[u8],
+    inspection: &mut InspectionBuilder,
+) -> std::result::Result<(), String> {
+    let mut sparse = ProtoCursor::new(bytes);
+    let mut has_values = false;
+    let mut has_indices = false;
+    while let Some(field) = sparse.next_field()? {
+        match field.number {
+            1 => {
+                if has_values {
+                    return Err(
+                        "SparseTensorProto contains more than one values tensor".to_string()
+                    );
+                }
+                has_values = true;
+                parse_tensor(field.bytes("SparseTensorProto.values")?, inspection)?;
+            }
+            2 => {
+                if has_indices {
+                    return Err(
+                        "SparseTensorProto contains more than one indices tensor".to_string()
+                    );
+                }
+                has_indices = true;
+                parse_tensor(field.bytes("SparseTensorProto.indices")?, inspection)?;
+            }
+            _ => {}
+        }
+    }
+    if !has_values || !has_indices {
+        return Err("SparseTensorProto requires values and indices tensors".to_string());
+    }
+    Ok(())
+}
+
+fn parse_tensor(
+    bytes: &[u8],
+    inspection: &mut InspectionBuilder,
+) -> std::result::Result<(), String> {
+    let mut tensor = ProtoCursor::new(bytes);
+    let mut external_data = BTreeMap::<String, String>::new();
+    let mut data_location = None;
+    while let Some(field) = tensor.next_field()? {
+        match field.number {
+            13 => {
+                let (key, value) =
+                    parse_string_string_entry(field.bytes("TensorProto.external_data")?)?;
+                if external_data.insert(key.clone(), value).is_some() {
+                    return Err(format!(
+                        "TensorProto.external_data contains duplicate key {key:?}"
+                    ));
+                }
+            }
+            14 => {
+                let location = field.varint("TensorProto.data_location")?;
+                if data_location.replace(location).is_some() {
+                    return Err(
+                        "TensorProto contains more than one data_location field".to_string()
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(location) = data_location {
+        if location > 1 {
+            return Err(format!(
+                "TensorProto.data_location has unknown enum value {location}"
+            ));
+        }
+    }
+    let is_external = data_location == Some(1);
+    if is_external != !external_data.is_empty() {
+        return Err(if is_external {
+            "TensorProto declares data_location=EXTERNAL without external_data metadata".to_string()
+        } else {
+            "TensorProto has external_data metadata without data_location=EXTERNAL".to_string()
+        });
+    }
+    if !is_external {
+        return Ok(());
+    }
+
+    for key in external_data.keys() {
+        match key.as_str() {
+            "location" | "offset" | "length" | "checksum" => {}
+            "basepath" => {
+                return Err(
+                    "TensorProto.external_data key \"basepath\" is forbidden; locations must be canonical paths relative to the model"
+                        .to_string(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "TensorProto.external_data contains unknown key {key:?}"
+                ));
+            }
+        }
+    }
+    let location = external_data
+        .remove("location")
+        .ok_or_else(|| "TensorProto.external_data has no location".to_string())?;
+    validate_external_location(&location)?;
+    let offset = external_data
+        .remove("offset")
+        .map(|value| parse_external_u64("offset", &value))
+        .transpose()?;
+    let length = external_data
+        .remove("length")
+        .map(|value| parse_external_u64("length", &value))
+        .transpose()?;
+    let checksum = external_data
+        .remove("checksum")
+        .map(|value| validate_external_checksum(&value))
+        .transpose()?;
+    debug_assert!(external_data.is_empty());
+
+    inspection.external_locations.insert(location.clone());
+    inspection
+        .external_references
+        .push(ExternalTensorReference {
+            location,
+            offset,
+            length,
+            checksum,
+        });
+    Ok(())
+}
+
+fn parse_string_string_entry(bytes: &[u8]) -> std::result::Result<(String, String), String> {
+    let mut entry = ProtoCursor::new(bytes);
+    let mut key = None;
+    let mut value = None;
+    while let Some(field) = entry.next_field()? {
+        match field.number {
+            1 => {
+                let field = field.string("StringStringEntryProto.key")?;
+                if key.replace(field.to_string()).is_some() {
+                    return Err(
+                        "StringStringEntryProto contains more than one key field".to_string()
+                    );
+                }
+            }
+            2 => {
+                let field = field.string("StringStringEntryProto.value")?;
+                if value.replace(field.to_string()).is_some() {
+                    return Err(
+                        "StringStringEntryProto contains more than one value field".to_string()
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let key = key.ok_or_else(|| "StringStringEntryProto has no key".to_string())?;
+    if key.is_empty() {
+        return Err("StringStringEntryProto key is empty".to_string());
+    }
+    let value = value.ok_or_else(|| "StringStringEntryProto has no value".to_string())?;
+    Ok((key, value))
+}
+
+fn validate_external_location(location: &str) -> std::result::Result<(), String> {
+    if location.is_empty()
+        || location.starts_with('/')
+        || location.contains('\\')
+        || location.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "TensorProto.external_data location must be a non-empty relative POSIX path: {location:?}"
+        ));
+    }
+    if location
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
+    {
+        return Err(format!(
+            "TensorProto.external_data location is not a canonical relative POSIX path: {location:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_external_u64(key: &str, value: &str) -> std::result::Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "TensorProto.external_data {key} must be a non-empty unsigned decimal integer: {value:?}"
+        ));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("TensorProto.external_data {key} exceeds u64: {value:?}: {error}"))
+}
+
+fn validate_external_checksum(value: &str) -> std::result::Result<String, String> {
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "TensorProto.external_data checksum must be exactly 40 hexadecimal SHA1 characters: {value:?}"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 struct ProtoField<'a> {
@@ -663,10 +1040,17 @@ impl<'a> ProtoField<'a> {
         std::str::from_utf8(self.bytes(label)?)
             .map_err(|error| format!("{label} is not UTF-8: {error}"))
     }
+
+    fn varint(self, label: &str) -> std::result::Result<u64, String> {
+        match self.value {
+            ProtoValue::Varint(value) => Ok(value),
+            _ => Err(format!("{label} is not a varint")),
+        }
+    }
 }
 
 enum ProtoValue<'a> {
-    Varint,
+    Varint(u64),
     Fixed,
     Bytes(&'a [u8]),
 }
@@ -692,10 +1076,7 @@ impl<'a> ProtoCursor<'a> {
             return Err("protobuf field number is zero".to_string());
         }
         let value = match key & 0x07 {
-            0 => {
-                self.varint()?;
-                ProtoValue::Varint
-            }
+            0 => ProtoValue::Varint(self.varint()?),
             1 => {
                 self.advance(8)?;
                 ProtoValue::Fixed

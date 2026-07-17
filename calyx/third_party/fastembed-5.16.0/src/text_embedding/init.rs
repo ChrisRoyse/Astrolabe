@@ -2,7 +2,7 @@
 //!
 
 use crate::{
-    common::TokenizerFiles,
+    common::{ExternalInitializerFile, TokenizerFiles},
     init::{HasMaxLength, InitOptionsWithLength, SessionPolicy},
     pooling::Pooling,
     EmbeddingModel, OutputKey, QuantizationMode,
@@ -106,16 +106,6 @@ pub struct UserDefinedEmbeddingModel {
     pub output_key: Option<OutputKey>,
 }
 
-/// Struct for adding external initializers to "bring your own" embedding models
-///
-/// The buffer is expecting the data of the external initializer and the file_name
-/// must match the one referenced by the model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalInitializerFile {
-    pub file_name: String,
-    pub buffer: Vec<u8>,
-}
-
 impl UserDefinedEmbeddingModel {
     pub fn new(onnx_file: Vec<u8>, tokenizer_files: TokenizerFiles) -> Self {
         Self {
@@ -140,7 +130,12 @@ impl UserDefinedEmbeddingModel {
 
     pub fn with_external_initializer(mut self, file_name: String, buffer: Vec<u8>) -> Self {
         self.external_initializers
-            .push(ExternalInitializerFile { file_name, buffer });
+            .push(ExternalInitializerFile::new(file_name, buffer));
+        self
+    }
+
+    pub fn with_output_key(mut self, output_key: OutputKey) -> Self {
+        self.output_key = Some(output_key);
         self
     }
 }

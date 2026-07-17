@@ -74,13 +74,33 @@ pub(super) fn preflight_gpu_mem_limit_for_artifacts<'a>(
                 ))
             })?
             .len();
-        total = total.saturating_add(bytes);
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| config_invalid("resolved ONNX artifact byte total exceeds u64"))?;
     }
-    if total > limit as u64 {
+    preflight_gpu_mem_limit(label, total, limit)
+}
+
+pub(super) fn preflight_gpu_mem_limit_for_bytes(
+    label: &str,
+    policy: OnnxProviderPolicy,
+    artifact_bytes: u64,
+) -> Result<()> {
+    if policy != OnnxProviderPolicy::CudaFailLoud {
+        return Ok(());
+    }
+    let Some(limit) = configured_gpu_mem_limit()? else {
+        return Ok(());
+    };
+    preflight_gpu_mem_limit(label, artifact_bytes, limit)
+}
+
+fn preflight_gpu_mem_limit(label: &str, artifact_bytes: u64, limit: usize) -> Result<()> {
+    if artifact_bytes > limit as u64 {
         return Err(config_invalid(format!(
             "{label} refused before ONNX session init: {GPU_MEM_LIMIT_ENV}={} MiB caps the CUDA BFC arena below the resolved artifact bytes {} MiB; refusing before ORT partial initialization can corrupt process teardown",
             limit / (1024 * 1024),
-            total.div_ceil(1024 * 1024)
+            artifact_bytes.div_ceil(1024 * 1024)
         )));
     }
     Ok(())

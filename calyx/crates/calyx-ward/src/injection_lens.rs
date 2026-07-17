@@ -24,9 +24,14 @@ use crate::error::WardError;
 
 mod backend;
 
-use backend::hash_parts;
 #[cfg(feature = "onnx-lens")]
-use backend::{OnnxInjectionBackend, external_data_path, sha256_files};
+use crate::onnx_session::{
+    WardCpuAuthorization, WardOnnxArtifactBundle, WardOnnxExecutionAttestation,
+    snapshot_cpu_artifacts, snapshot_cuda_artifacts,
+};
+#[cfg(feature = "onnx-lens")]
+use backend::OnnxInjectionBackend;
+use backend::hash_parts;
 
 pub const DEFAULT_INJECTION_MODEL_PATH: &str = "/var/lib/calyx/models/injection-guard/model.onnx";
 pub const DEFAULT_INJECTION_TOKENIZER_PATH: &str =
@@ -80,6 +85,14 @@ pub trait InjectionScoreBackend: Send + Sync {
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         Ok(None)
     }
+
+    #[cfg(feature = "onnx-lens")]
+    fn durable_execution_attestation(
+        &self,
+        _lens_id: LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        Ok(None)
+    }
 }
 
 /// Frozen prompt-injection guard lens. Runtime state is ORT + tokenizer handles.
@@ -106,14 +119,28 @@ impl InjectionLens {
         Self::new_with_provider_policy(model_path, InjectionProviderPolicy::CudaFailLoud)
     }
 
-    pub fn new_cpu_explicit(model_path: &Path) -> Result<Self, WardError> {
-        Self::new_with_provider_policy(model_path, InjectionProviderPolicy::CpuExplicit)
+    #[cfg(feature = "onnx-lens")]
+    pub fn new_cpu_explicit(
+        model_path: &Path,
+        authorization: &WardCpuAuthorization,
+    ) -> Result<Self, WardError> {
+        let tokenizer_path = model_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tokenizer.json");
+        Self::new_cpu_explicit_with_tokenizer(model_path, &tokenizer_path, authorization)
     }
 
     pub fn new_with_provider_policy(
         model_path: &Path,
         policy: InjectionProviderPolicy,
     ) -> Result<Self, WardError> {
+        if policy == InjectionProviderPolicy::CpuExplicit {
+            return Err(WardError::CpuCompanionUnauthorized {
+                reason: "InjectionProviderPolicy::CpuExplicit requires new_cpu_explicit and a WardCpuAuthorization"
+                    .to_string(),
+            });
+        }
         let tokenizer_path = model_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -127,16 +154,35 @@ impl InjectionLens {
         tokenizer_path: &Path,
         policy: InjectionProviderPolicy,
     ) -> Result<Self, WardError> {
-        // ONNX stores large weights in a `<model>.data` external-data sidecar;
-        // include it (when present) so the lens identity pins the actual weights,
-        // not just the tiny graph file.
-        let external_data = external_data_path(model_path);
-        let mut hash_paths: Vec<&Path> = vec![model_path, tokenizer_path];
-        if external_data.is_file() {
-            hash_paths.push(external_data.as_path());
+        if policy == InjectionProviderPolicy::CpuExplicit {
+            return Err(WardError::CpuCompanionUnauthorized {
+                reason: "InjectionProviderPolicy::CpuExplicit requires new_cpu_explicit_with_tokenizer and a WardCpuAuthorization"
+                    .to_string(),
+            });
         }
-        let weights_hash = sha256_files(&hash_paths)?;
-        let backend = OnnxInjectionBackend::new(model_path, tokenizer_path, policy)?;
+        let artifacts = snapshot_cuda_artifacts("injection", model_path, Some(tokenizer_path))?;
+        Self::from_artifacts(model_path, tokenizer_path, artifacts)
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    pub fn new_cpu_explicit_with_tokenizer(
+        model_path: &Path,
+        tokenizer_path: &Path,
+        authorization: &WardCpuAuthorization,
+    ) -> Result<Self, WardError> {
+        let artifacts =
+            snapshot_cpu_artifacts("injection", model_path, Some(tokenizer_path), authorization)?;
+        Self::from_artifacts(model_path, tokenizer_path, artifacts)
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    fn from_artifacts(
+        model_path: &Path,
+        tokenizer_path: &Path,
+        artifacts: WardOnnxArtifactBundle,
+    ) -> Result<Self, WardError> {
+        let weights_hash = artifacts.lens_weights_sha256();
+        let backend = OnnxInjectionBackend::new(artifacts)?;
         Self::from_backend(
             model_path.to_path_buf(),
             tokenizer_path.to_path_buf(),
@@ -237,6 +283,13 @@ impl InjectionLens {
 
     pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         self.backend.execution_attestation()
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    pub fn durable_execution_attestation(
+        &self,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.backend.durable_execution_attestation(self.lens_id)
     }
 }
 

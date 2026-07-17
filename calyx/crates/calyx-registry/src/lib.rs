@@ -50,7 +50,8 @@ pub use commission::{
 };
 pub use compression::{
     CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
-    MxFp4AssayEvidence, SlotCompressionReport, SlotCompressionRow, StoredSlotCodec,
+    COMPRESSED_SLOT_VERSION, CompressedSlotHit, CompressedSlotIndex, MxFp4AssayEvidence,
+    REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport, SlotCompressionRow, StoredSlotCodec,
     StoredSlotEnvelope, compress_slot_batch, compress_slot_batch_with_assay_evidence,
     decode_stored_slot_envelope, matryoshka_truncate_renormalize, write_compressed_slot_batch,
     write_compressed_slot_batch_with_assay_evidence,

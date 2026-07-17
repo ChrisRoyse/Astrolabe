@@ -1,22 +1,34 @@
 use crate::cpu::check_finite;
 use crate::quant::{
-    QuantLevel, QuantizedVec, Quantizer, RotationSeed, apply_inverse_rotation, apply_rotation,
+    QuantLevel, QuantizedVec, Quantizer, RotationSeed,
 };
+use crate::quant::rotation::HaarRotation;
 use crate::{ForgeError, Result};
 
 const BINARY_LEVEL_DETAIL: &str = "BinaryCodec only supports Bits1";
 const BINARY_REMEDIATION: &str =
     "Use finite vectors, matching seeds, and Bits1 binary quantized vectors";
 
-#[derive(Clone, Debug)]
 pub struct BinaryCodec {
     seed: RotationSeed,
+    rotation: HaarRotation,
+}
+
+impl std::fmt::Debug for BinaryCodec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BinaryCodec")
+            .field("dim", &self.seed.dim)
+            .field("seed_id", &self.seed.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BinaryCodec {
     pub fn new(seed: RotationSeed) -> Result<Self> {
         validate_seed(&seed)?;
-        Ok(Self { seed })
+        let rotation = HaarRotation::new(&seed)?;
+        Ok(Self { seed, rotation })
     }
 
     pub fn seed(&self) -> &RotationSeed {
@@ -36,7 +48,7 @@ impl Quantizer for BinaryCodec {
         }
         check_finite(vec, "binary_encode")?;
         let mut rotated = vec.to_vec();
-        apply_rotation(&self.seed, &mut rotated);
+        self.rotation.apply(&mut rotated)?;
         Ok(QuantizedVec {
             level: QuantLevel::Bits1,
             dim: self.seed.dim,
@@ -68,12 +80,50 @@ impl Quantizer for BinaryCodec {
                 }
             })
             .collect::<Vec<_>>();
-        apply_inverse_rotation(&self.seed, &mut approx);
+        self.rotation.apply_inverse(&mut approx)?;
         Ok(approx)
     }
 
-    fn dot_estimate(&self, a: &QuantizedVec, b: &QuantizedVec) -> Result<f32> {
-        hamming_dot_estimate(a, b)
+    fn dot_estimate(&self, query: &[f32], candidate: &QuantizedVec) -> Result<f32> {
+        if query.len() != self.seed.dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![self.seed.dim],
+                got: vec![query.len()],
+                remediation: "Score binary vectors with a raw query of the codec dimension"
+                    .to_string(),
+            });
+        }
+        check_finite(query, "binary_dot_estimate")?;
+        validate_quantized(candidate, "dot_estimate")?;
+        if candidate.dim != self.seed.dim || candidate.seed_id != self.seed.id {
+            return Err(binary_error(
+                "dot_estimate",
+                candidate.level,
+                "packed candidate geometry does not match the binary codec",
+            ));
+        }
+        let mut rotated = query.to_vec();
+        self.rotation.apply(&mut rotated)?;
+        let sum = rotated
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if read_bit(&candidate.bytes, index) {
+                    f64::from(*value)
+                } else {
+                    -f64::from(*value)
+                }
+            })
+            .sum::<f64>()
+            * f64::from(candidate.scale);
+        if !sum.is_finite() || sum.abs() > f64::from(f32::MAX) {
+            return Err(binary_error(
+                "dot_estimate",
+                candidate.level,
+                "dot estimate cannot be represented as finite f32",
+            ));
+        }
+        Ok(sum as f32)
     }
 
     fn level(&self) -> QuantLevel {
@@ -135,33 +185,7 @@ pub fn binary_prefilter(
 }
 
 fn validate_seed(seed: &RotationSeed) -> Result<()> {
-    seed.verify_current_version()?;
-    if seed.dim == 0 {
-        return Err(binary_error(
-            "new",
-            QuantLevel::Bits1,
-            "dim must be non-zero",
-        ));
-    }
-    if seed.diagonal.len() != seed.dim {
-        return Err(ForgeError::ShapeMismatch {
-            expected: vec![seed.dim],
-            got: vec![seed.diagonal.len()],
-            remediation: "Load a rotation seed whose diagonal length matches dim".to_string(),
-        });
-    }
-    if seed
-        .diagonal
-        .iter()
-        .any(|sign| !sign.is_finite() || (*sign != 1.0 && *sign != -1.0))
-    {
-        return Err(binary_error(
-            "new",
-            QuantLevel::Bits1,
-            "rotation seed diagonal must contain only finite +/-1 signs",
-        ));
-    }
-    Ok(())
+    seed.validate()
 }
 
 fn validate_quantized(qv: &QuantizedVec, op: &str) -> Result<()> {
@@ -187,6 +211,13 @@ fn validate_quantized(qv: &QuantizedVec, op: &str) -> Result<()> {
             op,
             qv.level,
             "scale must be finite and non-negative",
+        ));
+    }
+    if qv.scale.to_bits() != binary_amplitude(qv.dim).to_bits() {
+        return Err(binary_error(
+            op,
+            qv.level,
+            "binary amplitude is not canonical for the encoded dimension",
         ));
     }
     if has_nonzero_padding(&qv.bytes, qv.dim) {

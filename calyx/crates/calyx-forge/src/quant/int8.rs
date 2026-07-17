@@ -61,16 +61,36 @@ impl Quantizer for ScalarInt8Codec {
             .collect())
     }
 
-    fn dot_estimate(&self, a: &QuantizedVec, b: &QuantizedVec) -> Result<f32> {
-        validate_quantized(a, self.dim, "dot_estimate")?;
-        validate_quantized(b, self.dim, "dot_estimate")?;
-        let left = self.decode(a)?;
-        let right = self.decode(b)?;
-        Ok(left
+    fn dot_estimate(&self, query: &[f32], candidate: &QuantizedVec) -> Result<f32> {
+        if query.len() != self.dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![self.dim],
+                got: vec![query.len()],
+                remediation: "Score scalar INT8 vectors with a raw query of the codec dimension"
+                    .to_string(),
+            });
+        }
+        if let Some(index) = query.iter().position(|value| !value.is_finite()) {
+            return Err(quant_error(
+                "dot_estimate",
+                format!("non-finite raw query coefficient at index {index}"),
+            ));
+        }
+        validate_quantized(candidate, self.dim, "dot_estimate")?;
+        let sum = query
             .iter()
-            .zip(right.iter())
-            .map(|(lhs, rhs)| lhs * rhs)
-            .sum())
+            .zip(&candidate.bytes)
+            .map(|(value, code)| {
+                f64::from(*value) * f64::from(*code as i8) * f64::from(candidate.scale)
+            })
+            .sum::<f64>();
+        if !sum.is_finite() || sum.abs() > f64::from(f32::MAX) {
+            return Err(quant_error(
+                "dot_estimate",
+                "dot estimate cannot be represented as finite f32",
+            ));
+        }
+        Ok(sum as f32)
     }
 
     fn level(&self) -> QuantLevel {

@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::{CStr, OsStr, c_char};
-use std::fs::{self, File};
+use std::ffi::{CStr, OsStr, OsString, c_char};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
@@ -16,15 +17,21 @@ use calyx_core::{CalyxError, Result};
 use ort::ep::{CUDA, ExecutionProvider};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HMODULE};
+use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HANDLE, HMODULE};
+use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW,
+};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleFileNameExW};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use super::OnnxProviderPolicy;
+use super::OnnxRuntimePolicy;
 
 const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
 const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v2";
@@ -38,6 +45,7 @@ const EXPECTED_PROVIDER: &str = "CUDAExecutionProvider";
 const EXPECTED_ORT_DLL: &str = "onnxruntime.dll";
 const EXPECTED_CUDA_PROVIDER_DLL: &str = "onnxruntime_providers_cuda.dll";
 const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
+const MAX_FINAL_PATH_CHARS: usize = 32_768;
 const LEGACY_RUNTIME_ENVS: &[&str] = &["ORT_DYLIB_PATH", "CALYX_ORT_CAPI", "CALYX_NVIDIA_DLL_DIRS"];
 const REQUIRED_ARTIFACT_VERSIONS: &[(&str, &str)] = &[
     ("onnxruntime", "1.26.0"),
@@ -59,6 +67,7 @@ const LOCK_BYTES: &[u8] = include_bytes!(concat!(
 ));
 
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
+static EXECUTION_DECISION: OnceLock<Mutex<ExecutionDecision>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +109,105 @@ pub struct OnnxRuntimeArtifactAttestation {
 }
 
 pub type OnnxCudaDeviceAttestation = calyx_forge::PinnedCudaDeviceAttestation;
+
+/// Unforgeable process decision permitting separately commissioned CPU lenses.
+///
+/// This can only be created before CUDA execution is selected and only when
+/// the exact pinned CUDA Runtime reports no visible device. A CUDA provider,
+/// construction, or inference failure never creates this authorization.
+#[derive(Clone, Debug)]
+pub struct OnnxCpuAuthorization {
+    requested_runtime_ordinal: u32,
+    decision_code: &'static str,
+    _private: (),
+}
+
+impl OnnxCpuAuthorization {
+    pub fn requested_runtime_ordinal(&self) -> u32 {
+        self.requested_runtime_ordinal
+    }
+
+    pub fn decision_code(&self) -> &'static str {
+        self.decision_code
+    }
+}
+
+/// Stable Windows file identity read from the same handle as artifact bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImmutableFileIdentity {
+    pub volume_serial_number: u32,
+    pub file_index: u64,
+}
+
+/// Immutable one-handle snapshot used for exact ONNX/tokenizer commits.
+#[derive(Clone, Debug)]
+pub struct ImmutableFileSnapshot {
+    pub final_path: PathBuf,
+    pub identity: ImmutableFileIdentity,
+    pub bytes: Vec<u8>,
+}
+
+/// Open directory identity retained while a frozen artifact set is read.
+#[derive(Debug)]
+pub struct ImmutableDirectoryRoot {
+    handle: File,
+    final_path: PathBuf,
+    identity: ImmutableFileIdentity,
+}
+
+impl ImmutableDirectoryRoot {
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    pub fn identity(&self) -> ImmutableFileIdentity {
+        self.identity
+    }
+
+    fn attest_unchanged(&self) -> Result<()> {
+        let observed_path = final_path_from_handle(&self.handle)?;
+        let observed_identity = immutable_file_identity(&self.handle)?;
+        if !same_final_path(&observed_path, &self.final_path) || observed_identity != self.identity {
+            return Err(runtime_error(
+                "CALYX_ONNX_ARTIFACT_ROOT_CHANGED",
+                format!(
+                    "immutable artifact root changed: before path={} identity={:?}; after path={} identity={observed_identity:?}",
+                    self.final_path.display(),
+                    self.identity,
+                    observed_path.display()
+                ),
+                "stop concurrent model-root replacement and retry in a new process",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Retained physical-device-bound stream supplied to one CUDA ONNX session.
+///
+/// ORT receives the stable stream pointer during provider construction. Every
+/// explicit access is serialized because CUDA green/primary context handles
+/// do not provide an unconstrained `Sync` contract.
+#[derive(Debug)]
+pub struct OnnxCudaExecutionStream {
+    inner: Mutex<calyx_forge::CudaPrimaryContextStream>,
+    device: OnnxCudaDeviceAttestation,
+}
+
+#[derive(Clone, Debug)]
+enum ExecutionDecision {
+    Undecided,
+    Cuda,
+    CpuNoDevice(OnnxCpuAuthorization),
+    Failed(CalyxError),
+}
+
+impl Default for ExecutionDecision {
+    fn default() -> Self {
+        Self::Undecided
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +269,385 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
     Ok(state.live.as_ref().map(|live| live.receipt.clone()))
 }
 
+/// Makes the one process-wide learned-execution decision for a CPU-only host.
+///
+/// A usable GPU permanently selects CUDA. Only the exact pinned CUDA Runtime's
+/// no-device result can mint the opaque CPU capability. Every other probe
+/// failure is terminal for this process and is never converted to CPU work.
+pub fn authorize_cpu_companion() -> Result<OnnxCpuAuthorization> {
+    let state = EXECUTION_DECISION.get_or_init(|| Mutex::new(ExecutionDecision::default()));
+    let mut decision = state.lock().map_err(|_| execution_decision_poisoned())?;
+    match &*decision {
+        ExecutionDecision::Cuda => return Err(cpu_execution_unauthorized()),
+        ExecutionDecision::CpuNoDevice(authorization) => return Ok(authorization.clone()),
+        ExecutionDecision::Failed(error) => return Err(error.clone()),
+        ExecutionDecision::Undecided => {}
+    }
+
+    let requested = match calyx_forge::configured_cuda_runtime_ordinal() {
+        Ok(requested) => requested,
+        Err(error) => {
+            let error = runtime_error(
+                "CALYX_ONNX_EXECUTION_DECISION_FAILED",
+                format!(
+                    "resolve CALYX_CUDA_DEVICE for the startup execution decision failed: {error}"
+                ),
+                "repair the pinned CUDA Runtime/device-selection boundary and restart; do not construct a CPU lens from an ambiguous startup state",
+            );
+            *decision = ExecutionDecision::Failed(error.clone());
+            return Err(error);
+        }
+    };
+    match calyx_forge::select_pinned_cuda_device(requested) {
+        Ok(device) => {
+            tracing::info!(
+                code = "CALYX_ONNX_EXECUTION_MODE_CUDA",
+                runtime_ordinal = device.ordinal,
+                execution_device = %device.frozen_execution_device(),
+                "selected CUDA as the process-wide learned-execution mode"
+            );
+            *decision = ExecutionDecision::Cuda;
+            Err(cpu_execution_unauthorized())
+        }
+        Err(error) if error.code() == calyx_forge::CUDA_NO_DEVICE_ATTESTED_CODE => {
+            let authorization = OnnxCpuAuthorization {
+                requested_runtime_ordinal: requested,
+                decision_code: calyx_forge::CUDA_NO_DEVICE_ATTESTED_CODE,
+                _private: (),
+            };
+            tracing::info!(
+                code = authorization.decision_code,
+                requested_runtime_ordinal = requested,
+                "selected the separately commissioned CPU companion as the process-wide learned-execution mode"
+            );
+            *decision = ExecutionDecision::CpuNoDevice(authorization.clone());
+            Ok(authorization)
+        }
+        Err(error) => {
+            let error = runtime_error(
+                "CALYX_ONNX_EXECUTION_DECISION_FAILED",
+                format!(
+                    "CUDA startup probe failed with {} while selecting learned execution: {error}",
+                    error.code()
+                ),
+                "repair the CUDA provider/runtime/device failure and restart; never convert a CUDA failure into CPU execution",
+            );
+            *decision = ExecutionDecision::Failed(error.clone());
+            Err(error)
+        }
+    }
+}
+
+/// Creates and retains one physical-identity-bound CUDA stream for an ONNX
+/// session. The caller supplies this exact pointer to the CUDA EP and keeps the
+/// returned owner alive for the entire session lifetime.
+pub fn create_cuda_execution_stream(
+    device: &OnnxCudaDeviceAttestation,
+) -> Result<OnnxCudaExecutionStream> {
+    claim_cuda_execution()?;
+    let selected = selected_cuda_device(OnnxRuntimePolicy::CudaFailLoud, Some(device.ordinal))?
+        .ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISSING",
+                "CUDA stream construction has no selected physical-device receipt",
+                "restart from the pinned CUDA runtime and preserve the device receipt",
+            )
+        })?;
+    if !selected.same_stable_device(device) {
+        return Err(runtime_error(
+            "CALYX_ONNX_CUDA_STREAM_DEVICE_MISMATCH",
+            format!(
+                "requested stream device {} differs from process device {}",
+                device.frozen_execution_device(),
+                selected.frozen_execution_device()
+            ),
+            "terminate the process and restart with every ONNX session selecting one physical CUDA device",
+        ));
+    }
+    let stream = calyx_forge::CudaPrimaryContextStream::create_by_pci_bus_id(
+        &selected.cuda_runtime_pci_bus_id,
+    )
+    .map_err(forge_runtime_boundary_error)?;
+    attest_cuda_stream(&stream, &selected)?;
+    Ok(OnnxCudaExecutionStream {
+        inner: Mutex::new(stream),
+        device: selected,
+    })
+}
+
+impl OnnxCudaExecutionStream {
+    pub fn stream_ptr(&self) -> Result<*mut ()> {
+        let stream = self.inner.lock().map_err(|_| cuda_stream_poisoned())?;
+        attest_cuda_stream(&stream, &self.device)?;
+        Ok(stream.stream_ptr())
+    }
+
+    pub fn synchronize_and_attest(&self) -> Result<()> {
+        let stream = self.inner.lock().map_err(|_| cuda_stream_poisoned())?;
+        stream.synchronize().map_err(forge_runtime_boundary_error)?;
+        attest_cuda_stream(&stream, &self.device)
+    }
+
+    pub fn device(&self) -> &OnnxCudaDeviceAttestation {
+        &self.device
+    }
+}
+
+/// Opens one artifact once, proves the handle-resolved target is a confined
+/// regular file, then reads exactly that handle into memory.
+///
+/// `required_root` retains the directory handle for the whole artifact batch.
+/// Containment is checked before size-based allocation or byte reads. Root and
+/// file path, identity, and length are re-read after the snapshot to detect
+/// replacement or mutation.
+pub fn snapshot_immutable_file(
+    path: &Path,
+    required_root: Option<&ImmutableDirectoryRoot>,
+    maximum_bytes: u64,
+) -> Result<ImmutableFileSnapshot> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_OPEN_FAILED",
+                format!(
+                    "open immutable artifact {} with read-only sharing failed: {error}",
+                    path.display()
+                ),
+                "restore a readable regular artifact inside its frozen root and retry in a new process",
+            )
+        })?;
+    let final_path = final_path_from_handle(&file)?;
+    if let Some(root) = required_root {
+        root.attest_unchanged()?;
+        if !final_path_is_within(&final_path, root.final_path()) {
+            return Err(runtime_error(
+                "CALYX_ONNX_ARTIFACT_PATH_ESCAPE",
+                format!(
+                    "opened artifact {} resolves to {} outside frozen root {}",
+                    path.display(),
+                    final_path.display(),
+                    root.final_path().display()
+                ),
+                "place every ONNX external-data artifact under the model's immutable directory and remove junction/reparse escapes",
+            ));
+        }
+    }
+    let metadata = file.metadata().map_err(|error| {
+        runtime_error(
+            "CALYX_ONNX_ARTIFACT_METADATA_FAILED",
+            format!(
+                "read metadata from opened artifact {} failed: {error}",
+                final_path.display()
+            ),
+            "restore a readable regular artifact and retry in a new process",
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_NOT_REGULAR",
+            format!(
+                "opened artifact {} is not a regular non-reparse file",
+                final_path.display()
+            ),
+            "replace the artifact with a regular file under the frozen model root",
+        ));
+    }
+    let expected_bytes = metadata.len();
+    if expected_bytes > maximum_bytes {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_SIZE_LIMIT",
+            format!(
+                "artifact {} has {expected_bytes} bytes, exceeding its {maximum_bytes}-byte frozen read budget",
+                final_path.display()
+            ),
+            "commission an artifact within the measured RAM/VRAM budget or raise the explicit budget before process startup",
+        ));
+    }
+    let identity = immutable_file_identity(&file)?;
+    let byte_len = usize::try_from(expected_bytes).map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_ARTIFACT_SIZE_OVERFLOW",
+            format!(
+                "artifact {} length {expected_bytes} exceeds process address space",
+                final_path.display()
+            ),
+            "commission a smaller artifact that fits the native process address space",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(byte_len).map_err(|error| {
+        runtime_error(
+            "CALYX_ONNX_ARTIFACT_ALLOCATION_FAILED",
+            format!(
+                "reserve {byte_len} bytes for immutable artifact {} failed: {error}",
+                final_path.display()
+            ),
+            "free host RAM or commission a smaller artifact; the model was not partially committed",
+        )
+    })?;
+    bytes.resize(byte_len, 0);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let count = file
+            .seek_read(&mut bytes[offset..], offset as u64)
+            .map_err(|error| {
+                runtime_error(
+                    "CALYX_ONNX_ARTIFACT_READ_FAILED",
+                    format!(
+                        "read immutable artifact {} at offset {offset} failed: {error}",
+                        final_path.display()
+                    ),
+                    "restore the frozen artifact and retry in a new process",
+                )
+            })?;
+        if count == 0 {
+            return Err(runtime_error(
+                "CALYX_ONNX_ARTIFACT_CHANGED",
+                format!(
+                    "artifact {} ended at {offset} bytes after its handle reported {expected_bytes}",
+                    final_path.display()
+                ),
+                "stop concurrent artifact mutation and retry from an immutable model directory",
+            ));
+        }
+        offset = offset.checked_add(count).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_SIZE_OVERFLOW",
+                "immutable artifact read offset overflowed usize",
+                "commission a smaller artifact that fits the native process address space",
+            )
+        })?;
+    }
+    let mut extra = [0u8; 1];
+    if file
+        .seek_read(&mut extra, expected_bytes)
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_READ_FAILED",
+                format!(
+                    "read immutable artifact {} terminal byte failed: {error}",
+                    final_path.display()
+                ),
+                "restore the frozen artifact and retry in a new process",
+            )
+        })?
+        != 0
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_CHANGED",
+            format!(
+                "artifact {} grew while it was being snapshotted",
+                final_path.display()
+            ),
+            "stop concurrent artifact mutation and retry from an immutable model directory",
+        ));
+    }
+    let final_path_after = final_path_from_handle(&file)?;
+    let identity_after = immutable_file_identity(&file)?;
+    let bytes_after = file
+        .metadata()
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_METADATA_FAILED",
+                format!(
+                    "re-read metadata from {} failed: {error}",
+                    final_path.display()
+                ),
+                "restore the frozen artifact and retry in a new process",
+            )
+        })?
+        .len();
+    if !same_final_path(&final_path_after, &final_path)
+        || identity_after != identity
+        || bytes_after != expected_bytes
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_CHANGED",
+            format!(
+                "artifact changed during snapshot: before path={} identity={identity:?} bytes={expected_bytes}; after path={} identity={identity_after:?} bytes={bytes_after}",
+                final_path.display(),
+                final_path_after.display()
+            ),
+            "stop concurrent artifact mutation and retry from an immutable model directory",
+        ));
+    }
+    if let Some(root) = required_root {
+        root.attest_unchanged()?;
+    }
+    Ok(ImmutableFileSnapshot {
+        final_path,
+        identity,
+        bytes,
+    })
+}
+
+/// Resolves one existing directory through an open handle for later
+/// containment checks by [`snapshot_immutable_file`].
+pub fn open_immutable_directory(path: &Path) -> Result<ImmutableDirectoryRoot> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_ROOT_OPEN_FAILED",
+                format!("open immutable artifact root {} failed: {error}", path.display()),
+                "restore the model/profile root as an accessible directory and retry in a new process",
+            )
+        })?;
+    let metadata = directory.metadata().map_err(|error| {
+        runtime_error(
+            "CALYX_ONNX_ARTIFACT_ROOT_METADATA_FAILED",
+            format!(
+                "read artifact-root metadata {} failed: {error}",
+                path.display()
+            ),
+            "restore the model/profile root as an accessible directory and retry in a new process",
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_ROOT_NOT_DIRECTORY",
+            format!("artifact root {} is not a directory", path.display()),
+            "select the directory containing the frozen artifacts",
+        ));
+    }
+    let final_path = final_path_from_handle(&directory)?;
+    let identity = immutable_file_identity(&directory)?;
+    Ok(ImmutableDirectoryRoot {
+        handle: directory,
+        final_path,
+        identity,
+    })
+}
+
+/// Returns live available physical host memory for an artifact snapshot budget.
+pub fn available_host_memory_bytes() -> Result<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(last_windows_error(
+            "GlobalMemoryStatusEx for immutable artifact budget",
+        ));
+    }
+    if status.ullAvailPhys == 0 {
+        return Err(runtime_error(
+            "CALYX_ONNX_ARTIFACT_HOST_MEMORY_UNAVAILABLE",
+            "Windows reports zero available physical memory for immutable artifact snapshots",
+            "free host RAM before loading a learned lens",
+        ));
+    }
+    Ok(status.ullAvailPhys)
+}
+
 /// Establishes the process-wide, hash-attested CUDA DLL search boundary.
 ///
 /// This initializes only the pinned ORT core and exact DLL directory. CUDA
@@ -169,7 +656,7 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
 /// machine without a usable GPU. CUDA-enabled process entry points call this
 /// before any `cudarc`, Candle, FastEmbed, or ORT API can resolve a DLL.
 pub fn initialize_pinned_cuda_runtime_boundary() -> Result<OnnxRuntimeAttestation> {
-    ensure_runtime(OnnxProviderPolicy::CpuExplicit)?;
+    ensure_core_runtime()?;
     current_runtime_attestation()?.ok_or_else(|| {
         runtime_error(
             "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
@@ -179,7 +666,72 @@ pub fn initialize_pinned_cuda_runtime_boundary() -> Result<OnnxRuntimeAttestatio
     })
 }
 
-pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
+pub fn ensure_runtime(
+    policy: OnnxRuntimePolicy,
+    requested_cuda_device: Option<u32>,
+) -> Result<PathBuf> {
+    match policy {
+        OnnxRuntimePolicy::CudaFailLoud => claim_cuda_execution()?,
+        OnnxRuntimePolicy::CpuExplicit => require_cpu_execution_decision()?,
+    }
+    let core_path = ensure_core_runtime()?;
+    if policy != OnnxRuntimePolicy::CudaFailLoud {
+        return Ok(core_path);
+    }
+
+    let state = RUNTIME_STATE.get_or_init(|| Mutex::new(RuntimeState::default()));
+    let mut state = state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_STATE_POISONED",
+            "the process-global ONNX runtime state mutex was poisoned",
+            "terminate this process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    if let Some(error) = &state.cuda_failure {
+        return Err(error.clone());
+    }
+    let requested_cuda_device = match requested_cuda_device {
+        Some(device) => device,
+        None => {
+            let error = runtime_error(
+                "CALYX_ONNX_CUDA_DEVICE_MISSING",
+                "CUDA ORT initialization did not provide an attested CUDA Runtime ordinal",
+                "resolve the process-global CUDA Runtime ordinal before constructing a CUDA ORT session",
+            );
+            state.cuda_failure = Some(error.clone());
+            return Err(error);
+        }
+    };
+    let live = state.live.as_mut().expect("core initialized above");
+    if !live.receipt.provider_available {
+        if let Err(error) = initialize_cuda(live, requested_cuda_device) {
+            state.cuda_failure = Some(error.clone());
+            return Err(error);
+        }
+    } else if live
+        .receipt
+        .cuda_device
+        .as_ref()
+        .is_none_or(|device| device.ordinal != requested_cuda_device)
+    {
+        let error = runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_SELECTION_CHANGED",
+            format!(
+                "process-global ORT is already pinned to CUDA Runtime ordinal {}, later request selected ordinal {requested_cuda_device}",
+                live.receipt.cuda_device.as_ref().map_or_else(
+                    || "unattested".to_string(),
+                    |device| device.ordinal.to_string()
+                )
+            ),
+            "terminate the process and restart with every ORT consumer selecting one physical CUDA device",
+        );
+        state.cuda_failure = Some(error.clone());
+        return Err(error);
+    }
+    Ok(core_path)
+}
+
+fn ensure_core_runtime() -> Result<PathBuf> {
     let state = RUNTIME_STATE.get_or_init(|| Mutex::new(RuntimeState::default()));
     let mut state = state.lock().map_err(|_| {
         runtime_error(
@@ -200,18 +752,6 @@ pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
             }
         }
     }
-    if policy == OnnxProviderPolicy::CudaFailLoud {
-        if let Some(error) = &state.cuda_failure {
-            return Err(error.clone());
-        }
-        let live = state.live.as_mut().expect("initialized above");
-        if !live.receipt.provider_available {
-            if let Err(error) = initialize_cuda(live) {
-                state.cuda_failure = Some(error.clone());
-                return Err(error);
-            }
-        }
-    }
     Ok(state
         .live
         .as_ref()
@@ -220,23 +760,117 @@ pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
         .clone())
 }
 
-pub(super) fn selected_cuda_device(
-    policy: OnnxProviderPolicy,
+fn claim_cuda_execution() -> Result<()> {
+    let state = EXECUTION_DECISION.get_or_init(|| Mutex::new(ExecutionDecision::default()));
+    let mut decision = state.lock().map_err(|_| execution_decision_poisoned())?;
+    match &*decision {
+        ExecutionDecision::Undecided => {
+            tracing::info!(
+                code = "CALYX_ONNX_EXECUTION_MODE_CUDA",
+                "selected CUDA as the process-wide learned-execution mode"
+            );
+            *decision = ExecutionDecision::Cuda;
+            Ok(())
+        }
+        ExecutionDecision::Cuda => Ok(()),
+        ExecutionDecision::CpuNoDevice(_) => Err(runtime_error(
+            "CALYX_ONNX_CUDA_AFTER_CPU_DECISION",
+            "CUDA execution was requested after startup selected the CPU-only companion",
+            "terminate the process and restart after restoring GPU visibility; never change learned-execution mode in place",
+        )),
+        ExecutionDecision::Failed(error) => Err(error.clone()),
+    }
+}
+
+fn require_cpu_execution_decision() -> Result<()> {
+    let state = EXECUTION_DECISION.get_or_init(|| Mutex::new(ExecutionDecision::default()));
+    let decision = state.lock().map_err(|_| execution_decision_poisoned())?;
+    match &*decision {
+        ExecutionDecision::CpuNoDevice(_) => Ok(()),
+        ExecutionDecision::Cuda | ExecutionDecision::Undecided => Err(cpu_execution_unauthorized()),
+        ExecutionDecision::Failed(error) => Err(error.clone()),
+    }
+}
+
+fn attest_cuda_stream(
+    stream: &calyx_forge::CudaPrimaryContextStream,
+    device: &OnnxCudaDeviceAttestation,
+) -> Result<()> {
+    if stream.driver_ordinal() != device.cuda_driver_ordinal
+        || stream.physical_identity() != device.identity
+    {
+        return Err(runtime_error(
+            "CALYX_ONNX_CUDA_STREAM_DEVICE_MISMATCH",
+            format!(
+                "retained stream reports driver_ordinal={} identity={}; runtime receipt records driver_ordinal={} identity={}",
+                stream.driver_ordinal(),
+                stream.physical_identity(),
+                device.cuda_driver_ordinal,
+                device.identity
+            ),
+            "terminate the process, preserve both receipts, and repair the CUDA Runtime/Driver mapping",
+        ));
+    }
+    stream
+        .attest_identity()
+        .map_err(forge_runtime_boundary_error)?;
+    let observed = calyx_forge::attest_pinned_cuda_driver_identity(device.identity)
+        .map_err(forge_runtime_boundary_error)?;
+    if observed != device.cuda_driver_ordinal {
+        return Err(runtime_error(
+            "CALYX_ONNX_CUDA_STREAM_DEVICE_MISMATCH",
+            format!(
+                "independent CUDA Driver readback resolved {} to ordinal {observed}; receipt records {}",
+                device.identity, device.cuda_driver_ordinal
+            ),
+            "terminate the process, preserve both receipts, and repair the CUDA Runtime/Driver mapping",
+        ));
+    }
+    Ok(())
+}
+
+fn execution_decision_poisoned() -> CalyxError {
+    runtime_error(
+        "CALYX_ONNX_EXECUTION_DECISION_POISONED",
+        "the process-global learned-execution decision mutex was poisoned",
+        "terminate this process, preserve its logs, and restart before constructing any learned lens",
+    )
+}
+
+fn cpu_execution_unauthorized() -> CalyxError {
+    runtime_error(
+        "CALYX_ONNX_CPU_COMPANION_UNAUTHORIZED",
+        "the separately commissioned CPU companion is not authorized because startup did not prove exact CUDA Runtime no-device",
+        "use the CUDA lens on a GPU host; CPU execution is permitted only when authorize_cpu_companion selects it before any CUDA path",
+    )
+}
+
+fn cuda_stream_poisoned() -> CalyxError {
+    runtime_error(
+        "CALYX_ONNX_CUDA_STREAM_STATE_POISONED",
+        "the retained CUDA execution-stream mutex was poisoned",
+        "terminate the owning worker process, preserve its logs, and reload the frozen panel in a new generation",
+    )
+}
+
+pub fn selected_cuda_device(
+    policy: OnnxRuntimePolicy,
+    requested_cuda_device: Option<u32>,
 ) -> Result<Option<OnnxCudaDeviceAttestation>> {
-    if policy != OnnxProviderPolicy::CudaFailLoud {
+    if policy != OnnxRuntimePolicy::CudaFailLoud {
+        require_cpu_execution_decision()?;
         return Ok(None);
     }
-    let requested = super::session::configured_cuda_device()?;
-    let requested_u32 = u32::try_from(requested).map_err(|_| {
+    ensure_runtime(policy, requested_cuda_device)?;
+    let requested = requested_cuda_device.ok_or_else(|| {
         runtime_error(
-            "CALYX_ONNX_CUDA_DEVICE_INVALID",
-            format!("configured CUDA Runtime ordinal {requested} exceeds u32"),
-            "set CALYX_CUDA_DEVICE to a CUDA Runtime-visible ordinal",
+            "CALYX_ONNX_CUDA_DEVICE_MISSING",
+            "CUDA device selection did not provide a CUDA Runtime ordinal",
+            "resolve the process-global CUDA Runtime ordinal before constructing a CUDA ORT session",
         )
     })?;
-    ensure_runtime(policy)?;
-    let shared = calyx_forge::select_pinned_cuda_device(requested_u32)
-        .map_err(forge_runtime_boundary_error)?;
+    let shared =
+        calyx_forge::select_pinned_cuda_device(requested).map_err(forge_runtime_boundary_error)?;
     let attestation = current_runtime_attestation()?.ok_or_else(|| {
         runtime_error(
             "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
@@ -265,45 +899,6 @@ pub(super) fn selected_cuda_device(
     Ok(Some(device))
 }
 
-pub(super) fn attest_after_model_constructor(
-    policy: OnnxProviderPolicy,
-    bound_stream: Option<&super::green_context::GreenContextHandle>,
-) -> Result<()> {
-    if policy != OnnxProviderPolicy::CudaFailLoud {
-        if bound_stream.is_some() {
-            return Err(runtime_error(
-                "CALYX_ONNX_CPU_SESSION_HAS_CUDA_STREAM",
-                "CPU-policy ONNX constructor retained a CUDA execution stream",
-                "construct CPU and CUDA companion lenses through distinct provider policies",
-            ));
-        }
-        return Ok(());
-    }
-    ensure_runtime(policy)?;
-    let receipt = current_runtime_attestation()?.ok_or_else(|| {
-        runtime_error(
-            "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
-            "CUDA model construction completed without a live runtime attestation",
-            "terminate the process, preserve its logs, and restart from the pinned runtime bundle",
-        )
-    })?;
-    let selected = receipt.cuda_device.ok_or_else(|| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISSING",
-            "CUDA model construction completed without a selected physical-device receipt",
-            "terminate the process and restart from the pinned CUDA runtime boundary",
-        )
-    })?;
-    let stream = bound_stream.ok_or_else(|| {
-        runtime_error(
-            "CALYX_ONNX_BOUND_STREAM_MISSING",
-            "CUDA model construction did not retain an Astrolabe-owned execution stream",
-            "construct the CUDA EP with an attested compute stream and retain it for the full model lifetime",
-        )
-    })?;
-    super::green_context::attest_selected_stream(stream, &selected)
-}
-
 #[derive(Default)]
 struct RuntimeState {
     live: Option<LiveRuntime>,
@@ -319,6 +914,8 @@ struct LiveRuntime {
 }
 
 struct OwnedModule(usize);
+
+struct CommittedApiModuleGuard(Option<OwnedModule>);
 
 struct ModuleStack(Vec<OwnedModule>);
 
@@ -341,6 +938,28 @@ impl Drop for ModuleStack {
 impl OwnedModule {
     fn raw(&self) -> HMODULE {
         self.0 as HMODULE
+    }
+}
+
+impl CommittedApiModuleGuard {
+    fn new(module: OwnedModule) -> Self {
+        Self(Some(module))
+    }
+
+    fn into_owned(mut self) -> OwnedModule {
+        self.0.take().expect("committed API module is present")
+    }
+}
+
+impl Drop for CommittedApiModuleGuard {
+    fn drop(&mut self) {
+        if let Some(module) = self.0.take() {
+            // Once ort::set_api succeeds, the process-global table points into
+            // this DLL even if a later initialization/attestation step fails.
+            // Keep it mapped until worker exit so a structured error cannot
+            // leave dangling function pointers in a still-running process.
+            mem::forget(module);
+        }
     }
 }
 
@@ -498,28 +1117,29 @@ fn initialize_core() -> Result<LiveRuntime> {
             BUNDLE_REMEDIATION,
         ));
     }
-    let committed = ort::init_from(&core_path)
-        .map_err(|error| {
-            runtime_error(
-                "CALYX_ONNX_RUNTIME_INIT_FAILED",
-                format!(
-                    "initialize exact ORT core {} failed: {error}",
-                    core_path.display()
-                ),
-                BUNDLE_REMEDIATION,
-            )
-        })?
-        .commit();
+    let api_committed = ort::set_api(unsafe { (*api).clone() });
+    if !api_committed {
+        return Err(runtime_error(
+            "CALYX_ONNX_RUNTIME_API_PREINITIALIZED",
+            format!(
+                "the ort crate API table was initialized before Calyx could install the exact API24 table from {}",
+                core_path.display()
+            ),
+            "terminate the process and ensure every ONNX consumer enters through calyx-onnx-runtime before any ort API or alternative-backend registration",
+        ));
+    }
+    let core_handle = CommittedApiModuleGuard::new(core_handle);
+    let committed = ort::init().commit();
     if !committed {
         return Err(runtime_error(
             "CALYX_ONNX_RUNTIME_PREINITIALIZED",
-            "ORT global environment was configured before Calyx could commit the pinned runtime",
+            "ORT global environment was configured before Calyx could commit the exact installed API24 backend",
             "terminate the process and ensure every ONNX consumer calls the Calyx runtime boundary before any ort API",
         ));
     }
     let modules = attest_loaded_modules(&lock, &root)?;
     let mut module_handles = ModuleStack::with_capacity(2);
-    module_handles.push(core_handle);
+    module_handles.push(core_handle.into_owned());
     Ok(LiveRuntime {
         lock: lock.clone(),
         core_path,
@@ -545,19 +1165,11 @@ fn initialize_core() -> Result<LiveRuntime> {
     })
 }
 
-fn initialize_cuda(live: &mut LiveRuntime) -> Result<()> {
+fn initialize_cuda(live: &mut LiveRuntime, requested: u32) -> Result<()> {
     let lock_sha256 = sha256_bytes(LOCK_BYTES);
     let boundary = calyx_forge::cuda_runtime::initialize_pinned_cuda_dependencies()
         .map_err(forge_runtime_boundary_error)?;
     validate_forge_boundary(&boundary, &live.lock, &lock_sha256, true)?;
-    let requested = super::session::configured_cuda_device()?;
-    let requested = u32::try_from(requested).map_err(|_| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_DEVICE_INVALID",
-            format!("configured CUDA Runtime ordinal {requested} exceeds u32"),
-            "set CALYX_CUDA_DEVICE to a CUDA Runtime-visible ordinal",
-        )
-    })?;
     let device =
         calyx_forge::select_pinned_cuda_device(requested).map_err(forge_runtime_boundary_error)?;
     let observed_driver_ordinal = calyx_forge::attest_pinned_cuda_driver_identity(device.identity)
@@ -1811,14 +2423,111 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
+fn final_path_from_handle(file: &File) -> Result<PathBuf> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut capacity = 512usize;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let written = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        } as usize;
+        if written == 0 {
+            return Err(last_windows_error(
+                "GetFinalPathNameByHandleW for immutable artifact",
+            ));
+        }
+        if written < buffer.len() {
+            buffer.truncate(written);
+            if buffer.is_empty() || buffer.contains(&0) {
+                return Err(runtime_error(
+                    "CALYX_ONNX_ARTIFACT_FINAL_PATH_INVALID",
+                    "opened immutable artifact has an empty final path or interior NUL",
+                    "restore the artifact as a regular file under its frozen root",
+                ));
+            }
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        capacity = written.checked_add(1).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_ARTIFACT_FINAL_PATH_OVERFLOW",
+                "opened immutable artifact final-path length overflowed usize",
+                "move the artifact to a shorter canonical path",
+            )
+        })?;
+        if capacity > MAX_FINAL_PATH_CHARS {
+            return Err(runtime_error(
+                "CALYX_ONNX_ARTIFACT_FINAL_PATH_OVERFLOW",
+                format!("opened immutable artifact final path requires {capacity} UTF-16 units"),
+                "move the artifact to a shorter canonical path",
+            ));
+        }
+    }
+}
+
+fn immutable_file_identity(file: &File) -> Result<ImmutableFileIdentity> {
+    let mut information = unsafe { mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return Err(last_windows_error(
+            "GetFileInformationByHandle for immutable artifact",
+        ));
+    }
+    Ok(ImmutableFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+fn final_path_is_within(path: &Path, root: &Path) -> bool {
+    let path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let root = root.as_os_str().encode_wide().collect::<Vec<_>>();
+    if root.is_empty() || path.len() < root.len() || !wide_prefix_equal(&path, &root) {
+        return false;
+    }
+    path.len() == root.len()
+        || root
+            .last()
+            .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+        || path
+            .get(root.len())
+            .is_some_and(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+}
+
+fn same_final_path(left: &Path, right: &Path) -> bool {
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    left.len() == right.len() && wide_prefix_equal(&left, &right)
+}
+
+fn wide_prefix_equal(value: &[u16], prefix: &[u16]) -> bool {
+    let Ok(prefix_len) = i32::try_from(prefix.len()) else {
+        return false;
+    };
+    if value.len() < prefix.len() {
+        return false;
+    }
+    unsafe {
+        CompareStringOrdinal(value.as_ptr(), prefix_len, prefix.as_ptr(), prefix_len, 1)
+            == CSTR_EQUAL
+    }
+}
+
 fn runtime_error(
     code: &'static str,
     message: impl Into<String>,
     remediation: &'static str,
 ) -> CalyxError {
+    let message = message.into();
+    tracing::error!(
+        code,
+        message = %message,
+        remediation,
+        "process-global pinned ONNX Runtime boundary failed closed"
+    );
     CalyxError {
         code,
-        message: message.into(),
+        message,
         remediation,
     }
 }

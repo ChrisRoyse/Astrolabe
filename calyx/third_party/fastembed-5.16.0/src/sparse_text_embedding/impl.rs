@@ -1,8 +1,10 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    models::sparse::{models_list, SparseModel},
     ModelInfo, SparseEmbedding,
+    common::load_tokenizer,
+    models::sparse::{SparseModel, models_list},
+    text_embedding::InitOptionsUserDefined,
 };
 #[cfg(feature = "hf-hub")]
 use anyhow::Context;
@@ -22,10 +24,9 @@ use std::thread::available_parallelism;
 
 #[cfg(feature = "hf-hub")]
 use super::SparseInitOptions;
-use super::{SparseTextEmbedding, DEFAULT_BATCH_SIZE};
+use super::{DEFAULT_BATCH_SIZE, SparseTextEmbedding, UserDefinedSparseModel};
 
 impl SparseTextEmbedding {
-    #[cfg(feature = "hf-hub")]
     fn builder_error(err: ort::Error<ort::session::builder::SessionBuilder>) -> anyhow::Error {
         anyhow::Error::msg(err.to_string())
     }
@@ -38,7 +39,7 @@ impl SparseTextEmbedding {
     #[cfg(feature = "hf-hub")]
     pub fn try_new(options: SparseInitOptions) -> Result<Self> {
         use super::SparseInitOptions;
-        use ort::{session::builder::GraphOptimizationLevel, session::Session};
+        use ort::{session::Session, session::builder::GraphOptimizationLevel};
 
         let SparseInitOptions {
             max_length,
@@ -75,7 +76,9 @@ impl SparseTextEmbedding {
                     .context(format!("Failed to retrieve {}", file))?;
             }
         }
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -88,8 +91,41 @@ impl SparseTextEmbedding {
             .apply_to(builder)?
             .commit_from_file(model_file_reference)?;
 
-        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session, model_name))
+    }
+
+    /// Create a sparse embedder from one immutable in-memory artifact snapshot.
+    pub fn try_new_from_user_defined(
+        model: UserDefinedSparseModel,
+        options: InitOptionsUserDefined,
+    ) -> Result<Self> {
+        use ort::session::builder::GraphOptimizationLevel;
+
+        let InitOptionsUserDefined {
+            execution_providers,
+            session_policy,
+            max_length,
+            intra_threads,
+        } = options;
+        let threads = match intra_threads {
+            Some(n) => n,
+            None => available_parallelism()?.get(),
+        };
+        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
+        let builder = Session::builder()?
+            .with_execution_providers(execution_providers)
+            .map_err(Self::builder_error)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(Self::builder_error)?
+            .with_intra_threads(threads)
+            .map_err(Self::builder_error)?;
+        let builder = session_policy.apply_to(builder)?;
+        let builder =
+            crate::init::apply_external_initializers(builder, model.external_initializers)?;
+        let session = builder.commit_from_memory(&model.onnx_file)?;
+        Ok(Self::new(tokenizer, session, model.model))
     }
 
     /// Private method to return an instance

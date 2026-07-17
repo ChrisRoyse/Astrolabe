@@ -2,6 +2,7 @@ use super::*;
 use crate::path_identity::vault_template_source;
 
 const RESIDENT_CPU_LENS_REFUSED: &str = "CALYX_PANEL_RESIDENT_CPU_LENS_REFUSED";
+const RESIDENT_GPU_NEURAL_REQUIRED: &str = "CALYX_PANEL_RESIDENT_GPU_NEURAL_REQUIRED";
 const RESIDENT_UNMANAGED_RUNTIME: &str = "CALYX_PANEL_RESIDENT_UNMANAGED_RUNTIME";
 const RESIDENT_EXECUTION_UNATTESTED: &str = "CALYX_PANEL_RESIDENT_EXECUTION_UNATTESTED";
 const ONNX_CPU_FALLBACK_AUDIT_ENV: &str = "CALYX_ONNX_CPU_FALLBACK_AUDIT";
@@ -91,7 +92,6 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         log.append(&run_progress_record(&template, "resident_run_start"))?;
     }
     require_managed_resident_template_runtimes(&options.home, &template, progress_log.as_ref())?;
-    require_gpu_content_lenses(&options.home, &template, progress_log.as_ref())?;
     let preflight = warm_preflight(
         &options.home,
         &template,
@@ -184,7 +184,6 @@ fn load_vault_resident_warm_state(
         record.lens_count = Some(slot_scope.len());
         log.append(&record)?;
     }
-    require_gpu_content_slots(&selector, &panel.slots)?;
     let build = SavedTemplatePanelBuild {
         template_id: format!("vault:{}", vault.display()),
         template_name: vault
@@ -442,7 +441,11 @@ fn validate_resident_execution(
     }
     if matches!(
         runtime,
-        LensRuntime::Onnx { .. } | LensRuntime::OnnxColbert { .. }
+        LensRuntime::Onnx { .. }
+            | LensRuntime::OnnxColbert { .. }
+            | LensRuntime::FastembedSparse { .. }
+            | LensRuntime::FastembedBgem3 { .. }
+            | LensRuntime::FastembedReranker { .. }
     ) {
         let Some(total_nodes) = execution.total_compute_nodes.filter(|count| *count > 0) else {
             return Err(resident_execution_error(
@@ -521,7 +524,7 @@ fn require_managed_resident_template_runtimes(
     let store = template_store::TemplateStore::open(home);
     let template = store.load(selector)?;
     template.validate()?;
-    let unmanaged = template
+    let entries = template
         .lenses
         .iter()
         .enumerate()
@@ -529,8 +532,9 @@ fn require_managed_resident_template_runtimes(
             let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
             Ok((slot, lens, spec))
         })
-        .collect::<CliResult<Vec<_>>>()?
-        .into_iter()
+        .collect::<CliResult<Vec<_>>>()?;
+    let unmanaged = entries
+        .iter()
         .filter_map(|(slot, lens, spec)| {
             is_unmanaged_resident_runtime(&spec.runtime).then(|| {
                 format!(
@@ -543,7 +547,30 @@ fn require_managed_resident_template_runtimes(
             })
         })
         .collect::<Vec<_>>();
-    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)
+    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)?;
+    let cpu_neural = entries
+        .iter()
+        .filter(|(_, lens, spec)| {
+            is_managed_resident_neural_runtime(&spec.runtime) && lens.placement != Placement::Gpu
+        })
+        .map(|(slot, lens, spec)| {
+            format!(
+                "slot={slot} key={} lens={} runtime={} placement={:?}",
+                lens.slot_key,
+                lens.lens_id,
+                runtime_name(&spec.runtime),
+                lens.placement
+            )
+        })
+        .collect::<Vec<_>>();
+    reject_cpu_neural_runtimes(selector, cpu_neural, progress_log)?;
+    let gpu_neural_count = entries
+        .iter()
+        .filter(|(_, lens, spec)| {
+            lens.placement == Placement::Gpu && is_managed_resident_neural_runtime(&spec.runtime)
+        })
+        .count();
+    require_gpu_neural_runtime(selector, gpu_neural_count, progress_log)
 }
 
 fn require_managed_resident_runtimes(
@@ -551,11 +578,25 @@ fn require_managed_resident_runtimes(
     build: &SavedTemplatePanelBuild,
     progress_log: Option<&WarmProgressLog>,
 ) -> CliResult {
-    let mut seen = BTreeSet::new();
-    let unmanaged = active_registered_slots(build)
-        .filter(|slot| seen.insert(slot.lens_id))
-        .filter_map(|slot| {
-            let spec = build.registry.lens_spec(slot.lens_id)?;
+    let entries = active_registered_slots(build)
+        .map(|slot| {
+            build
+                .registry
+                .lens_spec(slot.lens_id)
+                .map(|spec| (slot, spec))
+                .ok_or_else(|| {
+                    CliError::from(CalyxError::registry_unavailable(format!(
+                        "resident admission slot={} key={} lens={} has no LensSpec",
+                        slot.slot_id.get(),
+                        slot.slot_key.key(),
+                        slot.lens_id
+                    )))
+                })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+    let unmanaged = entries
+        .iter()
+        .filter_map(|(slot, spec)| {
             is_unmanaged_resident_runtime(&spec.runtime).then(|| {
                 format!(
                     "slot={} key={} lens={} runtime={} runtime_detail={}",
@@ -568,7 +609,33 @@ fn require_managed_resident_runtimes(
             })
         })
         .collect::<Vec<_>>();
-    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)
+    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)?;
+    let cpu_neural = entries
+        .iter()
+        .filter(|(slot, spec)| {
+            is_managed_resident_neural_runtime(&spec.runtime)
+                && slot.resource.placement != Placement::Gpu
+        })
+        .map(|(slot, spec)| {
+            format!(
+                "slot={} key={} lens={} runtime={} placement={:?}",
+                slot.slot_id.get(),
+                slot.slot_key.key(),
+                slot.lens_id,
+                runtime_name(&spec.runtime),
+                slot.resource.placement
+            )
+        })
+        .collect::<Vec<_>>();
+    reject_cpu_neural_runtimes(selector, cpu_neural, progress_log)?;
+    let gpu_neural_count = entries
+        .iter()
+        .filter(|(slot, spec)| {
+            slot.resource.placement == Placement::Gpu
+                && is_managed_resident_neural_runtime(&spec.runtime)
+        })
+        .count();
+    require_gpu_neural_runtime(selector, gpu_neural_count, progress_log)
 }
 
 fn is_unmanaged_resident_runtime(runtime: &LensRuntime) -> bool {
@@ -585,7 +652,66 @@ pub(in crate::panel_commands) fn is_managed_resident_neural_runtime(runtime: &Le
             | LensRuntime::Onnx { .. }
             | LensRuntime::OnnxColbert { .. }
             | LensRuntime::FastembedQwen3 { .. }
+            | LensRuntime::FastembedSparse { .. }
+            | LensRuntime::FastembedBgem3 { .. }
+            | LensRuntime::FastembedReranker { .. }
     )
+}
+
+fn reject_cpu_neural_runtimes(
+    selector: &str,
+    cpu_neural: Vec<String>,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult {
+    if cpu_neural.is_empty() {
+        return Ok(());
+    }
+    let message = format!(
+        "resident panel {selector} refuses {} active neural runtimes without GPU placement: {}",
+        cpu_neural.len(),
+        cpu_neural.join(", ")
+    );
+    let remediation = "move every active neural lens to GPU placement; only Algorithmic and StaticLookup deterministic companions may remain on CPU";
+    if let Some(log) = progress_log {
+        let mut record = run_progress_record(selector, "resident_neural_gpu_placement_error");
+        record.lens_count = Some(cpu_neural.len());
+        record.error_code = Some(RESIDENT_CPU_LENS_REFUSED.to_string());
+        record.error_message = Some(message.clone());
+        record.remediation = Some(remediation.to_string());
+        log.append(&record)?;
+    }
+    Err(CliError::from(CalyxError {
+        code: RESIDENT_CPU_LENS_REFUSED,
+        message,
+        remediation,
+    }))
+}
+
+fn require_gpu_neural_runtime(
+    selector: &str,
+    gpu_neural_count: usize,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult {
+    if gpu_neural_count > 0 {
+        return Ok(());
+    }
+    let message = format!(
+        "resident panel {selector} has no active managed GPU neural runtime after applying its frozen scope"
+    );
+    let remediation = "add at least one active Calyx-managed GPU neural lens; CPU Algorithmic/StaticLookup slots are companions, not a resident GPU generation";
+    if let Some(log) = progress_log {
+        let mut record = run_progress_record(selector, "resident_gpu_neural_required");
+        record.lens_count = Some(0);
+        record.error_code = Some(RESIDENT_GPU_NEURAL_REQUIRED.to_string());
+        record.error_message = Some(message.clone());
+        record.remediation = Some(remediation.to_string());
+        log.append(&record)?;
+    }
+    Err(CliError::from(CalyxError {
+        code: RESIDENT_GPU_NEURAL_REQUIRED,
+        message,
+        remediation,
+    }))
 }
 
 fn reject_unmanaged_resident_runtimes(
@@ -646,7 +772,6 @@ fn apply_resident_slot_scope(
         return Ok(());
     }
     let requested = slot_scope.iter().copied().collect::<BTreeSet<_>>();
-    let mut scoped_lenses = Vec::with_capacity(slot_scope.len());
     for slot_id in slot_scope {
         let slot = panel
             .slots
@@ -692,26 +817,6 @@ fn apply_resident_slot_scope(
                 ),
             ));
         }
-        if slot.resource.placement != Placement::Gpu {
-            scoped_lenses.push(format!(
-                "slot={} key={} lens={} placement={:?}",
-                slot.slot_id.get(),
-                slot.slot_key.key(),
-                slot.lens_id,
-                slot.resource.placement
-            ));
-        }
-    }
-    if !scoped_lenses.is_empty() {
-        return Err(CliError::from(CalyxError {
-            code: RESIDENT_CPU_LENS_REFUSED,
-            message: format!(
-                "resident vault {selector} refuses {} selected CPU/non-GPU content lenses: {}",
-                scoped_lenses.len(),
-                scoped_lenses.join(", ")
-            ),
-            remediation: "choose only GPU resident slots or replace the selected content lenses with GPU resident runtimes",
-        }));
     }
     panel.slots.retain(|slot| requested.contains(&slot.slot_id));
     Ok(())
@@ -721,84 +826,6 @@ fn resident_slot_scope_error(selector: &str, detail: String) -> CliError {
     CliError::from(CalyxError {
         code: "CALYX_PANEL_RESIDENT_SLOT_SCOPE_INVALID",
         message: format!("resident vault {selector} has invalid slot scope: {detail}"),
-        remediation: "pass --slot only for active GPU content slots present in the vault panel",
+        remediation: "pass --slot only for active content slots present in the vault panel; include at least one managed GPU neural lens in the final scope",
     })
-}
-
-fn require_gpu_content_slots(selector: &str, slots: &[Slot]) -> CliResult {
-    let cpu_lenses = slots
-        .iter()
-        .filter(|slot| {
-            slot.state == SlotState::Active
-                && !slot.retrieval_only
-                && !slot.excluded_from_dedup
-                && slot.resource.placement != Placement::Gpu
-        })
-        .map(|slot| {
-            format!(
-                "slot={} key={} lens={} placement={:?}",
-                slot.slot_id.get(),
-                slot.slot_key.key(),
-                slot.lens_id,
-                slot.resource.placement
-            )
-        })
-        .collect::<Vec<_>>();
-    if cpu_lenses.is_empty() {
-        return Ok(());
-    }
-    Err(CliError::from(CalyxError {
-        code: RESIDENT_CPU_LENS_REFUSED,
-        message: format!(
-            "resident vault {selector} refuses {} CPU/non-GPU content lenses: {}",
-            cpu_lenses.len(),
-            cpu_lenses.join(", ")
-        ),
-        remediation: "pass --modality to select a GPU-only modality or replace every content lens with a GPU resident runtime",
-    }))
-}
-
-fn require_gpu_content_lenses(
-    home: &Path,
-    selector: &str,
-    progress_log: Option<&WarmProgressLog>,
-) -> CliResult {
-    let store = template_store::TemplateStore::open(home);
-    let template = store.load(selector)?;
-    template.validate()?;
-    let cpu_lenses = template
-        .lenses
-        .iter()
-        .filter(|lens| lens.counts_toward_a35 && lens.placement != Placement::Gpu)
-        .map(|lens| {
-            format!(
-                "{}:{}:{:?}:{}",
-                lens.slot_key, lens.lens_id, lens.placement, lens.manifest
-            )
-        })
-        .collect::<Vec<_>>();
-    if cpu_lenses.is_empty() {
-        return Ok(());
-    }
-    let message = format!(
-        "resident panel {selector} refuses {} CPU/non-GPU content lenses: {}",
-        cpu_lenses.len(),
-        cpu_lenses.join(", ")
-    );
-    if let Some(log) = progress_log {
-        let mut record = run_progress_record(selector, "resident_gpu_placement_error");
-        record.lens_count = Some(template.lenses.len());
-        record.error_code = Some(RESIDENT_CPU_LENS_REFUSED.to_string());
-        record.error_message = Some(message.clone());
-        record.remediation = Some(
-            "replace every content lens with a GPU resident runtime before starting the service"
-                .to_string(),
-        );
-        log.append(&record)?;
-    }
-    Err(CliError::from(CalyxError {
-        code: RESIDENT_CPU_LENS_REFUSED,
-        message,
-        remediation: "replace every content lens with a GPU resident runtime before starting the service",
-    }))
 }

@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CalyxError, Modality, Placement, SlotState};
+use calyx_core::{CalyxError, Modality, Panel, Placement, SlotState};
 use calyx_registry::{lens_spec_from_manifest_path, load_vault_panel_state};
 
 use super::flags::ServeFlags;
@@ -17,6 +18,8 @@ pub(super) struct FrozenResidentSource {
     pub(super) source_of_truth: String,
     pub(super) canonical_vault: Option<PathBuf>,
     pub(super) template: Option<String>,
+    pub(super) slot_contracts: Vec<ResidentSlotContract>,
+    pub(super) slot_scope: Vec<u16>,
     applicable_neural_modalities: Vec<Modality>,
 }
 
@@ -61,6 +64,7 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
     if let Some(selector) = flags.template.as_deref() {
         let template = TemplateStore::open(home).load(selector)?;
         template.validate()?;
+        let panel = template.to_target_panel(0);
         let mut applicable_neural_modalities = Vec::new();
         let template_bytes = serde_json::to_vec(&template).map_err(|error| {
             CliError::runtime(format!(
@@ -88,6 +92,11 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
             }
         }
         let fingerprint = hasher.finalize().to_hex().to_string();
+        let registered = template
+            .lenses
+            .iter()
+            .map(|lens| lens.lens_id)
+            .collect::<BTreeSet<_>>();
         return Ok(FrozenResidentSource {
             source_of_truth: format!(
                 "{} plus immutable template object and frozen lens manifests",
@@ -100,6 +109,10 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
             fingerprint,
             canonical_vault: None,
             template: Some(selector.to_string()),
+            slot_contracts: resident_slot_contracts(&panel, |lens_id| {
+                registered.contains(&lens_id)
+            }),
+            slot_scope: Vec::new(),
             applicable_neural_modalities,
         });
     }
@@ -114,6 +127,8 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
     // Vault registry restoration is lazy. Serializing its frozen snapshots
     // proves panel_ref/registry_ref identity without loading a model or CUDA.
     let state = load_vault_panel_state(&canonical_vault)?;
+    let mut panel = state.panel.clone();
+    let slot_scope = apply_frozen_vault_scope(&mut panel, flags)?;
     let applicable_neural_modalities = state
         .panel
         .slots
@@ -164,7 +179,96 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
         fingerprint,
         canonical_vault: Some(canonical_vault),
         template: None,
+        slot_contracts: resident_slot_contracts(&panel, |lens_id| state.registry.contains(lens_id)),
+        slot_scope,
         applicable_neural_modalities,
+    })
+}
+
+fn resident_slot_contracts(
+    panel: &Panel,
+    registered: impl Fn(calyx_core::LensId) -> bool,
+) -> Vec<ResidentSlotContract> {
+    panel
+        .slots
+        .iter()
+        .map(|slot| ResidentSlotContract {
+            slot: slot.slot_id.get(),
+            key: slot.slot_key.key().to_string(),
+            lens_id: slot.lens_id.to_string(),
+            shape: slot.shape,
+            modality: slot.modality,
+            placement: slot.resource.placement,
+            state: slot.state,
+            registered: registered(slot.lens_id),
+            retrieval_only: slot.retrieval_only,
+            excluded_from_dedup: slot.excluded_from_dedup,
+        })
+        .collect()
+}
+
+fn apply_frozen_vault_scope(panel: &mut Panel, flags: &ServeFlags) -> CliResult<Vec<u16>> {
+    let mut seen = BTreeSet::new();
+    let mut scope = Vec::with_capacity(flags.slots.len());
+    for slot_id in &flags.slots {
+        if !seen.insert(*slot_id) {
+            return Err(frozen_scope_error(format!(
+                "duplicate --slot {}",
+                slot_id.get()
+            )));
+        }
+        let slot = panel
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == *slot_id)
+            .ok_or_else(|| {
+                frozen_scope_error(format!("--slot {} is not present", slot_id.get()))
+            })?;
+        if slot.state != SlotState::Active {
+            return Err(frozen_scope_error(format!(
+                "--slot {} is {:?}, expected Active",
+                slot_id.get(),
+                slot.state
+            )));
+        }
+        if slot.retrieval_only || slot.excluded_from_dedup {
+            return Err(frozen_scope_error(format!(
+                "--slot {} is not a content lens retrieval_only={} excluded_from_dedup={}",
+                slot_id.get(),
+                slot.retrieval_only,
+                slot.excluded_from_dedup
+            )));
+        }
+        if let Some(modality) = flags.modality
+            && slot.modality != modality
+        {
+            return Err(frozen_scope_error(format!(
+                "--slot {} modality {:?} does not match --modality {:?}",
+                slot_id.get(),
+                slot.modality,
+                modality
+            )));
+        }
+        scope.push(slot_id.get());
+    }
+    if !seen.is_empty() {
+        panel.slots.retain(|slot| seen.contains(&slot.slot_id));
+    }
+    if let Some(modality) = flags.modality {
+        panel.slots.retain(|slot| {
+            slot.state != SlotState::Active
+                || slot.modality == modality
+                || slot.slot_key.key().starts_with('E')
+        });
+    }
+    Ok(scope)
+}
+
+fn frozen_scope_error(detail: String) -> CliError {
+    CliError::from(CalyxError {
+        code: "CALYX_PANEL_RESIDENT_SLOT_SCOPE_INVALID",
+        message: format!("resident frozen vault source has invalid slot scope: {detail}"),
+        remediation: "pass --slot only for active content slots present in the frozen vault panel",
     })
 }
 

@@ -1,4 +1,5 @@
 pub mod binary;
+mod codebook;
 pub mod int8;
 pub mod mxfp4_codec;
 pub mod qjl;
@@ -14,12 +15,15 @@ use crate::Result;
 pub use binary::{BinaryCodec, binary_prefilter, hamming_dot_estimate};
 pub use int8::ScalarInt8Codec;
 pub use mxfp4_codec::{AssayQuantSafety, MxFp4Codec};
-pub use qjl::{QjlResidual, dot_estimate_unbiased, dot_qjl_correction, encode_qjl_residual};
+pub use qjl::QjlResidual;
 pub use rotation::{
     CURRENT_SEED_VERSION, RotationSeed, apply_inverse_rotation, apply_rotation,
     apply_rotation_batch, new_seed, seed_id_hex,
 };
-pub use turboquant::TurboQuantCodec;
+pub use turboquant::{
+    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM,
+    TurboQuantCodec, TurboQuantPreparedQuery, TurboQuantStorage,
+};
 
 pub type SeedId = [u8; 32];
 
@@ -70,7 +74,8 @@ impl fmt::Display for QuantLevel {
 pub trait Quantizer: Send + Sync {
     fn encode(&self, vec: &[f32]) -> Result<QuantizedVec>;
     fn decode(&self, qv: &QuantizedVec) -> Result<Vec<f32>>;
-    fn dot_estimate(&self, a: &QuantizedVec, b: &QuantizedVec) -> Result<f32>;
+    /// Estimates `query dot candidate` without expanding the packed candidate.
+    fn dot_estimate(&self, query: &[f32], candidate: &QuantizedVec) -> Result<f32>;
     fn level(&self) -> QuantLevel;
     fn dim(&self) -> usize;
 }

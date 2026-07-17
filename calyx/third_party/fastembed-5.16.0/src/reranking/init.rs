@@ -1,7 +1,7 @@
 use super::DEFAULT_MAX_LENGTH;
 use crate::{
     init::{HasMaxLength, InitOptionsWithLength, SessionPolicy},
-    RerankerModel, TokenizerFiles,
+    ExternalInitializerFile, RerankerModel, TokenizerFiles,
 };
 use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
 use std::path::PathBuf;
@@ -112,6 +112,7 @@ impl From<PathBuf> for OnnxSource {
 #[non_exhaustive]
 pub struct UserDefinedRerankingModel {
     pub onnx_source: OnnxSource,
+    pub external_initializers: Vec<ExternalInitializerFile>,
     pub tokenizer_files: TokenizerFiles,
 }
 
@@ -119,8 +120,19 @@ impl UserDefinedRerankingModel {
     pub fn new(onnx_source: impl Into<OnnxSource>, tokenizer_files: TokenizerFiles) -> Self {
         Self {
             onnx_source: onnx_source.into(),
+            external_initializers: Vec::new(),
             tokenizer_files,
         }
+    }
+
+    pub fn with_external_initializer(
+        mut self,
+        file_name: impl Into<String>,
+        buffer: Vec<u8>,
+    ) -> Self {
+        self.external_initializers
+            .push(ExternalInitializerFile::new(file_name, buffer));
+        self
     }
 }
 

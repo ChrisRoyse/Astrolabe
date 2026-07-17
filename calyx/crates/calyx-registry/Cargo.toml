@@ -20,6 +20,7 @@ default = []
 # CALYX_REGISTRY_ML_RUNTIME_DISABLED. Mirrors the #191 calyx-ward `onnx-lens`
 # pattern.
 ml-runtime = [
+    "dep:calyx-onnx-runtime",
     "calyx-forge/cuda-runtime-boundary",
     "dep:candle-core",
     "dep:candle-nn",
@@ -41,19 +42,21 @@ calyx-aster = { path = "../calyx-aster" }
 calyx-core = { path = "../calyx-core" }
 calyx-forge = { path = "../calyx-forge" }
 calyx-ledger = { path = "../calyx-ledger" }
+calyx-onnx-runtime = { path = "../calyx-onnx-runtime", features = ["runtime"], optional = true }
 blake3.workspace = true
 candle-core = { version = "=0.10.2", optional = true }
 candle-nn = { version = "=0.10.2", optional = true }
 candle-transformers = { version = "=0.10.2", optional = true }
-fastembed = { version = "5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic", "qwen3"], optional = true }
+fastembed = { version = "5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-alternative-backend", "qwen3"], optional = true }
 half = { workspace = true, optional = true }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 memmap2 = { workspace = true, optional = true }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "alternative-backend", "cuda", "api-24"], optional = true }
 safetensors = { version = "=0.7.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1.workspace = true
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 tracing.workspace = true
 

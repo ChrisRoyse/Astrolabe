@@ -57,7 +57,8 @@ pub use cuda_device::{
 };
 #[cfg(all(windows, feature = "cuda-runtime-boundary"))]
 pub use cuda_runtime::{
-    PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation, PinnedCudaRuntimeAttestation,
+    CUDA_NO_DEVICE_ATTESTED_CODE, PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation,
+    PinnedCudaRuntimeAttestation,
     attest_pinned_cuda_dependencies, attest_pinned_cuda_driver_identity,
     current_pinned_cuda_device,
     initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
@@ -74,10 +75,11 @@ pub use mxfp8::{
 };
 pub use quant::{
     AssayQuantSafety, BinaryCodec, CURRENT_SEED_VERSION, MxFp4Codec, QjlResidual, QuantLevel,
-    QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId, TurboQuantCodec,
+    QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId,
+    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM,
+    TurboQuantCodec, TurboQuantPreparedQuery, TurboQuantStorage,
     apply_inverse_rotation, apply_rotation, apply_rotation_batch, binary_prefilter,
-    dot_estimate_unbiased, dot_qjl_correction, encode_qjl_residual, hamming_dot_estimate, new_seed,
-    seed_id_hex,
+    hamming_dot_estimate, new_seed, seed_id_hex,
 };
 #[cfg(feature = "cuda")]
 pub use vram::CudaStream;

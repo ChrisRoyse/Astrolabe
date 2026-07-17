@@ -106,7 +106,7 @@ ort-download-binaries-rustls-tls = [
     "ort/download-binaries",
     "ort/tls-rustls",
 ]
-ort-load-dynamic = ["ort/load-dynamic"]
+ort-alternative-backend = ["ort/alternative-backend"]
 qwen3 = [
     "dep:candle-core",
     "dep:candle-nn",

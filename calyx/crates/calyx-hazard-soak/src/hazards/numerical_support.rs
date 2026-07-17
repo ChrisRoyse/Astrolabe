@@ -79,12 +79,12 @@ pub fn recall_against_exact(
 
 pub fn min_bit_contract_code(dim: usize, bound: f32, code: &str) -> Result<MinBitDrift, String> {
     let seed = new_seed(dim, b"ph59-h10-min-bits");
-    let (left, right) = min_bit_edge_pair(&seed);
+    let (left, right) = min_bit_edge_pair(&seed)?;
     let codec = BinaryCodec::new(seed).map_err(err)?;
-    let lq = codec.encode(&left).map_err(err)?;
+    let _lq = codec.encode(&left).map_err(err)?;
     let rq = codec.encode(&right).map_err(err)?;
     let before = dot(&left, &right);
-    let after = codec.dot_estimate(&lq, &rq).map_err(err)?;
+    let after = codec.dot_estimate(&left, &rq).map_err(err)?;
     let relative_error = (before - after).abs() / before.abs().max(1e-6);
     let code = if relative_error > bound {
         code.to_string()
@@ -308,12 +308,12 @@ fn dense_signal(pair: usize, dim: usize, a: f32, b: f32, c: f32) -> f32 {
     (x * a).sin() * 0.63 + (y * b).cos() * 0.31 + ((x + y) * c).sin() * 0.06
 }
 
-fn min_bit_edge_pair(seed: &RotationSeed) -> (Vec<f32>, Vec<f32>) {
+fn min_bit_edge_pair(seed: &RotationSeed) -> Result<(Vec<f32>, Vec<f32>), String> {
     let mut left = vec![0.0; seed.dim];
     let mut right = vec![0.0; seed.dim];
     left[0] = 1.0;
     right[1] = 1.0;
-    apply_inverse_rotation(seed, &mut left);
-    apply_inverse_rotation(seed, &mut right);
-    (left, right)
+    apply_inverse_rotation(seed, &mut left).map_err(err)?;
+    apply_inverse_rotation(seed, &mut right).map_err(err)?;
+    Ok((left, right))
 }

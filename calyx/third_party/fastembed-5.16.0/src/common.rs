@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 #[cfg(feature = "hf-hub")]
@@ -32,6 +32,26 @@ pub struct TokenizerFiles {
     pub tokenizer_config_file: Vec<u8>,
 }
 
+/// One external-data file referenced by the exact in-memory ONNX graph.
+///
+/// `file_name` must be the canonical relative POSIX path stored in the graph's
+/// `TensorProto.external_data.location` entry. The buffer is retained by ONNX
+/// Runtime for the committed session's lifetime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalInitializerFile {
+    pub file_name: String,
+    pub buffer: Vec<u8>,
+}
+
+impl ExternalInitializerFile {
+    pub fn new(file_name: impl Into<String>, buffer: Vec<u8>) -> Self {
+        Self {
+            file_name: file_name.into(),
+            buffer,
+        }
+    }
+}
+
 /// The procedure for loading tokenizer files from the hugging face hub is separated
 /// from the main load_tokenizer function (which is expecting bytes, from any source).
 #[cfg(feature = "hf-hub")]
@@ -51,49 +71,108 @@ pub fn load_tokenizer_hf_hub(model_repo: ApiRepo, max_length: usize) -> Result<T
 ///
 /// Or indirectly from the try_new function via load_tokenizer_hf_hub (converting HF files to bytes)
 pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Result<Tokenizer> {
-    let base_error_message =
-        "Error building TokenizerFiles for UserDefinedEmbeddingModel. Could not read {} file.";
-
     // Deserialize each tokenizer file
-    let config: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.config_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "config.json"),
-            )
-        })?;
+    let config: serde_json::Value = serde_json::from_slice(&tokenizer_files.config_file)
+        .map_err(|error| tokenizer_error("JSON_INVALID", "config.json", error))?;
     let special_tokens_map: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.special_tokens_map_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "special_tokens_map.json"),
-            )
-        })?;
+        serde_json::from_slice(&tokenizer_files.special_tokens_map_file)
+            .map_err(|error| tokenizer_error("JSON_INVALID", "special_tokens_map.json", error))?;
     let tokenizer_config: serde_json::Value =
-        serde_json::from_slice(&tokenizer_files.tokenizer_config_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "tokenizer_config.json"),
-            )
-        })?;
+        serde_json::from_slice(&tokenizer_files.tokenizer_config_file)
+            .map_err(|error| tokenizer_error("JSON_INVALID", "tokenizer_config.json", error))?;
     let mut tokenizer: tokenizers::Tokenizer =
-        tokenizers::Tokenizer::from_bytes(tokenizer_files.tokenizer_file).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                base_error_message.replace("{}", "tokenizer.json"),
+        tokenizers::Tokenizer::from_bytes(tokenizer_files.tokenizer_file)
+            .map_err(|error| tokenizer_error("TOKENIZER_INVALID", "tokenizer.json", error))?;
+
+    let config = config.as_object().ok_or_else(|| {
+        tokenizer_error(
+            "ROOT_OBJECT_REQUIRED",
+            "config.json",
+            "top-level value is not an object",
+        )
+    })?;
+    let tokenizer_config = tokenizer_config.as_object().ok_or_else(|| {
+        tokenizer_error(
+            "ROOT_OBJECT_REQUIRED",
+            "tokenizer_config.json",
+            "top-level value is not an object",
+        )
+    })?;
+    let special_tokens_map = special_tokens_map.as_object().ok_or_else(|| {
+        tokenizer_error(
+            "ROOT_OBJECT_REQUIRED",
+            "special_tokens_map.json",
+            "top-level value is not an object",
+        )
+    })?;
+
+    // Some upstream BGE metadata declares an intentionally huge numeric cap.
+    let model_max_length = tokenizer_config
+        .get("model_max_length")
+        .ok_or_else(|| {
+            tokenizer_error(
+                "MODEL_MAX_LENGTH_MISSING",
+                "tokenizer_config.json",
+                "model_max_length is required",
+            )
+        })?
+        .as_f64()
+        .filter(|length| length.is_finite() && *length >= 1.0 && length.fract() == 0.0)
+        .ok_or_else(|| {
+            tokenizer_error(
+                "MODEL_MAX_LENGTH_INVALID",
+                "tokenizer_config.json",
+                "model_max_length must be a finite integer greater than or equal to one",
             )
         })?;
-
-    //For BGEBaseSmall, the model_max_length value is set to 1000000000000000019884624838656. Which fits in a f64
-    let model_max_length = tokenizer_config["model_max_length"]
-        .as_f64()
-        .expect("Error reading model_max_length from tokenizer_config.json")
-        as f32;
-    let max_length = max_length.min(model_max_length as usize);
-    let pad_id = config["pad_token_id"].as_u64().unwrap_or(0) as u32;
-    let pad_token = tokenizer_config["pad_token"]
-        .as_str()
-        .expect("Error reading pad_token from tokenizer_config.json")
+    if max_length == 0 {
+        return Err(tokenizer_error(
+            "REQUESTED_MAX_LENGTH_INVALID",
+            "constructor options",
+            "max_length must be greater than zero",
+        ));
+    }
+    let model_max_length = if model_max_length >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        model_max_length.floor() as usize
+    };
+    let max_length = max_length.min(model_max_length);
+    let raw_pad_id = config
+        .get("pad_token_id")
+        .ok_or_else(|| {
+            tokenizer_error(
+                "PAD_TOKEN_ID_MISSING",
+                "config.json",
+                "pad_token_id is required",
+            )
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            tokenizer_error(
+                "PAD_TOKEN_ID_INVALID",
+                "config.json",
+                "pad_token_id must be an unsigned integer",
+            )
+        })?;
+    let pad_id = u32::try_from(raw_pad_id).map_err(|_| {
+        tokenizer_error(
+            "PAD_TOKEN_ID_OUT_OF_RANGE",
+            "config.json",
+            format!("pad_token_id {raw_pad_id} exceeds u32"),
+        )
+    })?;
+    let pad_token = tokenizer_config
+        .get("pad_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            tokenizer_error(
+                "PAD_TOKEN_INVALID",
+                "tokenizer_config.json",
+                "pad_token must be a non-empty string",
+            )
+        })?
         .into();
 
     let mut tokenizer = tokenizer
@@ -108,45 +187,94 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
             max_length,
             ..Default::default()
         }))
-        .map_err(anyhow::Error::msg)?
+        .map_err(|error| {
+            tokenizer_error(
+                "TRUNCATION_CONFIGURATION_INVALID",
+                "tokenizer metadata",
+                error,
+            )
+        })?
         .clone();
-    if let serde_json::Value::Object(root_object) = special_tokens_map {
-        for (_, value) in root_object.iter() {
-            if value.is_string() {
-                if let Some(content) = value.as_str() {
-                    tokenizer.add_special_tokens(&[AddedToken {
-                        content: content.into(),
-                        special: true,
-                        ..Default::default()
-                    }]);
-                }
-            } else if value.is_object() {
-                if let (
-                    Some(content),
-                    Some(single_word),
-                    Some(lstrip),
-                    Some(rstrip),
-                    Some(normalized),
-                ) = (
-                    value["content"].as_str(),
-                    value["single_word"].as_bool(),
-                    value["lstrip"].as_bool(),
-                    value["rstrip"].as_bool(),
-                    value["normalized"].as_bool(),
-                ) {
-                    tokenizer.add_special_tokens(&[AddedToken {
-                        content: content.into(),
-                        special: true,
-                        single_word,
-                        lstrip,
-                        rstrip,
-                        normalized,
-                    }]);
-                }
+    for (name, value) in special_tokens_map {
+        let token = if let Some(content) = value.as_str() {
+            if content.is_empty() {
+                return Err(tokenizer_error(
+                    "SPECIAL_TOKEN_INVALID",
+                    "special_tokens_map.json",
+                    format!("special token {name} is empty"),
+                ));
             }
-        }
+            AddedToken {
+                content: content.into(),
+                special: true,
+                ..Default::default()
+            }
+        } else if let Some(value) = value.as_object() {
+            let content = required_special_token_string(value, name, "content")?;
+            AddedToken {
+                content,
+                special: true,
+                single_word: required_special_token_bool(value, name, "single_word")?,
+                lstrip: required_special_token_bool(value, name, "lstrip")?,
+                rstrip: required_special_token_bool(value, name, "rstrip")?,
+                normalized: required_special_token_bool(value, name, "normalized")?,
+            }
+        } else {
+            return Err(tokenizer_error(
+                "SPECIAL_TOKEN_INVALID",
+                "special_tokens_map.json",
+                format!("special token {name} must be a string or object"),
+            ));
+        };
+        tokenizer.add_special_tokens(&[token]);
     }
-    Ok(tokenizer.into())
+    Ok(tokenizer)
+}
+
+fn required_special_token_string(
+    value: &serde_json::Map<String, serde_json::Value>,
+    token: &str,
+    field: &str,
+) -> Result<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            tokenizer_error(
+                "SPECIAL_TOKEN_FIELD_INVALID",
+                "special_tokens_map.json",
+                format!("special token {token} requires non-empty string field {field}"),
+            )
+        })
+}
+
+fn required_special_token_bool(
+    value: &serde_json::Map<String, serde_json::Value>,
+    token: &str,
+    field: &str,
+) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            tokenizer_error(
+                "SPECIAL_TOKEN_FIELD_INVALID",
+                "special_tokens_map.json",
+                format!("special token {token} requires boolean field {field}"),
+            )
+        })
+}
+
+fn tokenizer_error(
+    code: &'static str,
+    source: impl std::fmt::Display,
+    detail: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "FASTEMBED_TOKENIZER_METADATA_INVALID code={code} source={source} detail={detail} remediation=repair the exact frozen tokenizer metadata bytes before constructing an ONNX session"
+    )
 }
 
 pub fn normalize(v: &[f32]) -> Vec<f32> {

@@ -1,10 +1,10 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::load_tokenizer,
-    models::bgem3::{models_list, Bgem3Model},
-    text_embedding::InitOptionsUserDefined,
     ModelInfo, SparseEmbedding, TokenizerFiles,
+    common::load_tokenizer,
+    models::bgem3::{Bgem3Model, models_list},
+    text_embedding::InitOptionsUserDefined,
 };
 #[cfg(feature = "hf-hub")]
 use anyhow::Context;
@@ -24,7 +24,7 @@ use std::thread::available_parallelism;
 
 #[cfg(feature = "hf-hub")]
 use super::Bgem3InitOptions;
-use super::{Bgem3Embedding, Bgem3EmbeddingOutput, UserDefinedBgem3Model, DEFAULT_BATCH_SIZE};
+use super::{Bgem3Embedding, Bgem3EmbeddingOutput, DEFAULT_BATCH_SIZE, UserDefinedBgem3Model};
 
 impl Bgem3Embedding {
     fn builder_error(err: ort::Error<ort::session::builder::SessionBuilder>) -> anyhow::Error {
@@ -75,7 +75,9 @@ impl Bgem3Embedding {
                     .context(format!("Failed to retrieve {}", file))?;
             }
         }
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -88,7 +90,6 @@ impl Bgem3Embedding {
             .apply_to(builder)?
             .commit_from_file(model_file_reference)?;
 
-        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session, model_name))
     }
 
@@ -110,7 +111,9 @@ impl Bgem3Embedding {
             Some(n) => n,
             None => available_parallelism()?.get(),
         };
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -119,12 +122,12 @@ impl Bgem3Embedding {
             .map_err(Self::builder_error)?
             .with_intra_threads(threads)
             .map_err(Self::builder_error)?;
-        let session = session_policy
-            .apply_to(builder)?
-            .commit_from_memory(&model.onnx_file)?;
+        let builder = session_policy.apply_to(builder)?;
+        let builder =
+            crate::init::apply_external_initializers(builder, model.external_initializers)?;
+        let session = builder.commit_from_memory(&model.onnx_file)?;
 
-        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
-        Ok(Self::new(tokenizer, session, Bgem3Model::default()))
+        Ok(Self::new(tokenizer, session, model.model))
     }
 
     /// Create a Bgem3Embedding instance from a model directory on disk.
@@ -147,7 +150,9 @@ impl Bgem3Embedding {
             Some(n) => n,
             None => available_parallelism()?.get(),
         };
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer(tokenizer_files, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -160,7 +165,6 @@ impl Bgem3Embedding {
             .apply_to(builder)?
             .commit_from_file(model_path.as_ref().join("model.onnx"))?;
 
-        let tokenizer = load_tokenizer(tokenizer_files, max_length)?;
         Ok(Self::new(tokenizer, session, Bgem3Model::default()))
     }
 

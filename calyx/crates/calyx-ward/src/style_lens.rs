@@ -10,17 +10,16 @@ use ort::session::Session;
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
 use std::fmt;
-#[cfg(feature = "onnx-lens")]
-use std::fs::File;
-#[cfg(feature = "onnx-lens")]
-use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "onnx-lens")]
 use tokenizers::Tokenizer;
 
 use crate::error::WardError;
 #[cfg(feature = "onnx-lens")]
-use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
+use crate::onnx_session::{
+    ManagedWardOnnxSession, WardCpuAuthorization, WardOnnxArtifactBundle,
+    WardOnnxExecutionAttestation, build_session, snapshot_cpu_artifacts, snapshot_cuda_artifacts,
+};
 
 pub const DEFAULT_STYLE_MODEL_PATH: &str = "/var/lib/calyx/models/style/style-embed-v1.onnx";
 pub const DEFAULT_STYLE_TOKENIZER_PATH: &str = "/var/lib/calyx/models/style/tokenizer.json";
@@ -69,6 +68,14 @@ pub trait StyleEmbeddingBackend: Send + Sync {
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         Ok(None)
     }
+
+    #[cfg(feature = "onnx-lens")]
+    fn durable_execution_attestation(
+        &self,
+        _lens_id: LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        Ok(None)
+    }
 }
 
 /// Frozen style/register lens. Runtime state is limited to ORT and tokenizer handles.
@@ -97,14 +104,28 @@ impl StyleLens {
         Self::new_with_provider_policy(model_path, StyleProviderPolicy::CudaFailLoud)
     }
 
-    pub fn new_cpu_explicit(model_path: &Path) -> Result<Self, WardError> {
-        Self::new_with_provider_policy(model_path, StyleProviderPolicy::CpuExplicit)
+    #[cfg(feature = "onnx-lens")]
+    pub fn new_cpu_explicit(
+        model_path: &Path,
+        authorization: &WardCpuAuthorization,
+    ) -> Result<Self, WardError> {
+        let tokenizer_path = model_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tokenizer.json");
+        Self::new_cpu_explicit_with_tokenizer(model_path, &tokenizer_path, authorization)
     }
 
     pub fn new_with_provider_policy(
         model_path: &Path,
         policy: StyleProviderPolicy,
     ) -> Result<Self, WardError> {
+        if policy == StyleProviderPolicy::CpuExplicit {
+            return Err(WardError::CpuCompanionUnauthorized {
+                reason: "StyleProviderPolicy::CpuExplicit requires new_cpu_explicit and a WardCpuAuthorization"
+                    .to_string(),
+            });
+        }
         let tokenizer_path = model_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -118,8 +139,35 @@ impl StyleLens {
         tokenizer_path: &Path,
         policy: StyleProviderPolicy,
     ) -> Result<Self, WardError> {
-        let weights_hash = sha256_files(&[model_path, tokenizer_path])?;
-        let backend = OnnxStyleBackend::new(model_path, tokenizer_path, policy)?;
+        if policy == StyleProviderPolicy::CpuExplicit {
+            return Err(WardError::CpuCompanionUnauthorized {
+                reason: "StyleProviderPolicy::CpuExplicit requires new_cpu_explicit_with_tokenizer and a WardCpuAuthorization"
+                    .to_string(),
+            });
+        }
+        let artifacts = snapshot_cuda_artifacts("style", model_path, Some(tokenizer_path))?;
+        Self::from_artifacts(model_path, tokenizer_path, artifacts)
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    pub fn new_cpu_explicit_with_tokenizer(
+        model_path: &Path,
+        tokenizer_path: &Path,
+        authorization: &WardCpuAuthorization,
+    ) -> Result<Self, WardError> {
+        let artifacts =
+            snapshot_cpu_artifacts("style", model_path, Some(tokenizer_path), authorization)?;
+        Self::from_artifacts(model_path, tokenizer_path, artifacts)
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    fn from_artifacts(
+        model_path: &Path,
+        tokenizer_path: &Path,
+        artifacts: WardOnnxArtifactBundle,
+    ) -> Result<Self, WardError> {
+        let weights_hash = artifacts.lens_weights_sha256();
+        let backend = OnnxStyleBackend::new(artifacts)?;
         Self::from_backend(
             model_path.to_path_buf(),
             tokenizer_path.to_path_buf(),
@@ -218,6 +266,13 @@ impl StyleLens {
     pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         self.backend.execution_attestation()
     }
+
+    #[cfg(feature = "onnx-lens")]
+    pub fn durable_execution_attestation(
+        &self,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.backend.durable_execution_attestation(self.lens_id)
+    }
 }
 
 impl Lens for StyleLens {
@@ -270,19 +325,10 @@ struct OnnxStyleBackend {
 
 #[cfg(feature = "onnx-lens")]
 impl OnnxStyleBackend {
-    fn new(
-        model_path: &Path,
-        tokenizer_path: &Path,
-        policy: StyleProviderPolicy,
-    ) -> Result<Self, WardError> {
-        let tokenizer =
-            Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
-                path: tokenizer_path.to_path_buf(),
-            })?;
-        let session = match policy {
-            StyleProviderPolicy::CudaFailLoud => build_cuda_session("style", model_path),
-            StyleProviderPolicy::CpuExplicit => build_cpu_session("style", model_path),
-        }?;
+    fn new(artifacts: WardOnnxArtifactBundle) -> Result<Self, WardError> {
+        let tokenizer = Tokenizer::from_bytes(artifacts.tokenizer_bytes()?)
+            .map_err(|error| artifacts.error("style", "tokenizer_commit", error))?;
+        let session = build_session("style", artifacts)?;
         let (input_names, output_names) = session.inspect_session(|raw| {
             Ok((
                 raw.inputs()
@@ -394,6 +440,13 @@ impl StyleEmbeddingBackend for OnnxStyleBackend {
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         self.session.execution_attestation()
     }
+
+    fn durable_execution_attestation(
+        &self,
+        lens_id: LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.session.durable_execution_attestation(lens_id)
+    }
 }
 
 #[cfg(feature = "onnx-lens")]
@@ -503,25 +556,6 @@ fn normalize_unit(mut data: Vec<f32>, expected_dim: usize) -> Result<Vec<f32>, W
     }
     data.iter_mut().for_each(|value| *value /= norm);
     Ok(data)
-}
-
-#[cfg(feature = "onnx-lens")]
-fn sha256_files(paths: &[&Path]) -> Result<[u8; 32], WardError> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    for path in paths {
-        let mut file = File::open(path).map_err(|_| WardError::ModelNotFound {
-            path: (*path).to_path_buf(),
-        })?;
-        loop {
-            let n = file.read(&mut buf).map_err(runtime_error)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-    }
-    Ok(hasher.finalize().into())
 }
 
 fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {

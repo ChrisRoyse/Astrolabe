@@ -123,23 +123,117 @@ fn warm_options(home: PathBuf, flags: ServeFlags) -> ResidentWarmOptions {
 }
 
 fn serve_loop(listener: TcpListener, service: Arc<ResidentService>) -> CliResult {
+    listener.set_nonblocking(true)?;
     let running = Arc::new(AtomicBool::new(true));
+    let expected_auth_line = worker_auth_line(&service.worker_auth_secret)?;
+    let handler_limit = std::thread::available_parallelism()
+        .map_err(|error| CliError::runtime(format!("measure resident worker capacity: {error}")))?
+        .get()
+        .saturating_add(1);
+    let mut handlers = Vec::new();
+    let mut accept_error = None;
     while running.load(Ordering::SeqCst) {
-        let (stream, peer) = listener.accept()?;
-        if !peer.ip().is_loopback() {
-            let _ = stream.shutdown(Shutdown::Both);
-            continue;
+        if let Err(error) = reap_worker_handlers(&mut handlers) {
+            accept_error = Some(error);
+            running.store(false, Ordering::SeqCst);
+            break;
         }
-        if let Err(error) = handle_client(stream, Arc::clone(&service), Arc::clone(&running)) {
-            eprintln!(
-                "CALYX_PANEL_RESIDENT_RUNTIME phase=worker_client_error code={} message={} remediation={}",
-                error.code(),
-                error.message(),
-                error.remediation()
-            );
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                if let Err(error) = authenticate_worker_connection(&mut stream, &expected_auth_line)
+                {
+                    eprintln!(
+                        "CALYX_PANEL_RESIDENT_RUNTIME phase=worker_authentication_error code={} message={} remediation={}",
+                        error.code(),
+                        error.message(),
+                        error.remediation()
+                    );
+                    continue;
+                }
+                if let Err(error) = reap_worker_handlers(&mut handlers) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    accept_error = Some(error);
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+                if handlers.len() >= handler_limit {
+                    if let Err(error) =
+                        reject_worker_back_pressure(stream, service.max_request_secs)
+                    {
+                        eprintln!(
+                            "CALYX_PANEL_RESIDENT_RUNTIME phase=worker_back_pressure_response_error code={} message={} remediation={}",
+                            error.code(),
+                            error.message(),
+                            error.remediation()
+                        );
+                    }
+                    continue;
+                }
+                let service = Arc::clone(&service);
+                let running = Arc::clone(&running);
+                handlers.push(std::thread::spawn(move || {
+                    if let Err(error) = handle_client(stream, service, running) {
+                        eprintln!(
+                            "CALYX_PANEL_RESIDENT_RUNTIME phase=worker_client_error code={} message={} remediation={}",
+                            error.code(),
+                            error.message(),
+                            error.remediation()
+                        );
+                    }
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                accept_error = Some(error.into());
+                running.store(false, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+    let joined = join_worker_handlers(handlers);
+    match accept_error {
+        Some(error) => {
+            joined?;
+            Err(error)
+        }
+        None => joined,
+    }
+}
+
+fn reap_worker_handlers(handlers: &mut Vec<std::thread::JoinHandle<()>>) -> CliResult {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            join_worker_handler(handlers.swap_remove(index))?;
+        } else {
+            index += 1;
         }
     }
     Ok(())
+}
+
+fn join_worker_handlers(handlers: Vec<std::thread::JoinHandle<()>>) -> CliResult {
+    let mut first_error = None;
+    for handler in handlers {
+        if let Err(error) = join_worker_handler(handler)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn join_worker_handler(handler: std::thread::JoinHandle<()>) -> CliResult {
+    handler.join().map_err(|_| {
+        CliError::runtime("resident private worker handler panicked before its socket was released")
+    })
 }
 
 fn handle_client(
@@ -147,33 +241,9 @@ fn handle_client(
     service: Arc<ResidentService>,
     running: Arc<AtomicBool>,
 ) -> CliResult {
-    let auth_deadline = deadline_after(WORKER_AUTH_IO_TIMEOUT)?;
-    let mut ingress = stream.try_clone()?;
-    let mut reader = BufReader::new(DeadlineStream::new(&mut ingress, auth_deadline));
-    let auth_line = match read_bounded_line(
-        &mut reader,
-        MAX_WORKER_AUTH_LINE_BYTES,
-        "resident worker authentication line",
-    ) {
-        Ok(line) => line,
-        Err(error) => {
-            return reject_worker_connection(
-                &mut stream,
-                format!("read resident worker authentication preamble: {error}"),
-                deadline_after(WORKER_AUTH_IO_TIMEOUT)?,
-            );
-        }
-    };
-    let expected_auth_line = worker_auth_line(&service.worker_auth_secret)?;
-    if !constant_time_eq(&auth_line, &expected_auth_line) {
-        return reject_worker_connection(
-            &mut stream,
-            "resident worker rejected a connection without its exact generation credential",
-            deadline_after(WORKER_AUTH_IO_TIMEOUT)?,
-        );
-    }
     let request_deadline = deadline_after(Duration::from_secs(service.max_request_secs))?;
-    reader.get_mut().set_deadline(request_deadline);
+    let mut ingress = stream.try_clone()?;
+    let mut reader = BufReader::new(DeadlineStream::new(&mut ingress, request_deadline));
 
     let first_line = read_bounded_line(
         &mut reader,
@@ -221,6 +291,85 @@ fn worker_auth_line(auth_secret: &str) -> CliResult<Vec<u8>> {
     let mut line = Vec::with_capacity(MAX_WORKER_AUTH_LINE_BYTES);
     super::worker::write_worker_auth_line(&mut line, auth_secret)?;
     Ok(line)
+}
+
+fn authenticate_worker_connection(stream: &mut TcpStream, expected: &[u8]) -> CliResult {
+    let deadline = deadline_after(WORKER_AUTH_IO_TIMEOUT)?;
+    let observed = match read_worker_auth_line(stream, deadline) {
+        Ok(line) => line,
+        Err(error) => {
+            return reject_worker_connection(
+                stream,
+                format!("read resident worker authentication preamble: {error}"),
+                deadline_after(WORKER_AUTH_IO_TIMEOUT)?,
+            );
+        }
+    };
+    if constant_time_eq(&observed, expected) {
+        return Ok(());
+    }
+    reject_worker_connection(
+        stream,
+        "resident worker rejected a connection without its exact generation credential",
+        deadline_after(WORKER_AUTH_IO_TIMEOUT)?,
+    )
+}
+
+fn read_worker_auth_line(stream: &mut TcpStream, deadline: Instant) -> CliResult<Vec<u8>> {
+    let mut stream = DeadlineStream::new(stream, deadline);
+    let mut line = Vec::with_capacity(MAX_WORKER_AUTH_LINE_BYTES);
+    loop {
+        if line.len() >= MAX_WORKER_AUTH_LINE_BYTES {
+            return Err(CliError::from(CalyxError {
+                code: WORKER_UNAUTHORIZED,
+                message: "resident worker authentication line exceeded its exact bound".to_string(),
+                remediation: "connect through the public resident supervisor; direct worker access is forbidden",
+            }));
+        }
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte)?;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+    }
+}
+
+fn reject_worker_back_pressure(mut stream: TcpStream, max_request_secs: u64) -> CliResult {
+    let deadline = deadline_after(Duration::from_secs(max_request_secs))?;
+    let mut ingress = stream.try_clone()?;
+    let mut reader = BufReader::new(DeadlineStream::new(&mut ingress, deadline));
+    let first_line = read_bounded_line(
+        &mut reader,
+        MAX_RESIDENT_JSON_LINE_BYTES,
+        "resident worker back-pressure request preamble",
+    )?;
+    let error = CliError::from(CalyxError {
+        code: PRIVATE_WORKER_BACK_PRESSURE,
+        message: "resident private worker reached its authenticated handler capacity".to_string(),
+        remediation: "retry the same request within its existing absolute supervisor deadline; the loaded generation remains healthy",
+    });
+    if first_line == RESIDENT_BINARY_MAGIC {
+        let response = (|| -> CliResult {
+            let mut output = DeadlineStream::new(&mut stream, deadline);
+            super::stream::write_stream_frame(
+                &mut output,
+                &ResidentMeasureBatchStreamFrame::Err {
+                    code: error.code().to_string(),
+                    message: error.message().to_string(),
+                    remediation: error.remediation().to_string(),
+                },
+            )?;
+            output.flush().map_err(CliError::from)
+        })();
+        let _ = stream.shutdown(Shutdown::Write);
+        let drained = super::codec::discard_frame(&mut reader).map_err(CliError::from);
+        let _ = stream.shutdown(Shutdown::Both);
+        response?;
+        drained
+    } else {
+        write_json_response(&mut stream, &cli_error_value(&error), deadline)
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

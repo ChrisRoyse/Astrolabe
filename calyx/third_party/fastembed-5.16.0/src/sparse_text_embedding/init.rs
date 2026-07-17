@@ -4,7 +4,7 @@ use tokenizers::Tokenizer;
 use crate::{
     init::{HasMaxLength, InitOptionsWithLength},
     models::sparse::SparseModel,
-    TokenizerFiles,
+    ExternalInitializerFile, TokenizerFiles,
 };
 
 use super::DEFAULT_MAX_LENGTH;
@@ -23,15 +23,34 @@ pub type SparseInitOptions = InitOptionsWithLength<SparseModel>;
 #[non_exhaustive]
 pub struct UserDefinedSparseModel {
     pub onnx_file: Vec<u8>,
+    pub external_initializers: Vec<ExternalInitializerFile>,
     pub tokenizer_files: TokenizerFiles,
+    pub model: SparseModel,
 }
 
 impl UserDefinedSparseModel {
     pub fn new(onnx_file: Vec<u8>, tokenizer_files: TokenizerFiles) -> Self {
         Self {
             onnx_file,
+            external_initializers: Vec::new(),
             tokenizer_files,
+            model: SparseModel::default(),
         }
+    }
+
+    pub fn with_model(mut self, model: SparseModel) -> Self {
+        self.model = model;
+        self
+    }
+
+    pub fn with_external_initializer(
+        mut self,
+        file_name: impl Into<String>,
+        buffer: Vec<u8>,
+    ) -> Self {
+        self.external_initializers
+            .push(ExternalInitializerFile::new(file_name, buffer));
+        self
     }
 }
 

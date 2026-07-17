@@ -163,25 +163,37 @@ impl Quantizer for MxFp4Codec {
         }
     }
 
-    fn dot_estimate(&self, a: &QuantizedVec, b: &QuantizedVec) -> Result<f32> {
-        validate_quantized(a, self.dim, "dot_estimate")?;
-        validate_quantized(b, self.dim, "dot_estimate")?;
-        if a.dim != b.dim {
+    fn dot_estimate(&self, query: &[f32], candidate: &QuantizedVec) -> Result<f32> {
+        if query.len() != self.dim {
             return Err(ForgeError::ShapeMismatch {
-                expected: vec![a.dim],
-                got: vec![b.dim],
-                remediation: "Compare MXFP4 vectors with the same dimension".to_string(),
+                expected: vec![self.dim],
+                got: vec![query.len()],
+                remediation: "Score MXFP vectors with a raw query of the codec dimension"
+                    .to_string(),
             });
         }
-        let left = self.decode(a)?;
-        let right = self.decode(b)?;
+        if let Some(index) = query.iter().position(|value| !value.is_finite()) {
+            return Err(quant_error(
+                "dot_estimate",
+                format!("non-finite raw query coefficient at index {index}"),
+            ));
+        }
+        validate_quantized(candidate, self.dim, "dot_estimate")?;
+        let right = self.decode(candidate)?;
         // Assay admits FP4 slots only after the intelligence-preservation gate,
         // so this path uses the raw decoded fp32 dot without an unbiased fixup.
-        Ok(left
+        let sum = query
             .iter()
             .zip(right.iter())
             .map(|(lhs, rhs)| lhs * rhs)
-            .sum())
+            .sum::<f32>();
+        if !sum.is_finite() {
+            return Err(quant_error(
+                "dot_estimate",
+                "dot estimate is non-finite",
+            ));
+        }
+        Ok(sum)
     }
 
     fn level(&self) -> QuantLevel {

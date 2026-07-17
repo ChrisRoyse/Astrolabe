@@ -379,8 +379,8 @@ fn driver_ordinal_for_identity(expected: PinnedCudaDeviceIdentity) -> Result<u32
     })?;
     if count <= 0 {
         return Err(identity_mismatch(
-            "CALYX_CUDA_NO_DEVICE",
-            "CUDA Driver reported zero devices while resolving the pinned physical identity",
+            "CALYX_CUDA_DRIVER_RUNTIME_INCONSISTENT",
+            "CUDA Driver reported zero devices after the CUDA Runtime pinned a physical identity",
         ));
     }
     let mut matches = Vec::new();

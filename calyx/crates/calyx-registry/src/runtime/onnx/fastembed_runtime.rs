@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use calyx_core::{CalyxError, Modality, Result, SlotShape};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{EmbeddingModel, InitOptionsUserDefined, TextEmbedding, UserDefinedEmbeddingModel};
 use hf_hub::api::sync::ApiBuilder;
 use ort::ep::{self, ArenaExtendStrategy, cuda::ConvAlgorithmSearch};
 
 use super::cuda_guard::CudaDropGuard;
 use super::{OnnxLens, OnnxModelFiles, OnnxProviderPolicy};
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
-use crate::runtime::common::{default_hf_cache_root, fastembed_cache_root, hash_files};
+use crate::runtime::common::{default_hf_cache_root, fastembed_cache_root};
 
 pub fn default_cache_root() -> PathBuf {
     default_hf_cache_root()
@@ -50,27 +50,45 @@ pub fn from_model_with_policy(
         &info.model_file,
         &info.additional_files,
     )?;
-    let weights_sha256 = hash_files(&files.artifact_paths())?;
+    let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
+        &files,
+        &info.model_file,
+        &info.additional_files,
+        provider_policy,
+    )?;
+    let weights_sha256 = artifacts.receipt().weights_sha256;
     let context = super::fastembed_attestation::FastembedModelContext::new(
         format!("onnx-fastembed:{}", info.model_code),
         &info.model_code,
         &files,
-        weights_sha256,
+        artifacts.receipt(),
         provider_policy,
     )?;
-    super::arena::preflight_gpu_mem_limit_for_artifacts(
+    super::arena::preflight_gpu_mem_limit_for_bytes(
         &format!("onnx-fastembed:{}", info.model_code),
         provider_policy,
-        files.artifact_paths().iter().map(|path| path.as_path()),
+        artifacts.receipt().artifact_bytes,
     )
     .map_err(|error| context.error("vram_preflight", error))?;
     let label = format!("onnx-fastembed:{}", info.model_code);
     let (execution_providers, bound_stream) = execution_providers(&label, provider_policy)
         .map_err(|error| context.error("execution_provider_configuration", error))?;
-    let model = TextEmbedding::try_new(
-        TextInitOptions::new(model_name.clone())
-            .with_cache_dir(cache_dir.clone())
-            .with_show_download_progress(false)
+    let (model_bytes, tokenizer_files, external_initializers) = artifacts.into_parts();
+    let mut user_model = UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files)
+        .with_quantization(TextEmbedding::get_quantization_mode(&model_name));
+    if let Some(pooling) = TextEmbedding::get_default_pooling_method(&model_name) {
+        user_model = user_model.with_pooling(pooling);
+    }
+    if let Some(output_key) = info.output_key.clone() {
+        user_model = user_model.with_output_key(output_key);
+    }
+    for initializer in external_initializers {
+        user_model =
+            user_model.with_external_initializer(initializer.file_name, initializer.buffer);
+    }
+    let model = TextEmbedding::try_new_from_user_defined(
+        user_model,
+        InitOptionsUserDefined::new()
             .with_intra_threads(1)
             .with_session_policy(context.session_policy())
             .with_execution_providers(execution_providers),
@@ -238,7 +256,7 @@ pub(super) fn execution_providers_for_attested_device(
             }
             Ok(vec![cuda.build().error_on_failure()])
         }
-        OnnxProviderPolicy::CpuExplicit => Ok(vec![ep::CPU::default().build()]),
+        OnnxProviderPolicy::CpuExplicit => Ok(vec![ep::CPU::default().build().error_on_failure()]),
     }
 }
 
@@ -248,6 +266,7 @@ pub(super) fn resolve_files(
     model_file: &str,
     additional_files: &[String],
 ) -> Result<OnnxModelFiles> {
+    super::fastembed_artifacts::validate_logical_file_set(model_file, additional_files)?;
     let api = ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .with_progress(false)

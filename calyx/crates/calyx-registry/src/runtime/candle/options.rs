@@ -298,7 +298,9 @@ fn cuda_policy_for_ordinal(
     })?;
     match calyx_forge::select_pinned_cuda_device(ordinal) {
         Ok(device) => executable_cuda_policy(device),
-        Err(error) if allow_absent && error.code() == "CALYX_CUDA_NO_DEVICE" => {
+        Err(error)
+            if allow_absent && error.code() == calyx_forge::CUDA_NO_DEVICE_ATTESTED_CODE =>
+        {
             Ok(CandleDevicePolicy::CpuNoCudaDevice)
         }
         Err(error) => Err(crate::runtime::common::forge_runtime_boundary_error(error)),

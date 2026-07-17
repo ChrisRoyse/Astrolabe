@@ -1,91 +1,235 @@
-use rand::{Rng, SeedableRng};
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use wide::f32x8;
 
 use crate::quant::SeedId;
 use crate::{ForgeError, Result};
 
-pub const CURRENT_SEED_VERSION: u8 = 1;
+/// Persisted seed contract used by the implicit Haar transform.
+pub const CURRENT_SEED_VERSION: u8 = 2;
+const ROTATION_MAX_DIM: usize = 4096;
+const SEED_DOMAIN: &[u8] = b"calyx/rotation-seed/v2\0";
+const HAAR_DOMAIN: &[u8] = b"calyx/haar-householder/v1\0";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Content-addressed deterministic geometry seed.
 pub struct RotationSeed {
     #[serde(with = "seed_id_hex_serde")]
     pub id: SeedId,
     pub version: u8,
     pub dim: usize,
-    pub diagonal: Vec<f32>,
+    #[serde(with = "seed_id_hex_serde")]
+    pub entropy: SeedId,
 }
 
 impl RotationSeed {
     pub fn verify_current_version(&self) -> Result<()> {
-        if self.version == CURRENT_SEED_VERSION {
-            return Ok(());
+        if self.version != CURRENT_SEED_VERSION {
+            return Err(ForgeError::SeedVersionMismatch {
+                expected: CURRENT_SEED_VERSION,
+                got: self.version,
+            });
         }
-        Err(ForgeError::SeedVersionMismatch {
-            expected: CURRENT_SEED_VERSION,
-            got: self.version,
-        })
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.verify_current_version()?;
+        if self.dim == 0 || self.dim > ROTATION_MAX_DIM {
+            return Err(rotation_error(
+                "validate_seed",
+                format!("dimension must be in 1..={ROTATION_MAX_DIM}, got {}", self.dim),
+            ));
+        }
+        let expected_id = content_id(&self.entropy, self.version, self.dim);
+        if self.id != expected_id {
+            return Err(rotation_error(
+                "validate_seed",
+                "rotation seed content ID does not match its persisted material",
+            ));
+        }
+        Ok(())
     }
 }
 
 pub fn new_seed(dim: usize, entropy: &[u8]) -> RotationSeed {
-    let rng_seed = sha256_entropy_dim(entropy, dim);
-    let mut rng = ChaCha8Rng::from_seed(rng_seed);
-    let diagonal: Vec<f32> = (0..dim)
-        .map(|_| if rng.r#gen::<bool>() { 1.0 } else { -1.0 })
-        .collect();
-    let id = content_id(&diagonal, CURRENT_SEED_VERSION, dim);
+    let entropy = domain_seed(SEED_DOMAIN, entropy, dim);
+    let id = content_id(&entropy, CURRENT_SEED_VERSION, dim);
     RotationSeed {
         id,
         version: CURRENT_SEED_VERSION,
         dim,
-        diagonal,
+        entropy,
     }
 }
 
-pub fn apply_rotation(seed: &RotationSeed, vec: &mut [f32]) {
-    assert_eq!(
-        vec.len(),
-        seed.dim,
-        "dimension mismatch: expected {} got {}",
-        seed.dim,
-        vec.len()
-    );
-    apply_block_hadamard(vec);
-    for (value, sign) in vec.iter_mut().zip(seed.diagonal.iter()) {
-        *value *= *sign;
+/// Compact implicit Haar-orthogonal transform built from Gaussian Householder factors.
+pub(crate) struct HaarRotation {
+    dim: usize,
+    seed_id: SeedId,
+    factor_starts: Vec<usize>,
+    factors: Vec<f32>,
+    column_signs: Vec<f32>,
+}
+
+impl HaarRotation {
+    pub(crate) fn new(seed: &RotationSeed) -> Result<Self> {
+        seed.validate()?;
+        let rng_seed = domain_seed(HAAR_DOMAIN, &seed.id, seed.dim);
+        let mut normal = DeterministicNormal::new(rng_seed);
+        let factor_capacity = seed
+            .dim
+            .checked_mul(seed.dim.saturating_add(1))
+            .and_then(|value| value.checked_div(2))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| rotation_error("haar_setup", "Householder geometry size overflow"))?;
+        let mut factors = Vec::with_capacity(factor_capacity);
+        let mut factor_starts = Vec::with_capacity(seed.dim.saturating_sub(1));
+        let mut column_signs = Vec::with_capacity(seed.dim);
+        let mut column = Vec::with_capacity(seed.dim);
+
+        for offset in 0..seed.dim {
+            let len = seed.dim - offset;
+            column.clear();
+            let mut norm_sq = 0.0_f64;
+            for _ in 0..len {
+                let value = normal.next_f32();
+                norm_sq += f64::from(value) * f64::from(value);
+                column.push(value);
+            }
+            let norm = norm_sq.sqrt();
+            if !norm.is_finite() || norm == 0.0 {
+                return Err(rotation_error(
+                    "haar_setup",
+                    format!("degenerate Gaussian column at offset {offset}"),
+                ));
+            }
+            let alpha = if column[0].is_sign_negative() {
+                norm
+            } else {
+                -norm
+            };
+            column_signs.push(if alpha.is_sign_negative() { -1.0 } else { 1.0 });
+            if len == 1 {
+                continue;
+            }
+            column[0] -= alpha as f32;
+            let factor_norm = column
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                .sqrt();
+            if !factor_norm.is_finite() || factor_norm == 0.0 {
+                return Err(rotation_error(
+                    "haar_setup",
+                    format!("degenerate Householder factor at offset {offset}"),
+                ));
+            }
+            factor_starts.push(factors.len());
+            factors.extend(
+                column
+                    .iter()
+                    .map(|value| (f64::from(*value) / factor_norm) as f32),
+            );
+        }
+
+        Ok(Self {
+            dim: seed.dim,
+            seed_id: seed.id,
+            factor_starts,
+            factors,
+            column_signs,
+        })
+    }
+
+    pub(crate) fn apply(&self, vec: &mut [f32]) -> Result<()> {
+        self.validate_input(vec, "apply_rotation")?;
+        for (value, sign) in vec.iter_mut().zip(&self.column_signs) {
+            *value *= *sign;
+        }
+        for offset in (0..self.factor_starts.len()).rev() {
+            self.apply_factor(offset, vec)?;
+        }
+        validate_finite_output(vec, "apply_rotation")
+    }
+
+    pub(crate) fn apply_inverse(&self, vec: &mut [f32]) -> Result<()> {
+        self.validate_input(vec, "apply_inverse_rotation")?;
+        for offset in 0..self.factor_starts.len() {
+            self.apply_factor(offset, vec)?;
+        }
+        for (value, sign) in vec.iter_mut().zip(&self.column_signs) {
+            *value *= *sign;
+        }
+        validate_finite_output(vec, "apply_inverse_rotation")
+    }
+
+    fn validate_input(&self, vec: &[f32], op: &str) -> Result<()> {
+        if vec.len() != self.dim {
+            return Err(ForgeError::ShapeMismatch {
+                expected: vec![self.dim],
+                got: vec![vec.len()],
+                remediation: "Apply the rotation to vectors with the seed dimension".to_string(),
+            });
+        }
+        if let Some(index) = vec.iter().position(|value| !value.is_finite()) {
+            return Err(rotation_error(op, format!("non-finite coefficient at index {index}")));
+        }
+        Ok(())
+    }
+
+    fn apply_factor(&self, offset: usize, vec: &mut [f32]) -> Result<()> {
+        let start = self.factor_starts[offset];
+        let len = self.dim - offset;
+        let end = start + len;
+        let factor = self.factors.get(start..end).ok_or_else(|| {
+            rotation_error(
+                "apply_householder",
+                format!("factor bounds invalid for offset {offset}"),
+            )
+        })?;
+        let tail = &mut vec[offset..];
+        let dot = simd_dot(factor, tail);
+        let twice_dot = 2.0 * dot;
+        for (value, normal) in tail.iter_mut().zip(factor) {
+            *value -= twice_dot * *normal;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn seed_id(&self) -> SeedId {
+        self.seed_id
     }
 }
 
-pub fn apply_inverse_rotation(seed: &RotationSeed, vec: &mut [f32]) {
-    assert_eq!(
-        vec.len(),
-        seed.dim,
-        "dimension mismatch: expected {} got {}",
-        seed.dim,
-        vec.len()
-    );
-    for (value, sign) in vec.iter_mut().zip(seed.diagonal.iter()) {
-        *value *= *sign;
-    }
-    apply_block_hadamard(vec);
+pub fn apply_rotation(seed: &RotationSeed, vec: &mut [f32]) -> Result<()> {
+    HaarRotation::new(seed)?.apply(vec)
 }
 
-pub fn apply_rotation_batch(seed: &RotationSeed, vecs: &mut [f32], n: usize) {
-    let expected = n
-        .checked_mul(seed.dim)
-        .expect("batch dimension mismatch: n * dim overflow");
-    assert_eq!(
-        vecs.len(),
-        expected,
-        "batch dimension mismatch: expected {} got {}",
-        expected,
-        vecs.len()
-    );
+pub fn apply_inverse_rotation(seed: &RotationSeed, vec: &mut [f32]) -> Result<()> {
+    HaarRotation::new(seed)?.apply_inverse(vec)
+}
+
+pub fn apply_rotation_batch(seed: &RotationSeed, vecs: &mut [f32], n: usize) -> Result<()> {
+    let expected = n.checked_mul(seed.dim).ok_or_else(|| ForgeError::ShapeMismatch {
+        expected: vec![n, seed.dim],
+        got: vec![vecs.len()],
+        remediation: "Use a batch shape whose row count times dimension fits usize".to_string(),
+    })?;
+    if vecs.len() != expected {
+        return Err(ForgeError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![vecs.len()],
+            remediation: "Provide exactly n contiguous rows of the seed dimension".to_string(),
+        });
+    }
+    let rotation = HaarRotation::new(seed)?;
     for row in vecs.chunks_exact_mut(seed.dim) {
-        apply_rotation(seed, row);
+        rotation.apply(row)?;
     }
+    Ok(())
 }
 
 pub fn seed_id_hex(id: &SeedId) -> String {
@@ -97,61 +241,100 @@ pub fn seed_id_hex(id: &SeedId) -> String {
     hex
 }
 
-fn sha256_entropy_dim(entropy: &[u8], dim: usize) -> SeedId {
+pub(crate) struct DeterministicNormal {
+    rng: ChaCha8Rng,
+    spare: Option<f32>,
+}
+
+impl DeterministicNormal {
+    pub(crate) fn new(seed: SeedId) -> Self {
+        Self {
+            rng: ChaCha8Rng::from_seed(seed),
+            spare: None,
+        }
+    }
+
+    pub(crate) fn next_f32(&mut self) -> f32 {
+        if let Some(value) = self.spare.take() {
+            return value;
+        }
+        let u1 = open_unit_f64(self.rng.next_u64());
+        let u2 = open_unit_f64(self.rng.next_u64());
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        let (sine, cosine) = angle.sin_cos();
+        let first = (radius * cosine) as f32;
+        self.spare = Some((radius * sine) as f32);
+        first
+    }
+}
+
+pub(crate) fn domain_seed(domain: &[u8], entropy: &[u8], dim: usize) -> SeedId {
     let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((entropy.len() as u64).to_le_bytes());
     hasher.update(entropy);
     hasher.update((dim as u64).to_le_bytes());
     hasher.finalize().into()
 }
 
-fn content_id(diagonal: &[f32], version: u8, dim: usize) -> SeedId {
+fn content_id(entropy: &SeedId, version: u8, dim: usize) -> SeedId {
     let mut hasher = Sha256::new();
-    for sign in diagonal {
-        hasher.update(sign.to_le_bytes());
-    }
+    hasher.update(SEED_DOMAIN);
     hasher.update([version]);
     hasher.update((dim as u64).to_le_bytes());
+    hasher.update(entropy);
     hasher.finalize().into()
 }
 
-fn apply_block_hadamard(vec: &mut [f32]) {
+fn open_unit_f64(value: u64) -> f64 {
+    const DENOMINATOR: f64 = (1_u64 << 53) as f64;
+    (((value >> 11) as f64) + 0.5) / DENOMINATOR
+}
+
+fn simd_dot(left: &[f32], right: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
     let mut offset = 0;
-    while offset < vec.len() {
-        let block_len = largest_power_of_two_at_most(vec.len() - offset);
-        hadamard_power_of_two(&mut vec[offset..offset + block_len]);
-        offset += block_len;
+    while offset + 8 <= left.len() {
+        let mut lhs = [0.0; 8];
+        let mut rhs = [0.0; 8];
+        lhs.copy_from_slice(&left[offset..offset + 8]);
+        rhs.copy_from_slice(&right[offset..offset + 8]);
+        sum += (f32x8::from(lhs) * f32x8::from(rhs)).reduce_add();
+        offset += 8;
     }
+    while offset < left.len() {
+        sum += left[offset] * right[offset];
+        offset += 1;
+    }
+    sum
 }
 
-fn hadamard_power_of_two(block: &mut [f32]) {
-    let mut width = 1;
-    while width < block.len() {
-        let step = width * 2;
-        for base in (0..block.len()).step_by(step) {
-            for idx in 0..width {
-                let left = block[base + idx];
-                let right = block[base + idx + width];
-                block[base + idx] = left + right;
-                block[base + idx + width] = left - right;
-            }
-        }
-        width = step;
+fn validate_finite_output(vec: &[f32], op: &str) -> Result<()> {
+    if let Some(index) = vec.iter().position(|value| !value.is_finite()) {
+        return Err(rotation_error(
+            op,
+            format!("rotation produced a non-finite coefficient at index {index}"),
+        ));
     }
-    let scale = 1.0 / (block.len() as f32).sqrt();
-    for value in block {
-        *value *= scale;
-    }
+    Ok(())
 }
 
-fn largest_power_of_two_at_most(value: usize) -> usize {
-    1usize << (usize::BITS - 1 - value.leading_zeros())
+fn rotation_error(op: &str, detail: impl Into<String>) -> ForgeError {
+    ForgeError::QuantError {
+        op: op.to_string(),
+        level: "rotation".to_string(),
+        detail: detail.into(),
+        remediation: "Use an intact current-version seed and finite vectors with dimension 1..=4096"
+            .to_string(),
+    }
 }
 
 fn nibble_hex(nibble: u8) -> char {
     match nibble {
         0..=9 => (b'0' + nibble) as char,
         10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => unreachable!("nibble is masked"),
+        _ => '?',
     }
 }
 

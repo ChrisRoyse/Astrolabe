@@ -122,7 +122,15 @@ intentionally carry an unspecified policy and fail before ONNX Runtime can selec
 CPU fallback. The examples below use an explicit CPU provider. For CUDA, pass exactly one
 `ort::ep::CUDA` provider and use
 `SessionPolicy::cuda_no_cpu_fallback("path/to/graph-assignment-profile.json")`; the profile path
-must be non-empty and every graph node must remain off CPU.
+must be non-empty and every graph node must remain off CPU. Every validated provider dispatch is
+registered with `error_on_failure`, including explicit CPU sessions.
+
+The text, sparse, BGE-M3, and reranker `try_new_from_user_defined` constructors commit the supplied
+ONNX buffer directly. Split ONNX models add every distinct external-data buffer with
+`with_external_initializer(location, bytes)`; `location` must exactly match the graph's canonical
+relative POSIX `TensorProto.external_data.location`. Sparse and BGE-M3 callers also select the
+matching built-in behavior with `with_model(...)`. This keeps graph bytes, external data, tokenizer
+files, pooling, quantization, and output selection bound to one caller-owned snapshot.
 
 ### Text Embeddings
 

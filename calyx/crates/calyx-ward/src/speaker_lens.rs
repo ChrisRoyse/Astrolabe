@@ -1,10 +1,6 @@
 //! WavLM speaker lens adapter for PH39 identity slots.
 
 use std::fmt;
-#[cfg(feature = "onnx-lens")]
-use std::fs::File;
-#[cfg(feature = "onnx-lens")]
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{
@@ -19,7 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::error::WardError;
 #[cfg(feature = "onnx-lens")]
-use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
+use crate::onnx_session::{
+    ManagedWardOnnxSession, WardCpuAuthorization, WardOnnxArtifactBundle,
+    WardOnnxExecutionAttestation, build_session, snapshot_cpu_artifacts, snapshot_cuda_artifacts,
+};
 
 pub const DEFAULT_WAVLM_MODEL_PATH: &str = "/var/lib/calyx/models/wavlm/wavlm-base-plus-sv.onnx";
 pub const WAVLM_SAMPLE_RATE: u32 = 16_000;
@@ -65,6 +64,14 @@ pub trait SpeakerEmbeddingBackend: Send + Sync {
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         Ok(None)
     }
+
+    #[cfg(feature = "onnx-lens")]
+    fn durable_execution_attestation(
+        &self,
+        _lens_id: LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        Ok(None)
+    }
 }
 
 /// Frozen WavLM speaker lens. Runtime state is limited to ORT's session handle.
@@ -91,8 +98,13 @@ impl SpeakerLens {
         Self::new_with_provider_policy(model_path, SpeakerProviderPolicy::CudaFailLoud)
     }
 
-    pub fn new_cpu_explicit(model_path: &Path) -> Result<Self, WardError> {
-        Self::new_with_provider_policy(model_path, SpeakerProviderPolicy::CpuExplicit)
+    #[cfg(feature = "onnx-lens")]
+    pub fn new_cpu_explicit(
+        model_path: &Path,
+        authorization: &WardCpuAuthorization,
+    ) -> Result<Self, WardError> {
+        let artifacts = snapshot_cpu_artifacts("speaker", model_path, None, authorization)?;
+        Self::from_artifacts(model_path, artifacts)
     }
 
     #[cfg(feature = "onnx-lens")]
@@ -100,8 +112,23 @@ impl SpeakerLens {
         model_path: &Path,
         policy: SpeakerProviderPolicy,
     ) -> Result<Self, WardError> {
-        let model_hash = sha256_file(model_path)?;
-        let backend = OnnxSpeakerBackend::new(model_path, policy)?;
+        if policy == SpeakerProviderPolicy::CpuExplicit {
+            return Err(WardError::CpuCompanionUnauthorized {
+                reason: "SpeakerProviderPolicy::CpuExplicit requires new_cpu_explicit and a WardCpuAuthorization"
+                    .to_string(),
+            });
+        }
+        let artifacts = snapshot_cuda_artifacts("speaker", model_path, None)?;
+        Self::from_artifacts(model_path, artifacts)
+    }
+
+    #[cfg(feature = "onnx-lens")]
+    fn from_artifacts(
+        model_path: &Path,
+        artifacts: WardOnnxArtifactBundle,
+    ) -> Result<Self, WardError> {
+        let model_hash = artifacts.lens_weights_sha256();
+        let backend = OnnxSpeakerBackend::new(artifacts)?;
         Self::from_backend(model_path.to_path_buf(), model_hash, backend)
     }
 
@@ -182,6 +209,13 @@ impl SpeakerLens {
     pub fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         self.backend.execution_attestation()
     }
+
+    #[cfg(feature = "onnx-lens")]
+    pub fn durable_execution_attestation(
+        &self,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.backend.durable_execution_attestation(self.lens_id)
+    }
 }
 
 impl Lens for SpeakerLens {
@@ -231,11 +265,8 @@ struct OnnxSpeakerBackend {
 
 #[cfg(feature = "onnx-lens")]
 impl OnnxSpeakerBackend {
-    fn new(model_path: &Path, policy: SpeakerProviderPolicy) -> Result<Self, WardError> {
-        let session = match policy {
-            SpeakerProviderPolicy::CudaFailLoud => build_cuda_session("speaker", model_path),
-            SpeakerProviderPolicy::CpuExplicit => build_cpu_session("speaker", model_path),
-        }?;
+    fn new(artifacts: WardOnnxArtifactBundle) -> Result<Self, WardError> {
+        let session = build_session("speaker", artifacts)?;
         let (input_names, output_names) = session.inspect_session(|raw| {
             Ok((
                 raw.inputs()
@@ -322,6 +353,13 @@ impl SpeakerEmbeddingBackend for OnnxSpeakerBackend {
     fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>, WardError> {
         self.session.execution_attestation()
     }
+
+    fn durable_execution_attestation(
+        &self,
+        lens_id: LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.session.durable_execution_attestation(lens_id)
+    }
 }
 
 #[cfg(feature = "onnx-lens")]
@@ -334,9 +372,13 @@ fn choose_name(
     names
         .iter()
         .find(|name| name.as_str() == preferred)
-        .or_else(|| names.first())
         .cloned()
-        .ok_or_else(|| session.error("model_metadata", format!("ONNX session has no {kind}s")))
+        .ok_or_else(|| {
+            session.error(
+                "model_metadata",
+                format!("ONNX session has no {kind} named {preferred}"),
+            )
+        })
 }
 
 #[cfg(feature = "onnx-lens")]
@@ -461,36 +503,12 @@ fn pcm_f32_le(bytes: &[u8]) -> Result<Vec<f32>, WardError> {
         .collect())
 }
 
-#[cfg(feature = "onnx-lens")]
-fn sha256_file(path: &Path) -> Result<[u8; 32], WardError> {
-    let mut file = File::open(path).map_err(|_| WardError::ModelNotFound {
-        path: path.to_path_buf(),
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).map_err(runtime_error)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().into())
-}
-
 fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
     }
     hasher.finalize().into()
-}
-
-#[cfg(feature = "onnx-lens")]
-fn runtime_error(error: impl fmt::Display) -> WardError {
-    WardError::Runtime {
-        reason: error.to_string(),
-    }
 }
 
 fn ward_as_calyx(error: WardError) -> CalyxError {

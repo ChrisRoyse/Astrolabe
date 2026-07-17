@@ -26,6 +26,7 @@ pub const CALYX_WARD_INVALID_INPUT: &str = "CALYX_WARD_INVALID_INPUT";
 pub const CALYX_WARD_MODEL_DIM_MISMATCH: &str = "CALYX_WARD_MODEL_DIM_MISMATCH";
 pub const CALYX_WARD_RUNTIME_ERROR: &str = "CALYX_WARD_RUNTIME_ERROR";
 pub const CALYX_WARD_ONNX_ERROR: &str = "CALYX_WARD_ONNX_ERROR";
+pub const CALYX_WARD_CPU_COMPANION_UNAUTHORIZED: &str = "CALYX_WARD_CPU_COMPANION_UNAUTHORIZED";
 pub const CALYX_WARD_MISSING_FREQUENCY: &str = "CALYX_WARD_MISSING_FREQUENCY";
 pub const CALYX_WARD_INVALID_FREQUENCY: &str = "CALYX_WARD_INVALID_FREQUENCY";
 pub const CALYX_WARD_INVALID_DOMAIN: &str = "CALYX_WARD_INVALID_DOMAIN";
@@ -107,6 +108,11 @@ pub enum WardError {
     Runtime {
         reason: String,
     },
+    /// A CPU learned-lens constructor was requested without startup proof that
+    /// the exact pinned CUDA Runtime reports zero visible devices.
+    CpuCompanionUnauthorized {
+        reason: String,
+    },
     /// A staged ONNX failure retaining the exact model/provider context and
     /// operator-facing remediation.
     Onnx {
@@ -114,9 +120,10 @@ pub enum WardError {
         stage: &'static str,
         model: PathBuf,
         model_sha256: String,
+        artifact_contract_sha256: String,
         frozen_operators: String,
-        provider: &'static str,
-        device: &'static str,
+        provider: String,
+        device: String,
         reason: String,
         remediation: &'static str,
     },
@@ -166,6 +173,7 @@ impl WardError {
             Self::InvalidInput { .. } => CALYX_WARD_INVALID_INPUT,
             Self::ModelDimMismatch { .. } => CALYX_WARD_MODEL_DIM_MISMATCH,
             Self::Runtime { .. } => CALYX_WARD_RUNTIME_ERROR,
+            Self::CpuCompanionUnauthorized { .. } => CALYX_WARD_CPU_COMPANION_UNAUTHORIZED,
             Self::Onnx { .. } => CALYX_WARD_ONNX_ERROR,
             Self::NoveltySink { .. } => CALYX_GUARD_NOVELTY_SINK,
             Self::MissingFrequency { .. } => CALYX_WARD_MISSING_FREQUENCY,
@@ -180,6 +188,9 @@ impl WardError {
     pub const fn remediation(&self) -> &'static str {
         match self {
             Self::Onnx { remediation, .. } => remediation,
+            Self::CpuCompanionUnauthorized { .. } => {
+                "use CUDA when a device is available; request a CPU companion only through authorize_cpu_companion after CALYX_CUDA_NO_DEVICE"
+            }
             _ => {
                 "repair the Ward lens model, runtime, or input identified by this error before retrying"
             }
@@ -276,11 +287,15 @@ impl fmt::Display for WardError {
             Self::Runtime { reason } => {
                 write!(f, "{CALYX_WARD_RUNTIME_ERROR}: {reason}")
             }
+            Self::CpuCompanionUnauthorized { reason } => {
+                write!(f, "{CALYX_WARD_CPU_COMPANION_UNAUTHORIZED}: {reason}")
+            }
             Self::Onnx {
                 lens,
                 stage,
                 model,
                 model_sha256,
+                artifact_contract_sha256,
                 frozen_operators,
                 provider,
                 device,
@@ -288,7 +303,7 @@ impl fmt::Display for WardError {
                 remediation,
             } => write!(
                 f,
-                "{CALYX_WARD_ONNX_ERROR}: lens={lens} stage={stage} model={} model_sha256={model_sha256} provider={provider} device={device} frozen_operators={frozen_operators}: {reason}; remediation: {remediation}",
+                "{CALYX_WARD_ONNX_ERROR}: lens={lens} stage={stage} model={} model_sha256={model_sha256} artifact_contract_sha256={artifact_contract_sha256} provider={provider} device={device} frozen_operators={frozen_operators}: {reason}; remediation: {remediation}",
                 model.display(),
             ),
             Self::NoveltySink { reason } => {

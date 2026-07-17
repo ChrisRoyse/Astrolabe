@@ -2,7 +2,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session},
+    session::{Session, builder::GraphOptimizationLevel},
     value::Value,
 };
 use std::thread::available_parallelism;
@@ -10,19 +10,19 @@ use std::thread::available_parallelism;
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::load_tokenizer, models::reranking::reranker_model_list, RerankerModel,
-    RerankerModelInfo,
+    RerankerModel, RerankerModelInfo, common::load_tokenizer,
+    models::reranking::reranker_model_list,
 };
 #[cfg(feature = "hf-hub")]
-use hf_hub::{api::sync::ApiBuilder, Cache};
-use ndarray::{s, Array};
+use hf_hub::{Cache, api::sync::ApiBuilder};
+use ndarray::{Array, s};
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "hf-hub")]
 use super::RerankInitOptions;
 use super::{
-    OnnxSource, RerankInitOptionsUserDefined, RerankResult, TextRerank, UserDefinedRerankingModel,
-    DEFAULT_BATCH_SIZE,
+    DEFAULT_BATCH_SIZE, OnnxSource, RerankInitOptionsUserDefined, RerankResult, TextRerank,
+    UserDefinedRerankingModel,
 };
 
 impl TextRerank {
@@ -91,7 +91,9 @@ impl TextRerank {
                 additional_file
             ))?;
         }
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -104,7 +106,6 @@ impl TextRerank {
             .apply_to(builder)?
             .commit_from_file(model_file_reference)?;
 
-        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session))
     }
 
@@ -126,7 +127,9 @@ impl TextRerank {
             Some(n) => n,
             None => available_parallelism()?.get(),
         };
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let mut session = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -136,13 +139,13 @@ impl TextRerank {
             .with_intra_threads(threads)
             .map_err(Self::builder_error)?;
         session = session_policy.apply_to(session)?;
+        session = crate::init::apply_external_initializers(session, model.external_initializers)?;
 
         let session = match &model.onnx_source {
             OnnxSource::Memory(bytes) => session.commit_from_memory(bytes)?,
             OnnxSource::File(path) => session.commit_from_file(path)?,
         };
 
-        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
         Ok(Self::new(tokenizer, session))
     }
 

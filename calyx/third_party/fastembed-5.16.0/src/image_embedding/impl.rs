@@ -74,7 +74,8 @@ impl ImageEmbedding {
             .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
         #[cfg(not(feature = "directml"))]
         let has_directml = false;
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let mut builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -124,7 +125,8 @@ impl ImageEmbedding {
             .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
         #[cfg(not(feature = "directml"))]
         let has_directml = false;
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let mut builder = Session::builder()?
             .with_execution_providers(execution_providers)

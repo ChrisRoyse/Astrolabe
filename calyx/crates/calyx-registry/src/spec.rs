@@ -41,6 +41,10 @@ pub enum LensRuntime {
         model_id: String,
         files: Vec<PathBuf>,
     },
+    FastembedDense {
+        model_id: String,
+        files: Vec<PathBuf>,
+    },
     OnnxColbert {
         model_id: String,
         files: Vec<PathBuf>,
@@ -114,6 +118,7 @@ pub(crate) fn ml_runtime_kind(runtime: &LensRuntime) -> &'static str {
     match runtime {
         LensRuntime::CandleLocal { .. } => "candle-local",
         LensRuntime::Onnx { .. } => "onnx",
+        LensRuntime::FastembedDense { .. } => "fastembed-dense",
         LensRuntime::OnnxColbert { .. } => "onnx-colbert",
         LensRuntime::FastembedSparse { .. } => "fastembed-sparse",
         LensRuntime::FastembedBgem3 { .. } => "fastembed-bgem3",
@@ -166,6 +171,7 @@ impl LensSpec {
                 candle_local_health(files, device)
             }
             LensRuntime::Onnx { files, .. }
+            | LensRuntime::FastembedDense { files, .. }
             | LensRuntime::OnnxColbert { files, .. }
             | LensRuntime::FastembedSparse { files, .. }
             | LensRuntime::FastembedBgem3 { files, .. }

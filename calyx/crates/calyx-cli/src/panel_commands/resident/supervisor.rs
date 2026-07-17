@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use calyx_core::{CalyxError, Placement, SlotShape, SlotState};
 use ulid::Ulid;
 
-use super::codec::{decode_binary, encode_binary, read_frame, write_frame};
+use super::codec::{decode_binary, discard_frame, encode_binary, read_frame, write_frame};
 use super::deadline::{
     DeadlineStream, connect_before, deadline_after, ensure_before, read_bounded_line,
 };
@@ -30,14 +30,16 @@ use super::*;
 const IDLE_TTL_MS: u64 = 60_000;
 const IDLE_TTL: Duration = Duration::from_millis(IDLE_TTL_MS);
 const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(500);
+const QUEUED_CLIENT_POLL: Duration = Duration::from_millis(20);
 const PUBLIC_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
-const BACK_PRESSURE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_LOST: &str = "CALYX_PANEL_RESIDENT_WORKER_LOST";
 const WORKER_PROTOCOL_INVALID: &str = "CALYX_PANEL_RESIDENT_WORKER_PROTOCOL_INVALID";
 const WORKER_REPORTED_ERROR: &str = "CALYX_PANEL_RESIDENT_WORKER_REPORTED_ERROR";
 const CLIENT_ABORTED_GENERATION: &str = "CALYX_PANEL_RESIDENT_CLIENT_ABORTED_GENERATION";
 const BACK_PRESSURE: &str = "CALYX_PANEL_RESIDENT_BACK_PRESSURE";
 const STOPPING: &str = "CALYX_PANEL_RESIDENT_STOPPING";
+const QUEUED_CLIENT_GONE: &str = "CALYX_PANEL_RESIDENT_QUEUED_CLIENT_GONE";
+const REQUEST_DEADLINE: &str = "CALYX_PANEL_RESIDENT_REQUEST_DEADLINE";
 
 struct Supervisor {
     original_args: Vec<String>,
@@ -60,7 +62,16 @@ struct SupervisorInner {
     worker: Option<WorkerProcess>,
     last_worker_ready: Option<ReadyResponse>,
     idle_deadline: Option<Instant>,
+    suspended_idle_deadline: Option<IdleDeadline>,
     worker_transition: Option<WorkerTransition>,
+    cancelled_load_generation: Option<u64>,
+    failed_load_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct IdleDeadline {
+    monotonic: Instant,
+    unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,7 +88,6 @@ struct WorkerEndpoint {
     template_source: String,
     slot_contracts: Vec<ResidentSlotContract>,
     auth_secret: String,
-    request_timeout: Duration,
 }
 
 struct ProductiveLease {
@@ -242,6 +252,12 @@ impl ProductiveLease {
             outcome,
             Some(&failure.lifecycle_error),
         )
+    }
+
+    fn reject_unproductive(mut self, error: &CliError) -> CliResult {
+        self.completed = true;
+        self.supervisor
+            .release_unproductive(self.endpoint.generation, &self.request_id, error)
     }
 
     fn fail_inner(
@@ -444,20 +460,13 @@ impl Supervisor {
             state.last_worker_start_unix_ms = previous.last_worker_start_unix_ms;
             state.last_completion_unix_ms = previous.last_completion_unix_ms;
             state.last_unload_unix_ms = previous.last_unload_unix_ms;
+            state.last_error = previous.last_error;
             if previous.frozen_panel_fingerprint == source.fingerprint {
                 state.lens_attestations = previous.lens_attestations;
                 state.onnx_runtime_attestation = previous.onnx_runtime_attestation;
             }
         }
         if legacy_in_flight != 0 {
-            state.last_error = Some(LifecycleErrorRecord {
-                code: "CALYX_PANEL_RESIDENT_LEGACY_REQUESTS_ABANDONED_ON_RESTART".to_string(),
-                message: format!(
-                    "resident supervisor recovered {legacy_in_flight} in-flight request(s) from a legacy lifecycle journal that did not record request identities"
-                ),
-                remediation: "inspect the preceding legacy supervisor logs and source of truth before retrying those requests; future requests carry exact ULIDs and stages".to_string(),
-                at_unix_ms: unix_now_ms(),
-            });
             store.append("legacy_requests_recovered_abandoned", &state)?;
         }
         for request in recovered_requests {
@@ -514,14 +523,17 @@ impl Supervisor {
                 worker: None,
                 last_worker_ready: None,
                 idle_deadline: None,
+                suspended_idle_deadline: None,
                 worker_transition: None,
+                cancelled_load_generation: None,
+                failed_load_generation: None,
             }),
             changed: Condvar::new(),
         }))
     }
 
     fn preload(self: &Arc<Self>) -> CliResult {
-        self.ensure_loaded()
+        self.ensure_loaded_blocking()
     }
 
     fn start_idle_monitor(self: &Arc<Self>) -> JoinHandle<()> {
@@ -529,7 +541,19 @@ impl Supervisor {
         std::thread::spawn(move || supervisor.idle_monitor())
     }
 
-    fn acquire(self: &Arc<Self>) -> CliResult<ProductiveLease> {
+    fn productive_deadline(&self) -> CliResult<Instant> {
+        let total_secs = self
+            .max_load_secs
+            .checked_add(self.max_request_secs)
+            .ok_or_else(|| CliError::runtime("resident productive budget exceeds u64 seconds"))?;
+        deadline_after(Duration::from_secs(total_secs)).map_err(CliError::from)
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        deadline: Instant,
+        client: &TcpStream,
+    ) -> CliResult<ProductiveLease> {
         let request_id = Ulid::new().to_string();
         let mut pending = PendingRequestGuard::new(Arc::clone(self), request_id.clone());
         {
@@ -537,19 +561,14 @@ impl Supervisor {
             if !self.accepting.load(Ordering::SeqCst) {
                 return Err(stopping_error());
             }
+            if inner.state.queued_requests == 0 && inner.state.phase == LifecyclePhase::Unloaded {
+                inner.failed_load_generation = None;
+            }
             inner.state.queued_requests =
                 inner.state.queued_requests.checked_add(1).ok_or_else(|| {
                     CliError::runtime("resident queued request counter overflowed")
                 })?;
             pending.mark_queued();
-            inner.state.idle_deadline_unix_ms = None;
-            inner.idle_deadline = None;
-            if matches!(
-                inner.state.phase,
-                LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy
-            ) {
-                inner.state.phase = LifecyclePhase::LoadedBusy;
-            }
             if let Err(error) = self.persist_request(
                 &mut inner,
                 "request_queued",
@@ -569,7 +588,7 @@ impl Supervisor {
             self.changed.notify_all();
         }
 
-        let acquired = self.acquire_queued(&request_id, &mut pending);
+        let acquired = self.acquire_queued(&request_id, &mut pending, deadline, client);
         match acquired {
             Ok(endpoint) => {
                 pending.disarm();
@@ -596,9 +615,13 @@ impl Supervisor {
         self: &Arc<Self>,
         request_id: &str,
         pending: &mut PendingRequestGuard,
+        deadline: Instant,
+        client: &TcpStream,
     ) -> CliResult<WorkerEndpoint> {
         loop {
-            self.ensure_loaded()?;
+            ensure_queued_client(client, deadline, request_id)?;
+            self.ensure_loaded_queued(deadline, client, request_id)?;
+            ensure_queued_client(client, deadline, request_id)?;
             let mut inner = self.lock()?;
             if !self.accepting.load(Ordering::SeqCst) {
                 return Err(stopping_error());
@@ -609,9 +632,19 @@ impl Supervisor {
             ) {
                 continue;
             }
-            if inner.state.in_flight != 0 {
-                drop(self.wait(inner)?);
-                continue;
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err(request_deadline_error(request_id));
+            }
+            if inner.state.phase == LifecyclePhase::LoadedIdle {
+                let (Some(monotonic), Some(unix_ms)) =
+                    (inner.idle_deadline, inner.state.idle_deadline_unix_ms)
+                else {
+                    return Err(CliError::runtime(format!(
+                        "resident generation {} is loaded-idle without its exact monotonic and persisted idle deadlines",
+                        inner.state.generation
+                    )));
+                };
+                inner.suspended_idle_deadline = Some(IdleDeadline { monotonic, unix_ms });
             }
             let endpoint = match inner.worker.as_ref() {
                 Some(worker) => WorkerEndpoint {
@@ -619,9 +652,8 @@ impl Supervisor {
                     bind: worker.bind,
                     process_id: worker.process_id(),
                     template_source: worker.ready.template_source.clone(),
-                    slot_contracts: worker.ready.slot_contracts.clone(),
+                    slot_contracts: self.source.slot_contracts.clone(),
                     auth_secret: worker.auth_secret().to_string(),
-                    request_timeout: Duration::from_secs(self.max_request_secs),
                 },
                 None => continue,
             };
@@ -658,6 +690,7 @@ impl Supervisor {
                 inner.state.phase = LifecyclePhase::Faulted;
                 inner.state.idle_deadline_unix_ms = None;
                 inner.idle_deadline = None;
+                inner.suspended_idle_deadline = None;
                 pending.mark_queued();
                 self.changed.notify_all();
                 return Err(error);
@@ -666,7 +699,7 @@ impl Supervisor {
         }
     }
 
-    fn ensure_loaded(self: &Arc<Self>) -> CliResult {
+    fn ensure_loaded_blocking(self: &Arc<Self>) -> CliResult {
         loop {
             if !self.accepting.load(Ordering::SeqCst) {
                 return Err(stopping_error());
@@ -693,6 +726,20 @@ impl Supervisor {
                     return Err(error);
                 }
                 LifecyclePhase::Unloaded => {
+                    if inner.failed_load_generation == Some(inner.state.generation) {
+                        return Err(inner.state.last_error.as_ref().map_or_else(
+                            || {
+                                worker_error(
+                                    format!(
+                                        "resident generation {} failed loading without an exact lifecycle error",
+                                        inner.state.generation
+                                    ),
+                                    "preserve the lifecycle journal and generation logs before retrying",
+                                )
+                            },
+                            prior_fault_cli_error,
+                        ));
+                    }
                     let generation = inner.state.generation.checked_add(1).ok_or_else(|| {
                         CliError::runtime("resident generation counter exhausted")
                     })?;
@@ -707,14 +754,16 @@ impl Supervisor {
                     inner.state.phase = LifecyclePhase::Loading;
                     inner.state.load_attempt_count = load_attempt_count;
                     inner.state.last_error = None;
+                    inner.suspended_idle_deadline = None;
                     inner.worker_transition = Some(WorkerTransition::Loading(generation));
+                    inner.cancelled_load_generation = None;
                     if let Err(error) = self.persist(&mut inner, "load_started") {
                         inner.worker_transition = None;
                         self.changed.notify_all();
                         return Err(error);
                     }
                     drop(inner);
-                    return self.load_generation(generation);
+                    return self.load_generation(generation, false);
                 }
                 LifecyclePhase::Faulted
                     if inner.worker.is_none()
@@ -738,7 +787,132 @@ impl Supervisor {
         }
     }
 
-    fn load_generation(self: &Arc<Self>, generation: u64) -> CliResult {
+    fn ensure_loaded_queued(
+        self: &Arc<Self>,
+        deadline: Instant,
+        client: &TcpStream,
+        request_id: &str,
+    ) -> CliResult {
+        loop {
+            ensure_queued_client(client, deadline, request_id)?;
+            if !self.accepting.load(Ordering::SeqCst) {
+                return Err(stopping_error());
+            }
+            let mut inner = self.lock()?;
+            match inner.state.phase {
+                LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy => {
+                    let health_error = match inner.worker.as_mut() {
+                        Some(worker) => worker.verify_live_exact().err(),
+                        None => Some(worker_error(
+                            format!(
+                                "resident generation {} has loaded state without an owned worker",
+                                inner.state.generation
+                            ),
+                            "inspect the lifecycle journal; retry only after the failed generation is reaped",
+                        )),
+                    };
+                    let Some(error) = health_error else {
+                        return Ok(());
+                    };
+                    let generation = inner.state.generation;
+                    drop(inner);
+                    self.invalidate_generation(generation, clone_cli_error(&error))?;
+                    return Err(error);
+                }
+                LifecyclePhase::Unloaded => {
+                    if inner.failed_load_generation == Some(inner.state.generation) {
+                        return Err(inner.state.last_error.as_ref().map_or_else(
+                            || {
+                                worker_error(
+                                    format!(
+                                        "resident generation {} failed loading without an exact lifecycle error",
+                                        inner.state.generation
+                                    ),
+                                    "preserve the lifecycle journal and generation logs before retrying",
+                                )
+                            },
+                            prior_fault_cli_error,
+                        ));
+                    }
+                    let generation = inner.state.generation.checked_add(1).ok_or_else(|| {
+                        CliError::runtime("resident generation counter exhausted")
+                    })?;
+                    inner.state.generation = generation;
+                    inner.state.phase = LifecyclePhase::Loading;
+                    inner.state.load_attempt_count = inner
+                        .state
+                        .load_attempt_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            CliError::runtime("resident load attempt counter exhausted")
+                        })?;
+                    inner.state.last_error = None;
+                    inner.suspended_idle_deadline = None;
+                    inner.worker_transition = Some(WorkerTransition::Loading(generation));
+                    inner.cancelled_load_generation = None;
+                    if let Err(error) = self.persist(&mut inner, "load_started") {
+                        inner.worker_transition = None;
+                        self.changed.notify_all();
+                        return Err(error);
+                    }
+                    drop(inner);
+                    let supervisor = Arc::clone(self);
+                    if let Err(spawn_error) = std::thread::Builder::new()
+                        .name(format!("calyx-resident-load-{generation}"))
+                        .spawn(move || {
+                            if let Err(error) = supervisor.load_generation(generation, true) {
+                                eprintln!(
+                                    "CALYX_PANEL_RESIDENT_RUNTIME phase=background_load_error generation={} code={} message={} remediation={}",
+                                    generation,
+                                    error.code(),
+                                    error.message(),
+                                    error.remediation()
+                                );
+                            }
+                        })
+                    {
+                        return self.finish_load_failure(
+                            generation,
+                            CliError::runtime(format!(
+                                "spawn resident generation {generation} loader: {spawn_error}"
+                            )),
+                            None,
+                        );
+                    }
+                }
+                LifecyclePhase::Faulted
+                    if inner.worker.is_none()
+                        && inner.state.in_flight == 0
+                        && inner.worker_transition.is_none() =>
+                {
+                    inner.state.phase = LifecyclePhase::Unloaded;
+                    inner.state.worker_pid = None;
+                    inner.state.worker_descendant_pids.clear();
+                    let persisted = self.persist(&mut inner, "fault_reaped");
+                    self.changed.notify_all();
+                    persisted?;
+                }
+                LifecyclePhase::Loading | LifecyclePhase::Unloading | LifecyclePhase::Faulted => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(request_deadline_error(request_id));
+                    }
+                    let timeout = remaining.min(QUEUED_CLIENT_POLL);
+                    let (guard, _) = self.changed.wait_timeout(inner, timeout).map_err(|_| {
+                        CliError::runtime(
+                            "resident supervisor state mutex was poisoned while polling queued admission",
+                        )
+                    })?;
+                    drop(guard);
+                }
+                LifecyclePhase::Stopping | LifecyclePhase::Stopped => {
+                    return Err(stopping_error());
+                }
+            }
+        }
+    }
+
+    fn load_generation(self: &Arc<Self>, generation: u64, cancellable: bool) -> CliResult {
         let worker = match WorkerProcess::spawn(
             &self.original_args,
             &self.home,
@@ -746,6 +920,7 @@ impl Supervisor {
             generation,
             self.max_load_secs,
             self.max_request_secs,
+            || cancellable && self.load_was_cancelled(generation),
         ) {
             Ok(worker) => worker,
             Err(error) => return self.finish_load_failure(generation, error, None),
@@ -765,6 +940,7 @@ impl Supervisor {
             || inner.state.phase != LifecyclePhase::Loading
             || inner.state.generation != generation
             || !self.accepting.load(Ordering::SeqCst)
+            || inner.cancelled_load_generation == Some(generation)
         {
             drop(inner);
             return self.finish_load_failure(
@@ -798,11 +974,17 @@ impl Supervisor {
         inner.state.worker_descendant_pids = members;
         inner.state.load_success_count = load_success_count;
         inner.state.last_worker_start_unix_ms = Some(now);
+        let warmed_deadline = IdleDeadline {
+            monotonic: Instant::now() + IDLE_TTL,
+            unix_ms: now.saturating_add(IDLE_TTL_MS),
+        };
         inner.state.idle_deadline_unix_ms =
-            (inner.state.queued_requests == 0).then_some(now.saturating_add(IDLE_TTL_MS));
+            (inner.state.queued_requests == 0).then_some(warmed_deadline.unix_ms);
         inner.state.lens_attestations = worker_ready.lens_attestations.clone();
         inner.state.onnx_runtime_attestation = worker_ready.onnx_runtime_attestation.clone();
-        inner.idle_deadline = (inner.state.queued_requests == 0).then(|| Instant::now() + IDLE_TTL);
+        inner.idle_deadline =
+            (inner.state.queued_requests == 0).then_some(warmed_deadline.monotonic);
+        inner.suspended_idle_deadline = Some(warmed_deadline);
         inner.last_worker_ready = Some(worker_ready);
         if let Err(error) = self.persist(&mut inner, "load_succeeded") {
             drop(inner);
@@ -810,6 +992,8 @@ impl Supervisor {
         }
         inner.worker = Some(worker);
         inner.worker_transition = None;
+        inner.cancelled_load_generation = None;
+        inner.failed_load_generation = None;
         self.changed.notify_all();
         Ok(())
     }
@@ -843,6 +1027,8 @@ impl Supervisor {
             ));
         }
         inner.worker_transition = None;
+        inner.cancelled_load_generation = None;
+        inner.failed_load_generation = Some(generation);
         inner.worker = None;
         if cleanup_error.is_none() {
             inner.state.worker_pid = None;
@@ -850,9 +1036,11 @@ impl Supervisor {
         }
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
+        inner.suspended_idle_deadline = None;
         let failure = cleanup_error.as_ref().unwrap_or(&error);
+        let failure_record = LifecycleErrorRecord::from_cli_error(failure);
         inner.state.phase = LifecyclePhase::Faulted;
-        inner.state.last_error = Some(LifecycleErrorRecord::from_cli_error(failure));
+        inner.state.last_error = Some(failure_record.clone());
         inner.state.load_failure_count = match inner.state.load_failure_count.checked_add(1) {
             Some(count) => count,
             None => {
@@ -880,7 +1068,7 @@ impl Supervisor {
             } else {
                 LifecyclePhase::Stopping
             };
-            inner.state.last_error = Some(LifecycleErrorRecord::from_cli_error(&error));
+            inner.state.last_error = Some(failure_record);
             let event = if accepting {
                 "load_failure_reaped"
             } else {
@@ -917,6 +1105,8 @@ impl Supervisor {
         if let Ok(mut inner) = self.lock() {
             if inner.worker_transition == Some(WorkerTransition::Loading(generation)) {
                 inner.worker_transition = None;
+                inner.cancelled_load_generation = None;
+                inner.failed_load_generation = Some(generation);
                 inner.worker = None;
                 if cleanup_error.is_none() {
                     inner.state.worker_pid = None;
@@ -924,6 +1114,7 @@ impl Supervisor {
                 }
                 inner.state.idle_deadline_unix_ms = None;
                 inner.idle_deadline = None;
+                inner.suspended_idle_deadline = None;
                 inner.state.phase = LifecyclePhase::Faulted;
                 inner.state.last_error = Some(LifecycleErrorRecord::from_cli_error(
                     cleanup_error.as_ref().unwrap_or(&error),
@@ -950,7 +1141,37 @@ impl Supervisor {
                 "resident request {request_id} cancelled with queued_requests=0"
             )));
         }
+        let restore_deadline = if inner.state.queued_requests == 1
+            && inner.state.in_flight == 0
+            && inner.worker_transition.is_none()
+            && inner.worker.is_some()
+            && inner.state.phase == LifecyclePhase::LoadedBusy
+        {
+            Some(inner.suspended_idle_deadline.ok_or_else(|| {
+                CliError::runtime(format!(
+                    "resident generation {} cannot cancel its final queued request without the suspended idle deadline",
+                    inner.state.generation
+                ))
+            })?)
+        } else {
+            None
+        };
         inner.state.queued_requests -= 1;
+        if inner.state.queued_requests == 0 && inner.state.in_flight == 0 {
+            let generation = inner.state.generation;
+            if inner.worker_transition == Some(WorkerTransition::Loading(generation)) {
+                inner.cancelled_load_generation = Some(generation);
+            } else if inner.worker.is_some() && inner.state.phase == LifecyclePhase::LoadedBusy {
+                let deadline = restore_deadline.ok_or_else(|| {
+                    CliError::runtime(format!(
+                        "resident generation {generation} reached loaded-idle without a suspended idle deadline"
+                    ))
+                })?;
+                inner.state.phase = LifecyclePhase::LoadedIdle;
+                inner.state.idle_deadline_unix_ms = Some(deadline.unix_ms);
+                inner.idle_deadline = Some(deadline.monotonic);
+            }
+        }
         let generation = (inner.state.generation != 0).then_some(inner.state.generation);
         let persisted = self.persist_request(
             &mut inner,
@@ -965,6 +1186,27 @@ impl Supervisor {
         );
         self.changed.notify_all();
         persisted
+    }
+
+    fn load_was_cancelled(&self, generation: u64) -> bool {
+        match self.lock() {
+            Ok(inner) => {
+                inner.cancelled_load_generation == Some(generation)
+                    || inner.worker_transition != Some(WorkerTransition::Loading(generation))
+                    || inner.state.generation != generation
+                    || !self.accepting.load(Ordering::SeqCst)
+            }
+            Err(error) => {
+                self.accepting.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "CALYX_PANEL_RESIDENT_RUNTIME phase=load_cancellation_probe_error generation={} code={} message={}",
+                    generation,
+                    error.code(),
+                    error.message()
+                );
+                true
+            }
+        }
     }
 
     fn release_success(
@@ -986,9 +1228,20 @@ impl Supervisor {
                 "resident generation {generation} released a lease with in_flight=0"
             )));
         }
-        inner.state.in_flight -= 1;
         let now = unix_now_ms();
+        let completion_deadline = IdleDeadline {
+            monotonic: Instant::now() + IDLE_TTL,
+            unix_ms: now.saturating_add(IDLE_TTL_MS),
+        };
+        inner.state.in_flight -= 1;
         inner.state.last_completion_unix_ms = Some(now);
+        if inner.worker_transition.is_none()
+            && inner.worker.is_some()
+            && inner.state.phase != LifecyclePhase::Faulted
+            && self.accepting.load(Ordering::SeqCst)
+        {
+            inner.suspended_idle_deadline = Some(completion_deadline);
+        }
         if inner.state.in_flight == 0 {
             if inner.worker_transition.is_none() {
                 if inner.worker.is_some()
@@ -997,8 +1250,8 @@ impl Supervisor {
                 {
                     if inner.state.queued_requests == 0 {
                         inner.state.phase = LifecyclePhase::LoadedIdle;
-                        inner.state.idle_deadline_unix_ms = Some(now.saturating_add(IDLE_TTL_MS));
-                        inner.idle_deadline = Some(Instant::now() + IDLE_TTL);
+                        inner.state.idle_deadline_unix_ms = Some(completion_deadline.unix_ms);
+                        inner.idle_deadline = Some(completion_deadline.monotonic);
                     } else {
                         inner.state.phase = LifecyclePhase::LoadedBusy;
                         inner.state.idle_deadline_unix_ms = None;
@@ -1014,6 +1267,7 @@ impl Supervisor {
                     inner.state.worker_descendant_pids.clear();
                     inner.state.idle_deadline_unix_ms = None;
                     inner.idle_deadline = None;
+                    inner.suspended_idle_deadline = None;
                 } else if !self.accepting.load(Ordering::SeqCst) {
                     inner.state.phase = LifecyclePhase::Stopping;
                 }
@@ -1028,6 +1282,87 @@ impl Supervisor {
                 stage: RequestStage::Released,
                 outcome: Some(outcome),
                 error: error.map(LifecycleErrorRecord::from_cli_error),
+            },
+        );
+        self.changed.notify_all();
+        persisted
+    }
+
+    fn release_unproductive(
+        &self,
+        generation: u64,
+        request_id: &str,
+        error: &CliError,
+    ) -> CliResult {
+        let mut inner = self.lock()?;
+        if inner.state.generation != generation {
+            return Err(CliError::runtime(format!(
+                "resident unproductive lease generation {generation} does not match current generation {}",
+                inner.state.generation
+            )));
+        }
+        if inner.state.in_flight == 0 {
+            return Err(CliError::runtime(format!(
+                "resident generation {generation} released unproductive request {request_id} with in_flight=0"
+            )));
+        }
+        let restore_deadline = if inner.state.in_flight == 1
+            && inner.worker_transition.is_none()
+            && inner.worker.is_some()
+            && inner.state.phase != LifecyclePhase::Faulted
+            && self.accepting.load(Ordering::SeqCst)
+            && inner.state.queued_requests == 0
+        {
+            Some(inner.suspended_idle_deadline.ok_or_else(|| {
+                CliError::runtime(format!(
+                    "resident generation {generation} cannot reject its final unproductive lease without the suspended idle deadline"
+                ))
+            })?)
+        } else {
+            None
+        };
+        inner.state.in_flight -= 1;
+        if inner.state.in_flight == 0 && inner.worker_transition.is_none() {
+            if inner.worker.is_some()
+                && inner.state.phase != LifecyclePhase::Faulted
+                && self.accepting.load(Ordering::SeqCst)
+            {
+                if inner.state.queued_requests == 0 {
+                    let deadline = restore_deadline.ok_or_else(|| {
+                        CliError::runtime(format!(
+                            "resident generation {generation} reached loaded-idle after an unproductive lease without a suspended idle deadline"
+                        ))
+                    })?;
+                    inner.state.phase = LifecyclePhase::LoadedIdle;
+                    inner.state.idle_deadline_unix_ms = Some(deadline.unix_ms);
+                    inner.idle_deadline = Some(deadline.monotonic);
+                } else {
+                    inner.state.phase = LifecyclePhase::LoadedBusy;
+                    inner.state.idle_deadline_unix_ms = None;
+                    inner.idle_deadline = None;
+                }
+            } else if inner.worker.is_none() {
+                inner.state.phase = if self.accepting.load(Ordering::SeqCst) {
+                    LifecyclePhase::Unloaded
+                } else {
+                    LifecyclePhase::Stopping
+                };
+                inner.state.worker_pid = None;
+                inner.state.worker_descendant_pids.clear();
+                inner.state.idle_deadline_unix_ms = None;
+                inner.idle_deadline = None;
+                inner.suspended_idle_deadline = None;
+            }
+        }
+        let persisted = self.persist_request(
+            &mut inner,
+            "request_released",
+            LifecycleRequestRecord {
+                request_id: request_id.to_string(),
+                generation: Some(generation),
+                stage: RequestStage::Released,
+                outcome: Some(RequestOutcome::Failed),
+                error: Some(LifecycleErrorRecord::from_cli_error(error)),
             },
         );
         self.changed.notify_all();
@@ -1057,6 +1392,7 @@ impl Supervisor {
         inner.state.in_flight -= 1;
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
+        inner.suspended_idle_deadline = None;
         if inner.state.in_flight == 0 && inner.worker_transition.is_none() {
             if inner.worker.is_none() {
                 if inner.state.phase != LifecyclePhase::Faulted
@@ -1114,9 +1450,21 @@ impl Supervisor {
             if inner.worker_transition == Some(WorkerTransition::Unloading(generation)) {
                 return Ok(());
             }
+            if inner.worker.is_none()
+                && matches!(
+                    inner.state.phase,
+                    LifecyclePhase::Faulted
+                        | LifecyclePhase::Unloaded
+                        | LifecyclePhase::Stopping
+                        | LifecyclePhase::Stopped
+                )
+            {
+                return Ok(());
+            }
             inner.state.phase = LifecyclePhase::Faulted;
             inner.state.idle_deadline_unix_ms = None;
             inner.idle_deadline = None;
+            inner.suspended_idle_deadline = None;
             inner.state.last_error = Some(
                 lifecycle_error
                     .clone()
@@ -1138,6 +1486,11 @@ impl Supervisor {
         if owned_worker && cleanup_error.is_none() {
             inner.state.worker_pid = None;
             inner.state.worker_descendant_pids.clear();
+        }
+        if !owned_worker {
+            self.accepting.store(false, Ordering::SeqCst);
+            self.changed.notify_all();
+            return fault_persist_error.map_or(Ok(()), Err);
         }
         let counter_error = if owned_worker && cleanup_error.is_none() {
             match inner.state.unload_count.checked_add(1) {
@@ -1199,6 +1552,7 @@ impl Supervisor {
         let mut inner = self.lock()?;
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
+        inner.suspended_idle_deadline = None;
         if !first_request || inner.state.phase == LifecyclePhase::Stopped {
             self.changed.notify_all();
             return Ok(());
@@ -1242,6 +1596,7 @@ impl Supervisor {
             inner.state.phase = LifecyclePhase::Stopping;
             inner.state.idle_deadline_unix_ms = None;
             inner.idle_deadline = None;
+            inner.suspended_idle_deadline = None;
             let generation = inner.state.generation;
             let worker = inner.worker.take();
             let persist_error = if worker.is_some() {
@@ -1265,6 +1620,7 @@ impl Supervisor {
         }
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
+        inner.suspended_idle_deadline = None;
         let counter_error = if owned_worker && cleanup_error.is_none() {
             match inner.state.unload_count.checked_add(1) {
                 Some(count) => {
@@ -1382,11 +1738,17 @@ impl Supervisor {
                 continue;
             };
             if inner.state.phase != LifecyclePhase::LoadedIdle
-                || inner.state.queued_requests != 0
                 || inner.state.in_flight != 0
                 || inner.worker_transition.is_some()
             {
                 inner.idle_deadline = None;
+                continue;
+            }
+            if inner.state.queued_requests != 0 {
+                match self.changed.wait_timeout(inner, QUEUED_CLIENT_POLL) {
+                    Ok((guard, _)) => drop(guard),
+                    Err(_) => self.accepting.store(false, Ordering::SeqCst),
+                }
                 continue;
             }
             let now = Instant::now();
@@ -1403,6 +1765,7 @@ impl Supervisor {
             inner.state.phase = LifecyclePhase::Unloading;
             inner.state.idle_deadline_unix_ms = None;
             inner.idle_deadline = None;
+            inner.suspended_idle_deadline = None;
             let generation = inner.state.generation;
             let worker = inner.worker.take();
             let owned_worker = worker.is_some();
@@ -1581,13 +1944,9 @@ impl Supervisor {
             load_parallelism: warm.as_ref().map_or(0, |ready| ready.load_parallelism),
             load_ms: warm.as_ref().map_or(0, |ready| ready.load_ms),
             probe_ms: warm.as_ref().map_or(0, |ready| ready.probe_ms),
-            slot_count: warm.as_ref().map_or(0, |ready| ready.slot_count),
-            slot_contracts: warm
-                .as_ref()
-                .map_or_else(Vec::new, |ready| ready.slot_contracts.clone()),
-            slot_scope: warm
-                .as_ref()
-                .map_or_else(Vec::new, |ready| ready.slot_scope.clone()),
+            slot_count: self.source.slot_contracts.len(),
+            slot_contracts: self.source.slot_contracts.clone(),
+            slot_scope: self.source.slot_scope.clone(),
             content_lens_count: warm.as_ref().map_or(0, |ready| ready.content_lens_count),
             registry_lens_count: warm.as_ref().map_or(0, |ready| ready.registry_lens_count),
             warmed_lens_count: warm.as_ref().map_or(0, |ready| ready.warmed_lens_count),
@@ -1809,7 +2168,7 @@ fn serve_loop(listener: TcpListener, supervisor: Arc<Supervisor>) -> CliResult {
 }
 
 fn reject_back_pressure(mut stream: TcpStream) -> CliResult {
-    let deadline = deadline_after(BACK_PRESSURE_RESPONSE_TIMEOUT)?;
+    let deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
     let mut ingress = stream.try_clone()?;
     let mut reader = BufReader::new(DeadlineStream::new(&mut ingress, deadline));
     let first_line = read_bounded_line(
@@ -1823,7 +2182,12 @@ fn reject_back_pressure(mut stream: TcpStream) -> CliResult {
         remediation: "retry after an active resident request completes; do not open idle loopback connections",
     });
     if first_line == RESIDENT_BINARY_MAGIC {
-        write_binary_error_before(&mut stream, &error, deadline)
+        let response = write_binary_error_before(&mut stream, &error, deadline);
+        let _ = stream.shutdown(Shutdown::Write);
+        let drained = discard_frame(&mut reader).map_err(CliError::from);
+        let _ = stream.shutdown(Shutdown::Both);
+        response?;
+        drained
     } else {
         write_json_response_before(&mut stream, &cli_error_value(&error), deadline)
     }
@@ -1852,6 +2216,10 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
     };
     if first_line == RESIDENT_BINARY_MAGIC {
         return handle_binary(&mut reader, &mut stream, supervisor, ingress_deadline);
+    }
+    if !reader.buffer().is_empty() {
+        let error = post_frame_bytes_error("JSON line", reader.buffer().len());
+        return write_json_response(&mut stream, &cli_error_value(&error));
     }
     let request = match std::str::from_utf8(&first_line) {
         Ok(line) => match serde_json::from_str::<ResidentRequest>(line) {
@@ -1919,62 +2287,95 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
             {
                 return write_json_response(&mut stream, &cli_error_value(&error));
             }
-            let mut lease = match supervisor.acquire() {
+            let request_deadline = match supervisor.productive_deadline() {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    return write_json_response(&mut stream, &cli_error_value(&error));
+                }
+            };
+            let mut lease = match supervisor.acquire(request_deadline, &stream) {
                 Ok(lease) => lease,
                 Err(error) => {
                     return write_json_response(&mut stream, &cli_error_value(&error));
                 }
             };
             let endpoint = lease.endpoint();
-            let request_deadline = deadline_after(endpoint.request_timeout)?;
-            let response = match proxy_json(&endpoint, &request, request_deadline, &mut lease) {
-                Ok(JsonProxyResponse::Success(response)) => response,
-                Ok(JsonProxyResponse::WorkerFailure { response, failure }) => {
-                    let cleanup = lease.fail_reported(&failure, RequestOutcome::Failed);
-                    let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
-                    return match cleanup {
-                        Ok(()) => {
-                            write_json_bytes_before(&mut stream, &response, response_deadline)
+            let mut capacity_retries = 0_usize;
+            let response = loop {
+                match proxy_json(&endpoint, &request, request_deadline, &mut lease) {
+                    Ok(JsonProxyResponse::Success(response)) => break response,
+                    Ok(JsonProxyResponse::WorkerBackPressure { response, failure }) => {
+                        capacity_retries += 1;
+                        if capacity_retries < 3
+                            && request_deadline.saturating_duration_since(Instant::now())
+                                > QUEUED_CLIENT_POLL
+                        {
+                            std::thread::sleep(QUEUED_CLIENT_POLL);
+                            continue;
                         }
-                        Err(cleanup_error) => {
-                            let value = cli_error_value(&cleanup_error);
-                            if let Err(write_error) =
-                                write_json_response_before(&mut stream, &value, response_deadline)
-                            {
+                        let capacity_error = private_worker_back_pressure_error(&failure);
+                        let cleanup = lease.reject_unproductive(&capacity_error);
+                        let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
+                        return match cleanup {
+                            Ok(()) => {
+                                write_json_bytes_before(&mut stream, &response, response_deadline)
+                            }
+                            Err(cleanup_error) => write_json_response_before(
+                                &mut stream,
+                                &cli_error_value(&cleanup_error),
+                                response_deadline,
+                            ),
+                        };
+                    }
+                    Ok(JsonProxyResponse::WorkerFailure { response, failure }) => {
+                        let cleanup = lease.fail_reported(&failure, RequestOutcome::Failed);
+                        let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
+                        return match cleanup {
+                            Ok(()) => {
+                                write_json_bytes_before(&mut stream, &response, response_deadline)
+                            }
+                            Err(cleanup_error) => {
+                                let value = cli_error_value(&cleanup_error);
+                                if let Err(write_error) = write_json_response_before(
+                                    &mut stream,
+                                    &value,
+                                    response_deadline,
+                                ) {
+                                    eprintln!(
+                                        "CALYX_PANEL_RESIDENT_RUNTIME phase=json_cleanup_error_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
+                                        cleanup_error.code(),
+                                        cleanup_error.message(),
+                                        write_error.code(),
+                                        write_error.message()
+                                    );
+                                }
+                                Err(cleanup_error)
+                            }
+                        };
+                    }
+                    Err(error) => {
+                        let cleanup = lease.fail(&error, RequestOutcome::Failed);
+                        let value = cli_error_value(cleanup.as_ref().err().unwrap_or(&error));
+                        let write = deadline_after(PUBLIC_SOCKET_TIMEOUT)
+                            .map_err(CliError::from)
+                            .and_then(|deadline| {
+                                write_json_response_before(&mut stream, &value, deadline)
+                            });
+                        if let Err(cleanup_error) = cleanup {
+                            if let Err(write_error) = write {
                                 eprintln!(
-                                    "CALYX_PANEL_RESIDENT_RUNTIME phase=json_cleanup_error_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
+                                    "CALYX_PANEL_RESIDENT_RUNTIME phase=json_worker_cleanup_and_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
                                     cleanup_error.code(),
                                     cleanup_error.message(),
                                     write_error.code(),
                                     write_error.message()
                                 );
                             }
-                            Err(cleanup_error)
+                            return Err(cleanup_error);
                         }
-                    };
-                }
-                Err(error) => {
-                    let cleanup = lease.fail(&error, RequestOutcome::Failed);
-                    let value = cli_error_value(cleanup.as_ref().err().unwrap_or(&error));
-                    let write = deadline_after(PUBLIC_SOCKET_TIMEOUT)
-                        .map_err(CliError::from)
-                        .and_then(|deadline| {
-                            write_json_response_before(&mut stream, &value, deadline)
-                        });
-                    if let Err(cleanup_error) = cleanup {
-                        if let Err(write_error) = write {
-                            eprintln!(
-                                "CALYX_PANEL_RESIDENT_RUNTIME phase=json_worker_cleanup_and_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
-                                cleanup_error.code(),
-                                cleanup_error.message(),
-                                write_error.code(),
-                                write_error.message()
-                            );
-                        }
-                        return Err(cleanup_error);
+                        write?;
+                        return Ok(());
                     }
-                    write?;
-                    return Ok(());
                 }
             };
             match write_json_bytes_before(&mut stream, &response, request_deadline) {
@@ -2022,8 +2423,67 @@ fn loaded_worker_failure(inner: &mut SupervisorInner) -> Option<(u64, CliError)>
     }
 }
 
+fn ensure_queued_client(client: &TcpStream, deadline: Instant, request_id: &str) -> CliResult {
+    if ensure_before(
+        deadline,
+        "resident queue, load, request, and public flush budget",
+    )
+    .is_err()
+    {
+        return Err(request_deadline_error(request_id));
+    }
+    client.set_nonblocking(true).map_err(|error| {
+        queued_client_error(
+            request_id,
+            format!("enable queued-client liveness probe: {error}"),
+        )
+    })?;
+    let mut byte = [0_u8; 1];
+    let observed = client.peek(&mut byte);
+    let restore = client.set_nonblocking(false);
+    if let Err(error) = restore {
+        return Err(queued_client_error(
+            request_id,
+            format!("restore queued-client blocking mode: {error}"),
+        ));
+    }
+    match observed {
+        Ok(0) => Err(queued_client_error(
+            request_id,
+            "client closed its socket while waiting for admission",
+        )),
+        Ok(count) => Err(queued_client_error(
+            request_id,
+            format!("client sent {count} unexpected byte(s) after its complete request frame"),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(queued_client_error(
+            request_id,
+            format!("probe queued-client socket: {error}"),
+        )),
+    }
+}
+
+fn queued_client_error(request_id: &str, detail: impl std::fmt::Display) -> CliError {
+    CliError::from(CalyxError {
+        code: QUEUED_CLIENT_GONE,
+        message: format!("resident queued request {request_id} is no longer live: {detail}"),
+        remediation: "retry one complete request; a cancelled queued request never acquires, refreshes, or invalidates a GPU generation",
+    })
+}
+
+fn request_deadline_error(request_id: &str) -> CliError {
+    CliError::from(CalyxError {
+        code: REQUEST_DEADLINE,
+        message: format!(
+            "resident request {request_id} exceeded its one absolute queue+load+request+flush budget"
+        ),
+        remediation: "reduce queue/load/request work or raise the explicit load/request budgets; a timed-out queued request is cancelled without invalidating a healthy generation",
+    })
+}
+
 fn handle_binary(
-    reader: &mut dyn std::io::Read,
+    reader: &mut BufReader<DeadlineStream<'_>>,
     stream: &mut TcpStream,
     supervisor: Arc<Supervisor>,
     ingress_deadline: Instant,
@@ -2035,6 +2495,11 @@ fn handle_binary(
             return Ok(());
         }
     };
+    if !reader.buffer().is_empty() {
+        let error = post_frame_bytes_error("binary frame", reader.buffer().len());
+        write_binary_error(stream, &error)?;
+        return Ok(());
+    }
     let decoded_request = match decode_binary_request(&payload) {
         Ok(request) => request,
         Err(error) => {
@@ -2073,7 +2538,14 @@ fn handle_binary(
         write_binary_error(stream, &error)?;
         return Ok(());
     }
-    let mut lease = match supervisor.acquire() {
+    let request_deadline = match supervisor.productive_deadline() {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            write_binary_error(stream, &error)?;
+            return Ok(());
+        }
+    };
+    let mut lease = match supervisor.acquire(request_deadline, stream) {
         Ok(lease) => lease,
         Err(error) => {
             write_binary_error(stream, &error)?;
@@ -2081,67 +2553,99 @@ fn handle_binary(
         }
     };
     let endpoint = lease.endpoint();
-    let request_deadline = deadline_after(endpoint.request_timeout)?;
-    match proxy_binary(
-        &endpoint,
-        &decoded_request,
-        stream,
-        request_deadline,
-        &mut lease,
-    ) {
-        Ok(()) => {
-            lease.advance(RequestStage::PublicFlushComplete)?;
-            lease.complete_success()
-        }
-        Err(BinaryProxyError::Worker(error)) => {
-            let cleanup = lease.fail(&error, RequestOutcome::Failed);
-            let response_error = cleanup.as_ref().err().unwrap_or(&error);
-            if let Ok(error_deadline) = deadline_after(PUBLIC_SOCKET_TIMEOUT) {
-                if let Err(write_error) =
-                    write_binary_error_before(stream, response_error, error_deadline)
-                {
-                    eprintln!(
-                        "CALYX_PANEL_RESIDENT_RUNTIME phase=binary_worker_error_response_failed worker_code={} worker_message={} write_code={} write_message={}",
-                        response_error.code(),
-                        response_error.message(),
-                        write_error.code(),
-                        write_error.message()
-                    );
-                }
+    let mut capacity_retries = 0_usize;
+    loop {
+        match proxy_binary(
+            &endpoint,
+            &decoded_request,
+            stream,
+            request_deadline,
+            &mut lease,
+        ) {
+            Ok(()) => {
+                lease.advance(RequestStage::PublicFlushComplete)?;
+                return lease.complete_success();
             }
-            cleanup?;
-            Err(error)
-        }
-        Err(BinaryProxyError::WorkerReported { failure, frame }) => {
-            let cleanup = lease.fail_reported(&failure, RequestOutcome::Failed);
-            let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
-            if let Err(cleanup_error) = cleanup {
-                if let Err(write_error) =
-                    write_binary_error_before(stream, &cleanup_error, response_deadline)
+            Err(BinaryProxyError::WorkerBackPressure { failure, frame }) => {
+                capacity_retries += 1;
+                if capacity_retries < 3
+                    && request_deadline.saturating_duration_since(Instant::now())
+                        > QUEUED_CLIENT_POLL
                 {
-                    eprintln!(
-                        "CALYX_PANEL_RESIDENT_RUNTIME phase=binary_cleanup_error_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
-                        cleanup_error.code(),
-                        cleanup_error.message(),
-                        write_error.code(),
-                        write_error.message()
-                    );
+                    std::thread::sleep(QUEUED_CLIENT_POLL);
+                    continue;
                 }
-                return Err(cleanup_error);
+                let capacity_error = private_worker_back_pressure_error(&failure);
+                let cleanup = lease.reject_unproductive(&capacity_error);
+                let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
+                if let Err(cleanup_error) = cleanup {
+                    write_binary_error_before(stream, &cleanup_error, response_deadline)?;
+                    return Err(cleanup_error);
+                }
+                write_binary_frame_before(stream, &frame, response_deadline)?;
+                return Err(capacity_error);
             }
-            write_binary_frame_before(stream, &frame, response_deadline)?;
-            Err(failure.supervisor_error)
-        }
-        Err(BinaryProxyError::Client(error)) => {
-            // The supervisor cannot prove that the private worker stopped
-            // computing merely because the public client stopped consuming a
-            // stream. Reap the generation before releasing its lease.
-            let cancellation = client_aborted_error(endpoint.generation, &error, "binary stream");
-            let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
-            cleanup?;
-            Err(error)
+            Err(BinaryProxyError::Worker(error)) => {
+                let cleanup = lease.fail(&error, RequestOutcome::Failed);
+                let response_error = cleanup.as_ref().err().unwrap_or(&error);
+                if let Ok(error_deadline) = deadline_after(PUBLIC_SOCKET_TIMEOUT) {
+                    if let Err(write_error) =
+                        write_binary_error_before(stream, response_error, error_deadline)
+                    {
+                        eprintln!(
+                            "CALYX_PANEL_RESIDENT_RUNTIME phase=binary_worker_error_response_failed worker_code={} worker_message={} write_code={} write_message={}",
+                            response_error.code(),
+                            response_error.message(),
+                            write_error.code(),
+                            write_error.message()
+                        );
+                    }
+                }
+                cleanup?;
+                return Err(error);
+            }
+            Err(BinaryProxyError::WorkerReported { failure, frame }) => {
+                let cleanup = lease.fail_reported(&failure, RequestOutcome::Failed);
+                let response_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
+                if let Err(cleanup_error) = cleanup {
+                    if let Err(write_error) =
+                        write_binary_error_before(stream, &cleanup_error, response_deadline)
+                    {
+                        eprintln!(
+                            "CALYX_PANEL_RESIDENT_RUNTIME phase=binary_cleanup_error_response_failed cleanup_code={} cleanup_message={} write_code={} write_message={}",
+                            cleanup_error.code(),
+                            cleanup_error.message(),
+                            write_error.code(),
+                            write_error.message()
+                        );
+                    }
+                    return Err(cleanup_error);
+                }
+                write_binary_frame_before(stream, &frame, response_deadline)?;
+                return Err(failure.supervisor_error);
+            }
+            Err(BinaryProxyError::Client(error)) => {
+                // The supervisor cannot prove that the private worker stopped
+                // computing merely because the public client stopped consuming a
+                // stream. Reap the generation before releasing its lease.
+                let cancellation =
+                    client_aborted_error(endpoint.generation, &error, "binary stream");
+                let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
+                cleanup?;
+                return Err(error);
+            }
         }
     }
+}
+
+fn post_frame_bytes_error(frame: &str, count: usize) -> CliError {
+    CliError::from(CalyxError {
+        code: "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+        message: format!(
+            "resident public {frame} was followed by {count} unexpected buffered byte(s)"
+        ),
+        remediation: "send exactly one complete request per connection and do not pipeline trailing bytes",
+    })
 }
 
 fn proxy_json(
@@ -2166,7 +2670,7 @@ fn proxy_json(
         .map_err(|error| CliError::runtime(format!("serialize worker request: {error}")))?;
     worker_io.write_all(b"\n")?;
     worker_io.flush()?;
-    lease.advance(RequestStage::WorkerRequestFlushed)?;
+    mark_worker_request_flushed(lease)?;
     let mut worker_reader = BufReader::new(worker_io);
     let response = read_bounded_line(
         &mut worker_reader,
@@ -2183,6 +2687,9 @@ fn proxy_json(
     match value.get("ok") {
         Some(Value::Bool(false)) => {
             let failure = worker_reported_json_error(endpoint.bind, &value)?;
+            if failure.lifecycle_error.code == PRIVATE_WORKER_BACK_PRESSURE {
+                return Ok(JsonProxyResponse::WorkerBackPressure { response, failure });
+            }
             lease.advance(RequestStage::TerminalReceived)?;
             return Ok(JsonProxyResponse::WorkerFailure { response, failure });
         }
@@ -2219,10 +2726,25 @@ fn proxy_json(
 
 enum JsonProxyResponse {
     Success(Vec<u8>),
+    WorkerBackPressure {
+        response: Vec<u8>,
+        failure: WorkerReportedFailure,
+    },
     WorkerFailure {
         response: Vec<u8>,
         failure: WorkerReportedFailure,
     },
+}
+
+fn mark_worker_request_flushed(lease: &mut ProductiveLease) -> CliResult {
+    match lease.stage {
+        RequestStage::Queued => lease.advance(RequestStage::WorkerRequestFlushed),
+        RequestStage::WorkerRequestFlushed => Ok(()),
+        stage => Err(CliError::runtime(format!(
+            "resident request {} cannot flush a worker retry from stage {stage:?}",
+            lease.request_id
+        ))),
+    }
 }
 
 struct WorkerReportedFailure {
@@ -2594,9 +3116,7 @@ fn proxy_binary(
     worker_io.flush().map_err(|error| {
         BinaryProxyError::Worker(worker_transport_error(bind, "flush binary request", error))
     })?;
-    lease
-        .advance(RequestStage::WorkerRequestFlushed)
-        .map_err(BinaryProxyError::Worker)?;
+    mark_worker_request_flushed(lease).map_err(BinaryProxyError::Worker)?;
     let mut saw_header = false;
     let mut row_count = 0usize;
     loop {
@@ -2672,6 +3192,9 @@ fn proxy_binary(
             } => {
                 let failure = validate_binary_worker_error(bind, code, message, remediation)
                     .map_err(BinaryProxyError::Worker)?;
+                if failure.lifecycle_error.code == PRIVATE_WORKER_BACK_PRESSURE {
+                    return Err(BinaryProxyError::WorkerBackPressure { failure, frame });
+                }
                 lease
                     .advance(RequestStage::TerminalReceived)
                     .map_err(BinaryProxyError::Worker)?;
@@ -2780,6 +3303,10 @@ fn validate_binary_header(
 
 enum BinaryProxyError {
     Worker(CliError),
+    WorkerBackPressure {
+        failure: WorkerReportedFailure,
+        frame: Vec<u8>,
+    },
     WorkerReported {
         failure: WorkerReportedFailure,
         frame: Vec<u8>,
@@ -2957,6 +3484,14 @@ fn reported_worker_error(
             at_unix_ms: unix_now_ms(),
         },
     }
+}
+
+fn private_worker_back_pressure_error(failure: &WorkerReportedFailure) -> CliError {
+    CliError::from(CalyxError {
+        code: PRIVATE_WORKER_BACK_PRESSURE,
+        message: failure.lifecycle_error.message.clone(),
+        remediation: "retry after an authenticated private handler completes; this capacity response does not invalidate or refresh the loaded generation",
+    })
 }
 
 fn client_aborted_error(generation: u64, error: &CliError, operation: &str) -> CliError {

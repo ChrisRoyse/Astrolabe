@@ -17,7 +17,8 @@ use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
 pub(super) const LIFECYCLE_SCHEMA_V2: &str = "calyx-panel-resident-lifecycle-v2";
-pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v3";
+pub(super) const LIFECYCLE_SCHEMA_V3: &str = "calyx-panel-resident-lifecycle-v3";
+pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v4";
 const LIFECYCLE_CORRUPT: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT";
 const LIFECYCLE_DURABILITY: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY";
 const SUPERVISOR_ALREADY_RUNNING: &str = "CALYX_PANEL_RESIDENT_ALREADY_RUNNING";
@@ -59,7 +60,7 @@ pub(super) enum RequestOutcome {
     Abandoned,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LifecycleRequestRecord {
     pub(super) request_id: String,
@@ -71,7 +72,7 @@ pub(super) struct LifecycleRequestRecord {
     pub(super) error: Option<LifecycleErrorRecord>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LifecycleErrorRecord {
     pub(super) code: String,
@@ -412,6 +413,12 @@ impl LifecycleStore {
             sequence,
             &previous_event_sha256,
         )?;
+        validate_replayed_lifecycle_transition(
+            &self.journal_path,
+            line_number,
+            self.last.as_ref(),
+            &projection,
+        )?;
         let mut proposed_request_states = self.request_states.clone();
         validate_replayed_request(
             &self.journal_path,
@@ -620,12 +627,731 @@ fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<LifecycleReplay> {
             ))
         })?;
         validate_replayed_record(path, line_index + 1, &record, sequence, &expected_previous)?;
+        validate_replayed_lifecycle_transition(path, line_index + 1, last.as_ref(), &record)?;
         validate_replayed_request(path, line_index + 1, last.as_ref(), &record, &mut requests)?;
         expected_sequence = sequence.checked_add(1);
         expected_previous.clone_from(&record.event_sha256);
         last = Some(record);
     }
     Ok(LifecycleReplay { last, requests })
+}
+
+fn validate_replayed_lifecycle_transition(
+    path: &Path,
+    line_number: usize,
+    previous: Option<&LifecycleProjection>,
+    record: &LifecycleProjection,
+) -> CliResult {
+    // v2/v3 journals predate event-specific state validation. They retain
+    // their original hash/request validation and are migrated by the first
+    // v4 event; every newly appended event is held to the complete contract.
+    if record.schema != LIFECYCLE_SCHEMA {
+        return Ok(());
+    }
+    validate_lifecycle_state(path, line_number, record)?;
+    let Some(previous) = previous else {
+        if record.event != "supervisor_started"
+            || record.phase != LifecyclePhase::Unloaded
+            || record.generation != 0
+            || record.queued_requests != 0
+            || record.in_flight != 0
+            || record.load_attempt_count != 0
+            || record.load_success_count != 0
+            || record.load_failure_count != 0
+            || record.unload_count != 0
+        {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "the first v4 event is not a zero-counter unloaded supervisor_started record",
+            ));
+        }
+        return Ok(());
+    };
+
+    if is_restart_event(&record.event) {
+        validate_counter_transition(path, line_number, previous, record)?;
+        return validate_restart_transition(path, line_number, previous, record);
+    }
+    if previous.schema != LIFECYCLE_SCHEMA {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} followed legacy schema without a restart boundary",
+                record.event
+            ),
+        ));
+    }
+    if record.supervisor_pid != previous.supervisor_pid {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed supervisor PID {} -> {} outside restart recovery",
+                record.event, previous.supervisor_pid, record.supervisor_pid
+            ),
+        ));
+    }
+    if record.frozen_panel_fingerprint != previous.frozen_panel_fingerprint
+        || record.idle_ttl_ms != previous.idle_ttl_ms
+        || record.max_load_secs != previous.max_load_secs
+        || record.max_request_secs != previous.max_request_secs
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed the frozen fingerprint or lifecycle budgets within one supervisor",
+                record.event
+            ),
+        ));
+    }
+    if previous.last_error.is_some()
+        && record.last_error.is_none()
+        && record.event != "load_started"
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} silently cleared global last_error",
+                record.event
+            ),
+        ));
+    }
+    validate_event_field_changes(path, line_number, previous, record)?;
+
+    validate_counter_transition(path, line_number, previous, record)?;
+    validate_event_state(path, line_number, previous, record)
+}
+
+fn is_recovery_event(event: &str) -> bool {
+    matches!(
+        event,
+        "legacy_requests_recovered_abandoned"
+            | "request_recovered_abandoned"
+            | "request_recovered_succeeded"
+    )
+}
+
+fn is_restart_event(event: &str) -> bool {
+    is_recovery_event(event) || event == "supervisor_started"
+}
+
+fn validate_restart_transition(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    if record.phase != LifecyclePhase::Unloaded
+        || record.worker_pid.is_some()
+        || !record.worker_descendant_pids.is_empty()
+        || record.queued_requests != 0
+        || record.in_flight != 0
+        || record.idle_deadline_unix_ms.is_some()
+        || record.generation != previous.generation
+        || record.last_worker_start_unix_ms != previous.last_worker_start_unix_ms
+        || record.last_completion_unix_ms != previous.last_completion_unix_ms
+        || record.last_unload_unix_ms != previous.last_unload_unix_ms
+        || record.last_error != previous.last_error
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "restart recovery did not collapse to one unloaded state while preserving exact counters, timestamps, and global last_error",
+        ));
+    }
+    if record.event == "legacy_requests_recovered_abandoned"
+        && (previous.schema != LIFECYCLE_SCHEMA_V2 || previous.in_flight == 0)
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "legacy request recovery did not directly follow a v2 record with in_flight work",
+        ));
+    }
+
+    let continuing_recovery =
+        previous.schema == LIFECYCLE_SCHEMA && is_recovery_event(&previous.event);
+    if continuing_recovery {
+        if record.supervisor_pid != previous.supervisor_pid
+            || record.frozen_panel_fingerprint != previous.frozen_panel_fingerprint
+            || record.idle_ttl_ms != previous.idle_ttl_ms
+            || record.max_load_secs != previous.max_load_secs
+            || record.max_request_secs != previous.max_request_secs
+            || record.lens_attestations != previous.lens_attestations
+            || !same_onnx_attestation(previous, record)
+        {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "restart recovery changed supervisor/configuration/attestation after its first boundary record",
+            ));
+        }
+    } else if record.frozen_panel_fingerprint == previous.frozen_panel_fingerprint {
+        if record.lens_attestations != previous.lens_attestations
+            || !same_onnx_attestation(previous, record)
+        {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "restart retained the frozen fingerprint but changed its exact runtime attestations",
+            ));
+        }
+    } else if !record.lens_attestations.is_empty() || has_onnx_attestation(record) {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "restart changed the frozen fingerprint without clearing stale runtime attestations",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event_field_changes(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    let event = record.event.as_str();
+    if event != "load_succeeded"
+        && (record.lens_attestations != previous.lens_attestations
+            || !same_onnx_attestation(previous, record))
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed frozen runtime attestations",
+                record.event
+            ),
+        ));
+    }
+    if event != "load_succeeded"
+        && record.last_worker_start_unix_ms != previous.last_worker_start_unix_ms
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!("event {:?} changed last_worker_start_unix_ms", record.event),
+        ));
+    }
+    if event == "request_released" {
+        let succeeded = record
+            .request
+            .as_ref()
+            .is_some_and(|request| request.outcome == Some(RequestOutcome::Succeeded));
+        if succeeded && record.last_completion_unix_ms.is_none() {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "successful request release omitted last_completion_unix_ms",
+            ));
+        }
+        if !succeeded && record.last_completion_unix_ms != previous.last_completion_unix_ms {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "failed or abandoned request release changed last_completion_unix_ms",
+            ));
+        }
+    } else if record.last_completion_unix_ms != previous.last_completion_unix_ms {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!("event {:?} changed last_completion_unix_ms", record.event),
+        ));
+    }
+    if !matches!(
+        event,
+        "worker_reaped"
+            | "idle_unload_completed"
+            | "idle_unload_failed"
+            | "shutdown_worker_failed"
+            | "supervisor_stopped"
+    ) && record.last_unload_unix_ms != previous.last_unload_unix_ms
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!("event {:?} changed last_unload_unix_ms", record.event),
+        ));
+    }
+    let may_change_last_error = matches!(
+        event,
+        "load_started"
+            | "load_failed"
+            | "worker_faulted"
+            | "worker_reap_failed"
+            | "worker_reap_accounting_failed"
+            | "idle_unload_failed"
+            | "shutdown_worker_failed"
+    );
+    if record.last_error != previous.last_error && !may_change_last_error {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed the exact global last_error",
+                record.event
+            ),
+        ));
+    }
+    if matches!(event, "request_queued" | "request_stage")
+        && record.idle_deadline_unix_ms != previous.idle_deadline_unix_ms
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed the productive idle deadline",
+                record.event
+            ),
+        ));
+    }
+    validate_worker_identity_change(path, line_number, previous, record)
+}
+
+#[cfg(windows)]
+fn same_onnx_attestation(previous: &LifecycleProjection, record: &LifecycleProjection) -> bool {
+    record.onnx_runtime_attestation == previous.onnx_runtime_attestation
+}
+
+#[cfg(not(windows))]
+fn same_onnx_attestation(_previous: &LifecycleProjection, _record: &LifecycleProjection) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn has_onnx_attestation(record: &LifecycleProjection) -> bool {
+    record.onnx_runtime_attestation.is_some()
+}
+
+#[cfg(not(windows))]
+fn has_onnx_attestation(_record: &LifecycleProjection) -> bool {
+    false
+}
+
+fn validate_worker_identity_change(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    let same = record.worker_pid == previous.worker_pid
+        && record.worker_descendant_pids == previous.worker_descendant_pids;
+    let valid = match record.event.as_str() {
+        "load_succeeded" => previous.worker_pid.is_none() && record.worker_pid.is_some(),
+        "worker_reaped" | "idle_unload_completed" => {
+            previous.worker_pid.is_some()
+                && record.worker_pid.is_none()
+                && record.worker_descendant_pids.is_empty()
+        }
+        "worker_reap_accounting_failed" => {
+            previous.worker_pid.is_some()
+                && record.worker_pid.is_none()
+                && record.worker_descendant_pids.is_empty()
+        }
+        "worker_reap_failed" => same,
+        "idle_unload_failed" | "shutdown_worker_failed" => {
+            same || (previous.worker_pid.is_some()
+                && record.worker_pid.is_none()
+                && record.worker_descendant_pids.is_empty())
+        }
+        "supervisor_stopped" => {
+            same || (previous.worker_pid.is_some()
+                && record.worker_pid.is_none()
+                && record.worker_descendant_pids.is_empty())
+        }
+        _ => same,
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(lifecycle_semantic_error(
+        path,
+        line_number,
+        format!(
+            "event {:?} changed worker ownership {:?}/{:?} -> {:?}/{:?} illegally",
+            record.event,
+            previous.worker_pid,
+            previous.worker_descendant_pids,
+            record.worker_pid,
+            record.worker_descendant_pids
+        ),
+    ))
+}
+
+fn validate_lifecycle_state(
+    path: &Path,
+    line_number: usize,
+    record: &LifecycleProjection,
+) -> CliResult {
+    if record.supervisor_pid == 0
+        || record.idle_ttl_ms != 60_000
+        || record.max_load_secs == 0
+        || record.max_request_secs == 0
+        || record.frozen_panel_fingerprint.len() != 64
+        || !record
+            .frozen_panel_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || record.load_success_count > record.load_attempt_count
+        || record.load_failure_count > record.load_attempt_count
+        || record
+            .load_success_count
+            .checked_add(record.load_failure_count)
+            .is_none_or(|finished| finished > record.load_attempt_count)
+        || record.unload_count > record.load_success_count
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "record has invalid supervisor identity, budgets, fingerprint, or aggregate counters",
+        ));
+    }
+    let mut descendants = record.worker_descendant_pids.clone();
+    descendants.sort_unstable();
+    if descendants.iter().any(|pid| *pid == 0)
+        || descendants.windows(2).any(|pair| pair[0] == pair[1])
+        || record
+            .worker_pid
+            .is_some_and(|pid| pid == record.supervisor_pid || !descendants.contains(&pid))
+        || (record.worker_pid.is_none() && !record.worker_descendant_pids.is_empty())
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "record has impossible worker/descendant PID ownership",
+        ));
+    }
+    let phase_valid = match record.phase {
+        LifecyclePhase::LoadedIdle => {
+            record.worker_pid.is_some()
+                && record.in_flight == 0
+                && record.last_error.is_none()
+                && record.idle_deadline_unix_ms.is_some_and(|deadline| {
+                    deadline
+                        <= record
+                            .recorded_at_unix_ms
+                            .saturating_add(record.idle_ttl_ms)
+                })
+                && idle_deadline_has_exact_source(record)
+        }
+        LifecyclePhase::LoadedBusy => {
+            record.worker_pid.is_some()
+                && (record.queued_requests > 0 || record.in_flight > 0)
+                && record.idle_deadline_unix_ms.is_none()
+                && record.last_error.is_none()
+        }
+        LifecyclePhase::Unloading => {
+            record.worker_pid.is_some()
+                && record.in_flight == 0
+                && record.idle_deadline_unix_ms.is_none()
+        }
+        LifecyclePhase::Loading => {
+            record.worker_pid.is_none()
+                && record.in_flight == 0
+                && record.idle_deadline_unix_ms.is_none()
+                && record.last_error.is_none()
+        }
+        LifecyclePhase::Unloaded => {
+            record.worker_pid.is_none()
+                && record.in_flight == 0
+                && record.idle_deadline_unix_ms.is_none()
+        }
+        LifecyclePhase::Stopped => {
+            record.worker_pid.is_none()
+                && record.queued_requests == 0
+                && record.in_flight == 0
+                && record.idle_deadline_unix_ms.is_none()
+        }
+        LifecyclePhase::Faulted => {
+            record.idle_deadline_unix_ms.is_none() && record.last_error.is_some()
+        }
+        LifecyclePhase::Stopping => record.idle_deadline_unix_ms.is_none(),
+    };
+    if !phase_valid {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "phase {:?} is inconsistent with worker_pid={:?} queued={} in_flight={} idle_deadline={:?}",
+                record.phase,
+                record.worker_pid,
+                record.queued_requests,
+                record.in_flight,
+                record.idle_deadline_unix_ms
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn idle_deadline_has_exact_source(record: &LifecycleProjection) -> bool {
+    let Some(deadline) = record.idle_deadline_unix_ms else {
+        return false;
+    };
+    [
+        record.last_worker_start_unix_ms,
+        record.last_completion_unix_ms,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|source| source.saturating_add(record.idle_ttl_ms) == deadline)
+}
+
+fn validate_counter_transition(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    let delta = |current: u64, prior: u64, name: &str| {
+        current.checked_sub(prior).ok_or_else(|| {
+            lifecycle_semantic_error(
+                path,
+                line_number,
+                format!("event {:?} decreased {name}", record.event),
+            )
+        })
+    };
+    let attempt = delta(
+        record.load_attempt_count,
+        previous.load_attempt_count,
+        "load_attempt_count",
+    )?;
+    let success = delta(
+        record.load_success_count,
+        previous.load_success_count,
+        "load_success_count",
+    )?;
+    let failure = delta(
+        record.load_failure_count,
+        previous.load_failure_count,
+        "load_failure_count",
+    )?;
+    let unload = delta(record.unload_count, previous.unload_count, "unload_count")?;
+    let generation = delta(record.generation, previous.generation, "generation")?;
+    let expected = match record.event.as_str() {
+        "load_started" => (1, 0, 0, 0, 1),
+        "load_succeeded" => (0, 1, 0, 0, 0),
+        "load_failed" => (0, 0, 1, 0, 0),
+        "worker_reaped" | "idle_unload_completed" => (0, 0, 0, 1, 0),
+        "supervisor_stopped" if previous.worker_pid.is_some() => (0, 0, 0, 1, 0),
+        "idle_unload_failed" | "shutdown_worker_failed" => {
+            if unload > 1 {
+                return Err(lifecycle_semantic_error(
+                    path,
+                    line_number,
+                    format!("event {:?} advanced unload_count by {unload}", record.event),
+                ));
+            }
+            (0, 0, 0, unload, 0)
+        }
+        _ => (0, 0, 0, 0, 0),
+    };
+    if (attempt, success, failure, unload, generation) != expected {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} has illegal counter deltas attempts/success/failure/unload/generation={attempt}/{success}/{failure}/{unload}/{generation}, expected {}/{}/{}/{}/{}",
+                record.event, expected.0, expected.1, expected.2, expected.3, expected.4
+            ),
+        ));
+    }
+    if unload == 0 && record.last_unload_unix_ms != previous.last_unload_unix_ms {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} changed last_unload_unix_ms without completing an owned unload",
+                record.event
+            ),
+        ));
+    }
+    if unload == 1 && record.last_unload_unix_ms.is_none() {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} completed an owned unload without last_unload_unix_ms",
+                record.event
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event_state(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    let allowed = match record.event.as_str() {
+        "fault_reaped" => {
+            previous.phase == LifecyclePhase::Faulted
+                && previous.worker_pid.is_none()
+                && record.phase == LifecyclePhase::Unloaded
+        }
+        "load_failure_reaped" => {
+            previous.phase == LifecyclePhase::Faulted
+                && previous.event == "load_failed"
+                && previous.worker_pid.is_none()
+                && record.phase == LifecyclePhase::Unloaded
+        }
+        "load_started" => {
+            previous.phase == LifecyclePhase::Unloaded
+                && record.phase == LifecyclePhase::Loading
+                && record.worker_pid.is_none()
+                && record.last_error.is_none()
+        }
+        "load_succeeded" => {
+            previous.phase == LifecyclePhase::Loading
+                && matches!(
+                    record.phase,
+                    LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy
+                )
+                && record.last_worker_start_unix_ms.is_some()
+                && record.last_error.is_none()
+        }
+        "load_failed" => {
+            previous.phase == LifecyclePhase::Loading
+                && record.phase == LifecyclePhase::Faulted
+                && record.last_error.is_some()
+        }
+        "load_cancelled_for_shutdown" => {
+            previous.phase == LifecyclePhase::Faulted
+                && previous.event == "load_failed"
+                && record.phase == LifecyclePhase::Stopping
+        }
+        "worker_faulted" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy | LifecyclePhase::Stopping
+            ) && record.phase == LifecyclePhase::Faulted
+                && record.last_error.is_some()
+        }
+        "worker_reaped" => {
+            previous.phase == LifecyclePhase::Faulted
+                && matches!(
+                    record.phase,
+                    LifecyclePhase::Unloaded | LifecyclePhase::Faulted | LifecyclePhase::Stopping
+                )
+        }
+        "worker_reap_failed" | "worker_reap_accounting_failed" => {
+            previous.phase == LifecyclePhase::Faulted
+                && record.phase == LifecyclePhase::Faulted
+                && record.last_error.is_some()
+        }
+        "idle_unload_started" => {
+            previous.phase == LifecyclePhase::LoadedIdle
+                && previous.queued_requests == 0
+                && previous.in_flight == 0
+                && record.phase == LifecyclePhase::Unloading
+        }
+        "shutdown_unload_started" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::Stopping | LifecyclePhase::Faulted
+            ) && record.phase == LifecyclePhase::Unloading
+        }
+        "idle_unload_completed" => {
+            previous.phase == LifecyclePhase::Unloading
+                && matches!(
+                    record.phase,
+                    LifecyclePhase::Unloaded | LifecyclePhase::Stopping
+                )
+        }
+        "idle_unload_failed" => {
+            previous.phase == LifecyclePhase::Unloading
+                && record.phase == LifecyclePhase::Faulted
+                && record.last_error.is_some()
+        }
+        "shutdown_worker_failed" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::Unloading | LifecyclePhase::Faulted | LifecyclePhase::Stopping
+            ) && record.phase == LifecyclePhase::Faulted
+                && record.last_error.is_some()
+        }
+        "shutdown_requested" => match previous.phase {
+            LifecyclePhase::Loading | LifecyclePhase::Unloading | LifecyclePhase::Faulted => {
+                record.phase == previous.phase
+            }
+            LifecyclePhase::Unloaded | LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy => {
+                record.phase == LifecyclePhase::Stopping
+            }
+            LifecyclePhase::Stopping | LifecyclePhase::Stopped => false,
+        },
+        "supervisor_stopped" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::Stopping | LifecyclePhase::Unloading
+            ) && record.phase == LifecyclePhase::Stopped
+        }
+        "request_queued" => {
+            !matches!(
+                previous.phase,
+                LifecyclePhase::Stopping | LifecyclePhase::Stopped
+            ) && record.phase == previous.phase
+        }
+        "lease_acquired" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy
+            ) && record.phase == LifecyclePhase::LoadedBusy
+                && record.idle_deadline_unix_ms.is_none()
+        }
+        "request_stage" => {
+            matches!(
+                previous.phase,
+                LifecyclePhase::LoadedBusy | LifecyclePhase::Faulted | LifecyclePhase::Stopping
+            ) && record.phase == previous.phase
+        }
+        "request_released" => {
+            !matches!(previous.phase, LifecyclePhase::Stopped)
+                && matches!(
+                    record.phase,
+                    LifecyclePhase::Loading
+                        | LifecyclePhase::LoadedIdle
+                        | LifecyclePhase::LoadedBusy
+                        | LifecyclePhase::Unloading
+                        | LifecyclePhase::Unloaded
+                        | LifecyclePhase::Faulted
+                        | LifecyclePhase::Stopping
+                )
+        }
+        _ => false,
+    };
+    if !allowed {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            format!(
+                "event {:?} cannot produce phase {:?} from previous phase {:?}",
+                record.event, record.phase, previous.phase
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn lifecycle_semantic_error(
+    path: &Path,
+    line_number: usize,
+    detail: impl std::fmt::Display,
+) -> CliError {
+    corrupt_error(format!(
+        "resident lifecycle journal {} line {} has an impossible lifecycle event: {detail}",
+        path.display(),
+        line_number
+    ))
 }
 
 fn validate_replayed_request(
@@ -646,9 +1372,6 @@ fn validate_replayed_request(
         && record.request.is_none()
         && record.queued_requests == 0
         && record.in_flight == 0
-        && record.last_error.as_ref().is_some_and(|error| {
-            error.code == "CALYX_PANEL_RESIDENT_LEGACY_REQUESTS_ABANDONED_ON_RESTART"
-        })
     {
         return Ok(());
     }
@@ -861,13 +1584,17 @@ fn validate_replayed_record(
     expected_sequence: u64,
     expected_previous: &str,
 ) -> CliResult {
-    if record.schema != LIFECYCLE_SCHEMA && record.schema != LIFECYCLE_SCHEMA_V2 {
+    if record.schema != LIFECYCLE_SCHEMA
+        && record.schema != LIFECYCLE_SCHEMA_V3
+        && record.schema != LIFECYCLE_SCHEMA_V2
+    {
         return Err(corrupt_error(format!(
-            "resident lifecycle journal {} line {} schema is {:?}, expected {:?} or legacy {:?}",
+            "resident lifecycle journal {} line {} schema is {:?}, expected {:?} or legacy {:?}/{:?}",
             path.display(),
             line_number,
             record.schema,
             LIFECYCLE_SCHEMA,
+            LIFECYCLE_SCHEMA_V3,
             LIFECYCLE_SCHEMA_V2,
         )));
     }

@@ -11,21 +11,22 @@ calyx-aster = { path = "../calyx-aster" }
 calyx-core = { path = "../calyx-core" }
 calyx-forge = { path = "../calyx-forge" }
 calyx-ledger = { path = "../calyx-ledger" }
+calyx-onnx-runtime = { path = "../calyx-onnx-runtime", features = ["runtime"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
-memmap2 = { workspace = true, optional = true }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "alternative-backend", "cuda", "api-24"], optional = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 uuid.workspace = true
 
 [features]
 # The ONNX ML-lens backends (style/speaker/injection) pull in `ort` (ONNX
-# Runtime bindings, load-dynamic + CUDA) and `tokenizers` (Oniguruma C build).
+# Runtime bindings, exact alternative backend + CUDA) and `tokenizers` (Oniguruma C build).
 # They are OFF by default: Astrolabe reaches calyx-ward only through the pure
 # per-slot cosine guard path (guard/novelty/profile) via calyx-loom, so the
 # ML stack is dead weight in that graph. Enable `onnx-lens` in a consumer that
 # actually runs the ONNX lenses; without it, the lens constructors fail closed
 # with CALYX_WARD_LENS_FEATURE_DISABLED.
 default = []
-onnx-lens = ["dep:memmap2", "dep:ort", "dep:tokenizers"]
+onnx-lens = ["dep:calyx-onnx-runtime", "dep:ort", "dep:tokenizers"]

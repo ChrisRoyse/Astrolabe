@@ -1,6 +1,6 @@
 //! Ward guard profile types for per-slot cosine policy enforcement.
 
-pub(crate) const CUDA_ONNX_PROVIDER_POLICY: &str = "cuda:0,error_on_failure,no_cpu_fallback";
+pub(crate) const CUDA_ONNX_PROVIDER_POLICY: &str = "cuda,error_on_failure,no_cpu_fallback";
 pub(crate) const CPU_ONNX_PROVIDER_POLICY: &str = "cpu_explicit,no_cuda";
 
 pub mod calibrate;
@@ -14,8 +14,6 @@ pub mod ledger;
 pub mod novelty;
 #[cfg(feature = "onnx-lens")]
 mod onnx_session;
-#[cfg(feature = "onnx-lens")]
-mod ort_runtime;
 pub mod polis;
 pub mod profile;
 pub mod query;
@@ -37,10 +35,10 @@ pub use error::{
     CALYX_GUARD_CALIBRATION_SLOT_UNKNOWN, CALYX_GUARD_ID_MISMATCH,
     CALYX_GUARD_IDENTITY_SLOT_NOT_REQUIRED, CALYX_GUARD_INERT_PROFILE, CALYX_GUARD_MISSING_SLOT,
     CALYX_GUARD_NOT_A_FAILURE, CALYX_GUARD_NOVELTY_SINK, CALYX_GUARD_OOD,
-    CALYX_GUARD_POLICY_VIOLATION, CALYX_GUARD_PROVISIONAL, CALYX_WARD_INVALID_DOMAIN,
-    CALYX_WARD_INVALID_FREQUENCY, CALYX_WARD_INVALID_INPUT, CALYX_WARD_LENS_FEATURE_DISABLED,
-    CALYX_WARD_MISSING_FREQUENCY, CALYX_WARD_MODEL_DIM_MISMATCH, CALYX_WARD_MODEL_NOT_FOUND,
-    CALYX_WARD_ONNX_ERROR, CALYX_WARD_RUNTIME_ERROR, WardError,
+    CALYX_GUARD_POLICY_VIOLATION, CALYX_GUARD_PROVISIONAL, CALYX_WARD_CPU_COMPANION_UNAUTHORIZED,
+    CALYX_WARD_INVALID_DOMAIN, CALYX_WARD_INVALID_FREQUENCY, CALYX_WARD_INVALID_INPUT,
+    CALYX_WARD_LENS_FEATURE_DISABLED, CALYX_WARD_MISSING_FREQUENCY, CALYX_WARD_MODEL_DIM_MISMATCH,
+    CALYX_WARD_MODEL_NOT_FOUND, CALYX_WARD_ONNX_ERROR, CALYX_WARD_RUNTIME_ERROR, WardError,
 };
 pub use generate::{
     GUARDED_PASS_TAG, GUARDED_REJECT_TAG, GUARDED_REJECT_UNPROVENANCED_TAG, GenerateInput,
@@ -89,3 +87,9 @@ pub use style_lens::{
     StyleEmbeddingBackend, StyleLens, StyleProviderPolicy,
 };
 pub use verdict::{GuardVerdict, SlotVerdict};
+
+#[cfg(feature = "onnx-lens")]
+pub use onnx_session::{
+    WardCpuAuthorization, WardOnnxArtifactContract, WardOnnxArtifactEvidence,
+    WardOnnxExecutionAttestation, authorize_cpu_companion,
+};

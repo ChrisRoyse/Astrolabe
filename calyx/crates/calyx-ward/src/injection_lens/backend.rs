@@ -1,29 +1,23 @@
 #[cfg(feature = "onnx-lens")]
-use std::fmt;
-#[cfg(feature = "onnx-lens")]
-use std::fs::File;
-#[cfg(feature = "onnx-lens")]
-use std::io::Read;
-#[cfg(feature = "onnx-lens")]
-use std::path::{Path, PathBuf};
-
-#[cfg(feature = "onnx-lens")]
 use ort::session::Session;
 #[cfg(feature = "onnx-lens")]
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "onnx-lens")]
+use std::fmt;
 #[cfg(feature = "onnx-lens")]
 use tokenizers::Tokenizer;
 
 #[cfg(any(feature = "onnx-lens", test))]
 use crate::error::WardError;
 #[cfg(feature = "onnx-lens")]
-use crate::onnx_session::{ManagedWardOnnxSession, build_cpu_session, build_cuda_session};
+use crate::onnx_session::{
+    ManagedWardOnnxSession, WardOnnxArtifactBundle, WardOnnxExecutionAttestation, build_session,
+};
 
 #[cfg(feature = "onnx-lens")]
 use super::{
-    BENIGN_LABEL, INJECTION_LABEL, INJECTION_LABELS, INJECTION_MAX_TOKENS, InjectionProviderPolicy,
-    InjectionScoreBackend,
+    BENIGN_LABEL, INJECTION_LABEL, INJECTION_LABELS, INJECTION_MAX_TOKENS, InjectionScoreBackend,
 };
 
 #[cfg(feature = "onnx-lens")]
@@ -39,19 +33,10 @@ pub(super) struct OnnxInjectionBackend {
 
 #[cfg(feature = "onnx-lens")]
 impl OnnxInjectionBackend {
-    pub(super) fn new(
-        model_path: &Path,
-        tokenizer_path: &Path,
-        policy: InjectionProviderPolicy,
-    ) -> Result<Self, WardError> {
-        let tokenizer =
-            Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
-                path: tokenizer_path.to_path_buf(),
-            })?;
-        let session = match policy {
-            InjectionProviderPolicy::CudaFailLoud => build_cuda_session("injection", model_path),
-            InjectionProviderPolicy::CpuExplicit => build_cpu_session("injection", model_path),
-        }?;
+    pub(super) fn new(artifacts: WardOnnxArtifactBundle) -> Result<Self, WardError> {
+        let tokenizer = Tokenizer::from_bytes(artifacts.tokenizer_bytes()?)
+            .map_err(|error| artifacts.error("injection", "tokenizer_commit", error))?;
+        let session = build_session("injection", artifacts)?;
         let (input_names, output_names) = session.inspect_session(|raw| {
             Ok((
                 raw.inputs()
@@ -160,6 +145,13 @@ impl InjectionScoreBackend for OnnxInjectionBackend {
     ) -> Result<Option<calyx_core::RuntimeExecutionAttestation>, WardError> {
         self.session.execution_attestation()
     }
+
+    fn durable_execution_attestation(
+        &self,
+        lens_id: calyx_core::LensId,
+    ) -> Result<Option<WardOnnxExecutionAttestation>, WardError> {
+        self.session.durable_execution_attestation(lens_id)
+    }
 }
 
 /// Numerically-stable 2-class softmax, returning `P(benign)`.
@@ -236,33 +228,6 @@ fn assert_logits_shape(
             format!("ONNX output {output_name} is not f32 tensor: {other:?}"),
         )),
     }
-}
-
-/// ONNX external-data sidecar path for `model.onnx` -> `model.onnx.data`.
-#[cfg(feature = "onnx-lens")]
-pub(super) fn external_data_path(model_path: &Path) -> PathBuf {
-    let mut name = model_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".data");
-    model_path.with_file_name(name)
-}
-
-#[cfg(feature = "onnx-lens")]
-pub(super) fn sha256_files(paths: &[&Path]) -> Result<[u8; 32], WardError> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    for path in paths {
-        let mut file = File::open(path).map_err(|_| WardError::ModelNotFound {
-            path: (*path).to_path_buf(),
-        })?;
-        loop {
-            let n = file.read(&mut buf).map_err(runtime_error)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-    }
-    Ok(hasher.finalize().into())
 }
 
 pub(super) fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {

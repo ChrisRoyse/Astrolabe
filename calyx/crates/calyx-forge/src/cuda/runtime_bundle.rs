@@ -28,6 +28,9 @@ use crate::cuda_system_trust::{SystemModuleTrustPolicy, VerifiedSystemFile, veri
 use crate::{ForgeError, PinnedCudaDeviceIdentity, Result};
 
 pub const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
+/// Emitted only after the exact pinned CUDA Runtime and exact system CUDA
+/// Driver independently report zero devices in the same startup probe.
+pub const CUDA_NO_DEVICE_ATTESTED_CODE: &str = "CALYX_CUDA_NO_DEVICE_ATTESTED";
 const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v2";
 const RECEIPT_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-receipt.v1";
 const LOCK_FILE: &str = "bundle.lock.json";
@@ -561,9 +564,20 @@ fn resolve_cuda_device(request: CudaDeviceRequest) -> Result<PinnedCudaDeviceAtt
     let cudart = load_locked_bundle_library(&boundary.root, cudart_contract)?;
     let visible_device_count = cuda_runtime_device_count(cudart.raw())?;
     if visible_device_count == 0 {
+        let nvcuda = load_verified_system_module(boundary, "nvcuda.dll")?;
+        let driver_device_count = cuda_driver_device_count(nvcuda.raw())?;
+        if driver_device_count != 0 {
+            return Err(runtime_error(
+                "CALYX_CUDA_DRIVER_RUNTIME_INCONSISTENT",
+                format!(
+                    "the exact pinned CUDA Runtime reports zero visible devices, but the exact system CUDA Driver reports {driver_device_count} devices"
+                ),
+                "repair the CUDA Runtime/Driver visibility mismatch and restart the process; this inconsistent state must not authorize CPU execution",
+            ));
+        }
         return Err(runtime_error(
-            "CALYX_CUDA_NO_DEVICE",
-            "the exact pinned CUDA Runtime reports zero visible CUDA devices",
+            CUDA_NO_DEVICE_ATTESTED_CODE,
+            "the exact pinned CUDA Runtime and exact system CUDA Driver independently report zero CUDA devices",
             "use the separately commissioned CPU companion panel, or expose a usable NVIDIA GPU and restart the process",
         ));
     }
@@ -750,11 +764,7 @@ fn cuda_runtime_device_count(module: HMODULE) -> Result<u32> {
     let mut count = 0i32;
     let status = unsafe { cuda_get_device_count(&mut count) };
     if status == 100 {
-        return Err(runtime_error(
-            "CALYX_CUDA_NO_DEVICE",
-            "the exact pinned CUDA Runtime returned cudaErrorNoDevice from cudaGetDeviceCount",
-            "use the separately commissioned CPU companion panel, or expose a usable NVIDIA GPU and restart the process",
-        ));
+        return Ok(0);
     }
     if status != 0 {
         return Err(cuda_runtime_call_error(
@@ -767,6 +777,38 @@ fn cuda_runtime_device_count(module: HMODULE) -> Result<u32> {
         runtime_error(
             "CALYX_CUDA_DEVICE_IDENTITY_INVALID",
             format!("exact cudart64_13.dll returned invalid device count {count}"),
+            DEVICE_REMEDIATION,
+        )
+    })
+}
+
+fn cuda_driver_device_count(module: HMODULE) -> Result<u32> {
+    type CuInit = unsafe extern "system" fn(u32) -> i32;
+    type CuDeviceGetCount = unsafe extern "system" fn(*mut i32) -> i32;
+
+    let cu_init: CuInit = unsafe { mem::transmute(required_export(module, c"cuInit")?) };
+    let cu_device_get_count: CuDeviceGetCount =
+        unsafe { mem::transmute(required_export(module, c"cuDeviceGetCount")?) };
+    let init_status = unsafe { cu_init(0) };
+    if init_status == 100 {
+        return Ok(0);
+    }
+    if init_status != 0 {
+        return Err(cuda_driver_call_error(module, "cuInit", init_status));
+    }
+    let mut count = 0i32;
+    let count_status = unsafe { cu_device_get_count(&mut count) };
+    if count_status != 0 {
+        return Err(cuda_driver_call_error(
+            module,
+            "cuDeviceGetCount",
+            count_status,
+        ));
+    }
+    u32::try_from(count).map_err(|_| {
+        runtime_error(
+            "CALYX_CUDA_DRIVER_DEVICE_COUNT_INVALID",
+            format!("the exact system CUDA Driver returned invalid device count {count}"),
             DEVICE_REMEDIATION,
         )
     })
@@ -842,9 +884,9 @@ fn cuda_driver_ordinal_for_identity(
     }
     if count <= 0 {
         return Err(runtime_error(
-            "CALYX_CUDA_NO_DEVICE",
-            "the exact system CUDA Driver reports zero devices",
-            "use the separately commissioned CPU companion panel, or repair GPU visibility and restart the process",
+            "CALYX_CUDA_DRIVER_RUNTIME_INCONSISTENT",
+            "the exact pinned CUDA Runtime reported a visible device, but the exact system CUDA Driver reports zero devices",
+            "repair the CUDA Runtime/Driver visibility mismatch and restart the process; this inconsistent state must not authorize CPU execution",
         ));
     }
     let mut matches = Vec::new();

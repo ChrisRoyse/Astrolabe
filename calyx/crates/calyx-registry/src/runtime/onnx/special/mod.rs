@@ -6,8 +6,9 @@ use calyx_core::{
     SlotVector,
 };
 use fastembed::{
-    Bgem3Embedding, Bgem3InitOptions, Bgem3Model, RerankInitOptions, RerankerModel,
-    SparseInitOptions, SparseModel, SparseTextEmbedding, TextRerank,
+    Bgem3Embedding, Bgem3Model, InitOptionsUserDefined, RerankInitOptionsUserDefined,
+    RerankerModel, SparseModel, SparseTextEmbedding, TextRerank, UserDefinedBgem3Model,
+    UserDefinedRerankingModel, UserDefinedSparseModel,
 };
 
 use super::cuda_guard::CudaDropGuard;
@@ -78,20 +79,40 @@ impl FastembedSparseLens {
         cache_dir: PathBuf,
         provider_policy: OnnxProviderPolicy,
     ) -> Result<Self> {
-        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
-        let name = name.into();
         let info = SparseTextEmbedding::get_model_info(&model_name);
-        let label = format!("onnx-fastembed-sparse:{}", info.model_code);
         let files = special_files(
             &cache_dir,
             &info.model_code,
             &info.model_file,
             &info.additional_files,
         )?;
+        Self::from_files_with_policy(name, model_name, files, provider_policy, None)
+    }
+
+    fn from_files_with_policy(
+        name: impl Into<String>,
+        model_name: SparseModel,
+        files: OnnxModelFiles,
+        provider_policy: OnnxProviderPolicy,
+        expected_spec: Option<&LensSpec>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let info = SparseTextEmbedding::get_model_info(&model_name);
+        let label = format!("onnx-fastembed-sparse:{}", info.model_code);
+        let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
+            &files,
+            &info.model_file,
+            &info.additional_files,
+            provider_policy,
+        )?;
         let shape = SlotShape::Sparse(sparse_dim(&model_name));
+        if let Some(spec) = expected_spec {
+            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+        }
+        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
-            &files,
+            artifacts.receipt().weights_sha256,
             shape,
             NormPolicy::Finite,
             fastembed_sparse_corpus_hash(&info.model_code),
@@ -100,16 +121,28 @@ impl FastembedSparseLens {
             label.clone(),
             &info.model_code,
             &files,
-            contract.weights_sha256(),
+            artifacts.receipt(),
             provider_policy,
         )?;
+        super::arena::preflight_gpu_mem_limit_for_bytes(
+            &label,
+            provider_policy,
+            artifacts.receipt().artifact_bytes,
+        )
+        .map_err(|error| context.error("vram_preflight", error))?;
         let (execution_providers, bound_stream) =
             super::fastembed_runtime::execution_providers(&label, provider_policy)
                 .map_err(|error| context.error("execution_provider_configuration", error))?;
-        let model = SparseTextEmbedding::try_new(
-            SparseInitOptions::new(model_name.clone())
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
+        let (model_bytes, tokenizer_files, external_initializers) = artifacts.into_parts();
+        let mut user_model = UserDefinedSparseModel::new(model_bytes, tokenizer_files)
+            .with_model(model_name.clone());
+        for initializer in external_initializers {
+            user_model =
+                user_model.with_external_initializer(initializer.file_name, initializer.buffer);
+        }
+        let model = SparseTextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::new()
                 .with_intra_threads(1)
                 .with_session_policy(context.session_policy())
                 .with_execution_providers(execution_providers),
@@ -137,19 +170,26 @@ impl FastembedSparseLens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::FastembedSparse { model_id, .. } = &spec.runtime else {
+        let LensRuntime::FastembedSparse { model_id, files } = &spec.runtime else {
             return Err(super::config_invalid(
                 "LensSpec runtime is not fastembed-sparse",
             ));
         };
-        let lens = Self::from_model_name_with_policy(
-            spec.name.clone(),
-            model_id,
-            super::fastembed_runtime::default_cache_root(),
-            OnnxProviderPolicy::CudaFailLoud,
+        let model_name = sparse_model_from_name(model_id)?;
+        let info = SparseTextEmbedding::get_model_info(&model_name);
+        let files = super::fastembed_artifacts::persisted_model_files(
+            &info.model_code,
+            files,
+            &info.model_file,
+            &info.additional_files,
         )?;
-        ensure_spec_match(lens.shape(), lens.contract.weights_sha256(), spec)?;
-        Ok(lens)
+        Self::from_files_with_policy(
+            spec.name.clone(),
+            model_name,
+            files,
+            OnnxProviderPolicy::CudaFailLoud,
+            Some(spec),
+        )
     }
 
     fn new(
@@ -203,7 +243,24 @@ impl FastembedBgem3Lens {
         cache_dir: PathBuf,
         provider_policy: OnnxProviderPolicy,
     ) -> Result<Self> {
-        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
+        let info = Bgem3Embedding::get_model_info(&model_name);
+        let files = special_files(
+            &cache_dir,
+            &info.model_code,
+            &info.model_file,
+            &info.additional_files,
+        )?;
+        Self::from_files_with_policy(name, model_name, output, files, provider_policy, None)
+    }
+
+    fn from_files_with_policy(
+        name: impl Into<String>,
+        model_name: Bgem3Model,
+        output: FastembedBgem3Output,
+        files: OnnxModelFiles,
+        provider_policy: OnnxProviderPolicy,
+        expected_spec: Option<&LensSpec>,
+    ) -> Result<Self> {
         let name = name.into();
         let info = Bgem3Embedding::get_model_info(&model_name);
         let label = format!(
@@ -211,16 +268,21 @@ impl FastembedBgem3Lens {
             info.model_code,
             bgem3_runtime_name(output)
         );
-        let files = special_files(
-            &cache_dir,
-            &info.model_code,
+        let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
+            &files,
             &info.model_file,
             &info.additional_files,
+            provider_policy,
         )?;
+        let shape = bgem3_shape(output);
+        if let Some(spec) = expected_spec {
+            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+        }
+        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
-            &files,
-            bgem3_shape(output),
+            artifacts.receipt().weights_sha256,
+            shape,
             bgem3_norm(output),
             fastembed_bgem3_corpus_hash(&info.model_code, bgem3_corpus_token(output)),
         )?;
@@ -228,16 +290,28 @@ impl FastembedBgem3Lens {
             label.clone(),
             &info.model_code,
             &files,
-            contract.weights_sha256(),
+            artifacts.receipt(),
             provider_policy,
         )?;
+        super::arena::preflight_gpu_mem_limit_for_bytes(
+            &label,
+            provider_policy,
+            artifacts.receipt().artifact_bytes,
+        )
+        .map_err(|error| context.error("vram_preflight", error))?;
         let (execution_providers, bound_stream) =
             super::fastembed_runtime::execution_providers(&label, provider_policy)
                 .map_err(|error| context.error("execution_provider_configuration", error))?;
-        let model = Bgem3Embedding::try_new(
-            Bgem3InitOptions::new(model_name)
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
+        let (model_bytes, tokenizer_files, external_initializers) = artifacts.into_parts();
+        let mut user_model =
+            UserDefinedBgem3Model::new(model_bytes, tokenizer_files).with_model(model_name);
+        for initializer in external_initializers {
+            user_model =
+                user_model.with_external_initializer(initializer.file_name, initializer.buffer);
+        }
+        let model = Bgem3Embedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::new()
                 .with_intra_threads(1)
                 .with_session_policy(context.session_policy())
                 .with_execution_providers(execution_providers),
@@ -267,22 +341,31 @@ impl FastembedBgem3Lens {
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
         let LensRuntime::FastembedBgem3 {
-            model_id, output, ..
+            model_id,
+            files,
+            output,
         } = &spec.runtime
         else {
             return Err(super::config_invalid(
                 "LensSpec runtime is not fastembed-bgem3",
             ));
         };
-        let lens = Self::from_model_name_with_policy(
-            spec.name.clone(),
-            model_id,
-            *output,
-            super::fastembed_runtime::default_cache_root(),
-            OnnxProviderPolicy::CudaFailLoud,
+        let model_name = bgem3_model_from_name(model_id)?;
+        let info = Bgem3Embedding::get_model_info(&model_name);
+        let files = super::fastembed_artifacts::persisted_model_files(
+            &info.model_code,
+            files,
+            &info.model_file,
+            &info.additional_files,
         )?;
-        ensure_spec_match(lens.shape(), lens.contract.weights_sha256(), spec)?;
-        Ok(lens)
+        Self::from_files_with_policy(
+            spec.name.clone(),
+            model_name,
+            *output,
+            files,
+            OnnxProviderPolicy::CudaFailLoud,
+            Some(spec),
+        )
     }
 
     fn new(
@@ -340,20 +423,41 @@ impl FastembedRerankerLens {
         cache_dir: PathBuf,
         provider_policy: OnnxProviderPolicy,
     ) -> Result<Self> {
-        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
-        let name = name.into();
         let info = TextRerank::get_model_info(&model_name);
-        let label = format!("onnx-fastembed-reranker:{}", info.model_code);
         let files = special_files(
             &cache_dir,
             &info.model_code,
             &info.model_file,
             &info.additional_files,
         )?;
+        Self::from_files_with_policy(name, model_name, files, provider_policy, None)
+    }
+
+    fn from_files_with_policy(
+        name: impl Into<String>,
+        model_name: RerankerModel,
+        files: OnnxModelFiles,
+        provider_policy: OnnxProviderPolicy,
+        expected_spec: Option<&LensSpec>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let info = TextRerank::get_model_info(&model_name);
+        let label = format!("onnx-fastembed-reranker:{}", info.model_code);
+        let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
+            &files,
+            &info.model_file,
+            &info.additional_files,
+            provider_policy,
+        )?;
+        let shape = SlotShape::Dense(1);
+        if let Some(spec) = expected_spec {
+            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+        }
+        super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
-            &files,
-            SlotShape::Dense(1),
+            artifacts.receipt().weights_sha256,
+            shape,
             NormPolicy::Finite,
             fastembed_reranker_corpus_hash(&info.model_code),
         )?;
@@ -361,16 +465,27 @@ impl FastembedRerankerLens {
             label.clone(),
             &info.model_code,
             &files,
-            contract.weights_sha256(),
+            artifacts.receipt(),
             provider_policy,
         )?;
+        super::arena::preflight_gpu_mem_limit_for_bytes(
+            &label,
+            provider_policy,
+            artifacts.receipt().artifact_bytes,
+        )
+        .map_err(|error| context.error("vram_preflight", error))?;
         let (execution_providers, bound_stream) =
             super::fastembed_runtime::execution_providers(&label, provider_policy)
                 .map_err(|error| context.error("execution_provider_configuration", error))?;
-        let model = TextRerank::try_new(
-            RerankInitOptions::new(model_name)
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(false)
+        let (model_bytes, tokenizer_files, external_initializers) = artifacts.into_parts();
+        let mut user_model = UserDefinedRerankingModel::new(model_bytes, tokenizer_files);
+        for initializer in external_initializers {
+            user_model =
+                user_model.with_external_initializer(initializer.file_name, initializer.buffer);
+        }
+        let model = TextRerank::try_new_from_user_defined(
+            user_model,
+            RerankInitOptionsUserDefined::default()
                 .with_intra_threads(1)
                 .with_session_policy(context.session_policy())
                 .with_execution_providers(execution_providers),
@@ -398,19 +513,26 @@ impl FastembedRerankerLens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::FastembedReranker { model_id, .. } = &spec.runtime else {
+        let LensRuntime::FastembedReranker { model_id, files } = &spec.runtime else {
             return Err(super::config_invalid(
                 "LensSpec runtime is not fastembed-reranker",
             ));
         };
-        let lens = Self::from_model_name_with_policy(
-            spec.name.clone(),
-            model_id,
-            super::fastembed_runtime::default_cache_root(),
-            OnnxProviderPolicy::CudaFailLoud,
+        let model_name = reranker_model_from_name(model_id)?;
+        let info = TextRerank::get_model_info(&model_name);
+        let files = super::fastembed_artifacts::persisted_model_files(
+            &info.model_code,
+            files,
+            &info.model_file,
+            &info.additional_files,
         )?;
-        ensure_spec_match(lens.shape(), lens.contract.weights_sha256(), spec)?;
-        Ok(lens)
+        Self::from_files_with_policy(
+            spec.name.clone(),
+            model_name,
+            files,
+            OnnxProviderPolicy::CudaFailLoud,
+            Some(spec),
+        )
     }
 
     fn new(
@@ -460,6 +582,7 @@ impl Lens for FastembedSparseLens {
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         single_vector(self.id, self.measure_batch(std::slice::from_ref(input))?)
+            .map_err(|error| self.execution.fail_terminal("output_validation", error))
     }
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
@@ -468,17 +591,19 @@ impl Lens for FastembedSparseLens {
         }
         self.execution.ensure_usable()?;
         let texts = input_texts(self, inputs)?;
-        let mut model = lock_model(&self.model, "sparse")?;
+        let mut model = lock_model(&self.model, "sparse")
+            .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
         let embeddings = model
             .embed(texts, None)
-            .map_err(|error| self.execution.error("inference", error))?;
+            .map_err(|error| self.execution.fail_terminal("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-sparse",
         )
-        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
-        let vectors = sparse_batch(embeddings, sparse_shape_dim(self.shape()), inputs.len())?;
+        .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
+        let vectors = sparse_batch(embeddings, sparse_shape_dim(self.shape()), inputs.len())
+            .map_err(|error| self.execution.fail_terminal("output_validation", error))?;
         self.execution
             .complete_first_inference(|| model.end_profiling())?;
         Ok(vectors)
@@ -504,6 +629,7 @@ impl Lens for FastembedBgem3Lens {
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         single_vector(self.id, self.measure_batch(std::slice::from_ref(input))?)
+            .map_err(|error| self.execution.fail_terminal("output_validation", error))
     }
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
@@ -512,16 +638,17 @@ impl Lens for FastembedBgem3Lens {
         }
         self.execution.ensure_usable()?;
         let texts = input_texts(self, inputs)?;
-        let mut model = lock_model(&self.model, "BGE-M3")?;
+        let mut model = lock_model(&self.model, "BGE-M3")
+            .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
         let output = model
             .embed(texts, None)
-            .map_err(|error| self.execution.error("inference", error))?;
+            .map_err(|error| self.execution.fail_terminal("inference", error))?;
         super::green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-bgem3",
         )
-        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
+        .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
         let vectors = match self.output {
             FastembedBgem3Output::Dense => {
                 dense_batch(output.dense, BGE_M3_DENSE_DIM, inputs.len())
@@ -532,7 +659,8 @@ impl Lens for FastembedBgem3Lens {
             FastembedBgem3Output::Colbert => {
                 multi_batch(output.colbert, BGE_M3_DENSE_DIM, inputs.len())
             }
-        }?;
+        }
+        .map_err(|error| self.execution.fail_terminal("output_validation", error))?;
         self.execution
             .complete_first_inference(|| model.end_profiling())?;
         Ok(vectors)
@@ -558,6 +686,7 @@ impl Lens for FastembedRerankerLens {
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         single_vector(self.id, self.measure_batch(std::slice::from_ref(input))?)
+            .map_err(|error| self.execution.fail_terminal("output_validation", error))
     }
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
@@ -565,19 +694,24 @@ impl Lens for FastembedRerankerLens {
             return Ok(Vec::new());
         }
         self.execution.ensure_usable()?;
+        let pairs = inputs
+            .iter()
+            .map(|input| crate::runtime::common::text_from_input(self, input).map(rerank_pair))
+            .collect::<Result<Vec<_>>>()?;
         let mut out = Vec::with_capacity(inputs.len());
-        let mut model = lock_model(&self.model, "reranker")?;
-        for input in inputs {
-            let text = crate::runtime::common::text_from_input(self, input)?;
-            let (query, doc) = rerank_pair(text);
+        let mut model = lock_model(&self.model, "reranker")
+            .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
+        for (query, doc) in pairs {
             let results = model
                 .rerank(query, [doc], false, Some(1))
-                .map_err(|error| self.execution.error("inference", error))?;
+                .map_err(|error| self.execution.fail_terminal("inference", error))?;
             let score = results
                 .first()
-                .ok_or_else(|| CalyxError::lens_dim_mismatch("reranker returned no score"))?
+                .ok_or_else(|| CalyxError::lens_dim_mismatch("reranker returned no score"))
+                .map_err(|error| self.execution.fail_terminal("output_validation", error))?
                 .score;
-            vectors::ensure_finite("reranker score", &[score])?;
+            vectors::ensure_finite("reranker score", &[score])
+                .map_err(|error| self.execution.fail_terminal("output_validation", error))?;
             out.push(SlotVector::Dense {
                 dim: 1,
                 data: vec![score],
@@ -588,7 +722,7 @@ impl Lens for FastembedRerankerLens {
             self.provider_policy,
             "onnx-fastembed-reranker",
         )
-        .map_err(|error| self.execution.error("cuda_synchronize", error))?;
+        .map_err(|error| self.execution.fail_terminal("cuda_synchronize", error))?;
         self.execution
             .complete_first_inference(|| model.end_profiling())?;
         Ok(out)

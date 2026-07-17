@@ -23,6 +23,7 @@ mod cuda_graphs;
 mod cuda_guard;
 mod custom;
 mod dynamic_ort;
+mod fastembed_artifacts;
 mod fastembed_attestation;
 mod fastembed_runtime;
 mod green_context;
@@ -70,7 +71,7 @@ impl OnnxProviderPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CudaFailLoud => {
-                "cuda:0,error_on_failure,no_cpu_fallback,cudnn_conv_algo=HEURISTIC,cudnn_workspace_cap=32MiB"
+                "cuda,error_on_failure,no_cpu_fallback,cudnn_conv_algo=HEURISTIC,cudnn_workspace_cap=32MiB"
             }
             Self::CpuExplicit => "cpu_explicit,no_cuda",
         }
@@ -401,7 +402,14 @@ impl Lens for OnnxLens {
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         let mut batch = self.measure_batch(std::slice::from_ref(input))?;
         batch.pop().ok_or_else(|| {
-            CalyxError::lens_dim_mismatch(format!("lens {} returned no ONNX vector", self.id))
+            let error =
+                CalyxError::lens_dim_mismatch(format!("lens {} returned no ONNX vector", self.id));
+            match self.backend_ref() {
+                OnnxBackend::FastEmbed(_) => self
+                    .fastembed_execution()
+                    .fail_terminal("output_validation", error),
+                OnnxBackend::Custom(_) => error,
+            }
         })
     }
 
@@ -451,23 +459,29 @@ impl OnnxLens {
             texts.push(text_from_input(self, input)?.to_string());
         }
         let mut model = model.lock().map_err(|_| {
-            CalyxError::lens_unreachable("ONNX model mutex was poisoned during inference")
+            execution.fail_terminal(
+                "model_lock",
+                "ONNX model mutex was poisoned during inference",
+            )
         })?;
         let embeddings = model
             .embed(texts, None)
-            .map_err(|err| execution.error("inference", err))?;
+            .map_err(|err| execution.fail_terminal("inference", err))?;
         green_context::synchronize_retained_stream(
             self.bound_stream.as_ref(),
             self.provider_policy,
             "onnx-fastembed-dense",
         )
-        .map_err(|error| execution.error("cuda_synchronize", error))?;
+        .map_err(|error| execution.fail_terminal("cuda_synchronize", error))?;
         if embeddings.len() != inputs.len() {
-            return Err(CalyxError::lens_dim_mismatch(format!(
-                "ONNX returned {} vectors for {} inputs",
-                embeddings.len(),
-                inputs.len()
-            )));
+            return Err(execution.fail_terminal(
+                "output_validation",
+                CalyxError::lens_dim_mismatch(format!(
+                    "ONNX returned {} vectors for {} inputs",
+                    embeddings.len(),
+                    inputs.len()
+                )),
+            ));
         }
         let vectors = embeddings
             .into_iter()
@@ -485,7 +499,8 @@ impl OnnxLens {
                     data,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| execution.fail_terminal("output_validation", error))?;
         execution.complete_first_inference(|| model.end_profiling())?;
         Ok(vectors)
     }

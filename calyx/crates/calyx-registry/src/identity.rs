@@ -104,6 +104,10 @@ pub(crate) fn fastembed_sparse_corpus_hash(model_code: &str) -> [u8; 32] {
     sha256_digest(&[b"fastembed-sparse-v1", model_code.as_bytes()])
 }
 
+pub(crate) fn fastembed_dense_corpus_hash(model_code: &str) -> [u8; 32] {
+    sha256_digest(&[b"fastembed-dense-v1", model_code.as_bytes()])
+}
+
 pub(crate) fn fastembed_bgem3_corpus_hash(model_code: &str, output_token: &[u8]) -> [u8; 32] {
     sha256_digest(&[b"fastembed-bgem3-v1", model_code.as_bytes(), output_token])
 }

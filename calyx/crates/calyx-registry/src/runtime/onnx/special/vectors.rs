@@ -7,7 +7,7 @@ use fastembed::SparseEmbedding;
 use super::super::{OnnxModelFiles, OnnxProviderPolicy, green_context::RetainedCudaStream};
 use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{ContractFacts, contract_from_facts};
-use crate::runtime::common::{fastembed_cache_root, hash_files, normalize_unit, text_from_input};
+use crate::runtime::common::{fastembed_cache_root, normalize_unit, text_from_input};
 use crate::spec::LensSpec;
 
 pub(super) fn special_files(
@@ -27,14 +27,14 @@ pub(super) fn special_files(
 
 pub(super) fn contract(
     name: String,
-    files: &OnnxModelFiles,
+    weights_sha256: [u8; 32],
     shape: SlotShape,
     norm: NormPolicy,
     corpus_hash: [u8; 32],
 ) -> Result<FrozenLensContract> {
     Ok(contract_from_facts(ContractFacts {
         name,
-        weights_sha256: hash_files(&files.artifact_paths())?,
+        weights_sha256,
         corpus_hash,
         shape,
         modality: calyx_core::Modality::Text,
@@ -54,11 +54,17 @@ pub(super) fn ensure_spec_match(
         )));
     }
     if weights != spec.weights_sha256 {
-        return Err(CalyxError::lens_frozen_violation(
-            "fastembed special artifact hash does not match LensSpec",
-        ));
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed special artifact hash {} does not match LensSpec {}",
+            hex_sha256(&weights),
+            hex_sha256(&spec.weights_sha256)
+        )));
     }
     Ok(())
+}
+
+fn hex_sha256(value: &[u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(super) fn input_texts(lens: &dyn Lens, inputs: &[Input]) -> Result<Vec<String>> {
@@ -197,7 +203,11 @@ pub(super) fn lock_model<'a, T>(
 ) -> Result<MutexGuard<'a, T>> {
     model
         .as_ref()
-        .expect("fastembed model is present until drop")
+        .ok_or_else(|| {
+            CalyxError::lens_unreachable(format!(
+                "{label} FastEmbed model is absent before lens drop"
+            ))
+        })?
         .lock()
         .map_err(|_| CalyxError::lens_unreachable(format!("{label} model mutex was poisoned")))
 }

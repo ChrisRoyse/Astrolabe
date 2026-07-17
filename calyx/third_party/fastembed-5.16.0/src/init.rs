@@ -1,6 +1,7 @@
-use crate::get_cache_dir;
+use crate::{get_cache_dir, ExternalInitializerFile};
 use ort::execution_providers::ExecutionProviderDispatch;
 use ort::session::builder::SessionBuilder;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const GRAPH_ASSIGNMENT_CONFIG: &str = "session.record_ep_graph_assignment_info";
@@ -61,6 +62,18 @@ impl SessionPolicy {
                 })
             }
         }
+    }
+
+    pub(crate) fn enforce_execution_providers(
+        &self,
+        execution_providers: Vec<ExecutionProviderDispatch>,
+    ) -> anyhow::Result<(ValidatedSessionPolicy, Vec<ExecutionProviderDispatch>)> {
+        let policy = self.validate_execution_providers(&execution_providers)?;
+        let execution_providers = execution_providers
+            .into_iter()
+            .map(ExecutionProviderDispatch::error_on_failure)
+            .collect();
+        Ok((policy, execution_providers))
     }
 }
 
@@ -132,6 +145,67 @@ fn require_exact_provider<E: ort::ep::ExecutionProvider>(
 fn policy_failure(code: &'static str, detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow::Error::msg(format!(
         "FASTEMBED_SESSION_POLICY[{code}] detail={detail}; remediation=select SessionPolicy::explicit_cpu with exactly one CPU execution provider, or SessionPolicy::cuda_no_cpu_fallback with exactly one CUDA execution provider and a non-empty profile path"
+    ))
+}
+
+pub(crate) fn apply_external_initializers(
+    mut builder: SessionBuilder,
+    external_initializers: Vec<ExternalInitializerFile>,
+) -> anyhow::Result<SessionBuilder> {
+    let mut names = BTreeSet::new();
+    for initializer in external_initializers {
+        validate_external_initializer_name(&initializer.file_name)?;
+        if !names.insert(initializer.file_name.clone()) {
+            return Err(external_initializer_failure(
+                "DUPLICATE_LOCATION",
+                format!(
+                    "external-data location {:?} was supplied more than once",
+                    initializer.file_name
+                ),
+            ));
+        }
+        builder = builder
+            .with_external_initializer_file_in_memory(
+                &initializer.file_name,
+                initializer.buffer.into(),
+            )
+            .map_err(|error| {
+                external_initializer_failure(
+                    "REGISTER_FAILED",
+                    format!(
+                        "external-data location {:?} could not be registered: {error}",
+                        initializer.file_name
+                    ),
+                )
+            })?;
+    }
+    Ok(builder)
+}
+
+fn validate_external_initializer_name(file_name: &str) -> anyhow::Result<()> {
+    let invalid = file_name.is_empty()
+        || file_name.starts_with('/')
+        || file_name.contains('\\')
+        || file_name.contains(':')
+        || file_name.as_bytes().contains(&0)
+        || file_name
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..");
+    if invalid {
+        return Err(external_initializer_failure(
+            "LOCATION_INVALID",
+            format!("external-data location {file_name:?} is not a canonical relative POSIX path"),
+        ));
+    }
+    Ok(())
+}
+
+fn external_initializer_failure(
+    code: &'static str,
+    detail: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "FASTEMBED_EXTERNAL_DATA[{code}] detail={detail}; remediation=snapshot every distinct TensorProto.external_data.location exactly once, preserve its canonical graph-relative name, and pass the identical bytes to the in-memory constructor"
     ))
 }
 

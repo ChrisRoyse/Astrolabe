@@ -3,11 +3,11 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
-    common::load_tokenizer,
-    models::{text_embedding::models_list, ModelTrait},
-    pooling::Pooling,
     Embedding, EmbeddingModel, EmbeddingOutput, ModelInfo, OutputKey, QuantizationMode,
     SingleBatchOutput,
+    common::load_tokenizer,
+    models::{ModelTrait, text_embedding::models_list},
+    pooling::Pooling,
 };
 #[cfg(feature = "hf-hub")]
 use anyhow::Context;
@@ -16,7 +16,7 @@ use anyhow::Result;
 use hf_hub::api::sync::ApiRepo;
 use ndarray::Array;
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session},
+    session::{Session, builder::GraphOptimizationLevel},
     value::Value,
 };
 #[cfg(feature = "hf-hub")]
@@ -27,7 +27,7 @@ use tokenizers::Tokenizer;
 #[cfg(feature = "hf-hub")]
 use super::TextInitOptions;
 use super::{
-    output, InitOptionsUserDefined, TextEmbedding, UserDefinedEmbeddingModel, DEFAULT_BATCH_SIZE,
+    DEFAULT_BATCH_SIZE, InitOptionsUserDefined, TextEmbedding, UserDefinedEmbeddingModel, output,
 };
 
 impl TextEmbedding {
@@ -78,6 +78,7 @@ impl TextEmbedding {
 
         // prioritise loading pooling config if available, if not (thanks qdrant!), look for it in hardcoded
         let post_processing = TextEmbedding::get_default_pooling_method(&model_name);
+        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
 
         #[cfg(feature = "directml")]
         let has_directml = execution_providers
@@ -85,7 +86,8 @@ impl TextEmbedding {
             .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
         #[cfg(not(feature = "directml"))]
         let has_directml = false;
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let mut builder = Session::builder()?
             .with_execution_providers(execution_providers)
@@ -106,7 +108,6 @@ impl TextEmbedding {
 
         let session = builder.commit_from_file(model_file_reference)?;
 
-        let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(
             tokenizer,
             session,
@@ -134,6 +135,7 @@ impl TextEmbedding {
             Some(n) => n,
             None => available_parallelism()?.get(),
         };
+        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
 
         #[cfg(feature = "directml")]
         let has_directml = execution_providers
@@ -141,7 +143,8 @@ impl TextEmbedding {
             .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
         #[cfg(not(feature = "directml"))]
         let has_directml = false;
-        let session_policy = session_policy.validate_execution_providers(&execution_providers)?;
+        let (session_policy, execution_providers) =
+            session_policy.enforce_execution_providers(execution_providers)?;
 
         let session = {
             let mut session_builder = Session::builder()?
@@ -161,19 +164,13 @@ impl TextEmbedding {
                     .map_err(Self::builder_error)?;
             }
 
-            for external_initializer_file in model.external_initializers {
-                session_builder = session_builder
-                    .with_external_initializer_file_in_memory(
-                        external_initializer_file.file_name,
-                        external_initializer_file.buffer.into(),
-                    )
-                    .map_err(Self::builder_error)?;
-            }
+            session_builder = crate::init::apply_external_initializers(
+                session_builder,
+                model.external_initializers,
+            )?;
 
             session_builder.commit_from_memory(&model.onnx_file)?
         };
-
-        let tokenizer = load_tokenizer(model.tokenizer_files, max_length)?;
         Ok(Self::new(
             tokenizer,
             session,

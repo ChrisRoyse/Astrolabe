@@ -108,3 +108,38 @@ pub(crate) fn read_frame(reader: &mut dyn Read) -> Result<Vec<u8>, CalyxError> {
     })?;
     Ok(body)
 }
+
+pub(crate) fn discard_frame(reader: &mut dyn Read) -> Result<(), CalyxError> {
+    let mut header = [0_u8; 8];
+    reader.read_exact(&mut header).map_err(|error| CalyxError {
+        code: "CALYX_PANEL_RESIDENT_BINARY_FRAME",
+        message: format!("read discarded resident frame header failed: {error}"),
+        remediation: CLIENT_TIMEOUT_REMEDIATION,
+    })?;
+    let length = u64::from_be_bytes(header);
+    if length > MAX_RESIDENT_SERVICE_FRAME_BYTES as u64 {
+        return Err(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_BINARY_FRAME",
+            message: format!(
+                "discarded resident frame {length} bytes exceeds max {MAX_RESIDENT_SERVICE_FRAME_BYTES}"
+            ),
+            remediation: "reduce the measurement batch size or implement streaming vector payloads",
+        });
+    }
+    let mut remaining = length;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        reader
+            .read_exact(&mut buffer[..chunk])
+            .map_err(|error| CalyxError {
+                code: "CALYX_PANEL_RESIDENT_BINARY_FRAME",
+                message: format!(
+                    "read discarded resident frame body ({length} bytes) failed with {remaining} bytes remaining: {error}"
+                ),
+                remediation: CLIENT_TIMEOUT_REMEDIATION,
+            })?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}

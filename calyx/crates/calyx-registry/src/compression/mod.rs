@@ -1,4 +1,5 @@
 mod codec;
+mod index;
 mod recall;
 
 use calyx_aster::cf::{ColumnFamily, slot_key};
@@ -9,16 +10,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::spec::LensSpec;
 pub use codec::decode_stored_slot_envelope;
-use codec::{EncodedRow, encode_rows};
+use codec::{EncodedBatch, encode_rows};
+pub use index::{CompressedSlotHit, CompressedSlotIndex};
 pub use recall::matryoshka_truncate_renormalize;
 use recall::{recall_at_k, recall_drop, validate_batch};
 
 pub const CALYX_VECTOR_COMPRESSION_EMPTY: &str = "CALYX_VECTOR_COMPRESSION_EMPTY";
 pub const CALYX_VECTOR_COMPRESSION_INVALID: &str = "CALYX_VECTOR_COMPRESSION_INVALID";
 pub const COMPRESSED_SLOT_TAG: u8 = 16;
-const COMPRESSED_SLOT_VERSION: u8 = 1;
+pub const COMPRESSED_SLOT_VERSION: u8 = 2;
+pub const REGISTRY_ENVELOPE_HEADER_BYTES: usize = 85;
 const COMPRESSION_REMEDIATION: &str =
-    "Use finite dense slot vectors, valid quant policy metadata, and raw sidecars";
+    "Re-encode finite dense vectors with the exact lens/slot codec context and inspect the reported envelope field";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,8 +51,26 @@ pub struct SlotCompressionReport {
     pub requested_quant: QuantPolicy,
     pub stored_codec: StoredSlotCodec,
     pub fallback_reason: Option<String>,
+    /// Independently encoded original SlotVector rows retained in `slot_*.raw`.
     pub raw_bytes_total: usize,
+    /// Complete compressed rows, including the registry envelope.
     pub stored_bytes_total: usize,
+    /// Codec payload bytes inside the registry envelope.
+    pub codec_payload_bytes_total: usize,
+    /// Fixed registry envelope bytes across all rows.
+    pub registry_envelope_bytes_total: usize,
+    /// Codec-format headers inside the payload (for TurboQuant, TQPR headers).
+    pub codec_header_bytes_total: usize,
+    /// Scalar-index plus QJL data bits, excluding every fixed header and norm.
+    pub logical_data_bits_total: u64,
+    /// Raw sidecars plus compressed envelopes actually written to the vault.
+    pub physical_bytes_total: usize,
+    /// Logical product-code bits per stored coefficient.
+    pub logical_data_bits_per_channel: f32,
+    /// Complete codec payload bits per stored coefficient.
+    pub codec_payload_bits_per_channel: f32,
+    /// Raw sidecar plus compressed envelope bits per stored coefficient.
+    pub physical_bits_per_channel: f32,
     pub recall_at_k_raw: f32,
     pub recall_at_k_compressed: f32,
     pub recall_delta: f32,
@@ -58,15 +79,19 @@ pub struct SlotCompressionReport {
     pub snapshot: Option<Seq>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredSlotEnvelope {
+    pub format_version: u8,
     pub codec: StoredSlotCodec,
     pub level: String,
     pub raw_dim: u32,
     pub stored_dim: u32,
-    pub fallback: bool,
     pub truncated: bool,
+    /// Codec scale field; TurboQuant defines this as the original L2 norm.
+    pub quant_scale: f32,
+    pub seed_id: String,
     pub payload_bytes: usize,
+    pub payload_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,14 +236,69 @@ fn build_report(
     rows: &[(CxId, Vec<f32>)],
     queries: &[Vec<f32>],
     k: usize,
-    encoded: Vec<EncodedRow>,
+    encoded: EncodedBatch,
     fallback_reason: Option<String>,
 ) -> Result<SlotCompressionReport> {
-    let raw_bytes_total = encoded.iter().map(|row| row.raw_bytes.len()).sum();
-    let stored_bytes_total = encoded.iter().map(|row| row.stored_bytes.len()).sum();
+    let raw_bytes_total = encoded.rows.iter().map(|row| row.raw_bytes.len()).sum();
+    let stored_bytes_total = encoded.rows.iter().map(|row| row.stored_bytes.len()).sum();
+    let codec_payload_bytes_total = encoded.rows.iter().map(|row| row.payload_bytes).sum();
+    let registry_envelope_bytes_total = encoded
+        .rows
+        .len()
+        .checked_mul(REGISTRY_ENVELOPE_HEADER_BYTES)
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "registry envelope byte accounting overflow",
+            )
+        })?;
+    let codec_header_bytes_total = encoded
+        .rows
+        .iter()
+        .map(|row| row.codec_header_bytes)
+        .sum();
+    let logical_data_bits_total = encoded.rows.iter().try_fold(0_u64, |sum, row| {
+        sum.checked_add(row.logical_data_bits).ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "logical compression bit accounting overflow",
+            )
+        })
+    })?;
+    let physical_bytes_total = raw_bytes_total
+        .checked_add(stored_bytes_total)
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "physical compression byte accounting overflow",
+            )
+        })?;
+    let stored_channels = encoded.rows.iter().try_fold(0_u64, |sum, row| {
+        sum.checked_add(row.prepared.len() as u64).ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                "stored channel accounting overflow",
+            )
+        })
+    })?;
+    if stored_channels == 0 {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_EMPTY,
+            "compression report has no stored coefficients",
+        ));
+    }
+    let channels = stored_channels as f64;
     let recall_at_k_raw = 1.0;
-    let recall_at_k_compressed = recall_at_k(rows, queries, &encoded, k, lens.truncate_dim)?;
+    let recall_at_k_compressed = recall_at_k(
+        rows,
+        queries,
+        &encoded.rows,
+        &encoded.codec,
+        k,
+        lens.truncate_dim,
+    )?;
     let stored_codec = encoded
+        .rows
         .first()
         .map(|row| row.codec)
         .unwrap_or(StoredSlotCodec::RawF32);
@@ -230,11 +310,20 @@ fn build_report(
         fallback_reason,
         raw_bytes_total,
         stored_bytes_total,
+        codec_payload_bytes_total,
+        registry_envelope_bytes_total,
+        codec_header_bytes_total,
+        logical_data_bits_total,
+        physical_bytes_total,
+        logical_data_bits_per_channel: (logical_data_bits_total as f64 / channels) as f32,
+        codec_payload_bits_per_channel: (codec_payload_bytes_total as f64 * 8.0 / channels) as f32,
+        physical_bits_per_channel: (physical_bytes_total as f64 * 8.0 / channels) as f32,
         recall_at_k_raw,
         recall_at_k_compressed,
         recall_delta: recall_at_k_compressed - recall_at_k_raw,
         truncate_dim: lens.truncate_dim,
         rows: encoded
+            .rows
             .into_iter()
             .map(|row| SlotCompressionRow {
                 cx_id: row.cx_id,

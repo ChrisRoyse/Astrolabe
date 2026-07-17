@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "hash_algorithm": "sha256-domain-u64le-path-u64le-content-v1",
   "attested_file_count": 42,
-  "attested_source_tree_sha256": "1ffd9799a8d1e0e5f21aec921bbbc96c76b8b5f58e275932fb608ab9ebb6c0d5",
+  "attested_source_tree_sha256": "cefba0dece1688c175eb40a01a4b0ecd7811aafdb6eecd6bc9af49fc91c3d087",
   "files": [
     {
       "path": ".cargo_vcs_info.json",
@@ -18,8 +18,8 @@
     },
     {
       "path": "Cargo.toml",
-      "bytes": 3767,
-      "sha256": "4b1b459ee6ac7975dd9d8aea0878406754a0ba2654a4181f5451f797b4e7bdcb"
+      "bytes": 3781,
+      "sha256": "55d0e00035bdbd92aaa8ec91af2dfcfff6446add1592aa993266b98d74eaf8f7"
     },
     {
       "path": "LICENSE",
@@ -28,8 +28,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 15644,
-      "sha256": "93f7f61981b9114e68497f76fd3b2858cda15e583cacb130dbce88056232685b"
+      "bytes": 16316,
+      "sha256": "9b476129ef2d9b5389f81bf3f0c0a6dd4b1f863ed853283cc941042e415cbedd"
     },
     {
       "path": "build.rs",
@@ -38,13 +38,13 @@
     },
     {
       "path": "src/bgem3_embedding/impl.rs",
-      "bytes": 13809,
-      "sha256": "e11b0e8cef123af00c5837c56e15fe6710157b97de44a1b53c58eeedc2b74ce8"
+      "bytes": 14018,
+      "sha256": "9e4e2d9609e41ece6b3937e1167d2aeeef7a95a939ed2fcdf8a7436a7d5bfc99"
     },
     {
       "path": "src/bgem3_embedding/init.rs",
-      "bytes": 1040,
-      "sha256": "3d2f47e60dcab103442d81f431bff5df5186ab65c548f31246dbcbe5c62670a1"
+      "bytes": 1609,
+      "sha256": "eab18b52a1266acd2414016aba0cc29f43d92f14f9e040c37d0483a16e6a5b13"
     },
     {
       "path": "src/bgem3_embedding/mod.rs",
@@ -53,13 +53,13 @@
     },
     {
       "path": "src/common.rs",
-      "bytes": 6828,
-      "sha256": "1e6428605481814af42f1bc1f1cf6669a8e1d91c0284b499227162cdee6d6481"
+      "bytes": 10819,
+      "sha256": "8695070a09455e9361e238d64e0e97b6ba44f9ef3f9e1adb98f7ee1893cd6d42"
     },
     {
       "path": "src/image_embedding/impl.rs",
-      "bytes": 12268,
-      "sha256": "466b2afcd48a50c91417e6a0b7d840651e880923934b99bba58191ed82d40309"
+      "bytes": 12334,
+      "sha256": "2bc440ef2a8ce67c1ccedfbbd9bb4fbe28b62dffa8d1ff93c8dda2ec5aa14d8c"
     },
     {
       "path": "src/image_embedding/init.rs",
@@ -78,13 +78,13 @@
     },
     {
       "path": "src/init.rs",
-      "bytes": 9969,
-      "sha256": "79d360c1433f8b534b7dc3ddc1400fbc483e53c878c7545f95c532271de10854"
+      "bytes": 12774,
+      "sha256": "abb5613816b6757ee4d4158d41dd7eded779addf412159e975f9ccadab76da90"
     },
     {
       "path": "src/lib.rs",
-      "bytes": 4784,
-      "sha256": "7b903134e942b3115b6dc4323ff0a113e453ae23957fe722893ec73ca01b8c75"
+      "bytes": 4816,
+      "sha256": "64fd079dba1c1df85781db2c4c7529fd5cad9897cbfcb4bc2bde9ae689068aed"
     },
     {
       "path": "src/models/bgem3.rs",
@@ -163,13 +163,13 @@
     },
     {
       "path": "src/reranking/impl.rs",
-      "bytes": 9390,
-      "sha256": "fbdcdb5f608df97c8b72c97408ebbc066fdc47a93d44a6e1ca8b21ed2f687924"
+      "bytes": 9555,
+      "sha256": "2dbe937e07d6dd9125676ad8e56348d01e2851f5f9fafacf2204a4958303025c"
     },
     {
       "path": "src/reranking/init.rs",
-      "bytes": 3956,
-      "sha256": "5c458c81d7b004b12102bed0de190a875789df3edc814ff75077a8adae87f9a6"
+      "bytes": 4347,
+      "sha256": "bed5f9e5fdb87b202d0a081da664ef598cf8211e31468e419f80e82c457fb2d4"
     },
     {
       "path": "src/reranking/mod.rs",
@@ -183,13 +183,13 @@
     },
     {
       "path": "src/sparse_text_embedding/impl.rs",
-      "bytes": 12948,
-      "sha256": "38f3d493d7d90f6b2ec938ad92d57b5719843410da5c177270bba95b020839ef"
+      "bytes": 14482,
+      "sha256": "3a27a89bb4266d8e73119d762b13f4b6a37a2c0ac0d85fe7885d097d66018cce"
     },
     {
       "path": "src/sparse_text_embedding/init.rs",
-      "bytes": 1133,
-      "sha256": "d3232fecb59c0654348cc7ded7c47c60c31e27abef4d012359b5f5f544d63c0b"
+      "bytes": 1705,
+      "sha256": "8ca3499f6532fd947e8487e7af62538fae9f20f5263579914b911a77d0feac95"
     },
     {
       "path": "src/sparse_text_embedding/mod.rs",
@@ -203,13 +203,13 @@
     },
     {
       "path": "src/text_embedding/impl.rs",
-      "bytes": 20196,
-      "sha256": "c3e29af67b5450138c22d0006d540c13dcc5e740ff079712b32427100a78c7af"
+      "bytes": 20025,
+      "sha256": "35c40342182db37cafff416e04f28a839f47e3fefda6920aba974624077d43f4"
     },
     {
       "path": "src/text_embedding/init.rs",
-      "bytes": 4900,
-      "sha256": "45b5eb4ed811c6b48dd8785cfc5a5e1fca695234a5ca1a485647aa59a99333e0"
+      "bytes": 4716,
+      "sha256": "6698465ab9e31df84852d1a8a3de4be57a5d18a016345b090c6dd79bcb9e44d9"
     },
     {
       "path": "src/text_embedding/mod.rs",
@@ -223,8 +223,12 @@
     }
   ],
   "owned_deltas": [
+    "expose the ORT alternative-backend feature for Astrolabe's sole process-global API commit and remove per-crate dynamic loading",
     "require and validate an explicit per-session CPU or fail-closed CUDA policy before every ONNX SessionBuilder",
+    "force every validated CPU and CUDA execution-provider dispatch to fail session registration on provider errors",
     "disable implicit CPU EP fallback and record graph assignment for every CUDA-policy session",
+    "commit caller-snapshotted graph, external-data, and tokenizer buffers in memory for dense, sparse, BGE-M3, and reranker sessions while preserving model-specific behavior",
+    "validate exact tokenizer bytes and all required tokenizer metadata before any dense, sparse, BGE-M3, or reranker ONNX session is committed",
     "document the mandatory provider-policy pair in every public ONNX construction example",
     "expose immutable committed-session access and profile finalization for Calyx placement attestation",
     "exclude upstream CI, doctests, and all test targets/modules under Astrolabe manual-FSV-only policy",
