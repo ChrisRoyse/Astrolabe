@@ -12,7 +12,7 @@ pub(super) use super::template_model::{
     PanelTemplateIndexEntry, PanelTemplateVersionRef, SavedPanelTemplate, TEMPLATE_INVALID,
     TEMPLATE_NOT_FOUND, TemplateDraft, TemplateEnsembleCard, TemplateLensRef, bound_lens_spec,
     default_time_controls, id_for_loaded, lens_ref_from_catalog, object_bytes, template_error,
-    validate_execution_attestation_against_spec, validate_lens_ref_against_spec,
+    validate_execution_attestation_against_spec,
 };
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::support::{prepare_manifest_runtime, register_prepared_manifest_runtime};
