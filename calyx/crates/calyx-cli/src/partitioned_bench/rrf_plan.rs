@@ -37,6 +37,13 @@ pub(crate) struct PlanSlot {
     #[serde(default)]
     pub(crate) query_start_row: u64,
     pub(crate) corpus: PathBuf,
+    /// Hex blake3 of the sealed corpus payload (authenticated source identity);
+    /// verified against the opened file before any build/measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) corpus_payload_blake3: Option<String>,
+    /// Hex blake3 of the sealed queries payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queries_payload_blake3: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -322,6 +329,8 @@ impl From<LegacyPlanSlot> for PlanSlot {
             queries: value.queries,
             query_start_row: 0,
             corpus: value.corpus,
+            corpus_payload_blake3: None,
+            queries_payload_blake3: None,
         }
     }
 }

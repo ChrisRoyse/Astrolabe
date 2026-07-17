@@ -1,11 +1,9 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::path::Path;
 
+use calyx_sextant::index::{FbinWriter, I8BinWriter};
 use serde::Serialize;
 
 use crate::error::{CliError, CliResult};
-
-use super::{io_error, local_error};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) enum VectorFormat {
@@ -47,126 +45,61 @@ impl VectorFormat {
 
     pub(crate) fn storage_contract(self) -> &'static str {
         match self {
-            Self::Fbin => "f32-row-major-calyx-fbin",
-            Self::I8Bin => "per-row-directional-symmetric-int8-normalized-on-read",
+            Self::Fbin => "clxvec02-exact-f32-bit-preserving-blake3-authenticated",
+            Self::I8Bin => "clxi8b02-per-row-scale-symmetric-int8-blake3-authenticated",
         }
     }
 }
 
-pub(super) fn write_header(
-    writer: &mut BufWriter<File>,
-    format: VectorFormat,
-    dim: usize,
-    count: usize,
-) -> CliResult {
-    match format {
-        VectorFormat::Fbin => write_fbin_header(writer, dim, count),
-        VectorFormat::I8Bin => write_i8bin_header(writer, dim, count),
+/// Streaming sink for one authenticated v2 vector file. Rows are written
+/// bit-exactly (fbin) or with a preserved per-row dequantization scale (i8bin);
+/// non-finite rows are refused fail-closed by the underlying writers and
+/// `finalize` seals the blake3 payload digest into the header.
+pub(crate) enum VectorFileSink {
+    Fbin(FbinWriter),
+    I8Bin(I8BinWriter),
+}
+
+impl VectorFileSink {
+    pub(crate) fn create(
+        path: &Path,
+        format: VectorFormat,
+        dim: usize,
+        count: usize,
+    ) -> CliResult<Self> {
+        let count = u64::try_from(count)
+            .map_err(|_| CliError::usage("vector file row count exceeds u64"))?;
+        match format {
+            VectorFormat::Fbin => Ok(Self::Fbin(
+                FbinWriter::create(path, dim, count).map_err(CliError::Calyx)?,
+            )),
+            VectorFormat::I8Bin => Ok(Self::I8Bin(
+                I8BinWriter::create(path, dim, count).map_err(CliError::Calyx)?,
+            )),
+        }
     }
-}
 
-pub(super) fn write_row(
-    writer: &mut BufWriter<File>,
-    format: VectorFormat,
-    vector: &[f32],
-) -> CliResult {
-    match format {
-        VectorFormat::Fbin => write_f32_row(writer, vector),
-        VectorFormat::I8Bin => write_i8_row(writer, vector),
+    pub(crate) fn write_row(&mut self, row: &[f32]) -> CliResult {
+        match self {
+            Self::Fbin(writer) => writer.write_row(row).map_err(CliError::Calyx),
+            Self::I8Bin(writer) => writer.write_row(row).map_err(CliError::Calyx),
+        }
     }
-}
 
-fn write_fbin_header(writer: &mut BufWriter<File>, dim: usize, count: usize) -> CliResult {
-    writer
-        .write_all(&calyx_sextant::index::VEC_MAGIC)
-        .map_err(io_error)?;
-    writer
-        .write_all(
-            &u32::try_from(dim)
-                .map_err(|_| CliError::usage("fbin dim exceeds u32"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)?;
-    writer
-        .write_all(
-            &u64::try_from(count)
-                .map_err(|_| CliError::usage("fbin count exceeds u64"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)
-}
-
-fn write_i8bin_header(writer: &mut BufWriter<File>, dim: usize, count: usize) -> CliResult {
-    writer
-        .write_all(
-            &u32::try_from(count)
-                .map_err(|_| CliError::usage("i8bin count exceeds u32"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)?;
-    writer
-        .write_all(
-            &u32::try_from(dim)
-                .map_err(|_| CliError::usage("i8bin dim exceeds u32"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)
-}
-
-fn write_f32_row(writer: &mut BufWriter<File>, vector: &[f32]) -> CliResult {
-    for value in vector {
-        writer
-            .write_all(&canonical_f32(*value).to_le_bytes())
-            .map_err(io_error)?;
+    pub(crate) fn flush_sync(&mut self) -> CliResult {
+        match self {
+            Self::Fbin(writer) => writer.flush_sync().map_err(CliError::Calyx),
+            Self::I8Bin(writer) => writer.flush_sync().map_err(CliError::Calyx),
+        }
     }
-    Ok(())
-}
 
-fn write_i8_row(writer: &mut BufWriter<File>, vector: &[f32]) -> CliResult {
-    let canonical = vector
-        .iter()
-        .copied()
-        .map(canonical_f32)
-        .collect::<Vec<_>>();
-    let quantized = quantize_direction_i8(&canonical)?;
-    let bytes = quantized
-        .iter()
-        .map(|value| *value as u8)
-        .collect::<Vec<_>>();
-    writer.write_all(&bytes).map_err(io_error)
-}
-
-fn quantize_direction_i8(vector: &[f32]) -> CliResult<Vec<i8>> {
-    let max_abs = vector
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f32, f32::max);
-    if !max_abs.is_finite() || max_abs == 0.0 {
-        return Err(local_error(
-            "CALYX_FSV_ASSAY_STREAM_FBIN_I8_ZERO_VECTOR",
-            "cannot encode zero/non-finite vector as directional i8bin row",
-            "inspect the lens output; i8bin rows require a finite non-zero direction",
-        ));
+    /// Seals the payload digest into the header and returns it hex-encoded for
+    /// downstream manifest binding.
+    pub(crate) fn finalize(self) -> CliResult<String> {
+        let digest = match self {
+            Self::Fbin(writer) => writer.finalize().map_err(CliError::Calyx)?,
+            Self::I8Bin(writer) => writer.finalize().map_err(CliError::Calyx)?,
+        };
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
-    let scale = 127.0 / max_abs;
-    let row = vector
-        .iter()
-        .map(|value| (value * scale).round().clamp(-127.0, 127.0) as i8)
-        .collect::<Vec<_>>();
-    if row.iter().all(|value| *value == 0) {
-        return Err(local_error(
-            "CALYX_FSV_ASSAY_STREAM_FBIN_I8_ZERO_VECTOR",
-            "i8bin quantization collapsed a vector to all zeros",
-            "inspect vector magnitudes before trusting compressed scale output",
-        ));
-    }
-    Ok(row)
-}
-
-fn canonical_f32(value: f32) -> f32 {
-    if !value.is_finite() {
-        return value;
-    }
-    let rounded = (value * 1_000.0).round() / 1_000.0;
-    if rounded == 0.0 { 0.0 } else { rounded }
 }

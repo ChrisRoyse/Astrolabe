@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use calyx_sextant::index::VEC_MAGIC;
+use calyx_sextant::index::FbinWriter;
 use serde_json::json;
 
 use crate::error::{CliError, CliResult};
@@ -15,8 +15,8 @@ use super::timeline::{self, TimelineScanBuilder};
 use super::{ExportEvidence, LensEvidence, io_error, local_error};
 
 struct FbinSink {
-    corpus: BufWriter<File>,
-    queries: BufWriter<File>,
+    corpus: FbinWriter,
+    queries: FbinWriter,
     corpus_written: usize,
     query_written: usize,
 }
@@ -116,14 +116,19 @@ fn create_sinks(
     for (slot, name) in selected.iter().enumerate() {
         let dim = dims[name];
         let prefix = lens_prefix(slot, name);
-        let mut corpus = BufWriter::new(
-            File::create(fbin_dir.join(format!("{prefix}_corpus.fbin"))).map_err(io_error)?,
-        );
-        let mut queries = BufWriter::new(
-            File::create(fbin_dir.join(format!("{prefix}_queries.fbin"))).map_err(io_error)?,
-        );
-        write_fbin_header(&mut corpus, dim, rows)?;
-        write_fbin_header(&mut queries, dim, query_count)?;
+        let corpus = FbinWriter::create(
+            &fbin_dir.join(format!("{prefix}_corpus.fbin")),
+            dim,
+            u64::try_from(rows).map_err(|_| CliError::usage("fbin row count exceeds u64"))?,
+        )
+        .map_err(CliError::Calyx)?;
+        let queries = FbinWriter::create(
+            &fbin_dir.join(format!("{prefix}_queries.fbin")),
+            dim,
+            u64::try_from(query_count)
+                .map_err(|_| CliError::usage("fbin query count exceeds u64"))?,
+        )
+        .map_err(CliError::Calyx)?;
         sinks.insert(
             name.clone(),
             FbinSink {
@@ -219,10 +224,10 @@ fn write_selected_row(
     row_idx: usize,
     query_count: usize,
 ) -> CliResult {
-    write_f32_row(&mut sink.corpus, vector)?;
+    sink.corpus.write_row(vector).map_err(CliError::Calyx)?;
     sink.corpus_written += 1;
     if row_idx < query_count {
-        write_f32_row(&mut sink.queries, vector)?;
+        sink.queries.write_row(vector).map_err(CliError::Calyx)?;
         sink.query_written += 1;
     }
     Ok(())
@@ -238,11 +243,11 @@ fn finish_sinks(
 ) -> CliResult<Vec<LensEvidence>> {
     let mut out = Vec::with_capacity(selected.len());
     for (slot, name) in selected.iter().enumerate() {
-        let mut sink = sinks.remove(name).expect("sink seeded");
-        sink.corpus.flush().map_err(io_error)?;
-        sink.queries.flush().map_err(io_error)?;
-        sink.corpus.get_ref().sync_all().map_err(io_error)?;
-        sink.queries.get_ref().sync_all().map_err(io_error)?;
+        let sink = sinks.remove(name).expect("sink seeded");
+        let corpus_rows_written = sink.corpus_written;
+        let query_rows_written = sink.query_written;
+        let corpus_payload_blake3 = hex32(sink.corpus.finalize().map_err(CliError::Calyx)?);
+        let queries_payload_blake3 = hex32(sink.queries.finalize().map_err(CliError::Calyx)?);
         let prefix = lens_prefix(slot, name);
         out.push(LensEvidence {
             slot: u16::try_from(slot).map_err(|_| CliError::usage("slot exceeds u16"))?,
@@ -257,11 +262,17 @@ fn finish_sinks(
             corpus_path: display_final(args, &format!("fbin/{prefix}_corpus.fbin")),
             queries_path: display_final(args, &format!("fbin/{prefix}_queries.fbin")),
             vault_path: display_final(args, &format!("vaults/{prefix}")),
-            corpus_rows_written: sink.corpus_written,
-            query_rows_written: sink.query_written,
+            corpus_rows_written,
+            query_rows_written,
+            corpus_payload_blake3,
+            queries_payload_blake3,
         });
     }
     Ok(out)
+}
+
+fn hex32(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn write_plan(path: &Path, timeline_path: &str, lenses: &[LensEvidence]) -> CliResult {
@@ -281,6 +292,8 @@ fn write_plan(path: &Path, timeline_path: &str, lenses: &[LensEvidence]) -> CliR
                 "vault": lens.vault_path,
                 "queries": lens.queries_path,
                 "corpus": lens.corpus_path,
+                "corpus_payload_blake3": lens.corpus_payload_blake3,
+                "queries_payload_blake3": lens.queries_payload_blake3,
             })
         })
         .collect::<Vec<_>>();
@@ -295,31 +308,6 @@ fn write_plan(path: &Path, timeline_path: &str, lenses: &[LensEvidence]) -> CliR
         .map_err(|error| CliError::runtime(format!("serialize partitioned RRF plan: {error}")))?,
     )
     .map_err(io_error)
-}
-
-fn write_fbin_header(writer: &mut BufWriter<File>, dim: usize, count: usize) -> CliResult {
-    writer.write_all(&VEC_MAGIC).map_err(io_error)?;
-    writer
-        .write_all(
-            &u32::try_from(dim)
-                .map_err(|_| CliError::usage("fbin dim exceeds u32"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)?;
-    writer
-        .write_all(
-            &u64::try_from(count)
-                .map_err(|_| CliError::usage("fbin count exceeds u64"))?
-                .to_le_bytes(),
-        )
-        .map_err(io_error)
-}
-
-fn write_f32_row(writer: &mut BufWriter<File>, vector: &[f32]) -> CliResult {
-    for value in vector {
-        writer.write_all(&value.to_le_bytes()).map_err(io_error)?;
-    }
-    Ok(())
 }
 
 fn fail_if_exists(path: &Path) -> CliResult {

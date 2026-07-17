@@ -72,7 +72,10 @@ pub use spann::{
     build_centroids, decode_posting_block, encode_posting_block,
 };
 pub use testutil::{SyntheticVault, build_synthetic_vault, synthetic_dense_rows};
-pub use vecfile::{DenseVectorFile, FbinVectors, I8BinVectors, I32BinMatrix, VEC_MAGIC};
+pub use vecfile::{
+    DenseVectorFile, FbinVectors, FbinWriter, I8BinVectors, I8BinWriter, I32BinMatrix,
+    I8BIN_MAGIC, VEC_HEADER_LEN, VEC_MAGIC, VEC_MAGIC_LEGACY_V1,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexSearchHit {

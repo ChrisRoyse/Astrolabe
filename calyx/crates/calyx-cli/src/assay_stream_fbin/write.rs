@@ -31,11 +31,17 @@ use paths::{display, display_final};
 use selection::{SelectedLens, selected_lenses};
 
 struct FbinSink {
-    corpus: BufWriter<File>,
-    queries: BufWriter<File>,
-    format: VectorFormat,
+    corpus: format::VectorFileSink,
+    queries: format::VectorFileSink,
     corpus_written: usize,
     query_written: usize,
+}
+
+/// Sealed payload digests (hex blake3) of one lens's finished vector files,
+/// bound into the worker report and the downstream RRF plan manifest.
+struct SinkDigests {
+    corpus_payload_blake3: String,
+    queries_payload_blake3: String,
 }
 
 struct LensStream<'a> {
@@ -215,14 +221,12 @@ fn create_sink(
     rows: usize,
     args: &Args,
 ) -> CliResult<FbinSink> {
-    let mut corpus = BufWriter::new(File::create(corpus_path).map_err(io_error)?);
-    let mut queries = BufWriter::new(File::create(queries_path).map_err(io_error)?);
-    format::write_header(&mut corpus, args.vector_format, dim, rows)?;
-    format::write_header(&mut queries, args.vector_format, dim, args.query_count)?;
+    let corpus = format::VectorFileSink::create(corpus_path, args.vector_format, dim, rows)?;
+    let queries =
+        format::VectorFileSink::create(queries_path, args.vector_format, dim, args.query_count)?;
     Ok(FbinSink {
         corpus,
         queries,
-        format: args.vector_format,
         corpus_written: 0,
         query_written: 0,
     })
@@ -312,10 +316,10 @@ fn flush_batch(
     }
     for (vector, (row_idx, row)) in vectors.iter().zip(metas.iter()) {
         validate_vector(stream.lens, vector)?;
-        format::write_row(&mut stream.sink.corpus, stream.sink.format, vector)?;
+        stream.sink.corpus.write_row(vector)?;
         stream.sink.corpus_written += 1;
         if *row_idx < stream.args.query_count {
-            format::write_row(&mut stream.sink.queries, stream.sink.format, vector)?;
+            stream.sink.queries.write_row(vector)?;
             stream.sink.query_written += 1;
         }
         if let Some(writer) = timeline.as_mut() {
@@ -386,15 +390,19 @@ fn write_timeline_row(
     writer.write_all(b"\n").map_err(io_error)
 }
 
-fn finish_sink(sink: &mut FbinSink) -> CliResult {
-    sync_sink(sink)
+/// Seals both vector files: verifies declared row counts, patches the blake3
+/// payload digests into the headers, and returns the digests for manifest
+/// binding.
+fn finish_sink(sink: FbinSink) -> CliResult<SinkDigests> {
+    Ok(SinkDigests {
+        corpus_payload_blake3: sink.corpus.finalize()?,
+        queries_payload_blake3: sink.queries.finalize()?,
+    })
 }
 
 fn sync_sink(sink: &mut FbinSink) -> CliResult {
-    sink.corpus.flush().map_err(io_error)?;
-    sink.queries.flush().map_err(io_error)?;
-    sink.corpus.get_ref().sync_all().map_err(io_error)?;
-    sink.queries.get_ref().sync_all().map_err(io_error)
+    sink.corpus.flush_sync()?;
+    sink.queries.flush_sync()
 }
 
 fn write_plan(
@@ -417,6 +425,8 @@ fn write_plan(
                 queries: PathBuf::from(&lens.queries_path),
                 query_start_row: 0,
                 corpus: PathBuf::from(&lens.corpus_path),
+                corpus_payload_blake3: Some(lens.corpus_payload_blake3.clone()),
+                queries_payload_blake3: Some(lens.queries_payload_blake3.clone()),
             })
             .collect(),
     };
@@ -436,6 +446,8 @@ fn write_plan(
                 "vault": lens.vault_path,
                 "queries": lens.queries_path,
                 "corpus": lens.corpus_path,
+                "corpus_payload_blake3": lens.corpus_payload_blake3,
+                "queries_payload_blake3": lens.queries_payload_blake3,
             })
         })
         .collect::<Vec<_>>();

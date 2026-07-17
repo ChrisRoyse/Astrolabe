@@ -429,6 +429,20 @@ fn open_slots(plan: &Plan, base_dir: &Path) -> CliResult<Vec<OpenSlot>> {
             let search = PartitionedSearch::open(&vault_path).map_err(CliError::Calyx)?;
             let queries = DenseVectorFile::open(&queries_path).map_err(CliError::Calyx)?;
             let corpus = DenseVectorFile::open(&corpus_path).map_err(CliError::Calyx)?;
+            verify_plan_payload_identity(
+                slot.slot,
+                "corpus",
+                &corpus_path,
+                slot.corpus_payload_blake3.as_deref(),
+                corpus.payload_blake3(),
+            )?;
+            verify_plan_payload_identity(
+                slot.slot,
+                "queries",
+                &queries_path,
+                slot.queries_payload_blake3.as_deref(),
+                queries.payload_blake3(),
+            )?;
             if queries.dim() != search.dim() || corpus.dim() != search.dim() {
                 return Err(CliError::usage(format!(
                     "slot {} dim mismatch: vault={} queries={} corpus={}",
@@ -447,6 +461,34 @@ fn open_slots(plan: &Plan, base_dir: &Path) -> CliResult<Vec<OpenSlot>> {
             })
         })
         .collect()
+}
+
+/// Binds the plan-declared authenticated source identity to the opened vector
+/// file. A plan that declares a payload digest must match the sealed digest of
+/// the file it names; mismatches are refused before any measurement.
+fn verify_plan_payload_identity(
+    slot: u16,
+    role: &str,
+    path: &Path,
+    declared_hex: Option<&str>,
+    opened: [u8; 32],
+) -> CliResult {
+    let Some(declared_hex) = declared_hex else {
+        return Ok(());
+    };
+    let opened_hex = opened
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if declared_hex != opened_hex {
+        return Err(CliError::usage(format!(
+            "slot {slot} {role} payload identity mismatch for {}: plan declares blake3 \
+             {declared_hex} but the sealed file digest is {opened_hex}; regenerate the plan or \
+             the vector files together",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn plan_source_report(args: &args::Args, loaded: &LoadedPlan) -> serde_json::Value {

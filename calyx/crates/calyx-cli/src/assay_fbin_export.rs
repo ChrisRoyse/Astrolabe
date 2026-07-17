@@ -49,6 +49,10 @@ pub(super) struct LensEvidence {
     pub(super) vault_path: String,
     pub(super) corpus_rows_written: usize,
     pub(super) query_rows_written: usize,
+    /// Hex blake3 of the sealed corpus payload (authenticated source identity).
+    pub(super) corpus_payload_blake3: String,
+    /// Hex blake3 of the sealed queries payload.
+    pub(super) queries_payload_blake3: String,
 }
 
 pub(crate) fn run(raw: &[String]) -> CliResult {

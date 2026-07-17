@@ -93,6 +93,11 @@ pub(crate) struct LensEvidence {
     pub(crate) vault_path: String,
     pub(crate) corpus_rows_written: usize,
     pub(crate) query_rows_written: usize,
+    /// Hex blake3 of the sealed corpus payload — the authenticated source
+    /// identity bound into downstream build/measurement manifests.
+    pub(crate) corpus_payload_blake3: String,
+    /// Hex blake3 of the sealed queries payload.
+    pub(crate) queries_payload_blake3: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

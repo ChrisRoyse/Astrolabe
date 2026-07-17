@@ -53,6 +53,10 @@ pub const CALYX_SEXTANT_SKILL_PAIR_NO_OVERLAP: &str = "CALYX_SEXTANT_SKILL_PAIR_
 pub const CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED: &str = "CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED";
 pub const CALYX_INDEX_CORRUPT: &str = "CALYX_INDEX_CORRUPT";
 pub const CALYX_INDEX_IO: &str = "CALYX_INDEX_IO";
+pub const CALYX_INDEX_LEGACY_FORMAT: &str = "CALYX_INDEX_LEGACY_FORMAT";
+pub const CALYX_INDEX_PAYLOAD_DIGEST: &str = "CALYX_INDEX_PAYLOAD_DIGEST";
+pub const CALYX_INDEX_NONFINITE: &str = "CALYX_INDEX_NONFINITE";
+pub const CALYX_INDEX_NONCANONICAL_I8: &str = "CALYX_INDEX_NONCANONICAL_I8";
 pub const CALYX_INDEX_MANIFEST_DB_MISSING: &str = "CALYX_INDEX_MANIFEST_DB_MISSING";
 pub const CALYX_INDEX_MANIFEST_DB_INVALID: &str = "CALYX_INDEX_MANIFEST_DB_INVALID";
 pub const CALYX_INDEX_MANIFEST_DB_MISMATCH: &str = "CALYX_INDEX_MANIFEST_DB_MISMATCH";
@@ -166,6 +170,20 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
             "rebuild the on-disk index from the vault; do not trust partial reads"
         }
         CALYX_INDEX_IO => "inspect disk/permissions on the index path, then rebuild",
+        CALYX_INDEX_LEGACY_FORMAT => {
+            "re-export the vector file with the current authenticated v2 writer \
+             (assay stream-fbin / fbin-export); legacy bytes are never reinterpreted"
+        }
+        CALYX_INDEX_PAYLOAD_DIGEST => {
+            "the payload bytes do not match the sealed header digest; regenerate the vector \
+             file from its source and never trust the corrupt copy"
+        }
+        CALYX_INDEX_NONFINITE => {
+            "reject the producing lens output; exact vector sources must be finite F32"
+        }
+        CALYX_INDEX_NONCANONICAL_I8 => {
+            "re-encode the int8 vector file with the canonical per-row-scale v2 writer"
+        }
         CALYX_INDEX_MANIFEST_DB_MISSING => {
             "rebuild or migrate the partitioned vault so the manifest is a Calyx/Aster Graph CF row"
         }

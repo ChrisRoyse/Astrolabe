@@ -42,6 +42,8 @@ pub(crate) struct StreamWorkerReport {
     pub(crate) manifest: String,
     pub(crate) corpus_rows_written: usize,
     pub(crate) query_rows_written: usize,
+    pub(crate) corpus_payload_blake3: String,
+    pub(crate) queries_payload_blake3: String,
     pub(crate) worker_pid: Option<u32>,
     pub(crate) worker_report_path: Option<String>,
     pub(crate) worker_stderr_path: Option<String>,
@@ -82,6 +84,8 @@ impl StreamWorkerReport {
             vault_path: display_final(args, &format!("vaults/{prefix}")),
             corpus_rows_written: self.corpus_rows_written,
             query_rows_written: self.query_rows_written,
+            corpus_payload_blake3: self.corpus_payload_blake3,
+            queries_payload_blake3: self.queries_payload_blake3,
             worker_pid: self.worker_pid,
             worker_report_path: self.worker_report_path,
             worker_stderr_path: self.worker_stderr_path,
@@ -274,7 +278,9 @@ fn stream_selected(
         &args.out_dir.join("timeline.jsonl"),
     )?;
     let elapsed_ms = elapsed_ms(started.elapsed())?;
-    finish_sink(&mut sink)?;
+    let corpus_rows_written = sink.corpus_written;
+    let query_rows_written = sink.query_written;
+    let digests = finish_sink(sink)?;
     let report = StreamWorkerReport {
         slot: u16::try_from(slot).map_err(|_| {
             local_error(
@@ -296,8 +302,10 @@ fn stream_selected(
         elapsed_ms,
         ms_per_input: elapsed_ms as f64 / stats.rows.max(1) as f64,
         manifest: display(lens.manifest()),
-        corpus_rows_written: sink.corpus_written,
-        query_rows_written: sink.query_written,
+        corpus_rows_written,
+        query_rows_written,
+        corpus_payload_blake3: digests.corpus_payload_blake3,
+        queries_payload_blake3: digests.queries_payload_blake3,
         worker_pid: Some(std::process::id()),
         worker_report_path: report_path.map(display),
         worker_stderr_path: None,
