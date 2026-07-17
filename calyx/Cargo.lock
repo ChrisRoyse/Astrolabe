@@ -838,6 +838,7 @@ dependencies = [
  "calyx-loom",
  "calyx-mcp",
  "calyx-oracle",
+ "calyx-registry",
  "calyx-ward",
  "nvml-wrapper",
  "prometheus",

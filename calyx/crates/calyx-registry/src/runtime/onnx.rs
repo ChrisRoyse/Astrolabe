@@ -37,7 +37,7 @@ pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbe
 pub use runtime_bundle::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
     OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
-    expected_runtime_contract,
+    expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
 };
 pub use special::{FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens};
 

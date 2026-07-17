@@ -57,6 +57,17 @@ async fn main() -> ExitCode {
     if args.iter().any(|arg| arg == "--build-info") {
         return print_build_info(&args);
     }
+    #[cfg(all(feature = "cuda", windows))]
+    if let Err(error) = calyx_registry::initialize_pinned_cuda_runtime_boundary() {
+        let envelope = serde_json::to_string(&error)
+            .unwrap_or_else(|serialize_error| {
+                format!(
+                    "{{\"code\":\"CALYX_DAEMON_RUNTIME_ERROR\",\"message\":\"failed to serialize CUDA runtime error: {serialize_error}\",\"remediation\":\"inspect the original process logs and pinned runtime bundle\"}}"
+                )
+            });
+        eprintln!("{envelope}");
+        return ExitCode::from(2);
+    }
     let config = match parse_args(args) {
         Ok(config) => config,
         Err(error) => {

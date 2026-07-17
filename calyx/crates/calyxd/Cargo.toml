@@ -23,6 +23,7 @@ calyx-lodestar = { path = "../calyx-lodestar" }
 calyx-loom = { path = "../calyx-loom" }
 calyx-mcp = { path = "../calyx-mcp" }
 calyx-oracle = { path = "../calyx-oracle" }
+calyx-registry = { path = "../calyx-registry", optional = true }
 calyx-ward = { path = "../calyx-ward" }
 nvml-wrapper = { workspace = true }
 calyx-ledger = { path = "../calyx-ledger" }
@@ -43,4 +44,4 @@ uuid.workspace = true
 default = []
 # Enables the real CUDA preflight probe (calyx-forge CUDA path). Build with
 # --features cuda on a GPU host; without it, server mode fails loud at startup.
-cuda = ["calyx-forge/cuda"]
+cuda = ["calyx-forge/cuda", "dep:calyx-registry", "calyx-registry/cuda"]

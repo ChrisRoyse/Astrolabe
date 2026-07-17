@@ -132,7 +132,7 @@ pub use runtime::onnx::{
 pub use runtime::onnx::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
     OnnxRuntimeAttestation, OnnxRuntimeContractAttestation, current_runtime_attestation,
-    expected_runtime_contract,
+    expected_runtime_contract, initialize_pinned_cuda_runtime_boundary,
 };
 #[cfg(feature = "ml-runtime")]
 pub use runtime::qwen3::{

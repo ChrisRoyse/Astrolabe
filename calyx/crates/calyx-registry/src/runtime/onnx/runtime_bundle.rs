@@ -163,6 +163,24 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
     Ok(state.live.as_ref().map(|live| live.receipt.clone()))
 }
 
+/// Establishes the process-wide, hash-attested CUDA DLL search boundary.
+///
+/// This initializes only the pinned ORT core and exact DLL directory. CUDA
+/// provider and device initialization remain deferred until a CUDA policy is
+/// selected, so an explicitly commissioned CPU runtime can still start on a
+/// machine without a usable GPU. CUDA-enabled process entry points call this
+/// before any `cudarc`, Candle, FastEmbed, or ORT API can resolve a DLL.
+pub fn initialize_pinned_cuda_runtime_boundary() -> Result<OnnxRuntimeAttestation> {
+    ensure_runtime(OnnxProviderPolicy::CpuExplicit)?;
+    current_runtime_attestation()?.ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
+            "pinned CUDA runtime boundary initialized without a live attestation",
+            "terminate the process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })
+}
+
 pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
     let state = RUNTIME_STATE.get_or_init(|| Mutex::new(RuntimeState::default()));
     let mut state = state.lock().map_err(|_| {
