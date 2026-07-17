@@ -1,21 +1,23 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use calyx_core::{
     Asymmetry, CalyxError, LensCost, LensId, Modality, Panel, Placement, QuantPolicy, Slot, SlotId,
     SlotKey, SlotResource, SlotShape, SlotState, content_address,
 };
-use calyx_registry::{LensHealth, LensSpec, lens_spec_from_manifest_path};
+use calyx_registry::{LensHealth, LensRuntime, LensSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::catalog::{
-    canonical_catalog_identity_matches, catalog_cost_matches, resolved_runtime_placement,
+    LocalExecutionAttestationReport, bound_spec_from_catalog_entry, catalog_cost_matches,
+    reparse_manifest_binding, resolved_runtime_placement,
 };
 use crate::lens_commands::support::runtime_name;
 
 pub(super) const MIN_CONTENT_LENSES: usize = 10;
 pub(super) const CATALOG_VERSION: u16 = 1;
-pub(super) const OBJECT_VERSION: u16 = 1;
+pub(super) const OBJECT_VERSION: u16 = 2;
 pub(super) const CARD_VERSION: u16 = 1;
 pub(super) const A37_ADMISSION_VERSION: u16 = 1;
 pub(super) const TEMPLATE_INVALID: &str = "CALYX_PANEL_TEMPLATE_INVALID";
@@ -46,6 +48,7 @@ pub(super) struct PanelTemplateVersionRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SavedPanelTemplate {
     pub schema_version: u16,
     pub name: String,
@@ -59,6 +62,7 @@ pub(super) struct SavedPanelTemplate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TemplateLensRef {
     pub slot_key: String,
     pub lens_name: String,
@@ -72,6 +76,8 @@ pub(super) struct TemplateLensRef {
     pub placement: Placement,
     pub cost: LensCost,
     pub manifest: String,
+    pub manifest_sha256: String,
+    pub execution_attestation: Option<LocalExecutionAttestationReport>,
     pub counts_toward_a35: bool,
 }
 
@@ -189,7 +195,11 @@ impl SavedPanelTemplate {
             ));
         }
         validate_lenses(self)?;
-        validate_time_controls(self)
+        validate_time_controls(self)?;
+        for lens in &self.lenses {
+            bound_lens_spec(lens)?;
+        }
+        Ok(())
     }
 
     pub(super) fn a37_admission(&self) -> TemplateA37Admission {
@@ -300,7 +310,7 @@ pub(super) fn default_time_controls() -> Vec<TemplateTimeControl> {
 }
 
 pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResult<TemplateLensRef> {
-    let spec = lens_spec_from_manifest_path(&entry.manifest)?;
+    let spec = bound_spec_from_catalog_entry(entry)?;
     let catalog_lens_id: LensId = entry
         .lens_id
         .parse()
@@ -319,16 +329,6 @@ pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResul
             "repair the lens catalog with `calyx lens add --manifest <manifest> --home <dir>` before saving templates",
         ));
     }
-    if !canonical_catalog_identity_matches(entry, &spec, &entry.manifest)? {
-        return Err(template_error(
-            TEMPLATE_INVALID,
-            format!(
-                "lens catalog entry {} does not match the canonical manifest identity, placement, or resource contract",
-                entry.name
-            ),
-            "preserve the catalog bytes, resolve the identity conflict explicitly, and rebuild the template from a canonical catalog row",
-        ));
-    }
     Ok(TemplateLensRef {
         slot_key: slug(&entry.name),
         lens_name: entry.name.clone(),
@@ -341,8 +341,30 @@ pub(super) fn lens_ref_from_catalog(entry: &super::LensCatalogEntry) -> CliResul
         placement: entry.placement,
         cost: entry.cost,
         manifest: entry.manifest.display().to_string(),
+        manifest_sha256: entry.manifest_sha256.clone(),
+        execution_attestation: entry.execution_attestation.clone(),
         counts_toward_a35: true,
     })
+}
+
+pub(super) fn bound_lens_spec(lens: &TemplateLensRef) -> CliResult<LensSpec> {
+    let manifest_path = Path::new(&lens.manifest);
+    let (spec, manifest_sha256) = reparse_manifest_binding(manifest_path)?;
+    if manifest_sha256 != lens.manifest_sha256 {
+        return Err(template_error(
+            "CALYX_PANEL_TEMPLATE_MANIFEST_DIGEST_MISMATCH",
+            format!(
+                "template lens {} binds manifest SHA-256 {}, but {} currently hashes to {}",
+                lens.lens_name,
+                lens.manifest_sha256,
+                manifest_path.display(),
+                manifest_sha256
+            ),
+            "preserve the template and manifest bytes, restore the admitted manifest, and save a new schema-v2 template only after re-attestation",
+        ));
+    }
+    validate_lens_ref_against_spec(lens, &spec)?;
+    Ok(spec)
 }
 
 pub(super) fn template_error(
@@ -389,7 +411,139 @@ pub(super) fn validate_lens_ref_against_spec(lens: &TemplateLensRef, spec: &Lens
             "preserve the template bytes and rebuild a new template version from the canonical catalog",
         ));
     }
+    validate_execution_attestation_against_spec(
+        lens.execution_attestation.as_ref(),
+        spec,
+        lens.placement,
+    )?;
     Ok(())
+}
+
+pub(super) fn validate_execution_attestation_against_spec(
+    report: Option<&LocalExecutionAttestationReport>,
+    spec: &LensSpec,
+    placement: Placement,
+) -> CliResult {
+    let expected_runtime = mandatory_execution_runtime(&spec.runtime);
+    let Some(expected_runtime) = expected_runtime else {
+        if report.is_none() {
+            return Ok(());
+        }
+        return Err(template_error(
+            TEMPLATE_INVALID,
+            format!(
+                "template lens {} carries execution evidence for runtime {:?}, which has no persisted execution-attestation contract",
+                spec.name, spec.runtime
+            ),
+            "rebuild the template from the authoritative catalog row",
+        ));
+    };
+    let report = report.ok_or_else(|| {
+        template_error(
+            "CALYX_PANEL_TEMPLATE_EXECUTION_ATTESTATION_MISSING",
+            format!(
+                "template lens {} runtime {:?} has no persisted first-real-inference execution attestation",
+                spec.name, spec.runtime
+            ),
+            "re-attest the exact manifest through calyx lens add and save a new schema-v2 template",
+        )
+    })?;
+    let expected_corpus_hash =
+        crate::lens_commands::support::hex_from_bytes(&spec.declared_contract().corpus_hash());
+    if report.executable_lens_id != spec.lens_id().to_string()
+        || report.executable_corpus_hash != expected_corpus_hash
+        || report.runtime != expected_runtime
+        || report.evidence_kind.trim().is_empty()
+        || report.provider.trim().is_empty()
+        || report.observed_execution_device.trim().is_empty()
+    {
+        return Err(template_error(
+            TEMPLATE_INVALID,
+            format!(
+                "template lens {} contains incomplete or conflicting execution evidence",
+                spec.name
+            ),
+            "rebuild the template from the authoritative attested catalog row",
+        ));
+    }
+    let provider = report.provider.to_ascii_uppercase();
+    match placement {
+        Placement::Gpu => {
+            if provider.contains("CPU")
+                || !provider.contains("CUDA")
+                || report
+                    .observed_execution_device
+                    .parse::<calyx_forge::PinnedCudaDeviceIdentity>()
+                    .is_err()
+            {
+                return Err(template_error(
+                    TEMPLATE_INVALID,
+                    format!(
+                        "GPU template lens {} persists non-CUDA execution provider={} device={}",
+                        spec.name, report.provider, report.observed_execution_device
+                    ),
+                    "re-attest the manifest on its exact physical CUDA device and save a new template",
+                ));
+            }
+        }
+        Placement::Cpu => {
+            if provider.contains("CUDA")
+                || !provider.contains("CPU")
+                || report.observed_execution_device != "cpu"
+            {
+                return Err(template_error(
+                    TEMPLATE_INVALID,
+                    format!(
+                        "CPU template lens {} persists conflicting provider={} device={}",
+                        spec.name, report.provider, report.observed_execution_device
+                    ),
+                    "re-attest only under the shared genuine-no-CUDA CPU authorization and save a new template",
+                ));
+            }
+        }
+    }
+    if matches!(
+        &spec.runtime,
+        LensRuntime::Onnx { .. }
+            | LensRuntime::OnnxColbert { .. }
+            | LensRuntime::FastembedDensePlaced { .. }
+            | LensRuntime::FastembedSparsePlaced { .. }
+            | LensRuntime::FastembedBgem3Placed { .. }
+            | LensRuntime::FastembedRerankerPlaced { .. }
+    ) {
+        let total = report.total_compute_nodes.unwrap_or_default();
+        let cpu = report.cpu_compute_nodes.unwrap_or(u64::MAX);
+        let expected_cpu = if placement == Placement::Cpu {
+            total
+        } else {
+            0
+        };
+        if total == 0 || cpu != expected_cpu {
+            return Err(template_error(
+                TEMPLATE_INVALID,
+                format!(
+                    "template lens {} placement={placement:?} persists cpu_nodes={cpu}/{total}",
+                    spec.name
+                ),
+                "re-attest committed node placement and save a new template",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mandatory_execution_runtime(runtime: &LensRuntime) -> Option<&'static str> {
+    match runtime {
+        LensRuntime::CandleLocal { .. } => Some("candle-local"),
+        LensRuntime::FastembedQwen3 { .. } => Some("fastembed-qwen3"),
+        LensRuntime::Onnx { .. } => Some("onnx-custom"),
+        LensRuntime::OnnxColbert { .. } => Some("onnx-colbert"),
+        LensRuntime::FastembedDensePlaced { .. }
+        | LensRuntime::FastembedSparsePlaced { .. }
+        | LensRuntime::FastembedBgem3Placed { .. }
+        | LensRuntime::FastembedRerankerPlaced { .. } => Some("onnx-fastembed-5.16.0-owned"),
+        _ => None,
+    }
 }
 
 fn validate_lenses(template: &SavedPanelTemplate) -> CliResult {
@@ -415,6 +569,7 @@ fn validate_lenses(template: &SavedPanelTemplate) -> CliResult {
             ));
         }
         validate_weight_hash(&lens.weights_sha256)?;
+        validate_manifest_hash(&lens.manifest_sha256)?;
         if !lens.counts_toward_a35 {
             return Err(template_error(
                 TEMPLATE_INVALID,
@@ -424,6 +579,21 @@ fn validate_lenses(template: &SavedPanelTemplate) -> CliResult {
         }
     }
     Ok(())
+}
+
+fn validate_manifest_hash(value: &str) -> CliResult {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(template_error(
+        "CALYX_PANEL_TEMPLATE_SCHEMA_MIGRATION_REQUIRED",
+        format!("manifest_sha256 must be 64 lowercase hex chars, got {value}"),
+        "preserve the old object and save a new schema-v2 template from the authoritative attested catalog",
+    ))
 }
 
 fn validate_time_controls(template: &SavedPanelTemplate) -> CliResult {

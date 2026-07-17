@@ -123,7 +123,7 @@ impl Bgem3Embedding {
             .with_intra_threads(threads)
             .map_err(Self::builder_error)?;
         let builder = session_policy.apply_to(builder)?;
-        let builder =
+        let mut builder =
             crate::init::apply_external_initializers(builder, model.external_initializers)?;
         let session = builder.commit_from_memory(&model.onnx_file)?;
 

@@ -1,10 +1,8 @@
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_registry::{
-    Registry, lens_spec_from_manifest_path, load_vault_panel_state, persist_vault_panel_state,
-    swap_panel_to_target,
+    Registry, load_vault_panel_state, persist_vault_panel_state, swap_panel_to_target,
 };
 use serde::Serialize;
 
@@ -12,9 +10,9 @@ pub(super) use super::template_cards::ensemble_card_from_capability_cards;
 pub(super) use super::template_model::{
     CATALOG_VERSION, MIN_CONTENT_LENSES, OBJECT_VERSION, PanelTemplateCatalog,
     PanelTemplateIndexEntry, PanelTemplateVersionRef, SavedPanelTemplate, TEMPLATE_INVALID,
-    TEMPLATE_NOT_FOUND, TemplateDraft, TemplateEnsembleCard, TemplateLensRef,
+    TEMPLATE_NOT_FOUND, TemplateDraft, TemplateEnsembleCard, TemplateLensRef, bound_lens_spec,
     default_time_controls, id_for_loaded, lens_ref_from_catalog, object_bytes, template_error,
-    validate_lens_ref_against_spec,
+    validate_execution_attestation_against_spec, validate_lens_ref_against_spec,
 };
 use crate::error::{CliError, CliResult};
 use crate::lens_commands::support::{prepare_manifest_runtime, register_prepared_manifest_runtime};
@@ -84,6 +82,12 @@ impl TemplateStore {
     }
 
     pub(super) fn save(&self, draft: TemplateDraft, saved_at_ms: u64) -> CliResult<TemplateSave> {
+        let index_path = self.index_path();
+        let _mutation_lock = crate::durable_write::DurableMutationLock::acquire(
+            &self.root.join("index.mutation.lock"),
+            "panel-template-save",
+            &index_path,
+        )?;
         let mut catalog = self.read_catalog()?;
         let version = next_version(&catalog, &draft.name);
         let template = SavedPanelTemplate {
@@ -113,7 +117,7 @@ impl TemplateStore {
         Ok(TemplateSave {
             template_id,
             object_path,
-            index_path: self.index_path(),
+            index_path,
             template,
         })
     }
@@ -321,7 +325,25 @@ impl TemplateStore {
                 "do not edit immutable template objects; re-save the template",
             ));
         }
-        let template: SavedPanelTemplate = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| CliError::runtime(format!("parse template object: {error}")))?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if schema_version != u64::from(OBJECT_VERSION) {
+            return Err(template_error(
+                "CALYX_PANEL_TEMPLATE_SCHEMA_MIGRATION_REQUIRED",
+                format!(
+                    "template object {} uses schema {}; runtime loading requires schema {} with immutable manifest digests and execution evidence",
+                    path.display(),
+                    schema_version,
+                    OBJECT_VERSION
+                ),
+                "preserve the old object and save a new schema-v2 template from the authoritative attested lens catalog",
+            ));
+        }
+        let template: SavedPanelTemplate = serde_json::from_value(value)
             .map_err(|error| CliError::runtime(format!("parse template object: {error}")))?;
         template.validate()?;
         Ok(template)
@@ -391,8 +413,7 @@ pub(super) fn register_template_lenses_with_progress(
                 ));
             }
         }
-        let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
-        validate_lens_ref_against_spec(lens, &spec)?;
+        let spec = bound_lens_spec(lens)?;
         if registry.contains(lens.lens_id) {
             if registry.lens_spec(lens.lens_id) != Some(&spec) {
                 return Err(template_error(
@@ -490,34 +511,9 @@ fn object_rel_path(template_id: &str) -> String {
 }
 
 fn write_immutable(path: &Path, bytes: &[u8]) -> CliResult {
-    match fs::read(path) {
-        Ok(existing) if existing == bytes => return Ok(()),
-        Ok(_) => {
-            return Err(template_error(
-                TEMPLATE_INVALID,
-                format!(
-                    "immutable template object {} already exists with different bytes",
-                    path.display()
-                ),
-                "do not edit immutable template objects; save a new template version",
-            ));
-        }
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
-    }
-    write_atomic(path, bytes)
+    crate::durable_write::write_bytes_immutable(path, bytes, "panel template object")
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> CliResult {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    crate::durable_write::write_bytes_atomic(path, bytes, "panel template catalog")
 }

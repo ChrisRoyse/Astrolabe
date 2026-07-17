@@ -21,6 +21,18 @@ pub(super) fn ensure_runtime(policy: OnnxProviderPolicy) -> Result<PathBuf> {
     calyx_onnx_runtime::ensure_runtime(runtime_policy(policy), requested_ordinal(policy)?)
 }
 
+pub(super) fn authorize_execution_policy(policy: OnnxProviderPolicy) -> Result<()> {
+    if policy == OnnxProviderPolicy::CpuExplicit {
+        let authorization = calyx_onnx_runtime::authorize_cpu_companion()?;
+        tracing::debug!(
+            decision_code = authorization.decision_code(),
+            requested_runtime_ordinal = authorization.requested_runtime_ordinal(),
+            "obtained shared dual-zero authorization for explicit CPU FastEmbed construction"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn selected_cuda_device(
     policy: OnnxProviderPolicy,
 ) -> Result<Option<OnnxCudaDeviceAttestation>> {

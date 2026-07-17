@@ -24,13 +24,13 @@ use calyx_core::{CalyxError, Input, LensCost, LensId, Modality, Panel, Placement
 use calyx_registry::{
     LensHealth, PanelSlotListing, Registry, RegistryBatchLimitChange, RegistryBatchLimitUpdate,
     RegistrySnapshotMeasureStats, VaultRegistrySnapshot, apply_registry_snapshot_batch_limits,
-    lens_spec_from_manifest_path, list_panel, load_vault_panel_state,
-    measure_registry_snapshot_lens_batch_with_stats, set_vault_registry_batch_limits,
+    list_panel, load_vault_panel_state, measure_registry_snapshot_lens_batch_with_stats,
+    set_vault_registry_batch_limits,
 };
 use serde::Serialize;
 
 use crate::error::{CliError, CliResult};
-use crate::lens_commands::catalog::{catalog_path, read_catalog};
+use crate::lens_commands::catalog::{bound_spec_from_catalog_entry, catalog_path, read_catalog};
 use crate::output::print_json;
 
 use manifest_restore::manifest_restore;
@@ -276,6 +276,7 @@ fn status_from_entry(
     entry: LensCatalogEntry,
     remaining_budget_after: Option<ResourceUsage>,
 ) -> PanelLensStatus {
+    let health = health_from_catalog_entry(&entry);
     PanelLensStatus {
         lens_id: entry.lens_id,
         name: entry.name,
@@ -285,18 +286,18 @@ fn status_from_entry(
         vram_mb: mib(entry.cost.vram_bytes),
         batch_ceiling: entry.cost.batch_ceiling,
         cost: entry.cost,
-        health: health_from_manifest(&entry.manifest),
+        health,
         manifest: entry.manifest,
         remaining_budget_after,
     }
 }
 
-fn health_from_manifest(path: &Path) -> LensHealth {
-    match lens_spec_from_manifest_path(path) {
+fn health_from_catalog_entry(entry: &LensCatalogEntry) -> LensHealth {
+    match bound_spec_from_catalog_entry(entry) {
         Ok(spec) => spec.health(),
         Err(error) => LensHealth::Failing {
-            code: error.code.to_string(),
-            reason: error.message,
+            code: error.code().to_string(),
+            reason: error.message().to_string(),
         },
     }
 }

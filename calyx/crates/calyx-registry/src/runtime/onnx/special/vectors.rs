@@ -45,6 +45,8 @@ pub(super) fn contract(
 pub(super) fn ensure_spec_match(
     shape: SlotShape,
     weights: [u8; 32],
+    corpus_hash: [u8; 32],
+    norm: NormPolicy,
     spec: &LensSpec,
 ) -> Result<()> {
     if shape != spec.output {
@@ -58,6 +60,25 @@ pub(super) fn ensure_spec_match(
             "fastembed special artifact hash {} does not match LensSpec {}",
             hex_sha256(&weights),
             hex_sha256(&spec.weights_sha256)
+        )));
+    }
+    if spec.corpus_hash != corpus_hash {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed special corpus identity {} does not match LensSpec {}",
+            hex_sha256(&corpus_hash),
+            hex_sha256(&spec.corpus_hash)
+        )));
+    }
+    if spec.modality != calyx_core::Modality::Text {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed special modality {:?} is not Text",
+            spec.modality
+        )));
+    }
+    if spec.norm_policy != norm {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "fastembed special norm {:?} does not match observed {norm:?}",
+            spec.norm_policy
         )));
     }
     Ok(())

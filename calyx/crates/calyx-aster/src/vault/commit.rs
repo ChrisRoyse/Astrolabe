@@ -103,6 +103,44 @@ where
         self.commit_rows_locked_owned(rows.to_vec())
     }
 
+    pub(crate) fn commit_rows_if_current_volatile(
+        &self,
+        expected_seq: Seq,
+        mut rows: Vec<encode::WriteRow>,
+    ) -> Result<Seq> {
+        if self.durable.is_some() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "volatile conditional commit called for a durable vault",
+            ));
+        }
+        if rows.is_empty() {
+            return self.rows.commit_batch_if_current(
+                expected_seq,
+                std::iter::empty::<(crate::cf::ColumnFamily, Vec<u8>, Vec<u8>)>(),
+            );
+        }
+        self.ensure_writeable("conditional commit")?;
+        let predicted = expected_seq.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard("conditional commit sequence overflow")
+        })?;
+        let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
+        rows.push(encode::WriteRow { cf, key, value });
+        self.rows.ensure_memtable_admission(
+            rows.iter()
+                .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice())),
+        )?;
+        let committed = self.rows.commit_batch_if_current(
+            expected_seq,
+            rows.into_iter().map(|row| (row.cf, row.key, row.value)),
+        )?;
+        if committed != predicted {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "conditional commit predicted seq {predicted}, committed seq {committed}"
+            )));
+        }
+        Ok(committed)
+    }
+
     /// Ownership-taking group commit. Identical committed bytes to
     /// [`Self::commit_rows_locked`] — the batch plus its single appended
     /// time-index row, in the same order — but appends the time-index row into

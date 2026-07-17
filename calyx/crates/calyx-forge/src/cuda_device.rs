@@ -8,8 +8,7 @@ use crate::ForgeError;
 const CUDA_TOKEN_PREFIX: &str = "cuda:pci=";
 const CUDA_UUID_SEPARATOR: &str = ";uuid=";
 pub const CUDA_DEVICE_ENV: &str = "CALYX_CUDA_DEVICE";
-const LEGACY_CUDA_DEVICE_ENVS: [&str; 2] =
-    ["CALYX_ONNX_CUDA_DEVICE", "CALYX_CANDLE_CUDA_DEVICE"];
+const LEGACY_CUDA_DEVICE_ENVS: [&str; 2] = ["CALYX_ONNX_CUDA_DEVICE", "CALYX_CANDLE_CUDA_DEVICE"];
 
 /// Stable physical CUDA-device identity used by frozen neural-lens contracts.
 ///

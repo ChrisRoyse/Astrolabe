@@ -448,6 +448,7 @@ pub(super) struct VerifiedFile {
 }
 
 mod artifacts;
+pub(super) use artifacts::metadata_fastembed_weights_sha256;
 use artifacts::{is_tei_runtime, read_and_verify_files, spec_weights_sha256};
 
 fn norm_policy(raw: &str) -> Result<NormPolicy> {

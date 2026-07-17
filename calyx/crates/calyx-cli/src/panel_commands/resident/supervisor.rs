@@ -1,4 +1,4 @@
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,28 +18,35 @@ use super::discovery::{
     write_resident_discovery,
 };
 use super::dispatch::{RequestClass, validate_public_request};
+use super::job::{
+    ResidentProcessIdentity, recover_recorded_generation, recover_recorded_preassignment_job,
+};
 use super::lifecycle::{
-    LIFECYCLE_SCHEMA_V2, LifecycleErrorRecord, LifecyclePhase, LifecycleProjection,
-    LifecycleRequestRecord, LifecycleState, LifecycleStore, RequestOutcome, RequestStage,
+    LIFECYCLE_SCHEMA_V2, LIFECYCLE_SCHEMA_V4, LifecycleErrorRecord, LifecyclePhase,
+    LifecycleProjection, LifecycleRequestRecord, LifecycleState, LifecycleStore, RequestOutcome,
+    RequestStage,
 };
 use super::source::{FrozenResidentSource, freeze_source};
 use super::stream::{decode_binary_request, write_stream_frame};
-use super::worker::{WorkerProcess, write_worker_auth_line};
+use super::worker::{WORKER_STOP_FAILED, WorkerProcess, write_worker_auth_line};
 use super::*;
 
 const IDLE_TTL_MS: u64 = 60_000;
 const IDLE_TTL: Duration = Duration::from_millis(IDLE_TTL_MS);
 const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(500);
 const QUEUED_CLIENT_POLL: Duration = Duration::from_millis(20);
+const QUEUED_TRAILING_DRAIN_LIMIT: usize = 64 * 1024;
 const PUBLIC_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOST: &str = "CALYX_PANEL_RESIDENT_WORKER_LOST";
 const WORKER_PROTOCOL_INVALID: &str = "CALYX_PANEL_RESIDENT_WORKER_PROTOCOL_INVALID";
 const WORKER_REPORTED_ERROR: &str = "CALYX_PANEL_RESIDENT_WORKER_REPORTED_ERROR";
 const CLIENT_ABORTED_GENERATION: &str = "CALYX_PANEL_RESIDENT_CLIENT_ABORTED_GENERATION";
+const TERMINAL_DELIVERY_FAILED: &str = "CALYX_PANEL_RESIDENT_TERMINAL_DELIVERY_FAILED";
 const BACK_PRESSURE: &str = "CALYX_PANEL_RESIDENT_BACK_PRESSURE";
 const STOPPING: &str = "CALYX_PANEL_RESIDENT_STOPPING";
 const QUEUED_CLIENT_GONE: &str = "CALYX_PANEL_RESIDENT_QUEUED_CLIENT_GONE";
 const REQUEST_DEADLINE: &str = "CALYX_PANEL_RESIDENT_REQUEST_DEADLINE";
+const RESTART_OWNERSHIP_UNPROVEN: &str = "CALYX_PANEL_RESIDENT_RESTART_OWNERSHIP_UNPROVEN";
 
 struct Supervisor {
     original_args: Vec<String>,
@@ -260,6 +267,23 @@ impl ProductiveLease {
             .release_unproductive(self.endpoint.generation, &self.request_id, error)
     }
 
+    fn abandon_terminal_delivery(mut self, error: &CliError) -> CliResult {
+        if self.stage != RequestStage::TerminalReceived {
+            return Err(CliError::runtime(format!(
+                "resident request {} cannot release a terminal delivery failure from stage {:?}",
+                self.request_id, self.stage
+            )));
+        }
+        self.completed = true;
+        self.supervisor.release_productive(
+            self.endpoint.generation,
+            &self.request_id,
+            "terminal_delivery_failed",
+            RequestOutcome::Abandoned,
+            Some(error),
+        )
+    }
+
     fn fail_inner(
         &self,
         error: &CliError,
@@ -441,7 +465,59 @@ impl Supervisor {
             .last()
             .filter(|projection| projection.schema == LIFECYCLE_SCHEMA_V2)
             .map_or(0, |projection| projection.in_flight);
-        let previous = store.last().map(LifecycleProjection::state);
+        let previous_projection = store.last().cloned();
+        if let Some(previous) = previous_projection.as_ref()
+            && previous.schema == LIFECYCLE_SCHEMA_V4
+            && (previous.worker_pid.is_some() || previous.phase == LifecyclePhase::Loading)
+        {
+            return Err(restart_ownership_error(
+                previous,
+                "v4 has no durable Job/process creation identity and did not end at a provably worker-free boundary",
+            ));
+        }
+        let recovered_generation = if let Some(previous) = previous_projection.as_ref()
+            && previous.worker_pid.is_some()
+        {
+            let job_name = previous.worker_job_name.as_deref().ok_or_else(|| {
+                restart_ownership_error(previous, "the recorded worker has no Windows Job identity")
+            })?;
+            if previous.worker_process_identities.is_empty() {
+                return Err(restart_ownership_error(
+                    previous,
+                    "the recorded worker has no process creation identities",
+                ));
+            }
+            recover_recorded_generation(
+                job_name,
+                &previous.worker_descendant_pids,
+                &previous.worker_process_identities,
+            )?;
+            eprintln!(
+                "resident restart recovered generation {} Job {} exact_process_identities={:?}",
+                previous.generation, job_name, previous.worker_process_identities
+            );
+            true
+        } else if let Some(previous) = previous_projection.as_ref()
+            && previous.schema == LIFECYCLE_SCHEMA
+            && previous.phase == LifecyclePhase::Loading
+        {
+            if let Some(job_name) = previous.worker_job_name.as_deref() {
+                recover_recorded_preassignment_job(job_name)?;
+                eprintln!(
+                    "resident restart recovered pre-assignment generation {} Job {} without PID-only ownership",
+                    previous.generation, job_name
+                );
+            } else {
+                eprintln!(
+                    "resident restart recovered generation {} before any Job or worker was created",
+                    previous.generation
+                );
+            }
+            true
+        } else {
+            false
+        };
+        let previous = previous_projection.as_ref().map(LifecycleProjection::state);
         let recovered_requests = store.take_recovered_requests();
         let mut state = LifecycleState::unloaded(
             std::process::id(),
@@ -465,6 +541,9 @@ impl Supervisor {
                 state.lens_attestations = previous.lens_attestations;
                 state.onnx_runtime_attestation = previous.onnx_runtime_attestation;
             }
+        }
+        if recovered_generation {
+            store.append("restart_generation_recovered", &state)?;
         }
         if legacy_in_flight != 0 {
             store.append("legacy_requests_recovered_abandoned", &state)?;
@@ -619,9 +698,14 @@ impl Supervisor {
         client: &TcpStream,
     ) -> CliResult<WorkerEndpoint> {
         loop {
-            ensure_queued_client(client, deadline, request_id)?;
+            if !ensure_queued_client(client, deadline, request_id)? {
+                std::thread::sleep(QUEUED_CLIENT_POLL);
+                continue;
+            }
             self.ensure_loaded_queued(deadline, client, request_id)?;
-            ensure_queued_client(client, deadline, request_id)?;
+            if !ensure_queued_client(client, deadline, request_id)? {
+                continue;
+            }
             let mut inner = self.lock()?;
             if !self.accepting.load(Ordering::SeqCst) {
                 return Err(stopping_error());
@@ -771,8 +855,7 @@ impl Supervisor {
                         && inner.worker_transition.is_none() =>
                 {
                     inner.state.phase = LifecyclePhase::Unloaded;
-                    inner.state.worker_pid = None;
-                    inner.state.worker_descendant_pids.clear();
+                    clear_worker_identity(&mut inner.state);
                     let persisted = self.persist(&mut inner, "fault_reaped");
                     self.changed.notify_all();
                     persisted?;
@@ -794,7 +877,10 @@ impl Supervisor {
         request_id: &str,
     ) -> CliResult {
         loop {
-            ensure_queued_client(client, deadline, request_id)?;
+            if !ensure_queued_client(client, deadline, request_id)? {
+                std::thread::sleep(QUEUED_CLIENT_POLL);
+                continue;
+            }
             if !self.accepting.load(Ordering::SeqCst) {
                 return Err(stopping_error());
             }
@@ -886,8 +972,7 @@ impl Supervisor {
                         && inner.worker_transition.is_none() =>
                 {
                     inner.state.phase = LifecyclePhase::Unloaded;
-                    inner.state.worker_pid = None;
-                    inner.state.worker_descendant_pids.clear();
+                    clear_worker_identity(&mut inner.state);
                     let persisted = self.persist(&mut inner, "fault_reaped");
                     self.changed.notify_all();
                     persisted?;
@@ -912,6 +997,102 @@ impl Supervisor {
         }
     }
 
+    fn record_loading_worker_identity(
+        &self,
+        generation: u64,
+        worker_pid: u32,
+        job_name: &str,
+        process_identities: &[ResidentProcessIdentity],
+    ) -> CliResult {
+        if process_identities.len() != 1 || process_identities[0].process_id != worker_pid {
+            return Err(worker_error(
+                format!(
+                    "resident generation {generation} assignment identity is not the sole worker PID {worker_pid}: {process_identities:?}"
+                ),
+                "keep the worker gate unpublished, terminate the entire generation Job, and preserve the assignment logs",
+            ));
+        }
+        let mut inner = self.lock()?;
+        if inner.worker_transition != Some(WorkerTransition::Loading(generation))
+            || inner.state.phase != LifecyclePhase::Loading
+            || inner.state.generation != generation
+            || inner.state.worker_pid.is_some()
+            || inner.state.worker_job_name.as_deref() != Some(job_name)
+            || !inner.state.worker_descendant_pids.is_empty()
+            || !inner.state.worker_process_identities.is_empty()
+        {
+            return Err(worker_error(
+                format!(
+                    "resident generation {generation} cannot publish assignment ownership from phase {:?}, transition {:?}, generation {}, worker_pid={:?}",
+                    inner.state.phase,
+                    inner.worker_transition,
+                    inner.state.generation,
+                    inner.state.worker_pid
+                ),
+                "keep the worker gate unpublished and inspect the lifecycle journal for the competing transition",
+            ));
+        }
+        inner.state.worker_pid = Some(worker_pid);
+        inner.state.worker_descendant_pids = process_identities
+            .iter()
+            .map(|identity| identity.process_id)
+            .collect();
+        inner.state.worker_process_identities = process_identities.to_vec();
+        let persist_result = self.persist(&mut inner, "load_worker_assigned");
+        let cancelled = !self.accepting.load(Ordering::SeqCst)
+            || inner.cancelled_load_generation == Some(generation);
+        self.changed.notify_all();
+        persist_result?;
+        if cancelled {
+            return Err(worker_error(
+                format!(
+                    "resident generation {generation} was cancelled after its assignment identity was persisted and before its worker gate was published"
+                ),
+                "allow the gated generation cleanup to prove an empty Job before retrying",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_loading_job_created(&self, generation: u64, job_name: &str) -> CliResult {
+        let mut inner = self.lock()?;
+        if inner.worker_transition != Some(WorkerTransition::Loading(generation))
+            || inner.state.phase != LifecyclePhase::Loading
+            || inner.state.generation != generation
+            || inner.state.worker_pid.is_some()
+            || inner.state.worker_job_name.is_some()
+            || !inner.state.worker_descendant_pids.is_empty()
+            || !inner.state.worker_process_identities.is_empty()
+        {
+            return Err(worker_error(
+                format!(
+                    "resident generation {generation} cannot publish Job creation from phase {:?}, transition {:?}, generation {}, worker_pid={:?}, worker_job_name={:?}",
+                    inner.state.phase,
+                    inner.worker_transition,
+                    inner.state.generation,
+                    inner.state.worker_pid,
+                    inner.state.worker_job_name
+                ),
+                "keep the empty generation Job closed and inspect the lifecycle journal for the competing transition",
+            ));
+        }
+        inner.state.worker_job_name = Some(job_name.to_string());
+        let persist_result = self.persist(&mut inner, "load_job_created");
+        let cancelled = !self.accepting.load(Ordering::SeqCst)
+            || inner.cancelled_load_generation == Some(generation);
+        self.changed.notify_all();
+        persist_result?;
+        if cancelled {
+            return Err(worker_error(
+                format!(
+                    "resident generation {generation} was cancelled after its empty Job identity was persisted and before atomic worker creation"
+                ),
+                "allow the generation Job handle to close and persist the resulting load failure before retrying",
+            ));
+        }
+        Ok(())
+    }
+
     fn load_generation(self: &Arc<Self>, generation: u64, cancellable: bool) -> CliResult {
         let worker = match WorkerProcess::spawn(
             &self.original_args,
@@ -920,15 +1101,29 @@ impl Supervisor {
             generation,
             self.max_load_secs,
             self.max_request_secs,
+            |job_name| self.record_loading_job_created(generation, job_name),
+            |worker_pid, job_name, process_identities| {
+                self.record_loading_worker_identity(
+                    generation,
+                    worker_pid,
+                    job_name,
+                    process_identities,
+                )
+            },
             || cancellable && self.load_was_cancelled(generation),
         ) {
             Ok(worker) => worker,
             Err(error) => return self.finish_load_failure(generation, error, None),
         };
-        let members = match worker.member_process_ids() {
-            Ok(members) => members,
+        let process_identities = match worker.member_process_identities() {
+            Ok(identities) => identities,
             Err(error) => return self.finish_load_failure(generation, error, Some(worker)),
         };
+        let members = process_identities
+            .iter()
+            .map(|identity| identity.process_id)
+            .collect();
+        let job_name = worker.job_name().to_string();
         let worker_pid = worker.process_id();
         let worker_ready = worker.ready.clone();
         let now = unix_now_ms();
@@ -939,6 +1134,10 @@ impl Supervisor {
         if inner.worker_transition != Some(WorkerTransition::Loading(generation))
             || inner.state.phase != LifecyclePhase::Loading
             || inner.state.generation != generation
+            || inner.state.worker_pid != Some(worker_pid)
+            || inner.state.worker_descendant_pids != members
+            || inner.state.worker_job_name.as_deref() != Some(job_name.as_str())
+            || inner.state.worker_process_identities != process_identities
             || !self.accepting.load(Ordering::SeqCst)
             || inner.cancelled_load_generation == Some(generation)
         {
@@ -972,6 +1171,8 @@ impl Supervisor {
         };
         inner.state.worker_pid = Some(worker_pid);
         inner.state.worker_descendant_pids = members;
+        inner.state.worker_job_name = Some(job_name);
+        inner.state.worker_process_identities = process_identities;
         inner.state.load_success_count = load_success_count;
         inner.state.last_worker_start_unix_ms = Some(now);
         let warmed_deadline = IdleDeadline {
@@ -1004,6 +1205,7 @@ impl Supervisor {
         error: CliError,
         worker: Option<WorkerProcess>,
     ) -> CliResult {
+        let spawn_cleanup_unproven = worker.is_none() && error.code() == WORKER_STOP_FAILED;
         let cleanup_error = worker.and_then(|worker| worker.terminate(87).err());
         let mut inner = match self.lock() {
             Ok(inner) => inner,
@@ -1030,9 +1232,8 @@ impl Supervisor {
         inner.cancelled_load_generation = None;
         inner.failed_load_generation = Some(generation);
         inner.worker = None;
-        if cleanup_error.is_none() {
-            inner.state.worker_pid = None;
-            inner.state.worker_descendant_pids.clear();
+        if cleanup_error.is_none() && !spawn_cleanup_unproven {
+            clear_worker_identity(&mut inner.state);
         }
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
@@ -1058,10 +1259,10 @@ impl Supervisor {
             }
         };
         let persist_error = self.persist(&mut inner, "load_failed").err();
-        if cleanup_error.is_some() {
+        if cleanup_error.is_some() || spawn_cleanup_unproven {
             self.accepting.store(false, Ordering::SeqCst);
         }
-        if persist_error.is_none() && cleanup_error.is_none() {
+        if persist_error.is_none() && cleanup_error.is_none() && !spawn_cleanup_unproven {
             let accepting = self.accepting.load(Ordering::SeqCst);
             inner.state.phase = if accepting {
                 LifecyclePhase::Unloaded
@@ -1109,8 +1310,7 @@ impl Supervisor {
                 inner.failed_load_generation = Some(generation);
                 inner.worker = None;
                 if cleanup_error.is_none() {
-                    inner.state.worker_pid = None;
-                    inner.state.worker_descendant_pids.clear();
+                    clear_worker_identity(&mut inner.state);
                 }
                 inner.state.idle_deadline_unix_ms = None;
                 inner.idle_deadline = None;
@@ -1216,6 +1416,17 @@ impl Supervisor {
         outcome: RequestOutcome,
         error: Option<&CliError>,
     ) -> CliResult {
+        self.release_productive(generation, request_id, "request_released", outcome, error)
+    }
+
+    fn release_productive(
+        &self,
+        generation: u64,
+        request_id: &str,
+        event: &'static str,
+        outcome: RequestOutcome,
+        error: Option<&CliError>,
+    ) -> CliResult {
         let mut inner = self.lock()?;
         if inner.state.generation != generation {
             return Err(CliError::runtime(format!(
@@ -1263,8 +1474,7 @@ impl Supervisor {
                     } else {
                         LifecyclePhase::Stopping
                     };
-                    inner.state.worker_pid = None;
-                    inner.state.worker_descendant_pids.clear();
+                    clear_worker_identity(&mut inner.state);
                     inner.state.idle_deadline_unix_ms = None;
                     inner.idle_deadline = None;
                     inner.suspended_idle_deadline = None;
@@ -1275,7 +1485,7 @@ impl Supervisor {
         }
         let persisted = self.persist_request(
             &mut inner,
-            "request_released",
+            event,
             LifecycleRequestRecord {
                 request_id: request_id.to_string(),
                 generation: Some(generation),
@@ -1347,8 +1557,7 @@ impl Supervisor {
                 } else {
                     LifecyclePhase::Stopping
                 };
-                inner.state.worker_pid = None;
-                inner.state.worker_descendant_pids.clear();
+                clear_worker_identity(&mut inner.state);
                 inner.state.idle_deadline_unix_ms = None;
                 inner.idle_deadline = None;
                 inner.suspended_idle_deadline = None;
@@ -1405,8 +1614,7 @@ impl Supervisor {
                     };
                 }
                 if inner.state.phase != LifecyclePhase::Faulted {
-                    inner.state.worker_pid = None;
-                    inner.state.worker_descendant_pids.clear();
+                    clear_worker_identity(&mut inner.state);
                 }
             } else {
                 inner.state.phase = LifecyclePhase::Faulted;
@@ -1484,8 +1692,7 @@ impl Supervisor {
             inner.worker_transition = None;
         }
         if owned_worker && cleanup_error.is_none() {
-            inner.state.worker_pid = None;
-            inner.state.worker_descendant_pids.clear();
+            clear_worker_identity(&mut inner.state);
         }
         if !owned_worker {
             self.accepting.store(false, Ordering::SeqCst);
@@ -1615,8 +1822,7 @@ impl Supervisor {
             inner.worker_transition = None;
         }
         if owned_worker && cleanup_error.is_none() {
-            inner.state.worker_pid = None;
-            inner.state.worker_descendant_pids.clear();
+            clear_worker_identity(&mut inner.state);
         }
         inner.state.idle_deadline_unix_ms = None;
         inner.idle_deadline = None;
@@ -1798,8 +2004,7 @@ impl Supervisor {
                 inner.worker_transition = None;
             }
             if owned_worker && cleanup_error.is_none() {
-                inner.state.worker_pid = None;
-                inner.state.worker_descendant_pids.clear();
+                clear_worker_identity(&mut inner.state);
             }
             let counter_error = if owned_worker && cleanup_error.is_none() {
                 match inner.state.unload_count.checked_add(1) {
@@ -2194,6 +2399,10 @@ fn reject_back_pressure(mut stream: TcpStream) -> CliResult {
 }
 
 fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResult {
+    // A public connection carries exactly one authoritative request: the
+    // first complete JSON line or binary frame. The handler never loops back
+    // to decode later bytes, so pipelined/trailing data is ignored uniformly
+    // whether it was already buffered or arrived while work was queued.
     let ingress_deadline = deadline_after(PUBLIC_SOCKET_TIMEOUT)?;
     let mut ingress = stream.try_clone()?;
     let mut reader = BufReader::new(DeadlineStream::new(&mut ingress, ingress_deadline));
@@ -2215,11 +2424,7 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
         }
     };
     if first_line == RESIDENT_BINARY_MAGIC {
-        return handle_binary(&mut reader, &mut stream, supervisor, ingress_deadline);
-    }
-    if !reader.buffer().is_empty() {
-        let error = post_frame_bytes_error("JSON line", reader.buffer().len());
-        return write_json_response(&mut stream, &cli_error_value(&error));
+        return handle_binary(reader, &mut stream, supervisor, ingress_deadline);
     }
     let request = match std::str::from_utf8(&first_line) {
         Ok(line) => match serde_json::from_str::<ResidentRequest>(line) {
@@ -2246,6 +2451,9 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
             );
         }
     };
+    // Bytes prefetched after the authoritative first JSON line are outside
+    // this request. Release them before queued liveness probes read the socket.
+    drop(reader);
     let class = match validate_public_request(&request) {
         Ok(class) => class,
         Err(error) => return write_json_response(&mut stream, &error),
@@ -2384,12 +2592,12 @@ fn handle_client(mut stream: TcpStream, supervisor: Arc<Supervisor>) -> CliResul
                     lease.complete_success()
                 }
                 Err(write_error) => {
-                    let cancellation = client_aborted_error(
+                    let cancellation = terminal_delivery_error(
                         endpoint.generation,
                         &write_error,
                         "JSON response flush",
                     );
-                    let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
+                    let cleanup = lease.abandon_terminal_delivery(&cancellation);
                     cleanup?;
                     Err(write_error)
                 }
@@ -2423,7 +2631,11 @@ fn loaded_worker_failure(inner: &mut SupervisorInner) -> Option<(u64, CliError)>
     }
 }
 
-fn ensure_queued_client(client: &TcpStream, deadline: Instant, request_id: &str) -> CliResult {
+fn ensure_queued_client(
+    client: &TcpStream,
+    deadline: Instant,
+    request_id: &str,
+) -> CliResult<bool> {
     if ensure_before(
         deadline,
         "resident queue, load, request, and public flush budget",
@@ -2438,8 +2650,30 @@ fn ensure_queued_client(client: &TcpStream, deadline: Instant, request_id: &str)
             format!("enable queued-client liveness probe: {error}"),
         )
     })?;
-    let mut byte = [0_u8; 1];
-    let observed = client.peek(&mut byte);
+    enum Probe {
+        Live,
+        MoreTrailing,
+        Closed,
+    }
+    let mut socket = client;
+    let mut drained = 0_usize;
+    let mut buffer = [0_u8; 4096];
+    let observed = loop {
+        let remaining = QUEUED_TRAILING_DRAIN_LIMIT.saturating_sub(drained);
+        if remaining == 0 {
+            break Ok(Probe::MoreTrailing);
+        }
+        let read_len = remaining.min(buffer.len());
+        match socket.read(&mut buffer[..read_len]) {
+            Ok(0) => break Ok(Probe::Closed),
+            Ok(read) => drained += read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                break Ok(Probe::Live);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
     let restore = client.set_nonblocking(false);
     if let Err(error) = restore {
         return Err(queued_client_error(
@@ -2448,15 +2682,17 @@ fn ensure_queued_client(client: &TcpStream, deadline: Instant, request_id: &str)
         ));
     }
     match observed {
-        Ok(0) => Err(queued_client_error(
+        Ok(Probe::Closed) => Err(queued_client_error(
             request_id,
-            "client closed its socket while waiting for admission",
+            format!(
+                "client closed its socket while waiting for admission after {drained} non-authoritative trailing bytes"
+            ),
         )),
-        Ok(count) => Err(queued_client_error(
-            request_id,
-            format!("client sent {count} unexpected byte(s) after its complete request frame"),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Ok(Probe::Live) => Ok(true),
+        // Do not admit while a later byte stream could still mask FIN. The next
+        // bounded poll resumes draining; the absolute request deadline bounds a
+        // peer that keeps sending ignored data forever.
+        Ok(Probe::MoreTrailing) => Ok(false),
         Err(error) => Err(queued_client_error(
             request_id,
             format!("probe queued-client socket: {error}"),
@@ -2483,23 +2719,18 @@ fn request_deadline_error(request_id: &str) -> CliError {
 }
 
 fn handle_binary(
-    reader: &mut BufReader<DeadlineStream<'_>>,
+    mut reader: BufReader<DeadlineStream<'_>>,
     stream: &mut TcpStream,
     supervisor: Arc<Supervisor>,
     ingress_deadline: Instant,
 ) -> CliResult {
-    let payload = match read_frame(reader) {
+    let payload = match read_frame(&mut reader) {
         Ok(payload) => payload,
         Err(error) => {
             write_binary_error(stream, &CliError::from(error))?;
             return Ok(());
         }
     };
-    if !reader.buffer().is_empty() {
-        let error = post_frame_bytes_error("binary frame", reader.buffer().len());
-        write_binary_error(stream, &error)?;
-        return Ok(());
-    }
     let decoded_request = match decode_binary_request(&payload) {
         Ok(request) => request,
         Err(error) => {
@@ -2507,6 +2738,9 @@ fn handle_binary(
             return Ok(());
         }
     };
+    // The first complete binary frame is authoritative. Drop any read-ahead so
+    // queued liveness observes FIN instead of a permanently buffered suffix.
+    drop(reader);
     if decoded_request.supervisor_request_id.is_some()
         || decoded_request.supervisor_generation.is_some()
     {
@@ -2625,27 +2859,24 @@ fn handle_binary(
                 return Err(failure.supervisor_error);
             }
             Err(BinaryProxyError::Client(error)) => {
-                // The supervisor cannot prove that the private worker stopped
-                // computing merely because the public client stopped consuming a
-                // stream. Reap the generation before releasing its lease.
-                let cancellation =
-                    client_aborted_error(endpoint.generation, &error, "binary stream");
-                let cleanup = lease.fail(&cancellation, RequestOutcome::Abandoned);
+                let terminal_received = lease.stage == RequestStage::TerminalReceived;
+                let cancellation = if terminal_received {
+                    terminal_delivery_error(endpoint.generation, &error, "binary stream")
+                } else {
+                    client_aborted_error(endpoint.generation, &error, "binary stream")
+                };
+                let cleanup = if terminal_received {
+                    lease.abandon_terminal_delivery(&cancellation)
+                } else {
+                    // Before the terminal End evidence, a public disconnect
+                    // cannot prove the worker stopped computing.
+                    lease.fail(&cancellation, RequestOutcome::Abandoned)
+                };
                 cleanup?;
                 return Err(error);
             }
         }
     }
-}
-
-fn post_frame_bytes_error(frame: &str, count: usize) -> CliError {
-    CliError::from(CalyxError {
-        code: "CALYX_PANEL_RESIDENT_BAD_REQUEST",
-        message: format!(
-            "resident public {frame} was followed by {count} unexpected buffered byte(s)"
-        ),
-        remediation: "send exactly one complete request per connection and do not pipeline trailing bytes",
-    })
 }
 
 fn proxy_json(
@@ -3455,6 +3686,33 @@ fn worker_error(message: impl Into<String>, remediation: &'static str) -> CliErr
     })
 }
 
+fn clear_worker_identity(state: &mut LifecycleState) {
+    state.worker_pid = None;
+    state.worker_descendant_pids.clear();
+    state.worker_job_name = None;
+    state.worker_process_identities.clear();
+}
+
+fn restart_ownership_error(
+    previous: &LifecycleProjection,
+    detail: impl std::fmt::Display,
+) -> CliError {
+    CliError::from(CalyxError {
+        code: RESTART_OWNERSHIP_UNPROVEN,
+        message: format!(
+            "resident restart cannot prove physical ownership of lifecycle sequence {} schema={} generation={} worker_pid={:?} descendants={:?} job_name={:?} process_identities={:?}: {detail}",
+            previous.sequence,
+            previous.schema,
+            previous.generation,
+            previous.worker_pid,
+            previous.worker_descendant_pids,
+            previous.worker_job_name,
+            previous.worker_process_identities
+        ),
+        remediation: "preserve the lifecycle journal and generation logs; independently prove that no process from the recorded generation remains before repairing the incompatible lifecycle record",
+    })
+}
+
 fn worker_protocol_error(bind: SocketAddr, detail: impl std::fmt::Display) -> CliError {
     CliError::from(CalyxError {
         code: WORKER_PROTOCOL_INVALID,
@@ -3502,6 +3760,17 @@ fn client_aborted_error(generation: u64, error: &CliError, operation: &str) -> C
             error.message()
         ),
         remediation: "retry the complete atomic request; the supervisor reaped the interrupted generation before releasing its lease",
+    })
+}
+
+fn terminal_delivery_error(generation: u64, error: &CliError, operation: &str) -> CliError {
+    CliError::from(CalyxError {
+        code: TERMINAL_DELIVERY_FAILED,
+        message: format!(
+            "public client transport failed after synchronized terminal evidence from resident generation {generation} during {operation}: {}",
+            error.message()
+        ),
+        remediation: "retry only the public request if its response is still needed; the healthy synchronized generation was retained and a fresh 60-second idle deadline was armed after productive completion",
     })
 }
 

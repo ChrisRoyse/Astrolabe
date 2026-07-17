@@ -31,6 +31,14 @@ use vectors::{
     multi_batch, rerank_pair, single_vector, sparse_batch, sparse_shape_dim, special_files,
 };
 
+fn legacy_unbound_error(family: &str) -> CalyxError {
+    CalyxError {
+        code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+        message: format!("persisted {family} FastEmbed runtime predates execution-policy identity"),
+        remediation: "recommission this lens from its manifest to a placement-bound FastEmbed runtime; never infer CPU or CUDA from legacy persisted bytes",
+    }
+}
+
 pub struct FastembedSparseLens {
     id: LensId,
     contract: FrozenLensContract,
@@ -103,19 +111,31 @@ impl FastembedSparseLens {
             &files,
             &info.model_file,
             &info.additional_files,
+            provider_policy.frozen_execution_token(),
             provider_policy,
         )?;
         let shape = SlotShape::Sparse(sparse_dim(&model_name));
+        let corpus_hash = fastembed_sparse_corpus_hash(
+            &info.model_code,
+            provider_policy.frozen_execution_token(),
+        );
         if let Some(spec) = expected_spec {
-            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+            ensure_spec_match(
+                shape,
+                artifacts.receipt().weights_sha256,
+                corpus_hash,
+                NormPolicy::Finite,
+                spec,
+            )?;
         }
+        super::runtime_bundle::authorize_execution_policy(provider_policy)?;
         super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
             artifacts.receipt().weights_sha256,
             shape,
             NormPolicy::Finite,
-            fastembed_sparse_corpus_hash(&info.model_code),
+            corpus_hash,
         )?;
         let context = super::fastembed_attestation::FastembedModelContext::new(
             label.clone(),
@@ -170,11 +190,20 @@ impl FastembedSparseLens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::FastembedSparse { model_id, files } = &spec.runtime else {
-            return Err(super::config_invalid(
-                "LensSpec runtime is not fastembed-sparse",
-            ));
+        let (model_id, files, execution) = match &spec.runtime {
+            LensRuntime::FastembedSparsePlaced {
+                model_id,
+                files,
+                execution,
+            } => (model_id, files, execution),
+            LensRuntime::FastembedSparse { .. } => return Err(legacy_unbound_error("sparse")),
+            _ => {
+                return Err(super::config_invalid(
+                    "LensSpec runtime is not placement-bound fastembed-sparse",
+                ));
+            }
         };
+        let provider_policy = OnnxProviderPolicy::from_frozen_execution_token(execution)?;
         let model_name = sparse_model_from_name(model_id)?;
         let info = SparseTextEmbedding::get_model_info(&model_name);
         let files = super::fastembed_artifacts::persisted_model_files(
@@ -187,7 +216,7 @@ impl FastembedSparseLens {
             spec.name.clone(),
             model_name,
             files,
-            OnnxProviderPolicy::CudaFailLoud,
+            provider_policy,
             Some(spec),
         )
     }
@@ -272,19 +301,32 @@ impl FastembedBgem3Lens {
             &files,
             &info.model_file,
             &info.additional_files,
+            provider_policy.frozen_execution_token(),
             provider_policy,
         )?;
         let shape = bgem3_shape(output);
+        let corpus_hash = fastembed_bgem3_corpus_hash(
+            &info.model_code,
+            bgem3_corpus_token(output),
+            provider_policy.frozen_execution_token(),
+        );
         if let Some(spec) = expected_spec {
-            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+            ensure_spec_match(
+                shape,
+                artifacts.receipt().weights_sha256,
+                corpus_hash,
+                bgem3_norm(output),
+                spec,
+            )?;
         }
+        super::runtime_bundle::authorize_execution_policy(provider_policy)?;
         super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
             artifacts.receipt().weights_sha256,
             shape,
             bgem3_norm(output),
-            fastembed_bgem3_corpus_hash(&info.model_code, bgem3_corpus_token(output)),
+            corpus_hash,
         )?;
         let context = super::fastembed_attestation::FastembedModelContext::new(
             label.clone(),
@@ -340,16 +382,21 @@ impl FastembedBgem3Lens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::FastembedBgem3 {
-            model_id,
-            files,
-            output,
-        } = &spec.runtime
-        else {
-            return Err(super::config_invalid(
-                "LensSpec runtime is not fastembed-bgem3",
-            ));
+        let (model_id, files, output, execution) = match &spec.runtime {
+            LensRuntime::FastembedBgem3Placed {
+                model_id,
+                files,
+                output,
+                execution,
+            } => (model_id, files, output, execution),
+            LensRuntime::FastembedBgem3 { .. } => return Err(legacy_unbound_error("BGE-M3")),
+            _ => {
+                return Err(super::config_invalid(
+                    "LensSpec runtime is not placement-bound fastembed-bgem3",
+                ));
+            }
         };
+        let provider_policy = OnnxProviderPolicy::from_frozen_execution_token(execution)?;
         let model_name = bgem3_model_from_name(model_id)?;
         let info = Bgem3Embedding::get_model_info(&model_name);
         let files = super::fastembed_artifacts::persisted_model_files(
@@ -363,7 +410,7 @@ impl FastembedBgem3Lens {
             model_name,
             *output,
             files,
-            OnnxProviderPolicy::CudaFailLoud,
+            provider_policy,
             Some(spec),
         )
     }
@@ -447,19 +494,31 @@ impl FastembedRerankerLens {
             &files,
             &info.model_file,
             &info.additional_files,
+            provider_policy.frozen_execution_token(),
             provider_policy,
         )?;
         let shape = SlotShape::Dense(1);
+        let corpus_hash = fastembed_reranker_corpus_hash(
+            &info.model_code,
+            provider_policy.frozen_execution_token(),
+        );
         if let Some(spec) = expected_spec {
-            ensure_spec_match(shape, artifacts.receipt().weights_sha256, spec)?;
+            ensure_spec_match(
+                shape,
+                artifacts.receipt().weights_sha256,
+                corpus_hash,
+                NormPolicy::Finite,
+                spec,
+            )?;
         }
+        super::runtime_bundle::authorize_execution_policy(provider_policy)?;
         super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
         let contract = contract(
             name,
             artifacts.receipt().weights_sha256,
             shape,
             NormPolicy::Finite,
-            fastembed_reranker_corpus_hash(&info.model_code),
+            corpus_hash,
         )?;
         let context = super::fastembed_attestation::FastembedModelContext::new(
             label.clone(),
@@ -513,11 +572,22 @@ impl FastembedRerankerLens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::FastembedReranker { model_id, files } = &spec.runtime else {
-            return Err(super::config_invalid(
-                "LensSpec runtime is not fastembed-reranker",
-            ));
+        let (model_id, files, execution) = match &spec.runtime {
+            LensRuntime::FastembedRerankerPlaced {
+                model_id,
+                files,
+                execution,
+            } => (model_id, files, execution),
+            LensRuntime::FastembedReranker { .. } => {
+                return Err(legacy_unbound_error("reranker"));
+            }
+            _ => {
+                return Err(super::config_invalid(
+                    "LensSpec runtime is not placement-bound fastembed-reranker",
+                ));
+            }
         };
+        let provider_policy = OnnxProviderPolicy::from_frozen_execution_token(execution)?;
         let model_name = reranker_model_from_name(model_id)?;
         let info = TextRerank::get_model_info(&model_name);
         let files = super::fastembed_artifacts::persisted_model_files(
@@ -530,7 +600,7 @@ impl FastembedRerankerLens {
             spec.name.clone(),
             model_name,
             files,
-            OnnxProviderPolicy::CudaFailLoud,
+            provider_policy,
             Some(spec),
         )
     }
@@ -593,6 +663,7 @@ impl Lens for FastembedSparseLens {
         let texts = input_texts(self, inputs)?;
         let mut model = lock_model(&self.model, "sparse")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
+        self.execution.ensure_usable()?;
         let embeddings = model
             .embed(texts, None)
             .map_err(|error| self.execution.fail_terminal("inference", error))?;
@@ -640,6 +711,7 @@ impl Lens for FastembedBgem3Lens {
         let texts = input_texts(self, inputs)?;
         let mut model = lock_model(&self.model, "BGE-M3")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
+        self.execution.ensure_usable()?;
         let output = model
             .embed(texts, None)
             .map_err(|error| self.execution.fail_terminal("inference", error))?;
@@ -701,6 +773,7 @@ impl Lens for FastembedRerankerLens {
         let mut out = Vec::with_capacity(inputs.len());
         let mut model = lock_model(&self.model, "reranker")
             .map_err(|error| self.execution.fail_terminal("model_lock", error))?;
+        self.execution.ensure_usable()?;
         for (query, doc) in pairs {
             let results = model
                 .rerank(query, [doc], false, Some(1))

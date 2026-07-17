@@ -189,7 +189,7 @@ impl WardError {
         match self {
             Self::Onnx { remediation, .. } => remediation,
             Self::CpuCompanionUnauthorized { .. } => {
-                "use CUDA when a device is available; request a CPU companion only through authorize_cpu_companion after CALYX_CUDA_NO_DEVICE"
+                "use CUDA when a device is available; request a CPU companion only through authorize_cpu_companion after the dual CUDA Runtime and Driver proof CALYX_CUDA_NO_DEVICE_ATTESTED"
             }
             _ => {
                 "repair the Ward lens model, runtime, or input identified by this error before retrying"

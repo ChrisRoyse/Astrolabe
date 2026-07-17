@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use calyx_core::CalyxError;
 use serde::Serialize;
 
-use super::catalog::{LensCatalog, LensCatalogEntry, catalog_path, read_catalog, write_catalog};
+use super::catalog::{
+    LensCatalog, LensCatalogEntry, catalog_fingerprint, catalog_path, read_catalog,
+    write_catalog_reduction,
+};
 use super::flags::value;
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
@@ -58,6 +61,7 @@ pub(crate) fn remove(args: &[String]) -> CliResult {
 fn remove_from_catalog(home: Option<&Path>, selector: RemoveSelector) -> CliResult<RemoveReport> {
     let catalog = catalog_path(home)?;
     let mut state = read_catalog(&catalog)?;
+    let expected_catalog_sha256 = catalog_fingerprint(&state)?;
     let before_count = state.lenses.len();
     let before_vram_bytes = placed_vram_bytes(&state);
     let before_ram_bytes = cpu_ram_bytes(&state);
@@ -66,7 +70,7 @@ fn remove_from_catalog(home: Option<&Path>, selector: RemoveSelector) -> CliResu
     let after_vram_bytes = placed_vram_bytes(&state);
     let after_ram_bytes = cpu_ram_bytes(&state);
 
-    write_catalog(&catalog, &state)?;
+    write_catalog_reduction(&catalog, &state, &expected_catalog_sha256)?;
     Ok(RemoveReport {
         catalog,
         selector: selector.report(),

@@ -19,25 +19,38 @@ pub struct QjlResidual {
 
 pub(crate) struct GaussianProjection {
     dim: usize,
+    level: QuantLevel,
     values: Vec<f32>,
 }
 
 impl GaussianProjection {
-    pub(crate) fn new(seed: &RotationSeed) -> Result<Self> {
+    pub(crate) fn new(seed: &RotationSeed, level: QuantLevel) -> Result<Self> {
         seed.validate()?;
         let count = seed
             .dim
             .checked_mul(seed.dim)
-            .ok_or_else(|| qjl_error("setup", "Gaussian matrix size overflow"))?;
+            .ok_or_else(|| qjl_error(level, "setup", "Gaussian matrix size overflow"))?;
         let mut normal = DeterministicNormal::new(domain_seed(QJL_DOMAIN, &seed.id, seed.dim));
-        let mut values = Vec::with_capacity(count);
+        let mut values = Vec::new();
+        values.try_reserve_exact(count).map_err(|error| {
+            qjl_error(
+                level,
+                "setup",
+                format!("cannot allocate {count} Gaussian coefficients: {error}"),
+            )
+        })?;
         for _ in 0..count {
             values.push(normal.next_f32());
         }
         Ok(Self {
             dim: seed.dim,
+            level,
             values,
         })
+    }
+
+    pub(crate) fn values(&self) -> &[f32] {
+        &self.values
     }
 
     pub(crate) fn project(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -50,15 +63,27 @@ impl GaussianProjection {
         }
         if let Some(index) = input.iter().position(|value| !value.is_finite()) {
             return Err(qjl_error(
+                self.level,
                 "project",
                 format!("non-finite input coefficient at index {index}"),
             ));
         }
-        let mut output = Vec::with_capacity(self.dim);
+        let mut output = Vec::new();
+        output.try_reserve_exact(self.dim).map_err(|error| {
+            qjl_error(
+                self.level,
+                "project",
+                format!(
+                    "cannot allocate {} projected coefficients: {error}",
+                    self.dim
+                ),
+            )
+        })?;
         for (row_index, row) in self.values.chunks_exact(self.dim).enumerate() {
             let value = simd_dot(row, input);
             if !value.is_finite() {
                 return Err(qjl_error(
+                    self.level,
                     "project",
                     format!("Gaussian projection overflowed at row {row_index}"),
                 ));
@@ -82,6 +107,7 @@ impl GaussianProjection {
         }
         if !source_norm.is_finite() || source_norm <= 0.0 {
             return Err(qjl_error(
+                self.level,
                 "encode",
                 "nonzero QJL residuals require a finite positive source norm",
             ));
@@ -94,6 +120,7 @@ impl GaussianProjection {
         let gamma_f64 = f64::from(source_norm) * residual_norm;
         if !gamma_f64.is_finite() || gamma_f64 > f64::from(f32::MAX) {
             return Err(qjl_error(
+                self.level,
                 "encode",
                 "scaled residual norm cannot be represented as finite f32",
             ));
@@ -110,6 +137,7 @@ impl GaussianProjection {
             let value = simd_dot(row, residual);
             if !value.is_finite() {
                 return Err(qjl_error(
+                    self.level,
                     "encode",
                     format!("Gaussian residual projection overflowed at row {index}"),
                 ));
@@ -118,10 +146,7 @@ impl GaussianProjection {
                 bits[index / 8] |= 1 << (index % 8);
             }
         }
-        Ok(QjlResidual {
-            bits,
-            gamma,
-        })
+        Ok(QjlResidual { bits, gamma })
     }
 
     pub(crate) fn correction_parts(
@@ -129,7 +154,7 @@ impl GaussianProjection {
         projected_query: &[f32],
         bits: &[u8],
         gamma: f32,
-    ) -> Result<f32> {
+    ) -> Result<f64> {
         self.validate_parts(bits, gamma, "score")?;
         if projected_query.len() != self.dim {
             return Err(ForgeError::ShapeMismatch {
@@ -140,7 +165,14 @@ impl GaussianProjection {
         }
         let signed_dot = sign_dot(projected_query, bits);
         let correction = QJL_FACTOR * f64::from(gamma) * signed_dot / self.dim as f64;
-        finite_f32(correction, "score", "QJL correction")
+        if !correction.is_finite() {
+            return Err(qjl_error(
+                self.level,
+                "score",
+                "QJL correction is non-finite",
+            ));
+        }
+        Ok(correction)
     }
 
     pub(crate) fn inverse_parts(&self, bits: &[u8], gamma: f32) -> Result<Vec<f32>> {
@@ -158,13 +190,21 @@ impl GaussianProjection {
             }
         }
         sums.into_iter()
-            .map(|sum| finite_f32(factor * sum, "decode", "QJL inverse coefficient"))
+            .map(|sum| {
+                finite_f32(
+                    factor * sum,
+                    self.level,
+                    "decode",
+                    "QJL inverse coefficient",
+                )
+            })
             .collect()
     }
 
     fn validate_parts(&self, bits: &[u8], gamma: f32, op: &str) -> Result<()> {
         if bits.len() != bitstream_len(self.dim) {
             return Err(qjl_error(
+                self.level,
                 op,
                 format!(
                     "QJL bitstream length mismatch: expected {} got {}",
@@ -173,11 +213,19 @@ impl GaussianProjection {
                 ),
             ));
         }
-        if !gamma.is_finite() || gamma < 0.0 {
-            return Err(qjl_error(op, "gamma must be finite and non-negative"));
+        if !gamma.is_finite() || gamma.is_sign_negative() {
+            return Err(qjl_error(
+                self.level,
+                op,
+                "gamma must be finite, non-negative, and canonical +0.0 when zero",
+            ));
         }
         if has_nonzero_padding(bits, self.dim) {
-            return Err(qjl_error(op, "QJL sign bitstream has non-zero padding"));
+            return Err(qjl_error(
+                self.level,
+                op,
+                "QJL sign bitstream has non-zero padding",
+            ));
         }
         Ok(())
     }
@@ -210,9 +258,8 @@ fn sign_dot(values: &[f32], bits: &[u8]) -> f64 {
             let mut value_lanes = [0.0_f32; 8];
             value_lanes.copy_from_slice(&values[base..base + 8]);
             sum += f64::from(
-                (f32x8::from(value_lanes)
-                    * f32x8::from(BIPOLAR_BYTE_LANES[usize::from(*byte)]))
-                .reduce_add(),
+                (f32x8::from(value_lanes) * f32x8::from(BIPOLAR_BYTE_LANES[usize::from(*byte)]))
+                    .reduce_add(),
             );
             base += 8;
             continue;
@@ -264,9 +311,10 @@ fn simd_dot(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-fn finite_f32(value: f64, op: &str, subject: &str) -> Result<f32> {
+fn finite_f32(value: f64, level: QuantLevel, op: &str, subject: &str) -> Result<f32> {
     if !value.is_finite() || value.abs() > f64::from(f32::MAX) {
         return Err(qjl_error(
+            level,
             op,
             format!("{subject} cannot be represented as finite f32"),
         ));
@@ -274,10 +322,10 @@ fn finite_f32(value: f64, op: &str, subject: &str) -> Result<f32> {
     Ok(value as f32)
 }
 
-fn qjl_error(op: &str, detail: impl Into<String>) -> ForgeError {
+fn qjl_error(level: QuantLevel, op: &str, detail: impl Into<String>) -> ForgeError {
     ForgeError::QuantError {
         op: format!("qjl_{op}"),
-        level: QuantLevel::Bits3p5.to_string(),
+        level: level.to_string(),
         detail: detail.into(),
         remediation:
             "Use the exact current TurboQuant payload, seed geometry, and finite query vector"

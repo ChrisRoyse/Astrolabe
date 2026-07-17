@@ -82,6 +82,11 @@ pub fn slot_key(cx_id: CxId) -> Vec<u8> {
     base_key(cx_id)
 }
 
+/// `compression` CF key: the big-endian slot id.
+pub fn compression_manifest_key(slot_id: SlotId) -> Vec<u8> {
+    slot_id.get().to_be_bytes().to_vec()
+}
+
 /// `xterm` CF key: `(CxId, SlotId_a, SlotId_b, XTermKind)`.
 pub fn xterm_key(cx_id: CxId, a: SlotId, b: SlotId, kind: XTermKind) -> Vec<u8> {
     let mut key = Vec::with_capacity(CX_ID_BYTES + 5);

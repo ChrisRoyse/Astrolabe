@@ -186,10 +186,15 @@ fn is_in_process_onnx_runtime(runtime: &LensRuntime) -> bool {
     matches!(
         runtime,
         LensRuntime::Onnx { .. }
+            | LensRuntime::FastembedDense { .. }
+            | LensRuntime::FastembedDensePlaced { .. }
             | LensRuntime::OnnxColbert { .. }
             | LensRuntime::FastembedSparse { .. }
             | LensRuntime::FastembedBgem3 { .. }
             | LensRuntime::FastembedReranker { .. }
+            | LensRuntime::FastembedSparsePlaced { .. }
+            | LensRuntime::FastembedBgem3Placed { .. }
+            | LensRuntime::FastembedRerankerPlaced { .. }
     )
 }
 
@@ -394,11 +399,21 @@ fn measure_runtime(spec: &LensSpec, probe: &Input, repeat: usize) -> CliResult<M
         LensRuntime::StaticLookup { .. } => measure_static_lookup(spec, probe, repeat),
         LensRuntime::TeiHttp { endpoint } => measure_tei(spec, endpoint, probe, repeat),
         LensRuntime::CandleLocal { .. } => measure_candle(spec, probe, repeat),
-        LensRuntime::Onnx { .. } => measure_onnx(spec, probe, repeat),
+        LensRuntime::Onnx { .. } | LensRuntime::FastembedDensePlaced { .. } => {
+            measure_onnx(spec, probe, repeat)
+        }
         LensRuntime::OnnxColbert { .. } => measure_onnx_colbert(spec, probe, repeat),
-        LensRuntime::FastembedSparse { .. } => measure_fastembed_sparse(spec, probe, repeat),
-        LensRuntime::FastembedBgem3 { .. } => measure_fastembed_bgem3(spec, probe, repeat),
-        LensRuntime::FastembedReranker { .. } => measure_fastembed_reranker(spec, probe, repeat),
+        LensRuntime::FastembedSparsePlaced { .. } => measure_fastembed_sparse(spec, probe, repeat),
+        LensRuntime::FastembedBgem3Placed { .. } => measure_fastembed_bgem3(spec, probe, repeat),
+        LensRuntime::FastembedRerankerPlaced { .. } => {
+            measure_fastembed_reranker(spec, probe, repeat)
+        }
+        LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. } => Err(CliError::runtime(
+            "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND: recommission this lens with an explicit cuda_fail_loud or cpu_explicit execution policy",
+        )),
         LensRuntime::FastembedQwen3 { .. } => measure_fastembed_qwen3(spec, probe, repeat),
         LensRuntime::MultimodalAdapter { .. } => measure_multimodal(spec, probe, repeat),
         other => Err(CliError::usage(format!(

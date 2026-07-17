@@ -23,9 +23,10 @@ use flags::{
 };
 use protocol::{
     ClientMeasureInput, MEASURE_BATCH_SCHEMA, MEASURE_SCHEMA, MeasureResponse, READY_SCHEMA,
-    RESIDENT_BINARY_PROTOCOL_VERSION, ReadyResponse, ResidentMeasureBatchBinaryRequest,
-    ResidentMeasureBatchStreamEnd, ResidentMeasureBatchStreamFrame,
-    ResidentMeasureBatchStreamHeader, ResidentRequest, ResidentSlotContract, hex_decode,
+    RESIDENT_BINARY_PROTOCOL_VERSION, ReadyResponse, ResidentCompletionAttestation,
+    ResidentMeasureBatchBinaryRequest, ResidentMeasureBatchStreamEnd,
+    ResidentMeasureBatchStreamFrame, ResidentMeasureBatchStreamHeader, ResidentRequest,
+    ResidentSlotContract, hex_decode,
 };
 pub(crate) use protocol::{
     MeasureBatchAtResponse, MeasureBatchResponse, MeasureBatchSummaryResponse,

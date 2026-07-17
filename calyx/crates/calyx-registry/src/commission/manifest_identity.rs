@@ -4,9 +4,10 @@ use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{
     CANDLE_DEFAULT_MAX_TOKENS, ContractFacts, QWEN3_DEFAULT_MAX_TOKENS,
     candle_execution_corpus_hash, contract_from_facts, external_command_corpus_hash,
-    external_command_weights_hash, fastembed_bgem3_corpus_hash, fastembed_reranker_corpus_hash,
-    fastembed_sparse_corpus_hash, multimodal_adapter_corpus_hash, onnx_colbert_corpus_hash,
-    onnx_custom_corpus_hash, qwen3_execution_corpus_hash, static_lookup_corpus_hash,
+    external_command_weights_hash, fastembed_bgem3_corpus_hash, fastembed_dense_corpus_hash,
+    fastembed_reranker_corpus_hash, fastembed_sparse_corpus_hash, multimodal_adapter_corpus_hash,
+    onnx_colbert_corpus_hash, onnx_custom_corpus_hash, qwen3_execution_corpus_hash,
+    static_lookup_corpus_hash,
 };
 use crate::spec::{FastembedBgem3Output, LensRuntime, LensSpec};
 
@@ -15,6 +16,14 @@ use super::manifest::LensForgeManifest;
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
+
+fn legacy_unbound_fastembed_identity() -> CalyxError {
+    CalyxError {
+        code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+        message: "legacy FastEmbed runtime has no frozen execution-policy identity".into(),
+        remediation: "recommission from a manifest so the runtime is placement-bound; never infer CPU or CUDA from legacy persisted bytes",
+    }
+}
 
 pub(super) fn spec_from_manifest_identity(
     manifest: &LensForgeManifest,
@@ -26,7 +35,7 @@ pub(super) fn spec_from_manifest_identity(
     let runtime = canonical_runtime(runtime)?;
     let contract = declared_contract(manifest, &runtime, output, weights_sha256, norm_policy)?;
     ensure_manifest_matches_contract(manifest, output, norm_policy, &contract)?;
-    let retrieval_only = matches!(runtime, LensRuntime::FastembedReranker { .. });
+    let retrieval_only = matches!(runtime, LensRuntime::FastembedRerankerPlaced { .. });
     Ok(LensSpec {
         name: contract.name().to_string(),
         runtime,
@@ -55,14 +64,23 @@ fn canonical_runtime(mut runtime: LensRuntime) -> Result<LensRuntime> {
         LensRuntime::FastembedQwen3 { model_id, .. } => {
             *model_id = canonical_qwen3_model_id(model_id)?.to_string();
         }
-        LensRuntime::FastembedSparse { model_id, .. } => {
+        LensRuntime::FastembedSparsePlaced { model_id, .. } => {
             *model_id = canonical_sparse_model_code(model_id)?.to_string();
         }
-        LensRuntime::FastembedBgem3 { model_id, .. } => {
+        LensRuntime::FastembedBgem3Placed { model_id, .. } => {
             *model_id = canonical_bgem3_model_code(model_id)?.to_string();
         }
-        LensRuntime::FastembedReranker { model_id, .. } => {
+        LensRuntime::FastembedRerankerPlaced { model_id, .. } => {
             *model_id = canonical_reranker_model_code(model_id)?.to_string();
+        }
+        LensRuntime::FastembedDensePlaced { model_id, .. } => {
+            *model_id = dense_model_identity(model_id)?.to_string();
+        }
+        LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. } => {
+            return Err(legacy_unbound_fastembed_identity());
         }
         LensRuntime::TeiHttp { .. }
         | LensRuntime::Onnx { .. }
@@ -207,6 +225,21 @@ fn declared_contract(
             modality: manifest.modality,
             norm: norm_policy,
         },
+        LensRuntime::FastembedDensePlaced {
+            model_id,
+            execution,
+            ..
+        } => {
+            let model_id = dense_model_identity(model_id)?;
+            ContractFacts {
+                name: manifest.name.clone(),
+                weights_sha256,
+                corpus_hash: fastembed_dense_corpus_hash(model_id, execution),
+                shape: output,
+                modality: Modality::Text,
+                norm: NormPolicy::unit(),
+            }
+        }
         LensRuntime::OnnxColbert { model_id, .. } => ContractFacts {
             name: manifest.name.clone(),
             weights_sha256,
@@ -215,16 +248,26 @@ fn declared_contract(
             modality: Modality::Text,
             norm: NormPolicy::Finite,
         },
-        LensRuntime::FastembedSparse { model_id, .. } => ContractFacts {
+        LensRuntime::FastembedSparsePlaced {
+            model_id,
+            execution,
+            ..
+        } => ContractFacts {
             name: manifest.name.clone(),
             weights_sha256,
-            corpus_hash: fastembed_sparse_corpus_hash(canonical_sparse_model_code(model_id)?),
+            corpus_hash: fastembed_sparse_corpus_hash(
+                canonical_sparse_model_code(model_id)?,
+                execution,
+            ),
             shape: sparse_shape_for_model(model_id)?,
             modality: Modality::Text,
             norm: NormPolicy::Finite,
         },
-        LensRuntime::FastembedBgem3 {
-            model_id, output, ..
+        LensRuntime::FastembedBgem3Placed {
+            model_id,
+            output,
+            execution,
+            ..
         } => {
             let (shape, norm, token) = match output {
                 FastembedBgem3Output::Dense => {
@@ -245,20 +288,34 @@ fn declared_contract(
                 corpus_hash: fastembed_bgem3_corpus_hash(
                     canonical_bgem3_model_code(model_id)?,
                     token.as_bytes(),
+                    execution,
                 ),
                 shape,
                 modality: Modality::Text,
                 norm,
             }
         }
-        LensRuntime::FastembedReranker { model_id, .. } => ContractFacts {
+        LensRuntime::FastembedRerankerPlaced {
+            model_id,
+            execution,
+            ..
+        } => ContractFacts {
             name: manifest.name.clone(),
             weights_sha256,
-            corpus_hash: fastembed_reranker_corpus_hash(canonical_reranker_model_code(model_id)?),
+            corpus_hash: fastembed_reranker_corpus_hash(
+                canonical_reranker_model_code(model_id)?,
+                execution,
+            ),
             shape: SlotShape::Dense(1),
             modality: Modality::Text,
             norm: NormPolicy::Finite,
         },
+        LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. } => {
+            return Err(legacy_unbound_fastembed_identity());
+        }
         LensRuntime::StaticLookup { dim, .. } => ContractFacts {
             name: manifest.name.clone(),
             weights_sha256,
@@ -354,6 +411,14 @@ fn canonical_qwen3_model_id(raw: &str) -> Result<&'static str> {
             "unsupported fastembed-qwen3 model {other}; expected {DEFAULT_QWEN3_MODEL}"
         ))),
     }
+}
+
+fn dense_model_identity(raw: &str) -> Result<&str> {
+    let model_id = raw.trim();
+    if model_id.is_empty() {
+        return Err(config_invalid("fastembed dense model id is empty"));
+    }
+    Ok(model_id)
 }
 
 fn canonical_sparse_model_code(raw: &str) -> Result<&'static str> {

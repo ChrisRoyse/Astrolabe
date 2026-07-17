@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "hash_algorithm": "sha256-domain-u64le-path-u64le-content-v1",
   "attested_file_count": 42,
-  "attested_source_tree_sha256": "cefba0dece1688c175eb40a01a4b0ecd7811aafdb6eecd6bc9af49fc91c3d087",
+  "attested_source_tree_sha256": "625bb7060b66499f9910dfa6c00d9861f4188aea9b2fdb3353a5b1def9fbc1e1",
   "files": [
     {
       "path": ".cargo_vcs_info.json",
@@ -38,8 +38,8 @@
     },
     {
       "path": "src/bgem3_embedding/impl.rs",
-      "bytes": 14018,
-      "sha256": "9e4e2d9609e41ece6b3937e1167d2aeeef7a95a939ed2fcdf8a7436a7d5bfc99"
+      "bytes": 14022,
+      "sha256": "db2940497f902464ac41ff78cfc3c1a559c0b511055d5303a50fb9c81cb5738f"
     },
     {
       "path": "src/bgem3_embedding/init.rs",
@@ -53,8 +53,8 @@
     },
     {
       "path": "src/common.rs",
-      "bytes": 10819,
-      "sha256": "8695070a09455e9361e238d64e0e97b6ba44f9ef3f9e1adb98f7ee1893cd6d42"
+      "bytes": 10826,
+      "sha256": "47ff44f070bbcd0c9361f463b358f7d4bad38e2dc108c599eb7aa41412bfea42"
     },
     {
       "path": "src/image_embedding/impl.rs",
@@ -183,8 +183,8 @@
     },
     {
       "path": "src/sparse_text_embedding/impl.rs",
-      "bytes": 14482,
-      "sha256": "3a27a89bb4266d8e73119d762b13f4b6a37a2c0ac0d85fe7885d097d66018cce"
+      "bytes": 14486,
+      "sha256": "3de8e18f931452f6cf1997fc7014063820c3e21ffcbb7a291f08dcc1af648c03"
     },
     {
       "path": "src/sparse_text_embedding/init.rs",

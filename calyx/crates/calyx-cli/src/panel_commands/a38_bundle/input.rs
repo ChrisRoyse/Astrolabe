@@ -9,7 +9,7 @@ use super::model::{
 use super::{A38_BUNDLE_BASE_A37_REFUSED, A38_BUNDLE_INVALID, bundle_error};
 use crate::error::{CliError, CliResult};
 
-use crate::lens_commands::catalog::LensCatalogDbReadback;
+use crate::lens_commands::catalog::{LensCatalogDbReadback, bound_spec_from_catalog_entry};
 use crate::panel_commands::LensCatalogEntry;
 use crate::panel_commands::template_store::TemplateStore;
 
@@ -44,6 +44,7 @@ pub(super) fn select_lenses(
                 "provide each included lens once by name or id, not both",
             ));
         }
+        bound_spec_from_catalog_entry(entry)?;
         parse_modality(&entry.modality)?;
         selected.push(BundleLensRef {
             lens_id: entry.lens_id.clone(),
@@ -52,6 +53,8 @@ pub(super) fn select_lenses(
             runtime: entry.runtime.clone(),
             weights_sha256: entry.weights_sha256.clone(),
             manifest: entry.manifest.display().to_string(),
+            manifest_sha256: entry.manifest_sha256.clone(),
+            execution_attestation: entry.execution_attestation.clone(),
             placement: entry.placement,
             cost: entry.cost,
         });

@@ -4,7 +4,7 @@ use std::path::Path;
 use calyx_core::{Input, Lens, Modality, SlotShape};
 use calyx_registry::{
     CandlePrecision, FastembedBgem3Lens, FastembedBgem3Output, FastembedQwen3Lens,
-    FastembedRerankerLens, FastembedSparseLens, NormPolicy, OnnxProviderPolicy, Qwen3ModelFiles,
+    FastembedRerankerLens, FastembedSparseLens, NormPolicy, Qwen3ModelFiles,
 };
 use serde_json::json;
 
@@ -48,8 +48,10 @@ fn commission_sparse(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
-        OnnxProviderPolicy::CudaFailLoud,
+        flags.onnx_provider_policy()?,
     )?;
+    let artifacts = copy_artifacts(lens.files(), out)?;
+    let source_contract = lens.contract().clone();
     let probe = Input::new(
         Modality::Text,
         b"Calyx fastembed sparse commission probe".to_vec(),
@@ -57,15 +59,19 @@ fn commission_sparse(
     let vector = lens.measure(&probe)?;
     validate_vector_contract(&vector, lens.shape(), norm_policy(flags))?;
     let dim = dim(lens.shape());
-    let artifacts = copy_artifacts(lens.files(), out)?;
     log.event(json!({
         "event": "fastembed_sparse_verified",
         "model_code": lens.files().model_code,
         "provider_policy": lens.provider_policy(),
         "dim": dim,
         "artifact_count": artifacts.len(),
+        "source_session_lens_id": source_contract.lens_id().to_string(),
     }))?;
-    Ok(FastembedCommission { artifacts, dim })
+    Ok(FastembedCommission {
+        artifacts,
+        dim,
+        source_contract: Some(source_contract),
+    })
 }
 
 fn commission_bgem3(
@@ -79,13 +85,14 @@ fn commission_bgem3(
         &flags.hf,
         output,
         cache_dir(flags)?,
-        OnnxProviderPolicy::CudaFailLoud,
+        flags.onnx_provider_policy()?,
     )?;
+    let artifacts = copy_artifacts(lens.files(), out)?;
+    let source_contract = lens.contract().clone();
     let probe = Input::new(Modality::Text, b"Calyx BGE-M3 commission probe".to_vec());
     let vector = lens.measure(&probe)?;
     validate_vector_contract(&vector, lens.shape(), norm_policy(flags))?;
     let dim = dim(lens.shape());
-    let artifacts = copy_artifacts(lens.files(), out)?;
     log.event(json!({
         "event": "fastembed_bgem3_verified",
         "model_code": lens.files().model_code,
@@ -93,8 +100,13 @@ fn commission_bgem3(
         "runtime": lens.runtime_name(),
         "dim": dim,
         "artifact_count": artifacts.len(),
+        "source_session_lens_id": source_contract.lens_id().to_string(),
     }))?;
-    Ok(FastembedCommission { artifacts, dim })
+    Ok(FastembedCommission {
+        artifacts,
+        dim,
+        source_contract: Some(source_contract),
+    })
 }
 
 fn commission_reranker(
@@ -106,8 +118,10 @@ fn commission_reranker(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
-        OnnxProviderPolicy::CudaFailLoud,
+        flags.onnx_provider_policy()?,
     )?;
+    let artifacts = copy_artifacts(lens.files(), out)?;
+    let source_contract = lens.contract().clone();
     let probe = Input::new(
         Modality::Text,
         b"Calyx retrieval query\nCalyx retrieval document".to_vec(),
@@ -115,15 +129,19 @@ fn commission_reranker(
     let vector = lens.measure(&probe)?;
     validate_vector_contract(&vector, lens.shape(), norm_policy(flags))?;
     let dim = dim(lens.shape());
-    let artifacts = copy_artifacts(lens.files(), out)?;
     log.event(json!({
         "event": "fastembed_reranker_verified",
         "model_code": lens.files().model_code,
         "provider_policy": lens.provider_policy(),
         "dim": dim,
         "artifact_count": artifacts.len(),
+        "source_session_lens_id": source_contract.lens_id().to_string(),
     }))?;
-    Ok(FastembedCommission { artifacts, dim })
+    Ok(FastembedCommission {
+        artifacts,
+        dim,
+        source_contract: Some(source_contract),
+    })
 }
 
 fn commission_qwen3(
@@ -138,11 +156,12 @@ fn commission_qwen3(
         flags.local_device_policy()?,
         CandlePrecision::parse(flags.manifest_dtype())?,
     )?;
+    let artifacts = copy_qwen3_artifacts(lens.files(), out)?;
+    let source_contract = lens.contract().clone();
     let probe = Input::new(Modality::Text, b"Calyx Qwen3 commission probe".to_vec());
     let vector = lens.measure(&probe)?;
     validate_vector_contract(&vector, lens.shape(), norm_policy(flags))?;
     let dim = dim(lens.shape());
-    let artifacts = copy_qwen3_artifacts(lens.files(), out)?;
     log.event(json!({
         "event": "fastembed_qwen3_verified",
         "model_id": lens.files().model_id,
@@ -152,8 +171,13 @@ fn commission_qwen3(
         "runtime": lens.runtime_name(),
         "dim": dim,
         "artifact_count": artifacts.len(),
+        "source_session_lens_id": source_contract.lens_id().to_string(),
     }))?;
-    Ok(FastembedCommission { artifacts, dim })
+    Ok(FastembedCommission {
+        artifacts,
+        dim,
+        source_contract: Some(source_contract),
+    })
 }
 
 fn norm_policy(flags: &CommissionFlags) -> NormPolicy {

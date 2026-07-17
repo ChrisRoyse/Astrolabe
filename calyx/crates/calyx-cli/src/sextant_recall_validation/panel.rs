@@ -9,13 +9,13 @@ use calyx_core::{
 };
 use calyx_registry::{
     FastembedQwen3Lens, FrozenLensContract, LensRuntime, LensSpec, OnnxColbertLens, OnnxLens,
-    Registry, StaticLookupLens, TeiHttpLens, lens_spec_from_manifest_path,
+    Registry, StaticLookupLens, TeiHttpLens,
 };
 use serde::{Deserialize, Serialize};
 
 use super::request::RecallRequest;
 use crate::error::{CliError, CliResult};
-use crate::lens_commands::catalog::read_catalog;
+use crate::lens_commands::catalog::{bound_spec_from_catalog_entry, read_catalog};
 
 const DEFAULT_LENS_CATALOG: &str = "/var/lib/calyx/lenses/catalog-db";
 const REAL_PANEL_VERSION: u32 = 727;
@@ -87,24 +87,24 @@ pub(crate) fn load_real_panel(request: &RecallRequest) -> CliResult<RealPanel> {
         .or_else(|| env::var("CALYX_LENS_CATALOG").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LENS_CATALOG));
     let catalog = read_catalog(&catalog_path)?;
-    let manifests = catalog
+    let catalog_entries = catalog
         .lenses
         .into_iter()
-        .map(|lens| (lens.name, lens.manifest))
+        .map(|lens| (lens.name.clone(), lens))
         .collect::<BTreeMap<_, _>>();
 
     let mut registry = Registry::new();
     let mut slots = Vec::new();
     let mut panel_slots = Vec::new();
     for (idx, selected) in packed.selected.iter().enumerate() {
-        let manifest = manifests.get(&selected.lens).ok_or_else(|| {
+        let entry = catalog_entries.get(&selected.lens).ok_or_else(|| {
             CliError::runtime(format!(
                 "CALYX_FSV_SEXTANT_PANEL_LENS_MISSING: {} not found in catalog DB {}",
                 selected.lens,
                 catalog_path.display()
             ))
         })?;
-        let spec = lens_spec_from_manifest_path(manifest)?;
+        let spec = bound_spec_from_catalog_entry(entry)?;
         if spec.modality != Modality::Text {
             return Err(CliError::runtime(format!(
                 "CALYX_FSV_SEXTANT_PANEL_INVALID: {} is {:?}, expected text",
@@ -157,7 +157,9 @@ pub(crate) fn load_real_panel(request: &RecallRequest) -> CliResult<RealPanel> {
 
 fn register_lens(registry: &mut Registry, spec: LensSpec) -> CliResult<LensId> {
     match &spec.runtime {
-        LensRuntime::Onnx { .. } => {
+        LensRuntime::Onnx { .. }
+        | LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedDensePlaced { .. } => {
             let lens = OnnxLens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();
             Ok(registry.register_frozen_with_spec(lens, contract, spec)?)

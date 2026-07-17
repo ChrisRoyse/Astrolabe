@@ -162,8 +162,7 @@ fn prepare_warm_lens(
     )?;
     let started = Instant::now();
     let result = (|| {
-        let spec = lens_spec_from_manifest_path(Path::new(&task.lens.manifest))?;
-        template_store::validate_lens_ref_against_spec(&task.lens, &spec)?;
+        let spec = template_store::bound_lens_spec(&task.lens)?;
         let spec_lens_id = spec.lens_id();
         if spec_lens_id != task.lens.lens_id {
             return Err(template_store::template_error(

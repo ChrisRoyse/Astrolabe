@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 
 use calyx_core::{Input, Lens, Modality, QuantPolicy, SlotShape};
 use calyx_registry::{
-    DEFAULT_TEI_ENDPOINT, LensForgeManifest, LensForgeShape, LensForgeSourceTensorDtypeProfile,
-    NormPolicy, TeiHttpLens, profile_safetensors_sources, resolve_safetensors_weight_set,
+    DEFAULT_TEI_ENDPOINT, FrozenLensContract, LensForgeManifest, LensForgeShape,
+    LensForgeSourceTensorDtypeProfile, NormPolicy, TeiHttpLens, profile_safetensors_sources,
+    resolve_safetensors_weight_set,
 };
 use serde::Serialize;
 use serde_json::json;
 
 mod artifact;
-mod attestation;
 mod batch_preflight;
 mod candle;
 mod fastembed;
@@ -24,11 +24,11 @@ use artifact::{
     Artifact, FileReport, add_optional, artifact, artifact_set_sha256, file_report, find_preferred,
     manifest_files, read_hidden_size, require_named, require_named_fallback,
 };
-use attestation::{LocalExecutionAttestationReport, attest_local_execution};
 use log::{ConversionLog, run_command, write_json_file};
 use options::{CommissionFlags, CommissionRuntime};
 
-use super::catalog::{AddReport, add_manifest_to_catalog};
+use super::catalog::admission::LocalExecutionAttestationReport;
+use super::catalog::{AddReport, add_attested_manifest_to_catalog};
 use super::support::validate_vector_contract;
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
@@ -65,6 +65,7 @@ struct CommissionOutput {
     dim_override: Option<u32>,
     source_hf_id: Option<String>,
     source_tensor_dtype_profile: Option<LensForgeSourceTensorDtypeProfile>,
+    expected_local_contract: Option<FrozenLensContract>,
 }
 
 impl CommissionOutput {
@@ -74,6 +75,7 @@ impl CommissionOutput {
             dim_override: None,
             source_hf_id: None,
             source_tensor_dtype_profile: None,
+            expected_local_contract: None,
         }
     }
 
@@ -83,6 +85,7 @@ impl CommissionOutput {
             dim_override: Some(dim),
             source_hf_id: None,
             source_tensor_dtype_profile: None,
+            expected_local_contract: None,
         }
     }
 
@@ -92,6 +95,21 @@ impl CommissionOutput {
             dim_override: None,
             source_hf_id: Some(source_hf_id),
             source_tensor_dtype_profile: None,
+            expected_local_contract: None,
+        }
+    }
+
+    fn with_dim_and_contract(
+        artifacts: Vec<Artifact>,
+        dim: u32,
+        expected_local_contract: FrozenLensContract,
+    ) -> Self {
+        Self {
+            artifacts,
+            dim_override: Some(dim),
+            source_hf_id: None,
+            source_tensor_dtype_profile: None,
+            expected_local_contract: Some(expected_local_contract),
         }
     }
 
@@ -135,7 +153,13 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         }
         CommissionRuntime::FastembedOnnx => {
             let commissioned = fastembed::commission(&flags, &out, &mut log)?;
-            CommissionOutput::with_dim(commissioned.artifacts, commissioned.dim)
+            CommissionOutput::with_dim_and_contract(
+                commissioned.artifacts,
+                commissioned.dim,
+                commissioned.source_contract.ok_or_else(|| {
+                    CliError::runtime("FastEmbed commission lost its immutable source contract")
+                })?,
+            )
         }
         CommissionRuntime::OnnxColbert => {
             let commissioned = onnx_colbert::commission(&flags, &out, &mut log)?;
@@ -148,7 +172,13 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         | CommissionRuntime::FastembedReranker
         | CommissionRuntime::FastembedQwen3 => {
             let commissioned = fastembed_special::commission(&flags, &out, &mut log)?;
-            CommissionOutput::with_dim(commissioned.artifacts, commissioned.dim)
+            CommissionOutput::with_dim_and_contract(
+                commissioned.artifacts,
+                commissioned.dim,
+                commissioned.source_contract.ok_or_else(|| {
+                    CliError::runtime("FastEmbed commission lost its immutable source contract")
+                })?,
+            )
         }
     };
     if matches!(
@@ -178,45 +208,37 @@ pub(crate) fn commission(args: &[String]) -> CliResult {
         output.source_tensor_dtype_profile.as_ref(),
         &mut log,
     )?;
-    let (max_batch, batch_policy) = match batch_preflight::apply(&flags, &manifest_path, &mut log) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            // Fail closed: a manifest that never passed the batch preflight
-            // must not linger on disk where a manual `lens add` could
-            // register it around the #1157 gate.
-            let removed = fs::remove_file(&manifest_path);
-            log.event(json!({
-                "event": "batch_preflight_failed_manifest_removed",
-                "manifest": manifest_path,
-                "removed": removed.is_ok(),
-            }))?;
-            return Err(error);
-        }
-    };
-    let local_execution_attestation = match attest_local_execution(
-        &manifest_path,
-        output.source_tensor_dtype_profile.as_ref(),
-        &mut log,
-    ) {
-        Ok(attestation) => attestation,
-        Err(error) => {
-            let removed = fs::remove_file(&manifest_path);
-            log.event(json!({
-                "event": "local_execution_attestation_failed_manifest_removed",
-                "manifest": manifest_path,
-                "removed": removed.is_ok(),
-                "code": error.code(),
-                "message": error.message(),
-            }))?;
-            return Err(error);
-        }
-    };
+    let (max_batch, batch_policy, local_execution_attestation, catalog_admission) =
+        match batch_preflight::apply(
+            &flags,
+            &manifest_path,
+            output.source_tensor_dtype_profile.as_ref(),
+            output.expected_local_contract.as_ref(),
+            &mut log,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // Fail closed: a manifest that never passed mandatory persisted
+                // execution attestation and the optional batch probe must not
+                // linger where a manual `lens add` could register it.
+                let removed = fs::remove_file(&manifest_path);
+                log.event(json!({
+                    "event": "commission_verification_failed_manifest_removed",
+                    "manifest": manifest_path,
+                    "removed": removed.is_ok(),
+                    "code": error.code(),
+                    "message": error.message(),
+                    "remediation": error.remediation(),
+                }))?;
+                return Err(error);
+            }
+        };
     let local_numeric_dtype = matches!(
         flags.runtime,
         CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
     )
     .then_some("f32");
-    let registered = add_manifest_to_catalog(flags.home.as_deref(), manifest_path.clone())?;
+    let registered = add_attested_manifest_to_catalog(flags.home.as_deref(), catalog_admission)?;
     log.event(json!({
         "event": "registered",
         "catalog": registered.catalog,

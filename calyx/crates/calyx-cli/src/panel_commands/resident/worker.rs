@@ -1,15 +1,15 @@
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use calyx_core::{CalyxError, SlotShape, SlotState};
 
 use super::deadline::{DeadlineStream, connect_before, deadline_after, read_bounded_line};
-use super::job::ResidentGenerationJob;
+use super::job::{ResidentChild, ResidentGenerationJob, ResidentProcessIdentity};
 use super::source::FrozenResidentSource;
 use super::*;
 
@@ -17,7 +17,7 @@ pub(super) const WORKER_GATE_ENV: &str = "CALYX_PANEL_RESIDENT_WORKER_GATE";
 pub(super) const WORKER_AUTH_PREFIX: &[u8] = b"CALYX_PANEL_RESIDENT_AUTH1 ";
 
 const WORKER_START_FAILED: &str = "CALYX_PANEL_RESIDENT_WORKER_START_FAILED";
-const WORKER_STOP_FAILED: &str = "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED";
+pub(super) const WORKER_STOP_FAILED: &str = "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED";
 const WORKER_FROZEN_VIOLATION: &str = "CALYX_LENS_FROZEN_VIOLATION";
 const WORKER_STOP_GRACE: Duration = Duration::from_secs(5);
 const WORKER_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -54,7 +54,7 @@ pub(super) struct WorkerProcess {
     pub(super) generation: u64,
     pub(super) bind: SocketAddr,
     pub(super) ready: ReadyResponse,
-    child: Child,
+    child: ResidentChild,
     job: ResidentGenerationJob,
     auth_secret: String,
 }
@@ -67,6 +67,8 @@ impl WorkerProcess {
         generation: u64,
         max_load_secs: u64,
         max_request_secs: u64,
+        mut job_created: impl FnMut(&str) -> CliResult,
+        mut assigned: impl FnMut(u32, &str, &[ResidentProcessIdentity]) -> CliResult,
         mut cancelled: impl FnMut() -> bool,
     ) -> CliResult<Self> {
         if cancelled() {
@@ -113,27 +115,26 @@ impl WorkerProcess {
         })?;
         let supervisor_pid = std::process::id();
         let job = ResidentGenerationJob::create(supervisor_pid, generation, &source.fingerprint)?;
+        job_created(job.name())?;
         let auth_secret = job.nonce().to_string();
-        let mut command = Command::new(&executable);
-        command.arg("__panel-resident-worker");
-        append_worker_args(&mut command, original_args, &ready_path, &progress_path);
-        command
-            .env(WORKER_GATE_ENV, &gate_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
-        let mut child = command.spawn().map_err(|error| {
-            worker_error(
-                WORKER_START_FAILED,
-                format!(
-                    "spawn resident generation {generation} from {}: {error}",
-                    executable.display()
-                ),
-                "inspect the generation logs and native executable permissions, then retry",
-            )
-        })?;
-        if let Err(error) = job.assign_child(&child) {
+        let arguments = worker_arguments(original_args, &ready_path, &progress_path);
+        let mut child = job.spawn_child_atomic(
+            &executable,
+            &arguments,
+            OsStr::new(WORKER_GATE_ENV),
+            gate_path.as_os_str(),
+            &stdout,
+            &stderr,
+        )?;
+        if let Err(error) = job.verify_exact_members(&[child.id()]) {
             return Err(cleanup_spawn_failure(&job, &mut child, 81, error));
+        }
+        let process_identities = match job.member_process_identities(&child) {
+            Ok(identities) => identities,
+            Err(error) => return Err(cleanup_spawn_failure(&job, &mut child, 82, error)),
+        };
+        if let Err(error) = assigned(child.id(), job.name(), &process_identities) {
+            return Err(cleanup_spawn_failure(&job, &mut child, 82, error));
         }
         let assignment = WorkerAssignment {
             schema: ASSIGNMENT_GATE_SCHEMA.to_string(),
@@ -145,7 +146,7 @@ impl WorkerProcess {
             nonce: auth_secret.clone(),
         };
         if let Err(error) = write_assignment_gate(&gate_path, &assignment) {
-            return Err(cleanup_spawn_failure(&job, &mut child, 82, error));
+            return Err(cleanup_spawn_failure(&job, &mut child, 83, error));
         }
 
         let ready = match wait_for_ready(
@@ -159,7 +160,7 @@ impl WorkerProcess {
         ) {
             Ok(ready) => ready,
             Err(error) => {
-                return Err(cleanup_spawn_failure(&job, &mut child, 83, error));
+                return Err(cleanup_spawn_failure(&job, &mut child, 84, error));
             }
         };
         if ready.process_id != child.id()
@@ -212,7 +213,7 @@ impl WorkerProcess {
                 let error = worker_error(
                     WORKER_START_FAILED,
                     format!(
-                        "resident generation {generation} worker PID {} exited {status} immediately after publishing readiness",
+                        "resident generation {generation} worker PID {} exited with Win32 code {status} immediately after publishing readiness",
                         child.id()
                     ),
                     "preserve generation logs and restart only after fixing the post-readiness worker failure",
@@ -253,8 +254,12 @@ impl WorkerProcess {
         &self.auth_secret
     }
 
-    pub(super) fn member_process_ids(&self) -> CliResult<Vec<u32>> {
-        self.job.member_process_ids()
+    pub(super) fn job_name(&self) -> &str {
+        self.job.name()
+    }
+
+    pub(super) fn member_process_identities(&self) -> CliResult<Vec<ResidentProcessIdentity>> {
+        self.job.member_process_identities(&self.child)
     }
 
     pub(super) fn is_alive(&mut self) -> CliResult<bool> {
@@ -575,12 +580,12 @@ pub(super) fn await_assignment_gate() -> CliResult<WorkerAssignment> {
     }
 }
 
-fn append_worker_args(
-    command: &mut Command,
+fn worker_arguments(
     original_args: &[String],
     ready_path: &Path,
     progress_path: &Path,
-) {
+) -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("__panel-resident-worker")];
     let mut index = 0;
     while index < original_args.len() {
         let flag = &original_args[index];
@@ -588,19 +593,19 @@ fn append_worker_args(
             index += 2;
             continue;
         }
-        command.arg(flag);
+        arguments.push(OsString::from(flag.as_str()));
         if let Some(value) = original_args.get(index + 1) {
-            command.arg(value);
+            arguments.push(OsString::from(value.as_str()));
         }
         index += 2;
     }
-    command
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .arg("--ready-out")
-        .arg(ready_path)
-        .arg("--progress-out")
-        .arg(progress_path);
+    arguments.push(OsString::from("--bind"));
+    arguments.push(OsString::from("127.0.0.1:0"));
+    arguments.push(OsString::from("--ready-out"));
+    arguments.push(ready_path.as_os_str().to_os_string());
+    arguments.push(OsString::from("--progress-out"));
+    arguments.push(progress_path.as_os_str().to_os_string());
+    arguments
 }
 
 fn create_log(path: &Path) -> CliResult<File> {
@@ -724,7 +729,7 @@ fn valid_nonce(value: &str) -> bool {
 
 fn cleanup_spawn_failure(
     job: &ResidentGenerationJob,
-    child: &mut Child,
+    child: &mut ResidentChild,
     exit_code: u32,
     primary: CliError,
 ) -> CliError {
@@ -746,7 +751,7 @@ fn cleanup_spawn_failure(
 
 fn terminate_reap_and_verify(
     job: &ResidentGenerationJob,
-    child: &mut Child,
+    child: &mut ResidentChild,
     exit_code: u32,
 ) -> CliResult {
     let mut failures = Vec::new();
@@ -828,7 +833,7 @@ fn wait_for_empty_job(job: &ResidentGenerationJob) -> CliResult {
 }
 
 fn wait_for_ready(
-    child: &mut Child,
+    child: &mut ResidentChild,
     ready_path: &Path,
     generation: u64,
     timeout: Duration,
@@ -946,7 +951,7 @@ fn request_worker_shutdown(bind: SocketAddr, auth_secret: &str) -> CliResult {
     Ok(())
 }
 
-fn wait_child(child: &mut Child, timeout: Duration) -> CliResult<bool> {
+fn wait_child(child: &mut ResidentChild, timeout: Duration) -> CliResult<bool> {
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {

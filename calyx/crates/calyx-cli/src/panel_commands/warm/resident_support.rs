@@ -321,10 +321,11 @@ fn is_in_process_onnx_runtime(runtime: &LensRuntime) -> bool {
     matches!(
         runtime,
         LensRuntime::Onnx { .. }
+            | LensRuntime::FastembedDensePlaced { .. }
             | LensRuntime::OnnxColbert { .. }
-            | LensRuntime::FastembedSparse { .. }
-            | LensRuntime::FastembedBgem3 { .. }
-            | LensRuntime::FastembedReranker { .. }
+            | LensRuntime::FastembedSparsePlaced { .. }
+            | LensRuntime::FastembedBgem3Placed { .. }
+            | LensRuntime::FastembedRerankerPlaced { .. }
     )
 }
 
@@ -442,10 +443,11 @@ fn validate_resident_execution(
     if matches!(
         runtime,
         LensRuntime::Onnx { .. }
+            | LensRuntime::FastembedDensePlaced { .. }
             | LensRuntime::OnnxColbert { .. }
-            | LensRuntime::FastembedSparse { .. }
-            | LensRuntime::FastembedBgem3 { .. }
-            | LensRuntime::FastembedReranker { .. }
+            | LensRuntime::FastembedSparsePlaced { .. }
+            | LensRuntime::FastembedBgem3Placed { .. }
+            | LensRuntime::FastembedRerankerPlaced { .. }
     ) {
         let Some(total_nodes) = execution.total_compute_nodes.filter(|count| *count > 0) else {
             return Err(resident_execution_error(
@@ -503,9 +505,18 @@ fn declared_runtime_execution(
         | LensRuntime::FastembedQwen3 { device, dtype, .. } => {
             (Some(device.clone()), Some(dtype.clone()), None)
         }
+        LensRuntime::FastembedDensePlaced { execution, .. }
+        | LensRuntime::FastembedSparsePlaced { execution, .. }
+        | LensRuntime::FastembedBgem3Placed { execution, .. }
+        | LensRuntime::FastembedRerankerPlaced { execution, .. } => match execution.as_str() {
+            "cpu_explicit" => (Some("cpu".to_string()), None, Some(execution.clone())),
+            "cuda_fail_loud" => (None, None, Some(execution.clone())),
+            _ => (Some(execution.clone()), None, Some(execution.clone())),
+        },
         LensRuntime::Algorithmic { .. }
         | LensRuntime::TeiHttp { .. }
         | LensRuntime::Onnx { .. }
+        | LensRuntime::FastembedDense { .. }
         | LensRuntime::OnnxColbert { .. }
         | LensRuntime::FastembedSparse { .. }
         | LensRuntime::FastembedBgem3 { .. }
@@ -529,10 +540,13 @@ fn require_managed_resident_template_runtimes(
         .iter()
         .enumerate()
         .map(|(slot, lens)| {
-            let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
+            let spec = template_store::bound_lens_spec(lens)?;
             Ok((slot, lens, spec))
         })
         .collect::<CliResult<Vec<_>>>()?;
+    for (_, _, spec) in &entries {
+        reject_legacy_unbound_fastembed(&spec.runtime)?;
+    }
     let unmanaged = entries
         .iter()
         .filter_map(|(slot, lens, spec)| {
@@ -594,6 +608,9 @@ fn require_managed_resident_runtimes(
                 })
         })
         .collect::<CliResult<Vec<_>>>()?;
+    for (_, spec) in &entries {
+        reject_legacy_unbound_fastembed(&spec.runtime)?;
+    }
     let unmanaged = entries
         .iter()
         .filter_map(|(slot, spec)| {
@@ -650,12 +667,31 @@ pub(in crate::panel_commands) fn is_managed_resident_neural_runtime(runtime: &Le
         runtime,
         LensRuntime::CandleLocal { .. }
             | LensRuntime::Onnx { .. }
+            | LensRuntime::FastembedDensePlaced { .. }
             | LensRuntime::OnnxColbert { .. }
             | LensRuntime::FastembedQwen3 { .. }
+            | LensRuntime::FastembedSparsePlaced { .. }
+            | LensRuntime::FastembedBgem3Placed { .. }
+            | LensRuntime::FastembedRerankerPlaced { .. }
+    )
+}
+
+fn reject_legacy_unbound_fastembed(runtime: &LensRuntime) -> CliResult {
+    if matches!(
+        runtime,
+        LensRuntime::FastembedDense { .. }
             | LensRuntime::FastembedSparse { .. }
             | LensRuntime::FastembedBgem3 { .. }
             | LensRuntime::FastembedReranker { .. }
-    )
+    ) {
+        return Err(CalyxError {
+            code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+            message: "resident admission refuses a legacy FastEmbed runtime without frozen execution identity".into(),
+            remediation: "recommission the lens with execution_device set explicitly to cuda_fail_loud or cpu_explicit before resident admission",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn reject_cpu_neural_runtimes(

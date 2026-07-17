@@ -40,7 +40,10 @@ impl RotationSeed {
         if self.dim == 0 || self.dim > ROTATION_MAX_DIM {
             return Err(rotation_error(
                 "validate_seed",
-                format!("dimension must be in 1..={ROTATION_MAX_DIM}, got {}", self.dim),
+                format!(
+                    "dimension must be in 1..={ROTATION_MAX_DIM}, got {}",
+                    self.dim
+                ),
             ));
         }
         let expected_id = content_id(&self.entropy, self.version, self.dim);
@@ -85,10 +88,38 @@ impl HaarRotation {
             .and_then(|value| value.checked_div(2))
             .and_then(|value| value.checked_sub(1))
             .ok_or_else(|| rotation_error("haar_setup", "Householder geometry size overflow"))?;
-        let mut factors = Vec::with_capacity(factor_capacity);
-        let mut factor_starts = Vec::with_capacity(seed.dim.saturating_sub(1));
-        let mut column_signs = Vec::with_capacity(seed.dim);
-        let mut column = Vec::with_capacity(seed.dim);
+        let mut factors = Vec::new();
+        factors
+            .try_reserve_exact(factor_capacity)
+            .map_err(|error| {
+                rotation_error(
+                    "haar_setup",
+                    format!("cannot allocate {factor_capacity} Householder coefficients: {error}"),
+                )
+            })?;
+        let mut factor_starts = Vec::new();
+        factor_starts
+            .try_reserve_exact(seed.dim.saturating_sub(1))
+            .map_err(|error| {
+                rotation_error(
+                    "haar_setup",
+                    format!("cannot allocate Householder offsets: {error}"),
+                )
+            })?;
+        let mut column_signs = Vec::new();
+        column_signs.try_reserve_exact(seed.dim).map_err(|error| {
+            rotation_error(
+                "haar_setup",
+                format!("cannot allocate column signs: {error}"),
+            )
+        })?;
+        let mut column = Vec::new();
+        column.try_reserve_exact(seed.dim).map_err(|error| {
+            rotation_error(
+                "haar_setup",
+                format!("cannot allocate Gaussian work column: {error}"),
+            )
+        })?;
 
         for offset in 0..seed.dim {
             let len = seed.dim - offset;
@@ -155,6 +186,10 @@ impl HaarRotation {
         validate_finite_output(vec, "apply_rotation")
     }
 
+    pub(crate) fn geometry_parts(&self) -> (&[usize], &[f32], &[f32]) {
+        (&self.factor_starts, &self.factors, &self.column_signs)
+    }
+
     pub(crate) fn apply_inverse(&self, vec: &mut [f32]) -> Result<()> {
         self.validate_input(vec, "apply_inverse_rotation")?;
         for offset in 0..self.factor_starts.len() {
@@ -175,7 +210,10 @@ impl HaarRotation {
             });
         }
         if let Some(index) = vec.iter().position(|value| !value.is_finite()) {
-            return Err(rotation_error(op, format!("non-finite coefficient at index {index}")));
+            return Err(rotation_error(
+                op,
+                format!("non-finite coefficient at index {index}"),
+            ));
         }
         Ok(())
     }
@@ -213,11 +251,13 @@ pub fn apply_inverse_rotation(seed: &RotationSeed, vec: &mut [f32]) -> Result<()
 }
 
 pub fn apply_rotation_batch(seed: &RotationSeed, vecs: &mut [f32], n: usize) -> Result<()> {
-    let expected = n.checked_mul(seed.dim).ok_or_else(|| ForgeError::ShapeMismatch {
-        expected: vec![n, seed.dim],
-        got: vec![vecs.len()],
-        remediation: "Use a batch shape whose row count times dimension fits usize".to_string(),
-    })?;
+    let expected = n
+        .checked_mul(seed.dim)
+        .ok_or_else(|| ForgeError::ShapeMismatch {
+            expected: vec![n, seed.dim],
+            got: vec![vecs.len()],
+            remediation: "Use a batch shape whose row count times dimension fits usize".to_string(),
+        })?;
     if vecs.len() != expected {
         return Err(ForgeError::ShapeMismatch {
             expected: vec![expected],
@@ -325,8 +365,9 @@ fn rotation_error(op: &str, detail: impl Into<String>) -> ForgeError {
         op: op.to_string(),
         level: "rotation".to_string(),
         detail: detail.into(),
-        remediation: "Use an intact current-version seed and finite vectors with dimension 1..=4096"
-            .to_string(),
+        remediation:
+            "Use an intact current-version seed and finite vectors with dimension 1..=4096"
+                .to_string(),
     }
 }
 

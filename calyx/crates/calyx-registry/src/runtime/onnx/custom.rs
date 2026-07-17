@@ -179,7 +179,12 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
         spec.provider_policy,
         session.as_ref().bound_stream(),
     )?;
-    let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
+    let run_plan = OnnxRunPlan::new(
+        spec.provider_policy,
+        run_label,
+        "onnx-custom",
+        session.as_ref(),
+    )?;
     let output = output_from_session(
         session.as_ref(),
         spec.expected_shape,
@@ -219,20 +224,21 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
 }
 
 impl CustomOnnxRuntime {
-    pub(super) fn execution_attestation(&self) -> Option<calyx_core::RuntimeExecutionAttestation> {
-        self.run_plan.execution_attestation("onnx-custom")
+    pub(super) fn execution_attestation(
+        &self,
+    ) -> Result<Option<calyx_core::RuntimeExecutionAttestation>> {
+        self.run_plan.execution_attestation()
     }
 
     fn run_token_batch(&mut self, batch: &TokenBatch) -> Result<Vec<SlotVector>> {
         let input_tensors = session_inputs(self.session.as_ref(), batch)?;
         let output = self.output;
         let vectors = self.run_plan.run_extract(
-            self.session.as_mut(),
+            &mut self.session,
             input_tensors,
             (batch.batch, batch.seq),
             |outputs| vectors_from_output(outputs, batch, output),
         )?;
-        self.session.synchronize_cuda_completion("onnx-custom")?;
         Ok(vectors)
     }
 }

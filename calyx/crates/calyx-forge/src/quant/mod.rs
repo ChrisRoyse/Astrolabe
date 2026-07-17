@@ -21,8 +21,9 @@ pub use rotation::{
     apply_rotation_batch, new_seed, seed_id_hex,
 };
 pub use turboquant::{
-    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM,
-    TurboQuantCodec, TurboQuantPreparedQuery, TurboQuantStorage,
+    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec,
+    TurboQuantPreparedQuery, TurboQuantStorage, TurboQuantV1MigrationVerifier,
+    TurboQuantValidatedCandidate,
 };
 
 pub type SeedId = [u8; 32];

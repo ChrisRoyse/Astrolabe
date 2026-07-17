@@ -188,10 +188,15 @@ fn declared_model_dtype(runtime: &LensRuntime) -> String {
         LensRuntime::Algorithmic { .. } => NOT_APPLICABLE_DTYPE.to_string(),
         // ONNX and TEI dtype are not retained by their runtime contracts; tracked by #485.
         LensRuntime::Onnx { .. }
+        | LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedDensePlaced { .. }
         | LensRuntime::OnnxColbert { .. }
         | LensRuntime::FastembedSparse { .. }
         | LensRuntime::FastembedBgem3 { .. }
         | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedSparsePlaced { .. }
+        | LensRuntime::FastembedBgem3Placed { .. }
+        | LensRuntime::FastembedRerankerPlaced { .. }
         | LensRuntime::TeiHttp { .. }
         | LensRuntime::StaticLookup { .. }
         | LensRuntime::MultimodalAdapter { .. }

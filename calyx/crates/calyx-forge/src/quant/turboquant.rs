@@ -3,9 +3,7 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::quant::codebook::LloydMaxCodebook;
-use crate::quant::qjl::{
-    GaussianProjection, QjlResidual, bitstream_len, has_nonzero_padding,
-};
+use crate::quant::qjl::{GaussianProjection, QjlResidual, bitstream_len, has_nonzero_padding};
 use crate::quant::rotation::HaarRotation;
 use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed, SeedId};
 use crate::{ForgeError, Result};
@@ -13,19 +11,22 @@ use crate::{ForgeError, Result};
 /// Maximum geometry dimension admitted by the dense Gaussian product format.
 pub const TURBOQUANT_MAX_DIM: usize = 4096;
 /// Current persisted `TQPR` product-format version.
-pub const TURBOQUANT_FORMAT_VERSION: u8 = 1;
+pub const TURBOQUANT_FORMAT_VERSION: u8 = 2;
 /// Fixed bytes preceding the scalar and QJL data bitstreams.
 pub const TURBOQUANT_FORMAT_HEADER_BYTES: usize = 88;
 
 const MAGIC: &[u8; 4] = b"TQPR";
 const FLAGS: u16 = 0;
-const DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v1\0";
+const DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v2\0";
+const LEGACY_V1_DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v1\0";
+const LEGACY_V1_FORMAT_VERSION: u8 = 1;
+const GEOMETRY_DOMAIN: &[u8] = b"calyx/turboquant/geometry/v2\0";
 const HEADER_PREFIX_BYTES: usize = 56;
 const DIGEST_OFFSET: usize = HEADER_PREFIX_BYTES;
 const BODY_OFFSET: usize = TURBOQUANT_FORMAT_HEADER_BYTES;
 const BITS2P5_LEVEL_CODE: u8 = 1;
 const BITS3P5_LEVEL_CODE: u8 = 2;
-const REMEDIATION: &str = "Use a canonical TQPR v1 payload, matching current-version seed, supported level, and finite vector with dimension 1..=4096";
+const REMEDIATION: &str = "Use a canonical TQPR v2 payload, matching current-version geometry, supported level, and finite vector with dimension 1..=4096";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 /// Physical and logical storage accounting for a validated TQPR payload.
@@ -53,6 +54,19 @@ pub struct TurboQuantPreparedQuery {
     projected: Vec<f32>,
 }
 
+/// Borrowed TQPR candidate whose digest, canonical bits, and codec geometry
+/// were validated exactly once for a hot read/search operation.
+pub struct TurboQuantValidatedCandidate<'a> {
+    level: QuantLevel,
+    dim: usize,
+    geometry_id: SeedId,
+    scale: f32,
+    scalar: &'a [u8],
+    qjl: &'a [u8],
+    gamma: f32,
+    storage: TurboQuantStorage,
+}
+
 impl TurboQuantPreparedQuery {
     /// Prepared query dimension.
     pub fn dim(&self) -> usize {
@@ -65,8 +79,28 @@ impl TurboQuantPreparedQuery {
     }
 }
 
-/// Paper-conformant TurboQuant product codec with asymmetric QJL scoring.
+/// TurboQuant product codec with dense random rotation and asymmetric QJL scoring.
+///
+/// The fractional levels use a data-oblivious alternating-width specialization
+/// of the paper's core estimator. They are not the model-calibrated outlier
+/// channel split used by the paper's KV-cache experiments.
 pub struct TurboQuantCodec {
+    seed: RotationSeed,
+    geometry_id: SeedId,
+    level: QuantLevel,
+    rotation: HaarRotation,
+    projection: GaussianProjection,
+    low_codebook: LloydMaxCodebook,
+    high_codebook: LloydMaxCodebook,
+}
+
+/// Exact, read-only verifier for upgrading committed TQPR-v1 payloads.
+///
+/// V1 used a different Lloyd-Max numerical solver and identified geometry by
+/// the rotation seed alone. This type exists only to prove that a legacy row
+/// was deterministically emitted from its persisted raw sidecar before an
+/// atomic rewrite to the current format.
+pub struct TurboQuantV1MigrationVerifier {
     seed: RotationSeed,
     level: QuantLevel,
     rotation: HaarRotation,
@@ -82,7 +116,227 @@ impl fmt::Debug for TurboQuantCodec {
             .field("level", &self.level)
             .field("dim", &self.seed.dim)
             .field("seed_id", &self.seed.id)
+            .field("geometry_id", &self.geometry_id)
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for TurboQuantV1MigrationVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurboQuantV1MigrationVerifier")
+            .field("level", &self.level)
+            .field("dim", &self.seed.dim)
+            .field("seed_id", &self.seed.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurboQuantV1MigrationVerifier {
+    /// Reconstructs the exact committed v1 geometry once for a whole column.
+    pub fn new(seed: RotationSeed, level: QuantLevel) -> Result<Self> {
+        validate_level(level, "legacy_v1_migration_new")?;
+        if seed.dim == 0 || seed.dim > TURBOQUANT_MAX_DIM {
+            return Err(quant_error(
+                "legacy_v1_migration_new",
+                level,
+                format!(
+                    "dimension must be in 1..={TURBOQUANT_MAX_DIM}, got {}",
+                    seed.dim
+                ),
+            ));
+        }
+        seed.validate()?;
+        let (low_bits, high_bits) = scalar_widths(level)?;
+        let rotation = HaarRotation::new(&seed)?;
+        if rotation.seed_id() != seed.id {
+            return Err(quant_error(
+                "legacy_v1_migration_new",
+                level,
+                "legacy Haar rotation seed identity mismatch",
+            ));
+        }
+        let projection = GaussianProjection::new(&seed, level)?;
+        let low_codebook = LloydMaxCodebook::new_legacy_v1(seed.dim, low_bits, level)?;
+        let high_codebook = LloydMaxCodebook::new_legacy_v1(seed.dim, high_bits, level)?;
+        Ok(Self {
+            seed,
+            level,
+            rotation,
+            projection,
+            low_codebook,
+            high_codebook,
+        })
+    }
+
+    /// Verifies every persisted metadata field and byte against a fresh v1
+    /// encoding of the independently read raw source.
+    pub fn verify(&self, source: &[f32], persisted: &QuantizedVec) -> Result<()> {
+        let expected = self.reconstruct_expected(source)?;
+        if persisted.level != expected.level {
+            return Err(quant_error(
+                "legacy_v1_migration_verify",
+                persisted.level,
+                format!(
+                    "legacy level mismatch: expected={} got={}",
+                    expected.level, persisted.level
+                ),
+            ));
+        }
+        if persisted.dim != expected.dim {
+            return Err(quant_error(
+                "legacy_v1_migration_verify",
+                persisted.level,
+                format!(
+                    "legacy dimension mismatch: expected={} got={}",
+                    expected.dim, persisted.dim
+                ),
+            ));
+        }
+        if persisted.scale.to_bits() != expected.scale.to_bits() {
+            return Err(quant_error(
+                "legacy_v1_migration_verify",
+                persisted.level,
+                format!(
+                    "legacy source norm mismatch: expected_bits=0x{:08x} got_bits=0x{:08x}",
+                    expected.scale.to_bits(),
+                    persisted.scale.to_bits()
+                ),
+            ));
+        }
+        if persisted.seed_id != expected.seed_id {
+            return Err(quant_error(
+                "legacy_v1_migration_verify",
+                persisted.level,
+                format!(
+                    "legacy seed mismatch: expected={:02x?} got={:02x?}",
+                    expected.seed_id, persisted.seed_id
+                ),
+            ));
+        }
+        if persisted.bytes != expected.bytes {
+            let first_difference = persisted
+                .bytes
+                .iter()
+                .zip(&expected.bytes)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or_else(|| persisted.bytes.len().min(expected.bytes.len()));
+            return Err(quant_error(
+                "legacy_v1_migration_verify",
+                persisted.level,
+                format!(
+                    "legacy TQPR-v1 bytes do not match deterministic raw-source re-encoding: first_difference={first_difference} expected_bytes={} got_bytes={}",
+                    expected.bytes.len(),
+                    persisted.bytes.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconstructs the bytes that the committed v1 writer emitted for source.
+    ///
+    /// This is exposed for migration inspection and historical fixture
+    /// construction only. Production persistence accepts current-format bytes
+    /// exclusively.
+    pub fn reconstruct_expected(&self, source: &[f32]) -> Result<QuantizedVec> {
+        self.encode_expected(source)
+    }
+
+    /// Produces legacy bytes only inside the migration verifier. Callers can
+    /// verify old state but cannot use this type as a general write codec.
+    fn encode_expected(&self, source: &[f32]) -> Result<QuantizedVec> {
+        validate_raw(
+            source,
+            self.seed.dim,
+            "legacy_v1_migration_encode",
+            self.level,
+        )?;
+        let norm = source
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() || norm > f64::from(f32::MAX) {
+            return Err(quant_error(
+                "legacy_v1_migration_encode",
+                self.level,
+                "source norm cannot be represented as finite f32",
+            ));
+        }
+        let source_norm = norm as f32;
+        let scalar_bit_count = scalar_bits(self.seed.dim, self.level)?;
+        if source_norm == 0.0 {
+            let scalar = vec![0_u8; scalar_bit_count.div_ceil(8)];
+            let qjl = QjlResidual {
+                bits: vec![0_u8; bitstream_len(self.seed.dim)],
+                gamma: 0.0,
+            };
+            let bytes = build_payload_with_contract(
+                LEGACY_V1_FORMAT_VERSION,
+                LEGACY_V1_DIGEST_DOMAIN,
+                self.level,
+                self.seed.dim,
+                self.seed.id,
+                source_norm,
+                scalar_bit_count,
+                &scalar,
+                &qjl,
+            )?;
+            return Ok(QuantizedVec {
+                level: self.level,
+                dim: self.seed.dim,
+                bytes,
+                scale: source_norm,
+                seed_id: self.seed.id,
+            });
+        }
+
+        let mut rotated = source
+            .iter()
+            .map(|value| (f64::from(*value) / f64::from(source_norm)) as f32)
+            .collect::<Vec<_>>();
+        self.rotation.apply(&mut rotated)?;
+        let mut scalar = vec![0_u8; scalar_bit_count.div_ceil(8)];
+        let mut residual = Vec::with_capacity(self.seed.dim);
+        let mut bit_offset = 0_usize;
+        for (index, value) in rotated.iter().enumerate() {
+            let codebook = if index % 2 == 0 {
+                &self.high_codebook
+            } else {
+                &self.low_codebook
+            };
+            let code = codebook.quantize(*value);
+            write_bits(&mut scalar, bit_offset, codebook.bits(), code);
+            bit_offset += codebook.bits();
+            let centroid = codebook.centroid(code).ok_or_else(|| {
+                quant_error(
+                    "legacy_v1_migration_encode",
+                    self.level,
+                    format!("legacy scalar code {code} is invalid at coordinate {index}"),
+                )
+            })?;
+            residual.push(*value - centroid);
+        }
+        let qjl = self.projection.encode_residual(&residual, source_norm)?;
+        let bytes = build_payload_with_contract(
+            LEGACY_V1_FORMAT_VERSION,
+            LEGACY_V1_DIGEST_DOMAIN,
+            self.level,
+            self.seed.dim,
+            self.seed.id,
+            source_norm,
+            scalar_bit_count,
+            &scalar,
+            &qjl,
+        )?;
+        Ok(QuantizedVec {
+            level: self.level,
+            dim: self.seed.dim,
+            bytes,
+            scale: source_norm,
+            seed_id: self.seed.id,
+        })
     }
 }
 
@@ -110,11 +364,20 @@ impl TurboQuantCodec {
                 "Haar rotation seed identity mismatch",
             ));
         }
-        let projection = GaussianProjection::new(&seed)?;
+        let projection = GaussianProjection::new(&seed, level)?;
         let low_codebook = LloydMaxCodebook::new(seed.dim, low_bits, level)?;
         let high_codebook = LloydMaxCodebook::new(seed.dim, high_bits, level)?;
+        let geometry_id = geometry_id(
+            &seed,
+            level,
+            &rotation,
+            &projection,
+            &low_codebook,
+            &high_codebook,
+        );
         Ok(Self {
             seed,
+            geometry_id,
             level,
             rotation,
             projection,
@@ -129,10 +392,32 @@ impl TurboQuantCodec {
         Ok(parsed.storage())
     }
 
+    /// Canonical identity of every generated f32 geometry coefficient.
+    pub fn geometry_id(&self) -> SeedId {
+        self.geometry_id
+    }
+
     /// Validates storage structure and verifies this codec owns the payload geometry.
     pub fn storage(&self, qv: &QuantizedVec) -> Result<TurboQuantStorage> {
-        let parsed = self.parse_owned(qv, "storage")?;
-        Ok(parsed.storage())
+        Ok(self.validate_candidate(qv)?.storage)
+    }
+
+    /// Validates a packed candidate once and returns a borrowed hot-path view.
+    pub fn validate_candidate<'a>(
+        &self,
+        qv: &'a QuantizedVec,
+    ) -> Result<TurboQuantValidatedCandidate<'a>> {
+        let parsed = self.parse_owned(qv, "validate_candidate")?;
+        Ok(TurboQuantValidatedCandidate {
+            level: qv.level,
+            dim: qv.dim,
+            geometry_id: qv.seed_id,
+            scale: qv.scale,
+            scalar: parsed.scalar,
+            qjl: parsed.qjl,
+            gamma: parsed.gamma,
+            storage: parsed.storage(),
+        })
     }
 
     /// Applies the shared Haar rotation and Gaussian projection once per raw query.
@@ -143,7 +428,7 @@ impl TurboQuantCodec {
         let projected = self.projection.project(&rotated)?;
         Ok(TurboQuantPreparedQuery {
             dim: self.seed.dim,
-            seed_id: self.seed.id,
+            seed_id: self.geometry_id,
             rotated,
             projected,
         })
@@ -155,51 +440,142 @@ impl TurboQuantCodec {
         query: &TurboQuantPreparedQuery,
         candidate: &QuantizedVec,
     ) -> Result<f32> {
-        if query.dim != self.seed.dim || query.seed_id != self.seed.id {
+        let candidate = self.validate_candidate(candidate)?;
+        self.dot_estimate_validated(query, &candidate)
+    }
+
+    /// Scores a candidate view without rehashing or reparsing its TQPR bytes.
+    pub fn dot_estimate_validated(
+        &self,
+        query: &TurboQuantPreparedQuery,
+        candidate: &TurboQuantValidatedCandidate<'_>,
+    ) -> Result<f32> {
+        if query.dim != self.seed.dim || query.seed_id != self.geometry_id {
             return Err(quant_error(
                 "score_prepared",
                 self.level,
                 "prepared query was produced by different codec geometry",
             ));
         }
-        let parsed = self.parse_owned(candidate, "score_prepared")?;
+        if candidate.level != self.level
+            || candidate.dim != self.seed.dim
+            || candidate.geometry_id != self.geometry_id
+        {
+            return Err(quant_error(
+                "score_validated",
+                self.level,
+                "validated candidate belongs to different codec geometry",
+            ));
+        }
         if candidate.scale == 0.0 {
             return Ok(0.0);
         }
-        let mut scalar_dot = 0.0_f64;
-        let mut bit_offset = 0usize;
-        for index in 0..self.seed.dim {
-            let codebook = self.codebook_for_index(index);
-            let code = read_bits(parsed.scalar, bit_offset, codebook.bits());
-            bit_offset += codebook.bits();
-            let centroid = codebook.centroid(code).ok_or_else(|| {
-                quant_error(
-                    "score_prepared",
-                    self.level,
-                    format!("scalar code {code} is invalid at coordinate {index}"),
-                )
-            })?;
-            scalar_dot += f64::from(query.rotated[index]) * f64::from(centroid);
-        }
+        let scalar_dot = self.scalar_dot(&query.rotated, candidate.scalar, "score_prepared")?;
         let correction =
             self.projection
-                .correction_parts(&query.projected, parsed.qjl, parsed.gamma)?;
+                .correction_parts(&query.projected, candidate.qjl, candidate.gamma)?;
         finite_f32(
-            f64::from(candidate.scale) * scalar_dot + f64::from(correction),
+            f64::from(candidate.scale) * scalar_dot + correction,
             "score_prepared",
             self.level,
         )
     }
 
+    fn scalar_dot(&self, query: &[f32], scalar: &[u8], op: &str) -> Result<f64> {
+        let high_bits = self.high_codebook.bits();
+        let low_bits = self.low_codebook.bits();
+        let pair_bits = high_bits + low_bits;
+        let mut sum = 0.0_f64;
+        for pair in 0..self.seed.dim.div_ceil(2) {
+            let index = pair * 2;
+            let (high_code, low_code) =
+                read_code_pair(scalar, pair * pair_bits, high_bits, low_bits);
+            let high = self.checked_centroid(&self.high_codebook, high_code, index, op)?;
+            sum += f64::from(query[index]) * f64::from(high);
+            if index + 1 < self.seed.dim {
+                let low = self.checked_centroid(&self.low_codebook, low_code, index + 1, op)?;
+                sum += f64::from(query[index + 1]) * f64::from(low);
+            }
+        }
+        if !sum.is_finite() {
+            return Err(quant_error(
+                op,
+                self.level,
+                "scalar dot product is non-finite",
+            ));
+        }
+        Ok(sum)
+    }
+
+    fn decode_scalar(&self, scalar: &[u8], scale: f32) -> Result<Vec<f32>> {
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(self.seed.dim).map_err(|error| {
+            quant_error(
+                "decode",
+                self.level,
+                format!(
+                    "cannot allocate {} decoded coefficients: {error}",
+                    self.seed.dim
+                ),
+            )
+        })?;
+        let high_bits = self.high_codebook.bits();
+        let low_bits = self.low_codebook.bits();
+        let pair_bits = high_bits + low_bits;
+        for pair in 0..self.seed.dim.div_ceil(2) {
+            let index = pair * 2;
+            let (high_code, low_code) =
+                read_code_pair(scalar, pair * pair_bits, high_bits, low_bits);
+            decoded.push(
+                scale * self.checked_centroid(&self.high_codebook, high_code, index, "decode")?,
+            );
+            if index + 1 < self.seed.dim {
+                decoded.push(
+                    scale
+                        * self.checked_centroid(
+                            &self.low_codebook,
+                            low_code,
+                            index + 1,
+                            "decode",
+                        )?,
+                );
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn checked_centroid(
+        &self,
+        codebook: &LloydMaxCodebook,
+        code: u8,
+        index: usize,
+        op: &str,
+    ) -> Result<f32> {
+        if !codebook.is_canonical_code(code) {
+            return Err(quant_error(
+                op,
+                self.level,
+                format!("scalar code {code} is non-canonical at coordinate {index}"),
+            ));
+        }
+        codebook.centroid(code).ok_or_else(|| {
+            quant_error(
+                op,
+                self.level,
+                format!("scalar code {code} is invalid at coordinate {index}"),
+            )
+        })
+    }
+
     fn parse_owned<'a>(&self, qv: &'a QuantizedVec, op: &str) -> Result<ParsedPayload<'a>> {
         let parsed = ParsedPayload::parse(qv, op)?;
-        if qv.level != self.level || qv.dim != self.seed.dim || qv.seed_id != self.seed.id {
+        if qv.level != self.level || qv.dim != self.seed.dim || qv.seed_id != self.geometry_id {
             return Err(quant_error(
                 op,
                 qv.level,
                 format!(
                     "payload geometry mismatch: codec level={} dim={} seed={:02x?}",
-                    self.level, self.seed.dim, self.seed.id
+                    self.level, self.seed.dim, self.geometry_id
                 ),
             ));
         }
@@ -242,7 +618,7 @@ impl TurboQuantCodec {
         let bytes = build_payload(
             self.level,
             self.seed.dim,
-            self.seed.id,
+            self.geometry_id,
             source_norm,
             scalar_bit_count,
             &scalar,
@@ -253,7 +629,7 @@ impl TurboQuantCodec {
             dim: self.seed.dim,
             bytes,
             scale: source_norm,
-            seed_id: self.seed.id,
+            seed_id: self.geometry_id,
         })
     }
 }
@@ -284,7 +660,7 @@ impl Quantizer for TurboQuantCodec {
             let bytes = build_payload(
                 self.level,
                 self.seed.dim,
-                self.seed.id,
+                self.geometry_id,
                 0.0,
                 scalar_bit_count,
                 &scalar,
@@ -295,7 +671,7 @@ impl Quantizer for TurboQuantCodec {
                 dim: self.seed.dim,
                 bytes,
                 scale: 0.0,
-                seed_id: self.seed.id,
+                seed_id: self.geometry_id,
             });
         }
         self.encode_nonzero(vec, source_norm)
@@ -306,21 +682,7 @@ impl Quantizer for TurboQuantCodec {
         if qv.scale == 0.0 {
             return Ok(vec![0.0; self.seed.dim]);
         }
-        let mut scalar = Vec::with_capacity(self.seed.dim);
-        let mut bit_offset = 0usize;
-        for index in 0..self.seed.dim {
-            let codebook = self.codebook_for_index(index);
-            let code = read_bits(parsed.scalar, bit_offset, codebook.bits());
-            bit_offset += codebook.bits();
-            let centroid = codebook.centroid(code).ok_or_else(|| {
-                quant_error(
-                    "decode",
-                    self.level,
-                    format!("scalar code {code} is invalid at coordinate {index}"),
-                )
-            })?;
-            scalar.push(qv.scale * centroid);
-        }
+        let mut scalar = self.decode_scalar(parsed.scalar, qv.scale)?;
         let inverse = self.projection.inverse_parts(parsed.qjl, parsed.gamma)?;
         for (value, correction) in scalar.iter_mut().zip(inverse) {
             *value += correction;
@@ -360,11 +722,18 @@ impl<'a> ParsedPayload<'a> {
             return Err(quant_error(
                 op,
                 qv.level,
-                format!("dimension must be in 1..={TURBOQUANT_MAX_DIM}, got {}", qv.dim),
+                format!(
+                    "dimension must be in 1..={TURBOQUANT_MAX_DIM}, got {}",
+                    qv.dim
+                ),
             ));
         }
-        if !qv.scale.is_finite() || qv.scale < 0.0 {
-            return Err(quant_error(op, qv.level, "source norm must be finite and non-negative"));
+        if !qv.scale.is_finite() || qv.scale.is_sign_negative() {
+            return Err(quant_error(
+                op,
+                qv.level,
+                "source norm must be finite, non-negative, and canonical +0.0 when zero",
+            ));
         }
         if qv.bytes.len() < TURBOQUANT_FORMAT_HEADER_BYTES {
             return Err(quant_error(
@@ -391,14 +760,26 @@ impl<'a> ParsedPayload<'a> {
         }
         let header_level = decode_level(qv.bytes[5], op)?;
         if header_level != qv.level {
-            return Err(quant_error(op, qv.level, "TQPR level does not match QuantizedVec"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR level does not match QuantizedVec",
+            ));
         }
         if read_u16(&qv.bytes, 6) != FLAGS {
-            return Err(quant_error(op, qv.level, "TQPR reserved flags must be zero"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR reserved flags must be zero",
+            ));
         }
         let header_dim = read_u32(&qv.bytes, 8) as usize;
         if header_dim != qv.dim {
-            return Err(quant_error(op, qv.level, "TQPR dimension does not match QuantizedVec"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR dimension does not match QuantizedVec",
+            ));
         }
         let header_scalar_bits = read_u32(&qv.bytes, 12) as usize;
         let expected_scalar_bits = scalar_bits(qv.dim, qv.level)?;
@@ -416,17 +797,28 @@ impl<'a> ParsedPayload<'a> {
             return Err(quant_error(
                 op,
                 qv.level,
-                format!("TQPR QJL bit count mismatch: expected {} got {header_qjl_bits}", qv.dim),
+                format!(
+                    "TQPR QJL bit count mismatch: expected {} got {header_qjl_bits}",
+                    qv.dim
+                ),
             ));
         }
         let gamma = f32::from_bits(read_u32(&qv.bytes, 20));
-        if !gamma.is_finite() || gamma < 0.0 {
-            return Err(quant_error(op, qv.level, "TQPR gamma must be finite and non-negative"));
+        if !gamma.is_finite() || gamma.is_sign_negative() {
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR gamma must be finite, non-negative, and canonical +0.0 when zero",
+            ));
         }
         let mut header_seed = [0u8; 32];
         header_seed.copy_from_slice(&qv.bytes[24..56]);
         if header_seed != qv.seed_id {
-            return Err(quant_error(op, qv.level, "TQPR seed ID does not match QuantizedVec"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR seed ID does not match QuantizedVec",
+            ));
         }
         let scalar_len = expected_scalar_bits.div_ceil(8);
         let qjl_len = header_qjl_bits.div_ceil(8);
@@ -438,17 +830,40 @@ impl<'a> ParsedPayload<'a> {
             return Err(quant_error(
                 op,
                 qv.level,
-                format!("TQPR length mismatch: expected {expected_len} got {}", qv.bytes.len()),
+                format!(
+                    "TQPR length mismatch: expected {expected_len} got {}",
+                    qv.bytes.len()
+                ),
             ));
         }
         let scalar_end = BODY_OFFSET + scalar_len;
         let scalar = &qv.bytes[BODY_OFFSET..scalar_end];
         let qjl = &qv.bytes[scalar_end..];
+        if qv.dim == 1 {
+            let (_, high_bits) = scalar_widths(qv.level)?;
+            let code = read_bits(scalar, 0, high_bits);
+            let positive_code = 1_u8 << (high_bits - 1);
+            if code != 0 && code != positive_code {
+                return Err(quant_error(
+                    op,
+                    qv.level,
+                    format!("dimension-one scalar code {code} is non-canonical"),
+                ));
+            }
+        }
         if has_nonzero_padding(scalar, expected_scalar_bits) {
-            return Err(quant_error(op, qv.level, "TQPR scalar bitstream has non-zero padding"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR scalar bitstream has non-zero padding",
+            ));
         }
         if has_nonzero_padding(qjl, header_qjl_bits) {
-            return Err(quant_error(op, qv.level, "TQPR QJL bitstream has non-zero padding"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR QJL bitstream has non-zero padding",
+            ));
         }
         let expected_digest = payload_digest(
             &qv.bytes[..HEADER_PREFIX_BYTES],
@@ -456,7 +871,11 @@ impl<'a> ParsedPayload<'a> {
             qv.scale,
         );
         if &qv.bytes[DIGEST_OFFSET..BODY_OFFSET] != expected_digest.as_slice() {
-            return Err(quant_error(op, qv.level, "TQPR SHA-256 payload digest mismatch"));
+            return Err(quant_error(
+                op,
+                qv.level,
+                "TQPR SHA-256 payload digest mismatch",
+            ));
         }
         if qv.scale == 0.0
             && (gamma != 0.0
@@ -509,11 +928,36 @@ fn build_payload(
     scalar: &[u8],
     qjl: &QjlResidual,
 ) -> Result<Vec<u8>> {
-    if !source_norm.is_finite() || source_norm < 0.0 {
+    build_payload_with_contract(
+        TURBOQUANT_FORMAT_VERSION,
+        DIGEST_DOMAIN,
+        level,
+        dim,
+        seed_id,
+        source_norm,
+        scalar_bit_count,
+        scalar,
+        qjl,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_payload_with_contract(
+    format_version: u8,
+    digest_domain: &[u8],
+    level: QuantLevel,
+    dim: usize,
+    seed_id: SeedId,
+    source_norm: f32,
+    scalar_bit_count: usize,
+    scalar: &[u8],
+    qjl: &QjlResidual,
+) -> Result<Vec<u8>> {
+    if !source_norm.is_finite() || source_norm.is_sign_negative() {
         return Err(quant_error(
             "build_payload",
             level,
-            "source norm must be finite and non-negative",
+            "source norm must be finite, non-negative, and canonical +0.0 when zero",
         ));
     }
     if scalar.len() != scalar_bit_count.div_ceil(8) || qjl.bits.len() != bitstream_len(dim) {
@@ -523,21 +967,33 @@ fn build_payload(
             "internal scalar or QJL bitstream length mismatch",
         ));
     }
-    if !qjl.gamma.is_finite() || qjl.gamma < 0.0 {
+    if !qjl.gamma.is_finite() || qjl.gamma.is_sign_negative() {
         return Err(quant_error(
             "build_payload",
             level,
-            "gamma must be finite and non-negative",
+            "gamma must be finite, non-negative, and canonical +0.0 when zero",
         ));
     }
     let dim_u32 = u32::try_from(dim).map_err(|_| {
-        quant_error("build_payload", level, "dimension cannot be represented as u32")
+        quant_error(
+            "build_payload",
+            level,
+            "dimension cannot be represented as u32",
+        )
     })?;
     let scalar_bits_u32 = u32::try_from(scalar_bit_count).map_err(|_| {
-        quant_error("build_payload", level, "scalar bit count cannot be represented as u32")
+        quant_error(
+            "build_payload",
+            level,
+            "scalar bit count cannot be represented as u32",
+        )
     })?;
     let qjl_bits_u32 = u32::try_from(dim).map_err(|_| {
-        quant_error("build_payload", level, "QJL bit count cannot be represented as u32")
+        quant_error(
+            "build_payload",
+            level,
+            "QJL bit count cannot be represented as u32",
+        )
     })?;
     let payload_len = BODY_OFFSET
         .checked_add(scalar.len())
@@ -545,7 +1001,7 @@ fn build_payload(
         .ok_or_else(|| quant_error("build_payload", level, "payload length overflow"))?;
     let mut bytes = Vec::with_capacity(payload_len);
     bytes.extend_from_slice(MAGIC);
-    bytes.push(TURBOQUANT_FORMAT_VERSION);
+    bytes.push(format_version);
     bytes.push(encode_level(level)?);
     bytes.extend_from_slice(&FLAGS.to_le_bytes());
     bytes.extend_from_slice(&dim_u32.to_le_bytes());
@@ -556,13 +1012,55 @@ fn build_payload(
     bytes.extend_from_slice(&[0u8; 32]);
     bytes.extend_from_slice(scalar);
     bytes.extend_from_slice(&qjl.bits);
-    let digest = payload_digest(
+    let digest = payload_digest_with_domain(
+        digest_domain,
         &bytes[..HEADER_PREFIX_BYTES],
         &bytes[BODY_OFFSET..],
         source_norm,
     );
     bytes[DIGEST_OFFSET..BODY_OFFSET].copy_from_slice(&digest);
     Ok(bytes)
+}
+
+fn geometry_id(
+    seed: &RotationSeed,
+    level: QuantLevel,
+    rotation: &HaarRotation,
+    projection: &GaussianProjection,
+    low_codebook: &LloydMaxCodebook,
+    high_codebook: &LloydMaxCodebook,
+) -> SeedId {
+    let mut hasher = Sha256::new();
+    hasher.update(GEOMETRY_DOMAIN);
+    hasher.update([TURBOQUANT_FORMAT_VERSION, encode_level_code(level)]);
+    hasher.update((seed.dim as u64).to_le_bytes());
+    hasher.update(seed.id);
+    let (factor_starts, factors, column_signs) = rotation.geometry_parts();
+    hasher.update((factor_starts.len() as u64).to_le_bytes());
+    for offset in factor_starts {
+        hasher.update((*offset as u64).to_le_bytes());
+    }
+    hash_f32_slice(&mut hasher, factors);
+    hash_f32_slice(&mut hasher, column_signs);
+    hash_f32_slice(&mut hasher, projection.values());
+    hash_f32_slice(&mut hasher, low_codebook.centroids());
+    hash_f32_slice(&mut hasher, high_codebook.centroids());
+    hasher.finalize().into()
+}
+
+fn hash_f32_slice(hasher: &mut Sha256, values: &[f32]) {
+    hasher.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+}
+
+const fn encode_level_code(level: QuantLevel) -> u8 {
+    match level {
+        QuantLevel::Bits2p5 => BITS2P5_LEVEL_CODE,
+        QuantLevel::Bits3p5 => BITS3P5_LEVEL_CODE,
+        _ => 0,
+    }
 }
 
 fn scalar_widths(level: QuantLevel) -> Result<(usize, usize)> {
@@ -629,11 +1127,12 @@ fn decode_level(value: u8, op: &str) -> Result<QuantLevel> {
     match value {
         BITS2P5_LEVEL_CODE => Ok(QuantLevel::Bits2p5),
         BITS3P5_LEVEL_CODE => Ok(QuantLevel::Bits3p5),
-        _ => Err(quant_error(
-            op,
-            QuantLevel::Bits3p5,
-            format!("unknown TQPR level code {value}"),
-        )),
+        _ => Err(ForgeError::QuantError {
+            op: format!("turboquant_{op}"),
+            level: format!("unknown({value})"),
+            detail: format!("unknown TQPR level code {value}"),
+            remediation: REMEDIATION.to_string(),
+        }),
     }
 }
 
@@ -657,6 +1156,20 @@ fn read_bits(bytes: &[u8], offset: usize, width: usize) -> u8 {
     value
 }
 
+fn read_code_pair(bytes: &[u8], offset: usize, high_width: usize, low_width: usize) -> (u8, u8) {
+    let byte_offset = offset / 8;
+    let shift = offset % 8;
+    let low_byte = u16::from(bytes.get(byte_offset).copied().unwrap_or(0));
+    let high_byte = u16::from(bytes.get(byte_offset + 1).copied().unwrap_or(0));
+    let packed = (low_byte | (high_byte << 8)) >> shift;
+    let high_mask = (1_u16 << high_width) - 1;
+    let low_mask = (1_u16 << low_width) - 1;
+    (
+        (packed & high_mask) as u8,
+        ((packed >> high_width) & low_mask) as u8,
+    )
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
@@ -671,8 +1184,17 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 fn payload_digest(prefix: &[u8], body: &[u8], source_norm: f32) -> [u8; 32] {
+    payload_digest_with_domain(DIGEST_DOMAIN, prefix, body, source_norm)
+}
+
+fn payload_digest_with_domain(
+    domain: &[u8],
+    prefix: &[u8],
+    body: &[u8],
+    source_norm: f32,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(DIGEST_DOMAIN);
+    hasher.update(domain);
     hasher.update((prefix.len() as u64).to_le_bytes());
     hasher.update(prefix);
     hasher.update((body.len() as u64).to_le_bytes());

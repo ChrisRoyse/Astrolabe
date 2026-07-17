@@ -85,6 +85,29 @@ pub enum LensRuntime {
         cmd: String,
         args: Vec<String>,
     },
+    // Placement-bound successors are appended after every historical variant
+    // so the existing bincode discriminants and field layouts remain intact.
+    FastembedDensePlaced {
+        model_id: String,
+        files: Vec<PathBuf>,
+        execution: String,
+    },
+    FastembedSparsePlaced {
+        model_id: String,
+        files: Vec<PathBuf>,
+        execution: String,
+    },
+    FastembedBgem3Placed {
+        model_id: String,
+        files: Vec<PathBuf>,
+        output: FastembedBgem3Output,
+        execution: String,
+    },
+    FastembedRerankerPlaced {
+        model_id: String,
+        files: Vec<PathBuf>,
+        execution: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,6 +142,10 @@ pub(crate) fn ml_runtime_kind(runtime: &LensRuntime) -> &'static str {
         LensRuntime::CandleLocal { .. } => "candle-local",
         LensRuntime::Onnx { .. } => "onnx",
         LensRuntime::FastembedDense { .. } => "fastembed-dense",
+        LensRuntime::FastembedDensePlaced { .. } => "fastembed-dense",
+        LensRuntime::FastembedSparsePlaced { .. } => "fastembed-sparse",
+        LensRuntime::FastembedBgem3Placed { .. } => "fastembed-bgem3",
+        LensRuntime::FastembedRerankerPlaced { .. } => "fastembed-reranker",
         LensRuntime::OnnxColbert { .. } => "onnx-colbert",
         LensRuntime::FastembedSparse { .. } => "fastembed-sparse",
         LensRuntime::FastembedBgem3 { .. } => "fastembed-bgem3",
@@ -172,6 +199,10 @@ impl LensSpec {
             }
             LensRuntime::Onnx { files, .. }
             | LensRuntime::FastembedDense { files, .. }
+            | LensRuntime::FastembedDensePlaced { files, .. }
+            | LensRuntime::FastembedSparsePlaced { files, .. }
+            | LensRuntime::FastembedBgem3Placed { files, .. }
+            | LensRuntime::FastembedRerankerPlaced { files, .. }
             | LensRuntime::OnnxColbert { files, .. }
             | LensRuntime::FastembedSparse { files, .. }
             | LensRuntime::FastembedBgem3 { files, .. }

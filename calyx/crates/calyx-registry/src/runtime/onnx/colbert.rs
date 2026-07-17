@@ -166,7 +166,12 @@ impl OnnxColbertLens {
             spec.provider_policy,
             session.as_ref().bound_stream(),
         )?;
-        let run_plan = OnnxRunPlan::new(spec.provider_policy, run_label)?;
+        let run_plan = OnnxRunPlan::new(
+            spec.provider_policy,
+            run_label,
+            "onnx-colbert",
+            session.as_ref(),
+        )?;
         let token_dim = output_token_dim(session.as_ref())?;
         let shape = SlotShape::Multi { token_dim };
         if let Some(expected) = spec.expected_shape
@@ -294,7 +299,7 @@ impl Lens for OnnxColbertLens {
         self.runtime
             .lock()
             .map_err(|_| CalyxError::lens_unreachable("ONNX ColBERT mutex was poisoned"))
-            .map(|runtime| runtime.run_plan.execution_attestation("onnx-colbert"))
+            .and_then(|runtime| runtime.run_plan.execution_attestation())
     }
 }
 
@@ -365,7 +370,7 @@ impl OnnxColbertRuntime {
         let input_tensors = session_inputs(session.as_ref(), batch)?;
         let token_dim = self.token_dim as usize;
         let rows = self.run_plan.run_extract(
-            session.as_mut(),
+            session,
             input_tensors,
             (batch.batch, batch.seq),
             |outputs| {
@@ -376,7 +381,6 @@ impl OnnxColbertRuntime {
                 multi_rows(shape, values, batch, token_dim)
             },
         )?;
-        session.synchronize_cuda_completion("onnx-colbert")?;
         Ok(rows)
     }
 }

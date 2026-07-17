@@ -12,9 +12,8 @@ use crate::{Backend, DeviceInfo, Result};
 #[cfg(windows)]
 pub use crate::cuda_runtime::{
     CUDA_NO_DEVICE_ATTESTED_CODE, PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation,
-    PinnedCudaRuntimeAttestation,
-    attest_pinned_cuda_dependencies, attest_pinned_cuda_driver_identity,
-    current_pinned_cuda_device,
+    PinnedCudaRuntimeAttestation, attest_pinned_cuda_dependencies,
+    attest_pinned_cuda_driver_identity, current_pinned_cuda_device,
     initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
     select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
 };

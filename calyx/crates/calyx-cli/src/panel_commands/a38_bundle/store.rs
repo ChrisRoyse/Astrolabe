@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::model::{
@@ -30,6 +29,12 @@ impl A38BundleStore {
     }
 
     pub(super) fn save(&self, draft: BundleDraft, saved_at_ms: u64) -> CliResult<BundleSave> {
+        let index_path = self.index_path();
+        let _mutation_lock = crate::durable_write::DurableMutationLock::acquire(
+            &self.root.join("index.mutation.lock"),
+            "A38-bundle-save",
+            &index_path,
+        )?;
         let mut catalog = self.read_catalog()?;
         let version = next_version(&catalog, &draft.name);
         let total_vram_bytes = draft
@@ -74,7 +79,7 @@ impl A38BundleStore {
         Ok(BundleSave {
             bundle_id,
             object_path,
-            index_path: self.index_path(),
+            index_path,
             bundle,
         })
     }
@@ -188,7 +193,29 @@ impl A38BundleStore {
                 "do not edit immutable A38 bundle objects; save a new bundle version",
             ));
         }
-        let bundle: SavedA38Bundle = serde_json::from_slice(&bytes).map_err(|error| {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            CliError::runtime(format!(
+                "parse A38 bundle object {}: {error}",
+                path.display()
+            ))
+        })?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if schema_version != u64::from(BUNDLE_OBJECT_VERSION) {
+            return Err(bundle_error(
+                "CALYX_A38_BUNDLE_SCHEMA_MIGRATION_REQUIRED",
+                format!(
+                    "A38 bundle object {} uses schema {}; runtime loading requires schema {} with immutable manifest digests and execution evidence",
+                    path.display(),
+                    schema_version,
+                    BUNDLE_OBJECT_VERSION
+                ),
+                "preserve the old object and save a new schema-v2 bundle from the authoritative attested lens catalog",
+            ));
+        }
+        let bundle: SavedA38Bundle = serde_json::from_value(value).map_err(|error| {
             CliError::runtime(format!(
                 "parse A38 bundle object {}: {error}",
                 path.display()
@@ -234,34 +261,9 @@ fn object_rel_path(bundle_id: &str) -> String {
 }
 
 fn write_immutable(path: &Path, bytes: &[u8]) -> CliResult {
-    match fs::read(path) {
-        Ok(existing) if existing == bytes => return Ok(()),
-        Ok(_) => {
-            return Err(bundle_error(
-                A38_BUNDLE_INVALID,
-                format!(
-                    "immutable A38 bundle object {} already exists with different bytes",
-                    path.display()
-                ),
-                "do not edit immutable A38 bundle objects; save a new bundle version",
-            ));
-        }
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
-    }
-    write_atomic(path, bytes)
+    crate::durable_write::write_bytes_immutable(path, bytes, "A38 bundle object")
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> CliResult {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    crate::durable_write::write_bytes_atomic(path, bytes, "A38 bundle catalog")
 }

@@ -188,10 +188,7 @@ impl Quantizer for MxFp4Codec {
             .map(|(lhs, rhs)| lhs * rhs)
             .sum::<f32>();
         if !sum.is_finite() {
-            return Err(quant_error(
-                "dot_estimate",
-                "dot estimate is non-finite",
-            ));
+            return Err(quant_error("dot_estimate", "dot estimate is non-finite"));
         }
         Ok(sum)
     }

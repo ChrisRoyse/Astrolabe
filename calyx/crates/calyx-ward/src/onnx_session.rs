@@ -332,11 +332,24 @@ fn snapshot_artifacts(
         Placement::CpuExplicit => host_available,
     };
     let mut seen_identities = BTreeMap::<ImmutableFileIdentity, ArtifactIdentityClaim>::new();
+    let model_parent = artifact_parent(model_path);
+    let model_root =
+        calyx_onnx_runtime::open_immutable_directory(model_parent).map_err(|error| {
+            bootstrap_error(
+                lens,
+                model_path,
+                "frozen_graph_root_snapshot",
+                provider,
+                &device,
+                error,
+                placement.remediation(),
+            )
+        })?;
     let model_snapshot = snapshot_artifact(
         "model",
         "model.onnx",
         model_path,
-        None,
+        Some(&model_root),
         &mut remaining_budget,
     )
     .map_err(|error| {
@@ -344,6 +357,17 @@ fn snapshot_artifacts(
             lens,
             model_path,
             "frozen_graph_snapshot",
+            provider,
+            &device,
+            error,
+            placement.remediation(),
+        )
+    })?;
+    validate_direct_root(&model_snapshot, &model_root, "model").map_err(|error| {
+        bootstrap_error(
+            lens,
+            model_path,
+            "frozen_graph_root_validation",
             provider,
             &device,
             error,
@@ -399,29 +423,6 @@ fn snapshot_artifacts(
             placement.remediation(),
         )
     })?;
-    let model_parent = model.source_path.parent().ok_or_else(|| {
-        bootstrap_error(
-            lens,
-            model_path,
-            "frozen_graph_parent",
-            provider,
-            &device,
-            "handle-final model path has no parent directory",
-            placement.remediation(),
-        )
-    })?;
-    let model_root =
-        calyx_onnx_runtime::open_immutable_directory(model_parent).map_err(|error| {
-            bootstrap_error(
-                lens,
-                model_path,
-                "frozen_graph_root_snapshot",
-                provider,
-                &device,
-                error,
-                placement.remediation(),
-            )
-        })?;
     let mut external_data = Vec::new();
     let mut external_evidence = Vec::new();
     let mut seen_locations = BTreeMap::<String, (PathBuf, PathBuf, usize)>::new();
@@ -519,11 +520,25 @@ fn snapshot_artifacts(
 
     let (tokenizer, tokenizer_bytes) = match tokenizer_path {
         Some(path) => {
+            let tokenizer_root = calyx_onnx_runtime::open_immutable_directory(artifact_parent(
+                path,
+            ))
+            .map_err(|error| {
+                bootstrap_error(
+                    lens,
+                    model_path,
+                    "tokenizer_root_snapshot",
+                    provider,
+                    &device,
+                    error,
+                    placement.remediation(),
+                )
+            })?;
             let snapshot = snapshot_artifact(
                 "tokenizer",
                 "tokenizer.json",
                 path,
-                None,
+                Some(&tokenizer_root),
                 &mut remaining_budget,
             )
             .map_err(|error| {
@@ -531,6 +546,17 @@ fn snapshot_artifacts(
                     lens,
                     model_path,
                     "tokenizer_snapshot",
+                    provider,
+                    &device,
+                    error,
+                    placement.remediation(),
+                )
+            })?;
+            validate_direct_root(&snapshot, &tokenizer_root, "tokenizer").map_err(|error| {
+                bootstrap_error(
+                    lens,
+                    model_path,
+                    "tokenizer_root_validation",
                     provider,
                     &device,
                     error,
@@ -599,6 +625,27 @@ struct ArtifactIdentityClaim {
     role: String,
     logical_name: String,
     source_path: PathBuf,
+}
+
+fn artifact_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn validate_direct_root(
+    snapshot: &FrozenArtifactSnapshot,
+    root: &ImmutableDirectoryRoot,
+    role: &str,
+) -> Result<(), String> {
+    if snapshot.evidence.source_path.parent() != Some(root.final_path()) {
+        return Err(format!(
+            "{role} handle-final path {} is not a direct child of retained root {}",
+            snapshot.evidence.source_path.display(),
+            root.final_path().display(),
+        ));
+    }
+    Ok(())
 }
 
 fn snapshot_artifact(
@@ -834,6 +881,7 @@ pub(crate) struct ManagedWardOnnxSession {
     // Declaration order is binding: ORT must drop before its user compute stream.
     session: Mutex<Session>,
     cuda_stream: Option<OnnxCudaExecutionStream>,
+    profile_root: ImmutableDirectoryRoot,
     context: SessionContext,
     assignment: GraphAssignment,
     execution_state: Mutex<ExecutionState>,
@@ -958,24 +1006,16 @@ impl ManagedWardOnnxSession {
             .end_profiling()
             .map_err(|error| self.error("first_inference_end_profiling", error))?;
         self.validate_returned_profile_name(&trace_path)?;
-        let profile_parent = self.context.profile_prefix.parent().ok_or_else(|| {
-            self.error(
-                "first_inference_profile_root",
-                "profiling prefix has no parent directory",
-            )
-        })?;
-        let profile_root = calyx_onnx_runtime::open_immutable_directory(profile_parent)
-            .map_err(|error| self.error("first_inference_profile_root", error))?;
         let profile_budget = calyx_onnx_runtime::available_host_memory_bytes()
             .map_err(|error| self.error("first_inference_profile_memory_budget", error))?
             .min(MAX_PROFILE_TRACE_BYTES);
         let trace = calyx_onnx_runtime::snapshot_immutable_file(
             Path::new(&trace_path),
-            Some(&profile_root),
+            Some(&self.profile_root),
             profile_budget,
         )
         .map_err(|error| self.error("first_inference_profile_readback", error))?;
-        self.validate_profile_snapshot(&trace_path, &trace, &profile_root)?;
+        self.validate_profile_snapshot(&trace_path, &trace, &self.profile_root)?;
         let trace_sha256 = format!("{:x}", Sha256::digest(&trace.bytes));
         let profile = parse_profile_assignment(&trace.bytes, &self.context.placement)
             .map_err(|error| self.error("first_inference_profile_parse", error))?;
@@ -1200,6 +1240,9 @@ pub(crate) fn build_session(
         context.placement.runtime_ordinal(),
     )
     .map_err(|error| context.error("pinned_runtime_validation", error))?;
+    let profile_root =
+        calyx_onnx_runtime::open_immutable_directory(artifact_parent(&context.profile_prefix))
+            .map_err(|error| context.error("first_inference_profile_root", error))?;
     let cuda_stream = match &context.placement {
         Placement::Cuda(device) => Some(
             calyx_onnx_runtime::create_cuda_execution_stream(device)
@@ -1281,6 +1324,7 @@ pub(crate) fn build_session(
     Ok(ManagedWardOnnxSession {
         session: Mutex::new(session),
         cuda_stream,
+        profile_root,
         context,
         assignment,
         execution_state: Mutex::new(ExecutionState::Pending),

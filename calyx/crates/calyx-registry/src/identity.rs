@@ -1,6 +1,10 @@
-use calyx_core::{Modality, SlotShape};
+use std::collections::BTreeSet;
 
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use calyx_core::{CalyxError, Modality, Result, SlotShape};
+
+use crate::frozen::{
+    FrozenLensContract, LengthDelimitedSha256, LensDType, NormPolicy, sha256_digest,
+};
 
 pub const CANDLE_BERT_EXECUTION_REVISION: &str = "calyx-candle-bert-v6,candle-core=0.10.2,candle-nn=0.10.2,candle-transformers=0.10.2,finite-native-mask,conditional-selection,source-dtype-profile-v1,full-forward-dtype-attestation";
 pub(crate) const CANDLE_DEFAULT_MAX_TOKENS: usize = 512;
@@ -100,20 +104,98 @@ pub(crate) fn onnx_colbert_corpus_hash(model_id: &str) -> [u8; 32] {
     ])
 }
 
-pub(crate) fn fastembed_sparse_corpus_hash(model_code: &str) -> [u8; 32] {
-    sha256_digest(&[b"fastembed-sparse-v1", model_code.as_bytes()])
+pub(crate) fn fastembed_sparse_corpus_hash(model_code: &str, execution: &str) -> [u8; 32] {
+    sha256_digest(&[
+        b"fastembed-sparse-v2",
+        model_code.as_bytes(),
+        execution.as_bytes(),
+    ])
 }
 
-pub(crate) fn fastembed_dense_corpus_hash(model_code: &str) -> [u8; 32] {
+pub(crate) fn fastembed_dense_corpus_hash(model_code: &str, execution: &str) -> [u8; 32] {
+    sha256_digest(&[
+        b"fastembed-dense-v2",
+        model_code.as_bytes(),
+        execution.as_bytes(),
+    ])
+}
+
+pub(crate) fn legacy_fastembed_dense_corpus_hash(model_code: &str) -> [u8; 32] {
     sha256_digest(&[b"fastembed-dense-v1", model_code.as_bytes()])
 }
 
-pub(crate) fn fastembed_bgem3_corpus_hash(model_code: &str, output_token: &[u8]) -> [u8; 32] {
-    sha256_digest(&[b"fastembed-bgem3-v1", model_code.as_bytes(), output_token])
+pub(crate) fn fastembed_bgem3_corpus_hash(
+    model_code: &str,
+    output_token: &[u8],
+    execution: &str,
+) -> [u8; 32] {
+    sha256_digest(&[
+        b"fastembed-bgem3-v2",
+        model_code.as_bytes(),
+        output_token,
+        execution.as_bytes(),
+    ])
 }
 
-pub(crate) fn fastembed_reranker_corpus_hash(model_code: &str) -> [u8; 32] {
-    sha256_digest(&[b"fastembed-reranker-v1", model_code.as_bytes()])
+pub(crate) fn fastembed_reranker_corpus_hash(model_code: &str, execution: &str) -> [u8; 32] {
+    sha256_digest(&[
+        b"fastembed-reranker-v2",
+        model_code.as_bytes(),
+        execution.as_bytes(),
+    ])
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FastembedNamedArtifactDigest {
+    pub(crate) role: String,
+    pub(crate) logical_name: String,
+    pub(crate) sha256: [u8; 32],
+}
+
+/// Hashes FastEmbed artifacts by canonical logical role/name and exact content
+/// digest. Sorting makes the identity independent of manifest or filesystem
+/// enumeration order without losing the name-to-bytes binding.
+pub(crate) fn fastembed_named_weights_sha256(
+    execution: &str,
+    mut artifacts: Vec<FastembedNamedArtifactDigest>,
+) -> Result<[u8; 32]> {
+    if execution.is_empty() {
+        return Err(fastembed_identity_invalid(
+            "FastEmbed execution identity token is empty",
+        ));
+    }
+    if artifacts.is_empty() {
+        return Err(fastembed_identity_invalid(
+            "FastEmbed artifact identity set is empty",
+        ));
+    }
+    artifacts.sort_by(|left, right| {
+        (&left.role, &left.logical_name).cmp(&(&right.role, &right.logical_name))
+    });
+    let mut names = BTreeSet::new();
+    let mut hash = LengthDelimitedSha256::new();
+    hash.update_part(b"calyx-fastembed-named-artifacts-v1");
+    hash.update_part(execution.as_bytes());
+    let artifact_count = u64::try_from(artifacts.len())
+        .map_err(|_| fastembed_identity_invalid("FastEmbed artifact identity count exceeds u64"))?;
+    hash.update_part(&artifact_count.to_be_bytes());
+    for artifact in artifacts {
+        if artifact.role.is_empty() || artifact.logical_name.is_empty() {
+            return Err(fastembed_identity_invalid(
+                "FastEmbed artifact role and logical name must be non-empty",
+            ));
+        }
+        if !names.insert((artifact.role.clone(), artifact.logical_name.clone())) {
+            return Err(fastembed_identity_invalid(format!(
+                "duplicate FastEmbed artifact identity {}/{}",
+                artifact.role, artifact.logical_name
+            )));
+        }
+        hash.update_part(artifact.role.as_bytes());
+        hash.update_part(artifact.logical_name.as_bytes());
+        hash.update_part(&artifact.sha256);
+    }
+    Ok(hash.finalize())
 }
 
 pub(crate) fn static_lookup_corpus_hash(dim: u32, dtype: &str) -> [u8; 32] {
@@ -140,4 +222,12 @@ pub(crate) fn external_command_weights_hash(cmd: &str, args: &[String]) -> [u8; 
 
 pub(crate) fn external_command_corpus_hash() -> [u8; 32] {
     sha256_digest(&[b"external-cmd-runtime-v1"])
+}
+
+fn fastembed_identity_invalid(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ONNX_FASTEMBED_ARTIFACT_INVALID",
+        message: message.into(),
+        remediation: "recommission from a canonical FastEmbed artifact set whose unique logical names bind to the declared exact bytes",
+    }
 }

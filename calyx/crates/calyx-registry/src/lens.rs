@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use calyx_aster::vault::AsterVault;
 use calyx_core::{
-    Asymmetry, CalyxError, Input, Lens, LensId, Result, RuntimeExecutionAttestation, SlotShape,
-    SlotVector, SparseEntry,
+    Asymmetry, CalyxError, Clock, CxId, Input, Lens, LensId, Result,
+    RuntimeExecutionAttestation, Slot, SlotShape, SlotVector, SparseEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,9 @@ mod contract;
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
 use crate::spec::{LensHealth, LensSpec};
+use crate::compression::{
+    self, CompressedSlotIndex, CompressionQuery, MxFp4AssayEvidence, SlotCompressionReport,
+};
 use contract::ensure_spec_declares_contract;
 
 /// Runtime registry for frozen lens measurement instruments.
@@ -260,6 +264,56 @@ impl Registry {
             .and_then(|entry| entry.spec.as_ref())
     }
 
+    /// Opens one reusable compression-aware slot view from the exact registered
+    /// lens interpretation. The returned view never substitutes raw sidecars.
+    pub fn compressed_slot_index<'a, C>(
+        &'a self,
+        vault: &'a AsterVault<C>,
+        slot: &'a Slot,
+    ) -> Result<CompressedSlotIndex<'a, C>>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        CompressedSlotIndex::open(vault, slot, spec)
+    }
+
+    /// Atomically replaces a complete persisted raw slot column with the codec
+    /// declared by its registered lens and slot.
+    pub fn write_compressed_slot_batch<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        rows: &[(CxId, Vec<f32>)],
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::write_compressed_slot_batch(vault, slot, spec, rows, queries, k)
+    }
+
+    /// Assay-bound variant of [`Self::write_compressed_slot_batch`] for MXFP4.
+    pub fn write_compressed_slot_batch_with_assay_evidence<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        rows: &[(CxId, Vec<f32>)],
+        queries: &[CompressionQuery],
+        k: usize,
+        evidence: Option<&MxFp4AssayEvidence>,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::write_compressed_slot_batch_with_assay_evidence(
+            vault, slot, spec, rows, queries, k, evidence,
+        )
+    }
+
     /// Returns execution facts observed by an already-loaded runtime.
     pub fn execution_attestation(
         &self,
@@ -384,6 +438,26 @@ impl Registry {
         self.lenses.get(&lens_id).ok_or_else(|| {
             CalyxError::lens_unreachable(format!("lens {lens_id} is not registered"))
         })
+    }
+
+    fn compression_spec(&self, slot: &Slot) -> Result<&LensSpec> {
+        let entry = self.lookup(slot.lens_id)?;
+        let spec = entry.spec.as_ref().ok_or_else(|| {
+            CalyxError::lens_frozen_violation(format!(
+                "compressed slot {} requires registered LensSpec metadata for lens {}",
+                slot.slot_key.key(),
+                slot.lens_id
+            ))
+        })?;
+        if spec.lens_id() != slot.lens_id {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "compressed slot {} lens id {} does not match registered LensSpec id {}",
+                slot.slot_key.key(),
+                slot.lens_id,
+                spec.lens_id()
+            )));
+        }
+        Ok(spec)
     }
 }
 

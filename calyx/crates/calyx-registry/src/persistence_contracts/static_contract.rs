@@ -15,7 +15,8 @@ mod fastembed_contract;
 
 #[cfg(feature = "ml-runtime")]
 use fastembed_contract::{
-    fastembed_bgem3_contract, fastembed_reranker_contract, fastembed_sparse_contract,
+    fastembed_bgem3_contract, fastembed_dense_contract, fastembed_reranker_contract,
+    fastembed_sparse_contract,
 };
 
 #[cfg(feature = "ml-runtime")]
@@ -65,23 +66,42 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         #[cfg(feature = "ml-runtime")]
         LensRuntime::Onnx { model_id, files } => onnx_contract(spec, model_id, files),
         #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedDense { .. } => legacy_unbound_fastembed(spec, "dense"),
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedDensePlaced {
+            model_id,
+            files,
+            execution,
+        } => fastembed_dense_contract(spec, model_id, files, execution),
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::OnnxColbert { model_id, files } => {
             onnx_colbert_contract(spec, model_id, files)
         }
         #[cfg(feature = "ml-runtime")]
-        LensRuntime::FastembedSparse { model_id, files } => {
-            fastembed_sparse_contract(spec, model_id, files)
-        }
+        LensRuntime::FastembedSparse { .. } => legacy_unbound_fastembed(spec, "sparse"),
         #[cfg(feature = "ml-runtime")]
-        LensRuntime::FastembedBgem3 {
+        LensRuntime::FastembedBgem3 { .. } => legacy_unbound_fastembed(spec, "BGE-M3"),
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedReranker { .. } => legacy_unbound_fastembed(spec, "reranker"),
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedSparsePlaced {
+            model_id,
+            files,
+            execution,
+        } => fastembed_sparse_contract(spec, model_id, files, execution),
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedBgem3Placed {
             model_id,
             files,
             output,
-        } => fastembed_bgem3_contract(spec, model_id, files, *output),
+            execution,
+        } => fastembed_bgem3_contract(spec, model_id, files, *output, execution),
         #[cfg(feature = "ml-runtime")]
-        LensRuntime::FastembedReranker { model_id, files } => {
-            fastembed_reranker_contract(spec, model_id, files)
-        }
+        LensRuntime::FastembedRerankerPlaced {
+            model_id,
+            files,
+            execution,
+        } => fastembed_reranker_contract(spec, model_id, files, execution),
         #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedQwen3 {
             model_id,
@@ -98,10 +118,15 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
         #[cfg(not(feature = "ml-runtime"))]
         LensRuntime::CandleLocal { .. }
         | LensRuntime::Onnx { .. }
+        | LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedDensePlaced { .. }
         | LensRuntime::OnnxColbert { .. }
         | LensRuntime::FastembedSparse { .. }
         | LensRuntime::FastembedBgem3 { .. }
         | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedSparsePlaced { .. }
+        | LensRuntime::FastembedBgem3Placed { .. }
+        | LensRuntime::FastembedRerankerPlaced { .. }
         | LensRuntime::FastembedQwen3 { .. }
         | LensRuntime::StaticLookup { .. } => Err(ml_runtime_disabled(spec)),
         LensRuntime::MultimodalAdapter {
@@ -111,6 +136,18 @@ pub(crate) fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<Froze
             files,
         } => multimodal_adapter_contract(spec, axis, model_id, adapter_config.as_deref(), files),
     }
+}
+
+#[cfg(feature = "ml-runtime")]
+fn legacy_unbound_fastembed(spec: &LensSpec, family: &str) -> Result<FrozenLensContract> {
+    Err(CalyxError {
+        code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+        message: format!(
+            "persisted {family} FastEmbed lens {} predates execution-policy identity",
+            spec.name
+        ),
+        remediation: "recommission this lens from its manifest to a placement-bound FastEmbed runtime; never infer CPU or CUDA from legacy persisted bytes",
+    })
 }
 
 fn algorithmic_contract(spec: &LensSpec, kind: &str) -> Result<FrozenLensContract> {

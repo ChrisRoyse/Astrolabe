@@ -1,8 +1,6 @@
 use crate::cpu::check_finite;
-use crate::quant::{
-    QuantLevel, QuantizedVec, Quantizer, RotationSeed,
-};
 use crate::quant::rotation::HaarRotation;
+use crate::quant::{QuantLevel, QuantizedVec, Quantizer, RotationSeed};
 use crate::{ForgeError, Result};
 
 const BINARY_LEVEL_DETAIL: &str = "BinaryCodec only supports Bits1";

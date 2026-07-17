@@ -79,6 +79,19 @@ pub enum CandleDevicePolicy {
     },
 }
 
+/// Retained proof that this process may construct learned CPU runtimes.
+///
+/// The inner capability is intentionally private and can only be minted by the
+/// shared CUDA Runtime/Driver startup decision. Keeping it alive with the lens
+/// makes CPU placement an executable invariant rather than a parsed string.
+#[derive(Clone, Debug)]
+pub(crate) struct CandleCpuAuthorization {
+    #[cfg(windows)]
+    _authorization: calyx_onnx_runtime::OnnxCpuAuthorization,
+    #[cfg(not(windows))]
+    _private: (),
+}
+
 impl CandleDevicePolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -144,6 +157,36 @@ impl CandleDevicePolicy {
                 format!("cuda-{pci}-{uuid}")
             }
         }
+    }
+}
+
+pub(crate) fn authorize_executable_cpu_policy(
+    policy: CandleDevicePolicy,
+) -> Result<Option<CandleCpuAuthorization>> {
+    if policy.is_gpu() {
+        return Ok(None);
+    }
+
+    #[cfg(windows)]
+    {
+        let authorization = calyx_onnx_runtime::authorize_cpu_companion()?;
+        tracing::debug!(
+            decision_code = authorization.decision_code(),
+            requested_runtime_ordinal = authorization.requested_runtime_ordinal(),
+            device_policy = %policy.detail(),
+            "obtained shared dual-zero authorization for learned Candle CPU construction"
+        );
+        Ok(Some(CandleCpuAuthorization {
+            _authorization: authorization,
+        }))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = policy;
+        Err(CalyxError::lens_unreachable(
+            "DEFERRED[ASTRO_PORT_PHASE]: learned CPU authorization through the exact CUDA Runtime/Driver boundary is currently Windows-only",
+        ))
     }
 }
 
@@ -298,9 +341,7 @@ fn cuda_policy_for_ordinal(
     })?;
     match calyx_forge::select_pinned_cuda_device(ordinal) {
         Ok(device) => executable_cuda_policy(device),
-        Err(error)
-            if allow_absent && error.code() == calyx_forge::CUDA_NO_DEVICE_ATTESTED_CODE =>
-        {
+        Err(error) if allow_absent && error.code() == calyx_forge::CUDA_NO_DEVICE_ATTESTED_CODE => {
             Ok(CandleDevicePolicy::CpuNoCudaDevice)
         }
         Err(error) => Err(crate::runtime::common::forge_runtime_boundary_error(error)),

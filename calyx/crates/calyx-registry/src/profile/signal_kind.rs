@@ -42,12 +42,25 @@ pub fn signal_kind_from_spec(spec: &LensSpec) -> CapabilitySignalKind {
             model_id, files, ..
         }
         | LensRuntime::Onnx { model_id, files }
+        | LensRuntime::FastembedDense { model_id, files }
+        | LensRuntime::FastembedDensePlaced {
+            model_id, files, ..
+        }
         | LensRuntime::OnnxColbert { model_id, files }
         | LensRuntime::FastembedSparse { model_id, files }
-        | LensRuntime::FastembedReranker { model_id, files } => learned_if(
+        | LensRuntime::FastembedSparsePlaced {
+            model_id, files, ..
+        }
+        | LensRuntime::FastembedReranker { model_id, files }
+        | LensRuntime::FastembedRerankerPlaced {
+            model_id, files, ..
+        } => learned_if(
             has_hash_provenance(spec) && has_model_id(model_id) && has_artifact_paths(files),
         ),
         LensRuntime::FastembedBgem3 {
+            model_id, files, ..
+        }
+        | LensRuntime::FastembedBgem3Placed {
             model_id, files, ..
         }
         | LensRuntime::FastembedQwen3 {

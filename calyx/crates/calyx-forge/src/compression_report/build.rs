@@ -172,16 +172,7 @@ fn validate_quantized_payload(qv: &QuantizedVec) -> Result<()> {
             require_payload_len(qv, qv.dim.div_ceil(MXFP4_BLOCK_SIZE) * MXFP4_BLOCK_BYTES)
         }
         QuantLevel::Bits3p5 | QuantLevel::Bits2p5 => {
-            let minimum = turboquant::packed_len(qv.dim, qv.level);
-            if qv.bytes.len() < minimum {
-                return Err(quant_error(
-                    qv.level,
-                    format!(
-                        "persisted TurboQuant payload too short: expected at least {minimum} bytes got {}",
-                        qv.bytes.len()
-                    ),
-                ));
-            }
+            turboquant::TurboQuantCodec::inspect(qv)?;
             Ok(())
         }
         QuantLevel::Bits1 => require_payload_len(qv, qv.dim.div_ceil(8)),

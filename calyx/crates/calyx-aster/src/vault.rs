@@ -294,6 +294,40 @@ where
         self.commit_rows(&rows)
     }
 
+    /// Writes a raw CF batch only if the vault is still at `expected_seq`.
+    ///
+    /// The sequence comparison and commit share the durable commit lock or the
+    /// volatile store's MVCC row lock, allowing fail-closed replace workflows.
+    pub fn write_cf_batch_if_seq(
+        &self,
+        expected_seq: Seq,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<Seq> {
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        if self.durable.is_none() {
+            return self.commit_rows_if_current_volatile(expected_seq, rows);
+        }
+        self.with_durable_commit_lock(|| {
+            let current_seq = self.latest_seq();
+            if current_seq != expected_seq {
+                return Err(calyx_core::CalyxError {
+                    code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+                    message: format!(
+                        "conditional CF batch expected seq {expected_seq}, current seq is {current_seq}; no rows were written"
+                    ),
+                    remediation: "re-read the current snapshot, revalidate the complete replacement, and retry with that exact sequence",
+                });
+            }
+            if rows.is_empty() {
+                return Ok(current_seq);
+            }
+            self.commit_rows_locked(&rows)
+        })
+    }
+
     /// Writes one raw CF row through the WAL-backed batch path.
     pub fn write_cf(&self, cf: ColumnFamily, key: Vec<u8>, value: Vec<u8>) -> Result<Seq> {
         self.write_cf_batch([(cf, key, value)])

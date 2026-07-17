@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use calyx_core::{LensCost, Placement};
+use calyx_registry::LensSpec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -9,10 +11,17 @@ use super::{
     A38_BUNDLE_INVALID, bundle_error,
 };
 use crate::error::{CliError, CliResult};
-use crate::panel_commands::template_store::SavedPanelTemplate;
+use crate::lens_commands::catalog::{
+    LocalExecutionAttestationReport, catalog_cost_matches, reparse_manifest_binding,
+    resolved_runtime_placement,
+};
+use crate::lens_commands::support::{hex_from_bytes, runtime_name};
+use crate::panel_commands::template_store::{
+    SavedPanelTemplate, validate_execution_attestation_against_spec,
+};
 
 pub(super) const BUNDLE_CATALOG_VERSION: u16 = 1;
-pub(super) const BUNDLE_OBJECT_VERSION: u16 = 1;
+pub(super) const BUNDLE_OBJECT_VERSION: u16 = 2;
 pub(super) const A38_COVERAGE_STATUS: &str = "a38_coverage_passed";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +48,7 @@ pub(super) struct A38BundleVersionRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SavedA38Bundle {
     pub schema_version: u16,
     pub name: String,
@@ -96,6 +106,7 @@ pub(super) struct EvidenceRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BundleLensRef {
     pub lens_id: String,
     pub name: String,
@@ -103,6 +114,8 @@ pub(super) struct BundleLensRef {
     pub runtime: String,
     pub weights_sha256: String,
     pub manifest: String,
+    pub manifest_sha256: String,
+    pub execution_attestation: Option<LocalExecutionAttestationReport>,
     pub placement: Placement,
     pub cost: LensCost,
 }
@@ -179,8 +192,56 @@ impl SavedA38Bundle {
                 "save the bundle through this command so coverage state is recomputed",
             ));
         }
+        for lens in &self.lenses {
+            validate_bundle_lens(lens)?;
+        }
         Ok(())
     }
+}
+
+fn validate_bundle_lens(lens: &BundleLensRef) -> CliResult {
+    let (spec, manifest_sha256) = reparse_manifest_binding(Path::new(&lens.manifest))?;
+    if manifest_sha256 != lens.manifest_sha256 {
+        return Err(bundle_error(
+            "CALYX_A38_BUNDLE_MANIFEST_DIGEST_MISMATCH",
+            format!(
+                "A38 lens {} binds manifest SHA-256 {}, but {} currently hashes to {}",
+                lens.name, lens.manifest_sha256, lens.manifest, manifest_sha256
+            ),
+            "preserve the bundle and manifest bytes, restore the admitted manifest, and save a new schema-v2 bundle after re-attestation",
+        ));
+    }
+    validate_bundle_fields(lens, &spec)?;
+    validate_execution_attestation_against_spec(
+        lens.execution_attestation.as_ref(),
+        &spec,
+        lens.placement,
+    )
+}
+
+fn validate_bundle_fields(lens: &BundleLensRef, spec: &LensSpec) -> CliResult {
+    let expected_modality = format!("{:?}", spec.modality).to_lowercase();
+    let expected_weights = hex_from_bytes(&spec.weights_sha256);
+    let expected_runtime = runtime_name(&spec.runtime);
+    let expected_placement = resolved_runtime_placement(spec)?;
+    let fields_match = lens.lens_id == spec.lens_id().to_string()
+        && lens.name == spec.name
+        && lens.modality == expected_modality
+        && lens.runtime == expected_runtime
+        && lens.weights_sha256 == expected_weights
+        && lens.placement == expected_placement
+        && catalog_cost_matches(spec, lens.cost)?;
+    if fields_match {
+        return Ok(());
+    }
+    Err(bundle_error(
+        A38_BUNDLE_INVALID,
+        format!(
+            "A38 lens {} does not match canonical manifest {}",
+            lens.name, lens.manifest
+        ),
+        "preserve the bundle bytes and save a new version from the authoritative attested catalog",
+    ))
 }
 
 pub(super) fn validate_required_modalities(

@@ -44,23 +44,19 @@ pub use compression_report::{
 pub use cpu::CpuBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    AbsentSlotSentinel, CudaBackend, CudaContext, CudaGreenContextStream,
-    CudaPrimaryContextStream, GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, RaggedBatch,
-    attest_cuda_driver_ordinal,
-    attest_cudarc_context, build_grouped_gemm_plan, build_ragged_batch,
+    AbsentSlotSentinel, CudaBackend, CudaContext, CudaGreenContextStream, CudaPrimaryContextStream,
+    GemmProblem, GroupedGemmExecutionMode, GroupedGemmPlan, RaggedBatch,
+    attest_cuda_driver_ordinal, attest_cudarc_context, build_grouped_gemm_plan, build_ragged_batch,
     build_ragged_batch_from_slabs, driver_ordinal_for_pci_bus_id, execute_grouped_gemm,
     execute_grouped_gemm_strict, extract_ragged_results, init_cuda, init_cuda_by_pci_bus_id,
     query_device_info, read_grouped_gemm_output, try_extract_ragged_results,
 };
-pub use cuda_device::{
-    CUDA_DEVICE_ENV, PinnedCudaDeviceIdentity, configured_cuda_runtime_ordinal,
-};
+pub use cuda_device::{CUDA_DEVICE_ENV, PinnedCudaDeviceIdentity, configured_cuda_runtime_ordinal};
 #[cfg(all(windows, feature = "cuda-runtime-boundary"))]
 pub use cuda_runtime::{
     CUDA_NO_DEVICE_ATTESTED_CODE, PinnedCudaDeviceAttestation, PinnedCudaModuleAttestation,
-    PinnedCudaRuntimeAttestation,
-    attest_pinned_cuda_dependencies, attest_pinned_cuda_driver_identity,
-    current_pinned_cuda_device,
+    PinnedCudaRuntimeAttestation, attest_pinned_cuda_dependencies,
+    attest_pinned_cuda_driver_identity, current_pinned_cuda_device,
     initialize_pinned_cuda_dependencies, initialize_pinned_cuda_runtime_boundary,
     select_pinned_cuda_device, select_pinned_cuda_device_by_identity,
 };
@@ -75,9 +71,9 @@ pub use mxfp8::{
 };
 pub use quant::{
     AssayQuantSafety, BinaryCodec, CURRENT_SEED_VERSION, MxFp4Codec, QjlResidual, QuantLevel,
-    QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId,
-    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM,
-    TurboQuantCodec, TurboQuantPreparedQuery, TurboQuantStorage,
+    QuantizedVec, Quantizer, RotationSeed, ScalarInt8Codec, SeedId, TURBOQUANT_FORMAT_HEADER_BYTES,
+    TURBOQUANT_FORMAT_VERSION, TURBOQUANT_MAX_DIM, TurboQuantCodec, TurboQuantPreparedQuery,
+    TurboQuantStorage, TurboQuantV1MigrationVerifier, TurboQuantValidatedCandidate,
     apply_inverse_rotation, apply_rotation, apply_rotation_batch, binary_prefilter,
     hamming_dot_estimate, new_seed, seed_id_hex,
 };

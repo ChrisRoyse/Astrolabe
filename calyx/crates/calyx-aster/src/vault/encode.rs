@@ -27,6 +27,12 @@ pub struct ConstellationHeader {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstellationBaseIdentity {
+    pub cx_id: CxId,
+    pub slot_hashes: BTreeMap<SlotId, [u8; 32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteRow {
     pub cf: ColumnFamily,
     pub key: Vec<u8>,
@@ -105,21 +111,60 @@ pub fn encode_constellation_base(cx: &Constellation) -> Result<Vec<u8>> {
 }
 
 pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
+    let (constellation, _) = decode_constellation_base_parts(bytes)?;
+    Ok(constellation)
+}
+
+pub fn decode_constellation_base_identity(bytes: &[u8]) -> Result<ConstellationBaseIdentity> {
+    let (_, identity) = decode_constellation_base_parts(bytes)?;
+    Ok(identity)
+}
+
+fn decode_constellation_base_parts(
+    bytes: &[u8],
+) -> Result<(Constellation, ConstellationBaseIdentity)> {
     let header = decode_header(bytes)?;
     let mut cursor = Cursor::new(&bytes[HEADER_LEN..]);
     let _identity = cursor.bytes(IDENTITY_HASH_LEN)?;
     let input_ref = decode_input_ref_tail(&mut cursor, header.input_hash)?;
     let slot_count = cursor.u16()? as usize;
+    if slot_count != header.n_slots as usize {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "constellation Base slot count mismatch: header={} body={slot_count}",
+            header.n_slots
+        )));
+    }
     let mut slots = BTreeMap::new();
+    let mut slot_hashes = BTreeMap::new();
+    let mut previous_slot: Option<SlotId> = None;
     for _ in 0..slot_count {
         let slot = SlotId::new(cursor.u16()?);
-        let _hash = cursor.bytes(IDENTITY_HASH_LEN)?;
-        slots.insert(
+        if let Some(previous) = previous_slot
+            && previous >= slot
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "constellation Base slot ids are not strictly increasing: previous={} current={}",
+                previous.get(),
+                slot.get()
+            )));
+        }
+        previous_slot = Some(slot);
+        let hash = cursor.array()?;
+        if slots
+            .insert(
             slot,
             SlotVector::Absent {
                 reason: AbsentReason::NotApplicable,
             },
-        );
+        )
+            .is_some()
+            || slot_hashes.insert(slot, hash).is_some()
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "constellation Base contains duplicate slot id {}",
+                slot.get()
+            )));
+        }
     }
     let scalar_count = cursor.u32()? as usize;
     let mut scalars = BTreeMap::new();
@@ -128,6 +173,12 @@ pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
         scalars.insert(key, f64::from_bits(cursor.u64()?));
     }
     let anchor_count = cursor.u32()? as usize;
+    if anchor_count != header.n_anchors as usize {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "constellation Base anchor count mismatch: header={} body={anchor_count}",
+            header.n_anchors
+        )));
+    }
     let mut anchors = Vec::with_capacity(anchor_count);
     for _ in 0..anchor_count {
         anchors.push(decode_anchor(cursor.bytes_prefixed()?)?);
@@ -146,7 +197,7 @@ pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
             "trailing bytes after constellation metadata",
         ));
     }
-    Ok(Constellation {
+    let constellation = Constellation {
         cx_id: header.cx_id,
         vault_id: header.vault_id,
         panel_version: header.panel_version,
@@ -159,7 +210,12 @@ pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
         anchors,
         provenance,
         flags: header.flags,
-    })
+    };
+    let identity = ConstellationBaseIdentity {
+        cx_id: header.cx_id,
+        slot_hashes,
+    };
+    Ok((constellation, identity))
 }
 
 pub fn same_constellation_identity(left: &[u8], right: &[u8]) -> Result<bool> {

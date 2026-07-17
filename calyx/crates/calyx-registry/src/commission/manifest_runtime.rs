@@ -4,6 +4,7 @@ use calyx_core::{CalyxError, Result};
 
 use super::algorithmic_manifest::algorithmic_kind;
 use super::manifest::{LensForgeManifest, VerifiedFile, modality_token};
+use crate::fastembed_execution::{canonical_fastembed_execution, is_in_process_fastembed_runtime};
 use crate::spec::{FastembedBgem3Output, LensRuntime};
 
 pub(super) fn canonical_local_model_dtype(
@@ -79,6 +80,10 @@ pub(super) fn validate_local_model_execution(
     dtype: &str,
     device: Option<&str>,
 ) -> Result<()> {
+    if is_in_process_fastembed_runtime(runtime) {
+        canonical_fastembed_execution(device)?;
+        return Ok(());
+    }
     let Some(dtype) = canonical_local_model_dtype(runtime, dtype)? else {
         if device.is_some() {
             return Err(config_invalid(format!(
@@ -138,38 +143,37 @@ pub(super) fn runtime_from_manifest(
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
     match manifest.runtime.as_str() {
-        "onnx" | "onnx-int8" | "onnx-custom" | "onnx-fastembed" | "onnx-splade" => {
-            Ok(LensRuntime::Onnx {
-                model_id: manifest.source_hf_id.clone(),
-                files,
-            })
-        }
+        "onnx" | "onnx-int8" | "onnx-custom" | "onnx-splade" => Ok(LensRuntime::Onnx {
+            model_id: manifest.source_hf_id.clone(),
+            files,
+        }),
+        "onnx-fastembed" => Ok(LensRuntime::FastembedDensePlaced {
+            model_id: manifest.source_hf_id.clone(),
+            files,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
+        }),
         "onnx-colbert" => Ok(LensRuntime::OnnxColbert {
             model_id: manifest.source_hf_id.clone(),
             files,
         }),
-        "fastembed-sparse" => Ok(LensRuntime::FastembedSparse {
+        "fastembed-sparse" => Ok(LensRuntime::FastembedSparsePlaced {
             model_id: manifest.source_hf_id.clone(),
             files,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
-        "fastembed-bgem3-dense" => Ok(fastembed_bgem3_runtime(
-            manifest,
-            files,
-            FastembedBgem3Output::Dense,
-        )),
-        "fastembed-bgem3-sparse" => Ok(fastembed_bgem3_runtime(
-            manifest,
-            files,
-            FastembedBgem3Output::Sparse,
-        )),
-        "fastembed-bgem3-colbert" => Ok(fastembed_bgem3_runtime(
-            manifest,
-            files,
-            FastembedBgem3Output::Colbert,
-        )),
-        "fastembed-reranker" => Ok(LensRuntime::FastembedReranker {
+        "fastembed-bgem3-dense" => {
+            fastembed_bgem3_runtime(manifest, files, FastembedBgem3Output::Dense)
+        }
+        "fastembed-bgem3-sparse" => {
+            fastembed_bgem3_runtime(manifest, files, FastembedBgem3Output::Sparse)
+        }
+        "fastembed-bgem3-colbert" => {
+            fastembed_bgem3_runtime(manifest, files, FastembedBgem3Output::Colbert)
+        }
+        "fastembed-reranker" => Ok(LensRuntime::FastembedRerankerPlaced {
             model_id: manifest.source_hf_id.clone(),
             files,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
         "fastembed-qwen3" => Ok(LensRuntime::FastembedQwen3 {
             model_id: manifest.source_hf_id.clone(),
@@ -237,12 +241,13 @@ fn fastembed_bgem3_runtime(
     manifest: &LensForgeManifest,
     files: Vec<PathBuf>,
     output: FastembedBgem3Output,
-) -> LensRuntime {
-    LensRuntime::FastembedBgem3 {
+) -> Result<LensRuntime> {
+    Ok(LensRuntime::FastembedBgem3Placed {
         model_id: manifest.source_hf_id.clone(),
         files,
         output,
-    }
+        execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
+    })
 }
 
 fn artifact_args(artifacts: &[VerifiedFile]) -> Vec<String> {

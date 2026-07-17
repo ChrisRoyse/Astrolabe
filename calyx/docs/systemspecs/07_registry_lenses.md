@@ -362,26 +362,36 @@ Assay exposes `PanelResourceBudget { max_vram_mb, max_ram_mb, max_ms_per_input }
 
 ### 6.2 Compression (`src/compression/`)
 
-`StoredSlotCodec { RawF32, TurboQuantBits3p5, TurboQuantBits2p5, ScalarInt8, MxFp4, MxFp8, Binary }`. `StoredSlotEnvelope { codec, level, raw_dim, stored_dim, truncated, payload_bytes }`.
+`StoredSlotCodec { RawF32, TurboQuantBits3p5, TurboQuantBits2p5, ScalarInt8, MxFp4, MxFp8, Binary }`. `StoredSlotEnvelope` reports codec/level/dimensions, scale and geometry identity, codec-context identity, bound `CxId`, generation root/count, payload bytes, and fixed envelope overhead.
 
 Envelope wire format (`compression/codec.rs`):
 
 ```
 byte 0      : COMPRESSED_SLOT_TAG (16 / 0x10)
-byte 1      : COMPRESSED_SLOT_VERSION (1)
+byte 1      : COMPRESSED_SLOT_VERSION (3)
 byte 2      : codec code (0=RawF32, 1=TurboQuantBits3p5, 2=TurboQuantBits2p5, 3=ScalarInt8, 4=MxFp4, 5=MxFp8, 6=Binary)
 byte 3      : quant level code (0–6)
 bytes 4..8  : raw_dim    (u32 big-endian)
 bytes 8..12 : stored_dim (u32 big-endian)
 byte 12     : flags (bit1 truncated)
-bytes 13..49: reserved (36 bytes)
-bytes 49..53: payload_len (u32 big-endian)
-bytes 53..  : quantized payload
+bytes 13..17: quant scale/source norm (canonical finite f32 bits, big-endian)
+bytes 17..49: codec seed or geometry id
+bytes 49..81: codec_context_id
+bytes 81..97: bound CxId
+bytes 97..129: whole-column compressed generation root
+bytes 129..133: generation row count (u32 big-endian)
+bytes 133..137: payload_len (u32 big-endian)
+bytes 137..169: SHA-256 over the v3 domain, prefix, and payload
+bytes 169.. : quantized payload
 ```
 
-`matryoshka_truncate_renormalize(raw, truncate_dim)`: require `0 < truncate_dim <= len`, slice `raw[0..truncate_dim]`, renormalize to unit L2.
+The 148-byte `CSMF` generation manifest stores version/codec/level, raw and stored dimensions, `codec_context_id`, compressed generation root, independently authenticated raw-sidecar generation root, row count, and a domain-separated SHA-256. Every envelope and both complete column keysets must agree with that manifest. The context identity binds the slot/lens id pair, slot-key id and text, dimensions and explicit truncation option, codec/level, modality, asymmetry, axis, retrieval/dedup flags, and canonical recall-admission threshold. A declared `Some(raw_dim)` truncation is non-canonical; omit truncation when no strict prefix reduction is intended.
 
-`compress_slot_batch`: encode with `lens.quant_default`; if `recall_drop <= lens.recall_delta` keep it, otherwise fail closed without storing substitute bytes. PQ requires a trained codebook artifact before real PQ codes can be stored. `decode_stored_slot_envelope` requires the compressed envelope tag and fails closed when it is absent or malformed. Errors: `CALYX_VECTOR_COMPRESSION_EMPTY`, `CALYX_VECTOR_COMPRESSION_INVALID`.
+TQPR-v2 payloads have an 88-byte header: `TQPR`, version/level/reserved flags, little-endian dimension/scalar-bit/QJL-bit counts, residual `gamma`, the complete current geometry id, and a domain-separated SHA-256, followed by canonical little-endian scalar and QJL bitstreams. The geometry id hashes every generated rotation/projection/codebook coefficient. TQPR-v1/outer-v2 rows can be upgraded only when one column-scoped historical codec deterministically re-encodes each independently read raw sidecar to byte-identical legacy payload bytes; other legacy codecs or ambiguous rows are refused.
+
+`matryoshka_truncate_renormalize(raw, truncate_dim)`: require `0 < truncate_dim <= len`, slice `raw[0..truncate_dim]`, renormalize to unit L2. Persisted compression additionally requires a declared truncation to be strictly smaller than the raw dimension.
+
+`write_compressed_slot_batch`: validates a complete persisted source column, rejects stored-row/query identity or positive-ray reuse, encodes with one frozen codec, admits only when measured packed-path recall drop is within `lens.recall_delta`, and atomically writes primary rows, raw sidecars, and manifest. `Registry::compressed_slot_index` is the trusted context-bound read/verify/search path. `inspect_unbound_stored_slot_envelope` validates only self-contained envelope/payload structure; it does not authenticate the CF key, registered context, generation, snapshot, or raw sidecar. Errors: `CALYX_VECTOR_COMPRESSION_EMPTY`, `CALYX_VECTOR_COMPRESSION_INVALID`.
 
 ---
 

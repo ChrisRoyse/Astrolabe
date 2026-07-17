@@ -1,25 +1,42 @@
 use calyx_aster::vault::encode;
-use calyx_core::{CalyxError, QuantPolicy, Result, Slot, SlotShape, SlotVector};
+use calyx_core::{Asymmetry, CalyxError, Modality, QuantPolicy, Result, Slot, SlotShape, SlotVector};
 use calyx_forge::{
-    BinaryCodec, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer, ScalarInt8Codec,
-    TurboQuantCodec, TurboQuantPreparedQuery, new_seed, seed_id_hex,
+    BinaryCodec, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer, ScalarInt8Codec, TurboQuantCodec,
+    TurboQuantPreparedQuery, TurboQuantV1MigrationVerifier, new_seed, seed_id_hex,
 };
 use sha2::{Digest, Sha256};
 
 use super::recall::prepare_dense;
 use super::{
     CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG, COMPRESSED_SLOT_VERSION,
-    MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES, StoredSlotCodec, StoredSlotEnvelope,
-    compression_error,
+    LEGACY_COMPRESSED_SLOT_VERSION, LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES, MxFp4AssayEvidence,
+    REGISTRY_ENVELOPE_HEADER_BYTES, StoredSlotCodec, StoredSlotEnvelope, compression_error,
 };
 use crate::spec::LensSpec;
 
-const ENVELOPE_HASH_DOMAIN: &[u8] = b"calyx-registry-slot-envelope-v2";
+const ENVELOPE_HASH_DOMAIN: &[u8] = b"calyx-registry-slot-envelope-v3";
+const LEGACY_ENVELOPE_HASH_DOMAIN: &[u8] = b"calyx-registry-slot-envelope-v2";
+const CODEC_CONTEXT_DOMAIN: &[u8] = b"calyx-registry-codec-context-v3";
+const GENERATION_ROOT_DOMAIN: &[u8] = b"calyx-registry-compression-generation-v1";
+const RAW_GENERATION_ROOT_DOMAIN: &[u8] = b"calyx-registry-compression-raw-generation-v1";
+const MANIFEST_HASH_DOMAIN: &[u8] = b"calyx-registry-compression-manifest-v1";
 const ZERO_SEED: [u8; 32] = [0; 32];
+const ENVELOPE_PREFIX_BYTES: usize = 137;
+const ENVELOPE_DIGEST_OFFSET: usize = ENVELOPE_PREFIX_BYTES;
+const MANIFEST_MAGIC: &[u8; 4] = b"CSMF";
+const MANIFEST_VERSION: u8 = 1;
+const MANIFEST_PREFIX_BYTES: usize = 116;
+const MANIFEST_BYTES: usize = MANIFEST_PREFIX_BYTES + 32;
+const LEGACY_TQPR_MAGIC: &[u8; 4] = b"TQPR";
+const LEGACY_TQPR_VERSION: u8 = 1;
+const LEGACY_TQPR_HEADER_BYTES: usize = 88;
+const LEGACY_TQPR_PREFIX_BYTES: usize = 56;
+const LEGACY_TQPR_DIGEST_DOMAIN: &[u8] = b"calyx/turboquant/tqpr/payload/v1\0";
 
 pub(super) struct EncodedBatch {
     pub(super) codec: CodecContext,
     pub(super) rows: Vec<EncodedRow>,
+    pub(super) manifest_bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -34,13 +51,73 @@ pub(super) struct EncodedRow {
     pub(super) logical_data_bits: u64,
 }
 
+struct PendingEncodedRow {
+    cx_id: calyx_core::CxId,
+    prepared: Vec<f32>,
+    raw_bytes: Vec<u8>,
+    qv: QuantizedVec,
+    codec_header_bytes: usize,
+    logical_data_bits: u64,
+}
+
 pub(super) struct ParsedStoredSlot {
     pub(super) envelope: StoredSlotEnvelope,
     pub(super) qv: QuantizedVec,
+    pub(super) codec_context_id: [u8; 32],
+    pub(super) cx_id: calyx_core::CxId,
+    pub(super) generation_root: [u8; 32],
+    pub(super) generation_rows: u32,
+}
+
+pub(super) struct CompressionManifest {
+    pub(super) codec: StoredSlotCodec,
+    pub(super) level: QuantLevel,
+    pub(super) raw_dim: u32,
+    pub(super) stored_dim: u32,
+    pub(super) codec_context_id: [u8; 32],
+    pub(super) generation_root: [u8; 32],
+    pub(super) raw_generation_root: [u8; 32],
+    pub(super) generation_rows: u32,
+}
+
+pub(super) struct LegacyV2EnvelopeVerifier {
+    slot: Slot,
+    lens: LensSpec,
+    codec: TurboQuantV1MigrationVerifier,
+}
+
+impl LegacyV2EnvelopeVerifier {
+    pub(super) fn new(slot: &Slot, lens: &LensSpec) -> Result<Self> {
+        let stored_dim = validate_context(slot, lens, lens.quant_default)?;
+        let (stored_codec, level) = legacy_policy_identity(lens.quant_default)?;
+        if !matches!(
+            stored_codec,
+            StoredSlotCodec::TurboQuantBits2p5 | StoredSlotCodec::TurboQuantBits3p5
+        ) {
+            return Err(invalid(format!(
+                "legacy v2 migration is implemented only for exact TQPR-v1 TurboQuant rows; codec {stored_codec:?} requires its separately versioned codec migration and will not be guessed"
+            )));
+        }
+        let seed = shared_seed(slot, lens, stored_dim, level, b"turboquant");
+        let codec = TurboQuantV1MigrationVerifier::new(seed, level).map_err(forge_error)?;
+        Ok(Self {
+            slot: slot.clone(),
+            lens: lens.clone(),
+            codec,
+        })
+    }
+
+    pub(super) fn verify(&self, bytes: &[u8], raw: &[f32]) -> Result<()> {
+        let qv = parse_legacy_v2_envelope(bytes, &self.slot, &self.lens)?;
+        let prepared = prepare_dense(raw, self.lens.truncate_dim)?;
+        self.codec.verify(&prepared, &qv).map_err(forge_error)
+    }
 }
 
 pub(super) enum CodecContext {
-    RawF32 { dim: usize },
+    RawF32 {
+        dim: usize,
+    },
     TurboQuant(TurboQuantCodec),
     ScalarInt8(ScalarInt8Codec),
     MxFp4 {
@@ -55,11 +132,11 @@ pub(super) enum CodecContext {
 pub(super) enum PreparedSlotQuery {
     TurboQuant {
         query: TurboQuantPreparedQuery,
-        norm: f32,
+        norm: f64,
     },
     Dense {
         values: Vec<f32>,
-        norm: f32,
+        norm: f64,
     },
 }
 
@@ -71,37 +148,416 @@ pub(super) fn encode_rows(
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<EncodedBatch> {
     let codec = CodecContext::for_write(slot, lens, policy, mxfp4_evidence)?;
-    let mut encoded_rows = Vec::with_capacity(rows.len());
+    let codec_context_id = codec_context_id(slot, lens, &codec)?;
+    let mut pending = Vec::with_capacity(rows.len());
     for (cx_id, raw) in rows {
         let prepared = prepare_dense(raw, lens.truncate_dim)?;
         let raw_bytes = raw_bytes(raw)?;
         let qv = codec.encode(&prepared)?;
         let metrics = codec.storage_metrics(&qv)?;
-        let stored_bytes = encode_envelope(codec.stored_codec(), &qv, raw.len() as u32)?;
-        encoded_rows.push(EncodedRow {
+        pending.push(PendingEncodedRow {
             cx_id: *cx_id,
             prepared,
             raw_bytes,
-            stored_bytes,
-            codec: codec.stored_codec(),
-            payload_bytes: qv.bytes.len(),
+            qv,
             codec_header_bytes: metrics.codec_header_bytes,
             logical_data_bits: metrics.logical_data_bits,
+        });
+    }
+    let generation_rows = u32::try_from(pending.len())
+        .map_err(|_| invalid("compressed generation row count exceeds u32"))?;
+    let generation_root = generation_root(
+        &codec_context_id,
+        generation_rows,
+        pending.iter().map(|row| (row.cx_id, &row.qv)),
+    )?;
+    let raw_generation_root = raw_generation_root(
+        &codec_context_id,
+        generation_rows,
+        pending
+            .iter()
+            .map(|row| (row.cx_id, row.raw_bytes.as_slice())),
+    )?;
+    let raw_dim = match slot.shape {
+        SlotShape::Dense(dim) => dim,
+        _ => return Err(invalid("slot compression requires a dense slot")),
+    };
+    let manifest_bytes = encode_manifest(
+        codec.stored_codec(),
+        codec.level(),
+        raw_dim,
+        u32::try_from(codec.dim()).map_err(|_| invalid("stored dimension exceeds u32"))?,
+        codec_context_id,
+        generation_root,
+        raw_generation_root,
+        generation_rows,
+    )?;
+    let mut encoded_rows = Vec::with_capacity(pending.len());
+    for row in pending {
+        let payload_bytes = row.qv.bytes.len();
+        let stored_bytes = encode_envelope(
+            codec.stored_codec(),
+            &row.qv,
+            raw_dim,
+            codec_context_id,
+            row.cx_id,
+            generation_root,
+            generation_rows,
+        )?;
+        encoded_rows.push(EncodedRow {
+            cx_id: row.cx_id,
+            prepared: row.prepared,
+            raw_bytes: row.raw_bytes,
+            stored_bytes,
+            codec: codec.stored_codec(),
+            payload_bytes,
+            codec_header_bytes: row.codec_header_bytes,
+            logical_data_bits: row.logical_data_bits,
         });
     }
     Ok(EncodedBatch {
         codec,
         rows: encoded_rows,
+        manifest_bytes,
     })
 }
 
-pub fn decode_stored_slot_envelope(bytes: &[u8]) -> Result<StoredSlotEnvelope> {
-    Ok(parse_stored_slot(bytes)?.envelope)
+/// Inspects one self-contained compressed envelope without binding it to storage.
+///
+/// This validates the envelope digest and standalone codec-payload canonicality.
+/// It does not authenticate the column-family key/CxId, registered slot or lens,
+/// derived codec context, generation manifest/root, snapshot, or raw sidecar.
+/// Trusted persisted reads must use `Registry::compressed_slot_index` followed
+/// by `envelope_at`, `read_at`, or `verify_at`.
+pub fn inspect_unbound_stored_slot_envelope(bytes: &[u8]) -> Result<StoredSlotEnvelope> {
+    Ok(parse_stored_slot_inner(bytes, true)?.envelope)
 }
 
 pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
+    parse_stored_slot_inner(bytes, false)
+}
+
+fn parse_legacy_v2_envelope(
+    bytes: &[u8],
+    slot: &Slot,
+    lens: &LensSpec,
+) -> Result<QuantizedVec> {
     if bytes.first().copied() != Some(COMPRESSED_SLOT_TAG) {
-        return Err(invalid("stored slot bytes are missing compressed slot envelope tag"));
+        return Err(invalid(
+            "legacy slot bytes are missing the compressed slot envelope tag",
+        ));
+    }
+    if bytes.len() < LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES {
+        return Err(invalid(format!(
+            "legacy v2 compressed envelope is shorter than {LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES} bytes: {}",
+            bytes.len()
+        )));
+    }
+    if bytes[1] != LEGACY_COMPRESSED_SLOT_VERSION {
+        return Err(invalid(format!(
+            "unmanifested compressed generation has unsupported envelope version {}; only exact legacy v2 generations can be upgraded",
+            bytes[1]
+        )));
+    }
+    let codec = decode_codec(bytes[2])?;
+    let level = decode_level(bytes[3])?;
+    validate_codec_level(codec, level)?;
+    let (expected_codec, expected_level) = legacy_policy_identity(lens.quant_default)?;
+    if codec != expected_codec || level != expected_level {
+        return Err(invalid(format!(
+            "legacy v2 codec identity does not match frozen slot/lens: expected codec={expected_codec:?} level={expected_level:?}, got codec={codec:?} level={level:?}"
+        )));
+    }
+    let stored_dim = validate_context(slot, lens, lens.quant_default)?;
+    let SlotShape::Dense(raw_dim) = slot.shape else {
+        return Err(invalid("legacy v2 migration requires a dense slot"));
+    };
+    let encoded_raw_dim = read_u32(bytes, 4, "legacy_raw_dim")?;
+    let encoded_stored_dim = read_u32(bytes, 8, "legacy_stored_dim")?;
+    if encoded_raw_dim != raw_dim || encoded_stored_dim as usize != stored_dim {
+        return Err(invalid(format!(
+            "legacy v2 dimensions do not match frozen slot/lens: expected raw={raw_dim} stored={stored_dim}, got raw={encoded_raw_dim} stored={encoded_stored_dim}"
+        )));
+    }
+    let flags = bytes[12];
+    if flags & !0b10 != 0 || (flags & 0b10 != 0) != (encoded_stored_dim < encoded_raw_dim) {
+        return Err(invalid(
+            "legacy v2 truncation or reserved flags are non-canonical",
+        ));
+    }
+    let scale = f32::from_bits(read_u32(bytes, 13, "legacy_quant_scale")?);
+    if !scale.is_finite() || scale.is_sign_negative() {
+        return Err(invalid(
+            "legacy v2 quant scale must be finite, non-negative, and canonical +0.0 when zero",
+        ));
+    }
+    let payload_len = read_u32(bytes, 49, "legacy_payload_len")? as usize;
+    let (_, _, exact_payload_len) = legacy_tqpr_layout(encoded_stored_dim as usize, level)?;
+    if payload_len != exact_payload_len {
+        return Err(invalid(format!(
+            "legacy v2 payload length is not canonical for its declared TQPR-v1 geometry: header={payload_len} exact={exact_payload_len} dim={encoded_stored_dim} level={level:?}"
+        )));
+    }
+    let expected_len = LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES
+        .checked_add(payload_len)
+        .ok_or_else(|| invalid("legacy v2 payload length overflow"))?;
+    if bytes.len() != expected_len {
+        return Err(invalid(format!(
+            "legacy v2 payload length mismatch: header={payload_len} actual={}",
+            bytes.len() - LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES
+        )));
+    }
+    let prefix = &bytes[..53];
+    let recorded = &bytes[53..LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES];
+    let payload = &bytes[LEGACY_REGISTRY_ENVELOPE_HEADER_BYTES..];
+    let computed = envelope_digest_with_domain(LEGACY_ENVELOPE_HASH_DOMAIN, prefix, payload);
+    if recorded != computed {
+        return Err(invalid(format!(
+            "legacy v2 compressed slot SHA-256 mismatch: recorded={} computed={}",
+            hex(recorded),
+            hex(&computed)
+        )));
+    }
+    let mut seed_id = [0_u8; 32];
+    seed_id.copy_from_slice(&bytes[17..49]);
+    let qv = QuantizedVec {
+        level,
+        dim: encoded_stored_dim as usize,
+        bytes: payload.to_vec(),
+        scale,
+        seed_id,
+    };
+    validate_legacy_v2_payload(codec, &qv, slot, lens)?;
+    Ok(qv)
+}
+
+fn validate_legacy_v2_payload(
+    codec: StoredSlotCodec,
+    qv: &QuantizedVec,
+    slot: &Slot,
+    lens: &LensSpec,
+) -> Result<()> {
+    if !matches!(
+        codec,
+        StoredSlotCodec::TurboQuantBits2p5 | StoredSlotCodec::TurboQuantBits3p5
+    ) {
+        return Err(invalid(format!(
+            "legacy v2 migration is implemented only for exact TQPR-v1 TurboQuant rows; codec {codec:?} requires its separately versioned codec migration and will not be guessed"
+        )));
+    }
+    let expected_seed = shared_seed(slot, lens, qv.dim, qv.level, b"turboquant");
+    if qv.seed_id != expected_seed.id {
+        return Err(invalid(format!(
+            "legacy v2 TurboQuant seed does not match the frozen slot/lens geometry: expected={} got={}",
+            seed_id_hex(&expected_seed.id),
+            seed_id_hex(&qv.seed_id)
+        )));
+    }
+    validate_legacy_tqpr_v1(qv)
+}
+
+fn validate_legacy_tqpr_v1(qv: &QuantizedVec) -> Result<()> {
+    let (high_bits, level_code) = match qv.level {
+        QuantLevel::Bits2p5 => (2_usize, 1_u8),
+        QuantLevel::Bits3p5 => (3_usize, 2_u8),
+        other => {
+            return Err(invalid(format!(
+                "legacy TQPR-v1 supports only Bits2p5/Bits3p5, got {other:?}"
+            )));
+        }
+    };
+    let (scalar_bits, scalar_len, expected_len) = legacy_tqpr_layout(qv.dim, qv.level)?;
+    if !qv.scale.is_finite() || qv.scale.is_sign_negative() {
+        return Err(invalid(
+            "legacy TQPR-v1 source norm must be finite, non-negative, and canonical +0.0 when zero",
+        ));
+    }
+    if qv.bytes.len() < LEGACY_TQPR_HEADER_BYTES {
+        return Err(invalid(format!(
+            "legacy TQPR-v1 payload is shorter than its {LEGACY_TQPR_HEADER_BYTES}-byte header"
+        )));
+    }
+    if &qv.bytes[..4] != LEGACY_TQPR_MAGIC
+        || qv.bytes[4] != LEGACY_TQPR_VERSION
+        || qv.bytes[5] != level_code
+    {
+        return Err(invalid(
+            "legacy TQPR-v1 magic, version, or level does not match the committed format",
+        ));
+    }
+    if u16::from_le_bytes([qv.bytes[6], qv.bytes[7]]) != 0 {
+        return Err(invalid("legacy TQPR-v1 reserved flags must be zero"));
+    }
+    let header_dim = legacy_tqpr_u32(&qv.bytes, 8, "dimension")? as usize;
+    let header_scalar_bits = legacy_tqpr_u32(&qv.bytes, 12, "scalar_bits")? as usize;
+    let header_qjl_bits = legacy_tqpr_u32(&qv.bytes, 16, "qjl_bits")? as usize;
+    if header_dim != qv.dim || header_scalar_bits != scalar_bits || header_qjl_bits != qv.dim {
+        return Err(invalid(format!(
+            "legacy TQPR-v1 geometry mismatch: outer_dim={} header_dim={header_dim} scalar_bits={header_scalar_bits}/{scalar_bits} qjl_bits={header_qjl_bits}/{}",
+            qv.dim, qv.dim
+        )));
+    }
+    let gamma = f32::from_bits(legacy_tqpr_u32(&qv.bytes, 20, "gamma")?);
+    if !gamma.is_finite() || gamma.is_sign_negative() {
+        return Err(invalid(
+            "legacy TQPR-v1 gamma must be finite, non-negative, and canonical +0.0 when zero",
+        ));
+    }
+    if qv.bytes[24..56] != qv.seed_id {
+        return Err(invalid(
+            "legacy TQPR-v1 seed ID does not match its v2 registry envelope",
+        ));
+    }
+    if qv.bytes.len() != expected_len {
+        return Err(invalid(format!(
+            "legacy TQPR-v1 payload length mismatch: expected={expected_len} got={}",
+            qv.bytes.len()
+        )));
+    }
+    let scalar_end = LEGACY_TQPR_HEADER_BYTES + scalar_len;
+    let scalar = &qv.bytes[LEGACY_TQPR_HEADER_BYTES..scalar_end];
+    let qjl = &qv.bytes[scalar_end..];
+    if legacy_has_nonzero_padding(scalar, scalar_bits)
+        || legacy_has_nonzero_padding(qjl, qv.dim)
+    {
+        return Err(invalid(
+            "legacy TQPR-v1 scalar or QJL bitstream has non-zero padding",
+        ));
+    }
+    if qv.dim == 1 {
+        let code = legacy_read_bits(scalar, 0, high_bits);
+        let positive_code = 1_u8 << (high_bits - 1);
+        if code != 0 && code != positive_code {
+            return Err(invalid(format!(
+                "legacy TQPR-v1 dimension-one scalar code {code} was never emitted canonically"
+            )));
+        }
+    }
+    let computed_digest = legacy_tqpr_digest(
+        &qv.bytes[..LEGACY_TQPR_PREFIX_BYTES],
+        &qv.bytes[LEGACY_TQPR_HEADER_BYTES..],
+        qv.scale,
+    );
+    if qv.bytes[LEGACY_TQPR_PREFIX_BYTES..LEGACY_TQPR_HEADER_BYTES] != computed_digest {
+        return Err(invalid("legacy TQPR-v1 SHA-256 payload digest mismatch"));
+    }
+    if qv.scale == 0.0
+        && (gamma != 0.0
+            || scalar.iter().any(|byte| *byte != 0)
+            || qjl.iter().any(|byte| *byte != 0))
+    {
+        return Err(invalid(
+            "legacy TQPR-v1 zero source norm requires all-zero scalar, QJL, and gamma state",
+        ));
+    }
+    if gamma == 0.0 && qjl.iter().any(|byte| *byte != 0) {
+        return Err(invalid(
+            "legacy TQPR-v1 zero residual norm requires all-zero QJL signs",
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_tqpr_layout(dim: usize, level: QuantLevel) -> Result<(usize, usize, usize)> {
+    if dim == 0 || dim > calyx_forge::TURBOQUANT_MAX_DIM {
+        return Err(invalid(format!(
+            "legacy TQPR-v1 dimension must be in 1..={}, got {dim}",
+            calyx_forge::TURBOQUANT_MAX_DIM
+        )));
+    }
+    let low_bits = match level {
+        QuantLevel::Bits2p5 => 1_usize,
+        QuantLevel::Bits3p5 => 2_usize,
+        other => {
+            return Err(invalid(format!(
+                "legacy TQPR-v1 supports only Bits2p5/Bits3p5, got {other:?}"
+            )));
+        }
+    };
+    let scalar_bits = dim
+        .checked_mul(low_bits)
+        .and_then(|base| base.checked_add(dim.div_ceil(2)))
+        .ok_or_else(|| invalid("legacy TQPR-v1 scalar bit count overflow"))?;
+    let scalar_len = scalar_bits.div_ceil(8);
+    let expected_len = LEGACY_TQPR_HEADER_BYTES
+        .checked_add(scalar_len)
+        .and_then(|value| value.checked_add(dim.div_ceil(8)))
+        .ok_or_else(|| invalid("legacy TQPR-v1 payload length overflow"))?;
+    Ok((scalar_bits, scalar_len, expected_len))
+}
+
+fn legacy_tqpr_u32(bytes: &[u8], offset: usize, field: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| invalid(format!("legacy TQPR-v1 {field} offset overflow")))?;
+    let chunk = bytes
+        .get(offset..end)
+        .ok_or_else(|| invalid(format!("legacy TQPR-v1 is missing {field}")))?;
+    Ok(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+}
+
+fn legacy_read_bits(bytes: &[u8], offset: usize, width: usize) -> u8 {
+    let mut value = 0_u8;
+    for bit in 0..width {
+        let absolute = offset + bit;
+        if bytes[absolute / 8] & (1 << (absolute % 8)) != 0 {
+            value |= 1 << bit;
+        }
+    }
+    value
+}
+
+fn legacy_has_nonzero_padding(bytes: &[u8], bits: usize) -> bool {
+    let used = bits % 8;
+    if used == 0 || bytes.is_empty() {
+        return false;
+    }
+    let mask = !((1_u16 << used) - 1) as u8;
+    bytes.last().is_some_and(|last| last & mask != 0)
+}
+
+fn legacy_tqpr_digest(prefix: &[u8], body: &[u8], scale: f32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_TQPR_DIGEST_DOMAIN);
+    hasher.update((prefix.len() as u64).to_le_bytes());
+    hasher.update(prefix);
+    hasher.update((body.len() as u64).to_le_bytes());
+    hasher.update(body);
+    hasher.update(scale.to_bits().to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn legacy_policy_identity(policy: QuantPolicy) -> Result<(StoredSlotCodec, QuantLevel)> {
+    match policy {
+        QuantPolicy::None => Ok((StoredSlotCodec::RawF32, QuantLevel::F32)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 16,
+        } => Ok((StoredSlotCodec::ScalarInt8, QuantLevel::Bits8)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 7,
+        } => Ok((StoredSlotCodec::TurboQuantBits3p5, QuantLevel::Bits3p5)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2: 5,
+        } => Ok((StoredSlotCodec::TurboQuantBits2p5, QuantLevel::Bits2p5)),
+        QuantPolicy::TurboQuant {
+            bits_per_channel_x2,
+        } => Err(invalid(format!(
+            "unsupported legacy TurboQuant bits_per_channel_x2 {bits_per_channel_x2}"
+        ))),
+        QuantPolicy::MxFp4 => Ok((StoredSlotCodec::MxFp4, QuantLevel::Bits4Fp)),
+        QuantPolicy::Float8 => Ok((StoredSlotCodec::MxFp8, QuantLevel::Bits8Fp)),
+        QuantPolicy::Binary => Ok((StoredSlotCodec::Binary, QuantLevel::Bits1)),
+        QuantPolicy::Pq { m, nbits } => Err(invalid(format!(
+            "legacy PQ codec is not implemented for m={m} nbits={nbits}; refusing migration"
+        ))),
+    }
+}
+
+fn parse_stored_slot_inner(bytes: &[u8], validate_turboquant: bool) -> Result<ParsedStoredSlot> {
+    if bytes.first().copied() != Some(COMPRESSED_SLOT_TAG) {
+        return Err(invalid(
+            "stored slot bytes are missing compressed slot envelope tag",
+        ));
     }
     if bytes.len() < REGISTRY_ENVELOPE_HEADER_BYTES {
         return Err(invalid(format!(
@@ -138,12 +594,23 @@ pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
         )));
     }
     let quant_scale = f32::from_bits(read_u32(bytes, 13, "quant_scale")?);
-    if !quant_scale.is_finite() || quant_scale < 0.0 {
+    if !quant_scale.is_finite() || quant_scale.is_sign_negative() {
         return Err(invalid("quant scale must be finite and non-negative"));
     }
     let mut seed_id = [0_u8; 32];
     seed_id.copy_from_slice(&bytes[17..49]);
-    let payload_len = read_u32(bytes, 49, "payload_len")? as usize;
+    let mut codec_context_id = [0_u8; 32];
+    codec_context_id.copy_from_slice(&bytes[49..81]);
+    let mut cx_id_bytes = [0_u8; 16];
+    cx_id_bytes.copy_from_slice(&bytes[81..97]);
+    let cx_id = calyx_core::CxId::from_bytes(cx_id_bytes);
+    let mut generation_root = [0_u8; 32];
+    generation_root.copy_from_slice(&bytes[97..129]);
+    let generation_rows = read_u32(bytes, 129, "generation_rows")?;
+    if generation_rows == 0 {
+        return Err(invalid("compressed generation row count must be non-zero"));
+    }
+    let payload_len = read_u32(bytes, 133, "payload_len")? as usize;
     let expected_len = REGISTRY_ENVELOPE_HEADER_BYTES
         .checked_add(payload_len)
         .ok_or_else(|| invalid("compressed slot payload length overflow"))?;
@@ -153,9 +620,9 @@ pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
             bytes.len() - REGISTRY_ENVELOPE_HEADER_BYTES
         )));
     }
-    let recorded_digest = &bytes[53..85];
+    let recorded_digest = &bytes[ENVELOPE_DIGEST_OFFSET..REGISTRY_ENVELOPE_HEADER_BYTES];
     let payload = &bytes[REGISTRY_ENVELOPE_HEADER_BYTES..];
-    let computed_digest = envelope_digest(&bytes[..53], payload);
+    let computed_digest = envelope_digest(&bytes[..ENVELOPE_PREFIX_BYTES], payload);
     if recorded_digest != computed_digest {
         return Err(invalid(format!(
             "compressed slot SHA-256 mismatch: recorded={} computed={}",
@@ -170,7 +637,7 @@ pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
         scale: quant_scale,
         seed_id,
     };
-    validate_payload_without_context(codec, &qv)?;
+    validate_payload_without_context(codec, &qv, validate_turboquant)?;
     Ok(ParsedStoredSlot {
         envelope: StoredSlotEnvelope {
             format_version: version,
@@ -181,10 +648,18 @@ pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
             truncated,
             quant_scale,
             seed_id: seed_id_hex(&seed_id),
+            codec_context_id: hex(&codec_context_id),
+            cx_id,
+            generation_root: hex(&generation_root),
+            generation_rows,
             payload_bytes: payload_len,
-            payload_sha256: hex(&computed_digest),
+            record_digest_sha256: hex(&computed_digest),
         },
         qv,
+        codec_context_id,
+        cx_id,
+        generation_root,
+        generation_rows,
     })
 }
 
@@ -227,7 +702,7 @@ impl CodecContext {
                         )));
                     }
                 };
-                let seed = shared_seed(slot, lens, dim, level, b"turboquant");
+                let seed = shared_seed(slot, lens, dim, level, b"turboquant-tqpr-v2");
                 Ok(Self::TurboQuant(
                     TurboQuantCodec::new(seed, level).map_err(forge_error)?,
                 ))
@@ -309,7 +784,7 @@ impl CodecContext {
                     level: QuantLevel::F32,
                     dim: *dim,
                     bytes: raw_f32_payload(prepared),
-                    scale: l2_norm(prepared)?,
+                    scale: norm_as_f32(l2_norm(prepared)?, "raw source norm")?,
                     seed_id: ZERO_SEED,
                 })
             }
@@ -375,17 +850,18 @@ impl CodecContext {
     ) -> Result<f32> {
         self.validate_parsed(parsed)?;
         match (self, query) {
-            (
-                Self::TurboQuant(codec),
-                PreparedSlotQuery::TurboQuant { query, norm },
-            ) => {
+            (Self::TurboQuant(codec), PreparedSlotQuery::TurboQuant { query, norm }) => {
                 if *norm == 0.0 || parsed.qv.scale == 0.0 {
                     return Ok(0.0);
                 }
+                let candidate = codec.validate_candidate(&parsed.qv).map_err(forge_error)?;
                 let dot = codec
-                    .dot_estimate_prepared(query, &parsed.qv)
+                    .dot_estimate_validated(query, &candidate)
                     .map_err(forge_error)?;
-                Ok(dot / (*norm * parsed.qv.scale))
+                finite_score(
+                    f64::from(dot) / (*norm * f64::from(parsed.qv.scale)),
+                    "TurboQuant cosine score",
+                )
             }
             (Self::RawF32 { .. }, PreparedSlotQuery::Dense { values, .. }) => {
                 let candidate = decode_raw_f32(&parsed.qv.bytes, parsed.qv.dim)?;
@@ -402,9 +878,18 @@ impl CodecContext {
                 if *norm == 0.0 {
                     return Ok(0.0);
                 }
-                Ok(codec.dot_estimate(values, &parsed.qv).map_err(forge_error)? / *norm)
+                finite_score(
+                    f64::from(
+                        codec
+                            .dot_estimate(values, &parsed.qv)
+                            .map_err(forge_error)?,
+                    ) / *norm,
+                    "binary cosine score",
+                )
             }
-            _ => Err(invalid("prepared query does not belong to this codec context")),
+            _ => Err(invalid(
+                "prepared query does not belong to this codec context",
+            )),
         }
     }
 
@@ -425,11 +910,17 @@ impl CodecContext {
         }
         match self {
             Self::TurboQuant(codec) => {
-                codec.storage(&parsed.qv).map_err(forge_error)?;
+                if parsed.qv.seed_id != codec.geometry_id() {
+                    return Err(invalid(
+                        "persisted TurboQuant geometry identity does not match frozen slot/lens",
+                    ));
+                }
             }
             Self::Binary(codec) => {
                 if parsed.qv.seed_id != codec.seed().id {
-                    return Err(invalid("persisted binary seed does not match frozen slot/lens"));
+                    return Err(invalid(
+                        "persisted binary seed does not match frozen slot/lens",
+                    ));
                 }
                 let expected_scale = 1.0 / (parsed.qv.dim as f32).sqrt();
                 if parsed.qv.scale.to_bits() != expected_scale.to_bits() {
@@ -438,9 +929,19 @@ impl CodecContext {
             }
             Self::RawF32 { .. } | Self::ScalarInt8(_) | Self::MxFp4 { .. } | Self::MxFp8(_) => {
                 if parsed.qv.seed_id != ZERO_SEED {
-                    return Err(invalid("persisted non-rotating codec requires a zero seed id"));
+                    return Err(invalid(
+                        "persisted non-rotating codec requires a zero seed id",
+                    ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_payload(&self, parsed: &ParsedStoredSlot) -> Result<()> {
+        self.validate_parsed(parsed)?;
+        if let Self::TurboQuant(codec) = self {
+            codec.storage(&parsed.qv).map_err(forge_error)?;
         }
         Ok(())
     }
@@ -469,7 +970,7 @@ struct StorageMetrics {
 fn score_decoded<Q: Quantizer>(
     codec: &Q,
     query: &[f32],
-    query_norm: f32,
+    query_norm: f64,
     candidate: &QuantizedVec,
 ) -> Result<f32> {
     if query_norm == 0.0 {
@@ -481,10 +982,20 @@ fn score_decoded<Q: Quantizer>(
     if candidate_norm == 0.0 {
         return Ok(0.0);
     }
-    Ok(dot / (query_norm * candidate_norm))
+    finite_score(
+        f64::from(dot) / (query_norm * candidate_norm),
+        "decoded cosine score",
+    )
 }
 
 fn validate_context(slot: &Slot, lens: &LensSpec, policy: QuantPolicy) -> Result<usize> {
+    if slot.slot_key.id() != slot.slot_id {
+        return Err(invalid(format!(
+            "slot key id {} does not match slot id {}",
+            slot.slot_key.id(),
+            slot.slot_id
+        )));
+    }
     if lens.output != slot.shape {
         return Err(CalyxError::lens_dim_mismatch(format!(
             "lens output {:?} does not match slot shape {:?}",
@@ -498,6 +1009,36 @@ fn validate_context(slot: &Slot, lens: &LensSpec, policy: QuantPolicy) -> Result
             lens.lens_id()
         )));
     }
+    if slot.modality != lens.modality {
+        return Err(invalid(format!(
+            "slot modality {:?} does not match frozen lens modality {:?}",
+            slot.modality, lens.modality
+        )));
+    }
+    if slot.asymmetry != lens.asymmetry {
+        return Err(invalid(format!(
+            "slot asymmetry {:?} does not match frozen lens asymmetry {:?}",
+            slot.asymmetry, lens.asymmetry
+        )));
+    }
+    if slot.axis != lens.axis {
+        return Err(invalid(format!(
+            "slot axis {:?} does not match frozen lens axis {:?}",
+            slot.axis, lens.axis
+        )));
+    }
+    if slot.retrieval_only != lens.retrieval_only {
+        return Err(invalid(format!(
+            "slot retrieval_only={} does not match frozen lens retrieval_only={}",
+            slot.retrieval_only, lens.retrieval_only
+        )));
+    }
+    if slot.excluded_from_dedup != lens.excluded_from_dedup {
+        return Err(invalid(format!(
+            "slot excluded_from_dedup={} does not match frozen lens excluded_from_dedup={}",
+            slot.excluded_from_dedup, lens.excluded_from_dedup
+        )));
+    }
     if slot.quant != policy || lens.quant_default != policy {
         return Err(invalid(format!(
             "quant policy mismatch: slot={:?} lens={:?} requested={policy:?}",
@@ -507,10 +1048,23 @@ fn validate_context(slot: &Slot, lens: &LensSpec, policy: QuantPolicy) -> Result
     let SlotShape::Dense(raw_dim) = slot.shape else {
         return Err(invalid("slot compression requires a dense slot"));
     };
-    let stored_dim = lens.truncate_dim.unwrap_or(raw_dim);
-    if stored_dim == 0 || stored_dim > raw_dim {
+    if !lens.recall_delta.is_finite()
+        || !(0.0..=1.0).contains(&lens.recall_delta)
+        || (lens.recall_delta == 0.0 && lens.recall_delta.is_sign_negative())
+    {
         return Err(invalid(format!(
-            "truncate_dim {stored_dim} is invalid for raw dimension {raw_dim}"
+            "lens recall_delta must be finite, within [0,1], and canonical +0.0 when zero; got {}",
+            lens.recall_delta
+        )));
+    }
+    let stored_dim = lens.truncate_dim.unwrap_or(raw_dim);
+    if stored_dim == 0
+        || stored_dim > raw_dim
+        || lens.truncate_dim.is_some_and(|dim| dim == raw_dim)
+    {
+        return Err(invalid(format!(
+            "truncate_dim {:?} is invalid for raw dimension {raw_dim}; omit it when no strict prefix reduction is intended",
+            lens.truncate_dim
         )));
     }
     Ok(stored_dim as usize)
@@ -536,10 +1090,251 @@ fn shared_seed(
     new_seed(dim, hasher.finalize().as_bytes())
 }
 
+pub(super) fn codec_context_id(
+    slot: &Slot,
+    lens: &LensSpec,
+    codec: &CodecContext,
+) -> Result<[u8; 32]> {
+    let SlotShape::Dense(raw_dim) = slot.shape else {
+        return Err(invalid("codec context requires a dense slot"));
+    };
+    let stored_dim = validate_context(slot, lens, slot.quant)?;
+    if stored_dim != codec.dim() {
+        return Err(invalid(format!(
+            "codec dimension {} does not match validated frozen context dimension {stored_dim}",
+            codec.dim()
+        )));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(CODEC_CONTEXT_DOMAIN);
+    hasher.update([COMPRESSED_SLOT_VERSION]);
+    hasher.update(lens.lens_id().as_bytes());
+    hasher.update(slot.slot_id.get().to_be_bytes());
+    hasher.update(slot.slot_key.id().get().to_be_bytes());
+    hasher.update((slot.slot_key.key().len() as u64).to_be_bytes());
+    hasher.update(slot.slot_key.key().as_bytes());
+    hasher.update(raw_dim.to_be_bytes());
+    hasher.update((codec.dim() as u64).to_be_bytes());
+    hasher.update([codec_code(codec.stored_codec()), level_code(codec.level())]);
+    hasher.update([modality_code(slot.modality)]);
+    match slot.asymmetry {
+        Asymmetry::None => {
+            hasher.update([0]);
+        }
+        Asymmetry::Dual { a, b } => {
+            hasher.update([1]);
+            hasher.update(a.get().to_be_bytes());
+            hasher.update(b.get().to_be_bytes());
+        }
+    };
+    match &slot.axis {
+        None => {
+            hasher.update([0]);
+        }
+        Some(axis) => {
+            hasher.update([1]);
+            hasher.update((axis.len() as u64).to_be_bytes());
+            hasher.update(axis.as_bytes());
+        }
+    };
+    hasher.update([u8::from(slot.retrieval_only)]);
+    hasher.update([u8::from(slot.excluded_from_dedup)]);
+    match lens.truncate_dim {
+        None => {
+            hasher.update([0]);
+        }
+        Some(dim) => {
+            hasher.update([1]);
+            hasher.update(dim.to_be_bytes());
+        }
+    };
+    hasher.update(lens.recall_delta.to_bits().to_be_bytes());
+    Ok(hasher.finalize().into())
+}
+
+const fn modality_code(modality: Modality) -> u8 {
+    match modality {
+        Modality::Text => 0,
+        Modality::Code => 1,
+        Modality::Image => 2,
+        Modality::Audio => 3,
+        Modality::Video => 4,
+        Modality::Protein => 5,
+        Modality::Dna => 6,
+        Modality::Molecule => 7,
+        Modality::Structured => 8,
+        Modality::Mixed => 9,
+    }
+}
+
+pub(super) fn generation_root<'a>(
+    codec_context_id: &[u8; 32],
+    generation_rows: u32,
+    rows: impl IntoIterator<Item = (calyx_core::CxId, &'a QuantizedVec)>,
+) -> Result<[u8; 32]> {
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    if rows.len() != generation_rows as usize {
+        return Err(invalid(format!(
+            "generation root row count mismatch: declared={generation_rows} actual={}",
+            rows.len()
+        )));
+    }
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].0.as_bytes() == pair[1].0.as_bytes())
+    {
+        return Err(invalid("generation root contains duplicate CxId keys"));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(GENERATION_ROOT_DOMAIN);
+    hasher.update(codec_context_id);
+    hasher.update(generation_rows.to_be_bytes());
+    for (cx_id, qv) in rows {
+        hasher.update(cx_id.as_bytes());
+        hasher.update([level_code(qv.level)]);
+        hasher.update((qv.dim as u64).to_be_bytes());
+        hasher.update(qv.scale.to_bits().to_be_bytes());
+        hasher.update(qv.seed_id);
+        hasher.update((qv.bytes.len() as u64).to_be_bytes());
+        hasher.update(&qv.bytes);
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub(super) fn raw_generation_root<'a>(
+    codec_context_id: &[u8; 32],
+    generation_rows: u32,
+    rows: impl IntoIterator<Item = (calyx_core::CxId, &'a [u8])>,
+) -> Result<[u8; 32]> {
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    if rows.len() != generation_rows as usize {
+        return Err(invalid(format!(
+            "raw generation root row count mismatch: declared={generation_rows} actual={}",
+            rows.len()
+        )));
+    }
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].0.as_bytes() == pair[1].0.as_bytes())
+    {
+        return Err(invalid("raw generation root contains duplicate CxId keys"));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(RAW_GENERATION_ROOT_DOMAIN);
+    hasher.update(codec_context_id);
+    hasher.update(generation_rows.to_be_bytes());
+    for (cx_id, raw) in rows {
+        hasher.update(cx_id.as_bytes());
+        hasher.update((raw.len() as u64).to_be_bytes());
+        hasher.update(raw);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn encode_manifest(
+    codec: StoredSlotCodec,
+    level: QuantLevel,
+    raw_dim: u32,
+    stored_dim: u32,
+    codec_context_id: [u8; 32],
+    generation_root: [u8; 32],
+    raw_generation_root: [u8; 32],
+    generation_rows: u32,
+) -> Result<Vec<u8>> {
+    validate_codec_level(codec, level)?;
+    if raw_dim == 0 || stored_dim == 0 || stored_dim > raw_dim || generation_rows == 0 {
+        return Err(invalid(format!(
+            "invalid compression manifest geometry raw_dim={raw_dim} stored_dim={stored_dim} rows={generation_rows}"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(MANIFEST_BYTES);
+    bytes.extend_from_slice(MANIFEST_MAGIC);
+    bytes.push(MANIFEST_VERSION);
+    bytes.push(codec_code(codec));
+    bytes.push(level_code(level));
+    bytes.push(0);
+    bytes.extend_from_slice(&raw_dim.to_be_bytes());
+    bytes.extend_from_slice(&stored_dim.to_be_bytes());
+    bytes.extend_from_slice(&codec_context_id);
+    bytes.extend_from_slice(&generation_root);
+    bytes.extend_from_slice(&raw_generation_root);
+    bytes.extend_from_slice(&generation_rows.to_be_bytes());
+    if bytes.len() != MANIFEST_PREFIX_BYTES {
+        return Err(invalid(
+            "internal compression manifest prefix length mismatch",
+        ));
+    }
+    let digest = manifest_digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    Ok(bytes)
+}
+
+pub(super) fn parse_compression_manifest(bytes: &[u8]) -> Result<CompressionManifest> {
+    if bytes.len() != MANIFEST_BYTES {
+        return Err(invalid(format!(
+            "compression manifest length must be {MANIFEST_BYTES} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if &bytes[..4] != MANIFEST_MAGIC {
+        return Err(invalid("compression manifest magic mismatch"));
+    }
+    if bytes[4] != MANIFEST_VERSION {
+        return Err(invalid(format!(
+            "unsupported compression manifest version {}; expected {MANIFEST_VERSION}",
+            bytes[4]
+        )));
+    }
+    let codec = decode_codec(bytes[5])?;
+    let level = decode_level(bytes[6])?;
+    validate_codec_level(codec, level)?;
+    if bytes[7] != 0 {
+        return Err(invalid("compression manifest reserved flags must be zero"));
+    }
+    let raw_dim = read_u32(bytes, 8, "manifest_raw_dim")?;
+    let stored_dim = read_u32(bytes, 12, "manifest_stored_dim")?;
+    let generation_rows = read_u32(bytes, 112, "manifest_generation_rows")?;
+    if raw_dim == 0 || stored_dim == 0 || stored_dim > raw_dim || generation_rows == 0 {
+        return Err(invalid(format!(
+            "invalid compression manifest geometry raw_dim={raw_dim} stored_dim={stored_dim} rows={generation_rows}"
+        )));
+    }
+    let computed = manifest_digest(&bytes[..MANIFEST_PREFIX_BYTES]);
+    if bytes[MANIFEST_PREFIX_BYTES..] != computed {
+        return Err(invalid(format!(
+            "compression manifest SHA-256 mismatch: recorded={} computed={}",
+            hex(&bytes[MANIFEST_PREFIX_BYTES..]),
+            hex(&computed)
+        )));
+    }
+    let mut codec_context_id = [0_u8; 32];
+    codec_context_id.copy_from_slice(&bytes[16..48]);
+    let mut generation_root = [0_u8; 32];
+    generation_root.copy_from_slice(&bytes[48..80]);
+    let mut raw_generation_root = [0_u8; 32];
+    raw_generation_root.copy_from_slice(&bytes[80..112]);
+    Ok(CompressionManifest {
+        codec,
+        level,
+        raw_dim,
+        stored_dim,
+        codec_context_id,
+        generation_root,
+        raw_generation_root,
+        generation_rows,
+    })
+}
+
 fn encode_envelope(
     codec: StoredSlotCodec,
     qv: &QuantizedVec,
     raw_dim: u32,
+    codec_context_id: [u8; 32],
+    cx_id: calyx_core::CxId,
+    generation_root: [u8; 32],
+    generation_rows: u32,
 ) -> Result<Vec<u8>> {
     validate_codec_level(codec, qv.level)?;
     if qv.dim == 0 || qv.dim > raw_dim as usize {
@@ -548,14 +1343,23 @@ fn encode_envelope(
             qv.dim
         )));
     }
-    if !qv.scale.is_finite() || qv.scale < 0.0 {
-        return Err(invalid("encoded quant scale must be finite and non-negative"));
+    if !qv.scale.is_finite() || qv.scale.is_sign_negative() {
+        return Err(invalid(
+            "encoded quant scale must be finite and non-negative",
+        ));
+    }
+    if generation_rows == 0 {
+        return Err(invalid("compressed generation row count must be non-zero"));
     }
     let stored_dim = u32::try_from(qv.dim)
         .map_err(|_| invalid(format!("stored dimension {} exceeds u32", qv.dim)))?;
-    let payload_len = u32::try_from(qv.bytes.len())
-        .map_err(|_| invalid(format!("codec payload {} bytes exceeds u32", qv.bytes.len())))?;
-    let mut prefix = Vec::with_capacity(53);
+    let payload_len = u32::try_from(qv.bytes.len()).map_err(|_| {
+        invalid(format!(
+            "codec payload {} bytes exceeds u32",
+            qv.bytes.len()
+        ))
+    })?;
+    let mut prefix = Vec::with_capacity(ENVELOPE_PREFIX_BYTES);
     prefix.push(COMPRESSED_SLOT_TAG);
     prefix.push(COMPRESSED_SLOT_VERSION);
     prefix.push(codec_code(codec));
@@ -565,7 +1369,16 @@ fn encode_envelope(
     prefix.push(u8::from(stored_dim < raw_dim) << 1);
     prefix.extend_from_slice(&qv.scale.to_bits().to_be_bytes());
     prefix.extend_from_slice(&qv.seed_id);
+    prefix.extend_from_slice(&codec_context_id);
+    prefix.extend_from_slice(cx_id.as_bytes());
+    prefix.extend_from_slice(&generation_root);
+    prefix.extend_from_slice(&generation_rows.to_be_bytes());
     prefix.extend_from_slice(&payload_len.to_be_bytes());
+    if prefix.len() != ENVELOPE_PREFIX_BYTES {
+        return Err(invalid(
+            "internal compressed envelope prefix length mismatch",
+        ));
+    }
     let digest = envelope_digest(&prefix, &qv.bytes);
     let capacity = REGISTRY_ENVELOPE_HEADER_BYTES
         .checked_add(qv.bytes.len())
@@ -577,28 +1390,38 @@ fn encode_envelope(
     Ok(out)
 }
 
-fn validate_payload_without_context(codec: StoredSlotCodec, qv: &QuantizedVec) -> Result<()> {
+fn validate_payload_without_context(
+    codec: StoredSlotCodec,
+    qv: &QuantizedVec,
+    validate_turboquant: bool,
+) -> Result<()> {
     match codec {
         StoredSlotCodec::RawF32 => {
-            decode_raw_f32(&qv.bytes, qv.dim)?;
-        }
-        StoredSlotCodec::TurboQuantBits3p5 | StoredSlotCodec::TurboQuantBits2p5 => {
-            TurboQuantCodec::inspect(qv).map_err(forge_error)?;
-        }
-        StoredSlotCodec::ScalarInt8 => {
-            if qv.bytes.len() != qv.dim || qv.seed_id != ZERO_SEED {
+            if qv.seed_id != ZERO_SEED {
+                return Err(invalid("raw f32 payload requires a zero seed id"));
+            }
+            let decoded = decode_raw_f32(&qv.bytes, qv.dim)?;
+            let expected = norm_as_f32(l2_norm(&decoded)?, "raw payload norm")?;
+            if qv.scale.to_bits() != expected.to_bits() {
                 return Err(invalid(format!(
-                    "invalid scalar INT8 payload: bytes={} dim={} zero_seed={}",
-                    qv.bytes.len(),
-                    qv.dim,
-                    qv.seed_id == ZERO_SEED
+                    "raw f32 payload norm is not canonical: recorded_bits=0x{:08x} expected_bits=0x{:08x}",
+                    qv.scale.to_bits(),
+                    expected.to_bits()
                 )));
             }
         }
-        StoredSlotCodec::MxFp4 | StoredSlotCodec::MxFp8 => {
-            MxFp4Codec::new(qv.dim)
+        StoredSlotCodec::TurboQuantBits3p5 | StoredSlotCodec::TurboQuantBits2p5 => {
+            if validate_turboquant {
+                TurboQuantCodec::inspect(qv).map_err(forge_error)?;
+            }
+        }
+        StoredSlotCodec::ScalarInt8 => {
+            ScalarInt8Codec::new(qv.dim)
                 .decode(qv)
                 .map_err(forge_error)?;
+        }
+        StoredSlotCodec::MxFp4 | StoredSlotCodec::MxFp8 => {
+            MxFp4Codec::new(qv.dim).decode(qv).map_err(forge_error)?;
         }
         StoredSlotCodec::Binary => {
             let expected = qv.dim.div_ceil(8);
@@ -608,14 +1431,14 @@ fn validate_payload_without_context(codec: StoredSlotCodec, qv: &QuantizedVec) -
                     qv.bytes.len()
                 )));
             }
+            let expected_scale = 1.0 / (qv.dim as f32).sqrt();
+            if qv.scale.to_bits() != expected_scale.to_bits() {
+                return Err(invalid("binary payload amplitude is not canonical"));
+            }
             let used = qv.dim % 8;
             if used != 0 {
                 let padding_mask = !((1_u16 << used) - 1) as u8;
-                if qv
-                    .bytes
-                    .last()
-                    .is_some_and(|last| last & padding_mask != 0)
-                {
+                if qv.bytes.last().is_some_and(|last| last & padding_mask != 0) {
                     return Err(invalid("binary payload has non-zero padding bits"));
                 }
             }
@@ -678,7 +1501,7 @@ fn validate_dense(values: &[f32], dim: usize, op: &str) -> Result<()> {
     Ok(())
 }
 
-fn l2_norm(values: &[f32]) -> Result<f32> {
+fn l2_norm(values: &[f32]) -> Result<f64> {
     let sum = values
         .iter()
         .try_fold(0.0_f64, |sum, value| {
@@ -686,7 +1509,7 @@ fn l2_norm(values: &[f32]) -> Result<f32> {
             next.is_finite().then_some(next)
         })
         .ok_or_else(|| invalid("vector L2 norm overflowed"))?;
-    let norm = sum.sqrt() as f32;
+    let norm = sum.sqrt();
     if !norm.is_finite() {
         return Err(invalid("vector L2 norm is non-finite"));
     }
@@ -709,18 +1532,55 @@ fn cosine(left: &[f32], right: &[f32]) -> Result<f32> {
     let dot = left
         .iter()
         .zip(right)
-        .map(|(lhs, rhs)| f64::from(*lhs) * f64::from(*rhs))
-        .sum::<f64>();
-    Ok((dot / (f64::from(lhs_norm) * f64::from(rhs_norm))) as f32)
+        .try_fold(0.0_f64, |sum, (lhs, rhs)| {
+            let next = sum + f64::from(*lhs) * f64::from(*rhs);
+            next.is_finite().then_some(next)
+        })
+        .ok_or_else(|| invalid("cosine dot product overflowed"))?;
+    finite_score(dot / (lhs_norm * rhs_norm), "raw cosine score")
+}
+
+fn norm_as_f32(norm: f64, field: &str) -> Result<f32> {
+    if !norm.is_finite() || norm > f64::from(f32::MAX) {
+        return Err(invalid(format!(
+            "{field} cannot be represented as a finite f32"
+        )));
+    }
+    Ok(norm as f32)
+}
+
+fn finite_score(score: f64, field: &str) -> Result<f32> {
+    if !score.is_finite() || score.abs() > f64::from(f32::MAX) {
+        return Err(invalid(format!(
+            "{field} cannot be represented as a finite f32"
+        )));
+    }
+    Ok(score as f32)
 }
 
 fn envelope_digest(prefix: &[u8], payload: &[u8]) -> [u8; 32] {
+    envelope_digest_with_domain(ENVELOPE_HASH_DOMAIN, prefix, payload)
+}
+
+fn envelope_digest_with_domain(
+    domain: &[u8],
+    prefix: &[u8],
+    payload: &[u8],
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(ENVELOPE_HASH_DOMAIN);
+    hasher.update(domain);
     hasher.update((prefix.len() as u64).to_be_bytes());
     hasher.update(prefix);
     hasher.update((payload.len() as u64).to_be_bytes());
     hasher.update(payload);
+    hasher.finalize().into()
+}
+
+fn manifest_digest(prefix: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MANIFEST_HASH_DOMAIN);
+    hasher.update((prefix.len() as u64).to_be_bytes());
+    hasher.update(prefix);
     hasher.finalize().into()
 }
 

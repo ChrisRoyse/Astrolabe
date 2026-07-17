@@ -3,7 +3,10 @@
 mod gc;
 mod read;
 mod scan_pages;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange};
+use crate::cf::{
+    COMPRESSED_SLOT_VALUE_TAG, CfRouter, ColumnFamily, KeyRange, SlotFamilyKind,
+    compression_manifest_key,
+};
 use crate::gc::{SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick};
 use crate::mvcc::{
     Freshness, ReadBarrier, ReaderLease, SeqAllocator, Snapshot, read_barrier::first_blocking,
@@ -12,7 +15,7 @@ use crate::resource::{
     LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ResourceCounters,
 };
 use crate::sst::{SstEntry, SstSummary};
-use calyx_core::{Clock, Result, Seq, Ts};
+use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
@@ -30,6 +33,111 @@ struct VersionedValue {
 type CfKey = (ColumnFamily, Vec<u8>);
 type VersionChain = Vec<VersionedValue>;
 type RowTable = BTreeMap<CfKey, VersionChain>;
+
+fn sequence_conflict(expected: Seq, current: Seq) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+        message: format!(
+            "conditional MVCC batch expected seq {expected}, current seq is {current}; no rows were written"
+        ),
+        remediation: "re-read the current snapshot, revalidate the complete replacement, and retry with that exact sequence",
+    }
+}
+
+fn validate_compression_writes(
+    table: &RowTable,
+    current: Seq,
+    rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+) -> Result<()> {
+    for (cf, _, value) in rows {
+        let ColumnFamily::Slot { slot, kind } = cf else {
+            continue;
+        };
+        let manifest_key = compression_manifest_key(*slot);
+        let manifest_in_batch = rows.iter().any(|(candidate_cf, key, candidate_value)| {
+            *candidate_cf == ColumnFamily::Compression
+                && key.as_slice() == manifest_key.as_slice()
+                && !is_tombstone_value(candidate_value)
+        });
+        let manifest_exists =
+            visible_value(table, current, ColumnFamily::Compression, &manifest_key)
+                .is_some_and(|bytes| !is_tombstone_value(bytes));
+        if manifest_exists && !manifest_in_batch {
+            return Err(compression_write_error(format!(
+                "slot {} belongs to a compressed generation; update its rows and compression manifest in one conditional full-column batch",
+                slot.get()
+            )));
+        }
+        match kind {
+            SlotFamilyKind::Quantized
+                if value.first().copied() == Some(COMPRESSED_SLOT_VALUE_TAG) =>
+            {
+                if !manifest_exists && !manifest_in_batch {
+                    return Err(compression_write_error(format!(
+                        "compressed slot {} row has no atomic generation manifest",
+                        slot.get()
+                    )));
+                }
+            }
+            SlotFamilyKind::Quantized if manifest_in_batch => {
+                return Err(compression_write_error(format!(
+                    "compression manifest update for slot {} contains a non-compressed primary row",
+                    slot.get()
+                )));
+            }
+            SlotFamilyKind::Raw if manifest_in_batch => {}
+            _ => {}
+        }
+    }
+    for (cf, key, value) in rows {
+        if *cf != ColumnFamily::Compression || is_tombstone_value(value) {
+            continue;
+        }
+        if key.len() != 2 {
+            return Err(compression_write_error(format!(
+                "compression manifest key must be a two-byte slot id, got {} bytes",
+                key.len()
+            )));
+        }
+        let slot = calyx_core::SlotId::new(u16::from_be_bytes([key[0], key[1]]));
+        let has_primary = rows.iter().any(|(candidate_cf, _, candidate_value)| {
+            *candidate_cf == ColumnFamily::slot(slot)
+                && candidate_value.first().copied() == Some(COMPRESSED_SLOT_VALUE_TAG)
+        });
+        let has_raw = rows
+            .iter()
+            .any(|(candidate_cf, _, _)| *candidate_cf == ColumnFamily::slot_raw(slot));
+        if !has_primary || !has_raw {
+            return Err(compression_write_error(format!(
+                "compression manifest for slot {} requires compressed primary and raw-sidecar rows in the same batch",
+                slot.get()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn visible_value<'a>(
+    table: &'a RowTable,
+    current: Seq,
+    cf: ColumnFamily,
+    key: &[u8],
+) -> Option<&'a [u8]> {
+    table
+        .get(&(cf, key.to_vec()))?
+        .iter()
+        .rev()
+        .find(|value| value.seq <= current)
+        .map(|value| value.value.as_slice())
+}
+
+fn compression_write_error(message: String) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_COMPRESSED_SLOT_WRITE_REQUIRES_MANIFEST",
+        message,
+        remediation: "use the registry compression writer to replace the complete slot column and generation manifest atomically",
+    }
+}
 
 /// One CF/key read requested against a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,15 +367,51 @@ impl VersionedCfStore {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        let rows: Vec<_> = rows
+        let rows = rows
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
+        self.commit_batch_inner(None, rows)
+    }
+
+    /// Atomically commits one write group only when the current sequence still
+    /// equals `expected_seq`.
+    pub fn commit_batch_if_current<I, K, V>(&self, expected_seq: Seq, rows: I) -> Result<Seq>
+    where
+        I: IntoIterator<Item = (ColumnFamily, K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| (cf, key.into(), value.into()))
+            .collect();
+        self.commit_batch_inner(Some(expected_seq), rows)
+    }
+
+    fn commit_batch_inner(
+        &self,
+        expected_seq: Option<Seq>,
+        rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<Seq> {
         if rows.is_empty() {
-            return Ok(self.current_seq());
+            let current = self.current_seq();
+            if let Some(expected) = expected_seq
+                && current != expected
+            {
+                return Err(sequence_conflict(expected, current));
+            }
+            return Ok(current);
         }
 
         let mut table = self.rows.write().expect("mvcc row table poisoned");
+        let current = self.current_seq();
+        if let Some(expected) = expected_seq
+            && current != expected
+        {
+            return Err(sequence_conflict(expected, current));
+        }
+        validate_compression_writes(&table, current, &rows)?;
         if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
             // Rows written here belong to the seq allocated below (current + 1,
             // exact because all allocations happen under the row write lock

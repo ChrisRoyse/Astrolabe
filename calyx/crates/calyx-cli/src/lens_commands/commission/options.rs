@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use calyx_registry::{
     CandleDeviceMode, CandleDevicePolicy, CandlePoolingPolicy, DEFAULT_CANDLE_MODEL,
-    configured_device_policy, device_policy_for_mode,
+    OnnxProviderPolicy, configured_device_policy, device_policy_for_mode,
 };
 
 use crate::error::{CliError, CliResult};
@@ -94,6 +94,18 @@ impl CommissionRuntime {
             _ => "unit",
         }
     }
+
+    const fn is_in_process_fastembed(self) -> bool {
+        matches!(
+            self,
+            Self::FastembedOnnx
+                | Self::FastembedSparse
+                | Self::FastembedBgem3Dense
+                | Self::FastembedBgem3Sparse
+                | Self::FastembedBgem3Colbert
+                | Self::FastembedReranker
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,6 +141,7 @@ pub(super) struct CommissionFlags {
     pub(super) runtime: CommissionRuntime,
     manifest_dtype: &'static str,
     device_policy: Option<CandleDevicePolicy>,
+    fastembed_execution: Option<&'static str>,
     pub(super) home: Option<PathBuf>,
     pub(super) out: Option<PathBuf>,
     pub(super) name: Option<String>,
@@ -309,9 +322,10 @@ impl CommissionFlags {
                 runtime,
                 CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3
             )
+            && !runtime.is_in_process_fastembed()
         {
             return Err(CliError::usage(
-                "--device is supported only with --runtime candle or fastembed-qwen3",
+                "--device is supported only with Candle-family or in-process FastEmbed runtimes",
             ));
         }
         let local_model = matches!(
@@ -322,6 +336,19 @@ impl CommissionFlags {
             Some(match device_mode {
                 Some(mode) => device_policy_for_mode(mode)?,
                 None => configured_device_policy()?,
+            })
+        } else {
+            None
+        };
+        let fastembed_execution = if runtime.is_in_process_fastembed() {
+            Some(match device_mode {
+                None | Some(CandleDeviceMode::Cuda) => "cuda_fail_loud",
+                Some(CandleDeviceMode::Cpu) => "cpu_explicit",
+                Some(CandleDeviceMode::Auto) => {
+                    return Err(CliError::usage(
+                        "in-process FastEmbed commission forbids --device auto; choose cuda or cpu so placement is frozen and CUDA failures never become CPU work",
+                    ));
+                }
             })
         } else {
             None
@@ -351,6 +378,7 @@ impl CommissionFlags {
             runtime,
             manifest_dtype,
             device_policy,
+            fastembed_execution,
             home,
             out,
             name,
@@ -396,6 +424,14 @@ impl CommissionFlags {
                     format!("{name}{suffix}")
                 }
             }
+            (Some(name), runtime) if runtime.is_in_process_fastembed() => {
+                let suffix = format!("-{}", self.fastembed_identity_suffix());
+                if name.ends_with(suffix.as_str()) {
+                    name.clone()
+                } else {
+                    format!("{name}{suffix}")
+                }
+            }
             (Some(name), _) => name.clone(),
             (None, _) => format!(
                 "{}-{}",
@@ -410,7 +446,23 @@ impl CommissionFlags {
     }
 
     pub(super) fn execution_device(&self) -> Option<String> {
+        if let Some(execution) = self.fastembed_execution {
+            return Some(execution.to_string());
+        }
         self.device_policy.map(CandleDevicePolicy::frozen_token)
+    }
+
+    pub(super) fn onnx_provider_policy(&self) -> CliResult<OnnxProviderPolicy> {
+        match self.fastembed_execution {
+            Some("cuda_fail_loud") => Ok(OnnxProviderPolicy::CudaFailLoud),
+            Some("cpu_explicit") => Ok(OnnxProviderPolicy::CpuExplicit),
+            Some(other) => Err(CliError::runtime(format!(
+                "noncanonical FastEmbed execution policy {other:?}"
+            ))),
+            None => Err(CliError::runtime(
+                "in-process FastEmbed commission is missing its explicit execution policy",
+            )),
+        }
     }
 
     pub(super) fn device_policy_detail(&self) -> Option<String> {
@@ -428,6 +480,9 @@ impl CommissionFlags {
             CommissionRuntime::Tei => false,
             CommissionRuntime::Candle | CommissionRuntime::FastembedQwen3 => {
                 self.device_policy.is_some_and(CandleDevicePolicy::is_gpu)
+            }
+            runtime if runtime.is_in_process_fastembed() => {
+                self.fastembed_execution == Some("cuda_fail_loud")
             }
             _ => true,
         }
@@ -464,7 +519,22 @@ impl CommissionFlags {
                 self.local_identity_suffix()
             );
         }
+        if self.runtime.is_in_process_fastembed() {
+            return format!(
+                "{}-{}",
+                self.runtime.manifest_runtime(),
+                self.fastembed_identity_suffix()
+            );
+        }
         self.runtime.manifest_runtime().to_string()
+    }
+
+    fn fastembed_identity_suffix(&self) -> &'static str {
+        match self.fastembed_execution {
+            Some("cuda_fail_loud") => "cuda-fail-loud",
+            Some("cpu_explicit") => "cpu-explicit",
+            _ => "execution-unbound",
+        }
     }
 
     fn local_identity_suffix(&self) -> String {

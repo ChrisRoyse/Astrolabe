@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Modality, Panel, Placement, SlotState};
-use calyx_registry::{lens_spec_from_manifest_path, load_vault_panel_state};
+use calyx_registry::load_vault_panel_state;
 
 use super::flags::ServeFlags;
 use super::*;
@@ -75,17 +75,9 @@ pub(super) fn freeze_source(home: &Path, flags: &ServeFlags) -> CliResult<Frozen
         hash_part(&mut hasher, selector.as_bytes());
         hash_part(&mut hasher, &template_bytes);
         for lens in &template.lenses {
-            let manifest_path = Path::new(&lens.manifest);
-            let manifest = std::fs::read(manifest_path).map_err(|error| {
-                CliError::io(format!(
-                    "read resident frozen manifest {}: {error}",
-                    manifest_path.display()
-                ))
-            })?;
             hash_part(&mut hasher, lens.manifest.as_bytes());
-            hash_part(&mut hasher, &manifest);
-            let spec = lens_spec_from_manifest_path(manifest_path)?;
-            template_store::validate_lens_ref_against_spec(lens, &spec)?;
+            hash_part(&mut hasher, lens.manifest_sha256.as_bytes());
+            let spec = template_store::bound_lens_spec(lens)?;
             if lens.placement == Placement::Gpu && is_managed_resident_neural_runtime(&spec.runtime)
             {
                 push_unique_modality(&mut applicable_neural_modalities, lens.modality);

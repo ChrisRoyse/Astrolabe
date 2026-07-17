@@ -254,12 +254,14 @@ pub(crate) fn interleaved_start_order(manifests: &[PathBuf]) -> Vec<usize> {
 
 fn is_cpu_heavy(manifest: &PathBuf) -> bool {
     match lens_spec_metadata_from_manifest_path(manifest) {
-        Ok(spec) => matches!(
-            spec.runtime,
-            LensRuntime::Algorithmic { .. }
-                | LensRuntime::StaticLookup { .. }
-                | LensRuntime::FastembedSparse { .. }
-        ),
+        Ok(spec) => match spec.runtime {
+            LensRuntime::Algorithmic { .. } | LensRuntime::StaticLookup { .. } => true,
+            LensRuntime::FastembedDensePlaced { execution, .. }
+            | LensRuntime::FastembedSparsePlaced { execution, .. }
+            | LensRuntime::FastembedBgem3Placed { execution, .. }
+            | LensRuntime::FastembedRerankerPlaced { execution, .. } => execution == "cpu_explicit",
+            _ => false,
+        },
         Err(error) => {
             eprintln!(
                 "{}",

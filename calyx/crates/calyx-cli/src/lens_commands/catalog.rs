@@ -7,7 +7,6 @@ use calyx_core::{Input, Lens, LensCost, Placement};
 use calyx_registry::{
     CandlePrecision, LensHealth, LensRuntime, LensSpec, MultimodalAdapterLens, PlacementBudget,
     StaticLookupLens, choose_resolved_placement, legacy_lensforge_manifest_v1_ids_from_path,
-    lens_spec_from_manifest_path, lens_spec_metadata_from_manifest_path,
     parse_frozen_device_policy,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,7 @@ use super::support::{dim, hex_from_bytes, runtime_name};
 use crate::error::{CliError, CliResult};
 use crate::output::print_json;
 
+pub(super) mod admission;
 mod budget;
 mod store;
 
@@ -24,14 +24,16 @@ const LENS_IDENTITY_MIGRATION_REQUIRED: &str = "CALYX_LENS_IDENTITY_MIGRATION_RE
 
 pub(crate) use store::LensCatalogDbReadback;
 
+use admission::{AttestedCatalogAdmission, attest_manifest};
+pub(crate) use admission::{LocalExecutionAttestationReport, reparse_manifest_binding};
 use budget::placement_budget_from_catalog;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LensCatalog {
     pub(crate) lenses: Vec<LensCatalogEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LensCatalogEntry {
     pub(crate) lens_id: String,
     pub(crate) name: String,
@@ -44,6 +46,10 @@ pub(crate) struct LensCatalogEntry {
     pub(crate) excluded_from_dedup: bool,
     pub(crate) weights_sha256: String,
     pub(crate) manifest: PathBuf,
+    #[serde(default)]
+    pub(crate) manifest_sha256: String,
+    #[serde(default)]
+    pub(crate) execution_attestation: Option<LocalExecutionAttestationReport>,
     #[serde(default)]
     pub(crate) cost: LensCost,
     #[serde(default)]
@@ -119,36 +125,84 @@ pub(crate) fn list(args: &[String]) -> CliResult {
 pub(crate) fn migrate_catalog(args: &[String]) -> CliResult {
     let flags = MigrateFlags::parse(args)?;
     let catalog_path = catalog_path(flags.home.as_deref())?;
-    let source = flags
-        .from
-        .unwrap_or_else(|| store::legacy_catalog_path(&catalog_path));
-    let catalog = read_legacy_catalog(&source)?;
-    validate_catalog_migration(&catalog)?;
-    let readback = write_catalog(&catalog_path, &catalog)?;
+    let source = match flags.from {
+        Some(source) => source,
+        None if store::has_v1_catalog_state(&catalog_path)? => catalog_path.clone(),
+        None => store::legacy_catalog_path(&catalog_path),
+    };
+    let (catalog, v1_source_sha256, legacy_source, source) = if source.is_dir() {
+        match store::read_v1_for_migration(&source)? {
+            store::V1MigrationRead::Live(snapshot) => {
+                (snapshot.catalog, Some(snapshot.source_sha256), None, source)
+            }
+            store::V1MigrationRead::Retired { catalog, readback } => {
+                if !store::same_existing_catalog_path(&source, &catalog_path)? {
+                    return Err(CliError::from(calyx_core::CalyxError {
+                        code: "CALYX_LENS_CATALOG_SCHEMA_MIGRATION_REQUIRED",
+                        message: format!(
+                            "retired migration source {} cannot stand in for distinct destination {}",
+                            source.display(),
+                            catalog_path.display()
+                        ),
+                        remediation: "rerun without --from to verify the in-place retired catalog, or import from a live source into an empty destination",
+                    }));
+                }
+                validate_catalog_bindings(&catalog)?;
+                return print_json(&MigrateReport {
+                    source,
+                    catalog: catalog_path,
+                    count: catalog.lenses.len(),
+                    readback,
+                });
+            }
+        }
+    } else {
+        let (catalog, legacy_source) = read_legacy_catalog(&source)?;
+        let source = legacy_source.canonical_path().to_path_buf();
+        (catalog, None, Some(legacy_source), source)
+    };
+    let migrated = validate_catalog_migration(&catalog)?;
+    let mutation_guard = store::CatalogMutationGuard::acquire(&catalog_path, "migrate-catalog")?;
+    // This is the final path-byte snapshot before publication, performed
+    // while every compliant catalog writer is excluded.
+    validate_catalog_bindings(&migrated)?;
+    let readback = store::write_migration(
+        &catalog_path,
+        &migrated,
+        &source,
+        v1_source_sha256.as_deref(),
+        legacy_source.as_ref(),
+        &mutation_guard,
+    )?;
+    drop(mutation_guard);
     print_json(&MigrateReport {
         source,
         catalog: catalog_path,
-        count: catalog.lenses.len(),
+        count: migrated.lenses.len(),
         readback,
     })
 }
 
-fn validate_catalog_migration(catalog: &LensCatalog) -> CliResult {
+fn validate_catalog_migration(catalog: &LensCatalog) -> CliResult<LensCatalog> {
+    let mut migrated = Vec::with_capacity(catalog.lenses.len());
     for entry in &catalog.lenses {
-        let spec = lens_spec_from_manifest_path(&entry.manifest).map_err(|error| {
+        // Mandatory local rows execute and attest here. Every admission is
+        // gathered before the sole catalog write below, so a later failure
+        // cannot partially migrate the source catalog.
+        let admission = attest_manifest(entry.manifest.clone()).map_err(|error| {
             CliError::from(calyx_core::CalyxError {
                 code: LENS_IDENTITY_MIGRATION_REQUIRED,
                 message: format!(
-                    "legacy catalog row name={} manifest={} lens_id={} cannot be reconstructed canonically: {}: {}",
+                    "legacy catalog row name={} manifest={} lens_id={} cannot be attested canonically: {}",
                     entry.name,
                     entry.manifest.display(),
                     entry.lens_id,
-                    error.code,
-                    error.message
+                    error
                 ),
-                remediation: "preserve the legacy catalog bytes and perform an explicit lineage migration before writing the catalog database",
+                remediation: "preserve the legacy catalog bytes, repair the manifest/runtime using the nested structured error, and rerun explicit migration",
             })
         })?;
+        let (spec, manifest, manifest_sha256, execution_attestation) = admission.into_parts();
         let collisions = catalog
             .lenses
             .iter()
@@ -157,30 +211,42 @@ fn validate_catalog_migration(catalog: &LensCatalog) -> CliResult {
                     candidate,
                     &spec.lens_id().to_string(),
                     &spec.name,
-                    &entry.manifest,
+                    &manifest,
                 )
             })
             .collect::<Vec<_>>();
-        if collisions.len() != 1
-            || !canonical_catalog_identity_matches(entry, &spec, &entry.manifest)?
-        {
-            return Err(identity_migration_required(
-                &collisions,
-                &spec,
-                &entry.manifest,
-            ));
+        if collisions.len() != 1 || !legacy_catalog_identity_matches(entry, &spec, &manifest)? {
+            return Err(identity_migration_required(&collisions, &spec, &manifest));
         }
+        let mut migrated_entry = entry.clone();
+        migrated_entry.manifest = manifest;
+        migrated_entry.manifest_sha256 = manifest_sha256;
+        migrated_entry.execution_attestation = execution_attestation;
+        migrated.push(migrated_entry);
     }
-    Ok(())
+    migrated.sort_by(|left, right| left.lens_id.cmp(&right.lens_id));
+    Ok(LensCatalog { lenses: migrated })
 }
 
 pub(crate) fn add_manifest_to_catalog(
     home: Option<&Path>,
     manifest: PathBuf,
 ) -> CliResult<AddReport> {
-    let spec = lens_spec_from_manifest_path(&manifest)?;
+    // Verification deliberately precedes even the catalog read and
+    // idempotent collision path.
+    let admission = attest_manifest(manifest)?;
+    add_attested_manifest_to_catalog(home, admission)
+}
+
+pub(crate) fn add_attested_manifest_to_catalog(
+    home: Option<&Path>,
+    admission: AttestedCatalogAdmission,
+) -> CliResult<AddReport> {
+    let (spec, manifest, manifest_sha256, execution_attestation) = admission.into_parts();
     let catalog_path = catalog_path(home)?;
+    let mutation_guard = store::CatalogMutationGuard::acquire(&catalog_path, "lens-add")?;
     let mut catalog = read_catalog(&catalog_path)?;
+    let expected_catalog_sha256 = store::catalog_sha256(&catalog)?;
     let lens_id = spec.lens_id().to_string();
     let collisions = catalog
         .lenses
@@ -190,6 +256,11 @@ pub(crate) fn add_manifest_to_catalog(
     if !collisions.is_empty() {
         if collisions.len() == 1
             && canonical_catalog_identity_matches(collisions[0], &spec, &manifest)?
+            && collisions[0].manifest_sha256 == manifest_sha256
+            && execution_attestations_match(
+                collisions[0].execution_attestation.as_ref(),
+                execution_attestation.as_ref(),
+            )
         {
             let existing = collisions[0];
             return Ok(AddReport {
@@ -213,12 +284,43 @@ pub(crate) fn add_manifest_to_catalog(
         &catalog,
         resolved_placement == Placement::Gpu && cost.vram_bytes > 0,
     )?;
-    let entry = entry_from_spec(&spec, manifest, cost, budget, resolved_placement)?;
+    let entry = entry_from_spec(
+        &spec,
+        manifest,
+        manifest_sha256.clone(),
+        execution_attestation,
+        cost,
+        budget,
+        resolved_placement,
+    )?;
     catalog.lenses.push(entry.clone());
     catalog
         .lenses
         .sort_by(|left, right| left.lens_id.cmp(&right.lens_id));
-    write_catalog(&catalog_path, &catalog)?;
+    // Last operation before persistence: reparse and rehash one byte snapshot
+    // and require admitted == current == row.
+    let (write_spec, write_sha256) = reparse_manifest_binding(&entry.manifest)?;
+    if write_spec != spec
+        || write_sha256 != entry.manifest_sha256
+        || write_sha256 != manifest_sha256
+    {
+        return Err(CliError::from(calyx_core::CalyxError {
+            code: "CALYX_LENS_CATALOG_ADMISSION_STALE",
+            message: format!(
+                "manifest {} changed after runtime admission (admitted_sha256={} current_sha256={})",
+                entry.manifest.display(),
+                manifest_sha256,
+                write_sha256
+            ),
+            remediation: "preserve both manifest hashes, discard the stale admission, and rerun verification against the final immutable bytes",
+        }));
+    }
+    write_catalog(
+        &catalog_path,
+        &catalog,
+        &expected_catalog_sha256,
+        &mutation_guard,
+    )?;
     Ok(AddReport {
         catalog: catalog_path,
         lens_id: entry.lens_id,
@@ -228,6 +330,17 @@ pub(crate) fn add_manifest_to_catalog(
         placement: entry.placement,
         count: catalog.lenses.len(),
     })
+}
+
+fn execution_attestations_match(
+    persisted: Option<&LocalExecutionAttestationReport>,
+    admitted: Option<&LocalExecutionAttestationReport>,
+) -> bool {
+    match (persisted, admitted) {
+        (Some(persisted), Some(admitted)) => persisted.same_execution_identity(admitted),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn catalog_identity_collides(
@@ -240,6 +353,45 @@ fn catalog_identity_collides(
 }
 
 pub(crate) fn canonical_catalog_identity_matches(
+    entry: &LensCatalogEntry,
+    spec: &LensSpec,
+    manifest: &Path,
+) -> CliResult<bool> {
+    let (persisted_spec, manifest_sha256) = reparse_manifest_binding(manifest)?;
+    canonical_catalog_snapshot_matches(entry, spec, manifest, &persisted_spec, &manifest_sha256)
+}
+
+pub(crate) fn bound_spec_from_catalog_entry(entry: &LensCatalogEntry) -> CliResult<LensSpec> {
+    let (spec, manifest_sha256) = reparse_manifest_binding(&entry.manifest)?;
+    if canonical_catalog_snapshot_matches(entry, &spec, &entry.manifest, &spec, &manifest_sha256)? {
+        return Ok(spec);
+    }
+    Err(CliError::from(calyx_core::CalyxError {
+        code: "CALYX_LENS_CATALOG_MANIFEST_BINDING_MISMATCH",
+        message: format!(
+            "catalog row {} does not match the current one-snapshot parse/hash of {} (row_sha256={} current_sha256={})",
+            entry.lens_id,
+            entry.manifest.display(),
+            entry.manifest_sha256,
+            manifest_sha256
+        ),
+        remediation: "preserve the catalog and manifest bytes, restore the admitted manifest, and rerun explicit attestation; never rewrite a frozen manifest in place",
+    }))
+}
+
+pub(crate) fn canonical_catalog_snapshot_matches(
+    entry: &LensCatalogEntry,
+    admitted_spec: &LensSpec,
+    manifest: &Path,
+    observed_spec: &LensSpec,
+    observed_manifest_sha256: &str,
+) -> CliResult<bool> {
+    Ok(observed_spec == admitted_spec
+        && entry.manifest_sha256 == observed_manifest_sha256
+        && legacy_catalog_identity_matches(entry, admitted_spec, manifest)?)
+}
+
+fn legacy_catalog_identity_matches(
     entry: &LensCatalogEntry,
     spec: &LensSpec,
     manifest: &Path,
@@ -296,10 +448,15 @@ pub(crate) fn catalog_cost_matches(spec: &LensSpec, cost: LensCost) -> CliResult
         }
         LensRuntime::CandleLocal { files, .. }
         | LensRuntime::Onnx { files, .. }
+        | LensRuntime::FastembedDense { files, .. }
+        | LensRuntime::FastembedDensePlaced { files, .. }
         | LensRuntime::OnnxColbert { files, .. }
         | LensRuntime::FastembedSparse { files, .. }
         | LensRuntime::FastembedBgem3 { files, .. }
         | LensRuntime::FastembedReranker { files, .. }
+        | LensRuntime::FastembedSparsePlaced { files, .. }
+        | LensRuntime::FastembedBgem3Placed { files, .. }
+        | LensRuntime::FastembedRerankerPlaced { files, .. }
         | LensRuntime::FastembedQwen3 { files, .. } => {
             let bytes = files_size(files)?;
             let placement = resolved_runtime_placement(spec)?;
@@ -409,29 +566,28 @@ pub(crate) fn catalog_path(home: Option<&Path>) -> CliResult<PathBuf> {
 }
 
 pub(crate) fn read_catalog(path: &Path) -> CliResult<LensCatalog> {
-    Ok(store::read(path)?)
+    let catalog = store::read(path)?;
+    validate_catalog_bindings(&catalog)?;
+    Ok(catalog)
 }
 
 pub(crate) fn read_catalog_with_readback(
     path: &Path,
 ) -> CliResult<(LensCatalog, LensCatalogDbReadback)> {
-    Ok(store::read_with_readback(path)?)
+    let (catalog, readback) = store::read_with_readback(path)?;
+    validate_catalog_bindings(&catalog)?;
+    Ok((catalog, readback))
 }
 
-fn read_legacy_catalog(path: &Path) -> CliResult<LensCatalog> {
-    if !path.exists() {
-        return Err(CliError::usage(format!(
-            "legacy lens catalog {} does not exist",
-            path.display()
-        )));
-    }
-    let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|err| {
+fn read_legacy_catalog(path: &Path) -> CliResult<(LensCatalog, store::LegacyCatalogSource)> {
+    let source = store::LegacyCatalogSource::open(path)?;
+    let catalog = serde_json::from_slice(source.bytes()).map_err(|err| {
         CliError::usage(format!(
             "parse legacy lens catalog {}: {err}",
-            path.display()
+            source.canonical_path().display()
         ))
-    })
+    })?;
+    Ok((catalog, source))
 }
 
 fn list_entry(entry: LensCatalogEntry) -> ListLensEntry {
@@ -440,9 +596,25 @@ fn list_entry(entry: LensCatalogEntry) -> ListLensEntry {
 }
 
 fn health_from_manifest(entry: &LensCatalogEntry) -> LensHealth {
-    match lens_spec_metadata_from_manifest_path(&entry.manifest) {
-        Ok(spec) if spec.lens_id().to_string() == entry.lens_id => spec.health(),
-        Ok(spec) => LensHealth::Failing {
+    match reparse_manifest_binding(&entry.manifest) {
+        Ok((spec, manifest_sha256))
+            if spec.lens_id().to_string() == entry.lens_id
+                && manifest_sha256 == entry.manifest_sha256 =>
+        {
+            spec.health()
+        }
+        Ok((_, manifest_sha256)) if manifest_sha256 != entry.manifest_sha256 => {
+            LensHealth::Failing {
+                code: "CALYX_LENS_CATALOG_MANIFEST_DIGEST_MISMATCH".to_string(),
+                reason: format!(
+                    "catalog manifest_sha256 {} != current manifest_sha256 {} for {}",
+                    entry.manifest_sha256,
+                    manifest_sha256,
+                    entry.manifest.display()
+                ),
+            }
+        }
+        Ok((spec, _)) => LensHealth::Failing {
             code: LENS_IDENTITY_MIGRATION_REQUIRED.to_string(),
             reason: format!(
                 "catalog lens_id {} != canonical manifest lens_id {} for {}",
@@ -452,22 +624,84 @@ fn health_from_manifest(entry: &LensCatalogEntry) -> LensHealth {
             ),
         },
         Err(error) => LensHealth::Failing {
-            code: error.code.to_string(),
-            reason: error.message,
+            code: error.code().to_string(),
+            reason: error.message().to_string(),
         },
     }
 }
 
-pub(crate) fn write_catalog(
+fn write_catalog(
     path: &Path,
     catalog: &LensCatalog,
+    expected_catalog_sha256: &str,
+    mutation_guard: &store::CatalogMutationGuard,
 ) -> CliResult<LensCatalogDbReadback> {
-    Ok(store::write(path, catalog)?)
+    validate_catalog_bindings(catalog)?;
+    Ok(store::write(
+        path,
+        catalog,
+        expected_catalog_sha256,
+        mutation_guard,
+    )?)
+}
+
+pub(super) fn write_catalog_reduction(
+    path: &Path,
+    proposed: &LensCatalog,
+    expected_catalog_sha256: &str,
+) -> CliResult<LensCatalogDbReadback> {
+    let mutation_guard = store::CatalogMutationGuard::acquire(path, "lens-remove")?;
+    let current = read_catalog(path)?;
+    let current_sha256 = store::catalog_sha256(&current)?;
+    if current_sha256 != expected_catalog_sha256 {
+        return Err(CliError::from(calyx_core::CalyxError {
+            code: "CALYX_LENS_CATALOG_CONCURRENT_MUTATION",
+            message: format!(
+                "catalog {} changed before reduction (expected_sha256={} current_sha256={})",
+                path.display(),
+                expected_catalog_sha256,
+                current_sha256
+            ),
+            remediation: "preserve both catalog readbacks, recompute the removal from the current authoritative catalog, and retry",
+        }));
+    }
+    if proposed.lenses.len() >= current.lenses.len()
+        || proposed
+            .lenses
+            .iter()
+            .any(|entry| !current.lenses.contains(entry))
+    {
+        return Err(CliError::from(calyx_core::CalyxError {
+            code: "CALYX_LENS_CATALOG_REDUCTION_INVALID",
+            message: "catalog reduction must contain only byte-equivalent existing entries and remove at least one row".to_string(),
+            remediation: "read the authoritative v2 catalog, remove only the selected existing row, and retry; additions require sealed runtime admission",
+        }));
+    }
+    validate_catalog_bindings(proposed)?;
+    Ok(store::write(
+        path,
+        proposed,
+        expected_catalog_sha256,
+        &mutation_guard,
+    )?)
+}
+
+pub(super) fn catalog_fingerprint(catalog: &LensCatalog) -> CliResult<String> {
+    Ok(store::catalog_sha256(catalog)?)
+}
+
+fn validate_catalog_bindings(catalog: &LensCatalog) -> CliResult<()> {
+    for entry in &catalog.lenses {
+        bound_spec_from_catalog_entry(entry)?;
+    }
+    Ok(())
 }
 
 fn entry_from_spec(
     spec: &LensSpec,
     manifest: PathBuf,
+    manifest_sha256: String,
+    execution_attestation: Option<LocalExecutionAttestationReport>,
     cost: LensCost,
     budget: PlacementBudget,
     resolved_placement: Placement,
@@ -483,6 +717,8 @@ fn entry_from_spec(
         excluded_from_dedup: spec.excluded_from_dedup,
         weights_sha256: hex_from_bytes(&spec.weights_sha256),
         manifest,
+        manifest_sha256,
+        execution_attestation,
         cost,
         placement,
     })
@@ -541,12 +777,40 @@ pub(crate) fn resolved_runtime_placement(spec: &LensSpec) -> CliResult<Placement
                 Placement::Cpu
             })
         }
+        LensRuntime::FastembedDensePlaced { execution, .. }
+        | LensRuntime::FastembedSparsePlaced { execution, .. }
+        | LensRuntime::FastembedBgem3Placed { execution, .. }
+        | LensRuntime::FastembedRerankerPlaced { execution, .. } => {
+            fastembed_placement(execution)
+        }
         LensRuntime::TeiHttp { .. }
         | LensRuntime::Onnx { .. }
-        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::OnnxColbert { .. } => Ok(Placement::Gpu),
+        LensRuntime::FastembedDense { .. }
         | LensRuntime::FastembedSparse { .. }
         | LensRuntime::FastembedBgem3 { .. }
-        | LensRuntime::FastembedReranker { .. } => Ok(Placement::Gpu),
+        | LensRuntime::FastembedReranker { .. } => Err(calyx_core::CalyxError {
+            code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+            message: format!(
+                "catalog refuses legacy FastEmbed lens {} without an execution identity",
+                spec.name
+            ),
+            remediation: "recommission the lens with execution_device set explicitly to cuda_fail_loud or cpu_explicit",
+        }
+        .into()),
+    }
+}
+
+fn fastembed_placement(execution: &str) -> CliResult<Placement> {
+    match execution {
+        "cuda_fail_loud" => Ok(Placement::Gpu),
+        "cpu_explicit" => Ok(Placement::Cpu),
+        other => Err(calyx_core::CalyxError {
+            code: "CALYX_FASTEMBED_EXECUTION_IDENTITY_NONCANONICAL",
+            message: format!("catalog found noncanonical FastEmbed execution token {other:?}"),
+            remediation: "recommission the lens with execution_device set explicitly to cuda_fail_loud or cpu_explicit; never rewrite frozen identity in place",
+        }
+        .into()),
     }
 }
 
@@ -582,16 +846,26 @@ fn estimate_lens_cost(spec: &LensSpec) -> CliResult<LensCost> {
         } => measure_static_lookup_cost(spec, embeddings_file, tokenizer),
         LensRuntime::CandleLocal { files, .. }
         | LensRuntime::Onnx { files, .. }
+        | LensRuntime::FastembedDense { files, .. }
+        | LensRuntime::FastembedDensePlaced { files, .. }
         | LensRuntime::OnnxColbert { files, .. }
         | LensRuntime::FastembedSparse { files, .. }
         | LensRuntime::FastembedBgem3 { files, .. }
         | LensRuntime::FastembedReranker { files, .. }
+        | LensRuntime::FastembedSparsePlaced { files, .. }
+        | LensRuntime::FastembedBgem3Placed { files, .. }
+        | LensRuntime::FastembedRerankerPlaced { files, .. }
         | LensRuntime::FastembedQwen3 { files, .. } => {
             let bytes = files_size(files)?;
+            let placement = resolved_runtime_placement(spec)?;
             Ok(LensCost {
                 total_ms: 0.0,
                 ms_per_input: 0.0,
-                vram_bytes: bytes,
+                vram_bytes: if placement == Placement::Gpu {
+                    bytes
+                } else {
+                    0
+                },
                 ram_bytes: bytes,
                 batch_ceiling: u32::MAX,
             })

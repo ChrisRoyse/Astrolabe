@@ -9,89 +9,36 @@
 //! said "gpu" while execution was CPU-bound (#1142), and `#1136`'s I/O binding
 //! cannot fix it — it addresses the copy path of GPU-executable graphs.
 //!
-//! This audit parses the ORT profiling trace after the first real run, counts
-//! compute nodes per execution provider, emits the per-provider counts in the
-//! readback telemetry (so the fallback is *visible*, not inferred), and — in
-//! `fail` mode — refuses a GPU-policy session that runs more than a configured
-//! fraction of its compute nodes on CPU. The pure parsing and policy functions
-//! are exercised directly by unit tests with synthetic traces; the GPU run that
-//! populates a real trace is exercised by the lens runtimes on device.
+//! Generic ONNX and ColBERT sessions inspect ORT's committed graph assignment
+//! through API 24 before they become usable, then parse the profiling trace
+//! after the first real run. CUDA sessions require every committed and executed
+//! compute node to be assigned to CUDA. This is mandatory runtime evidence, not
+//! optional telemetry.
 //!
-//! Environment knobs:
-//! - `CALYX_ONNX_CPU_FALLBACK_AUDIT` — `off` (default) | `warn` | `fail`. When
-//!   not `off`, ORT profiling is enabled at session build and the audit runs
-//!   once after the first successful inference. `warn` logs the per-provider
-//!   counts; `fail` additionally errors when a GPU-policy session is over the
-//!   CPU-node fraction. Default `off` keeps the hot path unchanged.
-//! - `CALYX_ONNX_MAX_CPU_NODE_FRACTION` — CPU compute-node fraction a GPU-policy
-//!   session may reach before `fail` refuses it (default 0.10, range [0,1]).
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_core::{CalyxError, Result};
+use ort::session::Session;
+use ort::{AsPointer, Error as OrtError};
 use serde_json::Value;
 
-pub(super) const CPU_FALLBACK_AUDIT_ENV: &str = "CALYX_ONNX_CPU_FALLBACK_AUDIT";
-pub(super) const MAX_CPU_NODE_FRACTION_ENV: &str = "CALYX_ONNX_MAX_CPU_NODE_FRACTION";
 pub(super) const CPU_FALLBACK_CODE: &str = "CALYX_ONNX_QUANT_CPU_FALLBACK";
-
-const DEFAULT_MAX_CPU_FRACTION: f64 = 0.10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AuditMode {
-    Off,
-    Warn,
     Fail,
 }
 
 impl AuditMode {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::Off => "off",
-            Self::Warn => "warn",
             Self::Fail => "fail",
         }
     }
-
-    pub(super) const fn enabled(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
-
-pub(super) fn configured_audit_mode() -> Result<AuditMode> {
-    let Ok(raw) = std::env::var(CPU_FALLBACK_AUDIT_ENV) else {
-        return Ok(AuditMode::Off);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "off" | "0" | "false" => Ok(AuditMode::Off),
-        "warn" => Ok(AuditMode::Warn),
-        "fail" | "1" | "true" => Ok(AuditMode::Fail),
-        other => Err(CalyxError {
-            code: "CALYX_ONNX_CPU_FALLBACK_AUDIT_INVALID",
-            message: format!("{CPU_FALLBACK_AUDIT_ENV}={other} is not off, warn, or fail"),
-            remediation: "set CALYX_ONNX_CPU_FALLBACK_AUDIT to off, warn, or fail (default off)",
-        }),
-    }
-}
-
-pub(super) fn configured_max_cpu_fraction() -> Result<f64> {
-    let Ok(raw) = std::env::var(MAX_CPU_NODE_FRACTION_ENV) else {
-        return Ok(DEFAULT_MAX_CPU_FRACTION);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(DEFAULT_MAX_CPU_FRACTION);
-    }
-    raw.parse::<f64>()
-        .ok()
-        .filter(|fraction| fraction.is_finite() && (0.0..=1.0).contains(fraction))
-        .ok_or_else(|| CalyxError {
-            code: "CALYX_ONNX_MAX_CPU_NODE_FRACTION_INVALID",
-            message: format!("{MAX_CPU_NODE_FRACTION_ENV}={raw} is not a fraction in [0, 1]"),
-            remediation: "set CALYX_ONNX_MAX_CPU_NODE_FRACTION to a value in [0, 1] (default 0.10), or unset it",
-        })
 }
 
 /// A unique, writable profiling trace path for a session. ORT appends its own
@@ -108,6 +55,223 @@ pub(super) fn profiling_file_path(label: &str) -> PathBuf {
         std::process::id(),
         slug
     ))
+}
+
+/// Exact provider assignment read from one committed ORT session through API
+/// 24. ORT owns every returned subgraph and node for the borrowed session's
+/// lifetime; this receipt copies only provider names, operator names, and
+/// counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CommittedGraphAssignment {
+    pub(super) total_nodes: u64,
+    pub(super) cpu_nodes: u64,
+    pub(super) cuda_nodes: u64,
+    pub(super) per_provider: String,
+    pub(super) per_provider_operators: String,
+}
+
+pub(super) fn read_committed_graph_assignment(
+    session: &Session,
+    label: &str,
+) -> Result<CommittedGraphAssignment> {
+    read_graph_assignment(session).map_err(|error| CalyxError {
+        code: "CALYX_ONNX_GRAPH_ASSIGNMENT_READBACK",
+        message: format!(
+            "read committed-session ONNX API-24 graph assignment for {label} failed: {error}"
+        ),
+        remediation: "preserve the exact model and pinned ONNX Runtime logs, repair the committed-session provider assignment readback, and retry in a new process",
+    })
+}
+
+fn read_graph_assignment(
+    session: &Session,
+) -> std::result::Result<CommittedGraphAssignment, OrtError> {
+    let mut subgraphs = ptr::null();
+    let mut subgraph_count = 0usize;
+    status_result(unsafe {
+        (ort::api().Session_GetEpGraphAssignmentInfo)(
+            session.ptr(),
+            &mut subgraphs,
+            &mut subgraph_count,
+        )
+    })?;
+    if subgraph_count > 0 && subgraphs.is_null() {
+        return Err(OrtError::new(
+            "Session_GetEpGraphAssignmentInfo returned a null subgraph array",
+        ));
+    }
+    validate_pointer_array_len(subgraph_count, "subgraph")?;
+    let subgraphs = if subgraph_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(subgraphs, subgraph_count) }
+    };
+
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut operators = BTreeMap::<String, BTreeSet<String>>::new();
+    for &subgraph in subgraphs {
+        if subgraph.is_null() {
+            return Err(OrtError::new(
+                "Session_GetEpGraphAssignmentInfo returned a null subgraph",
+            ));
+        }
+        let provider = assigned_string(|out| unsafe {
+            (ort::api().EpAssignedSubgraph_GetEpName)(subgraph, out)
+        })?;
+        if provider.trim().is_empty() {
+            return Err(OrtError::new(
+                "EpAssignedSubgraph_GetEpName returned an empty provider",
+            ));
+        }
+
+        let mut nodes = ptr::null();
+        let mut node_count = 0usize;
+        status_result(unsafe {
+            (ort::api().EpAssignedSubgraph_GetNodes)(subgraph, &mut nodes, &mut node_count)
+        })?;
+        if node_count > 0 && nodes.is_null() {
+            return Err(OrtError::new(
+                "EpAssignedSubgraph_GetNodes returned a null node array",
+            ));
+        }
+        if node_count == 0 {
+            return Err(OrtError::new(format!(
+                "EpAssignedSubgraph_GetNodes returned an empty assignment for provider {provider}"
+            )));
+        }
+        validate_pointer_array_len(node_count, "node")?;
+        let node_count = u64::try_from(node_count)
+            .map_err(|_| OrtError::new("assigned ONNX node count exceeds u64"))?;
+        let provider_count = counts.entry(provider.clone()).or_default();
+        *provider_count = provider_count
+            .checked_add(node_count)
+            .ok_or_else(|| OrtError::new("assigned ONNX provider node count exceeds u64"))?;
+
+        let nodes = if node_count == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    nodes,
+                    usize::try_from(node_count)
+                        .map_err(|_| OrtError::new("assigned ONNX node count exceeds usize"))?,
+                )
+            }
+        };
+        for &node in nodes {
+            if node.is_null() {
+                return Err(OrtError::new(
+                    "EpAssignedSubgraph_GetNodes returned a null node",
+                ));
+            }
+            let operator = assigned_string(|out| unsafe {
+                (ort::api().EpAssignedNode_GetOperatorType)(node, out)
+            })?;
+            if operator.trim().is_empty() {
+                return Err(OrtError::new(
+                    "EpAssignedNode_GetOperatorType returned an empty operator",
+                ));
+            }
+            let domain =
+                assigned_string(|out| unsafe { (ort::api().EpAssignedNode_GetDomain)(node, out) })?;
+            let operator = if domain.is_empty() {
+                operator
+            } else {
+                format!("{domain}::{operator}")
+            };
+            operators
+                .entry(provider.clone())
+                .or_default()
+                .insert(operator);
+        }
+    }
+
+    let checked_sum = |values: Vec<u64>, label: &'static str| {
+        values.into_iter().try_fold(0u64, |sum, value| {
+            sum.checked_add(value)
+                .ok_or_else(|| OrtError::new(format!("assigned ONNX {label} count exceeds u64")))
+        })
+    };
+    let total_nodes = checked_sum(counts.values().copied().collect(), "total node")?;
+    let cpu_nodes = checked_sum(
+        counts
+            .iter()
+            .filter(|(provider, _)| provider_name_is(provider, "CPUExecutionProvider"))
+            .map(|(_, count)| *count)
+            .collect(),
+        "CPU node",
+    )?;
+    let cuda_nodes = checked_sum(
+        counts
+            .iter()
+            .filter(|(provider, _)| provider_name_is(provider, "CUDAExecutionProvider"))
+            .map(|(_, count)| *count)
+            .collect(),
+        "CUDA node",
+    )?;
+    let per_provider = counts
+        .iter()
+        .map(|(provider, count)| format!("{provider}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let per_provider_operators = operators
+        .iter()
+        .map(|(provider, names)| {
+            format!(
+                "{}:[{}]",
+                provider,
+                names.iter().cloned().collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    Ok(CommittedGraphAssignment {
+        total_nodes,
+        cpu_nodes,
+        cuda_nodes,
+        per_provider,
+        per_provider_operators,
+    })
+}
+
+fn provider_name_is(provider: &str, expected: &str) -> bool {
+    provider == expected
+}
+
+fn validate_pointer_array_len(
+    count: usize,
+    label: &'static str,
+) -> std::result::Result<(), OrtError> {
+    if count > isize::MAX as usize / std::mem::size_of::<usize>() {
+        return Err(OrtError::new(format!(
+            "ONNX graph assignment {label} array exceeds the addressable slice length"
+        )));
+    }
+    Ok(())
+}
+
+fn assigned_string(
+    call: impl FnOnce(*mut *const c_char) -> ort::sys::OrtStatusPtr,
+) -> std::result::Result<String, OrtError> {
+    let mut raw = ptr::null();
+    status_result(call(&mut raw))?;
+    if raw.is_null() {
+        return Err(OrtError::new(
+            "ONNX graph assignment returned a null string",
+        ));
+    }
+    unsafe { CStr::from_ptr(raw) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|error| {
+            OrtError::new(format!(
+                "ONNX graph assignment string is not UTF-8: {error}"
+            ))
+        })
+}
+
+fn status_result(status: ort::sys::OrtStatusPtr) -> std::result::Result<(), OrtError> {
+    unsafe { OrtError::result_from_status(status) }
 }
 
 /// Compute-node counts keyed by ORT execution-provider name.
@@ -136,7 +300,7 @@ impl ProviderNodeCounts {
     fn cuda_nodes(&self) -> usize {
         self.counts
             .iter()
-            .filter(|(provider, _)| provider.to_ascii_uppercase().contains("CUDA"))
+            .filter(|(provider, _)| provider_name_is(provider, "CUDAExecutionProvider"))
             .map(|(_, count)| *count)
             .sum()
     }
@@ -154,21 +318,21 @@ impl ProviderNodeCounts {
 }
 
 fn is_cpu_provider(provider: &str) -> bool {
-    provider.to_ascii_uppercase().contains("CPU")
+    provider_name_is(provider, "CPUExecutionProvider")
 }
 
 /// Parse an ORT profiling trace into per-provider compute-node counts.
 ///
 /// ORT emits three events per node (`_fence_before`, `_kernel_time`,
 /// `_fence_after`); the `_kernel_time` record is the actual compute and carries
-/// `args.provider`. We count those. Some ORT builds omit the suffix, so if no
-/// `_kernel_time` records are present we fall back to every `cat=="Node"` event
-/// carrying a provider.
+/// `args.provider`. Mandatory placement evidence counts only those compute
+/// events and rejects malformed or incomplete node records; it never infers
+/// execution from fence or other provider-bearing events.
 pub(super) fn parse_profiling_nodes(trace_json: &str) -> Result<ProviderNodeCounts> {
     let value: Value = serde_json::from_str(trace_json).map_err(|err| CalyxError {
         code: "CALYX_ONNX_PROFILE_PARSE",
         message: format!("ONNX profiling trace is not valid JSON: {err}"),
-        remediation: "the ORT profiling trace is malformed; rerun with CALYX_ONNX_CPU_FALLBACK_AUDIT and check ORT version",
+        remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
     })?;
     let events = match &value {
         Value::Array(events) => events.as_slice(),
@@ -193,33 +357,92 @@ pub(super) fn parse_profiling_nodes(trace_json: &str) -> Result<ProviderNodeCoun
     };
 
     let mut kernel = ProviderNodeCounts::default();
-    let mut any_node = ProviderNodeCounts::default();
-    for event in events {
-        let Some(obj) = event.as_object() else {
-            continue;
-        };
-        if obj.get("cat").and_then(Value::as_str) != Some("Node") {
+    for (index, event) in events.iter().enumerate() {
+        let obj = event.as_object().ok_or_else(|| CalyxError {
+            code: "CALYX_ONNX_PROFILE_PARSE",
+            message: format!("ONNX profiling event {index} is not an object"),
+            remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+        })?;
+        let category = obj
+            .get("cat")
+            .and_then(Value::as_str)
+            .filter(|category| !category.trim().is_empty())
+            .ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_PROFILE_PARSE",
+                message: format!(
+                    "ONNX profiling event {index} has no non-empty string category"
+                ),
+                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+            })?;
+        if category != "Node" {
             continue;
         }
-        let Some(provider) = obj
-            .get("args")
-            .and_then(Value::as_object)
-            .and_then(|args| args.get("provider"))
-            .and_then(Value::as_str)
-            .filter(|provider| !provider.trim().is_empty())
-        else {
-            continue;
-        };
-        any_node.add(provider);
-        if obj
+        let name = obj
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| name.ends_with("_kernel_time"))
-        {
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_PROFILE_PARSE",
+                message: format!(
+                    "ONNX Node profiling event {index} has no non-empty string name"
+                ),
+                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+            })?;
+        let args = obj
+            .get("args")
+            .and_then(Value::as_object)
+            .ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_PROFILE_PARSE",
+                message: format!("ONNX Node profiling event {index} has no args object"),
+                remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+            })?;
+        if name.ends_with("_kernel_time") {
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .filter(|provider| !provider.trim().is_empty())
+                .ok_or_else(|| CalyxError {
+                    code: "CALYX_ONNX_PROFILE_PARSE",
+                    message: format!(
+                        "ONNX kernel-time event {index} has no non-empty args.provider string"
+                    ),
+                    remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+                })?;
             kernel.add(provider);
+        } else if name.ends_with("_fence_before") || name.ends_with("_fence_after") {
+            if let Some(provider) = args.get("provider")
+                && provider
+                    .as_str()
+                    .filter(|provider| !provider.trim().is_empty())
+                    .is_none()
+            {
+                return Err(CalyxError {
+                    code: "CALYX_ONNX_PROFILE_PARSE",
+                    message: format!(
+                        "ONNX fence event {index} has a malformed args.provider value"
+                    ),
+                    remediation: "preserve the malformed trace and pinned runtime logs, repair mandatory ONNX profiling output, and retry in a new process",
+                });
+            }
+        } else {
+            return Err(CalyxError {
+                code: "CALYX_ONNX_PROFILE_PARSE",
+                message: format!(
+                    "ONNX Node profiling event {index} has unsupported name {name:?}; expected *_kernel_time or a fence event"
+                ),
+                remediation: "preserve the unknown trace and pinned runtime logs, validate the exact ONNX Runtime profiling schema, and retry only after the placement parser recognizes every compute event",
+            });
         }
     }
-    Ok(if kernel.total() > 0 { kernel } else { any_node })
+    if kernel.total() == 0 {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_PROFILE_EMPTY",
+            message: "ONNX first-forward profiling trace contains no *_kernel_time compute events"
+                .to_string(),
+            remediation: "preserve the incomplete trace and pinned runtime logs, repair mandatory first-forward profiling, and retry in a new process",
+        });
+    }
+    Ok(kernel)
 }
 
 /// The verdict of a placement audit — the numbers that also go to telemetry.
@@ -283,18 +506,18 @@ pub(super) fn audit_from_trace(
         audit.max_cpu_fraction,
         audit.per_provider,
     );
-    if audit.over_threshold && mode == AuditMode::Fail {
+    if audit.over_threshold {
         return Err(CalyxError {
             code: CPU_FALLBACK_CODE,
             message: format!(
-                "{label} claims a GPU execution provider but ran {}/{} compute nodes ({:.1}%) on CPU (providers={}), exceeding {MAX_CPU_NODE_FRACTION_ENV}={:.4} — int8/quantized ONNX graphs have no CUDA kernels, so QLinearMatMul/QGemm/MatMulInteger fall back to CPU per node with a device<->host copy each way",
+                "{label} claims a GPU execution provider but ran {}/{} compute nodes ({:.1}%) on CPU (providers={}), exceeding the mandatory CPU-node fraction {:.4} — int8/quantized ONNX graphs have no CUDA kernels, so QLinearMatMul/QGemm/MatMulInteger fall back to CPU per node with a device<->host copy each way",
                 audit.cpu_nodes,
                 audit.total_nodes,
                 audit.cpu_fraction * 100.0,
                 audit.per_provider,
                 audit.max_cpu_fraction,
             ),
-            remediation: "prefer the fp16/fp32 ONNX variant of this lens for bulk encode (assay corpus-build / stream-fbin / ingest); keep int8 graphs for resident low-VRAM serving under CPU policy, or raise CALYX_ONNX_MAX_CPU_NODE_FRACTION only if this mixed placement is expected",
+            remediation: "use the CUDA-capable fp16/fp32 ONNX variant for a CUDA session; construct a separate explicit-CPU lens only when CPU execution is genuinely intended, and never retry this failed CUDA session on CPU",
         });
     }
     Ok(audit)

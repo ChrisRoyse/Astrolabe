@@ -228,7 +228,7 @@ pub fn load_tokenizer(tokenizer_files: TokenizerFiles, max_length: usize) -> Res
         };
         tokenizer.add_special_tokens(&[token]);
     }
-    Ok(tokenizer)
+    Ok(tokenizer.into())
 }
 
 fn required_special_token_string(

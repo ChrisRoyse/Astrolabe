@@ -17,8 +17,9 @@ use super::{OnnxModelFiles, OnnxProviderPolicy};
 const CUDA_REMEDIATION: &str = "verify the process-global pinned CUDA 13 ONNX Runtime identity, its attested selected physical device, and the CUDA kernel roster for every frozen operator; select the explicit CPU constructor only when CUDA is genuinely unavailable before session construction, and never retry a failed CUDA session on CPU";
 const CPU_REMEDIATION: &str = "verify the process-global pinned ONNX Runtime identity and repair the explicitly authorized CPU model/session configuration before retrying";
 const MAX_PROTO_RECURSION: usize = 64;
+const MAX_PROFILE_TRACE_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct FastembedModelContext {
     label: String,
     model_code: String,
@@ -31,6 +32,7 @@ pub(super) struct FastembedModelContext {
     provider_policy: OnnxProviderPolicy,
     device: String,
     profile_prefix: Option<PathBuf>,
+    profile_root: Option<calyx_onnx_runtime::ImmutableDirectoryRoot>,
     frozen_operators: String,
 }
 
@@ -44,10 +46,22 @@ impl FastembedModelContext {
     ) -> Result<Self> {
         let selected_device = super::runtime_bundle::selected_cuda_device(provider_policy)?;
         let device = selected_device
-            .map(|device| format!("cuda:{}", device.ordinal))
+            .map(|device| device.frozen_execution_device())
             .unwrap_or_else(|| "cpu".to_string());
         let profile_prefix = (provider_policy == OnnxProviderPolicy::CudaFailLoud)
             .then(|| profiling_file_path(&label));
+        let profile_root = profile_prefix
+            .as_ref()
+            .map(|prefix| {
+                let parent = prefix.parent().ok_or_else(|| {
+                    CalyxError::lens_unreachable(format!(
+                        "FastEmbed profiling prefix {} has no parent directory",
+                        prefix.display()
+                    ))
+                })?;
+                calyx_onnx_runtime::open_immutable_directory(parent)
+            })
+            .transpose()?;
         Ok(Self {
             label,
             model_code: model_code.to_string(),
@@ -60,6 +74,7 @@ impl FastembedModelContext {
             provider_policy,
             device,
             profile_prefix,
+            profile_root,
             frozen_operators: receipt.frozen_operators.clone(),
         })
     }
@@ -265,14 +280,14 @@ impl FastembedExecutionState {
     ) -> Result<RuntimeExecutionAttestation> {
         let trace_path = end_profiling()
             .map_err(|error| self.context.error("first_inference_end_profiling", error))?;
-        self.validate_profile_path(&trace_path)?;
-        let trace = std::fs::read_to_string(&trace_path).map_err(|error| {
+        let (trace_path, trace_bytes) = self.snapshot_profile(&trace_path)?;
+        let trace = std::str::from_utf8(&trace_bytes).map_err(|error| {
             self.context.error(
-                "first_inference_profile_readback",
-                format!("read {} failed: {error}", trace_path),
+                "first_inference_profile_parse",
+                format!("profile {} is not UTF-8: {error}", trace_path.display()),
             )
         })?;
-        let trace_sha256 = format!("{:x}", Sha256::digest(trace.as_bytes()));
+        let trace_sha256 = format!("{:x}", Sha256::digest(&trace_bytes));
         let profile = audit_from_trace(&self.context.label, &trace, true, AuditMode::Fail, 0.0)
             .map_err(|error| self.context.error("first_inference_profile_parse", error))?;
         if profile.total_nodes == 0
@@ -287,7 +302,7 @@ impl FastembedExecutionState {
                     profile.total_nodes,
                     profile.cpu_nodes,
                     profile.per_provider,
-                    trace_path
+                    trace_path.display()
                 ),
             ));
         }
@@ -298,26 +313,40 @@ impl FastembedExecutionState {
             self.context.provider_policy.as_str(),
             self.assignment.total_nodes,
             profile.total_nodes,
-            trace_path,
+            trace_path.display(),
             trace_sha256
         );
+        let trace_path_display = trace_path.to_string_lossy();
         Ok(self.assignment_attestation(
             "onnx_api24_committed_session+first_real_synchronized_inference_profile",
             format!(
                 "api24={};profile={}",
                 self.assignment.per_provider, profile.per_provider
             ),
-            Some((&trace_path, &trace_sha256)),
+            Some((trace_path_display.as_ref(), &trace_sha256)),
         ))
     }
 
-    fn validate_profile_path(&self, trace_path: &str) -> Result<()> {
+    fn snapshot_profile(&self, trace_path: &str) -> Result<(PathBuf, Vec<u8>)> {
         let prefix = self
             .context
             .profile_prefix
             .as_ref()
             .expect("CUDA FastEmbed context has a profiling prefix");
-        let observed = Path::new(trace_path);
+        let root = self
+            .context
+            .profile_root
+            .as_ref()
+            .expect("CUDA FastEmbed context retains its profiling root");
+        let snapshot = calyx_onnx_runtime::snapshot_immutable_file(
+            Path::new(trace_path),
+            Some(&root),
+            MAX_PROFILE_TRACE_BYTES,
+        )
+        .map_err(|error| {
+            self.context
+                .error("first_inference_profile_readback", error)
+        })?;
         let expected_name = prefix
             .file_name()
             .and_then(|name| name.to_str())
@@ -327,7 +356,8 @@ impl FastembedExecutionState {
                     "profiling prefix has no UTF-8 file name",
                 )
             })?;
-        let observed_name = observed
+        let observed_name = snapshot
+            .final_path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
@@ -336,16 +366,18 @@ impl FastembedExecutionState {
                     format!("returned profiling path {trace_path} has no UTF-8 file name"),
                 )
             })?;
-        if observed.parent() != prefix.parent() || !observed_name.starts_with(expected_name) {
+        if !observed_name.starts_with(expected_name) {
             return Err(self.context.error(
                 "first_inference_profile_path_validation",
                 format!(
-                    "ORT returned profile path {trace_path}, outside expected prefix {}",
-                    prefix.display()
+                    "ORT returned profile path {trace_path}, resolved to {}, outside expected prefix {} under retained root {}",
+                    snapshot.final_path.display(),
+                    prefix.display(),
+                    root.final_path().display()
                 ),
             ));
         }
-        Ok(())
+        Ok((snapshot.final_path, snapshot.bytes))
     }
 
     fn assignment_attestation(
@@ -861,8 +893,12 @@ fn parse_tensor(
     let mut tensor = ProtoCursor::new(bytes);
     let mut external_data = BTreeMap::<String, String>::new();
     let mut data_location = None;
+    let mut inline_data_fields = BTreeSet::<u32>::new();
     while let Some(field) = tensor.next_field()? {
         match field.number {
+            4 | 5 | 6 | 7 | 9 | 10 | 11 => {
+                inline_data_fields.insert(field.number);
+            }
             13 => {
                 let (key, value) =
                     parse_string_string_entry(field.bytes("TensorProto.external_data")?)?;
@@ -901,6 +937,11 @@ fn parse_tensor(
     }
     if !is_external {
         return Ok(());
+    }
+    if !inline_data_fields.is_empty() {
+        return Err(format!(
+            "external TensorProto also declares inline data field(s) {inline_data_fields:?}"
+        ));
     }
 
     for key in external_data.keys() {

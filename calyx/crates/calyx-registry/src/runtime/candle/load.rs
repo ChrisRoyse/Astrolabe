@@ -9,7 +9,8 @@ use tokenizers::{Tokenizer, TruncationParams};
 
 use super::bert::{CANDLE_BERT_EXECUTION_REVISION, CalyxBertModel};
 use super::options::{
-    attest_executable_cuda_policy, configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
+    CandleCpuAuthorization, attest_executable_cuda_policy, configure_f32_gemm_accumulation,
+    verify_f32_gemm_accumulation,
 };
 use super::{CandleDevicePolicy, CandleModelFiles, CandlePrecision};
 use crate::commission::LensForgeSourceTensorDtypeProfile;
@@ -67,6 +68,7 @@ pub(super) fn read_model(
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
     source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+    cpu_authorization: Option<&CandleCpuAuthorization>,
 ) -> Result<(CalyxBertModel, LocalModelExecutionAttestation)> {
     configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
         with_runtime_context(
@@ -77,7 +79,7 @@ pub(super) fn read_model(
             source_tensor_dtype_profile,
         )
     })?;
-    let device = candle_device(device_policy).map_err(|error| {
+    let device = candle_device(device_policy, cpu_authorization).map_err(|error| {
         with_runtime_context(
             error,
             "device_init",
@@ -149,11 +151,24 @@ pub(super) fn read_model(
     Ok((model, attestation))
 }
 
-pub(super) fn candle_device(policy: CandleDevicePolicy) -> Result<Device> {
+pub(super) fn candle_device(
+    policy: CandleDevicePolicy,
+    cpu_authorization: Option<&CandleCpuAuthorization>,
+) -> Result<Device> {
     match policy {
         CandleDevicePolicy::CpuExplicit
         | CandleDevicePolicy::CpuNoCudaFeature
-        | CandleDevicePolicy::CpuNoCudaDevice => Ok(Device::Cpu),
+        | CandleDevicePolicy::CpuNoCudaDevice => {
+            cpu_authorization.ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_CPU_COMPANION_UNAUTHORIZED",
+                message: format!(
+                    "Candle CPU device construction for {} has no retained shared dual-zero authorization",
+                    policy.detail()
+                ),
+                remediation: "obtain the opaque CPU capability from authorize_cpu_companion before model construction; never convert a CUDA failure into CPU execution",
+            })?;
+            Ok(Device::Cpu)
+        }
         CandleDevicePolicy::CudaFrozen { identity } => Err(CalyxError::lens_unreachable(format!(
             "Candle physical device {identity} was parsed but not resolved through the pinned CUDA Runtime/Driver boundary"
         ))),

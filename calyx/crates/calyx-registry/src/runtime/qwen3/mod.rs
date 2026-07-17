@@ -11,8 +11,8 @@ use crate::commission::{LensForgeSourceTensorDtypeProfile, profile_safetensors_s
 use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{ContractFacts, contract_from_facts, qwen3_execution_corpus_hash};
 use crate::runtime::candle::{
-    CandleDevicePolicy, CandlePrecision, configure_f32_gemm_accumulation, frozen_device_policy,
-    verify_f32_gemm_accumulation,
+    CandleCpuAuthorization, CandleDevicePolicy, CandlePrecision, authorize_executable_cpu_policy,
+    configure_f32_gemm_accumulation, frozen_device_policy, verify_f32_gemm_accumulation,
 };
 use crate::runtime::common::LocalModelExecutionAttestation;
 use crate::runtime::common::{
@@ -61,6 +61,7 @@ pub struct FastembedQwen3Lens {
     precision: CandlePrecision,
     source_tensor_dtype_profile: LensForgeSourceTensorDtypeProfile,
     execution_attestation: LocalModelExecutionAttestation,
+    _cpu_authorization: Option<CandleCpuAuthorization>,
     max_tokens: usize,
     model: Mutex<Qwen3TextEmbedding>,
 }
@@ -99,6 +100,7 @@ impl FastembedQwen3Lens {
                 spec.precision.as_str()
             )));
         }
+        let cpu_authorization = authorize_executable_cpu_policy(spec.device_policy)?;
         if spec.max_tokens == 0 {
             return Err(config_invalid("fastembed-qwen3 max_tokens must be > 0"));
         }
@@ -137,6 +139,7 @@ impl FastembedQwen3Lens {
             spec.device_policy,
             spec.precision,
             &source_tensor_dtype_profile,
+            cpu_authorization.as_ref(),
         )?;
         let execution_device = spec.device_policy.frozen_token();
         let corpus_hash = qwen3_corpus_hash(
@@ -163,6 +166,7 @@ impl FastembedQwen3Lens {
             precision: spec.precision,
             source_tensor_dtype_profile,
             execution_attestation,
+            _cpu_authorization: cpu_authorization,
             max_tokens: spec.max_tokens,
             model: Mutex::new(model),
         })

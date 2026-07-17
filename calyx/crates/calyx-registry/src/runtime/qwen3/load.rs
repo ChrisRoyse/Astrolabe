@@ -12,7 +12,7 @@ use super::{
 };
 use crate::commission::LensForgeSourceTensorDtypeProfile;
 use crate::runtime::candle::{
-    CandleDevicePolicy, CandlePrecision, attest_executable_cuda_policy,
+    CandleCpuAuthorization, CandleDevicePolicy, CandlePrecision, attest_executable_cuda_policy,
     configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
 };
 use crate::runtime::common::normalize_unit;
@@ -54,6 +54,7 @@ pub fn read_model(
     device_policy: CandleDevicePolicy,
     precision: CandlePrecision,
     source_tensor_dtype_profile: &LensForgeSourceTensorDtypeProfile,
+    cpu_authorization: Option<&CandleCpuAuthorization>,
 ) -> Result<(Qwen3TextEmbedding, LocalModelExecutionAttestation)> {
     configure_f32_gemm_accumulation(device_policy, precision).map_err(|error| {
         qwen3_runtime_context(
@@ -64,7 +65,7 @@ pub fn read_model(
             source_tensor_dtype_profile,
         )
     })?;
-    let device = qwen3_device(device_policy).map_err(|error| {
+    let device = qwen3_device(device_policy, cpu_authorization).map_err(|error| {
         qwen3_runtime_context(
             error,
             "device_init",
@@ -178,11 +179,24 @@ pub fn qwen3_model_id(raw: &str) -> Result<String> {
     }
 }
 
-fn qwen3_device(policy: CandleDevicePolicy) -> Result<Device> {
+fn qwen3_device(
+    policy: CandleDevicePolicy,
+    cpu_authorization: Option<&CandleCpuAuthorization>,
+) -> Result<Device> {
     match policy {
         CandleDevicePolicy::CpuExplicit
         | CandleDevicePolicy::CpuNoCudaFeature
-        | CandleDevicePolicy::CpuNoCudaDevice => Ok(Device::Cpu),
+        | CandleDevicePolicy::CpuNoCudaDevice => {
+            cpu_authorization.ok_or_else(|| CalyxError {
+                code: "CALYX_ONNX_CPU_COMPANION_UNAUTHORIZED",
+                message: format!(
+                    "Qwen3 CPU device construction for {} has no retained shared dual-zero authorization",
+                    policy.detail()
+                ),
+                remediation: "obtain the opaque CPU capability from authorize_cpu_companion before model construction; never convert a CUDA failure into CPU execution",
+            })?;
+            Ok(Device::Cpu)
+        }
         CandleDevicePolicy::CudaFrozen { identity } => Err(CalyxError::lens_unreachable(format!(
             "Qwen3 physical device {identity} was parsed but not resolved through the pinned CUDA Runtime/Driver boundary"
         ))),

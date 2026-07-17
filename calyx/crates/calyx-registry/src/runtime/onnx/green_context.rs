@@ -107,6 +107,29 @@ impl GreenContextHandle {
                 "retained_cuda_stream_after_host_materialization",
                 error,
             )
+        })?;
+        let selected =
+            super::runtime_bundle::selected_cuda_device(OnnxProviderPolicy::CudaFailLoud)
+                .map_err(|error| {
+                    crate::runtime::common::gpu_synchronization_failed(
+                        label,
+                        "retained_cuda_stream_device_readback_after_host_materialization",
+                        error,
+                    )
+                })?
+                .ok_or_else(|| {
+                    crate::runtime::common::gpu_synchronization_failed(
+                        label,
+                        "retained_cuda_stream_device_readback_after_host_materialization",
+                        "CUDA execution completed without a selected physical-device receipt",
+                    )
+                })?;
+        attest_selected_stream(self, &selected).map_err(|error| {
+            crate::runtime::common::gpu_synchronization_failed(
+                label,
+                "retained_cuda_stream_identity_after_host_materialization",
+                error,
+            )
         })
     }
 }
@@ -207,7 +230,21 @@ pub(super) fn attest_selected_stream(
             remediation: "terminate the process, preserve both receipts, and repair the CUDA Runtime/Driver mapping",
         });
     }
-    stream.attest_identity()
+    stream.attest_identity()?;
+    let observed_driver_ordinal =
+        calyx_forge::attest_pinned_cuda_driver_identity(selected_device.identity)
+            .map_err(crate::runtime::common::forge_runtime_boundary_error)?;
+    if observed_driver_ordinal != selected_device.cuda_driver_ordinal {
+        return Err(CalyxError {
+            code: "CALYX_ONNX_BOUND_STREAM_IDENTITY_MISMATCH",
+            message: format!(
+                "independent CUDA Driver readback resolved identity {} to ordinal {observed_driver_ordinal}; selected receipt records ordinal {}",
+                selected_device.identity, selected_device.cuda_driver_ordinal
+            ),
+            remediation: "terminate the process, preserve both receipts, and repair the CUDA Runtime/Driver mapping",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "cuda"))]

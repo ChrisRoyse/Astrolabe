@@ -39,5 +39,6 @@ pub(super) fn commission(
     Ok(FastembedCommission {
         artifacts,
         dim: token_dim,
+        source_contract: None,
     })
 }

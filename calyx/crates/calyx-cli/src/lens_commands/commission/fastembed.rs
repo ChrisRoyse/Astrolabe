@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{Input, Lens, Modality, SlotShape};
-use calyx_registry::{NormPolicy, OnnxLens, OnnxModelFiles, OnnxProviderPolicy};
+use calyx_registry::{FrozenLensContract, NormPolicy, OnnxLens, OnnxModelFiles};
 use serde_json::json;
 
 use super::artifact::{Artifact, artifact};
@@ -15,6 +15,7 @@ use crate::lens_commands::support::validate_vector_contract;
 pub(super) struct FastembedCommission {
     pub(super) artifacts: Vec<Artifact>,
     pub(super) dim: u32,
+    pub(super) source_contract: Option<FrozenLensContract>,
 }
 
 pub(super) fn commission(
@@ -26,8 +27,10 @@ pub(super) fn commission(
         flags.lens_name(),
         &flags.hf,
         cache_dir(flags)?,
-        OnnxProviderPolicy::CudaFailLoud,
+        flags.onnx_provider_policy()?,
     )?;
+    let artifacts = copy_artifacts(lens.files(), out)?;
+    let source_contract = lens.contract().clone();
     let probe = Input::new(
         Modality::Text,
         b"Calyx fastembed ONNX commission probe".to_vec(),
@@ -35,16 +38,20 @@ pub(super) fn commission(
     let vector = lens.measure(&probe)?;
     validate_vector_contract(&vector, lens.shape(), NormPolicy::unit())?;
     let dim = dense_dim(lens.shape())?;
-    let artifacts = copy_artifacts(lens.files(), out)?;
     log.event(json!({
-        "event": "fastembed_onnx_verified",
+        "event": "fastembed_source_session_verified",
         "model_code": lens.files().model_code,
         "provider_policy": lens.provider_policy(),
         "runtime": lens.runtime_name(),
         "dim": dim,
         "artifact_count": artifacts.len(),
+        "source_session_lens_id": source_contract.lens_id().to_string(),
     }))?;
-    Ok(FastembedCommission { artifacts, dim })
+    Ok(FastembedCommission {
+        artifacts,
+        dim,
+        source_contract: Some(source_contract),
+    })
 }
 
 pub(super) fn cache_dir(flags: &CommissionFlags) -> CliResult<PathBuf> {

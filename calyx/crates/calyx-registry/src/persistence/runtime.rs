@@ -195,6 +195,28 @@ pub(super) fn load_runtime_lens(snapshot: &RegistryLensSnapshot) -> Result<Arc<d
             snapshot.lens_id
         ))
     })?;
+    let declared_contract = spec.declared_contract();
+    let declared_lens_id = declared_contract.lens_id();
+    if declared_lens_id != snapshot.lens_id {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted lens key {} != LensSpec declared id {declared_lens_id} before runtime construction",
+            snapshot.lens_id
+        )));
+    }
+    if declared_contract != snapshot.contract {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted lens {} LensSpec contract drift before runtime construction: {}",
+            snapshot.lens_id,
+            contract_field_diffs("declared", &snapshot.contract, &declared_contract)
+                .into_iter()
+                .map(|field| format!(
+                    "{} persisted={} declared={}",
+                    field.field, field.persisted, field.reconstructed
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let (lens, runtime_contract) = load_runtime_lens_from_spec(spec)?;
     if runtime_contract != snapshot.contract {
         return Err(CalyxError::lens_frozen_violation(format!(

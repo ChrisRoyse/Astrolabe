@@ -113,8 +113,9 @@ pub type OnnxCudaDeviceAttestation = calyx_forge::PinnedCudaDeviceAttestation;
 /// Unforgeable process decision permitting separately commissioned CPU lenses.
 ///
 /// This can only be created before CUDA execution is selected and only when
-/// the exact pinned CUDA Runtime reports no visible device. A CUDA provider,
-/// construction, or inference failure never creates this authorization.
+/// the exact pinned CUDA Runtime and exact system CUDA Driver independently
+/// report no device. A CUDA provider, construction, or inference failure never
+/// creates this authorization.
 #[derive(Clone, Debug)]
 pub struct OnnxCpuAuthorization {
     requested_runtime_ordinal: u32,
@@ -168,7 +169,8 @@ impl ImmutableDirectoryRoot {
     fn attest_unchanged(&self) -> Result<()> {
         let observed_path = final_path_from_handle(&self.handle)?;
         let observed_identity = immutable_file_identity(&self.handle)?;
-        if !same_final_path(&observed_path, &self.final_path) || observed_identity != self.identity {
+        if !same_final_path(&observed_path, &self.final_path) || observed_identity != self.identity
+        {
             return Err(runtime_error(
                 "CALYX_ONNX_ARTIFACT_ROOT_CHANGED",
                 format!(
@@ -271,9 +273,10 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
 
 /// Makes the one process-wide learned-execution decision for a CPU-only host.
 ///
-/// A usable GPU permanently selects CUDA. Only the exact pinned CUDA Runtime's
-/// no-device result can mint the opaque CPU capability. Every other probe
-/// failure is terminal for this process and is never converted to CPU work.
+/// A usable GPU permanently selects CUDA. Only matching zero-device readbacks
+/// from the exact pinned CUDA Runtime and exact system CUDA Driver can mint the
+/// opaque CPU capability. Every other probe failure is terminal for this
+/// process and is never converted to CPU work.
 pub fn authorize_cpu_companion() -> Result<OnnxCpuAuthorization> {
     let state = EXECUTION_DECISION.get_or_init(|| Mutex::new(ExecutionDecision::default()));
     let mut decision = state.lock().map_err(|_| execution_decision_poisoned())?;
@@ -840,8 +843,8 @@ fn execution_decision_poisoned() -> CalyxError {
 fn cpu_execution_unauthorized() -> CalyxError {
     runtime_error(
         "CALYX_ONNX_CPU_COMPANION_UNAUTHORIZED",
-        "the separately commissioned CPU companion is not authorized because startup did not prove exact CUDA Runtime no-device",
-        "use the CUDA lens on a GPU host; CPU execution is permitted only when authorize_cpu_companion selects it before any CUDA path",
+        "the separately commissioned CPU companion is not authorized because startup did not prove matching zero-device results from the exact CUDA Runtime and Driver",
+        "use the CUDA lens on a GPU host; CPU execution is permitted only when authorize_cpu_companion obtains dual Runtime/Driver no-device evidence before any CUDA path",
     )
 }
 

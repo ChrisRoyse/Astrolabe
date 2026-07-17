@@ -41,7 +41,8 @@ pub use options::{
     frozen_device_policy, parse_frozen_device_policy,
 };
 pub(crate) use options::{
-    attest_executable_cuda_policy, configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
+    CandleCpuAuthorization, attest_executable_cuda_policy, authorize_executable_cpu_policy,
+    configure_f32_gemm_accumulation, verify_f32_gemm_accumulation,
 };
 use pooling::{apply_norm, pool_tokens};
 
@@ -55,6 +56,7 @@ pub struct CandleLens {
     pooling: CandlePoolingPolicy,
     source_tensor_dtype_profile: LensForgeSourceTensorDtypeProfile,
     execution_attestation: LocalModelExecutionAttestation,
+    _cpu_authorization: Option<CandleCpuAuthorization>,
     max_tokens: usize,
     tokenizer: Tokenizer,
     model: Mutex<CalyxBertModel>,
@@ -168,6 +170,7 @@ impl CandleLens {
                 spec.precision.as_str()
             )));
         }
+        let cpu_authorization = authorize_executable_cpu_policy(spec.device_policy)?;
         ensure_file("config", &spec.config)?;
         ensure_file("tokenizer", &spec.tokenizer)?;
         ensure_file("weights", &spec.weights)?;
@@ -236,6 +239,7 @@ impl CandleLens {
             spec.device_policy,
             spec.precision,
             &source_tensor_dtype_profile,
+            cpu_authorization.as_ref(),
         )?;
         let files = CandleModelFiles {
             cache_dir: spec.cache_dir,
@@ -274,6 +278,7 @@ impl CandleLens {
             pooling: spec.pooling,
             source_tensor_dtype_profile,
             execution_attestation,
+            _cpu_authorization: cpu_authorization,
             max_tokens: spec.max_tokens,
             tokenizer,
             model: Mutex::new(model),

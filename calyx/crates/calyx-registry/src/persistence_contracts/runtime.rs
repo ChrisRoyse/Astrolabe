@@ -71,6 +71,18 @@ pub(crate) fn load_runtime_lens_from_spec(
             Ok((Arc::new(lens), contract))
         }
         #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedDense { .. } => {
+            let lens = OnnxLens::from_lens_spec(spec)?;
+            let contract = lens.contract().clone();
+            Ok((Arc::new(lens), contract))
+        }
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedDensePlaced { .. } => {
+            let lens = OnnxLens::from_lens_spec(spec)?;
+            let contract = lens.contract().clone();
+            Ok((Arc::new(lens), contract))
+        }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::OnnxColbert { .. } => {
             let lens = OnnxColbertLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
@@ -83,13 +95,31 @@ pub(crate) fn load_runtime_lens_from_spec(
             Ok((Arc::new(lens), contract))
         }
         #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedSparsePlaced { .. } => {
+            let lens = FastembedSparseLens::from_lens_spec(spec)?;
+            let contract = lens.contract().clone();
+            Ok((Arc::new(lens), contract))
+        }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedBgem3 { .. } => {
             let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
         #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedBgem3Placed { .. } => {
+            let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
+            let contract = lens.contract().clone();
+            Ok((Arc::new(lens), contract))
+        }
+        #[cfg(feature = "ml-runtime")]
         LensRuntime::FastembedReranker { .. } => {
+            let lens = FastembedRerankerLens::from_lens_spec(spec)?;
+            let contract = lens.contract().clone();
+            Ok((Arc::new(lens), contract))
+        }
+        #[cfg(feature = "ml-runtime")]
+        LensRuntime::FastembedRerankerPlaced { .. } => {
             let lens = FastembedRerankerLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
@@ -109,10 +139,15 @@ pub(crate) fn load_runtime_lens_from_spec(
         #[cfg(not(feature = "ml-runtime"))]
         LensRuntime::CandleLocal { .. }
         | LensRuntime::Onnx { .. }
+        | LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedDensePlaced { .. }
         | LensRuntime::OnnxColbert { .. }
         | LensRuntime::FastembedSparse { .. }
         | LensRuntime::FastembedBgem3 { .. }
         | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedSparsePlaced { .. }
+        | LensRuntime::FastembedBgem3Placed { .. }
+        | LensRuntime::FastembedRerankerPlaced { .. }
         | LensRuntime::FastembedQwen3 { .. }
         | LensRuntime::StaticLookup { .. } => Err(ml_runtime_disabled(&spec.name, &spec.runtime)),
         LensRuntime::MultimodalAdapter { .. } => {

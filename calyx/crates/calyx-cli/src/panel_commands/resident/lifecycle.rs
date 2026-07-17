@@ -13,12 +13,14 @@ use ulid::Ulid;
 
 use super::super::warm::resident_support::ResidentLensAttestation;
 use super::discovery::unix_now_ms;
+use super::job::ResidentProcessIdentity;
 use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
 pub(super) const LIFECYCLE_SCHEMA_V2: &str = "calyx-panel-resident-lifecycle-v2";
 pub(super) const LIFECYCLE_SCHEMA_V3: &str = "calyx-panel-resident-lifecycle-v3";
-pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v4";
+pub(super) const LIFECYCLE_SCHEMA_V4: &str = "calyx-panel-resident-lifecycle-v4";
+pub(super) const LIFECYCLE_SCHEMA: &str = "calyx-panel-resident-lifecycle-v5";
 const LIFECYCLE_CORRUPT: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT";
 const LIFECYCLE_DURABILITY: &str = "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY";
 const SUPERVISOR_ALREADY_RUNNING: &str = "CALYX_PANEL_RESIDENT_ALREADY_RUNNING";
@@ -98,6 +100,8 @@ pub(super) struct LifecycleState {
     pub(super) supervisor_pid: u32,
     pub(super) worker_pid: Option<u32>,
     pub(super) worker_descendant_pids: Vec<u32>,
+    pub(super) worker_job_name: Option<String>,
+    pub(super) worker_process_identities: Vec<ResidentProcessIdentity>,
     pub(super) phase: LifecyclePhase,
     pub(super) generation: u64,
     pub(super) queued_requests: u64,
@@ -133,6 +137,8 @@ impl LifecycleState {
             supervisor_pid,
             worker_pid: None,
             worker_descendant_pids: Vec::new(),
+            worker_job_name: None,
+            worker_process_identities: Vec::new(),
             phase: LifecyclePhase::Unloaded,
             generation: 0,
             queued_requests: 0,
@@ -166,6 +172,10 @@ pub(super) struct LifecycleProjection {
     pub(super) supervisor_pid: u32,
     pub(super) worker_pid: Option<u32>,
     pub(super) worker_descendant_pids: Vec<u32>,
+    #[serde(default)]
+    pub(super) worker_job_name: Option<String>,
+    #[serde(default)]
+    pub(super) worker_process_identities: Vec<ResidentProcessIdentity>,
     pub(super) phase: LifecyclePhase,
     pub(super) generation: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -200,6 +210,8 @@ impl LifecycleProjection {
             supervisor_pid: self.supervisor_pid,
             worker_pid: self.worker_pid,
             worker_descendant_pids: self.worker_descendant_pids.clone(),
+            worker_job_name: self.worker_job_name.clone(),
+            worker_process_identities: self.worker_process_identities.clone(),
             phase: self.phase,
             generation: self.generation,
             queued_requests: self.queued_requests,
@@ -514,7 +526,12 @@ impl LifecycleStore {
     }
 
     fn publish_and_verify_snapshot(&self, projection: &LifecycleProjection) -> CliResult {
-        let mut bytes = serde_json::to_vec_pretty(projection).map_err(|error| {
+        let snapshot_value = projection_json_value(projection).map_err(|error| {
+            durability_error(format!(
+                "normalize resident lifecycle snapshot for publication failed: {error}"
+            ))
+        })?;
+        let mut bytes = serde_json::to_vec_pretty(&snapshot_value).map_err(|error| {
             durability_error(format!(
                 "serialize resident lifecycle snapshot failed: {error}"
             ))
@@ -604,7 +621,7 @@ fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<LifecycleReplay> {
                 ))
             },
         )?;
-        let typed_record = serde_json::to_value(&record).map_err(|error| {
+        let typed_record = projection_json_value(&record).map_err(|error| {
             corrupt_error(format!(
                 "resident lifecycle journal {} line {} cannot be normalized for verification: {error}",
                 path.display(),
@@ -616,7 +633,7 @@ fn replay_journal(path: &Path, bytes: &[u8]) -> CliResult<LifecycleReplay> {
                 "resident lifecycle journal {} line {} contains fields outside schema {}",
                 path.display(),
                 line_index + 1,
-                LIFECYCLE_SCHEMA
+                record.schema
             )));
         }
         let sequence = expected_sequence.ok_or_else(|| {
@@ -642,10 +659,12 @@ fn validate_replayed_lifecycle_transition(
     previous: Option<&LifecycleProjection>,
     record: &LifecycleProjection,
 ) -> CliResult {
-    // v2/v3 journals predate event-specific state validation. They retain
-    // their original hash/request validation and are migrated by the first
-    // v4 event; every newly appended event is held to the complete contract.
-    if record.schema != LIFECYCLE_SCHEMA {
+    // V2/V3 predate event-specific state validation. V4 retains its committed
+    // PID-only contract; V5 adds exact Windows Job/process creation identity.
+    if !matches!(
+        record.schema.as_str(),
+        LIFECYCLE_SCHEMA_V4 | LIFECYCLE_SCHEMA
+    ) {
         return Ok(());
     }
     validate_lifecycle_state(path, line_number, record)?;
@@ -663,17 +682,24 @@ fn validate_replayed_lifecycle_transition(
             return Err(lifecycle_semantic_error(
                 path,
                 line_number,
-                "the first v4 event is not a zero-counter unloaded supervisor_started record",
+                format!(
+                    "the first {} event is not a zero-counter unloaded supervisor_started record",
+                    record.schema
+                ),
             ));
         }
         return Ok(());
     };
 
-    if is_restart_event(&record.event) {
+    if is_restart_event(&record.schema, &record.event) {
         validate_counter_transition(path, line_number, previous, record)?;
-        return validate_restart_transition(path, line_number, previous, record);
+        return if record.schema == LIFECYCLE_SCHEMA_V4 {
+            validate_v4_restart_transition(path, line_number, previous, record)
+        } else {
+            validate_restart_transition(path, line_number, previous, record)
+        };
     }
-    if previous.schema != LIFECYCLE_SCHEMA {
+    if previous.schema != record.schema {
         return Err(lifecycle_semantic_error(
             path,
             line_number,
@@ -735,11 +761,13 @@ fn is_recovery_event(event: &str) -> bool {
     )
 }
 
-fn is_restart_event(event: &str) -> bool {
-    is_recovery_event(event) || event == "supervisor_started"
+fn is_restart_event(schema: &str, event: &str) -> bool {
+    is_recovery_event(event)
+        || event == "supervisor_started"
+        || (schema == LIFECYCLE_SCHEMA && event == "restart_generation_recovered")
 }
 
-fn validate_restart_transition(
+fn validate_v4_restart_transition(
     path: &Path,
     line_number: usize,
     previous: &LifecycleProjection,
@@ -748,6 +776,117 @@ fn validate_restart_transition(
     if record.phase != LifecyclePhase::Unloaded
         || record.worker_pid.is_some()
         || !record.worker_descendant_pids.is_empty()
+        || record.queued_requests != 0
+        || record.in_flight != 0
+        || record.idle_deadline_unix_ms.is_some()
+        || record.generation != previous.generation
+        || record.last_worker_start_unix_ms != previous.last_worker_start_unix_ms
+        || record.last_completion_unix_ms != previous.last_completion_unix_ms
+        || record.last_unload_unix_ms != previous.last_unload_unix_ms
+        || record.last_error != previous.last_error
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "v4 restart recovery did not collapse to one unloaded state while preserving exact counters, timestamps, and global last_error",
+        ));
+    }
+    if record.event == "legacy_requests_recovered_abandoned"
+        && (previous.schema != LIFECYCLE_SCHEMA_V2 || previous.in_flight == 0)
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "legacy request recovery did not directly follow a v2 record with in_flight work",
+        ));
+    }
+
+    let continuing_recovery =
+        previous.schema == LIFECYCLE_SCHEMA_V4 && is_recovery_event(&previous.event);
+    if continuing_recovery {
+        if record.supervisor_pid != previous.supervisor_pid
+            || record.frozen_panel_fingerprint != previous.frozen_panel_fingerprint
+            || record.idle_ttl_ms != previous.idle_ttl_ms
+            || record.max_load_secs != previous.max_load_secs
+            || record.max_request_secs != previous.max_request_secs
+            || record.lens_attestations != previous.lens_attestations
+            || !same_onnx_attestation(previous, record)
+        {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "v4 restart recovery changed supervisor/configuration/attestation after its first boundary record",
+            ));
+        }
+    } else if record.frozen_panel_fingerprint == previous.frozen_panel_fingerprint {
+        if record.lens_attestations != previous.lens_attestations
+            || !same_onnx_attestation(previous, record)
+        {
+            return Err(lifecycle_semantic_error(
+                path,
+                line_number,
+                "v4 restart retained the frozen fingerprint but changed its exact runtime attestations",
+            ));
+        }
+    } else if !record.lens_attestations.is_empty() || has_onnx_attestation(record) {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "v4 restart changed the frozen fingerprint without clearing stale runtime attestations",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restart_transition(
+    path: &Path,
+    line_number: usize,
+    previous: &LifecycleProjection,
+    record: &LifecycleProjection,
+) -> CliResult {
+    if previous.phase == LifecyclePhase::Loading
+        && previous.worker_pid.is_none()
+        && previous.schema != LIFECYCLE_SCHEMA
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "restart crossed a legacy pre-assignment loading state without v5 atomic Job ownership",
+        ));
+    }
+    if previous.phase == LifecyclePhase::Loading
+        && previous.worker_pid.is_none()
+        && previous.worker_job_name.is_some()
+        && record.event != "restart_generation_recovered"
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "restart discarded a durable pre-assignment Job without a dedicated physical recovery boundary",
+        ));
+    }
+    if previous.worker_pid.is_some() && record.event != "restart_generation_recovered" {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "restart discarded a recorded worker without a dedicated physical generation-recovery boundary",
+        ));
+    }
+    if record.event == "restart_generation_recovered"
+        && (previous.schema != LIFECYCLE_SCHEMA
+            || (previous.worker_pid.is_none() && previous.phase != LifecyclePhase::Loading))
+    {
+        return Err(lifecycle_semantic_error(
+            path,
+            line_number,
+            "physical generation recovery did not directly follow a v5 loading boundary or record with complete worker ownership",
+        ));
+    }
+    if record.phase != LifecyclePhase::Unloaded
+        || record.worker_pid.is_some()
+        || !record.worker_descendant_pids.is_empty()
+        || record.worker_job_name.is_some()
+        || !record.worker_process_identities.is_empty()
         || record.queued_requests != 0
         || record.in_flight != 0
         || record.idle_deadline_unix_ms.is_some()
@@ -773,8 +912,8 @@ fn validate_restart_transition(
         ));
     }
 
-    let continuing_recovery =
-        previous.schema == LIFECYCLE_SCHEMA && is_recovery_event(&previous.event);
+    let continuing_recovery = previous.schema == LIFECYCLE_SCHEMA
+        && (is_recovery_event(&previous.event) || previous.event == "restart_generation_recovered");
     if continuing_recovery {
         if record.supervisor_pid != previous.supervisor_pid
             || record.frozen_panel_fingerprint != previous.frozen_panel_fingerprint
@@ -839,19 +978,22 @@ fn validate_event_field_changes(
             format!("event {:?} changed last_worker_start_unix_ms", record.event),
         ));
     }
-    if event == "request_released" {
-        let succeeded = record
-            .request
-            .as_ref()
-            .is_some_and(|request| request.outcome == Some(RequestOutcome::Succeeded));
-        if succeeded && record.last_completion_unix_ms.is_none() {
+    if matches!(event, "request_released" | "terminal_delivery_failed") {
+        let productively_completed = event == "terminal_delivery_failed"
+            || record
+                .request
+                .as_ref()
+                .is_some_and(|request| request.outcome == Some(RequestOutcome::Succeeded));
+        if productively_completed && record.last_completion_unix_ms.is_none() {
             return Err(lifecycle_semantic_error(
                 path,
                 line_number,
-                "successful request release omitted last_completion_unix_ms",
+                "productive request release omitted last_completion_unix_ms",
             ));
         }
-        if !succeeded && record.last_completion_unix_ms != previous.last_completion_unix_ms {
+        if !productively_completed
+            && record.last_completion_unix_ms != previous.last_completion_unix_ms
+        {
             return Err(lifecycle_semantic_error(
                 path,
                 line_number,
@@ -942,31 +1084,60 @@ fn validate_worker_identity_change(
     record: &LifecycleProjection,
 ) -> CliResult {
     let same = record.worker_pid == previous.worker_pid
-        && record.worker_descendant_pids == previous.worker_descendant_pids;
-    let valid = match record.event.as_str() {
-        "load_succeeded" => previous.worker_pid.is_none() && record.worker_pid.is_some(),
-        "worker_reaped" | "idle_unload_completed" => {
-            previous.worker_pid.is_some()
-                && record.worker_pid.is_none()
-                && record.worker_descendant_pids.is_empty()
+        && record.worker_descendant_pids == previous.worker_descendant_pids
+        && record.worker_job_name == previous.worker_job_name
+        && record.worker_process_identities == previous.worker_process_identities;
+    let valid = if record.schema == LIFECYCLE_SCHEMA_V4 {
+        match record.event.as_str() {
+            "load_succeeded" => previous.worker_pid.is_none() && record.worker_pid.is_some(),
+            "worker_reaped" | "idle_unload_completed" | "worker_reap_accounting_failed" => {
+                previous.worker_pid.is_some()
+                    && record.worker_pid.is_none()
+                    && record.worker_descendant_pids.is_empty()
+            }
+            "worker_reap_failed" => same,
+            "idle_unload_failed" | "shutdown_worker_failed" | "supervisor_stopped" => {
+                same || (previous.worker_pid.is_some()
+                    && record.worker_pid.is_none()
+                    && record.worker_descendant_pids.is_empty())
+            }
+            _ => same,
         }
-        "worker_reap_accounting_failed" => {
-            previous.worker_pid.is_some()
-                && record.worker_pid.is_none()
-                && record.worker_descendant_pids.is_empty()
+    } else {
+        match record.event.as_str() {
+            "load_job_created" => {
+                worker_identity_is_absent(previous)
+                    && record.worker_pid.is_none()
+                    && record.worker_descendant_pids.is_empty()
+                    && record.worker_job_name.is_some()
+                    && record.worker_process_identities.is_empty()
+            }
+            "load_worker_assigned" => {
+                previous.worker_pid.is_none()
+                    && previous.worker_job_name.is_some()
+                    && record.worker_pid.is_some()
+                    && record.worker_job_name == previous.worker_job_name
+            }
+            "load_succeeded" => previous.worker_pid.is_some() && same,
+            "load_failed" => {
+                same || ((previous.worker_pid.is_some() || previous.worker_job_name.is_some())
+                    && worker_identity_is_absent(record))
+            }
+            "worker_reaped" | "idle_unload_completed" => {
+                previous.worker_pid.is_some() && worker_identity_is_absent(record)
+            }
+            "worker_reap_accounting_failed" => {
+                previous.worker_pid.is_some() && worker_identity_is_absent(record)
+            }
+            "worker_reap_failed" => same,
+            "idle_unload_failed" | "shutdown_worker_failed" => {
+                same || (previous.worker_pid.is_some() && worker_identity_is_absent(record))
+            }
+            "supervisor_stopped" => {
+                same || (previous.worker_pid.is_some() && worker_identity_is_absent(record))
+            }
+            _ => same,
         }
-        "worker_reap_failed" => same,
-        "idle_unload_failed" | "shutdown_worker_failed" => {
-            same || (previous.worker_pid.is_some()
-                && record.worker_pid.is_none()
-                && record.worker_descendant_pids.is_empty())
-        }
-        "supervisor_stopped" => {
-            same || (previous.worker_pid.is_some()
-                && record.worker_pid.is_none()
-                && record.worker_descendant_pids.is_empty())
-        }
-        _ => same,
     };
     if valid {
         return Ok(());
@@ -975,14 +1146,25 @@ fn validate_worker_identity_change(
         path,
         line_number,
         format!(
-            "event {:?} changed worker ownership {:?}/{:?} -> {:?}/{:?} illegally",
+            "event {:?} changed worker ownership {:?}/{:?}/{:?}/{:?} -> {:?}/{:?}/{:?}/{:?} illegally",
             record.event,
             previous.worker_pid,
             previous.worker_descendant_pids,
+            previous.worker_job_name,
+            previous.worker_process_identities,
             record.worker_pid,
-            record.worker_descendant_pids
+            record.worker_descendant_pids,
+            record.worker_job_name,
+            record.worker_process_identities
         ),
     ))
+}
+
+fn worker_identity_is_absent(record: &LifecycleProjection) -> bool {
+    record.worker_pid.is_none()
+        && record.worker_descendant_pids.is_empty()
+        && record.worker_job_name.is_none()
+        && record.worker_process_identities.is_empty()
 }
 
 fn validate_lifecycle_state(
@@ -1015,17 +1197,53 @@ fn validate_lifecycle_state(
     }
     let mut descendants = record.worker_descendant_pids.clone();
     descendants.sort_unstable();
+    let identity_process_ids = record
+        .worker_process_identities
+        .iter()
+        .map(|identity| identity.process_id)
+        .collect::<Vec<_>>();
+    let job_name_valid = record.worker_job_name.as_deref().is_some_and(|name| {
+        name.strip_prefix("Local\\CalyxPanelResident-")
+            .is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    });
+    let worker_identity_valid = if record.schema == LIFECYCLE_SCHEMA {
+        match record.worker_pid {
+            Some(_) => {
+                job_name_valid
+                    && identity_process_ids == record.worker_descendant_pids
+                    && record
+                        .worker_process_identities
+                        .iter()
+                        .all(|identity| identity.creation_time_filetime != 0)
+            }
+            None => {
+                record.worker_descendant_pids.is_empty()
+                    && record.worker_process_identities.is_empty()
+                    && (record.worker_job_name.is_none()
+                        || (record.phase == LifecyclePhase::Loading && job_name_valid))
+            }
+        }
+    } else {
+        record.worker_job_name.is_none() && record.worker_process_identities.is_empty()
+    };
     if descendants.iter().any(|pid| *pid == 0)
         || descendants.windows(2).any(|pair| pair[0] == pair[1])
+        || (record.schema == LIFECYCLE_SCHEMA && descendants != record.worker_descendant_pids)
         || record
             .worker_pid
             .is_some_and(|pid| pid == record.supervisor_pid || !descendants.contains(&pid))
         || (record.worker_pid.is_none() && !record.worker_descendant_pids.is_empty())
+        || !worker_identity_valid
     {
         return Err(lifecycle_semantic_error(
             path,
             line_number,
-            "record has impossible worker/descendant PID ownership",
+            "record has impossible worker Job/PID/creation-time ownership",
         ));
     }
     let phase_valid = match record.phase {
@@ -1053,7 +1271,7 @@ fn validate_lifecycle_state(
                 && record.idle_deadline_unix_ms.is_none()
         }
         LifecyclePhase::Loading => {
-            record.worker_pid.is_none()
+            (record.schema == LIFECYCLE_SCHEMA || record.worker_pid.is_none())
                 && record.in_flight == 0
                 && record.idle_deadline_unix_ms.is_none()
                 && record.last_error.is_none()
@@ -1211,8 +1429,29 @@ fn validate_event_state(
                 && record.worker_pid.is_none()
                 && record.last_error.is_none()
         }
+        "load_job_created" => {
+            record.schema == LIFECYCLE_SCHEMA
+                && previous.phase == LifecyclePhase::Loading
+                && previous.worker_pid.is_none()
+                && previous.worker_job_name.is_none()
+                && record.phase == LifecyclePhase::Loading
+                && record.worker_pid.is_none()
+                && record.worker_job_name.is_some()
+                && record.last_error.is_none()
+        }
+        "load_worker_assigned" => {
+            record.schema == LIFECYCLE_SCHEMA
+                && previous.phase == LifecyclePhase::Loading
+                && previous.worker_pid.is_none()
+                && previous.worker_job_name.is_some()
+                && record.phase == LifecyclePhase::Loading
+                && record.worker_pid.is_some()
+                && record.worker_job_name == previous.worker_job_name
+                && record.last_error.is_none()
+        }
         "load_succeeded" => {
             previous.phase == LifecyclePhase::Loading
+                && (record.schema == LIFECYCLE_SCHEMA_V4 || previous.worker_pid.is_some())
                 && matches!(
                     record.phase,
                     LifecyclePhase::LoadedIdle | LifecyclePhase::LoadedBusy
@@ -1314,8 +1553,9 @@ fn validate_event_state(
                 LifecyclePhase::LoadedBusy | LifecyclePhase::Faulted | LifecyclePhase::Stopping
             ) && record.phase == previous.phase
         }
-        "request_released" => {
-            !matches!(previous.phase, LifecyclePhase::Stopped)
+        "request_released" | "terminal_delivery_failed" => {
+            (record.event == "request_released" || record.schema == LIFECYCLE_SCHEMA)
+                && !matches!(previous.phase, LifecyclePhase::Stopped)
                 && matches!(
                     record.phase,
                     LifecyclePhase::Loading
@@ -1366,6 +1606,16 @@ fn validate_replayed_request(
     }
     let previous_queued = previous.map_or(0, |previous| previous.queued_requests);
     let previous_in_flight = previous.map_or(0, |previous| previous.in_flight);
+    if previous.is_some_and(|previous| {
+        previous.schema == LIFECYCLE_SCHEMA
+            && (previous.worker_pid.is_some() || previous.phase == LifecyclePhase::Loading)
+    }) && record.event == "restart_generation_recovered"
+        && record.request.is_none()
+        && record.queued_requests == 0
+        && record.in_flight == 0
+    {
+        return Ok(());
+    }
     if previous.is_some_and(|previous| previous.schema == LIFECYCLE_SCHEMA_V2)
         && record.event == "legacy_requests_recovered_abandoned"
         && previous_in_flight != 0
@@ -1485,7 +1735,10 @@ fn validate_replayed_request(
             }
             state.last = request.clone();
         }
-        "request_released" | "request_recovered_abandoned" | "request_recovered_succeeded" => {
+        "request_released"
+        | "terminal_delivery_failed"
+        | "request_recovered_abandoned"
+        | "request_recovered_succeeded" => {
             let Some(state) = requests.get(&request.request_id) else {
                 return Err(request_semantic_error(
                     path,
@@ -1499,6 +1752,7 @@ fn validate_replayed_request(
             let succeeded = request.outcome == Some(RequestOutcome::Succeeded);
             let recovered_abandoned = record.event == "request_recovered_abandoned";
             let recovered_succeeded = record.event == "request_recovered_succeeded";
+            let terminal_delivery_failed = record.event == "terminal_delivery_failed";
             let recovery = recovered_abandoned || recovered_succeeded;
             let counters_valid = if recovery {
                 record.queued_requests == 0 && record.in_flight == 0
@@ -1515,6 +1769,12 @@ fn validate_replayed_request(
                 || (succeeded
                     && (state.last.stage != RequestStage::PublicFlushComplete
                         || request.error.is_some()))
+                || (terminal_delivery_failed
+                    && (record.schema != LIFECYCLE_SCHEMA
+                        || !state.admitted
+                        || state.last.stage != RequestStage::TerminalReceived
+                        || request.outcome != Some(RequestOutcome::Abandoned)
+                        || request.error.is_none()))
                 || (!succeeded && request.error.is_none())
                 || (recovered_abandoned && request.outcome != Some(RequestOutcome::Abandoned))
                 || (recovered_succeeded && request.outcome != Some(RequestOutcome::Succeeded))
@@ -1585,15 +1845,17 @@ fn validate_replayed_record(
     expected_previous: &str,
 ) -> CliResult {
     if record.schema != LIFECYCLE_SCHEMA
+        && record.schema != LIFECYCLE_SCHEMA_V4
         && record.schema != LIFECYCLE_SCHEMA_V3
         && record.schema != LIFECYCLE_SCHEMA_V2
     {
         return Err(corrupt_error(format!(
-            "resident lifecycle journal {} line {} schema is {:?}, expected {:?} or legacy {:?}/{:?}",
+            "resident lifecycle journal {} line {} schema is {:?}, expected {:?} or legacy {:?}/{:?}/{:?}",
             path.display(),
             line_number,
             record.schema,
             LIFECYCLE_SCHEMA,
+            LIFECYCLE_SCHEMA_V4,
             LIFECYCLE_SCHEMA_V3,
             LIFECYCLE_SCHEMA_V2,
         )));
@@ -1667,6 +1929,8 @@ fn projection_from_state(
         supervisor_pid: state.supervisor_pid,
         worker_pid: state.worker_pid,
         worker_descendant_pids: state.worker_descendant_pids.clone(),
+        worker_job_name: state.worker_job_name.clone(),
+        worker_process_identities: state.worker_process_identities.clone(),
         phase: state.phase,
         generation: state.generation,
         queued_requests: state.queued_requests,
@@ -1758,6 +2022,41 @@ struct LifecycleHashMaterialV3<'a> {
     previous_event_sha256: &'a str,
 }
 
+#[derive(Serialize)]
+struct LifecycleHashMaterialV5<'a> {
+    schema: &'a str,
+    sequence: u64,
+    event: &'a str,
+    supervisor_pid: u32,
+    worker_pid: Option<u32>,
+    worker_descendant_pids: &'a [u32],
+    worker_job_name: &'a Option<String>,
+    worker_process_identities: &'a [ResidentProcessIdentity],
+    phase: LifecyclePhase,
+    generation: u64,
+    queued_requests: u64,
+    in_flight: u64,
+    idle_ttl_ms: u64,
+    max_load_secs: u64,
+    max_request_secs: u64,
+    idle_deadline_unix_ms: Option<u64>,
+    load_attempt_count: u64,
+    load_success_count: u64,
+    load_failure_count: u64,
+    unload_count: u64,
+    last_worker_start_unix_ms: Option<u64>,
+    last_completion_unix_ms: Option<u64>,
+    last_unload_unix_ms: Option<u64>,
+    frozen_panel_fingerprint: &'a str,
+    lens_attestations: &'a [ResidentLensAttestation],
+    #[cfg(windows)]
+    onnx_runtime_attestation: &'a Option<OnnxRuntimeAttestation>,
+    last_error: &'a Option<LifecycleErrorRecord>,
+    request: &'a Option<LifecycleRequestRecord>,
+    recorded_at_unix_ms: u64,
+    previous_event_sha256: &'a str,
+}
+
 fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Error> {
     if record.schema == LIFECYCLE_SCHEMA_V2 {
         return serde_json::to_vec(&LifecycleHashMaterialV2 {
@@ -1791,13 +2090,52 @@ fn event_sha256(record: &LifecycleProjection) -> Result<String, serde_json::Erro
         })
         .map(|bytes| sha256_hex(&bytes));
     }
-    let material = LifecycleHashMaterialV3 {
+    if matches!(
+        record.schema.as_str(),
+        LIFECYCLE_SCHEMA_V3 | LIFECYCLE_SCHEMA_V4
+    ) {
+        return serde_json::to_vec(&LifecycleHashMaterialV3 {
+            schema: &record.schema,
+            sequence: record.sequence,
+            event: &record.event,
+            supervisor_pid: record.supervisor_pid,
+            worker_pid: record.worker_pid,
+            worker_descendant_pids: &record.worker_descendant_pids,
+            phase: record.phase,
+            generation: record.generation,
+            queued_requests: record.queued_requests,
+            in_flight: record.in_flight,
+            idle_ttl_ms: record.idle_ttl_ms,
+            max_load_secs: record.max_load_secs,
+            max_request_secs: record.max_request_secs,
+            idle_deadline_unix_ms: record.idle_deadline_unix_ms,
+            load_attempt_count: record.load_attempt_count,
+            load_success_count: record.load_success_count,
+            load_failure_count: record.load_failure_count,
+            unload_count: record.unload_count,
+            last_worker_start_unix_ms: record.last_worker_start_unix_ms,
+            last_completion_unix_ms: record.last_completion_unix_ms,
+            last_unload_unix_ms: record.last_unload_unix_ms,
+            frozen_panel_fingerprint: &record.frozen_panel_fingerprint,
+            lens_attestations: &record.lens_attestations,
+            #[cfg(windows)]
+            onnx_runtime_attestation: &record.onnx_runtime_attestation,
+            last_error: &record.last_error,
+            request: &record.request,
+            recorded_at_unix_ms: record.recorded_at_unix_ms,
+            previous_event_sha256: &record.previous_event_sha256,
+        })
+        .map(|bytes| sha256_hex(&bytes));
+    }
+    let material = LifecycleHashMaterialV5 {
         schema: &record.schema,
         sequence: record.sequence,
         event: &record.event,
         supervisor_pid: record.supervisor_pid,
         worker_pid: record.worker_pid,
         worker_descendant_pids: &record.worker_descendant_pids,
+        worker_job_name: &record.worker_job_name,
+        worker_process_identities: &record.worker_process_identities,
         phase: record.phase,
         generation: record.generation,
         queued_requests: record.queued_requests,
@@ -1859,7 +2197,7 @@ fn read_snapshot(path: &Path) -> CliResult<LifecycleProjection> {
                 path.display()
             ))
         })?;
-    let typed_projection = serde_json::to_value(&projection).map_err(|error| {
+    let typed_projection = projection_json_value(&projection).map_err(|error| {
         durability_error(format!(
             "normalize resident lifecycle snapshot {} failed: {error}",
             path.display()
@@ -1869,19 +2207,43 @@ fn read_snapshot(path: &Path) -> CliResult<LifecycleProjection> {
         return Err(durability_error(format!(
             "resident lifecycle snapshot {} contains fields outside schema {}",
             path.display(),
-            LIFECYCLE_SCHEMA
+            projection.schema
         )));
     }
     Ok(projection)
 }
 
+fn remove_pre_v5_worker_identity_fields(
+    projection: &LifecycleProjection,
+    value: &mut serde_json::Value,
+) {
+    if !matches!(
+        projection.schema.as_str(),
+        LIFECYCLE_SCHEMA_V2 | LIFECYCLE_SCHEMA_V3 | LIFECYCLE_SCHEMA_V4
+    ) {
+        return;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("worker_job_name");
+        object.remove("worker_process_identities");
+    }
+}
+
+fn projection_json_value(
+    projection: &LifecycleProjection,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(projection)?;
+    remove_pre_v5_worker_identity_fields(projection, &mut value);
+    Ok(value)
+}
+
 fn projections_equal(left: &LifecycleProjection, right: &LifecycleProjection) -> CliResult<bool> {
-    let left = serde_json::to_vec(left).map_err(|error| {
+    let left = projection_json_value(left).map_err(|error| {
         durability_error(format!(
             "serialize resident lifecycle snapshot readback failed: {error}"
         ))
     })?;
-    let right = serde_json::to_vec(right).map_err(|error| {
+    let right = projection_json_value(right).map_err(|error| {
         durability_error(format!(
             "serialize authoritative resident lifecycle event failed: {error}"
         ))

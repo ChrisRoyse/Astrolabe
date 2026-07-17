@@ -401,12 +401,34 @@ pub(super) fn runtime_detail(runtime: &LensRuntime) -> String {
             ..
         } => format!("{model_id};device={device};dtype={dtype};pooling={pooling}"),
         LensRuntime::Onnx { model_id, .. }
+        | LensRuntime::FastembedDense { model_id, .. }
         | LensRuntime::OnnxColbert { model_id, .. }
         | LensRuntime::FastembedSparse { model_id, .. }
         | LensRuntime::FastembedReranker { model_id, .. } => model_id.clone(),
+        LensRuntime::FastembedDensePlaced {
+            model_id,
+            execution,
+            ..
+        }
+        | LensRuntime::FastembedSparsePlaced {
+            model_id,
+            execution,
+            ..
+        }
+        | LensRuntime::FastembedRerankerPlaced {
+            model_id,
+            execution,
+            ..
+        } => format!("{model_id};execution={execution}"),
         LensRuntime::FastembedBgem3 {
             model_id, output, ..
         } => format!("{model_id};output={output:?}"),
+        LensRuntime::FastembedBgem3Placed {
+            model_id,
+            output,
+            execution,
+            ..
+        } => format!("{model_id};output={output:?};execution={execution}"),
         LensRuntime::FastembedQwen3 {
             model_id,
             device,

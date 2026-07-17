@@ -8,8 +8,10 @@ use ort::ep::{self, ArenaExtendStrategy, cuda::ConvAlgorithmSearch};
 
 use super::cuda_guard::CudaDropGuard;
 use super::{OnnxLens, OnnxModelFiles, OnnxProviderPolicy};
-use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+use crate::frozen::{FrozenLensContract, LensDType, NormPolicy};
+use crate::identity::fastembed_dense_corpus_hash;
 use crate::runtime::common::{default_hf_cache_root, fastembed_cache_root};
+use crate::spec::{LensRuntime, LensSpec};
 
 pub fn default_cache_root() -> PathBuf {
     default_hf_cache_root()
@@ -38,7 +40,6 @@ pub fn from_model_with_policy(
     cache_dir: PathBuf,
     provider_policy: OnnxProviderPolicy,
 ) -> Result<OnnxLens> {
-    let _ort_dylib = super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
     let name = name.into();
     let info = TextEmbedding::get_model_info(&model_name).map_err(|err| {
         CalyxError::lens_unreachable(format!("fastembed model metadata failed: {err}"))
@@ -50,13 +51,45 @@ pub fn from_model_with_policy(
         &info.model_file,
         &info.additional_files,
     )?;
+    from_files_with_policy(name, model_name, files, provider_policy, None)
+}
+
+fn from_files_with_policy(
+    name: String,
+    model_name: EmbeddingModel,
+    files: OnnxModelFiles,
+    provider_policy: OnnxProviderPolicy,
+    expected_spec: Option<&LensSpec>,
+) -> Result<OnnxLens> {
+    let info = TextEmbedding::get_model_info(&model_name).map_err(|err| {
+        CalyxError::lens_unreachable(format!("fastembed model metadata failed: {err}"))
+    })?;
+    let dim = u32::try_from(info.dim)
+        .map_err(|_| CalyxError::lens_dim_mismatch(format!("ONNX dim {} exceeds u32", info.dim)))?;
+    let shape = SlotShape::Dense(dim);
+    if let Some(spec) = expected_spec
+        && spec.output != shape
+    {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "persisted dense FastEmbed shape {:?} != model shape {shape:?}",
+            spec.output
+        )));
+    }
     let artifacts = super::fastembed_artifacts::FrozenFastembedArtifacts::snapshot(
         &files,
         &info.model_file,
         &info.additional_files,
+        provider_policy.frozen_execution_token(),
         provider_policy,
     )?;
     let weights_sha256 = artifacts.receipt().weights_sha256;
+    let corpus_hash =
+        fastembed_dense_corpus_hash(&files.model_code, provider_policy.frozen_execution_token());
+    if let Some(spec) = expected_spec {
+        validate_persisted_contract(spec, weights_sha256, corpus_hash, shape)?;
+    }
+    super::runtime_bundle::authorize_execution_policy(provider_policy)?;
+    let _ort_dylib = super::dynamic_ort::ensure_dynamic_ort(provider_policy)?;
     let context = super::fastembed_attestation::FastembedModelContext::new(
         format!("onnx-fastembed:{}", info.model_code),
         &info.model_code,
@@ -101,13 +134,6 @@ pub fn from_model_with_policy(
         model.as_ref().session(),
         context,
     )?;
-    let corpus_hash = sha256_digest(&[
-        b"onnx-fastembed-mean-pool-v1",
-        info.model_code.as_bytes(),
-        info.model_file.as_bytes(),
-    ]);
-    let dim = u32::try_from(info.dim)
-        .map_err(|_| CalyxError::lens_dim_mismatch(format!("ONNX dim {} exceeds u32", info.dim)))?;
     let contract = FrozenLensContract::new(
         name,
         weights_sha256,
@@ -125,6 +151,7 @@ pub fn from_model_with_policy(
         contract,
         files,
         provider_policy,
+        expected_spec.and_then(|spec| spec.max_batch),
         model,
         execution,
         bound_stream,
@@ -137,8 +164,147 @@ pub fn from_model_name_with_policy(
     cache_dir: PathBuf,
     provider_policy: OnnxProviderPolicy,
 ) -> Result<OnnxLens> {
+    let identity = model_name.trim();
+    if identity.is_empty() {
+        return Err(CalyxError::lens_unreachable(
+            "fastembed model name must not be empty",
+        ));
+    }
     let model_name = model_from_name(model_name)?;
-    from_model_with_policy(name, model_name, cache_dir, provider_policy)
+    let info = TextEmbedding::get_model_info(&model_name).map_err(|err| {
+        CalyxError::lens_unreachable(format!("fastembed model metadata failed: {err}"))
+    })?;
+    let effective_cache = fastembed_cache_root(&cache_dir);
+    let mut files = resolve_files(
+        &effective_cache,
+        &info.model_code,
+        &info.model_file,
+        &info.additional_files,
+    )?;
+    files.model_code = identity.to_string();
+    from_files_with_policy(name.into(), model_name, files, provider_policy, None)
+}
+
+pub(super) fn from_lens_spec(spec: &LensSpec) -> Result<OnnxLens> {
+    let (model_id, files, execution) = match &spec.runtime {
+        LensRuntime::FastembedDensePlaced {
+            model_id,
+            files,
+            execution,
+        } => (model_id, files, execution),
+        LensRuntime::FastembedDense { .. } => {
+            return Err(CalyxError {
+                code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+                message: "persisted dense FastEmbed runtime predates execution-policy identity"
+                    .into(),
+                remediation: "recommission this lens from its onnx-fastembed manifest to a placement-bound FastEmbed runtime; never infer CPU or CUDA from legacy persisted bytes",
+            });
+        }
+        _ => {
+            return Err(super::config_invalid(
+                "LensSpec runtime is not placement-bound fastembed-dense",
+            ));
+        }
+    };
+    if spec.max_batch == Some(0) {
+        return Err(super::config_invalid("LensSpec max_batch must be > 0"));
+    }
+    let model_id = model_id.trim();
+    let provider_policy = OnnxProviderPolicy::from_frozen_execution_token(execution)?;
+    let model_name = model_from_name(model_id)?;
+    let info = TextEmbedding::get_model_info(&model_name).map_err(|err| {
+        CalyxError::lens_unreachable(format!("fastembed model metadata failed: {err}"))
+    })?;
+    let files = super::fastembed_artifacts::persisted_model_files(
+        model_id,
+        files,
+        &info.model_file,
+        &info.additional_files,
+    )?;
+    from_files_with_policy(
+        spec.name.clone(),
+        model_name,
+        files,
+        provider_policy,
+        Some(spec),
+    )
+}
+
+fn validate_persisted_contract(
+    spec: &LensSpec,
+    observed_weights: [u8; 32],
+    observed_corpus: [u8; 32],
+    observed_shape: SlotShape,
+) -> Result<()> {
+    if spec.modality != Modality::Text {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted dense FastEmbed modality {:?} != Text",
+            spec.modality
+        )));
+    }
+    if spec.norm_policy != NormPolicy::unit() {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted dense FastEmbed norm {:?} != unit",
+            spec.norm_policy
+        )));
+    }
+    if spec.output != observed_shape {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "persisted dense FastEmbed shape {:?} != observed {observed_shape:?}",
+            spec.output
+        )));
+    }
+    if spec.weights_sha256 != observed_weights {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted dense FastEmbed artifact hash {} != observed {}",
+            hex_sha256(&spec.weights_sha256),
+            hex_sha256(&observed_weights)
+        )));
+    }
+    if spec.corpus_hash != observed_corpus {
+        return Err(CalyxError::lens_frozen_violation(format!(
+            "persisted dense FastEmbed corpus hash {} != observed {}",
+            hex_sha256(&spec.corpus_hash),
+            hex_sha256(&observed_corpus)
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn reject_legacy_dense_custom_spec(spec: &LensSpec, model_id: &str) -> Result<()> {
+    let Ok(model) = model_from_name(model_id) else {
+        return Ok(());
+    };
+    let info = TextEmbedding::get_model_info(&model).map_err(|error| {
+        CalyxError::lens_unreachable(format!(
+            "inspect known FastEmbed model metadata during legacy provenance detection failed: {error}"
+        ))
+    })?;
+    let dim = u32::try_from(info.dim).map_err(|_| {
+        CalyxError::lens_dim_mismatch(format!("FastEmbed model dim {} exceeds u32", info.dim))
+    })?;
+    let legacy_identity = crate::identity::legacy_fastembed_dense_corpus_hash(model_id.trim());
+    let canonical_legacy_identity =
+        crate::identity::legacy_fastembed_dense_corpus_hash(&info.model_code);
+    let exact_legacy_contract = spec.output == SlotShape::Dense(dim)
+        && spec.modality == Modality::Text
+        && spec.norm_policy == NormPolicy::unit()
+        && (spec.corpus_hash == legacy_identity || spec.corpus_hash == canonical_legacy_identity);
+    if exact_legacy_contract {
+        return Err(CalyxError {
+            code: "CALYX_FASTEMBED_LEGACY_RUNTIME_MIGRATION_REQUIRED",
+            message: format!(
+                "persisted LensRuntime::Onnx for {} has the exact historical dense FastEmbed frozen identity and cannot be constructed as a generic custom ONNX runtime",
+                model_id.trim()
+            ),
+            remediation: "recommission this lens from a manifest using runtime onnx-fastembed so logical artifact names and execution placement receive the new frozen identity; never reinterpret or rewrite the old bytes in place",
+        });
+    }
+    Ok(())
+}
+
+fn hex_sha256(value: &[u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub fn model_from_name(raw: &str) -> Result<EmbeddingModel> {

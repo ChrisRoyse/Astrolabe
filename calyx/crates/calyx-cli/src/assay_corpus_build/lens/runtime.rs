@@ -19,9 +19,15 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
                 .map_err(lens_error)?;
             Ok(cpu_build_lens(manifest, spec, runtime, Box::new(lens), 0.0))
         }
-        LensRuntime::Onnx { files, .. } => {
+        LensRuntime::Onnx { files, .. } | LensRuntime::FastembedDense { files, .. } => {
             let lens = OnnxLens::from_lens_spec(&spec).map_err(lens_error)?;
             gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+        }
+        LensRuntime::FastembedDensePlaced {
+            files, execution, ..
+        } => {
+            let lens = OnnxLens::from_lens_spec(&spec).map_err(lens_error)?;
+            placed_fastembed_build_lens(manifest, spec, runtime, Box::new(lens), &files, &execution)
         }
         LensRuntime::OnnxColbert { files, .. } => {
             let lens = OnnxColbertLens::from_lens_spec(&spec).map_err(lens_error)?;
@@ -105,13 +111,31 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
             let lens = FastembedSparseLens::from_lens_spec(&spec).map_err(lens_error)?;
             gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
         }
+        LensRuntime::FastembedSparsePlaced {
+            files, execution, ..
+        } => {
+            let lens = FastembedSparseLens::from_lens_spec(&spec).map_err(lens_error)?;
+            placed_fastembed_build_lens(manifest, spec, runtime, Box::new(lens), &files, &execution)
+        }
         LensRuntime::FastembedBgem3 { files, .. } => {
             let lens = FastembedBgem3Lens::from_lens_spec(&spec).map_err(lens_error)?;
             gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
         }
+        LensRuntime::FastembedBgem3Placed {
+            files, execution, ..
+        } => {
+            let lens = FastembedBgem3Lens::from_lens_spec(&spec).map_err(lens_error)?;
+            placed_fastembed_build_lens(manifest, spec, runtime, Box::new(lens), &files, &execution)
+        }
         LensRuntime::FastembedReranker { files, .. } => {
             let lens = FastembedRerankerLens::from_lens_spec(&spec).map_err(lens_error)?;
             gpu_build_lens(manifest, spec, runtime, Box::new(lens), &files)
+        }
+        LensRuntime::FastembedRerankerPlaced {
+            files, execution, ..
+        } => {
+            let lens = FastembedRerankerLens::from_lens_spec(&spec).map_err(lens_error)?;
+            placed_fastembed_build_lens(manifest, spec, runtime, Box::new(lens), &files, &execution)
         }
         other => Err(format!(
             "CALYX_FSV_ASSAY_CORPUS_BUILD_UNSUPPORTED_RUNTIME: lens={} runtime={}",
@@ -121,6 +145,26 @@ pub(super) fn build_lens(manifest: PathBuf, spec: RegistryLensSpec) -> Result<Bu
     }?;
     require_runtime_lens_id(&built.spec, built.lens.as_ref()).map_err(lens_error)?;
     Ok(built)
+}
+
+fn placed_fastembed_build_lens(
+    manifest: PathBuf,
+    spec: RegistryLensSpec,
+    runtime: String,
+    lens: Box<dyn Lens>,
+    files: &[PathBuf],
+    execution: &str,
+) -> Result<BuildLens, String> {
+    match execution {
+        "cuda_fail_loud" => gpu_build_lens(manifest, spec, runtime, lens, files),
+        "cpu_explicit" => {
+            let ram_mb = paths_mb(files)?;
+            Ok(cpu_build_lens(manifest, spec, runtime, lens, ram_mb))
+        }
+        other => Err(format!(
+            "CALYX_FASTEMBED_EXECUTION_IDENTITY_NONCANONICAL: {other:?}"
+        )),
+    }
 }
 
 fn cpu_build_lens(

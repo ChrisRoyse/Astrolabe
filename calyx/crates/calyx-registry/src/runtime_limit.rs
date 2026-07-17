@@ -33,6 +33,11 @@ pub fn measure_registry_batch_with_runtime_limit(
 pub(crate) fn runtime_uses_scoped_batch_limit(spec: Option<&crate::LensSpec>) -> bool {
     matches!(
         spec.map(|spec| &spec.runtime),
-        Some(LensRuntime::Onnx { .. } | LensRuntime::OnnxColbert { .. })
+        Some(
+            LensRuntime::Onnx { .. }
+                | LensRuntime::FastembedDense { .. }
+                | LensRuntime::FastembedDensePlaced { .. }
+                | LensRuntime::OnnxColbert { .. }
+        )
     )
 }

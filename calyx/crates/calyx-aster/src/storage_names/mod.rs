@@ -219,6 +219,7 @@ pub fn parse_cf_dir_name(value: &str) -> Result<ColumnFamily> {
         "ledger" => ColumnFamily::Ledger,
         "kernel" => ColumnFamily::Kernel,
         "guard" => ColumnFamily::Guard,
+        "compression" => ColumnFamily::Compression,
         "recurrence" => ColumnFamily::Recurrence,
         "graph" => ColumnFamily::Graph,
         "online" => ColumnFamily::Online,

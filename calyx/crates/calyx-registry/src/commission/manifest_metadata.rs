@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result};
 
+use crate::fastembed_execution::canonical_fastembed_execution;
 use crate::frozen::{NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
 use crate::spec::{FastembedBgem3Output, LensRuntime, LensSpec};
 
 use super::algorithmic_manifest::{algorithmic_kind, is_algorithmic_runtime};
-use super::manifest::{LensForgeFile, LensForgeManifest};
+use super::manifest::{LensForgeFile, LensForgeManifest, metadata_fastembed_weights_sha256};
 use super::manifest_identity::spec_from_manifest_identity;
 use super::manifest_runtime::{
     canonical_local_model_device, canonical_local_model_dtype, requires_artifact_set,
@@ -47,7 +48,7 @@ pub fn lens_spec_metadata_from_manifest(
         allow_noncommercial_from_env(),
     )?;
     let output = manifest.output_shape()?;
-    let weights_sha256 = metadata_weights_sha256(manifest)?;
+    let weights_sha256 = metadata_weights_sha256(manifest, base_dir)?;
     let norm_policy = norm_policy(&manifest.norm)?;
     let runtime = metadata_runtime_from_manifest(manifest, base_dir)?;
     spec_from_manifest_identity(manifest, runtime, output, weights_sha256, norm_policy)
@@ -159,7 +160,7 @@ fn is_adapter_runtime(runtime: &str) -> bool {
     )
 }
 
-fn metadata_weights_sha256(manifest: &LensForgeManifest) -> Result<[u8; 32]> {
+fn metadata_weights_sha256(manifest: &LensForgeManifest, base_dir: &Path) -> Result<[u8; 32]> {
     if is_algorithmic_runtime(&manifest.runtime) && manifest.files.is_empty() {
         return Ok(sha256_digest(&[
             b"lensforge-algorithmic-v1",
@@ -168,6 +169,9 @@ fn metadata_weights_sha256(manifest: &LensForgeManifest) -> Result<[u8; 32]> {
             &manifest.dim.to_be_bytes(),
             modality_token(manifest.modality).as_bytes(),
         ]));
+    }
+    if let Some(weights) = metadata_fastembed_weights_sha256(manifest, base_dir)? {
+        return Ok(weights);
     }
     parse_hex_32(
         manifest
@@ -198,38 +202,46 @@ fn metadata_runtime_from_manifest(
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
     match manifest.runtime.as_str() {
-        "onnx" | "onnx-int8" | "onnx-custom" | "onnx-fastembed" | "onnx-splade" => {
-            Ok(LensRuntime::Onnx {
-                model_id: manifest.source_hf_id.clone(),
-                files: file_paths,
-            })
-        }
+        "onnx" | "onnx-int8" | "onnx-custom" | "onnx-splade" => Ok(LensRuntime::Onnx {
+            model_id: manifest.source_hf_id.clone(),
+            files: file_paths,
+        }),
+        "onnx-fastembed" => Ok(LensRuntime::FastembedDensePlaced {
+            model_id: manifest.source_hf_id.clone(),
+            files: file_paths,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
+        }),
         "onnx-colbert" => Ok(LensRuntime::OnnxColbert {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
         }),
-        "fastembed-sparse" => Ok(LensRuntime::FastembedSparse {
+        "fastembed-sparse" => Ok(LensRuntime::FastembedSparsePlaced {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
-        "fastembed-bgem3-dense" => Ok(LensRuntime::FastembedBgem3 {
+        "fastembed-bgem3-dense" => Ok(LensRuntime::FastembedBgem3Placed {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Dense,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
-        "fastembed-bgem3-sparse" => Ok(LensRuntime::FastembedBgem3 {
+        "fastembed-bgem3-sparse" => Ok(LensRuntime::FastembedBgem3Placed {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Sparse,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
-        "fastembed-bgem3-colbert" => Ok(LensRuntime::FastembedBgem3 {
+        "fastembed-bgem3-colbert" => Ok(LensRuntime::FastembedBgem3Placed {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
             output: FastembedBgem3Output::Colbert,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
-        "fastembed-reranker" => Ok(LensRuntime::FastembedReranker {
+        "fastembed-reranker" => Ok(LensRuntime::FastembedRerankerPlaced {
             model_id: manifest.source_hf_id.clone(),
             files: file_paths,
+            execution: canonical_fastembed_execution(manifest.execution_device.as_deref())?,
         }),
         "fastembed-qwen3" => Ok(LensRuntime::FastembedQwen3 {
             model_id: manifest.source_hf_id.clone(),

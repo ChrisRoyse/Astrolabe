@@ -126,8 +126,11 @@ fn validate_quantized(qv: &QuantizedVec, dim: usize, op: &str) -> Result<()> {
             ),
         ));
     }
-    if !qv.scale.is_finite() || qv.scale < 0.0 {
-        return Err(quant_error(op, "scale must be finite and non-negative"));
+    if !qv.scale.is_finite() || qv.scale.is_sign_negative() {
+        return Err(quant_error(
+            op,
+            "scale must be finite, non-negative, and canonical +0.0 when zero",
+        ));
     }
     if qv.seed_id != ZERO_SEED {
         return Err(quant_error(op, "scalar INT8 codec expects zero seed_id"));

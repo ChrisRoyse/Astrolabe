@@ -21,10 +21,15 @@ pub(crate) fn runtime_name(runtime: &LensRuntime) -> &'static str {
         LensRuntime::TeiHttp { .. } => "tei_http",
         LensRuntime::CandleLocal { .. } => "candle_local",
         LensRuntime::Onnx { .. } => "onnx",
+        LensRuntime::FastembedDense { .. } => "fastembed_dense",
+        LensRuntime::FastembedDensePlaced { .. } => "fastembed_dense",
         LensRuntime::OnnxColbert { .. } => "onnx_colbert",
         LensRuntime::FastembedSparse { .. } => "fastembed_sparse",
         LensRuntime::FastembedBgem3 { .. } => "fastembed_bgem3",
         LensRuntime::FastembedReranker { .. } => "fastembed_reranker",
+        LensRuntime::FastembedSparsePlaced { .. } => "fastembed_sparse",
+        LensRuntime::FastembedBgem3Placed { .. } => "fastembed_bgem3",
+        LensRuntime::FastembedRerankerPlaced { .. } => "fastembed_reranker",
         LensRuntime::FastembedQwen3 { .. } => "fastembed_qwen3",
         LensRuntime::StaticLookup { .. } => "static_lookup",
         LensRuntime::MultimodalAdapter { .. } => "multimodal_adapter",
@@ -45,7 +50,7 @@ pub(crate) fn register_prepared_manifest_runtime(
 
 pub(crate) fn prepare_manifest_runtime(spec: LensSpec) -> Result<PreparedRuntimeLens> {
     match &spec.runtime {
-        LensRuntime::Onnx { .. } => {
+        LensRuntime::Onnx { .. } | LensRuntime::FastembedDensePlaced { .. } => {
             let lens = OnnxLens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
@@ -55,17 +60,17 @@ pub(crate) fn prepare_manifest_runtime(spec: LensSpec) -> Result<PreparedRuntime
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
         }
-        LensRuntime::FastembedSparse { .. } => {
+        LensRuntime::FastembedSparsePlaced { .. } => {
             let lens = FastembedSparseLens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
         }
-        LensRuntime::FastembedBgem3 { .. } => {
+        LensRuntime::FastembedBgem3Placed { .. } => {
             let lens = FastembedBgem3Lens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
         }
-        LensRuntime::FastembedReranker { .. } => {
+        LensRuntime::FastembedRerankerPlaced { .. } => {
             let lens = FastembedRerankerLens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
@@ -75,6 +80,17 @@ pub(crate) fn prepare_manifest_runtime(spec: LensSpec) -> Result<PreparedRuntime
             let contract = lens.contract().clone();
             prepared(lens, contract, spec)
         }
+        LensRuntime::FastembedDense { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. } => Err(CalyxError {
+            code: "CALYX_FASTEMBED_LEGACY_EXECUTION_UNBOUND",
+            message: format!(
+                "runtime preparation refuses legacy FastEmbed lens {} without execution identity",
+                spec.name
+            ),
+            remediation: "recommission the lens with execution_device set explicitly to cuda_fail_loud or cpu_explicit",
+        }),
         LensRuntime::CandleLocal { .. } => {
             let lens = CandleLens::from_lens_spec(&spec)?;
             let contract = lens.contract().clone();

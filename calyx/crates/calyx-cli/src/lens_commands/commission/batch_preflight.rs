@@ -16,11 +16,18 @@ use std::time::Instant;
 
 use calyx_core::{CalyxError, Input, Lens, Modality};
 use calyx_registry::{
-    LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeManifest, lens_spec_from_manifest_path,
+    FrozenLensContract, LensForgeBatchPolicy, LensForgeBatchProbeLevel, LensForgeManifest,
+    LensForgeSourceTensorDtypeProfile, lens_spec_from_manifest_path,
 };
 use serde_json::json;
 
-use super::super::support::{prepare_manifest_runtime, validate_vector_contract};
+use super::super::catalog::admission::{
+    AttestedCatalogAdmission, LocalExecutionAttestationReport, attest_manifest,
+    begin_commission_admission, requires_mandatory_local_attestation,
+};
+use super::super::support::{
+    PreparedRuntimeLens, prepare_manifest_runtime, validate_vector_contract,
+};
 use super::log::{ConversionLog, write_json_file};
 use super::options::CommissionFlags;
 use crate::error::{CliError, CliResult};
@@ -40,8 +47,57 @@ const PREFLIGHT_TEXT: &str = "Calyx commission batch preflight probe: measure th
 pub(super) fn apply(
     flags: &CommissionFlags,
     manifest_path: &Path,
+    expected_profile: Option<&LensForgeSourceTensorDtypeProfile>,
+    expected_contract: Option<&FrozenLensContract>,
     log: &mut ConversionLog,
-) -> CliResult<(Option<usize>, LensForgeBatchPolicy)> {
+) -> CliResult<(
+    Option<usize>,
+    LensForgeBatchPolicy,
+    Option<LocalExecutionAttestationReport>,
+    AttestedCatalogAdmission,
+)> {
+    let cap = probe_cap(flags);
+    let mut spec = lens_spec_from_manifest_path(manifest_path)?;
+    let mandatory_local = requires_mandatory_local_attestation(&spec.runtime);
+    let prepared = if flags.skip_batch_preflight.is_none() || mandatory_local {
+        if flags.skip_batch_preflight.is_none() {
+            // The optional batch probe must exercise the requested cap rather than
+            // silently chunking at the unresolved manifest limit.
+            spec.max_batch = Some(cap);
+        }
+        Some(prepare_manifest_runtime(spec)?)
+    } else {
+        None
+    };
+    let admission_draft = match prepared {
+        Some(prepared) => Some(begin_commission_admission(
+            manifest_path,
+            prepared,
+            expected_profile,
+            expected_contract,
+        )?),
+        None => None,
+    };
+    if let Some(report) = admission_draft
+        .as_ref()
+        .and_then(|draft| draft.execution_report())
+    {
+        log.event(json!({
+            "event": "persisted_local_full_forward_attested",
+            "manifest": manifest_path,
+            "source_session_lens_id": expected_contract.map(|contract| contract.lens_id().to_string()),
+            "executable_lens_id": &report.executable_lens_id,
+            "executable_corpus_hash": &report.executable_corpus_hash,
+            "runtime": &report.runtime,
+            "provider": &report.provider,
+            "loader_target_dtype": &report.loader_target_dtype,
+            "observed_primary_activation_dtype": &report.observed_primary_activation_dtype,
+            "observed_execution_device": &report.observed_execution_device,
+            "evidence": &report.evidence_kind,
+            "total_compute_nodes": report.total_compute_nodes,
+            "cpu_compute_nodes": report.cpu_compute_nodes,
+        }))?;
+    }
     let policy = if let Some(skip_reason) = &flags.skip_batch_preflight {
         enforce_batch_1_gate(flags, flags.max_batch, None)?;
         LensForgeBatchPolicy {
@@ -52,7 +108,17 @@ pub(super) fn apply(
             preflight_levels: Vec::new(),
         }
     } else {
-        run_probe(flags, manifest_path, log)?
+        run_probe(
+            flags,
+            admission_draft
+                .as_ref()
+                .map(|draft| draft.prepared())
+                .ok_or_else(|| {
+                    CliError::runtime("batch preflight lost its prepared persisted runtime")
+                })?,
+            cap,
+            log,
+        )?
     };
     let resolved_max_batch = resolved_max_batch(flags, &policy)?;
     let mut manifest = read_manifest(manifest_path)?;
@@ -67,34 +133,38 @@ pub(super) fn apply(
         "preflight_skip_reason": policy.preflight_skip_reason,
         "levels": policy.preflight_levels.len(),
     }))?;
-    Ok((resolved_max_batch, policy))
+    let (catalog_admission, local_execution_attestation) = match admission_draft {
+        Some(draft) => draft.seal_final(manifest_path, resolved_max_batch, &policy)?,
+        None => (attest_manifest(manifest_path.to_path_buf())?, None),
+    };
+    Ok((
+        resolved_max_batch,
+        policy,
+        local_execution_attestation,
+        catalog_admission,
+    ))
 }
 
 fn run_probe(
     flags: &CommissionFlags,
-    manifest_path: &Path,
+    prepared: &PreparedRuntimeLens,
+    cap: usize,
     log: &mut ConversionLog,
 ) -> CliResult<LensForgeBatchPolicy> {
-    let cap = probe_cap(flags);
-    let mut spec = lens_spec_from_manifest_path(manifest_path)?;
-    if spec.modality != Modality::Text {
+    if !matches!(prepared.spec.modality, Modality::Text | Modality::Code) {
         return Err(CliError::from(CalyxError {
             code: "CALYX_LENS_COMMISSION_PREFLIGHT_MODALITY",
             message: format!(
                 "batch preflight supports Text lenses, but {} is {:?}",
-                spec.name, spec.modality
+                prepared.spec.name, prepared.spec.modality
             ),
             remediation: "add a modality-specific preflight input generator, or record an explicit \
                  --skip-batch-preflight <reason>",
         }));
     }
-    // The probe must exercise the real batch capability, not the manifest's
-    // requested cap: chunking at the operator's max_batch would silently turn
-    // a batch-8 probe into eight batch-1 runs.
-    spec.max_batch = Some(cap);
-    let prepared = prepare_manifest_runtime(spec)?;
     let levels = probe_levels(
         &*prepared.lens,
+        prepared.spec.modality,
         prepared.spec.output,
         prepared.spec.norm_policy,
         cap,
@@ -142,18 +212,14 @@ fn run_probe(
 
 fn probe_levels(
     lens: &dyn Lens,
+    modality: Modality,
     output: calyx_core::SlotShape,
     norm_policy: calyx_registry::NormPolicy,
     cap: usize,
     log: &mut ConversionLog,
 ) -> CliResult<Vec<LensForgeBatchProbeLevel>> {
     let inputs: Vec<Input> = (0..cap)
-        .map(|idx| {
-            Input::new(
-                Modality::Text,
-                format!("{PREFLIGHT_TEXT} {idx:04}").into_bytes(),
-            )
-        })
+        .map(|idx| Input::new(modality, format!("{PREFLIGHT_TEXT} {idx:04}").into_bytes()))
         .collect();
     let singles = inputs
         .iter()

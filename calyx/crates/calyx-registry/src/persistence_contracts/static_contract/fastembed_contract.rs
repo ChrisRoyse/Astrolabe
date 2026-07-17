@@ -3,23 +3,26 @@ use std::str::FromStr;
 
 use calyx_core::{CalyxError, Modality, Result, SlotShape};
 use fastembed::{
-    Bgem3Embedding, Bgem3Model, RerankerModel, SparseModel, SparseTextEmbedding, TextRerank,
+    Bgem3Embedding, Bgem3Model, RerankerModel, SparseModel, SparseTextEmbedding, TextEmbedding,
+    TextRerank,
 };
 
 use super::{ensure_file, lens_config_invalid};
+use crate::fastembed_execution::validate_frozen_fastembed_execution;
 use crate::frozen::{FrozenLensContract, NormPolicy};
 use crate::identity::{
-    ContractFacts, contract_from_facts, fastembed_bgem3_corpus_hash,
+    ContractFacts, contract_from_facts, fastembed_bgem3_corpus_hash, fastembed_dense_corpus_hash,
     fastembed_reranker_corpus_hash, fastembed_sparse_corpus_hash,
 };
-use crate::runtime::common::hash_files;
 use crate::{FastembedBgem3Output, LensSpec};
 
 pub(super) fn fastembed_sparse_contract(
     spec: &LensSpec,
     model_id: &str,
     files: &[PathBuf],
+    execution: &str,
 ) -> Result<FrozenLensContract> {
+    let execution = validate_frozen_fastembed_execution(execution)?;
     let model = sparse_model_from_name(model_id)?;
     let info = SparseTextEmbedding::get_model_info(&model);
     let shape = match model {
@@ -31,7 +34,46 @@ pub(super) fn fastembed_sparse_contract(
         files,
         shape,
         NormPolicy::Finite,
-        fastembed_sparse_corpus_hash(&info.model_code),
+        fastembed_sparse_corpus_hash(&info.model_code, execution),
+        &info.model_file,
+        &info.additional_files,
+        execution,
+    )
+}
+
+pub(super) fn fastembed_dense_contract(
+    spec: &LensSpec,
+    model_id: &str,
+    files: &[PathBuf],
+    execution: &str,
+) -> Result<FrozenLensContract> {
+    let execution = validate_frozen_fastembed_execution(execution)?;
+    let model = crate::runtime::onnx::fastembed_dense_model_from_name(model_id)?;
+    let info = TextEmbedding::get_model_info(&model).map_err(|error| {
+        CalyxError::lens_unreachable(format!("fastembed dense model metadata failed: {error}"))
+    })?;
+    let model_dim = u32::try_from(info.dim).map_err(|_| {
+        CalyxError::lens_dim_mismatch(format!(
+            "fastembed dense model {model_id} dimension {} exceeds u32",
+            info.dim
+        ))
+    })?;
+    let shape = SlotShape::Dense(model_dim);
+    if spec.output != shape {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "fastembed dense persisted output {:?} does not match model {model_id} canonical output {shape:?}",
+            spec.output
+        )));
+    }
+    fastembed_contract(
+        spec,
+        files,
+        shape,
+        NormPolicy::unit(),
+        fastembed_dense_corpus_hash(model_id.trim(), execution),
+        &info.model_file,
+        &info.additional_files,
+        execution,
     )
 }
 
@@ -40,7 +82,9 @@ pub(super) fn fastembed_bgem3_contract(
     model_id: &str,
     files: &[PathBuf],
     output: FastembedBgem3Output,
+    execution: &str,
 ) -> Result<FrozenLensContract> {
+    let execution = validate_frozen_fastembed_execution(execution)?;
     let model = bgem3_model_from_name(model_id)?;
     let info = Bgem3Embedding::get_model_info(&model);
     let (shape, norm, token): (SlotShape, NormPolicy, &[u8]) = match output {
@@ -57,7 +101,10 @@ pub(super) fn fastembed_bgem3_contract(
         files,
         shape,
         norm,
-        fastembed_bgem3_corpus_hash(&info.model_code, token),
+        fastembed_bgem3_corpus_hash(&info.model_code, token, execution),
+        &info.model_file,
+        &info.additional_files,
+        execution,
     )
 }
 
@@ -65,7 +112,9 @@ pub(super) fn fastembed_reranker_contract(
     spec: &LensSpec,
     model_id: &str,
     files: &[PathBuf],
+    execution: &str,
 ) -> Result<FrozenLensContract> {
+    let execution = validate_frozen_fastembed_execution(execution)?;
     let model = reranker_model_from_name(model_id)?;
     let info = TextRerank::get_model_info(&model);
     fastembed_contract(
@@ -73,7 +122,10 @@ pub(super) fn fastembed_reranker_contract(
         files,
         SlotShape::Dense(1),
         NormPolicy::Finite,
-        fastembed_reranker_corpus_hash(&info.model_code),
+        fastembed_reranker_corpus_hash(&info.model_code, execution),
+        &info.model_file,
+        &info.additional_files,
+        execution,
     )
 }
 
@@ -83,6 +135,9 @@ fn fastembed_contract(
     shape: SlotShape,
     norm: NormPolicy,
     corpus_hash: [u8; 32],
+    logical_model_file: &str,
+    logical_additional_files: &[String],
+    execution: &str,
 ) -> Result<FrozenLensContract> {
     if files.is_empty() {
         return Err(lens_config_invalid(format!(
@@ -93,7 +148,13 @@ fn fastembed_contract(
     for path in files {
         ensure_file("fastembed contract artifact", path)?;
     }
-    let observed_hash = hash_files(&files.to_vec())?;
+    let observed_hash =
+        crate::runtime::onnx::fastembed_artifacts::named_weights_from_persisted_paths(
+            files,
+            logical_model_file,
+            logical_additional_files,
+            execution,
+        )?;
     if observed_hash != spec.weights_sha256 {
         return Err(CalyxError::lens_frozen_violation(format!(
             "fastembed static contract artifact hash drift for {}",

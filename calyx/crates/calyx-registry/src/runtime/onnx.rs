@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -23,7 +22,7 @@ mod cuda_graphs;
 mod cuda_guard;
 mod custom;
 mod dynamic_ort;
-mod fastembed_artifacts;
+pub(crate) mod fastembed_artifacts;
 mod fastembed_attestation;
 mod fastembed_runtime;
 mod green_context;
@@ -35,6 +34,7 @@ mod special;
 
 pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
+pub(crate) use fastembed_runtime::model_from_name as fastembed_dense_model_from_name;
 #[cfg(windows)]
 pub use runtime_bundle::{
     OnnxCudaDeviceAttestation, OnnxLoadedModuleAttestation, OnnxRuntimeArtifactAttestation,
@@ -74,6 +74,23 @@ impl OnnxProviderPolicy {
                 "cuda,error_on_failure,no_cpu_fallback,cudnn_conv_algo=HEURISTIC,cudnn_workspace_cap=32MiB"
             }
             Self::CpuExplicit => "cpu_explicit,no_cuda",
+        }
+    }
+
+    pub(crate) const fn frozen_execution_token(self) -> &'static str {
+        match self {
+            Self::CudaFailLoud => crate::fastembed_execution::FASTEMBED_CUDA_EXECUTION,
+            Self::CpuExplicit => crate::fastembed_execution::FASTEMBED_CPU_EXECUTION,
+        }
+    }
+
+    pub(crate) fn from_frozen_execution_token(raw: &str) -> Result<Self> {
+        match crate::fastembed_execution::validate_frozen_fastembed_execution(raw)? {
+            crate::fastembed_execution::FASTEMBED_CUDA_EXECUTION => Ok(Self::CudaFailLoud),
+            crate::fastembed_execution::FASTEMBED_CPU_EXECUTION => Ok(Self::CpuExplicit),
+            _ => Err(config_invalid(
+                "validated FastEmbed execution token has no ONNX provider policy",
+            )),
         }
     }
 }
@@ -176,6 +193,7 @@ impl OnnxFileSpec {
         let LensRuntime::Onnx { model_id, files } = &spec.runtime else {
             return Err(config_invalid("LensSpec runtime is not onnx"));
         };
+        fastembed_runtime::reject_legacy_dense_custom_spec(spec, model_id)?;
         let [model_file, tokenizer, config, ..] = files.as_slice() else {
             return Err(config_invalid(
                 "LensRuntime::Onnx requires model, tokenizer, and config paths",
@@ -284,13 +302,15 @@ impl OnnxLens {
     }
 
     pub fn from_lens_spec(spec: &LensSpec) -> Result<Self> {
-        let LensRuntime::Onnx { model_id: _, files } = &spec.runtime else {
-            return Err(config_invalid("LensSpec runtime is not onnx"));
-        };
-        if is_fastembed_manifest(files) {
-            return Self::from_files(OnnxFileSpec::from_lens_spec(spec)?);
+        match &spec.runtime {
+            LensRuntime::FastembedDense { .. } | LensRuntime::FastembedDensePlaced { .. } => {
+                fastembed_runtime::from_lens_spec(spec)
+            }
+            LensRuntime::Onnx { .. } => Self::from_files(OnnxFileSpec::from_lens_spec(spec)?),
+            _ => Err(config_invalid(
+                "LensSpec runtime is neither fastembed-dense nor custom onnx",
+            )),
         }
-        Self::from_files(OnnxFileSpec::from_lens_spec(spec)?)
     }
 
     pub(in crate::runtime::onnx) fn from_fastembed_parts(
@@ -299,6 +319,7 @@ impl OnnxLens {
         contract: FrozenLensContract,
         files: OnnxModelFiles,
         provider_policy: OnnxProviderPolicy,
+        max_batch: Option<usize>,
         model: TextEmbedding,
         execution: fastembed_attestation::FastembedExecutionState,
         bound_stream: Option<green_context::GreenContextHandle>,
@@ -309,7 +330,7 @@ impl OnnxLens {
             contract,
             files,
             provider_policy,
-            max_batch: None,
+            max_batch,
             backend: Some(OnnxBackend::FastEmbed(Box::new(Mutex::new(model)))),
             fastembed_execution: Some(execution),
             bound_stream: green_context::retain_for_model(bound_stream),
@@ -356,12 +377,20 @@ impl OnnxLens {
     }
 
     pub fn lens_spec(&self) -> LensSpec {
-        LensSpec {
-            name: self.contract.name().to_string(),
-            runtime: LensRuntime::Onnx {
+        let runtime = match self.backend_ref() {
+            OnnxBackend::FastEmbed(_) => LensRuntime::FastembedDensePlaced {
+                model_id: self.files.model_code.clone(),
+                files: self.files.artifact_paths(),
+                execution: self.provider_policy.frozen_execution_token().to_string(),
+            },
+            OnnxBackend::Custom(_) => LensRuntime::Onnx {
                 model_id: self.files.model_code.clone(),
                 files: self.files.artifact_paths(),
             },
+        };
+        LensSpec {
+            name: self.contract.name().to_string(),
+            runtime,
             output: self.contract.shape(),
             modality: self.contract.modality(),
             weights_sha256: self.contract.weights_sha256(),
@@ -377,13 +406,6 @@ impl OnnxLens {
             excluded_from_dedup: false,
         }
     }
-}
-
-fn is_fastembed_manifest(files: &[PathBuf]) -> bool {
-    files.iter().any(|path| {
-        path.components()
-            .any(|component| component.as_os_str() == OsStr::new("fastembed-artifacts"))
-    })
 }
 
 impl Lens for OnnxLens {
@@ -435,7 +457,7 @@ impl Lens for OnnxLens {
             OnnxBackend::Custom(runtime) => runtime
                 .lock()
                 .map_err(|_| CalyxError::lens_unreachable("custom ONNX session mutex was poisoned"))
-                .map(|runtime| runtime.execution_attestation()),
+                .and_then(|runtime| runtime.execution_attestation()),
         }
     }
 }
@@ -464,6 +486,7 @@ impl OnnxLens {
                 "ONNX model mutex was poisoned during inference",
             )
         })?;
+        execution.ensure_usable()?;
         let embeddings = model
             .embed(texts, None)
             .map_err(|err| execution.fail_terminal("inference", err))?;
