@@ -118,10 +118,7 @@ pub(super) fn validate_batch(
             ));
         }
         if let Some(previous) = queries[..query_index].iter().find(|previous| {
-            same_positive_ray(
-                effective_query,
-                &previous.values[..effective_dim as usize],
-            )
+            same_positive_ray(effective_query, &previous.values[..effective_dim as usize])
         }) {
             return Err(compression_error(
                 CALYX_VECTOR_COMPRESSION_INVALID,
@@ -153,8 +150,7 @@ fn same_positive_ray(left: &[f32], right: &[f32]) -> bool {
         return false;
     }
     left.iter().zip(right).all(|(&left, &right)| {
-        f64::from(left) * f64::from(right_pivot)
-            == f64::from(right) * f64::from(left_pivot)
+        f64::from(left) * f64::from(right_pivot) == f64::from(right) * f64::from(left_pivot)
     })
 }
 
@@ -230,7 +226,13 @@ fn top_k_persisted(
     candidates: &[EncodedRow],
     k: usize,
 ) -> Result<Vec<CxId>> {
-    let mut best = BinaryHeap::with_capacity(k);
+    let boundary_size = k.checked_add(1).ok_or_else(|| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "compressed recall boundary size overflow",
+        )
+    })?;
+    let mut best = BinaryHeap::with_capacity(boundary_size);
     for row in candidates {
         let parsed = parse_stored_slot(&row.stored_bytes)?;
         let score = codec.score_parsed(query, &parsed)?;
@@ -243,10 +245,28 @@ fn top_k_persisted(
                 ),
             ));
         }
-        retain_top_k(&mut best, (row.cx_id, score), k);
+        retain_top_k(&mut best, (row.cx_id, score), boundary_size);
     }
     let mut best = best.into_vec();
     best.sort();
+    if best.len() <= k {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed recall scorer produced only {} ranked candidates for k={k}",
+                best.len()
+            ),
+        ));
+    }
+    if best[k - 1].0.1.total_cmp(&best[k].0.1).is_eq() {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed recall score is tied at the k={k} membership boundary; use a corpus and operating point with discriminating persisted scores"
+            ),
+        ));
+    }
+    best.truncate(k);
     Ok(best.into_iter().map(|hit| hit.0.0).collect())
 }
 

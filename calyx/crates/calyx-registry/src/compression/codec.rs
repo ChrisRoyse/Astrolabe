@@ -1,8 +1,11 @@
 use calyx_aster::vault::encode;
-use calyx_core::{Asymmetry, CalyxError, Modality, QuantPolicy, Result, Slot, SlotShape, SlotVector};
+use calyx_core::{
+    Asymmetry, CalyxError, Modality, QuantPolicy, Result, Slot, SlotShape, SlotVector,
+};
 use calyx_forge::{
-    BinaryCodec, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer, ScalarInt8Codec, TurboQuantCodec,
-    TurboQuantPreparedQuery, TurboQuantV1MigrationVerifier, new_seed, seed_id_hex,
+    BinaryCodec, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer, ScalarInt8Codec,
+    TURBOQUANT_FORMAT_HEADER_BYTES, TURBOQUANT_MAX_DIM, TurboQuantCodec, TurboQuantPreparedQuery,
+    TurboQuantV1MigrationVerifier, new_seed, seed_id_hex,
 };
 use sha2::{Digest, Sha256};
 
@@ -237,11 +240,7 @@ pub(super) fn parse_stored_slot(bytes: &[u8]) -> Result<ParsedStoredSlot> {
     parse_stored_slot_inner(bytes, false)
 }
 
-fn parse_legacy_v2_envelope(
-    bytes: &[u8],
-    slot: &Slot,
-    lens: &LensSpec,
-) -> Result<QuantizedVec> {
+fn parse_legacy_v2_envelope(bytes: &[u8], slot: &Slot, lens: &LensSpec) -> Result<QuantizedVec> {
     if bytes.first().copied() != Some(COMPRESSED_SLOT_TAG) {
         return Err(invalid(
             "legacy slot bytes are missing the compressed slot envelope tag",
@@ -417,9 +416,7 @@ fn validate_legacy_tqpr_v1(qv: &QuantizedVec) -> Result<()> {
     let scalar_end = LEGACY_TQPR_HEADER_BYTES + scalar_len;
     let scalar = &qv.bytes[LEGACY_TQPR_HEADER_BYTES..scalar_end];
     let qjl = &qv.bytes[scalar_end..];
-    if legacy_has_nonzero_padding(scalar, scalar_bits)
-        || legacy_has_nonzero_padding(qjl, qv.dim)
-    {
+    if legacy_has_nonzero_padding(scalar, scalar_bits) || legacy_has_nonzero_padding(qjl, qv.dim) {
         return Err(invalid(
             "legacy TQPR-v1 scalar or QJL bitstream has non-zero padding",
         ));
@@ -620,6 +617,7 @@ fn parse_stored_slot_inner(bytes: &[u8], validate_turboquant: bool) -> Result<Pa
             bytes.len() - REGISTRY_ENVELOPE_HEADER_BYTES
         )));
     }
+    validate_payload_layout_before_clone(codec, level, stored_dim as usize, payload_len)?;
     let recorded_digest = &bytes[ENVELOPE_DIGEST_OFFSET..REGISTRY_ENVELOPE_HEADER_BYTES];
     let payload = &bytes[REGISTRY_ENVELOPE_HEADER_BYTES..];
     let computed_digest = envelope_digest(&bytes[..ENVELOPE_PREFIX_BYTES], payload);
@@ -661,6 +659,48 @@ fn parse_stored_slot_inner(bytes: &[u8], validate_turboquant: bool) -> Result<Pa
         generation_root,
         generation_rows,
     })
+}
+
+fn validate_payload_layout_before_clone(
+    codec: StoredSlotCodec,
+    level: QuantLevel,
+    dim: usize,
+    payload_len: usize,
+) -> Result<()> {
+    if !matches!(
+        codec,
+        StoredSlotCodec::TurboQuantBits2p5 | StoredSlotCodec::TurboQuantBits3p5
+    ) {
+        return Ok(());
+    }
+    if dim > TURBOQUANT_MAX_DIM {
+        return Err(invalid(format!(
+            "TurboQuant dimension must be in 1..={TURBOQUANT_MAX_DIM} before payload allocation, got {dim}"
+        )));
+    }
+    let scalar_low_bits = match level {
+        QuantLevel::Bits2p5 => 1_usize,
+        QuantLevel::Bits3p5 => 2_usize,
+        _ => {
+            return Err(invalid(format!(
+                "TurboQuant envelope has unsupported level {level:?}"
+            )));
+        }
+    };
+    let scalar_bits = dim
+        .checked_mul(scalar_low_bits)
+        .and_then(|base| base.checked_add(dim.div_ceil(2)))
+        .ok_or_else(|| invalid("TurboQuant scalar bit count overflow before payload allocation"))?;
+    let exact_payload_len = TURBOQUANT_FORMAT_HEADER_BYTES
+        .checked_add(scalar_bits.div_ceil(8))
+        .and_then(|bytes| bytes.checked_add(dim.div_ceil(8)))
+        .ok_or_else(|| invalid("TurboQuant payload length overflow before allocation"))?;
+    if payload_len != exact_payload_len {
+        return Err(invalid(format!(
+            "TurboQuant payload length is not canonical for its declared geometry before allocation: header={payload_len} exact={exact_payload_len} dim={dim} level={level:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl CodecContext {
@@ -1562,11 +1602,7 @@ fn envelope_digest(prefix: &[u8], payload: &[u8]) -> [u8; 32] {
     envelope_digest_with_domain(ENVELOPE_HASH_DOMAIN, prefix, payload)
 }
 
-fn envelope_digest_with_domain(
-    domain: &[u8],
-    prefix: &[u8],
-    payload: &[u8],
-) -> [u8; 32] {
+fn envelope_digest_with_domain(domain: &[u8], prefix: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update((prefix.len() as u64).to_be_bytes());

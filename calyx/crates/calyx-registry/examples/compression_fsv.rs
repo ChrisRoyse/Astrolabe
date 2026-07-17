@@ -7,21 +7,19 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use calyx_aster::cf::{ColumnFamily, compression_manifest_key, slot_key};
+use calyx_aster::cf::{ColumnFamily, compression_manifest_key};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
 use calyx_core::{
-    Asymmetry, Constellation, CxFlags, CxId, FixedClock, Input, InputRef, LedgerRef,
-    Modality, QuantPolicy, Slot, SlotId, SlotResource, SlotShape, SlotState, SlotVector,
-    VaultId, VaultStore,
+    Asymmetry, Constellation, CxFlags, CxId, FixedClock, Input, InputRef, LedgerRef, Modality,
+    QuantPolicy, Slot, SlotId, SlotResource, SlotShape, SlotState, SlotVector, VaultId, VaultStore,
 };
 use calyx_forge::{
-    QuantLevel, QuantizedVec, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec,
-    TurboQuantV1MigrationVerifier, new_seed,
+    QuantLevel, QuantizedVec, Quantizer, TURBOQUANT_FORMAT_HEADER_BYTES, TurboQuantCodec, new_seed,
 };
 use calyx_registry::{
-    AlgorithmicLens, CompressionQuery, LensRuntime, LensSpec, Registry,
-    REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport, StoredSlotCodec,
+    AlgorithmicLens, CompressionQuery, LensRuntime, LensSpec, REGISTRY_ENVELOPE_HEADER_BYTES,
+    Registry, SlotCompressionReport, StoredSlotCodec, compress_slot_batch,
     inspect_unbound_stored_slot_envelope, matryoshka_truncate_renormalize,
 };
 use serde_json::{Value, json};
@@ -33,6 +31,99 @@ const HAPPY_DIM: u32 = 128;
 const MAX_DIM: u32 = 4096;
 const OVER_LIMIT_DIM: u32 = 4097;
 const MANIFEST_BYTES: usize = 148;
+const MANIFEST_PREFIX_BYTES: usize = 116;
+const CURRENT_OUTER_V3_PREFIX_BYTES: usize = 137;
+const LEGACY_OUTER_V2_HEADER_BYTES: usize = 85;
+const LEGACY_TQPR_V1_HEADER_BYTES: usize = 88;
+const LEGACY_TQPR_V1_PREFIX_BYTES: usize = 56;
+const LEGACY_WRITER_COMMIT: &str = "f6c8d778e1e73f2adc60e822ec0c2e8693ff0a99";
+const LEGACY_WRITER_SOURCE_BLOBS: &[(&str, &str, &str)] = &[
+    (
+        "calyx/crates/calyx-forge/src/quant/turboquant.rs",
+        "f76b929ae3c6dbe2052b6fcb2cb700912b9e7867",
+        "8a1d11a23147c5b1bbac42dcb89e70d54103c160bbfa26b8e0f7ae95469052f5",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/codebook.rs",
+        "620fce1baaf42f84fd022f9dc1bd2ec2102c1287",
+        "39c7f659c32770dd0643b3134d8aa0de926cadb44292c6c0f81daa87cf5c8806",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/qjl.rs",
+        "8e44eaf557fd0be1299bc054dc9dacfc5b13a557",
+        "951d699a1f4f2333c2011973657dcbbf01d79d5b11b1d7d936b876032c65ea5f",
+    ),
+    (
+        "calyx/crates/calyx-forge/src/quant/rotation.rs",
+        "3c0c504606eb3c1470bdbace6b856444626d5664",
+        "7edba36641b21281dc1ac1898e4c9dff8bdf47a86dc9ed1293d686d1c5262dc0",
+    ),
+    (
+        "calyx/crates/calyx-registry/src/compression/codec.rs",
+        "d137c1b2b19e6dfe4f1ddf079af2456eef0fc869",
+        "bcd347e0e585c2a391b79a0d3bbca3a6c0889273fc4f1eaffaeb896f6041fa7d",
+    ),
+];
+const LEGACY_TQ25_128_SHA256: &str =
+    "25f572987afd1c2606ad9761c72c65d79e098535dfee9150bcc4a78c65b4d18e";
+const LEGACY_TQ35_128_SHA256: &str =
+    "add912589e02c71b9ea91f884993b7330352753ec81d5a2f676fe8613cc74bd0";
+const LEGACY_TQ25_64_SHA256: &str =
+    "d60a82a7df86888bf305e6eb9f183fb9e2428195943b1e6db8ac04a4c0483ba3";
+const LEGACY_TQ25_128_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080d978aacee9c8475de5a9cbcaf0747eb06785c49fc3ecd81a29d67adb9bf9fc9b545150520101000080000000c000000080000000cb3ef13e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2f3aa636592c2b2a3986d5700ac90d08f457c0d0ca586cbd04be04660bee14d4b960ba3f50e5837f5289d23168393ccf5afb476e3d024342dd43648084c9db40b8b08910f3c097a77",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f200000080370ad31cdfee4693335547be1465db5c04fda047e1558a28adac6a5197aabcb4545150520101000080000000c000000080000000178bf23e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2855f1f6df9a02c27fc0d2c9266395800e602e0402a6428bda7658b04aed4c8bd451ac6771e272d96aa904118a5968add048b722f4d936b37da405d267c0bb78dea0725a8b796eed3",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000809a77e8ac1647b3dff2ce66be2e3b6bb79acf9604e44469c916b1323ebfe5bd4a545150520101000080000000c000000080000000520efc3e9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2a7abbca68e2eb30bbba10113f2f13cae53bb0b1b35f33972b98a20627d4c9319ea6f7f289dcf757b030d266816d41854e63bb5d346b32a9de081e3bdf3b72319bf7fd2523dc3cf27",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100202050000008000000080003f8000009f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2000000803704d1dbb394e6c568e12663c81091a93b93d0b1a0db3701a520fe2103cdbdee545150520101000080000000c0000000800000003e58033f9f04ae112afa8d3e85629067e619d9004028d1bf2ebd04e1816c684e4f7da8f2ec1ed4df2ac6eec66d403078509ebca5ef1923fd327fd04f1a7db763b30afee6a211924a564a94bf447f9b414d97a09b8dd28a00482a544efcc33131f13708d3ad6b564ea5a45835",
+    ),
+];
+const LEGACY_TQ35_128_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090c6eb0d36c0638dc24b639e953da010f2d57827a505292729dbca59e67d7b4e645451505201020000800000004001000080000000fa93853e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94253fe347c09b8bd9f8e9846d0f6a8f5c5f1c961ba8734a7ad3f1c5386024227c5356cb1593c5f73be8f4bfbae6795592add5aa6d7ab1fd64a4a4ae070789558b0593d3848e122d9dddb0e5321803e4b5fa3f60c501341cfa",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e94000000908ef83ab0022e351673fc06ca9f82ddc593d6a9b1ba81e6477f8694666ab48d655451505201020000800000004001000080000000ce3a803e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9441ef6db02b73b99f5a48721ff0ab5bccbd7349ad59cdf9cbc04545d3b07de536bf0c35e5e0448e16370f57925a758acc33ffad4eac6a39a952aa08b2a84a4dccb2f97c7d943d888c47eb463b754dbf2a6c1579608aad87f4",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090f32b61705d56d6cc1ad7a44dcacf39398f565950a41975fe73072e571c8883d25451505201020000800000004001000080000000f6e3943e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9427a4d1846c21ddc15f359bf4ec4a1ea5f14884f90a47609b263f347bf81791982a4eaed665cb2b75eb816db36591a766dbb64d289325d96b7174bd9914f33192c7b9a495253a7b219fd790856983cbf7a1ad9746a40167e0",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100201040000008000000080003f800000524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e9400000090bab9cc44421d9d40a827c5e037a678759b85453439fcad3252376968fa44d3b254515052010200008000000040010000800000001554923e524ea7fe18609bde23d66f818940e35ed43ae8a8f47163586b3d7c64f0c40e948980981a173f813266cf45e18a207c56d27ee9f976028f0af8246d360e36d6b615f3d6d48e6273ac9934b22ea726ab2c75c944a17d73dd69757309c5a7b0d37597f2a6755d6bdd627e2ee4aade0048404c1ea07a00732be4",
+    ),
+];
+const LEGACY_TQ25_64_ROWS: &[(&str, &str)] = &[
+    (
+        "8253d0cbc1b657329879d6e6aa011d24",
+        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c5e73ed9098f42def8f24e76bf526325328ef271611ef5c527d62baab08220fcb5451505201010000400000006000000040000000d970103f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e9697f6afb275018fde330717848ca88cb1c8184068438988f1de239349239fabee624a0fdfc869c558a9c538df736cf0fca4f7f2",
+    ),
+    (
+        "90ab579cef31f9b1d2bd6382dcea7512",
+        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006ce4d8725b0aff889b0de5a91ece6377b03872cf822170667ac9d815e00125cafd54515052010100004000000060000000400000003cd7f23e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1b890476ac797c89584f711f90cff09a14070e419508c697a54922b0d28d9ad7b693f6c021e49ba54852e5876be2aed4435a7c69",
+    ),
+    (
+        "d62233d29935f3a153b49d39cc480b95",
+        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c2127de77fff0cb4698db4f584703fefecd7e24a88e5fe4839776bfdacb21a1575451505201010000400000006000000040000000c9f3003f978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e1fa4ef543f39e6df8dee59fd59a993b2bca44dec24d448160d1843dea64f5ca5b02eab9202b14a07c7906b443a55e7e4a153026e",
+    ),
+    (
+        "ea451c0f9b3693c62968f22b8bbcd24f",
+        "100202050000008000000040023f800000978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0e0000006c90b9f0cc2da91c7dd0eed1c3395bcd9ac95e6a48a6c821249b464566d4fdfbca54515052010100004000000060000000400000001ad3ee3e978b49c2d287b90b5eef21dd7fa289f6b9a54209115e10755ffdbbeeacfe2d0ef21d305266dedeb937619f7a86a1a9f70b7b042eb934ed38697c9346592d63e7aa926ac10389156b3c508ce67831920e119f1c2a",
+    ),
+];
 const VAULT_SALT: &[u8] = b"issue-551-fsv-vault-salt-v1";
 const VAULT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -62,6 +153,7 @@ struct RegisteredSlot {
     lens_id: calyx_core::LensId,
     slot: Slot,
     bits_per_channel_x2: u8,
+    truncate_dim: Option<u32>,
 }
 
 struct Corpus {
@@ -130,6 +222,8 @@ fn run() -> AnyResult<()> {
             HAPPY_DIM / 2,
         )?,
     ];
+    let tie_slot = register_slot(&mut registry, "issue551-tq25-boundary-tie", 8, 36, 5)?;
+    compressed_boundary_tie_edge(&root, &registry, &tie_slot)?;
     let corpus = build_mixed_one_hot_corpus(&registry, &happy_slots, 4, "happy")?;
 
     let vault_a = root.join("happy-a");
@@ -150,6 +244,7 @@ fn run() -> AnyResult<()> {
     inspect_report_replay(&reports_a, &reports_b)?;
 
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[0], &corpus)?;
+    legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[1], &corpus)?;
     legacy_migration_edge(&root, &vault_a, &registry, &happy_slots[2], &corpus)?;
     wrong_context_edge(&vault_a, &registry, &happy_slots[0])?;
     current_metadata_edge(&vault_a, &happy_slots[0])?;
@@ -162,7 +257,7 @@ fn run() -> AnyResult<()> {
         "event": "fsv_success",
         "happy_rows": corpus.cx_ids.len(),
         "operating_points": [2.5, 3.5],
-        "edge_cases": ["empty_full_column", "recall_same_positive_ray", "legacy_v2_atomic_upgrade", "legacy_v2_truncated_atomic_upgrade", "legacy_wrong_seed_rehashed", "legacy_raw_body_mismatch_rehashed", "legacy_swapped_rows", "legacy_paired_primary_raw_swap", "wrong_codec_context", "wrong_slot_asymmetry", "wrong_slot_key_id", "current_wrong_version", "current_wrong_seed", "current_wrong_dimension", "persisted_primary_corruption", "persisted_raw_corruption", "zero_query", "maximum_dimension_4096", "over_limit_dimension_4097"],
+        "edge_cases": ["empty_full_column", "recall_same_positive_ray", "compressed_recall_boundary_tie", "legacy_v2_bits2p5_atomic_upgrade", "legacy_v2_bits3p5_atomic_upgrade", "legacy_v2_truncated_atomic_upgrade", "legacy_wrong_seed_rehashed", "legacy_raw_body_mismatch_rehashed", "legacy_swapped_rows", "legacy_paired_primary_raw_swap", "wrong_codec_context", "wrong_slot_asymmetry", "wrong_slot_key_id", "current_wrong_version", "current_wrong_seed", "current_wrong_dimension", "persisted_primary_corruption", "persisted_raw_corruption", "zero_query", "maximum_dimension_4096", "over_limit_dimension_4097"],
         "source_truth_readback": "complete",
         "tree_head": tree_head,
         "tree_state_sha256": tree_state_sha256,
@@ -239,9 +334,7 @@ fn register_algorithmic_slot(
     };
     let spec = LensSpec {
         name: contract.name().to_string(),
-        runtime: LensRuntime::Algorithmic {
-            kind: runtime_kind,
-        },
+        runtime: LensRuntime::Algorithmic { kind: runtime_kind },
         output: contract.shape(),
         modality: contract.modality(),
         weights_sha256: contract.weights_sha256(),
@@ -277,6 +370,7 @@ fn register_algorithmic_slot(
             added_at_panel_version: PANEL_VERSION,
         },
         bits_per_channel_x2,
+        truncate_dim,
     })
 }
 
@@ -286,7 +380,10 @@ fn build_corpus(
     row_count: usize,
     prefix: &str,
 ) -> AnyResult<Corpus> {
-    require(!slots.is_empty(), "corpus requires at least one registered slot")?;
+    require(
+        !slots.is_empty(),
+        "corpus requires at least one registered slot",
+    )?;
     require(row_count >= 2, "corpus requires at least two rows")?;
     let mut inputs = Vec::with_capacity(row_count);
     let mut buckets_by_slot = slots
@@ -351,9 +448,7 @@ fn build_corpus(
             }
             let vector = measure_dense(registry, registered.lens_id, &bytes)?;
             let bucket = one_hot_bucket(&vector)?;
-            Ok::<_, Box<dyn Error>>(
-                target_buckets.get(&registered.slot.slot_id) == Some(&bucket),
-            )
+            Ok::<_, Box<dyn Error>>(target_buckets.get(&registered.slot.slot_id) == Some(&bucket))
         })?;
         if matches_every_slot {
             query_input = Some(bytes);
@@ -400,7 +495,10 @@ fn build_mixed_one_hot_corpus(
             .map(|(&primary, &secondary)| 4.0_f64 * f64::from(primary) + f64::from(secondary))
             .collect::<Vec<_>>();
         let norm = values.iter().map(|value| value * value).sum::<f64>().sqrt();
-        require(norm.is_finite() && norm > 0.0, "mixed query norm is invalid")?;
+        require(
+            norm.is_finite() && norm > 0.0,
+            "mixed query norm is invalid",
+        )?;
         let values = values
             .drain(..)
             .map(|value| (value / norm) as f32)
@@ -415,7 +513,11 @@ fn build_mixed_one_hot_corpus(
             .iter()
             .map(|(_, row)| cosine(&values, row))
             .collect::<AnyResult<Vec<_>>>()?;
-        let mut ranked = exact_cosines.iter().copied().enumerate().collect::<Vec<_>>();
+        let mut ranked = exact_cosines
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
         ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         require(
             ranked.first().is_some_and(|(index, _)| *index == 0),
@@ -562,10 +664,7 @@ fn populate_and_compress(
             modality: Modality::Text,
             slots: vectors,
             scalars: BTreeMap::new(),
-            metadata: BTreeMap::from([(
-                "issue".to_string(),
-                "551-turboquant-fsv".to_string(),
-            )]),
+            metadata: BTreeMap::from([("issue".to_string(), "551-turboquant-fsv".to_string())]),
             anchors: Vec::new(),
             provenance: LedgerRef {
                 seq: 0,
@@ -607,8 +706,14 @@ fn populate_and_compress(
         ))?;
         let after_seq = vault.latest_seq();
         let after = logical_state(&vault, after_seq, slots)?;
-        require(source_seq == after_seq, "empty compression attempt advanced vault seq")?;
-        require(before == after, "empty compression attempt mutated logical CF state")?;
+        require(
+            source_seq == after_seq,
+            "empty compression attempt advanced vault seq",
+        )?;
+        require(
+            before == after,
+            "empty compression attempt mutated logical CF state",
+        )?;
         log(json!({
             "event": "edge_empty_after",
             "trigger_error": calyx_error_json(&error),
@@ -696,7 +801,10 @@ fn recall_identity_edges(
         .ok_or_else(|| failure("recall signed-zero edge needs a zero coordinate"))?;
     signed_zero[zero_index] = -0.0;
     require(
-        signed_zero.iter().zip(&row.1).all(|(left, right)| left == right),
+        signed_zero
+            .iter()
+            .zip(&row.1)
+            .all(|(left, right)| left == right),
         "signed-zero edge is not numerically identical to its source row",
     )?;
     require(
@@ -772,6 +880,260 @@ fn recall_identity_edges(
     Ok(())
 }
 
+fn compressed_boundary_tie_edge(
+    root: &Path,
+    registry: &Registry,
+    registered: &RegisteredSlot,
+) -> AnyResult<()> {
+    let SlotShape::Dense(dim) = registered.slot.shape else {
+        return Err(failure("compressed tie edge requires a dense slot").into());
+    };
+    let level = expected_level(registered.bits_per_channel_x2)?;
+    let seed = current_shared_seed(registered, dim as usize, level);
+    let codec = TurboQuantCodec::new(seed, level)?;
+    let query_values = normalized_fsv(&[1.0, -0.75, 0.5, -0.375, 0.25, -0.1875, 0.125, -0.0625])?;
+    let prepared_query = codec.prepare_query(&query_values)?;
+    let query_norm = query_values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    let mut seen = BTreeMap::<u32, (Vec<f32>, f32, String)>::new();
+    let mut rng = 0x6a09_e667_f3bc_c909_u64;
+    let mut collision = None;
+    for attempt in 1..=200_000_u32 {
+        let mut values = Vec::with_capacity(dim as usize);
+        for _ in 0..dim {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let signed = (rng >> 32) as u32 as i32;
+            values.push(signed as f32 / i32::MAX as f32);
+        }
+        let values = normalized_fsv(&values)?;
+        if same_positive_ray_exact(&query_values, &values) {
+            continue;
+        }
+        let qv = codec.encode(&values)?;
+        let dot = codec.dot_estimate_prepared(&prepared_query, &qv)?;
+        let approximate = (f64::from(dot) / (query_norm * f64::from(qv.scale))) as f32;
+        let exact = cosine(&query_values, &values)? as f32;
+        let qv_sha256 = sha256_hex(&qv.bytes);
+        if let Some((previous, previous_exact, previous_qv_sha256)) =
+            seen.get(&approximate.to_bits())
+        {
+            if previous_exact.total_cmp(&exact).is_ne()
+                && !same_positive_ray_exact(previous, &values)
+            {
+                collision = Some((
+                    previous.clone(),
+                    values,
+                    *previous_exact,
+                    exact,
+                    approximate,
+                    previous_qv_sha256.clone(),
+                    qv_sha256,
+                    attempt,
+                ));
+                break;
+            }
+        } else {
+            seen.insert(approximate.to_bits(), (values, exact, qv_sha256));
+        }
+    }
+    let (
+        first_values,
+        second_values,
+        first_exact,
+        second_exact,
+        approximate,
+        first_qv_sha256,
+        second_qv_sha256,
+        attempts,
+    ) = collision.ok_or_else(|| {
+        failure("could not construct a deterministic compressed-score boundary collision")
+    })?;
+    require(
+        first_exact.total_cmp(&second_exact).is_ne(),
+        "compressed tie edge exact scores are also tied",
+    )?;
+
+    let directory = root.join("compressed-boundary-tie");
+    fs::create_dir_all(&directory)?;
+    let vault = open_writer(&directory)?;
+    let row_inputs = [
+        b"issue551-tie-row-a".as_slice(),
+        b"issue551-tie-row-b".as_slice(),
+    ];
+    let row_values = [first_values, second_values];
+    let mut rows = Vec::with_capacity(row_values.len());
+    for (index, (input, values)) in row_inputs.iter().zip(row_values).enumerate() {
+        let cx_id = vault.cx_id_for_input(input, PANEL_VERSION);
+        let stored = vault.put(Constellation {
+            cx_id,
+            vault_id: vault.vault_id(),
+            panel_version: PANEL_VERSION,
+            created_at: FIXED_TS,
+            input_ref: InputRef {
+                hash: sha256_array(input),
+                pointer: Some(format!("fsv://issue551/compressed-tie/{index}")),
+                redacted: false,
+            },
+            modality: Modality::Text,
+            slots: BTreeMap::from([(
+                registered.slot.slot_id,
+                SlotVector::Dense {
+                    dim,
+                    data: values.clone(),
+                },
+            )]),
+            scalars: BTreeMap::new(),
+            metadata: BTreeMap::from([(
+                "issue".to_string(),
+                "551-compressed-boundary-tie".to_string(),
+            )]),
+            anchors: Vec::new(),
+            provenance: LedgerRef {
+                seq: 0,
+                hash: [0; 32],
+            },
+            flags: CxFlags {
+                ungrounded: true,
+                ..CxFlags::default()
+            },
+        })?;
+        require(
+            stored == cx_id,
+            "compressed tie edge persisted the wrong CxId",
+        )?;
+        rows.push((cx_id, values));
+    }
+    vault.flush()?;
+    let query = CompressionQuery {
+        cx_id: vault.cx_id_for_input(b"issue551-tie-query", PANEL_VERSION),
+        values: query_values,
+    };
+    let pure_error = match compress_slot_batch(
+        &registered.slot,
+        registry
+            .lens_spec(registered.lens_id)
+            .ok_or_else(|| failure("compressed tie edge lens spec is missing"))?,
+        &rows,
+        std::slice::from_ref(&query),
+        1,
+    ) {
+        Err(error) => error,
+        Ok(report) => {
+            let production_rows = report
+                .rows
+                .iter()
+                .map(|row| {
+                    let envelope = inspect_unbound_stored_slot_envelope(&row.compressed_bytes)?;
+                    let payload = row
+                        .compressed_bytes
+                        .get(REGISTRY_ENVELOPE_HEADER_BYTES..)
+                        .ok_or_else(|| failure("production tie envelope has no codec payload"))?;
+                    Ok(json!({
+                        "cx_id": row.cx_id.to_string(),
+                        "scale_bits": format!("0x{:08x}", envelope.quant_scale.to_bits()),
+                        "seed_id": envelope.seed_id,
+                        "payload_sha256": sha256_hex(payload),
+                    }))
+                })
+                .collect::<AnyResult<Vec<_>>>()?;
+            log(json!({
+                "event": "edge_compressed_boundary_tie_production_mismatch",
+                "locally_computed_payload_sha256": [first_qv_sha256, second_qv_sha256],
+                "production_rows": production_rows,
+                "production_recall_at_k": report.recall_at_k_compressed,
+                "production_recall_drop": report.recall_drop,
+            }));
+            return Err(failure(
+                "locally computed compressed-score collision was not a collision in the production compression path",
+            )
+            .into());
+        }
+    };
+    require(
+        pure_error
+            .message
+            .contains("compressed recall score is tied"),
+        format!(
+            "pure production compressed boundary tie reported the wrong root cause: {}",
+            pure_error.message
+        ),
+    )?;
+    let before_seq = vault.latest_seq();
+    let before = logical_state(&vault, before_seq, std::slice::from_ref(registered))?;
+    let before_physical = physical_digest(&directory)?;
+    log(json!({
+        "event": "edge_compressed_boundary_tie_before",
+        "attempts_to_smallest_collision": attempts,
+        "exact_scores": [first_exact, second_exact],
+        "compressed_score": approximate,
+        "candidate_qv_sha256": [first_qv_sha256, second_qv_sha256],
+        "seq": before_seq,
+        "state": before,
+        "physical": physical_json(&before_physical),
+    }));
+    let error = expect_calyx_error(registry.write_compressed_slot_batch(
+        &vault,
+        &registered.slot,
+        &rows,
+        std::slice::from_ref(&query),
+        1,
+    ))?;
+    require(
+        error.message.contains("compressed recall score is tied"),
+        format!(
+            "compressed boundary tie reported the wrong root cause: {}",
+            error.message
+        ),
+    )?;
+    let after_seq = vault.latest_seq();
+    let after = logical_state(&vault, after_seq, std::slice::from_ref(registered))?;
+    let after_physical = physical_digest(&directory)?;
+    require(
+        before_seq == after_seq,
+        "compressed tie refusal advanced durable seq",
+    )?;
+    require(
+        before == after,
+        "compressed tie refusal mutated durable state",
+    )?;
+    log(json!({
+        "event": "edge_compressed_boundary_tie_after",
+        "trigger_error": calyx_error_json(&error),
+        "seq": after_seq,
+        "state": after,
+        "physical": physical_json(&after_physical),
+        "mutation": false,
+    }));
+    drop(vault);
+    Ok(())
+}
+
+fn normalized_fsv(values: &[f32]) -> AnyResult<Vec<f32>> {
+    let squared_norm = values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>();
+    require(
+        squared_norm.is_finite() && squared_norm > 0.0,
+        "FSV normalization requires a finite non-zero vector",
+    )?;
+    let norm = squared_norm.sqrt();
+    let normalized = values
+        .iter()
+        .map(|value| (f64::from(*value) / norm) as f32)
+        .collect::<Vec<_>>();
+    require(
+        normalized.iter().all(|value| value.is_finite()),
+        "FSV normalization produced a non-finite coefficient",
+    )?;
+    Ok(normalized)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_recall_refusal(
     vault: &AsterVault<FixedClock>,
@@ -801,7 +1163,10 @@ fn verify_recall_refusal(
     ))?;
     require(
         error.message.contains(expected_error),
-        format!("recall identity case {label} reported the wrong error: {}", error.message),
+        format!(
+            "recall identity case {label} reported the wrong error: {}",
+            error.message
+        ),
     )?;
     let after_seq = vault.latest_seq();
     let after = logical_state(vault, after_seq, slots)?;
@@ -841,8 +1206,7 @@ fn same_positive_ray_exact(left: &[f32], right: &[f32]) -> bool {
         return false;
     }
     left.iter().zip(right).all(|(&left, &right)| {
-        f64::from(left) * f64::from(right_pivot)
-            == f64::from(right) * f64::from(left_pivot)
+        f64::from(left) * f64::from(right_pivot) == f64::from(right) * f64::from(left_pivot)
     })
 }
 
@@ -899,9 +1263,18 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
             &compression_manifest_key(registered.slot.slot_id),
         )?
         .ok_or_else(|| failure("compression manifest missing after independent reopen"))?;
-    require(primary.len() == corpus.cx_ids.len(), "primary row count mismatch")?;
-    require(raw.len() == corpus.cx_ids.len(), "raw-sidecar row count mismatch")?;
-    require(manifest.len() == MANIFEST_BYTES, "manifest physical length mismatch")?;
+    require(
+        primary.len() == corpus.cx_ids.len(),
+        "primary row count mismatch",
+    )?;
+    require(
+        raw.len() == corpus.cx_ids.len(),
+        "raw-sidecar row count mismatch",
+    )?;
+    require(
+        manifest.len() == MANIFEST_BYTES,
+        "manifest physical length mismatch",
+    )?;
     require(&manifest[..4] == b"CSMF", "manifest magic mismatch")?;
     require(
         sha256_hex(&manifest) == sha256_hex(&report.generation_manifest_bytes),
@@ -920,9 +1293,15 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
     let mut data_bits = 0_usize;
     for (key, bytes) in &primary {
         let cx_id = cx_id_from_key(key)?;
-        require(bytes.first().copied() == Some(16), "compressed row tag mismatch")?;
+        require(
+            bytes.first().copied() == Some(16),
+            "compressed row tag mismatch",
+        )?;
         let envelope = inspect_unbound_stored_slot_envelope(bytes)?;
-        require(envelope.format_version == 3, "outer envelope is not version 3")?;
+        require(
+            envelope.format_version == 3,
+            "outer envelope is not version 3",
+        )?;
         require(envelope.cx_id == cx_id, "envelope CxId differs from CF key")?;
         require(
             envelope.generation_rows as usize == primary.len(),
@@ -947,11 +1326,12 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
             seed_id: decode_hex_32(&envelope.seed_id)?,
         };
         let storage = TurboQuantCodec::inspect(&qv)?;
-        let expected_payload = expected_payload_bytes(
-            envelope.stored_dim as usize,
-            registered.bits_per_channel_x2,
+        let expected_payload =
+            expected_payload_bytes(envelope.stored_dim as usize, registered.bits_per_channel_x2)?;
+        require(
+            storage.payload_bytes == expected_payload,
+            "TQPR payload size mismatch",
         )?;
-        require(storage.payload_bytes == expected_payload, "TQPR payload size mismatch")?;
         require(
             storage.data_bits
                 == expected_data_bits(
@@ -980,9 +1360,18 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
             "independently decoded raw sidecar differs from source lens output",
         )?;
     }
-    require(payload_bytes == report.codec_payload_bytes_total, "payload total mismatch")?;
-    require(envelope_bytes == report.stored_bytes_total, "envelope total mismatch")?;
-    require(data_bits as u64 == report.logical_data_bits_total, "data-bit total mismatch")?;
+    require(
+        payload_bytes == report.codec_payload_bytes_total,
+        "payload total mismatch",
+    )?;
+    require(
+        envelope_bytes == report.stored_bytes_total,
+        "envelope total mismatch",
+    )?;
+    require(
+        data_bits as u64 == report.logical_data_bits_total,
+        "data-bit total mismatch",
+    )?;
 
     let index = registry.compressed_slot_index(vault, &registered.slot)?;
     index.verify_at(snapshot)?;
@@ -993,12 +1382,19 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
         let reconstructed = decoded
             .as_dense()
             .ok_or_else(|| failure("compression-aware read returned a non-dense vector"))?;
-        let cosine = cosine(source, reconstructed)?;
-        let rmse = rmse(source, reconstructed)?;
+        let prepared_source = match registered.truncate_dim {
+            Some(truncate_dim) => matryoshka_truncate_renormalize(source, truncate_dim)?,
+            None => source.clone(),
+        };
+        let cosine = cosine(&prepared_source, reconstructed)?;
+        let rmse = rmse(&prepared_source, reconstructed)?;
         min_reconstruction_cosine = min_reconstruction_cosine.min(cosine);
         max_reconstruction_rmse = max_reconstruction_rmse.max(rmse);
         let envelope = index.envelope_at(*cx_id, snapshot)?;
-        require(envelope.cx_id == *cx_id, "index envelope readback CxId mismatch")?;
+        require(
+            envelope.cx_id == *cx_id,
+            "index envelope readback CxId mismatch",
+        )?;
     }
 
     let query = corpus
@@ -1006,17 +1402,25 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
         .get(&registered.slot.slot_id)
         .ok_or_else(|| failure("slot query missing during persisted search"))?;
     let hits = index.search_at(&query.values, 1, snapshot)?;
-    require(hits.len() == 1, "persisted top-1 search returned the wrong hit count")?;
+    require(
+        hits.len() == 1,
+        "persisted top-1 search returned the wrong hit count",
+    )?;
     require(
         hits[0].cx_id == corpus.expected_top1,
         "persisted compressed search returned the wrong top-1 CxId",
     )?;
-    let exact_score = cosine(
-        &query.values,
-        expected_rows
-            .get(&corpus.expected_top1)
-            .ok_or_else(|| failure("expected top-1 source row missing"))?,
-    )?;
+    let exact_source = expected_rows
+        .get(&corpus.expected_top1)
+        .ok_or_else(|| failure("expected top-1 source row missing"))?;
+    let (exact_query, exact_source) = match registered.truncate_dim {
+        Some(truncate_dim) => (
+            matryoshka_truncate_renormalize(&query.values, truncate_dim)?,
+            matryoshka_truncate_renormalize(exact_source, truncate_dim)?,
+        ),
+        None => (query.values.clone(), exact_source.clone()),
+    };
+    let exact_score = cosine(&exact_query, &exact_source)?;
     let score_abs_error = (f64::from(hits[0].score) - exact_score).abs();
 
     if registered.bits_per_channel_x2 == 5 {
@@ -1029,7 +1433,10 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
         let zero = vec![0.0_f32; query.values.len()];
         let error = expect_calyx_error(index.search_at(&zero, 1, snapshot))?;
         let after = logical_state(vault, vault.latest_seq(), std::slice::from_ref(registered))?;
-        require(before == after, "zero-query rejection mutated persisted state")?;
+        require(
+            before == after,
+            "zero-query rejection mutated persisted state",
+        )?;
         log(json!({
             "event": "edge_zero_query_after",
             "trigger_error": calyx_error_json(&error),
@@ -1059,7 +1466,7 @@ fn inspect_persisted_slot<C: calyx_core::Clock>(
         "manifest_bytes": manifest.len(),
         "manifest_sha256": sha256_hex(&manifest),
         "logical_data_bits": data_bits,
-        "logical_data_bpc": data_bits as f64 / (primary.len() * slot_dense_dim(&registered.slot)?) as f64,
+        "logical_data_bpc": data_bits as f64 / (primary.len() * registered_stored_dim(registered)?) as f64,
         "codec_payload_bytes": payload_bytes,
         "min_reconstruction_cosine": min_reconstruction_cosine,
         "max_reconstruction_rmse": max_reconstruction_rmse,
@@ -1087,12 +1494,25 @@ fn validate_report(
     };
     let expected_bpc = f32::from(registered.bits_per_channel_x2) / 2.0;
     let expected_payload = expected_payload_bytes(
-        slot_dense_dim(&registered.slot)?,
+        registered_stored_dim(registered)?,
         registered.bits_per_channel_x2,
     )?;
-    require(report.stored_codec == expected_codec, "stored codec differs from requested codec")?;
-    require(report.fallback_reason.is_none(), "compression reported a fallback")?;
-    require(report.rows.len() == rows, "compression report row count mismatch")?;
+    require(
+        report.stored_codec == expected_codec,
+        "stored codec differs from requested codec",
+    )?;
+    require(
+        report.fallback_reason.is_none(),
+        "compression reported a fallback",
+    )?;
+    require(
+        report.rows.len() == rows,
+        "compression report row count mismatch",
+    )?;
+    require(
+        report.truncate_dim == registered.truncate_dim,
+        "compression report truncation contract mismatch",
+    )?;
     require(
         report.logical_data_bits_per_channel.to_bits() == expected_bpc.to_bits(),
         "logical bits-per-channel report is not exact",
@@ -1119,7 +1539,10 @@ fn validate_report(
             && report.recall_drop.to_bits() == 0.0_f32.to_bits(),
         "persisted scorer failed the declared zero-recall-drop contract",
     )?;
-    require(report.snapshot.is_some(), "persisted report has no committed snapshot")?;
+    require(
+        report.snapshot.is_some(),
+        "persisted report has no committed snapshot",
+    )?;
     Ok(())
 }
 
@@ -1141,9 +1564,18 @@ fn compare_replays(
         let key = compression_manifest_key(slot);
         let first_manifest = first.read_cf_at(first_seq, ColumnFamily::Compression, &key)?;
         let second_manifest = second.read_cf_at(second_seq, ColumnFamily::Compression, &key)?;
-        require(first_primary == second_primary, "deterministic replay primary bytes differ")?;
-        require(first_raw == second_raw, "deterministic replay raw bytes differ")?;
-        require(first_manifest == second_manifest, "deterministic replay manifest bytes differ")?;
+        require(
+            first_primary == second_primary,
+            "deterministic replay primary bytes differ",
+        )?;
+        require(
+            first_raw == second_raw,
+            "deterministic replay raw bytes differ",
+        )?;
+        require(
+            first_manifest == second_manifest,
+            "deterministic replay manifest bytes differ",
+        )?;
         log(json!({
             "event": "deterministic_replay",
             "slot": registered.slot.slot_key.key(),
@@ -1208,29 +1640,25 @@ fn legacy_migration_edge(
         SlotShape::Dense(dim) => dim,
         _ => return Err(failure("legacy migration fixture requires a dense slot").into()),
     };
-    let spec = registry
-        .lens_spec(registered.lens_id)
-        .ok_or_else(|| failure("legacy migration lens spec is missing"))?;
     let stored_dim = stored_dim_for(registry, registered)?;
-    let level = turboquant_level(registered.bits_per_channel_x2)?;
-    let seed = legacy_shared_seed(registered, stored_dim, level);
-    let legacy_seed_entropy = hex(&seed.entropy);
-    let legacy_seed_id = hex(&seed.id);
-    let verifier = TurboQuantV1MigrationVerifier::new(seed, level)?;
-    let mut legacy_primary_by_key = BTreeMap::new();
-    for (cx_id, values) in rows {
-        let prepared = match spec.truncate_dim {
-            Some(truncate_dim) => matryoshka_truncate_renormalize(values, truncate_dim)?,
-            None => values.clone(),
-        };
-        let qv = verifier.reconstruct_expected(&prepared)?;
-        let key = slot_key(*cx_id);
-        let value = legacy_v2_envelope(&qv, raw_dim)?;
-        require(
-            legacy_primary_by_key.insert(key, value).is_none(),
-            format!("historical reconstruction contains duplicate CxId {cx_id}"),
-        )?;
-    }
+    let golden = legacy_golden_set(registered.bits_per_channel_x2, raw_dim, stored_dim)?;
+    let legacy_primary_by_key = golden
+        .rows
+        .iter()
+        .map(|(key, value)| Ok((decode_hex(key)?, decode_hex(value)?)))
+        .collect::<AnyResult<BTreeMap<_, _>>>()?;
+    require(
+        legacy_primary_by_key.len() == golden.rows.len(),
+        "historical writer golden contains duplicate keyed rows",
+    )?;
+    require(
+        digest_map(&legacy_primary_by_key) == golden.aggregate_sha256,
+        format!(
+            "historical writer golden digest differs from pinned source: expected={} actual={}",
+            golden.aggregate_sha256,
+            digest_map(&legacy_primary_by_key),
+        ),
+    )?;
     let persisted_keys = primary
         .iter()
         .map(|(key, _)| key.clone())
@@ -1250,6 +1678,16 @@ fn legacy_migration_edge(
         ),
     )?;
     let legacy_primary = legacy_primary_by_key.into_iter().collect::<Vec<_>>();
+    let (first_key, first_value) = legacy_primary
+        .first()
+        .ok_or_else(|| failure("historical writer golden has no rows"))?;
+    let pinned_first = parse_legacy_fixture_row(first_key, first_value)?;
+    let legacy_seed_id = hex(&pinned_first.qv.seed_id);
+    let legacy_manifest = legacy_staging_manifest(&manifest, &legacy_primary, &raw)?;
+    require(
+        legacy_manifest[80..112] == manifest[80..112],
+        "legacy staging manifest raw root differs despite byte-identical raw sidecars",
+    )?;
     let mut stage = Vec::with_capacity(legacy_primary.len() + raw.len() + 1);
     stage.extend(
         legacy_primary
@@ -1262,7 +1700,11 @@ fn legacy_migration_edge(
             .cloned()
             .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
     );
-    stage.push((ColumnFamily::Compression, manifest_key.clone(), manifest));
+    stage.push((
+        ColumnFamily::Compression,
+        manifest_key.clone(),
+        legacy_manifest.clone(),
+    ));
     let staged_seq = writer.write_cf_batch_if_seq(initial_seq, stage)?;
     let legacy_seq = writer.write_cf_batch_if_seq(
         staged_seq,
@@ -1274,6 +1716,11 @@ fn legacy_migration_edge(
     )?;
     writer.flush()?;
     let before = logical_state(&writer, legacy_seq, std::slice::from_ref(registered))?;
+    require(
+        writer.read_cf_at(staged_seq, ColumnFamily::Compression, &manifest_key)?
+            == Some(legacy_manifest.clone()),
+        "legacy fixture staged snapshot lost its byte-authentic generation manifest",
+    )?;
     require(
         writer
             .read_cf_at(legacy_seq, ColumnFamily::Compression, &manifest_key)?
@@ -1294,8 +1741,19 @@ fn legacy_migration_edge(
         "inner_version": 1,
         "raw_dim": raw_dim,
         "stored_dim": stored_dim,
-        "legacy_seed_entropy": legacy_seed_entropy,
         "legacy_seed_id": legacy_seed_id,
+        "historical_writer_commit": LEGACY_WRITER_COMMIT,
+        "historical_writer_sources": LEGACY_WRITER_SOURCE_BLOBS.iter().map(
+            |(path, git_blob, sha256)| json!({
+                "path": path,
+                "git_blob": git_blob,
+                "sha256": sha256,
+            }),
+        ).collect::<Vec<_>>(),
+        "pinned_golden_sha256": golden.aggregate_sha256,
+        "staged_manifest_sha256": sha256_hex(&legacy_manifest),
+        "staged_generation_root": hex(&legacy_manifest[48..80]),
+        "staged_raw_generation_root": hex(&legacy_manifest[80..112]),
         "manifest_present": false,
         "legacy_primary_sha256": digest_rows(&legacy_primary),
         "legacy_primary_rows": legacy_primary.iter().map(|(key, value)| json!({
@@ -1312,6 +1770,7 @@ fn legacy_migration_edge(
         registry,
         registered,
         corpus,
+        &manifest,
         LegacyFixtureMutation::WrongSeed,
     )?;
     legacy_refusal_edge(
@@ -1320,6 +1779,7 @@ fn legacy_migration_edge(
         registry,
         registered,
         corpus,
+        &manifest,
         LegacyFixtureMutation::BodyMismatch,
     )?;
     legacy_refusal_edge(
@@ -1328,6 +1788,7 @@ fn legacy_migration_edge(
         registry,
         registered,
         corpus,
+        &manifest,
         LegacyFixtureMutation::SwapRows,
     )?;
     legacy_refusal_edge(
@@ -1336,6 +1797,7 @@ fn legacy_migration_edge(
         registry,
         registered,
         corpus,
+        &manifest,
         LegacyFixtureMutation::PairedPrimaryRawSwap,
     )?;
 
@@ -1354,7 +1816,10 @@ fn legacy_migration_edge(
     drop(writer);
 
     let reader = open_reader(&directory)?;
-    require(reader.latest_seq() == migrated_seq, "legacy migration reopen seq mismatch")?;
+    require(
+        reader.latest_seq() == migrated_seq,
+        "legacy migration reopen seq mismatch",
+    )?;
     let index = registry.compressed_slot_index(&reader, &registered.slot)?;
     index.verify_at(migrated_seq)?;
     let hits = index.search_at(&query.values, 1, migrated_seq)?;
@@ -1366,10 +1831,7 @@ fn legacy_migration_edge(
     require(
         migrated_primary.iter().all(|(_, bytes)| {
             bytes.get(1).copied() == Some(3)
-                && bytes
-                    .get(REGISTRY_ENVELOPE_HEADER_BYTES + 4)
-                    .copied()
-                    == Some(2)
+                && bytes.get(REGISTRY_ENVELOPE_HEADER_BYTES + 4).copied() == Some(2)
         }),
         "legacy migration did not atomically replace every row with v3/TQPR-v2 bytes",
     )?;
@@ -1391,74 +1853,340 @@ fn legacy_migration_edge(
     Ok(())
 }
 
-fn legacy_v2_envelope(qv: &QuantizedVec, raw_dim: u32) -> AnyResult<Vec<u8>> {
-    require(
-        qv.bytes.len() >= TURBOQUANT_FORMAT_HEADER_BYTES
-            && &qv.bytes[..4] == b"TQPR"
-            && qv.bytes[4] == 1,
-        "historical reconstruction did not produce TQPR-v1 bytes",
-    )?;
-    let stored_dim = u32::try_from(qv.dim)?;
-    require(
-        stored_dim > 0 && stored_dim <= raw_dim,
-        "legacy envelope dimensions are invalid",
-    )?;
-    let (codec_code, level_code) = match qv.level {
-        QuantLevel::Bits3p5 => (1_u8, 4_u8),
-        QuantLevel::Bits2p5 => (2_u8, 5_u8),
-        other => {
-            return Err(failure(format!(
-                "legacy envelope cannot store non-TurboQuant level {other}"
-            ))
-            .into());
-        }
-    };
-    let mut prefix = Vec::with_capacity(53);
-    prefix.push(16);
-    prefix.push(2);
-    prefix.push(codec_code);
-    prefix.push(level_code);
-    prefix.extend_from_slice(&raw_dim.to_be_bytes());
-    prefix.extend_from_slice(&stored_dim.to_be_bytes());
-    prefix.push(u8::from(stored_dim < raw_dim) << 1);
-    prefix.extend_from_slice(&qv.scale.to_bits().to_be_bytes());
-    prefix.extend_from_slice(&qv.seed_id);
-    prefix.extend_from_slice(&u32::try_from(qv.bytes.len())?.to_be_bytes());
-    require(prefix.len() == 53, "legacy envelope prefix length mismatch")?;
-    let digest = domain_digest(
-        b"calyx-registry-slot-envelope-v2",
-        &prefix,
-        &qv.bytes,
-        false,
-        None,
-    );
-    let mut legacy = Vec::with_capacity(85 + qv.bytes.len());
-    legacy.extend_from_slice(&prefix);
-    legacy.extend_from_slice(&digest);
-    legacy.extend_from_slice(&qv.bytes);
-    Ok(legacy)
+struct LegacyGoldenSet {
+    aggregate_sha256: &'static str,
+    rows: &'static [(&'static str, &'static str)],
 }
 
-fn turboquant_level(bits_per_channel_x2: u8) -> AnyResult<QuantLevel> {
-    match bits_per_channel_x2 {
-        5 => Ok(QuantLevel::Bits2p5),
-        7 => Ok(QuantLevel::Bits3p5),
-        other => Err(failure(format!(
-            "unsupported TurboQuant operating point x2={other} in FSV fixture"
+fn legacy_golden_set(
+    bits_per_channel_x2: u8,
+    raw_dim: u32,
+    stored_dim: usize,
+) -> AnyResult<LegacyGoldenSet> {
+    match (bits_per_channel_x2, raw_dim, stored_dim) {
+        (5, 128, 128) => Ok(LegacyGoldenSet {
+            aggregate_sha256: LEGACY_TQ25_128_SHA256,
+            rows: LEGACY_TQ25_128_ROWS,
+        }),
+        (7, 128, 128) => Ok(LegacyGoldenSet {
+            aggregate_sha256: LEGACY_TQ35_128_SHA256,
+            rows: LEGACY_TQ35_128_ROWS,
+        }),
+        (5, 128, 64) => Ok(LegacyGoldenSet {
+            aggregate_sha256: LEGACY_TQ25_64_SHA256,
+            rows: LEGACY_TQ25_64_ROWS,
+        }),
+        geometry => Err(failure(format!(
+            "no immutable historical writer golden is pinned for geometry {geometry:?}"
         ))
         .into()),
     }
 }
 
-fn legacy_shared_seed(
+struct LegacyFixtureRow {
+    cx_id: CxId,
+    codec_code: u8,
+    manifest_level_code: u8,
+    raw_dim: u32,
+    stored_dim: u32,
+    qv: QuantizedVec,
+}
+
+fn legacy_staging_manifest(
+    template: &[u8],
+    primary: &[(Vec<u8>, Vec<u8>)],
+    raw: &[(Vec<u8>, Vec<u8>)],
+) -> AnyResult<Vec<u8>> {
+    require(
+        template.len() == MANIFEST_BYTES
+            && &template[..4] == b"CSMF"
+            && template[4] == 1
+            && template[7] == 0,
+        "legacy staging manifest template is not canonical CSMF-v1",
+    )?;
+    require(
+        template[MANIFEST_PREFIX_BYTES..]
+            == legacy_manifest_digest(&template[..MANIFEST_PREFIX_BYTES]),
+        "legacy staging manifest template digest is invalid",
+    )?;
+    require(
+        !primary.is_empty() && primary.len() == raw.len(),
+        "legacy staging manifest requires matching non-empty primary/raw rows",
+    )?;
+    let primary_keys = primary
+        .iter()
+        .map(|(key, _)| key.as_slice())
+        .collect::<BTreeSet<_>>();
+    let raw_keys = raw
+        .iter()
+        .map(|(key, _)| key.as_slice())
+        .collect::<BTreeSet<_>>();
+    require(
+        primary_keys == raw_keys && primary_keys.len() == primary.len(),
+        "legacy staging manifest primary/raw keysets differ or contain duplicates",
+    )?;
+
+    let rows = primary
+        .iter()
+        .map(|(key, value)| parse_legacy_fixture_row(key, value))
+        .collect::<AnyResult<Vec<_>>>()?;
+    let first = rows
+        .first()
+        .ok_or_else(|| failure("legacy staging manifest has no parsed rows"))?;
+    require(
+        rows.iter().all(|row| {
+            row.codec_code == first.codec_code
+                && row.manifest_level_code == first.manifest_level_code
+                && row.raw_dim == first.raw_dim
+                && row.stored_dim == first.stored_dim
+        }),
+        "legacy staged rows disagree on codec or geometry",
+    )?;
+    let generation_rows = u32::try_from(rows.len())?;
+    require(
+        template[5] == first.codec_code
+            && template[6] == first.manifest_level_code
+            && u32::from_be_bytes(template[8..12].try_into()?) == first.raw_dim
+            && u32::from_be_bytes(template[12..16].try_into()?) == first.stored_dim
+            && u32::from_be_bytes(template[112..116].try_into()?) == generation_rows,
+        "legacy staged rows disagree with the frozen CSMF codec geometry",
+    )?;
+    let mut codec_context_id = [0_u8; 32];
+    codec_context_id.copy_from_slice(&template[16..48]);
+    let generation_root =
+        legacy_fixture_generation_root(&codec_context_id, generation_rows, &rows)?;
+    let raw_generation_root =
+        legacy_fixture_raw_generation_root(&codec_context_id, generation_rows, raw)?;
+
+    let mut manifest = template[..MANIFEST_PREFIX_BYTES].to_vec();
+    manifest[48..80].copy_from_slice(&generation_root);
+    manifest[80..112].copy_from_slice(&raw_generation_root);
+    manifest[112..116].copy_from_slice(&generation_rows.to_be_bytes());
+    let digest = legacy_manifest_digest(&manifest);
+    manifest.extend_from_slice(&digest);
+    require(
+        manifest.len() == MANIFEST_BYTES,
+        "legacy staging manifest length mismatch",
+    )?;
+    Ok(manifest)
+}
+
+fn parse_legacy_fixture_row(key: &[u8], envelope: &[u8]) -> AnyResult<LegacyFixtureRow> {
+    let cx_id = cx_id_from_key(key)?;
+    require(
+        envelope.len() >= LEGACY_OUTER_V2_HEADER_BYTES + LEGACY_TQPR_V1_HEADER_BYTES
+            && envelope[0] == 16
+            && envelope[1] == 2,
+        "legacy staging row is not an outer-v2/TQPR-v1 envelope",
+    )?;
+    let raw_dim = u32::from_be_bytes(envelope[4..8].try_into()?);
+    let stored_dim = u32::from_be_bytes(envelope[8..12].try_into()?);
+    require(
+        raw_dim > 0 && stored_dim > 0 && stored_dim <= raw_dim && stored_dim <= MAX_DIM,
+        "legacy staging row dimensions are outside the frozen 1..=4096 contract",
+    )?;
+    let flags = envelope[12];
+    require(
+        flags & !0b10 == 0 && (flags & 0b10 != 0) == (stored_dim < raw_dim),
+        "legacy staging row truncation flags are not canonical",
+    )?;
+    let scale = f32::from_bits(u32::from_be_bytes(envelope[13..17].try_into()?));
+    require(
+        scale.is_finite() && !scale.is_sign_negative(),
+        "legacy staging row scale is not canonical",
+    )?;
+    let mut seed_id = [0_u8; 32];
+    seed_id.copy_from_slice(&envelope[17..49]);
+    let payload_len = u32::from_be_bytes(envelope[49..53].try_into()?) as usize;
+    require(
+        envelope.len() == LEGACY_OUTER_V2_HEADER_BYTES + payload_len,
+        "legacy staging row outer payload length mismatch",
+    )?;
+    let payload = &envelope[LEGACY_OUTER_V2_HEADER_BYTES..];
+    let outer_digest = domain_digest(
+        b"calyx-registry-slot-envelope-v2",
+        &envelope[..53],
+        payload,
+        false,
+        None,
+    );
+    require(
+        envelope[53..LEGACY_OUTER_V2_HEADER_BYTES] == outer_digest,
+        "legacy staging row outer digest mismatch",
+    )?;
+    require(
+        &payload[..4] == b"TQPR" && payload[4] == 1,
+        "legacy staging row inner payload is not TQPR-v1",
+    )?;
+    let (codec_code, manifest_level_code, level, inner_level_code, scalar_low_bits) =
+        match (envelope[2], envelope[3]) {
+            (1, 4) => (1, 4, QuantLevel::Bits3p5, 2, 2_usize),
+            (2, 5) => (2, 5, QuantLevel::Bits2p5, 1, 1_usize),
+            other => {
+                return Err(failure(format!(
+                    "legacy staging row has unsupported codec/level bytes {other:?}"
+                ))
+                .into());
+            }
+        };
+    require(
+        payload[5] == inner_level_code && u16::from_le_bytes(payload[6..8].try_into()?) == 0,
+        "legacy staging row inner level or reserved flags are invalid",
+    )?;
+    let inner_dim = u32::from_le_bytes(payload[8..12].try_into()?) as usize;
+    let scalar_bits = inner_dim
+        .checked_mul(scalar_low_bits)
+        .and_then(|base| base.checked_add(inner_dim.div_ceil(2)))
+        .ok_or_else(|| failure("legacy staging scalar bit count overflow"))?;
+    let header_scalar_bits = u32::from_le_bytes(payload[12..16].try_into()?) as usize;
+    let header_qjl_bits = u32::from_le_bytes(payload[16..20].try_into()?) as usize;
+    require(
+        inner_dim == stored_dim as usize
+            && header_scalar_bits == scalar_bits
+            && header_qjl_bits == inner_dim,
+        "legacy staging row inner geometry is not canonical",
+    )?;
+    let gamma = f32::from_bits(u32::from_le_bytes(payload[20..24].try_into()?));
+    require(
+        gamma.is_finite()
+            && !gamma.is_sign_negative()
+            && payload[24..LEGACY_TQPR_V1_PREFIX_BYTES] == seed_id,
+        "legacy staging row inner gamma or seed is not canonical",
+    )?;
+    let scalar_bytes = scalar_bits.div_ceil(8);
+    let qjl_bytes = inner_dim.div_ceil(8);
+    let exact_payload_len = LEGACY_TQPR_V1_HEADER_BYTES
+        .checked_add(scalar_bytes)
+        .and_then(|bytes| bytes.checked_add(qjl_bytes))
+        .ok_or_else(|| failure("legacy staging payload length overflow"))?;
+    require(
+        payload.len() == exact_payload_len,
+        "legacy staging row inner payload length is not canonical",
+    )?;
+    let scalar = &payload[LEGACY_TQPR_V1_HEADER_BYTES..LEGACY_TQPR_V1_HEADER_BYTES + scalar_bytes];
+    let qjl = &payload[LEGACY_TQPR_V1_HEADER_BYTES + scalar_bytes..];
+    require(
+        !legacy_nonzero_padding(scalar, scalar_bits)
+            && !legacy_nonzero_padding(qjl, header_qjl_bits),
+        "legacy staging row contains non-zero padding bits",
+    )?;
+    let inner_digest = domain_digest(
+        b"calyx/turboquant/tqpr/payload/v1\0",
+        &payload[..LEGACY_TQPR_V1_PREFIX_BYTES],
+        &payload[LEGACY_TQPR_V1_HEADER_BYTES..],
+        true,
+        Some(scale),
+    );
+    require(
+        payload[LEGACY_TQPR_V1_PREFIX_BYTES..LEGACY_TQPR_V1_HEADER_BYTES] == inner_digest,
+        "legacy staging row inner digest mismatch",
+    )?;
+    Ok(LegacyFixtureRow {
+        cx_id,
+        codec_code,
+        manifest_level_code,
+        raw_dim,
+        stored_dim,
+        qv: QuantizedVec {
+            level,
+            dim: inner_dim,
+            bytes: payload.to_vec(),
+            scale,
+            seed_id,
+        },
+    })
+}
+
+fn legacy_fixture_generation_root(
+    codec_context_id: &[u8; 32],
+    generation_rows: u32,
+    rows: &[LegacyFixtureRow],
+) -> AnyResult<[u8; 32]> {
+    let mut rows = rows.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.cx_id.as_bytes().cmp(right.cx_id.as_bytes()));
+    require(
+        rows.len() == generation_rows as usize
+            && rows.windows(2).all(|pair| pair[0].cx_id != pair[1].cx_id),
+        "legacy staging generation root has duplicate or mismatched rows",
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"calyx-registry-compression-generation-v1");
+    hasher.update(codec_context_id);
+    hasher.update(generation_rows.to_be_bytes());
+    for row in rows {
+        hasher.update(row.cx_id.as_bytes());
+        hasher.update([row.manifest_level_code]);
+        hasher.update((row.qv.dim as u64).to_be_bytes());
+        hasher.update(row.qv.scale.to_bits().to_be_bytes());
+        hasher.update(row.qv.seed_id);
+        hasher.update((row.qv.bytes.len() as u64).to_be_bytes());
+        hasher.update(&row.qv.bytes);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn legacy_fixture_raw_generation_root(
+    codec_context_id: &[u8; 32],
+    generation_rows: u32,
+    raw: &[(Vec<u8>, Vec<u8>)],
+) -> AnyResult<[u8; 32]> {
+    let mut rows = raw
+        .iter()
+        .map(|(key, value)| Ok((cx_id_from_key(key)?, value.as_slice())))
+        .collect::<AnyResult<Vec<_>>>()?;
+    rows.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    require(
+        rows.len() == generation_rows as usize
+            && rows.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "legacy staging raw generation root has duplicate or mismatched rows",
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"calyx-registry-compression-raw-generation-v1");
+    hasher.update(codec_context_id);
+    hasher.update(generation_rows.to_be_bytes());
+    for (cx_id, bytes) in rows {
+        hasher.update(cx_id.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn legacy_manifest_digest(prefix: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"calyx-registry-compression-manifest-v1");
+    hasher.update((prefix.len() as u64).to_be_bytes());
+    hasher.update(prefix);
+    hasher.finalize().into()
+}
+
+fn legacy_nonzero_padding(bytes: &[u8], bits: usize) -> bool {
+    let used = bits % 8;
+    if used == 0 || bytes.is_empty() {
+        return false;
+    }
+    let mask = !((1_u16 << used) - 1) as u8;
+    bytes.last().is_some_and(|last| last & mask != 0)
+}
+
+fn current_shared_seed(
     registered: &RegisteredSlot,
     dim: usize,
     level: QuantLevel,
 ) -> calyx_forge::RotationSeed {
+    shared_seed_for_domain(registered, dim, level, b"turboquant-tqpr-v2")
+}
+
+fn shared_seed_for_domain(
+    registered: &RegisteredSlot,
+    dim: usize,
+    level: QuantLevel,
+    codec_domain: &[u8],
+) -> calyx_forge::RotationSeed {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"calyx-registry-shared-codec-v2");
-    hasher.update(&(b"turboquant".len() as u64).to_be_bytes());
-    hasher.update(b"turboquant");
+    hasher.update(&(codec_domain.len() as u64).to_be_bytes());
+    hasher.update(codec_domain);
     hasher.update(registered.lens_id.as_bytes());
     hasher.update(&registered.slot.slot_id.get().to_be_bytes());
     hasher.update(&(registered.slot.slot_key.key().len() as u64).to_be_bytes());
@@ -1511,11 +2239,13 @@ impl LegacyFixtureMutation {
                     .first_mut()
                     .ok_or_else(|| failure("wrong-seed legacy fixture has no rows"))?;
                 require(
-                    row.1.len() > 85 + 56 && row.1[1] == 2 && row.1[85 + 4] == 1,
+                    row.1.len() > LEGACY_OUTER_V2_HEADER_BYTES + LEGACY_TQPR_V1_PREFIX_BYTES
+                        && row.1[1] == 2
+                        && row.1[LEGACY_OUTER_V2_HEADER_BYTES + 4] == 1,
                     "wrong-seed fixture is not outer-v2/TQPR-v1",
                 )?;
                 row.1[17] ^= 0x80;
-                row.1[85 + 24] ^= 0x80;
+                row.1[LEGACY_OUTER_V2_HEADER_BYTES + 24] ^= 0x80;
                 rebuild_legacy_digests(&mut row.1)?;
             }
             Self::BodyMismatch => {
@@ -1523,14 +2253,17 @@ impl LegacyFixtureMutation {
                     .first_mut()
                     .ok_or_else(|| failure("body-mismatch legacy fixture has no rows"))?;
                 require(
-                    row.1.len() > 85 + TURBOQUANT_FORMAT_HEADER_BYTES,
+                    row.1.len() > LEGACY_OUTER_V2_HEADER_BYTES + LEGACY_TQPR_V1_HEADER_BYTES,
                     "body-mismatch fixture has no scalar payload byte",
                 )?;
-                row.1[85 + TURBOQUANT_FORMAT_HEADER_BYTES] ^= 0x01;
+                row.1[LEGACY_OUTER_V2_HEADER_BYTES + LEGACY_TQPR_V1_HEADER_BYTES] ^= 0x01;
                 rebuild_legacy_digests(&mut row.1)?;
             }
             Self::SwapRows => {
-                require(primary.len() >= 2, "swapped-row legacy fixture needs two rows")?;
+                require(
+                    primary.len() >= 2,
+                    "swapped-row legacy fixture needs two rows",
+                )?;
                 let (first, remaining) = primary.split_at_mut(1);
                 std::mem::swap(&mut first[0].1, &mut remaining[0].1);
             }
@@ -1579,33 +2312,34 @@ impl LegacyFixtureMutation {
 
 fn rebuild_legacy_digests(envelope: &mut [u8]) -> AnyResult<()> {
     require(
-        envelope.len() > 85 + TURBOQUANT_FORMAT_HEADER_BYTES
+        envelope.len() > LEGACY_OUTER_V2_HEADER_BYTES + LEGACY_TQPR_V1_HEADER_BYTES
             && envelope[0] == 16
             && envelope[1] == 2,
         "legacy digest rebuild requires an outer-v2 envelope",
     )?;
     let scale = f32::from_bits(u32::from_be_bytes(envelope[13..17].try_into()?));
-    let payload = &mut envelope[85..];
+    let payload = &mut envelope[LEGACY_OUTER_V2_HEADER_BYTES..];
     require(
         &payload[..4] == b"TQPR" && payload[4] == 1,
         "legacy digest rebuild requires TQPR-v1",
     )?;
     let inner_digest = domain_digest(
         b"calyx/turboquant/tqpr/payload/v1\0",
-        &payload[..56],
-        &payload[TURBOQUANT_FORMAT_HEADER_BYTES..],
+        &payload[..LEGACY_TQPR_V1_PREFIX_BYTES],
+        &payload[LEGACY_TQPR_V1_HEADER_BYTES..],
         true,
         Some(scale),
     );
-    payload[56..TURBOQUANT_FORMAT_HEADER_BYTES].copy_from_slice(&inner_digest);
+    payload[LEGACY_TQPR_V1_PREFIX_BYTES..LEGACY_TQPR_V1_HEADER_BYTES]
+        .copy_from_slice(&inner_digest);
     let outer_digest = domain_digest(
         b"calyx-registry-slot-envelope-v2",
         &envelope[..53],
-        &envelope[85..],
+        &envelope[LEGACY_OUTER_V2_HEADER_BYTES..],
         false,
         None,
     );
-    envelope[53..85].copy_from_slice(&outer_digest);
+    envelope[53..LEGACY_OUTER_V2_HEADER_BYTES].copy_from_slice(&outer_digest);
     Ok(())
 }
 
@@ -1615,6 +2349,7 @@ fn legacy_refusal_edge(
     registry: &Registry,
     registered: &RegisteredSlot,
     corpus: &Corpus,
+    manifest_template: &[u8],
     mutation: LegacyFixtureMutation,
 ) -> AnyResult<()> {
     let directory = root.join(format!(
@@ -1629,7 +2364,8 @@ fn legacy_refusal_edge(
     let mut primary = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot(slot_id))?;
     let mut raw = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot_raw(slot_id))?;
     mutation.apply(&mut primary, &mut raw)?;
-    let writes = primary
+    let staging_manifest = legacy_staging_manifest(manifest_template, &primary, &raw)?;
+    let mut writes = primary
         .iter()
         .cloned()
         .map(|(key, value)| (ColumnFamily::slot(slot_id), key, value))
@@ -1639,8 +2375,30 @@ fn legacy_refusal_edge(
                 .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
         )
         .collect::<Vec<_>>();
-    let injection_seq = writer.write_cf_batch_if_seq(injection_base_seq, writes)?;
+    let manifest_key = compression_manifest_key(slot_id);
+    writes.push((
+        ColumnFamily::Compression,
+        manifest_key.clone(),
+        staging_manifest.clone(),
+    ));
+    let staged_seq = writer.write_cf_batch_if_seq(injection_base_seq, writes)?;
+    let injection_seq = writer.write_cf_batch_if_seq(
+        staged_seq,
+        [(
+            ColumnFamily::Compression,
+            manifest_key.clone(),
+            tombstone_value(),
+        )],
+    )?;
     writer.flush()?;
+    require(
+        writer.read_cf_at(staged_seq, ColumnFamily::Compression, &manifest_key)?
+            == Some(staging_manifest.clone()),
+        format!(
+            "legacy {} refusal staged snapshot lost its byte-authentic generation manifest",
+            mutation.label()
+        ),
+    )?;
     drop(writer);
 
     let writer = open_writer(&directory)?;
@@ -1653,6 +2411,9 @@ fn legacy_refusal_edge(
         "event": "edge_legacy_refusal_before",
         "mutation_kind": mutation.label(),
         "seq": injection_seq,
+        "staged_manifest_sha256": sha256_hex(&staging_manifest),
+        "staged_generation_root": hex(&staging_manifest[48..80]),
+        "staged_raw_generation_root": hex(&staging_manifest[80..112]),
         "state": before,
     }));
     let rows = corpus
@@ -1755,9 +2516,8 @@ fn wrong_context_edge(
         a: wrong_asymmetry.slot_id,
         b: SlotId::new(wrong_asymmetry.slot_id.get() + 1),
     };
-    let asymmetry_error = expect_calyx_error(
-        registry.compressed_slot_index(&vault, &wrong_asymmetry),
-    )?;
+    let asymmetry_error =
+        expect_calyx_error(registry.compressed_slot_index(&vault, &wrong_asymmetry))?;
     require(
         asymmetry_error.message.contains("slot asymmetry"),
         "wrong-asymmetry context did not fail the duplicated contract check",
@@ -1766,14 +2526,16 @@ fn wrong_context_edge(
     let mut wrong_key_id = registered.slot.clone();
     wrong_key_id.slot_key = SlotId::new(wrong_key_id.slot_id.get() + 1_000)
         .with_key(wrong_key_id.slot_key.key().to_string());
-    let key_id_error =
-        expect_calyx_error(registry.compressed_slot_index(&vault, &wrong_key_id))?;
+    let key_id_error = expect_calyx_error(registry.compressed_slot_index(&vault, &wrong_key_id))?;
     require(
         key_id_error.message.contains("slot key id"),
         "wrong SlotKey id did not fail the duplicated identity check",
     )?;
     let after = logical_state(&vault, vault.latest_seq(), std::slice::from_ref(registered))?;
-    require(before == after, "wrong-context verification mutated persisted state")?;
+    require(
+        before == after,
+        "wrong-context verification mutated persisted state",
+    )?;
     log(json!({
         "event": "edge_wrong_context_after",
         "wrong_persisted_context_error": calyx_error_json(&key_error),
@@ -1835,10 +2597,31 @@ fn current_metadata_edge(directory: &Path, registered: &RegisteredSlot) -> AnyRe
         "wrong current TQPR dimension reported the wrong root cause",
     )?;
 
+    let mut oversized_outer = bytes.clone();
+    oversized_outer[4..8].copy_from_slice(&OVER_LIMIT_DIM.to_be_bytes());
+    oversized_outer[8..12].copy_from_slice(&OVER_LIMIT_DIM.to_be_bytes());
+    oversized_outer[12] = 0;
+    rebuild_current_outer_digest(&mut oversized_outer)?;
+    let oversized_error =
+        expect_calyx_error(inspect_unbound_stored_slot_envelope(&oversized_outer))?;
+    require(
+        oversized_error
+            .message
+            .contains("before payload allocation")
+            && oversized_error.message.contains("4096"),
+        "oversized current outer envelope was not refused before payload allocation",
+    )?;
+
     let after_seq = vault.latest_seq();
     let after = logical_state(&vault, after_seq, std::slice::from_ref(registered))?;
-    require(snapshot == after_seq, "metadata inspection edge changed snapshot")?;
-    require(before == after, "metadata inspection edge mutated persisted state")?;
+    require(
+        snapshot == after_seq,
+        "metadata inspection edge changed snapshot",
+    )?;
+    require(
+        before == after,
+        "metadata inspection edge mutated persisted state",
+    )?;
     log(json!({
         "event": "edge_current_metadata_after",
         "source": "independently reopened persisted v3 envelope/TQPR-v2 payload",
@@ -1846,10 +2629,28 @@ fn current_metadata_edge(directory: &Path, registered: &RegisteredSlot) -> AnyRe
         "wrong_version_error": forge_error_json(&version_error),
         "wrong_seed_error": forge_error_json(&seed_error),
         "wrong_dimension_error": forge_error_json(&dimension_error),
+        "oversized_outer_error": calyx_error_json(&oversized_error),
         "state": after,
         "mutation": false,
     }));
     drop(vault);
+    Ok(())
+}
+
+fn rebuild_current_outer_digest(envelope: &mut [u8]) -> AnyResult<()> {
+    require(
+        envelope.len() >= REGISTRY_ENVELOPE_HEADER_BYTES && envelope[0] == 16 && envelope[1] == 3,
+        "current outer digest rebuild requires a v3 compressed envelope",
+    )?;
+    let digest = domain_digest(
+        b"calyx-registry-slot-envelope-v3",
+        &envelope[..CURRENT_OUTER_V3_PREFIX_BYTES],
+        &envelope[REGISTRY_ENVELOPE_HEADER_BYTES..],
+        false,
+        None,
+    );
+    envelope[CURRENT_OUTER_V3_PREFIX_BYTES..REGISTRY_ENVELOPE_HEADER_BYTES]
+        .copy_from_slice(&digest);
     Ok(())
 }
 
@@ -1918,7 +2719,10 @@ fn corruption_edge(
     );
     writes.push((ColumnFamily::Compression, manifest_key, manifest));
     let corrupt_seq = writer.write_cf_batch_if_seq(before_seq, writes)?;
-    require(corrupt_seq > before_seq, "corruption injection did not advance durable seq")?;
+    require(
+        corrupt_seq > before_seq,
+        "corruption injection did not advance durable seq",
+    )?;
     writer.flush()?;
     let injected_state = logical_state(&writer, corrupt_seq, std::slice::from_ref(registered))?;
     require(
@@ -2006,7 +2810,9 @@ fn raw_corruption_edge(
     let index = registry.compressed_slot_index(&reader, &registered.slot)?;
     let error = expect_calyx_error(index.verify_at(corrupt_seq))?;
     require(
-        error.message.contains("raw-sidecar whole-column generation root mismatch"),
+        error
+            .message
+            .contains("raw-sidecar whole-column generation root mismatch"),
         "raw-sidecar corruption did not fail its authenticated generation root",
     )?;
     log(json!({
@@ -2050,7 +2856,8 @@ fn maximum_dimension_edge(root: &Path) -> AnyResult<()> {
     )?;
     let read = index.read_at(corpus.cx_ids[0], snapshot)?;
     require(
-        read.as_dense().is_some_and(|values| values.len() == MAX_DIM as usize),
+        read.as_dense()
+            .is_some_and(|values| values.len() == MAX_DIM as usize),
         "maximum-dimension readback has the wrong shape",
     )?;
     let report = reports
@@ -2122,8 +2929,14 @@ fn over_limit_edge(root: &Path) -> AnyResult<()> {
     )?;
     let after_seq = vault.latest_seq();
     let after = logical_state(&vault, after_seq, &slots)?;
-    require(before_seq == after_seq, "over-limit failure advanced vault seq")?;
-    require(before == after, "over-limit failure mutated persisted state")?;
+    require(
+        before_seq == after_seq,
+        "over-limit failure advanced vault seq",
+    )?;
+    require(
+        before == after,
+        "over-limit failure mutated persisted state",
+    )?;
     require(
         vault
             .read_cf_at(
@@ -2268,7 +3081,11 @@ fn open_reader(directory: &Path) -> AnyResult<AsterVault<FixedClock>> {
     )?)
 }
 
-fn measure_dense(registry: &Registry, lens_id: calyx_core::LensId, bytes: &[u8]) -> AnyResult<Vec<f32>> {
+fn measure_dense(
+    registry: &Registry,
+    lens_id: calyx_core::LensId,
+    bytes: &[u8],
+) -> AnyResult<Vec<f32>> {
     let vector = registry.measure(lens_id, &Input::new(Modality::Text, bytes.to_vec()))?;
     vector
         .as_dense()
@@ -2277,13 +3094,21 @@ fn measure_dense(registry: &Registry, lens_id: calyx_core::LensId, bytes: &[u8])
 }
 
 fn stored_dim_for(registry: &Registry, registered: &RegisteredSlot) -> AnyResult<usize> {
-    let SlotShape::Dense(raw_dim) = registered.slot.shape else {
-        return Err(failure("registered compression slot is not dense").into());
-    };
     let spec = registry
         .lens_spec(registered.lens_id)
         .ok_or_else(|| failure("registered compression lens spec is missing"))?;
-    let stored_dim = spec.truncate_dim.unwrap_or(raw_dim);
+    require(
+        spec.truncate_dim == registered.truncate_dim,
+        "registered compression fixture truncation differs from frozen lens spec",
+    )?;
+    registered_stored_dim(registered)
+}
+
+fn registered_stored_dim(registered: &RegisteredSlot) -> AnyResult<usize> {
+    let SlotShape::Dense(raw_dim) = registered.slot.shape else {
+        return Err(failure("registered compression slot is not dense").into());
+    };
+    let stored_dim = registered.truncate_dim.unwrap_or(raw_dim);
     require(
         stored_dim > 0 && stored_dim <= raw_dim,
         format!(
@@ -2301,9 +3126,10 @@ fn one_hot_bucket(values: &[f32]) -> AnyResult<usize> {
         .collect::<Vec<_>>();
     require(ones.len() == 1, "real one-hot lens output is not canonical")?;
     require(
-        values.iter().enumerate().all(|(index, value)| {
-            index == ones[0] || value.to_bits() == 0.0_f32.to_bits()
-        }),
+        values
+            .iter()
+            .enumerate()
+            .all(|(index, value)| index == ones[0] || value.to_bits() == 0.0_f32.to_bits()),
         "real one-hot lens output contains a non-binary coefficient",
     )?;
     Ok(ones[0])
@@ -2319,13 +3145,6 @@ fn expected_level(bits_per_channel_x2: u8) -> AnyResult<QuantLevel> {
     }
 }
 
-fn slot_dense_dim(slot: &Slot) -> AnyResult<usize> {
-    match slot.shape {
-        SlotShape::Dense(dim) => Ok(dim as usize),
-        _ => Err(failure("FSV slot is not dense")),
-    }
-}
-
 fn expected_data_bits(dim: usize, bits_per_channel_x2: u8) -> AnyResult<usize> {
     dim.checked_mul(bits_per_channel_x2 as usize)
         .and_then(|twice| twice.checked_add(1))
@@ -2334,10 +3153,13 @@ fn expected_data_bits(dim: usize, bits_per_channel_x2: u8) -> AnyResult<usize> {
 }
 
 fn expected_payload_bytes(dim: usize, bits_per_channel_x2: u8) -> AnyResult<usize> {
-    expected_data_bits(dim, bits_per_channel_x2)?
-        .checked_add(7)
-        .and_then(|bits| bits.checked_div(8))
-        .and_then(|body| body.checked_add(TURBOQUANT_FORMAT_HEADER_BYTES))
+    let data_bits = expected_data_bits(dim, bits_per_channel_x2)?;
+    let scalar_bits = data_bits
+        .checked_sub(dim)
+        .ok_or_else(|| failure("expected TurboQuant scalar bit count underflow"))?;
+    TURBOQUANT_FORMAT_HEADER_BYTES
+        .checked_add(scalar_bits.div_ceil(8))
+        .and_then(|bytes| bytes.checked_add(dim.div_ceil(8)))
         .ok_or_else(|| failure("expected TurboQuant payload byte count overflow"))
 }
 
@@ -2353,7 +3175,10 @@ fn cosine(left: &[f32], right: &[f32]) -> AnyResult<f64> {
         left_norm += left * left;
         right_norm += right * right;
     }
-    require(left_norm > 0.0 && right_norm > 0.0, "cosine requires non-zero vectors")?;
+    require(
+        left_norm > 0.0 && right_norm > 0.0,
+        "cosine requires non-zero vectors",
+    )?;
     Ok(dot / (left_norm.sqrt() * right_norm.sqrt()))
 }
 
@@ -2426,7 +3251,10 @@ fn copy_tree(source: &Path, destination: &Path) -> AnyResult<()> {
 
 fn ensure_fixture_boundary(workspace: &Path, root: &Path) -> AnyResult<()> {
     let target = workspace.join("target");
-    require(root.starts_with(&target), "FSV fixture root escaped workspace target")
+    require(
+        root.starts_with(&target),
+        "FSV fixture root escaped workspace target",
+    )
 }
 
 fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
@@ -2434,6 +3262,23 @@ fn cx_id_from_key(key: &[u8]) -> AnyResult<CxId> {
         .try_into()
         .map_err(|_| failure(format!("slot key has {} bytes, expected 16", key.len())))?;
     Ok(CxId::from_bytes(bytes))
+}
+
+fn decode_hex(value: &str) -> AnyResult<Vec<u8>> {
+    require(
+        value.len() % 2 == 0,
+        format!("hex input has odd length {}", value.len()),
+    )?;
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|error| {
+                failure(format!(
+                    "invalid hexadecimal byte at character offset {offset}: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn decode_hex_32(value: &str) -> AnyResult<[u8; 32]> {
@@ -2529,7 +3374,10 @@ fn forge_error_json(error: &calyx_forge::ForgeError) -> Value {
 }
 
 fn expect_calyx_error<T>(result: calyx_core::Result<T>) -> AnyResult<calyx_core::CalyxError> {
-    result.map(|_| ()).err().ok_or_else(|| failure("operation unexpectedly succeeded"))
+    result
+        .map(|_| ())
+        .err()
+        .ok_or_else(|| failure("operation unexpectedly succeeded"))
 }
 
 fn expect_forge_error<T>(result: calyx_forge::Result<T>) -> AnyResult<calyx_forge::ForgeError> {
