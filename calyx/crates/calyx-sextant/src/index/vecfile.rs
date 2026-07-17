@@ -133,11 +133,11 @@ fn open_verified(
         .metadata()
         .map_err(|e| sextant_error(CALYX_INDEX_IO, format!("stat {kind}: {e}")))?
         .len();
-    if len < VEC_HEADER_LEN as u64 {
+    if len < 8 {
         return Err(sextant_error(
             CALYX_INDEX_CORRUPT,
             format!(
-                "{kind} {} is {len} B, smaller than the {VEC_HEADER_LEN} B v2 header",
+                "{kind} {} is {len} B, smaller than any vector-file magic",
                 path.display()
             ),
         ));
@@ -147,6 +147,8 @@ fn open_verified(
     let mmap = unsafe {
         Mmap::map(&file).map_err(|e| sextant_error(CALYX_INDEX_IO, format!("mmap {kind}: {e}")))?
     };
+    // Magic dispatch runs before the size gate so a legacy file of any length
+    // is named as legacy, never lumped into generic corruption.
     if mmap[0..8] != expected_magic[..] {
         if mmap[0..8] == VEC_MAGIC_LEGACY_V1 {
             return Err(sextant_error(
@@ -165,6 +167,15 @@ fn open_verified(
                 path.display(),
                 &mmap[0..8],
                 expected_magic
+            ),
+        ));
+    }
+    if len < VEC_HEADER_LEN as u64 {
+        return Err(sextant_error(
+            CALYX_INDEX_CORRUPT,
+            format!(
+                "{kind} {} is {len} B, smaller than the {VEC_HEADER_LEN} B v2 header",
+                path.display()
             ),
         ));
     }
