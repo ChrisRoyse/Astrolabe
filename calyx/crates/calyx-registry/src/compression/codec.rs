@@ -534,9 +534,12 @@ fn legacy_tqpr_digest(prefix: &[u8], body: &[u8], scale: f32) -> [u8; 32] {
 fn legacy_policy_identity(policy: QuantPolicy) -> Result<(StoredSlotCodec, QuantLevel)> {
     match policy {
         QuantPolicy::None => Ok((StoredSlotCodec::RawF32, QuantLevel::F32)),
+        QuantPolicy::ScalarInt8 => Ok((StoredSlotCodec::ScalarInt8, QuantLevel::Bits8)),
         QuantPolicy::TurboQuant {
             bits_per_channel_x2: 16,
-        } => Ok((StoredSlotCodec::ScalarInt8, QuantLevel::Bits8)),
+        } => Err(invalid(
+            "legacy TurboQuant bits_per_channel_x2=16 state was written by the removed Scalar INT8 policy substitution; its intended semantics cannot be inferred from a TurboQuant identity, so migration is refused: re-commission the lens/slot with the explicit QuantPolicy::ScalarInt8 identity and rewrite the column through the versioned compression generation API",
+        )),
         QuantPolicy::TurboQuant {
             bits_per_channel_x2: 7,
         } => Ok((StoredSlotCodec::TurboQuantBits3p5, QuantLevel::Bits3p5)),
@@ -753,9 +756,12 @@ impl CodecContext {
         let dim = validate_context(slot, lens, policy)?;
         match policy {
             QuantPolicy::None => Ok(Self::RawF32 { dim }),
+            QuantPolicy::ScalarInt8 => Ok(Self::ScalarInt8(ScalarInt8Codec::new(dim))),
             QuantPolicy::TurboQuant {
                 bits_per_channel_x2: 16,
-            } => Ok(Self::ScalarInt8(ScalarInt8Codec::new(dim))),
+            } => Err(invalid(
+                "TurboQuant bits_per_channel_x2=16 was a removed policy substitution that silently selected Scalar INT8; request QuantPolicy::ScalarInt8 explicitly (its own frozen serialized identity) or a real TurboQuant operating point (5 or 7); no codec substitution is performed",
+            )),
             QuantPolicy::TurboQuant {
                 bits_per_channel_x2,
             } => {
@@ -764,7 +770,7 @@ impl CodecContext {
                     5 => QuantLevel::Bits2p5,
                     other => {
                         return Err(invalid(format!(
-                            "unsupported TurboQuant bits_per_channel_x2 {other}; expected 5, 7, or 16"
+                            "unsupported TurboQuant bits_per_channel_x2 {other}; the only TurboQuant operating points are 5 (2.5 bpc) and 7 (3.5 bpc)"
                         )));
                     }
                 };

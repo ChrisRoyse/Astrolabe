@@ -7,15 +7,16 @@ use calyx_aster::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key, slot_key,
 };
 use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{Clock, CxId, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
+use calyx_core::{Clock, CxId, LedgerRef, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
 use calyx_forge::AssayQuantSafety;
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 use crate::spec::LensSpec;
 pub use codec::inspect_unbound_stored_slot_envelope;
-use codec::{EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows};
+use codec::{EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest};
 pub use index::{CompressedSlotHit, CompressedSlotIndex};
 pub use recall::matryoshka_truncate_renormalize;
 use recall::{recall_at_k, recall_drop, validate_batch};
@@ -97,6 +98,13 @@ pub struct SlotCompressionReport {
     /// Exact manifest value committed with the compressed and raw columns.
     pub generation_manifest_bytes: Vec<u8>,
     pub snapshot: Option<Seq>,
+    /// Ledger transition committed atomically with the generation write.
+    ///
+    /// `Some` exactly when `snapshot` is `Some`: the durable write path commits
+    /// the envelopes, raw sidecars, generation manifest, and this hash-chained
+    /// ledger entry in one group commit. Pure (non-writing) compression reports
+    /// carry `None`.
+    pub ledger: Option<LedgerRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -520,8 +528,117 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
         compression_manifest_key(slot.slot_id),
         report.generation_manifest_bytes.clone(),
     ));
-    report.snapshot = Some(vault.write_cf_batch_if_seq(expected_seq, writes)?);
+    let ledger_payload = generation_ledger_payload(&report)?;
+    let (snapshot, ledger_ref) = vault.write_cf_batch_with_ledger_entry_if_seq(
+        expected_seq,
+        writes,
+        EntryKind::Migrate,
+        SubjectId::Query(compression_generation_subject(slot)),
+        ledger_payload,
+        ActorId::Service("calyx-registry".to_string()),
+    )?;
+    report.snapshot = Some(snapshot);
+    report.ledger = Some(ledger_ref);
     Ok(report)
+}
+
+/// Marker embedded in every compression-generation ledger subject.
+pub const COMPRESSION_GENERATION_MARKER: &str = "SLOT_COMPRESSION_GENERATION";
+
+fn compression_generation_subject(slot: &Slot) -> Vec<u8> {
+    let mut subject = COMPRESSION_GENERATION_MARKER.as_bytes().to_vec();
+    subject.push(b':');
+    subject.extend_from_slice(&slot.slot_id.get().to_be_bytes());
+    subject
+}
+
+fn generation_ledger_payload(report: &SlotCompressionReport) -> Result<Vec<u8>> {
+    let manifest = parse_compression_manifest(&report.generation_manifest_bytes)?;
+    serde_json::to_vec(&serde_json::json!({
+        "marker": COMPRESSION_GENERATION_MARKER,
+        "slot_id": report.slot_id,
+        "codec": report.stored_codec,
+        "rows": manifest.generation_rows,
+        "codec_context_id_sha256": hex_bytes(&manifest.codec_context_id),
+        "generation_root_sha256": hex_bytes(&manifest.generation_root),
+        "raw_generation_root_sha256": hex_bytes(&manifest.raw_generation_root),
+    }))
+    .map_err(|error| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!("compression generation ledger payload encoding failed: {error}"),
+        )
+    })
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Compresses the complete persisted raw slot column that a streaming ingest
+/// session wrote, as one registry-owned versioned generation transition.
+///
+/// Reads every persisted row of `slot`'s column at the current sequence,
+/// requires each to be an uncompressed dense `SlotVector` (a column that
+/// already carries a compressed generation, or any non-dense row, is a
+/// structured refusal — never a guess), and routes the exact persisted vectors
+/// through [`write_compressed_slot_batch`]. The write persists the contextual
+/// envelopes, raw source binding, generation manifest roots, and the ledger
+/// transition in one atomic seq-guarded commit under the single frozen
+/// slot/lens geometry. There is no per-row codec and no raw fallback.
+pub(crate) fn compress_streamed_column<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    lens: &LensSpec,
+    queries: &[CompressionQuery],
+    k: usize,
+) -> Result<SlotCompressionReport> {
+    let snapshot = vault.latest_seq();
+    let stored = vault.scan_cf_at(snapshot, ColumnFamily::slot(slot.slot_id))?;
+    if stored.is_empty() {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_EMPTY,
+            format!(
+                "streamed slot column {} has no persisted rows at seq={snapshot}; stream ingest must persist raw dense rows before compression",
+                slot.slot_id.get()
+            ),
+        ));
+    }
+    let mut rows = Vec::with_capacity(stored.len());
+    for (key, value) in stored {
+        if value.first().copied() == Some(COMPRESSED_SLOT_TAG) {
+            return Err(compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "slot column {} already carries a compressed envelope at seq={snapshot}; streamed-column compression only converts a complete raw column and will not re-guess an existing generation",
+                    slot.slot_id.get()
+                ),
+            ));
+        }
+        let cx_bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "slot column {} row key length {} is not a 16-byte CxId",
+                    slot.slot_id.get(),
+                    key.len()
+                ),
+            )
+        })?;
+        let cx_id = CxId::from_bytes(cx_bytes);
+        let vector = encode::decode_slot_vector(&value)?;
+        let SlotVector::Dense { data, .. } = vector else {
+            return Err(compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!(
+                    "slot column {} row {cx_id} is not a dense vector; streamed-column compression requires a dense raw source column",
+                    slot.slot_id.get()
+                ),
+            ));
+        };
+        rows.push((cx_id, data));
+    }
+    write_compressed_slot_batch(vault, slot, lens, &rows, queries, k)
 }
 
 fn validate_full_column_rewrite<C: Clock>(
@@ -875,6 +992,7 @@ fn build_report(
             .collect(),
         generation_manifest_bytes: encoded.manifest_bytes,
         snapshot: None,
+        ledger: None,
     })
 }
 

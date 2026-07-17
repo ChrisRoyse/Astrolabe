@@ -68,6 +68,91 @@ where
         })
     }
 
+    /// Writes a seq-guarded raw CF batch and one provenance Ledger entry in the
+    /// same atomic group commit.
+    ///
+    /// The sequence comparison, the CF rows, and the hash-chained Ledger row all
+    /// share one commit: either the complete batch plus its ledger transition is
+    /// durable, or nothing is. Used by replace-style workflows (for example the
+    /// registry compression generation rewrite) that must never persist state
+    /// without its paired ledger entry.
+    ///
+    /// Fail-closed: a stale `expected_seq` returns
+    /// `CALYX_ASTER_SEQUENCE_CONFLICT` and writes nothing.
+    pub fn write_cf_batch_with_ledger_entry_if_seq(
+        &self,
+        expected_seq: calyx_core::Seq,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<(calyx_core::Seq, LedgerRef)> {
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        if self.durable.is_none() {
+            return self.write_volatile_batch_with_ledger_entry_if_seq(
+                expected_seq,
+                rows,
+                kind,
+                subject,
+                payload,
+                actor,
+            );
+        }
+        self.with_durable_commit_lock(|| {
+            let current = self.latest_seq();
+            if current != expected_seq {
+                return Err(sequence_conflict_error(expected_seq, current));
+            }
+            let ledger_ref =
+                self.commit_rows_with_ledger_entry_locked(rows, kind, subject, payload, actor)?;
+            Ok((self.latest_seq(), ledger_ref))
+        })
+    }
+
+    fn write_volatile_batch_with_ledger_entry_if_seq(
+        &self,
+        expected_seq: calyx_core::Seq,
+        mut rows: Vec<encode::WriteRow>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<(calyx_core::Seq, LedgerRef)> {
+        let Some(hook) = &self.ledger_hook else {
+            let store = AsterRawLedgerStore { vault: self };
+            let appender = LedgerAppender::open(store, std::sync::Arc::clone(&self.clock))?;
+            let prepared = appender.prepare(kind, subject, payload, actor)?;
+            let ledger_ref = prepared.ledger_ref();
+            rows.push(encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key: ledger_key(prepared.seq()),
+                value: prepared.bytes().to_vec(),
+            });
+            let seq = self.commit_rows_if_current_volatile(expected_seq, rows)?;
+            return Ok((seq, ledger_ref));
+        };
+        let mut guard = ledger_hook::lock_hook(hook)?;
+        let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
+        let ledger_ref = staged
+            .first()
+            .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
+            .ledger_ref();
+        rows.extend(staged.iter().map(|row| encode::WriteRow {
+            cf: ColumnFamily::Ledger,
+            key: row.key().to_vec(),
+            value: row.value().to_vec(),
+        }));
+        let seq = self.commit_rows_if_current_volatile(expected_seq, rows)?;
+        for row in &staged {
+            guard.commit_staged(row)?;
+        }
+        Ok((seq, ledger_ref))
+    }
+
     /// Appends a provenance Ledger entry through Aster's durable group-commit path.
     pub fn append_ledger_entry(
         &self,
@@ -197,6 +282,16 @@ where
         });
         self.commit_rows_locked(&rows)?;
         Ok(ledger_ref)
+    }
+}
+
+fn sequence_conflict_error(expected: calyx_core::Seq, current: calyx_core::Seq) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SEQUENCE_CONFLICT",
+        message: format!(
+            "conditional CF batch with ledger entry expected seq {expected}, current seq is {current}; no rows were written"
+        ),
+        remediation: "re-read the current snapshot, revalidate the complete replacement, and retry with that exact sequence",
     }
 }
 

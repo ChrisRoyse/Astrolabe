@@ -295,6 +295,30 @@ impl Registry {
         compression::write_compressed_slot_batch(vault, slot, spec, rows, queries, k)
     }
 
+    /// Compresses the complete raw slot column persisted by a streaming ingest
+    /// session into one versioned compression generation.
+    ///
+    /// This is the registry-owned route for streamed dense slots: it reads the
+    /// exact persisted raw rows back from the vault, refuses columns that are
+    /// missing, non-dense, or already compressed, and atomically persists the
+    /// contextual envelopes, raw source binding, generation manifest roots, and
+    /// ledger transition under the single frozen slot/lens geometry. Missing
+    /// registry/lens context fails closed; no per-row codec and no raw
+    /// fallback exists.
+    pub fn compress_streamed_column<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::compress_streamed_column(vault, slot, spec, queries, k)
+    }
+
     /// Assay-bound variant of [`Self::write_compressed_slot_batch`] for MXFP4.
     pub fn write_compressed_slot_batch_with_assay_evidence<C>(
         &self,

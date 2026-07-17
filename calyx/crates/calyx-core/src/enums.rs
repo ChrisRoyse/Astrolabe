@@ -59,7 +59,19 @@ pub enum QuantPolicy {
     /// Store unquantized values.
     None,
     /// TurboQuant storage with `bits_per_channel_x2` where 7 means 3.5 bpc.
+    ///
+    /// Only the real TurboQuant operating points (5 = 2.5 bpc, 7 = 3.5 bpc) are
+    /// valid. Scalar INT8 is a different algorithm with its own byte contract
+    /// and must be requested through [`QuantPolicy::ScalarInt8`]; a TurboQuant
+    /// request is never translated into another codec.
     TurboQuant { bits_per_channel_x2: u8 },
+    /// Symmetric per-vector max-abs scalar INT8 storage (one byte per channel).
+    ///
+    /// This is the explicit frozen identity for the Scalar INT8 codec. Before
+    /// this variant existed, Scalar INT8 was reachable only through the removed
+    /// `TurboQuant { bits_per_channel_x2: 16 }` policy substitution; that entry
+    /// point now fails closed instead of silently selecting this codec.
+    ScalarInt8,
     /// Blackwell microscaling FP4 storage; requires current assay evidence.
     MxFp4,
     /// Product quantization with `m` subquantizers and `nbits` codebook bits.
