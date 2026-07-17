@@ -49,6 +49,7 @@
 
 use std::collections::BTreeSet;
 
+use calyx_core::RuntimeExecutionAttestation;
 use calyx_core::{CalyxError, Result};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session, SessionInputValue, SessionOutputs};
@@ -59,7 +60,8 @@ use super::arena::{
     configured_gpu_mem_limit, configured_max_distinct_shapes,
 };
 use super::cpu_fallback_audit::{
-    AuditMode, audit_from_trace, configured_audit_mode, configured_max_cpu_fraction,
+    AuditMode, CpuFallbackAudit, audit_from_trace, configured_audit_mode,
+    configured_max_cpu_fraction,
 };
 use super::cuda_graphs::{CUDA_GRAPHS_ENV, CudaGraphRunConfig, CudaGraphRunRequest};
 use super::session::{
@@ -83,6 +85,7 @@ pub(super) struct OnnxRunPlan {
     audit_mode: AuditMode,
     max_cpu_fraction: f64,
     audited: bool,
+    placement_audit: Option<CpuFallbackAudit>,
     bound_shape: Option<(usize, usize)>,
     seen_shapes: BTreeSet<(usize, usize)>,
 }
@@ -169,6 +172,7 @@ impl OnnxRunPlan {
             audit_mode,
             max_cpu_fraction,
             audited: false,
+            placement_audit: None,
             bound_shape: None,
             seen_shapes: BTreeSet::new(),
         })
@@ -348,14 +352,45 @@ impl OnnxRunPlan {
                 self.label
             ))
         })?;
-        audit_from_trace(
+        let audit = audit_from_trace(
             &self.label,
             &trace,
             self.gpu_policy,
             self.audit_mode,
             self.max_cpu_fraction,
-        )
-        .map(|_| ())
+        )?;
+        self.placement_audit = Some(audit);
+        Ok(())
+    }
+
+    pub(super) fn execution_attestation(
+        &self,
+        runtime: &str,
+    ) -> Option<RuntimeExecutionAttestation> {
+        let audit = self.placement_audit.as_ref()?;
+        if audit.total_nodes == 0 {
+            return None;
+        }
+        let providers = audit.per_provider.to_ascii_uppercase();
+        let observed_device = if providers.contains("CUDA") && audit.cpu_nodes == 0 {
+            "cuda"
+        } else if providers.contains("CUDA") {
+            "mixed"
+        } else if audit.cpu_nodes == audit.total_nodes {
+            "cpu"
+        } else {
+            "unknown"
+        };
+        Some(RuntimeExecutionAttestation {
+            runtime: runtime.to_string(),
+            provider: audit.per_provider.clone(),
+            device: observed_device.to_string(),
+            loader_dtype: None,
+            compute_dtype: None,
+            evidence: "onnx_runtime_provider_node_profile".to_string(),
+            total_compute_nodes: u64::try_from(audit.total_nodes).ok(),
+            cpu_compute_nodes: u64::try_from(audit.cpu_nodes).ok(),
+        })
     }
 
     /// Records the run shape; returns whether it is first-seen. GPU sessions

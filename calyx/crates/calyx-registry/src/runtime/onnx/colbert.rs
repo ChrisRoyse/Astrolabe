@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use ort::value::ValueType;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -281,6 +284,13 @@ impl Lens for OnnxColbertLens {
             out.extend(runtime.measure_batch(self, chunk, self.contract(), max_batch)?);
         }
         Ok(out)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        self.runtime
+            .lock()
+            .map_err(|_| CalyxError::lens_unreachable("ONNX ColBERT mutex was poisoned"))
+            .map(|runtime| runtime.run_plan.execution_attestation("onnx-colbert"))
     }
 }
 

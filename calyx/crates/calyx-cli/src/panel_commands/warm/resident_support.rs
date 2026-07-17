@@ -2,6 +2,10 @@ use super::*;
 use crate::path_identity::vault_template_source;
 
 const RESIDENT_CPU_LENS_REFUSED: &str = "CALYX_PANEL_RESIDENT_CPU_LENS_REFUSED";
+const RESIDENT_UNMANAGED_RUNTIME: &str = "CALYX_PANEL_RESIDENT_UNMANAGED_RUNTIME";
+const RESIDENT_EXECUTION_UNATTESTED: &str = "CALYX_PANEL_RESIDENT_EXECUTION_UNATTESTED";
+const ONNX_CPU_FALLBACK_AUDIT_ENV: &str = "CALYX_ONNX_CPU_FALLBACK_AUDIT";
+const ONNX_MAX_CPU_NODE_FRACTION_ENV: &str = "CALYX_ONNX_MAX_CPU_NODE_FRACTION";
 
 pub(in crate::panel_commands) struct ResidentWarmOptions {
     pub(in crate::panel_commands) home: PathBuf,
@@ -34,8 +38,26 @@ pub(in crate::panel_commands) struct ResidentWarmState {
     pub(in crate::panel_commands) load_ms: u128,
     pub(in crate::panel_commands) probe_ms: u128,
     pub(in crate::panel_commands) warmed_lens_count: usize,
+    pub(in crate::panel_commands) warmed_lens_scope: &'static str,
+    pub(in crate::panel_commands) lens_attestations: Vec<ResidentLensAttestation>,
     pub(in crate::panel_commands) content_lens_count: usize,
     pub(in crate::panel_commands) gpu_content_lens_count: usize,
+    _worker_shutdown: MultimodalGpuWorkerShutdownGuard,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(in crate::panel_commands) struct ResidentLensAttestation {
+    pub(in crate::panel_commands) slot: u16,
+    pub(in crate::panel_commands) key: String,
+    pub(in crate::panel_commands) lens_id: String,
+    pub(in crate::panel_commands) runtime: String,
+    pub(in crate::panel_commands) runtime_detail: String,
+    pub(in crate::panel_commands) modality: Modality,
+    pub(in crate::panel_commands) placement: Placement,
+    pub(in crate::panel_commands) declared_device: Option<String>,
+    pub(in crate::panel_commands) declared_dtype: Option<String>,
+    pub(in crate::panel_commands) declared_provider: Option<String>,
+    pub(in crate::panel_commands) execution: RuntimeExecutionAttestation,
 }
 
 pub(in crate::panel_commands) fn load_resident_warm_state(
@@ -46,6 +68,7 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
             "resident warm state requires exactly one of template or vault",
         ));
     }
+    configure_resident_runtime_audits();
     if let Some(vault) = options.vault.clone() {
         return load_vault_resident_warm_state(options, vault);
     }
@@ -53,7 +76,7 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         .template
         .clone()
         .ok_or_else(|| CliError::usage("resident warm state missing template"))?;
-    let _worker_shutdown = MultimodalGpuWorkerShutdownGuard;
+    let worker_shutdown = MultimodalGpuWorkerShutdownGuard;
     let progress_log = options
         .progress_out
         .clone()
@@ -65,6 +88,7 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
     if let Some(log) = &progress_log {
         log.append(&run_progress_record(&template, "resident_run_start"))?;
     }
+    require_managed_resident_template_runtimes(&options.home, &template, progress_log.as_ref())?;
     require_gpu_content_lenses(&options.home, &template, progress_log.as_ref())?;
     let preflight = warm_preflight(
         &options.home,
@@ -90,6 +114,8 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
     let probe_started = Instant::now();
     let probes = probe_panel(&build, progress_log.as_ref(), &template)?;
     let probe_ms = probe_started.elapsed().as_millis();
+    let lens_attestations = resident_lens_attestations(&build)?;
+    ensure_resident_count_parity(&build, probes.len(), lens_attestations.len())?;
     let content_lens_count = content_slots(&build).count();
     let gpu_content_lens_count = content_slots(&build)
         .filter(|slot| slot.resource.placement == Placement::Gpu)
@@ -111,8 +137,11 @@ pub(in crate::panel_commands) fn load_resident_warm_state(
         load_ms,
         probe_ms,
         warmed_lens_count: probes.len(),
+        warmed_lens_scope: "unique_active_registered_lenses",
+        lens_attestations,
         content_lens_count,
         gpu_content_lens_count,
+        _worker_shutdown: worker_shutdown,
     })
 }
 
@@ -120,7 +149,7 @@ fn load_vault_resident_warm_state(
     options: ResidentWarmOptions,
     vault: PathBuf,
 ) -> CliResult<ResidentWarmState> {
-    let _worker_shutdown = MultimodalGpuWorkerShutdownGuard;
+    let worker_shutdown = MultimodalGpuWorkerShutdownGuard;
     let selector = vault_template_source(&vault)?;
     let progress_log = options
         .progress_out
@@ -170,10 +199,13 @@ fn load_vault_resident_warm_state(
         a37_status: "vault_source".to_string(),
         registered_lenses_added: 0,
     };
+    require_managed_resident_runtimes(&selector, &build, progress_log.as_ref())?;
     let load_ms = load_started.elapsed().as_millis();
     let probe_started = Instant::now();
     let probes = probe_panel(&build, progress_log.as_ref(), &selector)?;
     let probe_ms = probe_started.elapsed().as_millis();
+    let lens_attestations = resident_lens_attestations(&build)?;
+    ensure_resident_count_parity(&build, probes.len(), lens_attestations.len())?;
     let content_lens_count = content_slots(&build).count();
     let gpu_content_lens_count = content_slots(&build)
         .filter(|slot| slot.resource.placement == Placement::Gpu)
@@ -195,9 +227,340 @@ fn load_vault_resident_warm_state(
         load_ms,
         probe_ms,
         warmed_lens_count: probes.len(),
+        warmed_lens_scope: "unique_active_registered_lenses",
+        lens_attestations,
         content_lens_count,
         gpu_content_lens_count,
+        _worker_shutdown: worker_shutdown,
     })
+}
+
+fn resident_lens_attestations(
+    build: &SavedTemplatePanelBuild,
+) -> CliResult<Vec<ResidentLensAttestation>> {
+    let mut seen = BTreeSet::new();
+    active_registered_slots(build)
+        .filter(|slot| seen.insert(slot.lens_id))
+        .map(|slot| {
+            let spec = build.registry.lens_spec(slot.lens_id).ok_or_else(|| {
+                CliError::from(CalyxError::registry_unavailable(format!(
+                    "resident attestation slot={} key={} lens={} has no LensSpec in registry",
+                    slot.slot_id.get(),
+                    slot.slot_key.key(),
+                    slot.lens_id
+                )))
+            })?;
+            let (declared_device, declared_dtype, declared_provider) =
+                declared_runtime_execution(&spec.runtime);
+            let execution = build
+                .registry
+                .execution_attestation(slot.lens_id)?
+                .ok_or_else(|| {
+                    resident_execution_error(
+                        slot,
+                        &spec.runtime,
+                        "runtime returned no post-measurement execution evidence",
+                    )
+                })?;
+            validate_resident_execution(slot, &spec.runtime, &execution)?;
+            Ok(ResidentLensAttestation {
+                slot: slot.slot_id.get(),
+                key: slot.slot_key.key().to_string(),
+                lens_id: slot.lens_id.to_string(),
+                runtime: runtime_name(&spec.runtime).to_string(),
+                runtime_detail: runtime_detail(&spec.runtime),
+                modality: slot.modality,
+                placement: slot.resource.placement,
+                declared_device,
+                declared_dtype,
+                declared_provider,
+                execution,
+            })
+        })
+        .collect()
+}
+
+fn configure_resident_runtime_audits() {
+    // Residency runs only in a fresh, private native-Windows worker before any
+    // model-load threads start. Force the existing ORT profiler to prove that
+    // every GPU-policy compute node stayed off CPU.
+    unsafe {
+        env::set_var(ONNX_CPU_FALLBACK_AUDIT_ENV, "fail");
+        env::set_var(ONNX_MAX_CPU_NODE_FRACTION_ENV, "0");
+    }
+}
+
+fn ensure_resident_count_parity(
+    build: &SavedTemplatePanelBuild,
+    probe_count: usize,
+    attestation_count: usize,
+) -> CliResult {
+    let active_lens_count = build
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active)
+        .map(|slot| slot.lens_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if active_lens_count == probe_count && probe_count == attestation_count {
+        return Ok(());
+    }
+    Err(CliError::from(CalyxError {
+        code: RESIDENT_EXECUTION_UNATTESTED,
+        message: format!(
+            "resident warm count mismatch: active_unique={active_lens_count} probed={probe_count} attested={attestation_count}"
+        ),
+        remediation: "register, probe, and execution-attest every unique active panel lens before declaring the resident worker warm",
+    }))
+}
+
+fn validate_resident_execution(
+    slot: &Slot,
+    runtime: &LensRuntime,
+    execution: &RuntimeExecutionAttestation,
+) -> CliResult {
+    let (declared_device, declared_dtype, _) = declared_runtime_execution(runtime);
+    if let Some(declared_device) = declared_device
+        && declared_device != execution.device
+    {
+        return Err(resident_execution_error(
+            slot,
+            runtime,
+            &format!(
+                "declared device {declared_device} != observed device {}",
+                execution.device
+            ),
+        ));
+    }
+    if let Some(declared_dtype) = declared_dtype {
+        let Some(loader_dtype) = execution.loader_dtype.as_deref() else {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!("declared dtype {declared_dtype} has no observed loader dtype"),
+            ));
+        };
+        let Some(compute_dtype) = execution.compute_dtype.as_deref() else {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!("declared dtype {declared_dtype} has no observed compute dtype"),
+            ));
+        };
+        if !declared_dtype.eq_ignore_ascii_case(loader_dtype)
+            || !declared_dtype.eq_ignore_ascii_case(compute_dtype)
+        {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!(
+                    "declared dtype {declared_dtype} != loader {loader_dtype} / compute {compute_dtype}"
+                ),
+            ));
+        }
+    }
+    if slot.resource.placement == Placement::Gpu {
+        if execution.device != "cuda" && !execution.device.starts_with("cuda:") {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!(
+                    "GPU slot executed on device {} with provider {}",
+                    execution.device, execution.provider
+                ),
+            ));
+        }
+        if execution.cpu_compute_nodes.is_some_and(|count| count != 0) {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!(
+                    "GPU slot observed {:?}/{:?} CPU compute nodes via {}",
+                    execution.cpu_compute_nodes, execution.total_compute_nodes, execution.provider
+                ),
+            ));
+        }
+    } else if execution.device != "cpu" {
+        return Err(resident_execution_error(
+            slot,
+            runtime,
+            &format!(
+                "CPU/non-GPU slot executed on unexpected device {}",
+                execution.device
+            ),
+        ));
+    }
+    if matches!(
+        runtime,
+        LensRuntime::Onnx { .. } | LensRuntime::OnnxColbert { .. }
+    ) {
+        let Some(total_nodes) = execution.total_compute_nodes.filter(|count| *count > 0) else {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                "ONNX runtime did not retain a non-empty total node count",
+            ));
+        };
+        let Some(cpu_nodes) = execution.cpu_compute_nodes else {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                "ONNX runtime did not retain a CPU node count",
+            ));
+        };
+        let providers = execution.provider.to_ascii_uppercase();
+        let placement_matches = match slot.resource.placement {
+            Placement::Gpu => providers.contains("CUDA") && cpu_nodes == 0,
+            Placement::Cpu => providers.contains("CPU") && cpu_nodes == total_nodes,
+        };
+        if !placement_matches {
+            return Err(resident_execution_error(
+                slot,
+                runtime,
+                &format!(
+                    "ONNX provider placement does not match {:?}: provider={} cpu_nodes={cpu_nodes} total_nodes={total_nodes}",
+                    slot.resource.placement, execution.provider
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resident_execution_error(slot: &Slot, runtime: &LensRuntime, detail: &str) -> CliError {
+    CliError::from(CalyxError {
+        code: RESIDENT_EXECUTION_UNATTESTED,
+        message: format!(
+            "resident execution attestation failed slot={} key={} lens={} runtime={} runtime_detail={}: {detail}",
+            slot.slot_id.get(),
+            slot.slot_key.key(),
+            slot.lens_id,
+            runtime_name(runtime),
+            runtime_detail(runtime)
+        ),
+        remediation: "use a Calyx-owned runtime that retains actual post-measurement provider/device/dtype evidence; do not substitute LensSpec declarations",
+    })
+}
+
+fn declared_runtime_execution(
+    runtime: &LensRuntime,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match runtime {
+        LensRuntime::CandleLocal { device, dtype, .. }
+        | LensRuntime::FastembedQwen3 { device, dtype, .. } => {
+            (Some(device.clone()), Some(dtype.clone()), None)
+        }
+        LensRuntime::Algorithmic { .. }
+        | LensRuntime::TeiHttp { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::StaticLookup { .. }
+        | LensRuntime::MultimodalAdapter { .. }
+        | LensRuntime::ExternalCmd { .. } => (None, None, None),
+    }
+}
+
+fn require_managed_resident_template_runtimes(
+    home: &Path,
+    selector: &str,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult {
+    let store = template_store::TemplateStore::open(home);
+    let template = store.load(selector)?;
+    template.validate()?;
+    let unmanaged = template
+        .lenses
+        .iter()
+        .enumerate()
+        .map(|(slot, lens)| {
+            let spec = lens_spec_from_manifest_path(Path::new(&lens.manifest))?;
+            Ok((slot, lens, spec))
+        })
+        .collect::<CliResult<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(slot, lens, spec)| {
+            is_unmanaged_resident_runtime(&spec.runtime).then(|| {
+                format!(
+                    "slot={slot} key={} lens={} runtime={} runtime_detail={}",
+                    lens.slot_key,
+                    lens.lens_id,
+                    runtime_name(&spec.runtime),
+                    runtime_detail(&spec.runtime)
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)
+}
+
+fn require_managed_resident_runtimes(
+    selector: &str,
+    build: &SavedTemplatePanelBuild,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult {
+    let mut seen = BTreeSet::new();
+    let unmanaged = active_registered_slots(build)
+        .filter(|slot| seen.insert(slot.lens_id))
+        .filter_map(|slot| {
+            let spec = build.registry.lens_spec(slot.lens_id)?;
+            is_unmanaged_resident_runtime(&spec.runtime).then(|| {
+                format!(
+                    "slot={} key={} lens={} runtime={} runtime_detail={}",
+                    slot.slot_id.get(),
+                    slot.slot_key.key(),
+                    slot.lens_id,
+                    runtime_name(&spec.runtime),
+                    runtime_detail(&spec.runtime)
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    reject_unmanaged_resident_runtimes(selector, unmanaged, progress_log)
+}
+
+fn is_unmanaged_resident_runtime(runtime: &LensRuntime) -> bool {
+    matches!(
+        runtime,
+        LensRuntime::TeiHttp { .. }
+            | LensRuntime::ExternalCmd { .. }
+            | LensRuntime::FastembedSparse { .. }
+            | LensRuntime::FastembedBgem3 { .. }
+            | LensRuntime::FastembedReranker { .. }
+            | LensRuntime::MultimodalAdapter { .. }
+    )
+}
+
+fn reject_unmanaged_resident_runtimes(
+    selector: &str,
+    unmanaged: Vec<String>,
+    progress_log: Option<&WarmProgressLog>,
+) -> CliResult {
+    if unmanaged.is_empty() {
+        return Ok(());
+    }
+    let message = format!(
+        "resident panel {selector} refuses {} unmanaged or unattested runtimes without both an owned lifetime and post-measurement execution evidence: {}",
+        unmanaged.len(),
+        unmanaged.join(", ")
+    );
+    let remediation = "commission/select a Calyx-owned runtime that retains actual provider/device/dtype evidence, or implement an owned process adapter that attests PID identity and health and guarantees stop";
+    if let Some(log) = progress_log {
+        let mut record = run_progress_record(selector, "resident_unmanaged_runtime_error");
+        record.lens_count = Some(unmanaged.len());
+        record.error_code = Some(RESIDENT_UNMANAGED_RUNTIME.to_string());
+        record.error_message = Some(message.clone());
+        record.remediation = Some(remediation.to_string());
+        log.append(&record)?;
+    }
+    Err(CliError::from(CalyxError {
+        code: RESIDENT_UNMANAGED_RUNTIME,
+        message,
+        remediation,
+    }))
 }
 
 fn vault_source_of_truth(vault_source: &str) -> String {

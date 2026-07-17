@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use calyx_core::{AbsentReason, Modality, Placement, SlotVector};
 use serde::{Deserialize, Serialize};
 
-pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v1";
+use super::lifecycle::{LifecycleErrorRecord, LifecyclePhase};
+use crate::panel_commands::warm::resident_support::ResidentLensAttestation;
+
+pub(super) const READY_SCHEMA: &str = "calyx-panel-resident-readiness-v2";
 pub(super) const MEASURE_SCHEMA: &str = "calyx-panel-resident-measure-v1";
 pub(super) const MEASURE_BATCH_SCHEMA: &str = "calyx-panel-resident-measure-batch-v1";
 /// v2 (#1002): measure_batch responses stream as one header frame, one frame
@@ -18,7 +21,8 @@ pub(super) enum ClientMeasureInput {
     Hex(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ResidentRequest {
     pub(super) op: String,
     pub(super) modality: Option<Modality>,
@@ -28,12 +32,21 @@ pub(super) struct ResidentRequest {
     pub(super) runtime_batch_limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ReadyResponse {
     pub(super) schema: String,
     pub(super) ready: bool,
-    pub(super) residency_scope: &'static str,
+    pub(super) accepting_requests: bool,
+    pub(super) warm_ready: bool,
+    pub(super) phase: LifecyclePhase,
+    pub(super) residency_scope: String,
     pub(super) process_id: u32,
+    pub(super) supervisor_pid: u32,
+    pub(super) worker_pid: Option<u32>,
+    pub(super) worker_descendant_pids: Vec<u32>,
+    pub(super) generation: u64,
+    pub(super) in_flight: u64,
     pub(super) bind: SocketAddr,
     pub(super) uptime_ms: u128,
     pub(super) source_of_truth: String,
@@ -47,6 +60,19 @@ pub(super) struct ReadyResponse {
     pub(super) resident_overhead_multiplier: f32,
     pub(super) estimated_resident_vram_mib: u64,
     pub(super) max_load_secs: u64,
+    pub(super) max_request_secs: u64,
+    pub(super) idle_ttl_ms: u64,
+    pub(super) idle_remaining_ms: Option<u64>,
+    pub(super) idle_deadline_unix_ms: Option<u64>,
+    pub(super) load_attempt_count: u64,
+    pub(super) load_success_count: u64,
+    pub(super) load_failure_count: u64,
+    pub(super) unload_count: u64,
+    pub(super) lifecycle_sequence: u64,
+    pub(super) lifecycle_journal: Option<PathBuf>,
+    pub(super) lifecycle_snapshot: Option<PathBuf>,
+    pub(super) frozen_panel_fingerprint: String,
+    pub(super) last_error: Option<LifecycleErrorRecord>,
     pub(super) load_parallelism: usize,
     pub(super) load_ms: u128,
     pub(super) probe_ms: u128,
@@ -56,6 +82,8 @@ pub(super) struct ReadyResponse {
     pub(super) content_lens_count: usize,
     pub(super) registry_lens_count: usize,
     pub(super) warmed_lens_count: usize,
+    pub(super) warmed_lens_scope: String,
+    pub(super) lens_attestations: Vec<ResidentLensAttestation>,
     pub(super) gpu_content_lens_count: usize,
     pub(super) cpu_content_lens_count: usize,
 }

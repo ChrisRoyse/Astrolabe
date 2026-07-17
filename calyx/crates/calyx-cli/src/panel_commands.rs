@@ -15,6 +15,8 @@ mod warm;
 
 pub(crate) use resident::measure_batch_at as measure_resident_batch_at;
 pub(crate) use resident::ready_value_at as resident_ready_value_at;
+#[cfg(windows)]
+pub(crate) use resident::run_worker as run_resident_worker;
 pub(crate) use resident::{ResidentDiscovery, read_resident_discovery, resident_discovery_path};
 
 use calyx_assay::{PanelResourceBudget, ResourceDensity, ResourceUsage, pack_panel_by_density};

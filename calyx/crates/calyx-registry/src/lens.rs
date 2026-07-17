@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use calyx_core::{
-    Asymmetry, CalyxError, Input, Lens, LensId, Result, SlotShape, SlotVector, SparseEntry,
+    Asymmetry, CalyxError, Input, Lens, LensId, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector, SparseEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -257,6 +258,14 @@ impl Registry {
         self.lenses
             .get(&lens_id)
             .and_then(|entry| entry.spec.as_ref())
+    }
+
+    /// Returns execution facts observed by an already-loaded runtime.
+    pub fn execution_attestation(
+        &self,
+        lens_id: LensId,
+    ) -> Result<Option<RuntimeExecutionAttestation>> {
+        self.lookup(lens_id)?.lens.execution_attestation()
     }
 
     pub fn lens_snapshots(&self) -> Vec<RegistryLensSnapshot> {

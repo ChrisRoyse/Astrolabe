@@ -34,6 +34,30 @@ impl Input {
     }
 }
 
+/// Runtime-observed execution facts captured after a real measurement.
+///
+/// Fields that a backend cannot directly observe stay absent; callers must not
+/// substitute frozen declarations for runtime evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeExecutionAttestation {
+    /// Runtime implementation that produced the measurement.
+    pub runtime: String,
+    /// Backend/provider observed during execution.
+    pub provider: String,
+    /// Device on which execution was observed.
+    pub device: String,
+    /// Dtype requested when model weights were loaded, when observable.
+    pub loader_dtype: Option<String>,
+    /// Dtype observed on a primary compute activation, when observable.
+    pub compute_dtype: Option<String>,
+    /// Evidence mechanism used to observe these facts.
+    pub evidence: String,
+    /// Compute nodes observed in a provider placement trace, when available.
+    pub total_compute_nodes: Option<u64>,
+    /// Compute nodes placed on a CPU provider, when available.
+    pub cpu_compute_nodes: Option<u64>,
+}
+
 /// Implemented by Registry lens runtimes as frozen measurement instruments.
 pub trait Lens: Send + Sync {
     /// Stable frozen lens id.
@@ -51,6 +75,14 @@ pub trait Lens: Send + Sync {
     /// Deterministically measures a batch of inputs.
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
         inputs.iter().map(|input| self.measure(input)).collect()
+    }
+
+    /// Returns runtime-observed execution evidence after measurement.
+    ///
+    /// The default is deliberately unattested. Implementations must only
+    /// return `Some` for facts retained from actual execution.
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        Ok(None)
     }
 }
 

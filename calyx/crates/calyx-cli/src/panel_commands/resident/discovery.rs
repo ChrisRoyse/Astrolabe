@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::durable_write;
 use crate::error::{CliError, CliResult};
 
 /// Schema tag for the resident-service discovery file. Bump when the shape
@@ -38,22 +39,10 @@ pub(crate) fn write_resident_discovery(
     discovery: &ResidentDiscovery,
 ) -> CliResult<PathBuf> {
     let path = resident_discovery_path(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            CliError::io(format!(
-                "create resident discovery dir {}: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(discovery)
+    let mut bytes = serde_json::to_vec_pretty(discovery)
         .map_err(|error| CliError::runtime(format!("serialize resident discovery: {error}")))?;
-    std::fs::write(&path, bytes).map_err(|error| {
-        CliError::io(format!(
-            "write resident discovery file {}: {error}",
-            path.display()
-        ))
-    })?;
+    bytes.push(b'\n');
+    durable_write::write_bytes_atomic(&path, &bytes, "resident discovery")?;
     Ok(path)
 }
 

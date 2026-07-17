@@ -1,7 +1,11 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use memmap2::Mmap;
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
@@ -24,6 +28,7 @@ pub struct StaticLookupLens {
     files: StaticLookupFiles,
     tokenizer: Tokenizer,
     matrix: StaticLookupMatrix,
+    executed: AtomicBool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +121,7 @@ impl StaticLookupLens {
             },
             tokenizer,
             matrix,
+            executed: AtomicBool::new(false),
         })
     }
 
@@ -209,7 +215,24 @@ impl Lens for StaticLookupLens {
             data,
         };
         self.contract.verify_vector(self.id, &vector)?;
+        self.executed.store(true, Ordering::Release);
         Ok(vector)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        if !self.executed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeExecutionAttestation {
+            runtime: "static-lookup".to_string(),
+            provider: "memory-mapped-lookup".to_string(),
+            device: "cpu".to_string(),
+            loader_dtype: Some(self.matrix.dtype.as_str().to_string()),
+            compute_dtype: Some("f32".to_string()),
+            evidence: "completed_memory_mapped_lookup".to_string(),
+            total_compute_nodes: None,
+            cpu_compute_nodes: None,
+        }))
     }
 }
 

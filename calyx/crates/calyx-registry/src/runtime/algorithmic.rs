@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use calyx_core::{
-    Input, Lens, LensId, Modality, Result, SlotShape, SlotVector, SparseEntry, content_address,
+    Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape, SlotVector,
+    SparseEntry, content_address,
 };
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
@@ -130,6 +135,7 @@ pub struct AlgorithmicLens {
     modality: Modality,
     encoder: AlgorithmicEncoder,
     contract: FrozenLensContract,
+    executed: Arc<AtomicBool>,
 }
 
 impl AlgorithmicLens {
@@ -228,6 +234,7 @@ impl AlgorithmicLens {
             modality,
             encoder,
             contract,
+            executed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -252,7 +259,7 @@ impl Lens for AlgorithmicLens {
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         ensure_input_modality(self, input)?;
-        Ok(match self.encoder {
+        let vector = match self.encoder {
             AlgorithmicEncoder::ByteFeatures => SlotVector::Dense {
                 dim: self.encoder.dim(),
                 data: byte_features(&input.bytes),
@@ -293,7 +300,25 @@ impl Lens for AlgorithmicLens {
             }
             AlgorithmicEncoder::GdeltSqlDate { dim } => gdelt::sql_date(&input.bytes, dim)?,
             AlgorithmicEncoder::GdeltEventCode { dim } => gdelt::event_code(&input.bytes, dim)?,
-        })
+        };
+        self.executed.store(true, Ordering::Release);
+        Ok(vector)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        if !self.executed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeExecutionAttestation {
+            runtime: "algorithmic".to_string(),
+            provider: "rust".to_string(),
+            device: "cpu".to_string(),
+            loader_dtype: None,
+            compute_dtype: None,
+            evidence: "completed_in_process_measurement".to_string(),
+            total_compute_nodes: None,
+            cpu_compute_nodes: None,
+        }))
     }
 }
 

@@ -215,6 +215,10 @@ pub fn from_files(spec: OnnxFileSpec) -> Result<OnnxLens> {
 }
 
 impl CustomOnnxRuntime {
+    pub(super) fn execution_attestation(&self) -> Option<calyx_core::RuntimeExecutionAttestation> {
+        self.run_plan.execution_attestation("onnx-custom")
+    }
+
     fn run_token_batch(&mut self, batch: &TokenBatch) -> Result<Vec<SlotVector>> {
         let input_tensors = session_inputs(self.session.as_ref(), batch)?;
         let output = self.output;

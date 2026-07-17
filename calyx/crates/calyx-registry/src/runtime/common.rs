@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result};
 #[cfg(feature = "ml-runtime")]
-use calyx_core::{Input, Lens};
+use calyx_core::{Input, Lens, RuntimeExecutionAttestation};
 #[cfg(feature = "ml-runtime")]
 use candle_core::{DType, Device, Tensor};
 
@@ -27,6 +27,27 @@ pub(crate) struct LocalModelExecutionAttestation {
     pub(crate) observed_primary_activation_dtype: &'static str,
     pub(crate) observed_device: String,
     pub(crate) evidence_kind: &'static str,
+}
+
+#[cfg(feature = "ml-runtime")]
+impl LocalModelExecutionAttestation {
+    pub(crate) fn runtime_attestation(&self, runtime: &str) -> RuntimeExecutionAttestation {
+        let provider = if self.observed_device.starts_with("cuda:") {
+            "candle_cuda"
+        } else {
+            "candle_cpu"
+        };
+        RuntimeExecutionAttestation {
+            runtime: runtime.to_string(),
+            provider: provider.to_string(),
+            device: self.observed_device.clone(),
+            loader_dtype: Some(self.loader_target_dtype.to_string()),
+            compute_dtype: Some(self.observed_primary_activation_dtype.to_string()),
+            evidence: self.evidence_kind.to_string(),
+            total_compute_nodes: None,
+            cpu_compute_nodes: None,
+        }
+    }
 }
 
 #[cfg(feature = "ml-runtime")]

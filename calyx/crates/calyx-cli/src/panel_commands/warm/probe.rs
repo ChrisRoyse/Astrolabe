@@ -7,7 +7,32 @@ pub(super) fn probe_panel(
 ) -> CliResult<Vec<WarmProbeReport>> {
     let mut seen = BTreeSet::new();
     let mut reports = Vec::new();
-    let slots = content_slots(build).collect::<Vec<_>>();
+    let missing = build
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active && !build.registry.contains(slot.lens_id))
+        .map(|slot| {
+            format!(
+                "slot={} key={} lens={}",
+                slot.slot_id.get(),
+                slot.slot_key.key(),
+                slot.lens_id
+            )
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_RUNTIME_MISSING",
+            message: format!(
+                "resident warm refuses {} active panel slots without registered runtimes: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+            remediation: "register a frozen runtime for every active panel slot, or park the slot before starting resident service",
+        }));
+    }
+    let slots = active_registered_slots(build).collect::<Vec<_>>();
     let total = slots
         .iter()
         .map(|slot| slot.lens_id)
@@ -107,6 +132,16 @@ pub(super) fn probe_panel(
             ))?;
         }
         reports.push(report);
+    }
+    if reports.len() != total {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_WARM_COUNT_MISMATCH",
+            message: format!(
+                "resident warm probed {} unique lenses but active registry scope contains {total}",
+                reports.len()
+            ),
+            remediation: "probe every unique active registered lens exactly once before declaring the worker warm",
+        }));
     }
     Ok(reports)
 }
@@ -276,6 +311,16 @@ pub(super) fn content_slots(build: &SavedTemplatePanelBuild) -> impl Iterator<It
     build.panel.slots.iter().filter(|slot| {
         slot.state == SlotState::Active && !slot.retrieval_only && !slot.excluded_from_dedup
     })
+}
+
+pub(super) fn active_registered_slots(
+    build: &SavedTemplatePanelBuild,
+) -> impl Iterator<Item = &Slot> {
+    build
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active && build.registry.contains(slot.lens_id))
 }
 
 pub(super) fn vector_kind_len(vector: &SlotVector) -> (&'static str, usize) {

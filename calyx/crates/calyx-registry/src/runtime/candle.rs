@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use candle_core::{DType, Tensor};
 use tokenizers::Tokenizer;
 
@@ -437,6 +440,13 @@ impl Lens for CandleLens {
                 &self.execution_attestation,
             )
         })
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        Ok(Some(
+            self.execution_attestation
+                .runtime_attestation("candle-local"),
+        ))
     }
 }
 

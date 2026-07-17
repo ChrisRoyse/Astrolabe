@@ -2,7 +2,10 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use fastembed::{EmbeddingModel, TextEmbedding};
 use serde::{Deserialize, Serialize};
 
@@ -399,6 +402,16 @@ impl Lens for OnnxLens {
                 let max_batch = scoped_max_batch(self.max_batch)?;
                 runtime.measure_batch(self, inputs, max_batch)
             }
+        }
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        match self.backend_ref() {
+            OnnxBackend::FastEmbed(_) => Ok(None),
+            OnnxBackend::Custom(runtime) => runtime
+                .lock()
+                .map_err(|_| CalyxError::lens_unreachable("custom ONNX session mutex was poisoned"))
+                .map(|runtime| runtime.execution_attestation()),
         }
     }
 }

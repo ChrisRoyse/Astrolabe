@@ -1,6 +1,14 @@
 use super::codec::{decode_binary, encode_binary, read_frame, write_frame};
+use super::deadline::{
+    DeadlineStream, connect_before, deadline_after, ensure_before, read_bounded_line,
+};
 use super::*;
+use calyx_core::CALYX_ERROR_CODES;
 use sha2::{Digest, Sha256};
+
+const REMOTE_RESIDENT_REMEDIATION: &str =
+    "follow the remote resident remediation included in the failure message, then retry";
+const UNKNOWN_REMOTE_REMEDIATION: &str = "restart the resident service from the same native Calyx build as the client and inspect the remote code included in the failure message";
 
 pub(crate) fn client_command(args: &[String], op: &str) -> CliResult {
     let flags = parse_client_flags(args, op)?;
@@ -36,7 +44,12 @@ pub(crate) fn client_command(args: &[String], op: &str) -> CliResult {
             ClientMeasureInput::Hex(input_hex) => request["input_hex"] = json!(input_hex),
         }
     }
-    let response = send_request(flags.addr, request)?;
+    let timeout = if op == "measure" {
+        productive_timeout(flags.addr)?
+    } else {
+        control_timeout()
+    };
+    let response = send_request_with_timeout(flags.addr, request, timeout)?;
     if let Some(path) = flags.out {
         write_json_file(path, &response)?;
     }
@@ -58,29 +71,77 @@ fn client_input_to_core(input: ClientMeasureInput, modality: Modality) -> CliRes
 /// Programmatic readiness probe used by ingest resident-route discovery: one
 /// JSON `ready` round-trip returning the raw readiness value.
 pub(crate) fn ready_value_at(addr: SocketAddr) -> CliResult<Value> {
-    send_request(addr, json!({ "op": "ready" }))
+    send_request_with_timeout(addr, json!({ "op": "ready" }), control_timeout())
 }
 
-fn send_request(addr: SocketAddr, request: Value) -> CliResult<Value> {
+fn send_request_with_timeout(
+    addr: SocketAddr,
+    request: Value,
+    timeout: Duration,
+) -> CliResult<Value> {
     ensure_loopback(addr)?;
-    let mut stream = TcpStream::connect(addr).map_err(|error| {
+    let deadline = deadline_after(timeout)?;
+    let mut stream = connect_before(&addr, deadline).map_err(|error| {
         CliError::from(CalyxError {
             code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
             message: format!("connect resident service {addr}: {error}"),
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    serde_json::to_writer(&mut stream, &request)
+    let mut deadline_stream = DeadlineStream::new(&mut stream, deadline);
+    serde_json::to_writer(&mut deadline_stream, &request)
         .map_err(|error| CliError::runtime(format!("write resident request to {addr}: {error}")))?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
-    serde_json::from_str(&response)
-        .map_err(|error| CliError::runtime(format!("parse resident response from {addr}: {error}")))
+    deadline_stream.write_all(b"\n")?;
+    deadline_stream.flush()?;
+    let mut reader = BufReader::new(deadline_stream);
+    let response = read_bounded_line(
+        &mut reader,
+        MAX_RESIDENT_JSON_LINE_BYTES,
+        "resident JSON response",
+    )?;
+    let response = serde_json::from_slice(&response).map_err(|error| {
+        CliError::runtime(format!("parse resident response from {addr}: {error}"))
+    })?;
+    ensure_before(deadline, "resident JSON client round trip")?;
+    reject_remote_json_error(addr, response)
+}
+
+fn reject_remote_json_error(addr: SocketAddr, response: Value) -> CliResult<Value> {
+    let Some(object) = response.as_object() else {
+        return Ok(response);
+    };
+    let ok_false = matches!(object.get("ok"), Some(Value::Bool(false)));
+    let invalid_ok = object
+        .get("ok")
+        .is_some_and(|value| !matches!(value, Value::Bool(_)));
+    let has_error_field = ["code", "message", "remediation"]
+        .iter()
+        .any(|field| object.contains_key(*field));
+    if !ok_false && !invalid_ok && !has_error_field {
+        return Ok(response);
+    }
+
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| malformed_remote_error(addr, name))
+    };
+    let code = field("code")?;
+    let message = field("message")?;
+    let remediation = field("remediation")?;
+    Err(remote_error(code, message, remediation))
+}
+
+fn malformed_remote_error(addr: SocketAddr, field: &str) -> CliError {
+    CliError::from(CalyxError {
+        code: "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
+        message: format!(
+            "resident response from {addr} declared or resembled a failure but {field} was missing, blank, or not a string"
+        ),
+        remediation: "restart the resident supervisor from the same native Calyx build as the client",
+    })
 }
 
 pub(crate) fn measure_batch_at(
@@ -90,17 +151,17 @@ pub(crate) fn measure_batch_at(
     runtime_batch_limit: Option<usize>,
 ) -> CliResult<MeasureBatchAtResponse> {
     ensure_loopback(addr)?;
-    let mut stream = TcpStream::connect(addr).map_err(|error| {
+    let timeout = productive_timeout(addr)?;
+    let deadline = deadline_after(timeout)?;
+    let mut stream = connect_before(&addr, deadline).map_err(|error| {
         CliError::from(CalyxError {
             code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
             message: format!("connect resident service {addr}: {error}"),
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    stream.write_all(RESIDENT_BINARY_MAGIC)?;
+    let mut deadline_stream = DeadlineStream::new(&mut stream, deadline);
+    deadline_stream.write_all(RESIDENT_BINARY_MAGIC)?;
     let request_bytes = encode_binary(&ResidentMeasureBatchBinaryRequest {
         protocol_version: RESIDENT_BINARY_PROTOCOL_VERSION,
         modality,
@@ -110,9 +171,12 @@ pub(crate) fn measure_batch_at(
             .collect::<Vec<_>>(),
         runtime_batch_limit,
     })?;
-    write_frame(&mut stream, &request_bytes)?;
-    stream.flush()?;
-    read_measure_batch_stream(&mut stream, inputs.len(), request_bytes.len())
+    write_frame(&mut deadline_stream, &request_bytes)?;
+    deadline_stream.flush()?;
+    let response =
+        read_measure_batch_stream(&mut deadline_stream, inputs.len(), request_bytes.len())?;
+    ensure_before(deadline, "resident measure_batch client round trip")?;
+    Ok(response)
 }
 
 fn measure_batch_summary_at(
@@ -122,17 +186,17 @@ fn measure_batch_summary_at(
     runtime_batch_limit: Option<usize>,
 ) -> CliResult<MeasureBatchSummaryResponse> {
     ensure_loopback(addr)?;
-    let mut stream = TcpStream::connect(addr).map_err(|error| {
+    let timeout = productive_timeout(addr)?;
+    let deadline = deadline_after(timeout)?;
+    let mut stream = connect_before(&addr, deadline).map_err(|error| {
         CliError::from(CalyxError {
             code: "CALYX_PANEL_RESIDENT_UNAVAILABLE",
             message: format!("connect resident service {addr}: {error}"),
             remediation: CLIENT_TIMEOUT_REMEDIATION,
         })
     })?;
-    let timeout = Some(Duration::from_secs(CLIENT_TIMEOUT_SECS));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    stream.write_all(RESIDENT_BINARY_MAGIC)?;
+    let mut deadline_stream = DeadlineStream::new(&mut stream, deadline);
+    deadline_stream.write_all(RESIDENT_BINARY_MAGIC)?;
     let request_bytes = encode_binary(&ResidentMeasureBatchBinaryRequest {
         protocol_version: RESIDENT_BINARY_PROTOCOL_VERSION,
         modality,
@@ -142,21 +206,63 @@ fn measure_batch_summary_at(
             .collect::<Vec<_>>(),
         runtime_batch_limit,
     })?;
-    write_frame(&mut stream, &request_bytes)?;
-    stream.flush()?;
-    read_measure_batch_summary_stream(&mut stream, inputs.len(), request_bytes.len())
+    write_frame(&mut deadline_stream, &request_bytes)?;
+    deadline_stream.flush()?;
+    let response =
+        read_measure_batch_summary_stream(&mut deadline_stream, inputs.len(), request_bytes.len())?;
+    ensure_before(deadline, "resident measure_batch summary client round trip")?;
+    Ok(response)
+}
+
+fn control_timeout() -> Duration {
+    Duration::from_secs(CLIENT_CONTROL_TIMEOUT_SECS)
+}
+
+fn productive_timeout(addr: SocketAddr) -> CliResult<Duration> {
+    let ready = ready_value_at(addr)?;
+    let max_load_secs = ready
+        .get("max_load_secs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CliError::from(CalyxError {
+                code: "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
+                message: format!(
+                    "resident readiness from {addr} has no positive max_load_secs"
+                ),
+                remediation: "restart the resident supervisor from the same native Calyx build as the client",
+            })
+        })?;
+    let max_request_secs = ready
+        .get("max_request_secs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CliError::from(CalyxError {
+                code: "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
+                message: format!(
+                    "resident readiness from {addr} has no positive max_request_secs"
+                ),
+                remediation: "restart the resident supervisor from the same native Calyx build as the client",
+            })
+        })?;
+    Ok(Duration::from_secs(
+        max_load_secs
+            .saturating_add(max_request_secs)
+            .saturating_add(CLIENT_PRODUCTIVE_MARGIN_SECS),
+    ))
 }
 
 /// Consume the streamed measure_batch frames: Header, then one Row frame per
 /// input, then End. Any Err frame, out-of-order frame, truncated stream, or
 /// row/count mismatch fails closed — a partial stream never yields rows.
 fn read_measure_batch_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Read,
     expected_inputs: usize,
     request_bytes: usize,
 ) -> CliResult<MeasureBatchAtResponse> {
     let mut response_bytes = 0usize;
-    let mut next_frame = |stream: &mut TcpStream| -> CliResult<ResidentMeasureBatchStreamFrame> {
+    let mut next_frame = |stream: &mut dyn Read| -> CliResult<ResidentMeasureBatchStreamFrame> {
         let frame = read_frame(stream)?;
         response_bytes += frame.len();
         Ok(decode_binary::<ResidentMeasureBatchStreamFrame>(&frame)?)
@@ -227,7 +333,7 @@ fn read_measure_batch_stream(
 }
 
 fn read_measure_batch_summary_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Read,
     expected_inputs: usize,
     request_bytes: usize,
 ) -> CliResult<MeasureBatchSummaryResponse> {
@@ -345,11 +451,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn remote_stream_error(code: &str, message: &str, remediation: &str) -> CliError {
-    CliError::from(CalyxError {
-        code: resident_remote_error_code(code),
-        message: format!("{code}: {message}; remediation={remediation}"),
-        remediation: CLIENT_TIMEOUT_REMEDIATION,
-    })
+    remote_error(code, message, remediation)
 }
 
 fn unexpected_stream_frame(expected: &str, got: &ResidentMeasureBatchStreamFrame) -> CliError {
@@ -368,16 +470,75 @@ fn unexpected_stream_frame(expected: &str, got: &ResidentMeasureBatchStreamFrame
     })
 }
 
-fn resident_remote_error_code(remote_code: &str) -> &'static str {
-    match remote_code {
-        "CALYX_PANEL_RESIDENT_BAD_REQUEST" => "CALYX_PANEL_RESIDENT_BAD_REQUEST",
-        "CALYX_PANEL_RESIDENT_INPUT_HEX_INVALID" => "CALYX_PANEL_RESIDENT_INPUT_HEX_INVALID",
-        "CALYX_PANEL_RESIDENT_UNAVAILABLE" => "CALYX_PANEL_RESIDENT_UNAVAILABLE",
-        "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH" => "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
-        "CALYX_PANEL_RESIDENT_BINARY_ENCODE" => "CALYX_PANEL_RESIDENT_BINARY_ENCODE",
-        "CALYX_PANEL_RESIDENT_BINARY_DECODE" => "CALYX_PANEL_RESIDENT_BINARY_DECODE",
-        "CALYX_PANEL_RESIDENT_BINARY_FRAME" => "CALYX_PANEL_RESIDENT_BINARY_FRAME",
-        "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH" => "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH",
-        _ => "CALYX_PANEL_RESIDENT_ERROR",
+fn remote_error(code: &str, message: &str, remediation: &str) -> CliError {
+    if let Some(catalog_code) = CALYX_ERROR_CODES
+        .iter()
+        .find(|catalog_code| catalog_code.code() == code)
+    {
+        return CliError::from(CalyxError {
+            code: catalog_code.code(),
+            message: message.to_string(),
+            remediation: catalog_code.remediation(),
+        });
     }
+    if let Some(code) = resident_remote_error_code(code) {
+        return CliError::from(CalyxError {
+            code,
+            message: format!("{message}; remote remediation: {remediation}"),
+            remediation: REMOTE_RESIDENT_REMEDIATION,
+        });
+    }
+    CliError::from(CalyxError {
+        code: "CALYX_PANEL_RESIDENT_ERROR",
+        message: format!(
+            "resident returned unknown remote code {code}: {message}; remote remediation: {remediation}"
+        ),
+        remediation: UNKNOWN_REMOTE_REMEDIATION,
+    })
+}
+
+fn resident_remote_error_code(remote_code: &str) -> Option<&'static str> {
+    Some(match remote_code {
+        "CALYX_CLI_IO_ERROR" => "CALYX_CLI_IO_ERROR",
+        "CALYX_CLI_RUNTIME_ERROR" => "CALYX_CLI_RUNTIME_ERROR",
+        "CALYX_CLI_USAGE_ERROR" => "CALYX_CLI_USAGE_ERROR",
+        "CALYX_PANEL_RESIDENT_ALREADY_RUNNING" => "CALYX_PANEL_RESIDENT_ALREADY_RUNNING",
+        "CALYX_PANEL_RESIDENT_BACK_PRESSURE" => "CALYX_PANEL_RESIDENT_BACK_PRESSURE",
+        "CALYX_PANEL_RESIDENT_BAD_REQUEST" => "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+        "CALYX_PANEL_RESIDENT_BINARY_DECODE" => "CALYX_PANEL_RESIDENT_BINARY_DECODE",
+        "CALYX_PANEL_RESIDENT_BINARY_ENCODE" => "CALYX_PANEL_RESIDENT_BINARY_ENCODE",
+        "CALYX_PANEL_RESIDENT_BINARY_FRAME" => "CALYX_PANEL_RESIDENT_BINARY_FRAME",
+        "CALYX_PANEL_RESIDENT_BIND_REFUSED" => "CALYX_PANEL_RESIDENT_BIND_REFUSED",
+        "CALYX_PANEL_RESIDENT_CPU_LENS_REFUSED" => "CALYX_PANEL_RESIDENT_CPU_LENS_REFUSED",
+        "CALYX_PANEL_RESIDENT_CLIENT_ABORTED_GENERATION" => {
+            "CALYX_PANEL_RESIDENT_CLIENT_ABORTED_GENERATION"
+        }
+        "CALYX_PANEL_RESIDENT_ERROR" => "CALYX_PANEL_RESIDENT_ERROR",
+        "CALYX_PANEL_RESIDENT_EXECUTION_UNATTESTED" => "CALYX_PANEL_RESIDENT_EXECUTION_UNATTESTED",
+        "CALYX_PANEL_RESIDENT_INPUT_HEX_INVALID" => "CALYX_PANEL_RESIDENT_INPUT_HEX_INVALID",
+        "CALYX_PANEL_RESIDENT_JOB_ASSIGN_FAILED" => "CALYX_PANEL_RESIDENT_JOB_ASSIGN_FAILED",
+        "CALYX_PANEL_RESIDENT_JOB_CONFIGURE_FAILED" => "CALYX_PANEL_RESIDENT_JOB_CONFIGURE_FAILED",
+        "CALYX_PANEL_RESIDENT_JOB_CREATE_FAILED" => "CALYX_PANEL_RESIDENT_JOB_CREATE_FAILED",
+        "CALYX_PANEL_RESIDENT_JOB_IDENTITY_INVALID" => "CALYX_PANEL_RESIDENT_JOB_IDENTITY_INVALID",
+        "CALYX_PANEL_RESIDENT_JOB_QUERY_FAILED" => "CALYX_PANEL_RESIDENT_JOB_QUERY_FAILED",
+        "CALYX_PANEL_RESIDENT_JOB_QUERY_INVALID" => "CALYX_PANEL_RESIDENT_JOB_QUERY_INVALID",
+        "CALYX_PANEL_RESIDENT_JOB_TERMINATE_FAILED" => "CALYX_PANEL_RESIDENT_JOB_TERMINATE_FAILED",
+        "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT" => "CALYX_PANEL_RESIDENT_LIFECYCLE_CORRUPT",
+        "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY" => "CALYX_PANEL_RESIDENT_LIFECYCLE_DURABILITY",
+        "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH" => "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH",
+        "CALYX_PANEL_RESIDENT_RUNTIME_MISSING" => "CALYX_PANEL_RESIDENT_RUNTIME_MISSING",
+        "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH" => "CALYX_PANEL_RESIDENT_SCHEMA_MISMATCH",
+        "CALYX_PANEL_RESIDENT_SLOT_SCOPE_INVALID" => "CALYX_PANEL_RESIDENT_SLOT_SCOPE_INVALID",
+        "CALYX_PANEL_RESIDENT_STOPPING" => "CALYX_PANEL_RESIDENT_STOPPING",
+        "CALYX_PANEL_RESIDENT_STREAM_ORDER" => "CALYX_PANEL_RESIDENT_STREAM_ORDER",
+        "CALYX_PANEL_RESIDENT_UNAVAILABLE" => "CALYX_PANEL_RESIDENT_UNAVAILABLE",
+        "CALYX_PANEL_RESIDENT_UNMANAGED_RUNTIME" => "CALYX_PANEL_RESIDENT_UNMANAGED_RUNTIME",
+        "CALYX_PANEL_RESIDENT_WARM_COUNT_MISMATCH" => "CALYX_PANEL_RESIDENT_WARM_COUNT_MISMATCH",
+        "CALYX_PANEL_RESIDENT_WORKER_GATE" => "CALYX_PANEL_RESIDENT_WORKER_GATE",
+        "CALYX_PANEL_RESIDENT_WORKER_UNAUTHORIZED" => "CALYX_PANEL_RESIDENT_WORKER_UNAUTHORIZED",
+        "CALYX_PANEL_RESIDENT_WORKER_LOST" => "CALYX_PANEL_RESIDENT_WORKER_LOST",
+        "CALYX_PANEL_RESIDENT_WORKER_START_FAILED" => "CALYX_PANEL_RESIDENT_WORKER_START_FAILED",
+        "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED" => "CALYX_PANEL_RESIDENT_WORKER_STOP_FAILED",
+        _ => return None,
+    })
 }

@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use calyx_core::{CalyxError, Input, Lens, LensId, Modality, Result, SlotShape, SlotVector};
+use calyx_core::{
+    CalyxError, Input, Lens, LensId, Modality, Result, RuntimeExecutionAttestation, SlotShape,
+    SlotVector,
+};
 use fastembed::Qwen3TextEmbedding;
 
 use crate::commission::{LensForgeSourceTensorDtypeProfile, profile_safetensors_sources};
@@ -321,6 +324,13 @@ impl Lens for FastembedQwen3Lens {
                 &self.execution_attestation,
             )
         })
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        Ok(Some(
+            self.execution_attestation
+                .runtime_attestation("fastembed-qwen3"),
+        ))
     }
 }
 

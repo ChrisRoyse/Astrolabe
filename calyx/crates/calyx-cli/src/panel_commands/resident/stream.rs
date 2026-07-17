@@ -165,10 +165,8 @@ pub(super) fn serve_binary_measure_batch(
     writer: &mut dyn Write,
     service: &ResidentService,
 ) -> CliResult {
-    let request = match read_frame(reader)
-        .and_then(|bytes| decode_binary::<ResidentMeasureBatchBinaryRequest>(&bytes))
-    {
-        Ok(request) => request,
+    let request_bytes = match read_frame(reader) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return write_stream_frame(
                 writer,
@@ -180,20 +178,19 @@ pub(super) fn serve_binary_measure_batch(
             );
         }
     };
-    if request.protocol_version != RESIDENT_BINARY_PROTOCOL_VERSION {
-        return write_stream_frame(
-            writer,
-            &ResidentMeasureBatchStreamFrame::Err {
-                code: "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH".to_string(),
-                message: format!(
-                    "resident binary measure_batch protocol version {}, expected {}",
-                    request.protocol_version, RESIDENT_BINARY_PROTOCOL_VERSION
-                ),
-                remediation: "restart the resident service from the same Calyx build as the CLI"
-                    .to_string(),
-            },
-        );
-    }
+    let request = match decode_binary_request(&request_bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_stream_frame(
+                writer,
+                &ResidentMeasureBatchStreamFrame::Err {
+                    code: error.code().to_string(),
+                    message: error.message().to_string(),
+                    remediation: error.remediation().to_string(),
+                },
+            );
+        }
+    };
     eprintln!(
         "CALYX_PANEL_RESIDENT_RUNTIME phase=measure_batch_binary_request process_id={} protocol_version={} inputs={}",
         std::process::id(),
@@ -258,6 +255,48 @@ pub(super) fn serve_binary_measure_batch(
             )
         }
     }
+}
+
+pub(super) fn decode_binary_request(bytes: &[u8]) -> CliResult<ResidentMeasureBatchBinaryRequest> {
+    let request = decode_binary::<ResidentMeasureBatchBinaryRequest>(bytes)?;
+    validate_binary_request(&request)?;
+    Ok(request)
+}
+
+pub(super) fn validate_binary_request(request: &ResidentMeasureBatchBinaryRequest) -> CliResult {
+    if request.protocol_version != RESIDENT_BINARY_PROTOCOL_VERSION {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_PROTOCOL_MISMATCH",
+            message: format!(
+                "resident binary measure_batch protocol version {}, expected {}",
+                request.protocol_version, RESIDENT_BINARY_PROTOCOL_VERSION
+            ),
+            remediation: "restart the resident service from the same Calyx build as the CLI",
+        }));
+    }
+    if request.inputs.is_empty() {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+            message: "resident binary measure_batch requires at least one input".to_string(),
+            remediation: "send a non-empty binary input batch",
+        }));
+    }
+    if let Some(index) = request.inputs.iter().position(Vec::is_empty) {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+            message: format!("resident binary measure_batch input {index} is empty"),
+            remediation: "send at least one byte for every binary input",
+        }));
+    }
+    if matches!(request.runtime_batch_limit, Some(0)) {
+        return Err(CliError::from(CalyxError {
+            code: "CALYX_PANEL_RESIDENT_BAD_REQUEST",
+            message: "resident binary measure_batch runtime_batch_limit must be greater than zero"
+                .to_string(),
+            remediation: "omit runtime_batch_limit or send a positive integer",
+        }));
+    }
+    Ok(())
 }
 
 pub(super) fn write_stream_frame(

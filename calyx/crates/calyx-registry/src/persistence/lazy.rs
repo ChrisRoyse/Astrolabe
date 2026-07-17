@@ -1,5 +1,6 @@
 use super::runtime::load_runtime_lens;
 use super::*;
+use calyx_core::RuntimeExecutionAttestation;
 
 pub(crate) fn rebuild_registry(snapshot: &VaultRegistrySnapshot) -> Result<Registry> {
     let mut registry = Registry::new();
@@ -97,5 +98,19 @@ impl Lens for LazyPersistedLens {
 
     fn measure_batch(&self, inputs: &[Input]) -> Result<Vec<SlotVector>> {
         self.runtime()?.measure_batch(inputs)
+    }
+
+    fn execution_attestation(&self) -> Result<Option<RuntimeExecutionAttestation>> {
+        let guard = self.runtime.lock().map_err(|_| {
+            CalyxError::lens_unreachable(format!(
+                "lazy persisted lens {} runtime mutex was poisoned",
+                self.snapshot.lens_id
+            ))
+        })?;
+        match guard.as_ref() {
+            Some(LazyRuntimeCache::Loaded(runtime)) => runtime.execution_attestation(),
+            Some(LazyRuntimeCache::Failed(load_error)) => Err(self.error(load_error.clone())),
+            None => Ok(None),
+        }
     }
 }

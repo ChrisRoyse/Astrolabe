@@ -8,7 +8,7 @@ use super::DEFAULT_BIND;
 use super::protocol::{ClientMeasureInput, hex_decode, hex_encode};
 use crate::error::{CliError, CliResult};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ServeFlags {
     pub(super) home: Option<PathBuf>,
     pub(super) template: Option<String>,
@@ -21,6 +21,7 @@ pub(super) struct ServeFlags {
     pub(super) max_resident_vram_mib: Option<u64>,
     pub(super) resident_overhead_multiplier_milli: Option<u64>,
     pub(super) max_load_secs: Option<u64>,
+    pub(super) max_request_secs: Option<u64>,
     pub(super) load_parallelism: Option<usize>,
 }
 
@@ -70,9 +71,15 @@ pub(super) fn parse_serve_flags(args: &[String]) -> CliResult<ServeFlags> {
                 )?)?)
             }
             "--max-load-secs" => {
-                flags.max_load_secs = Some(parse_u64(
+                flags.max_load_secs = Some(parse_positive_u64(
                     value(args, idx + 1, "--max-load-secs")?,
                     "--max-load-secs",
+                )?)
+            }
+            "--max-request-secs" => {
+                flags.max_request_secs = Some(parse_positive_u64(
+                    value(args, idx + 1, "--max-request-secs")?,
+                    "--max-request-secs",
                 )?)
             }
             "--load-parallelism" => {
@@ -286,6 +293,14 @@ fn parse_slot(raw: &str) -> CliResult<SlotId> {
 fn parse_u64(raw: &str, flag: &str) -> CliResult<u64> {
     raw.parse::<u64>()
         .map_err(|error| CliError::usage(format!("parse {flag} {raw}: {error}")))
+}
+
+fn parse_positive_u64(raw: &str, flag: &str) -> CliResult<u64> {
+    let value = parse_u64(raw, flag)?;
+    if value == 0 {
+        return Err(CliError::usage(format!("{flag} must be greater than zero")));
+    }
+    Ok(value)
 }
 
 fn parse_usize(raw: &str, flag: &str) -> CliResult<usize> {

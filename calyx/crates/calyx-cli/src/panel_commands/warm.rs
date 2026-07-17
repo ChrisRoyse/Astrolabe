@@ -8,13 +8,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use calyx_core::{
-    CalyxError, Input, Modality, Panel, Placement, Slot, SlotId, SlotShape, SlotState, SlotVector,
+    CalyxError, Input, Modality, Panel, Placement, RuntimeExecutionAttestation, Slot, SlotId,
+    SlotShape, SlotState, SlotVector,
 };
 use calyx_registry::{
     LensRuntime, Registry, lens_spec_from_manifest_path, load_vault_panel_state,
     shutdown_multimodal_gpu_workers,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     SavedTemplatePanelBuild,
@@ -355,7 +356,9 @@ mod load_progress;
 mod flags;
 
 mod probe;
-use probe::{content_slots, probe_panel, run_progress_record};
+use probe::{
+    active_registered_slots, content_slots, probe_panel, run_progress_record, runtime_detail,
+};
 
 pub(super) mod resident_support;
 
