@@ -675,9 +675,27 @@ function Verify-Bundle {
     if ($receipt.schema -cne $ReceiptSchema -or $receipt.bundle_id -cne $Lock.bundle.id -or $receipt.lock_sha256 -cne $LockSha256) {
         Fail-Runtime "ASTRO_CUDA13_RECEIPT" "installed receipt identity does not match the lock" "remove the incomplete bundle and rerun provisioning"
     }
-    Assert-NonBlankString $receipt.provisioned_at_utc 'receipt.provisioned_at_utc'
+    # PowerShell 7's JSON reader materializes ISO-8601 strings as DateTime,
+    # while Windows PowerShell 5.1 leaves the same token as String. Normalize
+    # both representations before applying the exact round-trip contract.
+    if ($receipt.provisioned_at_utc -is [DateTime]) {
+        $receiptTimestamp = $receipt.provisioned_at_utc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    elseif ($receipt.provisioned_at_utc -is [DateTimeOffset]) {
+        $receiptTimestamp = $receipt.provisioned_at_utc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    elseif ($receipt.provisioned_at_utc -is [string]) {
+        $receiptTimestamp = $receipt.provisioned_at_utc
+    }
+    else {
+        $receiptTimestampType = if ($null -eq $receipt.provisioned_at_utc) { 'null' } else { $receipt.provisioned_at_utc.GetType().FullName }
+        Fail-Runtime "ASTRO_CUDA13_RECEIPT" "receipt provisioned_at_utc has unsupported CLR type $receiptTimestampType" "remove the incomplete bundle and rerun provisioning"
+    }
+    if ([string]::IsNullOrWhiteSpace($receiptTimestamp)) {
+        Fail-Runtime "ASTRO_CUDA13_RECEIPT" "receipt provisioned_at_utc is blank" "remove the incomplete bundle and rerun provisioning"
+    }
     $parsedTimestamp = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParseExact($receipt.provisioned_at_utc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedTimestamp)) {
+    if (-not [DateTimeOffset]::TryParseExact($receiptTimestamp, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedTimestamp)) {
         Fail-Runtime "ASTRO_CUDA13_RECEIPT" "receipt provisioned_at_utc is not a valid round-trip timestamp" "remove the incomplete bundle and rerun provisioning"
     }
 
