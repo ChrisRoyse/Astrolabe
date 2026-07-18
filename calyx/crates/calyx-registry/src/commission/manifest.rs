@@ -1,10 +1,8 @@
 use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, LensId, Modality, QuantPolicy, Result, SlotShape, content_address};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::frozen::{LengthDelimitedSha256, NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
@@ -26,7 +24,6 @@ use super::source_tensor_profile::{
 use super::source_tensor_profile::{profile_safetensors_sources, resolve_safetensors_weight_set};
 
 const CONFIG_INVALID: &str = "CALYX_LENS_CONFIG_INVALID";
-const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LensForgeFile {
@@ -458,7 +455,11 @@ pub(super) struct VerifiedFile {
     pub(super) role: String,
     pub(super) path: PathBuf,
     sha256: String,
-    bytes: u64,
+    /// The single immutable byte snapshot every derived view of this artifact
+    /// must read from, so the frozen digest, source profile, and any downstream
+    /// hashing provably come from one byte set (#524). `sha256` above mirrors
+    /// this snapshot's digest for callers that only need the hex.
+    snapshot: std::sync::Arc<super::frozen_snapshot::FrozenArtifactSnapshot>,
 }
 
 mod artifacts;

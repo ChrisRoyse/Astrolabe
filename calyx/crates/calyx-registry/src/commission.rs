@@ -8,6 +8,7 @@ use crate::spec::{LensRuntime, LensSpec};
 use crate::{Registry, ensure_input_modality};
 
 mod algorithmic_manifest;
+mod frozen_snapshot;
 mod manifest;
 mod manifest_identity;
 mod manifest_metadata;
@@ -24,6 +25,7 @@ pub use manifest::{
 pub use manifest_metadata::{
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
 };
+#[cfg(feature = "ml-runtime")]
 pub(crate) use manifest_runtime::canonical_local_model_device;
 pub use onnx_int8::{
     OnnxExternalDataFile, OnnxExternalTensorSlice, OnnxGraphIdentity, OnnxInt8Attestation,

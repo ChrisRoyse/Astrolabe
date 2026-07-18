@@ -120,6 +120,7 @@ pub(crate) fn fastembed_dense_corpus_hash(model_code: &str, execution: &str) -> 
     ])
 }
 
+#[cfg(feature = "ml-runtime")]
 pub(crate) fn legacy_fastembed_dense_corpus_hash(model_code: &str) -> [u8; 32] {
     sha256_digest(&[b"fastembed-dense-v1", model_code.as_bytes()])
 }
