@@ -530,10 +530,7 @@ pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
             if *norm == 0.0 || *row_norm == 0.0 {
                 return Ok(0.0);
             }
-            let mut dot = 0.0_f64;
-            for (value, code) in values.iter().zip(codes) {
-                dot += f64::from(*value) * f64::from(*code as i8);
-            }
+            let dot = scalar8_dot(values, codes);
             Ok((dot * f64::from(*scale) / (f64::from(*norm) * f64::from(*row_norm))) as f32)
         }
         (
@@ -574,6 +571,63 @@ pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
             CALYX_SEXTANT_VECTOR_SHAPE,
             "prepared query kind does not match the packed row kind; prepare through the owning QuantConfig",
         )),
+    }
+}
+
+/// Asymmetric query-f32 by candidate-i8 dot product. Candidate bytes remain
+/// packed and are sign-extended directly into SIMD lanes; no candidate-wide
+/// decode or temporary allocation occurs.
+fn scalar8_dot(values: &[f32], codes: &[u8]) -> f64 {
+    debug_assert_eq!(values.len(), codes.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: feature detection proves AVX2 support, and the helper only
+        // loads within the equal-length slices established by score_packed.
+        return unsafe { scalar8_dot_avx2(values, codes) };
+    }
+    values
+        .iter()
+        .zip(codes)
+        .map(|(value, code)| f64::from(*value) * f64::from(*code as i8))
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scalar8_dot_avx2(values: &[f32], codes: &[u8]) -> f64 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mut low_acc = _mm256_setzero_pd();
+        let mut high_acc = _mm256_setzero_pd();
+        let vectorized = values.len() / 8 * 8;
+        let mut index = 0_usize;
+        while index < vectorized {
+            let packed = _mm_loadl_epi64(codes.as_ptr().add(index).cast::<__m128i>());
+            let widened = _mm256_cvtepi8_epi32(packed);
+            let code_low = _mm256_castsi256_si128(widened);
+            let code_high = _mm256_extracti128_si256::<1>(widened);
+            let query_low = _mm_loadu_ps(values.as_ptr().add(index));
+            let query_high = _mm_loadu_ps(values.as_ptr().add(index + 4));
+            low_acc = _mm256_add_pd(
+                low_acc,
+                _mm256_mul_pd(_mm256_cvtps_pd(query_low), _mm256_cvtepi32_pd(code_low)),
+            );
+            high_acc = _mm256_add_pd(
+                high_acc,
+                _mm256_mul_pd(_mm256_cvtps_pd(query_high), _mm256_cvtepi32_pd(code_high)),
+            );
+            index += 8;
+        }
+        let mut low = [0.0_f64; 4];
+        let mut high = [0.0_f64; 4];
+        _mm256_storeu_pd(low.as_mut_ptr(), low_acc);
+        _mm256_storeu_pd(high.as_mut_ptr(), high_acc);
+        let mut dot = low.into_iter().sum::<f64>() + high.into_iter().sum::<f64>();
+        for tail in index..values.len() {
+            dot += f64::from(values[tail]) * f64::from(codes[tail] as i8);
+        }
+        dot
     }
 }
 
