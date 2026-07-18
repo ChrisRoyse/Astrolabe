@@ -1280,6 +1280,16 @@ fn git_with_stdin(repo: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>, A
 
 fn git_command(repo: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
+    // Locale-stable stderr (#514): the blame containment classifies an absent
+    // parent-side path by matching git's English message `fatal: no such path
+    // <p> in <rev>`. Git localizes its `die(_())` diagnostics from
+    // `share/locale`, so under a translated host locale (`LANG`/`LC_ALL` set)
+    // that substring would not match and the counted skip would regress to the
+    // fail-closed `ASTRO_ARCHAEOLOGY_GIT_FAILED` this issue fixes. Force the C
+    // locale for every git child so the message contract holds on any host;
+    // `LC_ALL` overrides any ambient `LANG`/`LC_*`. Path bytes are emitted
+    // verbatim regardless of locale, so this does not alter mined ranges.
+    command.env("LC_ALL", "C");
     command.arg("--no-replace-objects").arg("-C").arg(repo);
     command.args(args);
     command
