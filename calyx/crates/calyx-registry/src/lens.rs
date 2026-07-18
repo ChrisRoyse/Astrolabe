@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use calyx_aster::compression_lifecycle::GenerationLifecycleRecord;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
     Asymmetry, CalyxError, Clock, CxId, Input, Lens, LensId, Result, RuntimeExecutionAttestation,
-    Slot, SlotShape, SlotVector, SparseEntry,
+    Seq, Slot, SlotShape, SlotVector, SparseEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +14,8 @@ mod contract;
 pub use contract::validate_quant_policy_for_shape;
 
 use crate::compression::{
-    self, CompressedSlotIndex, CompressionQuery, MxFp4AssayEvidence, SlotCompressionReport,
+    self, CompressedSlotIndex, CompressionQuery, GenerationDeleteReport, MxFp4AssayEvidence,
+    SlotCompressionReport,
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
@@ -295,6 +297,70 @@ impl Registry {
     {
         let spec = self.compression_spec(slot)?;
         compression::write_compressed_slot_batch(vault, slot, spec, rows, queries, k)
+    }
+
+    /// Adds new rows to a manifested compressed generation, resealing the whole
+    /// column under a fresh generation root (`AppendReseal`, issue #562).
+    pub fn append_reseal_compressed_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        new_rows: &[(CxId, Vec<f32>)],
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::append_reseal_compressed_rows(vault, slot, spec, new_rows, queries, k)
+    }
+
+    /// Removes a strict subset of a manifested generation's rows, resealing the
+    /// survivors (`EraseReseal`, issue #562).
+    pub fn erase_compressed_slot_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        erase_ids: &[CxId],
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::erase_compressed_slot_rows(vault, slot, spec, erase_ids, queries, k)
+    }
+
+    /// Removes an entire compressed generation — manifest, primary rows, and raw
+    /// sidecars — in one coordinated, ledgered batch (`DeleteGeneration`, #562).
+    pub fn delete_compressed_generation<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+    ) -> Result<GenerationDeleteReport>
+    where
+        C: Clock,
+    {
+        // Validate the slot's lens is registered before mutating its generation.
+        let _spec = self.compression_spec(slot)?;
+        compression::delete_compressed_generation(vault, slot)
+    }
+
+    /// Reads back the append-only generation lifecycle records for a slot at
+    /// `at_seq`, in ascending `prior_seq` order (issue #562).
+    pub fn generation_lifecycle<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        at_seq: Seq,
+    ) -> Result<Vec<GenerationLifecycleRecord>>
+    where
+        C: Clock,
+    {
+        let _spec = self.compression_spec(slot)?;
+        compression::generation_lifecycle(vault, slot, at_seq)
     }
 
     /// Compresses the complete raw slot column persisted by a streaming ingest
