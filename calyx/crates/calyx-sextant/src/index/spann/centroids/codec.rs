@@ -38,9 +38,38 @@ pub(super) fn decode_centroids(bytes: &[u8]) -> Result<SpannCentroidIndex> {
         return Err(corrupt(format!("format_version {version}")));
     }
     let dim = read_u32(bytes, &mut cursor)?;
-    let centroid_count = read_u64(bytes, &mut cursor)? as usize;
-    let offset_count = read_u64(bytes, &mut cursor)? as usize;
-    let assignment_count = read_u64(bytes, &mut cursor)? as usize;
+    let centroid_count = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| corrupt("centroid count exceeds usize"))?;
+    let offset_count = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| corrupt("centroid offset count exceeds usize"))?;
+    let assignment_count = usize::try_from(read_u64(bytes, &mut cursor)?)
+        .map_err(|_| corrupt("centroid assignment count exceeds usize"))?;
+    let centroid_values = centroid_count
+        .checked_mul(dim as usize)
+        .ok_or_else(|| corrupt("centroid value count overflow"))?;
+    let expected_len = 40_usize
+        .checked_add(
+            centroid_values
+                .checked_mul(4)
+                .ok_or_else(|| corrupt("centroid byte count overflow"))?,
+        )
+        .and_then(|len| {
+            offset_count
+                .checked_mul(8)
+                .and_then(|bytes| len.checked_add(bytes))
+        })
+        .and_then(|len| {
+            assignment_count
+                .checked_mul(8)
+                .and_then(|bytes| len.checked_add(bytes))
+        })
+        .ok_or_else(|| corrupt("centroid file length overflow"))?;
+    if expected_len != bytes.len() {
+        return Err(corrupt(format!(
+            "centroid counts require exactly {expected_len} bytes but file has {}",
+            bytes.len()
+        )));
+    }
     let mut centroids = Vec::with_capacity(centroid_count);
     for _ in 0..centroid_count {
         let mut centroid = Vec::with_capacity(dim as usize);

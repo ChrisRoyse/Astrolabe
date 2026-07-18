@@ -5,7 +5,7 @@ mod raw_l2_graph;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write as _};
+use std::io::{BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CxId, Result, SlotId, SlotVector};
@@ -27,6 +27,7 @@ const FORMAT_VERSION: u32 = 1;
 const KMEANS_ITERS: usize = 12;
 const RAW_L2_GRAPH_EF_FLOOR: usize = 128;
 const CENTROID_SLOT: SlotId = SlotId::new(u16::MAX - 1);
+const DEFAULT_MAX_CENTROID_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SpannCentroidIndex {
@@ -102,6 +103,31 @@ impl SpannCentroidIndex {
 
     pub fn assignments(&self) -> &[(u32, u32)] {
         &self.assignments
+    }
+
+    /// Canonical identity of the centroid geometry and persisted assignment
+    /// contract. Posting generations seal this value so lists can never be
+    /// opened against a different trained router.
+    pub fn content_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"calyx-spann-centroids-v1");
+        hasher.update(&self.dim.to_le_bytes());
+        hasher.update(&(self.centroids.len() as u64).to_le_bytes());
+        for centroid in &self.centroids {
+            for value in centroid {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+        }
+        hasher.update(&(self.posting_list_offsets.len() as u64).to_le_bytes());
+        for offset in &self.posting_list_offsets {
+            hasher.update(&offset.to_le_bytes());
+        }
+        hasher.update(&(self.assignments.len() as u64).to_le_bytes());
+        for (vector_id, centroid_id) in &self.assignments {
+            hasher.update(&vector_id.to_le_bytes());
+            hasher.update(&centroid_id.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
     }
 
     pub fn assignment(&self, vector_id: u32) -> Option<u32> {
@@ -214,15 +240,66 @@ impl SpannCentroidIndex {
             .map_err(|e| io("flush centroid tmp", e.into_error()))?;
         file.sync_all().map_err(|e| io("fsync centroid tmp", e))?;
         drop(file);
-        fs::rename(&tmp, path).map_err(|e| io("publish centroids", e))
+        let expected_hash = self.content_hash();
+        let staged = Self::open_from_path_with_max_bytes(&tmp, DEFAULT_MAX_CENTROID_FILE_BYTES)?;
+        if staged.content_hash() != expected_hash {
+            return Err(corrupt(format!(
+                "staged centroid readback {} changed content identity",
+                tmp.display()
+            )));
+        }
+        move_file_write_through(&tmp, path, path.exists())?;
+        let published = Self::open_from_path_with_max_bytes(path, DEFAULT_MAX_CENTROID_FILE_BYTES)?;
+        if published.content_hash() != expected_hash {
+            return Err(corrupt(format!(
+                "published centroid readback {} changed content identity",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     pub fn open(slot_sparse_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_from_path(slot_sparse_dir.as_ref().join("centroids.spn"))
+        Self::open_with_max_bytes(slot_sparse_dir, DEFAULT_MAX_CENTROID_FILE_BYTES)
+    }
+
+    pub fn open_with_max_bytes(
+        slot_sparse_dir: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_from_path_with_max_bytes(
+            slot_sparse_dir.as_ref().join("centroids.spn"),
+            max_file_bytes,
+        )
     }
 
     pub fn open_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = fs::read(path.as_ref()).map_err(|e| io("read centroids", e))?;
+        Self::open_from_path_with_max_bytes(path, DEFAULT_MAX_CENTROID_FILE_BYTES)
+    }
+
+    pub fn open_from_path_with_max_bytes(
+        path: impl AsRef<Path>,
+        max_file_bytes: u64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        if max_file_bytes < 40 {
+            return Err(invalid(format!(
+                "centroid file registry limit {max_file_bytes} is below the 40-byte header"
+            )));
+        }
+        let mut file = File::open(path).map_err(|e| io("open centroids", e))?;
+        let file_len = file.metadata().map_err(|e| io("stat centroids", e))?.len();
+        if file_len > max_file_bytes {
+            return Err(corrupt(format!(
+                "centroid file {} length {file_len} exceeds registry limit {max_file_bytes}",
+                path.display()
+            )));
+        }
+        let len =
+            usize::try_from(file_len).map_err(|_| corrupt("centroid file length exceeds usize"))?;
+        let mut bytes = vec![0_u8; len];
+        file.read_exact(&mut bytes)
+            .map_err(|e| io("read centroids", e))?;
         decode_centroids(&bytes)
     }
 }
@@ -466,4 +543,46 @@ fn corrupt(detail: impl std::fmt::Display) -> calyx_core::CalyxError {
 
 fn io(stage: &str, error: std::io::Error) -> calyx_core::CalyxError {
     sextant_error(CALYX_INDEX_IO, format!("spann centroids {stage}: {error}"))
+}
+
+#[cfg(windows)]
+fn move_file_write_through(source: &Path, target: &Path, replace: bool) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    // SAFETY: both UTF-16 buffers are NUL-terminated and alive for the call.
+    if unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) } == 0 {
+        return Err(io(
+            "publish centroids with MoveFileExW",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn move_file_write_through(source: &Path, target: &Path, replace: bool) -> Result<()> {
+    if !replace && target.exists() {
+        return Err(corrupt(format!(
+            "immutable centroid target already exists: {}",
+            target.display()
+        )));
+    }
+    fs::rename(source, target).map_err(|error| io("publish centroids", error))
 }

@@ -65,8 +65,11 @@ pub use quant_config::{
     PackedQuery, PackedVector, QuantConfig, QuantKind, SEXTANT_QUANT_LAYOUT_VERSION, score_packed,
 };
 pub use spann::{
-    PostingListReader, PostingListWriter, PostingMember, SPANN_CENTROID_MAGIC, SpannCentroidIndex,
-    SpannSearch, build_centroids,
+    PostingListReader, PostingListWriter, PostingMember, SPANN_ACTIVE_MAGIC, SPANN_CENTROID_MAGIC,
+    SPANN_MANIFEST_MAGIC, SPANN_POSTING_FORMAT_VERSION, SPANN_POSTING_SEGMENT_MAGIC,
+    SPANN_STATE_SEGMENT_MAGIC, SpannCentroidIndex, SpannDistanceMetric, SpannIndexIdentity,
+    SpannPostingLimits, SpannPostingPhysicalStats, SpannPostingWriteReceipt, SpannSearch,
+    build_centroids, decode_posting_block, encode_posting_block,
 };
 pub use testutil::{SyntheticVault, build_synthetic_vault, synthetic_dense_rows};
 pub use vecfile::{DenseVectorFile, FbinVectors, I8BinVectors, I32BinMatrix, VEC_MAGIC};

@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CxId, Result, SlotId};
+use calyx_core::{CxId, Result, SlotId, SlotVector, SparseEntry};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::index::{
-    DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, PostingListWriter, SpannSearch,
+    DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, SextantIndex, SpannSearch,
     build_centroids,
 };
 
@@ -59,10 +59,25 @@ pub fn build_synthetic_vault(
     let centroids = build_centroids(&local_rows, centroid_count, seed);
     let sparse_dir = vault_path.join("idx/slot_00.sparse");
     centroids.save(&sparse_dir)?;
-    write_postings(&sparse_dir, &centroids, &local_rows)?;
-    let spann = SpannSearch::new(SlotId::new(0), centroids, sparse_dir)
-        .with_cx_map(rows.iter().map(|(cx, _)| *cx).collect())
-        .with_default_n_probe(8);
+    let mut spann =
+        SpannSearch::new(SlotId::new(0), centroids, sparse_dir)?.with_default_n_probe(8)?;
+    for (seq, (cx_id, vector)) in rows.iter().enumerate() {
+        spann.insert(
+            *cx_id,
+            SlotVector::Sparse {
+                dim: dim as u32,
+                entries: vector
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, val)| SparseEntry {
+                        idx: idx as u32,
+                        val: *val,
+                    })
+                    .collect(),
+            },
+            seq as u64,
+        )?;
+    }
     Ok(SyntheticVault {
         root: vault_path.to_path_buf(),
         rows,
@@ -108,38 +123,6 @@ fn search_params(n: usize) -> DiskAnnSearchParams {
         rescore_k: n.max(64),
         rescore_from_raw: false,
     }
-}
-
-fn write_postings(
-    sparse_dir: &Path,
-    centroids: &crate::index::SpannCentroidIndex,
-    rows: &[(u32, Vec<f32>)],
-) -> Result<()> {
-    let writer = PostingListWriter::new(sparse_dir);
-    for centroid_id in 0..centroids.centroid_count() as u32 {
-        let mut entries = centroids
-            .assignments()
-            .iter()
-            .filter(|(_, assigned)| *assigned == centroid_id)
-            .map(|(local_id, _)| {
-                crate::index::PostingMember::new(*local_id, dense_to_sparse(rows, *local_id))
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|m| m.cx_id);
-        writer.write_list(centroid_id, &entries)?;
-    }
-    Ok(())
-}
-
-/// Posting members store the full member vector (#701) so SPANN search ranks by
-/// true query distance. Test fixtures are dense, so store every dim as an (idx,val).
-fn dense_to_sparse(rows: &[(u32, Vec<f32>)], local_id: u32) -> Vec<(u32, f32)> {
-    rows[local_id as usize]
-        .1
-        .iter()
-        .enumerate()
-        .map(|(idx, val)| (idx as u32, *val))
-        .collect()
 }
 
 fn validate_fixture_args(n_cx: usize, dim: usize, n_slots: usize) -> Result<()> {
