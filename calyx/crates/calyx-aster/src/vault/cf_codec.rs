@@ -1,7 +1,54 @@
 use crate::cf::{ColumnFamily, SlotFamilyKind};
 use calyx_core::{CalyxError, Result, SlotId};
 
-pub(super) fn cf_tag(cf: ColumnFamily) -> u8 {
+use super::cursor::Cursor;
+
+const CF_FIXED: u8 = 0;
+const CF_SLOT_QUANTIZED: u8 = 1;
+const CF_SLOT_RAW: u8 = 2;
+
+pub(super) fn encode_cf_v2(cf: ColumnFamily, out: &mut Vec<u8>) {
+    match cf {
+        ColumnFamily::Slot { slot, kind } => {
+            out.push(match kind {
+                SlotFamilyKind::Quantized => CF_SLOT_QUANTIZED,
+                SlotFamilyKind::Raw => CF_SLOT_RAW,
+            });
+            out.extend_from_slice(&slot.get().to_be_bytes());
+        }
+        fixed => {
+            out.push(CF_FIXED);
+            out.extend_from_slice(&u16::from(fixed_cf_tag(fixed)).to_be_bytes());
+        }
+    }
+}
+
+pub(super) fn decode_cf_v2(cursor: &mut Cursor<'_>) -> Result<ColumnFamily> {
+    let kind = cursor.u8()?;
+    let value = cursor.u16()?;
+    match kind {
+        CF_FIXED => {
+            let tag = u8::try_from(value).map_err(|_| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "CXLWAL2 fixed column-family tag {value} exceeds u8"
+                ))
+            })?;
+            if (16..=111).contains(&tag) {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "CXLWAL2 fixed column-family tag {tag} overlaps the legacy slot range; slots require an explicit family kind and u16 id"
+                )));
+            }
+            decode_fixed_cf(tag)
+        }
+        CF_SLOT_QUANTIZED => Ok(ColumnFamily::slot(SlotId::new(value))),
+        CF_SLOT_RAW => Ok(ColumnFamily::slot_raw(SlotId::new(value))),
+        other => Err(CalyxError::aster_corrupt_shard(format!(
+            "CXLWAL2 column-family kind {other} is invalid"
+        ))),
+    }
+}
+
+fn fixed_cf_tag(cf: ColumnFamily) -> u8 {
     match cf {
         ColumnFamily::Base => 0,
         ColumnFamily::Collections => 117,
@@ -37,17 +84,11 @@ pub(super) fn cf_tag(cf: ColumnFamily) -> u8 {
         ColumnFamily::Kernel => 127,
         ColumnFamily::Guard => 128,
         ColumnFamily::Compression => 129,
-        ColumnFamily::Slot { slot, kind } => {
-            let base = match kind {
-                SlotFamilyKind::Quantized => 16,
-                SlotFamilyKind::Raw => 64,
-            };
-            base + slot.get() as u8
-        }
+        ColumnFamily::Slot { .. } => unreachable!("slot CFs use the explicit CXLWAL2 family kind"),
     }
 }
 
-pub(super) fn decode_cf(tag: u8) -> Result<ColumnFamily> {
+fn decode_fixed_cf(tag: u8) -> Result<ColumnFamily> {
     Ok(match tag {
         0 => ColumnFamily::Base,
         117 => ColumnFamily::Collections,
@@ -83,11 +124,9 @@ pub(super) fn decode_cf(tag: u8) -> Result<ColumnFamily> {
         127 => ColumnFamily::Kernel,
         128 => ColumnFamily::Guard,
         129 => ColumnFamily::Compression,
-        16..=63 => ColumnFamily::slot(SlotId::new((tag - 16) as u16)),
-        64..=111 => ColumnFamily::slot_raw(SlotId::new((tag - 64) as u16)),
         _ => {
             return Err(CalyxError::aster_corrupt_shard(format!(
-                "unknown CF tag {tag}"
+                "unknown CXLWAL2 fixed column-family tag {tag}"
             )));
         }
     })

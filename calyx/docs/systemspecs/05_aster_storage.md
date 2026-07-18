@@ -99,6 +99,13 @@ derives the max commit-domain seq of its inputs
 | `HEADER_LEN` | 20 | Bytes of fixed header per record. |
 | `MAX_RECORD_BYTES` | `64 * 1024 * 1024` | Hard cap on one payload; `encode` rejects larger. |
 
+Every new record payload starts with `CXLWAL2\0` and binds each row's column
+family as `kind(u8) + value(u16)`: fixed CF, quantized slot, or raw slot. This
+preserves every `u16` slot id without the legacy one-byte quantized/raw range
+collision. Legacy unversioned payloads fail closed with
+`CALYX_ASTER_WAL_PAYLOAD_LEGACY`: their slot ids/families cannot be recovered
+without external format-specific knowledge, so they are never reinterpreted.
+
 On-disk record layout:
 
 | Offset | Size | Field | Encoding |
@@ -732,6 +739,7 @@ requires `kind == Inverted` and a `Text` field type (`index_for`).
 | Where | Constant | Value |
 |---|---|---|
 | WAL record | `MAGIC` | `b"CXW1"` (LE u32) |
+| WAL batch payload | `WRITE_BATCH_MAGIC_V2` | `b"CXLWAL2\0"` |
 | WAL record | header / max payload | 20 bytes / 64 MiB |
 | WAL segment | default max bytes | 64 MiB |
 | WAL group commit | window | 2 ms (hard cap) |

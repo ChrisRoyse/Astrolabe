@@ -3277,8 +3277,15 @@ A record is **Torn** (and the tail truncated) on: partial header (`<20` bytes,
 non-zero), bad magic, `len > MAX_RECORD_BYTES`, partial payload (UnexpectedEof),
 or CRC mismatch. `Eof` is a clean 0-byte read at a record boundary.
 
-The WAL payload is a `WriteRow` batch (`vault/encode.rs` `encode_write_batch`):
-`be_u32(row_count)` then per row `cf_tag(u8) ‖ be_u32(key_len) ‖ key ‖ be_u32(value_len) ‖ value`.
+The WAL payload is a versioned `WriteRow` batch (`vault/encode.rs`
+`encode_write_batch`): `"CXLWAL2\0" ‖ be_u32(row_count)`, then per row
+`cf_kind(u8) ‖ cf_value(be_u16) ‖ be_u32(key_len) ‖ key ‖ be_u32(value_len) ‖ value`.
+`cf_kind` is fixed / quantized-slot / raw-slot; slot ids therefore retain the
+full `u16` and the two slot families cannot alias. Legacy unversioned payloads
+fail `CALYX_ASTER_WAL_PAYLOAD_LEGACY`: their one-byte tag both truncated slot
+ids and overlapped raw/quantized families, so no general decoder can identify
+committed state without external format-specific knowledge. Counts, truncation,
+invalid kinds, and trailing bytes are checked before allocation/restoration.
 
 ### 2.2 Segments (`wal/segment.rs`)
 
@@ -11535,7 +11542,7 @@ and env gates.
 
 | Artifact | Magic | Version |
 |---|---|---|
-| WAL record stream | `CXW1` | header v1 (20-byte) |
+| WAL record stream / payload | `CXW1` / `CXLWAL2` | 20-byte record header / versioned CF-safe write batch |
 | SSTable | `CXS1` | **VERSION 2** (legacy 1 still readable) |
 | Arrow column chunk | `CXA1` | VERSION 1 |
 | Vault manifest | (JSON) | `ManifestVersion{major=1, minor=0}` |

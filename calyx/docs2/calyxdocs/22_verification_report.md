@@ -115,7 +115,7 @@ and env gates.
 
 | Artifact | Magic | Version |
 |---|---|---|
-| WAL record stream | `CXW1` | header v1 (20-byte) |
+| WAL record stream / payload | `CXW1` / `CXLWAL2` | 20-byte record header / versioned CF-safe write batch |
 | SSTable | `CXS1` | **VERSION 2** (legacy 1 still readable) |
 | Arrow column chunk | `CXA1` | VERSION 1 |
 | Vault manifest | (JSON) | `ManifestVersion{major=1, minor=0}` |
