@@ -68,6 +68,7 @@ pub(crate) fn attest_candle_cuda_device(
     attest_pinned_cuda_dependencies()
 }
 
+#[cfg(feature = "ml-runtime")]
 pub(crate) fn forge_runtime_boundary_error(error: calyx_forge::ForgeError) -> CalyxError {
     match error {
         calyx_forge::ForgeError::RuntimeBoundary {

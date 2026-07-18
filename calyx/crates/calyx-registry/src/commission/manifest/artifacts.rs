@@ -1,7 +1,9 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::path::Component;
+use std::sync::Arc;
 
+use super::super::frozen_snapshot::FrozenArtifactSnapshot;
 use crate::fastembed_execution::{canonical_fastembed_execution, is_in_process_fastembed_runtime};
 use crate::identity::{FastembedNamedArtifactDigest, fastembed_named_weights_sha256};
 
@@ -12,28 +14,26 @@ pub(super) fn read_and_verify_files(
     let mut files = Vec::with_capacity(manifest.files.len());
     for file in ordered_manifest_files(&manifest.files) {
         let path = resolve_manifest_path(base_dir, &file.path);
-        let actual = plain_sha256_file(&path)?;
-        if !hex_eq(&actual.sha256, &file.sha256) {
-            return Err(CalyxError::lens_frozen_violation(format!(
-                "lensforge artifact {} sha256 {} != manifest {}",
-                path.display(),
-                actual.sha256,
-                file.sha256
-            )));
-        }
-        if file.bytes != 0 && file.bytes != actual.bytes {
+        // Acquire one immutable, write-denied snapshot up front. The expected
+        // digest is verified against these snapshot bytes before any downstream
+        // stage derives metadata or hashes the artifact set, and every later
+        // view reads the same snapshot rather than reopening `path` (#524).
+        let snapshot = Arc::new(FrozenArtifactSnapshot::acquire(&path)?);
+        snapshot.verify_expected_hex(&file.sha256)?;
+        let actual_bytes = snapshot.len();
+        if file.bytes != 0 && file.bytes != actual_bytes {
             return Err(config_invalid(format!(
                 "lensforge artifact {} byte count {} != manifest {}",
                 path.display(),
-                actual.bytes,
+                actual_bytes,
                 file.bytes
             )));
         }
         files.push(VerifiedFile {
             role: file.role.clone(),
             path,
-            sha256: actual.sha256,
-            bytes: actual.bytes,
+            sha256: snapshot.sha256_hex(),
+            snapshot,
         });
     }
     Ok(files)
@@ -381,104 +381,21 @@ fn resolve_manifest_path(base_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-struct FileDigest {
-    sha256: String,
-    bytes: u64,
-}
-
-fn plain_sha256_file(path: &Path) -> Result<FileDigest> {
-    let file = fs::File::open(path).map_err(|err| {
-        config_invalid(format!(
-            "open lensforge artifact {} for hashing failed: {err}",
-            path.display()
-        ))
-    })?;
-    let metadata = file.metadata().map_err(|err| {
-        config_invalid(format!(
-            "stat lensforge artifact {} for hashing failed: {err}",
-            path.display()
-        ))
-    })?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; STREAM_HASH_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer).map_err(|err| {
-            config_invalid(format!(
-                "read lensforge artifact {} while hashing failed: {err}",
-                path.display()
-            ))
-        })?;
-        if read == 0 {
-            let digest: [u8; 32] = hasher.finalize().into();
-            return Ok(FileDigest {
-                sha256: hex_from_bytes(&digest),
-                bytes: metadata.len(),
-            });
-        }
-        hasher.update(&buffer[..read]);
-    }
-}
-
 fn artifact_set_sha256_hex(files: &[&VerifiedFile]) -> Result<String> {
     let mut contract = LengthDelimitedSha256::new();
-    let mut buffer = vec![0_u8; STREAM_HASH_BUFFER_BYTES];
     for file in files {
-        hash_verified_file_into(file, &mut contract, &mut buffer)?;
+        hash_verified_file_into(file, &mut contract);
     }
     Ok(hex_from_bytes(&contract.finalize()))
 }
 
-fn hash_verified_file_into(
-    file: &VerifiedFile,
-    contract: &mut LengthDelimitedSha256,
-    buffer: &mut [u8],
-) -> Result<()> {
-    let handle = fs::File::open(&file.path).map_err(|err| {
-        config_invalid(format!(
-            "open lensforge artifact {} for artifact_set hashing failed: {err}",
-            file.path.display()
-        ))
-    })?;
-    let metadata = handle.metadata().map_err(|err| {
-        config_invalid(format!(
-            "stat lensforge artifact {} for artifact_set hashing failed: {err}",
-            file.path.display()
-        ))
-    })?;
-    if metadata.len() != file.bytes {
-        return Err(config_invalid(format!(
-            "lensforge artifact {} byte count changed from {} to {} while hashing artifact_set",
-            file.path.display(),
-            file.bytes,
-            metadata.len()
-        )));
-    }
-    contract.begin_part(file.bytes);
-    let mut plain = Sha256::new();
-    let mut reader = BufReader::new(handle);
-    loop {
-        let read = reader.read(buffer).map_err(|err| {
-            config_invalid(format!(
-                "read lensforge artifact {} while hashing artifact_set failed: {err}",
-                file.path.display()
-            ))
-        })?;
-        if read == 0 {
-            let digest: [u8; 32] = plain.finalize().into();
-            let actual = hex_from_bytes(&digest);
-            if !hex_eq(&actual, &file.sha256) {
-                return Err(CalyxError::lens_frozen_violation(format!(
-                    "lensforge artifact {} sha256 changed from {} to {} while hashing artifact_set",
-                    file.path.display(),
-                    file.sha256,
-                    actual
-                )));
-            }
-            return Ok(());
-        }
-        let chunk = &buffer[..read];
-        plain.update(chunk);
-        contract.update_chunk(chunk);
-    }
+/// Folds one artifact into the length-delimited artifact-set hash directly from
+/// its immutable snapshot. The snapshot is the same byte set whose digest was
+/// verified against the manifest in `read_and_verify_files`, so there is no
+/// reopen, re-stat, or re-hash race to detect here (#524): the frozen digest
+/// and the artifact-set hash provably fold the same bytes.
+fn hash_verified_file_into(file: &VerifiedFile, contract: &mut LengthDelimitedSha256) {
+    let bytes = file.snapshot.bytes();
+    contract.begin_part(bytes.len() as u64);
+    contract.update_chunk(bytes);
 }
