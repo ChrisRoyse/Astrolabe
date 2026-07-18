@@ -246,7 +246,7 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
     let provisional_routing = match distance_metric {
         PartitionDistanceMetric::RawL2 if use_routed_assign => AssignmentRouting::RawL2Graph,
         PartitionDistanceMetric::RawL2 => AssignmentRouting::Exact,
-        PartitionDistanceMetric::UnitL2 if use_routed_assign => AssignmentRouting::Hnsw,
+        PartitionDistanceMetric::UnitL2 if use_routed_assign => AssignmentRouting::UnitCosineHnsw,
         PartitionDistanceMetric::UnitL2 => AssignmentRouting::Exact,
     };
     let provisional = stream_assign_to_ids_with_routing(
@@ -283,7 +283,7 @@ pub fn build_partitioned_vault_from_source_with_backend_and_metric(
     let final_routing = match distance_metric {
         PartitionDistanceMetric::RawL2 if use_final_routed_assign => AssignmentRouting::RawL2Graph,
         PartitionDistanceMetric::RawL2 => AssignmentRouting::Exact,
-        PartitionDistanceMetric::UnitL2 => AssignmentRouting::Hnsw,
+        PartitionDistanceMetric::UnitL2 => AssignmentRouting::UnitCosineHnsw,
     };
     let (region_ids, closure_stats) = stream_assign_to_ids_bounded(
         root,

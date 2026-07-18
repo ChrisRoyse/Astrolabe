@@ -122,9 +122,9 @@ impl PartitionedSearch {
             });
         }
         let mut regions = match self.manifest.distance_metric {
-            PartitionDistanceMetric::UnitL2 => {
-                self.centroids.nearest_centroids(query, n_probe.max(1))
-            }
+            PartitionDistanceMetric::UnitL2 => self
+                .centroids
+                .nearest_centroids_unit_cosine_hnsw(query, n_probe.max(1)),
             PartitionDistanceMetric::RawL2 => self
                 .centroids
                 .nearest_centroids_exact_l2(query, n_probe.max(1)),

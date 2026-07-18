@@ -23,7 +23,7 @@ pub(super) struct AssignmentRegion {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum AssignmentRouting {
     Exact,
-    Hnsw,
+    UnitCosineHnsw,
     RawL2Graph,
 }
 
@@ -31,7 +31,7 @@ impl AssignmentRouting {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact-l2",
-            Self::Hnsw => "hnsw",
+            Self::UnitCosineHnsw => "unit-cosine-hnsw",
             Self::RawL2Graph => "raw-l2-graph",
         }
     }
@@ -85,7 +85,7 @@ pub(super) fn stream_assign_to_ids_with_routing(
                 let row = source.row(idx);
                 let region = match routing {
                     AssignmentRouting::Exact => centroids.assign(&row)?,
-                    AssignmentRouting::Hnsw => centroids.assign_hnsw(&row)?,
+                    AssignmentRouting::UnitCosineHnsw => centroids.assign_unit_cosine_hnsw(&row)?,
                     AssignmentRouting::RawL2Graph => centroids.assign_raw_l2_graph(&row)?,
                 };
                 Ok((idx, region))
@@ -166,7 +166,9 @@ pub(super) fn stream_assign_to_ids_bounded(
                     AssignmentRouting::Exact => {
                         centroids.nearest_centroids_exact_l2(&row, probe)?
                     }
-                    AssignmentRouting::Hnsw => centroids.nearest_centroids(&row, probe)?,
+                    AssignmentRouting::UnitCosineHnsw => {
+                        centroids.nearest_centroids_unit_cosine_hnsw(&row, probe)?
+                    }
                     AssignmentRouting::RawL2Graph => {
                         centroids.nearest_centroids_raw_l2_graph(&row, probe)?
                     }

@@ -150,8 +150,8 @@ impl SpannCentroidIndex {
     /// makes the assignment phase O(N*R*dim) ~ quadratic in N; routing through the
     /// HNSW keeps it O(N*log R*dim). Any routing error or incomplete result is
     /// returned to the caller; assignment never substitutes another route.
-    pub fn assign_hnsw(&self, vector: &[f32]) -> Result<u32> {
-        self.nearest_centroids(vector, 1)?
+    pub fn assign_unit_cosine_hnsw(&self, vector: &[f32]) -> Result<u32> {
+        self.nearest_centroids_unit_cosine_hnsw(vector, 1)?
             .first()
             .copied()
             .ok_or_else(|| corrupt("HNSW centroid routing returned no region"))
@@ -167,7 +167,14 @@ impl SpannCentroidIndex {
             .ok_or_else(|| corrupt("raw squared-L2 centroid routing returned no region"))
     }
 
-    pub fn nearest_centroids(&self, query: &[f32], n_probe: usize) -> Result<Vec<u32>> {
+    /// Routes through the cosine-scored HNSW layer. Callers must have declared
+    /// UnitL2/cosine geometry; raw squared-L2 SPANN routes use
+    /// `nearest_centroids_raw_l2_graph` instead.
+    pub fn nearest_centroids_unit_cosine_hnsw(
+        &self,
+        query: &[f32],
+        n_probe: usize,
+    ) -> Result<Vec<u32>> {
         let k = self.validate_route_request(query, n_probe)?;
         let query = SlotVector::Dense {
             dim: self.dim,

@@ -355,7 +355,7 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
     fs::create_dir_all(root).map_err(|error| io_error("create routing edge store", error))?;
     let query = dense_known(0, 0);
     let centroids = build_known_centroids();
-    let mut expected = centroids
+    let mut expected_squared_l2 = centroids
         .centroids()
         .iter()
         .enumerate()
@@ -371,12 +371,44 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
             (centroid_id as u32, distance)
         })
         .collect::<Vec<_>>();
-    expected.sort_by(|left, right| {
+    expected_squared_l2.sort_by(|left, right| {
         left.1
             .total_cmp(&right.1)
             .then_with(|| left.0.cmp(&right.0))
     });
-    let expected = expected
+    let expected_squared_l2 = expected_squared_l2
+        .into_iter()
+        .take(2)
+        .map(|(centroid_id, _)| centroid_id)
+        .collect::<Vec<_>>();
+    let mut expected_unit_cosine = centroids
+        .centroids()
+        .iter()
+        .enumerate()
+        .map(|(centroid_id, centroid)| {
+            let mut dot = 0.0_f32;
+            let mut query_norm = 0.0_f32;
+            let mut centroid_norm = 0.0_f32;
+            for (left, right) in centroid.iter().zip(&query) {
+                dot += left * right;
+                query_norm += right * right;
+                centroid_norm += left * left;
+            }
+            let similarity = if query_norm == 0.0 || centroid_norm == 0.0 {
+                0.0
+            } else {
+                dot / (query_norm.sqrt() * centroid_norm.sqrt())
+            };
+            (centroid_id as u32, similarity)
+        })
+        .collect::<Vec<_>>();
+    expected_unit_cosine.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let expected_unit_cosine = expected_unit_cosine
         .into_iter()
         .take(2)
         .map(|(centroid_id, _)| centroid_id)
@@ -387,20 +419,24 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
             "query": query,
             "centroids": centroids.centroids(),
             "n_probe": 2,
-            "expected_squared_l2_order": expected,
+            "expected_squared_l2_order": expected_squared_l2,
+            "expected_unit_cosine_order": expected_unit_cosine,
         }),
     )?;
     let before = filesystem_state(root)?;
     let exact = centroids.nearest_centroids_exact_l2(&query, 2)?;
-    let hnsw = centroids.nearest_centroids(&query, 2)?;
+    let unit_cosine_hnsw = centroids.nearest_centroids_unit_cosine_hnsw(&query, 2)?;
     let raw_l2_graph = centroids.nearest_centroids_raw_l2_graph(&query, 2)?;
-    if exact != expected || hnsw != expected || raw_l2_graph != expected {
+    if exact != expected_squared_l2
+        || raw_l2_graph != expected_squared_l2
+        || unit_cosine_hnsw != expected_unit_cosine
+    {
         return Err(driver_error(
-            "valid centroid routes differ from the known squared-L2 result",
+            "valid centroid routes differ from their independently calculated declared metrics",
         ));
     }
     let wrong_dim = centroids
-        .nearest_centroids(&query[..query.len() - 1], 1)
+        .nearest_centroids_unit_cosine_hnsw(&query[..query.len() - 1], 1)
         .expect_err("wrong-dimension route must fail closed");
     let zero_probe = centroids
         .nearest_centroids_exact_l2(&query, 0)
@@ -422,9 +458,10 @@ fn routing_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
         "before": before,
         "after": after,
         "valid": {
-            "expected_squared_l2_order": expected,
+            "expected_squared_l2_order": expected_squared_l2,
+            "expected_unit_cosine_order": expected_unit_cosine,
             "exact": exact,
-            "hnsw": hnsw,
+            "unit_cosine_hnsw": unit_cosine_hnsw,
             "raw_l2_graph": raw_l2_graph,
         },
         "errors": {
