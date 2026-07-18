@@ -99,7 +99,10 @@ pub fn legal_default() -> PanelTemplate {
         registry(
             "general_semantic",
             "semantic-bge-small-en-v1-5",
-            SlotShape::Dense(768),
+            // BGE-small-en-v1.5 emits 384-d embeddings (fastembed roster /
+            // EMBEDDER_ROSTER_REPORT), not 768 — declaring 768 persisted a
+            // contract that never matches the frozen runtime output (#489).
+            SlotShape::Dense(384),
             Modality::Text,
         ),
         registry(
@@ -138,7 +141,10 @@ pub fn medical_default() -> PanelTemplate {
         registry(
             "general_semantic",
             "semantic-bge-small-en-v1-5",
-            SlotShape::Dense(768),
+            // BGE-small-en-v1.5 emits 384-d embeddings (fastembed roster /
+            // EMBEDDER_ROSTER_REPORT), not 768 — declaring 768 persisted a
+            // contract that never matches the frozen runtime output (#489).
+            SlotShape::Dense(384),
             Modality::Text,
         ),
         registry(
@@ -178,7 +184,10 @@ pub fn bio_default() -> PanelTemplate {
         registry(
             "general_semantic",
             "semantic-bge-small-en-v1-5",
-            SlotShape::Dense(768),
+            // BGE-small-en-v1.5 emits 384-d embeddings (fastembed roster /
+            // EMBEDDER_ROSTER_REPORT), not 768 — declaring 768 persisted a
+            // contract that never matches the frozen runtime output (#489).
+            SlotShape::Dense(384),
             Modality::Text,
         ),
     ];

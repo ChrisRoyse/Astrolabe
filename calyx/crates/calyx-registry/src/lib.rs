@@ -48,7 +48,7 @@ pub use commission::{
     lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
     onnx_int8_attestation_from_manifest_path, register_commissioned,
-    verify_manifest_onnx_int8_attestation,
+    reject_declaration_only_learned_lens, verify_manifest_onnx_int8_attestation,
 };
 #[cfg(feature = "ml-runtime")]
 pub use commission::{
@@ -74,7 +74,8 @@ pub use identity::CANDLE_BERT_EXECUTION_REVISION;
 pub use ingest_microbatch::{
     DEFAULT_INGEST_MICROBATCH_CAP_BYTES, INGEST_MICROBATCH_INPUT_OVERHEAD_BYTES, IngestLensOutcome,
     IngestLensOutcomeStatus, IngestMicrobatchConfig, IngestMicrobatchController,
-    IngestMicrobatchPermit, IngestMicrobatchStats, IngestPanelReadout, estimate_microbatch_bytes,
+    IngestMicrobatchPermit, IngestMicrobatchStats, IngestPanelReadout, LensFailurePolicy,
+    estimate_microbatch_bytes,
 };
 pub use lens::{
     DeterminismProof, DualMeasurement, FrozenLensSnapshot, Registry, RegistryLensSnapshot,

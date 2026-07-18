@@ -1,11 +1,9 @@
 use std::fs;
-use std::path::PathBuf;
 
-use calyx_core::{Asymmetry, CalyxError, Input, Lens, LensId, Modality, SlotShape, SlotVector};
-use calyx_registry::frozen::sha256_digest;
+use calyx_core::{Asymmetry, CalyxError, Input, Lens, LensId, Modality, SlotShape};
 use calyx_registry::{
-    AlgorithmicLens, CapabilityCard, FrozenLensContract, LensDType, LensRuntime, LensSpec,
-    NormPolicy, ProfileProbe, Registry, TeiHttpLens, profile_lens,
+    AlgorithmicLens, CapabilityCard, FrozenLensContract, LensRuntime, LensSpec, ProfileProbe,
+    Registry, TeiHttpLens, profile_lens,
 };
 use serde_json::Value;
 
@@ -27,7 +25,6 @@ pub(super) struct BuiltLens {
 enum BuiltRuntime {
     Algorithmic(AlgorithmicLens, FrozenLensContract),
     Tei(TeiHttpLens, FrozenLensContract),
-    Declared(DeclaredLens, FrozenLensContract),
 }
 
 impl BuiltLens {
@@ -39,9 +36,6 @@ impl BuiltLens {
             BuiltRuntime::Tei(lens, contract) => {
                 registry.register_frozen_with_spec(lens, contract, self.spec)
             }
-            BuiltRuntime::Declared(lens, contract) => {
-                registry.register_frozen_with_spec(lens, contract, self.spec)
-            }
         }
     }
 }
@@ -50,19 +44,24 @@ pub(super) fn build_lens(
     name: &str,
     runtime: &str,
     endpoint: Option<&str>,
-    weights: Option<&str>,
+    _weights: Option<&str>,
     shape: Option<&str>,
     modality: Option<&str>,
 ) -> ToolResult<BuiltLens> {
     validate_path_safe("lens name", name)?;
     let modality = parse_modality(modality)?;
-    match runtime.replace('_', "-").as_str() {
+    let runtime_key = runtime.replace('_', "-");
+    // #523: a declaration-only learned Candle/ONNX request would synthesize
+    // device/dtype/pooling/artifact-hash/dimension metadata and register a lens
+    // whose runtime is permanently unreachable. Refuse it before any vault,
+    // panel, registry, or ledger mutation; the verified path is `lens commission`.
+    calyx_registry::reject_declaration_only_learned_lens(&runtime_key)?;
+    match runtime_key.as_str() {
         "algorithmic" => build_algorithmic_lens(name, DEFAULT_ALGORITHMIC_KIND, shape, modality),
         "tei-http" => build_tei_lens(name, endpoint, shape, modality),
-        "onnx" => build_declared_lens(name, "onnx", endpoint, weights, shape, modality),
-        "candle" => build_declared_lens(name, "candle", endpoint, weights, shape, modality),
         other => Err(ToolError::invalid_params(format!(
-            "unknown runtime {other}; expected tei-http, onnx, candle, or algorithmic"
+            "unknown runtime {other}; expected tei-http or algorithmic (learned onnx/candle lenses \
+             must be commissioned into a verified manifest via `calyx lens commission`, not declared)"
         ))),
     }
 }
@@ -154,45 +153,6 @@ fn build_tei_lens(
     })
 }
 
-fn build_declared_lens(
-    name: &str,
-    runtime: &str,
-    endpoint: Option<&str>,
-    weights: Option<&str>,
-    shape: Option<&str>,
-    modality: Modality,
-) -> ToolResult<BuiltLens> {
-    let output = shape
-        .map(parse_shape)
-        .transpose()?
-        .unwrap_or(SlotShape::Dense(768));
-    let weights_hash = weights_hash(weights, runtime, endpoint)?;
-    let contract = FrozenLensContract::new(
-        name,
-        weights_hash,
-        sha256_digest(&[runtime.as_bytes(), endpoint.unwrap_or("").as_bytes()]),
-        output,
-        modality,
-        LensDType::F32,
-        NormPolicy::finite_only(),
-    );
-    let spec = spec_from_contract(
-        name,
-        declared_runtime(runtime, endpoint, weights)?,
-        &contract,
-    );
-    let lens = DeclaredLens {
-        id: contract.lens_id(),
-        shape: output,
-        modality,
-    };
-    Ok(BuiltLens {
-        lens_id: contract.lens_id(),
-        spec,
-        runtime: BuiltRuntime::Declared(lens, contract),
-    })
-}
-
 fn parse_modality(value: Option<&str>) -> ToolResult<Modality> {
     match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
         "text" => Ok(Modality::Text),
@@ -205,28 +165,6 @@ fn parse_modality(value: Option<&str>) -> ToolResult<Modality> {
         other => Err(ToolError::invalid_params(format!(
             "unknown modality {other}; expected text, code, image, audio, video, structured, or mixed"
         ))),
-    }
-}
-
-fn declared_runtime(
-    runtime: &str,
-    endpoint: Option<&str>,
-    weights: Option<&str>,
-) -> ToolResult<LensRuntime> {
-    let files = weights.into_iter().map(PathBuf::from).collect();
-    match runtime {
-        "candle" => Ok(LensRuntime::CandleLocal {
-            model_id: endpoint.unwrap_or("declared-candle").to_string(),
-            files,
-            device: "cpu".to_string(),
-            dtype: "f32".to_string(),
-            pooling: "mean".to_string(),
-        }),
-        "onnx" => Ok(LensRuntime::Onnx {
-            model_id: endpoint.unwrap_or("declared-onnx").to_string(),
-            files,
-        }),
-        _ => unreachable!("runtime already validated"),
     }
 }
 
@@ -279,50 +217,6 @@ fn dense_dim(shape: SlotShape) -> ToolResult<u32> {
             "runtime requires dense output, got {other:?}"
         ))
         .into()),
-    }
-}
-
-fn weights_hash(
-    weights: Option<&str>,
-    runtime: &str,
-    endpoint: Option<&str>,
-) -> ToolResult<[u8; 32]> {
-    if let Some(path) = weights {
-        let bytes = fs::read(path)
-            .map_err(|err| CalyxError::lens_unreachable(format!("read weights failed: {err}")))?;
-        return Ok(sha256_digest(&[&bytes]));
-    }
-    Ok(sha256_digest(&[
-        runtime.as_bytes(),
-        endpoint.unwrap_or("").as_bytes(),
-    ]))
-}
-
-#[derive(Debug)]
-struct DeclaredLens {
-    id: LensId,
-    shape: SlotShape,
-    modality: Modality,
-}
-
-impl Lens for DeclaredLens {
-    fn id(&self) -> LensId {
-        self.id
-    }
-
-    fn shape(&self) -> SlotShape {
-        self.shape
-    }
-
-    fn modality(&self) -> Modality {
-        self.modality
-    }
-
-    fn measure(&self, _input: &Input) -> calyx_core::Result<SlotVector> {
-        Err(CalyxError::lens_unreachable(format!(
-            "lens {} is declared but its runtime is unavailable in this process",
-            self.id
-        )))
     }
 }
 
