@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CxId, Result, SlotId};
+use calyx_forge::{QuantLevel, QuantizedVec, RotationSeed, SeedId, TURBOQUANT_FORMAT_HEADER_BYTES};
 
 use super::{HNSW_MAX_DIM, HnswIndex, Row};
 use crate::error::{
@@ -23,7 +24,7 @@ use crate::index::quant_config::{
 };
 
 pub const HNSW_ARTIFACT_MAGIC: [u8; 8] = *b"CLXHNSW1";
-pub const HNSW_ARTIFACT_VERSION: u16 = 1;
+pub const HNSW_ARTIFACT_VERSION: u16 = 2;
 const DIGEST_BYTES: usize = 32;
 const NO_ENTRY: u64 = u64::MAX;
 const ROW_FIXED_BYTES: usize = 16 + 8 + 1 + 1 + 4;
@@ -36,6 +37,8 @@ pub struct HnswArtifactExpectation {
     pub slot: SlotId,
     pub dim: u32,
     pub quant_kind: QuantKind,
+    /// Exact TurboQuant geometry, or all zeroes for non-seeded codecs.
+    pub quant_geometry_id: SeedId,
     pub base_seq: u64,
 }
 
@@ -45,6 +48,7 @@ pub struct HnswArtifactMetadata {
     pub version: u16,
     pub quant_layout_version: u8,
     pub quant_kind: QuantKind,
+    pub quant_geometry_id: SeedId,
     pub slot: SlotId,
     pub dim: u32,
     pub seed: u64,
@@ -98,6 +102,11 @@ impl HnswIndex {
                     body.extend_from_slice(codes);
                 }
                 PackedVector::Binary { bits, .. } => body.extend_from_slice(bits),
+                PackedVector::TurboQuant { candidate } => {
+                    let quantized = candidate.quantized();
+                    put_u32(&mut body, quantized.scale.to_bits());
+                    body.extend_from_slice(&quantized.bytes);
+                }
             }
             for neighbor in &row.neighbors {
                 put_u32(
@@ -123,6 +132,15 @@ impl HnswIndex {
         put_u32(&mut bytes, self.quant.scale().to_bits());
         bytes.push(self.quant.zero_point() as u8);
         bytes.extend_from_slice(&[0_u8; 3]);
+        if let Some(seed) = self.quant.turbo_seed() {
+            bytes.push(seed.version);
+            bytes.extend_from_slice(&[0_u8; 3]);
+            bytes.extend_from_slice(&seed.id);
+            bytes.extend_from_slice(&seed.entropy);
+            bytes.extend_from_slice(&self.quant.geometry_id());
+        } else {
+            bytes.extend_from_slice(&[0_u8; 100]);
+        }
         put_u64(&mut bytes, row_count);
         put_u64(
             &mut bytes,
@@ -147,17 +165,20 @@ impl HnswIndex {
         if header.slot != expected.slot
             || header.dim != expected.dim
             || header.quant_kind != expected.quant_kind
+            || header.geometry_id != expected.quant_geometry_id
         {
             return Err(sextant_error(
                 CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED,
                 format!(
-                    "HNSW artifact identity slot={}/dim={}/codec={:?} does not match expected slot={}/dim={}/codec={:?}",
+                    "HNSW artifact identity slot={}/dim={}/codec={:?}/geometry={:02x?} does not match expected slot={}/dim={}/codec={:?}/geometry={:02x?}",
                     header.slot.get(),
                     header.dim,
                     header.quant_kind,
+                    header.geometry_id,
                     expected.slot.get(),
                     expected.dim,
-                    expected.quant_kind
+                    expected.quant_kind,
+                    expected.quant_geometry_id
                 ),
             ));
         }
@@ -174,6 +195,26 @@ impl HnswIndex {
             QuantKind::None => QuantConfig::none(),
             QuantKind::Scalar8 => QuantConfig::scalar8(f32::from_bits(header.scale_bits)),
             QuantKind::Binary => QuantConfig::binary(),
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                let seed = RotationSeed {
+                    id: header.seed_id,
+                    version: header.seed_version,
+                    dim: header.dim as usize,
+                    entropy: header.seed_entropy,
+                };
+                let level = header.quant_kind.turboquant_level().ok_or_else(|| {
+                    corrupt("TurboQuant artifact tag has no exact fractional level")
+                })?;
+                let config = QuantConfig::turboquant_structured(seed, level).map_err(|error| {
+                    corrupt(format!("TurboQuant codec reconstruction failed: {error}"))
+                })?;
+                if config.geometry_id() != header.geometry_id {
+                    return Err(corrupt(
+                        "TurboQuant artifact geometry does not match its frozen seed/level",
+                    ));
+                }
+                config
+            }
         };
         if quant.zero_point() != header.zero_point {
             return Err(corrupt("artifact zero_point is non-canonical"));
@@ -239,6 +280,26 @@ impl HnswIndex {
                     bits: decoder.take((header.dim as usize).div_ceil(8))?.to_vec(),
                     dim: header.dim,
                 },
+                QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                    let level = header.quant_kind.turboquant_level().ok_or_else(|| {
+                        corrupt("TurboQuant artifact tag has no exact fractional level")
+                    })?;
+                    let payload_len = turboquant_payload_bytes(level, header.dim)?;
+                    let quantized = QuantizedVec {
+                        level,
+                        dim: header.dim as usize,
+                        scale: f32::from_bits(decoder.u32()?),
+                        seed_id: header.geometry_id,
+                        bytes: decoder.take(payload_len)?.to_vec(),
+                    };
+                    let codec = quant.turbo_codec().ok_or_else(|| {
+                        corrupt("TurboQuant artifact codec was not reconstructed")
+                    })?;
+                    let candidate = codec.validate_owned_candidate(quantized).map_err(|error| {
+                        corrupt(format!("invalid TurboQuant row {ordinal}: {error}"))
+                    })?;
+                    PackedVector::TurboQuant { candidate }
+                }
             };
             let mut neighbors = Vec::new();
             neighbors
@@ -302,6 +363,7 @@ impl HnswIndex {
             version: HNSW_ARTIFACT_VERSION,
             quant_layout_version: SEXTANT_QUANT_LAYOUT_VERSION,
             quant_kind: header.quant_kind,
+            quant_geometry_id: header.geometry_id,
             slot: header.slot,
             dim: header.dim,
             seed: header.seed,
@@ -412,6 +474,7 @@ impl HnswIndex {
             slot: self.slot,
             dim: self.dim,
             quant_kind: self.quant.kind(),
+            quant_geometry_id: self.quant.geometry_id(),
             base_seq: self.base_seq,
         }
     }
@@ -481,6 +544,10 @@ struct Header {
     built_at_seq: u64,
     scale_bits: u32,
     zero_point: i8,
+    seed_version: u8,
+    seed_id: SeedId,
+    seed_entropy: SeedId,
+    geometry_id: SeedId,
     row_count: u64,
     entry_point: u64,
     packed_vector_bytes: u64,
@@ -542,6 +609,22 @@ fn decode_envelope(bytes: &[u8]) -> Result<(Header, &[u8], [u8; DIGEST_BYTES])> 
     if decoder.array::<3>()? != [0_u8; 3] {
         return Err(corrupt("artifact reserved header bytes are nonzero"));
     }
+    let seed_version = decoder.u8()?;
+    if decoder.array::<3>()? != [0_u8; 3] {
+        return Err(corrupt("artifact TurboQuant reserved bytes are nonzero"));
+    }
+    let seed_id = decoder.array::<32>()?;
+    let seed_entropy = decoder.array::<32>()?;
+    let geometry_id = decoder.array::<32>()?;
+    let has_turbo_identity = seed_version != 0
+        || seed_id != [0_u8; 32]
+        || seed_entropy != [0_u8; 32]
+        || geometry_id != [0_u8; 32];
+    if quant_kind.turboquant_level().is_some() != has_turbo_identity {
+        return Err(corrupt(
+            "artifact codec tag and TurboQuant geometry identity disagree",
+        ));
+    }
     let row_count = decoder.u64()?;
     let entry_point = decoder.u64()?;
     let packed_vector_bytes = decoder.u64()?;
@@ -565,6 +648,10 @@ fn decode_envelope(bytes: &[u8]) -> Result<(Header, &[u8], [u8; DIGEST_BYTES])> 
             built_at_seq,
             scale_bits,
             zero_point,
+            seed_version,
+            seed_id,
+            seed_entropy,
+            geometry_id,
             row_count,
             entry_point,
             packed_vector_bytes,
@@ -623,6 +710,33 @@ fn validate_stored(row: &Row, ordinal: usize, dim: u32, quant: &QuantConfig) -> 
                 )));
             }
         }
+        (
+            PackedVector::TurboQuant { candidate },
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5,
+        ) => {
+            let quantized = candidate.quantized();
+            let level = quant.kind().turboquant_level().ok_or_else(|| {
+                corrupt(format!("row {ordinal} TurboQuant codec has no exact level"))
+            })?;
+            if quantized.dim != dim as usize
+                || quantized.level != level
+                || quantized.seed_id != quant.geometry_id()
+            {
+                return Err(corrupt(format!(
+                    "row {ordinal} TurboQuant shape/level/geometry does not match its index codec"
+                )));
+            }
+            let codec = quant.turbo_codec().ok_or_else(|| {
+                corrupt(format!(
+                    "row {ordinal} TurboQuant codec geometry is missing"
+                ))
+            })?;
+            codec.storage(quantized).map_err(|error| {
+                corrupt(format!(
+                    "row {ordinal} TurboQuant payload is invalid: {error}"
+                ))
+            })?;
+        }
         _ => {
             return Err(corrupt(format!(
                 "row {ordinal} packed kind does not match index codec {:?}",
@@ -643,6 +757,14 @@ fn vector_body_bytes(kind: QuantKind, dim: u32) -> Result<usize> {
             .checked_add(4)
             .ok_or_else(|| corrupt("Scalar8 artifact row size overflow")),
         QuantKind::Binary => Ok(dim.div_ceil(8)),
+        QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+            let level = kind
+                .turboquant_level()
+                .ok_or_else(|| corrupt("TurboQuant artifact tag has no exact fractional level"))?;
+            turboquant_payload_bytes(level, dim as u32)?
+                .checked_add(4)
+                .ok_or_else(|| corrupt("TurboQuant artifact row size overflow"))
+        }
     }
 }
 
@@ -651,6 +773,8 @@ fn quant_tag(kind: QuantKind) -> u8 {
         QuantKind::None => 0,
         QuantKind::Scalar8 => 1,
         QuantKind::Binary => 2,
+        QuantKind::TurboQuant2p5 => 3,
+        QuantKind::TurboQuant3p5 => 4,
     }
 }
 
@@ -659,11 +783,40 @@ fn quant_from_tag(tag: u8) -> Result<QuantKind> {
         0 => Ok(QuantKind::None),
         1 => Ok(QuantKind::Scalar8),
         2 => Ok(QuantKind::Binary),
+        3 => Ok(QuantKind::TurboQuant2p5),
+        4 => Ok(QuantKind::TurboQuant3p5),
         _ => Err(sextant_error(
             CALYX_SEXTANT_HNSW_ARTIFACT_UNSUPPORTED,
             format!("HNSW artifact quantizer tag {tag} is unsupported"),
         )),
     }
+}
+
+fn turboquant_payload_bytes(level: QuantLevel, dim: u32) -> Result<usize> {
+    let dim = dim as usize;
+    let (low, high) = match level {
+        QuantLevel::Bits2p5 => (2_usize, 3_usize),
+        QuantLevel::Bits3p5 => (3_usize, 4_usize),
+        _ => {
+            return Err(corrupt(format!(
+                "unsupported TurboQuant artifact level {level}"
+            )));
+        }
+    };
+    let high_count = dim.div_ceil(2);
+    let low_count = dim / 2;
+    let scalar_bits = high_count
+        .checked_mul(high)
+        .and_then(|value| {
+            low_count
+                .checked_mul(low)
+                .and_then(|low_bits| value.checked_add(low_bits))
+        })
+        .ok_or_else(|| corrupt("TurboQuant scalar bit count overflow"))?;
+    TURBOQUANT_FORMAT_HEADER_BYTES
+        .checked_add(scalar_bits.div_ceil(8))
+        .and_then(|value| value.checked_add(dim.div_ceil(8)))
+        .ok_or_else(|| corrupt("TurboQuant payload length overflow"))
 }
 
 fn read_all(path: &Path) -> Result<Vec<u8>> {

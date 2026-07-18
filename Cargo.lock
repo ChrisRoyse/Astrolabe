@@ -503,6 +503,7 @@ dependencies = [
  "calyx-anneal",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-paths",
  "calyx-ward",
  "memmap2",
@@ -512,6 +513,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "windows-sys",
  "zeroize",
  "zstd",
 ]

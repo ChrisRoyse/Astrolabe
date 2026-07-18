@@ -1,29 +1,28 @@
-//! Per-slot quantization policy and physically packed row storage for Sextant
-//! indexes.
+//! Per-slot quantization policy and physically packed row storage for Sextant.
 //!
-//! A configured quantizer changes the bytes an index actually holds and the
-//! kernel that scores candidates — inert configuration is impossible. The
-//! versioned in-memory layout (`SEXTANT_QUANT_LAYOUT_VERSION` = 1) is:
+//! A configured quantizer changes both resident bytes and the scoring kernel.
+//! The versioned layout (`SEXTANT_QUANT_LAYOUT_VERSION` = 2) is:
 //!
-//! - `None`   — exact `f32` values, 4 bytes/channel.
-//! - `Scalar8`— one signed 8-bit code per channel (`(v/scale).round()` clamped
-//!   to `[-127, 127]`), 1 byte/channel, plus two `f32` metadata fields (the
-//!   frozen scale and the dequantized L2 norm). No `f32` approximation is
-//!   retained; scoring reads the codes directly.
-//! - `Binary` — one physical bit per sign (bit set iff `v >= 0.0`, LSB-first
-//!   within each byte), `ceil(dim/8)` bytes. Scoring is XOR + popcount over
-//!   the packed words; no `f32` approximation is retained.
-//!
-//! The former `QuantizedVector { bytes, approx }` shape — one byte per binary
-//! sign plus a retained full-`f32` approximation — was removed under #553.
+//! - `None`: exact `f32`, four bytes/channel.
+//! - `Scalar8`: one signed byte/channel plus frozen scale and row norm.
+//! - `Binary`: one sign bit/channel plus the declared dimension.
+//! - `TurboQuant{2p5,3p5}`: one canonical TQPR-v2 payload plus its source
+//!   norm, validated once at insertion/open. Search uses one prepared
+//!   structured-Hadamard LUT/QJL query and never decodes or rehashes rows.
 
-use calyx_core::Result;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use calyx_core::{CalyxError, Result};
+use calyx_forge::{
+    QuantLevel, Quantizer, RotationSeed, SeedId, TurboQuantCodec, TurboQuantOwnedCandidate,
+    TurboQuantPreparedQuery,
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::error::{CALYX_SEXTANT_VECTOR_SHAPE, sextant_error};
 
 /// Version of the packed per-row quantized layout documented in this module.
-pub const SEXTANT_QUANT_LAYOUT_VERSION: u8 = 1;
+pub const SEXTANT_QUANT_LAYOUT_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,39 +30,160 @@ pub enum QuantKind {
     None,
     Scalar8,
     Binary,
+    TurboQuant2p5,
+    TurboQuant3p5,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+impl QuantKind {
+    /// Exact TurboQuant level represented by this codec kind, if any.
+    pub const fn turboquant_level(self) -> Option<QuantLevel> {
+        match self {
+            Self::TurboQuant2p5 => Some(QuantLevel::Bits2p5),
+            Self::TurboQuant3p5 => Some(QuantLevel::Bits3p5),
+            Self::None | Self::Scalar8 | Self::Binary => None,
+        }
+    }
+
+    /// Integer storage-budget ceiling used by Anneal's existing index knob.
+    /// Exact fractional width remains bound by the codec tag and TQPR header.
+    pub const fn quant_bits_ceiling(self) -> u8 {
+        match self {
+            Self::None => 32,
+            Self::Scalar8 => 8,
+            Self::Binary => 1,
+            Self::TurboQuant2p5 => 3,
+            Self::TurboQuant3p5 => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct QuantConfig {
     kind: QuantKind,
     scale: f32,
     zero_point: i8,
-    #[serde(skip, default)]
+    turbo_seed: Option<RotationSeed>,
+    turbo_geometry_id: SeedId,
+    turbo_codec: Option<Arc<TurboQuantCodec>>,
     locked: bool,
 }
 
-/// Physically packed per-row storage (layout v1, see module docs).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Deserialize, Serialize)]
+struct QuantConfigWire {
+    kind: QuantKind,
+    scale: f32,
+    zero_point: i8,
+    #[serde(default)]
+    turbo_seed: Option<RotationSeed>,
+    #[serde(default)]
+    turbo_geometry_id: SeedId,
+}
+
+impl PartialEq for QuantConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.scale.to_bits() == other.scale.to_bits()
+            && self.zero_point == other.zero_point
+            && self.turbo_seed == other.turbo_seed
+            && self.turbo_geometry_id == other.turbo_geometry_id
+            && self.locked == other.locked
+    }
+}
+
+impl Serialize for QuantConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        QuantConfigWire {
+            kind: self.kind,
+            scale: self.scale,
+            zero_point: self.zero_point,
+            turbo_seed: self.turbo_seed.clone(),
+            turbo_geometry_id: self.turbo_geometry_id,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for QuantConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = QuantConfigWire::deserialize(deserializer)?;
+        let config = match wire.kind {
+            QuantKind::None => Self::none(),
+            QuantKind::Scalar8 => Self::scalar8(wire.scale),
+            QuantKind::Binary => Self::binary(),
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                let seed = wire.turbo_seed.clone().ok_or_else(|| {
+                    de::Error::custom("TurboQuant config is missing its frozen rotation seed")
+                })?;
+                let level = wire.kind.turboquant_level().ok_or_else(|| {
+                    de::Error::custom("TurboQuant config has no exact fractional level")
+                })?;
+                let config = Self::turboquant_structured(seed, level)
+                    .map_err(|error| de::Error::custom(error.to_string()))?;
+                if wire.turbo_geometry_id != config.turbo_geometry_id {
+                    return Err(de::Error::custom(
+                        "TurboQuant config geometry identity does not match its frozen seed",
+                    ));
+                }
+                config
+            }
+        };
+        if config.scale.to_bits() != wire.scale.to_bits()
+            || config.zero_point != wire.zero_point
+            || (!matches!(
+                wire.kind,
+                QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5
+            ) && (wire.turbo_seed.is_some() || wire.turbo_geometry_id != [0_u8; 32]))
+        {
+            return Err(de::Error::custom(
+                "quantization config contains non-canonical codec metadata",
+            ));
+        }
+        Ok(config)
+    }
+}
+
+/// Physically packed per-row storage (layout v2, see module docs).
+#[derive(Clone, Debug, PartialEq)]
 pub enum PackedVector {
-    /// Exact unquantized values.
-    F32 { values: Vec<f32> },
-    /// Signed 8-bit codes with frozen scale and precomputed dequantized norm.
+    F32 {
+        values: Vec<f32>,
+    },
     Scalar8 {
         codes: Vec<u8>,
         scale: f32,
         norm: f32,
     },
-    /// One bit per sign, LSB-first; `dim` disambiguates trailing padding.
-    Binary { bits: Vec<u8>, dim: u32 },
+    Binary {
+        bits: Vec<u8>,
+        dim: u32,
+    },
+    TurboQuant {
+        candidate: TurboQuantOwnedCandidate,
+    },
 }
 
 /// Query prepared once per search for direct packed-row scoring.
 #[derive(Clone, Debug)]
 pub enum PackedQuery {
-    /// Raw query values plus precomputed L2 norm (used for `None`/`Scalar8`).
-    F32 { values: Vec<f32>, norm: f32 },
-    /// Packed query sign bits (used for `Binary`).
-    Binary { bits: Vec<u8>, dim: u32 },
+    F32 {
+        values: Vec<f32>,
+        norm: f32,
+    },
+    Binary {
+        bits: Vec<u8>,
+        dim: u32,
+    },
+    TurboQuant {
+        codec: Arc<TurboQuantCodec>,
+        prepared: TurboQuantPreparedQuery,
+        norm: f32,
+    },
 }
 
 impl QuantConfig {
@@ -72,6 +192,9 @@ impl QuantConfig {
             kind: QuantKind::None,
             scale: 1.0,
             zero_point: 0,
+            turbo_seed: None,
+            turbo_geometry_id: [0_u8; 32],
+            turbo_codec: None,
             locked: false,
         }
     }
@@ -81,6 +204,9 @@ impl QuantConfig {
             kind: QuantKind::Scalar8,
             scale,
             zero_point: 0,
+            turbo_seed: None,
+            turbo_geometry_id: [0_u8; 32],
+            turbo_codec: None,
             locked: false,
         }
     }
@@ -90,8 +216,35 @@ impl QuantConfig {
             kind: QuantKind::Binary,
             scale: 1.0,
             zero_point: 0,
+            turbo_seed: None,
+            turbo_geometry_id: [0_u8; 32],
+            turbo_codec: None,
             locked: false,
         }
+    }
+
+    /// Builds a reusable bit-exact structured TurboQuant codec for one index.
+    pub fn turboquant_structured(seed: RotationSeed, level: QuantLevel) -> Result<Self> {
+        let kind = match level {
+            QuantLevel::Bits2p5 => QuantKind::TurboQuant2p5,
+            QuantLevel::Bits3p5 => QuantKind::TurboQuant3p5,
+            _ => {
+                return Err(sextant_error(
+                    CALYX_SEXTANT_VECTOR_SHAPE,
+                    format!("Sextant TurboQuant supports only Bits2p5/Bits3p5, not {level}"),
+                ));
+            }
+        };
+        let codec = TurboQuantCodec::shared_structured(seed.clone(), level).map_err(forge_error)?;
+        Ok(Self {
+            kind,
+            scale: 1.0,
+            zero_point: 0,
+            turbo_seed: Some(seed),
+            turbo_geometry_id: codec.geometry_id(),
+            turbo_codec: Some(codec),
+            locked: false,
+        })
     }
 
     pub const fn kind(&self) -> QuantKind {
@@ -106,22 +259,71 @@ impl QuantConfig {
         self.zero_point
     }
 
-    /// Validates the frozen codec identity before any row is accepted.
+    /// Frozen geometry identity; zero for codecs without seeded geometry.
+    pub const fn geometry_id(&self) -> SeedId {
+        self.turbo_geometry_id
+    }
+
+    /// Frozen structured TurboQuant seed, if this is a TurboQuant config.
+    pub fn turbo_seed(&self) -> Option<&RotationSeed> {
+        self.turbo_seed.as_ref()
+    }
+
+    pub(crate) fn turbo_codec(&self) -> Option<&Arc<TurboQuantCodec>> {
+        self.turbo_codec.as_ref()
+    }
+
+    /// Shared codec geometry heap bytes owned by this index configuration.
+    pub fn geometry_physical_bytes(&self) -> usize {
+        self.turbo_codec
+            .as_ref()
+            .map_or(0, |codec| codec.geometry_physical_bytes())
+    }
+
+    /// Validates the complete frozen codec identity before accepting a row.
     pub fn validate(&self) -> Result<()> {
         let canonical = match self.kind {
             QuantKind::None | QuantKind::Binary => {
-                self.scale.to_bits() == 1.0_f32.to_bits() && self.zero_point == 0
+                self.scale.to_bits() == 1.0_f32.to_bits()
+                    && self.zero_point == 0
+                    && self.turbo_seed.is_none()
+                    && self.turbo_geometry_id == [0_u8; 32]
+                    && self.turbo_codec.is_none()
             }
             QuantKind::Scalar8 => {
-                self.scale.is_finite() && self.scale > 0.0 && self.zero_point == 0
+                self.scale.is_finite()
+                    && self.scale > 0.0
+                    && self.zero_point == 0
+                    && self.turbo_seed.is_none()
+                    && self.turbo_geometry_id == [0_u8; 32]
+                    && self.turbo_codec.is_none()
+            }
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                let Some(seed) = self.turbo_seed.as_ref() else {
+                    return Err(sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        "TurboQuant config is missing its frozen structured seed",
+                    ));
+                };
+                let Some(codec) = self.turbo_codec.as_ref() else {
+                    return Err(sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        "TurboQuant config is missing its live shared codec geometry",
+                    ));
+                };
+                seed.dim == codec.dim()
+                    && Some(codec.level()) == self.kind.turboquant_level()
+                    && codec.geometry_id() == self.turbo_geometry_id
+                    && self.scale.to_bits() == 1.0_f32.to_bits()
+                    && self.zero_point == 0
             }
         };
         if !canonical {
             return Err(sextant_error(
                 CALYX_SEXTANT_VECTOR_SHAPE,
                 format!(
-                    "non-canonical {:?} quantization config: scale={} zero_point={}",
-                    self.kind, self.scale, self.zero_point
+                    "non-canonical {:?} quantization config: scale={} zero_point={} geometry={:02x?}",
+                    self.kind, self.scale, self.zero_point, self.turbo_geometry_id
                 ),
             ));
         }
@@ -136,25 +338,24 @@ impl QuantConfig {
         self.locked
     }
 
-    /// Packs raw values into the physical row representation for this policy.
-    pub fn pack(&self, values: &[f32]) -> PackedVector {
-        match self.kind {
+    /// Packs one finite raw row into this index's physical representation.
+    pub fn pack(&self, values: &[f32]) -> Result<PackedVector> {
+        let packed = match self.kind {
             QuantKind::None => PackedVector::F32 {
                 values: values.to_vec(),
             },
             QuantKind::Scalar8 => {
-                let scale = self.scale.max(1e-6);
                 let mut codes = Vec::with_capacity(values.len());
                 let mut norm_sq = 0.0_f64;
                 for value in values {
-                    let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                    let code = (value / self.scale).round().clamp(-127.0, 127.0) as i8;
                     codes.push(code as u8);
-                    let dequantized = f64::from(code) * f64::from(scale);
+                    let dequantized = f64::from(code) * f64::from(self.scale);
                     norm_sq += dequantized * dequantized;
                 }
                 PackedVector::Scalar8 {
                     codes,
-                    scale,
+                    scale: self.scale,
                     norm: norm_sq.sqrt() as f32,
                 }
             }
@@ -162,12 +363,26 @@ impl QuantConfig {
                 bits: pack_sign_bits(values),
                 dim: values.len() as u32,
             },
-        }
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                let codec = self.turbo_codec.as_ref().ok_or_else(|| {
+                    sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        "TurboQuant row packing requires the owning index codec",
+                    )
+                })?;
+                let quantized = codec.encode(values).map_err(forge_error)?;
+                let candidate = codec
+                    .validate_owned_candidate(quantized)
+                    .map_err(forge_error)?;
+                PackedVector::TurboQuant { candidate }
+            }
+        };
+        Ok(packed)
     }
 
     /// Prepares one query for repeated direct scoring against packed rows.
-    pub fn prepare_query(&self, values: &[f32]) -> PackedQuery {
-        match self.kind {
+    pub fn prepare_query(&self, values: &[f32]) -> Result<PackedQuery> {
+        let query = match self.kind {
             QuantKind::None | QuantKind::Scalar8 => PackedQuery::F32 {
                 values: values.to_vec(),
                 norm: l2_norm(values),
@@ -176,6 +391,58 @@ impl QuantConfig {
                 bits: pack_sign_bits(values),
                 dim: values.len() as u32,
             },
+            QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5 => {
+                let codec = self.turbo_codec.as_ref().ok_or_else(|| {
+                    sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        "TurboQuant query preparation requires the owning index codec",
+                    )
+                })?;
+                PackedQuery::TurboQuant {
+                    codec: Arc::clone(codec),
+                    prepared: codec.prepare_query(values).map_err(forge_error)?,
+                    norm: l2_norm(values),
+                }
+            }
+        };
+        Ok(query)
+    }
+
+    /// Reconstructs one row for explicit readback/reranking, never search.
+    pub fn approx_f32(&self, row: &PackedVector) -> Result<Vec<f32>> {
+        match (self.kind, row) {
+            (QuantKind::None, PackedVector::F32 { values }) => Ok(values.clone()),
+            (QuantKind::Scalar8, PackedVector::Scalar8 { codes, scale, .. }) => Ok(codes
+                .iter()
+                .map(|code| f32::from(*code as i8) * *scale)
+                .collect()),
+            (QuantKind::Binary, PackedVector::Binary { bits, dim }) => Ok((0..*dim as usize)
+                .map(|index| {
+                    if bits[index / 8] & (1 << (index % 8)) != 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect()),
+            (
+                QuantKind::TurboQuant2p5 | QuantKind::TurboQuant3p5,
+                PackedVector::TurboQuant { candidate },
+            ) => self
+                .turbo_codec
+                .as_ref()
+                .ok_or_else(|| {
+                    sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        "TurboQuant reconstruction requires the owning index codec",
+                    )
+                })?
+                .decode(candidate.quantized())
+                .map_err(forge_error),
+            _ => Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                "packed row kind does not match the owning QuantConfig",
+            )),
         }
     }
 
@@ -188,50 +455,27 @@ impl QuantConfig {
 }
 
 impl PackedVector {
-    /// Physical payload bytes actually held for this row (excluding the enum
-    /// discriminant and `Vec` bookkeeping).
+    /// Physical payload bytes held for this row, excluding Rust bookkeeping.
     pub fn physical_bytes(&self) -> usize {
         match self {
             Self::F32 { values } => values.len() * 4,
             Self::Scalar8 { codes, .. } => codes.len() + 8,
             Self::Binary { bits, .. } => bits.len() + 4,
+            Self::TurboQuant { candidate } => candidate.storage().payload_bytes + 4,
         }
     }
 
-    /// Number of channels this row represents.
+    /// Number of source channels represented by this row.
     pub fn dim(&self) -> usize {
         match self {
             Self::F32 { values } => values.len(),
             Self::Scalar8 { codes, .. } => codes.len(),
             Self::Binary { dim, .. } => *dim as usize,
+            Self::TurboQuant { candidate } => candidate.quantized().dim,
         }
     }
 
-    /// Reconstructs the representable approximation from the packed codes.
-    ///
-    /// This is a labeled reconstruction (exact only for `F32`); it is the
-    /// read-back/decode path, never the scoring path.
-    pub fn approx_f32(&self) -> Vec<f32> {
-        match self {
-            Self::F32 { values } => values.clone(),
-            Self::Scalar8 { codes, scale, .. } => codes
-                .iter()
-                .map(|code| f32::from(*code as i8) * *scale)
-                .collect(),
-            Self::Binary { bits, dim } => (0..*dim as usize)
-                .map(|index| {
-                    if bits[index / 8] & (1 << (index % 8)) != 0 {
-                        1.0
-                    } else {
-                        -1.0
-                    }
-                })
-                .collect(),
-        }
-    }
-
-    /// Stable byte identity of the packed representation, for exact-duplicate
-    /// fingerprinting in the quantized domain.
+    /// Stable packed-domain identity for exact-duplicate fingerprinting.
     pub fn identity_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self {
@@ -251,27 +495,24 @@ impl PackedVector {
                 bytes.extend_from_slice(&dim.to_le_bytes());
                 bytes.extend_from_slice(bits);
             }
+            Self::TurboQuant { candidate } => {
+                let quantized = candidate.quantized();
+                bytes.push(match quantized.level {
+                    QuantLevel::Bits2p5 => 3,
+                    QuantLevel::Bits3p5 => 4,
+                    _ => unreachable!("owned Sextant TurboQuant row has unsupported level"),
+                });
+                bytes.extend_from_slice(&quantized.scale.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&quantized.bytes);
+            }
         }
         bytes
     }
 }
 
-/// Scores one prepared query against one packed row on the packed
-/// representation directly — no candidate decode, no `f32` reconstruction.
-///
-/// - `F32` query vs `F32` row: exact cosine.
-/// - `F32` query vs `Scalar8` row: asymmetric cosine — the dot walks the
-///   signed codes once (`sum q[i]·code[i]`, scaled after the loop) against the
-///   precomputed dequantized row norm.
-/// - `Binary` query vs `Binary` row: XOR + popcount Hamming sign agreement,
-///   mapped to the cosine-like estimate `1 − 2·mismatches/dim`.
-///
-/// A kind pairing that the owning index cannot produce is refused fail-closed.
+/// Scores one prepared query against one packed row without candidate decode.
 pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
     match (query, row) {
-        // Exact cosine, computed identically to the historical unquantized
-        // path (bit-for-bit — weave's deterministic similarity plans depend
-        // on unchanged QuantKind::None scores).
         (PackedQuery::F32 { values, .. }, PackedVector::F32 { values: row_values }) => {
             Ok(crate::util::cosine(values, row_values))
         }
@@ -312,14 +553,31 @@ pub fn score_packed(query: &PackedQuery, row: &PackedVector) -> Result<f32> {
                 .sum();
             Ok(1.0 - 2.0 * mismatches as f32 / *dim as f32)
         }
+        (
+            PackedQuery::TurboQuant {
+                codec,
+                prepared,
+                norm,
+            },
+            PackedVector::TurboQuant { candidate },
+        ) => {
+            let candidate_norm = candidate.quantized().scale;
+            if *norm == 0.0 || candidate_norm == 0.0 {
+                return Ok(0.0);
+            }
+            let dot = codec
+                .dot_estimate_owned(prepared, candidate)
+                .map_err(forge_error)?;
+            Ok((f64::from(dot) / (f64::from(*norm) * f64::from(candidate_norm))) as f32)
+        }
         _ => Err(sextant_error(
             CALYX_SEXTANT_VECTOR_SHAPE,
-            "prepared query kind does not match the packed row kind; prepare queries through the owning index's QuantConfig",
+            "prepared query kind does not match the packed row kind; prepare through the owning QuantConfig",
         )),
     }
 }
 
-fn dim_mismatch(query: usize, row: usize) -> calyx_core::CalyxError {
+fn dim_mismatch(query: usize, row: usize) -> CalyxError {
     sextant_error(
         CALYX_SEXTANT_VECTOR_SHAPE,
         format!("packed scoring dimension mismatch: query={query} row={row}"),
@@ -342,4 +600,12 @@ fn l2_norm(values: &[f32]) -> f32 {
         .map(|value| f64::from(*value) * f64::from(*value))
         .sum::<f64>()
         .sqrt() as f32
+}
+
+fn forge_error(error: calyx_forge::ForgeError) -> CalyxError {
+    CalyxError {
+        code: error.code(),
+        message: error.to_string(),
+        remediation: "rebuild the exact packed index from finite authoritative vectors using the recorded current-version TurboQuant seed and geometry",
+    }
 }

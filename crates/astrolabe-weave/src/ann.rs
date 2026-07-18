@@ -353,8 +353,18 @@ fn dense_candidates(
         // receive raw values: Sextant owns packing and keeps no f32 copy.
         let approximations: Vec<Vec<f32>> = dense_inputs
             .iter()
-            .map(|data| quant.pack(data).approx_f32())
-            .collect();
+            .map(|data| {
+                let row = quant.pack(data)?;
+                quant.approx_f32(&row)
+            })
+            .collect::<calyx_core::Result<Vec<_>>>()
+            .map_err(|error| SimilarityPlanError::AnnCandidateFailure {
+                family,
+                message: format!(
+                    "exact scalar8 pool packing failed for dim {dim}: {} ({})",
+                    error.message, error.code
+                ),
+            })?;
         return Ok(exact_dense_candidates(
             &approximations,
             group,
@@ -393,7 +403,14 @@ fn hnsw_dense_candidates(
 ) -> Result<usize, SimilarityPlanError> {
     let ann_failure =
         |message: String| SimilarityPlanError::AnnCandidateFailure { family, message };
-    let mut index = HnswIndex::new(family.slot(), dim, config.seed).with_quant(quant);
+    let mut index = HnswIndex::new(family.slot(), dim, config.seed)
+        .with_quant(quant)
+        .map_err(|error| {
+            ann_failure(format!(
+                "hnsw quantizer setup failed for {family} dim {dim}: {} ({})",
+                error.message, error.code
+            ))
+        })?;
     for (ordinal, input) in dense_inputs.iter().enumerate() {
         index
             .insert(

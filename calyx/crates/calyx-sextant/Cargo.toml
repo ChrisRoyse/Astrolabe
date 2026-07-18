@@ -23,6 +23,7 @@ blake3.workspace = true
 calyx-anneal = { path = "../calyx-anneal" }
 calyx-aster = { path = "../calyx-aster" }
 calyx-core = { path = "../calyx-core" }
+calyx-forge = { path = "../calyx-forge" }
 calyx-paths = { path = "../calyx-paths" }
 calyx-ward = { path = "../calyx-ward" }
 memmap2.workspace = true
@@ -42,8 +43,10 @@ cuvs-sys = { workspace = true, optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
-calyx-forge = { path = "../calyx-forge" }
 calyx-ledger = { path = "../calyx-ledger" }
+sha2.workspace = true

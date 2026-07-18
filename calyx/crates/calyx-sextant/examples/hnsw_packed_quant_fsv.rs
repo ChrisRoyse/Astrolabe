@@ -21,7 +21,7 @@ use calyx_anneal::{
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{CalyxError, CxId, SlotId, SlotVector, SystemClock, VaultId};
-use calyx_forge::AutotuneCache;
+use calyx_forge::{AutotuneCache, QuantLevel, TURBOQUANT_FORMAT_HEADER_BYTES, new_seed};
 use calyx_ledger::{ActorId, LedgerAppender};
 use calyx_sextant::{
     CALYX_SEXTANT_HNSW_POINTER_CORRUPT, CALYX_SEXTANT_HNSW_POINTER_STALE,
@@ -30,6 +30,7 @@ use calyx_sextant::{
     HnswArtifactExpectation, HnswIndex, PackedQuery, PackedVector, QuantConfig, QuantKind,
     SEXTANT_QUANT_LAYOUT_VERSION, SextantIndex, score_packed,
 };
+use sha2::{Digest, Sha256};
 
 const DIM: usize = 128;
 const ROWS: usize = 200;
@@ -37,9 +38,10 @@ const QUERIES: usize = 8;
 const K: usize = 10;
 const SLOT: SlotId = SlotId::new(7);
 const BASE_SEQ: u64 = 777;
-const HEADER_BYTES: usize = 86;
+const HEADER_BYTES: usize = 186;
 const FOOTER_BYTES: usize = 32;
-const POINTER_HEADER_BYTES: usize = 112;
+const POINTER_HEADER_BYTES: usize = 144;
+const TURBOQUANT_SEED: &[u8] = b"calyx/sextant/hnsw/slot-7/turboquant/fsv-v1";
 const ANNEAL_VAULT_ID: &str = "01J00000000000000000000553";
 const ANNEAL_VAULT_SALT: &[u8] = b"calyx-553-anneal-fsv";
 
@@ -65,10 +67,23 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
     let run_dir = output_root.join(format!("hnsw-553-{}", std::process::id()));
     let before_exists = run_dir.exists();
     std::fs::create_dir_all(&run_dir)?;
+    let tree_sha = std::env::var("CALYX_FSV_TREE_SHA")
+        .map_err(|_| "CALYX_FSV_TREE_SHA must identify the exact committed source tree")?;
+    let current_exe = std::env::current_exe()?;
+    let executable_bytes = std::fs::read(&current_exe)?;
+    let preserved_executable = run_dir.join("hnsw_packed_quant_fsv.exe");
+    std::fs::copy(&current_exe, &preserved_executable)?;
     println!(
         "{{\"event\":\"source_of_truth\",\"path\":\"{}\",\"before_exists\":{},\"after_exists\":true,\"source\":\"persisted CLXHNSW1 files independently reopened from disk\"}}",
         json(&run_dir.display().to_string()),
         before_exists
+    );
+    println!(
+        "{{\"event\":\"binary_provenance\",\"tree_sha\":\"{}\",\"binary_path\":\"{}\",\"binary_bytes\":{},\"binary_blake3\":\"{}\"}}",
+        json(&tree_sha),
+        json(&preserved_executable.display().to_string()),
+        executable_bytes.len(),
+        blake3::hash(&executable_bytes).to_hex()
     );
 
     let vectors = real_corpus_vectors(ROWS + QUERIES)?;
@@ -90,23 +105,53 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         K
     );
 
+    let turbo2p5_config =
+        QuantConfig::turboquant_structured(new_seed(DIM, TURBOQUANT_SEED), QuantLevel::Bits2p5)?;
+    let turbo2p5_geometry_id = turbo2p5_config.geometry_id();
+    let turbo3p5_config =
+        QuantConfig::turboquant_structured(new_seed(DIM, TURBOQUANT_SEED), QuantLevel::Bits3p5)?;
+    let turbo3p5_geometry_id = turbo3p5_config.geometry_id();
+    let turbo2p5_row_bytes = TURBOQUANT_FORMAT_HEADER_BYTES
+        + ((DIM / 2 * 5 + (DIM % 2) * 3).div_ceil(8))
+        + DIM.div_ceil(8)
+        + 4;
+    let turbo3p5_row_bytes = TURBOQUANT_FORMAT_HEADER_BYTES
+        + ((DIM / 2 * 7 + (DIM % 2) * 4).div_ceil(8))
+        + DIM.div_ceil(8)
+        + 4;
     let mut artifacts = Vec::new();
-    for (name, config, expected_tag, expected_vector_bytes) in [
-        ("f32", QuantConfig::none(), 0_u8, ROWS * DIM * 4),
+    for (name, config, expected_tag, expected_vector_bytes, expected_geometry) in vec![
+        ("f32", QuantConfig::none(), 0_u8, ROWS * DIM * 4, [0_u8; 32]),
         (
             "scalar8",
             QuantConfig::scalar8(scale),
             1_u8,
             ROWS * (DIM + 8),
+            [0_u8; 32],
         ),
         (
             "binary",
             QuantConfig::binary(),
             2_u8,
             ROWS * (DIM.div_ceil(8) + 4),
+            [0_u8; 32],
+        ),
+        (
+            "turboquant2p5",
+            turbo2p5_config,
+            3_u8,
+            ROWS * turbo2p5_row_bytes,
+            turbo2p5_geometry_id,
+        ),
+        (
+            "turboquant3p5",
+            turbo3p5_config,
+            4_u8,
+            ROWS * turbo3p5_row_bytes,
+            turbo3p5_geometry_id,
         ),
     ] {
-        let mut index = HnswIndex::new(SLOT, DIM as u32, 553).with_quant(config);
+        let mut index = HnswIndex::new(SLOT, DIM as u32, 553).with_quant(config)?;
         for (ordinal, data) in rows.iter().enumerate() {
             index.insert(
                 cx(ordinal),
@@ -141,7 +186,7 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
             let got: Vec<CxId> = hits.iter().map(|hit| hit.cx_id).collect();
             raw_recall += overlap(&got, truth) as f64 / K as f64;
             let packed_truth: Vec<CxId> = index
-                .brute_force(query, K)
+                .brute_force(query, K)?
                 .into_iter()
                 .map(|(cx_id, _)| cx_id)
                 .collect();
@@ -158,11 +203,15 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         let search_us = started.elapsed().as_secs_f64() * 1_000_000.0 / QUERIES as f64;
 
         let path = run_dir.join(format!("{name}.clxhnsw"));
+        let process_rss_bytes = process_rss_bytes()?;
         println!(
-            "{{\"event\":\"happy_state_before\",\"kind\":\"{name}\",\"artifact_exists\":{},\"rows_in_memory\":{},\"packed_vector_bytes\":{}}}",
+            "{{\"event\":\"happy_state_before\",\"kind\":\"{name}\",\"artifact_exists\":{},\"rows_in_memory\":{},\"packed_vector_bytes\":{},\"shared_geometry_bytes\":{},\"raw_rerank_bytes\":{},\"total_compressed_footprint_bytes\":{}}}",
             path.exists(),
             index.total_nodes(),
-            index.physical_vector_bytes()
+            index.physical_vector_bytes(),
+            index.quant_geometry_bytes(),
+            index.raw_rerank_vector_bytes(),
+            index.total_compressed_footprint_bytes()
         );
         let receipt = index.persist_artifact(&path)?;
         let physical = independent_artifact_read(&path)?;
@@ -175,6 +224,10 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
             || physical.base_seq != BASE_SEQ
             || physical.row_count != ROWS as u64
             || physical.packed_vector_bytes != expected_vector_bytes as u64
+            || physical.geometry_id != expected_geometry
+            || ((expected_tag == 3 || expected_tag == 4)
+                && (physical.tqpr_rows != ROWS as u64 || physical.first_tqpr_digest == [0_u8; 32]))
+            || (expected_tag < 3 && physical.tqpr_rows != 0)
             || physical.digest != receipt.metadata.digest
         {
             return Err(
@@ -190,11 +243,14 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         println!(
-            "{{\"event\":\"happy_state_after\",\"kind\":\"{name}\",\"artifact_exists\":true,\"artifact_bytes\":{},\"body_bytes\":{},\"packed_vector_bytes\":{},\"digest\":\"{}\",\"recall_at_{}_vs_raw\":{:.3},\"recall_at_{}_vs_packed\":{:.3},\"search_us_per_query\":{:.1},\"child_readback\":{}}}",
+            "{{\"event\":\"happy_state_after\",\"kind\":\"{name}\",\"artifact_exists\":true,\"artifact_bytes\":{},\"body_bytes\":{},\"packed_vector_bytes\":{},\"process_rss_bytes\":{},\"digest\":\"{}\",\"tqpr_rows\":{},\"first_tqpr_digest\":\"{}\",\"recall_at_{}_vs_raw\":{:.3},\"recall_at_{}_vs_packed\":{:.3},\"search_us_per_query\":{:.1},\"child_readback\":{}}}",
             physical.artifact_bytes,
             physical.body_bytes,
             physical.packed_vector_bytes,
+            process_rss_bytes,
             hex(&physical.digest),
+            physical.tqpr_rows,
+            hex(&physical.first_tqpr_digest),
             K,
             raw_recall,
             K,
@@ -204,18 +260,19 @@ fn parent_run() -> Result<(), Box<dyn std::error::Error>> {
         );
         artifacts.push((name, path, physical));
     }
-    if artifacts[0].2.packed_vector_bytes == artifacts[1].2.packed_vector_bytes
-        || artifacts[1].2.packed_vector_bytes == artifacts[2].2.packed_vector_bytes
+    if artifacts
+        .windows(2)
+        .any(|pair| pair[0].2.packed_vector_bytes == pair[1].2.packed_vector_bytes)
     {
         return Err("quantization did not alter persisted physical vector bytes".into());
     }
 
-    anneal_activation_fsv(&run_dir, &artifacts[0].1, &artifacts[1].1, queries)?;
+    anneal_activation_fsv(&run_dir, &artifacts[0].1, &artifacts[4].1, queries)?;
 
     edge_empty(&run_dir, queries)?;
     edge_limits(&run_dir, rows)?;
-    edge_invalid_config(rows)?;
-    edge_corrupt_stale_unsupported(&run_dir, &artifacts[1].1)?;
+    edge_invalid_config()?;
+    edge_corrupt_stale_unsupported(&run_dir, &artifacts[4].1)?;
 
     println!(
         "{{\"event\":\"evidence_inventory\",\"path\":\"{}\",\"files\":{},\"bytes\":{}}}",
@@ -238,12 +295,20 @@ fn child_reload() -> Result<(), Box<dyn std::error::Error>> {
         "f32" => QuantKind::None,
         "scalar8" => QuantKind::Scalar8,
         "binary" => QuantKind::Binary,
+        "turboquant2p5" => QuantKind::TurboQuant2p5,
+        "turboquant3p5" => QuantKind::TurboQuant3p5,
         _ => return Err(format!("unknown reload codec {name}").into()),
+    };
+    let quant_geometry_id = if let Some(level) = kind.turboquant_level() {
+        QuantConfig::turboquant_structured(new_seed(DIM, TURBOQUANT_SEED), level)?.geometry_id()
+    } else {
+        [0_u8; 32]
     };
     let expectation = HnswArtifactExpectation {
         slot: SLOT,
         dim: DIM as u32,
         quant_kind: kind,
+        quant_geometry_id,
         base_seq: BASE_SEQ,
     };
     let (index, metadata) = HnswIndex::load_artifact(&path, expectation)?;
@@ -261,7 +326,7 @@ fn child_reload() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let got: Vec<CxId> = hits.iter().map(|hit| hit.cx_id).collect();
         let truth: Vec<CxId> = index
-            .brute_force(query, K)
+            .brute_force(query, K)?
             .into_iter()
             .map(|(cx_id, _)| cx_id)
             .collect();
@@ -286,7 +351,7 @@ fn child_reload() -> Result<(), Box<dyn std::error::Error>> {
 fn anneal_activation_fsv(
     run_dir: &Path,
     f32_artifact: &Path,
-    scalar_artifact: &Path,
+    turbo_artifact: &Path,
     queries: &[Vec<f32>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pointer_path = run_dir.join("slot-7.active.clxhnpt");
@@ -303,10 +368,16 @@ fn anneal_activation_fsv(
         slot: SLOT,
         dim: DIM as u32,
         quant_kind: QuantKind::None,
+        quant_geometry_id: [0_u8; 32],
         base_seq: BASE_SEQ,
     };
-    let scalar_expectation = HnswArtifactExpectation {
-        quant_kind: QuantKind::Scalar8,
+    let turbo_expectation = HnswArtifactExpectation {
+        quant_kind: QuantKind::TurboQuant3p5,
+        quant_geometry_id: QuantConfig::turboquant_structured(
+            new_seed(DIM, TURBOQUANT_SEED),
+            QuantLevel::Bits3p5,
+        )?
+        .geometry_id(),
         ..f32_expectation
     };
 
@@ -328,6 +399,8 @@ fn anneal_activation_fsv(
         || initialized.quant_bits != 32
         || incumbent_physical.config_hash != incumbent_hash
         || incumbent_physical.quant_bits != 32
+        || incumbent_physical.kind_tag != 0
+        || incumbent_physical.geometry_id != [0_u8; 32]
     {
         return Err("initial active pointer did not bind the F32 incumbent".into());
     }
@@ -431,9 +504,9 @@ fn anneal_activation_fsv(
         let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
         activator.stage_candidate(
             candidate_hash,
-            8,
-            scalar_artifact,
-            scalar_expectation,
+            4,
+            turbo_artifact,
+            turbo_expectation,
             QUERIES as u64,
         )?;
         let mut tuner =
@@ -496,9 +569,9 @@ fn anneal_activation_fsv(
         let mut activator = HnswArtifactActivator::new(&pointer_path, SLOT);
         activator.stage_candidate(
             candidate_hash,
-            8,
-            scalar_artifact,
-            scalar_expectation,
+            4,
+            turbo_artifact,
+            turbo_expectation,
             QUERIES as u64,
         )?;
         let mut tuner =
@@ -525,7 +598,7 @@ fn anneal_activation_fsv(
                 Some(quant_evidence()),
             )?
             .promoted
-            .ok_or("measured Scalar8 candidate did not promote")?
+            .ok_or("measured TurboQuant3p5 candidate did not promote")?
     };
     vault.flush()?;
 
@@ -533,10 +606,10 @@ fn anneal_activation_fsv(
     let active_physical = independent_pointer_read(&pointer_path)?;
     let cache_bytes = std::fs::read(&cache_path)?;
     let cache_json: serde_json::Value = serde_json::from_slice(&cache_bytes)?;
-    let cache_has_quant8 = cache_json["entries"].as_array().is_some_and(|entries| {
+    let cache_has_quant4 = cache_json["entries"].as_array().is_some_and(|entries| {
         entries
             .iter()
-            .any(|entry| entry["config"]["extra"]["quant_bits"].as_str() == Some("8"))
+            .any(|entry| entry["config"]["extra"]["quant_bits"].as_str() == Some("4"))
     });
     let bandit = persisted_bandit(&vault)?;
     let anneal_entries = read_anneal_entries(&vault)?;
@@ -559,21 +632,23 @@ fn anneal_activation_fsv(
     )?;
     if active_pointer_bytes == incumbent_pointer_bytes
         || active_physical.config_hash != candidate_hash
-        || active_physical.quant_bits != 8
+        || active_physical.quant_bits != 4
+        || active_physical.kind_tag != 4
+        || active_physical.geometry_id != turbo_expectation.quant_geometry_id
         || active.config_hash != candidate_hash
-        || active.quant_bits != 8
+        || active.quant_bits != 4
         || promotion.served_artifact.is_none()
-        || !cache_has_quant8
+        || !cache_has_quant4
         || bandit.incumbent_idx != 1
         || anneal_entries.len() != 1
         || ledger_entry.action != AnnealLedgerAction::AutotunePromote
-        || served_bits != Some(8)
+        || served_bits != Some(4)
         || live_hits.len() != K
     {
         return Err("successful Anneal promotion state is incomplete or inconsistent".into());
     }
     println!(
-        "{{\"event\":\"anneal_promotion_after\",\"pointer_quant_bits\":8,\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_bytes\":{},\"cache_quant_bits\":8,\"persisted_bandit_incumbent\":{},\"ledger_rows\":{},\"ledger_action\":\"autotune_promote\",\"ledger_served_quant_bits\":{},\"live_search_hits\":{}}}",
+        "{{\"event\":\"anneal_promotion_after\",\"pointer_quant_bits\":4,\"codec\":\"turboquant3p5\",\"pointer_bytes\":{},\"pointer_digest\":\"{}\",\"artifact_path\":\"{}\",\"artifact_bytes\":{},\"artifact_digest\":\"{}\",\"cache_bytes\":{},\"cache_quant_bits\":4,\"persisted_bandit_incumbent\":{},\"ledger_rows\":{},\"ledger_action\":\"autotune_promote\",\"ledger_served_quant_bits\":{},\"live_search_hits\":{}}}",
         active_physical.pointer_bytes,
         hex(&active_physical.pointer_digest),
         json(&active_physical.artifact_path),
@@ -650,8 +725,9 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
         Some(64),
     )?;
     if active.config_hash != candidate_hash
-        || active.quant_bits != 8
-        || cached_config.quant_bits != 8
+        || active.quant_bits != 4
+        || active.expectation.quant_kind != QuantKind::TurboQuant3p5
+        || cached_config.quant_bits != 4
         || bandit.incumbent_idx != 1
         || entries.len() != 1
         || entries[0].action != AnnealLedgerAction::AutotunePromote
@@ -767,7 +843,7 @@ fn anneal_configs() -> (IndexConfig, IndexConfig) {
         quant_bits: 32,
     };
     let candidate = IndexConfig {
-        quant_bits: 8,
+        quant_bits: 4,
         ..incumbent.clone()
     };
     (incumbent, candidate)
@@ -823,7 +899,7 @@ fn spawn_anneal_reload(run_dir: &Path) -> Result<ChildOutput, Box<dyn std::error
 fn edge_empty(run_dir: &Path, queries: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
     let path = run_dir.join("edge-empty.clxhnsw");
     let mut index =
-        HnswIndex::new(SlotId::new(8), DIM as u32, 553).with_quant(QuantConfig::binary());
+        HnswIndex::new(SlotId::new(8), DIM as u32, 553).with_quant(QuantConfig::binary())?;
     index.set_base_seq(800);
     println!(
         "{{\"event\":\"edge_empty_before\",\"artifact_exists\":{},\"rows_in_memory\":0}}",
@@ -847,13 +923,17 @@ fn edge_empty(run_dir: &Path, queries: &[Vec<f32>]) -> Result<(), Box<dyn std::e
 }
 
 fn edge_limits(run_dir: &Path, rows: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
-    let path = run_dir.join("edge-max-dim-binary.clxhnsw");
+    let path = run_dir.join("edge-max-dim-turboquant3p5.clxhnsw");
     let mut max_data = Vec::with_capacity(HNSW_MAX_DIM as usize);
     for index in 0..HNSW_MAX_DIM as usize {
         max_data.push(rows[index % rows.len()][index % DIM]);
     }
-    let mut max_index =
-        HnswIndex::new(SlotId::new(9), HNSW_MAX_DIM, 553).with_quant(QuantConfig::binary());
+    let mut max_index = HnswIndex::new(SlotId::new(9), HNSW_MAX_DIM, 553).with_quant(
+        QuantConfig::turboquant_structured(
+            new_seed(HNSW_MAX_DIM as usize, b"calyx/sextant/hnsw/max-dim/fsv-v1"),
+            QuantLevel::Bits3p5,
+        )?,
+    )?;
     println!(
         "{{\"event\":\"edge_limits_before\",\"max_dim_artifact_exists\":{},\"over_limit_rows\":0}}",
         path.exists()
@@ -869,47 +949,53 @@ fn edge_limits(run_dir: &Path, rows: &[Vec<f32>]) -> Result<(), Box<dyn std::err
     max_index.set_base_seq(900);
     max_index.persist_artifact(&path)?;
     let physical = independent_artifact_read(&path)?;
-    let over_dim = HNSW_MAX_DIM + 1;
-    let mut over = HnswIndex::new(SlotId::new(10), over_dim, 553).with_quant(QuantConfig::binary());
-    let over_error = require_error(over.insert(
-        cx(90_001),
-        SlotVector::Dense {
-            dim: over_dim,
-            data: vec![1.0; over_dim as usize],
+    let max_candidate_hits = max_index.search(
+        &SlotVector::Dense {
+            dim: HNSW_MAX_DIM,
+            data: rows[0]
+                .iter()
+                .copied()
+                .cycle()
+                .take(HNSW_MAX_DIM as usize)
+                .collect(),
         },
-        1,
+        usize::MAX,
+        Some(usize::MAX),
+    )?;
+    let over_dim = HNSW_MAX_DIM + 1;
+    let over_error = require_error(QuantConfig::turboquant_structured(
+        new_seed(over_dim as usize, b"calyx/sextant/hnsw/over-dim/fsv-v1"),
+        QuantLevel::Bits3p5,
     ))?;
     println!(
-        "{{\"event\":\"edge_limits_after\",\"max_dim\":{},\"max_dim_rows\":{},\"max_dim_packed_vector_bytes\":{},\"over_dim\":{},\"over_limit_rows\":{},\"over_limit_error\":\"{}\"}}",
+        "{{\"event\":\"edge_limits_after\",\"codec\":\"turboquant3p5\",\"max_dim\":{},\"max_dim_rows\":{},\"max_dim_packed_vector_bytes\":{},\"max_candidate_request\":\"usize::MAX\",\"max_candidate_hits\":{},\"over_dim\":{},\"over_limit_rows\":{},\"over_limit_error\":\"{}\"}}",
         HNSW_MAX_DIM,
         physical.row_count,
         physical.packed_vector_bytes,
+        max_candidate_hits.len(),
         over_dim,
-        over.total_nodes(),
+        0,
         over_error.code
     );
     Ok(())
 }
 
-fn edge_invalid_config(rows: &[Vec<f32>]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut invalid =
-        HnswIndex::new(SlotId::new(11), DIM as u32, 553).with_quant(QuantConfig::scalar8(f32::NAN));
+fn edge_invalid_config() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{{\"event\":\"edge_invalid_config_before\",\"rows_in_memory\":{},\"scale\":\"NaN\"}}",
-        invalid.total_nodes()
+        0
     );
-    let error = require_error(invalid.insert(
-        cx(91_000),
-        SlotVector::Dense {
-            dim: DIM as u32,
-            data: rows[0].clone(),
-        },
-        1,
-    ))?;
+    let error = require_error(
+        HnswIndex::new(SlotId::new(11), DIM as u32, 553).with_quant(QuantConfig::scalar8(f32::NAN)),
+    )?;
+    let mismatch_error = packed_kind_mismatch(&vec![1.0; DIM])?;
+    let unsupported_backend_error = require_error(
+        QuantConfig::turboquant_structured(new_seed(DIM, TURBOQUANT_SEED), QuantLevel::Bits3p5)?
+            .cpu_gpu_delta(&vec![1.0; DIM]),
+    )?;
     println!(
-        "{{\"event\":\"edge_invalid_config_after\",\"rows_in_memory\":{},\"error\":\"{}\"}}",
-        invalid.total_nodes(),
-        error.code
+        "{{\"event\":\"edge_invalid_config_after\",\"rows_in_memory\":{},\"invalid_config_error\":\"{}\",\"mismatched_kernel_error\":\"{}\",\"unsupported_backend_error\":\"{}\"}}",
+        0, error.code, mismatch_error.code, unsupported_backend_error.code
     );
     Ok(())
 }
@@ -923,7 +1009,12 @@ fn edge_corrupt_stale_unsupported(
     let expected = HnswArtifactExpectation {
         slot: SLOT,
         dim: DIM as u32,
-        quant_kind: QuantKind::Scalar8,
+        quant_kind: QuantKind::TurboQuant3p5,
+        quant_geometry_id: QuantConfig::turboquant_structured(
+            new_seed(DIM, TURBOQUANT_SEED),
+            QuantLevel::Bits3p5,
+        )?
+        .geometry_id(),
         base_seq: BASE_SEQ,
     };
     println!(
@@ -938,6 +1029,14 @@ fn edge_corrupt_stale_unsupported(
     corrupt[HEADER_BYTES] ^= 0x40;
     std::fs::write(&corrupt_path, &corrupt)?;
     let corrupt_error = require_error(HnswIndex::load_artifact(&corrupt_path, expected))?;
+
+    let malformed_path = run_dir.join("edge-malformed-tqpr-row.clxhnsw");
+    let mut malformed = valid.clone();
+    let first_tqpr_body_byte = HEADER_BYTES + 30 + 4 + TURBOQUANT_FORMAT_HEADER_BYTES;
+    malformed[first_tqpr_body_byte] ^= 0x01;
+    reseal(&mut malformed)?;
+    std::fs::write(&malformed_path, &malformed)?;
+    let malformed_error = require_error(HnswIndex::load_artifact(&malformed_path, expected))?;
 
     let stale_error = require_error(HnswIndex::load_artifact(
         valid_path,
@@ -955,6 +1054,14 @@ fn edge_corrupt_stale_unsupported(
         },
     ))?;
 
+    let wrong_geometry_error = require_error(HnswIndex::load_artifact(
+        valid_path,
+        HnswArtifactExpectation {
+            quant_geometry_id: [0xA5_u8; 32],
+            ..expected
+        },
+    ))?;
+
     let unsupported_path = run_dir.join("edge-unsupported-version.clxhnsw");
     let mut unsupported = valid.clone();
     unsupported[8..10].copy_from_slice(&(HNSW_ARTIFACT_VERSION + 1).to_le_bytes());
@@ -967,12 +1074,15 @@ fn edge_corrupt_stale_unsupported(
         return Err("edge actions mutated the valid source artifact".into());
     }
     println!(
-        "{{\"event\":\"edge_bytes_after\",\"valid_hash\":\"{}\",\"valid_unchanged\":true,\"corrupt_file_exists\":{},\"corrupt_error\":\"{}\",\"stale_error\":\"{}\",\"wrong_dim_error\":\"{}\",\"unsupported_file_exists\":{},\"unsupported_error\":\"{}\"}}",
+        "{{\"event\":\"edge_bytes_after\",\"valid_hash\":\"{}\",\"valid_unchanged\":true,\"corrupt_file_exists\":{},\"corrupt_error\":\"{}\",\"malformed_tqpr_file_exists\":{},\"malformed_tqpr_error\":\"{}\",\"stale_error\":\"{}\",\"wrong_dim_error\":\"{}\",\"wrong_geometry_error\":\"{}\",\"unsupported_file_exists\":{},\"unsupported_error\":\"{}\"}}",
         blake3::hash(&after_valid).to_hex(),
         corrupt_path.exists(),
         corrupt_error.code,
+        malformed_path.exists(),
+        malformed_error.code,
         stale_error.code,
         wrong_dim_error.code,
+        wrong_geometry_error.code,
         unsupported_path.exists(),
         unsupported_error.code
     );
@@ -1006,15 +1116,20 @@ struct PhysicalReadback {
     slot: u16,
     dim: u32,
     base_seq: u64,
+    geometry_id: [u8; 32],
     row_count: u64,
     packed_vector_bytes: u64,
     body_bytes: u64,
     artifact_bytes: u64,
     digest: [u8; 32],
+    tqpr_rows: u64,
+    first_tqpr_digest: [u8; 32],
 }
 
 struct PointerPhysicalReadback {
     quant_bits: u8,
+    kind_tag: u8,
+    geometry_id: [u8; 32],
     config_hash: [u8; 32],
     artifact_digest: [u8; 32],
     artifact_bytes: u64,
@@ -1042,24 +1157,30 @@ fn independent_pointer_read(
     if pointer_digest != *blake3::hash(&bytes[..payload_len]).as_bytes() {
         return Err(format!("{} active pointer checksum mismatch", path.display()).into());
     }
-    let path_len = u32::from_le_bytes(bytes[108..112].try_into()?) as usize;
+    let path_len = u32::from_le_bytes(bytes[140..144].try_into()?) as usize;
     if POINTER_HEADER_BYTES + path_len != payload_len {
         return Err(format!("{} active pointer length mismatch", path.display()).into());
     }
     let artifact_path = std::str::from_utf8(&bytes[POINTER_HEADER_BYTES..payload_len])?.to_string();
     let mut config_hash = [0_u8; 32];
-    config_hash.copy_from_slice(&bytes[28..60]);
+    config_hash.copy_from_slice(&bytes[60..92]);
+    let mut geometry_id = [0_u8; 32];
+    geometry_id.copy_from_slice(&bytes[28..60]);
     let mut artifact_digest = [0_u8; 32];
-    artifact_digest.copy_from_slice(&bytes[60..92]);
-    let artifact_bytes = u64::from_le_bytes(bytes[92..100].try_into()?);
+    artifact_digest.copy_from_slice(&bytes[92..124]);
+    let artifact_bytes = u64::from_le_bytes(bytes[124..132].try_into()?);
     let artifact_physical = independent_artifact_read(Path::new(&artifact_path))?;
     if artifact_physical.artifact_bytes != artifact_bytes
         || artifact_physical.digest != artifact_digest
+        || artifact_physical.kind_tag != bytes[13]
+        || artifact_physical.geometry_id != geometry_id
     {
         return Err("active pointer artifact digest/length readback mismatch".into());
     }
     Ok(PointerPhysicalReadback {
         quant_bits: bytes[12],
+        kind_tag: bytes[13],
+        geometry_id,
         config_hash,
         artifact_digest,
         artifact_bytes,
@@ -1081,23 +1202,106 @@ fn independent_artifact_read(path: &Path) -> Result<PhysicalReadback, Box<dyn st
     if digest != computed {
         return Err(format!("{} independent checksum mismatch", path.display()).into());
     }
-    let body_bytes = u64::from_le_bytes(bytes[78..86].try_into()?);
+    let body_bytes = u64::from_le_bytes(bytes[178..186].try_into()?);
     if HEADER_BYTES as u64 + body_bytes + FOOTER_BYTES as u64 != bytes.len() as u64 {
         return Err(format!("{} independent length mismatch", path.display()).into());
+    }
+    let kind_tag = bytes[11];
+    let dim = u32::from_le_bytes(bytes[14..18].try_into()?);
+    let geometry_id: [u8; 32] = bytes[122..154].try_into()?;
+    let row_count = u64::from_le_bytes(bytes[154..162].try_into()?);
+    let mut cursor = HEADER_BYTES;
+    let mut tqpr_rows = 0_u64;
+    let mut first_tqpr_digest = [0_u8; 32];
+    for ordinal in 0..row_count {
+        let fixed_end = cursor.checked_add(30).ok_or("row cursor overflow")?;
+        let fixed = bytes
+            .get(cursor..fixed_end)
+            .ok_or("artifact row fixed fields are truncated")?;
+        let neighbor_count = u32::from_le_bytes(fixed[26..30].try_into()?) as usize;
+        cursor = fixed_end;
+        let vector_bytes = match kind_tag {
+            0 => dim as usize * 4,
+            1 => dim as usize + 4,
+            2 => (dim as usize).div_ceil(8),
+            3 | 4 => {
+                let pair_bits = if kind_tag == 3 { 5 } else { 7 };
+                let odd_bits = if kind_tag == 3 { 3 } else { 4 };
+                let scalar_bits = dim as usize / 2 * pair_bits + dim as usize % 2 * odd_bits;
+                let payload_len = TURBOQUANT_FORMAT_HEADER_BYTES
+                    + scalar_bits.div_ceil(8)
+                    + (dim as usize).div_ceil(8);
+                let row_end = cursor
+                    .checked_add(4 + payload_len)
+                    .ok_or("TQPR row length overflow")?;
+                let row = bytes.get(cursor..row_end).ok_or("TQPR row is truncated")?;
+                let source_norm = f32::from_bits(u32::from_le_bytes(row[0..4].try_into()?));
+                let payload = &row[4..];
+                let expected_level = if kind_tag == 3 { 1 } else { 2 };
+                if !source_norm.is_finite()
+                    || source_norm.is_sign_negative()
+                    || &payload[0..4] != b"TQPR"
+                    || payload[4] != 2
+                    || payload[5] != expected_level
+                    || u32::from_le_bytes(payload[8..12].try_into()?) != dim
+                    || payload[24..56] != geometry_id
+                {
+                    return Err(format!(
+                        "row {ordinal} independently parsed TQPR identity is invalid"
+                    )
+                    .into());
+                }
+                let mut hasher = Sha256::new();
+                hasher.update(b"calyx/turboquant/tqpr/payload/v2\0");
+                hasher.update(56_u64.to_le_bytes());
+                hasher.update(&payload[..56]);
+                hasher.update(((payload.len() - 88) as u64).to_le_bytes());
+                hasher.update(&payload[88..]);
+                hasher.update(source_norm.to_bits().to_le_bytes());
+                let computed: [u8; 32] = hasher.finalize().into();
+                if payload[56..88] != computed {
+                    return Err(format!(
+                        "row {ordinal} independently parsed TQPR SHA-256 mismatch"
+                    )
+                    .into());
+                }
+                if tqpr_rows == 0 {
+                    first_tqpr_digest = computed;
+                }
+                tqpr_rows += 1;
+                4 + payload_len
+            }
+            tag => return Err(format!("artifact codec tag {tag} is unknown").into()),
+        };
+        cursor = cursor
+            .checked_add(vector_bytes)
+            .and_then(|value| value.checked_add(neighbor_count * 4))
+            .ok_or("artifact row cursor overflow")?;
+        if cursor > payload_len {
+            return Err(format!("row {ordinal} exceeds the artifact body").into());
+        }
+    }
+    if cursor != payload_len {
+        return Err(
+            format!("independent row parse ended at {cursor}, expected {payload_len}").into(),
+        );
     }
     Ok(PhysicalReadback {
         magic: bytes[0..8].try_into()?,
         version: u16::from_le_bytes(bytes[8..10].try_into()?),
         layout: bytes[10],
-        kind_tag: bytes[11],
+        kind_tag,
         slot: u16::from_le_bytes(bytes[12..14].try_into()?),
-        dim: u32::from_le_bytes(bytes[14..18].try_into()?),
+        dim,
         base_seq: u64::from_le_bytes(bytes[30..38].try_into()?),
-        row_count: u64::from_le_bytes(bytes[54..62].try_into()?),
-        packed_vector_bytes: u64::from_le_bytes(bytes[70..78].try_into()?),
+        geometry_id,
+        row_count,
+        packed_vector_bytes: u64::from_le_bytes(bytes[170..178].try_into()?),
         body_bytes,
         artifact_bytes: bytes.len() as u64,
         digest,
+        tqpr_rows,
+        first_tqpr_digest,
     })
 }
 
@@ -1118,6 +1322,44 @@ fn require_error<T>(
         Ok(_) => Err("operation unexpectedly succeeded".into()),
         Err(error) => Ok(error),
     }
+}
+
+#[cfg(windows)]
+fn process_rss_bytes() -> Result<u64, Box<dyn std::error::Error>> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        PageFaultCount: 0,
+        PeakWorkingSetSize: 0,
+        WorkingSetSize: 0,
+        QuotaPeakPagedPoolUsage: 0,
+        QuotaPagedPoolUsage: 0,
+        QuotaPeakNonPagedPoolUsage: 0,
+        QuotaNonPagedPoolUsage: 0,
+        PagefileUsage: 0,
+        PeakPagefileUsage: 0,
+    };
+    // SAFETY: `counters` is a correctly sized writable PROCESS_MEMORY_COUNTERS
+    // for the current pseudo-handle and remains alive for the entire call.
+    let read = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    if read == 0 {
+        return Err(format!(
+            "GetProcessMemoryInfo failed: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    Ok(counters.WorkingSetSize as u64)
 }
 
 fn cx(ordinal: usize) -> CxId {
@@ -1237,7 +1479,6 @@ fn json(value: &str) -> String {
 }
 
 // Direct kernel mismatch edge retained as part of the public packed API audit.
-#[allow(dead_code)]
 fn packed_kind_mismatch(query: &[f32]) -> Result<CalyxError, Box<dyn std::error::Error>> {
     require_error(score_packed(
         &PackedQuery::F32 {

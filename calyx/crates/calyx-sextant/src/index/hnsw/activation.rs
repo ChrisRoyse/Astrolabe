@@ -26,9 +26,9 @@ use crate::error::{
 use crate::index::QuantKind;
 
 pub const HNSW_ACTIVE_POINTER_MAGIC: [u8; 8] = *b"CLXHNPT1";
-pub const HNSW_ACTIVE_POINTER_VERSION: u16 = 1;
+pub const HNSW_ACTIVE_POINTER_VERSION: u16 = 2;
 
-const POINTER_HEADER_BYTES: usize = 112;
+const POINTER_HEADER_BYTES: usize = 144;
 const DIGEST_BYTES: usize = 32;
 const MAX_POINTER_PATH_BYTES: usize = 32_768;
 const MAX_POINTER_BYTES: usize = POINTER_HEADER_BYTES + MAX_POINTER_PATH_BYTES + DIGEST_BYTES;
@@ -429,6 +429,7 @@ fn encode_pointer(pointer: &HnswActivePointer) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&[0_u8; 2]);
     bytes.extend_from_slice(&pointer.expectation.dim.to_le_bytes());
     bytes.extend_from_slice(&pointer.expectation.base_seq.to_le_bytes());
+    bytes.extend_from_slice(&pointer.expectation.quant_geometry_id);
     bytes.extend_from_slice(&pointer.config_hash);
     bytes.extend_from_slice(&pointer.artifact_digest);
     bytes.extend_from_slice(&pointer.artifact_bytes.to_le_bytes());
@@ -485,11 +486,18 @@ fn decode_pointer(bytes: &[u8]) -> Result<HnswActivePointer> {
     }
     let dim = u32::from_le_bytes(fixed(&bytes[16..20])?);
     let base_seq = u64::from_le_bytes(fixed(&bytes[20..28])?);
-    let config_hash = fixed(&bytes[28..60])?;
-    let artifact_digest = fixed(&bytes[60..92])?;
-    let artifact_bytes = u64::from_le_bytes(fixed(&bytes[92..100])?);
-    let heldout_query_count = u64::from_le_bytes(fixed(&bytes[100..108])?);
-    let path_len = u32::from_le_bytes(fixed(&bytes[108..112])?) as usize;
+    let quant_geometry_id = fixed(&bytes[28..60])?;
+    if quant_kind.turboquant_level().is_some() != (quant_geometry_id != [0_u8; 32]) {
+        return Err(pointer_error(
+            CALYX_SEXTANT_HNSW_POINTER_CORRUPT,
+            "active HNSW pointer codec and TurboQuant geometry identity disagree",
+        ));
+    }
+    let config_hash = fixed(&bytes[60..92])?;
+    let artifact_digest = fixed(&bytes[92..124])?;
+    let artifact_bytes = u64::from_le_bytes(fixed(&bytes[124..132])?);
+    let heldout_query_count = u64::from_le_bytes(fixed(&bytes[132..140])?);
+    let path_len = u32::from_le_bytes(fixed(&bytes[140..144])?) as usize;
     if path_len == 0 || path_len > MAX_POINTER_PATH_BYTES {
         return Err(pointer_error(
             CALYX_SEXTANT_HNSW_POINTER_CORRUPT,
@@ -547,6 +555,7 @@ fn decode_pointer(bytes: &[u8]) -> Result<HnswActivePointer> {
             slot,
             dim,
             quant_kind,
+            quant_geometry_id,
             base_seq,
         },
     })
@@ -738,11 +747,7 @@ fn publish_temp(temp: &Path, path: &Path, replace: bool) -> Result<()> {
 }
 
 fn quant_bits_for_kind(kind: QuantKind) -> u8 {
-    match kind {
-        QuantKind::None => 32,
-        QuantKind::Scalar8 => 8,
-        QuantKind::Binary => 1,
-    }
+    kind.quant_bits_ceiling()
 }
 
 fn quant_tag(kind: QuantKind) -> u8 {
@@ -750,6 +755,8 @@ fn quant_tag(kind: QuantKind) -> u8 {
         QuantKind::None => 0,
         QuantKind::Scalar8 => 1,
         QuantKind::Binary => 2,
+        QuantKind::TurboQuant2p5 => 3,
+        QuantKind::TurboQuant3p5 => 4,
     }
 }
 
@@ -758,6 +765,8 @@ fn quant_from_tag(tag: u8) -> Result<QuantKind> {
         0 => Ok(QuantKind::None),
         1 => Ok(QuantKind::Scalar8),
         2 => Ok(QuantKind::Binary),
+        3 => Ok(QuantKind::TurboQuant2p5),
+        4 => Ok(QuantKind::TurboQuant3p5),
         _ => Err(pointer_error(
             CALYX_SEXTANT_HNSW_POINTER_CORRUPT,
             format!("active HNSW pointer codec tag {tag} is invalid"),

@@ -130,7 +130,9 @@ pub fn knn_base_rate(corpus: &[ResolvedExemplar], query: &[f32], k: usize) -> Re
     }
 
     // Exact cosine kNN (deterministic, no ANN error).
-    let hits = index.brute_force(query, k);
+    let hits = index
+        .brute_force(query, k)
+        .map_err(|err| PolyError::diagnostics(ERR_KNN_DIM, format!("index scan failed: {err}")))?;
     let mut neighbors = Vec::with_capacity(hits.len());
     let mut yes = 0usize;
     let mut sim_sum = 0.0f64;

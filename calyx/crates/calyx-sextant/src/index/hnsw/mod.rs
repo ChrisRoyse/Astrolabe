@@ -76,9 +76,17 @@ impl HnswIndex {
         }
     }
 
-    pub fn with_quant(mut self, quant: QuantConfig) -> Self {
+    /// Selects and validates the physical codec before the first row exists.
+    pub fn with_quant(mut self, quant: QuantConfig) -> Result<Self> {
+        if !self.rows.is_empty() || self.quant.is_locked() {
+            return Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                "cannot replace an HNSW quantizer after physical rows exist",
+            ));
+        }
         self.quant = quant;
-        self
+        self.validate_configuration()?;
+        Ok(self)
     }
 
     fn validate_configuration(&self) -> Result<()> {
@@ -88,6 +96,20 @@ impl HnswIndex {
                 CALYX_SEXTANT_VECTOR_SHAPE,
                 format!(
                     "hnsw dimension {} is outside the supported range 1..={HNSW_MAX_DIM}",
+                    self.dim
+                ),
+            ));
+        }
+        if self
+            .quant
+            .turbo_seed()
+            .is_some_and(|seed| seed.dim != self.dim as usize)
+        {
+            return Err(sextant_error(
+                CALYX_SEXTANT_VECTOR_SHAPE,
+                format!(
+                    "TurboQuant codec dimension {} does not match HNSW dimension {}",
+                    self.quant.turbo_seed().map_or(0, |seed| seed.dim),
                     self.dim
                 ),
             ));
@@ -157,17 +179,19 @@ impl HnswIndex {
         hist
     }
 
-    pub fn brute_force(&self, query: &[f32], k: usize) -> Vec<(CxId, f32)> {
-        let prepared = self.quant.prepare_query(query);
-        top_k(
-            self.rows
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| !row.deleted)
-                .map(|(idx, row)| (row.cx_id, self.score_row(&prepared, idx)))
-                .collect(),
-            k,
-        )
+    pub fn brute_force(&self, query: &[f32], k: usize) -> Result<Vec<(CxId, f32)>> {
+        let prepared = self.quant.prepare_query(query)?;
+        let scored = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.deleted)
+            .map(|(idx, row)| {
+                self.score_row(&prepared, idx)
+                    .map(|score| (row.cx_id, score))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(top_k(scored, k))
     }
 
     /// Total packed vector payload bytes physically held by this index.
@@ -176,6 +200,24 @@ impl HnswIndex {
             .iter()
             .map(|row| row.stored.physical_bytes())
             .sum()
+    }
+
+    /// Shared transform/codebook bytes required to score the packed rows.
+    pub fn quant_geometry_bytes(&self) -> usize {
+        self.quant.geometry_physical_bytes()
+    }
+
+    /// Raw candidate vectors retained solely for reranking. Sextant's packed
+    /// HNSW contract retains none; an owner adding reranking must account here.
+    pub const fn raw_rerank_vector_bytes(&self) -> usize {
+        0
+    }
+
+    /// Complete declared compressed-vector footprint (rows + shared geometry).
+    pub fn total_compressed_footprint_bytes(&self) -> usize {
+        self.physical_vector_bytes()
+            .saturating_add(self.quant_geometry_bytes())
+            .saturating_add(self.raw_rerank_vector_bytes())
     }
 
     /// The quantization policy this index physically stores and scores with.
@@ -188,40 +230,34 @@ impl HnswIndex {
     /// The query is always prepared by this index's own `QuantConfig` and row
     /// dimensions are validated at insert, so a pairing failure here is an
     /// internal invariant violation, not a caller state.
-    pub(super) fn score_row(&self, query: &PackedQuery, idx: usize) -> f32 {
-        match score_packed(query, &self.rows[idx].stored) {
-            Ok(score) => score,
-            Err(error) => unreachable!(
-                "packed scoring invariant violated inside HnswIndex: {}",
-                error.message
-            ),
-        }
+    pub(super) fn score_row(&self, query: &PackedQuery, idx: usize) -> Result<f32> {
+        score_packed(query, &self.rows[idx].stored)
     }
 
     /// Builds the construction-time query for an already-inserted row from its
     /// packed representation (no raw vector is retained).
-    pub(super) fn construction_query(&self, index: usize) -> PackedQuery {
+    pub(super) fn construction_query(&self, index: usize) -> Result<PackedQuery> {
         match &self.rows[index].stored {
             PackedVector::F32 { values } => self.quant.prepare_query(values),
-            PackedVector::Scalar8 { .. } => {
-                let approx = self.rows[index].stored.approx_f32();
-                self.quant.prepare_query(&approx)
-            }
-            PackedVector::Binary { bits, dim } => PackedQuery::Binary {
+            PackedVector::Scalar8 { .. } | PackedVector::TurboQuant { .. } => self
+                .quant
+                .approx_f32(&self.rows[index].stored)
+                .and_then(|approx| self.quant.prepare_query(&approx)),
+            PackedVector::Binary { bits, dim } => Ok(PackedQuery::Binary {
                 bits: bits.clone(),
                 dim: *dim,
-            },
+            }),
         }
     }
 
-    pub fn recall_at(&self, queries: &[Vec<f32>], k: usize, ef: usize) -> f32 {
+    pub fn recall_at(&self, queries: &[Vec<f32>], k: usize, ef: usize) -> Result<f32> {
         if queries.is_empty() {
-            return 1.0;
+            return Ok(1.0);
         }
         let mut total = 0.0;
         for query in queries {
             let exact: Vec<_> = self
-                .brute_force(query, k)
+                .brute_force(query, k)?
                 .into_iter()
                 .map(|x| x.0)
                 .collect();
@@ -233,15 +269,14 @@ impl HnswIndex {
                     },
                     k,
                     Some(ef),
-                )
-                .unwrap()
+                )?
                 .into_iter()
                 .map(|x| x.cx_id)
                 .collect();
             let overlap = got.iter().filter(|cx| exact.contains(cx)).count();
             total += overlap as f32 / k.max(1) as f32;
         }
-        total / queries.len() as f32
+        Ok(total / queries.len() as f32)
     }
 
     fn level_for(&self, cx_id: CxId, ordinal: usize) -> u8 {
@@ -275,7 +310,7 @@ impl HnswIndex {
         &self,
         packed_query: &PackedVector,
         prepared: &PackedQuery,
-    ) -> Vec<(CxId, f32)> {
+    ) -> Result<Vec<(CxId, f32)>> {
         let identity = packed_query.identity_bytes();
         self.fingerprints
             .get(&packed_fingerprint(packed_query))
@@ -286,7 +321,10 @@ impl HnswIndex {
                     .get(**idx)
                     .is_some_and(|row| !row.deleted && row.stored.identity_bytes() == identity)
             })
-            .map(|idx| (self.rows[*idx].cx_id, self.score_row(prepared, *idx)))
+            .map(|idx| {
+                self.score_row(prepared, *idx)
+                    .map(|score| (self.rows[*idx].cx_id, score))
+            })
             .collect()
     }
 
@@ -342,19 +380,40 @@ impl SextantIndex for HnswIndex {
                 "hnsw insert contains a non-finite coordinate",
             ));
         }
-        self.quant.lock_after_first_insert();
-        let packed = self.quant.pack(values);
+        let packed = self.quant.pack(values)?;
         if let Some(&index) = self.positions.get(&cx_id) {
+            let prior_row = self.rows[index].clone();
+            let prior_base_seq = self.base_seq;
+            let prior_built_at_seq = self.built_at_seq;
             self.remove_fingerprint(index);
             self.rows[index].stored = packed;
             self.rows[index].seq = seq;
             self.rows[index].deleted = false;
             self.index_fingerprint(index);
             self.base_seq = self.base_seq.max(seq);
-            self.rebuild()?;
+            if let Err(update_error) = self.rebuild() {
+                self.rows[index] = prior_row;
+                self.base_seq = prior_base_seq;
+                self.built_at_seq = prior_built_at_seq;
+                self.rebuild_lookup_maps();
+                if let Err(rollback_error) = self.rebuild() {
+                    return Err(sextant_error(
+                        CALYX_SEXTANT_VECTOR_SHAPE,
+                        format!(
+                            "HNSW row update failed ({}) and restoring the prior graph also failed ({})",
+                            update_error.message, rollback_error.message
+                        ),
+                    ));
+                }
+                self.built_at_seq = prior_built_at_seq;
+                return Err(update_error);
+            }
+            self.quant.lock_after_first_insert();
             return Ok(());
         }
         let index = self.rows.len();
+        let prior_base_seq = self.base_seq;
+        let prior_built_at_seq = self.built_at_seq;
         let level = self.level_for(cx_id, index);
         self.rows.push(Row {
             cx_id,
@@ -366,7 +425,25 @@ impl SextantIndex for HnswIndex {
         });
         self.positions.insert(cx_id, index);
         self.index_fingerprint(index);
-        self.connect_new_row(index);
+        if let Err(insert_error) = self.connect_new_row(index) {
+            self.rows.pop();
+            self.positions.remove(&cx_id);
+            self.base_seq = prior_base_seq;
+            self.built_at_seq = prior_built_at_seq;
+            self.rebuild_lookup_maps();
+            if let Err(rollback_error) = self.rebuild() {
+                return Err(sextant_error(
+                    CALYX_SEXTANT_VECTOR_SHAPE,
+                    format!(
+                        "HNSW row insert failed ({}) and restoring the prior graph also failed ({})",
+                        insert_error.message, rollback_error.message
+                    ),
+                ));
+            }
+            self.built_at_seq = prior_built_at_seq;
+            return Err(insert_error);
+        }
+        self.quant.lock_after_first_insert();
         self.refresh_entry_after_insert(index);
         self.built_at_seq = self.built_at_seq.max(seq);
         self.base_seq = self.base_seq.max(seq);
@@ -399,8 +476,8 @@ impl SextantIndex for HnswIndex {
             ));
         }
         let raw_query = self.checked_query(query)?;
-        let prepared = self.quant.prepare_query(raw_query);
-        let packed_query = self.quant.pack(raw_query);
+        let prepared = self.quant.prepare_query(raw_query)?;
+        let packed_query = self.quant.pack(raw_query)?;
         let needed = k.min(live_len);
         let ef = ef
             .unwrap_or_else(|| needed.max(self.max_neighbors * 2))
@@ -417,12 +494,12 @@ impl SextantIndex for HnswIndex {
                 "hnsw search requested on an empty index",
             )
         })?;
-        let start = self.greedy_descent(&prepared, entry);
-        let results = self.beam_search(&prepared, start, ef);
+        let start = self.greedy_descent(&prepared, entry)?;
+        let results = self.beam_search(&prepared, start, ef)?;
         let mut merged = HashMap::<CxId, f32>::new();
         for (cx_id, score) in results
             .into_iter()
-            .chain(self.exact_vector_hits(&packed_query, &prepared))
+            .chain(self.exact_vector_hits(&packed_query, &prepared)?)
         {
             merged
                 .entry(cx_id)
@@ -440,7 +517,7 @@ impl SextantIndex for HnswIndex {
         }
         self.entry_point = None;
         for idx in 0..self.rows.len() {
-            self.connect_new_row(idx);
+            self.connect_new_row(idx)?;
             self.refresh_entry_after_insert(idx);
         }
         self.built_at_seq = self.base_seq;
@@ -453,7 +530,15 @@ impl SextantIndex for HnswIndex {
         self.positions.get(&cx_id).and_then(|&index| {
             (!self.rows[index].deleted).then(|| SlotVector::Dense {
                 dim: self.dim,
-                data: self.rows[index].stored.approx_f32(),
+                data: self
+                    .quant
+                    .approx_f32(&self.rows[index].stored)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "validated HNSW row reconstruction invariant failed: {} ({})",
+                            error.message, error.code
+                        )
+                    }),
             })
         })
     }

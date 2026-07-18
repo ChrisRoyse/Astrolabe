@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
@@ -100,6 +101,46 @@ pub struct TurboQuantValidatedCandidate<'a> {
     qjl: &'a [u8],
     gamma: f32,
     storage: TurboQuantStorage,
+}
+
+/// Owned TQPR row validated once at an index/storage boundary.
+///
+/// The canonical [`QuantizedVec`] remains the sole physical payload. Cached
+/// byte ranges point into that payload, allowing every later packed scan to
+/// construct a borrowed [`TurboQuantValidatedCandidate`] without rehashing,
+/// reparsing, decoding, or allocating per candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurboQuantOwnedCandidate {
+    quantized: QuantizedVec,
+    scalar_range: Range<usize>,
+    qjl_range: Range<usize>,
+    gamma: f32,
+    storage: TurboQuantStorage,
+}
+
+impl TurboQuantOwnedCandidate {
+    /// Canonical persisted TQPR payload and its source norm/geometry identity.
+    pub fn quantized(&self) -> &QuantizedVec {
+        &self.quantized
+    }
+
+    /// Validated physical/logical storage accounting for this row.
+    pub fn storage(&self) -> TurboQuantStorage {
+        self.storage
+    }
+
+    fn validated(&self) -> TurboQuantValidatedCandidate<'_> {
+        TurboQuantValidatedCandidate {
+            level: self.quantized.level,
+            dim: self.quantized.dim,
+            geometry_id: self.quantized.seed_id,
+            scale: self.quantized.scale,
+            scalar: &self.quantized.bytes[self.scalar_range.clone()],
+            qjl: &self.quantized.bytes[self.qjl_range.clone()],
+            gamma: self.gamma,
+            storage: self.storage,
+        }
+    }
 }
 
 enum RotationGeometry {
@@ -791,6 +832,55 @@ impl TurboQuantCodec {
         })
     }
 
+    /// Takes ownership of one canonical TQPR row after validating its digest,
+    /// bit padding, shape, level, and exact codec geometry once.
+    ///
+    /// Indexes should call this at insertion/load and retain the returned row;
+    /// [`Self::dot_estimate_owned`] then stays validation-free in the candidate
+    /// scan loop while still using the exact canonical payload bytes.
+    pub fn validate_owned_candidate(
+        &self,
+        quantized: QuantizedVec,
+    ) -> Result<TurboQuantOwnedCandidate> {
+        let (scalar_len, qjl_len, gamma, storage) = {
+            let parsed = self.parse_owned(&quantized, "validate_owned_candidate")?;
+            (
+                parsed.scalar.len(),
+                parsed.qjl.len(),
+                parsed.gamma,
+                parsed.storage(),
+            )
+        };
+        let scalar_end = BODY_OFFSET.checked_add(scalar_len).ok_or_else(|| {
+            quant_error(
+                "validate_owned_candidate",
+                self.level,
+                "TQPR scalar range overflow",
+            )
+        })?;
+        let qjl_end = scalar_end.checked_add(qjl_len).ok_or_else(|| {
+            quant_error(
+                "validate_owned_candidate",
+                self.level,
+                "TQPR QJL range overflow",
+            )
+        })?;
+        if qjl_end != quantized.bytes.len() {
+            return Err(quant_error(
+                "validate_owned_candidate",
+                self.level,
+                "validated TQPR ranges do not cover the canonical payload",
+            ));
+        }
+        Ok(TurboQuantOwnedCandidate {
+            quantized,
+            scalar_range: BODY_OFFSET..scalar_end,
+            qjl_range: scalar_end..qjl_end,
+            gamma,
+            storage,
+        })
+    }
+
     /// Applies the shared Haar rotation and Gaussian projection once per raw
     /// query, and builds the per-coordinate scalar lookup tables that make the
     /// packed candidate scan multiplication-free.
@@ -876,6 +966,15 @@ impl TurboQuantCodec {
             "score_prepared",
             self.level,
         )
+    }
+
+    /// Scores an owned, boundary-validated row without candidate revalidation.
+    pub fn dot_estimate_owned(
+        &self,
+        query: &TurboQuantPreparedQuery,
+        candidate: &TurboQuantOwnedCandidate,
+    ) -> Result<f32> {
+        self.dot_estimate_validated(query, &candidate.validated())
     }
 
     /// Reference (non-LUT) scoring path: per-coordinate checked centroid walk.

@@ -168,6 +168,7 @@ pub fn compute_knn_edges(
     }
     Ok(index
         .brute_force(&ingested.vector, k)
+        .map_err(|err| invalid(ERR_KNN_GRAPH_DIM_MISMATCH, err.to_string()))?
         .into_iter()
         .enumerate()
         .map(|(idx, (dst, raw_similarity))| {
