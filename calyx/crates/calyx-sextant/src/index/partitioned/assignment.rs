@@ -81,16 +81,16 @@ pub(super) fn stream_assign_to_ids_with_routing(
         let end = (start + chunk).min(n);
         let mut assigned: Vec<(u64, u32)> = (start..end)
             .into_par_iter()
-            .map(|idx| {
+            .map(|idx| -> Result<(u64, u32)> {
                 let row = source.row(idx);
                 let region = match routing {
-                    AssignmentRouting::Exact => centroids.assign(&row),
-                    AssignmentRouting::Hnsw => centroids.assign_hnsw(&row),
-                    AssignmentRouting::RawL2Graph => centroids.assign_raw_l2_graph(&row),
+                    AssignmentRouting::Exact => centroids.assign(&row)?,
+                    AssignmentRouting::Hnsw => centroids.assign_hnsw(&row)?,
+                    AssignmentRouting::RawL2Graph => centroids.assign_raw_l2_graph(&row)?,
                 };
-                (idx, region)
+                Ok((idx, region))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         for &(idx, region) in &assigned {
             let region = region as usize;
             if region >= counts.len() {
@@ -160,18 +160,20 @@ pub(super) fn stream_assign_to_ids_bounded(
         let end = (start + chunk).min(n);
         let rayon_assigned: Vec<(u64, Vec<(usize, f32)>)> = (start..end)
             .into_par_iter()
-            .map(|idx| {
+            .map(|idx| -> Result<(u64, Vec<(usize, f32)>)> {
                 let row = source.row(idx);
                 let candidates = match config.routing {
-                    AssignmentRouting::Exact => centroids.nearest_centroids_exact_l2(&row, probe),
-                    AssignmentRouting::Hnsw => centroids.nearest_centroids(&row, probe),
+                    AssignmentRouting::Exact => {
+                        centroids.nearest_centroids_exact_l2(&row, probe)?
+                    }
+                    AssignmentRouting::Hnsw => centroids.nearest_centroids(&row, probe)?,
                     AssignmentRouting::RawL2Graph => {
-                        centroids.nearest_centroids_raw_l2_graph(&row, probe)
+                        centroids.nearest_centroids_raw_l2_graph(&row, probe)?
                     }
                 };
-                (idx, score_candidates(centroids, &row, &candidates))
+                Ok((idx, score_candidates(centroids, &row, &candidates)))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut assigned = Vec::with_capacity(rayon_assigned.len());
         for (idx, candidates) in rayon_assigned {
             let regions = choose_bounded_regions(

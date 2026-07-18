@@ -3,7 +3,11 @@ use std::collections::BinaryHeap;
 
 use rayon::prelude::*;
 
+use calyx_core::Result;
+
 use crate::index::distance::l2_sq;
+
+use super::{corrupt, invalid};
 
 const RAW_L2_GRAPH_DEGREE: usize = 32;
 const RAW_L2_GRAPH_MAX_DEGREE: usize = RAW_L2_GRAPH_DEGREE * 2;
@@ -46,14 +50,23 @@ impl RawL2CentroidGraph {
         query: &[f32],
         n_probe: usize,
         ef: usize,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>> {
         if centroids.is_empty() || n_probe == 0 || query.len() != centroids[0].len() {
-            return Vec::new();
+            return Err(invalid(
+                "raw squared-L2 routing requires non-empty centroids, positive n_probe, and matching dimensions",
+            ));
         }
         let k = n_probe.min(centroids.len());
         let ef = ef.max(k).min(centroids.len());
         if ef == centroids.len() || self.neighbors.len() != centroids.len() {
-            return exact_l2(centroids, query, k);
+            if self.neighbors.len() != centroids.len() {
+                return Err(corrupt(format!(
+                    "raw squared-L2 graph has {} rows for {} centroids",
+                    self.neighbors.len(),
+                    centroids.len()
+                )));
+            }
+            return Ok(exact_l2(centroids, query, k));
         }
         let mut seen = vec![false; centroids.len()];
         let mut heap = BinaryHeap::new();
@@ -71,11 +84,14 @@ impl RawL2CentroidGraph {
             }
         }
         if scored.len() < k {
-            return exact_l2(centroids, query, k);
+            return Err(corrupt(format!(
+                "raw squared-L2 graph reached {} centroids, expected at least {k}",
+                scored.len()
+            )));
         }
         sort_l2_scored(&mut scored);
         scored.truncate(k);
-        scored.into_iter().map(|(idx, _)| idx).collect()
+        Ok(scored.into_iter().map(|(idx, _)| idx).collect())
     }
 }
 

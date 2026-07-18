@@ -12,7 +12,7 @@ use super::config::{
     SpannIndexIdentity, SpannPostingLimits,
 };
 use super::format::{
-    SegmentDescriptor, SegmentKind, limits_hash, move_file_write_through, safe_component_path,
+    SegmentDescriptor, SegmentKind, limits_hash, publish_synced_file_atomic, safe_component_path,
 };
 use super::{corrupt, io};
 
@@ -165,7 +165,7 @@ pub(super) fn publish_manifest(
             return Err(corrupt("staged manifest hash mismatch"));
         }
         decode_manifest(&manifest_readback, &manifest.identity, &manifest.limits)?;
-        move_file_write_through(&manifest_temp, &manifest_path, false)?;
+        publish_synced_file_atomic(&manifest_temp, &manifest_path, false)?;
 
         let pointer = ActivePointer {
             generation: manifest.generation,
@@ -184,7 +184,7 @@ pub(super) fn publish_manifest(
         if decode_active_pointer(&pointer_readback, &manifest.identity)? != pointer.manifest_hash {
             return Err(corrupt("staged active pointer readback changed"));
         }
-        move_file_write_through(&active_temp, &active_path, replace_active)?;
+        publish_synced_file_atomic(&active_temp, &active_path, replace_active)?;
         let final_pointer = read_bounded_file(
             &active_path,
             ACTIVE_POINTER_BYTES as u64,
@@ -366,8 +366,11 @@ pub(super) fn manifest_for_update(
     base_seq: u64,
     changed: BTreeMap<u32, Vec<SegmentDescriptor>>,
     state_segments: Vec<SegmentDescriptor>,
-) -> PostingManifest {
-    let next_generation = current.generation + 1;
+) -> Result<PostingManifest> {
+    let next_generation = current
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| corrupt("SPANN manifest generation exhausted u64"))?;
     let snapshot = current.chain_depth >= limits.max_manifest_chain;
     let (kind, parent_generation, parent_hash, chain_depth, changes) = if snapshot {
         let mut postings = current.postings.clone();
@@ -403,7 +406,7 @@ pub(super) fn manifest_for_update(
                 .collect(),
         )
     };
-    PostingManifest {
+    Ok(PostingManifest {
         kind,
         generation: next_generation,
         parent_generation,
@@ -415,7 +418,7 @@ pub(super) fn manifest_for_update(
         limits: limits.clone(),
         state_segments: Some(state_segments),
         changes,
-    }
+    })
 }
 
 fn encode_manifest(manifest: &PostingManifest) -> Result<Vec<u8>> {

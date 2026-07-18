@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use calyx_core::{CalyxError, CxId, SlotId, SlotVector, SparseEntry};
 use calyx_sextant::{
@@ -20,11 +20,18 @@ fn main() {
         [_, mode, root, report] if mode == "open" => open(Path::new(root), Path::new(report)),
         [_, mode, root, report] if mode == "empty" => empty(Path::new(root), Path::new(report)),
         [_, mode, root, report] if mode == "maximum" => maximum(Path::new(root), Path::new(report)),
+        [_, mode, root, report] if mode == "update" => update(Path::new(root), Path::new(report)),
         [_, mode, root, report] if mode == "codec-edges" => {
             codec_edges(Path::new(root), Path::new(report))
         }
+        [_, mode, root, ready, release, report] if mode == "hold-open" => hold_open(
+            Path::new(root),
+            Path::new(ready),
+            Path::new(release),
+            Path::new(report),
+        ),
         _ => Err(driver_error(
-            "usage: spann_compression_fsv <build|open|empty|maximum|codec-edges> <store-root> <report.json>",
+            "usage: spann_compression_fsv <build|open|empty|maximum|update|codec-edges> <store-root> <report.json> OR hold-open <store-root> <ready.json> <release.signal> <report.json>",
         )),
     };
     match result {
@@ -51,6 +58,7 @@ fn main() {
 }
 
 fn build(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
+    let build_started = Instant::now();
     require_absent(root)?;
     fs::create_dir_all(root).map_err(|error| io_error("create FSV store", error))?;
     let before = filesystem_state(root)?;
@@ -59,17 +67,31 @@ fn build(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
     centroids.save(root)?;
     let centroid_hash = hex(&centroids.content_hash());
     let mut search = SpannSearch::new_with_limits(SLOT, centroids, root, limits.clone())?;
-    let mut receipts = Vec::new();
+    let mut receipt_count = 0_u64;
+    let mut total_logical_bytes = 0_u64;
+    let mut total_physical_bytes = 0_u64;
+    let mut total_compaction_bytes = 0_u64;
+    let mut total_reclaimed_bytes = 0_u64;
+    let mut total_reclaimed_files = 0_u64;
+    let mut compaction_events = 0_u64;
     let mut ids = Vec::new();
     for ordinal in 0..128_u32 {
         let cx_id = known_cx(ordinal);
         let vector = known_vector((ordinal as usize) % CLUSTERS, ordinal);
         search.insert(cx_id, vector, u64::from(ordinal) + 1)?;
         ids.push(cx_id);
-        receipts.push(receipt_json(
-            search.last_write().expect("insert writes receipt"),
-        ));
+        let receipt = search.last_write().expect("insert writes receipt");
+        receipt_count += 1;
+        total_logical_bytes += receipt.logical_decoded_bytes;
+        total_physical_bytes += receipt.physical_bytes_written;
+        total_compaction_bytes += receipt.compaction_bytes_written;
+        total_reclaimed_bytes += receipt.reclaimed_bytes;
+        total_reclaimed_files += u64::from(receipt.reclaimed_files);
+        if receipt.compacted_postings > 0 || receipt.state_compacted {
+            compaction_events += 1;
+        }
     }
+    let index_build_elapsed_ms = build_started.elapsed().as_millis();
     let query0 = known_vector(0, 0);
     let before_update = SextantIndex::search(&search, &query0, 5, Some(4))?;
     if before_update.first().map(|hit| hit.cx_id) != Some(ids[0]) {
@@ -139,7 +161,17 @@ fn build(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
         "cold_physical": stats_json(&cold_stats),
         "latency": latency,
         "rss_bytes": process_rss_bytes()?,
-        "insert_receipt_count": receipts.len(),
+        "index_build_elapsed_ms": index_build_elapsed_ms,
+        "insert_receipts": {
+            "count": receipt_count,
+            "incoming_logical_bytes": total_logical_bytes,
+            "physical_bytes_written": total_physical_bytes,
+            "compaction_bytes_written": total_compaction_bytes,
+            "reclaimed_files": total_reclaimed_files,
+            "reclaimed_bytes": total_reclaimed_bytes,
+            "compaction_events": compaction_events,
+            "physical_to_incoming_logical": total_physical_bytes as f64 / total_logical_bytes.max(1) as f64,
+        },
     });
     write_report(report_path, &report)?;
     Ok(report)
@@ -310,6 +342,112 @@ fn codec_edges(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
         "before": before,
         "after": after,
         "outcomes": outcomes,
+    });
+    write_report(report_path, &report)?;
+    Ok(report)
+}
+
+fn update(root: &Path, report_path: &Path) -> Result<Value, CalyxError> {
+    let before = filesystem_state(root)?;
+    let pointer = root.join("postings.active");
+    let pointer_before = file_hash(&pointer)?;
+    let mut search = SpannSearch::open_with_limits(SLOT, root, root, fsv_limits())?;
+    for (offset, cluster) in [0, 3, 0, 3, 0].into_iter().enumerate() {
+        search.insert(
+            known_cx(0),
+            known_vector(cluster, 0),
+            20_000 + offset as u64,
+        )?;
+    }
+    search.verify_storage()?;
+    let query0 = SextantIndex::search(&search, &known_vector(0, 0), 5, Some(4))?;
+    let query3 = SextantIndex::search(&search, &known_vector(3, 0), 5, Some(4))?;
+    if query0.first().map(|hit| hit.cx_id) != Some(known_cx(0))
+        || query3.iter().any(|hit| hit.cx_id == known_cx(0))
+    {
+        return Err(driver_error(
+            "concurrent update did not relocate the known record exactly",
+        ));
+    }
+    let pointer_after = file_hash(&pointer)?;
+    if pointer_before == pointer_after {
+        return Err(driver_error(
+            "successful concurrent update did not advance the active pointer",
+        ));
+    }
+    let after = filesystem_state(root)?;
+    let report = json!({
+        "status": "ok",
+        "mode": "update",
+        "before": before,
+        "after": after,
+        "pointer_before": pointer_before,
+        "pointer_after": pointer_after,
+        "top_cluster0": hits_json(&query0),
+        "top_cluster3": hits_json(&query3),
+        "physical": stats_json(&search.physical_stats()?),
+        "write_receipt": receipt_json(search.last_write().expect("update writes receipt")),
+    });
+    write_report(report_path, &report)?;
+    Ok(report)
+}
+
+fn hold_open(
+    root: &Path,
+    ready_path: &Path,
+    release_path: &Path,
+    report_path: &Path,
+) -> Result<Value, CalyxError> {
+    if ready_path.exists() || release_path.exists() || report_path.exists() {
+        return Err(driver_error(
+            "hold-open ready/release/report paths must start absent",
+        ));
+    }
+    let before = filesystem_state(root)?;
+    let search = SpannSearch::open_with_limits(SLOT, root, root, fsv_limits())?;
+    let generation = search.physical_stats()?.generation;
+    let initial_hits = SextantIndex::search(&search, &known_vector(3, 0), 5, Some(4))?;
+    if initial_hits.first().map(|hit| hit.cx_id) != Some(known_cx(0)) {
+        return Err(driver_error(
+            "held reader did not open the expected pre-update generation",
+        ));
+    }
+    write_report(
+        ready_path,
+        &json!({
+            "status": "ready",
+            "generation": generation,
+            "pid": std::process::id(),
+            "top_cluster3": hits_json(&initial_hits),
+        }),
+    )?;
+    let wait_started = Instant::now();
+    while !release_path.exists() {
+        if wait_started.elapsed() > Duration::from_secs(60) {
+            return Err(driver_error(
+                "hold-open release signal was not observed within 60 seconds",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let held_hits = SextantIndex::search(&search, &known_vector(3, 0), 5, Some(4))?;
+    if held_hits.first().map(|hit| hit.cx_id) != Some(known_cx(0)) {
+        return Err(driver_error(
+            "held generation changed after concurrent publication",
+        ));
+    }
+    search.verify_storage()?;
+    let after = filesystem_state(root)?;
+    let report = json!({
+        "status": "ok",
+        "mode": "hold-open",
+        "held_generation": generation,
+        "before": before,
+        "after": after,
+        "initial_top_cluster3": hits_json(&initial_hits),
+        "held_top_cluster3": hits_json(&held_hits),
+        "physical": stats_json(&search.physical_stats()?),
+        "waited_ms": wait_started.elapsed().as_millis(),
     });
     write_report(report_path, &report)?;
     Ok(report)
@@ -488,7 +626,7 @@ fn stats_json(stats: &SpannPostingPhysicalStats) -> Value {
         "active_pointer_bytes": stats.active_pointer_bytes,
         "active_physical_bytes": stats.active_physical_bytes,
         "directory_physical_bytes": stats.directory_physical_bytes,
-        "retained_reader_bytes": stats.retained_reader_bytes,
+        "retained_generation_bytes": stats.retained_generation_bytes,
         "reader_lease_bytes": stats.reader_lease_bytes,
         "temporary_bytes": stats.temporary_bytes,
         "orphan_bytes": stats.orphan_bytes,

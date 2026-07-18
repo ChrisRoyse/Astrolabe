@@ -52,7 +52,7 @@ pub(super) fn balance_region_files(
                 };
                 return Ok(vec![centroid.clone()]);
             }
-            Ok(split_oversized(
+            split_oversized(
                 &members,
                 source,
                 seed,
@@ -60,7 +60,7 @@ pub(super) fn balance_region_files(
                 region.id as u64,
                 0,
                 distance_metric,
-            ))
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(balanced.into_iter().flatten().collect())
@@ -74,16 +74,21 @@ fn split_oversized(
     salt: u64,
     depth: usize,
     distance_metric: PartitionDistanceMetric,
-) -> Vec<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>> {
     if members.len() <= cap {
-        return vec![centroid_for_source_members(
+        return Ok(vec![centroid_for_source_members(
             members,
             source,
             distance_metric,
-        )];
+        )]);
     }
     if depth >= MAX_RECLUSTER_DEPTH {
-        return chunk_centroids_by_cap(members, source, cap, distance_metric);
+        return Ok(chunk_centroids_by_cap(
+            members,
+            source,
+            cap,
+            distance_metric,
+        ));
     }
     let sample = sample_rows(members, source);
     let k_sub = members.len().div_ceil(cap).max(2).min(sample.len().max(1));
@@ -91,11 +96,16 @@ fn split_oversized(
     let mut sub_buckets: Vec<Vec<u64>> = vec![Vec::new(); sub.centroid_count()];
     for &idx in members {
         let row = source.row(idx);
-        sub_buckets[sub.assign(&row) as usize].push(idx);
+        sub_buckets[sub.assign(&row)? as usize].push(idx);
     }
     let largest = sub_buckets.iter().map(Vec::len).max().unwrap_or(0);
     if largest >= members.len() {
-        return chunk_centroids_by_cap(members, source, cap, distance_metric);
+        return Ok(chunk_centroids_by_cap(
+            members,
+            source,
+            cap,
+            distance_metric,
+        ));
     }
     let mut out = Vec::new();
     for (sub_idx, bucket) in sub_buckets.into_iter().enumerate() {
@@ -113,10 +123,10 @@ fn split_oversized(
                 salt ^ (sub_idx as u64).wrapping_mul(IDX_MIX),
                 depth + 1,
                 distance_metric,
-            ));
+            )?);
         }
     }
-    out
+    Ok(out)
 }
 
 fn sample_rows(members: &[u64], source: &dyn VectorSource) -> Vec<(u32, Vec<f32>)> {

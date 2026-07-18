@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 
 use calyx_core::{CxId, Result};
 
-use super::codec::{PostingMutation, StoredRecord, validate_sparse_vector};
+use super::codec::{
+    PostingMutation, StoredRecord, encode_posting_mutations, encode_state_records,
+    validate_sparse_vector,
+};
 use super::config::{SpannIndexIdentity, SpannPostingLimits};
 use super::format::{
-    DecodedSegment, SegmentDescriptor, SegmentKind, build_posting_segment, build_state_segment,
-    publish_segment, read_segment,
+    DecodedSegment, SegmentDescriptor, SegmentKind, StagedSegment, build_posting_segment,
+    build_state_segment, publish_segment, read_segment,
 };
 use super::lease::{ReaderLease, live_lease_targets};
 use super::manifest::{
@@ -34,7 +37,7 @@ pub struct SpannPostingPhysicalStats {
     pub active_pointer_bytes: u64,
     pub active_physical_bytes: u64,
     pub directory_physical_bytes: u64,
-    pub retained_reader_bytes: u64,
+    pub retained_generation_bytes: u64,
     pub reader_lease_bytes: u64,
     pub temporary_bytes: u64,
     pub orphan_bytes: u64,
@@ -91,7 +94,7 @@ struct ReclaimStats {
 #[derive(Clone, Copy, Debug, Default)]
 struct DirectoryPhysicalState {
     total_bytes: u64,
-    retained_reader_bytes: u64,
+    retained_generation_bytes: u64,
     reader_lease_bytes: u64,
     temporary_bytes: u64,
     orphan_bytes: u64,
@@ -331,7 +334,11 @@ impl PostingStore {
             memberships: memberships.clone(),
             seq,
         };
-        let next_generation = self.manifest.generation + 1;
+        let next_generation = self
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("SPANN generation exhausted u64"))?;
         let mut changed = BTreeMap::new();
         let mut published_bytes = 0_u64;
         let mut logical_bytes = 0_u64;
@@ -351,105 +358,82 @@ impl PostingStore {
             } else {
                 PostingMutation::delete(local_id)
             };
-            let current = &self.manifest.postings[centroid_id as usize];
-            let (staged, compacted) =
-                if current.len() + 1 > self.limits.max_segments_per_posting as usize {
-                    let mut materialized =
-                        materialize_posting(&self.dir, current, &self.identity, &self.limits)?
-                            .into_iter()
-                            .map(|member| (member.cx_id, member))
-                            .collect::<BTreeMap<_, _>>();
-                    apply_mutation(&mut materialized, mutation.clone());
-                    let operations = materialized
-                        .into_values()
-                        .map(PostingMutation::upsert)
-                        .collect::<Vec<_>>();
-                    (
-                        build_posting_segment(
-                            &self.identity,
-                            centroid_id,
-                            next_generation,
-                            &operations,
-                            &self.limits,
-                        )?,
-                        true,
-                    )
-                } else {
-                    (
-                        build_posting_segment(
-                            &self.identity,
-                            centroid_id,
-                            next_generation,
-                            &[mutation],
-                            &self.limits,
-                        )?,
-                        false,
-                    )
-                };
             logical_bytes = logical_bytes
-                .checked_add(staged.descriptor.decoded_len)
+                .checked_add(
+                    u64::try_from(
+                        encode_posting_mutations(
+                            std::slice::from_ref(&mutation),
+                            self.identity.dim,
+                            &self.limits,
+                        )?
+                        .len(),
+                    )
+                    .map_err(|_| invalid("logical posting mutation length exceeds u64"))?,
+                )
                 .ok_or_else(|| invalid("logical posting byte accounting overflow"))?;
-            let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
-            published_bytes = published_bytes
-                .checked_add(descriptor.file_len)
-                .ok_or_else(|| invalid("physical posting byte accounting overflow"))?;
-            let next_segments = if compacted {
-                compacted_postings += 1;
-                compaction_bytes = compaction_bytes
+            let current = &self.manifest.postings[centroid_id as usize];
+            let (mut next_segments, staged_segments, compacted) = prepare_posting_update(
+                &self.dir,
+                current,
+                &self.identity,
+                &self.limits,
+                centroid_id,
+                next_generation,
+                mutation,
+            )?;
+            for staged in staged_segments {
+                let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
+                published_bytes = published_bytes
                     .checked_add(descriptor.file_len)
-                    .ok_or_else(|| invalid("compaction byte accounting overflow"))?;
-                vec![descriptor]
-            } else {
-                let mut segments = current.clone();
-                segments.push(descriptor);
-                segments
-            };
+                    .ok_or_else(|| invalid("physical posting byte accounting overflow"))?;
+                if compacted {
+                    compaction_bytes = compaction_bytes
+                        .checked_add(descriptor.file_len)
+                        .ok_or_else(|| invalid("compaction byte accounting overflow"))?;
+                }
+                next_segments.push(descriptor);
+            }
+            if compacted {
+                compacted_postings += 1;
+            }
             changed.insert(centroid_id, next_segments);
         }
 
         let mut next_records = self.records.clone();
         next_records.insert(local_id, next_record.clone());
-        let mut next_state_segments = self.manifest.state_segments.clone();
-        let mut state_compacted = false;
-        if next_state_segments.len() + 1 > self.limits.max_state_segments as usize {
-            state_compacted = true;
-            next_state_segments = Vec::new();
-            for chunk in state_compaction_chunks(next_records.values(), &self.limits)? {
-                let staged =
-                    build_state_segment(&self.identity, next_generation, &chunk, &self.limits)?;
-                logical_bytes = logical_bytes
-                    .checked_add(staged.descriptor.decoded_len)
-                    .ok_or_else(|| invalid("logical state byte accounting overflow"))?;
-                let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
-                published_bytes = published_bytes
-                    .checked_add(descriptor.file_len)
-                    .ok_or_else(|| invalid("physical state byte accounting overflow"))?;
-                compaction_bytes = compaction_bytes
-                    .checked_add(descriptor.file_len)
-                    .ok_or_else(|| invalid("state compaction byte accounting overflow"))?;
-                next_state_segments.push(descriptor);
-            }
-            if next_state_segments.len() > self.limits.max_state_segments as usize {
-                return Err(invalid(format!(
-                    "state compaction needs {} segments, above registry limit {}",
-                    next_state_segments.len(),
-                    self.limits.max_state_segments
-                )));
-            }
-        } else {
-            let staged = build_state_segment(
-                &self.identity,
-                next_generation,
-                std::slice::from_ref(&next_record),
-                &self.limits,
-            )?;
-            logical_bytes = logical_bytes
-                .checked_add(staged.descriptor.decoded_len)
-                .ok_or_else(|| invalid("logical state byte accounting overflow"))?;
+        logical_bytes = logical_bytes
+            .checked_add(
+                u64::try_from(
+                    encode_state_records(
+                        std::slice::from_ref(&next_record),
+                        self.identity.dim,
+                        self.identity.centroid_count,
+                        &self.limits,
+                    )?
+                    .len(),
+                )
+                .map_err(|_| invalid("logical state mutation length exceeds u64"))?,
+            )
+            .ok_or_else(|| invalid("logical state byte accounting overflow"))?;
+        let (mut next_state_segments, staged_state, state_compacted) = prepare_state_update(
+            &self.dir,
+            &self.manifest.state_segments,
+            &next_records,
+            &self.identity,
+            &self.limits,
+            next_generation,
+            next_record,
+        )?;
+        for staged in staged_state {
             let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
             published_bytes = published_bytes
                 .checked_add(descriptor.file_len)
                 .ok_or_else(|| invalid("physical state byte accounting overflow"))?;
+            if state_compacted {
+                compaction_bytes = compaction_bytes
+                    .checked_add(descriptor.file_len)
+                    .ok_or_else(|| invalid("state compaction byte accounting overflow"))?;
+            }
             next_state_segments.push(descriptor);
         }
 
@@ -461,7 +445,7 @@ impl PostingStore {
             self.manifest.base_seq.max(seq),
             changed,
             next_state_segments,
-        );
+        )?;
         publish_manifest(&self.dir, &manifest, true)?;
         let active = read_active_pointer(&self.dir, &self.identity)?;
         let next_lease = ReaderLease::acquire(&self.dir, &self.identity, &active)?;
@@ -514,7 +498,11 @@ impl PostingStore {
         if disk_state.manifest_hash != self.manifest.manifest_hash {
             return Err(corrupt("SPANN generation changed before compaction"));
         }
-        let generation = self.manifest.generation + 1;
+        let generation = self
+            .manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("SPANN generation exhausted u64"))?;
         let mut changed = BTreeMap::new();
         let mut physical = 0_u64;
         let mut logical = 0_u64;
@@ -540,17 +528,25 @@ impl PostingStore {
                 &operations,
                 &self.limits,
             )?;
-            logical += staged.descriptor.decoded_len;
+            logical = logical
+                .checked_add(staged.descriptor.decoded_len)
+                .ok_or_else(|| invalid("explicit compaction logical byte overflow"))?;
             let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
-            physical += descriptor.file_len;
+            physical = physical
+                .checked_add(descriptor.file_len)
+                .ok_or_else(|| invalid("explicit compaction physical byte overflow"))?;
             changed.insert(centroid_id, vec![descriptor]);
         }
         let mut state_segments = Vec::new();
         for chunk in state_compaction_chunks(self.records.values(), &self.limits)? {
             let staged = build_state_segment(&self.identity, generation, &chunk, &self.limits)?;
-            logical += staged.descriptor.decoded_len;
+            logical = logical
+                .checked_add(staged.descriptor.decoded_len)
+                .ok_or_else(|| invalid("explicit state compaction logical byte overflow"))?;
             let descriptor = publish_segment(&self.dir, staged, &self.identity, &self.limits)?;
-            physical += descriptor.file_len;
+            physical = physical
+                .checked_add(descriptor.file_len)
+                .ok_or_else(|| invalid("explicit state compaction physical byte overflow"))?;
             state_segments.push(descriptor);
         }
         let manifest = manifest_for_update(
@@ -561,7 +557,7 @@ impl PostingStore {
             self.manifest.base_seq,
             changed,
             state_segments,
-        );
+        )?;
         publish_manifest(&self.dir, &manifest, true)?;
         let active = read_active_pointer(&self.dir, &self.identity)?;
         let next_lease = ReaderLease::acquire(&self.dir, &self.identity, &active)?;
@@ -571,7 +567,9 @@ impl PostingStore {
             .lock()
             .map_err(|_| corrupt("posting cache poisoned"))?
             .clear();
-        physical += self.manifest.active_pointer_bytes;
+        physical = physical
+            .checked_add(self.manifest.active_pointer_bytes)
+            .ok_or_else(|| invalid("explicit compaction pointer byte overflow"))?;
         let reclaimed = self.reclaim_obsolete_files()?;
         let receipt = SpannPostingWriteReceipt {
             generation: self.manifest.generation,
@@ -646,7 +644,10 @@ impl PostingStore {
     }
 
     fn live_reachable_files(&self) -> Result<BTreeSet<String>> {
-        let mut targets = live_lease_targets(&self.dir, &self.identity, &self.limits)?;
+        // The atomic pointer is itself a reachability root, including between
+        // processes when no current-generation reader lease is open.
+        let mut targets = vec![read_active_pointer(&self.dir, &self.identity)?];
+        targets.extend(live_lease_targets(&self.dir, &self.identity, &self.limits)?);
         targets.sort_by_key(|target| (target.generation, target.manifest_hash));
         targets.dedup_by_key(|target| (target.generation, target.manifest_hash));
         let mut reachable = BTreeSet::new();
@@ -707,7 +708,7 @@ impl PostingStore {
             active_pointer_bytes: self.manifest.active_pointer_bytes,
             active_physical_bytes,
             directory_physical_bytes: directory.total_bytes,
-            retained_reader_bytes: directory.retained_reader_bytes,
+            retained_generation_bytes: directory.retained_generation_bytes,
             reader_lease_bytes: directory.reader_lease_bytes,
             temporary_bytes: directory.temporary_bytes,
             orphan_bytes: directory.orphan_bytes,
@@ -815,6 +816,293 @@ impl StoreWriteLock {
         })?;
         Ok(Self { _file: file })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_posting_update(
+    dir: &Path,
+    current: &[SegmentDescriptor],
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+    centroid_id: u32,
+    generation: u64,
+    mutation: PostingMutation,
+) -> Result<(Vec<SegmentDescriptor>, Vec<StagedSegment>, bool)> {
+    let original_mutation = mutation.clone();
+    let mut prefix = current.to_vec();
+    let mut pending = vec![mutation];
+    let mut compacted = false;
+
+    // Binary/size-tiered tail compaction: only replace the newest adjacent
+    // run, so the manifest remains chronological and older tombstones cannot
+    // be lost. Equal tiers make total rewrite work amortized O(N log N).
+    loop {
+        let Some(last) = prefix.last() else {
+            break;
+        };
+        let pending_count = u32::try_from(pending.len())
+            .map_err(|_| invalid("pending posting tier count exceeds u32"))?;
+        if segment_tier(last.record_count)? != segment_tier(pending_count)?
+            || !posting_runs_fit(last, &pending, identity, limits)?
+        {
+            break;
+        }
+        let prior = read_posting_operations(dir, last, identity, limits)?;
+        pending = merge_posting_mutations(prior, pending);
+        prefix.pop();
+        compacted = true;
+    }
+
+    let chunks = if prefix.len() + 1 > limits.max_segments_per_posting as usize {
+        // A deliberately small registry segment count may exhaust the binary
+        // tiers. Compact the complete history once, then split it back into
+        // bounded segments. Because no older run remains, tombstones may be
+        // discarded without allowing deleted memberships to reappear.
+        let mut materialized = materialize_posting(dir, current, identity, limits)?
+            .into_iter()
+            .map(|member| (member.cx_id, member))
+            .collect::<BTreeMap<_, _>>();
+        apply_mutation(&mut materialized, original_mutation);
+        prefix.clear();
+        compacted = true;
+        posting_compaction_chunks(materialized.into_values(), limits)?
+    } else {
+        vec![pending]
+    };
+    if prefix.len() + chunks.len() > limits.max_segments_per_posting as usize {
+        return Err(invalid(format!(
+            "centroid {centroid_id} needs {} bounded posting segments, above registry limit {}; raise max_segments_per_posting or rebuild with a larger segment budget",
+            prefix.len() + chunks.len(),
+            limits.max_segments_per_posting
+        )));
+    }
+    let mut staged = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        staged.push(build_posting_segment(
+            identity,
+            centroid_id,
+            generation,
+            &chunk,
+            limits,
+        )?);
+    }
+    Ok((prefix, staged, compacted))
+}
+
+fn prepare_state_update(
+    dir: &Path,
+    current: &[SegmentDescriptor],
+    next_records: &BTreeMap<u32, StoredRecord>,
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+    generation: u64,
+    next_record: StoredRecord,
+) -> Result<(Vec<SegmentDescriptor>, Vec<StagedSegment>, bool)> {
+    let mut prefix = current.to_vec();
+    let mut pending = vec![next_record];
+    let mut compacted = false;
+    loop {
+        let Some(last) = prefix.last() else {
+            break;
+        };
+        let pending_count = u32::try_from(pending.len())
+            .map_err(|_| invalid("pending state tier count exceeds u32"))?;
+        if segment_tier(last.record_count)? != segment_tier(pending_count)?
+            || !state_runs_fit(last, &pending, identity, limits)?
+        {
+            break;
+        }
+        let prior = read_state_records(dir, last, identity, limits)?;
+        pending = merge_state_records(prior, pending);
+        prefix.pop();
+        compacted = true;
+    }
+
+    let chunks = if prefix.len() + 1 > limits.max_state_segments as usize {
+        prefix.clear();
+        compacted = true;
+        state_compaction_chunks(next_records.values(), limits)?
+    } else {
+        vec![pending]
+    };
+    if prefix.len() + chunks.len() > limits.max_state_segments as usize {
+        return Err(invalid(format!(
+            "state needs {} bounded segments, above registry limit {}; raise max_state_segments or rebuild with a larger segment budget",
+            prefix.len() + chunks.len(),
+            limits.max_state_segments
+        )));
+    }
+    let mut staged = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        staged.push(build_state_segment(identity, generation, &chunk, limits)?);
+    }
+    Ok((prefix, staged, compacted))
+}
+
+fn posting_runs_fit(
+    left: &SegmentDescriptor,
+    right: &[PostingMutation],
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+) -> Result<bool> {
+    let right_count = u32::try_from(right.len())
+        .map_err(|_| invalid("pending posting tier count exceeds u32"))?;
+    let Some(combined_count) = left.record_count.checked_add(right_count) else {
+        return Ok(false);
+    };
+    if combined_count > limits.max_members_per_segment {
+        return Ok(false);
+    }
+    let right_len = u64::try_from(encode_posting_mutations(right, identity.dim, limits)?.len())
+        .map_err(|_| invalid("pending posting tier length exceeds u64"))?;
+    let upper = left
+        .decoded_len
+        .checked_add(right_len)
+        .and_then(|bytes| bytes.checked_sub(4))
+        .ok_or_else(|| invalid("posting tier length accounting overflow"))?;
+    Ok(upper <= limits.max_decoded_segment_bytes)
+}
+
+fn state_runs_fit(
+    left: &SegmentDescriptor,
+    right: &[StoredRecord],
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+) -> Result<bool> {
+    let right_count =
+        u32::try_from(right.len()).map_err(|_| invalid("pending state tier count exceeds u32"))?;
+    let Some(combined_count) = left.record_count.checked_add(right_count) else {
+        return Ok(false);
+    };
+    if combined_count > limits.max_members_per_segment {
+        return Ok(false);
+    }
+    let right_len = u64::try_from(
+        encode_state_records(right, identity.dim, identity.centroid_count, limits)?.len(),
+    )
+    .map_err(|_| invalid("pending state tier length exceeds u64"))?;
+    let upper = left
+        .decoded_len
+        .checked_add(right_len)
+        .and_then(|bytes| bytes.checked_sub(4))
+        .ok_or_else(|| invalid("state tier length accounting overflow"))?;
+    Ok(upper <= limits.max_decoded_segment_bytes)
+}
+
+fn segment_tier(record_count: u32) -> Result<u32> {
+    if record_count == 0 {
+        return Err(corrupt("immutable SPANN segment has zero records"));
+    }
+    Ok(u32::BITS - 1 - record_count.leading_zeros())
+}
+
+fn read_posting_operations(
+    dir: &Path,
+    descriptor: &SegmentDescriptor,
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+) -> Result<Vec<PostingMutation>> {
+    let DecodedSegment::Posting(operations) = read_segment(dir, descriptor, identity, limits)?
+    else {
+        return Err(corrupt(format!(
+            "posting descriptor {} decoded as state data",
+            descriptor.file_name
+        )));
+    };
+    Ok(operations)
+}
+
+fn read_state_records(
+    dir: &Path,
+    descriptor: &SegmentDescriptor,
+    identity: &SpannIndexIdentity,
+    limits: &SpannPostingLimits,
+) -> Result<Vec<StoredRecord>> {
+    let DecodedSegment::State(records) = read_segment(dir, descriptor, identity, limits)? else {
+        return Err(corrupt(format!(
+            "state descriptor {} decoded as posting data",
+            descriptor.file_name
+        )));
+    };
+    Ok(records)
+}
+
+fn merge_posting_mutations(
+    older: Vec<PostingMutation>,
+    newer: Vec<PostingMutation>,
+) -> Vec<PostingMutation> {
+    let mut merged = BTreeMap::new();
+    for operation in older.into_iter().chain(newer) {
+        merged.insert(operation.cx_id, operation);
+    }
+    merged.into_values().collect()
+}
+
+fn merge_state_records(older: Vec<StoredRecord>, newer: Vec<StoredRecord>) -> Vec<StoredRecord> {
+    let mut merged = BTreeMap::new();
+    for record in older.into_iter().chain(newer) {
+        merged.insert(record.local_id, record);
+    }
+    merged.into_values().collect()
+}
+
+fn posting_compaction_chunks(
+    members: impl Iterator<Item = PostingMember>,
+    limits: &SpannPostingLimits,
+) -> Result<Vec<Vec<PostingMutation>>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 4_u64;
+    for member in members {
+        let operation = PostingMutation::upsert(member);
+        let operation_bytes = estimate_posting_mutation_bytes(&operation)?;
+        if operation_bytes
+            .checked_add(4)
+            .ok_or_else(|| invalid("posting compaction member byte overflow"))?
+            > limits.max_decoded_segment_bytes
+        {
+            return Err(invalid(format!(
+                "posting member {} needs {operation_bytes} bytes above segment limit {}",
+                operation.cx_id, limits.max_decoded_segment_bytes
+            )));
+        }
+        if !current.is_empty()
+            && (current.len() >= limits.max_members_per_segment as usize
+                || current_bytes
+                    .checked_add(operation_bytes)
+                    .is_none_or(|bytes| bytes > limits.max_decoded_segment_bytes))
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 4;
+        }
+        current.push(operation);
+        current_bytes = current_bytes
+            .checked_add(operation_bytes)
+            .ok_or_else(|| invalid("posting compaction byte estimate overflow"))?;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+fn estimate_posting_mutation_bytes(operation: &PostingMutation) -> Result<u64> {
+    let mut bytes = 6_u64; // worst-case u32 varint + operation tag
+    if let Some(vector) = &operation.vector {
+        let nnz = u64::try_from(vector.len())
+            .map_err(|_| invalid("posting compaction nnz exceeds u64"))?;
+        bytes = bytes
+            .checked_add(5)
+            .and_then(|sum| sum.checked_add(nnz.checked_mul(9)?))
+            .ok_or_else(|| invalid("posting compaction byte estimate overflow"))?;
+    }
+    Ok(bytes)
 }
 
 fn validate_declared_components(
@@ -965,7 +1253,11 @@ fn state_compaction_chunks<'a>(
     let mut current_bytes = 4_u64;
     for record in records {
         let record_bytes = estimate_state_record_bytes(record)?;
-        if record_bytes + 4 > limits.max_decoded_segment_bytes {
+        if record_bytes
+            .checked_add(4)
+            .ok_or_else(|| invalid("state compaction record byte overflow"))?
+            > limits.max_decoded_segment_bytes
+        {
             return Err(invalid(format!(
                 "state record {} needs {record_bytes} bytes above segment limit {}",
                 record.local_id, limits.max_decoded_segment_bytes
@@ -973,13 +1265,17 @@ fn state_compaction_chunks<'a>(
         }
         if !current.is_empty()
             && (current.len() >= limits.max_members_per_segment as usize
-                || current_bytes + record_bytes > limits.max_decoded_segment_bytes)
+                || current_bytes
+                    .checked_add(record_bytes)
+                    .is_none_or(|bytes| bytes > limits.max_decoded_segment_bytes))
         {
             chunks.push(std::mem::take(&mut current));
             current_bytes = 4;
         }
         current.push(record.clone());
-        current_bytes += record_bytes;
+        current_bytes = current_bytes
+            .checked_add(record_bytes)
+            .ok_or_else(|| invalid("state compaction byte estimate overflow"))?;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -988,26 +1284,39 @@ fn state_compaction_chunks<'a>(
 }
 
 fn estimate_state_record_bytes(record: &StoredRecord) -> Result<u64> {
-    let mut bytes = varint_len(record.local_id) as u64 + 16 + 8;
-    bytes += varint_len(record.memberships.len() as u32) as u64;
+    let membership_count = u32::try_from(record.memberships.len())
+        .map_err(|_| invalid("state membership count exceeds u32"))?;
+    let vector_count =
+        u32::try_from(record.vector.len()).map_err(|_| invalid("state vector nnz exceeds u32"))?;
+    let mut bytes = u64::try_from(varint_len(record.local_id))
+        .map_err(|_| invalid("state local-id varint length exceeds u64"))?
+        .checked_add(24)
+        .and_then(|sum| sum.checked_add(varint_len(membership_count) as u64))
+        .ok_or_else(|| invalid("state record byte estimate overflow"))?;
     let mut previous = 0_u32;
     for (ordinal, centroid) in record.memberships.iter().enumerate() {
-        bytes += varint_len(if ordinal == 0 {
-            *centroid
-        } else {
-            *centroid - previous
-        }) as u64;
+        bytes = bytes
+            .checked_add(varint_len(if ordinal == 0 {
+                *centroid
+            } else {
+                *centroid - previous
+            }) as u64)
+            .ok_or_else(|| invalid("state membership byte estimate overflow"))?;
         previous = *centroid;
     }
-    bytes += varint_len(record.vector.len() as u32) as u64;
+    bytes = bytes
+        .checked_add(varint_len(vector_count) as u64)
+        .ok_or_else(|| invalid("state vector-count byte estimate overflow"))?;
     let mut previous_idx = 0_u32;
     for (ordinal, (idx, _)) in record.vector.iter().enumerate() {
-        bytes += varint_len(if ordinal == 0 {
-            *idx
-        } else {
-            *idx - previous_idx
-        }) as u64
-            + 4;
+        bytes = bytes
+            .checked_add(varint_len(if ordinal == 0 {
+                *idx
+            } else {
+                *idx - previous_idx
+            }) as u64)
+            .and_then(|sum| sum.checked_add(4))
+            .ok_or_else(|| invalid("state vector byte estimate overflow"))?;
         previous_idx = *idx;
     }
     Ok(bytes)
@@ -1103,11 +1412,10 @@ fn directory_physical_state(
                 .checked_add(metadata.len())
                 .ok_or_else(|| invalid("active byte accounting overflow"))?;
         } else if retained_files.contains(name.as_ref()) {
-            state.retained_reader_bytes =
-                state
-                    .retained_reader_bytes
-                    .checked_add(metadata.len())
-                    .ok_or_else(|| invalid("retained-reader byte accounting overflow"))?;
+            state.retained_generation_bytes = state
+                .retained_generation_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| invalid("retained-generation byte accounting overflow"))?;
         } else if name.ends_with(".lease") {
             state.reader_lease_bytes = state
                 .reader_lease_bytes

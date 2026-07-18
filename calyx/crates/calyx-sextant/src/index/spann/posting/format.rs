@@ -244,7 +244,7 @@ pub(super) fn publish_segment(
             )));
         }
         decode_segment_bytes(&readback, &staged.descriptor, identity, limits)?;
-        move_file_write_through(&temp_path, &final_path, false)?;
+        publish_synced_file_atomic(&temp_path, &final_path, false)?;
         let final_readback = read_exact_file(&final_path, staged.descriptor.file_len, limits)?;
         if blake3::hash(&final_readback).as_bytes() != &staged.descriptor.file_hash {
             return Err(corrupt(format!(
@@ -517,35 +517,107 @@ fn unique_temp_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(temp))
 }
 
-pub(super) fn move_file_write_through(source: &Path, target: &Path, replace: bool) -> Result<()> {
-    move_file_write_through_impl(source, target, replace)
+pub(crate) fn publish_synced_file_atomic(
+    source: &Path,
+    target: &Path,
+    replace: bool,
+) -> Result<()> {
+    publish_synced_file_atomic_impl(source, target, replace)
 }
 
 #[cfg(windows)]
-fn move_file_write_through_impl(source: &Path, target: &Path, replace: bool) -> Result<()> {
+fn publish_synced_file_atomic_impl(source: &Path, target: &Path, replace: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileRenameInfoEx, SYNCHRONIZE, SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
     };
 
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target_wide = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
+    if target.file_name().is_none() {
+        return Err(corrupt(format!(
+            "SPANN publication target {} has no file name",
+            target.display()
+        )));
     }
-    // SAFETY: both UTF-16 buffers are NUL-terminated and alive for the call.
-    if unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) } == 0 {
+    // `canonicalize` produces a Win32 verbatim (`\\?\`) path. That prefix is
+    // a Win32 parser instruction, not part of the native rename filename, and
+    // FileRenameInfoEx can persist bytes beyond the intended component when it
+    // is embedded in FILE_RENAME_INFO. Supply an ordinary absolute DOS path.
+    let absolute_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| io("resolve SPANN publication working directory", error))?
+            .join(target)
+    };
+    let target_wide = absolute_target
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    let file_name_bytes = target_wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| corrupt("SPANN publication target length overflow"))?;
+    let file_name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let buffer_len = file_name_offset
+        .checked_add(file_name_bytes)
+        .ok_or_else(|| corrupt("SPANN rename buffer length overflow"))?;
+    let buffer_len_u32 = u32::try_from(buffer_len)
+        .map_err(|_| corrupt("SPANN rename buffer exceeds the Windows u32 limit"))?;
+    let word_size = std::mem::size_of::<usize>();
+    let word_count = buffer_len
+        .checked_add(word_size - 1)
+        .ok_or_else(|| corrupt("SPANN rename buffer alignment overflow"))?
+        / word_size;
+    let mut buffer = vec![0_usize; word_count];
+    let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let mut flags = 0_u32;
+    if replace {
+        flags |= FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    }
+    // SAFETY: `buffer` is pointer-aligned and large enough for the fixed
+    // FILE_RENAME_INFO prefix plus every UTF-16 code unit copied below.
+    unsafe {
+        std::ptr::write(rename_info, FILE_RENAME_INFO::default());
+        (*rename_info).Anonymous.Flags = flags;
+        (*rename_info).RootDirectory = std::ptr::null_mut();
+        (*rename_info).FileNameLength = u32::try_from(file_name_bytes)
+            .map_err(|_| corrupt("SPANN publication target exceeds the Windows u32 limit"))?;
+        std::ptr::copy_nonoverlapping(
+            target_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
+            target_wide.len(),
+        );
+    }
+
+    let source_file = OpenOptions::new()
+        .read(true)
+        .access_mode(DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(source)
+        .map_err(|error| io("open staged SPANN component for atomic publication", error))?;
+    // SAFETY: the source handle is live and DELETE-capable; `buffer` remains
+    // live and contains an initialized variable-length FILE_RENAME_INFO.
+    if unsafe {
+        SetFileInformationByHandle(
+            source_file.as_raw_handle(),
+            FileRenameInfoEx,
+            buffer.as_ptr().cast(),
+            buffer_len_u32,
+        )
+    } == 0
+    {
         return Err(io(
-            "publish SPANN component with MoveFileExW",
+            &format!(
+                "atomically publish SPANN component {} -> {} with FileRenameInfoEx",
+                source.display(),
+                target.display()
+            ),
             std::io::Error::last_os_error(),
         ));
     }
@@ -553,7 +625,7 @@ fn move_file_write_through_impl(source: &Path, target: &Path, replace: bool) -> 
 }
 
 #[cfg(not(windows))]
-fn move_file_write_through_impl(source: &Path, target: &Path, replace: bool) -> Result<()> {
+fn publish_synced_file_atomic_impl(source: &Path, target: &Path, replace: bool) -> Result<()> {
     if !replace && target.exists() {
         return Err(corrupt(format!(
             "immutable SPANN target already exists: {}",

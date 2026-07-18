@@ -8,6 +8,8 @@ mod lease;
 mod manifest;
 mod store;
 
+pub(super) use format::publish_synced_file_atomic;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -254,7 +256,7 @@ impl SpannSearch {
         validate_query(self.dim, query)?;
         let centroid_ids = self
             .centroids
-            .nearest_centroids_raw_l2_graph(query, n_probe);
+            .nearest_centroids_raw_l2_graph(query, n_probe)?;
         let expected = n_probe.min(self.centroids.centroid_count());
         if centroid_ids.len() != expected {
             return Err(corrupt(format!(

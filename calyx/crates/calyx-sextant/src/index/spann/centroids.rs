@@ -13,6 +13,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
+use super::posting::publish_synced_file_atomic;
 use crate::error::{
     CALYX_INDEX_CORRUPT, CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_INVALID_PARAMS, CALYX_INDEX_IO,
     sextant_error,
@@ -136,58 +137,63 @@ impl SpannCentroidIndex {
             .find_map(|(id, centroid)| (*id == vector_id).then_some(*centroid))
     }
 
-    pub fn assign(&self, vector: &[f32]) -> u32 {
-        nearest_by_l2(&self.centroids, vector).unwrap_or(0)
+    pub fn assign(&self, vector: &[f32]) -> Result<u32> {
+        self.nearest_centroids_exact_l2(vector, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| corrupt("exact squared-L2 centroid routing returned no region"))
     }
 
     /// Approximate nearest-centroid assignment via the HNSW routing layer —
     /// O(log R) instead of `assign`'s O(R) linear scan. The partitioned
     /// billion-scale builder grows the centroid count R with N, so an exact scan
     /// makes the assignment phase O(N*R*dim) ~ quadratic in N; routing through the
-    /// HNSW keeps it O(N*log R*dim). Falls back to the exact scan if the HNSW
-    /// returns nothing (degenerate/empty index) so assignment never silently drops
-    /// a vector.
-    pub fn assign_hnsw(&self, vector: &[f32]) -> u32 {
-        self.nearest_centroids(vector, 1)
+    /// HNSW keeps it O(N*log R*dim). Any routing error or incomplete result is
+    /// returned to the caller; assignment never substitutes another route.
+    pub fn assign_hnsw(&self, vector: &[f32]) -> Result<u32> {
+        self.nearest_centroids(vector, 1)?
             .first()
             .copied()
-            .unwrap_or_else(|| self.assign(vector))
+            .ok_or_else(|| corrupt("HNSW centroid routing returned no region"))
     }
 
     /// Approximate raw-L2 nearest-centroid assignment through the metric-aware
     /// centroid graph. This avoids the cosine-only HNSW route while keeping the
     /// assignment phase sublinear in the final centroid count.
-    pub fn assign_raw_l2_graph(&self, vector: &[f32]) -> u32 {
-        self.nearest_centroids_raw_l2_graph(vector, 1)
+    pub fn assign_raw_l2_graph(&self, vector: &[f32]) -> Result<u32> {
+        self.nearest_centroids_raw_l2_graph(vector, 1)?
             .first()
             .copied()
-            .unwrap_or_else(|| self.assign(vector))
+            .ok_or_else(|| corrupt("raw squared-L2 centroid routing returned no region"))
     }
 
-    pub fn nearest_centroids(&self, query: &[f32], n_probe: usize) -> Vec<u32> {
-        if self.centroids.is_empty() || n_probe == 0 || query.len() != self.dim as usize {
-            return Vec::new();
-        }
+    pub fn nearest_centroids(&self, query: &[f32], n_probe: usize) -> Result<Vec<u32>> {
+        let k = self.validate_route_request(query, n_probe)?;
         let query = SlotVector::Dense {
             dim: self.dim,
             data: query.to_vec(),
         };
-        let k = n_probe.min(self.centroids.len());
-        self.hnsw
-            .search(&query, k, Some(k.max(64)))
-            .map(|hits| {
-                hits.into_iter()
-                    .filter_map(|hit| self.centroid_lookup.get(&hit.cx_id).copied())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let hits = self.hnsw.search(&query, k, Some(k.max(64)))?;
+        let mut routes = Vec::with_capacity(hits.len());
+        for hit in hits {
+            routes.push(*self.centroid_lookup.get(&hit.cx_id).ok_or_else(|| {
+                corrupt(format!(
+                    "HNSW centroid route references unknown CxId {}",
+                    hit.cx_id
+                ))
+            })?);
+        }
+        if routes.len() != k {
+            return Err(corrupt(format!(
+                "HNSW centroid router returned {} routes, expected {k}",
+                routes.len()
+            )));
+        }
+        Ok(routes)
     }
 
-    pub fn nearest_centroids_exact_l2(&self, query: &[f32], n_probe: usize) -> Vec<u32> {
-        if self.centroids.is_empty() || n_probe == 0 || query.len() != self.dim as usize {
-            return Vec::new();
-        }
-        let k = n_probe.min(self.centroids.len());
+    pub fn nearest_centroids_exact_l2(&self, query: &[f32], n_probe: usize) -> Result<Vec<u32>> {
+        let k = self.validate_route_request(query, n_probe)?;
         let mut scored: Vec<(u32, f32)> = self
             .centroids
             .iter()
@@ -195,13 +201,38 @@ impl SpannCentroidIndex {
             .map(|(idx, centroid)| (idx as u32, l2_sq(centroid, query)))
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        scored.into_iter().take(k).map(|(idx, _)| idx).collect()
+        Ok(scored.into_iter().take(k).map(|(idx, _)| idx).collect())
     }
 
-    pub fn nearest_centroids_raw_l2_graph(&self, query: &[f32], n_probe: usize) -> Vec<u32> {
+    pub fn nearest_centroids_raw_l2_graph(
+        &self,
+        query: &[f32],
+        n_probe: usize,
+    ) -> Result<Vec<u32>> {
+        self.validate_route_request(query, n_probe)?;
         let ef = n_probe.saturating_mul(4).max(RAW_L2_GRAPH_EF_FLOOR);
         self.raw_l2_graph
             .search(&self.centroids, query, n_probe, ef)
+    }
+
+    fn validate_route_request(&self, query: &[f32], n_probe: usize) -> Result<usize> {
+        if self.centroids.is_empty() {
+            return Err(invalid("centroid routing requires a non-empty index"));
+        }
+        if n_probe == 0 {
+            return Err(invalid("centroid routing n_probe must be positive"));
+        }
+        if query.len() != self.dim as usize {
+            return Err(invalid(format!(
+                "centroid routing query dim {} != {}",
+                query.len(),
+                self.dim
+            )));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(invalid("centroid routing query contains non-finite values"));
+        }
+        Ok(n_probe.min(self.centroids.len()))
     }
 
     pub fn save(&self, slot_sparse_dir: impl AsRef<Path>) -> Result<()> {
@@ -248,7 +279,7 @@ impl SpannCentroidIndex {
                 tmp.display()
             )));
         }
-        move_file_write_through(&tmp, path, path.exists())?;
+        publish_synced_file_atomic(&tmp, path, path.exists())?;
         let published = Self::open_from_path_with_max_bytes(path, DEFAULT_MAX_CENTROID_FILE_BYTES)?;
         if published.content_hash() != expected_hash {
             return Err(corrupt(format!(
@@ -543,46 +574,4 @@ fn corrupt(detail: impl std::fmt::Display) -> calyx_core::CalyxError {
 
 fn io(stage: &str, error: std::io::Error) -> calyx_core::CalyxError {
     sextant_error(CALYX_INDEX_IO, format!("spann centroids {stage}: {error}"))
-}
-
-#[cfg(windows)]
-fn move_file_write_through(source: &Path, target: &Path, replace: bool) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target_wide = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
-    }
-    // SAFETY: both UTF-16 buffers are NUL-terminated and alive for the call.
-    if unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) } == 0 {
-        return Err(io(
-            "publish centroids with MoveFileExW",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn move_file_write_through(source: &Path, target: &Path, replace: bool) -> Result<()> {
-    if !replace && target.exists() {
-        return Err(corrupt(format!(
-            "immutable centroid target already exists: {}",
-            target.display()
-        )));
-    }
-    fs::rename(source, target).map_err(|error| io("publish centroids", error))
 }

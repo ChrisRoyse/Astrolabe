@@ -128,7 +128,7 @@ impl PartitionedSearch {
             PartitionDistanceMetric::RawL2 => self
                 .centroids
                 .nearest_centroids_exact_l2(query, n_probe.max(1)),
-        };
+        }?;
         if let Some(epsilon) = pruning_epsilon {
             regions = self.prune_candidate_regions(query, regions, epsilon);
         }
