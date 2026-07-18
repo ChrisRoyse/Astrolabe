@@ -1075,6 +1075,7 @@ struct LoadedModulePolicy {
     ort_managed_load: Vec<String>,
     bundle_module_globs: Vec<String>,
     system_modules: Vec<SystemModulePolicy>,
+    driver_store_companions: Vec<DriverStoreCompanionPolicy>,
     system_roots: Vec<String>,
     reject_application_dir: bool,
     reject_path_search: bool,
@@ -1090,6 +1091,22 @@ struct SystemModulePolicy {
     signed_company_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriverStoreCompanionPolicy {
+    name: String,
+    attestation_name: String,
+    owner: String,
+    required_root: String,
+    signature_kind: String,
+    signer_organization: String,
+    signed_company_name: String,
+    require_same_catalog: bool,
+    require_same_signer_certificate: bool,
+    require_same_file_version: bool,
+    require_same_product_name: bool,
+}
+
 fn initialize_core() -> Result<LiveRuntime> {
     reject_legacy_environment()?;
     let lock = parse_and_validate_embedded_lock()?;
@@ -1097,7 +1114,7 @@ fn initialize_core() -> Result<LiveRuntime> {
     let (root, bundle_receipt_sha256, provisioned_at_utc) = {
         let boundary = calyx_forge::cuda_runtime::initialize_pinned_cuda_runtime_boundary()
             .map_err(forge_runtime_boundary_error)?;
-        validate_forge_boundary(&boundary, &lock, &lock_sha256, false)?;
+        validate_forge_boundary(&boundary, &lock, &lock_sha256, false, false)?;
         (
             boundary.bundle_root,
             boundary.bundle_receipt_sha256,
@@ -1176,7 +1193,7 @@ fn initialize_cuda(live: &mut LiveRuntime, requested: u32) -> Result<()> {
     let lock_sha256 = sha256_bytes(LOCK_BYTES);
     let boundary = calyx_forge::cuda_runtime::initialize_pinned_cuda_dependencies()
         .map_err(forge_runtime_boundary_error)?;
-    validate_forge_boundary(&boundary, &live.lock, &lock_sha256, true)?;
+    validate_forge_boundary(&boundary, &live.lock, &lock_sha256, true, false)?;
     let device =
         calyx_forge::select_pinned_cuda_device(requested).map_err(forge_runtime_boundary_error)?;
     let observed_driver_ordinal = calyx_forge::attest_pinned_cuda_driver_identity(device.identity)
@@ -1205,7 +1222,7 @@ fn refresh_cuda_module_attestation(
 ) -> Result<()> {
     let boundary = calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
         .map_err(forge_runtime_boundary_error)?;
-    validate_forge_boundary(&boundary, &live.lock, lock_sha256, true)?;
+    validate_forge_boundary(&boundary, &live.lock, lock_sha256, true, true)?;
     let mut modules = boundary
         .modules
         .into_iter()
@@ -1296,6 +1313,9 @@ fn validate_forge_boundary(
     lock: &RuntimeLock,
     lock_sha256: &str,
     require_cuda: bool,
+    // Mirrors Forge's demand-load boundary: optional before select_pinned_cuda_device,
+    // mandatory after its real CUDA/NVML probes and after session creation.
+    require_driver_store_companions: bool,
 ) -> Result<()> {
     require_contract(
         boundary.schema == "calyx-pinned-cuda-runtime-attestation-v3",
@@ -1348,6 +1368,16 @@ fn validate_forge_boundary(
     if require_cuda {
         expected_names.insert("nvcuda.dll".to_string());
         expected_names.insert("nvml.dll".to_string());
+        for policy in &lock.loaded_module_policy.driver_store_companions {
+            if require_driver_store_companions
+                || boundary
+                    .modules
+                    .iter()
+                    .any(|module| module.name.eq_ignore_ascii_case(&policy.attestation_name))
+            {
+                expected_names.insert(policy.attestation_name.to_ascii_lowercase());
+            }
+        }
     }
     let observed = boundary
         .modules
@@ -1410,9 +1440,9 @@ fn validate_forge_boundary(
     let system32 =
         canonicalize_existing_dir(&boundary.system_module_root, "Forge OS system-module root")?;
     reject_reparse_entry(&system32, "canonical Forge OS system-module root")?;
-    for (name, module) in observed {
+    for (name, module) in &observed {
         let observed_path = canonicalize_existing_file(&module.path, "Forge loaded module")?;
-        if let Some(file) = locked.get(&name) {
+        if let Some(file) = locked.get(name) {
             let expected_path = canonicalize_existing_file(
                 &expected_root.join(windows_relative_path(&file.bundle_path)?),
                 "locked managed module",
@@ -1425,14 +1455,28 @@ fn validate_forge_boundary(
                     && module.system_trust.is_none(),
                 &format!("Forge attestation differs from lock for {name}"),
             )?;
+        } else if let Some(policy) = lock
+            .loaded_module_policy
+            .driver_store_companions
+            .iter()
+            .find(|policy| policy.attestation_name.eq_ignore_ascii_case(name))
+        {
+            validate_driver_store_companion_attestation(
+                &system32,
+                &observed,
+                policy,
+                name,
+                module,
+                &observed_path,
+            )?;
         } else {
             let expected_path =
-                canonicalize_existing_file(&system32.join(&name), "NVIDIA system module")?;
+                canonicalize_existing_file(&system32.join(name), "NVIDIA system module")?;
             let policy = lock
                 .loaded_module_policy
                 .system_modules
                 .iter()
-                .find(|policy| policy.name.eq_ignore_ascii_case(&name))
+                .find(|policy| policy.name.eq_ignore_ascii_case(name))
                 .ok_or_else(|| {
                     runtime_error(
                         "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
@@ -1452,7 +1496,7 @@ fn validate_forge_boundary(
                     && module.bytes > 0
                     && module.sha256.len() == 64
                     && trust.schema == "calyx-system-module-trust-v1"
-                    && trust.module_name.eq_ignore_ascii_case(&name)
+                    && trust.module_name.eq_ignore_ascii_case(name)
                     && same_path(&trust.module_path, &expected_path)
                     && trust.file_bytes == module.bytes
                     && trust.file_sha256 == module.sha256
@@ -1469,6 +1513,118 @@ fn validate_forge_boundary(
             )?;
         }
     }
+    Ok(())
+}
+
+fn validate_driver_store_companion_attestation(
+    system32: &Path,
+    observed: &BTreeMap<String, &calyx_forge::cuda_runtime::PinnedCudaModuleAttestation>,
+    policy: &DriverStoreCompanionPolicy,
+    name: &str,
+    module: &calyx_forge::cuda_runtime::PinnedCudaModuleAttestation,
+    observed_path: &Path,
+) -> Result<()> {
+    reject_reparse_entry(&module.path, "Forge DriverStore companion")?;
+    let repository_raw = system32.join("DriverStore").join("FileRepository");
+    reject_reparse_entry(&repository_raw, "DriverStore FileRepository root")?;
+    let repository = canonicalize_existing_dir(&repository_raw, "DriverStore FileRepository root")?;
+    reject_reparse_entry(&repository, "canonical DriverStore FileRepository root")?;
+    let package_raw = module.path.parent().ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+            format!(
+                "DriverStore companion {} has no package parent",
+                module.path.display()
+            ),
+            CONTRACT_REMEDIATION,
+        )
+    })?;
+    reject_reparse_entry(package_raw, "DriverStore package root")?;
+    let package = canonicalize_existing_dir(package_raw, "DriverStore package root")?;
+    require_contract(
+        package
+            .parent()
+            .is_some_and(|parent| same_path(parent, &repository)),
+        &format!(
+            "Forge DriverStore companion package is not one direct child of {}",
+            repository.display()
+        ),
+    )?;
+    let expected_path =
+        canonicalize_existing_file(&package.join(&policy.name), "NVIDIA DriverStore companion")?;
+    let trust = module.system_trust.as_ref().ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_SYSTEM_TRUST_MISSING",
+            format!("Forge supplied no catalog trust proof for DriverStore companion {name}"),
+            BUNDLE_REMEDIATION,
+        )
+    })?;
+    let owner_name = policy.owner.to_ascii_lowercase();
+    let owner = observed.get(&owner_name).ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+            format!(
+                "DriverStore companion {name} owner {} is absent",
+                policy.owner
+            ),
+            CONTRACT_REMEDIATION,
+        )
+    })?;
+    let owner_trust = owner.system_trust.as_ref().ok_or_else(|| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_SYSTEM_TRUST_MISSING",
+            format!(
+                "DriverStore companion {name} owner {} has no catalog trust proof",
+                policy.owner
+            ),
+            BUNDLE_REMEDIATION,
+        )
+    })?;
+    let bytes = fs::metadata(observed_path)
+        .map_err(|error| {
+            runtime_error(
+                "CALYX_ONNX_RUNTIME_FILE_UNREADABLE",
+                format!("stat {} failed: {error}", observed_path.display()),
+                BUNDLE_REMEDIATION,
+            )
+        })?
+        .len();
+    let sha256 = sha256_file(observed_path)?;
+    let expected_source = format!(
+        "system-driver:driverstore-companion;owner={};catalog+signer+version+product-bound",
+        owner_name
+    );
+    require_contract(
+        same_path(observed_path, &expected_path)
+            && module.bytes == bytes
+            && module.bytes > 0
+            && module.sha256 == sha256
+            && module.file_version.as_deref() == Some(trust.signed_file_version.as_str())
+            && module.source == expected_source
+            && trust.schema == "calyx-system-module-trust-v1"
+            && trust.module_name.eq_ignore_ascii_case(&policy.name)
+            && same_path(&trust.module_path, &expected_path)
+            && trust.file_bytes == module.bytes
+            && trust.file_sha256 == module.sha256
+            && trust.signature_kind == "windows-catalog-authenticode"
+            && trust.winverifytrust_status == 0
+            && trust.signer_organization == policy.signer_organization
+            && trust.signed_company_name == policy.signed_company_name
+            && !trust.signer_certificate_sha256.is_empty()
+            && !trust.signed_file_version.trim().is_empty()
+            && !trust.signed_product_name.trim().is_empty()
+            && !trust.version_translations.is_empty()
+            && same_path(&trust.catalog_path, &owner_trust.catalog_path)
+            && trust.signer_organization == owner_trust.signer_organization
+            && trust.signer_certificate_sha256 == owner_trust.signer_certificate_sha256
+            && trust.signed_company_name == owner_trust.signed_company_name
+            && trust.signed_file_version == owner_trust.signed_file_version
+            && trust.signed_product_name == owner_trust.signed_product_name,
+        &format!(
+            "Forge DriverStore companion attestation is invalid or does not match owner {} for {name}",
+            policy.owner
+        ),
+    )?;
     Ok(())
 }
 
@@ -1570,15 +1726,53 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
             "system module trust policy differs from the Windows NVIDIA driver contract",
         )?;
     }
+    let companions = lock
+        .loaded_module_policy
+        .driver_store_companions
+        .iter()
+        .map(|module| (module.attestation_name.to_ascii_lowercase(), module))
+        .collect::<BTreeMap<_, _>>();
     require_contract(
-        !lock.loaded_module_policy.system_roots.is_empty(),
-        "system_roots is empty",
+        companions.len() == lock.loaded_module_policy.driver_store_companions.len()
+            && companions.len() == 2
+            && companions.contains_key("nvcuda64.dll")
+            && companions.contains_key("nvml.driverstore.dll"),
+        "DriverStore companion identity/cardinality mismatch",
     )?;
+    for (attestation_name, companion) in companions {
+        require_contract(
+            ((attestation_name == "nvcuda64.dll"
+                && companion.name.eq_ignore_ascii_case("nvcuda64.dll")
+                && companion.owner.eq_ignore_ascii_case("nvcuda.dll"))
+                || (attestation_name == "nvml.driverstore.dll"
+                    && companion.name.eq_ignore_ascii_case("nvml.dll")
+                    && companion.owner.eq_ignore_ascii_case("nvml.dll")))
+                && companion
+                    .required_root
+                    .eq_ignore_ascii_case("%SystemRoot%\\System32\\DriverStore\\FileRepository")
+                && companion.signature_kind == "catalog"
+                && companion.signer_organization == "Microsoft Corporation"
+                && companion.signed_company_name == "NVIDIA Corporation"
+                && companion.require_same_catalog
+                && companion.require_same_signer_certificate
+                && companion.require_same_file_version
+                && companion.require_same_product_name,
+            "DriverStore companion trust policy differs from the Windows NVIDIA driver contract",
+        )?;
+    }
     require_contract(
-        lock.loaded_module_policy.system_roots.len() == 1
-            && lock.loaded_module_policy.system_roots[0]
-                .eq_ignore_ascii_case("%SystemRoot%\\System32"),
-        "system_roots must exactly identify System32",
+        lock.loaded_module_policy.system_roots.len() == 2
+            && lock
+                .loaded_module_policy
+                .system_roots
+                .iter()
+                .map(|root| root.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([
+                    "%systemroot%\\system32".to_string(),
+                    "%systemroot%\\system32\\driverstore\\filerepository".to_string(),
+                ]),
+        "system_roots must exactly identify System32 and DriverStore FileRepository",
     )?;
     require_contract(
         !lock.loaded_module_policy.bundle_module_globs.is_empty(),

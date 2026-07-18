@@ -24,7 +24,10 @@ use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 pub use crate::cuda_system_trust::{SystemModuleTrustAttestation, SystemModuleVersionTranslation};
-use crate::cuda_system_trust::{SystemModuleTrustPolicy, VerifiedSystemFile, verify_system_module};
+use crate::cuda_system_trust::{
+    SystemModuleTrustPolicy, VerifiedSystemFile, verify_driver_store_companion,
+    verify_system_module,
+};
 use crate::{ForgeError, PinnedCudaDeviceIdentity, Result};
 
 pub const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
@@ -334,6 +337,7 @@ struct LoadedModulePolicy {
     ort_managed_load: Vec<String>,
     bundle_module_globs: Vec<String>,
     system_modules: Vec<SystemModulePolicy>,
+    driver_store_companions: Vec<DriverStoreCompanionPolicy>,
     system_roots: Vec<String>,
     reject_application_dir: bool,
     reject_path_search: bool,
@@ -347,6 +351,22 @@ struct SystemModulePolicy {
     signature_kind: String,
     signer_organization: String,
     signed_company_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriverStoreCompanionPolicy {
+    name: String,
+    attestation_name: String,
+    owner: String,
+    required_root: String,
+    signature_kind: String,
+    signer_organization: String,
+    signed_company_name: String,
+    require_same_catalog: bool,
+    require_same_signer_certificate: bool,
+    require_same_file_version: bool,
+    require_same_product_name: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +442,7 @@ pub fn attest_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation>
         &boundary.root,
         &boundary.system32,
         &enumerate_process_modules()?,
+        true,
         true,
         true,
     )?;
@@ -1177,6 +1198,7 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         &enumerate_process_modules()?,
         false,
         false,
+        false,
     )?;
     let (ort_managed_modules, ort_managed_file_guards) =
         open_locked_ort_managed_modules(&lock, &root)?;
@@ -1252,6 +1274,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         &enumerate_process_modules()?,
         true,
         false,
+        false,
     )?;
     let mut attestation = boundary.attestation.clone();
     attestation.modules = modules;
@@ -1298,8 +1321,18 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
         "loaded-module policy does not reject ambient search",
     )?;
     require(
-        lock.loaded_module_policy.system_roots == ["%SystemRoot%\\System32"],
-        "System32 must be the only system module root",
+        lock.loaded_module_policy.system_roots.len() == 2
+            && lock
+                .loaded_module_policy
+                .system_roots
+                .iter()
+                .map(|root| root.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([
+                    "%systemroot%\\system32".to_string(),
+                    "%systemroot%\\system32\\driverstore\\filerepository".to_string(),
+                ]),
+        "system module roots must be exactly System32 and DriverStore FileRepository",
     )?;
     let system_modules = lock
         .loaded_module_policy
@@ -1324,6 +1357,40 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
                 && module.signer_organization == "Microsoft Corporation"
                 && module.signed_company_name == "NVIDIA Corporation",
             "system module trust policy differs from the Windows NVIDIA driver contract",
+        )?;
+    }
+    let companions = lock
+        .loaded_module_policy
+        .driver_store_companions
+        .iter()
+        .map(|module| (module.attestation_name.to_ascii_lowercase(), module))
+        .collect::<BTreeMap<_, _>>();
+    require(
+        companions.len() == lock.loaded_module_policy.driver_store_companions.len()
+            && companions.len() == 2
+            && companions.contains_key("nvcuda64.dll")
+            && companions.contains_key("nvml.driverstore.dll"),
+        "DriverStore companion identity/cardinality mismatch",
+    )?;
+    for (attestation_name, companion) in companions {
+        require(
+            ((attestation_name == "nvcuda64.dll"
+                && companion.name.eq_ignore_ascii_case("nvcuda64.dll")
+                && companion.owner.eq_ignore_ascii_case("nvcuda.dll"))
+                || (attestation_name == "nvml.driverstore.dll"
+                    && companion.name.eq_ignore_ascii_case("nvml.dll")
+                    && companion.owner.eq_ignore_ascii_case("nvml.dll")))
+                && companion
+                    .required_root
+                    .eq_ignore_ascii_case("%SystemRoot%\\System32\\DriverStore\\FileRepository")
+                && companion.signature_kind == "catalog"
+                && companion.signer_organization == "Microsoft Corporation"
+                && companion.signed_company_name == "NVIDIA Corporation"
+                && companion.require_same_catalog
+                && companion.require_same_signer_certificate
+                && companion.require_same_file_version
+                && companion.require_same_product_name,
+            "DriverStore companion trust policy differs from the Windows NVIDIA driver contract",
         )?;
     }
     require(
@@ -1808,6 +1875,18 @@ fn reject_ambient_modules(
         {
             Some(required) if same_path(&canonical, required) => {}
             Some(required) => {
+                if require_cuda {
+                    if let Some(policy) = driver_store_companion_policy(lock, &lower) {
+                        let owner = verify_locked_system_module(lock, system32, &policy.owner)?;
+                        let _companion = verify_locked_driver_store_companion(
+                            system32,
+                            policy,
+                            &canonical,
+                            owner.attestation(),
+                        )?;
+                        continue;
+                    }
+                }
                 return Err(runtime_error(
                     "CALYX_ONNX_RUNTIME_AMBIENT_MODULE",
                     format!(
@@ -1817,6 +1896,25 @@ fn reject_ambient_modules(
                     ),
                     BUNDLE_REMEDIATION,
                 ));
+            }
+            None if require_cuda => {
+                let Some(policy) = driver_store_companion_policy(lock, &lower) else {
+                    return Err(runtime_error(
+                        "CALYX_ONNX_RUNTIME_AMBIENT_MODULE",
+                        format!(
+                            "unowned CUDA alias {name} is loaded from {}",
+                            canonical.display()
+                        ),
+                        BUNDLE_REMEDIATION,
+                    ));
+                };
+                let owner = verify_locked_system_module(lock, system32, &policy.owner)?;
+                let _companion = verify_locked_driver_store_companion(
+                    system32,
+                    policy,
+                    &canonical,
+                    owner.attestation(),
+                )?;
             }
             None => {
                 return Err(runtime_error(
@@ -1839,6 +1937,9 @@ fn attest_modules(
     system32: &Path,
     modules: &[PathBuf],
     require_cuda: bool,
+    // NVIDIA maps the CUDA and NVML DriverStore implementations lazily on the first
+    // real API calls. Dependency preload accepts absence; post-driver-use refreshes do not.
+    require_driver_store_companions: bool,
     allow_ort_managed: bool,
 ) -> Result<Vec<PinnedCudaModuleAttestation>> {
     reject_ambient_modules(
@@ -1850,18 +1951,23 @@ fn attest_modules(
         allow_ort_managed,
     )?;
     let expected = expected_module_paths(lock, root, system32, require_cuda)?;
-    let mut loaded = BTreeMap::new();
+    let companion_names = require_cuda
+        .then(|| {
+            lock.loaded_module_policy
+                .driver_store_companions
+                .iter()
+                .map(|policy| policy.name.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut loaded = BTreeMap::<String, Vec<&PathBuf>>::new();
     for module in modules {
         let Some(name) = module.file_name().and_then(OsStr::to_str) else {
             continue;
         };
         let key = name.to_ascii_lowercase();
-        if expected.contains_key(&key) && loaded.insert(key.clone(), module).is_some() {
-            return Err(runtime_error(
-                "CALYX_ONNX_RUNTIME_DUPLICATE_MODULE",
-                format!("duplicate loaded CUDA module basename {name}"),
-                BUNDLE_REMEDIATION,
-            ));
+        if expected.contains_key(&key) || companion_names.contains(&key) {
+            loaded.entry(key).or_default().push(module);
         }
     }
     let file_contracts = lock
@@ -1874,27 +1980,39 @@ fn attest_modules(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let mut out = Vec::with_capacity(expected.len());
+    let mut out = Vec::with_capacity(expected.len() + companion_names.len());
     for (name, required) in expected {
-        let observed = loaded.get(&name).ok_or_else(|| {
+        let candidates = loaded.get(&name).ok_or_else(|| {
             runtime_error(
                 "CALYX_ONNX_RUNTIME_MODULE_NOT_LOADED",
                 format!("required CUDA module {name} is absent from the process"),
                 BUNDLE_REMEDIATION,
             )
         })?;
-        let canonical = canonicalize_existing_file(observed, "loaded CUDA module")?;
-        if !same_path(&canonical, &required) {
+        let mut exact = candidates
+            .iter()
+            .map(|observed| canonicalize_existing_file(observed, "loaded CUDA module"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|canonical| same_path(canonical, &required))
+            .collect::<Vec<_>>();
+        if exact.len() != 1 {
             return Err(runtime_error(
-                "CALYX_ONNX_RUNTIME_AMBIENT_MODULE",
+                "CALYX_ONNX_RUNTIME_MODULE_IDENTITY_AMBIGUOUS",
                 format!(
-                    "{name} is loaded from {}; exact required path is {}",
-                    canonical.display(),
-                    required.display()
+                    "required CUDA module {name} has {} exact loaded instances at {}; observed candidates: {}",
+                    exact.len(),
+                    required.display(),
+                    candidates
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 BUNDLE_REMEDIATION,
             ));
         }
+        let canonical = exact.remove(0);
         if let Some(file) = file_contracts.get(&name) {
             verify_locked_file(root, &file.bundle_path, file.bytes, &file.sha256)?;
             out.push(PinnedCudaModuleAttestation {
@@ -1928,6 +2046,87 @@ fn attest_modules(
                 sha256: trust.file_sha256.clone(),
                 file_version: Some(trust.signed_file_version.clone()),
                 source: "system-driver:system32+catalog-authenticode+version-info".to_string(),
+                system_trust: Some(trust),
+            });
+        }
+    }
+    if require_cuda {
+        for policy in &lock.loaded_module_policy.driver_store_companions {
+            let loaded_name = policy.name.to_ascii_lowercase();
+            let owner = out
+                .iter()
+                .find(|module| module.name.eq_ignore_ascii_case(&policy.owner))
+                .and_then(|module| {
+                    module
+                        .system_trust
+                        .as_ref()
+                        .map(|trust| (module.path.clone(), trust.clone()))
+                })
+                .ok_or_else(|| {
+                    runtime_error(
+                        "CALYX_ONNX_RUNTIME_SYSTEM_TRUST_MISSING",
+                        format!(
+                            "DriverStore companion {} has no verified owner receipt for {}",
+                            policy.name, policy.owner
+                        ),
+                        BUNDLE_REMEDIATION,
+                    )
+                })?;
+            let mut companion_paths = loaded
+                .get(&loaded_name)
+                .into_iter()
+                .flatten()
+                .map(|observed| {
+                    canonicalize_existing_file(observed, "loaded DriverStore companion")
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|canonical| !same_path(canonical, &owner.0))
+                .collect::<Vec<_>>();
+            if companion_paths.is_empty() {
+                if require_driver_store_companions {
+                    return Err(runtime_error(
+                        "CALYX_ONNX_RUNTIME_MODULE_NOT_LOADED",
+                        format!(
+                            "required signed DriverStore companion {} for {} is absent after the CUDA Driver API was exercised",
+                            policy.name, policy.owner
+                        ),
+                        BUNDLE_REMEDIATION,
+                    ));
+                }
+                continue;
+            }
+            if companion_paths.len() != 1 {
+                return Err(runtime_error(
+                    "CALYX_ONNX_RUNTIME_MODULE_IDENTITY_AMBIGUOUS",
+                    format!(
+                        "DriverStore companion {} for {} has {} non-owner loaded instances: {}",
+                        policy.name,
+                        policy.owner,
+                        companion_paths.len(),
+                        companion_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    BUNDLE_REMEDIATION,
+                ));
+            }
+            let canonical = companion_paths.remove(0);
+            let verified =
+                verify_locked_driver_store_companion(system32, policy, &canonical, &owner.1)?;
+            let trust = verified.attestation().clone();
+            out.push(PinnedCudaModuleAttestation {
+                name: policy.attestation_name.to_ascii_lowercase(),
+                path: canonical,
+                bytes: trust.file_bytes,
+                sha256: trust.file_sha256.clone(),
+                file_version: Some(trust.signed_file_version.clone()),
+                source: format!(
+                    "system-driver:driverstore-companion;owner={};catalog+signer+version+product-bound",
+                    policy.owner.to_ascii_lowercase()
+                ),
                 system_trust: Some(trust),
             });
         }
@@ -1975,6 +2174,34 @@ fn verify_locked_system_module(
             authenticode_signer_organization: policy.signer_organization.clone(),
             signed_company_name: policy.signed_company_name.clone(),
         },
+    )
+}
+
+fn driver_store_companion_policy<'a>(
+    lock: &'a RuntimeLock,
+    name: &str,
+) -> Option<&'a DriverStoreCompanionPolicy> {
+    lock.loaded_module_policy
+        .driver_store_companions
+        .iter()
+        .find(|policy| policy.name.eq_ignore_ascii_case(name))
+}
+
+fn verify_locked_driver_store_companion(
+    system32: &Path,
+    policy: &DriverStoreCompanionPolicy,
+    path: &Path,
+    owner: &SystemModuleTrustAttestation,
+) -> Result<VerifiedSystemFile> {
+    verify_driver_store_companion(
+        path,
+        &SystemModuleTrustPolicy {
+            module_name: policy.name.clone(),
+            required_root: system32.join("DriverStore").join("FileRepository"),
+            authenticode_signer_organization: policy.signer_organization.clone(),
+            signed_company_name: policy.signed_company_name.clone(),
+        },
+        owner,
     )
 }
 

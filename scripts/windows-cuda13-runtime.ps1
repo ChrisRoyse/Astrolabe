@@ -192,7 +192,7 @@ function Read-Lock {
     Assert-SafeRelativePath $lock.contract.ort_dll 'lock.contract.ort_dll'
     Assert-SafeRelativePath $lock.contract.provider_dll 'lock.contract.provider_dll'
 
-    Assert-ExactFields $lock.loaded_module_policy @('boundary_load', 'dependency_preload_order', 'ort_managed_load', 'bundle_module_globs', 'system_modules', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
+    Assert-ExactFields $lock.loaded_module_policy @('boundary_load', 'dependency_preload_order', 'ort_managed_load', 'bundle_module_globs', 'system_modules', 'driver_store_companions', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
     $loadOrderSet = @{}
     foreach ($phase in @('boundary_load', 'dependency_preload_order', 'ort_managed_load')) {
         foreach ($path in @($lock.loaded_module_policy.$phase)) {
@@ -240,14 +240,54 @@ function Read-Lock {
             Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_modules omits $required" "restore the checked-in lock"
         }
     }
+    $driverStoreCompanions = @($lock.loaded_module_policy.driver_store_companions)
+    if ($driverStoreCompanions.Count -ne 2) {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "driver_store_companions must contain exactly nvcuda64.dll and the NVML DriverStore implementation" "restore the checked-in lock"
+    }
+    $companionAttestations = @{}
+    foreach ($companion in $driverStoreCompanions) {
+        Assert-ExactFields $companion @('name', 'attestation_name', 'owner', 'required_root', 'signature_kind', 'signer_organization', 'signed_company_name', 'require_same_catalog', 'require_same_signer_certificate', 'require_same_file_version', 'require_same_product_name') 'lock.loaded_module_policy.driver_store_companions[]'
+        Assert-SafeFileName $companion.name 'lock.loaded_module_policy.driver_store_companions[].name'
+        Assert-SafeFileName $companion.attestation_name 'lock.loaded_module_policy.driver_store_companions[].attestation_name'
+        Assert-SafeFileName $companion.owner 'lock.loaded_module_policy.driver_store_companions[].owner'
+        foreach ($field in @('required_root', 'signature_kind', 'signer_organization', 'signed_company_name')) {
+            Assert-NonBlankString $companion.$field "lock.loaded_module_policy.driver_store_companions[].$field"
+        }
+        $attestationKey = $companion.attestation_name.ToLowerInvariant()
+        if ($companionAttestations.ContainsKey($attestationKey)) {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "duplicate DriverStore companion attestation_name $($companion.attestation_name)" "restore the checked-in lock"
+        }
+        $companionAttestations.Add($attestationKey, $companion)
+        if ($companion.required_root -cne '%SystemRoot%\System32\DriverStore\FileRepository' -or
+            $companion.signature_kind -cne 'catalog' -or
+            $companion.signer_organization -cne 'Microsoft Corporation' -or
+            $companion.signed_company_name -cne 'NVIDIA Corporation') {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "DriverStore companion trust identity differs from the Windows NVIDIA driver contract" "restore the checked-in lock"
+        }
+        foreach ($field in @('require_same_catalog', 'require_same_signer_certificate', 'require_same_file_version', 'require_same_product_name')) {
+            if (-not ($companion.$field -is [bool]) -or -not $companion.$field) {
+                Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "DriverStore companion must set $field=true" "restore the checked-in lock"
+            }
+        }
+    }
+    if (-not $companionAttestations.ContainsKey('nvcuda64.dll') -or
+        $companionAttestations['nvcuda64.dll'].name -cne 'nvcuda64.dll' -or
+        $companionAttestations['nvcuda64.dll'].owner -cne 'nvcuda.dll' -or
+        -not $companionAttestations.ContainsKey('nvml.driverstore.dll') -or
+        $companionAttestations['nvml.driverstore.dll'].name -cne 'nvml.dll' -or
+        $companionAttestations['nvml.driverstore.dll'].owner -cne 'nvml.dll') {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "DriverStore companion owner/attestation mapping differs from the NVIDIA CUDA/NVML loader contract" "restore the checked-in lock"
+    }
     foreach ($glob in @($lock.loaded_module_policy.bundle_module_globs)) {
         Assert-NonBlankString $glob 'lock.loaded_module_policy.bundle_module_globs[]'
     }
     foreach ($root in @($lock.loaded_module_policy.system_roots)) {
         Assert-NonBlankString $root 'lock.loaded_module_policy.system_roots[]'
     }
-    if (@($lock.loaded_module_policy.system_roots).Count -ne 1 -or $lock.loaded_module_policy.system_roots[0] -cne '%SystemRoot%\System32') {
-        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_roots must contain only %SystemRoot%\System32" "restore the checked-in lock"
+    if (@($lock.loaded_module_policy.system_roots).Count -ne 2 -or
+        $lock.loaded_module_policy.system_roots[0] -cne '%SystemRoot%\System32' -or
+        $lock.loaded_module_policy.system_roots[1] -cne '%SystemRoot%\System32\DriverStore\FileRepository') {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "system_roots must contain exactly System32 and DriverStore FileRepository" "restore the checked-in lock"
     }
     if (-not ($lock.loaded_module_policy.reject_application_dir -is [bool]) -or -not ($lock.loaded_module_policy.reject_path_search -is [bool]) -or -not $lock.loaded_module_policy.reject_application_dir -or -not $lock.loaded_module_policy.reject_path_search) {
         Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "loaded module policy must reject application-directory and PATH search" "restore the checked-in lock"

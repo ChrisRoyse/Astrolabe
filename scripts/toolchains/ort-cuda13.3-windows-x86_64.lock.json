@@ -444,7 +444,38 @@
         "signed_company_name": "NVIDIA Corporation"
       }
     ],
-    "system_roots": ["%SystemRoot%\\System32"],
+    "driver_store_companions": [
+      {
+        "name": "nvcuda64.dll",
+        "attestation_name": "nvcuda64.dll",
+        "owner": "nvcuda.dll",
+        "required_root": "%SystemRoot%\\System32\\DriverStore\\FileRepository",
+        "signature_kind": "catalog",
+        "signer_organization": "Microsoft Corporation",
+        "signed_company_name": "NVIDIA Corporation",
+        "require_same_catalog": true,
+        "require_same_signer_certificate": true,
+        "require_same_file_version": true,
+        "require_same_product_name": true
+      },
+      {
+        "name": "nvml.dll",
+        "attestation_name": "nvml.driverstore.dll",
+        "owner": "nvml.dll",
+        "required_root": "%SystemRoot%\\System32\\DriverStore\\FileRepository",
+        "signature_kind": "catalog",
+        "signer_organization": "Microsoft Corporation",
+        "signed_company_name": "NVIDIA Corporation",
+        "require_same_catalog": true,
+        "require_same_signer_certificate": true,
+        "require_same_file_version": true,
+        "require_same_product_name": true
+      }
+    ],
+    "system_roots": [
+      "%SystemRoot%\\System32",
+      "%SystemRoot%\\System32\\DriverStore\\FileRepository"
+    ],
     "reject_application_dir": true,
     "reject_path_search": true
   }

@@ -190,10 +190,22 @@ pub fn verify_system_module(
     path: &Path,
     policy: &SystemModuleTrustPolicy,
 ) -> Result<VerifiedSystemFile> {
+    verify_system_module_with_catalog_root(path, policy, &policy.required_root)
+}
+
+fn verify_system_module_with_catalog_root(
+    path: &Path,
+    policy: &SystemModuleTrustPolicy,
+    catalog_system_root: &Path,
+) -> Result<VerifiedSystemFile> {
     validate_policy(policy)?;
 
     reject_reparse(path, "system module path")?;
+    reject_reparse(&policy.required_root, "system module root")?;
     let required_root = canonical_existing_dir(&policy.required_root, "system module root")?;
+    reject_reparse(catalog_system_root, "Windows system catalog root")?;
+    let catalog_system_root =
+        canonical_existing_dir(catalog_system_root, "Windows system catalog root")?;
     let module_path = canonical_existing_file(path, "system module")?;
     reject_reparse(&module_path, "canonical system module")?;
 
@@ -280,7 +292,7 @@ pub fn verify_system_module(
     let operation = verify_with_catalog_admin(
         &file,
         &module_path,
-        &required_root,
+        &catalog_system_root,
         &policy.authenticode_signer_organization,
         admin.handle,
     );
@@ -318,6 +330,133 @@ pub fn verify_system_module(
             version_translations: version_info.translations,
         },
     })
+}
+
+/// Verifies one user-mode CUDA driver companion loaded from the same signed
+/// Windows DriverStore package as its System32 owner module.
+///
+/// The DriverStore package directory is discovered from the process module
+/// table; its generated name is never hard-coded. Trust still fails closed:
+/// the package must be one direct, non-reparse child of FileRepository, the
+/// companion must have a valid Windows catalog proof, and catalog, signer,
+/// file-version, and product identity must exactly match the already verified
+/// System32 owner.
+pub fn verify_driver_store_companion(
+    path: &Path,
+    policy: &SystemModuleTrustPolicy,
+    owner: &SystemModuleTrustAttestation,
+) -> Result<VerifiedSystemFile> {
+    reject_reparse(&policy.required_root, "DriverStore FileRepository root")?;
+    let repository =
+        canonical_existing_dir(&policy.required_root, "DriverStore FileRepository root")?;
+    let requested_package = path.parent().ok_or_else(|| {
+        trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_PATH_INVALID",
+            format!(
+                "DriverStore companion has no package parent: {}",
+                path.display()
+            ),
+        )
+    })?;
+    reject_reparse(requested_package, "DriverStore package root")?;
+    let package = canonical_existing_dir(requested_package, "DriverStore package root")?;
+    let package_parent = package.parent().ok_or_else(|| {
+        trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_PATH_INVALID",
+            format!(
+                "DriverStore package has no repository parent: {}",
+                package.display()
+            ),
+        )
+    })?;
+    if !same_path(package_parent, &repository) {
+        return Err(trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_ROOT_MISMATCH",
+            format!(
+                "{} is not one direct package child of {}",
+                package.display(),
+                repository.display()
+            ),
+        ));
+    }
+
+    let driver_store = repository.parent().ok_or_else(|| {
+        trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_ROOT_MISMATCH",
+            format!(
+                "DriverStore FileRepository has no DriverStore parent: {}",
+                repository.display()
+            ),
+        )
+    })?;
+    let catalog_system_root = driver_store.parent().ok_or_else(|| {
+        trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_ROOT_MISMATCH",
+            format!(
+                "DriverStore root has no Windows system parent: {}",
+                driver_store.display()
+            ),
+        )
+    })?;
+    if !repository
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("FileRepository"))
+        || !driver_store
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("DriverStore"))
+        || !catalog_system_root
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("System32"))
+    {
+        return Err(trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_ROOT_MISMATCH",
+            format!(
+                "DriverStore companion root {} does not have the required System32\\DriverStore\\FileRepository identity",
+                repository.display()
+            ),
+        ));
+    }
+    reject_reparse(driver_store, "DriverStore root")?;
+    reject_reparse(catalog_system_root, "Windows system catalog root")?;
+
+    let verified = verify_system_module_with_catalog_root(
+        path,
+        &SystemModuleTrustPolicy {
+            module_name: policy.module_name.clone(),
+            required_root: package,
+            authenticode_signer_organization: policy.authenticode_signer_organization.clone(),
+            signed_company_name: policy.signed_company_name.clone(),
+        },
+        catalog_system_root,
+    )?;
+    let companion = verified.attestation();
+    if !same_path(&companion.catalog_path, &owner.catalog_path)
+        || companion.signer_organization != owner.signer_organization
+        || companion.signer_certificate_sha256 != owner.signer_certificate_sha256
+        || companion.signed_company_name != owner.signed_company_name
+        || companion.signed_file_version != owner.signed_file_version
+        || companion.signed_product_name != owner.signed_product_name
+    {
+        return Err(trust_error(
+            "CALYX_CUDA_DRIVER_COMPANION_OWNER_MISMATCH",
+            format!(
+                "DriverStore companion {} is not the same signed driver package identity as System32 owner {}: companion catalog={} signer_cert={} company={:?} version={:?} product={:?}; owner catalog={} signer_cert={} company={:?} version={:?} product={:?}",
+                companion.module_path.display(),
+                owner.module_path.display(),
+                companion.catalog_path.display(),
+                companion.signer_certificate_sha256,
+                companion.signed_company_name,
+                companion.signed_file_version,
+                companion.signed_product_name,
+                owner.catalog_path.display(),
+                owner.signer_certificate_sha256,
+                owner.signed_company_name,
+                owner.signed_file_version,
+                owner.signed_product_name,
+            ),
+        ));
+    }
+    Ok(verified)
 }
 
 fn verify_with_catalog_admin(
