@@ -12,6 +12,7 @@ use crate::error::{CliError, CliResult};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
     Happy,
+    Restart,
     Empty,
     DimMismatch,
     Truncated,
@@ -71,6 +72,7 @@ impl Request {
         let root = required_path(args, "--root")?;
         let mode = match value(args, "--mode").unwrap_or("happy") {
             "happy" => Mode::Happy,
+            "restart" => Mode::Restart,
             "empty" => Mode::Empty,
             "dim-mismatch" => Mode::DimMismatch,
             "truncated" => Mode::Truncated,

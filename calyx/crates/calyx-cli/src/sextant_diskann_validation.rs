@@ -70,6 +70,35 @@ struct Summary {
 }
 
 #[derive(Serialize)]
+struct RestartSummary {
+    mode: String,
+    root: String,
+    graph_path: String,
+    generation_id: String,
+    source_hash: String,
+    graph_hash: String,
+    raw_hash: Option<String>,
+    pq_hash: Option<String>,
+    graph_component: String,
+    raw_component: Option<String>,
+    pq_component: Option<String>,
+    node_count: u64,
+    dim: u32,
+    query_count: usize,
+    recall_at_10_avg: f64,
+    recall_at_10_min: f64,
+    query_throughput_qps: f64,
+    p50_us: u128,
+    p99_us: u128,
+    exact_query_node7_rank: usize,
+    exact_query_node7_distance: f32,
+    active_pointer_bytes: u64,
+    retained_physical_bytes: u64,
+    persisted_summary_path: String,
+    persisted_hits_path: String,
+}
+
+#[derive(Serialize)]
 struct EdgeReport {
     mode: String,
     build_backend: String,
@@ -91,6 +120,7 @@ pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
     let request = Request::parse(args).map_err(CliError::usage)?;
     match request.mode {
         Mode::Happy => run_happy(&request),
+        Mode::Restart => run_restart(&request),
         Mode::Empty => run_empty_edge(&request),
         Mode::DimMismatch => run_dim_mismatch_edge(&request),
         Mode::Truncated => run_truncated_edge(&request),
@@ -101,6 +131,109 @@ pub(crate) fn run(args: &[String]) -> crate::error::CliResult {
         Mode::InvalidSubspace => run_invalid_pq_build_edge(&request, false),
         Mode::NonUnit => run_non_unit_edge(&request),
     }
+}
+
+fn run_restart(request: &Request) -> crate::error::CliResult {
+    let paths = Paths::for_root(&request.root);
+    if request.nodes <= 7 {
+        return Err(CliError::usage(
+            "restart verification requires --nodes greater than 7",
+        ));
+    }
+    let raw = raw_vectors(request.nodes, request.dim);
+    let index = DiskAnnSearch::open(
+        SLOT,
+        &paths.graph_path,
+        (0..request.nodes).map(cx).collect(),
+        None,
+        search_params(request),
+    )?;
+    let generation = index
+        .generation()
+        .ok_or_else(|| CliError::runtime("opened DiskANN has no active generation"))?;
+    if generation.node_count() != request.nodes as u64 || generation.dim() != request.dim as u32 {
+        return Err(CliError::runtime(format!(
+            "CALYX_FSV_DISKANN_RESTART_SHAPE_MISMATCH: persisted count/dim={}/{} requested={}/{}",
+            generation.node_count(),
+            generation.dim(),
+            request.nodes,
+            request.dim
+        )));
+    }
+
+    let mut latencies = Vec::with_capacity(request.queries);
+    let mut recalls = Vec::with_capacity(request.queries);
+    let mut hits_tsv = String::from("query_id\trank\tnode_id\tdistance\texact_top10\n");
+    let query_batch_started = Instant::now();
+    for q in 0..request.queries {
+        let query_id = (q * 17 + 7) % request.nodes;
+        let exact = exact_top_k(&raw, query_id, request.k);
+        let exact_ids: BTreeSet<_> = exact.iter().map(|(id, _)| *id).collect();
+        let started = Instant::now();
+        let hits = index.search_ids(&raw[query_id].1, request.k, &search_params(request))?;
+        latencies.push(started.elapsed().as_micros());
+        let got_ids: BTreeSet<_> = hits.iter().map(|(id, _)| *id).collect();
+        recalls.push(got_ids.intersection(&exact_ids).count() as f64 / exact_ids.len() as f64);
+        for (rank, (node_id, distance)) in hits.iter().enumerate() {
+            hits_tsv.push_str(&format!(
+                "{query_id}\t{}\t{node_id}\t{distance:.8}\t{}\n",
+                rank + 1,
+                exact_ids.contains(node_id)
+            ));
+        }
+    }
+    let query_batch_secs = query_batch_started.elapsed().as_secs_f64();
+    let node7 = index.search_ids(&raw[7].1, request.k, &search_params(request))?;
+    let hits_path = paths.metrics_dir.join("diskann_restart_hits.tsv");
+    fs::write(&hits_path, hits_tsv)?;
+    let summary_path = paths.metrics_dir.join("diskann_restart_summary.json");
+    let summary = RestartSummary {
+        mode: "restart".to_string(),
+        root: request.root.display().to_string(),
+        graph_path: paths.graph_path.display().to_string(),
+        generation_id: hex(generation.generation_id()),
+        source_hash: hex(generation.source_hash()),
+        graph_hash: hex(generation.graph_hash()),
+        raw_hash: generation.raw_hash().map(hex),
+        pq_hash: generation.pq_hash().map(hex),
+        graph_component: generation.graph_path().display().to_string(),
+        raw_component: generation.raw_path().map(|path| path.display().to_string()),
+        pq_component: generation.pq_path().map(|path| path.display().to_string()),
+        node_count: generation.node_count(),
+        dim: generation.dim(),
+        query_count: request.queries,
+        recall_at_10_avg: recalls.iter().sum::<f64>() / recalls.len() as f64,
+        recall_at_10_min: recalls.iter().copied().fold(f64::INFINITY, f64::min),
+        query_throughput_qps: request.queries as f64 / query_batch_secs,
+        p50_us: percentile(&latencies, 50),
+        p99_us: percentile(&latencies, 99),
+        exact_query_node7_rank: rank_of(&node7, 7),
+        exact_query_node7_distance: node7
+            .iter()
+            .find(|(id, _)| *id == 7)
+            .map(|(_, distance)| *distance)
+            .unwrap_or(f32::INFINITY),
+        active_pointer_bytes: generation.pointer_bytes(),
+        retained_physical_bytes: generation.physical_bytes(),
+        persisted_summary_path: summary_path.display().to_string(),
+        persisted_hits_path: hits_path.display().to_string(),
+    };
+    write_json(&summary_path, &summary)?;
+    if summary.recall_at_10_min + f64::EPSILON < request.recall_floor.unwrap_or(0.0) {
+        return Err(CliError::runtime(format!(
+            "CALYX_FSV_DISKANN_RESTART_RECALL_BELOW_FLOOR: recall_at_10_min={:.6} recall_floor={:.6} summary={} hits={}",
+            summary.recall_at_10_min,
+            request.recall_floor.unwrap_or(0.0),
+            summary_path.display(),
+            hits_path.display()
+        )));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary)
+            .map_err(|error| CliError::runtime(format!("serialize restart summary: {error}")))?
+    );
+    Ok(())
 }
 
 fn run_happy(request: &Request) -> crate::error::CliResult {
