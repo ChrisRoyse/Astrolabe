@@ -16,8 +16,10 @@ enum {
     PP_RING = 4,
     PP_RING_MASK = 3,
     PP_JSON_MARGIN = 10,
-    PP_ESC_MARGIN = 3,
     PP_ESC_SPACE = 2,
+    /* Byte length of the U+FFFD replacement char (EF BF BD) an invalid UTF-8
+     * byte degrades to in emitted JSON (#578). */
+    PP_UTF8_REPL_LEN = 3,
     /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
      * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
     PP_JSON_FIELD_OVERHEAD = 6,
@@ -321,56 +323,109 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Append a JSON-escaped string value to buf at position *pos. */
-/* Escape one character for JSON. Returns bytes written (1 or 2). */
-static int json_escape_char(char *buf, size_t avail, char ch) {
-    char esc = 0;
-    switch (ch) {
-    case '"':
-        esc = '"';
-        break;
-    case '\\':
-        esc = '\\';
-        break;
-    case '\n':
-        esc = 'n';
-        break;
-    case '\r':
-        esc = 'r';
-        break;
-    case '\t':
-        esc = 't';
-        break;
-    default:
-        if (avail >= SKIP_ONE) {
-            /* Any other raw control byte (e.g. form feed) is invalid inside a
-             * JSON string — degrade to a space. */
-            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
-        }
-        return SKIP_ONE;
-    }
-    if (avail >= PP_ESC_SPACE) {
-        buf[0] = '\\';
-        buf[SKIP_ONE] = esc;
-    }
-    return PP_ESC_SPACE;
-}
-
-/* Escaped length of a string under json_escape_char's rules: escaped
- * characters expand to 2 bytes, everything else stays 1. */
-static size_t pp_json_escaped_len(const char *s) {
-    size_t n = 0;
-    for (; *s; s++) {
-        switch (*s) {
+/* Append a JSON-escaped string value at *pos, UTF-8-strict (#578).
+ *
+ * This is the node-properties writer for the parallel (tree-sitter / Rust) path.
+ * A raw invalid UTF-8 byte in source metadata — e.g. 0xC0 inside a Rust doc
+ * comment — must NOT reach nodes.properties raw: the vault importer fails the
+ * whole repo closed on an invalid-UTF-8 properties cell. So this mirrors the
+ * pass_definitions.c writer: quote/backslash/\n/\r/\t are backslash-escaped,
+ * other C0 control bytes degrade to a space (invalid bare inside a JSON string),
+ * a valid multi-byte UTF-8 sequence is copied atomically (so a buffer-cap
+ * truncation can only land on a character boundary), and any invalid byte (bad
+ * lead/continuation, overlong, surrogate, out of range) becomes U+FFFD. The
+ * emitted JSON is therefore always valid UTF-8. *pos is advanced. */
+static void pp_json_emit_value(char *buf, size_t bufsize, size_t *pos, const char *val) {
+    size_t p = *pos;
+    for (const unsigned char *s = (const unsigned char *)val; *s;) {
+        unsigned char c = *s;
+        char esc = 0;
+        switch (c) {
         case '"':
+            esc = '"';
+            break;
         case '\\':
+            esc = '\\';
+            break;
         case '\n':
+            esc = 'n';
+            break;
         case '\r':
+            esc = 'r';
+            break;
         case '\t':
-            n += PP_ESC_SPACE;
+            esc = 't';
             break;
         default:
+            break;
+        }
+        if (esc) {
+            if (p + PP_ESC_SPACE > bufsize - PP_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = '\\';
+            buf[p++] = esc;
+            s++;
+        } else if (c < 0x20) {
+            /* Other raw control byte (e.g. form feed) is invalid bare inside a
+             * JSON string — degrade to a space. */
+            if (p + SKIP_ONE > bufsize - PP_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = ' ';
+            s++;
+        } else if (c < 0x80) {
+            if (p + SKIP_ONE > bufsize - PP_ESC_SPACE) {
+                break;
+            }
+            buf[p++] = (char)c;
+            s++;
+        } else {
+            int seq = cbm_utf8_sequence_len(s);
+            if (seq > 0) {
+                if (p + (size_t)seq > bufsize - PP_ESC_SPACE) {
+                    break;
+                }
+                memcpy(buf + p, s, (size_t)seq);
+                p += (size_t)seq;
+                s += seq;
+            } else {
+                if (p + PP_UTF8_REPL_LEN > bufsize - PP_ESC_SPACE) {
+                    break;
+                }
+                buf[p++] = (char)0xEF;
+                buf[p++] = (char)0xBF;
+                buf[p++] = (char)0xBD;
+                s++;
+            }
+        }
+    }
+    *pos = p;
+}
+
+/* Escaped length of a string under pp_json_emit_value's rules (#578): escaped
+ * characters expand to 2 bytes, an invalid UTF-8 byte expands to the 3-byte
+ * U+FFFD replacement, a valid multi-byte sequence keeps its length, everything
+ * else stays 1. Used only for the atomic whole-field fit budget. */
+static size_t pp_json_escaped_len(const char *src) {
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p;) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
+            n += PP_ESC_SPACE;
+            p++;
+        } else if (c < 0x80) {
             n += SKIP_ONE;
+            p++;
+        } else {
+            int seq = cbm_utf8_sequence_len(p);
+            if (seq > 0) {
+                n += (size_t)seq;
+                p += seq;
+            } else {
+                n += PP_UTF8_REPL_LEN;
+                p++;
+            }
         }
     }
     return n;
@@ -398,10 +453,7 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     p += (size_t)w;
-    for (const char *s = val; *s && p < bufsize - PP_ESC_MARGIN; s++) {
-        int n = json_escape_char(buf + p, bufsize - p - PP_ESC_SPACE, *s);
-        p += (size_t)n;
-    }
+    pp_json_emit_value(buf, bufsize, &p, val);
     if (p < bufsize - SKIP_ONE) {
         buf[p++] = '"';
     }
@@ -439,10 +491,9 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
         }
         /* Full escaping (not just quote/backslash): items like C param types
          * sliced from multi-line declarations carry raw \n/\t bytes, which are
-         * invalid inside JSON strings. */
-        for (const char *s = arr[i]; *s && p < bufsize - PP_ESC_SPACE; s++) {
-            p += (size_t)json_escape_char(buf + p, bufsize - p - PP_ESC_SPACE, *s);
-        }
+         * invalid inside JSON strings; and raw invalid UTF-8 bytes must degrade
+         * to U+FFFD (#578) so the properties cell stays valid UTF-8. */
+        pp_json_emit_value(buf, bufsize, &p, arr[i]);
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
@@ -1909,12 +1960,19 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
                                             "{\"source\":\"grpc\"}");
 
+    /* service/method are parsed out of the callee QN: escape UTF-8-strict so a
+     * bad byte can't corrupt the GRPC_CALLS edges.properties cell and make the
+     * vault importer refuse the repo (#528). callee was already escaped. */
     char esc_c[CBM_SZ_256];
+    char esc_svc[CBM_SZ_256 * 3];
+    char esc_mth[CBM_SZ_256 * 3];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_svc, (int)sizeof(esc_svc), service);
+    cbm_json_escape(esc_mth, (int)sizeof(esc_mth), method);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"confidence\":%.2f}", esc_c,
-             service, method, res->confidence);
+             esc_svc, esc_mth, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
 }
 

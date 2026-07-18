@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use calyx_aster::cf::{ColumnFamily, compression_manifest_key};
+use calyx_aster::cf::{
+    ColumnFamily, compression_lifecycle_prefix_range, compression_manifest_key,
+};
 use calyx_aster::mvcc::tombstone_value;
 use calyx_aster::vault::{AsterVault, VaultOptions, encode};
 use calyx_core::{
@@ -1688,39 +1690,17 @@ fn legacy_migration_edge(
         legacy_manifest[80..112] == manifest[80..112],
         "legacy staging manifest raw root differs despite byte-identical raw sidecars",
     )?;
-    let mut stage = Vec::with_capacity(legacy_primary.len() + raw.len() + 1);
-    stage.extend(
-        legacy_primary
-            .iter()
-            .cloned()
-            .map(|(key, value)| (ColumnFamily::slot(slot_id), key, value)),
-    );
-    stage.extend(
-        raw.iter()
-            .cloned()
-            .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
-    );
-    stage.push((
-        ColumnFamily::Compression,
-        manifest_key.clone(),
-        legacy_manifest.clone(),
-    ));
-    let staged_seq = writer.write_cf_batch_if_seq(initial_seq, stage)?;
-    let legacy_seq = writer.write_cf_batch_if_seq(
-        staged_seq,
-        [(
-            ColumnFamily::Compression,
-            manifest_key.clone(),
-            tombstone_value(),
-        )],
-    )?;
+    // Reconstruct the pre-#562 legacy on-disk generation (unmanifested v2 column
+    // + raw sidecar) in one reconstruction-ingress batch. The lawful compression
+    // guard refuses to synthesize an unmanifested compressed column, so this is
+    // how the fixture reproduces the exact bytes a pre-lifecycle binary left and
+    // that WAL recovery replays — the input the production `Migrate` upgrade path
+    // consumes. `legacy_manifest` is retained only as reference evidence for the
+    // v2 generation roots; it is never persisted.
+    let legacy_seq =
+        reconstruct_legacy_generation(&writer, slot_id, &legacy_primary, &raw, initial_seq)?;
     writer.flush()?;
     let before = logical_state(&writer, legacy_seq, std::slice::from_ref(registered))?;
-    require(
-        writer.read_cf_at(staged_seq, ColumnFamily::Compression, &manifest_key)?
-            == Some(legacy_manifest.clone()),
-        "legacy fixture staged snapshot lost its byte-authentic generation manifest",
-    )?;
     require(
         writer
             .read_cf_at(legacy_seq, ColumnFamily::Compression, &manifest_key)?
@@ -1751,9 +1731,10 @@ fn legacy_migration_edge(
             }),
         ).collect::<Vec<_>>(),
         "pinned_golden_sha256": golden.aggregate_sha256,
-        "staged_manifest_sha256": sha256_hex(&legacy_manifest),
-        "staged_generation_root": hex(&legacy_manifest[48..80]),
-        "staged_raw_generation_root": hex(&legacy_manifest[80..112]),
+        "reference_legacy_manifest_sha256": sha256_hex(&legacy_manifest),
+        "reference_generation_root": hex(&legacy_manifest[48..80]),
+        "reference_raw_generation_root": hex(&legacy_manifest[80..112]),
+        "reconstruction_ingress": "commit_legacy_generation_reconstruction_if_seq",
         "manifest_present": false,
         "legacy_primary_sha256": digest_rows(&legacy_primary),
         "legacy_primary_rows": legacy_primary.iter().map(|(key, value)| json!({
@@ -1890,6 +1871,49 @@ struct LegacyFixtureRow {
     raw_dim: u32,
     stored_dim: u32,
     qv: QuantizedVec,
+}
+
+/// Reconstructs a pre-#562 legacy on-disk generation for `slot_id` in ONE batch:
+/// the v2 primary column and its raw sidecar (put), plus tombstones for the
+/// existing #562 manifest and every existing append-only lifecycle record. The
+/// lawful compression guard deliberately refuses to synthesize an unmanifested
+/// compressed column, so this fixture stages the legacy shape the way WAL recovery
+/// replays a pre-lifecycle binary's bytes, through the dedicated reconstruction
+/// ingress (which fail-closed-validates the legacy shape before committing).
+/// Returns the committed sequence.
+fn reconstruct_legacy_generation(
+    writer: &AsterVault<FixedClock>,
+    slot_id: SlotId,
+    primary: &[(Vec<u8>, Vec<u8>)],
+    raw: &[(Vec<u8>, Vec<u8>)],
+    base_seq: u64,
+) -> AnyResult<u64> {
+    let mut batch: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> =
+        Vec::with_capacity(primary.len() + raw.len() + 4);
+    batch.extend(
+        primary
+            .iter()
+            .cloned()
+            .map(|(key, value)| (ColumnFamily::slot(slot_id), key, value)),
+    );
+    batch.extend(
+        raw.iter()
+            .cloned()
+            .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
+    );
+    batch.push((
+        ColumnFamily::Compression,
+        compression_manifest_key(slot_id),
+        tombstone_value(),
+    ));
+    for (key, _) in writer.scan_cf_range_at(
+        base_seq,
+        ColumnFamily::Compression,
+        &compression_lifecycle_prefix_range(slot_id),
+    )? {
+        batch.push((ColumnFamily::Compression, key, tombstone_value()));
+    }
+    Ok(writer.commit_generation_injection_if_seq(base_seq, batch)?)
 }
 
 fn legacy_staging_manifest(
@@ -2364,38 +2388,23 @@ fn legacy_refusal_edge(
     let mut primary = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot(slot_id))?;
     let mut raw = writer.scan_cf_at(injection_base_seq, ColumnFamily::slot_raw(slot_id))?;
     mutation.apply(&mut primary, &mut raw)?;
+    // Reference-only evidence for the mutated v2 generation roots; never persisted.
     let staging_manifest = legacy_staging_manifest(manifest_template, &primary, &raw)?;
-    let mut writes = primary
-        .iter()
-        .cloned()
-        .map(|(key, value)| (ColumnFamily::slot(slot_id), key, value))
-        .chain(
-            raw.iter()
-                .cloned()
-                .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
-        )
-        .collect::<Vec<_>>();
     let manifest_key = compression_manifest_key(slot_id);
-    writes.push((
-        ColumnFamily::Compression,
-        manifest_key.clone(),
-        staging_manifest.clone(),
-    ));
-    let staged_seq = writer.write_cf_batch_if_seq(injection_base_seq, writes)?;
-    let injection_seq = writer.write_cf_batch_if_seq(
-        staged_seq,
-        [(
-            ColumnFamily::Compression,
-            manifest_key.clone(),
-            tombstone_value(),
-        )],
-    )?;
+    // Reconstruct the mutated pre-#562 legacy on-disk generation through the
+    // reconstruction ingress (the lawful guard refuses an unmanifested compressed
+    // column). The mutations preserve the primary/raw key sets and the v2
+    // compressed tag, so the reconstruction's legacy-shape contract admits them;
+    // the corruption is caught downstream by the production `Migrate` verifier.
+    let injection_seq =
+        reconstruct_legacy_generation(&writer, slot_id, &primary, &raw, injection_base_seq)?;
     writer.flush()?;
     require(
-        writer.read_cf_at(staged_seq, ColumnFamily::Compression, &manifest_key)?
-            == Some(staging_manifest.clone()),
+        writer
+            .read_cf_at(injection_seq, ColumnFamily::Compression, &manifest_key)?
+            .is_none(),
         format!(
-            "legacy {} refusal staged snapshot lost its byte-authentic generation manifest",
+            "legacy {} refusal fixture still exposes a generation manifest",
             mutation.label()
         ),
     )?;
@@ -2411,9 +2420,10 @@ fn legacy_refusal_edge(
         "event": "edge_legacy_refusal_before",
         "mutation_kind": mutation.label(),
         "seq": injection_seq,
-        "staged_manifest_sha256": sha256_hex(&staging_manifest),
-        "staged_generation_root": hex(&staging_manifest[48..80]),
-        "staged_raw_generation_root": hex(&staging_manifest[80..112]),
+        "reference_legacy_manifest_sha256": sha256_hex(&staging_manifest),
+        "reference_generation_root": hex(&staging_manifest[48..80]),
+        "reference_raw_generation_root": hex(&staging_manifest[80..112]),
+        "reconstruction_ingress": "commit_legacy_generation_reconstruction_if_seq",
         "state": before,
     }));
     let rows = corpus
@@ -2705,7 +2715,15 @@ fn corruption_edge(
     let last = corrupt_row.1.len() - 1;
     corrupt_row.1[last] ^= 0x01;
 
-    let mut writes = Vec::with_capacity(primary.len() + raw.len() + 1);
+    // Persisted-corruption injection: tamper one compressed primary byte and
+    // rewrite the full column in place through the generation-injection ingress.
+    // The lawful compression guard refuses any row mutation of a manifested
+    // generation outside a lifecycle transition, so this simulates on-disk
+    // corruption the way a bit-rot event would — leaving the manifest untouched so
+    // the index's generation-root verification still runs against it. `manifest`
+    // is read only to confirm the fixture starts manifested; it is not rewritten.
+    let _ = &manifest;
+    let mut writes = Vec::with_capacity(primary.len() + raw.len());
     writes.extend(
         primary
             .iter()
@@ -2717,8 +2735,7 @@ fn corruption_edge(
             .cloned()
             .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
     );
-    writes.push((ColumnFamily::Compression, manifest_key, manifest));
-    let corrupt_seq = writer.write_cf_batch_if_seq(before_seq, writes)?;
+    let corrupt_seq = writer.commit_generation_injection_if_seq(before_seq, writes)?;
     require(
         corrupt_seq > before_seq,
         "corruption injection did not advance durable seq",
@@ -2787,7 +2804,12 @@ fn raw_corruption_edge(
         .ok_or_else(|| failure("raw-corruption fixture sidecar row missing"))?;
     let last = corrupt_row.1.len() - 1;
     corrupt_row.1[last] ^= 0x01;
-    let mut writes = Vec::with_capacity(primary.len() + raw.len() + 1);
+    // Persisted raw-sidecar corruption injected in place through the
+    // generation-injection ingress (see `corruption_edge`); the manifest is read
+    // only to confirm the fixture starts manifested and is left untouched so the
+    // authenticated raw-generation-root check still runs against it.
+    let _ = &manifest;
+    let mut writes = Vec::with_capacity(primary.len() + raw.len());
     writes.extend(
         primary
             .iter()
@@ -2799,8 +2821,7 @@ fn raw_corruption_edge(
             .cloned()
             .map(|(key, value)| (ColumnFamily::slot_raw(slot_id), key, value)),
     );
-    writes.push((ColumnFamily::Compression, manifest_key, manifest));
-    let corrupt_seq = writer.write_cf_batch_if_seq(before_seq, writes)?;
+    let corrupt_seq = writer.commit_generation_injection_if_seq(before_seq, writes)?;
     writer.flush()?;
     drop(writer);
 

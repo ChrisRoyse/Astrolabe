@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Instant;
 
-#[cfg(not(test))]
 use std::{env, process::Command};
 
 use serde::{Deserialize, Serialize};
@@ -202,7 +201,6 @@ pub(super) fn run_one_worker(
     Ok(report)
 }
 
-#[cfg(not(test))]
 fn run_worker_process(
     args: &Args,
     selected: &SelectedLens,
@@ -350,7 +348,6 @@ fn verify_worker_counts(
     Ok(())
 }
 
-#[cfg(not(test))]
 fn add_worker_args(
     command: &mut Command,
     args: &Args,
@@ -406,7 +403,6 @@ fn add_worker_args(
     }
 }
 
-#[cfg(not(test))]
 fn add_admission_args(command: &mut Command, args: &Args) {
     if let Some(path) = &args.bits_report {
         command.arg("--bits-report").arg(path);

@@ -136,13 +136,18 @@ impl FrozenLensContract {
     }
 
     /// Stable content-addressed id for this frozen instrument.
+    ///
+    /// The identity fingerprint is versioned (`v2;…`) and binds modality, so a
+    /// current id can never equal a legacy (unversioned, modality-blind) id and
+    /// two contracts differing only in modality can never share an id. See
+    /// [`Self::identity_fingerprint`].
     pub fn lens_id(&self) -> LensId {
-        let shape = self.output_shape_fingerprint();
+        let fingerprint = self.identity_fingerprint();
         LensId::from_parts(
             &self.name,
             &self.weights_sha256,
             &self.corpus_hash,
-            shape.as_bytes(),
+            fingerprint.as_bytes(),
         )
     }
 
@@ -254,9 +259,26 @@ impl FrozenLensContract {
         }
     }
 
-    fn output_shape_fingerprint(&self) -> String {
+    /// Versioned identity fingerprint hashed into [`Self::lens_id`].
+    ///
+    /// Format (`v2`): `v2;modality=<stable>;dtype=<d>;shape=<s>;norm=<n>`.
+    ///
+    /// The `v2;` prefix versions the identity itself. The historical (`v1`)
+    /// fingerprint was `dtype=<d>;shape=<s>;norm=<n>` with no version prefix and
+    /// no modality term, so two lenses differing only in modality collided and
+    /// every persisted key was modality-blind. Because the prefix changed, every
+    /// v2 id differs from every legacy id: persisted legacy references fail
+    /// closed wherever an id is recomputed and compared against a stored key
+    /// (`FrozenLensContract::verify_registration`,
+    /// `verify_registry_snapshot_contract`, `LensSpec::lens_id` equality gates),
+    /// with a structured `CALYX_LENS_FROZEN_VIOLATION` naming both ids. The only
+    /// migration is re-commission/re-ingest; there is no silent reinterpretation
+    /// path. Changing this string is a contract break — bump the version token
+    /// and treat all prior ids as legacy.
+    fn identity_fingerprint(&self) -> String {
         format!(
-            "dtype={};shape={};norm={}",
+            "v2;modality={};dtype={};shape={};norm={}",
+            self.modality.stable_str(),
             self.dtype.as_str(),
             shape_fingerprint(self.shape),
             self.norm.fingerprint()

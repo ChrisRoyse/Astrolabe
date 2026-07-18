@@ -146,6 +146,50 @@ pub fn register_commissioned(
     registry.register_frozen_with_spec(lens, artifact.contract.clone(), artifact.spec)
 }
 
+/// Learned runtime keys whose real execution contract — device, dtype, pooling,
+/// artifact hashes, and output dimension — is only knowable from a verified
+/// LensForge manifest produced by `calyx lens commission`. Accepting a
+/// declaration-only `lens add` / vault-lens request for one of these would force
+/// the surface to synthesize that metadata and register a lens whose `measure`
+/// is permanently unreachable, persisting a false learned-lens contract (#523).
+///
+/// Normalization folds `_` to `-` so both CLI (`candle-local`) and MCP
+/// (`candle`) spellings classify identically.
+fn is_learned_declaration_runtime(runtime_key: &str) -> bool {
+    matches!(
+        runtime_key.replace('_', "-").as_str(),
+        "candle" | "candle-local" | "onnx"
+    )
+}
+
+/// Fail-closed guard shared by the CLI and MCP lens-registration surfaces.
+///
+/// Refuses a declaration-only learned Candle/ONNX registration *before* any
+/// catalog, vault, panel, or ledger mutation, naming the missing manifest-backed
+/// contract and the remediation (`calyx lens commission`). Algorithmic, TEI, and
+/// external-command runtimes — whose execution contract is fully determined by
+/// the request — pass through unchanged, as does any runtime a caller resolves
+/// from a verified manifest before reaching this guard.
+pub fn reject_declaration_only_learned_lens(runtime_key: &str) -> Result<()> {
+    if is_learned_declaration_runtime(runtime_key) {
+        return Err(calyx_core::CalyxError {
+            code: "CALYX_LENS_DECLARATION_UNVERIFIED",
+            message: format!(
+                "learned runtime {runtime_key:?} cannot be registered by declaration: its \
+                 device, dtype, pooling, artifact hashes, and output dimension are not knowable \
+                 without a verified LensForge manifest, and a declared-only learned lens is \
+                 permanently unreachable at measure time"
+            ),
+            remediation: "commission a verified manifest with `calyx lens commission` (it loads \
+                          the model, verifies the artifact set, and freezes device/dtype/pooling/\
+                          dimension), then register that manifest through the catalog authority; \
+                          declaration-only `lens add`/vault-lens supports only algorithmic, \
+                          tei-http, and external-cmd runtimes",
+        });
+    }
+    Ok(())
+}
+
 impl Lens for CommissionedLens {
     fn id(&self) -> LensId {
         self.artifact.lens_id

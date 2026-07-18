@@ -94,8 +94,16 @@ enum { CBM_SEM_MAX_TOKENS = 512 };
 
 /* Split a name into tokens: camelCase, snake_case, dot.separated.
  * Writes up to max_out tokens into out. Returns token count.
- * Tokens are lowercased. Caller must free each token. */
+ * Tokens are lowercased. Caller must free each token.
+ * An invalid UTF-8 byte is a token boundary (split, never fused) and is counted
+ * as a stripped byte; a valid multi-byte UTF-8 char is skipped atomically. */
 int cbm_sem_tokenize(const char *name, char **out, int max_out);
+
+/* Atomically read-and-reset the count of invalid UTF-8 bytes the tokenizer has
+ * stripped (treated as token boundaries) since the last call. The semantic pass
+ * drains this once after parallel tokenization and logs it as labeled
+ * degradation. Thread-safe across parallel tokenize workers. See #532. */
+unsigned long long cbm_sem_tokenize_stripped_take(void);
 
 /* ── Dense vectors ───────────────────────────────────────────────── */
 

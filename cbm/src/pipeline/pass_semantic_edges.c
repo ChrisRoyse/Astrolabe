@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -943,9 +944,89 @@ static int cmp_node_ptr_by_qn(const void *pa, const void *pb) {
     return 0;
 }
 
+/* Transactionally grow the paired funcs[] / node_ptrs[] scan arrays.
+ *
+ * The two arrays share one logical ownership unit: funcs[k] and node_ptrs[k]
+ * describe the same function, and every downstream phase indexes them in
+ * lockstep. Growing them with two independent realloc calls is unsafe — if the
+ * first realloc moves the block and the second fails, the caller is left with a
+ * freed-and-moved funcs pointer, a stale node_ptrs pointer, and a capacity that
+ * matches neither, so any subsequent write is a use-after-free/out-of-bounds.
+ *
+ * Instead, allocate BOTH replacement buffers up front (malloc, never realloc so
+ * the originals are never invalidated before both allocations succeed), copy the
+ * committed [0, committed) prefix, then swap the pointers and capacity together.
+ * On any allocation or overflow failure the caller's *funcs, *node_ptrs and *cap
+ * are left exactly as they were — the previous scan state stays fully readable —
+ * and a structured error is logged. Returns 0 on success, CBM_NOT_FOUND on
+ * failure. */
+static int scan_arrays_grow(cbm_sem_func_t **funcs, const cbm_gbuf_node_t ***node_ptrs,
+                            int committed, int *cap) {
+    int old_cap = *cap;
+    if (old_cap < 0 || committed < 0 || committed > old_cap) {
+        cbm_log_error("pass.semantic.scan_alloc_failed", "code", "CBM_SEM_SCAN_ALLOC_FAILED",
+                      "operation", "scan_arrays_grow", "detail", "invalid scan array state",
+                      "message", "semantic edge scan array growth received inconsistent state",
+                      "remediation",
+                      "this indicates a scan-loop invariant violation; retry the index and report "
+                      "if it recurs");
+        return CBM_NOT_FOUND;
+    }
+    int new_cap = old_cap < MAX_FUNCS_INIT ? MAX_FUNCS_INIT : old_cap;
+    /* Only grow past MAX_FUNCS_INIT by doubling, guarding the int multiply. */
+    if (new_cap <= old_cap) {
+        if (old_cap > INT_MAX / GROW) {
+            cbm_log_error("pass.semantic.scan_alloc_failed", "code",
+                          "CBM_SEM_SCAN_CAPACITY_OVERFLOW", "operation", "scan_arrays_grow",
+                          "detail", "scan capacity multiplication would overflow int", "message",
+                          "semantic edge scan array capacity overflow", "remediation",
+                          "reduce the number of Function/Method nodes in one index, or split the "
+                          "repository");
+            return CBM_NOT_FOUND;
+        }
+        new_cap = old_cap * GROW;
+    }
+    /* Guard the element-count → byte-count multiply for both arrays. */
+    if ((size_t)new_cap > SIZE_MAX / sizeof(cbm_sem_func_t) ||
+        (size_t)new_cap > SIZE_MAX / sizeof(cbm_gbuf_node_t *)) {
+        cbm_log_error("pass.semantic.scan_alloc_failed", "code", "CBM_SEM_SCAN_CAPACITY_OVERFLOW",
+                      "operation", "scan_arrays_grow", "detail",
+                      "scan allocation size would overflow size_t", "message",
+                      "semantic edge scan array allocation size overflow", "remediation",
+                      "reduce the number of Function/Method nodes in one index, or split the "
+                      "repository");
+        return CBM_NOT_FOUND;
+    }
+    cbm_sem_func_t *new_funcs = malloc((size_t)new_cap * sizeof(cbm_sem_func_t));
+    const cbm_gbuf_node_t **new_nodes = malloc((size_t)new_cap * sizeof(cbm_gbuf_node_t *));
+    if (!new_funcs || !new_nodes) {
+        free(new_funcs);
+        free(new_nodes);
+        cbm_log_error("pass.semantic.scan_alloc_failed", "code", "CBM_SEM_SCAN_ALLOC_FAILED",
+                      "operation", "scan_arrays_grow", "detail",
+                      "paired scan-array allocation failed", "requested_cap", itoa_log(new_cap),
+                      "message", "semantic edge scan arrays could not be grown", "remediation",
+                      "free memory or reduce the indexed corpus size, then retry");
+        return CBM_NOT_FOUND;
+    }
+    if (committed > 0) {
+        memcpy(new_funcs, *funcs, (size_t)committed * sizeof(cbm_sem_func_t));
+        memcpy(new_nodes, *node_ptrs, (size_t)committed * sizeof(cbm_gbuf_node_t *));
+    }
+    free(*funcs);
+    free(*node_ptrs);
+    *funcs = new_funcs;
+    *node_ptrs = new_nodes;
+    *cap = new_cap;
+    return 0;
+}
+
 /* Phase 1a: seed the funcs[] / node_ptrs[] arrays from all Function and
  * Method nodes in the graph buffer.  Returns the number of functions collected
- * (0 on OOM), and fills *out_funcs / *out_nodes with newly malloc'd arrays. */
+ * on success (>= 0), or CBM_NOT_FOUND (< 0) if a paired scan-array growth failed
+ * — in which case *out_funcs / *out_nodes are left NULL and the caller must fail
+ * the pass closed rather than persist a partial semantic graph. On success it
+ * fills *out_funcs / *out_nodes with newly malloc'd arrays. */
 static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
                                  const cbm_gbuf_node_t ***out_nodes) {
     *out_funcs = NULL;
@@ -963,19 +1044,14 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
         }
         for (int i = 0; i < node_count; i++) {
             if (func_count >= func_cap) {
-                int new_cap = func_cap < MAX_FUNCS_INIT ? MAX_FUNCS_INIT : func_cap * GROW;
-                cbm_sem_func_t *grown = realloc(funcs, (size_t)new_cap * sizeof(cbm_sem_func_t));
-                if (!grown) {
-                    break;
+                if (scan_arrays_grow(&funcs, &node_ptrs, func_count, &func_cap) != 0) {
+                    /* Growth failed transactionally: funcs/node_ptrs still hold
+                     * the committed prefix. Release them and signal failure so
+                     * the pass fails closed instead of emitting a partial graph. */
+                    free(funcs);
+                    free(node_ptrs);
+                    return CBM_NOT_FOUND;
                 }
-                funcs = grown;
-                const cbm_gbuf_node_t **np_grown =
-                    realloc(node_ptrs, (size_t)new_cap * sizeof(cbm_gbuf_node_t *));
-                if (!np_grown) {
-                    break;
-                }
-                node_ptrs = np_grown;
-                func_cap = new_cap;
             }
             memset(&funcs[func_count], 0, sizeof(cbm_sem_func_t));
             funcs[func_count].node_id = nodes[i]->id;
@@ -1381,6 +1457,19 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     cbm_sem_func_t *funcs = NULL;
     const cbm_gbuf_node_t **node_ptrs = NULL;
     int func_count = phase1_scan_functions(gbuf, &funcs, &node_ptrs);
+    if (func_count < 0) {
+        /* A paired scan-array growth failed closed inside phase1_scan_functions;
+         * funcs/node_ptrs are already freed and NULL. Do not run any downstream
+         * phase against a partial scan — abort the pass with a structured error
+         * so run_predump_passes (rc < 0 gate) stops the index before the database
+         * dump and no incomplete semantic graph is persisted. */
+        cbm_log_error("pass.semantic.scan_failed", "code", "CBM_SEM_SCAN_FAILED", "message",
+                      "semantic edge scan phase failed to build its function arrays", "remediation",
+                      "inspect the preceding CBM_SEM_SCAN_ALLOC_FAILED error, free memory or reduce "
+                      "the indexed corpus size, then retry");
+        CBM_PROF_END_N("semantic_edges", "1a_scan_seq", t_phase1a, 0);
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_END_N("semantic_edges", "1a_scan_seq", t_phase1a, func_count);
 
     /* Phase 1b: Decode minhash + profile + build api/type/deco vectors (PARALLEL). */
@@ -1444,6 +1533,19 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
                     token_pools);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
+
+    /* Labeled degradation (#532, invariant 3): if the tokenizer treated any
+     * invalid UTF-8 bytes in node metadata as token boundaries, surface the count
+     * — a silent strip would be an unlabeled transformation of evidence. */
+    unsigned long long stripped = cbm_sem_tokenize_stripped_take();
+    if (stripped > 0) {
+        char stripped_buf[CBM_SZ_32];
+        snprintf(stripped_buf, sizeof(stripped_buf), "%llu", stripped);
+        cbm_log_warn("pass.semantic.tokenize_stripped_bytes", "code",
+                     "CBM_SEM_TOKENIZE_INVALID_BYTES", "stripped_bytes", stripped_buf, "message",
+                     "invalid UTF-8 bytes in node metadata were treated as token boundaries and "
+                     "stripped from semantic tokens");
+    }
 
     /* Phase 3: Build corpus (batch add), finalize, export enriched token vectors. */
     cbm_sem_corpus_t *corpus = run_corpus_phase(gbuf, all_tokens, token_counts, func_count);

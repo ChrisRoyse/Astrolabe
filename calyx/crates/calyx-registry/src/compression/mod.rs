@@ -1,11 +1,13 @@
 mod codec;
 mod index;
+mod lifecycle;
 mod recall;
 
 use calyx_assay::{AssayCacheKey, AssayStore, AssaySubject, MiEstimate, TrustTag};
 use calyx_aster::cf::{
     COMPRESSED_SLOT_VALUE_TAG, ColumnFamily, base_key, compression_manifest_key, slot_key,
 };
+use calyx_aster::compression_lifecycle::GenerationTransition;
 use calyx_aster::vault::{AsterVault, encode};
 use calyx_core::{Clock, CxId, LedgerRef, LensId, QuantPolicy, Result, Seq, Slot, SlotVector};
 use calyx_forge::AssayQuantSafety;
@@ -18,6 +20,10 @@ use crate::spec::LensSpec;
 pub use codec::inspect_unbound_stored_slot_envelope;
 use codec::{EncodedBatch, LegacyV2EnvelopeVerifier, encode_rows, parse_compression_manifest};
 pub use index::{CompressedSlotHit, CompressedSlotIndex};
+pub use lifecycle::{
+    GenerationDeleteReport, append_reseal_compressed_rows, delete_compressed_generation,
+    erase_compressed_slot_rows, generation_lifecycle,
+};
 pub use recall::matryoshka_truncate_renormalize;
 use recall::{recall_at_k, recall_drop, validate_batch};
 
@@ -486,7 +492,7 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
     k: usize,
     mxfp4_evidence: Option<&MxFp4AssayEvidence>,
 ) -> Result<SlotCompressionReport> {
-    let expected_seq = validate_full_column_rewrite(vault, slot, lens, rows)?;
+    let (expected_seq, transition) = validate_full_column_rewrite(vault, slot, lens, rows)?;
     if lens.quant_default == QuantPolicy::MxFp4
         && let Some(evidence) = mxfp4_evidence
         && evidence.current_seq != expected_seq
@@ -528,7 +534,18 @@ pub(crate) fn write_compressed_slot_batch_with_assay_evidence<C: Clock>(
         compression_manifest_key(slot.slot_id),
         report.generation_manifest_bytes.clone(),
     ));
-    let ledger_payload = generation_ledger_payload(&report)?;
+    // Issue #562: every manifest put carries its append-only lifecycle record in
+    // the same seq-guarded batch. The full-column create/migrate/reseal rewrite
+    // touches every row, so the affected set is the complete generation.
+    let affected: Vec<CxId> = report.rows.iter().map(|row| row.cx_id).collect();
+    writes.push(lifecycle::lifecycle_record_row_from_report(
+        transition,
+        slot,
+        expected_seq,
+        &report,
+        &affected,
+    )?);
+    let ledger_payload = generation_ledger_payload(&report, transition, &affected)?;
     let (snapshot, ledger_ref) = vault.write_cf_batch_with_ledger_entry_if_seq(
         expected_seq,
         writes,
@@ -552,16 +569,22 @@ fn compression_generation_subject(slot: &Slot) -> Vec<u8> {
     subject
 }
 
-fn generation_ledger_payload(report: &SlotCompressionReport) -> Result<Vec<u8>> {
+fn generation_ledger_payload(
+    report: &SlotCompressionReport,
+    transition: GenerationTransition,
+    affected: &[CxId],
+) -> Result<Vec<u8>> {
     let manifest = parse_compression_manifest(&report.generation_manifest_bytes)?;
     serde_json::to_vec(&serde_json::json!({
         "marker": COMPRESSION_GENERATION_MARKER,
+        "transition": transition.as_str(),
         "slot_id": report.slot_id,
         "codec": report.stored_codec,
         "rows": manifest.generation_rows,
         "codec_context_id_sha256": hex_bytes(&manifest.codec_context_id),
         "generation_root_sha256": hex_bytes(&manifest.generation_root),
         "raw_generation_root_sha256": hex_bytes(&manifest.raw_generation_root),
+        "affected_cx_ids": affected.iter().map(|cx| hex_bytes(cx.as_bytes())).collect::<Vec<_>>(),
     }))
     .map_err(|error| {
         compression_error(
@@ -641,12 +664,16 @@ pub(crate) fn compress_streamed_column<C: Clock>(
     write_compressed_slot_batch(vault, slot, lens, &rows, queries, k)
 }
 
+/// Validates a full-column compressed rewrite against the persisted source of
+/// truth and classifies which lifecycle transition it is (issue #562):
+/// `Create` for a fresh raw column, `Migrate` for a legacy unmanifested
+/// compressed column, `Reseal` for an already-manifested generation.
 fn validate_full_column_rewrite<C: Clock>(
     vault: &AsterVault<C>,
     slot: &Slot,
     lens: &LensSpec,
     rows: &[(CxId, Vec<f32>)],
-) -> Result<Seq> {
+) -> Result<(Seq, GenerationTransition)> {
     let snapshot = vault.latest_seq();
     let mut incoming = std::collections::BTreeMap::new();
     let mut incoming_values = std::collections::BTreeMap::new();
@@ -777,7 +804,7 @@ fn validate_full_column_rewrite<C: Clock>(
                 })?;
                 verifier.verify(stored_value, raw)?;
             }
-            return Ok(snapshot);
+            return Ok((snapshot, GenerationTransition::Migrate));
         }
         for (key, value) in &stored_rows {
             if value.first().copied() == Some(COMPRESSED_SLOT_TAG) {
@@ -793,7 +820,7 @@ fn validate_full_column_rewrite<C: Clock>(
                 ));
             }
         }
-        return Ok(snapshot);
+        return Ok((snapshot, GenerationTransition::Create));
     }
 
     let raw = raw_rows
@@ -814,7 +841,68 @@ fn validate_full_column_rewrite<C: Clock>(
         }
     }
     CompressedSlotIndex::open(vault, slot, lens)?.verify_at(snapshot)?;
-    Ok(snapshot)
+    Ok((snapshot, GenerationTransition::Reseal))
+}
+
+/// Verifies one incoming row is bound to its immutable `Base` slot hash at
+/// `snapshot`, reproducing the per-row check inside
+/// [`validate_full_column_rewrite`]. Used by the append transition to admit new
+/// rows into an existing generation (issue #562).
+pub(super) fn validate_row_base_binding<C: Clock>(
+    vault: &AsterVault<C>,
+    slot: &Slot,
+    snapshot: Seq,
+    cx_id: CxId,
+    values: &[f32],
+) -> Result<()> {
+    let dim = u32::try_from(values.len()).map_err(|_| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            "incoming raw vector dimension exceeds u32",
+        )
+    })?;
+    let value = encode::encode_slot_vector(&SlotVector::Dense {
+        dim,
+        data: values.to_vec(),
+    })?;
+    let actual_hash = blake3::hash(&value);
+    let base_bytes = vault
+        .read_cf_at(snapshot, ColumnFamily::Base, &base_key(cx_id))?
+        .ok_or_else(|| {
+            compression_error(
+                CALYX_VECTOR_COMPRESSION_INVALID,
+                format!("compressed slot source {cx_id} has no Base constellation at seq={snapshot}"),
+            )
+        })?;
+    let base_identity = encode::decode_constellation_base_identity(&base_bytes)?;
+    if base_identity.cx_id != cx_id {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed slot source Base identity mismatch at seq={snapshot}: key_cx_id={cx_id} embedded_cx_id={}",
+                base_identity.cx_id
+            ),
+        ));
+    }
+    let expected_hash = base_identity.slot_hashes.get(&slot.slot_id).ok_or_else(|| {
+        compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed slot source {cx_id} Base constellation does not declare slot {} at seq={snapshot}",
+                slot.slot_id.get()
+            ),
+        )
+    })?;
+    if actual_hash.as_bytes() != expected_hash {
+        return Err(compression_error(
+            CALYX_VECTOR_COMPRESSION_INVALID,
+            format!(
+                "compressed slot source {cx_id} slot {} does not match the immutable Base slot hash at seq={snapshot}",
+                slot.slot_id.get()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn compress_slot_batch(

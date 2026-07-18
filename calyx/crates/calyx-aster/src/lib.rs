@@ -5,6 +5,7 @@ pub mod cf;
 pub mod collection;
 mod commit_timing;
 pub mod compaction;
+pub mod compression_lifecycle;
 pub mod dedup;
 pub mod erase;
 mod file_lock;

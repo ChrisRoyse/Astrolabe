@@ -3,7 +3,7 @@
 use crate::cf::{ColumnFamily, base_key, slot_key};
 use crate::mvcc::tombstone_value;
 use crate::vault::AsterVault;
-use crate::vault::encode::{decode_constellation_base, encode_constellation_base};
+use crate::vault::encode::{BaseRecord, decode_constellation_base};
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -309,27 +309,33 @@ where
         else {
             return Err(orphan_error("base row disappeared before repair"));
         };
-        let mut cx = decode_constellation_base(&bytes)?;
-        cx.flags.degraded = true;
-        cx.metadata.insert(
+        // Update flags/metadata through the lossless BaseRecord so the immutable
+        // per-slot BLAKE3 hashes persist byte-for-byte across the orphan-repair
+        // rewrite. A plain decode -> encode_constellation_base round-trip would
+        // replace every stored slot hash with the hash of an Absent placeholder.
+        let mut record = BaseRecord::decode_for_key(cx_id, &bytes)?;
+        record.flags_mut().degraded = true;
+        record.metadata_mut().insert(
             REBUILD_METADATA_KEY.to_string(),
             REBUILD_METADATA_VALUE.to_string(),
         );
+        let slot_count = record.slot_hashes().len();
+        let base_value = record.encode()?;
         let mut rebuild_key = REBUILD_PREFIX.to_vec();
         rebuild_key.extend_from_slice(cx_id.as_bytes());
         let rows = vec![
-            (ColumnFamily::Base, key, encode_constellation_base(&cx)?),
+            (ColumnFamily::Base, key, base_value),
             (
                 ColumnFamily::AnnealReplay,
                 rebuild_key,
-                orphan_payload("orphan_base_rebuild_requested", cx.slots.len())?,
+                orphan_payload("orphan_base_rebuild_requested", slot_count)?,
             ),
         ];
         self.vault.write_cf_batch(rows)?;
         self.vault.append_ledger_entry(
             EntryKind::Admin,
             SubjectId::Cx(cx_id),
-            orphan_payload("orphan_base_degraded", cx.slots.len())?,
+            orphan_payload("orphan_base_degraded", slot_count)?,
             ActorId::System,
         )?;
         Ok(())

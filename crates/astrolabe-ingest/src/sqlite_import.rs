@@ -4476,9 +4476,14 @@ fn expected_group_commit_bytes(
     ledger_ref: &LedgerRef,
 ) -> IngestResult<Vec<u8>> {
     if cf == ColumnFamily::Base {
-        let mut constellation = encode::decode_constellation_base(&value)?;
-        constellation.provenance = ledger_ref.clone();
-        return Ok(encode::encode_constellation_base(&constellation)?);
+        // Mirror Aster's fixed ledger-ref attachment: the production path stamps
+        // provenance through the lossless BaseRecord so the immutable per-slot
+        // hashes survive byte-for-byte. Computing expected bytes via a lossy
+        // decode -> encode round-trip would substitute placeholder-slot hashes
+        // and diverge from the real committed row.
+        let mut record = encode::BaseRecord::decode(&value)?;
+        record.set_provenance(ledger_ref.clone());
+        return Ok(record.encode()?);
     }
     if cf == ColumnFamily::Graph {
         let Ok(mut json) = serde_json::from_slice::<Value>(&value) else {

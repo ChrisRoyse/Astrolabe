@@ -87,6 +87,54 @@ pub fn compression_manifest_key(slot_id: SlotId) -> Vec<u8> {
     slot_id.get().to_be_bytes().to_vec()
 }
 
+/// Leading byte marking a per-slot compression generation lifecycle record key
+/// inside the `compression` CF.
+///
+/// A manifest key is exactly the two-byte slot id; a lifecycle key is eleven
+/// bytes (`tag ‖ slot_id ‖ prior_seq`). The distinct length and leading tag mean
+/// a lifecycle record can never collide with any slot's manifest key, so the two
+/// key families coexist in one column family under a single fail-closed guard
+/// (issue #562).
+pub const COMPRESSION_LIFECYCLE_KEY_TAG: u8 = 0x4C;
+
+/// `compression` CF lifecycle-record key: `0x4C ‖ slot_id_be(2) ‖ prior_seq_be(8)`.
+///
+/// One lifecycle record is written per generation transition, keyed by the
+/// sequence the transition observed as current (`prior_seq`). A seq-guarded
+/// conditional batch commits at most once per prior sequence, so the key is
+/// unique per transition and the record family is append-only.
+pub fn compression_lifecycle_key(slot_id: SlotId, prior_seq: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 2 + 8);
+    key.push(COMPRESSION_LIFECYCLE_KEY_TAG);
+    key.extend_from_slice(&slot_id.get().to_be_bytes());
+    key.extend_from_slice(&prior_seq.to_be_bytes());
+    key
+}
+
+/// Prefix range over every lifecycle record for one slot in the `compression` CF.
+pub fn compression_lifecycle_prefix_range(slot_id: SlotId) -> KeyRange {
+    let mut prefix = Vec::with_capacity(1 + 2);
+    prefix.push(COMPRESSION_LIFECYCLE_KEY_TAG);
+    prefix.extend_from_slice(&slot_id.get().to_be_bytes());
+    prefix_range(&prefix)
+}
+
+/// Parses the `(slot_id, prior_seq)` addressed by a lifecycle-record key.
+///
+/// Returns `None` for any key that is not a canonical eleven-byte lifecycle key
+/// (wrong length or wrong leading tag), so callers fail closed rather than
+/// mis-classifying a manifest or foreign key as a lifecycle record.
+pub fn parse_compression_lifecycle_key(key: &[u8]) -> Option<(SlotId, u64)> {
+    if key.len() != 11 || key[0] != COMPRESSION_LIFECYCLE_KEY_TAG {
+        return None;
+    }
+    let slot = SlotId::new(u16::from_be_bytes([key[1], key[2]]));
+    let prior_seq = u64::from_be_bytes([
+        key[3], key[4], key[5], key[6], key[7], key[8], key[9], key[10],
+    ]);
+    Some((slot, prior_seq))
+}
+
 /// `xterm` CF key: `(CxId, SlotId_a, SlotId_b, XTermKind)`.
 pub fn xterm_key(cx_id: CxId, a: SlotId, b: SlotId, kind: XTermKind) -> Vec<u8> {
     let mut key = Vec::with_capacity(CX_ID_BYTES + 5);

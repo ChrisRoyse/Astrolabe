@@ -9,19 +9,21 @@ where
     pub(crate) fn commit_recurrence_batch(
         &self,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
-        updated_base: Option<Constellation>,
+        updated_base: Option<encode::BaseRecord>,
     ) -> Result<Seq> {
         let mut rows = Vec::new();
-        if let Some(cx) = updated_base.as_ref() {
-            if cx.vault_id != self.vault_id {
+        if let Some(record) = updated_base.as_ref() {
+            if record.vault_id() != self.vault_id {
                 return Err(CalyxError::vault_access_denied(
                     "recurrence base update belongs to another vault",
                 ));
             }
+            // Re-emit via the lossless BaseRecord so the immutable per-slot
+            // hashes survive the frequency-scalar update byte-for-byte.
             rows.push(encode::WriteRow {
                 cf: ColumnFamily::Base,
-                key: base_key(cx.cx_id),
-                value: encode::encode_constellation_base(cx)?,
+                key: base_key(record.cx_id()),
+                value: record.encode()?,
             });
         }
         rows.extend(

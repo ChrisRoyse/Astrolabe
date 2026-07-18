@@ -144,12 +144,30 @@ where
     C: Clock,
 {
     vault.with_recurrence_write_lock(|| {
-        let base = read_base(vault, cx_id)?.ok_or_else(|| {
-            CalyxError::stale_derived("recurrence append requires an existing constellation")
-        })?;
-        let append = build_append(vault, base, t_k, context, observed_at, retention)?;
+        // Decode the persisted Base row losslessly so the immutable per-slot
+        // hashes survive the frequency-scalar rewrite. `build_append` operates
+        // on the logical constellation (it only needs cx_id + scalars), and the
+        // resulting scalar map is carried back onto the lossless record so the
+        // committed Base row re-emits the stored slot hashes byte-for-byte.
+        let base_bytes = vault
+            .read_cf_at(vault.snapshot(), ColumnFamily::Base, &base_key(cx_id))?
+            .ok_or_else(|| {
+                CalyxError::stale_derived("recurrence append requires an existing constellation")
+            })?;
+        let mut record = encode::BaseRecord::decode_for_key(cx_id, &base_bytes)?;
+        let append = build_append(
+            vault,
+            record.constellation().clone(),
+            t_k,
+            context,
+            observed_at,
+            retention,
+        )?;
         let occurrence_id = append.occurrence_id;
-        vault.commit_recurrence_batch(append.recurrence_rows, Some(append.updated_base))?;
+        record
+            .scalars_mut()
+            .clone_from(&append.updated_base.scalars);
+        vault.commit_recurrence_batch(append.recurrence_rows, Some(record))?;
         Ok(occurrence_id)
     })
 }

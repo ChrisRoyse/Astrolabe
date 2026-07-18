@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use calyx_aster::compression_lifecycle::GenerationLifecycleRecord;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{
     Asymmetry, CalyxError, Clock, CxId, Input, Lens, LensId, Result, RuntimeExecutionAttestation,
-    Slot, SlotShape, SlotVector, SparseEntry,
+    Seq, Slot, SlotShape, SlotVector, SparseEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +14,12 @@ mod contract;
 pub use contract::validate_quant_policy_for_shape;
 
 use crate::compression::{
-    self, CompressedSlotIndex, CompressionQuery, MxFp4AssayEvidence, SlotCompressionReport,
+    self, CompressedSlotIndex, CompressionQuery, GenerationDeleteReport, MxFp4AssayEvidence,
+    SlotCompressionReport,
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
+use crate::persistence_contracts::contract_field_diffs;
 use crate::spec::{LensHealth, LensSpec};
 use contract::ensure_spec_declares_contract;
 
@@ -205,8 +208,17 @@ impl Registry {
         let mut outcomes = Vec::with_capacity(lens_ids.len());
         for &lens_id in lens_ids {
             self.lookup(lens_id)?;
+            // Classify by the lens's declared runtime: only a transient remote
+            // transport may degrade to Absent; a required in-process runtime
+            // (GPU Candle/ONNX/Fastembed, static-lookup, algorithmic) propagates
+            // its failure fail-closed instead of silently dropping the lens
+            // (#488). A lens with no recorded spec/runtime defaults to required.
+            let policy = self
+                .lens_spec(lens_id)
+                .map(|spec| crate::LensFailurePolicy::for_runtime(&spec.runtime))
+                .unwrap_or(crate::LensFailurePolicy::RequiredRuntime);
             let outcome: IngestLensOutcome =
-                admission.measure_lens_batch(lens_id, inputs, now_ms, |batch| {
+                admission.measure_lens_batch(lens_id, policy, inputs, now_ms, |batch| {
                     self.measure_batch(lens_id, batch)
                 })?;
             outcomes.push(outcome);
@@ -297,6 +309,70 @@ impl Registry {
         compression::write_compressed_slot_batch(vault, slot, spec, rows, queries, k)
     }
 
+    /// Adds new rows to a manifested compressed generation, resealing the whole
+    /// column under a fresh generation root (`AppendReseal`, issue #562).
+    pub fn append_reseal_compressed_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        new_rows: &[(CxId, Vec<f32>)],
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::append_reseal_compressed_rows(vault, slot, spec, new_rows, queries, k)
+    }
+
+    /// Removes a strict subset of a manifested generation's rows, resealing the
+    /// survivors (`EraseReseal`, issue #562).
+    pub fn erase_compressed_slot_rows<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        erase_ids: &[CxId],
+        queries: &[CompressionQuery],
+        k: usize,
+    ) -> Result<SlotCompressionReport>
+    where
+        C: Clock,
+    {
+        let spec = self.compression_spec(slot)?;
+        compression::erase_compressed_slot_rows(vault, slot, spec, erase_ids, queries, k)
+    }
+
+    /// Removes an entire compressed generation — manifest, primary rows, and raw
+    /// sidecars — in one coordinated, ledgered batch (`DeleteGeneration`, #562).
+    pub fn delete_compressed_generation<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+    ) -> Result<GenerationDeleteReport>
+    where
+        C: Clock,
+    {
+        // Validate the slot's lens is registered before mutating its generation.
+        let _spec = self.compression_spec(slot)?;
+        compression::delete_compressed_generation(vault, slot)
+    }
+
+    /// Reads back the append-only generation lifecycle records for a slot at
+    /// `at_seq`, in ascending `prior_seq` order (issue #562).
+    pub fn generation_lifecycle<C>(
+        &self,
+        vault: &AsterVault<C>,
+        slot: &Slot,
+        at_seq: Seq,
+    ) -> Result<Vec<GenerationLifecycleRecord>>
+    where
+        C: Clock,
+    {
+        let _spec = self.compression_spec(slot)?;
+        compression::generation_lifecycle(vault, slot, at_seq)
+    }
+
     /// Compresses the complete raw slot column persisted by a streaming ingest
     /// session into one versioned compression generation.
     ///
@@ -374,11 +450,7 @@ impl Registry {
             ensure_spec_declares_contract(&contract, spec)?;
         }
         let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
+        self.reject_duplicate_id(id, &contract)?;
         self.lenses.insert(
             id,
             RegistryEntry {
@@ -389,6 +461,49 @@ impl Registry {
             },
         );
         Ok(id)
+    }
+
+    /// Fails closed when a lens id is already registered.
+    ///
+    /// Ids are content-addressed by the versioned frozen contract, so an
+    /// incoming id can only collide with an existing entry two ways. If the
+    /// stored frozen contract is byte-identical to the incoming one, this is a
+    /// benign re-registration and refuses with `CALYX_REGISTRY_DUPLICATE`
+    /// without mutating state. If the stored contract differs — only reachable
+    /// when a caller supplies a legacy/forged id that hashed differently than
+    /// its true v2 contract — this refuses with `CALYX_LENS_FROZEN_VIOLATION`
+    /// carrying the complete field-by-field diff of both contracts so the
+    /// collision is fully diagnosable and no state is mutated.
+    fn reject_duplicate_id(&self, id: LensId, incoming: &FrozenLensContract) -> Result<()> {
+        let Some(existing) = self.lenses.get(&id) else {
+            return Ok(());
+        };
+        match &existing.frozen {
+            Some(registered) if registered == incoming => Err(CalyxError::registry_duplicate(
+                format!("lens {id} is already registered with an identical frozen contract"),
+            )),
+            Some(registered) => {
+                let diff = contract_field_diffs("registered_vs_incoming", registered, incoming)
+                    .into_iter()
+                    .map(|field| {
+                        format!(
+                            "{} registered={} incoming={}",
+                            field.field, field.persisted, field.reconstructed
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(CalyxError::lens_frozen_violation(format!(
+                    "lens id {id} collides with a different registered frozen contract \
+                     (registered {} != incoming {}): {diff}",
+                    registered.lens_id(),
+                    incoming.lens_id()
+                )))
+            }
+            None => Err(CalyxError::registry_duplicate(format!(
+                "lens {id} is already registered without a frozen contract"
+            ))),
+        }
     }
 
     /// Returns whether registration verified a deterministic probe or used an explicit exemption.
@@ -429,11 +544,7 @@ impl Registry {
             DeterminismProof::ContractOnlyExemption
         };
         let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
+        self.reject_duplicate_id(id, &contract)?;
         self.lenses.insert(
             id,
             RegistryEntry {

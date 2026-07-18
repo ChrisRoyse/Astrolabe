@@ -30,6 +30,32 @@ pub enum Modality {
     Mixed,
 }
 
+impl Modality {
+    /// Frozen, never-change token for content-addressing this modality.
+    ///
+    /// These bytes are hashed into the versioned [`crate::LensId`] identity
+    /// (`frozen` contract, v2 fingerprint), so a modality's token is a
+    /// permanent wire contract: it MUST NOT be renamed, reordered, or reused.
+    /// Adding a new modality means adding a new token; changing an existing
+    /// token silently repartitions every persisted lens identity and is a
+    /// contract break. This is intentionally independent of the serde
+    /// representation so that a future serde rename can never move an id.
+    pub const fn stable_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Code => "code",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Protein => "protein",
+            Self::Dna => "dna",
+            Self::Molecule => "molecule",
+            Self::Structured => "structured",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
 /// Physical vector shape produced by a lens slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

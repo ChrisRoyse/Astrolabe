@@ -192,6 +192,71 @@ function Test-PathUnderRoot {
     return $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-AstroOwnedCargoTargetRoots {
+    # #534/#566: the complete set of Cargo target directories this launcher owns and must
+    # clean under one root. An authoritative CARGO_TARGET_DIR (exported by
+    # Set-ToolchainEnvironment) confines every Cargo child -- a nested
+    # `--manifest-path calyx/Cargo.toml` invocation included -- to $Root\target, but a target
+    # that already exists from a run predating that confinement (or a non-launcher cargo run)
+    # must still be swept. The owned surface is the canonical root target plus one
+    # `<dir>\target` for every depth-1 directory carrying its own Cargo.toml -- i.e. every
+    # workspace a `--manifest-path <dir>/Cargo.toml` child could resolve (calyx/ today; cbm/ is
+    # C source and has no Cargo.toml). Returns absolute, de-duplicated target paths, root first.
+    param([Parameter(Mandatory)][string]$Root)
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    $rootTarget = [IO.Path]::GetFullPath((Join-Path $Root "target"))
+    $roots.Add($rootTarget)
+    Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $manifest = Join-Path $_.FullName "Cargo.toml"
+            if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+                $nestedTarget = [IO.Path]::GetFullPath((Join-Path $_.FullName "target"))
+                if (-not [string]::Equals($nestedTarget, $rootTarget, [StringComparison]::OrdinalIgnoreCase)) {
+                    $roots.Add($nestedTarget)
+                }
+            }
+        }
+    return @($roots | Select-Object -Unique)
+}
+
+function Assert-NoAmbientCargoTargetEscape {
+    # #534/#566: the launcher exports an authoritative CARGO_TARGET_DIR (= $OwnedTargetRoot) so
+    # every Cargo child is confined to the owned, cleaned root. An ambient CARGO_TARGET_DIR or
+    # CARGO_BUILD_TARGET_DIR in the launcher's own environment that points ELSEWHERE would be
+    # silently overwritten -- masking operator intent, and leaving an unowned artifact tree
+    # behind if any child read the ambient value first. Fail closed instead: an ambient value
+    # is admitted only when it resolves to the owned root; anything else is refused by name.
+    param([Parameter(Mandatory)][string]$OwnedTargetRoot)
+
+    $ownedFull = [IO.Path]::GetFullPath($OwnedTargetRoot).TrimEnd('\', '/')
+    foreach ($varName in @("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")) {
+        $item = Get-Item -Path "Env:$varName" -ErrorAction SilentlyContinue
+        if ($null -eq $item -or [string]::IsNullOrWhiteSpace($item.Value)) {
+            continue
+        }
+        $ambientFull = [IO.Path]::GetFullPath($item.Value).TrimEnd('\', '/')
+        if (-not [string]::Equals($ambientFull, $ownedFull, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_TARGET_ESCAPE]: {code=ASTRO_CARGO_TARGET_ESCAPE; message=`"ambient $varName=$($item.Value) resolves to '$ambientFull', outside the launcher-owned Cargo target root '$ownedFull'; the launcher owns and cleans only that root, so a Cargo child writing there would escape hygiene`"; remediation=`"unset $varName (the launcher exports its own authoritative CARGO_TARGET_DIR) or set it to '$ownedFull', then rerun the launcher`"}"
+        }
+    }
+}
+
+function Assert-NoCargoTargetDirOverride {
+    # #534/#566: a child `--target-dir <path>` / `--target-dir=<path>` on the Cargo CLI outranks
+    # the launcher's authoritative CARGO_TARGET_DIR (CLI > env), so it cannot be overridden --
+    # only refused. Reject it fail-closed so no invocation can steer Cargo output out of the
+    # owned, cleaned target root.
+    param([string[]]$CommandArgs)
+
+    foreach ($rawArg in $CommandArgs) {
+        $arg = [string]$rawArg
+        if ($arg -eq "--target-dir" -or $arg -like "--target-dir=*") {
+            throw "LAUNCHER_BOUNDARY[ASTRO_CARGO_TARGET_DIR_OVERRIDE]: {code=ASTRO_CARGO_TARGET_DIR_OVERRIDE; message=`"the child command passes '$arg', which overrides the launcher's authoritative CARGO_TARGET_DIR and would write Cargo output outside the owned, cleaned target root`"; remediation=`"remove --target-dir from the command; the launcher confines every Cargo child (nested manifests included) to its owned target root automatically`"}"
+        }
+    }
+}
+
 function Resolve-PinnedCuda13Runtime {
     param(
         [string]$Provisioner,
@@ -1263,7 +1328,12 @@ function Set-ToolchainEnvironment {
         [string]$GitUsrBin,
         [string]$SccacheExe,
         [string]$SccacheDir,
-        [string]$SccacheServerPort
+        [string]$SccacheServerPort,
+        # #534/#566: the launcher-owned canonical Cargo target root. Exported as an
+        # authoritative CARGO_TARGET_DIR so every Cargo child -- including a nested
+        # `--manifest-path calyx/Cargo.toml` invocation that would otherwise select
+        # calyx/target -- writes into the one directory the launcher owns and cleans.
+        [Parameter(Mandatory)][string]$CargoTargetRoot
     )
 
     $env:PATH = "$MingwBin;$LlvmBin;$CppcheckRoot;$RipgrepRoot;$GitUsrBin;$GitBin;$env:PATH"
@@ -1290,6 +1360,14 @@ function Set-ToolchainEnvironment {
     $env:SCCACHE_DIR = $SccacheDir
     $env:SCCACHE_CACHE_SIZE = $SccacheCacheSize
     $env:CARGO_INCREMENTAL = "0"
+    # #534/#566: authoritative CARGO_TARGET_DIR. Cargo precedence is CLI --target-dir > env
+    # CARGO_TARGET_DIR > env CARGO_BUILD_TARGET_DIR > config, so exporting this pins every
+    # Cargo descendant -- root workspace, nested `--manifest-path calyx/Cargo.toml`, and the
+    # nested cargo trybuild would spawn -- to the launcher-owned target root regardless of the
+    # manifest it resolves. A child `--target-dir` (which would outrank this) is refused up
+    # front by Assert-NoCargoTargetDirOverride, and an escaping ambient value is refused by
+    # Assert-NoAmbientCargoTargetEscape, so this value is the single, owned target directory.
+    $env:CARGO_TARGET_DIR = $CargoTargetRoot
     # #242: every descendant of the child command -- cargo, its parallel rustc processes,
     # and the NESTED cargo that trybuild spawns -- inherits these two, so they all address
     # the single server this launcher pre-starts on this root's port and none of them ever
@@ -2008,15 +2086,13 @@ if ($isWorktreeRoot -and $Bootstrap) {
 if ($isWorktreeRoot) {
     Write-Output "LAUNCHER_WORKTREE[ASTRO_WORKTREE_ROOT]: root=$root; pinned tools and sccache shared from $ExpectedWorkspace; target/, .tmp/, and session lock stay worktree-local"
 }
-# The CUDA runtime provisioner owns concurrency through unique staging roots and
-# immutable content-addressed publication. Run it before claiming the local
-# launcher lock so a download or attestation failure cannot strand that lock.
+# #588: toolchain-bundle roots are pure path derivations here (no download, extraction, or
+# move). The pinned CUDA runtime provisioning that MUTATES .toolchains, and every pinned-tool
+# install, run later -- inside the lock-guarded try/finally below -- so the session lock is
+# always HELD before any toolchain mutation and every failure path removes it (#589). The
+# earlier design ran provisioning before the claim to avoid a stranded lock; that is now
+# guaranteed by the finally instead, without leaving a live install stage unattributed.
 $toolsRoot = Join-Path $ExpectedWorkspace ".toolchains"
-$cuda13RuntimeProvisioner = Join-Path $ExpectedWorkspace "scripts\windows-cuda13-runtime.ps1"
-$cuda13RuntimeLock = Join-Path $ExpectedWorkspace "scripts\toolchains\ort-cuda13.3-windows-x86_64.lock.json"
-$cuda13RuntimeRoot = Resolve-PinnedCuda13Runtime -Provisioner $cuda13RuntimeProvisioner -LockManifest $cuda13RuntimeLock -WorkspaceRoot $ExpectedWorkspace -ToolchainsRoot $toolsRoot
-$env:CALYX_CUDA13_RUNTIME_ROOT = $cuda13RuntimeRoot
-Write-Output "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT]: attested pinned runtime root exported via CALYX_CUDA13_RUNTIME_ROOT=$cuda13RuntimeRoot (PATH unchanged)"
 # #226/#242: every root -- canonical AND worktree -- gets its own sccache server on a
 # deterministic, non-ephemeral port. #226 derived a port for worktrees only, which left the
 # canonical workspace on sccache's machine-wide default (127.0.0.1:4226): a stray default-port
@@ -2030,6 +2106,16 @@ $workspaceTempParent = Join-Path $root ".tmp"
 $workspaceTempParentExisted = Test-Path -LiteralPath $workspaceTempParent
 $workspaceTemp = Join-Path $workspaceTempParent "windows-gnu-toolchain-$PID"
 $launcherLock = Join-Path $workspaceTempParent "astrolabe-launcher.lock"
+# #534/#566: the complete set of Cargo target directories this launcher owns and must clean
+# (root target + calyx/target). An authoritative CARGO_TARGET_DIR exported under the lock
+# (Set-ToolchainEnvironment) confines every Cargo child to the root target; this list drives
+# the preflight reclaim and the finally sweep of any pre-existing nested debris.
+$ownedTargetRoots = @(Get-AstroOwnedCargoTargetRoots -Root $root)
+# #534/#566: refuse an ambient CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR that would steer a
+# Cargo child out of the owned root. Checked before the lock claim so a misconfigured
+# environment fails fast without lock churn; the authoritative value is exported later,
+# under the held lock, by Set-ToolchainEnvironment.
+Assert-NoAmbientCargoTargetEscape -OwnedTargetRoot $target
 # #197/#247: the session-lock semantics live in one audited, dot-sourceable place
 # (scripts/launcher-lock.ps1) that has NO capability to stop any process. A live foreign
 # holder is refused (ASTRO_LAUNCHER_LOCK_HELD), a malformed lock fails closed
@@ -2055,6 +2141,29 @@ if ((Test-Path -LiteralPath $target) -and ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "
 }
 if (($env:ASTROLABE_CONTIGUOUS_BATCH -eq "1") -and (Test-Path -LiteralPath $target)) {
     Write-Output "TARGET[ASTRO_BATCH_WARM]: ASTROLABE_CONTIGUOUS_BATCH=1 -> reusing warm target/ from this session's batch"
+}
+# #534/#566: nested owned Cargo target roots (calyx/target) are reclaimed as dead-owner debris
+# here. The session lock is already claimable (Assert-AstroLauncherLockClaimable passed above
+# => no live foreign owner on this root), so a nested target is a leftover from a dead run and
+# this session -- which now owns the workspace -- reclaims it fail-closed. The canonical root
+# target keeps its existing hard-fail "must be absent" contract (#421) above; nested targets
+# are new to launcher ownership and had no such contract, so they are swept, not fatal. Under
+# the contiguous-batch carve-out an authoritative CARGO_TARGET_DIR keeps every child in the
+# root target, so no nested target appears to reclaim.
+if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
+    $rootTargetFull = [IO.Path]::GetFullPath($target)
+    foreach ($ownedTarget in $ownedTargetRoots) {
+        if ([string]::Equals($ownedTarget, $rootTargetFull, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        if (Test-Path -LiteralPath $ownedTarget) {
+            Remove-TreeResilient -Path $ownedTarget
+            if (Test-Path -LiteralPath $ownedTarget) {
+                throw "nested Cargo target must be absent before toolchain work and could not be reclaimed: $ownedTarget"
+            }
+            Write-Output "TARGET[ASTRO_NESTED_TARGET_RECLAIMED]: reclaimed dead-owner nested Cargo target under claimable lock: $ownedTarget (#534/#566)"
+        }
+    }
 }
 if ((Test-Path -LiteralPath $workspaceTempParent) -and -not (Test-Path -LiteralPath $workspaceTempParent -PathType Container)) {
     throw "workspace temporary parent is not a directory: $workspaceTempParent"
@@ -2104,7 +2213,8 @@ catch {
 }
 
 # #226: pinned tools always live in the canonical workspace so worktree sessions
-# reuse one bootstrapped bundle instead of re-downloading per worktree.
+# reuse one bootstrapped bundle instead of re-downloading per worktree. These are pure path
+# derivations; the mutating installs run below, inside the lock-guarded try/finally.
 $mingwRoot = Join-Path $toolsRoot $ToolchainDirectoryName
 $mingwBin = Join-Path $mingwRoot "bin"
 $llvmRoot = Join-Path $toolsRoot $LlvmDirectoryName
@@ -2121,104 +2231,134 @@ $sccacheDir = Join-Path $ExpectedWorkspace ".sccache"
 $gitRoot = $GitInstallRoot
 $gitBin = Join-Path $gitRoot "bin"
 $gitUsrBin = Join-Path $gitRoot "usr\bin"
-Require-Path (Join-Path $gitBin "bash.exe") "native Git for Windows Bash is required"
-Require-Path (Join-Path $gitUsrBin "sh.exe") "native Git for Windows shell is required"
-Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot
 
-if ($Bootstrap) {
-    Install-PinnedToolchain -ToolsRoot $toolsRoot -MingwRoot $mingwRoot
-}
-Require-Path (Join-Path $mingwBin "gcc.exe") "pinned MinGW toolchain is missing; rerun with -Bootstrap"
-Ensure-BundledMakeAlias -MingwBin $mingwBin
-if ($Bootstrap) {
-    Install-PinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
-    Install-PinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot -MingwBin $mingwBin -GitBin $gitBin -GitUsrBin $gitUsrBin
-    Install-PinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
-    Install-PinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
-    Remove-StalePinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
-    Remove-StalePinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot
-    Remove-StalePinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
-    Remove-StalePinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
-}
-Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
-Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
-Require-Path (Join-Path $ripgrepRoot "rg.exe") "pinned ripgrep is missing; rerun with -Bootstrap"
-Require-Path $sccacheExe "pinned sccache is missing; rerun with -Bootstrap"
-New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
-Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin -SccacheExe $sccacheExe -SccacheDir $sccacheDir -SccacheServerPort $sccacheServerPort
-# No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
-# host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
-# (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
-# PS 5.1). The launcher uses Git bash explicitly via $env:BASH/$env:SHELL, and
-# Set-ToolchainEnvironment prepends $GitBin to the child PATH; $Command is invoked
-# by explicit path. An explicitly-passed bash $Command is still validated by
-# Assert-AllowedBashCommand above. See #205.
-Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -SccacheExe $sccacheExe
-Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, sccache $ExpectedSccacheVersion, runtime $mingwBin"
-
-# #303: when the operator opts into the #270 lld linker (RUSTFLAGS carries -fuse-ld=lld),
-# guarantee the pinned LLVM 20.1.8 ld.lld -- never the host's unpinned MSVS BuildTools LLD --
-# is the one gcc/collect2 uses. Set-ToolchainEnvironment already prepends the pinned LLVM bin
-# to PATH; here we (1) end-to-end probe gcc and FAIL CLOSED unless it resolves LLD 20.1.8,
-# then (2) pin collect2's ld.lld search to the pinned dir via -B for the actual child build,
-# so a poisoned PATH cannot silently downgrade the linker. This only ADDS a pin when lld is
-# already requested; the default ld.bfd path is untouched.
-if ($env:RUSTFLAGS -and ($env:RUSTFLAGS -match 'fuse-ld=lld')) {
-    $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $llvmBin -ScratchDir $workspaceTempParent
-    $lldPrefix = ($llvmBin.TrimEnd('\', '/')) + '\'
-    $lldPinArg = "-Clink-arg=-B$lldPrefix"
-    if ($env:RUSTFLAGS -notmatch [regex]::Escape($lldPinArg)) {
-        $env:RUSTFLAGS = "$lldPinArg $($env:RUSTFLAGS)"
-    }
-    Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in RUSTFLAGS; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
-}
-
-if ([string]::IsNullOrWhiteSpace($Command)) {
-    Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
-    Remove-LauncherLockFile -LockPath $launcherLock
-    if (-not $workspaceTempParentExisted -and (Test-Path -LiteralPath $workspaceTempParent)) {
-        Remove-Item -LiteralPath $workspaceTempParent -Force -ErrorAction SilentlyContinue
-    }
-    exit 0
-}
-
-# Windows PowerShell 5.1's ConvertFrom-Json emits a JSON array as ONE object instead of
-# enumerating it, so `@(ConvertFrom-Json '["a","b"]')` yields an array-of-one-array there
-# while PowerShell 7 unrolls it into two strings. Under 5.1 -- the host CLAUDE.md documents
-# for `powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1` -- that
-# made every multi-argument invocation (including CLAUDE.md's own
-# '["test","-p","cbm-sys","--lib"]' example) fail the string check below. Normalise both
-# hosts to a flat argument list before validating.
-$parsedCommandArgs = ConvertFrom-Json -InputObject $CommandArgsJson
-$commandArgs = @()
-if ($null -ne $parsedCommandArgs) {
-    if (($parsedCommandArgs -is [System.Collections.IEnumerable]) -and ($parsedCommandArgs -isnot [string])) {
-        foreach ($argument in $parsedCommandArgs) {
-            $commandArgs += $argument
-        }
-    }
-    else {
-        $commandArgs += $parsedCommandArgs
-    }
-}
-foreach ($argument in $commandArgs) {
-    if ($argument -isnot [string]) {
-        throw "CommandArgsJson must contain only strings"
-    }
-}
-
-# #239: $commandExit stays $null until the child command actually reports an exit code.
-# "the child never ran" and "the child exited 0" are different facts and must not collapse.
+# #239: cleanup-tracking state, initialised BEFORE the lock-guarded try so the finally can
+# always reference it even if the very first provisioning step below faults. $commandExit
+# stays $null until the child reports an exit code -- "the child never ran" and "the child
+# exited 0" are different facts and must not collapse.
 $commandExit = $null
 $launcherFault = $null
 $cleanupErrors = @()
 $treeRecorder = $null
+# #588/#589: guards the finally's sccache stat/stop block. Set true only once THIS run begins
+# managing the daemon on this root's port, so an environment-probe (empty $Command) or a fault
+# before that point never makes the finally touch sccache.
+$sccacheDaemonStarted = $false
 $attributionManifest = Join-Path $workspaceTempParent "no-escape-attribution-$PID.json"
 $previousTempEnvironment = @{}
 foreach ($name in @("TEMP", "TMP", "TMPDIR", "GIT_CEILING_DIRECTORIES", "ASTRO_NO_ESCAPE_ATTRIBUTION")) {
     $previousTempEnvironment[$name] = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
 }
+# #588: the session lock is now HELD (claimed atomically above). Everything that MUTATES the
+# toolchains -- CUDA-runtime provisioning, pinned-tool installs, the make alias -- runs from
+# here, under the lock, inside this single try/finally. #589: every post-claim validation
+# (argument JSON parse, Cargo target-dir refusal) also runs here, so no fault after the claim
+# can strand the lock: the finally removes the lock, the per-run TEMP, and every owned Cargo
+# target root on success, child failure, and launcher fault alike.
 try {
+    # #588: CUDA-runtime provisioning MUTATES the pinned toolchains (it downloads/extracts into
+    # .toolchains/.installing-ort-cuda13-* before publishing the immutable content-addressed
+    # root), so it runs here, under the held lock -- not before the claim as it once did. A
+    # download or attestation fault is a launcher fault caught below; the finally then removes
+    # this run's lock, so a concurrent session never mistakes a live install stage for
+    # abandoned debris (the #197 lock-discipline breach #588 fixes).
+    $cuda13RuntimeProvisioner = Join-Path $ExpectedWorkspace "scripts\windows-cuda13-runtime.ps1"
+    $cuda13RuntimeLock = Join-Path $ExpectedWorkspace "scripts\toolchains\ort-cuda13.3-windows-x86_64.lock.json"
+    $cuda13RuntimeRoot = Resolve-PinnedCuda13Runtime -Provisioner $cuda13RuntimeProvisioner -LockManifest $cuda13RuntimeLock -WorkspaceRoot $ExpectedWorkspace -ToolchainsRoot $toolsRoot
+    $env:CALYX_CUDA13_RUNTIME_ROOT = $cuda13RuntimeRoot
+    Write-Output "CUDA13_RUNTIME[ASTRO_CUDA13_RUNTIME_ROOT]: attested pinned runtime root exported via CALYX_CUDA13_RUNTIME_ROOT=$cuda13RuntimeRoot (PATH unchanged)"
+
+    Require-Path (Join-Path $gitBin "bash.exe") "native Git for Windows Bash is required"
+    Require-Path (Join-Path $gitUsrBin "sh.exe") "native Git for Windows shell is required"
+    Assert-AllowedBashCommand -Command $Command -GitRoot $gitRoot
+
+    if ($Bootstrap) {
+        Install-PinnedToolchain -ToolsRoot $toolsRoot -MingwRoot $mingwRoot
+    }
+    Require-Path (Join-Path $mingwBin "gcc.exe") "pinned MinGW toolchain is missing; rerun with -Bootstrap"
+    Ensure-BundledMakeAlias -MingwBin $mingwBin
+    if ($Bootstrap) {
+        Install-PinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
+        Install-PinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot -MingwBin $mingwBin -GitBin $gitBin -GitUsrBin $gitUsrBin
+        Install-PinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
+        Install-PinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
+        Remove-StalePinnedLlvm -ToolsRoot $toolsRoot -LlvmRoot $llvmRoot
+        Remove-StalePinnedCppcheck -ToolsRoot $toolsRoot -CppcheckRoot $cppcheckRoot
+        Remove-StalePinnedRipgrep -ToolsRoot $toolsRoot -RipgrepRoot $ripgrepRoot
+        Remove-StalePinnedSccache -ToolsRoot $toolsRoot -SccacheRoot $sccacheRoot
+    }
+    Require-Path (Join-Path $llvmBin "clang-tidy.exe") "pinned LLVM analysis toolchain is missing; rerun with -Bootstrap"
+    Require-Path (Join-Path $cppcheckRoot "cppcheck.exe") "pinned cppcheck is missing; rerun with -Bootstrap"
+    Require-Path (Join-Path $ripgrepRoot "rg.exe") "pinned ripgrep is missing; rerun with -Bootstrap"
+    Require-Path $sccacheExe "pinned sccache is missing; rerun with -Bootstrap"
+    New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
+    Set-ToolchainEnvironment -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -GitBin $gitBin -GitUsrBin $gitUsrBin -SccacheExe $sccacheExe -SccacheDir $sccacheDir -SccacheServerPort $sccacheServerPort -CargoTargetRoot $target
+    # #534/#566: announce the authoritative, owned Cargo target root BEFORE any child runs, and
+    # list every target directory the finally will verify absent on exit.
+    Write-Output "TARGET[ASTRO_CARGO_TARGET_ROOT]: CARGO_TARGET_DIR=$target (authoritative; nested manifests confined; owned roots: $(($ownedTargetRoots | Sort-Object) -join '; '))"
+    # No ambient-PATH bash.exe policing: WSL is a permitted, coexisting part of this
+    # host (direction reversed 2026-07-11), so a WSL bash.exe on PATH is not a fault
+    # (and `Get-Command bash.exe` returning multiple sources crashed GetFullPath under
+    # PS 5.1). The launcher uses Git bash explicitly via $env:BASH/$env:SHELL, and
+    # Set-ToolchainEnvironment prepends $GitBin to the child PATH; $Command is invoked
+    # by explicit path. An explicitly-passed bash $Command is still validated by
+    # Assert-AllowedBashCommand above. See #205.
+    Test-PinnedToolchain -MingwBin $mingwBin -LlvmBin $llvmBin -CppcheckRoot $cppcheckRoot -RipgrepRoot $ripgrepRoot -SccacheExe $sccacheExe
+    Write-Output "WINDOWS_GNU_TOOLCHAIN: Rust $RustToolchain, GCC $ExpectedGccVersion, LLVM $ExpectedClangTidyVersion, Cppcheck $ExpectedCppcheckVersion, ripgrep $RipgrepVersion, sccache $ExpectedSccacheVersion, runtime $mingwBin"
+
+    # #303: when the operator opts into the #270 lld linker (RUSTFLAGS carries -fuse-ld=lld),
+    # guarantee the pinned LLVM 20.1.8 ld.lld -- never the host's unpinned MSVS BuildTools LLD --
+    # is the one gcc/collect2 uses. Set-ToolchainEnvironment already prepends the pinned LLVM bin
+    # to PATH; here we (1) end-to-end probe gcc and FAIL CLOSED unless it resolves LLD 20.1.8,
+    # then (2) pin collect2's ld.lld search to the pinned dir via -B for the actual child build,
+    # so a poisoned PATH cannot silently downgrade the linker. This only ADDS a pin when lld is
+    # already requested; the default ld.bfd path is untouched.
+    if ($env:RUSTFLAGS -and ($env:RUSTFLAGS -match 'fuse-ld=lld')) {
+        $pinnedLld = Assert-GccResolvesPinnedLld -GccExe $env:CC -LlvmBin $llvmBin -ScratchDir $workspaceTempParent
+        $lldPrefix = ($llvmBin.TrimEnd('\', '/')) + '\'
+        $lldPinArg = "-Clink-arg=-B$lldPrefix"
+        if ($env:RUSTFLAGS -notmatch [regex]::Escape($lldPinArg)) {
+            $env:RUSTFLAGS = "$lldPinArg $($env:RUSTFLAGS)"
+        }
+        Write-Output "LLD[ASTRO_PINNED_LLD]: lld-enabled build detected in RUSTFLAGS; verified gcc resolves $pinnedLld (LLD $ExpectedLldVersion); pinned collect2 ld.lld search via -B$lldPrefix ahead of PATH"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        # Environment-probe mode: the toolchain env is set up and reported ready, no child runs.
+        # The finally still removes the lock and the (unused) per-run TEMP; $sccacheDaemonStarted
+        # stays false, so no sccache daemon is touched.
+        Write-Output 'Ready. Example: .\scripts\windows-gnu-toolchain.ps1 -Issue <driving-issue> -Command cargo -CommandArgsJson ''["test","-p","cbm-sys","--lib"]'''
+        $commandExit = 0
+    }
+    else {
+        # Windows PowerShell 5.1's ConvertFrom-Json emits a JSON array as ONE object instead of
+        # enumerating it, so `@(ConvertFrom-Json '["a","b"]')` yields an array-of-one-array there
+        # while PowerShell 7 unrolls it into two strings. Under 5.1 -- the host CLAUDE.md documents
+        # for `powershell -ExecutionPolicy Bypass -File scripts\windows-gnu-toolchain.ps1` -- that
+        # made every multi-argument invocation (including CLAUDE.md's own
+        # '["test","-p","cbm-sys","--lib"]' example) fail the string check below. Normalise both
+        # hosts to a flat argument list before validating. #589: this parse runs under the held
+        # lock's finally, so a malformed CommandArgsJson exits nonzero AND removes the lock/TEMP.
+        $parsedCommandArgs = ConvertFrom-Json -InputObject $CommandArgsJson
+        $commandArgs = @()
+        if ($null -ne $parsedCommandArgs) {
+            if (($parsedCommandArgs -is [System.Collections.IEnumerable]) -and ($parsedCommandArgs -isnot [string])) {
+                foreach ($argument in $parsedCommandArgs) {
+                    $commandArgs += $argument
+                }
+            }
+            else {
+                $commandArgs += $parsedCommandArgs
+            }
+        }
+        foreach ($argument in $commandArgs) {
+            if ($argument -isnot [string]) {
+                throw "CommandArgsJson must contain only strings"
+            }
+        }
+        # #534/#566: a child --target-dir outranks the launcher's authoritative CARGO_TARGET_DIR,
+        # so it is refused (never overridden) before the child runs, under the lock's finally.
+        Assert-NoCargoTargetDirOverride -CommandArgs $commandArgs
     Set-WorkspaceTempEnvironment -WorkspaceTemp $workspaceTemp
     New-Item -ItemType Directory -Path $workspaceTemp -Force | Out-Null
     Set-CudaMsvcRuntimeLinkEnvironment -LlvmBin $llvmBin -WorkspaceTemp $workspaceTemp
@@ -2239,6 +2379,10 @@ try {
     # orphan started under a since-deleted per-session temp poisons every compile. Stop
     # it, then start one daemon whose environment we know exactly. Exit 2 here means
     # "no server was listening", which is the normal, expected case.
+    # #588/#589: from here on this run manages the sccache daemon on this root's port, so the
+    # finally must attempt to stop it even if the start/zero-stats handshake below faults. An
+    # environment-probe (empty $Command) never reaches this branch, so its finally skips sccache.
+    $sccacheDaemonStarted = $true
     $sccachePreStop = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--stop-server")
     if ($sccachePreStop.ExitCode -eq 0) {
         Write-Output "SCCACHE[ASTRO_CACHE_SERVER_REPLACED]: stopped a pre-existing sccache daemon on 127.0.0.1:$sccacheServerPort before starting this session's daemon"
@@ -2290,6 +2434,7 @@ try {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     Write-Output "LAUNCHER_EXIT[ASTRO_CHILD_EXIT]: child command exited with $commandExit"
+    }
 }
 catch {
     # #239: a fault in the launcher itself (bad sccache daemon, unlaunchable command, ...)
@@ -2367,6 +2512,10 @@ finally {
     # behind for the next session to inherit blindly.
     # #239: NOTHING in this block may change the launcher's exit code. Every native call
     # here has its exit code captured and reported under a named label, never propagated.
+    # #588/#589: only touch sccache if THIS run began managing the daemon on this root's port
+    # (an environment-probe with an empty $Command never starts one), so the finally never
+    # spuriously spins up and stops a daemon it did not create.
+    if ($sccacheDaemonStarted) {
     try {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS]:"
         $sccacheStats = Invoke-NativeCapture -Exe $sccacheExe -Arguments @("--show-stats")
@@ -2388,6 +2537,7 @@ finally {
     catch {
         Write-Output "SCCACHE[ASTRO_CACHE_STATS_UNAVAILABLE]: $($_.Exception.Message)"
     }
+    }
     # #280: ASTROLABE_CONTIGUOUS_BATCH=1 invokes the CLAUDE.md "contiguous
     # verification batch" carve-out — consecutive gate runs within one session
     # keep target/ warm (the workspace-test phase is ~95% rebuild cost from a
@@ -2400,17 +2550,22 @@ finally {
         Write-Output "CLEANUP[ASTRO_TARGET_BATCH_DEFERRED]: ASTROLABE_CONTIGUOUS_BATCH=1 -> target/ kept warm; the batch owner wipes it at the batch boundary"
     }
     else {
-        if (Test-Path -LiteralPath $target) {
-            try {
-                # #421: depth-independent, not MAX_PATH-bound (deep-store FSV fixtures).
-                Remove-TreeResilient -Path $target
+        # #534/#566: sweep EVERY owned Cargo target root -- the canonical root target and each
+        # nested workspace target (calyx/target) -- not just $target, so a nested manifest can
+        # leave nothing behind. Each is removed depth-independently and verified absent.
+        foreach ($ownedTarget in $ownedTargetRoots) {
+            if (Test-Path -LiteralPath $ownedTarget) {
+                try {
+                    # #421: depth-independent, not MAX_PATH-bound (deep-store FSV fixtures).
+                    Remove-TreeResilient -Path $ownedTarget
+                }
+                catch {
+                    $cleanupErrors += "target cleanup failed ($ownedTarget): $($_.Exception.Message)"
+                }
             }
-            catch {
-                $cleanupErrors += "target cleanup failed: $($_.Exception.Message)"
+            if (Test-Path -LiteralPath $ownedTarget) {
+                $cleanupErrors += "target cleanup failed: $ownedTarget remains"
             }
-        }
-        if (Test-Path -LiteralPath $target) {
-            $cleanupErrors += "target cleanup failed: $target remains"
         }
     }
     if (Test-Path -LiteralPath $workspaceTemp) {
@@ -2459,7 +2614,7 @@ finally {
     # Cleanup failures are recorded in $cleanupErrors and adjudicated below, loudly.
     if (-not $deferCleanupForLiveChildren -and $cleanupErrors.Count -eq 0) {
         if ($env:ASTROLABE_CONTIGUOUS_BATCH -ne "1") {
-            Write-Output "CLEANUP[ASTRO_TARGET]: $target is absent"
+            Write-Output "CLEANUP[ASTRO_TARGET]: absent: $(($ownedTargetRoots | Sort-Object) -join '; ')"
         }
         Write-Output "CLEANUP[ASTRO_WORKSPACE_TEMP]: $workspaceTemp is absent"
     }

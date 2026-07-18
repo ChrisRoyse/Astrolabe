@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use calyx_core::{AbsentReason, CalyxError, Input, LensId, Result, SlotVector};
 use serde::{Deserialize, Serialize};
 
+use crate::spec::LensRuntime;
+
 pub const DEFAULT_INGEST_MICROBATCH_CAP_BYTES: usize = 16 * 1024 * 1024;
 pub const INGEST_MICROBATCH_INPUT_OVERHEAD_BYTES: usize = 64;
 const DEFAULT_HIGH_WATER_NUMERATOR: usize = 3;
@@ -57,6 +59,42 @@ impl IngestMicrobatchConfig {
     }
 }
 
+/// How a lens measure failure during a bounded ingest microbatch is handled.
+///
+/// The circuit breaker's degrade-to-`Absent` path exists for genuinely transient
+/// *service* conditions — a remote embedding endpoint that is momentarily down or
+/// slow. Required in-process runtimes (Candle/ONNX/Fastembed GPU inference,
+/// static-lookup, algorithmic) do not have that character: a CUDA provider,
+/// kernel, driver, or inference failure is a required-capability failure, and
+/// silently degrading it would drop a lens from a GPU-required panel while
+/// reporting success (#488). Those failures must propagate before any partial
+/// record or ledger commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensFailurePolicy {
+    /// Remote/transport runtimes whose transient unreachability is a degradable
+    /// service condition guarded by the circuit breaker (TEI HTTP, external
+    /// command).
+    TransientDegradable,
+    /// Required in-process runtimes whose measure failure must propagate
+    /// fail-closed rather than becoming a degraded `Absent` success.
+    RequiredRuntime,
+}
+
+impl LensFailurePolicy {
+    /// Classifies a lens by its declared runtime. Any runtime that is not an
+    /// explicitly transient remote transport is treated as required — the
+    /// fail-closed default, so an unknown or missing runtime never degrades.
+    pub fn for_runtime(runtime: &LensRuntime) -> Self {
+        match runtime {
+            LensRuntime::TeiHttp { .. } | LensRuntime::ExternalCmd { .. } => {
+                Self::TransientDegradable
+            }
+            _ => Self::RequiredRuntime,
+        }
+    }
+}
+
 /// Shared admission controller for bounded ingest microbatches.
 #[derive(Clone, Debug)]
 pub struct IngestMicrobatchController {
@@ -105,6 +143,7 @@ impl IngestMicrobatchController {
     pub fn measure_lens_batch<F>(
         &self,
         lens_id: LensId,
+        policy: LensFailurePolicy,
         inputs: &[Input],
         now_ms: u64,
         measure: F,
@@ -112,6 +151,9 @@ impl IngestMicrobatchController {
     where
         F: FnOnce(&[Input]) -> Result<Vec<SlotVector>>,
     {
+        // A required in-process runtime never opens its breaker (its failures
+        // propagate below), so an open breaker only exists for a transient
+        // transport lens and degrading here is correct.
         if let Some(open_until_ms) = self.breaker_open_until(lens_id, now_ms) {
             return Ok(self.degraded_outcome(lens_id, inputs.len(), 0, None, Some(open_until_ms)));
         }
@@ -137,7 +179,16 @@ impl IngestMicrobatchController {
                     breaker_open_until_ms: None,
                 })
             }
-            Err(error) if is_lens_timeout_like(&error) => {
+            // Degrade to Absent only for an explicitly transient transport
+            // condition on a degradable runtime. Every other failure — and every
+            // failure on a required in-process runtime, including GPU
+            // capability/kernel/driver/inference failures that share the
+            // CALYX_LENS_UNREACHABLE code — propagates before any partial
+            // record/ledger commit (#488).
+            Err(error)
+                if policy == LensFailurePolicy::TransientDegradable
+                    && is_transient_degradable(&error) =>
+            {
                 let open_until_ms = self.record_lens_timeout(lens_id, now_ms);
                 Ok(self.degraded_outcome(
                     lens_id,
@@ -427,6 +478,10 @@ fn absent_vectors(input_len: usize) -> Vec<SlotVector> {
     ]
 }
 
-fn is_lens_timeout_like(error: &CalyxError) -> bool {
+/// A transient transport condition that a degradable runtime may absorb as an
+/// `Absent` degrade + breaker trip. This is deliberately narrow: it names the
+/// remote-endpoint-down code only, and its result is used solely on a
+/// [`LensFailurePolicy::TransientDegradable`] runtime (see `measure_lens_batch`).
+fn is_transient_degradable(error: &CalyxError) -> bool {
     error.code == "CALYX_LENS_UNREACHABLE"
 }

@@ -48,7 +48,7 @@ pub use commission::{
     lens_spec_from_manifest_path, lens_spec_from_manifest_with_license_override,
     lens_spec_metadata_from_manifest, lens_spec_metadata_from_manifest_path,
     onnx_int8_attestation_from_manifest_path, register_commissioned,
-    verify_manifest_onnx_int8_attestation,
+    reject_declaration_only_learned_lens, verify_manifest_onnx_int8_attestation,
 };
 #[cfg(feature = "ml-runtime")]
 pub use commission::{
@@ -57,10 +57,15 @@ pub use commission::{
 pub use compression::{
     CALYX_VECTOR_COMPRESSION_EMPTY, CALYX_VECTOR_COMPRESSION_INVALID, COMPRESSED_SLOT_TAG,
     COMPRESSED_SLOT_VERSION, COMPRESSION_GENERATION_MARKER, CompressedSlotHit, CompressedSlotIndex,
-    CompressionQuery, MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES, SlotCompressionReport,
-    SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope, compress_slot_batch,
-    compress_slot_batch_with_assay_evidence, inspect_unbound_stored_slot_envelope,
-    load_mxfp4_assay_evidence, matryoshka_truncate_renormalize, persist_mxfp4_assay_evidence,
+    CompressionQuery, GenerationDeleteReport, MxFp4AssayEvidence, REGISTRY_ENVELOPE_HEADER_BYTES,
+    SlotCompressionReport, SlotCompressionRow, StoredSlotCodec, StoredSlotEnvelope,
+    append_reseal_compressed_rows, compress_slot_batch, compress_slot_batch_with_assay_evidence,
+    delete_compressed_generation, erase_compressed_slot_rows, generation_lifecycle,
+    inspect_unbound_stored_slot_envelope, load_mxfp4_assay_evidence,
+    matryoshka_truncate_renormalize, persist_mxfp4_assay_evidence,
+};
+pub use calyx_aster::compression_lifecycle::{
+    CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
 };
 pub use drift::{DriftDecision, RuntimeGolden};
 pub use explain::{LensExplanation, explain_lens, explain_lens_from_card};
@@ -69,7 +74,8 @@ pub use identity::CANDLE_BERT_EXECUTION_REVISION;
 pub use ingest_microbatch::{
     DEFAULT_INGEST_MICROBATCH_CAP_BYTES, INGEST_MICROBATCH_INPUT_OVERHEAD_BYTES, IngestLensOutcome,
     IngestLensOutcomeStatus, IngestMicrobatchConfig, IngestMicrobatchController,
-    IngestMicrobatchPermit, IngestMicrobatchStats, IngestPanelReadout, estimate_microbatch_bytes,
+    IngestMicrobatchPermit, IngestMicrobatchStats, IngestPanelReadout, LensFailurePolicy,
+    estimate_microbatch_bytes,
 };
 pub use lens::{
     DeterminismProof, DualMeasurement, FrozenLensSnapshot, Registry, RegistryLensSnapshot,
