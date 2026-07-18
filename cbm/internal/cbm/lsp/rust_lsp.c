@@ -2485,27 +2485,6 @@ static const CBMRegisteredFunc *rust_find_sole_trait_impl(RustLSPContext *ctx, c
  * 8. Macro handling
  * ════════════════════════════════════════════════════════════════════ */
 
-/* Walk a `macro_invocation`'s `token_tree` looking for nested call/method
- * call expressions. We do this so calls inside `vec![foo()]`,
- * `assert_eq!(a.bar(), 0)`, and `dbg!(get_value())` still get attributed
- * to the enclosing function. */
-static void rust_walk_macro_tokens(RustLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node))
-        return;
-    const char *kind = ts_node_type(node);
-    if (strcmp(kind, "call_expression") == 0 || strcmp(kind, "macro_invocation") == 0 ||
-        strcmp(kind, "field_expression") == 0) {
-        rust_resolve_calls_in_node(ctx, node);
-        return;
-    }
-    uint32_t nc = ts_node_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(node, i);
-        if (!ts_node_is_null(c))
-            rust_walk_macro_tokens(ctx, c);
-    }
-}
-
 /* Map a Rust infix/index operator token to the std::ops trait method that
  * the compiler desugars it to. `a + b` calls `Add::add`, `a[i]` calls
  * `Index::index`, etc. Returns NULL for operators with no overloadable
@@ -3212,15 +3191,19 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     ts_parser_delete(parser);
 }
 
-/* Re-parse the argument list of a built-in expression-macro (format!,
- * println!, assert!, …) as ordinary Rust expressions and walk them for
- * calls. The tree-sitter-rust grammar tokenises macro arguments rather than
- * parsing them as expression AST, so a method call like `format!("{}",
- * d.label())` never appears as a call_expression/field_expression node and
- * rust_walk_macro_tokens cannot recover it. Because these macros DO evaluate
- * their arguments as normal expressions, re-parsing the argument text and
- * resolving calls in it is sound — it recovers exactly the calls the program
- * makes. We wrap the args in a block so each comma-separated argument parses
+/* Re-parse the argument list of a macro invocation as ordinary Rust
+ * expressions and walk them for calls. The tree-sitter-rust grammar tokenises
+ * macro arguments rather than parsing them as expression AST, so a method call
+ * like `format!("{}", d.label())` never reliably appears as a
+ * call_expression/field_expression node inside the token_tree (whether it does
+ * is a parse-context-dependent GLR ambiguity resolution — the #358/#373
+ * divergence). Because a macro that evaluates its arguments DOES evaluate them
+ * as normal expressions, re-parsing the argument TEXT and resolving calls in it
+ * is sound and parse-context-invariant — it recovers exactly the calls the
+ * program makes, identically in whole-file and isolated parses. This is the one
+ * consistent macro-token call-recovery pass #373 mandates (it replaced the
+ * former rust_walk_macro_tokens token_tree DFS). We wrap the args in a block so
+ * each comma-separated argument parses
  * as its own statement; the current scope (params/locals) is preserved so
  * typed receivers still resolve. */
 static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation) {
@@ -4014,9 +3997,29 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
         }
     }
 
-    /* Macro invocation: walk inner tokens for nested calls and try the
+    /* Macro invocation: recover calls embedded in the arguments, then try the
      * macro-as-function mapping. */
     if (strcmp(kind, "macro_invocation") == 0) {
+        /* One consistent macro-token call-recovery pass (#373). Recover calls
+         * embedded in the macro's arguments by re-parsing the RAW argument
+         * token TEXT as ordinary Rust expressions (rust_resolve_macro_arg_exprs).
+         * This reads the argument text, NOT tree-sitter's GLR-ambiguity-resolved
+         * token_tree subtree structure, so the recovered callee set is identical
+         * whether the enclosing function is parsed whole-file or in isolation —
+         * the parse-context invariance #358/#341 require. It replaces the former
+         * rust_walk_macro_tokens DFS over the already-parsed token_tree, whose
+         * recovered set depended on whether tree-sitter happened to structure a
+         * token_tree interior as call_expression nodes (the whole-file parse is a
+         * superset of the isolated parse — the #358 divergence). Direction chosen
+         * by corpus FAR/FRR measurement over the real cbm/+calyx/ trees: textual
+         * recovery recovers the real macro-embedded call edges the DFS lost in
+         * isolation, and the re-parse bails on any argument text that does not
+         * parse cleanly as Rust expressions (ts_node_has_error), so it never
+         * fabricates an edge (FAR 0). Applied identically to every macro
+         * invocation — std/known macros, and user macro_rules! invocations whose
+         * arguments are themselves evaluated. */
+        rust_resolve_macro_arg_exprs(ctx, node);
+
         TSNode mname_node = ts_node_child_by_field_name(node, "macro", 5);
         if (!ts_node_is_null(mname_node)) {
             char *mname = rust_node_text(ctx, mname_node);
@@ -4024,22 +4027,6 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                 /* For known std macros emit a synthetic call under their
                  * canonical paths so trace tools can see the dependency. */
                 const char *path = NULL;
-                /* Macros whose arguments are ordinary Rust expressions — their
-                 * call sites are lost to tree-sitter's macro tokenisation, so
-                 * re-parse the args to recover calls like `format!("{}",
-                 * d.label())`. */
-                bool expr_arg_macro =
-                    strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
-                    strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
-                    strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
-                    strcmp(mname, "writeln") == 0 || strcmp(mname, "panic") == 0 ||
-                    strcmp(mname, "assert") == 0 || strcmp(mname, "assert_eq") == 0 ||
-                    strcmp(mname, "assert_ne") == 0 || strcmp(mname, "debug_assert") == 0 ||
-                    strcmp(mname, "debug_assert_eq") == 0 ||
-                    strcmp(mname, "debug_assert_ne") == 0 || strcmp(mname, "dbg") == 0;
-                if (expr_arg_macro) {
-                    rust_resolve_macro_arg_exprs(ctx, node);
-                }
                 if (strcmp(mname, "println") == 0 || strcmp(mname, "eprintln") == 0 ||
                     strcmp(mname, "print") == 0 || strcmp(mname, "eprint") == 0 ||
                     strcmp(mname, "format") == 0 || strcmp(mname, "write") == 0 ||
@@ -4074,10 +4061,9 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                 }
             }
         }
-        TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
-        if (!ts_node_is_null(args))
-            rust_walk_macro_tokens(ctx, args);
-        /* Don't recurse normally below — we already drilled into args. */
+        /* The argument-text re-parse above already recovered every embedded call
+         * (parse-context-invariantly); do not descend into the raw token_tree,
+         * whose structuring varies with parse context (#373). */
         return;
     }
 
