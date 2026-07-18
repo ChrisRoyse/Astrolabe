@@ -220,6 +220,48 @@ function Get-AstroOwnedCargoTargetRoots {
     return @($roots | Select-Object -Unique)
 }
 
+function Get-AstroRepoEvidenceState {
+    # #424/#519: the frozen-tree evidence fingerprint for a build root, captured read-only.
+    #
+    #   HeadSha      -- `git rev-parse HEAD` (the commit the built artifact is attributable to)
+    #   StatusSha256 -- SHA-256 of `git status --porcelain` (tracked AND untracked path states;
+    #                   catches adds/removes/stage changes and new untracked sources)
+    #   DiffSha256   -- SHA-256 of `git diff HEAD` (content-level tracked deltas vs HEAD;
+    #                   catches byte edits inside already-dirty tracked files)
+    #
+    # Limitations recorded honestly: a content edit inside an UNTRACKED file whose path set is
+    # unchanged is not captured (path-level only for untracked); everything tracked is captured
+    # at content level. `git status` may racily refresh the index cache, which is why the
+    # fingerprint hashes command OUTPUT, never raw index bytes.
+    param(
+        [Parameter(Mandatory)][string]$GitExe,
+        [Parameter(Mandatory)][string]$Root
+    )
+
+    $head = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "rev-parse", "HEAD")
+    $headSha = (@($head.Output) -join "`n").Trim()
+    if ($head.ExitCode -ne 0 -or $headSha -notmatch '^[0-9a-f]{40}$') {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"could not resolve HEAD for evidence-lease recording at $Root (git exit=$($head.ExitCode): $headSha)`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
+    }
+    $status = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "status", "--porcelain")
+    if ($status.ExitCode -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git status --porcelain' failed for evidence-lease recording at $Root (exit=$($status.ExitCode))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
+    }
+    $diff = Invoke-NativeCapture -Exe $GitExe -Arguments @("-C", $Root, "diff", "HEAD")
+    if ($diff.ExitCode -ne 0) {
+        throw "GIT_FREEZE[ASTRO_GIT_EVIDENCE_STATE_UNREADABLE]: {code=ASTRO_GIT_EVIDENCE_STATE_UNREADABLE; message=`"'git diff HEAD' failed for evidence-lease recording at $Root (exit=$($diff.ExitCode))`"; remediation=`"run the launcher from a healthy git checkout of the workspace; repair the repository state first`"}"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $statusSha = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((@($status.Output) -join "`n")))) -replace '-', '').ToLowerInvariant()
+        $diffSha = ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((@($diff.Output) -join "`n")))) -replace '-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+    return [pscustomobject]@{ HeadSha = $headSha; StatusSha256 = $statusSha; DiffSha256 = $diffSha }
+}
+
 function Assert-NoAmbientCargoTargetEscape {
     # #534/#566: the launcher exports an authoritative CARGO_TARGET_DIR (= $OwnedTargetRoot) so
     # every Cargo child is confined to the owned, cleaned root. An ambient CARGO_TARGET_DIR or
@@ -2198,11 +2240,39 @@ $launcherCommand = ("$Command $CommandArgsJson").Trim()
 if ([string]::IsNullOrWhiteSpace($launcherCommand)) {
     $launcherCommand = if ($Bootstrap) { "bootstrap" } else { "environment-probe" }
 }
+# #424/#519: the launcher lock is also the repository EVIDENCE LEASE. Record the exact
+# tree the coming build is attributable to (HEAD + content-level dirty-state fingerprint)
+# in the lock manifest itself, so any session can identify the frozen tree and the finally
+# block can refuse closure evidence when HEAD/index/tracked bytes changed inside the lease.
+$evidenceGitExe = Join-Path (Join-Path $GitInstallRoot "bin") "git.exe"
+Require-Path $evidenceGitExe "native Git for Windows git.exe is required"
+$repoEvidenceBefore = Get-AstroRepoEvidenceState -GitExe $evidenceGitExe -Root $root
+Write-Output "GIT_FREEZE[ASTRO_EVIDENCE_LEASE]: head=$($repoEvidenceBefore.HeadSha) status_sha256=$($repoEvidenceBefore.StatusSha256) diff_sha256=$($repoEvidenceBefore.DiffSha256) recorded in the launcher lock (#424/#519)"
+if ($isCanonicalRoot) {
+    # core.hooksPath is shared repo config, so installing it from the canonical root covers
+    # every registered worktree. Each hook inspects the lock in its own operating tree.
+    # Never silently replace a foreign hook path.
+    $hooksProbe = Invoke-NativeCapture -Exe $evidenceGitExe -Arguments @("-C", $root, "config", "core.hooksPath")
+    $hooksCurrent = (@($hooksProbe.Output) -join "`n").Trim()
+    if ($hooksProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($hooksCurrent) -and $hooksCurrent -ne "scripts/githooks") {
+        throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_CONFLICT]: {code=ASTRO_GIT_FREEZE_HOOKS_CONFLICT; message=`"core.hooksPath is already set to '$hooksCurrent'; the #519 mutation-lease hooks require core.hooksPath=scripts/githooks and will not silently clobber a foreign hook path`"; remediation=`"reconcile the existing hook path with scripts/githooks (move its hooks in, or clear the setting), then rerun the launcher`"}"
+    }
+    if ($hooksCurrent -ne "scripts/githooks") {
+        $hooksSet = Invoke-NativeCapture -Exe $evidenceGitExe -Arguments @("-C", $root, "config", "core.hooksPath", "scripts/githooks")
+        if ($hooksSet.ExitCode -ne 0) {
+            throw "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED]: {code=ASTRO_GIT_FREEZE_HOOKS_UNINSTALLED; message=`"could not install core.hooksPath=scripts/githooks (git exit=$($hooksSet.ExitCode): $(@($hooksSet.Output) -join ' | '))`"; remediation=`"repair the repository config write path, then rerun the launcher`"}"
+        }
+        Write-Output "GIT_FREEZE[ASTRO_GIT_FREEZE_HOOKS]: installed core.hooksPath=scripts/githooks (mutation-lease enforcement for canonical and registered worktrees, #519)"
+    }
+}
 [ordered]@{
     pid = $PID
     issue = $drivingIssue
     started = (Get-Date).ToString("o")
     command = $launcherCommand
+    head_sha = $repoEvidenceBefore.HeadSha
+    status_sha256 = $repoEvidenceBefore.StatusSha256
+    diff_sha256 = $repoEvidenceBefore.DiffSha256
 } | ConvertTo-Json -Compress | Set-Content -LiteralPath $launcherLockStage -Encoding UTF8
 try {
     Move-Item -LiteralPath $launcherLockStage -Destination $launcherLock -ErrorAction Stop
@@ -2447,6 +2517,22 @@ finally {
     # teardown removes .tmp. Stopping never changes the launcher's exit code.
     if ($null -ne $treeRecorder) {
         try { $treeRecorder.Stop() } catch { $cleanupErrors += "tree-attribution recorder stop failed: $($_.Exception.Message)" }
+    }
+    # #424/#519: re-fingerprint the evidence tree before cleanup. A mismatch becomes a
+    # cleanup error, preserving a red child and converting a green child to exit 71.
+    try {
+        $repoEvidenceAfter = Get-AstroRepoEvidenceState -GitExe $evidenceGitExe -Root $root
+        if ($repoEvidenceAfter.HeadSha -cne $repoEvidenceBefore.HeadSha -or
+            $repoEvidenceAfter.StatusSha256 -cne $repoEvidenceBefore.StatusSha256 -or
+            $repoEvidenceAfter.DiffSha256 -cne $repoEvidenceBefore.DiffSha256) {
+            $cleanupErrors += "GIT_FREEZE[ASTRO_LAUNCHER_TREE_MUTATED]: {code=ASTRO_LAUNCHER_TREE_MUTATED; message=`"the build root $root mutated during the evidence lease: head $($repoEvidenceBefore.HeadSha) -> $($repoEvidenceAfter.HeadSha), status_sha256 $($repoEvidenceBefore.StatusSha256) -> $($repoEvidenceAfter.StatusSha256), diff_sha256 $($repoEvidenceBefore.DiffSha256) -> $($repoEvidenceAfter.DiffSha256); this run's artifacts are NOT closure evidence (#424)`"; remediation=`"freeze the checkout for the whole build+FSV window (mutate only in an independent registered worktree), then rebuild`"}"
+        }
+        else {
+            Write-Output "GIT_FREEZE[ASTRO_EVIDENCE_LEASE_STABLE]: head=$($repoEvidenceAfter.HeadSha) unchanged; status/diff fingerprints unchanged across the lease window (#424/#519)"
+        }
+    }
+    catch {
+        $cleanupErrors += "GIT_FREEZE[ASTRO_EVIDENCE_LEASE_UNVERIFIED]: {code=ASTRO_EVIDENCE_LEASE_UNVERIFIED; message=`"the evidence-lease tree fingerprint could not be re-verified: $($_.Exception.Message)`"; remediation=`"treat this run's artifacts as non-evidence; repair the repository state and rebuild`"}"
     }
     # #320: LIVENESS GATE. The recorder's final flush (above) leaves any DETACHED child of
     # this run -- a cargo/rustc/test grandchild that outlived the owner pwsh -- as an OPEN

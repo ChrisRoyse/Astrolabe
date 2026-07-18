@@ -1,0 +1,26 @@
+#!/bin/sh
+# #519/#424: authoritative backstop. A nonzero exit in Git's prepared reference
+# transaction state aborts before any ref is committed. Scope is HEAD and local branches;
+# remote-tracking updates do not mutate the evidence tree and remain allowed.
+
+state="$1"
+updates=$(cat)
+[ "$state" = "prepared" ] || exit 0
+
+mutating=0
+while IFS=' ' read -r old_value new_value refname; do
+    [ -n "$refname" ] || continue
+    case "$refname" in
+        HEAD|refs/heads/*)
+            mutating=1
+            break
+            ;;
+    esac
+done <<EOF
+$updates
+EOF
+
+[ $mutating -eq 1 ] || exit 0
+. "$(dirname "$0")/astro-freeze-guard.sh"
+astro_freeze_guard "reference-transaction($state)" || exit 1
+exit 0

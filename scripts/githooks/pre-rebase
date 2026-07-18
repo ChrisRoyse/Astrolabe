@@ -1,0 +1,5 @@
+#!/bin/sh
+# #519/#424: early refusal for `git rebase` under a live evidence lease.
+. "$(dirname "$0")/astro-freeze-guard.sh"
+astro_freeze_guard "pre-rebase" || exit 1
+exit 0
