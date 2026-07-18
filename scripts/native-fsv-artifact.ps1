@@ -24,7 +24,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Stage', 'Inspect', 'Cleanup')]
+    [ValidateSet('Stage', 'Inspect', 'Cleanup', 'Abandon')]
     [string]$Operation,
 
     [string]$SourcePath = '',
@@ -32,7 +32,10 @@ param(
     [string]$RunRecordPath = '',
     [int]$Issue = 0,
     [string]$TreeSha = '',
-    [string]$SessionId = ''
+    [string]$SessionId = '',
+    [string]$AbandonRecordPath = '',
+    [string]$ReasonCode = '',
+    [string]$ReasonMessage = ''
 )
 
 Set-StrictMode -Version Latest
@@ -285,8 +288,41 @@ function Inspect-ReceiptArtifact {
     }
 }
 
+function Assert-FsvLockAbsent {
+    param([Parameter(Mandatory)][string]$LockPath)
+    if (-not (Test-Path -LiteralPath $LockPath)) { return }
+    $rawLock = Get-Content -LiteralPath $LockPath -Raw -ErrorAction SilentlyContinue
+    $lockState = $null
+    try { $lockState = $rawLock | ConvertFrom-Json } catch { }
+    $ownerPid = 0
+    $ownerPids = New-Object System.Collections.Generic.List[int]
+    if ($null -ne $lockState -and $lockState.PSObject.Properties['pid'] -and
+        [int]::TryParse([string]$lockState.pid, [ref]$ownerPid) -and $ownerPid -gt 0) {
+        $ownerPids.Add($ownerPid)
+    }
+    if ($null -ne $lockState -and $lockState.PSObject.Properties['owner_pids']) {
+        foreach ($candidate in @($lockState.owner_pids)) {
+            $parsed = 0
+            if ([int]::TryParse([string]$candidate, [ref]$parsed) -and $parsed -gt 0 -and -not $ownerPids.Contains($parsed)) {
+                $ownerPids.Add($parsed)
+            }
+        }
+    }
+    if ($null -ne $lockState -and $lockState.PSObject.Properties['child_pid']) {
+        $parsedChild = 0
+        if ([int]::TryParse([string]$lockState.child_pid, [ref]$parsedChild) -and $parsedChild -gt 0 -and -not $ownerPids.Contains($parsedChild)) {
+            $ownerPids.Add($parsedChild)
+        }
+    }
+    $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+    $code = if ($liveOwnerPids.Count -gt 0) { 'ASTRO_FSV_CLEANUP_LIVE_LOCK' } else { 'ASTRO_FSV_CLEANUP_STALE_LOCK' }
+    Fail-Astro $code "FSV lock exists at $LockPath (owner_pids=$($ownerPids -join ',') live_pids=$($liveOwnerPids -join ',')); lifecycle mutation refused" `
+        'never remove a live lock; for a stale lock, post exact PID-probe evidence to the driving issue before removing it'
+}
+
 $workspace = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $evidenceRoot = Join-Path $workspace '.tmp\native-fsv-artifacts'
+$abandonRoot = Join-Path $workspace '.tmp\native-fsv-abandon-records'
 $fsvLock = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-fsv.lock'
 $launcherLockPath = Join-Path (Join-Path $workspace '.tmp') 'astrolabe-launcher.lock'
 $gitExe = 'C:\Program Files\Git\bin\git.exe'
@@ -445,38 +481,141 @@ try {
             [ordered]@{ operation = 'inspect'; readback = $inspection } |
                 ConvertTo-Json -Depth 12 -Compress | Write-Output
         }
+        'Abandon' {
+            $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
+            $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
+            Assert-FsvLockAbsent $fsvLock
+            if (Test-Path -LiteralPath $launcherLockPath) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_LAUNCHER_LOCK' `
+                    "launcher lock exists at $launcherLockPath; never-run session abandonment is refused during any evidence lease" `
+                    'wait for the launcher owner to finish and independently prove every receipt owner PID dead'
+            }
+            if ($ReasonCode -notmatch '^[A-Z][A-Z0-9_]{2,95}$') {
+                Fail-Astro 'ASTRO_FSV_ABANDON_REASON_INVALID' "ReasonCode is not a structured upper-case code: '$ReasonCode'" `
+                    'pass a stable code such as ASTRO_FSV_ORCHESTRATION_FAILED'
+            }
+            if ([string]::IsNullOrWhiteSpace($ReasonMessage)) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_REASON_INVALID' 'ReasonMessage is required and may not be blank' `
+                    'describe the exact pre-run failure whose persisted evidence authorizes abandonment'
+            }
+            if ([string]::IsNullOrWhiteSpace($AbandonRecordPath)) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_RECORD_REQUIRED' 'AbandonRecordPath is required for Abandon' `
+                    "use a fresh JSON path below $abandonRoot; the record persists after session removal"
+            }
+            $abandonRecord = Assert-PathWithin $AbandonRecordPath $abandonRoot `
+                'ASTRO_FSV_ABANDON_RECORD_ESCAPE' 'abandonment record path'
+            if (Test-Path -LiteralPath $abandonRecord) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_RECORD_REUSE_REFUSED' "abandonment record already exists: $abandonRecord" `
+                    'use one fresh append-only record path for each never-run evidence session'
+            }
+            $receipt = $receiptState.Receipt
+            $ownerPids = New-Object System.Collections.Generic.List[int]
+            foreach ($field in @('launcher_pid', 'promoter_pid')) {
+                if (-not $receipt.PSObject.Properties[$field]) {
+                    Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt has no $field required for abandonment" `
+                        'preserve the session and investigate its incomplete provenance'
+                }
+                $parsedPid = 0
+                if (-not [int]::TryParse([string]$receipt.$field, [ref]$parsedPid) -or $parsedPid -le 0) {
+                    Fail-Astro 'ASTRO_FSV_RECEIPT_INVALID' "receipt $field is not a positive PID" `
+                        'preserve the session and investigate its incomplete provenance'
+                }
+                if (-not $ownerPids.Contains($parsedPid)) { $ownerPids.Add($parsedPid) }
+            }
+            $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
+            if ($liveOwnerPids.Count -gt 0) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_LIVE_OWNER' `
+                    "never-run session still names live receipt owner PID(s): $($liveOwnerPids -join ',')" `
+                    'wait for every exact receipt owner to exit naturally; never abandon a live session'
+            }
+            $session = [IO.Path]::GetFullPath($inspection.session_directory)
+            $allowedEntries = @(
+                [IO.Path]::GetFullPath($receiptState.Path),
+                [IO.Path]::GetFullPath($inspection.artifact_path)
+            )
+            $unexpectedEntries = @(
+                Get-ChildItem -LiteralPath $session -Force |
+                    Where-Object {
+                        $full = [IO.Path]::GetFullPath($_.FullName)
+                        -not ($allowedEntries -contains $full)
+                    } |
+                    ForEach-Object { $_.FullName }
+            )
+            if ($unexpectedEntries.Count -gt 0 -or @(Get-ChildItem -LiteralPath $session -Force).Count -ne 2) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_NONPRISTINE' `
+                    "session contains state beyond its never-run artifact and receipt: $($unexpectedEntries -join ', ')" `
+                    'preserve the session; inspect the partial/live run state and use Cleanup only with a valid bound run record'
+            }
+            Assert-NotReparseEntry $abandonRoot 'abandonment record root'
+            $recordParent = Split-Path -Parent $abandonRecord
+            Assert-NotReparseEntry $recordParent 'abandonment record parent'
+            New-Item -ItemType Directory -Path $recordParent -Force | Out-Null
+            Assert-NotReparseEntry $recordParent 'abandonment record parent'
+            $currentRepository = Get-RepoState -GitExe $gitExe -Workspace $workspace
+            $record = [ordered]@{
+                schema = 'astrolabe.native-fsv-abandon.v1'
+                verdict = 'abandoned-before-run'
+                issue = [int]$inspection.issue
+                recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+                receipt_path = $receiptState.Path
+                session_directory = $session
+                artifact = [ordered]@{
+                    path = $inspection.artifact_path
+                    bytes = [uint64]$inspection.bytes
+                    sha256 = $inspection.sha256
+                }
+                staged_repository = $receipt.repository
+                current_repository = $currentRepository
+                receipt_owner_pids = @($ownerPids)
+                owner_pids_live = @()
+                failure = [ordered]@{
+                    code = $ReasonCode
+                    message = $ReasonMessage
+                }
+            }
+            Write-NewDurableUtf8 $abandonRecord ($record | ConvertTo-Json -Depth 15)
+            $persistedRecord = Get-Content -LiteralPath $abandonRecord -Raw | ConvertFrom-Json
+            if ($persistedRecord.schema -ne 'astrolabe.native-fsv-abandon.v1' -or
+                [string]$persistedRecord.artifact.sha256 -cne [string]$inspection.sha256 -or
+                [string]$persistedRecord.failure.code -cne $ReasonCode) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_RECORD_INVALID' `
+                    "persisted abandonment record readback does not bind the session: $abandonRecord" `
+                    'preserve both session and record and investigate the durable-write mismatch'
+            }
+            $recordHash = File-Sha256 $abandonRecord
+            $before = [ordered]@{
+                session = $session
+                exists = $true
+                artifact_sha256 = $inspection.sha256
+                receipt_owner_pids = @($ownerPids)
+                owner_pids_live = @()
+            }
+            $artifactItem = Get-Item -LiteralPath $inspection.artifact_path
+            $artifactItem.IsReadOnly = $false
+            Remove-Item -LiteralPath $session -Recurse -Force
+            if (Test-Path -LiteralPath $session) {
+                Fail-Astro 'ASTRO_FSV_ABANDON_FAILED' "evidence session remains after abandonment: $session" `
+                    'preserve the external abandonment record and inspect open handles before retrying exact cleanup'
+            }
+            foreach ($parent in @((Split-Path -Parent $session), (Split-Path -Parent (Split-Path -Parent $session)))) {
+                if ((Test-Path -LiteralPath $parent -PathType Container) -and
+                    @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
+                    Remove-Item -LiteralPath $parent -Force
+                }
+            }
+            [ordered]@{
+                operation = 'abandon'
+                record_path = $abandonRecord
+                record_sha256 = $recordHash
+                record = $persistedRecord
+                before = $before
+                after = [ordered]@{ session = $session; exists = $false }
+            } | ConvertTo-Json -Depth 18 -Compress | Write-Output
+        }
         'Cleanup' {
             $receiptState = Read-Receipt $ReceiptPath $evidenceRoot
             $inspection = Inspect-ReceiptArtifact $receiptState $evidenceRoot
-            if (Test-Path -LiteralPath $fsvLock) {
-                $rawLock = Get-Content -LiteralPath $fsvLock -Raw -ErrorAction SilentlyContinue
-                $lockState = $null
-                try { $lockState = $rawLock | ConvertFrom-Json } catch { }
-                $ownerPid = 0
-                $ownerPids = New-Object System.Collections.Generic.List[int]
-                if ($null -ne $lockState -and $lockState.PSObject.Properties['pid'] -and
-                    [int]::TryParse([string]$lockState.pid, [ref]$ownerPid) -and $ownerPid -gt 0) {
-                    $ownerPids.Add($ownerPid)
-                }
-                if ($null -ne $lockState -and $lockState.PSObject.Properties['owner_pids']) {
-                    foreach ($candidate in @($lockState.owner_pids)) {
-                        $parsed = 0
-                        if ([int]::TryParse([string]$candidate, [ref]$parsed) -and $parsed -gt 0 -and -not $ownerPids.Contains($parsed)) {
-                            $ownerPids.Add($parsed)
-                        }
-                    }
-                }
-                if ($null -ne $lockState -and $lockState.PSObject.Properties['child_pid']) {
-                    $parsedChild = 0
-                    if ([int]::TryParse([string]$lockState.child_pid, [ref]$parsedChild) -and $parsedChild -gt 0 -and -not $ownerPids.Contains($parsedChild)) {
-                        $ownerPids.Add($parsedChild)
-                    }
-                }
-                $liveOwnerPids = @($ownerPids | Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })
-                $code = if ($liveOwnerPids.Count -gt 0) { 'ASTRO_FSV_CLEANUP_LIVE_LOCK' } else { 'ASTRO_FSV_CLEANUP_STALE_LOCK' }
-                Fail-Astro $code "FSV lock exists at $fsvLock (owner_pids=$($ownerPids -join ',') live_pids=$($liveOwnerPids -join ',')); cleanup refused" `
-                    'never remove a live lock; for a stale lock, post exact PID-probe evidence to the driving issue before removing it'
-            }
+            Assert-FsvLockAbsent $fsvLock
             if ([string]::IsNullOrWhiteSpace($RunRecordPath)) {
                 Fail-Astro 'ASTRO_FSV_RUN_RECORD_REQUIRED' 'RunRecordPath is required for Cleanup' `
                     'pass the persisted run record written by native-fsv-run.ps1 after the real process exited'
