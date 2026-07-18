@@ -14,7 +14,6 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use calyx_core::{CalyxError, Result};
-use ort::ep::{CUDA, ExecutionProvider};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HANDLE, HMODULE};
@@ -34,13 +33,13 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use super::OnnxRuntimePolicy;
 
 const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
-const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v2";
+const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v3";
 const RECEIPT_FILE: &str = "bundle.receipt.json";
 const EXPECTED_LAYOUT: &str = "flat-bin-v1";
 const EXPECTED_PLATFORM: &str = "windows-x86_64";
 const EXPECTED_ROOT_PREFIX: &str = "ort-cuda13.3-windows-x86_64";
-const EXPECTED_ORT_VERSION: &str = "1.26.0";
-const EXPECTED_ORT_FILE_VERSION: &str = "1.26.20260504.3.55c5c82";
+const EXPECTED_ORT_VERSION: &str = "1.27.1";
+const EXPECTED_ORT_FILE_VERSION: &str = "1.27.20260709.2.df2ba1c";
 const EXPECTED_PROVIDER: &str = "CUDAExecutionProvider";
 const EXPECTED_ORT_DLL: &str = "onnxruntime.dll";
 const EXPECTED_CUDA_PROVIDER_DLL: &str = "onnxruntime_providers_cuda.dll";
@@ -48,7 +47,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
 const MAX_FINAL_PATH_CHARS: usize = 32_768;
 const LEGACY_RUNTIME_ENVS: &[&str] = &["ORT_DYLIB_PATH", "CALYX_ORT_CAPI", "CALYX_NVIDIA_DLL_DIRS"];
 const REQUIRED_ARTIFACT_VERSIONS: &[(&str, &str)] = &[
-    ("onnxruntime", "1.26.0"),
+    ("onnxruntime", "1.27.1"),
     ("cublas", "13.5.1.27"),
     ("cuda-nvrtc", "13.3.33"),
     ("cuda-runtime", "13.3.29"),
@@ -105,6 +104,7 @@ pub struct OnnxRuntimeArtifactAttestation {
     pub url: String,
     pub bytes: u64,
     pub sha256: String,
+    pub archive_verification: String,
     pub license_expression: String,
 }
 
@@ -262,6 +262,7 @@ pub fn current_runtime_attestation() -> Result<Option<OnnxRuntimeAttestation>> {
         let refresh = refresh_cuda_module_attestation(
             state.live.as_mut().expect("checked above"),
             &sha256_bytes(LOCK_BYTES),
+            true,
         );
         if let Err(error) = refresh {
             state.cuda_failure = Some(error.clone());
@@ -706,7 +707,7 @@ pub fn ensure_runtime(
         }
     };
     let live = state.live.as_mut().expect("core initialized above");
-    if !live.receipt.provider_available {
+    if live.receipt.cuda_device.is_none() {
         if let Err(error) = initialize_cuda(live, requested_cuda_device) {
             state.cuda_failure = Some(error.clone());
             return Err(error);
@@ -1029,8 +1030,9 @@ struct ArtifactContract {
     url: String,
     bytes: u64,
     sha256: String,
-    record: String,
-    metadata: String,
+    archive_verification: String,
+    record: Option<String>,
+    metadata: Option<String>,
     license_expression: String,
 }
 
@@ -1068,7 +1070,9 @@ struct NoticeContract {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoadedModulePolicy {
-    bundle_load_order: Vec<String>,
+    boundary_load: Vec<String>,
+    dependency_preload_order: Vec<String>,
+    ort_managed_load: Vec<String>,
     bundle_module_globs: Vec<String>,
     system_modules: Vec<SystemModulePolicy>,
     system_roots: Vec<String>,
@@ -1148,7 +1152,7 @@ fn initialize_core() -> Result<LiveRuntime> {
         core_path,
         _module_handles: module_handles,
         receipt: OnnxRuntimeAttestation {
-            schema: "calyx-onnx-runtime-attestation-v3".to_string(),
+            schema: "calyx-onnx-runtime-attestation-v4".to_string(),
             contract: contract_attestation(&lock, &lock_sha256),
             bundle_root: root.clone(),
             bundle_receipt: root.join(RECEIPT_FILE),
@@ -1189,34 +1193,20 @@ fn initialize_cuda(live: &mut LiveRuntime, requested: u32) -> Result<()> {
             "terminate the process, preserve the device receipt, and repair the CUDA Runtime/Driver/NVML identity boundary",
         ));
     }
-    let available = CUDA::default().is_available().map_err(|error| {
-        runtime_error(
-            "CALYX_ONNX_CUDA_PROVIDER_QUERY_FAILED",
-            format!("query {EXPECTED_PROVIDER} availability from pinned ORT failed: {error}"),
-            BUNDLE_REMEDIATION,
-        )
-    })?;
-    if !available {
-        return Err(runtime_error(
-            "CALYX_ONNX_CUDA_PROVIDER_UNAVAILABLE",
-            format!(
-                "pinned ORT {} does not report {EXPECTED_PROVIDER}",
-                live.core_path.display()
-            ),
-            BUNDLE_REMEDIATION,
-        ));
-    }
-    refresh_cuda_module_attestation(live, &lock_sha256)?;
-    live.receipt.provider_available = true;
+    refresh_cuda_module_attestation(live, &lock_sha256, false)?;
     live.receipt.cuda_device = Some(device);
     Ok(())
 }
 
-fn refresh_cuda_module_attestation(live: &mut LiveRuntime, lock_sha256: &str) -> Result<()> {
+fn refresh_cuda_module_attestation(
+    live: &mut LiveRuntime,
+    lock_sha256: &str,
+    require_provider: bool,
+) -> Result<()> {
     let boundary = calyx_forge::cuda_runtime::attest_pinned_cuda_dependencies()
         .map_err(forge_runtime_boundary_error)?;
     validate_forge_boundary(&boundary, &live.lock, lock_sha256, true)?;
-    live.receipt.modules = boundary
+    let mut modules = boundary
         .modules
         .into_iter()
         .map(|module| OnnxLoadedModuleAttestation {
@@ -1228,7 +1218,57 @@ fn refresh_cuda_module_attestation(live: &mut LiveRuntime, lock_sha256: &str) ->
             source: module.source,
             system_trust: module.system_trust,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if require_provider {
+        modules.extend(attest_ort_managed_modules(
+            &live.lock,
+            &live.receipt.bundle_root,
+        )?);
+    }
+    modules.sort_by(|left, right| left.name.cmp(&right.name));
+    live.receipt.modules = modules;
+    Ok(())
+}
+
+/// Promotes provider residency only after a real ORT model/session constructor
+/// has returned successfully. The caller must invoke this immediately after
+/// construction; inventory queries and locked bytes never count as execution.
+pub fn attest_cuda_provider_after_session() -> Result<()> {
+    let state = RUNTIME_STATE.get_or_init(|| Mutex::new(RuntimeState::default()));
+    let mut state = state.lock().map_err(|_| {
+        runtime_error(
+            "CALYX_ONNX_RUNTIME_STATE_POISONED",
+            "the process-global ONNX runtime state mutex was poisoned during provider attestation",
+            "terminate this process, preserve its logs, and restart from the pinned runtime bundle",
+        )
+    })?;
+    if let Some(error) = &state.cuda_failure {
+        return Err(error.clone());
+    }
+    let Some(live) = state.live.as_mut() else {
+        let error = runtime_error(
+            "CALYX_ONNX_RUNTIME_NOT_INITIALIZED",
+            "a model constructor returned before the pinned ONNX runtime was initialized",
+            "construct every ONNX model through the Calyx runtime boundary",
+        );
+        state.cuda_failure = Some(error.clone());
+        return Err(error);
+    };
+    if live.receipt.cuda_device.is_none() {
+        let error = runtime_error(
+            "CALYX_ONNX_CUDA_DEVICE_ATTESTATION_MISSING",
+            "a CUDA model constructor returned without an attested physical-device receipt",
+            "terminate the process and reconstruct the model through the pinned CUDA device boundary",
+        );
+        state.cuda_failure = Some(error.clone());
+        return Err(error);
+    }
+    let lock_sha256 = sha256_bytes(LOCK_BYTES);
+    if let Err(error) = refresh_cuda_module_attestation(live, &lock_sha256, true) {
+        state.cuda_failure = Some(error.clone());
+        return Err(error);
+    }
+    live.receipt.provider_available = true;
     Ok(())
 }
 
@@ -1258,7 +1298,7 @@ fn validate_forge_boundary(
     require_cuda: bool,
 ) -> Result<()> {
     require_contract(
-        boundary.schema == "calyx-pinned-cuda-runtime-attestation-v2",
+        boundary.schema == "calyx-pinned-cuda-runtime-attestation-v3",
         "Forge runtime attestation schema mismatch",
     )?;
     require_contract(
@@ -1296,11 +1336,15 @@ fn validate_forge_boundary(
     )?;
 
     let locked = expected_dlls(lock, &expected_root)?;
-    let mut expected_names = locked
-        .keys()
-        .filter(|name| require_cuda || basename_eq(name, &lock.contract.ort_dll))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let scheduled = lock.loaded_module_policy.boundary_load.iter().chain(
+        require_cuda
+            .then_some(lock.loaded_module_policy.dependency_preload_order.iter())
+            .into_iter()
+            .flatten(),
+    );
+    let mut expected_names = scheduled
+        .map(|path| bundle_basename(path).map(|name| name.to_ascii_lowercase()))
+        .collect::<Result<BTreeSet<_>>>()?;
     if require_cuda {
         expected_names.insert("nvcuda.dll".to_string());
         expected_names.insert("nvml.dll".to_string());
@@ -1318,6 +1362,50 @@ fn validate_forge_boundary(
         observed.keys().cloned().collect::<BTreeSet<_>>() == expected_names,
         "Forge runtime module set differs from the locked module set",
     )?;
+    let expected_ort_managed = lock
+        .loaded_module_policy
+        .ort_managed_load
+        .iter()
+        .map(|path| bundle_basename(path).map(|name| name.to_ascii_lowercase()))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let observed_ort_managed = boundary
+        .ort_managed_modules
+        .iter()
+        .map(|module| (module.name.to_ascii_lowercase(), module))
+        .collect::<BTreeMap<_, _>>();
+    require_contract(
+        observed_ort_managed.len() == boundary.ort_managed_modules.len()
+            && observed_ort_managed
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == expected_ort_managed,
+        "Forge ORT-managed module contract differs from the lock",
+    )?;
+    for (name, module) in observed_ort_managed {
+        let file = locked.get(&name).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                format!("Forge ORT-managed module {name} is absent from the lock"),
+                CONTRACT_REMEDIATION,
+            )
+        })?;
+        let expected_path = canonicalize_existing_file(
+            &expected_root.join(windows_relative_path(&file.bundle_path)?),
+            "locked ORT-managed module",
+        )?;
+        let observed_path = canonicalize_existing_file(&module.path, "Forge ORT-managed module")?;
+        require_contract(
+            same_path(&observed_path, &expected_path)
+                && module.bytes == file.bytes
+                && module.sha256 == file.sha256
+                && module.file_version == file.file_version
+                && module.source == format!("bundle:{}", file.artifact)
+                && module.loader == "onnxruntime-provider-api"
+                && module.state == "validated-not-directly-mapped",
+            &format!("Forge ORT-managed module attestation is invalid for {name}"),
+        )?;
+    }
     reject_reparse_entry(&boundary.system_module_root, "Forge OS system-module root")?;
     let system32 =
         canonicalize_existing_dir(&boundary.system_module_root, "Forge OS system-module root")?;
@@ -1446,11 +1534,11 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
         "unexpected CUDA provider DLL",
     )?;
     require_contract(
-        lock.contract.api_non_null == [24, 25, 26],
+        lock.contract.api_non_null == [24, 25, 26, 27],
         "unexpected api_non_null contract",
     )?;
     require_contract(
-        lock.contract.first_api_null == 27,
+        lock.contract.first_api_null == 28,
         "unexpected first_api_null contract",
     )?;
     require_contract(
@@ -1539,12 +1627,23 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
             "artifact license is empty",
         )?;
         require_contract(
-            !artifact.record.trim().is_empty(),
-            "artifact RECORD path is empty",
-        )?;
-        require_contract(
-            !artifact.metadata.trim().is_empty(),
-            "artifact METADATA path is empty",
+            match artifact.archive_verification.as_str() {
+                "wheel-record-sha256" => {
+                    artifact
+                        .record
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                        && artifact
+                            .metadata
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                }
+                "release-archive-sha256" => {
+                    artifact.record.is_none() && artifact.metadata.is_none()
+                }
+                _ => false,
+            },
+            "artifact archive-verification contract is invalid",
         )?;
     }
     let mut paths = BTreeSet::new();
@@ -1586,26 +1685,63 @@ fn validate_lock_contract(lock: &RuntimeLock) -> Result<()> {
             )?;
         }
     }
-    let load_order = lock
+    let boundary = lock
         .loaded_module_policy
-        .bundle_load_order
+        .boundary_load
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let preload = lock
+        .loaded_module_policy
+        .dependency_preload_order
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let ort_managed = lock
+        .loaded_module_policy
+        .ort_managed_load
         .iter()
         .map(|path| path.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     require_contract(
-        load_order.len() == lock.loaded_module_policy.bundle_load_order.len(),
-        "bundle load order contains duplicate paths",
+        boundary.len() == lock.loaded_module_policy.boundary_load.len()
+            && preload.len() == lock.loaded_module_policy.dependency_preload_order.len()
+            && ort_managed.len() == lock.loaded_module_policy.ort_managed_load.len(),
+        "module load phase contains duplicate paths",
     )?;
     require_contract(
-        load_order
+        boundary.is_disjoint(&preload)
+            && boundary.is_disjoint(&ort_managed)
+            && preload.is_disjoint(&ort_managed),
+        "module load phases overlap",
+    )?;
+    let mut scheduled = boundary.clone();
+    scheduled.extend(preload.iter().cloned());
+    scheduled.extend(ort_managed.iter().cloned());
+    require_contract(
+        scheduled
             == lock
                 .files
                 .iter()
                 .map(|file| file.bundle_path.to_ascii_lowercase())
                 .collect(),
-        "bundle load order must name every locked DLL exactly once",
+        "module load phases must name every locked DLL exactly once",
     )?;
-    for path in &lock.loaded_module_policy.bundle_load_order {
+    require_contract(
+        boundary == BTreeSet::from([lock.contract.ort_dll.to_ascii_lowercase()]),
+        "boundary load must contain only the ORT core",
+    )?;
+    require_contract(
+        ort_managed == BTreeSet::from([lock.contract.provider_dll.to_ascii_lowercase()]),
+        "ORT-managed load must contain only the CUDA provider",
+    )?;
+    for path in lock
+        .loaded_module_policy
+        .boundary_load
+        .iter()
+        .chain(&lock.loaded_module_policy.dependency_preload_order)
+        .chain(&lock.loaded_module_policy.ort_managed_load)
+    {
         validate_relative_bundle_path(path, true)?;
     }
     for notice in &lock.notices {
@@ -2067,6 +2203,78 @@ fn attest_loaded_modules(
     Ok(out)
 }
 
+fn attest_ort_managed_modules(
+    lock: &RuntimeLock,
+    root: &Path,
+) -> Result<Vec<OnnxLoadedModuleAttestation>> {
+    let process_modules = enumerate_process_modules()?;
+    reject_ambient_managed_modules(lock, root, &process_modules)?;
+    let locked = expected_dlls(lock, root)?;
+    let required = lock
+        .loaded_module_policy
+        .ort_managed_load
+        .iter()
+        .map(|path| bundle_basename(path).map(|name| name.to_ascii_lowercase()))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut loaded = BTreeMap::new();
+    for path in process_modules {
+        let Some(name) = path.file_name().and_then(OsStr::to_str).map(str::to_owned) else {
+            continue;
+        };
+        let key = name.to_ascii_lowercase();
+        if required.contains(&key) && loaded.insert(key.clone(), path).is_some() {
+            return Err(runtime_error(
+                "CALYX_ONNX_RUNTIME_DUPLICATE_MODULE",
+                format!("process loaded duplicate ORT-managed module basename {name}"),
+                BUNDLE_REMEDIATION,
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(required.len());
+    for name in required {
+        let file = locked.get(&name).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                format!("ORT-managed module {name} is absent from the lock"),
+                CONTRACT_REMEDIATION,
+            )
+        })?;
+        let observed = loaded.get(&name).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_CUDA_PROVIDER_NOT_RESIDENT",
+                format!(
+                    "a CUDA model constructor returned successfully but ORT-managed module {name} is absent from the process module table"
+                ),
+                "terminate the process, preserve the constructor logs, and repair the provider/session construction path; do not report CUDA availability",
+            )
+        })?;
+        let observed = canonicalize_existing_file(observed, "loaded ORT-managed module")?;
+        let expected = canonicalize_existing_file(
+            &root.join(windows_relative_path(&file.bundle_path)?),
+            "locked ORT-managed module",
+        )?;
+        if !same_path(&observed, &expected) {
+            return Err(ambient_module_error(
+                &name,
+                &observed,
+                &format!("required exact ORT-managed path is {}", expected.display()),
+            ));
+        }
+        verify_locked_file(root, &file.bundle_path, file.bytes, &file.sha256)?;
+        out.push(OnnxLoadedModuleAttestation {
+            name,
+            path: observed,
+            bytes: file.bytes,
+            sha256: file.sha256.clone(),
+            file_version: file.file_version.clone(),
+            source: format!("bundle:{};loader=onnxruntime-provider-api", file.artifact),
+            system_trust: None,
+        });
+    }
+    out.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(out)
+}
+
 fn enumerate_process_modules() -> Result<Vec<PathBuf>> {
     let process = unsafe { GetCurrentProcess() };
     let mut capacity = 256usize;
@@ -2179,6 +2387,7 @@ fn artifact_attestations(lock: &RuntimeLock) -> Vec<OnnxRuntimeArtifactAttestati
             url: artifact.url.clone(),
             bytes: artifact.bytes,
             sha256: artifact.sha256.clone(),
+            archive_verification: artifact.archive_verification.clone(),
             license_expression: artifact.license_expression.clone(),
         })
         .collect()

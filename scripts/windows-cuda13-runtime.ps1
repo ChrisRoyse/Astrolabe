@@ -11,8 +11,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
-$LockSchema = "astrolabe.windows-ort-cuda-runtime-lock.v2"
-$ReceiptSchema = "astrolabe.windows-ort-cuda-runtime-receipt.v1"
+$LockSchema = "astrolabe.windows-ort-cuda-runtime-lock.v3"
+$ReceiptSchema = "astrolabe.windows-ort-cuda-runtime-receipt.v2"
 $LockFileName = "ort-cuda13.3-windows-x86_64.lock.json"
 $CanonicalWorkspace = "C:\code\Astrolabe"
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -192,18 +192,25 @@ function Read-Lock {
     Assert-SafeRelativePath $lock.contract.ort_dll 'lock.contract.ort_dll'
     Assert-SafeRelativePath $lock.contract.provider_dll 'lock.contract.provider_dll'
 
-    Assert-ExactFields $lock.loaded_module_policy @('bundle_load_order', 'bundle_module_globs', 'system_modules', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
-    $loadOrder = @($lock.loaded_module_policy.bundle_load_order)
+    Assert-ExactFields $lock.loaded_module_policy @('boundary_load', 'dependency_preload_order', 'ort_managed_load', 'bundle_module_globs', 'system_modules', 'system_roots', 'reject_application_dir', 'reject_path_search') 'lock.loaded_module_policy'
     $loadOrderSet = @{}
-    foreach ($path in $loadOrder) {
-        Assert-SafeRelativePath $path 'lock.loaded_module_policy.bundle_load_order[]'
-        if (-not $path.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) {
-            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load-order entry is not a DLL: $path" "restore the checked-in lock"
+    foreach ($phase in @('boundary_load', 'dependency_preload_order', 'ort_managed_load')) {
+        foreach ($path in @($lock.loaded_module_policy.$phase)) {
+            Assert-SafeRelativePath $path "lock.loaded_module_policy.$phase[]"
+            if (-not $path.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) {
+                Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "$phase entry is not a DLL: $path" "restore the checked-in lock"
+            }
+            if ($loadOrderSet.ContainsKey($path)) {
+                Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "module $path appears in multiple load phases" "restore the checked-in lock"
+            }
+            $loadOrderSet.Add($path, $phase)
         }
-        if ($loadOrderSet.ContainsKey($path)) {
-            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "duplicate bundle load-order entry $path" "restore the checked-in lock"
-        }
-        $loadOrderSet.Add($path, $true)
+    }
+    if (@($lock.loaded_module_policy.boundary_load).Count -ne 1 -or $lock.loaded_module_policy.boundary_load[0] -cne $lock.contract.ort_dll) {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "boundary_load must contain only the contracted ORT core" "restore the checked-in lock"
+    }
+    if (@($lock.loaded_module_policy.ort_managed_load).Count -ne 1 -or $lock.loaded_module_policy.ort_managed_load[0] -cne $lock.contract.provider_dll) {
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "ort_managed_load must contain only the contracted CUDA provider" "restore the checked-in lock"
     }
     $systemModules = @($lock.loaded_module_policy.system_modules)
     if ($systemModules.Count -ne 2) {
@@ -248,8 +255,8 @@ function Read-Lock {
 
     $artifacts = @{}
     foreach ($artifact in @($lock.artifacts)) {
-        Assert-ExactFields $artifact @('id', 'distribution', 'version', 'filename', 'url', 'bytes', 'sha256', 'record', 'metadata', 'license_expression') "artifact"
-        foreach ($field in @('id', 'distribution', 'version', 'url', 'license_expression')) {
+        Assert-ExactFields $artifact @('id', 'distribution', 'version', 'filename', 'url', 'bytes', 'sha256', 'archive_verification', 'record', 'metadata', 'license_expression') "artifact"
+        foreach ($field in @('id', 'distribution', 'version', 'url', 'archive_verification', 'license_expression')) {
             Assert-NonBlankString $artifact.$field "artifact.$($artifact.id).$field"
         }
         if ($artifact.id -cnotmatch '^[a-z0-9][a-z0-9-]*$') {
@@ -261,8 +268,18 @@ function Read-Lock {
         Assert-SafeFileName $artifact.filename "artifact.$($artifact.id).filename"
         Assert-PositiveInteger $artifact.bytes "artifact.$($artifact.id).bytes"
         Assert-Sha256 $artifact.sha256 "artifact.$($artifact.id).sha256"
-        Assert-SafeRelativePath $artifact.record "artifact.$($artifact.id).record"
-        Assert-SafeRelativePath $artifact.metadata "artifact.$($artifact.id).metadata"
+        if ($artifact.archive_verification -ceq 'wheel-record-sha256') {
+            Assert-SafeRelativePath $artifact.record "artifact.$($artifact.id).record"
+            Assert-SafeRelativePath $artifact.metadata "artifact.$($artifact.id).metadata"
+        }
+        elseif ($artifact.archive_verification -ceq 'release-archive-sha256') {
+            if ($null -ne $artifact.record -or $null -ne $artifact.metadata) {
+                Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "release archive $($artifact.id) must not claim wheel RECORD/METADATA paths" "restore the checked-in lock"
+            }
+        }
+        else {
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "artifact $($artifact.id) has unsupported archive verification $($artifact.archive_verification)" "update the provisioner and lock schema together"
+        }
         try {
             $uri = [Uri]$artifact.url
         }
@@ -309,11 +326,11 @@ function Read-Lock {
     }
 
     if ($loadOrderSet.Count -ne @($lock.files).Count) {
-        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load order must name every locked DLL exactly once" "restore the checked-in lock"
+        Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "the three module load phases must name every locked DLL exactly once" "restore the checked-in lock"
     }
     foreach ($path in $loadOrderSet.Keys) {
         if (-not $bundlePaths.ContainsKey($path)) {
-            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "bundle load order names unlocked path $path" "restore the checked-in lock"
+            Fail-Runtime "ASTRO_CUDA13_LOCK_SCHEMA" "module load phases name unlocked path $path" "restore the checked-in lock"
         }
     }
 
@@ -607,26 +624,38 @@ function Install-Bundle {
 
     foreach ($artifact in @($Lock.artifacts)) {
         Write-Verbose "provisioning locked CUDA artifact $($artifact.id) $($artifact.version)"
-        $wheelPath = Download-Artifact $artifact $downloadRoot $CurlExe
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($wheelPath)
+        $archivePath = Download-Artifact $artifact $downloadRoot $CurlExe
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
         try {
             $entries = Get-ArchiveEntries $archive
-            if (-not $entries.ContainsKey($artifact.metadata)) {
-                Fail-Runtime "ASTRO_CUDA13_WHEEL_METADATA" "artifact $($artifact.id) is missing $($artifact.metadata)" "report the changed upstream wheel and update the lock deliberately"
+            $rows = $null
+            $manifestEntries = 0L
+            $manifestEntriesVerified = 0L
+            if ($artifact.archive_verification -ceq 'wheel-record-sha256') {
+                if (-not $entries.ContainsKey($artifact.metadata)) {
+                    Fail-Runtime "ASTRO_CUDA13_WHEEL_METADATA" "artifact $($artifact.id) is missing $($artifact.metadata)" "report the changed upstream wheel and update the lock deliberately"
+                }
+                $metadata = Read-ZipEntryText $entries[$artifact.metadata]
+                $escapedDistribution = [Regex]::Escape($artifact.distribution)
+                $escapedVersion = [Regex]::Escape($artifact.version)
+                if ($metadata -notmatch "(?m)^Name:\s*$escapedDistribution\s*`r?$" -or $metadata -notmatch "(?m)^Version:\s*$escapedVersion\s*`r?$") {
+                    Fail-Runtime "ASTRO_CUDA13_WHEEL_METADATA" "artifact $($artifact.id) METADATA identity does not match the lock" "report the changed upstream wheel and update the lock deliberately"
+                }
+                $rows = Get-RecordRows $entries $artifact
+                $manifestEntries = [long]$rows.Count
+                $manifestEntriesVerified = [long]$rows.Count
             }
-            $metadata = Read-ZipEntryText $entries[$artifact.metadata]
-            $escapedDistribution = [Regex]::Escape($artifact.distribution)
-            $escapedVersion = [Regex]::Escape($artifact.version)
-            if ($metadata -notmatch "(?m)^Name:\s*$escapedDistribution\s*`r?$" -or $metadata -notmatch "(?m)^Version:\s*$escapedVersion\s*`r?$") {
-                Fail-Runtime "ASTRO_CUDA13_WHEEL_METADATA" "artifact $($artifact.id) METADATA identity does not match the lock" "report the changed upstream wheel and update the lock deliberately"
+            elseif ($artifact.archive_verification -cne 'release-archive-sha256') {
+                Fail-Runtime "ASTRO_CUDA13_ARCHIVE_VERIFICATION" "artifact $($artifact.id) has unsupported verification $($artifact.archive_verification)" "update the provisioner and lock schema together"
             }
-            $rows = Get-RecordRows $entries $artifact
             $payloads = @(@($Lock.files) | Where-Object { $_.artifact -ceq $artifact.id }) + @(@($Lock.notices) | Where-Object { $_.artifact -ceq $artifact.id })
             foreach ($payload in $payloads) {
                 if (-not $entries.ContainsKey($payload.archive_path)) {
-                    Fail-Runtime "ASTRO_CUDA13_WHEEL_PAYLOAD" "artifact $($artifact.id) is missing $($payload.archive_path)" "report the changed upstream wheel and update the lock deliberately"
+                    Fail-Runtime "ASTRO_CUDA13_ARCHIVE_PAYLOAD" "artifact $($artifact.id) is missing $($payload.archive_path)" "report the changed upstream archive and update the lock deliberately"
                 }
-                Assert-RecordRow $rows $payload $artifact.id
+                if ($artifact.archive_verification -ceq 'wheel-record-sha256') {
+                    Assert-RecordRow $rows $payload $artifact.id
+                }
                 Expand-LockedPayload $entries[$payload.archive_path] $payload $bundleRoot
                 if ($payload.PSObject.Properties.Name -contains 'authenticode') {
                     $destination = Join-Path $bundleRoot ($payload.bundle_path.Replace('/', '\'))
@@ -638,16 +667,17 @@ function Install-Bundle {
                 filename = $artifact.filename
                 bytes = [long]$artifact.bytes
                 sha256 = $artifact.sha256
+                verification = $artifact.archive_verification
                 archive_entries = [long]$entries.Count
-                record_entries = [long]$rows.Count
-                record_entries_verified = [long]$rows.Count
-                locked_record_entries_verified = [long]$payloads.Count
+                manifest_entries = $manifestEntries
+                manifest_entries_verified = $manifestEntriesVerified
+                locked_payloads_verified = [long]$payloads.Count
             }
         }
         finally {
             $archive.Dispose()
         }
-        Remove-Item -LiteralPath $wheelPath -Force
+        Remove-Item -LiteralPath $archivePath -Force
     }
 
     [System.IO.File]::WriteAllBytes((Join-Path $bundleRoot 'bundle.lock.json'), [System.IO.File]::ReadAllBytes($LockPath))
@@ -757,7 +787,7 @@ function Verify-Bundle {
 
     $receiptArtifacts = @{}
     foreach ($artifact in @($receipt.artifacts)) {
-        Assert-ExactFields $artifact @('id', 'filename', 'bytes', 'sha256', 'archive_entries', 'record_entries', 'record_entries_verified', 'locked_record_entries_verified') 'receipt.artifacts[]'
+        Assert-ExactFields $artifact @('id', 'filename', 'bytes', 'sha256', 'verification', 'archive_entries', 'manifest_entries', 'manifest_entries_verified', 'locked_payloads_verified') 'receipt.artifacts[]'
         if ($receiptArtifacts.ContainsKey($artifact.id)) {
             Fail-Runtime "ASTRO_CUDA13_RECEIPT" "receipt contains duplicate artifact $($artifact.id)" "remove the incomplete bundle and rerun provisioning"
         }
@@ -769,7 +799,9 @@ function Verify-Bundle {
         }
         $artifact = $receiptArtifacts[$lockedArtifact.id]
         $lockedCount = (@(@($Lock.files) | Where-Object { $_.artifact -ceq $lockedArtifact.id })).Count + (@(@($Lock.notices) | Where-Object { $_.artifact -ceq $lockedArtifact.id })).Count
-        if ($artifact.filename -cne $lockedArtifact.filename -or [long]$artifact.bytes -ne [long]$lockedArtifact.bytes -or $artifact.sha256 -cne $lockedArtifact.sha256 -or [long]$artifact.locked_record_entries_verified -ne $lockedCount -or [long]$artifact.archive_entries -ne [long]$artifact.record_entries -or [long]$artifact.record_entries_verified -ne [long]$artifact.record_entries -or [long]$artifact.record_entries -lt $lockedCount) {
+        $wheelManifestValid = $artifact.verification -cne 'wheel-record-sha256' -or ([long]$artifact.archive_entries -eq [long]$artifact.manifest_entries -and [long]$artifact.manifest_entries_verified -eq [long]$artifact.manifest_entries -and [long]$artifact.manifest_entries -ge $lockedCount)
+        $releaseManifestValid = $artifact.verification -cne 'release-archive-sha256' -or ([long]$artifact.manifest_entries -eq 0 -and [long]$artifact.manifest_entries_verified -eq 0 -and [long]$artifact.archive_entries -ge $lockedCount)
+        if ($artifact.filename -cne $lockedArtifact.filename -or [long]$artifact.bytes -ne [long]$lockedArtifact.bytes -or $artifact.sha256 -cne $lockedArtifact.sha256 -or $artifact.verification -cne $lockedArtifact.archive_verification -or [long]$artifact.locked_payloads_verified -ne $lockedCount -or -not $wheelManifestValid -or -not $releaseManifestValid) {
             Fail-Runtime "ASTRO_CUDA13_RECEIPT" "receipt artifact facts do not match lock for $($lockedArtifact.id)" "remove the incomplete bundle and rerun provisioning"
         }
         $null = $receiptArtifacts.Remove($lockedArtifact.id)

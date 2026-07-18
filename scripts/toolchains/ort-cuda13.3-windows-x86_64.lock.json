@@ -1,18 +1,18 @@
 {
-  "schema": "astrolabe.windows-ort-cuda-runtime-lock.v2",
+  "schema": "astrolabe.windows-ort-cuda-runtime-lock.v3",
   "bundle": {
-    "id": "ort-1.26.0-cuda-13.3-cudnn-9.24.0.43-windows-x86_64",
+    "id": "ort-1.27.1-cuda-13.3-cudnn-9.24.0.43-windows-x86_64",
     "platform": "windows-x86_64",
     "layout": "flat-bin-v1",
     "root_prefix": "ort-cuda13.3-windows-x86_64",
     "root_from": "sha256(lock_file_bytes)"
   },
   "contract": {
-    "ort_version": "1.26.0",
-    "ort_file_version": "1.26.20260504.3.55c5c82",
+    "ort_version": "1.27.1",
+    "ort_file_version": "1.27.20260709.2.df2ba1c",
     "ort_api": 24,
-    "api_non_null": [24, 25, 26],
-    "first_api_null": 27,
+    "api_non_null": [24, 25, 26, 27],
+    "first_api_null": 28,
     "provider": "CUDAExecutionProvider",
     "ort_dll": "bin/onnxruntime.dll",
     "provider_dll": "bin/onnxruntime_providers_cuda.dll",
@@ -27,14 +27,15 @@
   "artifacts": [
     {
       "id": "onnxruntime",
-      "distribution": "onnxruntime-gpu",
-      "version": "1.26.0",
-      "filename": "onnxruntime_gpu-1.26.0-cp313-cp313-win_amd64.whl",
-      "url": "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/download/onnxruntime-gpu/1.26.0/onnxruntime_gpu-1.26.0-cp313-cp313-win_amd64.whl",
-      "bytes": 198946390,
-      "sha256": "e104b2ee538f0668616cfd12e4ed1911940b25140f9a1b58dfc6cdd164cc17a7",
-      "record": "onnxruntime_gpu-1.26.0.dist-info/RECORD",
-      "metadata": "onnxruntime_gpu-1.26.0.dist-info/METADATA",
+      "distribution": "onnxruntime-win-x64-gpu-cuda13",
+      "version": "1.27.1",
+      "filename": "onnxruntime-win-x64-gpu_cuda13-1.27.1.zip",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.1/onnxruntime-win-x64-gpu_cuda13-1.27.1.zip",
+      "bytes": 333496804,
+      "sha256": "1a88828fb1ca78c9920637acf0f8d8ce40a854bef874128c55193e3d1a2b9ef8",
+      "archive_verification": "release-archive-sha256",
+      "record": null,
+      "metadata": null,
       "license_expression": "MIT"
     },
     {
@@ -45,6 +46,7 @@
       "url": "https://files.pythonhosted.org/packages/99/73/2c08fc3802d72931af348e8f1cf3a0b013e5dd91a6dcc235af8f52cfcb87/nvidia_cublas-13.5.1.27-py3-none-win_amd64.whl",
       "bytes": 391875500,
       "sha256": "234a2e89682080421431d2f2ea422fc2ad7d0b462336ccdfde76c559c906c670",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_cublas-13.5.1.27.dist-info/RECORD",
       "metadata": "nvidia_cublas-13.5.1.27.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -57,6 +59,7 @@
       "url": "https://files.pythonhosted.org/packages/a1/42/edce72f2c5a0f587168109c867f25f4a9a6cd7289ecf0d68ed2b1070f273/nvidia_cuda_nvrtc-13.3.33-py3-none-win_amd64.whl",
       "bytes": 45319163,
       "sha256": "7d2af818851c0c224d5f92221e9226e51ee23c236df4b51f9194563979c888be",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_cuda_nvrtc-13.3.33.dist-info/RECORD",
       "metadata": "nvidia_cuda_nvrtc-13.3.33.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -69,6 +72,7 @@
       "url": "https://files.pythonhosted.org/packages/d2/27/b53a5e0397842a5c11f0e1a39d4e5b2f22638a4126e83b3c4e196f62c969/nvidia_cuda_runtime-13.3.29-py3-none-win_amd64.whl",
       "bytes": 2630354,
       "sha256": "0667ec61c3d897388efa305ed4f7609ace88849a753ba9c6311d06dca55fff4f",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_cuda_runtime-13.3.29.dist-info/RECORD",
       "metadata": "nvidia_cuda_runtime-13.3.29.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -81,6 +85,7 @@
       "url": "https://files.pythonhosted.org/packages/31/23/1dd3aa15cc4ab62c8fc88f8049ef137bc44c17892f5577bc80d994941f77/nvidia_cudnn_cu13-9.24.0.43-py3-none-win_amd64.whl",
       "bytes": 412314771,
       "sha256": "67a7273b5cf062f9446fd76cf464351a1c0f66501e6cd78f6675c0d604d8ac87",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_cudnn_cu13-9.24.0.43.dist-info/RECORD",
       "metadata": "nvidia_cudnn_cu13-9.24.0.43.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -93,6 +98,7 @@
       "url": "https://files.pythonhosted.org/packages/94/64/8e9d808720559d3cbfcd1d1bc8a2e6f55deb29d692513d5a93c8d417b7e5/nvidia_cufft-12.3.0.29-py3-none-win_amd64.whl",
       "bytes": 183939745,
       "sha256": "510036a2bbab5c83ae93dc5c907c3a49d3518e3066ac3a2052ff0f7f9b27dfc4",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_cufft-12.3.0.29.dist-info/RECORD",
       "metadata": "nvidia_cufft-12.3.0.29.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -105,6 +111,7 @@
       "url": "https://files.pythonhosted.org/packages/2a/eb/63f7710fc84837e0118002bc29671542807921aef3a0c710da83a5e7e711/nvidia_curand-10.4.3.29-py3-none-win_amd64.whl",
       "bytes": 55429221,
       "sha256": "34b18d5a2a8e5db4c3846475ae4eef0cacdf3ac5e9c501f3a4efb422f137a74e",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_curand-10.4.3.29.dist-info/RECORD",
       "metadata": "nvidia_curand-10.4.3.29.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -117,6 +124,7 @@
       "url": "https://files.pythonhosted.org/packages/67/f2/ec9c05a108095828dfc58840978c627b3c313fdf2a567c6de9ffbbb46901/nvidia_nvjitlink-13.3.33-py3-none-win_amd64.whl",
       "bytes": 37766359,
       "sha256": "4297ee49639b4f2e07255a1d69b3acc7ab2d011bb892b403e91ac98368962e3b",
+      "archive_verification": "wheel-record-sha256",
       "record": "nvidia_nvjitlink-13.3.33.dist-info/RECORD",
       "metadata": "nvidia_nvjitlink-13.3.33.dist-info/METADATA",
       "license_expression": "LicenseRef-NVIDIA-Proprietary"
@@ -125,11 +133,11 @@
   "files": [
     {
       "artifact": "onnxruntime",
-      "archive_path": "onnxruntime/capi/onnxruntime.dll",
+      "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/lib/onnxruntime.dll",
       "bundle_path": "bin/onnxruntime.dll",
-      "bytes": 16395576,
-      "sha256": "fb71e7c1fabb69faafdc4ae6c356f759aaa970998c2bf6a90f2d74e5a6bd7def",
-      "file_version": "1.26.20260504.3.55c5c82",
+      "bytes": 15839032,
+      "sha256": "75bbf0c47cb90e17f566da46f50ecaab4a0da978e6d8c2b58fbb89708ea067de",
+      "file_version": "1.27.20260709.2.df2ba1c",
       "authenticode": {
         "status": "Valid",
         "subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
@@ -139,11 +147,11 @@
     },
     {
       "artifact": "onnxruntime",
-      "archive_path": "onnxruntime/capi/onnxruntime_providers_cuda.dll",
+      "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/lib/onnxruntime_providers_cuda.dll",
       "bundle_path": "bin/onnxruntime_providers_cuda.dll",
-      "bytes": 227843936,
-      "sha256": "9cac0740494c6249b66910da82cba56cc8c48e1ce50f422ad439dbf5fe70c539",
-      "file_version": "1.26.20260504.3.55c5c82",
+      "bytes": 250590560,
+      "sha256": "46766ba4a7f971a2d5f01569ea6ccfd501f5cf578f2257734cfd578dc28cad2e",
+      "file_version": "1.27.20260709.2.df2ba1c",
       "authenticode": {
         "status": "Valid",
         "subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
@@ -153,11 +161,11 @@
     },
     {
       "artifact": "onnxruntime",
-      "archive_path": "onnxruntime/capi/onnxruntime_providers_shared.dll",
+      "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/lib/onnxruntime_providers_shared.dll",
       "bundle_path": "bin/onnxruntime_providers_shared.dll",
       "bytes": 21816,
-      "sha256": "ec5f80789ba54714c8787676b125abab6ad9bd207ae97b60e44ce775498d8464",
-      "file_version": "1.26.20260504.3.55c5c82",
+      "sha256": "3d8ef56babc5d581153cb032de6841cfbcc884533a3c74038ceb6dfb6ccb05ae",
+      "file_version": "1.27.20260709.2.df2ba1c",
       "authenticode": {
         "status": "Valid",
         "subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
@@ -367,8 +375,10 @@
     }
   ],
   "notices": [
-    { "artifact": "onnxruntime", "archive_path": "onnxruntime/LICENSE", "bundle_path": "licenses/onnxruntime/LICENSE", "bytes": 1094, "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674" },
-    { "artifact": "onnxruntime", "archive_path": "onnxruntime/ThirdPartyNotices.txt", "bundle_path": "licenses/onnxruntime/ThirdPartyNotices.txt", "bytes": 331175, "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866" },
+    { "artifact": "onnxruntime", "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/LICENSE", "bundle_path": "licenses/onnxruntime/LICENSE", "bytes": 1094, "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674" },
+    { "artifact": "onnxruntime", "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/ThirdPartyNotices.txt", "bundle_path": "licenses/onnxruntime/ThirdPartyNotices.txt", "bytes": 331175, "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866" },
+    { "artifact": "onnxruntime", "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/VERSION_NUMBER", "bundle_path": "licenses/onnxruntime/VERSION_NUMBER", "bytes": 8, "sha256": "82ca0fbff041341ce9edaba97b2b30632548527e20d92f148bc6d24eadeda5ee" },
+    { "artifact": "onnxruntime", "archive_path": "onnxruntime-win-x64-gpu_cuda13-1.27.1/GIT_COMMIT_ID", "bundle_path": "licenses/onnxruntime/GIT_COMMIT_ID", "bytes": 43, "sha256": "54929c1264e41c8dee8816c0470bae4183993ababbc36a807d5bbdcbe0b6a2f4" },
     { "artifact": "cublas", "archive_path": "nvidia_cublas-13.5.1.27.dist-info/licenses/License.txt", "bundle_path": "licenses/cublas/License.txt", "bytes": 59262, "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd" },
     { "artifact": "cuda-nvrtc", "archive_path": "nvidia_cuda_nvrtc-13.3.33.dist-info/licenses/License.txt", "bundle_path": "licenses/cuda-nvrtc/License.txt", "bytes": 59262, "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd" },
     { "artifact": "cuda-runtime", "archive_path": "nvidia_cuda_runtime-13.3.29.dist-info/licenses/License.txt", "bundle_path": "licenses/cuda-runtime/License.txt", "bytes": 59262, "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd" },
@@ -378,7 +388,10 @@
     { "artifact": "nvjitlink", "archive_path": "nvidia_nvjitlink-13.3.33.dist-info/licenses/License.txt", "bundle_path": "licenses/nvjitlink/License.txt", "bytes": 59262, "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd" }
   ],
   "loaded_module_policy": {
-    "bundle_load_order": [
+    "boundary_load": [
+      "bin/onnxruntime.dll"
+    ],
+    "dependency_preload_order": [
       "bin/cublasLt64_13.dll",
       "bin/cudart64_13.dll",
       "bin/cudnn_graph64_9.dll",
@@ -389,7 +402,6 @@
       "bin/nvJitLink_130_0.dll",
       "bin/nvrtc-builtins64_133.dll",
       "bin/onnxruntime_providers_shared.dll",
-      "bin/onnxruntime.dll",
       "bin/cublas64_13.dll",
       "bin/cudnn_ops64_9.dll",
       "bin/cudnn_adv64_9.dll",
@@ -400,7 +412,9 @@
       "bin/cudnn_heuristic64_9.dll",
       "bin/cufftw64_12.dll",
       "bin/nvblas64_13.dll",
-      "bin/nvrtc64_130_0.dll",
+      "bin/nvrtc64_130_0.dll"
+    ],
+    "ort_managed_load": [
       "bin/onnxruntime_providers_cuda.dll"
     ],
     "bundle_module_globs": [

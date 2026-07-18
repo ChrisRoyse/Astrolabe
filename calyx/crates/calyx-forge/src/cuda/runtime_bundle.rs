@@ -31,19 +31,19 @@ pub const RUNTIME_ROOT_ENV: &str = "CALYX_CUDA13_RUNTIME_ROOT";
 /// Emitted only after the exact pinned CUDA Runtime and exact system CUDA
 /// Driver independently report zero devices in the same startup probe.
 pub const CUDA_NO_DEVICE_ATTESTED_CODE: &str = "CALYX_CUDA_NO_DEVICE_ATTESTED";
-const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v2";
-const RECEIPT_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-receipt.v1";
+const LOCK_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-lock.v3";
+const RECEIPT_SCHEMA: &str = "astrolabe.windows-ort-cuda-runtime-receipt.v2";
 const LOCK_FILE: &str = "bundle.lock.json";
 const LOCK_DIGEST_FILE: &str = "bundle.lock.sha256";
 const RECEIPT_FILE: &str = "bundle.receipt.json";
 const EXPECTED_PLATFORM: &str = "windows-x86_64";
 const EXPECTED_LAYOUT: &str = "flat-bin-v1";
 const EXPECTED_ROOT_PREFIX: &str = "ort-cuda13.3-windows-x86_64";
-const EXPECTED_ORT_VERSION: &str = "1.26.0";
-const EXPECTED_ORT_FILE_VERSION: &str = "1.26.20260504.3.55c5c82";
+const EXPECTED_ORT_VERSION: &str = "1.27.1";
+const EXPECTED_ORT_FILE_VERSION: &str = "1.27.20260709.2.df2ba1c";
 const EXPECTED_PROVIDER: &str = "CUDAExecutionProvider";
 const REQUIRED_ARTIFACT_VERSIONS: &[(&str, &str)] = &[
-    ("onnxruntime", "1.26.0"),
+    ("onnxruntime", "1.27.1"),
     ("cublas", "13.5.1.27"),
     ("cuda-nvrtc", "13.3.33"),
     ("cuda-runtime", "13.3.29"),
@@ -83,6 +83,22 @@ pub struct PinnedCudaModuleAttestation {
     pub system_trust: Option<SystemModuleTrustAttestation>,
 }
 
+/// Exact locked module whose lifetime is owned by ONNX Runtime rather than
+/// Forge. Forge validates these bytes and rejects ambient copies, but never
+/// maps them directly; a successful ORT session must prove residency later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedCudaOrtManagedModuleAttestation {
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+    pub file_version: Option<String>,
+    pub source: String,
+    pub loader: String,
+    pub state: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinnedCudaRuntimeAttestation {
@@ -97,6 +113,7 @@ pub struct PinnedCudaRuntimeAttestation {
     pub validated_file_count: usize,
     pub validated_notice_count: usize,
     pub modules: Vec<PinnedCudaModuleAttestation>,
+    pub ort_managed_modules: Vec<PinnedCudaOrtManagedModuleAttestation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +184,7 @@ struct PinnedRuntimeBoundary {
     system32: PathBuf,
     attestation: PinnedCudaRuntimeAttestation,
     _core_handle: OwnedModule,
+    _ort_managed_file_guards: Vec<VerifiedBundleFile>,
 }
 
 struct OwnedModule {
@@ -261,8 +279,9 @@ struct ArtifactContract {
     url: String,
     bytes: u64,
     sha256: String,
-    record: String,
-    metadata: String,
+    archive_verification: String,
+    record: Option<String>,
+    metadata: Option<String>,
     license_expression: String,
 }
 
@@ -310,7 +329,9 @@ struct NoticeContract {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoadedModulePolicy {
-    bundle_load_order: Vec<String>,
+    boundary_load: Vec<String>,
+    dependency_preload_order: Vec<String>,
+    ort_managed_load: Vec<String>,
     bundle_module_globs: Vec<String>,
     system_modules: Vec<SystemModulePolicy>,
     system_roots: Vec<String>,
@@ -347,10 +368,11 @@ struct ReceiptArtifact {
     filename: String,
     bytes: u64,
     sha256: String,
+    verification: String,
     archive_entries: u64,
-    record_entries: u64,
-    record_entries_verified: u64,
-    locked_record_entries_verified: u64,
+    manifest_entries: u64,
+    manifest_entries_verified: u64,
+    locked_payloads_verified: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,6 +422,7 @@ pub fn attest_pinned_cuda_dependencies() -> Result<PinnedCudaRuntimeAttestation>
         &boundary.root,
         &boundary.system32,
         &enumerate_process_modules()?,
+        true,
         true,
     )?;
     Ok(attestation)
@@ -1124,6 +1147,7 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         &system32,
         &enumerate_process_modules()?,
         false,
+        false,
     )?;
     if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
         return Err(last_windows_error(
@@ -1152,9 +1176,12 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         &system32,
         &enumerate_process_modules()?,
         false,
+        false,
     )?;
+    let (ort_managed_modules, ort_managed_file_guards) =
+        open_locked_ort_managed_modules(&lock, &root)?;
     let attestation = PinnedCudaRuntimeAttestation {
-        schema: "calyx-pinned-cuda-runtime-attestation-v2".to_string(),
+        schema: "calyx-pinned-cuda-runtime-attestation-v3".to_string(),
         lock_sha256,
         bundle_id: lock.bundle.id.clone(),
         bundle_root: root.clone(),
@@ -1165,6 +1192,7 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         validated_file_count: lock.files.len(),
         validated_notice_count: lock.notices.len(),
         modules,
+        ort_managed_modules,
     };
     Ok(PinnedRuntimeBoundary {
         lock,
@@ -1172,6 +1200,7 @@ fn initialize_boundary() -> Result<PinnedRuntimeBoundary> {
         system32,
         attestation,
         _core_handle: core_handle,
+        _ort_managed_file_guards: ort_managed_file_guards,
     })
 }
 
@@ -1186,6 +1215,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         &boundary.system32,
         &enumerate_process_modules()?,
         true,
+        false,
     )?;
     let mut handles = ModuleStack::with_capacity(boundary.lock.files.len() + SYSTEM_MODULES.len());
     for name in SYSTEM_MODULES {
@@ -1199,7 +1229,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         )?;
         handles.push(handle);
     }
-    for bundle_path in &boundary.lock.loaded_module_policy.bundle_load_order {
+    for bundle_path in &boundary.lock.loaded_module_policy.dependency_preload_order {
         let file = boundary
             .lock
             .files
@@ -1221,6 +1251,7 @@ fn initialize_cuda_dependencies() -> Result<PinnedCudaRuntime> {
         &boundary.system32,
         &enumerate_process_modules()?,
         true,
+        false,
     )?;
     let mut attestation = boundary.attestation.clone();
     attestation.modules = modules;
@@ -1253,8 +1284,8 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
         lock.contract.ort_version == EXPECTED_ORT_VERSION
             && lock.contract.ort_file_version == EXPECTED_ORT_FILE_VERSION
             && lock.contract.ort_api == 24
-            && lock.contract.api_non_null == [24, 25, 26]
-            && lock.contract.first_api_null == 27
+            && lock.contract.api_non_null == [24, 25, 26, 27]
+            && lock.contract.first_api_null == 28
             && lock.contract.provider == EXPECTED_PROVIDER
             && bundle_basename(&lock.contract.ort_dll)?.eq_ignore_ascii_case("onnxruntime.dll")
             && bundle_basename(&lock.contract.provider_dll)?
@@ -1323,11 +1354,28 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
             !artifact.distribution.trim().is_empty()
                 && !artifact.filename.trim().is_empty()
                 && !artifact.url.trim().is_empty()
-                && !artifact.record.trim().is_empty()
-                && !artifact.metadata.trim().is_empty()
                 && !artifact.license_expression.trim().is_empty()
                 && artifact.bytes > 0,
             "artifact provenance is incomplete",
+        )?;
+        require(
+            match artifact.archive_verification.as_str() {
+                "wheel-record-sha256" => {
+                    artifact
+                        .record
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                        && artifact
+                            .metadata
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                }
+                "release-archive-sha256" => {
+                    artifact.record.is_none() && artifact.metadata.is_none()
+                }
+                _ => false,
+            },
+            "artifact archive-verification contract is invalid",
         )?;
         require_sha256(&artifact.sha256, "artifact")?;
     }
@@ -1342,9 +1390,21 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
         .iter()
         .map(|file| bundle_basename(&file.bundle_path).map(|name| name.to_ascii_lowercase()))
         .collect::<Result<BTreeSet<_>>>()?;
-    let order = lock
+    let boundary = lock
         .loaded_module_policy
-        .bundle_load_order
+        .boundary_load
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let preload = lock
+        .loaded_module_policy
+        .dependency_preload_order
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let ort_managed = lock
+        .loaded_module_policy
+        .ort_managed_load
         .iter()
         .map(|path| path.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
@@ -1357,12 +1417,31 @@ fn validate_lock(lock: &RuntimeLock) -> Result<()> {
         "duplicate locked module basename",
     )?;
     require(
-        order.len() == lock.loaded_module_policy.bundle_load_order.len(),
-        "duplicate module load-order path",
+        boundary.len() == lock.loaded_module_policy.boundary_load.len()
+            && preload.len() == lock.loaded_module_policy.dependency_preload_order.len()
+            && ort_managed.len() == lock.loaded_module_policy.ort_managed_load.len(),
+        "duplicate module load-phase path",
     )?;
     require(
-        files == order,
-        "module load order is not an exact file permutation",
+        boundary.is_disjoint(&preload)
+            && boundary.is_disjoint(&ort_managed)
+            && preload.is_disjoint(&ort_managed),
+        "module load phases overlap",
+    )?;
+    let mut scheduled = boundary.clone();
+    scheduled.extend(preload.iter().cloned());
+    scheduled.extend(ort_managed.iter().cloned());
+    require(
+        files == scheduled,
+        "module load phases are not an exact file permutation",
+    )?;
+    require(
+        boundary == BTreeSet::from([lock.contract.ort_dll.to_ascii_lowercase()]),
+        "boundary load phase must contain only the ORT core",
+    )?;
+    require(
+        ort_managed == BTreeSet::from([lock.contract.provider_dll.to_ascii_lowercase()]),
+        "ORT-managed load phase must contain only the CUDA provider",
     )?;
     for file in &lock.files {
         require(
@@ -1542,15 +1621,36 @@ fn validate_bundle(
         require_bundle(
             actual.filename == expected.filename
                 && actual.bytes == expected.bytes
-                && actual.sha256 == expected.sha256,
+                && actual.sha256 == expected.sha256
+                && actual.verification == expected.archive_verification,
             &format!("receipt artifact contract differs for {}", expected.id),
         )?;
+        let locked_payload_count = lock
+            .files
+            .iter()
+            .filter(|file| file.artifact == expected.id)
+            .count()
+            + lock
+                .notices
+                .iter()
+                .filter(|notice| notice.artifact == expected.id)
+                .count();
         require_bundle(
             actual.archive_entries > 0
-                && actual.archive_entries == actual.record_entries
-                && actual.record_entries_verified == actual.record_entries
-                && actual.locked_record_entries_verified > 0
-                && actual.locked_record_entries_verified <= actual.record_entries,
+                && actual.locked_payloads_verified == locked_payload_count as u64
+                && match expected.archive_verification.as_str() {
+                    "wheel-record-sha256" => {
+                        actual.archive_entries == actual.manifest_entries
+                            && actual.manifest_entries_verified == actual.manifest_entries
+                            && actual.manifest_entries >= locked_payload_count as u64
+                    }
+                    "release-archive-sha256" => {
+                        actual.manifest_entries == 0
+                            && actual.manifest_entries_verified == 0
+                            && actual.archive_entries >= locked_payload_count as u64
+                    }
+                    _ => false,
+                },
             &format!(
                 "receipt artifact verification counts are invalid for {}",
                 expected.id
@@ -1678,8 +1778,14 @@ fn reject_ambient_modules(
     system32: &Path,
     modules: &[PathBuf],
     require_cuda: bool,
+    allow_ort_managed: bool,
 ) -> Result<()> {
     let expected = expected_module_paths(lock, root, system32, require_cuda)?;
+    let permitted_ort_managed = if allow_ort_managed {
+        expected_ort_managed_paths(lock, root)?
+    } else {
+        BTreeMap::new()
+    };
     for module in modules {
         let Some(name) = module.file_name().and_then(OsStr::to_str) else {
             continue;
@@ -1696,7 +1802,10 @@ fn reject_ambient_modules(
             continue;
         }
         let canonical = canonicalize_existing_file(module, "loaded CUDA module")?;
-        match expected.get(&lower) {
+        match expected
+            .get(&lower)
+            .or_else(|| permitted_ort_managed.get(&lower))
+        {
             Some(required) if same_path(&canonical, required) => {}
             Some(required) => {
                 return Err(runtime_error(
@@ -1730,8 +1839,16 @@ fn attest_modules(
     system32: &Path,
     modules: &[PathBuf],
     require_cuda: bool,
+    allow_ort_managed: bool,
 ) -> Result<Vec<PinnedCudaModuleAttestation>> {
-    reject_ambient_modules(lock, root, system32, modules, require_cuda)?;
+    reject_ambient_modules(
+        lock,
+        root,
+        system32,
+        modules,
+        require_cuda,
+        allow_ort_managed,
+    )?;
     let expected = expected_module_paths(lock, root, system32, require_cuda)?;
     let mut loaded = BTreeMap::new();
     for module in modules {
@@ -1868,11 +1985,25 @@ fn expected_module_paths(
     require_cuda: bool,
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
-    for file in &lock.files {
+    let scheduled = lock.loaded_module_policy.boundary_load.iter().chain(
+        require_cuda
+            .then_some(lock.loaded_module_policy.dependency_preload_order.iter())
+            .into_iter()
+            .flatten(),
+    );
+    for bundle_path in scheduled {
+        let file = lock
+            .files
+            .iter()
+            .find(|file| file.bundle_path.eq_ignore_ascii_case(bundle_path))
+            .ok_or_else(|| {
+                runtime_error(
+                    "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                    format!("module load phase references unlocked path {bundle_path}"),
+                    CONTRACT_REMEDIATION,
+                )
+            })?;
         let name = bundle_basename(&file.bundle_path)?.to_ascii_lowercase();
-        if !require_cuda && name != "onnxruntime.dll" {
-            continue;
-        }
         let path = canonicalize_existing_file(
             &root.join(windows_relative_path(&file.bundle_path)?),
             "locked CUDA module",
@@ -1888,6 +2019,90 @@ fn expected_module_paths(
         }
     }
     Ok(out)
+}
+
+fn expected_ort_managed_paths(
+    lock: &RuntimeLock,
+    root: &Path,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let mut out = BTreeMap::new();
+    for bundle_path in &lock.loaded_module_policy.ort_managed_load {
+        let file = lock
+            .files
+            .iter()
+            .find(|file| file.bundle_path.eq_ignore_ascii_case(bundle_path))
+            .ok_or_else(|| {
+                runtime_error(
+                    "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                    format!("ORT-managed load phase references unlocked path {bundle_path}"),
+                    CONTRACT_REMEDIATION,
+                )
+            })?;
+        out.insert(
+            bundle_basename(&file.bundle_path)?.to_ascii_lowercase(),
+            canonicalize_existing_file(
+                &root.join(windows_relative_path(&file.bundle_path)?),
+                "locked ORT-managed module",
+            )?,
+        );
+    }
+    Ok(out)
+}
+
+fn open_locked_ort_managed_modules(
+    lock: &RuntimeLock,
+    root: &Path,
+) -> Result<(
+    Vec<PinnedCudaOrtManagedModuleAttestation>,
+    Vec<VerifiedBundleFile>,
+)> {
+    let expected = expected_ort_managed_paths(lock, root)?;
+    let files = lock
+        .files
+        .iter()
+        .map(|file| {
+            Ok((
+                bundle_basename(&file.bundle_path)?.to_ascii_lowercase(),
+                file,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut out = Vec::with_capacity(expected.len());
+    let mut guards = Vec::with_capacity(expected.len());
+    for (name, path) in expected {
+        let file = files.get(&name).ok_or_else(|| {
+            runtime_error(
+                "CALYX_ONNX_RUNTIME_CONTRACT_INVALID",
+                format!("ORT-managed module {name} has no file contract"),
+                CONTRACT_REMEDIATION,
+            )
+        })?;
+        let guard = open_verified_locked_file(root, &file.bundle_path, file.bytes, &file.sha256)?;
+        if !same_path(&guard.path, &path) {
+            return Err(runtime_error(
+                "CALYX_ONNX_RUNTIME_FILE_CHANGED",
+                format!(
+                    "retained ORT-managed file handle resolves to {}; expected {}",
+                    guard.path.display(),
+                    path.display()
+                ),
+                BUNDLE_REMEDIATION,
+            ));
+        }
+        out.push(PinnedCudaOrtManagedModuleAttestation {
+            name,
+            path,
+            bytes: file.bytes,
+            sha256: file.sha256.clone(),
+            file_version: file.file_version.clone(),
+            source: format!("bundle:{}", file.artifact),
+            loader: "onnxruntime-provider-api".to_string(),
+            state: "validated-not-directly-mapped".to_string(),
+        });
+        guards.push(guard);
+    }
+    out.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok((out, guards))
 }
 
 fn enumerate_bundle_paths(root: &Path) -> Result<BTreeSet<String>> {

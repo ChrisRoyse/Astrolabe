@@ -59,6 +59,7 @@ pub(super) fn attest_after_model_constructor(
     }
 
     ensure_runtime(policy)?;
+    calyx_onnx_runtime::attest_cuda_provider_after_session()?;
     let receipt = current_runtime_attestation()?.ok_or_else(|| CalyxError {
         code: "CALYX_ONNX_RUNTIME_ATTESTATION_MISSING",
         message: "CUDA model construction completed without a live runtime attestation".into(),
