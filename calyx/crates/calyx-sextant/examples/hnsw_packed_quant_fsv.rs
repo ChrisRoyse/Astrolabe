@@ -46,6 +46,8 @@ const ANNEAL_VAULT_ID: &str = "01J00000000000000000000553";
 const ANNEAL_VAULT_SALT: &[u8] = b"calyx-553-anneal-fsv";
 const ADMISSION_ROWS: usize = 64;
 const ADMISSION_SAMPLES: usize = 64;
+const ADMISSION_DIM: usize = HNSW_MAX_DIM as usize;
+const ADMISSION_K: usize = 1;
 const ADMISSION_MAX_COSINE_ERROR: f64 = 0.02;
 
 #[derive(Clone, Copy)]
@@ -459,12 +461,12 @@ fn build_admission_fixture(run_dir: &Path) -> Result<AdmissionFixture, Box<dyn s
     let rows = admission_rows();
     let queries = admission_queries();
     let scale = measured_scale(&rows);
-    let mut f32 = HnswIndex::new(SLOT, DIM as u32, 553).with_quant(QuantConfig::none())?;
+    let mut f32 = HnswIndex::new(SLOT, ADMISSION_DIM as u32, 553).with_quant(QuantConfig::none())?;
     let mut scalar =
-        HnswIndex::new(SLOT, DIM as u32, 553).with_quant(QuantConfig::scalar8(scale))?;
+        HnswIndex::new(SLOT, ADMISSION_DIM as u32, 553).with_quant(QuantConfig::scalar8(scale))?;
     for (ordinal, row) in rows.iter().enumerate() {
         let vector = SlotVector::Dense {
-            dim: DIM as u32,
+            dim: ADMISSION_DIM as u32,
             data: row.clone(),
         };
         f32.insert(cx(ordinal), vector.clone(), ordinal as u64 + 1)?;
@@ -504,15 +506,15 @@ fn build_admission_fixture(run_dir: &Path) -> Result<AdmissionFixture, Box<dyn s
         || scalar_physical.digest != scalar_receipt.metadata.digest
         || f32_physical.row_count != ADMISSION_ROWS as u64
         || scalar_physical.row_count != ADMISSION_ROWS as u64
-        || scalar_physical.packed_vector_bytes != (ADMISSION_ROWS * (DIM + 8)) as u64
+        || scalar_physical.packed_vector_bytes != (ADMISSION_ROWS * (ADMISSION_DIM + 8)) as u64
     {
         return Err("admission artifacts did not independently reread as measured".into());
     }
     println!(
-        "{{\"event\":\"anneal_admission_measurement\",\"corpus\":\"64 deterministic one-hot records with eight strict-mixture queries\",\"rows\":{},\"heldout_queries\":{},\"k\":{},\"f32_recall\":{:.3},\"scalar8_recall\":{:.3},\"f32_p99_ns\":{},\"scalar8_p99_ns\":{},\"f32_mean_cosine_error\":{:.9},\"f32_max_cosine_error\":{:.9},\"scalar8_mean_cosine_error\":{:.9},\"scalar8_max_cosine_error\":{:.9},\"accepted_max_cosine_error\":{:.3},\"f32_far\":{:.6},\"scalar8_far\":{:.6},\"f32_artifact_bytes\":{},\"scalar8_artifact_bytes\":{},\"scalar8_packed_bytes\":{}}}",
+        "{{\"event\":\"anneal_admission_measurement\",\"corpus\":\"64 deterministic 4096-D one-hot records with eight strict-mixture queries\",\"rows\":{},\"heldout_queries\":{},\"k\":{},\"f32_recall\":{:.3},\"scalar8_recall\":{:.3},\"f32_p99_ns\":{},\"scalar8_p99_ns\":{},\"f32_mean_cosine_error\":{:.9},\"f32_max_cosine_error\":{:.9},\"scalar8_mean_cosine_error\":{:.9},\"scalar8_max_cosine_error\":{:.9},\"accepted_max_cosine_error\":{:.3},\"f32_far\":{:.6},\"scalar8_far\":{:.6},\"f32_artifact_bytes\":{},\"scalar8_artifact_bytes\":{},\"scalar8_packed_bytes\":{}}}",
         ADMISSION_ROWS,
         queries.len(),
-        K,
+        ADMISSION_K,
         incumbent.recall,
         candidate.recall,
         incumbent.latency_ns,
@@ -555,13 +557,13 @@ fn measure_admission_index(
     let mut overlap_total = 0_usize;
     let mut errors = Vec::new();
     for query in queries {
-        let truth = exact_top_k(query, rows, K);
+        let truth = exact_top_k(query, rows, ADMISSION_K);
         let hits = index.search(
             &SlotVector::Dense {
-                dim: DIM as u32,
+                dim: ADMISSION_DIM as u32,
                 data: query.clone(),
             },
-            K,
+            ADMISSION_K,
             Some(64),
         )?;
         let got: Vec<_> = hits.iter().map(|hit| hit.cx_id).collect();
@@ -574,10 +576,10 @@ fn measure_admission_index(
     for query in queries {
         let _ = index.search(
             &SlotVector::Dense {
-                dim: DIM as u32,
+                dim: ADMISSION_DIM as u32,
                 data: query.clone(),
             },
-            K,
+            ADMISSION_K,
             Some(64),
         )?;
     }
@@ -587,10 +589,10 @@ fn measure_admission_index(
         for query in queries {
             let _ = index.search(
                 &SlotVector::Dense {
-                    dim: DIM as u32,
+                    dim: ADMISSION_DIM as u32,
                     data: query.clone(),
                 },
-                K,
+                ADMISSION_K,
                 Some(64),
             )?;
         }
@@ -614,7 +616,7 @@ fn measure_admission_index(
     let max_error = errors.into_iter().fold(0.0_f64, f64::max);
     Ok((
         CodecMeasurement {
-            recall: overlap_total as f64 / (queries.len() * K) as f64,
+            recall: overlap_total as f64 / (queries.len() * ADMISSION_K) as f64,
             latency_ns: p99_ns,
         },
         mean_error,
@@ -626,7 +628,7 @@ fn measure_admission_index(
 fn admission_rows() -> Vec<Vec<f32>> {
     (0..ADMISSION_ROWS)
         .map(|ordinal| {
-            let mut row = vec![0.0_f32; DIM];
+            let mut row = vec![0.0_f32; ADMISSION_DIM];
             row[ordinal] = 1.0;
             row
         })
@@ -636,7 +638,7 @@ fn admission_rows() -> Vec<Vec<f32>> {
 fn admission_queries() -> Vec<Vec<f32>> {
     (0..QUERIES)
         .map(|query_ordinal| {
-            let mut query = vec![0.0_f32; DIM];
+            let mut query = vec![0.0_f32; ADMISSION_DIM];
             for rank in 0..ADMISSION_ROWS {
                 let ordinal = (rank + query_ordinal * 7) % ADMISSION_ROWS;
                 query[ordinal] = 1.0 / (rank + 1) as f32;
@@ -930,10 +932,10 @@ fn anneal_activation_fsv(
     let (active_index, active) = HnswArtifactActivator::new(&pointer_path, SLOT).open_active()?;
     let live_hits = active_index.search(
         &SlotVector::Dense {
-            dim: DIM as u32,
+            dim: ADMISSION_DIM as u32,
             data: queries[0].clone(),
         },
-        K,
+        ADMISSION_K,
         Some(64),
     )?;
     if active_pointer_bytes == incumbent_pointer_bytes
@@ -957,7 +959,7 @@ fn anneal_activation_fsv(
         || promotion.recall_before != fixture.incumbent.recall
         || promotion.recall_after != fixture.candidate.recall
         || fixture.max_cosine_error > fixture.quant_evidence.max_cosine_error
-        || live_hits.len() != K
+        || live_hits.len() != ADMISSION_K
     {
         return Err("successful Anneal promotion state is incomplete or inconsistent".into());
     }
@@ -1038,10 +1040,10 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
     let query = &queries[0];
     let hits = index.search(
         &SlotVector::Dense {
-            dim: DIM as u32,
+            dim: ADMISSION_DIM as u32,
             data: query.clone(),
         },
-        K,
+        ADMISSION_K,
         Some(64),
     )?;
     if active.config_hash != candidate_hash
@@ -1051,7 +1053,7 @@ fn child_anneal_reload() -> Result<(), Box<dyn std::error::Error>> {
         || bandit.incumbent_idx != 1
         || entries.len() != 1
         || entries[0].action != AnnealLedgerAction::AutotunePromote
-        || hits.len() != K
+        || hits.len() != ADMISSION_K
     {
         return Err("restart did not recover the complete promoted state".into());
     }
