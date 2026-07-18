@@ -2,15 +2,33 @@
 
 mod ledger;
 
+use std::collections::BTreeSet;
+
 use crate::cf::{
-    ColumnFamily, KeyRange, anchor_prefix_range, base_key, recurrence_prefix_range, slot_key,
-    temporal_xterm_prefix_range, xterm_prefix_range,
+    ColumnFamily, KeyRange, anchor_prefix_range, base_key, compression_lifecycle_key,
+    compression_manifest_key, recurrence_prefix_range, slot_key, temporal_xterm_prefix_range,
+    xterm_prefix_range,
 };
-use crate::mvcc::tombstone_value;
+use crate::compression_lifecycle::{
+    CALYX_COMPRESSION_LIFECYCLE_INVALID, GenerationLifecycleRecord, GenerationTransition,
+};
+use crate::mvcc::{is_tombstone_value, tombstone_value};
 use crate::vault::{AsterVault, VaultContext, encode};
-use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Ts, VaultId};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, SlotId, Ts, VaultId};
 use calyx_ledger::{EntryKind, SubjectId};
 use serde::{Deserialize, Serialize};
+
+/// How a lawful erase treats a targeted slot that carries a live compressed
+/// generation manifest (issue #562).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionErasePolicy {
+    /// Constellation- and subject-scoped erases cannot shed a single row from a
+    /// compressed generation; they fail closed and route the caller to a reseal.
+    RouteReseal,
+    /// A full-vault erase removes each generation wholesale, staging a
+    /// coordinated manifest tombstone plus a `DeleteGeneration` lifecycle record.
+    CoordinatedDelete,
+}
 
 /// Metadata key used by `EraseScope::Subject`.
 ///
@@ -140,7 +158,7 @@ where
         }
         let affected = affected_cfs(&targets.rows);
         let row_tombstone = tombstone_value();
-        let rows = targets
+        let mut rows = targets
             .rows
             .iter()
             .map(|target| encode::WriteRow {
@@ -149,6 +167,30 @@ where
                 value: row_tombstone.clone(),
             })
             .collect::<Vec<_>>();
+        // Issue #562: a coordinated full-generation delete must carry its
+        // append-only DeleteGeneration lifecycle record and a paired ledger entry
+        // in the same batch, or the commit-time guard refuses the manifest
+        // tombstone. Without a real ledger hook there is no lawful way to record
+        // the transition, so the vault erase fails closed.
+        if !targets.lifecycle_writes.is_empty() {
+            if !real_ledger {
+                return Err(CalyxError {
+                    code: CALYX_COMPRESSION_LIFECYCLE_INVALID,
+                    message: format!(
+                        "vault erase of {} compressed slot generation(s) requires a real ledger hook to record each DeleteGeneration transition",
+                        targets.lifecycle_writes.len()
+                    ),
+                    remediation: "open the vault with its ledger hook so the coordinated generation delete can pair its manifest tombstone with a hash-chained ledger entry",
+                });
+            }
+            for (cf, key, value) in &targets.lifecycle_writes {
+                rows.push(encode::WriteRow {
+                    cf: *cf,
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
         if real_ledger {
             let tombstone =
                 ledger::tombstone_for(vault, &scope, targets.records_deleted, vault.clock_now())?;
@@ -210,6 +252,19 @@ where
         if let Some(registry) = registry {
             registry.run_all(scope, vault.vault_id())?;
         }
+        if !targets.lifecycle_writes.is_empty() {
+            // This ledger-free path cannot pair a manifest tombstone with its
+            // DeleteGeneration record; fail closed rather than trip the commit
+            // guard (issue #562).
+            return Err(CalyxError {
+                code: CALYX_COMPRESSION_LIFECYCLE_INVALID,
+                message: format!(
+                    "erase_cf_records cannot delete {} compressed slot generation(s) without a ledgered coordinated delete",
+                    targets.lifecycle_writes.len()
+                ),
+                remediation: "use AsterVault::erase on a vault opened with its ledger hook so each generation delete records its DeleteGeneration transition",
+            });
+        }
         if targets.rows.is_empty() {
             return Ok(EraseWriteSummary {
                 records_deleted: targets.records_deleted,
@@ -253,6 +308,12 @@ struct EraseTarget {
 struct EraseTargets {
     rows: Vec<EraseTarget>,
     records_deleted: usize,
+    /// Non-tombstone rows (DeleteGeneration lifecycle records) that must be
+    /// committed alongside the tombstones for a coordinated generation delete.
+    lifecycle_writes: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    /// Slots whose full-generation delete has already been staged, so a slot
+    /// referenced by several constellations is deleted exactly once.
+    staged_delete_slots: BTreeSet<u16>,
 }
 
 #[derive(Debug)]
@@ -281,7 +342,10 @@ where
 {
     let mut targets = EraseTargets::default();
     for cf in ColumnFamily::STATIC {
-        if cf == ColumnFamily::Ledger {
+        // Ledger is append-only; Compression is handled per-generation below so a
+        // manifest tombstone is always paired with its DeleteGeneration record and
+        // append-only lifecycle records are never tombstoned (issue #562).
+        if cf == ColumnFamily::Ledger || cf == ColumnFamily::Compression {
             continue;
         }
         for (key, _) in vault.scan_cf_at(snapshot, cf)? {
@@ -291,7 +355,20 @@ where
     for (_, base) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
         let cx = encode::decode_constellation_base(&base)?;
         targets.records_deleted += 1;
-        collect_slot_targets(vault, snapshot, &cx, &mut targets.rows)?;
+        collect_slot_targets(
+            vault,
+            snapshot,
+            &cx,
+            &mut targets,
+            CompressionErasePolicy::CoordinatedDelete,
+        )?;
+    }
+    // Sweep any compressed generation not reached through a base constellation.
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Compression)? {
+        if key.len() == 2 && !is_tombstone_value(&value) {
+            let slot = SlotId::new(u16::from_be_bytes([key[0], key[1]]));
+            stage_generation_delete(vault, snapshot, slot, &mut targets)?;
+        }
     }
     Ok(targets)
 }
@@ -340,7 +417,13 @@ where
     if let Some(cx) = &base {
         push_unique(&mut targets.rows, ColumnFamily::Base, base_key(cx.cx_id));
         targets.records_deleted = 1;
-        collect_slot_targets(vault, snapshot, cx, &mut targets.rows)?;
+        collect_slot_targets(
+            vault,
+            snapshot,
+            cx,
+            &mut targets,
+            CompressionErasePolicy::RouteReseal,
+        )?;
     }
     collect_range_targets(
         vault,
@@ -372,23 +455,122 @@ fn collect_slot_targets<C>(
     vault: &AsterVault<C>,
     snapshot: u64,
     cx: &Constellation,
-    targets: &mut Vec<EraseTarget>,
+    targets: &mut EraseTargets,
+    policy: CompressionErasePolicy,
 ) -> Result<()>
 where
     C: Clock,
 {
     for slot in cx.slots.keys().copied() {
+        if slot_has_live_manifest(vault, snapshot, slot)? {
+            match policy {
+                CompressionErasePolicy::RouteReseal => return Err(lifecycle_route_error(slot)),
+                CompressionErasePolicy::CoordinatedDelete => {
+                    stage_generation_delete(vault, snapshot, slot, targets)?;
+                    continue;
+                }
+            }
+        }
         let key = slot_key(cx.cx_id);
         push_if_visible(
             vault,
             snapshot,
             ColumnFamily::slot(slot),
             key.clone(),
-            targets,
+            &mut targets.rows,
         )?;
-        push_if_visible(vault, snapshot, ColumnFamily::slot_raw(slot), key, targets)?;
+        push_if_visible(
+            vault,
+            snapshot,
+            ColumnFamily::slot_raw(slot),
+            key,
+            &mut targets.rows,
+        )?;
     }
     Ok(())
+}
+
+fn slot_has_live_manifest<C>(vault: &AsterVault<C>, snapshot: u64, slot: SlotId) -> Result<bool>
+where
+    C: Clock,
+{
+    Ok(vault
+        .read_cf_at(
+            snapshot,
+            ColumnFamily::Compression,
+            &compression_manifest_key(slot),
+        )?
+        .is_some())
+}
+
+/// Stages a coordinated full-generation delete for one manifested slot: tombstone
+/// every compressed primary row and raw sidecar, tombstone the manifest, and add
+/// one append-only DeleteGeneration lifecycle record. Idempotent per slot.
+fn stage_generation_delete<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    slot: SlotId,
+    targets: &mut EraseTargets,
+) -> Result<()>
+where
+    C: Clock,
+{
+    if !targets.staged_delete_slots.insert(slot.get()) {
+        return Ok(());
+    }
+    let mut deleted: Vec<CxId> = Vec::new();
+    let mut deleted_set: BTreeSet<CxId> = BTreeSet::new();
+    for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::slot(slot))? {
+        if let Some(cx_id) = cx_id_from_slot_key(&key)
+            && deleted_set.insert(cx_id)
+        {
+            deleted.push(cx_id);
+        }
+        push_unique(&mut targets.rows, ColumnFamily::slot(slot), key);
+    }
+    for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::slot_raw(slot))? {
+        if let Some(cx_id) = cx_id_from_slot_key(&key)
+            && deleted_set.insert(cx_id)
+        {
+            deleted.push(cx_id);
+        }
+        push_unique(&mut targets.rows, ColumnFamily::slot_raw(slot), key);
+    }
+    push_unique(
+        &mut targets.rows,
+        ColumnFamily::Compression,
+        compression_manifest_key(slot),
+    );
+    let record = GenerationLifecycleRecord::new(
+        GenerationTransition::DeleteGeneration,
+        slot.get(),
+        snapshot,
+        0,
+        String::new(),
+        String::new(),
+        deleted.iter().map(|cx_id| hex(cx_id.as_bytes())).collect(),
+    )?;
+    targets.lifecycle_writes.push((
+        ColumnFamily::Compression,
+        compression_lifecycle_key(slot, snapshot),
+        record.encode()?,
+    ));
+    Ok(())
+}
+
+fn cx_id_from_slot_key(key: &[u8]) -> Option<CxId> {
+    <[u8; 16]>::try_from(key).ok().map(CxId::from_bytes)
+}
+
+fn lifecycle_route_error(slot: SlotId) -> CalyxError {
+    CalyxError {
+        code: CALYX_COMPRESSION_LIFECYCLE_INVALID,
+        message: format!(
+            "cannot erase individual constellation rows from compressed slot {} generation; a compressed generation sheds rows only by resealing the whole column",
+            slot.get()
+        ),
+        remediation: "run the EraseReseal transition (Registry::erase_compressed_slot_rows) for the slot, or delete the whole generation, then retry the constellation erase",
+    }
 }
 
 fn collect_range_targets<C>(

@@ -1,4 +1,5 @@
 use super::{AsterVault, encode, ledger_hook};
+use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, Result, Seq};
 
 /// The WAL append is durable, but the live MVCC/router apply failed and the
@@ -183,6 +184,16 @@ where
                 .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice())),
         )?;
         admission.stop("memtable_admission", row_count, 0);
+        // Pre-WAL compression-generation admission (issue #562): reject an
+        // unlawful generation mutation BEFORE it is appended to the WAL, so a
+        // refused batch never becomes durable and the post-WAL reconciliation
+        // arm below can never persist it. Runs under the durable commit lock, so
+        // the visible state is stable through the subsequent commit.
+        let compression_admission: Vec<(ColumnFamily, &[u8], &[u8])> = rows
+            .iter()
+            .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice()))
+            .collect();
+        self.rows.validate_batch_admission(&compression_admission)?;
         let Some(durable) = &self.durable else {
             let mvcc = crate::commit_timing::start();
             let seq = self.commit_rows_to_mvcc(rows);
