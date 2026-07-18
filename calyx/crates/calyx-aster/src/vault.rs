@@ -54,6 +54,7 @@ pub use failpoints::{
     CRASH_FSV_ARMED_IN_PRODUCTION, crash_fsv_guard_decision, guard_against_production_failpoints,
 };
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
+pub use ledger_append::CALYX_ASTER_RAW_LEDGER_COMMIT_BOUNDARY;
 pub use htap::HtapDualRead;
 pub use input_store::{
     CALYX_INPUT_STORE_CORRUPT, CALYX_INPUT_STORE_MISSING, CALYX_INPUT_STORE_TOO_LARGE,
@@ -252,6 +253,15 @@ where
 
     pub(crate) fn clock_now(&self) -> u64 {
         self.clock.now()
+    }
+
+    /// Filesystem root of the durable store, or `None` for a volatile vault.
+    ///
+    /// Crate-internal: erase-intent persistence (issue #561) addresses the
+    /// durable intent record under this root. Volatile vaults have no root and
+    /// skip intent persistence — nothing survives a crash there by construction.
+    pub(crate) fn durable_root(&self) -> Option<&Path> {
+        self.durable.as_ref().map(DurableVault::root)
     }
 
     pub fn dedup_policy(&self) -> &DedupPolicy {
