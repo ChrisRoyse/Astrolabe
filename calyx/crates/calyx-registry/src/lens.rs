@@ -19,6 +19,7 @@ use crate::compression::{
 };
 use crate::frozen::FrozenLensContract;
 use crate::ingest_microbatch::{IngestLensOutcome, IngestMicrobatchController, IngestPanelReadout};
+use crate::persistence_contracts::contract_field_diffs;
 use crate::spec::{LensHealth, LensSpec};
 use contract::ensure_spec_declares_contract;
 
@@ -449,11 +450,7 @@ impl Registry {
             ensure_spec_declares_contract(&contract, spec)?;
         }
         let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
+        self.reject_duplicate_id(id, &contract)?;
         self.lenses.insert(
             id,
             RegistryEntry {
@@ -464,6 +461,49 @@ impl Registry {
             },
         );
         Ok(id)
+    }
+
+    /// Fails closed when a lens id is already registered.
+    ///
+    /// Ids are content-addressed by the versioned frozen contract, so an
+    /// incoming id can only collide with an existing entry two ways. If the
+    /// stored frozen contract is byte-identical to the incoming one, this is a
+    /// benign re-registration and refuses with `CALYX_REGISTRY_DUPLICATE`
+    /// without mutating state. If the stored contract differs — only reachable
+    /// when a caller supplies a legacy/forged id that hashed differently than
+    /// its true v2 contract — this refuses with `CALYX_LENS_FROZEN_VIOLATION`
+    /// carrying the complete field-by-field diff of both contracts so the
+    /// collision is fully diagnosable and no state is mutated.
+    fn reject_duplicate_id(&self, id: LensId, incoming: &FrozenLensContract) -> Result<()> {
+        let Some(existing) = self.lenses.get(&id) else {
+            return Ok(());
+        };
+        match &existing.frozen {
+            Some(registered) if registered == incoming => Err(CalyxError::registry_duplicate(
+                format!("lens {id} is already registered with an identical frozen contract"),
+            )),
+            Some(registered) => {
+                let diff = contract_field_diffs("registered_vs_incoming", registered, incoming)
+                    .into_iter()
+                    .map(|field| {
+                        format!(
+                            "{} registered={} incoming={}",
+                            field.field, field.persisted, field.reconstructed
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(CalyxError::lens_frozen_violation(format!(
+                    "lens id {id} collides with a different registered frozen contract \
+                     (registered {} != incoming {}): {diff}",
+                    registered.lens_id(),
+                    incoming.lens_id()
+                )))
+            }
+            None => Err(CalyxError::registry_duplicate(format!(
+                "lens {id} is already registered without a frozen contract"
+            ))),
+        }
     }
 
     /// Returns whether registration verified a deterministic probe or used an explicit exemption.
@@ -504,11 +544,7 @@ impl Registry {
             DeterminismProof::ContractOnlyExemption
         };
         let id = lens.id();
-        if self.lenses.contains_key(&id) {
-            return Err(CalyxError::registry_duplicate(format!(
-                "lens {id} is already registered"
-            )));
-        }
+        self.reject_duplicate_id(id, &contract)?;
         self.lenses.insert(
             id,
             RegistryEntry {
